@@ -225,7 +225,34 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// is not optional: they are cache-admitted, they look freshly indexed, and
 /// they would keep publishing a minifier's `t`, `e` and `n` as declarations of
 /// the repository long after the extractor stopped producing them.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "33";
+///
+/// v34 (X40) changes the payload in two ways, both of which a v33 row gets
+/// wrong rather than merely misses. `scope_locals` now carries a callable's
+/// **type parameters**, so a v33 row asserts that `read<T>` binds no `T` — the
+/// classifier reads that set as complete and files the generic in the tier
+/// reserved for probable defects. And `references` no longer carries the
+/// inferred-type placeholder `_`, so a v33 row still holds one reference per
+/// turbofish argument, each of which resolves to nothing by construction.
+/// Reusing either would leave a warm cache reporting the old classification
+/// with no sign that it is the old one.
+///
+/// v35 (X41) changes what a Rust `use` statement contributes. A v34 row for a
+/// `.rs` file carries one import per statement whose `module_specifier` is the
+/// statement's own source text (`"tree_sitter::{Language, Node, Parser}"`) and
+/// whose `imported_names` is empty — a specifier that matches no file and binds
+/// no name. The rows are not merely thinner: they are the shape that made every
+/// `.rs` file in a warm cache report zero `Imports` edges and zero `External`
+/// classifications while looking completely indexed.
+///
+/// v36 (X44) changes what `receiver_expr` means, on calls and on references
+/// alike. A v35 row carries `get_node_text` of the receiver node, whole: the
+/// entire left-hand expression of a chained call, newlines included — 13,387
+/// such rows on this repository, 4,973 of them multi-line, the longest 38,644
+/// characters. A v36 row carries the receiver's *identity* — the callee name of
+/// an inner call, a bounded dotted path otherwise. That is a different string
+/// for the same source, so mixing generations would put two spellings of one
+/// receiver in one ledger and split every grouping over it without saying so.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "36";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

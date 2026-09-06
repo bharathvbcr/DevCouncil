@@ -122,10 +122,14 @@ fn helper() {}
         .symbols
         .iter()
         .any(|s| s.name == "helper" && s.kind == SymbolKind::Function));
-    assert!(rs_ext
-        .imports
-        .iter()
-        .any(|i| i.module_specifier == "std::collections::HashMap"));
+    // X41. A `use` names a module and the names it takes out of it, the shape
+    // every other grammar produces. This used to expect the whole path as the
+    // module specifier — a string that matches no file and binds no name.
+    assert!(rs_ext.imports.iter().any(|i| {
+        i.module_specifier == "std::collections"
+            && i.imported_names.iter().any(|name| name == "HashMap")
+            && i.local_names.iter().any(|name| name == "HashMap")
+    }));
 
     // Test Go
     let go_code = r#"

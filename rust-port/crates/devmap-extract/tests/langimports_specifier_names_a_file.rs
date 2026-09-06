@@ -394,9 +394,11 @@ fn rust_use_declarations_are_still_extracted_beside_mod() {
     assert_specifiers(
         "src/lib.rs",
         "use crate::parser::Token;\nmod parser;\n",
-        // The `use` arm keeps the whole path — the resolver's `crate::` rung
-        // walks it down to an indexed file itself. Only `mod` is normalised to
-        // a module path here, because only `mod` names a file.
-        &["crate::parser::Token", "self::parser"],
+        // X41. The `use` arm now splits module from name, so the specifier is
+        // the module `crate::parser` and `Token` is what it imports — the shape
+        // every other language's extractor produces, and the one the resolver's
+        // per-name binding walk reads. Only `mod` is normalised to a `self::`
+        // module path here, because only `mod` names a file outright.
+        &["crate::parser", "self::parser"],
     );
 }

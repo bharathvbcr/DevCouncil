@@ -9,6 +9,25 @@ use devmap_extract::model::*;
 use crate::model::*;
 use devmap_extract::GoModule;
 
+/// Where the name a resolution rung failed on was written.
+///
+/// The tiers in [`UnresolvedClass`] are stated over evidence, and the evidence
+/// available for a name differs by position: a *value* is answered by the
+/// scope's bindings, the language's builtins and the file's imports, while a
+/// *type* additionally has the qualifier the author wrote beside it and the
+/// language's prelude. Passing the position explicitly is what lets
+/// [`Resolver::classify_unresolved`] consult only the rungs whose evidence
+/// actually exists, instead of a caller pre-deciding which class to file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsePosition<'a> {
+    /// A call, or an identifier in expression position.
+    Value,
+    /// A type annotation. `types` names the value this annotation types — `t`
+    /// for `t *testing.T` — when the extractor recorded one, because that is
+    /// the key the `TypeQualifier` sibling was indexed under.
+    Type { types: Option<&'a str> },
+}
+
 pub struct Resolver {
     symbol_index: BTreeMap<String, Vec<(String, SymbolKind, LangFamily)>>,
     file_symbols: BTreeMap<String, Vec<String>>, // file_path -> symbol_names
@@ -26,6 +45,22 @@ pub struct Resolver {
     /// abstaining is correct, answering with the winner of a race is not.
     poisoned_receiver_keys: BTreeSet<String>,
     type_methods: BTreeMap<(LangFamily, String, String), Vec<(String, String)>>,
+    /// `(family, type name)` -> the type names it declares as supertypes.
+    ///
+    /// X42. Built from the `Heritage` / `HeritageInterface` references the
+    /// extractor already emits — the same rows that produce `Extends` and
+    /// `Implements` edges — so nothing new is parsed and no naming convention
+    /// is consulted. It exists because `self.m()` where `m` is declared by a
+    /// base class is a *receiver-type* fact, and until this map there was no
+    /// way to state it: the ladder fell through to the global rung and bound
+    /// the call by bare name, at HIGH, to whichever declaration happened to be
+    /// unique.
+    ///
+    /// Flat by bare type name, exactly as `type_methods` is, so it adds no
+    /// namespace imprecision that map does not already carry — and the walk
+    /// that reads it refuses to continue through a type name two files declare,
+    /// where the chain stops being identifiable.
+    supertypes: BTreeMap<(LangFamily, String), BTreeSet<String>>,
     /// Per-file local import name → (target file, exported symbol) for import-scoped calls (G6).
     import_bindings: BTreeMap<String, BTreeMap<String, (String, String)>>,
     /// `file:scope:var` and `file:var` → the *declared* type name of a value,
@@ -61,6 +96,23 @@ pub struct Resolver {
     /// Kept as its own map rather than dropped, so the specifier survives as
     /// evidence in the ledger's reason string.
     unindexed_local_imports: BTreeMap<String, BTreeMap<String, String>>,
+    /// Per-file set of **module-path roots** this file's imports name, split
+    /// into the two halves `external_imports` and `unindexed_local_imports`
+    /// already draw: outside the corpus, and repo-relative-but-unindexed.
+    ///
+    /// X43. A Rust path is addressable without a `use` of its root —
+    /// `use serde_json::Value;` makes `Value` a binding but leaves
+    /// `serde_json::from_str(...)` written as a path, whose *root* is a key
+    /// neither existing map has. These are those roots, derived from the same
+    /// walk so the three maps cannot disagree about what a specifier meant.
+    ///
+    /// Consulted only for a receiver that is syntactically a path (it contains
+    /// `::`), which is what keeps a local variable sharing a crate's name out
+    /// of reach — a binding cannot contain `::`.
+    external_module_roots: BTreeMap<String, BTreeSet<String>>,
+    /// The repo-relative half of the above. A path rooted here is an index gap,
+    /// never `External`.
+    local_module_roots: BTreeMap<String, BTreeSet<String>>,
     /// (file, bare symbol name) → qualified name. Edge endpoints are graph
     /// identities, not bare words: emitting `open` instead of `app.py::open`
     /// makes an edge unjoinable to the node it names.
@@ -155,10 +207,13 @@ impl Resolver {
             scoped_receiver_types: BTreeMap::new(),
             poisoned_receiver_keys: BTreeSet::new(),
             type_methods: BTreeMap::new(),
+            supertypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             external_imports: BTreeMap::new(),
             unindexed_local_imports: BTreeMap::new(),
+            external_module_roots: BTreeMap::new(),
+            local_module_roots: BTreeMap::new(),
             qualified_names: BTreeMap::new(),
             symbol_parents: BTreeMap::new(),
             go_modules: Vec::new(),
@@ -258,6 +313,40 @@ impl Resolver {
             ))
     }
 
+    /// The leftmost segment of a dotted, scoped or slashed path.
+    ///
+    /// One owner for a split that `classify_unresolved` was doing inline and
+    /// `index_extractions` now needs too — `metrics.counters.Inc()` is evidence
+    /// about `metrics`, `std::fs::write()` about `std`, and a Go specifier
+    /// `example.com/pkg/sub` about `example.com`. All three separators, because
+    /// the caller does not know which language wrote the string.
+    fn path_root(path: &str) -> &str {
+        path.split("::")
+            .next()
+            .unwrap_or(path)
+            .split('.')
+            .next()
+            .unwrap_or(path)
+            .split('/')
+            .next()
+            .unwrap_or(path)
+    }
+
+    /// Whether any indexed file this family may resolve into declares `name`.
+    ///
+    /// The corpus's veto over a name table. A rung that says "the language
+    /// declares this" must not fire where the *repository* declares it too:
+    /// there the ladder either bound the reference already or abstained between
+    /// several declarations, and an abstention filed as "expected" is a real
+    /// ambiguity hidden behind a label. Any symbol kind counts — a struct, a
+    /// trait and a function named `Default` are all reasons to abstain.
+    fn family_declares(&self, family: LangFamily, name: &str) -> bool {
+        self.symbol_index.get(name).is_some_and(|hits| {
+            hits.iter()
+                .any(|(_, _, candidate_family)| family.admits(*candidate_family))
+        })
+    }
+
     /// Why a call that failed the resolution ladder has no edge (SC18).
     ///
     /// Ordered by strength of evidence, and **fail-open toward `Unresolved`**:
@@ -271,7 +360,68 @@ impl Resolver {
         callee_name: &str,
         receiver: Option<&str>,
         enclosing_symbol: &str,
+        position: UsePosition<'_>,
     ) -> UnresolvedClass {
+        // X40. A name in type position is classified from type-position
+        // evidence, and only then from the value-position ladder below.
+        //
+        // Ordered the way the value rungs are: file-specific evidence (the
+        // qualifier the author wrote) outranks a name list, for the same reason
+        // an import outranks the host-global table.
+        if let UsePosition::Type { types } = position {
+            // `t *testing.T`. The extractor splits the written type into a bare
+            // name for dispatch and a `TypeQualifier` sibling for provenance
+            // (SC25), so by the time the bare `T` fails the ladder the qualifier
+            // is the only thing that still knows where it came from. Read
+            // through `declared_types`, which is where that sibling was
+            // indexed, and scoped-first for the SC9 reason: a qualifier this
+            // scope wrote may not speak for a same-named binding in another.
+            if let Some(typed) = types {
+                let qualifier = self
+                    .declared_types
+                    .get(&format!("{file_path}:{enclosing_symbol}:{typed}@mod"))
+                    .or_else(|| self.declared_types.get(&format!("{file_path}:{typed}@mod")));
+                if let Some(qualifier) = qualifier {
+                    if let Some(module) = self
+                        .external_imports
+                        .get(file_path)
+                        .and_then(|imports| imports.get(qualifier.as_str()))
+                    {
+                        return UnresolvedClass::External {
+                            module: module.clone(),
+                        };
+                    }
+                    // A repo-relative qualifier that named no indexed file is an
+                    // index gap, exactly as it is for a call — never `External`.
+                    if self
+                        .unindexed_local_imports
+                        .get(file_path)
+                        .is_some_and(|imports| imports.contains_key(qualifier.as_str()))
+                    {
+                        return UnresolvedClass::Unresolved;
+                    }
+                }
+            }
+            // X43. The qualifier itself, when it *is* a reserved standard-library
+            // root: `p: std::path::PathBuf` emits a `TypeQualifier` reference
+            // named `std`, which is a module and not a type anything declares.
+            if crate::builtins::is_reserved_module_root(family, callee_name) {
+                return UnresolvedClass::External {
+                    module: callee_name.to_string(),
+                };
+            }
+            // A prelude type, and **nothing in this corpus declares the name**.
+            // The second half is the whole guard: where a file does declare it,
+            // the reference either resolved to that declaration or the resolver
+            // abstained between several, and an abstention is not evidence that
+            // the language owns the name. See `builtins::RUST_PRELUDE_TYPES`.
+            if crate::builtins::is_prelude_type(family, callee_name)
+                && !self.family_declares(family, callee_name)
+            {
+                return UnresolvedClass::Builtin;
+            }
+        }
+
         // The enclosing scope's own binding beats every wider authority, so it
         // is asked first. A parameter named `len` shadows Go's builtin, and a
         // parameter named `useState` shadows the import: in both cases the call
@@ -330,13 +480,7 @@ impl Resolver {
         // `metrics.counters.Inc()` is evidence about `metrics` and
         // `std::fs::write()` is evidence about `std`. Both separators are
         // handled because Rust's `scoped_identifier` receivers use `::`.
-        let root = receiver
-            .split("::")
-            .next()
-            .unwrap_or(receiver)
-            .split('.')
-            .next()
-            .unwrap_or(receiver);
+        let root = Self::path_root(receiver);
 
         if let Some(imports) = external {
             // `strings.TrimSpace()` / `assert.Equal()`: the receiver is the
@@ -401,10 +545,90 @@ impl Resolver {
             return UnresolvedClass::Unresolved;
         }
 
+        // X43. The receiver is a **module path** rather than a value.
+        //
+        // `std::fs::write(...)` reached `UninferredReceiver`, the tier that
+        // means "the receiver is a value whose type we could not infer", and
+        // `std::fs` is not a value at all. 2,128 rows on this repository, plus
+        // 373 rooted at `serde_json` — a crate the file's own `use` lines name,
+        // whose *root* is a key no handle-keyed map above holds, because Rust
+        // makes a crate addressable by path without a `use` of the root.
+        //
+        // Two shapes, and the test differs because the evidence does:
+        //
+        // * a receiver containing `::` whose every segment is a plain
+        //   identifier is a path *syntactically* — no binding in these
+        //   languages can contain `::`, so this cannot mistake a local for a
+        //   module. It is also what keeps a chained-call receiver out: the text
+        //   `std::fs::write("out.txt", body)` has a segment with parentheses,
+        //   so `unwrap()` on its result stays an uninferred receiver, which is
+        //   what it is.
+        // * a bare root is only a module if the enclosing scope does **not**
+        //   bind that name. `serde_json::from_str(x)` reduces to the receiver
+        //   `serde_json`, and `let serde_json = build(); serde_json.take()`
+        //   reduces to the same string — the scope's own binding tables are the
+        //   only thing that separates them, and they are asked in the same
+        //   direction the `LocalBinding` rung asks them.
+        let root_is_a_value_here = self.scope_declares_local(file_path, enclosing_symbol, root)
+            || self
+                .declared_types
+                .contains_key(&format!("{file_path}:{root}@type"))
+            || self
+                .receiver_types
+                .contains_key(&format!("{file_path}:{root}"));
+        // The bare shape requires the receiver to *be* the root and nothing
+        // else. `std::fs::write("out.txt", body)` as the receiver of `unwrap()`
+        // is also rooted at `std`, and it is an expression, not a module — the
+        // whole point of the tier it belongs in.
+        let bare_module_handle =
+            receiver == root && Self::receiver_is_module_path(&format!("{root}::x"));
+        if Self::receiver_is_module_path(receiver) || (bare_module_handle && !root_is_a_value_here)
+        {
+            // Repo-relative by construction: `crate::missing::helper()` cannot
+            // name anything outside this tree, so a miss is an index gap and
+            // keeps the tier that says a human should look.
+            if matches!(root, "crate" | "self" | "super")
+                || self
+                    .local_module_roots
+                    .get(file_path)
+                    .is_some_and(|roots| roots.contains(root))
+            {
+                return UnresolvedClass::Unresolved;
+            }
+            if crate::builtins::is_reserved_module_root(family, root)
+                || self
+                    .external_module_roots
+                    .get(file_path)
+                    .is_some_and(|roots| roots.contains(root))
+            {
+                return UnresolvedClass::External {
+                    module: root.to_string(),
+                };
+            }
+        }
+
         // A receiver we could not type. Not a defect — naming its owner needs
         // real type inference — but distinct from a bare-name failure, and by
         // far the larger group.
         UnresolvedClass::UninferredReceiver
+    }
+
+    /// Whether a receiver expression is a module **path** rather than a value.
+    ///
+    /// Syntactic on purpose. A binding cannot contain `::` in any language this
+    /// resolver types receivers for, so a `::`-joined run of plain identifiers
+    /// is a path and nothing else. Requiring *every* segment to be an
+    /// identifier is what excludes a chained call whose text happens to contain
+    /// a path — `std::fs::write("out.txt", body)` as the receiver of `unwrap()`
+    /// — from being read as one.
+    fn receiver_is_module_path(receiver: &str) -> bool {
+        receiver.contains("::")
+            && receiver.split("::").all(|segment| {
+                !segment.is_empty()
+                    && segment
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            })
     }
 
     /// Whether an import specifier names something inside this repository *by
@@ -450,10 +674,13 @@ impl Resolver {
         self.scoped_receiver_types.clear();
         self.poisoned_receiver_keys.clear();
         self.type_methods.clear();
+        self.supertypes.clear();
         self.import_bindings.clear();
         self.declared_types.clear();
         self.external_imports.clear();
         self.unindexed_local_imports.clear();
+        self.external_module_roots.clear();
+        self.local_module_roots.clear();
         self.qualified_names.clear();
         self.symbol_parents.clear();
         self.go_package_by_file.clear();
@@ -565,10 +792,23 @@ impl Resolver {
             // The half of that mirror whose specifier is repo-relative, and so
             // proves an index gap rather than an outside origin.
             let mut file_local_gap: BTreeMap<String, String> = BTreeMap::new();
+            // X43. The specifier's own leading segment, recorded beside the
+            // local handle. A path is written from its root — `serde_json::
+            // from_str(...)` — and the root of a specifier is a key no
+            // handle-keyed map holds.
+            let mut file_external_roots: BTreeSet<String> = BTreeSet::new();
+            let mut file_local_roots: BTreeSet<String> = BTreeSet::new();
             let mut unresolved_import = |local: String, specifier: &str| {
+                let root = Self::path_root(specifier);
                 if Self::specifier_is_repo_relative(specifier) {
+                    if !root.is_empty() {
+                        file_local_roots.insert(root.to_string());
+                    }
                     file_local_gap.insert(local, specifier.to_string());
                 } else {
+                    if !root.is_empty() {
+                        file_external_roots.insert(root.to_string());
+                    }
                     file_external.insert(local, specifier.to_string());
                 }
             };
@@ -668,14 +908,38 @@ impl Resolver {
                         // `import "strings"`, `import react from "react"`. The
                         // local name is the package handle, so a later
                         // `strings.TrimSpace` can be recognised by its receiver.
-                        let local = alias.map(str::to_string).unwrap_or_else(|| {
-                            Self::import_local_name(&ext.language, &imp.module_specifier)
-                        });
+                        //
+                        // `.` is not a handle — it is the marker for "bind
+                        // everything this module exports", so a glob whose
+                        // module resolved to nothing must fall back to the
+                        // specifier's own last segment. Keying `external_imports`
+                        // under `"."` would file the evidence under a name no
+                        // call site can ever mention.
+                        let local = alias
+                            .filter(|alias| *alias != ".")
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                Self::import_local_name(&ext.language, &imp.module_specifier)
+                            });
                         unresolved_import(local, &imp.module_specifier);
                         continue;
                     };
                     if alias == Some(".") {
                         for file in &targets {
+                            // X41. A glob of the file's *own* module —
+                            // `mod tests { use super::*; }` — is skipped, and
+                            // not as an optimisation. `import_bindings` is
+                            // per-file and rung 2a consults it with **no scope
+                            // test**, so binding every symbol of this file into
+                            // it would let a bare `run()` anywhere in the file
+                            // reach `class C: def run(self)` at DETERMINISTIC —
+                            // the fabricated-caller defect rung 2c's
+                            // `bare_name_is_in_scope` exists to stop. The
+                            // same-file rungs already reach everything this
+                            // binding could, and they apply that test.
+                            if file == &ext.file_path {
+                                continue;
+                            }
                             if let Some(syms) = self.file_symbols.get(file) {
                                 for name in syms {
                                     file_bindings
@@ -696,6 +960,14 @@ impl Resolver {
                 self.external_imports
                     .insert(ext.file_path.clone(), file_external);
             }
+            if !file_external_roots.is_empty() {
+                self.external_module_roots
+                    .insert(ext.file_path.clone(), file_external_roots);
+            }
+            if !file_local_roots.is_empty() {
+                self.local_module_roots
+                    .insert(ext.file_path.clone(), file_local_roots);
+            }
             if !file_local_gap.is_empty() {
                 self.unindexed_local_imports
                     .insert(ext.file_path.clone(), file_local_gap);
@@ -706,6 +978,45 @@ impl Resolver {
             }
 
             let family = LangFamily::from_lang(&ext.language);
+            // X42. The supertype table, read from the heritage references the
+            // extractor emits. `enclosing_symbol` on one of these is the
+            // *declaring* type — that is what makes the `Extends` edge have two
+            // endpoints — so its tail is the subtype's name and the reference's
+            // own name is the supertype's.
+            for reference in &ext.references {
+                if !matches!(
+                    reference.kind,
+                    ReferenceKind::Heritage | ReferenceKind::HeritageInterface
+                ) {
+                    continue;
+                }
+                let Some(subtype) = reference
+                    .enclosing_symbol
+                    .as_deref()
+                    .filter(|symbol| *symbol != ext.file_path)
+                    .and_then(|symbol| symbol.rsplit("::").next())
+                    .filter(|subtype| !subtype.is_empty())
+                else {
+                    continue;
+                };
+                // A qualified base (`base.Widget`, `crate::m::Widget`) reduces
+                // to the bare name, which is the key `type_methods` uses.
+                let supertype = reference
+                    .name
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&reference.name)
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&reference.name);
+                if supertype.is_empty() || supertype == subtype {
+                    continue;
+                }
+                self.supertypes
+                    .entry((family, subtype.to_string()))
+                    .or_default()
+                    .insert(supertype.to_string());
+            }
             for reference in &ext.references {
                 let Some(receiver) = &reference.assigned_to else {
                     continue;
@@ -1024,6 +1335,19 @@ impl Resolver {
                         targets
                     };
                     for target_f in edge_targets {
+                        // X41. An import that names the file it is written in
+                        // is a real statement about the module tree — `mod
+                        // tests { use super::*; }` — and not a dependency
+                        // between files. `langimports/rust.rs` already declines
+                        // to emit one for the `mod` half of the same fact, for
+                        // the same reason: "emitting an import for it would be
+                        // an edge from a file to itself". The import is still
+                        // *resolved*, so it stops being recorded as an
+                        // unresolved relative import; only the self-loop is
+                        // withheld.
+                        if target_f == ext.file_path {
+                            continue;
+                        }
                         edges.push(ResolvedEdge::resolved(
                             ext.file_path.clone(),
                             target_f.clone(),
@@ -1086,8 +1410,53 @@ impl Resolver {
                         }
                     }
 
+                    // Whether the receiver is the enclosing object itself.
+                    // Several rungs below turn on it, and it was previously
+                    // recomputed at each of them.
+                    let implicit_receiver = call
+                        .receiver_expr
+                        .as_deref()
+                        .is_some_and(Self::receiver_is_self);
+
+                    // 1b. X42. An implicit receiver dispatches on the type the
+                    // call is written inside, and on that type's supertypes.
+                    //
+                    // Runs after rung 1 on purpose: a scope that writes
+                    // `self = Other()` has stated what `self` is, and written
+                    // evidence in this very scope outranks the enclosing type's
+                    // default. It runs *before* the import rungs for the
+                    // opposite reason — `self.run()` cannot mean an imported
+                    // free function, in any language here, so an import binding
+                    // of that bare name is not evidence about this call.
+                    if resolution.is_none() && implicit_receiver {
+                        if let Some(caller) = call.caller_symbol.as_deref() {
+                            if let Some((target_file, target_symbol, receiver_type)) = self
+                                .implicit_receiver_target(
+                                    &ext.file_path,
+                                    family,
+                                    caller,
+                                    &call.callee_name,
+                                )
+                            {
+                                resolution = Some(Arc::new(Resolution::ReceiverType {
+                                    target_symbol,
+                                    target_file,
+                                    receiver_type,
+                                }));
+                            }
+                        }
+                    }
+
                     // 2a. Import-scoped named binding (G6 — no silent global widen)
-                    if resolution.is_none() {
+                    //
+                    // Refused for an implicit receiver. This rung reads
+                    // `import_bindings` by the **bare callee name** and never
+                    // looked at the receiver, so `self.run()` in a file carrying
+                    // `from helpers import run` bound to `helpers.run` at
+                    // DETERMINISTIC — a confident edge to a function the code
+                    // demonstrably does not call, and one that also hands the
+                    // real method one fewer caller than it has.
+                    if resolution.is_none() && !implicit_receiver {
                         if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
                             if let Some((target_f, target_sym)) = bindings.get(&call.callee_name) {
                                 if let Some((resolved_file, resolved_sym)) =
@@ -1253,8 +1622,22 @@ impl Resolver {
                             let bare_call = call.receiver_expr.is_none();
                             let family_hits: Vec<_> = hits
                                 .iter()
-                                .filter(|(path, _, candidate_family)| {
+                                .filter(|(path, kind, candidate_family)| {
                                     family.admits(*candidate_family)
+                                        // X42. `self.m()` names a *member* of
+                                        // the receiver's type. A module-level
+                                        // function of the same name is not one,
+                                        // so binding to it is a wrong edge in
+                                        // both directions: the call gets a
+                                        // target it cannot reach, and the free
+                                        // function gets a caller it does not
+                                        // have — which shields it from the
+                                        // dead-code pass. Measured shape:
+                                        // `self.run()` fanning out to both
+                                        // `Service.run` and an unrelated
+                                        // `other.py::run`.
+                                        && (!implicit_receiver
+                                            || matches!(kind, SymbolKind::Method))
                                         && (*candidate_family != LangFamily::Go
                                             || Self::go_symbol_visible_from(
                                                 &ext.file_path,
@@ -1384,6 +1767,7 @@ impl Resolver {
                             &call.callee_name,
                             call.receiver_expr.as_deref(),
                             &caller_sym,
+                            UsePosition::Value,
                         );
                         unresolved.push(UnresolvedReference {
                             source_file: ext.file_path.clone(),
@@ -1448,12 +1832,31 @@ impl Resolver {
                         .enclosing_symbol
                         .clone()
                         .unwrap_or_else(|| ext.file_path.clone());
+                    // A `Type` or `TypeQualifier` reference is a type
+                    // annotation; every other surviving kind — `Name`,
+                    // `Heritage`, `HeritageInterface`, `Decorator` — names a
+                    // value or a supertype and is answered by the value rungs.
+                    // Heritage is deliberately *not* a type position here: a
+                    // base class is a real declaration the corpus is expected
+                    // to contain, and exempting an unfound one as "the language
+                    // declares it" would hide a missing supertype.
+                    let position = if matches!(
+                        reference.kind,
+                        ReferenceKind::Type | ReferenceKind::TypeQualifier
+                    ) {
+                        UsePosition::Type {
+                            types: reference.assigned_to.as_deref(),
+                        }
+                    } else {
+                        UsePosition::Value
+                    };
                     let class = self.classify_unresolved(
                         &ext.file_path,
                         family,
                         name,
                         reference.receiver_expr.as_deref(),
                         &source_symbol,
+                        position,
                     );
                     unresolved.push(UnresolvedReference {
                         source_file: ext.file_path.clone(),
@@ -1719,10 +2122,88 @@ impl Resolver {
         crate::importpath::normalize_rel(base_dir, spec)
     }
 
+    /// The directories a Rust module's children can live in, best first.
+    ///
+    /// `src/lib.rs` and `src/deep/mod.rs` keep their children in their own
+    /// directory; `src/deep/leaf.rs` keeps them in `src/deep/leaf/`. The second
+    /// is the rule the module system states and the one this resolver never
+    /// applied — it used the file's directory for both, so `super::sibling`
+    /// written in `src/deep/leaf.rs` probed `src/sibling.rs` when the statement
+    /// names `src/deep/sibling.rs`.
+    ///
+    /// Both readings are returned rather than one chosen, because "is this file
+    /// a crate root" is not decidable from its path: `lib.rs` and `main.rs` are,
+    /// and so is every file directly under `tests/`, `benches/`, `examples/` and
+    /// `src/bin/` — a list that goes stale against Cargo's auto-discovery and
+    /// against a hand-written `[[test]] path = …`. The module-system reading is
+    /// tried first and the indexed file universe decides; neither can invent a
+    /// file that is not there, so the worst case is the answer this rung gave
+    /// before.
+    fn rust_module_dirs(file: &str) -> Vec<String> {
+        let dir = Self::parent_dir(file);
+        let stem = file
+            .rsplit('/')
+            .next()
+            .unwrap_or(file)
+            .strip_suffix(".rs")
+            .unwrap_or_default();
+        // A directory module's file: its children are its siblings, not its
+        // descendants.
+        if stem.is_empty() || matches!(stem, "mod" | "lib" | "main") {
+            return vec![dir];
+        }
+        let nested = if dir.is_empty() {
+            stem.to_string()
+        } else {
+            format!("{dir}/{stem}")
+        };
+        if nested == dir {
+            vec![dir]
+        } else {
+            vec![nested, dir]
+        }
+    }
+
+    /// The source root of the crate `file` belongs to — what `crate::` is
+    /// relative to.
+    ///
+    /// The longest ancestor path whose last component is `src`. Cargo requires
+    /// a crate's root to be `src/lib.rs` or `src/main.rs` (or a path named in
+    /// the manifest), so the innermost `src` above a file is its crate's root
+    /// in every layout this resolver can be pointed at, single-crate and
+    /// workspace alike.
+    ///
+    /// Falls back to the literal `src`, which is what this rung probed
+    /// unconditionally before: a file with no `src` ancestor — `build.rs`, a
+    /// `tests/` integration crate, a bare script — keeps exactly the behaviour
+    /// it had rather than gaining a guess.
+    fn rust_crate_src_root(file: &str) -> String {
+        let mut components: Vec<&str> = file.split('/').collect();
+        components.pop();
+        while let Some(last) = components.last() {
+            if *last == "src" {
+                return components.join("/");
+            }
+            components.pop();
+        }
+        "src".to_string()
+    }
+
     fn import_local_name(lang: &str, specifier: &str) -> String {
         if lang == "go" {
             specifier
                 .rsplit('/')
+                .next()
+                .unwrap_or(specifier)
+                .to_string()
+        } else if lang == "rust" {
+            // Rust's path separator is `::`, and splitting on `.` returns the
+            // whole specifier — so `use serde_json::*;` used to record its
+            // module handle as the literal `"serde_json::*"`, a name no call
+            // site can mention. Nothing depended on that before X41 because no
+            // Rust `use` reached this function with a real path at all.
+            specifier
+                .rsplit("::")
                 .next()
                 .unwrap_or(specifier)
                 .to_string()
@@ -1818,6 +2299,122 @@ impl Resolver {
     /// matching it against this file's symbols by bare name is a guess.
     fn receiver_is_self(receiver: &str) -> bool {
         matches!(receiver, "self" | "this" | "cls" | "$this" | "me" | "Self")
+    }
+
+    /// How far the supertype walk may climb.
+    ///
+    /// A bound rather than a cycle check alone: `class A(B)` / `class B(A)` is
+    /// not the only pathology, and a generated hierarchy thousands deep would
+    /// cost a lookup per level per call site. Eight covers every hierarchy this
+    /// resolver has been pointed at; past it the rung abstains, which loses an
+    /// edge and invents nothing.
+    const HERITAGE_WALK_MAX_DEPTH: usize = 8;
+
+    /// The type `symbol` is declared by, or `None` when it is declared at file
+    /// level.
+    ///
+    /// Read from `symbol_parents` — the extractor's own answer — and reduced to
+    /// the bare name the same way `type_methods` reduces `parent_symbol` when
+    /// it is built, so the two cannot key differently. Deliberately **not** a
+    /// split of the method's qualified name on `.`: `Outer.Inner.method` and a
+    /// module-level `a.b` are the same string to that rule and different facts.
+    fn declaring_type_of(&self, file: &str, symbol: &str) -> Option<&str> {
+        self.symbol_parents
+            .get(&(file.to_string(), symbol.to_string()))
+            .filter(|parent| *parent != file)
+            .and_then(|parent| parent.rsplit("::").next())
+            .filter(|type_name| !type_name.is_empty())
+    }
+
+    /// Whether exactly one indexed file declares a type of this name.
+    ///
+    /// The identifiability test for the supertype walk. `type_methods` and
+    /// `supertypes` are both flat by bare type name, so a chain that passes
+    /// through a name two files declare is a chain this resolver cannot follow
+    /// — and following it anyway would dispatch on whichever declaration the
+    /// merge happened to produce.
+    fn type_name_is_identifiable(&self, family: LangFamily, type_name: &str) -> bool {
+        let mut files: BTreeSet<&str> = BTreeSet::new();
+        for (path, kind, candidate_family) in self.symbol_index.get(type_name).into_iter().flatten()
+        {
+            if family.admits(*candidate_family)
+                && matches!(
+                    kind,
+                    SymbolKind::Class
+                        | SymbolKind::Struct
+                        | SymbolKind::Enum
+                        | SymbolKind::Interface
+                        | SymbolKind::Trait
+                )
+            {
+                files.insert(path.as_str());
+            }
+        }
+        files.len() <= 1
+    }
+
+    /// X42. Where `self.m()` / `cls.m()` / `this.m()` / a Go receiver's `s.M()`
+    /// goes, given the type the call is written inside.
+    ///
+    /// The receiver of such a call *is* the enclosing type — that is what the
+    /// keyword means — so this is `ReceiverType` evidence and not a new rung.
+    /// The type's own methods answer first; failing that, its declared
+    /// supertypes do, breadth-first, because an inherited method is still a
+    /// method of the receiver's type.
+    ///
+    /// Abstains, rather than choosing, on every ambiguity: a type that declares
+    /// the name twice, a level of the hierarchy where two supertypes declare
+    /// it, and a type name two files declare. Returns
+    /// `(target file, target symbol, the type that declared it)`.
+    fn implicit_receiver_target(
+        &self,
+        file: &str,
+        family: LangFamily,
+        caller_symbol: &str,
+        method: &str,
+    ) -> Option<(String, String, String)> {
+        let enclosing = self.declaring_type_of(file, caller_symbol)?.to_string();
+        let mut frontier = vec![enclosing];
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            let mut found: BTreeSet<(String, String, String)> = BTreeSet::new();
+            let mut next: Vec<String> = Vec::new();
+            for type_name in &frontier {
+                if !visited.insert(type_name.clone()) {
+                    continue;
+                }
+                if !self.type_name_is_identifiable(family, type_name) {
+                    return None;
+                }
+                if let Some(hits) =
+                    self.type_methods
+                        .get(&(family, type_name.clone(), method.to_string()))
+                {
+                    // One type declaring the same method twice is an ambiguity
+                    // inside that type, and nothing here can choose.
+                    if hits.len() != 1 {
+                        return None;
+                    }
+                    found.insert((hits[0].0.clone(), hits[0].1.clone(), type_name.clone()));
+                }
+                if let Some(bases) = self.supertypes.get(&(family, type_name.clone())) {
+                    next.extend(bases.iter().cloned());
+                }
+            }
+            match found.len() {
+                1 => return found.into_iter().next(),
+                0 => {}
+                // Two supertypes at one level declare the name. The language's
+                // own MRO might pick one; this resolver has no MRO, and a guess
+                // at DETERMINISTIC is the one answer it must not give.
+                _ => return None,
+            }
+            if next.is_empty() {
+                return None;
+            }
+            frontier = next;
+        }
+        None
     }
 
     fn lookup_in_package(&self, file: &str, name: &str) -> Option<(String, String)> {
@@ -2433,15 +3030,63 @@ impl Resolver {
             }
         }
 
+        // X41. `use` now arrives here as a real module path, so the three
+        // module roots it can name have to be answerable **bare** as well as
+        // prefixed: `use super::*;` inside `mod tests { … }` is rewritten by
+        // the extractor to the bare `self`, naming the file it is written in.
+        if lang == "rust" {
+            if clean_spec == "self" {
+                return self
+                    .file_symbols
+                    .contains_key(current_file)
+                    .then(|| current_file.to_string());
+            }
+            if clean_spec == "crate" {
+                let root = Self::rust_crate_src_root(current_file);
+                for candidate in [format!("{root}/lib.rs"), format!("{root}/main.rs")] {
+                    if self.file_symbols.contains_key(&candidate) {
+                        return Some(candidate);
+                    }
+                }
+            }
+            // The parent module *as a file*: `src/deep/leaf.rs` is `deep::leaf`,
+            // so its `super` is `deep`, which lives in `src/deep/mod.rs` or
+            // `src/deep.rs`.
+            if clean_spec == "super" {
+                for module_dir in Self::rust_module_dirs(current_file)
+                    .iter()
+                    .map(|module_dir| Self::parent_dir(module_dir))
+                {
+                    for candidate in [
+                        format!("{module_dir}/mod.rs"),
+                        format!("{module_dir}.rs"),
+                        format!("{module_dir}/lib.rs"),
+                        format!("{module_dir}/main.rs"),
+                    ] {
+                        if self.file_symbols.contains_key(&candidate) {
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+
         if lang == "rust" && clean_spec.starts_with("crate::") {
             let crate_tail = clean_spec.strip_prefix("crate::")?;
+            // The **crate's** source root, not the repository's. `crate::` is
+            // relative to the crate the file belongs to, and a workspace puts
+            // that at `crates/<name>/src`, so probing a literal `src/…` from
+            // the tree root answered nothing for every workspace member. That
+            // is why this repository produced no `Imports` edge at all for the
+            // hundreds of `use crate::…` lines in its own kernel.
+            let root = Self::rust_crate_src_root(current_file);
             let mut parts: Vec<&str> = crate_tail.split("::").collect();
             self.trim_to_indexed_depth(&mut parts);
             while !parts.is_empty() {
                 let rust_path = parts.join("/");
                 let candidates = [
-                    format!("src/{}.rs", rust_path),
-                    format!("src/{}/mod.rs", rust_path),
+                    format!("{root}/{rust_path}.rs"),
+                    format!("{root}/{rust_path}/mod.rs"),
                 ];
                 for cand in &candidates {
                     if self.file_symbols.contains_key(cand) {
@@ -2454,31 +3099,46 @@ impl Resolver {
 
         if lang == "rust" && (clean_spec.starts_with("self::") || clean_spec.starts_with("super::"))
         {
-            let mut module_dir = dir.clone();
             let mut tail = clean_spec;
+            let mut hops = 0usize;
             if let Some(stripped) = tail.strip_prefix("self::") {
                 tail = stripped;
             } else {
                 while let Some(stripped) = tail.strip_prefix("super::") {
-                    module_dir = Self::parent_dir(&module_dir);
+                    hops += 1;
                     tail = stripped;
                 }
             }
             let mut parts: Vec<&str> = tail.split("::").collect();
             self.trim_to_indexed_depth(&mut parts);
+            // Both readings of "where does this module keep its children", best
+            // first — see `rust_module_dirs`. Each `super::` walks one directory
+            // up from whichever base is being tried.
+            let bases: Vec<String> = Self::rust_module_dirs(current_file)
+                .into_iter()
+                .map(|mut module_dir| {
+                    for _ in 0..hops {
+                        module_dir = Self::parent_dir(&module_dir);
+                    }
+                    module_dir
+                })
+                .collect();
             while !parts.is_empty() {
                 let module_path = parts.join("/");
-                let base = Self::normalize_rel(&module_dir, &module_path);
-                // `base` itself, before the two conventional forms: a
-                // `#[path = "generated/tables.rs"] mod tables;` reaches this
-                // rung as `self::generated/tables.rs`, and the extension is
-                // already on it. Appending `.rs` to a path that has one probes
-                // `tables.rs.rs` and finds nothing — which is precisely the
-                // case the attribute exists to declare, so failing it would
-                // leave the real file reported as imported by nothing.
-                for candidate in [base.clone(), format!("{base}.rs"), format!("{base}/mod.rs")] {
-                    if self.file_symbols.contains_key(&candidate) {
-                        return Some(candidate);
+                for module_dir in &bases {
+                    let base = Self::normalize_rel(module_dir, &module_path);
+                    // `base` itself, before the two conventional forms: a
+                    // `#[path = "generated/tables.rs"] mod tables;` reaches this
+                    // rung as `self::generated/tables.rs`, and the extension is
+                    // already on it. Appending `.rs` to a path that has one probes
+                    // `tables.rs.rs` and finds nothing — which is precisely the
+                    // case the attribute exists to declare, so failing it would
+                    // leave the real file reported as imported by nothing.
+                    for candidate in [base.clone(), format!("{base}.rs"), format!("{base}/mod.rs")]
+                    {
+                        if self.file_symbols.contains_key(&candidate) {
+                            return Some(candidate);
+                        }
                     }
                 }
                 parts.pop();
