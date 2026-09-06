@@ -230,12 +230,14 @@ context."
             .to_string(),
         role_buckets_step(map),
         cross_subsystem_step(map),
-        "7. Prefer `devmap dead --confidence extracted` + file greps for dead code. Treat \
-`inferred` as unconfirmed. Prefer `unwired_candidates` / `dead_symbol_candidates` over \
-`unreachable_files` (static BFS is often noisy for routers / dynamic imports / JSX). If \
-`entry_roots` are empty / `liveness_unreachable_unreliable`, ignore `unreachable_files` and mass \
-inferred dead. Check `unwired_candidates` / `dead_symbol_candidates` before creating new modules \
-— wire what you create into a real caller."
+        "7. For dead code, run `devmap dead --json` and read each row's own `confidence` \
+before acting — a high-confidence row is a parsed fact, a low one is unconfirmed, and the command \
+returns both rather than pre-filtering. Every answer also carries `walk_incomplete` when \
+unattributed calls mean the list is a lower bound. Prefer `unwired_candidates` / \
+`dead_symbol_candidates` in the map over `unreachable_files` (static BFS is noisy for routers, \
+dynamic imports and JSX). If `entry_roots` is empty or `liveness_unreachable_unreliable` is set, \
+ignore `unreachable_files` entirely. Check `unwired_candidates` before creating a new module — \
+wire what you create into a real caller."
             .to_string(),
         "8. Use `devmap explore <name>` for a symbol's whole neighbourhood in one call; \
 `devmap search`, `devmap impact`, `devmap trace <a> <b>`, `devmap dead` for the individual \

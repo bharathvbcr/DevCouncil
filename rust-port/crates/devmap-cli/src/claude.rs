@@ -1256,10 +1256,6 @@ pub fn known_subcommands<C: clap::CommandFactory>() -> Vec<String> {
         .collect()
 }
 
-/// Build the `{"hooks": {...}}` block Dev Map installs.
-///
-/// `subcommands` is the parser's own list; a spec naming anything outside it is
-/// refused rather than written.
 /// The command string to write into an emitted hook or MCP entry.
 ///
 /// `std::env::current_exe()` is an absolute path into whatever tree the running
@@ -1319,6 +1315,10 @@ fn resolves_to_self(name: &str, executable: &Path, path_var: Option<&std::ffi::O
     false
 }
 
+/// Build the `{"hooks": {...}}` block Dev Map installs.
+///
+/// `subcommands` is the parser's own list; a spec naming anything outside it is
+/// refused rather than written.
 pub fn hooks_block(executable: &Path, db: &Path, subcommands: &[String]) -> anyhow::Result<Value> {
     let exe = utf8_path("the devmap executable path", executable)?;
     let db_arg = hook_db_arg(db)?;

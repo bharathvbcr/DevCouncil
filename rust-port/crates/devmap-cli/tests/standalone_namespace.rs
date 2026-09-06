@@ -245,3 +245,131 @@ fn an_emitted_hook_does_not_name_a_path_that_exists_on_one_machine() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// WAS A DEFECT, NOW THE GATE: the guide must not name a command that does not
+/// exist.
+///
+/// The generated guide told every agent to run `devmap dead --confidence
+/// extracted`. That flag was DevCouncil's — `dev map dead` had it, `devmap dead`
+/// never did — so an agent following step 7 got a clap parse error instead of a
+/// dead-code list, and the guide is the one file whose whole job is to be
+/// followed literally.
+///
+/// Checked against the parser's own subcommand list rather than a list typed
+/// here, so a command renamed in `Commands` fails this test rather than silently
+/// invalidating the guide.
+#[test]
+fn every_command_the_guide_names_is_a_real_subcommand() {
+    let map = serde_json::json!({
+        "meta": {"devmap_rust": {"role_files_computed": true, "handoff_paths_computed": true}},
+        "subsystems": [{"area": "src", "summary": "the code"}],
+        "important_files": ["src/main.rs"]
+    });
+    let guide = devmap_query::guides::agent_guide_text(
+        &map,
+        ".devmap/repo_map.json",
+        ".devmap/graph/code_graph.json",
+        ".devmap/codeintel/devmap.sqlite",
+    );
+
+    let known = known_subcommand_names();
+    let mut seen = 0usize;
+    for (index, _) in guide.match_indices("`devmap ") {
+        let rest = &guide[index + "`devmap ".len()..];
+        let Some(word) = rest.split([' ', '`', '\n']).next() else {
+            continue;
+        };
+        if word.is_empty() {
+            continue;
+        }
+        seen += 1;
+        assert!(
+            known.contains(&word.to_string()),
+            "the guide tells an agent to run `devmap {word}`, which is not a subcommand. \
+Known: {known:?}"
+        );
+    }
+    // A guide that named no commands at all would pass the loop above without
+    // checking anything, which is the failure mode this whole file guards
+    // against: a check that could not run reporting as one that passed.
+    assert!(
+        seen >= 5,
+        "expected the guide to name several commands, found {seen}"
+    );
+}
+
+/// Every flag the guide names must parse, too.
+///
+/// The `--confidence` defect was a *flag*, not a command, so checking command
+/// names alone would not have caught it. This runs each documented invocation
+/// through the real parser with `--help`, which exits non-zero on an unknown
+/// flag and touches no store.
+#[test]
+fn every_flag_the_guide_names_is_accepted_by_the_parser() {
+    let map = serde_json::json!({"subsystems": [], "important_files": []});
+    let guide = devmap_query::guides::agent_guide_text(&map, "m.json", "g.json", "s.sqlite");
+
+    let mut checked = 0usize;
+    for (index, _) in guide.match_indices("`devmap ") {
+        let rest = &guide[index + "`devmap ".len()..];
+        let Some(invocation) = rest.split('`').next() else {
+            continue;
+        };
+        // Only the flags: a placeholder like `<name>` is prose, not an argument
+        // the parser could resolve.
+        let args: Vec<&str> = invocation
+            .split_whitespace()
+            .filter(|token| !token.starts_with('<'))
+            .collect();
+        if args.len() < 2 || !args[1..].iter().any(|t| t.starts_with("--")) {
+            continue;
+        }
+        checked += 1;
+        let output = Command::new(devmap())
+            .args(&args)
+            .arg("--help")
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .output()
+            .expect("devmap invocation");
+        assert!(
+            output.status.success(),
+            "`devmap {}` does not parse: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(checked >= 1, "no flagged invocation was checked");
+}
+
+/// The parser's subcommand names, read from the binary rather than restated.
+fn known_subcommand_names() -> Vec<String> {
+    let output = Command::new(devmap())
+        .arg("--help")
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .output()
+        .expect("devmap --help");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut names = Vec::new();
+    let mut in_commands = false;
+    for line in text.lines() {
+        if line.starts_with("Commands:") {
+            in_commands = true;
+            continue;
+        }
+        if in_commands {
+            if line.trim().is_empty() || line.starts_with("Options:") {
+                break;
+            }
+            if let Some(name) = line.split_whitespace().next() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    assert!(
+        !names.is_empty(),
+        "could not read the subcommand list: {text}"
+    );
+    names
+}

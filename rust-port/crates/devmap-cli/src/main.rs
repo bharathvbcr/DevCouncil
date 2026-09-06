@@ -132,14 +132,21 @@ struct Cli {
     /// Unset, it is resolved by [`Cli::db`] rather than fixed to a literal:
     /// which state directory a repository uses is a property of the repository,
     /// not of this binary. See `devmap_extract::paths`.
-    #[arg(short, long)]
+    ///
+    /// `global`, so it is accepted on either side of the subcommand. A flag that
+    /// parses as `devmap --db X status` and fails as `devmap status --db X` is a
+    /// papercut every caller hits once, and the generated agent guide hit it in
+    /// writing: it told agents to run `devmap dead --json`, which did not parse.
+    #[arg(short, long, global = true)]
     db: Option<PathBuf>,
 
-    #[arg(long, default_value_t = false)]
+    /// Machine-readable output. Global; see `--db`.
+    #[arg(long, global = true, default_value_t = false)]
     json: bool,
 
-    /// Build progress policy. Auto writes progress to stderr only for an interactive terminal.
-    #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
+    /// Build progress policy. Auto writes progress to stderr only for an
+    /// interactive terminal. Global; see `--db`.
+    #[arg(long, value_enum, global = true, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
 
     #[command(subcommand)]
@@ -158,7 +165,8 @@ impl Cli {
             Commands::Build { path, .. }
             | Commands::Manifest { path, .. }
             | Commands::Freshness { path, .. }
-            | Commands::Serve { path, .. } => path,
+            | Commands::Serve { path, .. }
+            | Commands::Html { path, .. } => path,
             _ => Path::new("."),
         }
     }
@@ -867,6 +875,30 @@ enum Commands {
         /// what has not happened.
         #[arg(long)]
         print_config: bool,
+    },
+
+    /// Render the graph as one self-contained HTML file.
+    ///
+    /// No network and no build step: the renderer is embedded, so the page
+    /// opens from a `file://` URL on a machine that has never seen a package
+    /// manager. Capped by node count and honest about it — see `--max-nodes`.
+    Html {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Where to write. Defaults to `<state dir>/graph.html`.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Draw symbols and their calls rather than files and their imports.
+        #[arg(long)]
+        symbols: bool,
+        /// Most nodes to draw, ranked by degree so the hubs survive.
+        ///
+        /// A force layout stops converging in a browser tab well before a real
+        /// repository's node count, so this is a cap rather than a preference.
+        /// Whatever it cuts is stated in the payload *and* in the page header:
+        /// "1,000 of 12,103 nodes", never "1,000 nodes".
+        #[arg(long, default_value_t = 1_500)]
+        max_nodes: usize,
     },
 
     /// Emit and check Dev Map's own Claude Code integration.
@@ -2153,6 +2185,7 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         | Commands::Workspace { .. }
         | Commands::Serve { .. }
         | Commands::Mcp { .. }
+        | Commands::Html { .. }
         | Commands::Claude { .. } => Ok(()),
     }
 }
@@ -3639,6 +3672,93 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 .with_store_path(cli.db())
                 .with_ipc_path(ipc_path);
             daemon.run_loop().await?;
+        }
+        Commands::Html {
+            path,
+            out,
+            symbols,
+            max_nodes,
+        } => {
+            let store = open_for_read(&cli.db())?;
+            let gen_id = store.latest_generation_id()?.ok_or_else(|| {
+                anyhow::anyhow!("html unavailable: build a persisted generation first")
+            })?;
+            let extractions = store.latest_extractions()?;
+            let analysis = store.latest_analysis()?.ok_or_else(|| {
+                anyhow::anyhow!("html unavailable: build a persisted generation first")
+            })?;
+            let edges = store
+                .latest_edges(0.0)?
+                .into_iter()
+                .map(resolved_edge_from_stored)
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let repo_root = store.latest_repo_root()?;
+            // The page describes the generation, not the working tree, so the
+            // freshness fields it would carry are the store's own. Digesting
+            // the tree here would make rendering a picture cost a full rehash.
+            let freshness = FreshnessInfo {
+                head_sha: store
+                    .latest_generation_head()?
+                    .unwrap_or_else(|| "unavailable".to_string()),
+                generation_id: gen_id,
+                pending_count: store.status(&cli.db().display().to_string())?.pending_count,
+                stamped: StampedFreshness::default(),
+            };
+            let graph = devmap_query::build_code_graph_value(
+                &extractions,
+                &analysis,
+                &edges,
+                &freshness,
+                repo_root.as_deref(),
+            )?;
+
+            let title = repo_root
+                .as_deref()
+                .and_then(|root| Path::new(root).file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Dev Map".to_string());
+            let options = devmap_query::viz::VizOptions {
+                symbols: *symbols,
+                max_nodes: *max_nodes,
+                title,
+            };
+            let payload = devmap_query::viz::build_payload(&graph, &options);
+            let html = devmap_query::viz::render_html(&graph, &options);
+
+            let destination = out
+                .clone()
+                .unwrap_or_else(|| devmap_extract::paths::state_dir(path).join("graph.html"));
+            ensure_parent(&destination)?;
+            std::fs::write(&destination, &html)?;
+
+            let counts = &payload["counts"];
+            if cli.json {
+                emit_json(
+                    cli,
+                    &serde_json::json!({
+                        "output": destination,
+                        "generation_id": gen_id,
+                        "level": payload["level"],
+                        // Both numbers travel with the answer, as they do in the
+                        // page: a capped view reported as a node count is a
+                        // capped view nobody knows is capped.
+                        "counts": counts,
+                        "bytes": html.len(),
+                    }),
+                )?;
+            } else {
+                println!("Wrote {}", destination.display());
+                let shown = counts["nodes_shown"].as_u64().unwrap_or(0);
+                let total = counts["nodes_total"].as_u64().unwrap_or(0);
+                if counts["nodes_truncated"].as_bool().unwrap_or(false) {
+                    println!(
+                        "  {shown} of {total} nodes drawn (most connected first); \
+raise --max-nodes to widen"
+                    );
+                } else {
+                    println!("  {total} nodes drawn");
+                }
+            }
         }
         Commands::Claude { action } => run_claude(cli, action)?,
     }

@@ -439,7 +439,13 @@ struct GraphProvenance {
 /// interned form `encode_compact` produces — are rendered from *this* value.
 /// A second traversal would be a second place for a field to be dropped, and
 /// the two artifacts would then disagree with nothing to notice it.
-fn build_code_graph_value(
+/// The graph model both artifacts and the HTML view are projections of.
+///
+/// `pub` so `viz` can render from the same value the writer serializes rather
+/// than reading `code_graph.json` back off disk. The picture and the artifact
+/// must not be able to describe different generations, and the cheapest way to
+/// guarantee that is for there to be only one of them.
+pub fn build_code_graph_value(
     extractions: &[Extraction],
     analysis: &AnalysisSummary,
     edges: &[ResolvedEdge],

@@ -20,6 +20,7 @@ pub mod rung;
 pub mod snapshots;
 
 pub mod semantic;
+pub mod viz;
 pub mod workspace;
 
 pub use artifacts::{
@@ -28,8 +29,9 @@ pub use artifacts::{
 };
 pub use cancel::{cancelled_queries, Cancel, QueryCancelled};
 pub use code_graph::{
-    decode_compact, encode_compact, generate_code_graph_encodings, generate_code_graph_json,
-    write_code_graph_atomically, CODE_GRAPH_COMPACT_ENCODING, CODE_GRAPH_SCHEMA_VERSION,
+    build_code_graph_value, decode_compact, encode_compact, generate_code_graph_encodings,
+    generate_code_graph_json, write_code_graph_atomically, CODE_GRAPH_COMPACT_ENCODING,
+    CODE_GRAPH_SCHEMA_VERSION,
 };
 pub use engine::{
     budget_take, clone_group_tokens, is_test_path, link_candidates, parse_clone_kind,
