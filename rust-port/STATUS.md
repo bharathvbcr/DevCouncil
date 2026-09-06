@@ -4161,3 +4161,272 @@ warm-up, so x1.25 separates them cleanly. On a step, refuse the assertion with
 reporting a leak. This lane did not apply it because the script was executing
 throughout the window in which it could have been; whoever does owns the change
 in `tools/soak.sh`'s plateau block.
+
+## `subsystems[].handoff_paths` was a literal too (2026-09-05)
+
+The second half of the defect [§4 above](#4-subsystemsneighbors-was-a-literal--closed-handed-over-mid-pass)
+closed: `build_repo_map_value` emitted `"handoff_paths": []` for every subsystem,
+for the field's whole life in this kernel, so no reader could tell "this
+subsystem hands off to nothing" from "this producer does not compute this
+field". The neighbour fix left it untouched two lines below the field it fixed.
+
+This field is read further out than `neighbors` was. `indexing/map_artifacts.py`
+writes step 6 of the *generated agent guide* — the `CLAUDE.md` / `AGENTS.md` that
+`dev map` puts in every workspace — as "Use `neighbors` and `handoff_paths` in
+`subsystems` to follow cross-subsystem flow". So the instruction sent every agent
+to a stubbed field, and the stub answered "there is no flow here". Four more
+readers repeated it: `execution/prompt_builder.py` (the "Cross-subsystem flow"
+line in a coding agent's prompt), `knowledge/wiki.py` (the "Handoff paths"
+section, omitted entirely when empty), `integrations/mcp/handlers/map.py` (the
+subsystem detail row), and `indexing/map_viz.py` (the graph HTML detail pane,
+which printed `(none)`).
+
+Measured before, on this repository's `.devcouncil/repo_map.json`: 16 subsystems,
+**0** with a non-empty `handoff_paths`, while 12 already had non-empty
+`neighbors` — the two fields disagreeing in the artifact itself.
+
+**Derived from the same sweep as `neighbors`, not a second one beside it.**
+`area_adjacency` already walked the generation's `calls`/`references`/`imports`
+edges at `extracted` confidence and resolved both endpoints to areas; it now
+returns an `AreaCoupling` carrying both relations. `neighbors` is that relation
+made symmetric and projected onto area names; `handoff_paths` is the same
+relation kept **directed** and kept at file granularity — the ordered pair
+`source -> target`, recorded only on the area the edge *leaves*. Recording it on
+both ends would tell a reader that the called subsystem calls back. One sweep
+means the two fields cannot drift apart, and a test asserts the invariant
+directly: every handoff starts inside its own area and lands on an area that
+area lists as a neighbour.
+
+The synthetic-Go-package trap from §4 applies here in a sharper form: a handoff
+must name a *file a consumer can open*, and both Python validators split on `->`
+and assert each half is an indexed path. `endpoint_file` resolves a
+`package:<dir>/<pkg>` node through the same `MemberOf` edge `endpoint_area` uses,
+so an endpoint can never contribute an area without also contributing the path
+that justifies it. On the real corpus this is what turns
+`backend/go_orchestrator/dc/dcgrep/dcgrep.go -> package:...` into
+`… -> backend/go_orchestrator/internal/proc/proc.go`.
+
+Capped at 16 per subsystem — half the neighbour cap, because each entry costs
+about four times as much (two full repository paths and an arrow, against one
+area name) and this artifact is written compact precisely because it is the file
+an agent opens before searching. `liveness_meta.subsystems` now carries
+`handoff_paths_shown` / `handoff_paths_total` / `handoff_paths_truncated`, and
+`meta.devmap_rust.handoff_paths_computed` marks the provenance.
+
+**The counts are a separate question from the neighbour counts, deliberately.**
+An area with two neighbours can reach them through fifty file pairs, so
+`neighbors_truncated: false` says nothing about whether the handoff lists are
+whole; `_handoff_paths_answer_is_partial` reads the handoff counters and only
+shares `neighbors_endpoints_unresolved`, which is genuinely one sweep's rejects.
+On this repository the two answer differently on the first run — neighbours are
+complete (67/67) while handoffs are capped (145/508) — so a shared flag would
+have been wrong immediately.
+
+Verified with the release binary against this repository's store
+(1,417 files, 16,559 symbols, 88,479 edges):
+
+| | before | after |
+|---|---|---|
+| subsystems | 16 | 16 |
+| with a non-empty `handoff_paths` | 0 | 12 |
+| synthetic `package:` endpoints | — | 0 |
+| `handoff_paths_shown` / `handoff_paths_total` | — | 145 / 508 |
+| `handoff_paths_truncated` | — | `true` (reported, not hidden) |
+| `meta.devmap_rust.handoff_paths_computed` | absent | `true` |
+| `repo_map.json` | 336,790 B | 349,490 B (+3.8%) |
+
+`devmap manifest` on that store, 11 runs each, release binary, no other load:
+
+| | p50 | full sorted sample (s) |
+|---|---|---|
+| before | **0.17 s** | 0.13 0.13 0.15 0.16 0.17 **0.17** 0.18 0.19 0.21 0.22 1.09 |
+| after | **0.17 s** | 0.13 0.13 0.13 0.13 0.13 **0.17** 0.17 0.17 0.23 0.30 2.23 |
+
+No measurable cost, the same result the neighbour derivation got. **These
+conditions are not the same as §4's**, which reported 0.90 s → 0.90 s on the
+15,080-node corpus *with the soak running beside it*; this pass measured a clean
+machine, so the absolute numbers are not comparable across the two entries — only
+the before/after within each. The high tail sample in each column is the first
+run against a cold page cache.
+
+**Honesty surface, Python side.** `indexing/subsystem_map.py` gains
+`handoff_paths_established`, `can_rule_out_handoffs` and the tri-state
+`handoff_paths_for_area` (a list, or `None` for unknown), mirroring
+`neighbors_established` / `can_rule_out_adjacency` / `are_neighbors` rule for
+rule: a *positive* is definite whatever the map omits; only the empty list has to
+prove the producer was in a position to give it. Every reader now answers
+honestly when the marker is absent — the guide's step 6 says the field was not
+computed and stops pointing at it, the prompt builder and the wiki say so
+explicitly instead of omitting a section, the MCP detail carries
+`handoff_paths_computed` beside `neighbors_computed`, and the graph HTML prints
+`(not computed for this map)` rather than `(none)`.
+
+Two supporting fixes fell out of wiring that up:
+
+- **`RepoMap` was silently dropping `meta`.** The model declared
+  `liveness_meta` but not `meta`, so pydantic validation discarded the
+  `devmap_rust` block — every consumer reading the map *through the model* (the
+  wiki builder and the agent-guide writer among them) lost the only positive
+  evidence the marker provides and could only guess from the lists. Declared.
+- **One adapter, not two copies.** `repo_mapper.handoffs_computed(repo_map)` is
+  the single bridge from the model to the dependency-free reader; the wiki and
+  the guide both call it, because a second copy is how the guide comes to promise
+  a field the wiki knows is absent.
+
+**Tests.** `crates/devmap-query/tests/subsystem_handoff_paths_are_computed.rs`
+(7 tests, gated on the `parse` feature like its neighbour sibling) — 3 fail
+against the pre-fix literal for the right reasons (empty list where a pair was
+derived, empty list on the Go fixture, absent provenance marker) and the other 4
+are the guards that only become meaningful once the field is populated.
+`tests/unit/test_subsystem_map.py` gains 8 reader tests covering the tri-state,
+the cap, the separate-counters rule, and malformed input. The strict-`xfail`
+`test_repo_map_subsystem_roles_handoffs_and_file_kinds` still xfails — on
+`role_files` and file kinds, which this pass does not touch — and its reason
+string was corrected, because it claimed the kernel "writes no handoff_paths".
+
+**Left undone by this lane, precisely.** `role_files` is still `{}` for every
+subsystem and every file is still classified `kind=code`, so step 5 of the same
+generated guide points at a field with the same defect this one just closed —
+the third instance of the shape, and the one that keeps that test xfailing.
+`summary` is likewise `""` for every subsystem. None of these were derived here.
+
+## `role_files` and `files[].kind` were constants too (2026-09-05)
+
+The third and fourth instances of the shape closed in the two sections above,
+and the last of the four navigation fields the *generated agent guide* points
+at. `dev map` writes that guide into every workspace it maps, so each constant
+was an instruction pointing at a question nobody had measured:
+
+- **`role_files` was `{}` for every subsystem.** Step 5 of the guide reads "Use
+  `role_files` in `subsystems` for subsystem role buckets". Four readers took it
+  at its word and got nothing — `knowledge/wiki.py`, `indexing/map_viz.py`,
+  `integrations/mcp/handlers/map.py`, and, functionally,
+  `verification/test_resolver.py`, which resolves a subsystem's tests through
+  `role_files["tests"]`. That last one is not cosmetic: a change with no direct
+  test importer had **no fallback at all**, and the emptiness read as "this
+  subsystem has no tests" rather than "nothing computed this".
+- **`files[].kind` was the literal `"code"`.** Measured before: 1,417 of 1,417
+  entries, including 108 markdown files, 172 JSON files, and `README.md` — on a
+  record that already carried `language: markdown`. A constant is not a
+  classification, and `wiki.py` renders this field per file.
+
+**The vocabulary is the retired Python writer's, deliberately.** `role_files`
+uses `_GENERIC_ROLE_RULES` (removed in d232dea) — tests, migrations, entry, api,
+models, services, config, docs — in its original order, most-specific first,
+first match wins, so `routes/user_test.py` is a test rather than an `api` file.
+Consumers were written against those names; a second vocabulary here would make
+the field's history unreadable for no gain. The *curated* half of that writer
+(`_SUBSYSTEM_ROLE_FILES`, a hand-written table keyed on DevCouncil's own paths)
+was **not** ported: its own docstring records that it produced `{}` for all 10
+subsystems of a 4,082-file polyglot repo, which is the defect, not the fix.
+
+**Two deliberate departures from the ancestor, both measured.**
+
+1. *`other` is always emitted when anything is left over.* The Python version
+   returned `{}` when no rule matched, which reintroduces exactly the ambiguity
+   being removed. An area the map emits has files under it by construction, so
+   it always has an answer, and "these play no role I recognise" is one. This is
+   what makes "every subsystem has a non-empty bucket" true rather than lucky.
+2. *A test/doc directory counts at any path depth, not just the top level.* The
+   ancestor checked only the first segment, which was sound when the Python
+   engine mapped `src/devcouncil` alone. This kernel maps the whole repository.
+   Measured on the corpus: of 691 files now classified `test`, the top-only rule
+   would have caught **363** and missed **290** under `rust-port/` and **29**
+   under `backend/` — every nested `crates/*/tests/` and `testdata/` tree.
+
+`role_files` is a **capped sample for orientation, never an inventory** (4 per
+role). `role_file_counts` now travels beside it with the real per-role totals,
+because four names in `tests` otherwise reads as "this subsystem has four
+tests" — on `src/devcouncil` the true `other` count is 356.
+
+Verified with the release binary against this repository's store
+(1,417 files, 16,559 symbols, 88,479 edges):
+
+| | before | after |
+|---|---|---|
+| subsystems with a non-empty `role_files` | 0 | 16 of 16 |
+| `role_file_counts` | absent | present on every subsystem |
+| `role_files_shown` / `role_files_total` | — | 78 / 628 (truncated, reported) |
+| `files[].kind` distinct values | 1 (`code`) | 7 |
+| `kind` breakdown | `code` 1,417 | `test` 691, `module` 497, `doc` 107, `config` 67, `package` 43, `script` 10, `file` 3 |
+| `README.md` kind | `code` | `doc` |
+| `meta.devmap_rust.role_files_computed` / `file_kinds_computed` | absent | `true` |
+| `repo_map.json` | 349,490 B | 371,086 B (+6.2%) |
+
+**This one has a real cost, unlike the two before it.** `devmap manifest` on the
+same store and machine:
+
+| | p50 | min | n |
+|---|---|---|---|
+| before this pass (baseline) | 0.17 s | 0.13 s | 11 |
+| after `handoff_paths` only | 0.17 s | 0.13 s | 11 |
+| roles + kinds, first cut | 0.20 s | 0.17 s | 21 |
+| roles + kinds, after the fix below | **0.19 s** | 0.15 s | 21 |
+
+So roughly **+0.02 s at p50** against the baseline, and it is not measurement
+noise — the minimum moved too. It is stated rather than rounded away: the field
+was a constant, and classifying 1,417 files and bucketing them across 16 nested
+areas is work that did not previously exist. The baseline rows were sampled
+earlier in the same session at n=11 and the later rows at n=21, so the two are
+not perfectly matched; the p50 figures use this ledger's minimum-p50 convention.
+
+The first cut was 0.20 s and two avoidable costs were removed to reach 0.19 s:
+`file_kind` ran six independent `split('/')` scans per file (now one pass
+setting both flags), and `role_buckets` normalized each path *once per area* —
+areas nest, so `src/devcouncil/cli/main.py` was lowercased once for
+`src/devcouncil` and again for `src/devcouncil/cli`. Paths are now normalized
+once for the whole generation and borrowed.
+
+**Honesty surface, Python side.** `indexing/subsystem_map.py` gains
+`role_files_established`, `role_files_are_complete`, the tri-state
+`role_files_for_area` (a mapping, or `None` for unknown) and `role_file_total`,
+which reads the companion counts. `role_file_total` returns `None` rather than
+`len(bucket)` when the map carries no total — answering with the sample size is
+the specific way a capped list comes to be reported as an inventory.
+`role_files_are_complete` is `False` on any real map, which is the honest answer
+for a documented sample. Readers updated to match: guide step 5 now says the
+buckets are a sample and names the real roles (or says the field was not
+computed and points at `files` instead), the wiki prints `showing 4 of 356` and
+says so explicitly when the field is absent, the MCP detail carries
+`role_files_computed` and `role_file_counts`, and the graph HTML prints
+`(not computed for this map)` rather than an empty roles block.
+`repo_mapper.role_buckets_computed` is the single model→reader adapter, beside
+`handoffs_computed`.
+
+**Tests.** `crates/devmap-query/tests/subsystem_roles_and_file_kinds_are_computed.rs`
+(9 tests) — 8 fail against the pre-fix constants. Two of them are guards against
+the *cheap* fix rather than the real one: `kind` must take at least four
+distinct values across a mixed fixture (asserting `README.md == "doc"` alone
+would pass for a writer that swapped one constant for another), and a test file
+under an `/routes` path must land in `tests`, not `api`, or the buckets stop
+partitioning and `test_resolver.py` runs a route handler as a test.
+`tests/unit/test_subsystem_map.py` gains 8 reader tests.
+
+**`test_repo_map_subsystem_roles_handoffs_and_file_kinds` is no longer
+`xfail`.** It was `xfail(strict=True)` for as long as all three fields were
+constants; it now passes, un-xfailed rather than deleted because the assertions
+were always the right ones. It was also strengthened while it was open: it now
+asserts `kind` takes ≥4 values, that every role bucket has a matching count, and
+that all three provenance markers are present.
+
+**A known false positive, found by checking the consumer rather than the
+field.** `verification/test_resolver.py` now populates `_tests_by_area` for 6
+areas where it had 0 for the field's whole life — the dead fallback is live. Two
+of those entries are not runnable tests:
+`src/devcouncil/verification/test_resolver.py` itself (a production module whose
+filename starts with `test_`, which pytest's own collection convention would
+also claim) and `rust-port/testdata/fixtures/tier_a/ts_app/index.ts` (extractor
+*fixtures*, matched by the `/testdata/` token). The rule is faithful to its
+ancestor and the corpus shows no *mid-name* `test_` matches to tighten against —
+0 of 1,417 files have `test_` anywhere but at the start of a filename — so this
+is name-based classification's floor, not a bug in the port. It is recorded
+because it has a consequence: `test_resolver` may suggest running a file that is
+not a test. Narrowing it needs a signal the map does not carry (whether a file
+is collected by a test runner), which is a separate piece of work.
+
+**Left undone by this lane, precisely.** `subsystems[].summary` is still `""
+for every subsystem, and the second surviving `xfail` in that file still stands:
+`package_managers`, `candidate_files` and `lsp` are written as constants
+(`[]`/`{}`) where the Python writer detected uv/npm from lockfiles and the LSP
+languages, and `wiki.py` and the MCP map handler render them. Same shape, not
+touched here.

@@ -387,6 +387,14 @@ class PromptBuilder:
         ]
         if not relevant:
             return ""
+        # Whether the producer computed the crossing relation at all. Asked once
+        # for the map, not once per subsystem: it is a property of the artifact.
+        # Without it an agent reads a stubbed field as a measured "nothing
+        # crosses here" — and this block is exactly where that misreading turns
+        # into an edit that misses its callers.
+        from devcouncil.indexing.subsystem_map import handoff_paths_established
+
+        handoffs_computed = handoff_paths_established(data)
         lines = ["## Repo map (structural context)"]
         for s in relevant[:3]:
             lines.append(f"\n**{s.get('area')}** — {s.get('summary', '')}".rstrip())
@@ -402,6 +410,11 @@ class PromptBuilder:
             handoffs = s.get("handoff_paths") or []
             if handoffs:
                 lines.append("Cross-subsystem flow: " + "; ".join(handoffs[:4]))
+            elif not handoffs_computed:
+                lines.append(
+                    "Cross-subsystem flow: not computed by this map "
+                    "— absence here is not evidence that nothing crosses."
+                )
         return "\n".join(lines).strip() + "\n"
 
     def _skills_section(self, task: Task) -> str:

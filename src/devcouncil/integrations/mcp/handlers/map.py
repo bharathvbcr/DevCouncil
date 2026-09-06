@@ -32,7 +32,9 @@ from devcouncil.indexing.subsystem_map import (
     area_for_path,
     can_rule_out_adjacency,
     cross_boundary_pairs,
+    handoff_paths_established,
     neighbors_established,
+    role_files_established,
     dead_symbol_candidates_of,
     dependents_total_of,
     impact_targets,
@@ -151,13 +153,17 @@ def _subsystem_detail(
     sub: dict[str, Any],
     *,
     neighbors_computed: bool = False,
+    handoff_paths_computed: bool = False,
+    role_files_computed: bool = False,
 ) -> dict[str, Any]:
-    """One subsystem's detail rows, with `neighbors` carrying whether it is an answer.
+    """One subsystem's detail rows, with the derived fields carrying whether they are answers.
 
-    ``neighbors_computed`` defaults to False because that is the fail-closed
-    reading: a caller that did not pass the map cannot vouch for the field, and
-    an empty ``neighbors`` from the kernel means "not computed" far more often
-    than "none".
+    ``neighbors_computed`` and ``handoff_paths_computed`` default to False
+    because that is the fail-closed reading: a caller that did not pass the map
+    cannot vouch for either field, and an empty list from the kernel means "not
+    computed" far more often than "none". They are two flags rather than one
+    because the kernel derived the two fields in two separate passes of its
+    history, so a map can genuinely carry one and not the other.
     """
     role_files = sub.get("role_files") or {}
     if not isinstance(role_files, dict):
@@ -170,7 +176,16 @@ def _subsystem_detail(
         "neighbors": list(sub.get("neighbors") or []),
         "neighbors_computed": neighbors_computed,
         "handoff_paths": list(sub.get("handoff_paths") or []),
+        "handoff_paths_computed": handoff_paths_computed,
         "role_files": {str(k): list(v or []) for k, v in role_files.items()},
+        "role_files_computed": role_files_computed,
+        # The real per-role totals. `role_files` is a capped sample, so without
+        # these a caller reads four names as the whole bucket.
+        "role_file_counts": {
+            str(k): v
+            for k, v in (sub.get("role_file_counts") or {}).items()
+            if isinstance(v, int) and not isinstance(v, bool)
+        },
     }
 
 
@@ -290,7 +305,10 @@ async def handle_repo_map(root: Path, arguments: dict) -> list[TextContent]:
                 "path": path,
                 "area": resolved_area or subsystem,
                 "subsystem": _subsystem_detail(
-                    sub, neighbors_computed=neighbors_established(data)
+                    sub,
+                    neighbors_computed=neighbors_established(data),
+                    handoff_paths_computed=handoff_paths_established(data),
+                    role_files_computed=role_files_established(data),
                 ),
                 **symbol_fields,
             })

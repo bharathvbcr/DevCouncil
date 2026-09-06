@@ -7,6 +7,10 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
+from devcouncil.indexing.subsystem_map import (
+    handoff_paths_established,
+    role_files_established,
+)
 from devcouncil.indexing.viz import _canvas_controls_css, _canvas_controls_js, _vendor_js
 
 logger = logging.getLogger(__name__)
@@ -198,6 +202,11 @@ def build_map_viz_payload(repo_map: Any) -> Dict[str, Any]:
             "languages": _cap_list(data.get("languages") or [], 32),
             "generated_head": str(data.get("generated_head") or ""),
             "graph_html": "graph/graph.html",
+            # Whether the producer derived the crossing relation. The detail
+            # pane printed "(none)" for an empty list, which is the one reading
+            # an un-derived field cannot support.
+            "handoff_paths_computed": handoff_paths_established(data),
+            "role_files_computed": role_files_established(data),
         },
     }
 
@@ -301,9 +310,13 @@ function showDetail(id) {{
   html += 'entry points:\\n'+(s.entry_points||[]).slice(0,12).map(p => '  · '+escapeHtml(p)).join('\\n')+'\\n';
   html += 'critical files:\\n'+(s.critical_files||[]).slice(0,12).map(p => '  · '+escapeHtml(p)).join('\\n')+'\\n';
   html += 'neighbors:\\n'+((s.neighbors||[]).map(p => '  · '+escapeHtml(p)).join('\\n') || '  (none)')+'\\n';
-  html += 'handoffs:\\n'+((s.handoff_paths||[]).map(p => '  · '+escapeHtml(p)).join('\\n') || '  (none)')+'\\n';
+  const handoffFallback = (DATA.meta && DATA.meta.handoff_paths_computed) ? '  (none)' : '  (not computed for this map)';
+  html += 'handoffs:\\n'+((s.handoff_paths||[]).map(p => '  · '+escapeHtml(p)).join('\\n') || handoffFallback)+'\\n';
   const roles = s.role_files || {{}};
   const roleKeys = Object.keys(roles);
+  if (!roleKeys.length && !(DATA.meta && DATA.meta.role_files_computed)) {{
+    html += 'roles:\\n  (not computed for this map)\\n';
+  }}
   if (roleKeys.length) {{
     html += 'roles:\\n';
     roleKeys.forEach(r => {{

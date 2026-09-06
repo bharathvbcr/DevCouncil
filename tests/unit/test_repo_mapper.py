@@ -81,16 +81,22 @@ def test_repo_mapper_basic():
             )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the kernel manifest leaves every subsystem's role_files empty and writes no "
-        "handoff_paths, and classifies every file (README.md included) as kind=code. "
-        "CLAUDE.md steps 5-6 tell agents to navigate by role_files / handoff_paths, "
-        "and the Python writer filled them."
-    ),
-)
 def test_repo_map_subsystem_roles_handoffs_and_file_kinds():
+    """The three navigation fields the generated agent guide points at are answers.
+
+    Was `xfail(strict=True)` for as long as the kernel emitted all three as
+    constants: `role_files` was `{}` on every subsystem, `handoff_paths` was
+    `[]` on every subsystem, and `files[].kind` was the literal `"code"` on
+    every entry — 1,417 of 1,417 on this repository, `README.md` included, on a
+    record that already said `language: markdown`. Steps 5 and 6 of the guide
+    `dev map` writes into every workspace tell agents to navigate by exactly
+    these fields, so each constant answered a question no one had measured.
+
+    Un-xfailed rather than deleted: the assertions were always the right ones,
+    and they now hold against a map the kernel builds. The provenance markers
+    checked below are what let a *consumer* draw the same distinction this test
+    draws — an empty bucket is now separable from an unimplemented field.
+    """
     map_path = Path(".") / ".devcouncil" / "repo_map.json"
     if not map_path.is_file():
         pytest.skip("no kernel-built map on disk: run `dev map`")
@@ -99,6 +105,23 @@ def test_repo_map_subsystem_roles_handoffs_and_file_kinds():
         assert subsystem.get("role_files"), f"role_files empty for {subsystem['area']}"
     assert any(subsystem.get("handoff_paths") for subsystem in raw["subsystems"])
     assert any(f["path"] == "README.md" and f["kind"] == "doc" for f in raw["files"])
+    # `kind` must partition the corpus rather than name one constant: the
+    # assertion above passes for a writer that swapped `"code"` for `"doc"`.
+    assert len({f["kind"] for f in raw["files"]}) >= 4, (
+        "files[].kind is close to a constant again: "
+        f"{sorted({f['kind'] for f in raw['files']})}"
+    )
+    # The real per-role totals travel with the capped samples, so a reader can
+    # tell a small subsystem from a truncated one.
+    for subsystem in raw["subsystems"]:
+        counts = subsystem.get("role_file_counts") or {}
+        assert set(subsystem["role_files"]) <= set(counts), (
+            f"role bucket without a count in {subsystem['area']}: "
+            f"{sorted(set(subsystem['role_files']) - set(counts))}"
+        )
+    marker = (raw.get("meta") or {}).get("devmap_rust") or {}
+    for flag in ("role_files_computed", "handoff_paths_computed", "file_kinds_computed"):
+        assert marker.get(flag) is True, f"missing provenance marker {flag}: {marker}"
 
 
 @pytest.mark.xfail(

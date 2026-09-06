@@ -221,7 +221,7 @@ fn consumer_manifest_json(
         files.push(json!({
             "path": ext.file_path,
             "area": file_area(&ext.file_path),
-            "kind": "code",
+            "kind": file_kind(&ext.file_path, &ext.language),
             "language": ext.language,
         }));
     }
@@ -302,9 +302,30 @@ fn consumer_manifest_json(
     // vocabulary the lookup will use rather than in a second one beside it.
     let mut lookup_areas: Vec<String> = kept.iter().map(|(_, area)| area.clone()).collect();
     lookup_areas.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-    let (adjacency, unresolved_endpoints) = area_adjacency(&lookup_areas, &file_paths, edges);
+    let AreaCoupling {
+        adjacency,
+        handoffs,
+        unresolved_endpoints,
+    } = area_adjacency(&lookup_areas, &file_paths, edges);
     let mut neighbors_shown = 0usize;
     let mut neighbors_total = 0usize;
+    let mut handoff_paths_shown = 0usize;
+    let mut handoff_paths_total = 0usize;
+    let mut role_files_shown = 0usize;
+    let mut role_files_total = 0usize;
+    // `/`-prefixed and lowercased once per file, for the role rules below. The
+    // leading slash is what lets a token like `/tests/` anchor on a segment
+    // boundary rather than matching `mytests/`.
+    let lowered_paths: BTreeMap<&str, String> = file_paths
+        .iter()
+        .map(|path| {
+            (
+                *path,
+                format!("/{}", path.replace('\\', "/").trim_start_matches('/'))
+                    .to_ascii_lowercase(),
+            )
+        })
+        .collect();
     let subsystems: Vec<Value> = kept
         .iter()
         .map(|(entry, area)| {
@@ -325,14 +346,51 @@ fn consumer_manifest_json(
                 .collect();
             neighbors_shown += names.len();
             neighbors_total += total;
+            // The same coupling at file granularity and with its direction
+            // kept. `neighbors` answers "which areas is this one bound to";
+            // `handoff_paths` answers "through which files does this one reach
+            // them", which is what the generated agent guide's step 6 tells an
+            // agent to follow. Ranked and tie-broken by the same rule, so the
+            // strongest flow survives the cap and the order is not hash order.
+            let crossings = handoffs.get(area);
+            let handoff_total = crossings.map_or(0, BTreeMap::len);
+            let mut ranked_handoffs: Vec<(&(&str, &str), &usize)> = crossings
+                .map(|map| map.iter().collect())
+                .unwrap_or_default();
+            ranked_handoffs
+                .sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+            let handoff_paths: Vec<String> = ranked_handoffs
+                .iter()
+                .take(SUBSYSTEM_HANDOFF_CAP)
+                .map(|((source, target), _)| format!("{source} -> {target}"))
+                .collect();
+            handoff_paths_shown += handoff_paths.len();
+            handoff_paths_total += handoff_total;
+            // The subsystem's own files, in the map's sorted order so the
+            // buckets are deterministic (R4). `kept` guarantees at least one,
+            // so every subsystem gets a non-empty answer.
+            let prefix = format!("{area}/");
+            let area_files: Vec<&str> = file_paths
+                .iter()
+                .copied()
+                .filter(|path| path.starts_with(&prefix))
+                .collect();
+            let (buckets, bucket_counts) = role_buckets(&area_files, &lowered_paths);
+            role_files_shown += buckets.values().map(Vec::len).sum::<usize>();
+            role_files_total += bucket_counts.values().sum::<usize>();
             json!({
                 "area": area,
                 "summary": "",
                 "entry_points": entry.entry_points,
                 "critical_files": [entry.path],
                 "neighbors": names,
-                "handoff_paths": [],
-                "role_files": {},
+                "handoff_paths": handoff_paths,
+                "role_files": buckets,
+                // The real per-role totals. Without these the capped sample
+                // reads as an inventory: four names in `tests` says "this
+                // subsystem has four tests" to every consumer that does not
+                // know about the cap.
+                "role_file_counts": bucket_counts,
             })
         })
         .collect();
@@ -467,10 +525,28 @@ fn consumer_manifest_json(
                 "neighbors_shown": neighbors_shown,
                 "neighbors_total": neighbors_total,
                 "neighbors_truncated": neighbors_total > neighbors_shown,
+                // The same pair for the capped handoff lists, which come out of
+                // the same sweep. Counted separately from the neighbour pair
+                // because they cap different populations: an area with two
+                // neighbours can reach them through fifty file pairs, so
+                // `neighbors_truncated: false` says nothing about whether the
+                // handoff lists are whole.
+                "handoff_paths_shown": handoff_paths_shown,
+                "handoff_paths_total": handoff_paths_total,
+                "handoff_paths_truncated": handoff_paths_total > handoff_paths_shown,
+                // And for the role buckets, which are capped per role rather
+                // than per subsystem. `role_file_counts` on each subsystem says
+                // which role was cut; this pair says how much was cut overall,
+                // so a reader can tell "these are samples" without walking
+                // every subsystem to work it out.
+                "role_files_shown": role_files_shown,
+                "role_files_total": role_files_total,
+                "role_files_truncated": role_files_total > role_files_shown,
                 // Coupling edges whose endpoint named nothing this generation
                 // indexed, so no area could be assigned to it. Zero on every
                 // corpus measured; carried because "no neighbours" and "some
-                // couplings could not be placed" are different answers.
+                // couplings could not be placed" are different answers. One
+                // sweep feeds both fields, so this counts the rejects for both.
                 "neighbors_endpoints_unresolved": unresolved_endpoints,
             },
             "important_files": {
@@ -511,9 +587,26 @@ fn consumer_manifest_json(
         // field'". `subsystem_map.neighbors_established` reads exactly this
         // key; the counts that go with it are in
         // `liveness_meta.subsystems.neighbors_*`.
+        // `handoff_paths_computed` is the same claim for the same reason, kept
+        // as its own key rather than folded into the one above: the two fields
+        // could be derived in different passes of this file's history, and a
+        // single "subsystems_computed" boolean would let a reader vouch for a
+        // field nothing had computed yet. `subsystem_map.handoff_paths_established`
+        // reads exactly this key; its counts are in
+        // `liveness_meta.subsystems.handoff_paths_*`.
         "meta": {
             "devmap_rust": {
                 "neighbors_computed": true,
+                "handoff_paths_computed": true,
+                // `role_files` was `{}` for every subsystem and `files[].kind`
+                // was the constant `"code"`, so both carried the same defect:
+                // a consumer could not tell an answer from an unimplemented
+                // field. One key each, for the same reason the two above are
+                // separate — they were derived in different passes, and a
+                // single boolean would let a reader vouch for a field nothing
+                // had computed yet.
+                "role_files_computed": true,
+                "file_kinds_computed": true,
             },
         },
     });
@@ -625,6 +718,273 @@ fn file_area(path: &str) -> String {
 /// can couple one area to hundreds. What is cut is reported beside it.
 const SUBSYSTEM_NEIGHBOR_CAP: usize = 32;
 
+/// How many handoff pairs one subsystem may name.
+///
+/// Half the neighbour cap because each entry costs about four times as much:
+/// a neighbour is one area name, a handoff is two full repository paths joined
+/// by an arrow. The artifact is written compact precisely because it is the
+/// file an agent opens before searching, so the field has to buy its bytes —
+/// and the readers already show far fewer than this (`prompt_builder` prints
+/// the first four). What the cap cuts is reported beside it.
+const SUBSYSTEM_HANDOFF_CAP: usize = 16;
+
+/// Examples per role bucket.
+///
+/// The buckets are a **capped sample for orientation, never an inventory**:
+/// `role_files["tests"]` naming four files does not mean the subsystem has four
+/// tests. `role_file_counts` carries the real total beside them so a reader can
+/// tell a small subsystem from a truncated one, and a consumer that needs
+/// completeness goes to `files`. Four is the retired Python writer's figure,
+/// kept so the two producers' artifacts stay comparable.
+const SUBSYSTEM_ROLE_FILE_CAP: usize = 4;
+
+/// What role a file plays inside its subsystem: `(role, suffixes, tokens)`.
+///
+/// The vocabulary and the order are the retired Python writer's
+/// `_GENERIC_ROLE_RULES` (removed in d232dea), deliberately: `test_resolver.py`,
+/// `wiki.py`, `map_viz.py` and the generated agent guide were all written
+/// against these names, and a second vocabulary here would make the field's
+/// history unreadable for no gain.
+///
+/// **Ordered most-specific first, first match wins**, so `routes/user_test.py`
+/// is a test rather than an `api` file and a migration is a migration before it
+/// is an `entry`. Without that a path lands in several buckets and they stop
+/// partitioning the subsystem — which matters concretely, because
+/// `verification/test_resolver.py` runs what it finds in `tests`.
+///
+/// An empty suffix list means the rule does not care about the extension.
+type RoleRule = (
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+);
+const GENERIC_ROLE_RULES: &[RoleRule] = &[
+    (
+        "tests",
+        &["py", "go", "ts", "tsx", "js", "jsx", "rs"],
+        &[
+            "test_",
+            "_test.",
+            ".test.",
+            ".spec.",
+            "/tests/",
+            "/__tests__/",
+            "/testdata/",
+        ],
+    ),
+    (
+        "migrations",
+        &[],
+        &["/migrations/", "/migrate", "migration_"],
+    ),
+    (
+        "entry",
+        &[],
+        &[
+            "/main.",
+            "/index.",
+            "/__main__.",
+            "/app.",
+            "/server.",
+            "/cmd/",
+        ],
+    ),
+    (
+        "api",
+        &[],
+        &[
+            "/router",
+            "/routes",
+            "/handler",
+            "/controller",
+            "/api/",
+            "/endpoints",
+        ],
+    ),
+    (
+        "models",
+        &[],
+        &["/model", "/schema", "/types.", "/entities", ".proto"],
+    ),
+    (
+        "services",
+        &[],
+        &[
+            "/service",
+            "/client",
+            "/provider",
+            "/adapter",
+            "/repository",
+        ],
+    ),
+    (
+        "config",
+        &["yaml", "yml", "toml", "ini", "env"],
+        &["/config", ".config.", "settings"],
+    ),
+    ("docs", &["md", "rst", "adoc"], &["/docs/"]),
+];
+
+/// The lowercased extension of a path, without the dot; `""` when it has none.
+fn path_suffix(lower_name: &str) -> &str {
+    match lower_name.rsplit_once('.') {
+        // A dotfile such as `.env` has no stem, so the whole name is the
+        // extension by this rule — which is what the role table's `env` entry
+        // expects.
+        Some((_, suffix)) => suffix,
+        None => "",
+    }
+}
+
+/// What kind of thing a file is, for `files[].kind`.
+///
+/// This was the literal `"code"` for every entry — 1,417 of 1,417 on this
+/// repository, including 108 markdown files and `README.md`, which the same
+/// record already labelled `language: markdown`. A constant is not a
+/// classification, and the wiki renders this field per file.
+///
+/// The vocabulary is the retired Python writer's `_kind_for_file`. **One rule
+/// is deliberately wider than its ancestor:** that version only looked at the
+/// *top-level* directory for `tests`/`docs`, which was sound when the Python
+/// engine mapped `src/devcouncil` alone. This kernel maps the whole repository,
+/// where every test directory is nested — `rust-port/crates/*/tests/`,
+/// `backend/go_orchestrator/**`, `benchmarks/` — so a top-only check classifies
+/// none of them. Any path segment counts here.
+fn file_kind(path: &str, language: &str) -> &'static str {
+    let normalized = path.replace('\\', "/");
+    let lowered = normalized.to_ascii_lowercase();
+    let lower_name = lowered.rsplit('/').next().unwrap_or(&lowered);
+
+    // One pass over the segments rather than one per directory name. This runs
+    // for every file in the generation, and six independent `split('/')` scans
+    // measured as the larger half of a +0.03 s p50 regression on `manifest`.
+    let mut in_test_dir = false;
+    let mut in_doc_dir = false;
+    for segment in lowered.split('/') {
+        match segment {
+            "tests" | "test" | "testdata" | "__tests__" => in_test_dir = true,
+            "docs" | "doc" => in_doc_dir = true,
+            _ => {}
+        }
+    }
+    if in_test_dir {
+        return "test";
+    }
+    if lower_name.starts_with("test_")
+        || lower_name.contains("_test.")
+        || lower_name.contains(".test.")
+        || lower_name.contains(".spec.")
+    {
+        return "test";
+    }
+    if in_doc_dir {
+        return "doc";
+    }
+    match path_suffix(lower_name) {
+        "md" | "markdown" | "rst" | "adoc" => "doc",
+        // Static markup stays `file` rather than `module`: it is labelled in
+        // `language` via the markup overlay but excluded from the code
+        // extensions, so it must not read as a source module.
+        "html" | "htm" => "file",
+        "yaml" | "yml" | "toml" | "json" | "ini" | "cfg" => "config",
+        "sh" | "ps1" | "bat" => "script",
+        "sqlite" | "db" => "database",
+        _ if lower_name == "__init__.py" => "package",
+        _ if !language.is_empty() && language != "unknown" => "module",
+        _ => "file",
+    }
+}
+
+/// Bucket one subsystem's files by the role they play, with the real totals.
+///
+/// The sample and the counts are produced in one pass so they can never
+/// disagree about what was matched: a file that matched a role is counted and
+/// marked used even when it lost the cap, so `other` holds only genuinely
+/// unclassified files.
+///
+/// **`other` is always emitted when anything is left over, even if no rule
+/// matched at all.** The retired writer returned `{}` in that case, which
+/// reintroduces exactly the ambiguity this field is being fixed to remove — an
+/// area the map emits has files under it by construction, so it always has an
+/// answer, and "these files play no role I recognise" is one.
+fn role_buckets<'paths>(
+    area_files: &[&'paths str],
+    lowered_paths: &BTreeMap<&'paths str, String>,
+) -> (
+    BTreeMap<&'static str, Vec<String>>,
+    BTreeMap<&'static str, usize>,
+) {
+    let mut by_role: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut unclaimed: Vec<&str> = Vec::new();
+
+    for path in area_files {
+        // Normalized once for the whole generation, not once per area. Areas
+        // nest — `src/devcouncil` and `src/devcouncil/cli` both claim
+        // `src/devcouncil/cli/main.py` — so a per-area normalization pays for
+        // the deepest file as many times as it has ancestors.
+        let Some(lowered) = lowered_paths.get(*path) else {
+            // Unreachable while the table is built from the same `file_paths`
+            // this slice is filtered from, but a file whose role could not be
+            // *asked* must not disappear from the counts as well — that is a
+            // silent undercount wearing the same shape as "nothing matched".
+            unclaimed.push(path);
+            continue;
+        };
+        let lower_name = lowered.rsplit('/').next().unwrap_or("");
+        let suffix = path_suffix(lower_name);
+
+        let matched = GENERIC_ROLE_RULES.iter().find(|(_, suffixes, tokens)| {
+            if !suffixes.is_empty() && !suffixes.contains(&suffix) {
+                return false;
+            }
+            tokens.iter().any(|token| lowered.contains(token))
+        });
+
+        match matched {
+            Some((role, _, _)) => {
+                let bucket = by_role.entry(role).or_default();
+                if bucket.len() < SUBSYSTEM_ROLE_FILE_CAP {
+                    bucket.push((*path).to_string());
+                }
+                *counts.entry(role).or_default() += 1;
+            }
+            None => unclaimed.push(path),
+        }
+    }
+
+    if !unclaimed.is_empty() {
+        by_role.insert(
+            "other",
+            unclaimed
+                .iter()
+                .take(SUBSYSTEM_ROLE_FILE_CAP)
+                .map(|path| (*path).to_string())
+                .collect(),
+        );
+        counts.insert("other", unclaimed.len());
+    }
+    (by_role, counts)
+}
+
+/// One sweep's account of how the generation's areas couple.
+///
+/// Both fields come from the same pass over the same filtered edges so they can
+/// never contradict each other: `adjacency` is the relation made symmetric and
+/// projected onto area names, `handoffs` is the same relation kept directed and
+/// kept at file granularity.
+struct AreaCoupling<'edges> {
+    /// area -> coupled area -> how many edges run between them, both ways.
+    adjacency: BTreeMap<String, BTreeMap<String, usize>>,
+    /// area -> ordered (source file, target file) -> how many edges leave this
+    /// area through that pair. Keys borrow from `edges` rather than allocating:
+    /// a generation has hundreds of thousands of edges, and the same handful of
+    /// paths appear in most of them.
+    handoffs: BTreeMap<String, BTreeMap<(&'edges str, &'edges str), usize>>,
+    /// Coupling edges with an endpoint this generation could place in no area.
+    unresolved_endpoints: usize,
+}
+
 /// Which areas are coupled, and how strongly, from the generation's own edges.
 ///
 /// The same derivation `backend/go_orchestrator/repomap` performs, deliberately:
@@ -650,13 +1010,13 @@ const SUBSYSTEM_NEIGHBOR_CAP: usize = 32;
 /// not use is an empty relation with extra steps. That exact mismatch
 /// (`community-4` against a directory path) is why the field joined nothing
 /// before it was a literal.
-/// Returns the adjacency and the number of coupling edges whose endpoint could
-/// not be placed in any area.
-fn area_adjacency(
+/// Returns the adjacency, the directed file-pair handoffs, and the number of
+/// coupling edges whose endpoint could not be placed in any area.
+fn area_adjacency<'edges>(
     lookup_areas: &[String],
     file_paths: &BTreeSet<&str>,
-    edges: &[ResolvedEdge],
-) -> (BTreeMap<String, BTreeMap<String, usize>>, usize) {
+    edges: &'edges [ResolvedEdge],
+) -> AreaCoupling<'edges> {
     // Not every endpoint is a file. The resolver emits a synthetic node for
     // each Go package (`package:<dir>/<pkg>`) and points the package's imports
     // at it, so `backend/.../dcgrep` came out coupled to both
@@ -687,6 +1047,7 @@ fn area_adjacency(
     // once per distinct endpoint rather than once per edge.
     let mut area_of: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut adjacency: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut handoffs: BTreeMap<String, BTreeMap<(&str, &str), usize>> = BTreeMap::new();
     let mut unresolved = 0usize;
     for edge in edges {
         if !matches!(
@@ -726,6 +1087,22 @@ fn area_adjacency(
         if from == to {
             continue;
         }
+        // The handoff is recorded only on the area the edge *leaves*, and names
+        // the concrete files on both ends. A synthetic Go package node is
+        // replaced by the member file the area was resolved through, for the
+        // same reason it is replaced in the neighbour list: `package:<dir>/<pkg>`
+        // is a vocabulary no consumer can match, and both Python readers of
+        // this field assert that each half is an indexed path.
+        if let (Some(source), Some(target)) = (
+            endpoint_file(&edge.source_file, file_paths, &member_file),
+            endpoint_file(&edge.target_file, file_paths, &member_file),
+        ) {
+            *handoffs
+                .entry(from.clone())
+                .or_default()
+                .entry((source, target))
+                .or_default() += 1;
+        }
         *adjacency
             .entry(from.clone())
             .or_default()
@@ -733,7 +1110,30 @@ fn area_adjacency(
             .or_default() += 1;
         *adjacency.entry(to).or_default().entry(from).or_default() += 1;
     }
-    (adjacency, unresolved)
+    AreaCoupling {
+        adjacency,
+        handoffs,
+        unresolved_endpoints: unresolved,
+    }
+}
+
+/// The concrete file one edge endpoint stands for, or `None` when it stands for
+/// nothing this generation indexed.
+///
+/// The file half of [`endpoint_area`]: that function answers which area an
+/// endpoint belongs to, this one answers which file the consumer can open. They
+/// resolve a synthetic package node the same way — through the `MemberOf` edge
+/// — so an endpoint can never contribute an area without also contributing the
+/// path that justifies it.
+fn endpoint_file<'edges>(
+    endpoint: &'edges str,
+    file_paths: &BTreeSet<&str>,
+    member_file: &BTreeMap<&'edges str, &'edges str>,
+) -> Option<&'edges str> {
+    if file_paths.contains(endpoint) {
+        return Some(endpoint);
+    }
+    member_file.get(endpoint).copied()
 }
 
 /// The area one edge endpoint belongs to, or `None` when it belongs to nothing
