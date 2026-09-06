@@ -35,17 +35,23 @@ use devmap_query::model::FreshnessInfo;
 use devmap_resolve::Resolver;
 use serde_json::Value;
 
-/// One Java file (a real import-blind source language), one Terraform file
-/// (also import-blind, and call-blind), and three files no grammar reads.
+/// Two import-blind source files and three files no grammar reads.
+///
+/// C# and Swift, not the Java and Terraform this test was written with. Both of
+/// those gained import extraction in W0.3 move 2 and are no longer import-blind
+/// at all, which would have made the assertions below pass for the wrong reason
+/// — zero equals zero. C# and Swift are two of the four languages whose
+/// exclusion is a documented decision rather than a gap waiting to close, so
+/// the fixture cannot rot the same way.
 fn corpus() -> Vec<Extraction> {
     vec![
         extract_file(
-            "src/Helper.java",
-            "package app;\n\npublic class Helper {\n    public void run() {}\n}\n",
+            "src/Helper.cs",
+            "using System;\n\npublic class Helper {\n    public void Run() {}\n}\n",
         ),
         extract_file(
-            "infra/main.tf",
-            "resource \"aws_s3_bucket\" \"b\" {\n  bucket = \"x\"\n}\n",
+            "Sources/App/Helper.swift",
+            "import Foundation\n\nfunc helper() -> Int { return 1 }\n",
         ),
         extract_file("README.md", "# Title\n\nProse, and no imports.\n"),
         extract_file("data/config.json", "{\"a\": 1}\n"),
@@ -148,8 +154,8 @@ fn only_source_files_are_charged_as_import_blind() {
     let excluded = counter(&graph(&extractions), "unwired_excluded_import_blind");
     assert_eq!(
         excluded, 2,
-        "the Java file and the Terraform file are import-blind; the README, \
-         the JSON and the YAML are not source and were never candidates"
+        "the C# file and the Swift file are import-blind; the README, the JSON \
+         and the YAML are not source and were never candidates"
     );
 }
 

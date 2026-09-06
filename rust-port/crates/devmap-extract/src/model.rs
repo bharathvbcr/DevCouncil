@@ -813,6 +813,16 @@ pub struct WiringAnnotation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WiringKind {
     ScriptEntry,
+    /// A file the toolchain compiles as a root — a Cargo crate root, build
+    /// script, `bin/`, `examples/` or `benches/` target.
+    ///
+    /// A claim about the *file* and nothing inside it. Nothing in the source
+    /// imports a target root and nothing should, so it is never an unwired
+    /// candidate; but its symbols are ordinary code, and an unused helper in
+    /// `src/bin/tool.rs` is exactly as dead as one anywhere else. That is why
+    /// this is its own kind rather than a `ScriptEntry`, which exempts every
+    /// symbol in the file it names.
+    TargetRoot,
     Launcher,
     ReExportPackage,
     FrameworkDecorator,

@@ -413,7 +413,13 @@ fn a_cfml_file_is_charged_as_call_blind() {
     };
 
     assert_eq!(outcome.coverage.call_blind_files, 1);
-    assert_eq!(outcome.coverage.import_blind_files, 1, "CFML is both");
+    assert_eq!(
+        outcome.coverage.import_blind_files, 0,
+        "CFML used to be both. W0.3 move 2 reads `template=\"…\"`, so its \
+         imports are no longer missing — its *calls* still are, and the two \
+         are charged separately precisely so one can be fixed without the \
+         other silently going with it"
+    );
     assert_eq!(
         outcome.coverage.parse_failed_files, 0,
         "a clean parse must not be charged as a failure; the two are different \
@@ -497,19 +503,25 @@ fn a_pattern_recovered_file_is_not_also_charged_as_call_blind() {
 
 /// Import-blindness must not demote a dead-code verdict.
 ///
-/// A Java corpus is import-blind — there is no `imports.push` on any Java path
-/// — but its calls are extracted normally, and the dead-symbol verdict rests on
-/// call edges. Folding import-blindness into `is_complete()` would cap every
-/// finding in every Java, C++, Ruby, Swift, C# and PHP repository at
-/// `ambiguous`, which is most of the world's code demoted for a blindness the
-/// verdict does not rest on. It is charged, published, and consumed by
-/// `unwired_candidates` instead.
+/// A C# corpus is import-blind — `using System;` names a namespace, not a
+/// file, so there is nothing for an extractor to resolve and W0.3 move 2
+/// declined the language on purpose — but its calls are extracted normally,
+/// and the dead-symbol verdict rests on call edges. Folding import-blindness
+/// into `is_complete()` would cap every finding in every such repository at
+/// `ambiguous`, for a blindness the verdict does not rest on. It is charged,
+/// published, and consumed by `unwired_candidates` instead.
+///
+/// This test was written against Java, which was import-blind until W0.3 move
+/// 2 and is not any more. Repointing it at C# rather than deleting it keeps the
+/// invariant under test — the two blindnesses stay independent — and C# is one
+/// of the four languages whose exclusion is a documented decision rather than a
+/// gap waiting to close, so the fixture will not rot the same way.
 #[test]
 fn import_blindness_is_charged_without_capping_the_call_verdict() {
     let extractions = vec![extract_file(
-        "A.java",
-        "class A {\n  private void used() {}\n  private void unused() {}\n  \
-         private void run() { used(); }\n}\n",
+        "A.cs",
+        "using System;\n\nclass A {\n  private void Used() {}\n  \
+         private void Unused() {}\n  private void Run() { Used(); }\n}\n",
     )];
     let outcome = {
         let mut resolver = Resolver::new();
@@ -521,7 +533,7 @@ fn import_blindness_is_charged_without_capping_the_call_verdict() {
     assert_eq!(outcome.coverage.import_blind_files, 1);
     assert_eq!(
         outcome.coverage.call_blind_files, 0,
-        "Java extracts calls; only its imports are missing"
+        "C# extracts calls; only its imports are missing"
     );
     assert!(
         outcome.coverage.is_complete(),
@@ -532,10 +544,10 @@ fn import_blindness_is_charged_without_capping_the_call_verdict() {
         outcome
             .reports
             .iter()
-            .any(|r| r.symbol_name.contains("unused")
+            .any(|r| r.symbol_name.contains("Unused")
                 && !r.is_exempt
                 && r.confidence > COVERAGE_LOSS_CONFIDENCE_CAP),
-        "a genuinely uncalled Java method must still reach the confident tier: {:?}",
+        "a genuinely uncalled C# method must still reach the confident tier: {:?}",
         outcome.reports
     );
 }

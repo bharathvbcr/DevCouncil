@@ -624,12 +624,14 @@ fn the_cache_identity_covers_the_embedded_grammars() {
 
     // An exact pin, deliberately: it is the tripwire that makes somebody read
     // `EXTRACTION_SCHEMA_VERSION`'s doc comment and write a rationale paragraph
-    // before changing what a cached payload contains. It has fired twice —
-    // 30 -> 31 for reading `<script>` blocks, and 31 -> 32 for W1.2's heritage
-    // references and W3.3's wiring annotations, both of which are additive and
-    // so leave a stale row looking perfectly complete.
+    // before changing what a cached payload contains. It has fired three times
+    // — 30 -> 31 for reading `<script>` blocks, 31 -> 32 for W1.2's heritage
+    // references and W3.3's wiring annotations, and 32 -> 33 for W0.3 move 2's
+    // import extraction across nineteen grammar keys. All three are additive,
+    // which is exactly why each needed the bump: an additive change leaves a
+    // stale row looking perfectly complete.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "32",
+        EXTRACTION_SCHEMA_VERSION, "33",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

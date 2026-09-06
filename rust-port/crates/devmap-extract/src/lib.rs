@@ -15,6 +15,7 @@ pub mod heritage;
 pub mod langcalls;
 #[cfg(feature = "parse")]
 pub(crate) mod langdecl;
+pub mod langimports;
 pub mod languages;
 pub mod model;
 // Needs the grammars: a notebook's cells are reconstructed and then handed to

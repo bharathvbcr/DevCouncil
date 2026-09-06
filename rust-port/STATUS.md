@@ -5001,3 +5001,169 @@ denominator that counts the wrong thing.
   permanently empty for them. On this repository that is 71 files; in a Java or
   C++ shop it is the whole tree. The W0.3 plan shipped move 1 ("stop the
   bleeding") deliberately and named move 2 as the follow-up.
+
+## Every import that names a file (W0.3 move 2, 2026-09-06)
+
+`unwired_candidates` names files an agent may delete. Move 1 gave it an honest
+gate — it stopped reporting files in languages where no import was ever looked
+for, and counted the exclusion. This move removes the reason for the exclusion,
+and then removes two false-positive classes that only became visible once it
+did.
+
+### What the extractor could see before
+
+Five `imports.push` sites in the whole extractor — Python, JS/TS/TSX, Rust
+`use`, Go `import_spec`, the embedded-script merge — and **no `#include`
+handler anywhere**. For 24 of 35 declared languages the answer to "does anything
+import this file" was structurally *no*. `langimports/` now serves nineteen more
+grammar keys, wired into `extract_node` after the whole `match lang`, not inside
+its generic arm: the C family and HCL reach `extract_node` through *specialised*
+arms, so the obvious position beside `langcalls::extract_calls` would have missed
+the one family that had no import handler at all.
+
+Measured A/B on this repository (1,612 files), same command, pre-change binary
+built from `707f76a` in a detached worktree — not inferred from the after-state:
+
+| | before | after |
+|---|---|---|
+| grammars declaring `Capability::Imports` | 11 | 31 |
+| import-blind languages | 24 | **4** |
+| `unwired_candidates` | 245 | **120** |
+| ... of which `.rs` | 119 | **2** |
+| ... of which `.py` | 85 | **46** |
+| ... of which `.go` | 17 | **8** |
+| `unwired_excluded_import_blind` | 57 | **15** |
+| `unwired_excluded_coverage_loss` | 5 | 5 |
+| `Imports` edges | 2,989 | **3,099** |
+
+Half the finding was wrong. The `.rs` collapse is `mod` extraction plus Cargo
+target roots; the `.py` collapse is the widened evidence, and is the measurement
+that shows defect 3 below was never about the newly-served languages at all —
+Python has had import extraction since the first commit, and 39 of its files
+were still being reported because nothing *imported* them while something
+called them.
+
+The four that remain are decisions, not gaps, and
+`the_languages_without_import_extraction_are_named_with_reasons` pins each by
+name: **C#** (`using` names a namespace that spans files), **Swift** (`import`
+names a module, and same-module files import each other not at all — the one
+syntax that structurally cannot explain intra-repository wiring), **VB.NET**
+(C#'s case, and no linked grammar besides — its files are already charged as
+coverage loss), **COBOL** (`COPY` really does name a copybook, but the grammar
+is refused by `UNSAFE_GRAMMARS`, so its files are charged as a *parse failure* —
+a stronger signal reaching the filter through an earlier branch).
+
+### Three defects found by adversarial input and by measurement
+
+**1. A string inside a nested call is not this import's path.** `require
+File.join(dir, 'x')` extracted `x` — a specifier the author never wrote, which
+resolves either to nothing or, worse, to a real file of that name. Found by the
+refusal case in the Ruby tests, fixed in the one walk all thirteen languages
+share rather than in the module where it surfaced, and pinned for Lua, R and PHP
+too. PHP's concatenation stays transparent on purpose: `__DIR__ . '/util.php'`
+is idiomatic and the string in it really is the path.
+
+**2. Rust's `mod` had no handler, and the capability audit could not see it.**
+Rust already declared `Capability::Imports` because the extractor reads
+`use_declaration`, so every check that asks "does this language extract imports"
+answered yes. It does — for the wrong statement. `use` names a path in the
+module tree; `mod foo;` names a **file**, by a rule the Rust reference fixes.
+Measured before the fix: every `langdecl/*.rs` and `langcalls/*.rs` module in
+this repository — each declared by a `mod` line in its own parent and used
+everywhere — was an unwired candidate. Found only by building the real corpus.
+
+**3. Import edges were not the only wiring evidence, and never had been.**
+This one was latent for as long as the scan existed and could not surface while
+most languages had no import extraction. The moment Java stopped being excluded,
+`Helper.java` was *reported* — because same-package Java files import each other
+not at all, so its caller one file away produces a resolved `References` edge and
+no import. The same wrong answer with a new reason.
+
+So the question moved with the evidence: **does anything depend on this file.**
+Every confident cross-file dependency edge answers it, and an import is one kind.
+Two restrictions keep the widening honest — structural edges (`Contains`,
+`Defines`, `MemberOf`) are not dependencies, and an ambiguous resolution is a
+guess, not evidence: one ambiguous call fans out to as many as
+`AMBIGUOUS_FANOUT_CAP` candidates of which at most one is right, so only the
+confident tier counts, compared in milliconfidence for the reason
+`EXTRACTED_FLOOR_MILLIS` already records.
+
+### Two more classes the corpus showed, after that
+
+**Cargo target roots were not entry roots.** Seventeen Rust files were still
+reported and eleven were target roots — five `src/lib.rs` crate roots, five
+`examples/*.rs`, one `build.rs` — each a delete-this suggestion for a file named
+in a `Cargo.toml`. No import will ever point at one: a target root is where the
+module tree *starts*.
+
+The first attempt marked them `ScriptEntry`, and
+`test_runtime_entry_points_are_exempt_without_exempting_their_file` failed
+immediately — every file-level wiring kind exempts every *symbol* in the file
+from the dead-code verdict, so an unused helper in `src/bin/tool.rs` became
+exempt because its file had a `main`. `WiringKind::TargetRoot` is a claim about
+the file's wiring and nothing inside it. A second conflation in the same attempt
+— making `rust_path_declares_main` delegate to `rust_target_root_reason`, which
+says `src/lib.rs` declares `main` — was caught by two more existing tests. Both
+are now pinned apart by name.
+
+**A Go package import names no file.** `go_import_edge_targets` collapses
+`import "app/store"` onto one synthetic `package:app/store/store` node instead of
+one edge per file — which is right, and is what keeps a 200-file package from
+fanning one import into 200 edges — so the files behind it had no inbound
+file-level edge and every one was reported. Nine of the eleven remaining Go
+candidates. Read back by directory, matched on the file's own directory rather
+than a prefix: a Go package does not include its subdirectories, and treating
+`store` as covering `store/internal` would exempt a genuinely stranded file one
+level down.
+
+### Resolution
+
+Extraction without resolution moves the failure one stage later and leaves the
+answer the same. `devmap-resolve/src/importpath.rs` carries one table: the
+languages differ only in **separator** (`.` for the JVM family and Lua, `\` for
+PHP, `/` elsewhere), **extensions**, and the **build roots** a non-relative
+specifier resolves against. The last rung is a candidate's basename naming
+exactly one indexed file — guarded on uniqueness, not plausibility, so two files
+named `util.h` mean it abstains. A specifier the author wrote as relative skips
+both the roots and the basename rung: `./util.h` is a precise statement of
+location, and measured without that guard it produced an edge to a root-level
+`util.h` the author never referred to.
+
+A JVM wildcard (`import com.foo.*`, `import foo.bar._`) and a Terraform
+`module { source = "./modules/vpc" }` expand to every file in the directory,
+uncapped and deliberately: `AMBIGUOUS_FANOUT_CAP` bounds a *guess*, and these N
+edges are all correct. The consumer is `unwired_candidates`, so truncating would
+leave the files past the cut falsely reported as imported by nothing — a bound
+turning into a false finding. The one guard is that the repository root is never
+a package.
+
+`EXTRACTION_SCHEMA_VERSION` 32 → 33. A v32 row for any of these languages
+carries an **empty** import list — not a partial one, not one marked incomplete
+— and the consumer is the scan whose whole question is whether an inbound edge
+exists. A warm cache would answer "nothing imports this file" with the full
+confidence of a fresh extraction, for every header, every Java class and every
+Terraform module.
+
+### Gate ledger
+
+| check | result |
+|---|---|
+| `cargo test --workspace` | **1,695 passed / 1 failed** |
+| `cargo fmt --all --check` | clean |
+| `cargo clippy --workspace --all-targets -D warnings` | clean |
+| real-corpus build (1,612 files) | exit 0, manifest + graph written |
+
+The one failure is `devmap-serve`'s
+`status_answers_while_the_connect_time_sweep_is_still_running`, and it is a
+pre-existing timing flake in a crate this change does not touch: it fails its own
+**fixture precondition** — "a 6000-file sweep took only 119 ms; the ordering
+assertion below would be vacuous" — on a warm page cache, and passed 2 of 3
+reruns. Refusing to report a pass for a vacuous assertion is the behaviour this
+repository asks for; loosening the precondition to make it green would be the
+"raised to fit" it refuses. Left as found, and named here rather than absorbed.
+
+**55 new tests**, each failing against the pre-change tree: 32 in
+`langimports_specifier_names_a_file.rs`, 26 in
+`import_paths_resolve_to_real_files.rs`, 7 in `cargo_target_roots_are_wired.rs`,
+plus the widened-evidence and Go-package cases in `unwired_is_not_import_blind.rs`
+and the registry/dispatcher agreement test in `language_capabilities.rs`.

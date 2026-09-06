@@ -218,3 +218,11 @@ required-features = ["parse"]
 [[test]]
 name = "wiring_port_under_stress"
 required-features = ["parse"]
+
+[[test]]
+name = "langimports_specifier_names_a_file"
+required-features = ["parse"]
+
+[[test]]
+name = "cargo_target_roots_are_wired"
+required-features = ["parse"]
