@@ -1,5 +1,6 @@
 pub mod clones;
 pub mod clustering;
+pub mod dead_clusters;
 pub mod liveness;
 pub mod model;
 pub mod pdg;
@@ -11,6 +12,10 @@ pub use clones::{
     CloneGroup, CloneKind, CloneMember, CloneSummary,
 };
 pub use clustering::{detect_communities, CommunityDetection};
+pub use dead_clusters::{
+    dead_clusters, DeadClusterReport, DeadClusterScan, DEAD_CLUSTER_CAP, DEAD_CLUSTER_CONFIDENCE,
+    DEAD_CLUSTER_MEMBER_CAP,
+};
 pub use liveness::{
     analyze_liveness, analyze_liveness_with_coverage, extraction_coverage, extraction_gaps,
     DiscoveryCoverage, ExtractionCoverage, ExtractionGap, ExtractionGapEntry, LivenessOutcome,
@@ -91,6 +96,17 @@ pub fn analyze_with_discovery(
         // Python ratchet fences it. A rate computed at the point of printing is
         // a rate nothing else can ratchet.
         resolution_rate: crate::resolution_rate::resolution_rate(extractions, resolution),
+        // Under the same coverage ceiling as every other verdict, and for a
+        // stronger reason: a cluster finding is wrong outright if one call edge
+        // into the component was missed, so a corpus with unread files must not
+        // publish one at the tier a complete corpus would.
+        dead_clusters: {
+            let mut scan = crate::dead_clusters::dead_clusters(extractions, resolution);
+            for cluster in &mut scan.clusters {
+                cluster.confidence = liveness.coverage.cap(cluster.confidence);
+            }
+            scan
+        },
     }
 }
 

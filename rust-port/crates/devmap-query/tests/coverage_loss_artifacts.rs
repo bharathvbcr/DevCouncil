@@ -286,7 +286,11 @@ fn dead_symbol_candidates_rank_by_confidence_before_truncating() {
         status: devmap_analyze::model::AnalysisStatus::Ok,
         unresolved_calls: 0,
         clone_coverage: Default::default(),
-        resolution_rate: Default::default(),
+        // Fields this fixture does not exercise. Spread rather than
+        // enumerated so a new analysis field does not break every test
+        // literal in the workspace; the one production construction in
+        // `analyze()` still names every field exhaustively.
+        ..Default::default()
     };
     let extractions = vec![
         extract_file("a_low.py", "def x(): pass\n"),

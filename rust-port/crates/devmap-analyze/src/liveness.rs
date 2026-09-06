@@ -363,7 +363,12 @@ impl ExtractionCoverage {
 
     /// Ceiling applied to a non-exempt dead-code confidence while the scan has
     /// a hole in it, leaving anything below it untouched.
-    fn cap(&self, confidence: f32) -> f32 {
+    ///
+    /// Public because the cluster pass applies the same ceiling for a stronger
+    /// reason: a cluster finding is wrong outright if one call edge into the
+    /// component was missed. Two implementations of one ceiling is how the two
+    /// would come to disagree about what "degraded" costs.
+    pub fn cap(&self, confidence: f32) -> f32 {
         if self.is_complete() {
             confidence
         } else {

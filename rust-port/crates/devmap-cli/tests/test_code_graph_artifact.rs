@@ -124,6 +124,13 @@ fn one_manifest_invocation_publishes_both_consumer_artifacts() {
         keys,
         [
             "content_fingerprint",
+            // Added by W1.1, additively: the Python models ignore
+            // unknown keys (pydantic's default), so a consumer that
+            // predates the component pass reads the artifact
+            // unchanged. `CODE_GRAPH_SCHEMA_VERSION` therefore does
+            // not move: nothing that was readable stopped being so.
+            "dead_clusters",
+            "dead_clusters_truncated",
             "dead_code",
             "edges",
             "entry_roots",
@@ -194,10 +201,27 @@ fn one_manifest_invocation_publishes_both_consumer_artifacts() {
     );
 
     // Liveness fields are honest about what was and was not computed.
+    //
+    // Retired from "never computed" (W1.1/W2.4). The component pass answers
+    // reachability now, and this fixture's analysis is `ok`, so the empty list
+    // is a real result rather than a placeholder. The property being pinned is
+    // the same one: the list and the flag must agree about whether anything was
+    // measured, in both directions.
     assert_eq!(graph["unreachable_files"], serde_json::json!([]));
     assert_eq!(
-        graph["meta"]["liveness_unreachable_unreliable"], true,
-        "reachability was never computed, so the empty list must be flagged"
+        graph["meta"]["liveness_unreachable_unreliable"], false,
+        "the analysis is `ok`, so reachability was answered and the empty list \
+         is a computed zero"
+    );
+    assert!(
+        graph["meta"]["devmap_rust"]["unavailable"]
+            .get("unreachable_files")
+            .is_none(),
+        "a computed answer must not also be declared unavailable"
+    );
+    assert!(
+        graph["dead_clusters"].is_array(),
+        "the component pass publishes its findings beside the per-symbol list"
     );
     assert_eq!(graph["meta"]["map_engine"], "devmap-rust");
     assert_eq!(graph["meta"]["devmap_rust"]["analysis_status"], "ok");

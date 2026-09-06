@@ -629,6 +629,13 @@ fn build_code_graph_value(
         AnalysisStatus::Timeout { reason } => format!("timeout: {reason}"),
     };
 
+    // Reachability is answerable exactly when the component pass ran over a
+    // corpus whose calls were fully extracted. Both halves matter: an oversized
+    // graph means no answer at all, and a coverage hole means a missing edge
+    // into a component could invalidate every cluster in the result.
+    let unreachable_unreliable = analysis.dead_clusters.refused_oversized_graph
+        || !matches!(analysis.status, AnalysisStatus::Ok);
+
     // The `unavailable` map is built rather than written as a literal because
     // two of its entries are now conditional. A digest the caller supplied is a
     // computed answer; leaving its "not fingerprinted" note in place would have
@@ -637,13 +644,23 @@ fn build_code_graph_value(
     // satisfied. The unconditional entries stay unconditional: nothing about a
     // caller-supplied digest makes reachability or edge reasons computable.
     let mut unavailable = serde_json::Map::new();
-    unavailable.insert(
-        "unreachable_files".to_string(),
-        json!(
-            "file-level reachability BFS is not implemented in the Rust \
-             kernel; the empty list is not a computed result"
-        ),
-    );
+    // Conditional since W1.1. Reachability *is* computed now — by the
+    // strongly-connected-component pass, not by the entry-root BFS this note
+    // used to describe — so the marker is written only when that pass could not
+    // answer. Leaving it unconditional beside a populated list would have the
+    // artifact assert both at once, which the comment above already calls worse
+    // than either alone.
+    if unreachable_unreliable {
+        unavailable.insert(
+            "unreachable_files".to_string(),
+            json!(
+                "the component pass could not answer reachability for this \
+                 generation: it refused an oversized graph, or call coverage \
+                 had a hole and one missing edge into a component invalidates \
+                 the whole finding"
+            ),
+        );
+    }
     unavailable.insert(
         "edge_reason".to_string(),
         json!(
@@ -687,11 +704,18 @@ fn build_code_graph_value(
         "nodes": nodes,
         "edges": edge_values,
         "dead_code": dead_code,
+        // One finding per abandoned cycle, beside the per-symbol list rather
+        // than inside it: a 40-symbol dead subsystem is one thing a reader acts
+        // on, and forty entries would push real single-symbol findings past the
+        // cap. Top level, with the other finding lists.
+        "dead_clusters": analysis.dead_clusters.clusters.clone(),
+        "dead_clusters_truncated": analysis.dead_clusters.truncated_clusters,
         "entry_roots": entry_root_paths(extractions),
         "unwired_candidates": unwired.paths,
-        // Never computed. See `meta.devmap_rust.unavailable.unreachable_files`
-        // and the unconditional `liveness_unreachable_unreliable` below.
-        "unreachable_files": Vec::<String>::new(),
+        // Computed by the component pass — files whose every declared symbol
+        // sits in a cycle nothing outside reaches. Not the entry-root BFS the
+        // `unreliable` flag was warning about.
+        "unreachable_files": analysis.dead_clusters.unreachable_files.clone(),
         "generated_head": freshness.generated_head(),
         // Empty unless the caller computed one. See `StampedFreshness`; the
         // paired `meta.devmap_rust.unavailable` entries below are removed for
@@ -707,11 +731,11 @@ fn build_code_graph_value(
             // Ownership marker. Python never writes this key, so its absence is
             // what identifies a foreign graph to the clobber guard.
             "map_engine": CONSUMER_MAP_ENGINE,
-            // Unconditional: reachability was not computed, so an empty
-            // `unreachable_files` must never be read as "everything is
-            // reachable". `CLAUDE.md` already instructs agents to ignore that
-            // list when this flag is set.
-            "liveness_unreachable_unreliable": true,
+            // No longer unconditional; see `unreachable_unreliable` above. It
+            // now means the answer cannot be trusted, rather than that no
+            // answer was attempted — which is what let four Python consumers
+            // suppress the key permanently and leave it a third state.
+            "liveness_unreachable_unreliable": unreachable_unreliable,
             "legacy_dead_symbol_candidates": legacy_dead,
             "devmap_rust": {
                 "engine": CONSUMER_MAP_ENGINE,
@@ -1162,7 +1186,11 @@ mod tests {
             status: AnalysisStatus::Ok,
             unresolved_calls: 0,
             clone_coverage: Default::default(),
-            resolution_rate: Default::default(),
+            // Fields this fixture does not exercise. Spread rather than
+            // enumerated so a new analysis field does not break every test
+            // literal in the workspace; the one production construction in
+            // `analyze()` still names every field exhaustively.
+            ..Default::default()
         }
     }
 
@@ -1251,6 +1279,13 @@ mod tests {
             keys,
             [
                 "content_fingerprint",
+                // Added by W1.1, additively: the Python models ignore
+                // unknown keys (pydantic's default), so a consumer that
+                // predates the component pass reads the artifact
+                // unchanged. `CODE_GRAPH_SCHEMA_VERSION` therefore does
+                // not move: nothing that was readable stopped being so.
+                "dead_clusters",
+                "dead_clusters_truncated",
                 "dead_code",
                 "edges",
                 "entry_roots",
@@ -1314,14 +1349,21 @@ mod tests {
             unavailable.get("content_fingerprint").is_none(),
             "a stamped content_fingerprint must not also be declared unavailable"
         );
-        // Nothing about a supplied digest makes reachability computable.
+        // Retired from "unconditional" to "conditional, and independent of
+        // stamping" (W1.1/W2.4). Reachability *is* computed now, by the
+        // component pass, so this fixture — an `Ok` analysis with no clusters —
+        // carries no marker. The axis the assertion protects is unchanged: a
+        // supplied digest must not change what the artifact claims about
+        // reachability, in either direction.
         assert!(
-            unavailable.get("unreachable_files").is_some(),
-            "unconditional unavailability markers must survive stamping"
+            unavailable.get("unreachable_files").is_none(),
+            "this fixture's analysis is `Ok`, so reachability was answered and \
+             no unavailability marker belongs here"
         );
         assert_eq!(
             value["meta"]["liveness_unreachable_unreliable"],
-            json!(true)
+            json!(false),
+            "stamping a digest must not make reachability unreliable"
         );
     }
 
@@ -1646,29 +1688,55 @@ mod tests {
         );
     }
 
-    /// An empty `unreachable_files` is always flagged as uncomputed.
+    /// An `unreachable_files` answer is flagged exactly when it is unreliable.
     ///
-    /// The Rust kernel runs no reachability BFS. Emitting `[]` with no marker
-    /// tells a consumer every file is reachable, which is a stronger claim than
-    /// "we did not look" and the exact confusion this repository forbids.
+    /// Retired from `unreachable_files_is_never_presented_as_a_computed_result`
+    /// (W1.1/W2.4). That pinned the field as permanently uncomputed, which was
+    /// true of a hardcoded `[]` and is not true of the component pass. The axis
+    /// it protected is kept and inverted into both directions, because that is
+    /// where the danger actually lives: an empty list read as "everything is
+    /// reachable" is a stronger claim than "we did not look", and a populated
+    /// list published beside a "never computed" marker asserts both at once.
     #[test]
-    fn unreachable_files_is_never_presented_as_a_computed_result() {
-        let value = graph(
+    fn unreachable_files_is_flagged_exactly_when_the_answer_is_unreliable() {
+        // A complete analysis: the answer is computed, so no marker.
+        let computed = graph(
             &[extract_file("k.py", "def a(): pass\n")],
             &empty_analysis(),
             &[],
         );
-        assert_eq!(value["unreachable_files"], json!([]));
+        assert_eq!(computed["unreachable_files"], json!([]));
         assert_eq!(
-            value["meta"]["liveness_unreachable_unreliable"],
-            json!(true),
-            "the empty list must always be marked unreliable"
+            computed["meta"]["liveness_unreachable_unreliable"],
+            json!(false),
+            "an `Ok` analysis answered the question; saying otherwise makes the \
+             flag meaningless and four Python consumers suppress the key forever"
         );
         assert!(
-            value["meta"]["devmap_rust"]["unavailable"]["unreachable_files"]
+            computed["meta"]["devmap_rust"]["unavailable"]
+                .get("unreachable_files")
+                .is_none(),
+            "a computed answer must not also be declared unavailable"
+        );
+
+        // A degraded analysis: one missing edge into a component invalidates
+        // the whole finding, so the answer is marked unreliable and the reason
+        // is stated.
+        let mut degraded = empty_analysis();
+        degraded.status = AnalysisStatus::Partial {
+            reason: "call extraction did not cover the whole corpus".to_string(),
+        };
+        let flagged = graph(&[extract_file("k.py", "def a(): pass\n")], &degraded, &[]);
+        assert_eq!(
+            flagged["meta"]["liveness_unreachable_unreliable"],
+            json!(true)
+        );
+        assert!(
+            flagged["meta"]["devmap_rust"]["unavailable"]["unreachable_files"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("not implemented")),
-            "the reason the list is empty must be stated"
+                .is_some_and(|reason| reason.contains("coverage")),
+            "the reason the answer cannot be trusted must be stated: {:?}",
+            flagged["meta"]["devmap_rust"]["unavailable"]["unreachable_files"]
         );
     }
 

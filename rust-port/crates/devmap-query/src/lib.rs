@@ -1,3 +1,10 @@
+// `manifest.rs` builds `repo_map.json` as one `json!` literal, which expands
+// recursively once per key. The default limit of 128 is below what that
+// artifact needs; raising it is a build knob, not a behaviour change, and
+// splitting the literal to stay under the default would scatter one document
+// across several builders.
+#![recursion_limit = "512"]
+
 pub mod artifacts;
 pub mod cancel;
 pub mod code_graph;

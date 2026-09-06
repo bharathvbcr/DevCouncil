@@ -42,7 +42,7 @@ pub struct AnalysisDisclosure {
     pub unresolved_calls: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisSummary {
     pub total_files: usize,
     pub total_symbols: usize,
@@ -103,6 +103,21 @@ pub struct AnalysisSummary {
     /// `Permille` alias exists to preserve.
     #[serde(default)]
     pub resolution_rate: crate::resolution_rate::ResolutionRate,
+    /// Components of the call graph that reference only each other and are
+    /// reached by nothing outside. See [`crate::dead_clusters`].
+    ///
+    /// Reported apart from `dead_symbols` rather than merged into it, and the
+    /// separation is load-bearing twice. A cluster is **one** finding, not one
+    /// per member, or a 40-symbol abandoned subsystem pushes forty real
+    /// single-symbol findings past `DEAD_CANDIDATE_CAP`. And a cluster verdict
+    /// is a weaker claim — it depends on the whole graph being complete, where
+    /// a single-symbol verdict depends only on one symbol's inbound edges — so
+    /// it carries its own ceiling rather than borrowing the other's tiers.
+    ///
+    /// `serde(default)` yields an empty scan for generations written before
+    /// this existed, which reads as "not computed" and is the truth about them.
+    #[serde(default)]
+    pub dead_clusters: crate::dead_clusters::DeadClusterScan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +125,18 @@ pub enum AnalysisStatus {
     Ok,
     Partial { reason: String },
     Timeout { reason: String },
+}
+
+impl Default for AnalysisStatus {
+    /// A summary nobody filled in reports `Ok`.
+    ///
+    /// Only reachable through [`AnalysisSummary::default`], which exists for
+    /// test fixtures: the one production construction site in `analyze()` names
+    /// every field, so this can never stand in for a status that was not
+    /// computed.
+    fn default() -> Self {
+        AnalysisStatus::Ok
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +163,11 @@ mod disclosure_tests {
             clone_coverage: crate::clones::CloneCoverage::default(),
             discovery_refused_files: Some(2),
             resolution_rate: crate::resolution_rate::ResolutionRate::default(),
+            // Fields this fixture does not exercise. Spread rather than
+            // enumerated so a new analysis field does not break every test
+            // literal in the workspace; the one production construction in
+            // `analyze()` still names every field exhaustively.
+            ..Default::default()
         }
     }
 

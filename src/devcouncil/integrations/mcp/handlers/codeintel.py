@@ -731,7 +731,7 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
             root,
             "dead",
             "no built devmap store (run `dev map`)",
-            {"dead_code": [], "runtime_proven_live": [], "total": 0, "truncated": False},
+            {"dead_code": [], "total": 0, "truncated": False},
         )
     try:
         resp = client.dead_symbols(budget=2000)
@@ -766,7 +766,7 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
         capped = _incomplete_walk_envelope(
             root, "dead", resp, rows,
             {"minimum_confidence": minimum_confidence, "dead_code": [],
-             "runtime_proven_live": [], "total": resp.total, "truncated": resp.truncated},
+             "total": resp.total, "truncated": resp.truncated},
         )
         if capped is not None:
             return capped
@@ -777,7 +777,6 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
             {
                 "minimum_confidence": minimum_confidence,
                 "dead_code": rows,
-                "runtime_proven_live": [],
                 "index_freshness": {
                     "fresh": status.is_fresh,
                     "generation": status.generation_id,
@@ -800,7 +799,7 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
             root,
             "dead",
             str(exc),
-            {"dead_code": [], "runtime_proven_live": [], "total": 0, "truncated": False},
+            {"dead_code": [], "total": 0, "truncated": False},
         )
 
 

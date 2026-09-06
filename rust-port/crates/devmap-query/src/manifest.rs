@@ -409,6 +409,22 @@ fn consumer_manifest_json(
         AnalysisStatus::Timeout { reason } => (true, format!("timeout: {reason}")),
     };
     let entry_root_total = entry_root_paths(extractions).len();
+    // Mirrors `code_graph.json`: the marker is written only when the component
+    // pass could not answer, so a populated list and a "never computed" note
+    // are never both published.
+    let unreachable_unreliable = analysis.dead_clusters.refused_oversized_graph
+        || !matches!(analysis.status, AnalysisStatus::Ok);
+    let unreachable_unavailable = if unreachable_unreliable {
+        serde_json::json!({
+            "unreachable_files": "the component pass could not answer \
+                 reachability for this generation: it refused an oversized \
+                 graph, or call coverage had a hole and one missing edge into \
+                 a component invalidates the whole finding",
+        })
+    } else {
+        serde_json::json!({})
+    };
+
     let all_unwired = crate::code_graph::unwired_candidates(extractions, edges);
     let unwired_excluded = all_unwired.excluded_coverage_loss;
     let unwired_excluded_import_blind = all_unwired.excluded_import_blind;
@@ -457,13 +473,32 @@ fn consumer_manifest_json(
         // receives; emitting `[]` here made the two artifacts contradict each
         // other, and read to a consumer as "nothing is unwired".
         "unwired_candidates": unwired_shown,
-        // Genuinely never computed by this kernel — see
-        // `liveness_meta.unavailable.unreachable_files` and the now
-        // unconditional `liveness_unreachable_unreliable`, which is how
-        // `code_graph.json` has always stated it.
-        "unreachable_files": [],
+        // Computed since W1.1, from the strongly-connected-component pass
+        // rather than from a BFS out of the entry roots. The distinction is the
+        // whole reason this key could be filled in at all: a static BFS is
+        // genuinely noisy for routers, dynamic imports and JSX — which is what
+        // `liveness_unreachable_unreliable` was warning about — while this is
+        // the much narrower claim that every symbol the file declares sits in a
+        // component nothing outside reaches, over deterministic edges only,
+        // with everything exported or wired already exempt.
+        "unreachable_files": analysis.dead_clusters.unreachable_files,
         "dead_symbol_candidates": dead_symbol_candidates,
-        "liveness_unreachable_unreliable": true,
+        // No longer unconditional. It now means what its name says: the
+        // reachability answer cannot be trusted, because the component pass
+        // refused an oversized graph or because call coverage had a hole in it
+        // and a missing edge into a component invalidates the whole finding.
+        //
+        // Four Python consumers suppress this key whenever the flag is set, so
+        // leaving it hardcoded `true` while filling the key would have been the
+        // worst of the three states: computed, published, and ignored.
+        "liveness_unreachable_unreliable": analysis.dead_clusters.refused_oversized_graph
+            || !matches!(analysis.status, AnalysisStatus::Ok),
+        // One finding per abandoned cycle. Reported beside the single-symbol
+        // list rather than inside it: a 40-symbol dead subsystem is one thing a
+        // reader acts on, and forty entries would push real single-symbol
+        // findings past the cap.
+        "dead_clusters": analysis.dead_clusters.clusters,
+        "dead_clusters_truncated": analysis.dead_clusters.truncated_clusters,
         "liveness_meta": {
             "engine": CONSUMER_MAP_ENGINE,
             "dead_symbol": {
@@ -572,11 +607,7 @@ fn consumer_manifest_json(
                 // from "we cannot see imports in this language at all".
                 "excluded_import_blind": unwired_excluded_import_blind,
             },
-            "unavailable": {
-                "unreachable_files": "file-level reachability BFS is not \
-                     implemented in the Rust kernel; the empty list is not a \
-                     computed result",
-            },
+            "unavailable": unreachable_unavailable,
         },
         "processes": [],
         "map_engine": CONSUMER_MAP_ENGINE,
@@ -651,7 +682,11 @@ mod wire_format_tests {
             status: AnalysisStatus::Ok,
             unresolved_calls: 0,
             clone_coverage: Default::default(),
-            resolution_rate: Default::default(),
+            // Fields this fixture does not exercise. Spread rather than
+            // enumerated so a new analysis field does not break every test
+            // literal in the workspace; the one production construction in
+            // `analyze()` still names every field exhaustively.
+            ..Default::default()
         };
         let freshness = FreshnessInfo::new("head".into(), 1, 0);
         let (_, json) = generate_manifest_with_edges(&extractions, &analysis, freshness, &[]);
@@ -1289,7 +1324,11 @@ mod tests {
             status: AnalysisStatus::Ok,
             unresolved_calls: 0,
             clone_coverage: Default::default(),
-            resolution_rate: Default::default(),
+            // Fields this fixture does not exercise. Spread rather than
+            // enumerated so a new analysis field does not break every test
+            // literal in the workspace; the one production construction in
+            // `analyze()` still names every field exhaustively.
+            ..Default::default()
         }
     }
 
@@ -1514,18 +1553,22 @@ mod tests {
             "an entry root is never unwired: {unwired:?}"
         );
 
+        // Retired from "the flag is unconditional" (W1.1/W2.4). Reachability is
+        // computed by the component pass now, so an `Ok` analysis answers it
+        // and neither the flag nor the marker is set. The axis is preserved:
+        // the two artifacts must agree, and a populated list must never sit
+        // beside a "never computed" note.
         assert_eq!(
-            value["liveness_unreachable_unreliable"], true,
-            "file-level reachability is never computed here, so the flag is \
-             unconditional — `code_graph.json` already sets it that way"
+            value["liveness_unreachable_unreliable"], false,
+            "this fixture's analysis is `Ok`, so the answer stands — and it must \
+             match what `code_graph.json` says for the same input"
         );
-        let marker = value["liveness_meta"]["unavailable"]["unreachable_files"]
-            .as_str()
-            .unwrap_or("");
         assert!(
-            marker.contains("not"),
-            "the empty `unreachable_files` needs a marker saying it was never \
-             computed, got {marker:?}"
+            value["liveness_meta"]["unavailable"]
+                .get("unreachable_files")
+                .is_none(),
+            "a computed answer must not also be declared unavailable: {:?}",
+            value["liveness_meta"]["unavailable"]
         );
     }
 
