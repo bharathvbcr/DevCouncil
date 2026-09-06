@@ -279,6 +279,80 @@ fn reached_dynamically(path: &str, forms: &BTreeSet<&str>) -> bool {
     false
 }
 
+/// Whether one resolved edge is evidence that another file depends on this one.
+///
+/// An `Imports` edge is not the only such evidence, and treating it as the only
+/// one was a defect that stayed invisible while most languages had no import
+/// extraction at all. It surfaced the moment they did: `Main.java` reaching
+/// `new Helper().run()` produces a resolved `References` edge and no import,
+/// because **Java files in one package import each other not at all**. Under
+/// the import-only rule `Helper.java` went straight from "excluded, because
+/// nothing could have imported it" to "reported, because nothing imported it" —
+/// the same wrong answer with a new reason, on a file whose caller is sitting
+/// right there in the graph.
+///
+/// The same shape is ordinary in C++ (a `.cpp` defining what a header
+/// declares), Go (one package, no imports), C#, Swift and Kotlin. So the
+/// question this scan asks is "does anything depend on this file", and every
+/// resolved cross-file dependency edge answers it.
+///
+/// Two restrictions keep the widening honest:
+///
+/// * **Structural edges are not dependencies.** `Contains`, `Defines` and
+///   `MemberOf` record that a file holds its own symbols. Cross-file instances
+///   exist for re-exports, and counting them would let a file's own declaration
+///   wire it to itself through a third party.
+/// * **A guess is not evidence.** An ambiguous call fans out to as many as
+///   `AMBIGUOUS_FANOUT_CAP` candidate files of which at most one is right, so
+///   accepting it would mark up to fifteen files wired on the strength of a
+///   name collision. Only the confident tier counts — the same line
+///   `EXTRACTED_FLOOR_MILLIS` draws for a dead-code verdict, and for the same
+///   reason: this scan's output is also a delete-this suggestion.
+fn is_wiring_evidence(edge: &ResolvedEdge) -> bool {
+    if matches!(
+        edge.edge_kind,
+        EdgeKind::Contains | EdgeKind::Defines | EdgeKind::MemberOf
+    ) {
+        return false;
+    }
+    // `Imports` is textual and exact: the specifier was written in the source
+    // and resolved to an indexed path, so it carries no ambiguity to score.
+    // Every other kind must clear the confident tier.
+    //
+    // Compared in milliconfidence, not as `f32`, for the reason
+    // `EXTRACTED_FLOOR_MILLIS` above records: an edge persisted at HIGH reads
+    // back from SQLite as 0.89999997, so a `>= 0.9` float comparison would
+    // silently stop counting every unique-global call as wiring on a store
+    // round trip while counting it in-process.
+    edge.edge_kind == EdgeKind::Imports
+        || confidence_millis(edge.confidence.0) >= EXTRACTED_FLOOR_MILLIS
+}
+
+/// Whether this file sits in a Go package something imports.
+///
+/// A Go package is a directory, and an import names the package, not a file —
+/// there is no statement a Go author could write that would name
+/// `store/helpers.go` specifically. So the inbound edge lands on the synthetic
+/// package node and the files behind it are reachable with nothing pointing at
+/// them, which is the same shape as the same-package Java case and needs the
+/// same answer: the question is whether anything depends on this file, and
+/// something depends on the package it constitutes.
+///
+/// Matched on the file's own directory, not on a prefix: a package does not
+/// include its subdirectories, and treating `app/store` as covering
+/// `app/store/internal/x.go` would exempt a genuinely stranded file one level
+/// down.
+fn file_is_in_imported_go_package(ext: &Extraction, imported: &BTreeSet<&str>) -> bool {
+    if ext.language != "go" || imported.is_empty() {
+        return false;
+    }
+    let directory = match ext.file_path.rsplit_once('/') {
+        Some((directory, _file)) => directory,
+        None => "",
+    };
+    imported.contains(directory)
+}
+
 pub(crate) fn unwired_candidates(
     extractions: &[Extraction],
     edges: &[ResolvedEdge],
@@ -289,15 +363,35 @@ pub(crate) fn unwired_candidates(
         .map(|ext| ext.file_path.as_str())
         .collect();
 
-    let mut imported_by_production: BTreeSet<&str> = BTreeSet::new();
+    let mut depended_on_by_production: BTreeSet<&str> = BTreeSet::new();
+    // Directories named by a Go package import. `go_import_edge_targets`
+    // collapses an `import "app/store"` onto one synthetic
+    // `package:app/store/store` node instead of one edge per file, so the files
+    // in an imported package have **no inbound file-level edge at all** and
+    // every one of them was reported as unwired. Measured on this repository:
+    // nine of the eleven remaining Go candidates were files in packages that
+    // other packages import.
+    //
+    // The collapse itself is right — it is what keeps a 200-file package from
+    // fanning one import into 200 edges — so this reads the node back rather
+    // than undoing it.
+    let mut imported_go_packages: BTreeSet<&str> = BTreeSet::new();
     for edge in edges {
-        if edge.edge_kind != EdgeKind::Imports || edge.source_file == edge.target_file {
+        if !is_wiring_evidence(edge) || edge.source_file == edge.target_file {
             continue;
         }
         if test_files.contains(edge.source_file.as_str()) {
             continue;
         }
-        imported_by_production.insert(edge.target_file.as_str());
+        if let Some(package_node) = edge.target_file.strip_prefix("package:") {
+            // `package:<dir>/<pkg>` — the package name is the last segment and
+            // the directory is what precedes it.
+            if let Some((directory, _package)) = package_node.rsplit_once('/') {
+                imported_go_packages.insert(directory);
+            }
+            continue;
+        }
+        depended_on_by_production.insert(edge.target_file.as_str());
     }
 
     // W3.3: files a *dynamic* reference reaches, which no import edge records.
@@ -333,7 +427,8 @@ pub(crate) fn unwired_candidates(
                             | WiringKind::AllowUnwired
                     )
                 })
-                || imported_by_production.contains(ext.file_path.as_str())
+                || depended_on_by_production.contains(ext.file_path.as_str())
+                || file_is_in_imported_go_package(ext, &imported_go_packages)
                 || reached_dynamically(&ext.file_path, &dynamic_forms)
             {
                 return false;
@@ -346,6 +441,26 @@ pub(crate) fn unwired_candidates(
             if ext.is_parse_failure() || matches!(ext.parse_outcome, ParseOutcome::Fallback { .. })
             {
                 excluded_coverage_loss += 1;
+                return false;
+            }
+            // A file no grammar read is not a candidate for anything.
+            //
+            // Prose and data formats have no imports because they are prose,
+            // which is a different fact from a source language whose imports
+            // this build cannot read — and charging them to the capability
+            // counter below made `unwired_excluded_import_blind` disagree with
+            // `coverage_gaps.import_blind` by five times on this repository,
+            // 355 against 71, for one question with one answer.
+            //
+            // The exclusion itself is load-bearing and predates the reason
+            // given for it: before the capability gate landed, every `.md`,
+            // `.json` and `.yaml` in every repository was an unwired candidate,
+            // and the gate swept them up by accident. They are excluded here on
+            // their own grounds — nothing read them, they declare nothing to
+            // strand — and counted in neither number, exactly as
+            // `extraction_coverage` already keeps them out of both sides of its
+            // own ratio.
+            if !ext.grammar_read_this_file() {
                 return false;
             }
             // The kernel never looked for an import of this file, so its

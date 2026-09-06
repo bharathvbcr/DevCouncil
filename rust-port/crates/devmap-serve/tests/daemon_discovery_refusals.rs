@@ -59,9 +59,13 @@ const APP: &str = "from lib import helper\n\n\ndef main():\n    return helper()\
 /// stale payload by re-extracting the whole tree — the branch under test.
 fn age_stored_payloads(db_path: &Path) {
     let conn = rusqlite::Connection::open(db_path).unwrap();
+    // `generation_files` is a view since schema v17 and is not updatable; the
+    // identity lives on the payload the current generation's rows point at.
     conn.execute(
-        "UPDATE generation_files SET analyzer_version = '0.0.9:extract-v1'
-         WHERE generation_id = (SELECT max(id) FROM generations)",
+        "UPDATE file_payloads SET analyzer_version = '0.0.9:extract-v1'
+          WHERE payload_id IN (
+                SELECT payload_id FROM generation_file_rows
+                 WHERE generation_id = (SELECT max(id) FROM generations))",
         [],
     )
     .unwrap();

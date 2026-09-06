@@ -239,17 +239,70 @@ fn db_path(root: &std::path::Path) -> std::path::PathBuf {
 /// exists.
 fn age_stored_payloads(root: &std::path::Path, analyzer: Option<&str>) {
     let conn = rusqlite::Connection::open(db_path(root)).unwrap();
-    let changed = conn
-        .execute(
-            "UPDATE generation_files SET analyzer_version = ?1
-             WHERE generation_id = (SELECT max(id) FROM generations)",
-            rusqlite::params![analyzer],
-        )
-        .unwrap();
+    // `generation_files` is a view since schema v17 and is not updatable; the
+    // identity lives on `file_payloads`, and it is unique per
+    // (file, content, language, grammar, analyzer).
+    //
+    // That uniqueness is why this is three statements rather than one. Aging a
+    // payload *changes its identity*, and a store that has been aged before can
+    // already hold the aged twin — so a blind update collides. What the fixture
+    // means is "every stored payload now looks like an older kernel wrote it",
+    // and the honest way to say that is: age what can be aged, repoint anything
+    // whose aged twin already exists, then drop what nothing points at.
+    let changed = age_payloads(&conn, analyzer);
     assert!(
         changed > 0,
         "fixture precondition: a generation exists to age"
     );
+}
+
+/// Re-stamp every stored payload with `analyzer`, merging duplicates.
+fn age_payloads(conn: &rusqlite::Connection, analyzer: Option<&str>) -> usize {
+    // The twin of a payload: same file and content, differing only in the
+    // analyzer identity, already carrying the value we are aging towards.
+    const TWIN: &str = "SELECT o.payload_id FROM file_payloads o
+                         WHERE o.file_id = mine.file_id
+                           AND o.content_hash = mine.content_hash
+                           AND o.language = mine.language
+                           AND COALESCE(o.grammar_version, '') = COALESCE(mine.grammar_version, '')
+                           AND COALESCE(o.analyzer_version, '') = COALESCE(?1, '')
+                           AND o.payload_id <> mine.payload_id";
+
+    let aged = conn
+        .execute(
+            &format!(
+                "UPDATE file_payloads AS mine SET analyzer_version = ?1
+                  WHERE COALESCE(mine.analyzer_version, '') <> COALESCE(?1, '')
+                    AND NOT EXISTS ({TWIN})"
+            ),
+            rusqlite::params![analyzer],
+        )
+        .unwrap();
+
+    let repointed = conn
+        .execute(
+            &format!(
+                "UPDATE generation_file_rows SET payload_id = (
+                     SELECT ({TWIN}) FROM file_payloads mine
+                      WHERE mine.payload_id = generation_file_rows.payload_id)
+                  WHERE EXISTS (
+                     SELECT 1 FROM file_payloads mine
+                      WHERE mine.payload_id = generation_file_rows.payload_id
+                        AND COALESCE(mine.analyzer_version, '') <> COALESCE(?1, '')
+                        AND EXISTS ({TWIN}))"
+            ),
+            rusqlite::params![analyzer],
+        )
+        .unwrap();
+
+    conn.execute(
+        "DELETE FROM file_payloads
+          WHERE payload_id NOT IN (SELECT payload_id FROM generation_file_rows)",
+        [],
+    )
+    .unwrap();
+
+    aged + repointed
 }
 
 /// Copy a working tree without its index, so the same sources can be built cold.

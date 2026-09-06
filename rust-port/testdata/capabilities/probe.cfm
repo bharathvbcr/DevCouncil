@@ -1,3 +1,4 @@
+<cfinclude template="header.cfm">
 <cfimport path="example.helper">
 <cfscript>
     component Widget extends="BaseWidget" {

@@ -249,6 +249,20 @@ pub struct ExtractionCoverage {
     /// question is "does an inbound `Imports` edge exist", and which for 24 of
     /// 35 languages was answering it from an absence the extractor created.
     pub import_blind_files: usize,
+    /// Files whose calls a grammar actually read.
+    ///
+    /// The denominator the other five counters never had. Without it `cap()`
+    /// could only ask *whether* the scan had a hole, never *how big* — so one
+    /// unreadable vendored file and a corpus that is 90% unreadable produced
+    /// the identical verdict, and the whole confidence ladder collapsed onto
+    /// [`COVERAGE_LOSS_CONFIDENCE_CAP`].
+    ///
+    /// Counted the same way `call_blind_files` is charged, from
+    /// [`a_grammar_read_this_file`] and the language's `Calls` capability, so
+    /// the two are two sides of one partition and cannot drift into describing
+    /// different corpora. Prose and data formats are in neither: no grammar
+    /// read them and none ever will, so they are not part of the question.
+    pub files_with_call_extraction: usize,
 }
 
 /// What discovery refused, for the analysis that cannot see it.
@@ -324,8 +338,17 @@ impl ExtractionCoverage {
     }
 
     /// Files that contributed no call edges, of any kind.
+    ///
+    /// Saturating rather than wrapping. Every counter here is bounded by a file
+    /// count in production, but `discovery_refused_files` is folded in from
+    /// *outside* — `DiscoveryCoverage::refused(n)` takes whatever a caller
+    /// passes — and this feeds a division. A wrap would turn a huge blind count
+    /// into a small one and hand a confident ceiling to a corpus nothing read,
+    /// which is the flattering direction and therefore the one to bound.
     pub fn files_without_call_extraction(&self) -> usize {
-        self.parse_failed_files + self.pattern_recovered_files + self.call_blind_files
+        self.parse_failed_files
+            .saturating_add(self.pattern_recovered_files)
+            .saturating_add(self.call_blind_files)
     }
 
     /// Why the corpus-level scan is incomplete, or `None` when it is complete.
@@ -361,8 +384,77 @@ impl ExtractionCoverage {
         Some(reason)
     }
 
+    /// Files this scan had no call edges from, of any cause.
+    ///
+    /// The numerator of [`Self::blind_share`]. `import_blind_files` is
+    /// deliberately absent for the same reason it is absent from
+    /// `is_complete()`: it is a hole in a different claim.
+    fn blind_files(&self) -> usize {
+        self.files_without_call_extraction()
+            .saturating_add(self.discovery_refused_files)
+    }
+
+    /// The share of the corpus whose calls were never extracted, in `[0, 1]`.
+    ///
+    /// `None` when nothing was measured at all — which is not zero. A
+    /// [`Self::default`] record with no file counts behind it has not observed
+    /// a complete corpus; it has observed nothing, and the two must not read
+    /// alike.
+    ///
+    /// Saturating throughout, and the ratio is clamped after the division. Both
+    /// guards were written after `graded_cap_under_hostile_input.rs` found the
+    /// plain adds: a debug build panics on the overflow, and a **release** build
+    /// wraps a saturated blind count round to a small one and hands a near-
+    /// `extracted` ceiling to a corpus nothing read. Saturating turns the same
+    /// input into "entirely blind", which is the answer it should have had.
+    fn blind_share(&self) -> Option<f32> {
+        let blind = self.blind_files();
+        let considered = blind.saturating_add(self.files_with_call_extraction);
+        if considered == 0 {
+            return None;
+        }
+        // `as f32` on a saturated `usize` is lossy but monotone, and both sides
+        // lose the same way, so the ratio survives. Clamped anyway: a ratio
+        // outside `[0, 1]` would put `powi`'s base outside it too.
+        Some((blind as f32 / considered as f32).clamp(0.0, 1.0))
+    }
+
     /// Ceiling applied to a non-exempt dead-code confidence while the scan has
     /// a hole in it, leaving anything below it untouched.
+    ///
+    /// **Graded, not binary.** The old rule asked one question — is any counter
+    /// non-zero — and answered every finding in the generation with
+    /// [`COVERAGE_LOSS_CONFIDENCE_CAP`]. Measured on this repository: 1,502
+    /// files, 10 of them blind (0.67%), and all 214 dead findings came back at
+    /// exactly 0.35. `generation_dead_symbols` is read `ORDER BY confidence
+    /// DESC, file_path`, so with every confidence tied the ranked list an agent
+    /// reads degenerated to alphabetical order, and the default budget showed
+    /// it the first ~66 filenames rather than the strongest evidence.
+    ///
+    /// Worse than the ranking: the three tiers below became one number. "No
+    /// edge names this symbol" (0.9) is evidence *for* death; "something calls
+    /// it and the resolver could not say which" (0.4) and "an unresolved site
+    /// names it" (0.4) are evidence *against*. Collapsing opposite evidence
+    /// into one value is not conservatism — conservatism lowers the ceiling and
+    /// keeps the order.
+    ///
+    /// So the ceiling now tracks the size of the hole. A caller's claim is "no
+    /// file in the corpus calls this", and the risk it is wrong scales with the
+    /// share of the corpus that was never read — not with whether that share is
+    /// non-zero.
+    ///
+    /// Three properties, each pinned in `coverage_cap_is_graded.rs`:
+    ///
+    /// * **Never `extracted`.** [`HIGHEST_DEGRADED_CONFIDENCE`] sits below
+    ///   `EXTRACTED_FLOOR_MILLIS`, so a check that could not run cannot reach
+    ///   the tier whose contract is "safe to act on" — at *any* blind share.
+    ///   That rule is absolute and does not scale.
+    /// * **Never below the old floor.** A mostly-blind corpus lands on
+    ///   [`COVERAGE_LOSS_CONFIDENCE_CAP`] exactly as it does today, so the
+    ///   constant keeps its meaning instead of becoming decorative.
+    /// * **Monotone, and never raises.** `cap` is non-decreasing in its input
+    ///   and never returns more than it was given, so no finding is promoted by
+    ///   this change — only separated from findings it was never equal to.
     ///
     /// Public because the cluster pass applies the same ceiling for a stronger
     /// reason: a cluster finding is wrong outright if one call edge into the
@@ -370,12 +462,107 @@ impl ExtractionCoverage {
     /// would come to disagree about what "degraded" costs.
     pub fn cap(&self, confidence: f32) -> f32 {
         if self.is_complete() {
-            confidence
-        } else {
-            confidence.min(COVERAGE_LOSS_CONFIDENCE_CAP)
+            return confidence;
         }
+        // No measured corpus behind the record: nothing was read, so nothing is
+        // known, and the floor is the only honest answer. Reachable — a build
+        // whose discovery refused every file it found produces exactly this.
+        let Some(blind_share) = self.blind_share() else {
+            return confidence.min(COVERAGE_LOSS_CONFIDENCE_CAP);
+        };
+        let ceiling = (1.0 - blind_share)
+            .powi(COVERAGE_CEILING_EXPONENT)
+            .clamp(COVERAGE_LOSS_CONFIDENCE_CAP, HIGHEST_DEGRADED_CONFIDENCE);
+        confidence.min(ceiling)
+    }
+
+    /// The ceiling for a **whole-graph** claim, which falls faster than
+    /// [`Self::cap`]'s.
+    ///
+    /// `dead_clusters` states the difference and this is where it is priced: a
+    /// missed call edge into a component makes the entire cluster finding
+    /// wrong, where the same missed edge costs a single-symbol finding only
+    /// itself. So the claim is not "this one symbol has no caller in the blind
+    /// region" but "**none of the `size` members** does", and the ceiling
+    /// compounds accordingly.
+    ///
+    /// The consequence is the one the cluster pass already argues for: a
+    /// forty-symbol cluster in a corpus that is five percent blind is a much
+    /// weaker claim than a two-symbol cluster in a corpus that is one file
+    /// short, and before this the two were priced identically.
+    ///
+    /// `size` is clamped rather than trusted: `powi` on a 400,000-member
+    /// component would underflow to zero, which the floor would catch anyway,
+    /// but the clamp says so rather than relying on it.
+    pub fn cap_cluster(&self, confidence: f32, size: usize) -> f32 {
+        if self.is_complete() {
+            return confidence;
+        }
+        let Some(blind_share) = self.blind_share() else {
+            return confidence.min(COVERAGE_LOSS_CONFIDENCE_CAP);
+        };
+        let members = size.clamp(1, CLUSTER_COMPOUNDING_MEMBER_CAP) as i32;
+        let ceiling = (1.0 - blind_share)
+            .powi(COVERAGE_CEILING_EXPONENT + members)
+            .clamp(COVERAGE_LOSS_CONFIDENCE_CAP, HIGHEST_DEGRADED_CONFIDENCE);
+        confidence.min(ceiling)
     }
 }
+
+/// How many members the cluster ceiling compounds over before it stops caring.
+///
+/// **This clamp is load-bearing, not a rounding convenience.** An earlier
+/// draft of this comment claimed the ceiling "has long since hit the floor for
+/// any non-trivial blind share" by this point, which is false where it matters:
+/// measured on a hostile corpus of 411 files with 2 refused (0.49% blind), a
+/// 5,000-member abandoned ring compounds to `0.99513^5008` — about 2.5e-11, so
+/// the floor — while the same corpus's three-member cycle keeps 0.5. Without
+/// the clamp, *every* large component in *any* corpus with one unreadable file
+/// lands on `ambiguous`, which is the flattening this whole mechanism exists to
+/// undo, reintroduced for clusters.
+///
+/// So the clamp is where the compounding stops being informative and starts
+/// being a size penalty. A 64-member component is already a much weaker claim
+/// than a 2-member one and is priced as such; past that, the extra members say
+/// more about how the subsystem was written than about how likely the scan is
+/// to have missed an edge into it.
+///
+/// It also keeps `powi` away from an exponent that would underflow silently.
+const CLUSTER_COMPOUNDING_MEMBER_CAP: usize = 64;
+
+/// How sharply the coverage ceiling falls as the corpus goes blind.
+///
+/// **A policy dial, stated as one rather than dressed up as derived.** There is
+/// no probability model here that anyone can defend to three decimal places;
+/// what there is, is a shape the answer has to have, and one number that fixes
+/// it. The shape:
+///
+/// * A handful of unreadable files in a thousand must barely move the ceiling,
+///   because otherwise the ladder collapses. That is the defect this exponent
+///   exists to fix: 10 blind files of 1,502 on this repository put all 214 dead
+///   findings on the same number.
+/// * A corpus that is *substantially* unread must land on
+///   [`COVERAGE_LOSS_CONFIDENCE_CAP`] exactly as it does today, because at that
+///   point "nothing calls this" really is a statement about the scan.
+///
+/// At 8, the ceiling reaches the floor at a blind share of **12.3%**
+/// (`0.35^(1/8) = 0.877`), which is the crossover
+/// `the_ceiling_reaches_the_floor_well_before_the_corpus_is_half_unread` pins.
+/// Every fixture in this crate's older coverage tests is a two- or three-file
+/// corpus — 33% to 50% blind — so all of them sit past the crossover and keep
+/// the exact behaviour they were written to assert. That is not a coincidence
+/// to rely on quietly; it is why those tests still pass unchanged, and it is
+/// checked rather than assumed.
+const COVERAGE_CEILING_EXPONENT: i32 = 8;
+
+/// The highest confidence a finding from an incomplete scan may carry.
+///
+/// `confidence_millis` rounds, and `EXTRACTED_FLOOR_MILLIS` is 900, so this has
+/// to sit far enough below 0.9 that no rounding can reach it: 0.89 renders 890
+/// and therefore `inferred`. A value of 0.8995 would round *up* into
+/// `extracted` and quietly retire the one rule this whole mechanism exists to
+/// enforce.
+pub const HIGHEST_DEGRADED_CONFIDENCE: f32 = 0.89;
 
 /// Confidence ceiling for a dead-code finding made against a partially read
 /// corpus.
@@ -633,7 +820,7 @@ pub const UNRESOLVED_NAMESAKE_REASON: &str =
 /// the call graph at all, so an unbound one leaves a live handler looking dead.
 /// `Import` is excluded because its `callee_name` is a *module specifier*, not
 /// a symbol name, and matching specifiers against symbols is noise.
-fn unresolved_namesakes(resolution: &ResolutionResult) -> HashSet<&str> {
+pub(crate) fn unresolved_namesake_names(resolution: &ResolutionResult) -> HashSet<&str> {
     resolution
         .unresolved
         .iter()
@@ -677,13 +864,10 @@ pub const CALL_BLIND_REASON: &str =
 /// are already charged, as `PatternRecovered` and `ParseFailed` respectively.
 /// Charging them again would double-count one file's single hole.
 fn a_grammar_read_this_file(ext: &Extraction) -> bool {
-    matches!(
-        ext.engine,
-        ExtractionEngine::TreeSitter { .. } | ExtractionEngine::Notebook { .. }
-    ) && matches!(
-        ext.parse_outcome,
-        ParseOutcome::Clean | ParseOutcome::Partial { .. }
-    )
+    // Delegated rather than repeated. `devmap-query` asks the same question of
+    // the same files and used to answer it differently — see
+    // `Extraction::grammar_read_this_file` for the two numbers that disagreed.
+    ext.grammar_read_this_file()
 }
 
 /// One file that call extraction did not cover, and why.
@@ -771,6 +955,18 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
             ExtractionGap::ImportBlind => coverage.import_blind_files += 1,
         }
     }
+    // The other side of the same partition, counted from the same two
+    // predicates `extraction_gaps` charges `CallBlind` from. Derived here
+    // rather than as `extractions.len() - gaps` because that subtraction would
+    // fold every `.md` and `.json` into the covered side and flatter the share
+    // — the denominator is files whose calls were *looked for*, not files seen.
+    coverage.files_with_call_extraction = extractions
+        .iter()
+        .filter(|ext| {
+            a_grammar_read_this_file(ext)
+                && capabilities_for_language(&ext.language).contains(Capability::Calls)
+        })
+        .count();
     coverage
 }
 
@@ -805,7 +1001,7 @@ pub fn analyze_liveness_with_coverage(
     coverage.discovery_refused_files = discovery.charged();
     // Computed once for the whole corpus: the join is name-only, so it has no
     // per-file component to recompute.
-    let unresolved_names = unresolved_namesakes(resolution);
+    let unresolved_names = unresolved_namesake_names(resolution);
     let supertypes = supertypes_by_type(resolution);
     let go_interface_specs = go_interface_specs_by_package(extractions);
     let c_header_exports = c_header_exported_names(extractions);

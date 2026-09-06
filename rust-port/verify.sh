@@ -40,6 +40,17 @@ cargo test --workspace
 
 if [ "$QUICK" -eq 1 ]; then echo "quick mode: skipping determinism/perf/mutants"; exit 0; fi
 
+# Where `cargo` actually put the release binary. Steps 5 and 8 run it directly
+# rather than through `cargo run`, so they have to agree with cargo about the
+# path — and `CARGO_TARGET_DIR` is set by anyone running two lanes against one
+# checkout, which is a layout this repository's own guidance recommends. Before
+# this, such a run reported "could not measure peak RSS", which is true and is
+# the wrong reason: the measurement was fine and the binary was not there.
+DEVMAP_BIN="${CARGO_TARGET_DIR:-$(pwd)/target}/release/devmap"
+# Exported so `tools/memory_model_probe.sh` and `tools/soak.sh` measure the same
+# binary these gates did, rather than each resolving it again.
+export DEVMAP_BIN
+
 step "4/9 determinism — two clean builds must produce identical graph digests"
 TMP1=$(mktemp -d) ; TMP2=$(mktemp -d)
 trap 'rm -rf "$TMP1" "$TMP2"' EXIT
@@ -68,7 +79,9 @@ step "5/9 self-build gates — DevCouncil repo, release"
 . tools/peak_rss.sh
 
 START=$(now_ns)
-RSS=$(peak_rss_bytes "$TMP1/self.rss" ./target/release/devmap --db "$TMP1/self.sqlite" --progress never build ..) || {
+[ -x "$DEVMAP_BIN" ] || {
+  echo "GATE FAIL: no release binary at $DEVMAP_BIN — step 4 builds it with \`cargo run --release\`, so this means cargo wrote it somewhere else (check CARGO_TARGET_DIR)"; exit 1; }
+RSS=$(peak_rss_bytes "$TMP1/self.rss" "$DEVMAP_BIN" --db "$TMP1/self.sqlite" --progress never build ..) || {
   echo "GATE FAIL: could not measure peak RSS — refusing to report an unmeasured build as passing"; exit 1; }
 END=$(now_ns)
 MS=$(( (END - START) / 1000000 ))
@@ -116,10 +129,28 @@ RSS_GATE=$(( 2 * 1024*1024*1024 ))
 # between the macOS host these numbers were measured on and the Linux runner CI
 # uses, which has not been measured.
 #
-# 600 B per fan-out edge is 1.5x the 401-415 B/edge measured by
-# tools/memory_model_probe.sh, which is where that coefficient is gated tightly.
+# The fan-out term has TWO coefficients, not one, and for a while it had the
+# wrong one.
+#
+# `AMBIGUOUS_FANOUT_CAP` bounds how many edges an ambiguous site emits (16); it
+# does not bound the candidate list the `Arc<Resolution>` holds, which is what
+# the memory is proportional to. A single 600 B/edge term was therefore charging
+# the wrong quantity — on a corpus whose ambiguous sites weigh many candidates
+# each it under-counts by the ratio between the two. Measured on this repository
+# 2026-09-06: 59,309 candidates weighed against 38,006 edges emitted, 1.56x, and
+# a corpus with wider ambiguity separates them further. Re-derived by
+# `tools/memory_model_probe.sh` over a seven-shape sweep (fan-out width 16..200,
+# site count 100..400):
+#
+#     fan-out cost = 694 B x emitted_edges + 86 B x candidates
+#
+# fitting every point to 96.1%..103.9%. Both terms are carried here, each with
+# the same 1.5x headroom the single term had: 1050 and 130. `candidates` comes
+# from `generation_edges.candidate_total` (schema v16), which is what made the
+# right denominator derivable from a store at all.
 RSS_BASE_PER_FILE=$(( 512 * 1024 ))
-RSS_PER_FANOUT_EDGE=600
+RSS_PER_FANOUT_EDGE=1050
+RSS_PER_CANDIDATE=130
 
 # The fan-out is derived from the persisted store, not from the resolver's
 # source, and it fails closed: tools/fanout.sh exits non-zero if any fan-out
@@ -129,12 +160,16 @@ RSS_PER_FANOUT_EDGE=600
 FANOUT=$(./tools/fanout.sh "$TMP1/self.sqlite") || {
   echo "GATE FAIL: could not derive the ambiguity fan-out — refusing to report an underived memory budget as passing"; exit 1; }
 FANOUT_EDGES=$(printf '%s\n' "$FANOUT" | tr ' ' '\n' | awk -F= '$1=="fanout_edges" {print $2; exit}')
+FANOUT_CANDIDATES=$(printf '%s\n' "$FANOUT" | tr ' ' '\n' | awk -F= '$1=="candidates" {print $2; exit}')
 [[ "$FANOUT_EDGES" =~ ^[0-9]+$ ]] || { echo "GATE FAIL: malformed fan-out metrics: $FANOUT"; exit 1; }
-RSS_BUDGET=$(( FILE_COUNT * RSS_BASE_PER_FILE + FANOUT_EDGES * RSS_PER_FANOUT_EDGE ))
+[[ "$FANOUT_CANDIDATES" =~ ^[0-9]+$ ]] || { echo "GATE FAIL: fan-out metrics carry no candidate total: $FANOUT"; exit 1; }
+RSS_BUDGET=$(( FILE_COUNT * RSS_BASE_PER_FILE \
+             + FANOUT_EDGES * RSS_PER_FANOUT_EDGE \
+             + FANOUT_CANDIDATES * RSS_PER_CANDIDATE ))
 
 echo "build ${MS} ms, db $((BYTES/1024/1024)) MiB (cold), files ${FILE_COUNT}, gate $((GATE/1024/1024)) MiB, peak RSS $((RSS/1024/1024)) MiB"
 echo "$FANOUT"
-echo "rss budget $((RSS_BUDGET/1024/1024)) MiB = ${FILE_COUNT} files x $((RSS_BASE_PER_FILE/1024)) KiB + ${FANOUT_EDGES} fan-out edges x ${RSS_PER_FANOUT_EDGE} B"
+echo "rss budget $((RSS_BUDGET/1024/1024)) MiB = ${FILE_COUNT} files x $((RSS_BASE_PER_FILE/1024)) KiB + ${FANOUT_EDGES} fan-out edges x ${RSS_PER_FANOUT_EDGE} B + ${FANOUT_CANDIDATES} candidates x ${RSS_PER_CANDIDATE} B"
 # Budget re-derived 2026-08-16 when the grammar matrix went from 5 linked
 # languages to 32: the port now parses 22 more grammars and 1,110 files instead
 # of 1,088, so the 5 s budget measured work the build no longer does. Quiet-run
@@ -147,7 +182,7 @@ echo "rss budget $((RSS_BUDGET/1024/1024)) MiB = ${FILE_COUNT} files x $((RSS_BA
 [ "$BYTES" -lt "$GATE" ] || { echo "GATE FAIL: db >= $((GATE/1024/1024)) MiB for ${FILE_COUNT} files"; exit 1; }
 [ "$RSS" -lt "$RSS_GATE" ] || { echo "GATE FAIL: peak RSS $((RSS/1024/1024)) MiB >= $((RSS_GATE/1024/1024)) MiB"; exit 1; }
 [ "$RSS" -lt "$RSS_BUDGET" ] || {
-  echo "GATE FAIL: peak RSS $((RSS/1024/1024)) MiB >= scale-invariant budget $((RSS_BUDGET/1024/1024)) MiB for ${FILE_COUNT} files and ${FANOUT_EDGES} fan-out edges"; exit 1; }
+  echo "GATE FAIL: peak RSS $((RSS/1024/1024)) MiB >= scale-invariant budget $((RSS_BUDGET/1024/1024)) MiB for ${FILE_COUNT} files, ${FANOUT_EDGES} fan-out edges and ${FANOUT_CANDIDATES} candidates"; exit 1; }
 
 step "6/9 memory-model probe — bound the cost per unit of ambiguity fan-out"
 # The two gates above bound this repository. Neither says anything about the
@@ -156,8 +191,11 @@ step "6/9 memory-model probe — bound the cost per unit of ambiguity fan-out"
 # stop catching a regression here. A coefficient is the same number at any
 # corpus size, so this probe builds a synthetic corpus whose fan-out is known by
 # construction, subtracts a paired zero-ambiguity control to measure the base
-# term rather than model it, and bounds bytes-per-candidate-pair and
-# bytes-per-fan-out-edge. It prints exactly what it capped.
+# term rather than model it, and bounds bytes-per-*candidate* — the quantity the
+# memory actually tracks since `AMBIGUOUS_FANOUT_CAP` decoupled it from emitted
+# edges — plus the model that combines the two terms, plus how the per-candidate
+# cost *moves* when the candidate list doubles, which is the direct test of the
+# shared-`Arc` invariant. It prints exactly what it capped.
 ./tools/memory_model_probe.sh || { echo "GATE FAIL: memory-model probe"; exit 1; }
 
 step "7/9 growth gate — repeated builds must plateau"
@@ -172,7 +210,7 @@ cp -R testdata/. "$GROWTH_SRC/" 2>/dev/null || true
 SIZES=""
 for round in 1 2 3 4 5; do
   printf '\n# growth probe %s\n' "$round" >> "$GROWTH_SRC/churn.py"
-  ./target/release/devmap --db "$GROWTH_DB" --progress never build "$GROWTH_SRC" >/dev/null
+  "$DEVMAP_BIN" --db "$GROWTH_DB" --progress never build "$GROWTH_SRC" >/dev/null
   SIZES="$SIZES $(stat -f%z "$GROWTH_DB" 2>/dev/null || stat -c%s "$GROWTH_DB")"
 done
 set -- $SIZES

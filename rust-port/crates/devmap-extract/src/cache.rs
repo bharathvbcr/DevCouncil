@@ -195,7 +195,28 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Both are additive to the payload, which is exactly why the bump is
 /// necessary: nothing about a v31 row *looks* stale, so without it a warm cache
 /// serves a complete-looking extraction with the new evidence silently missing.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "32";
+/// v33 adds `imports` for nineteen grammar keys that had none (W0.3 move 2):
+/// the whole C family, the JVM family, Dart, PHP, Ruby, Lua, Luau, R, Nix,
+/// Pascal, Solidity, Erlang, CFML and HCL. Before it the extractor had five
+/// `imports.push` sites in total and no `#include` handler anywhere, so a v32
+/// row for any file in those languages carries an **empty** import list — not a
+/// partial one, and not one marked incomplete.
+///
+/// That is the worst shape a stale row can have here, because the consumer is
+/// `unwired_candidates`, whose whole question is whether an inbound `Imports`
+/// edge exists. A reused v32 row answers "nothing imports this file" with the
+/// full confidence of a fresh extraction, for every header, every Java class
+/// and every Terraform module in a warm cache — a delete-this verdict resting
+/// on evidence that was never collected. The capability bit moved in the same
+/// change, so the coverage machinery would no longer even charge the file as
+/// import-blind: it would look examined and be blind.
+///
+/// v33 also adds `WiringKind::TargetRoot` for Cargo target roots — crate roots,
+/// build scripts, `bin/`, `examples/` and `benches/` — which a v32 row cannot
+/// carry either, and which decides whether a file is an entry root. One bump
+/// covers both for the reason the v31 note records: the version answers "may a
+/// stored row be reused?", and either change on its own already answers no.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "33";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

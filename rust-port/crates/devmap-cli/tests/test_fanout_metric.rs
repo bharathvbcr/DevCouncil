@@ -83,6 +83,15 @@ struct Fanout {
     unjoined: i64,
     alt_sum_n2: i64,
     alt_sites: i64,
+    /// Candidates weighed, not edges emitted. `AMBIGUOUS_FANOUT_CAP` bounds the
+    /// second and not the first, so since audit R-7 these are different
+    /// quantities — and resolver memory is proportional to this one.
+    candidates: i64,
+    candidate_n2: i64,
+    max_candidates: i64,
+    /// Ambiguous rows carrying no `candidate_total`, i.e. written before schema
+    /// v16. Must be zero, or the candidate denominator is not recoverable.
+    pre_v16: i64,
 }
 
 /// Runs `tools/fanout.sql` exactly as the shell gates do: every statement ahead
@@ -109,7 +118,7 @@ fn fanout(db: &Path) -> Fanout {
         .split('|')
         .map(|f| f.parse().expect("fanout.sql emits integers"))
         .collect();
-    assert_eq!(parts.len(), 8, "fanout.sql emits 8 pipe-separated fields");
+    assert_eq!(parts.len(), 12, "fanout.sql emits 12 pipe-separated fields");
     Fanout {
         files: parts[0],
         edges: parts[1],
@@ -119,6 +128,10 @@ fn fanout(db: &Path) -> Fanout {
         unjoined: parts[5],
         alt_sum_n2: parts[6],
         alt_sites: parts[7],
+        candidates: parts[8],
+        candidate_n2: parts[9],
+        max_candidates: parts[10],
+        pre_v16: parts[11],
     }
 }
 
@@ -170,6 +183,33 @@ fn the_fanout_metric_matches_a_hand_counted_corpus() {
     assert_eq!(
         f.alt_sites, f.sites,
         "node-join and name-suffix derivations of the site count must agree"
+    );
+
+    // The candidate denominator, hand-counted like everything else here.
+    //
+    // `alpha` has three declarations and `beta` two, so the three `alpha` sites
+    // weigh 3 candidates each and the two `beta` sites weigh 2:
+    //   candidates   = 3*3 + 2*2 = 13
+    //   candidate_n2 = 3*9 + 2*4 = 35
+    // On this fixture every width is under `AMBIGUOUS_FANOUT_CAP`, so
+    // candidates and edges coincide — which is exactly why the cap makes them
+    // different quantities on a real corpus and why nothing here can be checked
+    // against `edges` and called a check of the candidate column.
+    assert_eq!(f.candidates, 13, "candidates weighed across all sites");
+    assert_eq!(f.candidate_n2, 35, "sum of candidates^2 across all sites");
+    assert_eq!(f.max_candidates, 3, "widest candidate list");
+    assert_eq!(
+        f.pre_v16, 0,
+        "every ambiguous edge this binary writes carries a candidate total; a \
+         NULL means the row predates schema v16 and the denominator is not \
+         recoverable"
+    );
+    // A site's candidate list is never smaller than the edges it produced.
+    assert!(
+        f.candidates >= f.edges,
+        "a site cannot emit more edges ({}) than it weighed candidates ({})",
+        f.edges,
+        f.candidates
     );
 
     // `gamma` has exactly one declaration, so it resolves on the UniqueGlobal
@@ -266,4 +306,88 @@ fn repeated_calls_to_one_ambiguous_name_collapse_into_a_single_site() {
     assert_eq!(f.alt_sum_n2, f.sum_n2);
 
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// The case the whole candidate column exists for: the cap active.
+///
+/// `AMBIGUOUS_FANOUT_CAP` bounds how many edges one site emits. It does not
+/// bound the candidate list the `Arc<Resolution>` holds, so above the cap the
+/// two numbers separate — and every memory coefficient derived from the store
+/// was, until schema v16, computed against the one that stops growing.
+///
+/// This is the test the previous fixture cannot be: on a 3-candidate corpus
+/// candidates and edges coincide, so a `candidate_total` column that simply
+/// echoed the group size would pass there and fail here.
+#[test]
+fn above_the_cap_candidates_and_emitted_edges_are_different_numbers() {
+    let cap = ambiguous_fanout_cap();
+    let width = cap + 24;
+
+    let root = std::env::temp_dir().join(format!("devmap-fanout-cap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    for index in 0..width {
+        write(
+            root.as_path(),
+            &format!("defs/d{index}.rs"),
+            "pub fn alpha() -> u32 { 0 }\n",
+        );
+    }
+    write(
+        root.as_path(),
+        "callers/c0.rs",
+        "pub fn one() -> u32 {\n    let _ = alpha();\n    0\n}\n",
+    );
+
+    let db = root.join("index.sqlite");
+    let out = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .args(["--db", db.to_str().unwrap(), "--progress", "never", "build"])
+        .arg(&root)
+        .output()
+        .expect("devmap build");
+    assert!(out.status.success(), "build failed");
+
+    let f = fanout(&db);
+    assert_eq!(f.sites, 1, "one ambiguous call site");
+    assert_eq!(
+        f.edges, cap as i64,
+        "the site emits exactly AMBIGUOUS_FANOUT_CAP edges"
+    );
+    assert_eq!(
+        f.candidates, width as i64,
+        "the site weighed every declaration, which is what the resolution holds \
+         and what the memory is proportional to"
+    );
+    assert!(
+        f.candidates > f.edges,
+        "above the cap these must be different numbers ({} vs {}); a column \
+         that echoed the emitted-edge count would be indistinguishable from the \
+         denominator this replaces",
+        f.candidates,
+        f.edges
+    );
+    assert_eq!(f.max_candidates, width as i64);
+    assert_eq!(f.pre_v16, 0);
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Read the cap from its owner rather than repeating it, the same way
+/// `tools/memory_model_probe.sh` does — a test that hard-coded 16 would start
+/// asserting the shape of a resolver that no longer exists.
+fn ambiguous_fanout_cap() -> usize {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../devmap-resolve/src/model.rs"),
+    )
+    .expect("devmap-resolve/src/model.rs is readable");
+    let marker = "AMBIGUOUS_FANOUT_CAP: usize = ";
+    let tail = source
+        .split_once(marker)
+        .expect("AMBIGUOUS_FANOUT_CAP is declared in devmap-resolve/src/model.rs")
+        .1;
+    tail.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("AMBIGUOUS_FANOUT_CAP is a number")
 }

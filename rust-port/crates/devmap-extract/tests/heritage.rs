@@ -21,11 +21,12 @@ use devmap_extract::model::ReferenceKind;
 /// Sources are minimal on purpose: each exercises one grammar's heritage
 /// clause and nothing else, so a failure names the grammar rather than
 /// something incidental about the fixture.
-/// `(what the case proves, path, source, expected supertypes, expected interfaces)`.
+/// One row of [`MATRIX`]: label, path, source, expected `extends`, expected
+/// `implements`.
 ///
-/// A named alias rather than the tuple inline: the shape is five fields wide
-/// and two of them are `&[&str]`, so at the use site nothing says which is
-/// which.
+/// Named rather than written inline for two reasons that both apply: clippy
+/// refuses a tuple this wide, and at the use site five anonymous fields — two
+/// of them `&[&str]` — say nothing about which is which.
 type HeritageCase = (
     &'static str,
     &'static str,

@@ -236,31 +236,123 @@ fn the_call_blind_clean_parsing_languages_are_named() {
     );
 }
 
-/// The scale of W0.3, pinned as a number.
+/// The four languages `unwired_candidates` still cannot answer for, by name.
 ///
-/// `unwired_candidates` asks whether a file has an inbound `Imports` edge. For
-/// a language in this list the answer is always no, because there are only five
-/// `imports.push` sites in the whole extractor. The count is asserted so that
-/// adding import extraction is visible here as the list shrinking, rather than
-/// landing with no evidence that anything changed.
+/// This assertion used to read `import_blind.len() == 24` and to be titled
+/// "the majority", because `unwired_candidates` asks whether a file has an
+/// inbound `Imports` edge and for 24 of 35 languages the answer was
+/// structurally *no*: the whole extractor had five `imports.push` sites and no
+/// `#include` handler anywhere. W0.3 move 2 turned that number into four.
+///
+/// It is now pinned by **name with a reason**, not by count. A count says the
+/// list changed; it does not say whether a language left the list because an
+/// extractor was written or because a bit was set by hand — which is the exact
+/// rot `CALL_EXTRACTION_LANGUAGES` died of. Each entry below is a decision that
+/// has to survive review to change:
+///
+/// * **`csharp`** — `using System;` names a *namespace*. A C# namespace spans
+///   any number of files and one file may declare several, so no rule of the
+///   language or its tooling maps a `using` to a file. Extracting one would
+///   mean inventing a convention C# does not have.
+/// * **`swift`** — `import Foundation` names a *module*, and that is the one
+///   thing that cannot explain intra-repository wiring: files in the same
+///   module — which is what a Swift target is, and where almost every file in a
+///   Swift repository lives — import each other not at all. Swift's inbound
+///   dependencies are invisible to import syntax by design.
+/// * **`vb`** — `Imports System.Collections` is C#'s case again, and VB.NET has
+///   no linked grammar besides: it reaches `scan_declarations`, whose
+///   `Fallback` engine `grammar_read_this_file` already answers `false` for, so
+///   its files are charged as coverage loss rather than as import blindness.
+/// * **`cobol`** — `COPY MYCOPY.` really does name a copybook file, but COBOL
+///   is refused by `UNSAFE_GRAMMARS` and reports `ParseOutcome::Failed`. Its
+///   files are charged as a parse failure, which is a *stronger* signal than
+///   import blindness and reaches `unwired_candidates` through a different,
+///   earlier branch. Claiming imports for a file no grammar read would be the
+///   "a check that could not run reports what a check that passed reports"
+///   failure this repository exists to refuse.
+///
+/// The two that were added rather than declined are recorded here as well, so
+/// the boundary is legible from one place: `hcl` because
+/// `module { source = "./modules/vpc" }` names a path, and `cfml` because
+/// `template="header.cfm"` does — even though CFML's `<cfscript>` bodies stay
+/// opaque to its grammar and its `include` statements are a stated residual.
 #[test]
-fn import_blind_languages_are_the_majority() {
+fn the_languages_without_import_extraction_are_named_with_reasons() {
     let import_blind: Vec<&str> = LANGUAGE_SPECS
         .iter()
         .filter(|spec| !spec.capabilities.contains(Capability::Imports))
         .map(|spec| spec.grammar)
         .collect();
     assert_eq!(
-        import_blind.len(),
-        24,
-        "import-blind languages: {import_blind:?}"
+        import_blind,
+        vec!["csharp", "vb", "swift", "cobol"],
+        "the set of import-blind languages changed; each entry is a documented \
+         decision, so adding or removing one means updating the reason above"
     );
-    for expected in [
-        "java", "csharp", "c", "cpp", "ruby", "php", "swift", "kotlin",
-    ] {
-        assert!(
-            import_blind.contains(&expected),
-            "{expected} is expected to be import-blind"
-        );
-    }
+}
+
+/// Every language the dispatcher routes must declare `IMPORTS`, and vice versa.
+///
+/// The registry and `langimports` are two lists of the same fact, and the way
+/// that goes wrong is not subtle: a module added without its flag extracts
+/// imports that every consumer discards as "this language is blind", and a flag
+/// set without its module claims coverage that does not exist. The
+/// bidirectional probe above catches both *for the grammars the corpus
+/// reaches*; this catches them at the source, for all of them, without needing
+/// a fixture per language.
+#[test]
+fn the_import_dispatcher_and_the_registry_agree() {
+    use devmap_extract::langimports::IMPORT_EXTRACTION_LANGUAGES;
+
+    // Languages whose *specialised* arm in `extract_node` pushes imports rather
+    // than the dispatcher — they are absent from `langimports` on purpose, and
+    // their flag is older than this module.
+    const SPECIALISED: &[&str] = &[
+        "typescript",
+        "tsx",
+        "javascript",
+        "python",
+        "go",
+        "rust",
+        "svelte",
+        "vue",
+        "astro",
+        "liquid",
+    ];
+
+    let declared: BTreeSet<&str> = LANGUAGE_SPECS
+        .iter()
+        .filter(|spec| spec.capabilities.contains(Capability::Imports))
+        .map(|spec| spec.grammar)
+        .collect();
+    let dispatched: BTreeSet<&str> = IMPORT_EXTRACTION_LANGUAGES.iter().copied().collect();
+    let specialised: BTreeSet<&str> = SPECIALISED.iter().copied().collect();
+
+    let dispatched_without_flag: Vec<&&str> = dispatched.difference(&declared).collect();
+    assert!(
+        dispatched_without_flag.is_empty(),
+        "{dispatched_without_flag:?} have an import extractor but no IMPORTS bit, \
+         so every consumer still treats them as import-blind and their edges are \
+         extracted and then ignored"
+    );
+
+    let flagged_without_extractor: Vec<&str> = declared
+        .difference(&dispatched)
+        .copied()
+        .filter(|grammar| !specialised.contains(grammar))
+        .collect();
+    assert!(
+        flagged_without_extractor.is_empty(),
+        "{flagged_without_extractor:?} declare IMPORTS but no arm extracts them — \
+         the bit claims coverage nothing delivers"
+    );
+
+    // And the specialised list is not a place to hide a language: every entry
+    // must really be flagged, or it is a stale name rather than an exemption.
+    let stale: Vec<&&str> = specialised.difference(&declared).collect();
+    assert!(
+        stale.is_empty(),
+        "{stale:?} are listed as having a specialised import arm but do not \
+         declare IMPORTS; the exemption list has rotted"
+    );
 }

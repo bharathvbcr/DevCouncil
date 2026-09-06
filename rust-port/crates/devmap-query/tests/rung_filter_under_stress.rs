@@ -73,6 +73,10 @@ fn the_histogram_accounts_for_every_edge_at_scale() {
 /// it is not guaranteed to equal any constant. Every one of them has to bucket,
 /// and none may bucket twice.
 #[test]
+// Excessive precision is exactly the point. Each neighbour below is the f32
+// immediately either side of a rung floor; rounding one to a literal f32 can
+// hold exactly would delete the boundary this test exists to walk.
+#[allow(clippy::excessive_precision)]
 fn every_representable_confidence_lands_on_exactly_one_rung() {
     // The neighbours of each boundary, computed rather than written out.
     // `next_down`/`next_up` give the adjacent representable `f32`, which is

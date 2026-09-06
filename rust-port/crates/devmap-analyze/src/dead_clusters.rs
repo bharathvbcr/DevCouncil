@@ -50,6 +50,28 @@ pub const DEAD_CLUSTER_MEMBER_CAP: usize = 25;
 /// gets a strictly lower tier.
 pub const DEAD_CLUSTER_CONFIDENCE: f32 = 0.5;
 
+/// Confidence for a cluster something reaches through evidence the resolver
+/// could not bind.
+///
+/// The single-symbol cascade already prices exactly this evidence: an ambiguous
+/// caller is `only_ambiguous_callers` at 0.4, and an unresolved site naming the
+/// symbol is [`crate::UNRESOLVED_NAMESAKE_REASON`] at 0.4. The component pass
+/// excluded both from `is_reaching_edge` — correctly, because a guess must not
+/// keep a cluster alive — and then never looked at them again, so the identical
+/// evidence produced 0.4 for one symbol and 0.5 for a component containing it.
+///
+/// Measured on the fixture in `clusters_read_the_defect_ledger.rs`: one call
+/// site, one ambiguity, two candidates. `Widget.alpha` came back at 0.4 saying
+/// "only ambiguous callers"; `Task.alpha` came back inside a cluster at 0.5
+/// saying it was "reached by nothing outside the component", which the edge
+/// list contradicts. The stronger claim carried the higher confidence and the
+/// more absolute prose.
+///
+/// Equal to the single-symbol tier rather than below it: the evidence is the
+/// same, and the component's extra weakness is already priced by
+/// `ExtractionCoverage::cap_cluster`, which compounds over the membership.
+pub const DEAD_CLUSTER_QUALIFIED_CONFIDENCE: f32 = 0.4;
+
 /// A group of symbols that reference only each other, reachable from nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeadClusterReport {
@@ -98,23 +120,101 @@ pub struct DeadClusterScan {
 /// leaving an empty result to read as "no dead clusters".
 pub const DEAD_CLUSTER_MAX_NODES: usize = 400_000;
 
-/// Whether this edge is evidence that its target is reached.
+/// Whether this edge relates two *symbols* at all.
 ///
 /// Structural edges say where a symbol lives, not that anything uses it —
 /// `Contains` alone would put every symbol in a file into one component with
-/// the file. Ambiguous and unresolved edges are excluded because a cluster kept
-/// alive by a guess is a finding silently suppressed.
-fn is_reaching_edge(edge: &ResolvedEdge) -> bool {
-    if matches!(
+/// the file.
+///
+/// `Imports` is excluded for a different and sharper reason: an import edge
+/// carries the **file path** in both symbol positions, so `a.py -> b.py ->
+/// a.py` — an ordinary circular import, and TypeScript barrels and Python
+/// packages are full of them — is a two-node strongly connected component in
+/// the very graph this pass walks. Nothing came of it only because all three
+/// `File`-symbol construction sites emit `is_exported: true`, which puts every
+/// file into `externally_reachable_symbols`. That is a load-bearing dependency
+/// on an unstated property of a different crate: the day a `File` node stops
+/// reading as exported — a reasonable change, since a file node is not public
+/// API — every circular import in every repository becomes a dead cluster.
+///
+/// Dropping them costs nothing that could ever have been a finding. Import
+/// edges connect file nodes only, liveness never reports a `SymbolKind::File`,
+/// and "a cluster of files" is not the claim this pass makes. It also shrinks
+/// the graph Tarjan walks by one node per file plus every import edge.
+fn is_symbol_edge(edge: &ResolvedEdge) -> bool {
+    !matches!(
         edge.edge_kind,
-        EdgeKind::Contains | EdgeKind::Defines | EdgeKind::MemberOf
-    ) {
+        EdgeKind::Contains | EdgeKind::Defines | EdgeKind::MemberOf | EdgeKind::Imports
+    )
+}
+
+/// Whether this edge is evidence that its target is reached.
+///
+/// Ambiguous and unresolved edges are excluded because a cluster kept alive by
+/// a guess is a finding silently suppressed. They are not *forgotten*, though —
+/// see [`qualifying_symbols`], which is where the same evidence that demotes a
+/// single symbol reaches the component verdict.
+fn is_reaching_edge(edge: &ResolvedEdge) -> bool {
+    if !is_symbol_edge(edge) {
         return false;
     }
     !matches!(
         edge.resolution.as_deref(),
         Some(Resolution::AmbiguousGlobal { .. }) | Some(Resolution::Unresolved { .. })
     )
+}
+
+/// Symbols something reaches through evidence the resolver could not bind.
+///
+/// Two sources, and they are exactly the two the single-symbol cascade already
+/// reads:
+///
+/// * an **ambiguous or unresolved edge** naming the symbol — the fan-out
+///   `is_reaching_edge` refuses to count as reaching, which is right, but which
+///   is still evidence that *something* meant this name;
+/// * the **unresolved ledger**, filtered by [`crate::liveness::
+///   unresolved_namesake_names`] so the two passes cannot drift about which
+///   classes admit a veto.
+///
+/// Both the qualified name and the short name are recorded, because a cluster
+/// member is identified by its full `file::Type.method` id while an unresolved
+/// row carries only the callee spelling.
+fn qualifying_symbols<'a>(resolution: &'a ResolutionResult) -> BTreeSet<&'a str> {
+    let mut named: BTreeSet<&'a str> = BTreeSet::new();
+    for edge in &resolution.edges {
+        if !is_symbol_edge(edge) {
+            continue;
+        }
+        if matches!(
+            edge.resolution.as_deref(),
+            Some(Resolution::AmbiguousGlobal { .. }) | Some(Resolution::Unresolved { .. })
+        ) {
+            named.insert(edge.target_symbol.as_str());
+        }
+    }
+    named.extend(crate::liveness::unresolved_namesake_names(resolution));
+    named
+}
+
+/// Whether any member of this component is named by unbindable evidence.
+///
+/// A member id is `file.py::Type.method`; the ledger's half of
+/// [`qualifying_symbols`] holds bare callee names, so both spellings are tried.
+fn component_is_qualified(members: &[String], qualifying: &BTreeSet<&str>) -> bool {
+    members.iter().any(|member| {
+        if qualifying.contains(member.as_str()) {
+            return true;
+        }
+        let short = member.rsplit("::").next().unwrap_or(member);
+        if qualifying.contains(short) {
+            return true;
+        }
+        // `Type.method` also answers to `method`, which is what an unresolved
+        // receiver-qualified call site records.
+        short
+            .rsplit_once('.')
+            .is_some_and(|(_, bare)| qualifying.contains(bare))
+    })
 }
 
 /// Strongly connected components, iteratively.
@@ -298,6 +398,7 @@ pub fn dead_clusters(extractions: &[Extraction], resolution: &ResolutionResult) 
     }
 
     let externally_reachable = externally_reachable_symbols(extractions);
+    let qualifying = qualifying_symbols(resolution);
 
     let mut clustered_symbols: BTreeSet<String> = BTreeSet::new();
     let mut found: Vec<DeadClusterReport> = Vec::new();
@@ -332,12 +433,25 @@ pub fn dead_clusters(extractions: &[Extraction], resolution: &ResolutionResult) 
         clustered_symbols.extend(member_names.iter().cloned());
         let size = member_names.len();
         let shown = size.min(DEAD_CLUSTER_MEMBER_CAP);
+        // The evidence `is_reaching_edge` refused to count as reaching is still
+        // evidence. Refusing it was right — a guess must not keep a cluster
+        // alive — but discarding it made the component claim *more* confident
+        // than the single-symbol claim built from the same call site.
+        let qualified = component_is_qualified(&member_names, &qualifying);
         found.push(DeadClusterReport {
             cluster_id: component_id as u32,
             members: member_names.into_iter().take(shown).collect(),
             size,
-            confidence: DEAD_CLUSTER_CONFIDENCE,
-            reason: cluster_reason(size, shown),
+            confidence: if qualified {
+                DEAD_CLUSTER_QUALIFIED_CONFIDENCE
+            } else {
+                DEAD_CLUSTER_CONFIDENCE
+            },
+            reason: if qualified {
+                qualified_cluster_reason(size, shown)
+            } else {
+                cluster_reason(size, shown)
+            },
         });
     }
 
@@ -406,14 +520,35 @@ fn cluster_reason(size: usize, shown: usize) -> String {
          component — an abandoned cycle is invisible to the one-hop liveness join, because \
          every member has an inbound edge from another member"
     );
-    if shown < size {
-        reason.push_str(&format!(
-            "; {shown} of {size} members listed",
-            shown = shown,
-            size = size
-        ));
-    }
+    append_sample_note(&mut reason, size, shown);
     reason
+}
+
+/// The reason for a component something reaches through evidence the resolver
+/// could not bind.
+///
+/// A separate sentence rather than a suffix on the one above, because the first
+/// clause of that sentence — "reached by nothing outside the component" — is
+/// exactly what stops being true here, and appending a caveat to a false claim
+/// leaves the false claim in the text an agent reads first.
+fn qualified_cluster_reason(size: usize, shown: usize) -> String {
+    let mut reason = format!(
+        "{size} symbols that reference only each other, and something outside the component \
+         names one of them through a call the resolver could not bind — an ambiguous \
+         candidate, or an unresolved site. So the cycle may well be abandoned, but \"nothing \
+         reaches it\" is a statement about the resolver rather than about the code, and this \
+         is reported at the same tier a single symbol with the same evidence gets"
+    );
+    append_sample_note(&mut reason, size, shown);
+    reason
+}
+
+/// One owner for the truncation note, so a capped sample says so whichever
+/// reason it carries.
+fn append_sample_note(reason: &mut String, size: usize, shown: usize) {
+    if shown < size {
+        reason.push_str(&format!("; {shown} of {size} members listed"));
+    }
 }
 
 #[cfg(test)]

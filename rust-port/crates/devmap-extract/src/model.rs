@@ -813,6 +813,16 @@ pub struct WiringAnnotation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WiringKind {
     ScriptEntry,
+    /// A file the toolchain compiles as a root — a Cargo crate root, build
+    /// script, `bin/`, `examples/` or `benches/` target.
+    ///
+    /// A claim about the *file* and nothing inside it. Nothing in the source
+    /// imports a target root and nothing should, so it is never an unwired
+    /// candidate; but its symbols are ordinary code, and an unused helper in
+    /// `src/bin/tool.rs` is exactly as dead as one anywhere else. That is why
+    /// this is its own kind rather than a `ScriptEntry`, which exempts every
+    /// symbol in the file it names.
+    TargetRoot,
     Launcher,
     ReExportPackage,
     FrameworkDecorator,
@@ -1011,6 +1021,35 @@ impl Extraction {
     pub fn is_parse_failure(&self) -> bool {
         matches!(self.parse_outcome, ParseOutcome::Failed { .. })
             && !matches!(self.engine, ExtractionEngine::NotApplicable { .. })
+    }
+
+    /// Whether a grammar actually read this file.
+    ///
+    /// The other half of the same line [`Self::is_parse_failure`] draws, and
+    /// the one that decides whether a file is *in the population* a coverage
+    /// question is asked about at all. Prose and data formats are not: no
+    /// grammar read them, none ever will, and they declare nothing that could
+    /// be called dead or stranded.
+    ///
+    /// The canonical owner, because two crates were answering it and one of
+    /// them was not asking. `devmap-analyze` charges `ExtractionGap::ImportBlind`
+    /// only for files this returns `true` for; `devmap-query`'s
+    /// `unwired_candidates` charged everything that survived the parse-failure
+    /// branch, which for prose is `false` by design. So the same fact — "this
+    /// file's language has no import extractor" — was published as 71 by
+    /// `devmap status` and as 355 by the manifest beside it, on this
+    /// repository, for the same generation.
+    ///
+    /// `RegexFallback` and `Unavailable` are excluded: a grammar was *wanted*
+    /// there and did not run, which is a failure and is charged as one.
+    pub fn grammar_read_this_file(&self) -> bool {
+        matches!(
+            self.engine,
+            ExtractionEngine::TreeSitter { .. } | ExtractionEngine::Notebook { .. }
+        ) && matches!(
+            self.parse_outcome,
+            ParseOutcome::Clean | ParseOutcome::Partial { .. }
+        )
     }
 
     /// Method `qualified_name` to declared parameter count, for the Go

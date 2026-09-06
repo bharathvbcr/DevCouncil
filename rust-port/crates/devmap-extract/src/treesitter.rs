@@ -99,6 +99,61 @@ const UNSAFE_GRAMMARS: &[(&str, &str)] = &[(
      calls even on well-formed source, so it is not linked",
 )];
 
+/// The grammar this build parses `lang` with, and the key it records.
+///
+/// Hoisted out of `extract_treesitter_with_budget` so it has a name and a
+/// second caller. `langimports` needs the same table to prove, per language,
+/// that an import node kind it matches is a kind the linked grammar actually
+/// produces — a claim that was previously only checkable by running the whole
+/// extractor and inferring the answer from what came out.
+///
+/// The returned `&'static str` is the *grammar* key, which is not always the
+/// language key: ArkTS answers `typescript` and Metal answers `cpp`, because
+/// they reuse those grammars.
+pub(crate) fn grammar_for(lang: &str) -> Option<(&'static str, Language)> {
+    match lang {
+        "python" => Some(("python", tree_sitter_python::LANGUAGE.into())),
+        "javascript" => Some(("javascript", tree_sitter_javascript::LANGUAGE.into())),
+        "typescript" => Some((
+            "typescript",
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        )),
+        "tsx" => Some(("tsx", tree_sitter_typescript::LANGUAGE_TSX.into())),
+        "rust" => Some(("rust", tree_sitter_rust::LANGUAGE.into())),
+        "go" => Some(("go", tree_sitter_go::LANGUAGE.into())),
+        "hcl" => Some(("hcl", tree_sitter_hcl::LANGUAGE.into())),
+        "vue" => Some(("vue", vendored::vue())),
+        "liquid" => Some(("liquid", vendored::liquid())),
+        "astro" => Some(("astro", tree_sitter_astro_next::LANGUAGE.into())),
+        "kotlin" => Some(("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into())),
+        "svelte" => Some(("svelte", tree_sitter_svelte_ng::LANGUAGE.into())),
+        "java" => Some(("java", tree_sitter_java::LANGUAGE.into())),
+        "csharp" => Some(("csharp", tree_sitter_c_sharp::LANGUAGE.into())),
+        "php" => Some(("php", tree_sitter_php::LANGUAGE_PHP.into())),
+        "ruby" => Some(("ruby", tree_sitter_ruby::LANGUAGE.into())),
+        "c" => Some(("c", tree_sitter_c::LANGUAGE.into())),
+        "cpp" => Some(("cpp", tree_sitter_cpp::LANGUAGE.into())),
+        "objc" => Some(("objc", tree_sitter_objc::LANGUAGE.into())),
+        "cuda" => Some(("cuda", tree_sitter_cuda::LANGUAGE.into())),
+        "swift" => Some(("swift", tree_sitter_swift::LANGUAGE.into())),
+        "scala" => Some(("scala", tree_sitter_scala::LANGUAGE.into())),
+        "dart" => Some(("dart", tree_sitter_dart::LANGUAGE.into())),
+        "pascal" => Some(("pascal", tree_sitter_pascal::LANGUAGE.into())),
+        "lua" => Some(("lua", tree_sitter_lua::LANGUAGE.into())),
+        "luau" => Some(("luau", tree_sitter_luau::LANGUAGE.into())),
+        "r" => Some(("r", tree_sitter_r::LANGUAGE.into())),
+        "cfml" => Some(("cfml", tree_sitter_cfml::LANGUAGE_CFML.into())),
+        "erlang" => Some(("erlang", tree_sitter_erlang::LANGUAGE.into())),
+        "solidity" => Some(("solidity", tree_sitter_solidity::LANGUAGE.into())),
+        "nix" => Some(("nix", tree_sitter_nix::LANGUAGE.into())),
+        // Not in the frozen Python 35 and so not in LANGUAGE_SPECS, but
+        // `detect_language` already produces these keys from its fallback table.
+        "shell" => Some(("shell", tree_sitter_bash::LANGUAGE.into())),
+        "sql" => Some(("sql", tree_sitter_sequel::LANGUAGE.into())),
+        _ => None,
+    }
+}
+
 pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
     extract_treesitter_with_budget(path, lang, source, DEFAULT_PARSE_BUDGET)
 }
@@ -202,47 +257,7 @@ pub fn extract_treesitter_with_budget(
 
     let mut parser = Parser::new();
 
-    let ts_lang: Option<(&str, Language)> = match lang {
-        "python" => Some(("python", tree_sitter_python::LANGUAGE.into())),
-        "javascript" => Some(("javascript", tree_sitter_javascript::LANGUAGE.into())),
-        "typescript" => Some((
-            "typescript",
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        )),
-        "tsx" => Some(("tsx", tree_sitter_typescript::LANGUAGE_TSX.into())),
-        "rust" => Some(("rust", tree_sitter_rust::LANGUAGE.into())),
-        "go" => Some(("go", tree_sitter_go::LANGUAGE.into())),
-        "hcl" => Some(("hcl", tree_sitter_hcl::LANGUAGE.into())),
-        "vue" => Some(("vue", vendored::vue())),
-        "liquid" => Some(("liquid", vendored::liquid())),
-        "astro" => Some(("astro", tree_sitter_astro_next::LANGUAGE.into())),
-        "kotlin" => Some(("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into())),
-        "svelte" => Some(("svelte", tree_sitter_svelte_ng::LANGUAGE.into())),
-        "java" => Some(("java", tree_sitter_java::LANGUAGE.into())),
-        "csharp" => Some(("csharp", tree_sitter_c_sharp::LANGUAGE.into())),
-        "php" => Some(("php", tree_sitter_php::LANGUAGE_PHP.into())),
-        "ruby" => Some(("ruby", tree_sitter_ruby::LANGUAGE.into())),
-        "c" => Some(("c", tree_sitter_c::LANGUAGE.into())),
-        "cpp" => Some(("cpp", tree_sitter_cpp::LANGUAGE.into())),
-        "objc" => Some(("objc", tree_sitter_objc::LANGUAGE.into())),
-        "cuda" => Some(("cuda", tree_sitter_cuda::LANGUAGE.into())),
-        "swift" => Some(("swift", tree_sitter_swift::LANGUAGE.into())),
-        "scala" => Some(("scala", tree_sitter_scala::LANGUAGE.into())),
-        "dart" => Some(("dart", tree_sitter_dart::LANGUAGE.into())),
-        "pascal" => Some(("pascal", tree_sitter_pascal::LANGUAGE.into())),
-        "lua" => Some(("lua", tree_sitter_lua::LANGUAGE.into())),
-        "luau" => Some(("luau", tree_sitter_luau::LANGUAGE.into())),
-        "r" => Some(("r", tree_sitter_r::LANGUAGE.into())),
-        "cfml" => Some(("cfml", tree_sitter_cfml::LANGUAGE_CFML.into())),
-        "erlang" => Some(("erlang", tree_sitter_erlang::LANGUAGE.into())),
-        "solidity" => Some(("solidity", tree_sitter_solidity::LANGUAGE.into())),
-        "nix" => Some(("nix", tree_sitter_nix::LANGUAGE.into())),
-        // Not in the frozen Python 35 and so not in LANGUAGE_SPECS, but
-        // `detect_language` already produces these keys from its fallback table.
-        "shell" => Some(("shell", tree_sitter_bash::LANGUAGE.into())),
-        "sql" => Some(("sql", tree_sitter_sequel::LANGUAGE.into())),
-        _ => None,
-    };
+    let ts_lang: Option<(&str, Language)> = grammar_for(lang);
 
     if let Some((grammar, ts_l)) = ts_lang {
         // A NUL byte means this is not source text, and some grammars do not
@@ -3369,6 +3384,20 @@ fn extract_node(
             }
         }
     }
+    // Import extraction for the languages whose specifier names a file
+    // (W0.3 move 2), after the `match` rather than inside its generic arm.
+    //
+    // Two of the languages served here reach `extract_node` through a
+    // *specialised* arm — `hcl` has one of its own, and the C family takes the
+    // `c_family` branch — so a call wired beside `langcalls::extract_calls`
+    // would have missed both, including the one family that had no import
+    // handler anywhere. This position is also the one that cannot rot: a
+    // language gaining a specialised arm later keeps its imports, where the
+    // inner position would have taken them away silently.
+    //
+    // Languages whose arm already pushes imports — Python, JS/TS, Rust, Go —
+    // are absent from the dispatcher's match, so nothing is counted twice.
+    crate::langimports::extract_imports(lang, node, source, imports);
     maybe_push_name_reference(node, source, lang, file_symbol_name, references);
 }
 

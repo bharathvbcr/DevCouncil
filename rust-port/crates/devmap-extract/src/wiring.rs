@@ -162,15 +162,66 @@ pub fn rust_attribute_entry_reason(attribute_path: &str) -> Option<&'static str>
     })
 }
 
+/// Why Cargo compiles `path` as a target root, if it does.
+///
+/// The single owner of Rust's layout conventions. A target root is a file the
+/// toolchain compiles directly: nothing in the source imports it, nothing
+/// should, and `mod` declarations run *outward* from it. Measured on this
+/// repository before this rule existed: seventeen Rust files were reported as
+/// unwired candidates and eleven of them were target roots — five `src/lib.rs`
+/// crate roots, five `examples/*.rs`, one `build.rs` — each one a delete-this
+/// suggestion for a file Cargo names in its own manifest.
+///
+/// `rust_path_declares_main` answers the narrower symbol-level question and
+/// delegates here, so the two cannot disagree about what `examples/` means.
+pub fn rust_target_root_reason(path: &str) -> Option<&'static str> {
+    let norm = path.replace('\\', "/");
+    let name = norm.rsplit('/').next().unwrap_or(&norm);
+    if name == "build.rs" {
+        return Some("Cargo build script");
+    }
+    let parent = norm.rsplit('/').nth(1);
+    match name {
+        // A crate root only at a crate root's own place. A `lib.rs` nested
+        // inside a module directory is an ordinary module, and calling it a
+        // target root would exempt a file that really can be stranded.
+        "main.rs" if parent == Some("src") || parent.is_none() => {
+            return Some("Cargo binary crate root")
+        }
+        "lib.rs" if parent == Some("src") || parent.is_none() => {
+            return Some("Cargo library crate root")
+        }
+        _ => {}
+    }
+    let dirs: Vec<&str> = norm.split('/').rev().skip(1).collect();
+    if dirs.contains(&"bin") {
+        return Some("Cargo binary target");
+    }
+    if dirs.contains(&"examples") {
+        return Some("Cargo example target");
+    }
+    if dirs.contains(&"benches") {
+        return Some("Cargo benchmark target");
+    }
+    None
+}
+
 /// Whether a Rust `fn main` at file scope in `path` is a binary entry point.
 ///
-/// `src/main.rs` is already covered by the file-level `ScriptEntry` rule; the
-/// gap is every other Cargo target root — `src/bin/*.rs`, `examples/`,
-/// `benches/`, `tests/` — where `fn main` is invoked by the toolchain.
+/// A *different* question from `rust_target_root_reason`, and delegating to it
+/// was wrong in a way the existing tests caught immediately: `src/lib.rs` is a
+/// target root and has no `fn main` at all, so a `main` written in a library
+/// file is an ordinary function and a real dead-code candidate. The two rules
+/// overlap on the binary shapes and part company on the library one.
 pub fn rust_path_declares_main(path: &str) -> bool {
     let norm = path.replace('\\', "/");
     let name = norm.rsplit('/').next().unwrap_or(&norm);
     if name == "main.rs" {
+        return true;
+    }
+    // A build script's `fn main` is invoked by Cargo before the crate compiles
+    // and has no call site anywhere in the corpus — the same claim `bin/` makes.
+    if name == "build.rs" {
         return true;
     }
     let dirs: Vec<&str> = norm.split('/').rev().skip(1).collect();
@@ -514,6 +565,26 @@ pub fn extract_wiring_annotations(path: &str, source: &str) -> Vec<WiringAnnotat
         });
     }
 
+    // A file the toolchain compiles as a root: nothing in the source imports
+    // it, nothing should, and its `mod` declarations run outward from it.
+    //
+    // Deliberately **not** `ScriptEntry`, which exempts every symbol in the
+    // file from the dead-code verdict. That over-exemption is what
+    // `test_runtime_entry_points_are_exempt_without_exempting_their_file`
+    // exists to refuse, and it fired the moment this rule was first written as
+    // a `ScriptEntry`: an unused helper in `src/bin/tool.rs` went from
+    // confidently dead to exempt because its file had a `main`. A target root
+    // is a claim about the *file's* wiring and nothing else.
+    if path.ends_with(".rs") {
+        if let Some(reason) = rust_target_root_reason(path) {
+            annotations.push(WiringAnnotation {
+                kind: WiringKind::TargetRoot,
+                target_symbol: path.to_string(),
+                details: reason.to_string(),
+            });
+        }
+    }
+
     for line in source.lines() {
         let t = line.trim();
         if t.starts_with('@') && is_wiring_decorator(t) {
@@ -531,7 +602,6 @@ pub fn extract_wiring_annotations(path: &str, source: &str) -> Vec<WiringAnnotat
 
 // ---------------------------------------------------------------------------
 // W3.3 — the two rules the Python wiring module held and the kernel did not
-// ---------------------------------------------------------------------------
 
 /// The author's explicit "this file is intentionally unwired" declaration.
 ///

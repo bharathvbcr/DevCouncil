@@ -126,6 +126,17 @@ pub struct Resolver {
     /// corpus rather than picked, so it cannot become a cap on what a real
     /// repository is allowed to contain.
     max_indexed_path_depth: usize,
+    /// File basename -> the one indexed file with that basename, or `None`
+    /// when two or more share it.
+    ///
+    /// The last rung of `resolve_import_path` needs "is there exactly one file
+    /// called `util.h`". Answering that by scanning `file_symbols` would be one
+    /// pass over every file per import — quadratic in a repository's size, on
+    /// the hot path of every build. The map is built once, in the same walk
+    /// that establishes the file universe, and stores the *answer* rather than
+    /// the candidates: `None` is the ambiguous case, so an ambiguous basename
+    /// costs one entry rather than a growing list.
+    unique_basename: BTreeMap<String, Option<String>>,
 }
 
 impl Default for Resolver {
@@ -155,6 +166,7 @@ impl Resolver {
             go_package_by_file: BTreeMap::new(),
             scope_locals: BTreeSet::new(),
             max_indexed_path_depth: 0,
+            unique_basename: BTreeMap::new(),
         }
     }
 
@@ -451,6 +463,29 @@ impl Resolver {
             .map(|ext| ext.file_path.split('/').count())
             .max()
             .unwrap_or(0);
+        self.unique_basename.clear();
+        for ext in extractions {
+            let basename = ext
+                .file_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&ext.file_path)
+                .to_string();
+            match self.unique_basename.entry(basename) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(Some(ext.file_path.clone()));
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    // Seen twice: poisoned, permanently. Not "the later one
+                    // wins" — the rung that reads this exists to abstain when
+                    // it cannot tell, and a winner picked by input order is
+                    // exactly the confidently-wrong edge it must not produce.
+                    if slot.get().as_deref() != Some(ext.file_path.as_str()) {
+                        slot.insert(None);
+                    }
+                }
+            }
+        }
         // `go_modules` is the one input this method does not own: it arrives
         // through `index_go_modules`, which callers may run before *or* after
         // this. Discard it unless it was supplied for this snapshot, so a
@@ -1660,24 +1695,13 @@ impl Resolver {
             || Self::parent_dir(source_file) == Self::parent_dir(target_file)
     }
 
+    /// Delegates to `importpath::normalize_rel`, which is the single owner.
+    ///
+    /// The two implementations were identical when the table-driven ladder
+    /// landed, and two identical copies of path normalisation is how a resolver
+    /// starts answering two different questions about one `..`.
     fn normalize_rel(base_dir: &str, spec: &str) -> String {
-        let joined = if base_dir == "." {
-            spec.to_string()
-        } else {
-            format!("{}/{}", base_dir, spec)
-        };
-        let norm = joined.replace('\\', "/");
-        let mut stack: Vec<&str> = Vec::new();
-        for part in norm.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    stack.pop();
-                }
-                other => stack.push(other),
-            }
-        }
-        stack.join("/")
+        crate::importpath::normalize_rel(base_dir, spec)
     }
 
     fn import_local_name(lang: &str, specifier: &str) -> String {
@@ -1957,9 +1981,94 @@ impl Resolver {
         if lang == "go" {
             return self.resolve_go_import(specifier);
         }
+        // A JVM wildcard import names a package, and a package is every file in
+        // one directory. `import com.foo.*;` and `import foo.bar._` really do
+        // depend on all of them, so all of them get an edge.
+        //
+        // Not capped, deliberately. `AMBIGUOUS_FANOUT_CAP` bounds an ambiguous
+        // *guess* — N candidates of which at most one is right — where emitting
+        // all N is how a resolver launders uncertainty into volume. These N are
+        // all correct, and the consumer is `unwired_candidates`: truncating the
+        // list would leave the files past the cut falsely reported as imported
+        // by nothing, turning a bound into a false finding. The bound here is
+        // the repository's own size, which already bounds everything else.
+        if let Some(package) = specifier.strip_suffix(".*") {
+            return self.resolve_package_wildcard(lang, package);
+        }
+        // A Terraform `module` source names a directory of `.tf` files, for the
+        // same reason and with the same answer.
+        if lang == "hcl" {
+            return self.resolve_terraform_module(current_file, specifier);
+        }
         self.resolve_import_path(current_file, lang, specifier)
             .into_iter()
             .collect()
+    }
+
+    /// Every indexed file in the directory a JVM package name maps to.
+    fn resolve_package_wildcard(&self, lang: &str, package: &str) -> Vec<String> {
+        let Some(rule) = crate::importpath::rule_for(lang) else {
+            return Vec::new();
+        };
+        let relative = package.replace(rule.separator, "/");
+        if relative.is_empty() {
+            return Vec::new();
+        }
+        let mut directories: Vec<String> = Vec::new();
+        for root in rule.roots {
+            let dir = crate::importpath::normalize_rel(root, &relative);
+            // The repository root is never a package. Without this an
+            // unqualified wildcard would link its importer to every file in the
+            // corpus — the one shape of this expansion that is not merely large
+            // but wrong.
+            if dir.is_empty() || directories.contains(&dir) {
+                continue;
+            }
+            directories.push(dir);
+        }
+        for directory in directories {
+            let files = self.files_in_dir_with_extensions(&directory, rule.extensions);
+            if !files.is_empty() {
+                return files;
+            }
+        }
+        Vec::new()
+    }
+
+    /// Every indexed `.tf` file in the directory a Terraform `source` names.
+    fn resolve_terraform_module(&self, current_file: &str, specifier: &str) -> Vec<String> {
+        // Only a local source is a path. `hashicorp/consul/aws` is a registry
+        // address and `git::https://…` is a remote; both name something outside
+        // the repository and must not be resolved against a same-named local
+        // directory.
+        if !(specifier.starts_with("./") || specifier.starts_with("../")) {
+            return Vec::new();
+        }
+        let directory =
+            crate::importpath::normalize_rel(&Self::parent_dir(current_file), specifier);
+        if directory.is_empty() {
+            return Vec::new();
+        }
+        self.files_in_dir_with_extensions(&directory, &[".tf"])
+    }
+
+    /// Indexed files sitting directly in `dir` whose name ends in one of
+    /// `extensions`. Sorted, so an expansion is deterministic across runs.
+    fn files_in_dir_with_extensions(&self, dir: &str, extensions: &[&str]) -> Vec<String> {
+        let dir = dir.trim_end_matches('/');
+        let mut files: Vec<String> = self
+            .file_symbols
+            .keys()
+            .filter(|path| {
+                Self::parent_dir(path) == dir
+                    && extensions
+                        .iter()
+                        .any(|extension| !extension.is_empty() && path.ends_with(extension))
+            })
+            .cloned()
+            .collect();
+        files.sort();
+        files
     }
 
     /// A member reference resolved through its receiver.
@@ -2330,7 +2439,7 @@ impl Resolver {
 
         if lang == "rust" && (clean_spec.starts_with("self::") || clean_spec.starts_with("super::"))
         {
-            let mut module_dir = dir;
+            let mut module_dir = dir.clone();
             let mut tail = clean_spec;
             if let Some(stripped) = tail.strip_prefix("self::") {
                 tail = stripped;
@@ -2345,12 +2454,53 @@ impl Resolver {
             while !parts.is_empty() {
                 let module_path = parts.join("/");
                 let base = Self::normalize_rel(&module_dir, &module_path);
-                for candidate in [format!("{base}.rs"), format!("{base}/mod.rs")] {
+                // `base` itself, before the two conventional forms: a
+                // `#[path = "generated/tables.rs"] mod tables;` reaches this
+                // rung as `self::generated/tables.rs`, and the extension is
+                // already on it. Appending `.rs` to a path that has one probes
+                // `tables.rs.rs` and finds nothing — which is precisely the
+                // case the attribute exists to declare, so failing it would
+                // leave the real file reported as imported by nothing.
+                for candidate in [base.clone(), format!("{base}.rs"), format!("{base}/mod.rs")] {
                     if self.file_symbols.contains_key(&candidate) {
                         return Some(candidate);
                     }
                 }
                 parts.pop();
+            }
+        }
+
+        // W0.3 move 2: the thirteen languages whose import extraction landed
+        // with this rung. Table-driven rather than thirteen more blocks above,
+        // because they differ only in separator, extensions and build roots —
+        // see `importpath`, which owns the table and the candidate order.
+        if let Some(rule) = crate::importpath::rule_for(lang) {
+            let spec = crate::importpath::strip_dart_package_prefix(clean_spec)
+                .filter(|_| lang == "dart")
+                .unwrap_or(clean_spec);
+            let candidates = crate::importpath::candidates(rule, &dir, spec);
+            for candidate in &candidates {
+                if self.file_symbols.contains_key(candidate) {
+                    return Some(candidate.clone());
+                }
+            }
+            // Last rung: a candidate's *basename* naming exactly one indexed
+            // file. This is what makes `#include "util.h"` from a target built
+            // with `-Isrc/core` resolve without the resolver knowing the build
+            // system's include path, and `-include_lib("kernel/include/x.hrl")`
+            // resolve without knowing where the application was unpacked.
+            //
+            // Guarded on uniqueness, not on plausibility. Two files named
+            // `util.h` mean this rung abstains — which is the same answer the
+            // ambiguity ladder gives elsewhere in this resolver, and the reason
+            // it can be trusted at all: it never picks a winner.
+            if !crate::importpath::is_relative_specifier(spec) {
+                for candidate in &candidates {
+                    let basename = candidate.rsplit('/').next().unwrap_or(candidate);
+                    if let Some(Some(unique)) = self.unique_basename.get(basename) {
+                        return Some(unique.clone());
+                    }
+                }
             }
         }
 

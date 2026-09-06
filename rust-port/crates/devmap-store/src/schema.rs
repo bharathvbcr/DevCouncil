@@ -27,18 +27,81 @@ CREATE TABLE IF NOT EXISTS generation_nodes (
     PRIMARY KEY (generation_id, ordinal)
 ) WITHOUT ROWID;
 
-CREATE TABLE IF NOT EXISTS generation_files (
-    generation_id      INTEGER NOT NULL,
+CREATE TABLE IF NOT EXISTS file_payloads (
+    payload_id         INTEGER PRIMARY KEY,
     file_id            INTEGER NOT NULL REFERENCES paths(id),
-    language           TEXT NOT NULL,
     content_hash       INTEGER NOT NULL,
-    parse_outcome_json TEXT NOT NULL,
-    engine_json        TEXT NOT NULL,
-    extraction_json    TEXT NOT NULL,
+    language           TEXT NOT NULL,
     grammar_version    TEXT,
     analyzer_version   TEXT,
+    parse_outcome_json TEXT NOT NULL,
+    engine_json        TEXT NOT NULL,
+    extraction_json    TEXT NOT NULL
+);
+
+-- The payload's identity: **the file** plus the four fields the extraction
+-- cache keys on, NULL-safe.
+--
+-- `file_id` is in the key and must be. A payload is a serialized `Extraction`,
+-- and an `Extraction` carries its own `file_path` — so content-addressing
+-- alone collapses two files with identical bytes into one payload and makes
+-- both membership rows report the *same* path. That is not hypothetical:
+-- `a_cold_build_indexes_an_in_root_symlink_and_a_drain_of_it_keeps_the_symbol`
+-- caught it on the first run, because a symlink and its target are byte-
+-- identical by construction and the linked path vanished from the generation.
+--
+-- Nothing is lost. What B3 deduplicates is the *same file, unchanged, across
+-- generations*, which is 1,530 of the 1,530 duplicate rows measured on this
+-- repository. Two different files that happen to share content have genuinely
+-- different payloads.
+--
+-- `grammar_version` and `analyzer_version` are nullable — NULL means "stored by
+-- a build with no parsing frontend", which is a real state — and SQLite treats
+-- NULLs as distinct inside a UNIQUE index, so a plain unique constraint would
+-- let two identical NULL-version payloads both insert and defeat the point. The
+-- COALESCE expressions make the index NULL-safe; the write path probes with the
+-- same expressions.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_file_payloads_identity
+    ON file_payloads(file_id, content_hash, language,
+                     COALESCE(grammar_version, ''), COALESCE(analyzer_version, ''));
+
+-- The extraction-cache fallback asks by content identity alone — it has no
+-- path, because `CacheKey` has none — so it needs its own index. This is v13's
+-- index, over one row per (file, content) instead of one per (generation,
+-- file): the relation v13 described as a scan "whose rows each carry a ~47 KB
+-- `extraction_json` the scan must skip past".
+CREATE INDEX IF NOT EXISTS idx_file_payloads_cache_identity
+    ON file_payloads(content_hash, language, grammar_version, analyzer_version);
+
+CREATE TABLE IF NOT EXISTS generation_file_rows (
+    generation_id INTEGER NOT NULL,
+    file_id       INTEGER NOT NULL REFERENCES paths(id),
+    payload_id    INTEGER NOT NULL REFERENCES file_payloads(payload_id),
     PRIMARY KEY (generation_id, file_id)
 ) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_generation_file_rows_payload
+    ON generation_file_rows(payload_id);
+
+-- `generation_files` keeps its name and its exact column set, as a view.
+--
+-- Twenty-five read sites across five crates, `tools/fanout.sql` and a dozen
+-- tests query this relation by name. Splitting the payload out under a *new*
+-- name would have meant rewriting every one of them for a change none of them
+-- cares about: what a generation holds for a file is unchanged, only where the
+-- bytes live.
+CREATE VIEW IF NOT EXISTS generation_files AS
+SELECT m.generation_id      AS generation_id,
+       m.file_id            AS file_id,
+       p.language           AS language,
+       p.content_hash       AS content_hash,
+       p.parse_outcome_json AS parse_outcome_json,
+       p.engine_json        AS engine_json,
+       p.extraction_json    AS extraction_json,
+       p.grammar_version    AS grammar_version,
+       p.analyzer_version   AS analyzer_version
+  FROM generation_file_rows m
+  JOIN file_payloads p ON p.payload_id = m.payload_id;
 
 CREATE TABLE IF NOT EXISTS generation_edges (
     generation_id  INTEGER NOT NULL,
@@ -50,6 +113,7 @@ CREATE TABLE IF NOT EXISTS generation_edges (
     edge_kind      TEXT NOT NULL,
     confidence     REAL NOT NULL,
     resolution     TEXT,
+    candidate_total INTEGER,
     PRIMARY KEY (generation_id, ordinal)
 ) WITHOUT ROWID;
 
@@ -113,8 +177,6 @@ CREATE TABLE IF NOT EXISTS extraction_retry (
     updated_at   REAL NOT NULL
 ) WITHOUT ROWID;
 
-CREATE INDEX IF NOT EXISTS idx_generation_files_cache_identity
-    ON generation_files(content_hash, language, grammar_version, analyzer_version);
 "#;
 
 pub const MIGRATION_V3_TO_V4: &str = r#"
@@ -151,18 +213,81 @@ CREATE TABLE IF NOT EXISTS generations (
     head_sha   TEXT
 );
 
-CREATE TABLE IF NOT EXISTS generation_files (
-    generation_id      INTEGER NOT NULL,
+CREATE TABLE IF NOT EXISTS file_payloads (
+    payload_id         INTEGER PRIMARY KEY,
     file_id            INTEGER NOT NULL REFERENCES paths(id),
-    language           TEXT NOT NULL,
     content_hash       INTEGER NOT NULL,
-    parse_outcome_json TEXT NOT NULL,
-    engine_json        TEXT NOT NULL,
-    extraction_json    TEXT NOT NULL,
+    language           TEXT NOT NULL,
     grammar_version    TEXT,
     analyzer_version   TEXT,
+    parse_outcome_json TEXT NOT NULL,
+    engine_json        TEXT NOT NULL,
+    extraction_json    TEXT NOT NULL
+);
+
+-- The payload's identity: **the file** plus the four fields the extraction
+-- cache keys on, NULL-safe.
+--
+-- `file_id` is in the key and must be. A payload is a serialized `Extraction`,
+-- and an `Extraction` carries its own `file_path` — so content-addressing
+-- alone collapses two files with identical bytes into one payload and makes
+-- both membership rows report the *same* path. That is not hypothetical:
+-- `a_cold_build_indexes_an_in_root_symlink_and_a_drain_of_it_keeps_the_symbol`
+-- caught it on the first run, because a symlink and its target are byte-
+-- identical by construction and the linked path vanished from the generation.
+--
+-- Nothing is lost. What B3 deduplicates is the *same file, unchanged, across
+-- generations*, which is 1,530 of the 1,530 duplicate rows measured on this
+-- repository. Two different files that happen to share content have genuinely
+-- different payloads.
+--
+-- `grammar_version` and `analyzer_version` are nullable — NULL means "stored by
+-- a build with no parsing frontend", which is a real state — and SQLite treats
+-- NULLs as distinct inside a UNIQUE index, so a plain unique constraint would
+-- let two identical NULL-version payloads both insert and defeat the point. The
+-- COALESCE expressions make the index NULL-safe; the write path probes with the
+-- same expressions.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_file_payloads_identity
+    ON file_payloads(file_id, content_hash, language,
+                     COALESCE(grammar_version, ''), COALESCE(analyzer_version, ''));
+
+-- The extraction-cache fallback asks by content identity alone — it has no
+-- path, because `CacheKey` has none — so it needs its own index. This is v13's
+-- index, over one row per (file, content) instead of one per (generation,
+-- file): the relation v13 described as a scan "whose rows each carry a ~47 KB
+-- `extraction_json` the scan must skip past".
+CREATE INDEX IF NOT EXISTS idx_file_payloads_cache_identity
+    ON file_payloads(content_hash, language, grammar_version, analyzer_version);
+
+CREATE TABLE IF NOT EXISTS generation_file_rows (
+    generation_id INTEGER NOT NULL,
+    file_id       INTEGER NOT NULL REFERENCES paths(id),
+    payload_id    INTEGER NOT NULL REFERENCES file_payloads(payload_id),
     PRIMARY KEY (generation_id, file_id)
 ) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_generation_file_rows_payload
+    ON generation_file_rows(payload_id);
+
+-- `generation_files` keeps its name and its exact column set, as a view.
+--
+-- Twenty-five read sites across five crates, `tools/fanout.sql` and a dozen
+-- tests query this relation by name. Splitting the payload out under a *new*
+-- name would have meant rewriting every one of them for a change none of them
+-- cares about: what a generation holds for a file is unchanged, only where the
+-- bytes live.
+CREATE VIEW IF NOT EXISTS generation_files AS
+SELECT m.generation_id      AS generation_id,
+       m.file_id            AS file_id,
+       p.language           AS language,
+       p.content_hash       AS content_hash,
+       p.parse_outcome_json AS parse_outcome_json,
+       p.engine_json        AS engine_json,
+       p.extraction_json    AS extraction_json,
+       p.grammar_version    AS grammar_version,
+       p.analyzer_version   AS analyzer_version
+  FROM generation_file_rows m
+  JOIN file_payloads p ON p.payload_id = m.payload_id;
 
 CREATE TABLE IF NOT EXISTS generation_dead_symbols (
     generation_id    INTEGER NOT NULL,
@@ -448,7 +573,122 @@ pub const MIGRATION_V14_TO_V15: &str = r#"
 ALTER TABLE generation_edges ADD COLUMN resolution TEXT;
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 15;
+/// How many candidates an ambiguous resolution actually held.
+///
+/// `AMBIGUOUS_FANOUT_CAP` (audit R-7) bounds how many **edges** one ambiguous
+/// site emits — 16. It does not bound the site's candidate list, which the
+/// `Arc<Resolution>` still holds in full, deliberately: that list is what keeps
+/// `impact` answerable on candidates 2..N. So resolver memory is proportional
+/// to *candidates* while every number derivable from the store counted
+/// *emitted edges*, and since R-7 the two have not been the same quantity.
+///
+/// `verify.sh` step 6 has been red because of it. Its three coefficient caps
+/// were calibrated on a resolver with no cap, and re-deriving them needs the
+/// denominator the memory actually tracks — which was not in the store at all:
+/// the candidate list lives only on the in-memory `ResolvedEdge`, and
+/// `generation_edges` had no column that could carry any part of it. Fixing the
+/// gate by moving a coefficient instead would have been the "raised to fit"
+/// this repository refuses.
+///
+/// One integer, on the ambiguous rows only. NULL means one of two things and
+/// the reader must not conflate them: the edge is not an `AmbiguousGlobal` (no
+/// candidate list exists), or the row predates this column. `resolution` tells
+/// them apart — an ambiguous row written by this binary always carries a
+/// count, so `resolution = 'AmbiguousGlobal' AND candidate_total IS NULL` is an
+/// older row and a query that needs the denominator must refuse rather than
+/// treat it as zero.
+pub const MIGRATION_V15_TO_V16: &str = r#"
+ALTER TABLE generation_edges ADD COLUMN candidate_total INTEGER;
+"#;
+
+/// v17: store one extraction payload per *content*, not per generation (B3).
+///
+/// Measured on this repository, two generations apart by a single edited line:
+/// `generation_files` held 3,062 rows totalling **164.5 MB of
+/// `extraction_json`, 54% of a 302.8 MB store — and 1,530 of those rows were
+/// byte-identical duplicates.** One edited file caused ~82 MB of JSON to be
+/// read out of SQLite, moved through Rust one row at a time, and written back.
+/// That is the whole of B3's measured cost: the carry-forward this store has
+/// done since B3's first half landed avoids re-*deriving* an unchanged payload,
+/// but still re-*materialises* it under the new generation id.
+///
+/// The split is by the identity the extraction cache already keys on —
+/// `(content_hash, language, grammar_version, analyzer_version)`, which v13
+/// indexed on `generation_files` for exactly this lookup and described as a
+/// scan "whose rows each carry a ~47 KB `extraction_json` the scan must skip
+/// past to reach the identity columns". Those columns now live in a table with
+/// one row per distinct payload, so that lookup stops skipping past anything.
+///
+/// `generation_files` keeps its name and its exact column set as a view over
+/// the join, so all twenty-five read sites, `tools/fanout.sql` and the tests
+/// are unchanged: what a generation holds for a file has not changed, only
+/// where the bytes live.
+///
+/// The backfill deduplicates as it copies. `INSERT OR IGNORE` against the
+/// NULL-safe unique index keeps the first payload of each identity; the
+/// membership rows then join back to it, so a store with N generations of an
+/// unchanged file collapses to one payload and N 16-byte rows.
+pub const MIGRATION_V16_TO_V17: &str = r#"
+CREATE TABLE IF NOT EXISTS file_payloads (
+    payload_id         INTEGER PRIMARY KEY,
+    content_hash       INTEGER NOT NULL,
+    language           TEXT NOT NULL,
+    grammar_version    TEXT,
+    analyzer_version   TEXT,
+    parse_outcome_json TEXT NOT NULL,
+    engine_json        TEXT NOT NULL,
+    extraction_json    TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_file_payloads_identity
+    ON file_payloads(content_hash, language,
+                     COALESCE(grammar_version, ''), COALESCE(analyzer_version, ''));
+
+CREATE TABLE IF NOT EXISTS generation_file_rows (
+    generation_id INTEGER NOT NULL,
+    file_id       INTEGER NOT NULL REFERENCES paths(id),
+    payload_id    INTEGER NOT NULL REFERENCES file_payloads(payload_id),
+    PRIMARY KEY (generation_id, file_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_generation_file_rows_payload
+    ON generation_file_rows(payload_id);
+
+INSERT OR IGNORE INTO file_payloads
+    (file_id, content_hash, language, grammar_version, analyzer_version,
+     parse_outcome_json, engine_json, extraction_json)
+SELECT file_id, content_hash, language, grammar_version, analyzer_version,
+       parse_outcome_json, engine_json, extraction_json
+  FROM generation_files;
+
+INSERT OR IGNORE INTO generation_file_rows (generation_id, file_id, payload_id)
+SELECT f.generation_id, f.file_id, p.payload_id
+  FROM generation_files f
+  JOIN file_payloads p
+    ON p.file_id = f.file_id
+   AND p.content_hash = f.content_hash
+   AND p.language = f.language
+   AND COALESCE(p.grammar_version, '') = COALESCE(f.grammar_version, '')
+   AND COALESCE(p.analyzer_version, '') = COALESCE(f.analyzer_version, '');
+
+DROP INDEX IF EXISTS idx_generation_files_cache_identity;
+DROP TABLE generation_files;
+
+CREATE VIEW generation_files AS
+SELECT m.generation_id      AS generation_id,
+       m.file_id            AS file_id,
+       p.language           AS language,
+       p.content_hash       AS content_hash,
+       p.parse_outcome_json AS parse_outcome_json,
+       p.engine_json        AS engine_json,
+       p.extraction_json    AS extraction_json,
+       p.grammar_version    AS grammar_version,
+       p.analyzer_version   AS analyzer_version
+  FROM generation_file_rows m
+  JOIN file_payloads p ON p.payload_id = m.payload_id;
+"#;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 17;
 
 #[cfg(test)]
 mod retention_constant_tests {

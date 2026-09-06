@@ -76,7 +76,7 @@ pub(crate) fn is_entry_root(ext: &Extraction) -> bool {
     ext.wiring.iter().any(|w| {
         matches!(
             w.kind,
-            WiringKind::ScriptEntry | WiringKind::FrameworkDecorator
+            WiringKind::ScriptEntry | WiringKind::FrameworkDecorator | WiringKind::TargetRoot
         )
     })
 }

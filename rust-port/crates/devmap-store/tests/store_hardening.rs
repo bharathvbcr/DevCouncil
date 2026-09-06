@@ -1380,8 +1380,11 @@ fn a_generation_payload_serves_cache_misses_only_on_matching_identity() {
 
     // Rows written before v8 carry NULL identity. Absence of a recorded
     // identity is not proof of a matching one, so they must never be eligible.
+    // The payload columns moved to `file_payloads` in schema v17;
+    // `generation_files` is a view over it and is not updatable. What the
+    // fixture states is unchanged: the stored payload carries no identity.
     conn.execute(
-        "UPDATE generation_files SET grammar_version = NULL, analyzer_version = NULL",
+        "UPDATE file_payloads SET grammar_version = NULL, analyzer_version = NULL",
         [],
     )
     .unwrap();
@@ -2074,8 +2077,9 @@ fn s4_prune_evicts_a_cache_row_no_retained_generation_can_ever_serve() {
     // can never satisfy a lookup, so the cache copy is not redundant.
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
+        // `file_payloads` since v17 — see the note at the first of these.
         conn.execute(
-            "UPDATE generation_files SET grammar_version = NULL, analyzer_version = NULL",
+            "UPDATE file_payloads SET grammar_version = NULL, analyzer_version = NULL",
             [],
         )
         .unwrap();
@@ -2136,11 +2140,9 @@ fn s5_an_unreadable_cached_payload_is_reported_not_answered_as_a_miss() {
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute("DELETE FROM extraction_cache", []).unwrap();
-        conn.execute(
-            "UPDATE generation_files SET extraction_json = '{not json'",
-            [],
-        )
-        .unwrap();
+        // `file_payloads` since v17 — see the note at the first of these.
+        conn.execute("UPDATE file_payloads SET extraction_json = '{not json'", [])
+            .unwrap();
     }
     let error = store
         .try_get_cached_extraction(&key)
@@ -2272,8 +2274,52 @@ fn s8_the_schema_gate_refuses_a_store_missing_a_column_its_writers_require() {
                 conn.execute_batch(&format!("DROP INDEX IF EXISTS {index}"))
                     .unwrap();
             }
-            conn.execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"), [])
+            // `generation_files` became a *view* in v17, and a view has no
+            // column to drop. What the gate checks is unchanged — does the
+            // relation carry the columns its readers name — so the fixture
+            // removes the column the way a view loses one: by being redefined
+            // without it. Derived from `sqlite_master` rather than written out,
+            // so a column added to the view later is covered without anyone
+            // remembering this fixture exists.
+            if relation_is_view(&conn, table) {
+                let definition: String = conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_master WHERE name = ?1 AND type = 'view'",
+                        [table],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let projection: Vec<String> = definition
+                    .lines()
+                    .filter(|line| line.contains(" AS ") && line.trim_end().ends_with(','))
+                    .map(|line| {
+                        // The first projected column shares its line with the
+                        // `SELECT` keyword.
+                        line.trim()
+                            .trim_start_matches("SELECT ")
+                            .trim()
+                            .trim_end_matches(',')
+                            .to_string()
+                    })
+                    .filter(|line| !line.ends_with(&format!(" AS {column}")))
+                    .collect();
+                assert!(
+                    !projection.is_empty(),
+                    "could not re-project the view {table} without {column}: {definition}"
+                );
+                let from = definition
+                    .split_once("  FROM ")
+                    .unwrap_or_else(|| panic!("view {table} has no FROM clause: {definition}"))
+                    .1;
+                conn.execute_batch(&format!(
+                    "DROP VIEW {table};\nCREATE VIEW {table} AS SELECT {}\n  FROM {from}",
+                    projection.join(", ")
+                ))
                 .unwrap();
+            } else {
+                conn.execute(&format!("ALTER TABLE {table} DROP COLUMN {column}"), [])
+                    .unwrap();
+            }
         }
 
         let error = Store::open(&db_path)
@@ -2436,4 +2482,15 @@ fn the_stored_parse_failure_rule_matches_the_canonical_classifier() {
         row.parse_failed, canonical,
         "the stored rule disagreed with the canonical classifier on an incremental build"
     );
+}
+
+/// Whether the store object `name` is a view rather than a base table.
+fn relation_is_view(conn: &rusqlite::Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT type FROM sqlite_master WHERE name = ?1",
+        [name],
+        |row| row.get::<_, String>(0),
+    )
+    .map(|kind| kind == "view")
+    .unwrap_or(false)
 }

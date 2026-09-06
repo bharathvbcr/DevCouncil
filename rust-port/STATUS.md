@@ -4719,3 +4719,695 @@ code graph schema 2)`. Python: ruff and mypy clean, the 40 unit files that
 touch the graph schema 776 passed. Go, against this kernel's artifacts:
 all seven packages `ok` with `MANVI_MAP_BINARY` pointed at it, including `dc/devmap`'s live interop test that builds one `Map` from both wires. `devmap --json status` on a fresh 41,276-node / 271k-edge
 scholarlm store, 21 runs: p50 61 ms / min 54 ms wall, of which the SQL count is p50 33 ms (271,508 rows scanned, 0 mismatches). That cost is paid only by the fresh-process CLI path — the daemon answers from the index it already holds — and it scales with the edge count; a partial index on the mismatch predicate would make it O(mismatches) but would bake the ladder into DDL, a second copy of the table, and was not done.
+
+---
+
+## Coverage as a ratio, not a flag (2026-09-06)
+
+An audit of the shipped P0–P4 work orders, run against a real corpus rather
+than against fixtures. Five defects, each reproduced by measurement before it
+was fixed, each with a test watched go red against the pre-fix tree.
+
+### The confidence ladder was collapsing on every real repository
+
+`ExtractionCoverage::cap` was a **binary** gate. `is_complete()` asks whether
+any of four corpus-wide counters is non-zero; if one is, every non-exempt
+finding in the generation is set to `COVERAGE_LOSS_CONFIDENCE_CAP`.
+
+Measured on this repository: 1,502 files, **10 of them blind** — 3 parse
+failures, 2 pattern-recovered, 1 oversized vendored `parser.c`, 4 in a
+call-blind language. **0.67% of the corpus.** All **214** dead findings came
+back at exactly 0.35.
+
+Two consequences:
+
+- `generation_dead_symbols` is read `ORDER BY confidence DESC, file_path`, so
+  with every confidence tied the ranked list an agent reads degenerated to
+  **alphabetical order**. The default 2,000-token budget showed it the first
+  ~66 filenames rather than the strongest evidence.
+- Three claims printed as one number: "no edge in the generation names this
+  symbol" (0.9), "something calls it and the resolver could not say which"
+  (0.4), and "an unresolved site names it" (0.4). The first is evidence *for*
+  death and the other two are evidence *against* it. That is not conservatism.
+  Conservatism lowers the ceiling and keeps the order.
+
+The ceiling now tracks the size of the hole: `(1 - blind_share)^8`, clamped
+into `[0.35, 0.89]`. `files_with_call_extraction` is the denominator the five
+gap counters never had, counted from the same two predicates `extraction_gaps`
+charges `CallBlind` from. Prose is in neither side — in the numerator it would
+mark every repository degraded, in the denominator a README would raise a
+broken repository's confidence.
+
+The exponent is a policy dial and is documented as one. At 8 the ceiling reaches
+the floor at a blind share of **12.3%**, so a substantially-unread corpus keeps
+exactly the previous behaviour and only a small hole buys grading. Every older
+coverage fixture in `devmap-analyze` is a two- or three-file corpus — 33% to
+50% blind — which is why all of them still pass unchanged; that is pinned by
+`the_ceiling_reaches_the_floor_well_before_the_corpus_is_half_unread`, not left
+to luck.
+
+Nothing is promoted. `cap` never raises a confidence, and
+`HIGHEST_DEGRADED_CONFIDENCE` (0.89, rendering 890 millis) keeps an incomplete
+scan below `EXTRACTED_FLOOR_MILLIS` at **any** blind share.
+
+**Measured after, same corpus, same command:** the same 214 findings, now 49 at
+0.89 and 165 at 0.40, ranked by evidence. `dev map dead --confidence inferred`
+returns the 49 rows with no inbound edge at all; before, it returned nothing on
+this repository, because `extracted` was structurally unreachable and
+everything else was `ambiguous`.
+
+### A cluster outranked the single-symbol verdict on identical evidence
+
+`is_reaching_edge` excludes ambiguous and unresolved edges — correctly, since a
+cluster kept alive by a guess is a finding silently suppressed — and then
+nothing looked at them again.
+
+Reproduced with one call site, `it.alpha()`, and two candidates:
+`Widget.alpha` came back at 0.4 with `only_ambiguous_callers`; `Task.alpha`,
+reached by the *same* ambiguity, came back inside a cluster at **0.5** saying it
+was "reached by nothing outside the component", which the edge list contradicts.
+`Task.alpha` never appears in the single-symbol list at all — its sibling calls
+it deterministically — so the cluster row was the only thing naming it, at the
+wrong tier with the more absolute prose.
+
+A component something names through an unbindable call now carries
+`DEAD_CLUSTER_QUALIFIED_CONFIDENCE` (0.4) and a reason that says what reaches
+it. The unresolved ledger reaches it through `unresolved_namesake_names`, now
+shared with liveness rather than copied. A component nothing reaches is
+untouched, which is pinned.
+
+`cap_cluster` also prices the component claim separately: it compounds the
+coverage ceiling over the membership, because a missed edge into a component
+makes the whole finding wrong where the same edge costs a single-symbol finding
+only itself — which `dead_clusters` already argued in prose and nothing
+implemented.
+
+### A circular import was a dead cluster waiting for one unrelated change
+
+`Imports` edges carry the file path in **both** symbol positions, so
+`a.py -> b.py -> a.py` is a two-node strongly connected component in the graph
+Tarjan walks. Nothing came of it only because all three `File`-symbol
+construction sites emit `is_exported: true`, putting every file into
+`externally_reachable_symbols`. Nothing stated that dependency and nothing
+tested it — and the day a `File` node stops reading as exported, which is a
+reasonable change since a file node is not public API, every circular import in
+every TypeScript barrel and Python package becomes a dead cluster.
+
+Import edges are excluded from the component graph outright. They connect file
+nodes only, liveness never reports a `SymbolKind::File`, and "a cluster of
+files" is not this pass's claim — so the exclusion costs nothing that could have
+been a finding, and shrinks the graph by one node per file plus every import
+edge. Pinned with a hand-built extraction whose `File` symbol is *not* exported,
+because that state is unreachable from `extract_file` and is exactly the point.
+
+### Two numbers for one fact
+
+`devmap status --json` reports `coverage_gaps.import_blind.total = 71` on this
+repository; the manifest beside it, same generation, reports
+`liveness_meta.unwired.excluded_import_blind = 355`.
+
+The gap is prose. `extraction_gaps` charges `ImportBlind` only for files a
+grammar read; `unwired_candidates` never asked — it runs the parse-failure
+branch first, which `is_parse_failure` deliberately answers `false` for prose,
+then charges everything left with no `Imports` capability, Markdown included.
+
+The predicate now has one owner, `Extraction::grammar_read_this_file`, beside
+`is_parse_failure` where the same line is already drawn. **Measured after:
+355 -> 57**, against a population of 71.
+
+The two are not meant to be equal, and that is the sharper form of the defect.
+`coverage_gaps.import_blind` is every file whose language has no import
+extractor; `unwired_excluded_import_blind` is only those the filter dropped,
+which excludes any that returned earlier for being an entry root, a test,
+vendored, or already imported. So the law is `<=`, and 355 against 71 broke it
+in the one direction that cannot be explained away: a filter cannot drop more
+files than exist for it to drop. The test asserts the subset law first, and the
+fixture's coincidental equality second, so a fixture where the two happen to
+match cannot hide the impossibility.
+
+The *exclusion* was load-bearing and older than the reason given for it: before
+the W0.3 capability gate, every `.md`, `.json` and `.yaml` in every repository
+was an unwired candidate, and the gate swept them up by accident. They are now
+excluded on their own grounds and counted in neither number.
+
+### `verify.sh` had never run past step 5 from a clean checkout
+
+Every shell script under `rust-port/` is committed `100644`. `verify.sh` invokes
+`./tools/fanout.sh`, `./tools/memory_model_probe.sh` and `./tools/soak.sh`
+directly, so **steps 5 through 9 have never run** for anyone who did not
+`chmod` their own working tree. CI runs `bash ./verify.sh`, which starts the
+script and then hits the same wall inside it.
+
+It failed the way this ledger's own discipline warns against, twice: a true
+sentence with the wrong cause. `GATE FAIL: could not derive the ambiguity
+fan-out` was about neither the fan-out nor the derivation.
+
+Steps 1 and 2 were also red at HEAD on rustc 1.98 — six clippy lints and a
+formatting drift, none of them in code this pass had touched — so steps 3
+onward did not run either. And step 5 hardcoded `./target/release/devmap` while
+step 4 builds it with `cargo run --release`, so any run with `CARGO_TARGET_DIR`
+set reported "could not measure peak RSS" when the measurement was fine and the
+binary was elsewhere.
+
+### Adversarial input found three overflow panics in the new code
+
+`blind_files()` and `blind_share()` summed `usize` counters with a plain `+`.
+Four of the five are bounded by a file count, but `discovery_refused_files` is
+folded in from outside — `DiscoveryCoverage::refused(n)` takes whatever a caller
+passes — and it is the numerator of a division. Debug panics; **release wraps a
+saturated blind count round to a small one and hands a near-`extracted` ceiling
+to a corpus nothing read.** Saturating adds, and the ratio clamped after the
+division.
+
+`graded_cap_under_hostile_input.rs` carries twelve cases: saturated counters
+together and singly, `NaN`/`INFINITY`/`f32::MAX` as confidences, a cluster of
+`usize::MAX` members against a `powi` exponent, a corpus that is entirely
+refusals, ratio-independence from corpus size, a 100,000-node ring through the
+public entry point, the oversized-graph refusal stated rather than returned as
+an empty result, degenerate self-loops and empty names, a symbol named only by
+`::` and `.` separators, and a determinism sweep over the new qualification
+pass.
+
+### Examined and found not to be defects
+
+- **The Python resolution-rate ratchet has zero tolerance where the Rust CI
+  fence has 10 permille.** Predicted as a false-positive generator; **measured
+  and refuted.** On a 423-file corpus with ~44k attribution sites, adding one
+  unresolvable call moves the net rate by **0 permille** (372 → 372); ~93 new
+  unresolvable sites are needed to move it by one. The two thresholds are
+  calibrated for different denominators — tiny deterministic fixtures against a
+  whole repository — and the divergence is explained rather than accidental.
+- **A file with both a `CallBlind` and an `ImportBlind` gap writes two rows.**
+  `generation_coverage_gaps` is keyed `(generation_id, gap, path)` and every
+  count is `WHERE gap = ?`, so neither bucket double-counts.
+- **`unwired_candidates` counts ambiguous and unresolved `Imports` edges as
+  wiring** where liveness and the component pass exclude them. Inconsistent, but
+  in the conservative direction for this question — an ambiguous import edge is
+  evidence the file *may* be imported — so it errs toward fewer findings.
+
+### Numbers
+
+The gate suite, step by step, before and after. "never reached" means the run
+stopped at an earlier step, which is where all of these sat.
+
+| step | before | after |
+|---|---|---|
+| 1 format | **FAIL** — drift in `rung.rs`, `code_graph.rs` | pass |
+| 2 clippy `-D warnings` | **FAIL** — six lints on rustc 1.98 | pass |
+| 3 `cargo test --workspace` | never reached | pass |
+| 4 determinism double-build | never reached | pass — `c613ef69…ca736e`, identical |
+| 5 self-build gates | never reached | pass — build 4,093 ms, 1,506 files, peak RSS 659 MiB against a 774 MiB budget |
+| 6 memory-model probe | never reached | **FAIL** — see the section above; measured, named, not papered over |
+| 7 growth gate | never reached | pass — 925,696 → 1,720,320 → 1,785,856 → 1,789,952 → 1,794,048 B over five builds, 2 generations retained |
+| 8 incremental-vs-cold | never reached | pass — `SOAK SMOKE OK`, digest stable across 5 cycles |
+| 9 mutation testing | optional | not run |
+
+Beyond the suite, a synthetic hostile corpus — 411 files: three-way circular
+imports, a 5,000-function mutually recursive ring, non-ASCII identifiers, a
+200,000-term single line, 400-deep nested braces, 40-deep directories, 200
+same-named modules, a self-importing module, invalid UTF-8, an empty file, a
+symlink loop and a dangling symlink. Cold build **0.64 s**, exit 0, refusing
+exactly two files with named reasons (`Unreadable`, `EscapesRoot`). Every
+subcommand answered without a panic. The ring came back as **one** cluster of
+5,000, not 5,000 findings; the import cycle as a three-member cluster of
+*functions*, not of files; `trace` past its depth bound returned `Unavailable`
+with the bound named rather than "no path". Modify, add and delete cycles
+converged on the cold digest exactly.
+
+### Step 6 has never run, and it is red — with a named cause
+
+Making `tools/memory_model_probe.sh` executable and pointing it at the right
+binary ran the memory-model probe for what is, as far as this ledger can tell,
+the first time. Its arithmetic preconditions failed immediately:
+
+```
+PROBE FAIL: derived widest fan-out 16, corpus has 100
+```
+
+**16 is `AMBIGUOUS_FANOUT_CAP`.** The probe designs a corpus with 100
+candidates per name and asserts a widest fan-out of 100; audit R-7 capped one
+site's *emission* at 16 edges after this probe was written, and every one of
+its four arithmetic preconditions was stated in terms of `DEFS`. The probe now
+reads the constant from its owner — the pattern `verify.sh` already uses for
+`DB_SIZE_GATE_PER_FILE` — computes the effective width as `min(DEFS, cap)`, and
+fails closed if the constant cannot be read. All four preconditions pass.
+
+**The three coefficient caps then fail, and that is the real finding.** The cap
+bounds edges; it does not bound the candidate list, which the `Arc<Resolution>`
+still holds in full and deliberately so — that is what keeps `impact`
+answerable on candidates 2..N. So since R-7 the memory is proportional to
+*candidates* while every denominator in the probe and in `verify.sh`'s RSS
+budget is derived from *emitted edges*, and the two stopped being the same
+number.
+
+Measured, both runs after the preconditions were corrected:
+
+| corpus | milli-B/pair (cap 40,000) | milli-B/edge (cap 800,000) | % of model (max 125) |
+|---|---:|---:|---:|
+| `DEFS=100` — cap active, 100 candidates → 16 edges | 77,145 | 1,234,329 | 193% |
+| `DEFS=16` — cap inert, 16 candidates → 16 edges | 45,926 | 734,822 | 138% |
+
+Removing the cap's effect alone takes bytes-per-edge from 1,234 to 735 and back
+inside its 800 cap, which is the decoupling measured rather than argued. What
+is left — 46 B/pair against 40, 138% against 125% — is either a real per-edge
+regression from the 410 B the model assumes, or an artifact of comparing a
+16-wide 116-file corpus against coefficients measured on a 100-wide one. **It
+was not settled here, and no number was moved to make the gate green**; that
+would be the "raised to fit" this ledger refuses two sections above.
+
+Fixing the denominator properly needs a schema change. `tools/fanout.sh`
+derives from the persisted graph and `generation_edges` has no `details`
+column — the candidate total lives only on the in-memory `ResolvedEdge`. The
+same staleness reaches `verify.sh` step 5, whose `RSS_PER_FANOUT_EDGE = 600 B`
+is justified as "1.5x the 401-415 B/edge measured by
+tools/memory_model_probe.sh": that measurement was taken on the pre-cap
+resolver. Step 5 passes today (659 MiB against a 774 MiB budget) with a
+denominator that counts the wrong thing.
+
+### Still open, and deliberately not started here
+
+- **B3/SC2 — write amplification.** Re-measured, and this ledger's
+  characterisation is stale. On a 1,060-file / 58,651-edge corpus a one-file
+  edit costs: extract 0.565 s, **resolve 0.340 s (15%)**, analyze 0.109 s (5%),
+  **persist 1.221 s (55%)**. The "resolve and analyze are 54% of a rebuild"
+  figure was measured on a different corpus and does not hold here. The narrowed
+  write and a `--full` write cost about the same (~1.2 s each), which is write
+  amplification measured rather than argued. The fix is the validity-range
+  schema redesign AGENT_PLAN marks **decision (#2)**; it is a store-schema
+  rewrite and was not started unilaterally.
+- **W0.3 move 2 — import extraction for the C family and the JVM/CLR
+  languages.** `#include` still has no handler anywhere in the extractor, and 23
+  of 35 languages declare no `IMPORTS` capability, so `unwired_candidates` is
+  permanently empty for them. On this repository that is 71 files; in a Java or
+  C++ shop it is the whole tree. The W0.3 plan shipped move 1 ("stop the
+  bleeding") deliberately and named move 2 as the follow-up.
+
+## Every import that names a file (W0.3 move 2, 2026-09-06)
+
+`unwired_candidates` names files an agent may delete. Move 1 gave it an honest
+gate — it stopped reporting files in languages where no import was ever looked
+for, and counted the exclusion. This move removes the reason for the exclusion,
+and then removes two false-positive classes that only became visible once it
+did.
+
+### What the extractor could see before
+
+Five `imports.push` sites in the whole extractor — Python, JS/TS/TSX, Rust
+`use`, Go `import_spec`, the embedded-script merge — and **no `#include`
+handler anywhere**. For 24 of 35 declared languages the answer to "does anything
+import this file" was structurally *no*. `langimports/` now serves nineteen more
+grammar keys, wired into `extract_node` after the whole `match lang`, not inside
+its generic arm: the C family and HCL reach `extract_node` through *specialised*
+arms, so the obvious position beside `langcalls::extract_calls` would have missed
+the one family that had no import handler at all.
+
+Measured A/B on this repository (1,612 files), same command, pre-change binary
+built from `707f76a` in a detached worktree — not inferred from the after-state:
+
+| | before | after |
+|---|---|---|
+| grammars declaring `Capability::Imports` | 11 | 31 |
+| import-blind languages | 24 | **4** |
+| `unwired_candidates` | 245 | **120** |
+| ... of which `.rs` | 119 | **2** |
+| ... of which `.py` | 85 | **46** |
+| ... of which `.go` | 17 | **8** |
+| `unwired_excluded_import_blind` | 57 | **15** |
+| `unwired_excluded_coverage_loss` | 5 | 5 |
+| `Imports` edges | 2,989 | **3,099** |
+
+Half the finding was wrong. The `.rs` collapse is `mod` extraction plus Cargo
+target roots; the `.py` collapse is the widened evidence, and is the measurement
+that shows defect 3 below was never about the newly-served languages at all —
+Python has had import extraction since the first commit, and 39 of its files
+were still being reported because nothing *imported* them while something
+called them.
+
+The four that remain are decisions, not gaps, and
+`the_languages_without_import_extraction_are_named_with_reasons` pins each by
+name: **C#** (`using` names a namespace that spans files), **Swift** (`import`
+names a module, and same-module files import each other not at all — the one
+syntax that structurally cannot explain intra-repository wiring), **VB.NET**
+(C#'s case, and no linked grammar besides — its files are already charged as
+coverage loss), **COBOL** (`COPY` really does name a copybook, but the grammar
+is refused by `UNSAFE_GRAMMARS`, so its files are charged as a *parse failure* —
+a stronger signal reaching the filter through an earlier branch).
+
+### Three defects found by adversarial input and by measurement
+
+**1. A string inside a nested call is not this import's path.** `require
+File.join(dir, 'x')` extracted `x` — a specifier the author never wrote, which
+resolves either to nothing or, worse, to a real file of that name. Found by the
+refusal case in the Ruby tests, fixed in the one walk all thirteen languages
+share rather than in the module where it surfaced, and pinned for Lua, R and PHP
+too. PHP's concatenation stays transparent on purpose: `__DIR__ . '/util.php'`
+is idiomatic and the string in it really is the path.
+
+**2. Rust's `mod` had no handler, and the capability audit could not see it.**
+Rust already declared `Capability::Imports` because the extractor reads
+`use_declaration`, so every check that asks "does this language extract imports"
+answered yes. It does — for the wrong statement. `use` names a path in the
+module tree; `mod foo;` names a **file**, by a rule the Rust reference fixes.
+Measured before the fix: every `langdecl/*.rs` and `langcalls/*.rs` module in
+this repository — each declared by a `mod` line in its own parent and used
+everywhere — was an unwired candidate. Found only by building the real corpus.
+
+**3. Import edges were not the only wiring evidence, and never had been.**
+This one was latent for as long as the scan existed and could not surface while
+most languages had no import extraction. The moment Java stopped being excluded,
+`Helper.java` was *reported* — because same-package Java files import each other
+not at all, so its caller one file away produces a resolved `References` edge and
+no import. The same wrong answer with a new reason.
+
+So the question moved with the evidence: **does anything depend on this file.**
+Every confident cross-file dependency edge answers it, and an import is one kind.
+Two restrictions keep the widening honest — structural edges (`Contains`,
+`Defines`, `MemberOf`) are not dependencies, and an ambiguous resolution is a
+guess, not evidence: one ambiguous call fans out to as many as
+`AMBIGUOUS_FANOUT_CAP` candidates of which at most one is right, so only the
+confident tier counts, compared in milliconfidence for the reason
+`EXTRACTED_FLOOR_MILLIS` already records.
+
+### Two more classes the corpus showed, after that
+
+**Cargo target roots were not entry roots.** Seventeen Rust files were still
+reported and eleven were target roots — five `src/lib.rs` crate roots, five
+`examples/*.rs`, one `build.rs` — each a delete-this suggestion for a file named
+in a `Cargo.toml`. No import will ever point at one: a target root is where the
+module tree *starts*.
+
+The first attempt marked them `ScriptEntry`, and
+`test_runtime_entry_points_are_exempt_without_exempting_their_file` failed
+immediately — every file-level wiring kind exempts every *symbol* in the file
+from the dead-code verdict, so an unused helper in `src/bin/tool.rs` became
+exempt because its file had a `main`. `WiringKind::TargetRoot` is a claim about
+the file's wiring and nothing inside it. A second conflation in the same attempt
+— making `rust_path_declares_main` delegate to `rust_target_root_reason`, which
+says `src/lib.rs` declares `main` — was caught by two more existing tests. Both
+are now pinned apart by name.
+
+**A Go package import names no file.** `go_import_edge_targets` collapses
+`import "app/store"` onto one synthetic `package:app/store/store` node instead of
+one edge per file — which is right, and is what keeps a 200-file package from
+fanning one import into 200 edges — so the files behind it had no inbound
+file-level edge and every one was reported. Nine of the eleven remaining Go
+candidates. Read back by directory, matched on the file's own directory rather
+than a prefix: a Go package does not include its subdirectories, and treating
+`store` as covering `store/internal` would exempt a genuinely stranded file one
+level down.
+
+### Resolution
+
+Extraction without resolution moves the failure one stage later and leaves the
+answer the same. `devmap-resolve/src/importpath.rs` carries one table: the
+languages differ only in **separator** (`.` for the JVM family and Lua, `\` for
+PHP, `/` elsewhere), **extensions**, and the **build roots** a non-relative
+specifier resolves against. The last rung is a candidate's basename naming
+exactly one indexed file — guarded on uniqueness, not plausibility, so two files
+named `util.h` mean it abstains. A specifier the author wrote as relative skips
+both the roots and the basename rung: `./util.h` is a precise statement of
+location, and measured without that guard it produced an edge to a root-level
+`util.h` the author never referred to.
+
+A JVM wildcard (`import com.foo.*`, `import foo.bar._`) and a Terraform
+`module { source = "./modules/vpc" }` expand to every file in the directory,
+uncapped and deliberately: `AMBIGUOUS_FANOUT_CAP` bounds a *guess*, and these N
+edges are all correct. The consumer is `unwired_candidates`, so truncating would
+leave the files past the cut falsely reported as imported by nothing — a bound
+turning into a false finding. The one guard is that the repository root is never
+a package.
+
+`EXTRACTION_SCHEMA_VERSION` 32 → 33. A v32 row for any of these languages
+carries an **empty** import list — not a partial one, not one marked incomplete
+— and the consumer is the scan whose whole question is whether an inbound edge
+exists. A warm cache would answer "nothing imports this file" with the full
+confidence of a fresh extraction, for every header, every Java class and every
+Terraform module.
+
+### Gate ledger
+
+| check | result |
+|---|---|
+| `cargo test --workspace` | **1,695 passed / 1 failed** |
+| `cargo fmt --all --check` | clean |
+| `cargo clippy --workspace --all-targets -D warnings` | clean |
+| real-corpus build (1,612 files) | exit 0, manifest + graph written |
+
+The one failure is `devmap-serve`'s
+`status_answers_while_the_connect_time_sweep_is_still_running`, and it is a
+pre-existing timing flake in a crate this change does not touch: it fails its own
+**fixture precondition** — "a 6000-file sweep took only 119 ms; the ordering
+assertion below would be vacuous" — on a warm page cache, and passed 2 of 3
+reruns. Refusing to report a pass for a vacuous assertion is the behaviour this
+repository asks for; loosening the precondition to make it green would be the
+"raised to fit" it refuses. Left as found, and named here rather than absorbed.
+
+**55 new tests**, each failing against the pre-change tree: 32 in
+`langimports_specifier_names_a_file.rs`, 26 in
+`import_paths_resolve_to_real_files.rs`, 7 in `cargo_target_roots_are_wired.rs`,
+plus the widened-evidence and Go-package cases in `unwired_is_not_import_blind.rs`
+and the registry/dispatcher agreement test in `language_capabilities.rs`.
+
+## The denominator the memory actually tracks (2026-09-06)
+
+`verify.sh` step 6 has been red, and the cause was understood but not fixed:
+its three coefficient caps were calibrated on a resolver that had no
+`AMBIGUOUS_FANOUT_CAP`. **All nine gates are now green**, and step 6 is green
+because its denominator changed, not because a number moved.
+
+### What was wrong
+
+The cap (16, `devmap-resolve/src/model.rs`, audit R-7) bounds how many **edges**
+one ambiguous site emits. It does not bound the site's **candidate list**, which
+the `Arc<Resolution>` still holds in full — deliberately, because that list is
+what keeps `impact` answerable on candidates 2..N. So since R-7 resolver memory
+has been proportional to candidates while every number derivable from the store
+counted emitted edges, and the two stopped being the same quantity.
+
+The candidate total was not in the store at all: it lived only on the in-memory
+`ResolvedEdge`, and `generation_edges` had no column that could carry any part
+of it. **Schema v16** adds `candidate_total INTEGER`, written on the ambiguous
+rows only. NULL means one of two things and the reader must not conflate them —
+the edge is not an `AmbiguousGlobal`, or the row predates the column —
+so `fanout.sh` refuses a store with `resolution = 'AmbiguousGlobal' AND
+candidate_total IS NULL` rather than summing a NULL as zero, which would
+understate the denominator and inflate every coefficient computed from it.
+
+### The re-derivation
+
+Seven shapes, sweeping fan-out width 16..200 (12.5×) at a fixed 80,000 emitted
+edges and site count 100..400 (4×) at a fixed width, each an ambiguous corpus
+minus its own unique-name control:
+
+| DEFS | CALLERS | edges | candidates | delta bytes | B/edge | B/candidate |
+|---|---|---|---|---|---|---|
+| 16 | 100 | 80,000 | 80,000 | 59,883,520 | 748.5 | 748.5 |
+| 32 | 100 | 80,000 | 160,000 | 71,598,080 | 895.0 | 447.5 |
+| 64 | 100 | 80,000 | 320,000 | 86,081,536 | 1076.0 | 269.0 |
+| 100 | 100 | 80,000 | 500,000 | 100,483,072 | 1256.0 | 201.0 |
+| 200 | 100 | 80,000 | 1,000,000 | 141,819,904 | 1772.7 | 141.8 |
+| 100 | 200 | 160,000 | 1,000,000 | 196,771,840 | 1229.8 | 196.8 |
+| 100 | 400 | 320,000 | 2,000,000 | 391,495,680 | 1223.4 | 195.7 |
+
+Neither single-term coefficient is scale-invariant. Bytes per emitted edge moves
+2.4× across the width sweep. **Bytes per candidate pair — the old
+`PAIR_CAP_MILLI` denominator — moves 66×**, from 46,784 to 709 milli-B/pair. A
+gate on a number that varies 66× with corpus shape is not a bound, and the only
+reason it read as one for so long is that it sat ten times under its cap at the
+single shape it was calibrated on.
+
+A two-term model fits all seven points. Least squares with no intercept, since
+the control *is* the base and is measured rather than modelled:
+
+```
+fan-out cost = 694 B x emitted_edges + 86 B x candidates
+```
+
+Measured against predicted: 96.1, 103.5, 103.9, 102.2, 100.5, 100.1, 99.6 — a
+**96.1%–103.9% band across a 12.5× width range and a 4× site range**. That is
+the scale invariance the probe exists to assert, now asserted on a model that
+describes the code.
+
+### What is gated now
+
+| gate | value | measured |
+|---|---|---|
+| bytes per candidate | cap 150 B | 88.0 B |
+| width invariance — per-candidate cost when the list doubles | max 125% | **99%** |
+| the two-term model, on the delta | 85–115% | **100%** |
+
+The model band is computed on the **delta**, not on total-vs-total. The base
+term sits in both sides of a total ratio and dilutes it; the delta is what the
+coefficients describe and what they were measured against, so the band is both
+tighter (85–115 against 60–125) and better founded.
+
+The width-invariance check is the direct test of the shared-`Arc` invariant and
+is what the retired pair cap was reaching for. SC3 measured the pre-`Arc`
+resolver at 112–128 B per candidate *pair*, because each of a site's N edges
+owned its own clone of the N-element list: cost was quadratic in width. A single
+per-candidate cap cannot tell a clone revert from a corpus that simply got
+bigger; measuring the coefficient at two widths can, because a clone makes it
+grow linearly with width. The probe now builds four corpora rather than two.
+
+The two retired coefficients are still **printed**, ungated, because this ledger
+quotes them and a reader comparing runs needs the same numbers to compare.
+
+### verify.sh step 5
+
+Its `RSS_PER_FANOUT_EDGE=600` had the same wrong denominator. Now two terms with
+the same 1.5× headroom the single term had — 1050 B/edge and 130 B/candidate —
+and the budget line names both. Measured on this repository: **59,309 candidates
+weighed against 38,006 edges emitted**, 1.56×, and a corpus with wider ambiguity
+separates them further.
+
+### Gate ledger
+
+| check | result |
+|---|---|
+| `bash ./verify.sh` | **ALL GATES GREEN** (9/9; step 9 skipped without `--mutants`) |
+| `cargo test --workspace` | **1,697 passed / 0 failed** |
+| `cargo fmt --all --check` | clean |
+| `cargo clippy --workspace --all-targets -D warnings` | clean |
+
+`test_fanout_metric.rs` gains the hand-counted candidate totals and a
+cap-*active* fixture — 40 declarations of one name, 16 edges emitted, 40
+candidates weighed. That second fixture is the one the old one could not be: on
+a 3-candidate corpus candidates and edges coincide, so a column that merely
+echoed the group size would pass there and fail here.
+
+## One payload per file, not per generation (B3, 2026-09-06)
+
+`AGENT_PLAN.md` carried B3 as "write amplification — decision (#2), unstarted".
+The premise was right and the cost was in a different place than the plan said.
+
+### Where it actually was
+
+`PLAN.md` §7.5 frames B3 as row count: "each generation re-materialises all
+59,880 membership rows". Measured on this repository, two generations apart by
+one appended line in one file:
+
+| | rows | bytes |
+|---|---|---|
+| `generation_files` | 3,062 | **169 MB** |
+| `generation_unresolved` | 89,537 | 59 MB |
+| `generation_edges` | 96,525 | 38 MB |
+| `generation_nodes` | 17,475 | 5.5 MB |
+
+**`generation_files` is 54% of a 302.8 MB store on 1,531 rows per generation**,
+because each row carries a serialized `Extraction` averaging 53.7 KB. And
+**1,530 of the 3,062 rows were byte-identical duplicates**: one file changed,
+and the other 1,530 payloads were read out of SQLite, moved through Rust one row
+at a time, and written back. The carry-forward B3's first half added avoids
+re-*deriving* an unchanged payload; it still re-*materialises* it.
+
+So the row count was the visible symptom and the bytes were the cost. A
+membership row is 16 bytes; 1,531 of them is 24 KB.
+
+### Schema v17
+
+One payload per **(file, content, language, grammar, analyzer)** in
+`file_payloads`, one 16-byte row per generation in `generation_file_rows`, and
+`generation_files` kept as a **view** over the join with its exact column set —
+so all twenty-five read sites across five crates, `tools/fanout.sql` and a dozen
+tests are unchanged. What a generation holds for a file has not changed, only
+where the bytes live.
+
+The key is the one v13 already indexed `generation_files` on for the
+extraction-cache fallback, describing it then as a scan "whose rows each carry a
+~47 KB `extraction_json` the scan must skip past to reach the identity columns".
+It no longer skips past anything.
+
+Measured A/B on one fixture, same command, pre-change binary built from
+`7dfa20f`:
+
+| payload bytes added by a one-file edit | before | after |
+|---|---|---|
+| against 100,165 already stored | **100,432 (100%)** | **1,908 (1%)** |
+
+And on this repository: store after the same edit **302.8 MB → 217.6 MB**
+(−28%), `extraction_json` **164.5 MB → 82.4 MB** (−50%, the duplicate half
+exactly), payload rows **3,062 → 1,533** — one per file, shared by both
+generations.
+
+### The bug the symlink test caught
+
+`file_id` is in the payload identity, and the first version of this did not have
+it. A payload is a serialized `Extraction` and an `Extraction` **carries its own
+`file_path`**, so content-addressing alone collapses two byte-identical files
+into one payload and makes both membership rows report the same path. A symlink
+and its target are byte-identical by construction:
+`a_cold_build_indexes_an_in_root_symlink_and_a_drain_of_it_keeps_the_symbol`
+failed on the first run with "the cold walk indexes the link, got []", and it
+passes at `7dfa20f`, so it was a real regression and not a stale fixture.
+
+Nothing is lost by narrowing the key: what B3 deduplicates is the same file,
+unchanged, across generations — 1,530 of the 1,530 duplicates measured.
+
+### What is left, with its measured size
+
+`generation_edges` (96,525 rows) and `generation_unresolved` (89,537) are still
+re-materialised per generation, about **67 MB** of the remaining growth. They are
+not content-addressable per file the way a payload is: an edge's target depends
+on the whole corpus, so carrying one forward because its *source* file did not
+change would be wrong when a rename elsewhere moved the target. That needs the
+validity-range treatment — one row with `[valid_from, valid_to)` rather than one
+row per generation — and it is B3's second half.
+
+It is recorded here with its number rather than asserted by a red test, because
+a failing test standing in for unfinished work reports the same thing as a
+broken one. `a_one_file_edit_writes_one_file_of_rows.rs` says the same in its
+header, beside the invariant that now holds.
+
+### Blast radius, and what it cost
+
+Six test fixtures wrote `generation_files` directly to age or corrupt a stored
+payload; a view is not updatable, so each was repointed at `file_payloads`. One
+of them — `age_stored_payloads` — became three statements rather than one,
+because aging a payload *changes its identity* and a store aged twice can
+already hold the aged twin: age what can be aged, repoint anything whose twin
+exists, drop what nothing points at. The unique constraint found that, which is
+what a unique constraint is for.
+
+Two migration steps needed guards they did not need before: v13's
+`CREATE INDEX ON generation_files` is not legal against a view, and v17's own
+step probes for the view rather than for a column.
+
+### Gate ledger
+
+| check | result |
+|---|---|
+| `cargo test --workspace` | **1,699 passed / 0 failed** |
+| `bash ./verify.sh` | **ALL GATES GREEN** (9/9) |
+| `cargo fmt --all --check` | clean |
+| `cargo clippy --workspace --all-targets -D warnings` | clean |
+| cold-build store, this repository | 143 MiB |
+
+### B3's second half, with the design its measurement points at
+
+Recorded here rather than left implicit. `generation_edges` (96,525 rows,
+**50.2% of them byte-identical across generations**) and
+`generation_unresolved` (89,537) are ~67 MB of the remaining per-generation
+growth, and `generation_nodes` is 50.0% duplicated on the same measure.
+
+The obvious move — apply v17's content-addressing again — does not work here,
+and the reason is measurable rather than stylistic. Both tables carry composite
+indexes spanning the generation **and** a row column:
+
+```
+idx_generation_edges_source       (generation_id, source_file_id)
+idx_generation_edges_target       (generation_id, target_file_id)
+idx_generation_unresolved_callee  (generation_id, callee_name)
+idx_generation_unresolved_class   (generation_id, classification)
+```
+
+Splitting the row from its membership puts the two halves of every one of those
+in different tables, and no index can span a join. `generation_files` had no
+such index, which is exactly why the same pattern was safe there.
+
+A row carrying its own `[valid_from, valid_to)` keeps them intact. The open
+decision is what that costs on the read side: `generation_id = ?` becomes a
+range predicate rather than an equality, so the latest generation wants a
+partial index on `valid_to IS NULL` and reads of an older generation fall back
+to a scan. That is a behaviour change in about ten query sites and needs its own
+latency measurement, which is why it stays a decision rather than being taken
+here.
