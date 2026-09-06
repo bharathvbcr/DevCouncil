@@ -3917,10 +3917,11 @@ is empty; counts the main database *plus* its WAL, because a WAL that never
 checkpoints is exactly the unbounded growth this looks for; honours
 `CARGO_TARGET_DIR`/`DEVMAP_BIN` so a lane cannot silently measure a stale
 binary; samples `(cycle, RSS, store bytes)` into a CSV every cycle; and asserts
-a plateau against a **baseline cycle** rather than against cycle 1, because the
-first cycles are still filling the extraction and page caches and calling that
-growth a leak would fail every healthy kernel. A run shorter than twice the
-baseline cycle is reported as a smoke test, not as a plateau measurement.
+a plateau by comparing the means of two halves taken after a warm-up, because
+the first cycles are still filling the extraction and page caches and calling
+that growth a leak would fail every healthy kernel. A run under 40 cycles is
+reported as a smoke test — digest asserted, growth not — in a verdict line
+distinct from the plateau's; how the warm-up is found is in 2b below.
 
 A second mode, `--daemon`, drives a long-lived `devmap serve` through the same
 edit cycles with `status`/`search`/`impact` over IPC — the process an agent host
@@ -3989,8 +3990,9 @@ daemon's own warm-up quarter moved **+210%**.
 convenience.** The daemon's first full drain lands between cycles 20 and 50 and
 takes RSS from 240 MB to ~900 MB and the store from 247 MB to 498 MB: the
 process loading what it is for. Asserting cycle 200 against cycle 20 would fail
-on every healthy kernel, which is why the harness excludes a warm-up quarter and
-compares the two halves of the remainder by mean. The build half needs no such
+on every healthy kernel, which is why the harness excludes a warm-up — for the
+daemon, one that ends where the samples show the first drain landing (2b) —
+and compares the two halves of the remainder by mean. The build half needs no such
 allowance — its store reaches its steady size inside cycle 1 — and passes the
 same rule at +0.01%.
 
@@ -4148,7 +4150,8 @@ $ cargo build --release
 soak running beside both: p50 0.90 s before the neighbour derivation and 0.90 s
 after — no measurable cost.
 
-**Left undone by this lane, precisely.** `tools/soak.sh` reports "did not
+**Left undone by this lane, precisely — closed by the lead the same evening,
+see 2b.** `tools/soak.sh` reports "did not
 plateau" when a run is too short for its warm-up quarter to cover the
 working-set load — a 40-cycle daemon run on the 15,080-node corpus does exactly
 that, because the first full drain lands at cycle ~33, inside the compared
@@ -4161,3 +4164,68 @@ warm-up, so x1.25 separates them cleanly. On a step, refuse the assertion with
 reporting a leak. This lane did not apply it because the script was executing
 throughout the window in which it could have been; whoever does owns the change
 in `tools/soak.sh`'s plateau block.
+
+### 2b. The soak's warm-up is read from the samples, not assumed (lead, 2026-09-05)
+
+**Found, running the committed harness at its own default.** `tools/soak.sh <copy
+of this repository's corpus> 40 --daemon` with the final release binary
+(`devmap 0.1.0`, store schema 13):
+
+```
+soak baseline: mode=--daemon digest=216e37ba3170 db=123252736 tolerance=10%
+  cycle 30 ok rss=308592640 db=123256888
+  cycle 40 ok rss=654868480 db=497552080
+SOAK FAIL: rss did not plateau — mean(11-25) 250298368 -> mean(26-40) 462048460 (limit 275328204)
+SOAK FAIL: db did not plateau — mean(11-25) 123252736 -> mean(26-40) 264666023 (limit 135578009)
+```
+
+A cycle on this corpus takes about half a second, and the daemon's first drain
+is a wall-clock event — the watcher holds a burst for its 2 s quiet window and
+at most 10 s (`MAX_DEBOUNCE_HOLD`) — so it landed at cycle 30, inside the
+compared window, and the process loading its graph was reported as a leak. On
+the 15,080-node corpus the same drain lands at cycle 31–33 of a run whose
+cycles take 4–5 s; a fixed "first quarter" was calibrated to that run and
+nothing else. The lane's own "Left undone" paragraph above names this.
+
+A second defect in the same block: a run under 40 cycles printed
+`SOAK OK (… growth bounded)` — the very line a plateau run prints — for a
+check that had not run. `verify.sh` step 8 runs five cycles through that path.
+
+**Fix.** The plateau block is now `assert_plateau` (`tools/soak.sh`, between
+the `plateau begin` / `plateau end` markers). In daemon mode the warm-up ends
+at the first sampled cycle whose store bytes differ from the baseline — the
+first generation the daemon wrote — plus a quarter of what remains, for the
+generations and index that follow it; build mode keeps the first quarter,
+which its flat-from-cycle-1 data supports. Fewer than 30 cycles after warm-up
+refuses the comparison with `run more cycles`; a daemon that never wrote a
+generation refuses with `the plateau check could not run`; both exit 1. Under
+40 cycles the verdict is a different word, `SOAK SMOKE OK (… growth NOT
+asserted)`, and `verify.sh` now greps for that one. A ratio-based step guard
+(the x1.25 the lane measured) was not used: it detects that a step happened
+but not where warm-up ends, and the store-bytes column answers that directly
+without a threshold.
+
+**Evidence.** The shipped function, sourced from between its markers and run
+over recorded and synthetic curves:
+
+| curve | verdict |
+|---|---|
+| lane's daemon run, 200 cycles (`final_daemon.csv`) | first drain at cycle 31, warm-up ends 73; `rss mean(74-136) 902 MB -> mean(137-200) 842 MB`, store flat — ok |
+| lane's build run, 198 cycles (`final_build2.csv`) | `rss 1597.46 MB -> 1597.38 MB`, store +0.001% — ok |
+| lead's 40-cycle daemon run above | `9 cycles after warm-up (which ends at cycle 31 of 40) is fewer than the 30 … — run more cycles` |
+| the same run cut at cycle 29 | `the daemon never wrote a generation in 29 cycles, so the plateau check could not run` |
+| synthetic +1 MB/cycle leak, 200 cycles | `rss did not plateau — mean(55-127) 191000000 -> mean(128-200) 264000000` |
+
+End to end, fresh corpus copies, the final binary, the shipped script:
+
+| run | verdict |
+|---|---|
+| build, 5 cycles | `SOAK SMOKE OK (5 cycles, digest stable; growth NOT asserted — under the 40-cycle minimum)`, exit 0 |
+| daemon, 40 cycles | first drain at 29; `SOAK FAIL: 9 cycles after warm-up … run more cycles`, exit 1 |
+| daemon, 600 cycles | first drain at 30, warm-up ends 172; `rss mean(173-386) 853 MB -> mean(387-600) 897 MB`, `db 493 MB -> 497 MB`, peak 1.03 GB; `SOAK OK (600 cycles, digest stable, growth bounded)`, exit 0. A second 600-cycle run on another copy, sampled by the previous block and re-read through this one: `rss 851 MB -> 869 MB`, `db 492 MB -> 494 MB` — two runs, ±3% of each other, no trend |
+
+The two 600-cycle runs are ~30 drains each on this repository's corpus; with
+the lane's 200 cycles on the 15,080-node corpus (about 45 drains) that is the
+final kernel holding a plateau in daemon mode on both corpora. **No leak — none
+fixed**; what changed is that the harness now says which of "leak", "still
+loading" and "not measured" it saw.
