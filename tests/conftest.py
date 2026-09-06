@@ -135,6 +135,17 @@ def _repo_map_state_is_not_collateral():
 
     Deliberately a stat comparison and nothing more. This is a tripwire, not a
     sandbox; a test that legitimately needs a store builds one under `tmp_path`.
+
+    **Its blind spot, measured rather than guessed.** `index.sqlite` is written
+    by `load_code_graph` only when it is *absent*
+    (`indexing/graph/build.py:429`, `if not service.store.exists()`), so once a
+    contaminated run has created it, every later run merely reads it and this
+    comparison sees nothing move. Observed directly: one full run created it at
+    15:47:31 and tripped; the identical run immediately afterwards passed clean
+    while the 94 MB file sat there the whole time. So a green session is only
+    evidence of cleanliness when the cache was absent at session start — delete
+    `.devcouncil/codeintel/index.sqlite` before trusting one. The same caveat
+    applies to any create-if-absent artifact added to the watched set.
     """
     before = _repo_state_fingerprint()
     yield
