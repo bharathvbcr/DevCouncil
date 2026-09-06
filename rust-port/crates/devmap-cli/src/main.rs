@@ -2772,7 +2772,6 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // `--full` reuses the same scan rather than walking and reading the
             // corpus a second time.
             let scanned = devmap_extract::scan_tree(path)?;
-            let discovery = &scanned.report;
             // Report what discovery refused. A file dropped for being oversized
             // or unreadable used to vanish with no record: `repo_map.json` would
             // say five files while two more existed, and nothing distinguished
@@ -2781,7 +2780,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // and nowhere else — the daemon reads the same report and must reach
             // the same verdict, and it cannot do that against a copy of the rule.
             let refused: Vec<&(String, devmap_extract::model::DiscoverySkipReason)> =
-                discovery.refusals().collect();
+                scanned.report.refusals().collect();
             if !refused.is_empty() {
                 // Both numbers in the header. A bare list of twenty under a
                 // count of two hundred is a capped sample presented as the set,
@@ -2952,6 +2951,21 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             } else {
                 devmap_store::extract_scanned_cached(&store, &scanned)?
             };
+            // The corpus text is dead the moment extraction has consumed it,
+            // but it is bound in this scope and would otherwise stay resident
+            // through resolve, analyze and persist — the stages that set the
+            // peak. It is the one cost the scan-before-extract split would
+            // otherwise have added, and it is not hypothetical: measured A/B on
+            // scholarlm (4,278 files), holding it cost 23 MiB of peak RSS.
+            //
+            // The *report* has to outlive it — `discovery_refusals` below turns
+            // it into the analysis disclosure — so this destructures rather
+            // than dropping the pair, and only the source text goes.
+            let devmap_extract::ScannedTree {
+                sources,
+                report: discovery,
+            } = scanned;
+            drop(sources);
 
             // B3/SC2: `affected` narrows what this generation *writes*. It no
             // longer narrows what is *resolved*.
