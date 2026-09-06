@@ -136,10 +136,10 @@ class Database:
             rows = conn.execute(
                 text("SELECT id, task_id, created_at FROM task_leases WHERE status = 'active'")
             ).fetchall()
-            by_task = defaultdict(list)
+            by_task: defaultdict[str, list[tuple[str, str]]] = defaultdict(list)
             for row in rows:
                 by_task[row.task_id].append(((row.created_at or ""), row.id))
-            stale_ids = []
+            stale_ids: list[str] = []
             for items in by_task.values():
                 if len(items) <= 1:
                     continue
