@@ -4989,6 +4989,20 @@ fn maybe_push_name_reference(
     if !is_user_ident(&name) {
         return;
     }
+    // X40. `_` in **type position** is the inferred-type placeholder — Rust's
+    // `row.get::<_, f64>(1)`, Go's blank identifier — and it references
+    // nothing, so there is no attribution to attempt and no honest tier to file
+    // the failure under. Measured on this repository: 275 of the 9,790 rows in
+    // the tier documented as "the only tier that indicates a defect" were this
+    // placeholder, every one of them a turbofish.
+    //
+    // Restricted to type position on purpose. `_` is a perfectly ordinary
+    // value-position identifier in JavaScript (lodash) and Python (gettext), so
+    // refusing it everywhere would drop real references; no language names a
+    // *type* `_`.
+    if ref_kind == ReferenceKind::Type && name.chars().all(|character| character == '_') {
+        return;
+    }
     if ref_kind == ReferenceKind::Name && name_is_shadowed_by_local(node, source, &name) {
         return;
     }
@@ -5662,6 +5676,63 @@ fn collect_parameter_names(callable: Node, source: &str, out: &mut BTreeSet<Stri
         }
     }
 }
+/// The **type parameters** the callable declares on itself: `T` and `E` in
+/// `fn read<T, E>(…)`, `T` in `func Map[T any](…)`, `K` in
+/// `function pick<K extends string>(…)`.
+///
+/// X40. A type parameter is a name the enclosing item binds in its own
+/// signature, which is precisely what `UnresolvedClass::LocalBinding` is
+/// defined as — "a bare call to a name the enclosing symbol itself declares".
+/// Before this, a use of `T` in the body or the parameter list matched no
+/// indexed symbol and landed in the tier documented as the one that indicates a
+/// defect, which is not what a generic parameter is.
+///
+/// Read through the grammar's `type_parameters` node rather than from a naming
+/// convention: `T`-shaped single letters are the *style*, not the rule, and a
+/// parameter called `Item` is no less bound by the signature that declares it.
+/// Every grammar this crate links spells the list `type_parameters`; a language
+/// whose grammar does not simply contributes nothing here, which leaves its
+/// generics exactly where they are today rather than guessing.
+fn collect_type_parameter_names(callable: Node, source: &str, out: &mut BTreeSet<String>) {
+    let mut cursor = callable.walk();
+    let Some(params) = callable
+        .children(&mut cursor)
+        .find(|child| child.kind() == "type_parameters")
+    else {
+        return;
+    };
+    let mut worklist = vec![params];
+    while let Some(node) = worklist.pop() {
+        // The declared name is the *first* identifier of each entry; a bound
+        // (`T: Display`, `T any`) is a use of another type and must not be
+        // recorded as though this signature declared it.
+        if matches!(node.kind(), "type_parameter" | "constrained_type_parameter") {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .or_else(|| node.named_child(0))
+                .map(|child| get_node_text(child, source))
+                .filter(|name| is_user_ident(name))
+            {
+                out.insert(name);
+            }
+            continue;
+        }
+        if matches!(node.kind(), "type_identifier" | "identifier")
+            && bounded_parent(node).is_some_and(|parent| parent.kind() == "type_parameters")
+        {
+            let name = get_node_text(node, source);
+            if is_user_ident(&name) {
+                out.insert(name);
+            }
+            continue;
+        }
+        let mut children = node.walk();
+        for child in node.named_children(&mut children) {
+            worklist.push(child);
+        }
+    }
+}
+
 fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec<(String, String)> {
     let mut by_scope: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut worklist = vec![root];
@@ -5683,6 +5754,10 @@ fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec
                 // which is why `next_gap_id: Callable[…]` and `cls` were the two
                 // largest remaining unattributed callees on this repository.
                 collect_parameter_names(node, source, entry);
+                // X40. A type parameter is bound by this signature exactly as a
+                // value parameter is, and the resolver reads both from the same
+                // per-scope set.
+                collect_type_parameter_names(node, source, entry);
             }
         }
         push_children(node, &mut worklist);

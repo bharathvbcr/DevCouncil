@@ -9,6 +9,25 @@ use devmap_extract::model::*;
 use crate::model::*;
 use devmap_extract::GoModule;
 
+/// Where the name a resolution rung failed on was written.
+///
+/// The tiers in [`UnresolvedClass`] are stated over evidence, and the evidence
+/// available for a name differs by position: a *value* is answered by the
+/// scope's bindings, the language's builtins and the file's imports, while a
+/// *type* additionally has the qualifier the author wrote beside it and the
+/// language's prelude. Passing the position explicitly is what lets
+/// [`Resolver::classify_unresolved`] consult only the rungs whose evidence
+/// actually exists, instead of a caller pre-deciding which class to file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsePosition<'a> {
+    /// A call, or an identifier in expression position.
+    Value,
+    /// A type annotation. `types` names the value this annotation types — `t`
+    /// for `t *testing.T` — when the extractor recorded one, because that is
+    /// the key the `TypeQualifier` sibling was indexed under.
+    Type { types: Option<&'a str> },
+}
+
 pub struct Resolver {
     symbol_index: BTreeMap<String, Vec<(String, SymbolKind, LangFamily)>>,
     file_symbols: BTreeMap<String, Vec<String>>, // file_path -> symbol_names
@@ -258,6 +277,21 @@ impl Resolver {
             ))
     }
 
+    /// Whether any indexed file this family may resolve into declares `name`.
+    ///
+    /// The corpus's veto over a name table. A rung that says "the language
+    /// declares this" must not fire where the *repository* declares it too:
+    /// there the ladder either bound the reference already or abstained between
+    /// several declarations, and an abstention filed as "expected" is a real
+    /// ambiguity hidden behind a label. Any symbol kind counts — a struct, a
+    /// trait and a function named `Default` are all reasons to abstain.
+    fn family_declares(&self, family: LangFamily, name: &str) -> bool {
+        self.symbol_index.get(name).is_some_and(|hits| {
+            hits.iter()
+                .any(|(_, _, candidate_family)| family.admits(*candidate_family))
+        })
+    }
+
     /// Why a call that failed the resolution ladder has no edge (SC18).
     ///
     /// Ordered by strength of evidence, and **fail-open toward `Unresolved`**:
@@ -271,7 +305,60 @@ impl Resolver {
         callee_name: &str,
         receiver: Option<&str>,
         enclosing_symbol: &str,
+        position: UsePosition<'_>,
     ) -> UnresolvedClass {
+        // X40. A name in type position is classified from type-position
+        // evidence, and only then from the value-position ladder below.
+        //
+        // Ordered the way the value rungs are: file-specific evidence (the
+        // qualifier the author wrote) outranks a name list, for the same reason
+        // an import outranks the host-global table.
+        if let UsePosition::Type { types } = position {
+            // `t *testing.T`. The extractor splits the written type into a bare
+            // name for dispatch and a `TypeQualifier` sibling for provenance
+            // (SC25), so by the time the bare `T` fails the ladder the qualifier
+            // is the only thing that still knows where it came from. Read
+            // through `declared_types`, which is where that sibling was
+            // indexed, and scoped-first for the SC9 reason: a qualifier this
+            // scope wrote may not speak for a same-named binding in another.
+            if let Some(typed) = types {
+                let qualifier = self
+                    .declared_types
+                    .get(&format!("{file_path}:{enclosing_symbol}:{typed}@mod"))
+                    .or_else(|| self.declared_types.get(&format!("{file_path}:{typed}@mod")));
+                if let Some(qualifier) = qualifier {
+                    if let Some(module) = self
+                        .external_imports
+                        .get(file_path)
+                        .and_then(|imports| imports.get(qualifier.as_str()))
+                    {
+                        return UnresolvedClass::External {
+                            module: module.clone(),
+                        };
+                    }
+                    // A repo-relative qualifier that named no indexed file is an
+                    // index gap, exactly as it is for a call — never `External`.
+                    if self
+                        .unindexed_local_imports
+                        .get(file_path)
+                        .is_some_and(|imports| imports.contains_key(qualifier.as_str()))
+                    {
+                        return UnresolvedClass::Unresolved;
+                    }
+                }
+            }
+            // A prelude type, and **nothing in this corpus declares the name**.
+            // The second half is the whole guard: where a file does declare it,
+            // the reference either resolved to that declaration or the resolver
+            // abstained between several, and an abstention is not evidence that
+            // the language owns the name. See `builtins::RUST_PRELUDE_TYPES`.
+            if crate::builtins::is_prelude_type(family, callee_name)
+                && !self.family_declares(family, callee_name)
+            {
+                return UnresolvedClass::Builtin;
+            }
+        }
+
         // The enclosing scope's own binding beats every wider authority, so it
         // is asked first. A parameter named `len` shadows Go's builtin, and a
         // parameter named `useState` shadows the import: in both cases the call
@@ -1384,6 +1471,7 @@ impl Resolver {
                             &call.callee_name,
                             call.receiver_expr.as_deref(),
                             &caller_sym,
+                            UsePosition::Value,
                         );
                         unresolved.push(UnresolvedReference {
                             source_file: ext.file_path.clone(),
@@ -1448,12 +1536,31 @@ impl Resolver {
                         .enclosing_symbol
                         .clone()
                         .unwrap_or_else(|| ext.file_path.clone());
+                    // A `Type` or `TypeQualifier` reference is a type
+                    // annotation; every other surviving kind — `Name`,
+                    // `Heritage`, `HeritageInterface`, `Decorator` — names a
+                    // value or a supertype and is answered by the value rungs.
+                    // Heritage is deliberately *not* a type position here: a
+                    // base class is a real declaration the corpus is expected
+                    // to contain, and exempting an unfound one as "the language
+                    // declares it" would hide a missing supertype.
+                    let position = if matches!(
+                        reference.kind,
+                        ReferenceKind::Type | ReferenceKind::TypeQualifier
+                    ) {
+                        UsePosition::Type {
+                            types: reference.assigned_to.as_deref(),
+                        }
+                    } else {
+                        UsePosition::Value
+                    };
                     let class = self.classify_unresolved(
                         &ext.file_path,
                         family,
                         name,
                         reference.receiver_expr.as_deref(),
                         &source_symbol,
+                        position,
                     );
                     unresolved.push(UnresolvedReference {
                         source_file: ext.file_path.clone(),

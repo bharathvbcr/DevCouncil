@@ -501,6 +501,87 @@ pub fn is_builtin(family: LangFamily, name: &str) -> bool {
     table.binary_search(&name).is_ok()
 }
 
+/// Rust's standard prelude, restricted to the names that appear in **type
+/// position**: the types and traits `std::prelude::rust_2021` brings into scope
+/// with no `use` at all, plus the derive macros usable unqualified.
+///
+/// Kept apart from [`RUST_BUILTINS`] rather than folded into it, because the
+/// two are consulted with different evidence. `RUST_BUILTINS` answers a *bare
+/// callee* — `println!`, `Some(x)` — and a Rust source file cannot write
+/// `String(x)` as a call at all, so nothing in this table belongs there. These
+/// names reach the resolver as `ReferenceKind::Type`, and the rung that reads
+/// them (`Resolver::classify_unresolved`) additionally requires that **no
+/// indexed file of the same family declares the name**. That second condition
+/// is what makes the table safe where the module comment says a name list is
+/// not: `Default`, `Debug`, `Clone`, `Iterator` and `Error`-adjacent names are
+/// all plausible things a Rust repository declares itself, and where one does,
+/// the reference either resolved to it or the resolver *abstained on
+/// ambiguity*. Labelling an abstention "the language declares this" is exactly
+/// the over-classification the module comment forbids, so the corpus gets the
+/// last word.
+///
+/// Audited against the Rust reference's "Standard library prelude" section for
+/// the 2021 edition: `std::prelude::v1` (which re-exports `core::prelude::v1`)
+/// plus the 2021 additions `TryFrom`, `TryInto` and `FromIterator`. The
+/// prelude's enum *variants* — `Some`, `None`, `Ok`, `Err` — are deliberately
+/// absent here and present in [`RUST_BUILTINS`] instead: they are written in
+/// value position, where that table is the one consulted.
+///
+/// Sorted, not grouped by category: [`is_prelude_type`] uses `binary_search`.
+pub const RUST_PRELUDE_TYPES: &[&str] = &[
+    "AsMut",
+    "AsRef",
+    "Box",
+    "Clone",
+    "Copy",
+    "Debug",
+    "Default",
+    "DoubleEndedIterator",
+    "Drop",
+    "Eq",
+    "ExactSizeIterator",
+    "Extend",
+    "Fn",
+    "FnMut",
+    "FnOnce",
+    "From",
+    "FromIterator",
+    "Hash",
+    "Into",
+    "IntoIterator",
+    "Iterator",
+    "Option",
+    "Ord",
+    "PartialEq",
+    "PartialOrd",
+    "Result",
+    "Send",
+    "Sized",
+    "String",
+    "Sync",
+    "ToOwned",
+    "ToString",
+    "TryFrom",
+    "TryInto",
+    "Unpin",
+    "Vec",
+];
+
+/// Whether `name`, written in **type position**, is one the language itself
+/// puts in scope with no import.
+///
+/// Rust only. Every other family either has its type names in [`is_builtin`]
+/// already (Go's predeclared types, JavaScript's constructors, Python's
+/// `str`/`int`/`list`) or has no prelude to speak of, and inventing a table for
+/// one that does not exist would classify a real defect as expected — the one
+/// direction this module refuses to fail in.
+pub fn is_prelude_type(family: LangFamily, name: &str) -> bool {
+    match family {
+        LangFamily::Rust => RUST_PRELUDE_TYPES.binary_search(&name).is_ok(),
+        _ => false,
+    }
+}
+
 /// Swift standard-library **free functions**, from the Swift Standard Library
 /// reference. Swift is a primary language for this repository, so a bare call
 /// to one of these is expected-unresolvable rather than a defect.
@@ -727,6 +808,7 @@ mod tests {
             ("kotlin", KOTLIN_BUILTINS),
             ("ruby", RUBY_BUILTINS),
             ("php", PHP_BUILTINS),
+            ("rust prelude types", RUST_PRELUDE_TYPES),
         ] {
             let mut sorted = table.to_vec();
             sorted.sort_unstable();
