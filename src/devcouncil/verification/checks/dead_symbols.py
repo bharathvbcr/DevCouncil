@@ -31,6 +31,14 @@ from devcouncil.indexing.wiring import (
     strip_py_comments,
     strip_string_literals,
 )
+from devcouncil.devmap_client import (
+    REACHED,
+    REACH_UNKNOWN,
+    UNREACHED,
+    DevMapClient,
+    DevMapClientError,
+    SymbolReach,
+)
 from devcouncil.verification.checks.semantic_diff import task_intent_text
 from devcouncil.verification.stub_detector import added_lines_by_file, task_allows_scaffolding
 
@@ -202,6 +210,48 @@ def _symbol_is_referenced(
     return any(ln < start or ln > end for ln in same_lines)
 
 
+def _symbol_reach(project_root: Path, path: str, name: str) -> SymbolReach:
+    """Ask the kernel whether anything non-test reaches ``name``.
+
+    Two routes to one answer, in order of authority:
+
+    * ``DevMapClient.symbol_is_reached`` — the live store.
+    * ``symbol_has_non_test_inbound`` — ``code_graph.json``, the artifact the
+      same kernel writes. Not a second engine; the same answer by another route
+      when the store cannot be reached.
+
+    The fallback can only *clear* a symbol. It reads a file that may predate the
+    diff being checked, so its silence is not evidence — a stale graph that
+    happens not to mention a symbol added five minutes ago would otherwise
+    confirm the very finding it cannot speak to. Reached is safe from a stale
+    graph (a caller that existed still exists in the tree, or the symbol is
+    older than the graph); unreached is not.
+    """
+    try:
+        client = DevMapClient(project_root)
+        reach = client.symbol_is_reached(path, name)
+    except DevMapClientError as exc:
+        reach = SymbolReach(REACH_UNKNOWN, f"kernel unavailable: {exc}")
+    except (OSError, ValueError) as exc:
+        # Narrow deliberately. A missing binary, an unreadable store or a
+        # malformed argument are conditions this function is expected to meet;
+        # anything else is a defect here and must surface as one rather than be
+        # rendered as "the graph could not confirm it".
+        reach = SymbolReach(REACH_UNKNOWN, f"{type(exc).__name__}: {exc}")
+
+    if reach.verdict != REACH_UNKNOWN:
+        return reach
+
+    try:
+        from devcouncil.indexing.graph.query import symbol_has_non_test_inbound
+
+        if symbol_has_non_test_inbound(project_root, path, name):
+            return SymbolReach(REACHED, "code_graph.json inbound edge")
+    except (ImportError, OSError, ValueError, KeyError, TypeError) as exc:
+        return SymbolReach(REACH_UNKNOWN, f"{reach.detail}; fallback also failed: {exc}")
+    return reach
+
+
 def detect_dead_symbol_gaps(
     *,
     task: Task,
@@ -319,58 +369,24 @@ def detect_dead_symbol_gaps(
                 if _symbol_is_referenced(name, path, start, end, token_index, lines_index):
                     continue
 
-                # True until an inbound check demonstrably could not run.
-                graph_confirmed = True
-
-                try:
-                    from devcouncil.devmap_client import DevMapClient, DevMapClientError
-
-                    client = DevMapClient(project_root)
-                    inbound_resp = client.impact(path, depth=1)
-                    if isinstance(inbound_resp.resolution, dict) and "Unavailable" in inbound_resp.resolution:
-                        raise DevMapClientError(
-                            f"impact unavailable for {path}: {inbound_resp.resolution['Unavailable']}"
-                        )
-                    has_non_test_inbound = any(
-                        _norm(str(item.get("target_file") or "")) == _norm(path)
-                        and (
-                            str(item.get("target_symbol") or "") == name
-                            or str(item.get("target_symbol") or "").endswith(f"::{name}")
-                        )
-                        and not is_test_path(str(item.get("source_file") or ""))
-                        for item in inbound_resp.items
+                # One query, three answers. `reached` clears the symbol,
+                # `unreached` confirms the token scan, and `unknown` means the
+                # strongest check did not run — which is neither of the other
+                # two and must not be spelled like them.
+                reach = _symbol_reach(project_root, path, name)
+                if reach.verdict == REACHED:
+                    continue
+                graph_confirmed = reach.verdict == UNREACHED
+                if not graph_confirmed:
+                    logger.warning(
+                        "dead-symbol graph confirmation unavailable for %s at %s:%s (%s); "
+                        "the finding rests on the token scan alone and is reported "
+                        "non-blocking",
+                        name,
+                        path,
+                        start,
+                        reach.detail,
                     )
-                    if has_non_test_inbound:
-                        continue
-                except DevMapClientError as exc:
-                    logger.debug("devmap client inbound check failed for %s: %s", name, exc)
-                    # Not a second engine: `symbol_has_non_test_inbound` reads
-                    # `code_graph.json`, the artifact the Rust kernel itself
-                    # writes. Reading the kernel's own output when the live
-                    # store cannot be reached is the same answer by another
-                    # route.
-                    try:
-                        from devcouncil.indexing.graph.query import symbol_has_non_test_inbound
-
-                        if symbol_has_non_test_inbound(project_root, path, name):
-                            continue
-                    except Exception:
-                        # Both inbound checks failed. The token scan above still
-                        # ran, so this is not a baseless accusation — but the
-                        # graph evidence that would normally back it is absent,
-                        # and a finding that says "never referenced" while its
-                        # strongest check silently did not run is the SC3c shape:
-                        # a check that could not run reporting what a check that
-                        # ran and passed reports. Recorded, not swallowed.
-                        logger.warning(
-                            "dead-symbol graph confirmation unavailable for %s at %s:%s; "
-                            "the finding rests on the token scan alone",
-                            name,
-                            path,
-                            start,
-                            exc_info=True,
-                        )
-                        graph_confirmed = False
 
                 if lsp_pool is not None:
                     try:
@@ -380,14 +396,27 @@ def detect_dead_symbol_gaps(
                     except Exception:
                         logger.debug("LSP dead-symbol confirm failed for %s", name, exc_info=True)
 
+                # An unconfirmed finding is downgraded on every axis at once:
+                # severity, blocking, and the sentence itself. Previously only
+                # the evidence list differed, so a finding whose strongest
+                # check never ran blocked a task with the same weight and the
+                # same flat assertion — "is never referenced" — as one the
+                # graph confirmed. A gate that cannot tell the caller it failed
+                # open is not a gate.
                 gaps.append(Gap(
                     id=next_gap_id(task.id, f"DEAD-{path}:{start}:{name}"),
-                    severity="high" if dead_symbol_blocking else "medium",
+                    severity=("high" if dead_symbol_blocking else "medium") if graph_confirmed else "low",
                     gap_type="dead_symbol",
                     task_id=task.id,
                     description=(
                         f"New public symbol `{name}` at {path}:{start} is never referenced "
                         "outside its own definition."
+                        if graph_confirmed
+                        else (
+                            f"New public symbol `{name}` at {path}:{start} has no reference in a "
+                            "token scan, but the call graph could not confirm it — treat this as "
+                            "unverified, not as dead code."
+                        )
                     ),
                     evidence=(
                         [f"{path}:{start}", f"symbol:{name}"]
@@ -403,7 +432,7 @@ def detect_dead_symbol_gaps(
                         f"(use `dev scope update {task.id} --lease-token <token> "
                         f"--planned-file <caller>` if the caller is out of scope), or remove it."
                     ),
-                    blocking=dead_symbol_blocking,
+                    blocking=dead_symbol_blocking and graph_confirmed,
                     file=path,
                     line=start,
                 ))
@@ -411,6 +440,47 @@ def detect_dead_symbol_gaps(
             if lsp_pool is not None:
                 lsp_pool.close()
     except Exception:
-        logger.debug("detect_dead_symbol_gaps failed; degrading to zero gaps", exc_info=True)
-        return []
+        # Loud, and at the level a reader will actually see. Returning `[]` is
+        # indistinguishable from "the gate ran and found nothing", so a gate
+        # that degrades silently is a gate that reports `approved` for
+        # `unexamined`. It still degrades — a verification run must not be
+        # brought down by this check — but it says so, and it says so once per
+        # failure rather than at debug level where nothing is listening.
+        logger.error(
+            "detect_dead_symbol_gaps failed for task %s; the dead-symbol gate did NOT "
+            "run and its silence is not a pass",
+            getattr(task, "id", "<unknown>"),
+            exc_info=True,
+        )
+        # And say it where a reader will see it. `verify_orchestration` has a
+        # `quality_gate_failed` gap for exactly this, guarded by `except
+        # Exception` around the call — but this function never raises (its
+        # docstring promises as much), so that branch has never fired and the
+        # outage reached the log alone. The report said nothing, which reads as
+        # "the gate ran and found nothing".
+        #
+        # Non-blocking: an outage is not evidence of a defect in the diff. But
+        # it is evidence the run is incomplete, and that belongs in the result.
+        try:
+            return [Gap(
+                id=next_gap_id(task.id, "QGFAIL-dead_symbol"),
+                severity="medium",
+                gap_type="quality_gate_failed",
+                task_id=task.id,
+                description=(
+                    "Dead-symbol verification gate crashed; it did not run and its "
+                    "silence is not a pass."
+                ),
+                evidence=["gate:dead_symbol"],
+                recommended_fix=(
+                    "Re-run verify after fixing the gate error; do not treat this pass "
+                    "as proven."
+                ),
+                blocking=False,
+            )]
+        except Exception:
+            # `next_gap_id` or the task itself may be what failed. Losing the
+            # marker is worse than losing nothing, but it is all that is left.
+            logger.error("could not even record the dead-symbol gate outage", exc_info=True)
+            return []
     return gaps

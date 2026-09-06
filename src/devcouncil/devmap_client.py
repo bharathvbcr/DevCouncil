@@ -130,6 +130,42 @@ class DevMapStatus:
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
+#: The graph shows a non-test caller.
+REACHED = "reached"
+#: The graph was read in full and holds no non-test caller.
+UNREACHED = "unreached"
+#: The check could not run. Never fold this into :data:`UNREACHED`.
+REACH_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class SymbolReach:
+    """Whether the graph reaches a symbol — in three states, not two.
+
+    A boolean cannot carry this answer. ``False`` would have to mean both "the
+    graph was read and nothing calls it" and "the graph could not be read", and
+    those are the two readings this kernel exists to keep apart: the first is
+    evidence a symbol is dead, the second is the absence of evidence, and a
+    caller that treats them alike deletes live code.
+
+    ``__bool__`` therefore raises. ``if reach:`` is exactly the mistake the type
+    is here to prevent, and it must fail loudly at the call site rather than
+    quietly resolve :data:`REACH_UNKNOWN` to falsy.
+    """
+
+    verdict: str
+    #: Which caller reached it, or why the check could not run. Carried so a
+    #: finding can say *what* was missing rather than only that something was.
+    detail: str = ""
+
+    def __bool__(self) -> bool:  # pragma: no cover - the raise is the contract
+        raise TypeError(
+            "SymbolReach has three states; compare `.verdict` against REACHED, "
+            "UNREACHED or REACH_UNKNOWN rather than testing truthiness — "
+            "`unknown` is not `unreached`"
+        )
+
+
 @dataclass
 class BudgetedResponse:
     shown: int
@@ -166,6 +202,34 @@ class CloneReport:
     groups: BudgetedResponse
     signed_symbols: int
     unsigned_symbols: int
+
+
+def _norm_repo_path(path: str) -> str:
+    """Repo-relative form: forward slashes, no leading ``./``.
+
+    Matches ``devcouncil.indexing.wiring._norm`` exactly. Not imported from
+    there because this module sits below ``indexing`` in the dependency order
+    and must stay importable without it; the rule is two lines and frozen by
+    ``test_symbol_is_reached.py``, which asserts the two agree.
+    """
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _is_test_file(path: str) -> bool:
+    """``wiring.is_test_path``, imported lazily.
+
+    Lazy because ``devcouncil.indexing.wiring`` pulls in the indexing package
+    and this module is imported by tools that have no reason to load it. A
+    module that cannot be imported must not silently make every file look
+    non-test — that would let a test-only caller clear a symbol — so the
+    failure re-raises rather than defaulting.
+    """
+    from devcouncil.indexing.wiring import is_test_path
+
+    return is_test_path(path)
 
 
 def _positional(*values: str) -> List[str]:
@@ -1038,6 +1102,64 @@ class DevMapClient:
             args,
         )
         return self._budgeted(resp, budget)
+
+    def symbol_is_reached(self, path: str, name: str, *, depth: int = 1) -> SymbolReach:
+        """Whether any non-test file calls ``name`` as defined in ``path``.
+
+        A first-class query rather than an ``impact`` call each caller
+        re-interprets. The inbound walk, the target matching, the test-path
+        exclusion and — most of all — the distinction between "no caller" and
+        "could not look" were previously reassembled at the call site, and the
+        gate that did so folded a kernel outage into a `False` that read as
+        "never referenced".
+
+        Returns :data:`REACH_UNKNOWN` for every condition under which the
+        question was not actually answered: the kernel could not be reached, the
+        walk reported itself unavailable, or the walk stopped early. That last
+        one matters and was previously invisible — a capped walk that found no
+        caller has not established there is none.
+        """
+        self._validate_query(path, "path")
+        self._validate_query(name, "name")
+        try:
+            resp = self.impact(path, depth=depth)
+        except DevMapClientError as exc:
+            return SymbolReach(REACH_UNKNOWN, f"kernel unavailable: {exc}")
+
+        if isinstance(resp.resolution, dict) and "Unavailable" in resp.resolution:
+            reason = resp.resolution.get("Unavailable")
+            detail = ""
+            if isinstance(reason, dict):
+                detail = str(reason.get("reason") or "")
+            return SymbolReach(REACH_UNKNOWN, detail or f"impact unavailable for {path}")
+
+        wanted = _norm_repo_path(path)
+        for item in resp.items:
+            if _norm_repo_path(str(item.get("target_file") or "")) != wanted:
+                continue
+            target = str(item.get("target_symbol") or "")
+            if target != name and not target.endswith(f"::{name}"):
+                continue
+            source = str(item.get("source_file") or "")
+            if _is_test_file(source):
+                continue
+            return SymbolReach(REACHED, f"{source}::{item.get('source_symbol') or ''}")
+
+        # Only now, and only if the walk actually finished. A depth cap or a
+        # node cap that stopped short found no caller *in what it searched*,
+        # which is not the same statement as "there is none" — and it is the
+        # statement a delete-this verdict would be built on.
+        if resp.walk_incomplete:
+            return SymbolReach(
+                REACH_UNKNOWN,
+                f"the inbound walk stopped early: {resp.walk_incomplete}",
+            )
+        if resp.truncated:
+            return SymbolReach(
+                REACH_UNKNOWN,
+                f"the inbound edge list was truncated at {resp.shown} of {resp.total}",
+            )
+        return SymbolReach(UNREACHED, f"no non-test caller among {resp.total} inbound edge(s)")
 
     def dead_symbols(self, budget: int = 2000) -> BudgetedResponse:
         self._validate_budget(budget)

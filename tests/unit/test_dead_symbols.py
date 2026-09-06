@@ -172,15 +172,18 @@ def test_same_file_use_outside_span_clears(tmp_path):
         next_gap_id=_gap_id,
         dead_symbol_blocking=True,
     )
-    assert not any(
-        "ModelsConfig" in (g.description or "") and g.blocking
-        for g in gaps if g.gap_type == "dead_symbol"
-    )
-    # AppConfig unused outside its span → still flagged.
-    assert any(
-        "AppConfig" in (g.description or "") and g.blocking
-        for g in gaps if g.gap_type == "dead_symbol"
-    )
+    dead = [g for g in gaps if g.gap_type == "dead_symbol"]
+    # `ModelsConfig` is used by `AppConfig`, outside its own span, so it is not
+    # flagged at all. Asserted as "no gap" rather than "no *blocking* gap": with
+    # no kernel in `tmp_path` nothing blocks, so the weaker form would pass over
+    # a gap that should not exist.
+    assert not any("ModelsConfig" in (g.description or "") for g in dead)
+    # AppConfig unused outside its span → still flagged. Not asserted as
+    # blocking: this fixture has no devmap store, so graph confirmation cannot
+    # run, and a finding whose strongest check did not run is reported
+    # non-blocking by design. `test_dead_symbol_reach.py` pins both directions
+    # of that contract; this test is about the span logic.
+    assert any("AppConfig" in (g.description or "") for g in dead)
 
 
 def test_recursive_self_ref_still_flagged(tmp_path):
