@@ -4771,6 +4771,25 @@ fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
             }
             None => println!("    {language:<12} not measured (no attribution sites)"),
         }
+        // Printed beside a *measured* row too, and that is the point: a language
+        // can attribute calls perfectly and still have no heritage extractor, so
+        // "no Extends edges in this corpus" reads as a fact about the code when
+        // it is a fact about the build. `extracts_calls` already made this
+        // sentence for one bit; the other three had no reader at all.
+        let blind: Vec<&str> = row
+            .blind_to
+            .iter()
+            .map(String::as_str)
+            .filter(|name| *name != "calls")
+            .collect();
+        if !blind.is_empty() {
+            println!(
+                "    {:<12} …and this build extracts no {} for it, so an empty \
+                 answer there is a hole and not a finding",
+                "",
+                blind.join("/")
+            );
+        }
     }
     if rows.len() > RESOLUTION_RATE_LANGUAGES_SHOWN {
         println!(

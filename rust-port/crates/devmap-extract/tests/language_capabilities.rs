@@ -19,7 +19,8 @@
 //! grammar a probe reaches must have a declared capability row.
 
 use devmap_extract::languages::{
-    capabilities_for_language, language_capability_is_declared, Capability, LANGUAGE_SPECS,
+    language_capability_is_declared, Capabilities, Capability, LANGUAGE_SPECS,
+    NON_REGISTRY_CAPABILITIES,
 };
 use devmap_extract::model::ReferenceKind;
 use devmap_extract::{extract_file, Extraction};
@@ -99,15 +100,75 @@ fn observed_by_grammar() -> BTreeMap<String, BTreeSet<Capability>> {
     by_grammar
 }
 
+/// What each grammar *declares*, asked the way production asks it.
+///
+/// `Extraction::capabilities()` and not `capabilities_for_language(&language)`,
+/// because those two are the same function for every grammar but one and the
+/// exception is the whole point: an `.ipynb` stores `language: "notebook"` while
+/// the parse ran under its kernel's grammar, so the string answers `NONE` for a
+/// file that produced calls, imports, references and heritage. A matrix test
+/// that asks a different function than the four production charge sites ask is
+/// checking a claim nothing depends on.
+fn declared_by_grammar() -> BTreeMap<String, Capabilities> {
+    let mut by_grammar: BTreeMap<String, Capabilities> = BTreeMap::new();
+    for (_, extraction) in probes() {
+        by_grammar.insert(extraction.language.clone(), extraction.capabilities());
+    }
+    by_grammar
+}
+
+/// A bit deliberately left clear for a grammar that can be observed producing
+/// it, with the reason.
+///
+/// **The gap this closes.** The matrix below proves `declared ==
+/// observed-on-this-corpus`, which is not `declared == what the extractor
+/// does`: a bit stays clear either because the extractor cannot produce it, or
+/// because no probe happened to ask. Those two are indistinguishable, and the
+/// second is the failure mode the whole capability registry exists to end —
+/// `CALL_EXTRACTION_LANGUAGES` rotted by being a list nothing compared against
+/// behaviour.
+///
+/// So an observation for a clear bit fails, *unless* the pair is named here.
+/// Naming it converts "nobody checked" into a recorded decision, and the entry
+/// is itself checked: a row whose observation stops happening fails too, so a
+/// stale exemption cannot outlive the behaviour it excuses.
+///
+/// Under-claiming is the safe direction — a consumer treats the language as
+/// blind and is more conservative, where a bit claimed but not delivered is the
+/// exact failure W0.1 exists to prevent — but safe is not the same as
+/// unexamined.
+const UNDER_CLAIMED: &[(&str, Capability, &str)] = &[(
+    "liquid",
+    Capability::Heritage,
+    "the vendored tree-sitter-liquid grammar fragments the template run for many \
+     real script bodies (see `liquid_script_scanner_limits.rs`), so heritage is \
+     recoverable from some `.liquid` files and not from others. Declaring the bit \
+     would claim a coverage the grammar does not reliably deliver; leaving it \
+     clear costs only conservatism.",
+)];
+
+fn is_under_claimed(grammar: &str, capability: Capability) -> bool {
+    UNDER_CLAIMED
+        .iter()
+        .any(|(name, declared, _)| *name == grammar && *declared == capability)
+}
+
 #[test]
 fn declared_capabilities_match_observed_extraction_in_both_directions() {
+    let declared_by = declared_by_grammar();
     let mut wrong = Vec::new();
     for (grammar, seen) in observed_by_grammar() {
-        let declared = capabilities_for_language(&grammar);
+        let declared = declared_by
+            .get(&grammar)
+            .copied()
+            .unwrap_or(Capabilities::NONE);
         for capability in Capability::ALL {
             let is_declared = declared.contains(*capability);
             let is_observed = seen.contains(capability);
             if is_declared == is_observed {
+                continue;
+            }
+            if is_observed && is_under_claimed(&grammar, *capability) {
                 continue;
             }
             wrong.push(if is_observed {
@@ -155,6 +216,67 @@ fn every_registry_language_has_a_probe() {
         "no probe file in testdata/capabilities/ parses as: {missing:?} — \
          add one with a call, an import, a reference and a supertype, or this \
          language's capability bits are unverified"
+    );
+}
+
+/// Every recorded under-claim must still be observable.
+///
+/// The vacuity guard for `UNDER_CLAIMED`. Without it, an entry whose extractor
+/// stopped producing the capability — or which was never right — sits in the
+/// table forever excusing a bit nothing checks, which is the state the table
+/// exists to end.
+#[test]
+fn every_recorded_under_claim_is_still_observed() {
+    let seen = observed_by_grammar();
+    let stale: Vec<&str> = UNDER_CLAIMED
+        .iter()
+        .filter(|(grammar, capability, _)| {
+            !seen
+                .get(*grammar)
+                .is_some_and(|caps| caps.contains(capability))
+        })
+        .map(|(grammar, _, _)| *grammar)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "{stale:?} are recorded as deliberately under-claiming a capability the \
+         corpus no longer observes — either the probe stopped exercising it, or \
+         the exemption has outlived its reason and should be deleted"
+    );
+    for (_, _, reason) in UNDER_CLAIMED {
+        assert!(
+            reason.len() > 40,
+            "an under-claim without a real reason is the unexamined state it \
+             exists to replace: {reason:?}"
+        );
+    }
+}
+
+/// The `LANGUAGE_SPECS`-only coverage guard, extended to the rest of the
+/// registry.
+///
+/// `every_registry_language_has_a_probe` iterates `LANGUAGE_SPECS` and stops
+/// there, so the thirteen `NON_REGISTRY_CAPABILITIES` rows were unverified — and
+/// one of them was wrong in the direction that matters. `("notebook",
+/// Capabilities::NONE)` sat beside a `notebook.rs` that fills
+/// `extraction.imports` and `extraction.calls`, and nothing could notice
+/// because there was no `.ipynb` in the corpus for the matrix to look at.
+#[test]
+fn every_declared_language_has_a_probe() {
+    let covered: BTreeSet<String> = probes()
+        .into_iter()
+        .map(|(_, extraction)| extraction.language)
+        .collect();
+    let missing: Vec<&str> = NON_REGISTRY_CAPABILITIES
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !covered.contains(*name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "no probe file in testdata/capabilities/ parses as: {missing:?} — these \
+         rows declare capabilities nothing compares against behaviour, which is \
+         the state `CALL_EXTRACTION_LANGUAGES` rotted in"
     );
 }
 

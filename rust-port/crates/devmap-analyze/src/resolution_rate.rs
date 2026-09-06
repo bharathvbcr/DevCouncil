@@ -59,6 +59,22 @@ pub struct LanguageResolution {
     /// have surfaced in.
     #[serde(default)]
     pub extracts_calls: bool,
+    /// The capabilities this build does **not** have for the language, by name.
+    ///
+    /// `Capability::Heritage` and `Capability::References` had no production
+    /// reader at all: two of the registry's four bits were declared, maintained
+    /// and bidirectionally tested, and consulted by nobody — which is half the
+    /// registry sitting in the state the constant it replaced was condemned for,
+    /// minus the wrongness. This is the reader, and it is the same sentence
+    /// `extracts_calls` already makes: an empty answer from a blind extractor
+    /// and an empty answer from a language that simply has none of the thing
+    /// must not render alike. A Pascal corpus with no `Extends` edges is not a
+    /// Pascal corpus with no inheritance.
+    ///
+    /// Both projections come from one `Capabilities` value, so `extracts_calls`
+    /// cannot disagree with the absence of `"calls"` here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blind_to: Vec<String>,
     /// Attribution sites that produced at least one edge.
     pub resolved_sites: usize,
     /// Sites the ladder gave up on, all six classes.
@@ -218,6 +234,20 @@ pub fn resolution_rate(
     // attempt no attribution and never will; a row for every `.md` extension
     // would bury the source languages under noise, which is its own way of
     // hiding the answer.
+    // One capability set per language key, unioned over the files reported
+    // under it. See `Capabilities::union` for why the union is the honest
+    // aggregate.
+    let mut capabilities_by_language: std::collections::BTreeMap<
+        String,
+        devmap_extract::languages::Capabilities,
+    > = std::collections::BTreeMap::new();
+    for ext in extractions {
+        let entry = capabilities_by_language
+            .entry(ext.language.clone())
+            .or_insert(devmap_extract::languages::Capabilities::NONE);
+        *entry = entry.union(ext.capabilities());
+    }
+
     let mut present: std::collections::BTreeSet<String> = extractions
         .iter()
         .filter(|ext| {
@@ -238,12 +268,24 @@ pub fn resolution_rate(
             .get(&language)
             .copied()
             .unwrap_or((0, 0));
-        let extracts_calls = devmap_extract::languages::capabilities_for_language(&language)
-            .contains(devmap_extract::languages::Capability::Calls);
+        // Asked of the extractions, not of the language string, so a notebook
+        // row reports its kernel's capabilities rather than `NONE`. Falls back
+        // to the registry for a language that appears only in the resolution
+        // maps and has no extraction in this corpus.
+        let capabilities = capabilities_by_language
+            .get(&language)
+            .copied()
+            .unwrap_or_else(|| devmap_extract::languages::capabilities_for_language(&language));
+        let extracts_calls = capabilities.contains(devmap_extract::languages::Capability::Calls);
+        let blind_to: Vec<String> = capabilities
+            .missing()
+            .map(|capability| capability.label().to_string())
+            .collect();
         by_language.insert(
             language,
             LanguageResolution {
                 extracts_calls,
+                blind_to,
                 resolved_sites: resolved,
                 unresolved_sites: unresolved,
                 explained_sites: explained,

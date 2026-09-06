@@ -268,3 +268,80 @@ fn every_language_in_the_corpus_gets_a_row() {
         );
     }
 }
+
+/// **R13.** Every capability bit the registry declares must reach a consumer.
+///
+/// `Capability::Calls` and `Capability::Imports` had production readers;
+/// `Heritage` and `References` had none in any crate. Two of four bits were
+/// declared, maintained and bidirectionally verified against a probe corpus, and
+/// read by nobody — which is half the registry sitting in exactly the state
+/// `CALL_EXTRACTION_LANGUAGES` was condemned for, minus the wrongness. A fact
+/// nothing consults is a fact nothing keeps true.
+///
+/// Derived over `Capability::ALL` and over the real probe corpus, so a fifth bit
+/// added to the enum fails here until it too has a reader, and so the corpus
+/// this asserts against is the same one the registry is verified against.
+#[test]
+fn every_capability_bit_reaches_the_per_language_readout() {
+    use devmap_extract::languages::Capability;
+
+    let corpus_dir = std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/capabilities"
+    ));
+    let mut extractions: Vec<Extraction> = Vec::new();
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&corpus_dir)
+        .expect("the capability corpus must exist")
+        .map(|entry| entry.expect("a readable entry").path())
+        .filter(|path| path.is_file())
+        .collect();
+    entries.sort();
+    for path in entries {
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        extractions.push(extract_file(&name, &source));
+    }
+    assert!(
+        !extractions.is_empty(),
+        "an empty corpus would make every assertion below vacuous"
+    );
+
+    let rate = rate_of(&extractions);
+    assert!(
+        !rate.by_language.is_empty(),
+        "the corpus must produce per-language rows"
+    );
+
+    let disclosed: std::collections::BTreeSet<&str> = rate
+        .by_language
+        .values()
+        .flat_map(|row| row.blind_to.iter().map(String::as_str))
+        .collect();
+    let unread: Vec<&str> = Capability::ALL
+        .iter()
+        .map(|capability| capability.label())
+        .filter(|label| !disclosed.contains(label))
+        .collect();
+    assert!(
+        unread.is_empty(),
+        "{unread:?} are declared by the capability registry and reach no \
+         consumer; a bit nothing reads is a bit nothing keeps true. Disclosed: \
+         {disclosed:?}"
+    );
+
+    // The OFF direction: a language with every bit set must disclose nothing,
+    // or `blind_to` is a field that is always non-empty and therefore says
+    // nothing.
+    let python = rate
+        .by_language
+        .get("python")
+        .expect("the corpus contains a Python probe");
+    assert!(
+        python.blind_to.is_empty(),
+        "Python declares every capability; disclosing a blindness for it would \
+         make the field meaningless: {:?}",
+        python.blind_to
+    );
+}
