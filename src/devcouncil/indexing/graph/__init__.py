@@ -36,7 +36,6 @@ if TYPE_CHECKING:  # pragma: no cover - import-time cost is the whole point
     )
     from devcouncil.indexing.graph.export import (  # noqa: F401
         build_code_graph_okf,
-        export_graphml,
         file_doc_rel,
         write_code_graph_okf,
     )
@@ -52,7 +51,6 @@ if TYPE_CHECKING:  # pragma: no cover - import-time cost is the whole point
     from devcouncil.indexing.graph.okf_export import (  # noqa: F401
         build_graph_okf_bundle,
         export_graph_okf,
-        graph_to_graphml,
     )
     from devcouncil.indexing.graph.query import (  # noqa: F401
         query_symbol,
@@ -74,7 +72,6 @@ _EXPORTS: dict[str, str] = {
     "load_code_graph": "build",
     "write_code_graph": "build",
     "build_code_graph_okf": "export",
-    "export_graphml": "export",
     "file_doc_rel": "export",
     "write_code_graph_okf": "export",
     "blast_radius": "intel",
@@ -97,7 +94,6 @@ _EXPORTS: dict[str, str] = {
     # `repo_mapper` rather than for cost. Both reasons now share one mechanism.
     "build_graph_okf_bundle": "okf_export",
     "export_graph_okf": "okf_export",
-    "graph_to_graphml": "okf_export",
 }
 
 __all__ = sorted(_EXPORTS)

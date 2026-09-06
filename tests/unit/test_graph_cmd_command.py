@@ -355,23 +355,66 @@ def test_graph_impact_no_paths(tmp_path, monkeypatch):
 # --- export -----------------------------------------------------------------------
 
 
+def _no_python_graph(monkeypatch):
+    """GraphML comes from the kernel; the Python graph must not even be loaded."""
+
+    def _never(root):
+        raise AssertionError("graphml export must not load the Python code graph")
+
+    monkeypatch.setattr(graph_build, "load_code_graph", _never)
+
+
 def test_graph_export_graphml_stdout(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
-    monkeypatch.setattr(export_mod, "export_graphml", lambda graph: "<graphml/>")
+    import devcouncil.devmap_engine as devmap_engine
+
+    _no_python_graph(monkeypatch)
+    calls = []
+
+    def fake_export(root, *, output=None, timeout=120.0):
+        calls.append((root, output))
+        return {"text": "<graphml/>\n"}
+
+    monkeypatch.setattr(devmap_engine, "export_graphml", fake_export)
     result = runner.invoke(app, ["map", "export", "--format", "graphml", "--project-root", str(tmp_path)])
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert "<graphml/>" in result.output
+    assert calls == [(tmp_path.resolve(), None)]
 
 
-def test_graph_export_graphml_to_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
-    monkeypatch.setattr(export_mod, "export_graphml", lambda graph: "<graphml/>")
+def test_graph_export_graphml_to_file_reports_the_kernel_counts(tmp_path, monkeypatch):
+    import devcouncil.devmap_engine as devmap_engine
+
+    _no_python_graph(monkeypatch)
+
+    def fake_export(root, *, output=None, timeout=120.0):
+        output.write_text("<graphml/>", encoding="utf-8")
+        return {"nodes": 3, "edges": 2, "edges_dangling": 1, "characters_replaced": 0}
+
+    monkeypatch.setattr(devmap_engine, "export_graphml", fake_export)
     out = tmp_path / "out" / "g.graphml"
     result = runner.invoke(
         app, ["map", "export", "--format", "graphml", "-o", str(out), "--project-root", str(tmp_path)]
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert out.read_text(encoding="utf-8") == "<graphml/>"
+    # The repairs the Python exporter never made, and never reported. Rich
+    # wraps the line at the runner's 80 columns, so compare on words.
+    assert "1 edge(s) omitted" in " ".join(result.output.split())
+
+
+def test_graph_export_graphml_kernel_failure_is_red(tmp_path, monkeypatch):
+    import devcouncil.devmap_engine as devmap_engine
+    from devcouncil.devmap_engine import DevMapEngineError
+
+    _no_python_graph(monkeypatch)
+
+    def fake_export(root, *, output=None, timeout=120.0):
+        raise DevMapEngineError("no devmap binary", code="engine_unavailable", stage="export")
+
+    monkeypatch.setattr(devmap_engine, "export_graphml", fake_export)
+    result = runner.invoke(app, ["map", "export", "--format", "graphml", "--project-root", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "no devmap binary" in result.output
 
 
 def test_graph_export_okf_requires_dir(tmp_path, monkeypatch):

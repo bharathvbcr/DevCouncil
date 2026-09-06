@@ -1336,3 +1336,69 @@ def _write_manifest_separately(
     # afterwards. Doing both would re-serialize the graph for no reason.
     if not stamped_by_kernel:
         stamp_freshness(root, map_path, graph_path)
+
+
+def export_graphml(
+    root: Path,
+    *,
+    output: Optional[Path] = None,
+    timeout: float = 120.0,
+) -> Dict[str, Any]:
+    """``devmap export``: the committed generation as attributed GraphML.
+
+    The kernel is the only exporter. `indexing/graph/export.py` held a second
+    one until 2026-09-06 — the Rust module's own docstring opens "Ported from
+    the GraphML half of `indexing/graph/export.py`" — and the survivor was the
+    worse of the two: it emitted edges whose endpoints it never declared as
+    nodes (invalid GraphML) and left the C0 controls XML forbids unescaped,
+    and reported neither. The kernel repairs both and counts both
+    (``edges_dangling``, ``characters_replaced``), and its attribute set is a
+    superset of the Python one (``language``, ``line`` and the graph-level
+    ``liveness_reliable`` on top of kind/path/name/area/community/dead/
+    unwired/unreachable).
+
+    With ``output`` the file is written and the kernel's ``--json`` report is
+    returned. Without it the document itself is returned under ``"text"``,
+    which is the kernel's own ``-o -``.
+    """
+    root = Path(root).expanduser().resolve()
+    binary = find_engine_binary(root)
+    if output is None:
+        argv = [binary, "--progress", "never", "export", str(root), "-o", "-"]
+    else:
+        argv = [binary, "--progress", "never", "--json", "export", str(root), "-o", str(output)]
+    try:
+        completed = _run(argv, cwd=root, timeout=timeout, stage="export")
+    except DevMapEngineError as exc:
+        if any(marker in str(exc).lower() for marker in _UNKNOWN_SUBCOMMAND_MARKERS):
+            raise DevMapEngineError(
+                f"the devmap binary {binary} has no `export` subcommand — it predates "
+                "the Rust GraphML exporter.",
+                code="binary_too_old",
+                fix=(
+                    "Rebuild the kernel with `cargo build --release -p devmap-cli` in "
+                    f"rust-port/, or set {BINARY_ENV_VAR} to a newer build."
+                ),
+                stage="export",
+            ) from exc
+        raise
+    if output is None:
+        return {"text": completed.stdout}
+    lines = [line for line in str(completed.stdout).splitlines() if line.strip()]
+    try:
+        report = json.loads(lines[-1]) if lines else None
+    except json.JSONDecodeError:
+        report = None
+    if not isinstance(report, dict):
+        raise DevMapEngineError(
+            "devmap export reported success but printed no JSON report",
+            code="artifact_missing",
+            stage="export",
+        )
+    if not Path(output).is_file():
+        raise DevMapEngineError(
+            f"devmap reported success but did not write {output}",
+            code="artifact_missing",
+            stage="export",
+        )
+    return report

@@ -8,7 +8,6 @@ from devcouncil.indexing.graph.build import write_code_graph
 from tests.unit.graph_fixtures import kernel_graph
 from devcouncil.indexing.graph.export import (
     build_code_graph_okf,
-    export_graphml,
     file_doc_rel,
     write_code_graph_okf,
 )
@@ -52,17 +51,6 @@ def _tiny_graph(tmp_path):
 def test_file_doc_rel_convention():
     assert file_doc_rel("src/foo.py") == "files/src/foo.py.md"
     assert file_doc_rel("./pkg/a.py") == "files/pkg/a.py.md"
-
-
-def test_export_graphml_has_attributes(tmp_path):
-    graph = _tiny_graph(tmp_path)
-    xml = export_graphml(graph)
-    assert 'attr.name="kind"' in xml
-    assert 'attr.name="confidence"' in xml
-    assert 'attr.name="community"' in xml
-    assert 'attr.name="dead"' in xml
-    assert "<data key=\"kind\">" in xml
-    assert "<data key=\"ekind\">" in xml
 
 
 def test_code_graph_okf_bundle_valid(tmp_path):

@@ -14,16 +14,6 @@ from devcouncil.indexing.graph.schema import CodeGraph, GraphNode
 from devcouncil.knowledge.okf import OKFBundle, OKFDocument, write_bundle
 
 
-def _xml(s: str) -> str:
-    return (
-        str(s)
-        .replace("&", "&amp;")
-        .replace('"', "&quot;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
 def _kind_val(obj: Any) -> str:
     if hasattr(obj, "value"):
         return str(obj.value)
@@ -52,57 +42,6 @@ def _rel_link(from_rel: str, to_rel: str) -> str:
     """POSIX relative link from one bundle doc to another."""
     src = PurePosixPath(from_rel).parent
     return os.path.relpath(to_rel, start=str(src) or ".").replace("\\", "/")
-
-
-def export_graphml(graph: CodeGraph) -> str:
-    """GraphML with node/edge attributes (kind, confidence, area, community, dead)."""
-    dead = _dead_ids(graph)
-    unwired = set(graph.unwired_candidates)
-    unreliable = bool(graph.meta.get("liveness_unreachable_unreliable"))
-    unreachable = set() if unreliable else set(graph.unreachable_files)
-    lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
-        '  <key id="kind" for="node" attr.name="kind" attr.type="string"/>',
-        '  <key id="path" for="node" attr.name="path" attr.type="string"/>',
-        '  <key id="name" for="node" attr.name="name" attr.type="string"/>',
-        '  <key id="area" for="node" attr.name="area" attr.type="string"/>',
-        '  <key id="community" for="node" attr.name="community" attr.type="string"/>',
-        '  <key id="dead" for="node" attr.name="dead" attr.type="boolean"/>',
-        '  <key id="unwired" for="node" attr.name="unwired" attr.type="boolean"/>',
-        '  <key id="unreachable" for="node" attr.name="unreachable" attr.type="boolean"/>',
-        '  <key id="ekind" for="edge" attr.name="kind" attr.type="string"/>',
-        '  <key id="confidence" for="edge" attr.name="confidence" attr.type="string"/>',
-        '  <graph id="G" edgedefault="directed">',
-    ]
-    for n in graph.nodes:
-        nid = _xml(n.id)
-        community = (n.community or "").strip() or (n.area or "")
-        lines.append(f'    <node id="{nid}">')
-        lines.append(f'      <data key="kind">{_xml(_kind_val(n.kind))}</data>')
-        lines.append(f'      <data key="path">{_xml(n.path)}</data>')
-        lines.append(f'      <data key="name">{_xml(n.name)}</data>')
-        lines.append(f'      <data key="area">{_xml(n.area)}</data>')
-        lines.append(f'      <data key="community">{_xml(community)}</data>')
-        lines.append(f'      <data key="dead">{"true" if (n.id in dead) else "false"}</data>')
-        lines.append(
-            f'      <data key="unwired">{"true" if (n.path in unwired or n.id in unwired) else "false"}</data>'
-        )
-        lines.append(
-            f'      <data key="unreachable">'
-            f'{"true" if (n.path in unreachable or n.id in unreachable) else "false"}</data>'
-        )
-        lines.append("    </node>")
-    for i, e in enumerate(graph.edges):
-        lines.append(
-            f'    <edge id="e{i}" source="{_xml(e.source)}" target="{_xml(e.target)}">'
-        )
-        lines.append(f'      <data key="ekind">{_xml(e.kind)}</data>')
-        lines.append(f'      <data key="confidence">{_xml(_kind_val(e.confidence))}</data>')
-        lines.append("    </edge>")
-    lines.append("  </graph>")
-    lines.append("</graphml>")
-    return "\n".join(lines)
 
 
 def _areas_from_graph(graph: CodeGraph) -> Dict[str, List[GraphNode]]:
