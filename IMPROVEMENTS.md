@@ -1733,3 +1733,29 @@ gaps are `rust-port/testdata/fixtures/languages/cobol/main.cob` and `scripts/ins
 pattern), and `rust-port/vendor/grammars/cobol/parser.c` (refused by discovery) — each with the
 kernel's own reason. That binary does not yet report `edge_confidence_mismatches`, and the
 `edges` check says so rather than passing.
+
+## Staleness is age, not coverage (2026-09-06)
+
+Found on this repository minutes after the "leave no gaps" merge: `dev map` had just written
+the map, every fingerprint in `repo_map.json` matched the tree (`generated_head`,
+`indexed_hash`, `content_fingerprint` all equal to what the kernel recomputed) and `git status`
+was clean, yet `dev map doctor` said `freshness: tracked files changed since the map was
+written`. `RepoMapper.map_is_stale` had a branch: a map with `graph_degraded` set is stale,
+"so `--if-stale` / watch / verify keep retrying until healthy". This repository's degradation
+is permanent and correct — `rust-port/vendor/grammars/cobol/parser.c` at 30.6 MB against the
+1 MiB ceiling, two files with no linked grammar — so all eleven consumers of that verdict
+(`--if-stale`, the hook's Continuity line on every prompt, verification's `stale_map` and
+`corpus_stale` checks, the MCP freshness annotation, the prompt builder, the doctor) called
+the map stale forever, and the doctor explained it with a cause that was false.
+
+`RepoMapper.staleness(repo_map) -> Optional[str]` is now the one owner of the verdict *and*
+its reason (HEAD moved / tracked file set changed / tracked file contents changed / could not
+be verified), `map_is_stale` is `staleness() is not None`, and `map_freshness` reports the
+owner's reason instead of deriving one from the heads. Degradation is reported where it
+belongs — `graph_degraded`, `degraded_reason`, the doctor's `kernel` check, which now names
+the files. A rebuild cannot make a refused file readable.
+
+Red first: `tests/unit/test_map_staleness_is_not_degradation.py` — the degraded-but-current
+case is the live reproduction above (`map_is_stale` True with every fingerprint equal); the
+reason vocabulary and the fail-closed "could not be verified" path are pinned. 552 related
+unit tests pass; ruff and mypy clean.

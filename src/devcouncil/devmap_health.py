@@ -374,22 +374,17 @@ def map_freshness(root: Path) -> Dict[str, Any]:
         result["current_head"] = mapper._git_head()
     except Exception:  # noqa: BLE001 - freshness must not raise
         result["current_head"] = ""
+    # One owner for the verdict and its reason. Deriving the reason here from
+    # the heads alone once produced "tracked files changed since the map was
+    # written" for a map whose every fingerprint matched — the verdict had come
+    # from the map's `graph_degraded` flag, which is coverage, not age.
     try:
-        stale = bool(mapper.map_is_stale(payload))
+        reason = mapper.staleness(payload)
     except Exception as exc:  # noqa: BLE001
         result["reason"] = f"freshness check failed: {exc}"
         return result
-    result["fresh"] = not stale
-    if stale:
-        if result["map_head"] and result["current_head"] and result["map_head"] != result["current_head"]:
-            result["reason"] = (
-                f"map was built from {result['map_head'][:12]} but HEAD is "
-                f"{result['current_head'][:12]}"
-            )
-        elif not payload.get("generated_head") and not payload.get("indexed_hash"):
-            result["reason"] = "map carries no freshness stamps"
-        else:
-            result["reason"] = "tracked files changed since the map was written"
+    result["fresh"] = reason is None
+    result["reason"] = reason or ""
     return result
 
 

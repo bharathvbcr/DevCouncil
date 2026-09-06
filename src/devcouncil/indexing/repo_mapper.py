@@ -2137,42 +2137,66 @@ class RepoMapper:
             self.project_root, files, persist_cache=self.persist_content_cache
         )
 
-    def map_is_stale(self, repo_map: Dict[str, object]) -> bool:
-        """True when the stored map no longer matches the repo's current git HEAD,
-        tracked file set, or content fingerprint — i.e. commits, file add/removes, or
-        plain edits happened since ``dev map`` last ran.
+    def staleness(self, repo_map: Dict[str, object]) -> Optional[str]:
+        """Why the stored map no longer describes the tree, or ``None`` when it does.
 
-        Fail-closed: exceptions from ``get_git_files`` / content fingerprinting
-        return True (stale) so ``--if-stale`` / verify rebuild rather than trusting
-        an unverifiable map.
+        The one owner of the freshness verdict *and* its reason: every consumer
+        (``--if-stale``, the hook's Continuity line, verification's stale-map
+        check, the MCP freshness annotation, the doctor) asks this, so they
+        cannot disagree with each other or explain a verdict with the wrong
+        cause. Compares git HEAD, the tracked file set and the content
+        fingerprint, in that order, and names the first that differs.
 
-        Returns False for maps written before fingerprinting (no false alarms).
-        Legacy maps without ``content_fingerprint`` skip the content check.
+        Fail-closed: a tree that cannot be listed or fingerprinted is reported
+        stale, with a reason that says it could not be verified rather than
+        claiming something changed.
+
+        A map written before fingerprinting (no stamps at all) is not stale —
+        there is nothing to compare, and a false alarm on every legacy map is
+        noise, not caution. Legacy maps without ``content_fingerprint`` skip the
+        content check.
+
+        Degradation is *not* staleness. A map whose ``graph_degraded`` flag is
+        set is a partial map of the tree as it stands — a vendored 30 MB
+        ``parser.c`` refused at the source ceiling, a file with no linked
+        grammar — and that fact is reported as coverage (``graph_degraded``,
+        ``degraded_reason``, the doctor's ``kernel`` check), not as age. This
+        method used to answer ``True`` for it "so ``--if-stale`` keeps retrying
+        until healthy"; on a repository whose degradation is permanent that
+        made every consumer call the map stale forever, the hook demand a
+        rebuild on every prompt, and the doctor say "tracked files changed" of
+        a tree nothing had touched. A rebuild cannot make a refused file
+        readable.
         """
         stored_head = str(repo_map.get("generated_head") or "")
         stored_hash = str(repo_map.get("indexed_hash") or "")
         if not stored_head and not stored_hash:
-            return False
-        # Lean/degraded maps re-stamp fingerprints but lack a trustworthy graph —
-        # fail closed so --if-stale / watch / verify keep retrying until healthy.
-        if bool(repo_map.get("graph_degraded")):
-            return True
+            return None
+        try:
+            current_head = self._git_head()
+        except Exception:  # noqa: BLE001 - fail closed, and say why
+            return "git HEAD could not be read, so freshness could not be verified"
+        if stored_head and current_head != stored_head:
+            return f"map was built from {stored_head[:12]} but HEAD is {current_head[:12]}"
         try:
             files = self.get_git_files()
-        except Exception:
-            # Fail closed: cannot prove freshness → treat as stale so --if-stale /
-            # verify rebuild rather than trusting a possibly outdated map.
-            return True
-        if self._git_head() != stored_head or self._files_fingerprint(files) != stored_hash:
-            return True
+        except Exception:  # noqa: BLE001
+            return "tracked files could not be listed, so freshness could not be verified"
+        if stored_hash and self._files_fingerprint(files) != stored_hash:
+            return "tracked file set changed since the map was written"
         stored_content = str(repo_map.get("content_fingerprint") or "")
         if not stored_content:
-            # Legacy maps without content_fingerprint skip the content check.
-            return False
+            return None
         try:
-            return self._content_fingerprint(files) != stored_content
-        except Exception:
-            return True
+            if self._content_fingerprint(files) != stored_content:
+                return "tracked file contents changed since the map was written"
+        except Exception:  # noqa: BLE001
+            return "tracked file contents could not be fingerprinted, so freshness could not be verified"
+        return None
+
+    def map_is_stale(self, repo_map: Dict[str, object]) -> bool:
+        """``staleness(repo_map) is not None`` — kept for its eleven callers."""
+        return self.staleness(repo_map) is not None
 
     def _inventory_limits(self) -> tuple[bool, int]:
         """``(include_untracked, max_indexed_files)`` from indexing config."""
