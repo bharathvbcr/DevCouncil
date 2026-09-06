@@ -18,6 +18,7 @@
 //! coupling-only score under the same name would be a different metric wearing
 //! the old one's label.
 
+use crate::dead_clusters::strongly_connected_components;
 use std::collections::{BTreeMap, BTreeSet};
 
 use devmap_extract::model::EdgeKind;
@@ -243,80 +244,6 @@ impl GraphIntel {
             .collect();
         self
     }
-}
-
-/// Tarjan's strongly connected components, iterative.
-///
-/// Iterative rather than recursive because the input is a whole repository's
-/// import graph and a recursive walk is one deep chain away from overflowing
-/// the stack.
-///
-/// **This duplicates `dead_clusters::strongly_connected_components`**, which is
-/// the same algorithm over the same shape of adjacency list and is private to
-/// that module. The correct end state is one implementation: make that one
-/// `pub(crate)` and delete this. It is written out here only because
-/// `dead_clusters.rs` belongs to another lane in this pass and may not be
-/// edited — the visibility change is a one-word diff and is reported as the
-/// follow-up.
-fn strongly_connected_components(adjacency: &[Vec<u32>]) -> Vec<Vec<u32>> {
-    let count = adjacency.len();
-    let mut index_of: Vec<u32> = vec![u32::MAX; count];
-    let mut low_link: Vec<u32> = vec![0; count];
-    let mut on_stack: Vec<bool> = vec![false; count];
-    let mut stack: Vec<u32> = Vec::new();
-    let mut components: Vec<Vec<u32>> = Vec::new();
-    let mut next_index: u32 = 0;
-
-    for root in 0..count {
-        if index_of[root] != u32::MAX {
-            continue;
-        }
-        // (node, how many of its successors have been visited)
-        let mut call_stack: Vec<(u32, usize)> = vec![(root as u32, 0)];
-        index_of[root] = next_index;
-        low_link[root] = next_index;
-        next_index += 1;
-        stack.push(root as u32);
-        on_stack[root] = true;
-
-        while let Some((node, cursor)) = call_stack.pop() {
-            let successors = &adjacency[node as usize];
-            if cursor < successors.len() {
-                let successor = successors[cursor];
-                call_stack.push((node, cursor + 1));
-                if index_of[successor as usize] == u32::MAX {
-                    index_of[successor as usize] = next_index;
-                    low_link[successor as usize] = next_index;
-                    next_index += 1;
-                    stack.push(successor);
-                    on_stack[successor as usize] = true;
-                    call_stack.push((successor, 0));
-                } else if on_stack[successor as usize] {
-                    low_link[node as usize] =
-                        low_link[node as usize].min(index_of[successor as usize]);
-                }
-                continue;
-            }
-            // Every successor is done: fold this node's low-link into its
-            // parent's, then close the component if this node roots one.
-            if let Some((parent, _)) = call_stack.last() {
-                low_link[*parent as usize] =
-                    low_link[*parent as usize].min(low_link[node as usize]);
-            }
-            if low_link[node as usize] == index_of[node as usize] {
-                let mut component = Vec::new();
-                while let Some(member) = stack.pop() {
-                    on_stack[member as usize] = false;
-                    component.push(member);
-                    if member == node {
-                        break;
-                    }
-                }
-                components.push(component);
-            }
-        }
-    }
-    components
 }
 
 #[cfg(test)]
