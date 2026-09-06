@@ -1501,6 +1501,46 @@ fn write_consumer_artifacts(
 /// to spawn a third process to learn what the store it just wrote looks like.
 /// The schema keys are *not* here — they come from a probe `status` runs before
 /// it opens the store at all, and a build has already opened it.
+///
+/// What this kernel can be asked to do, read out of its own parser.
+///
+/// The seam used to learn this by running `devmap manifest --help` and
+/// `devmap build --help` and grepping the output — two extra process launches
+/// (~140 ms each, measured) per `dev map`, on top of the `status` probe it
+/// already runs to rank candidate binaries. `status` is the probe that has to
+/// happen anyway, so it is the one that should answer.
+///
+/// Derived from clap's command tree rather than asserted, because a hand-written
+/// `true` is a claim that drifts the moment a flag is renamed: this cannot
+/// declare a flag the binary does not actually accept. A kernel too old to carry
+/// this key declares nothing, and the seam falls back to the `--help` probe —
+/// "no evidence" must not read as "does not support it".
+fn kernel_capabilities() -> serde_json::Value {
+    use clap::CommandFactory;
+    let command = Cli::command();
+    let accepts = |subcommand: &str, flag: &str| -> bool {
+        command
+            .get_subcommands()
+            .find(|candidate| candidate.get_name() == subcommand)
+            .is_some_and(|candidate| {
+                candidate
+                    .get_arguments()
+                    .any(|argument| argument.get_long() == Some(flag))
+            })
+    };
+    // All three or none: a kernel accepting only some of the digests would need
+    // the read-modify-write path for the rest, and running both is strictly
+    // worse than running one.
+    let stamp_flags = ["generated-head", "indexed-hash", "content-fingerprint"]
+        .iter()
+        .all(|flag| accepts("manifest", flag));
+    serde_json::json!({
+        "manifest_graph_output": accepts("manifest", "graph-output"),
+        "manifest_stamp_flags": stamp_flags,
+        "build_manifest": accepts("build", "manifest"),
+    })
+}
+
 fn store_status_fields(
     store: &Store,
     db: &std::path::Path,
@@ -3931,6 +3971,10 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "schema_outdated": false,
                     "schema_version": serde_json::Value::Null,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
+                    // A property of the binary, not of the store — so it is
+                    // answered even here, where there is no store. This is the
+                    // exit the seam's own probe takes.
+                    "capabilities": kernel_capabilities(),
                 });
                 // Through `emit_json` like every other exit from this command.
                 // Printed pretty regardless of `--json`, this was the one
@@ -3965,6 +4009,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "schema_outdated": true,
                     "schema_version": version,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
+                    "capabilities": kernel_capabilities(),
                 });
                 emit_json(cli, &payload)?;
                 return Ok(());
@@ -3982,6 +4027,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 "expected_schema_version".into(),
                 serde_json::json!(devmap_store::CURRENT_SCHEMA_VERSION),
             );
+            payload.insert("capabilities".into(), kernel_capabilities());
             emit_json(cli, &serde_json::Value::Object(payload))?;
         }
         Commands::History { last } => {

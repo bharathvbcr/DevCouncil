@@ -91,7 +91,7 @@ def _isolate_binary_search(monkeypatch, tmp_path: Path, *, path_binary: Path | N
     import shutil as _shutil
 
     monkeypatch.setattr(_shutil, "which", lambda _name: str(path_binary) if path_binary else None)
-    devmap_engine._MANIFEST_HELP_CACHE.clear()
+    devmap_engine._clear_probe_caches()
     return package_root
 
 
@@ -116,7 +116,7 @@ def test_the_newest_capable_build_wins_over_a_stale_release_binary(tmp_path, mon
 
     # And the other way round: a release rebuilt after the debug build wins.
     _set_mtime(release, now)
-    devmap_engine._MANIFEST_HELP_CACHE.clear()
+    devmap_engine._clear_probe_caches()
     assert find_engine_binary() == str(release)
 
 
@@ -152,7 +152,7 @@ def test_an_explicit_binary_override_is_honoured_and_still_probed(tmp_path, monk
 
     stale = _fake_kernel(tmp_path / "stale" / "devmap", capable=False)
     monkeypatch.setenv("DEVMAP_BINARY", str(stale))
-    devmap_engine._MANIFEST_HELP_CACHE.clear()
+    devmap_engine._clear_probe_caches()
     with pytest.raises(DevMapEngineError) as caught:
         find_engine_binary()
     assert str(stale) in str(caught.value)

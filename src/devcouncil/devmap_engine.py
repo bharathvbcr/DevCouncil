@@ -142,23 +142,61 @@ def _expected_schema_version(binary: str) -> Optional[int]:
 
     `devmap --db <path with no store> status` reports `expected_schema_version`
     and exits 0 without creating anything, so the question can be asked
-    directly. Memoised by path, mtime and size exactly as `_manifest_help` is:
-    every build of this workspace reports the same `devmap 0.1.0`, so the path
-    alone is not an identity.
+    directly — see `_status_probe`, which is the launch this reads.
 
     Returns `None` when the binary cannot answer — a kernel too old to have the
     field, a probe that fails, unparseable output. `None` is not 0: it means
     "no evidence", and the caller must not treat it as a low version.
+    """
+    candidate = _status_probe(binary).get("expected_schema_version")
+    return candidate if isinstance(candidate, int) else None
+
+
+def _status_probe(binary: str) -> dict:
+    """`devmap --db <no store> status`, parsed and memoised per binary identity.
+
+    The one launch that asks a candidate binary about itself. Two questions come
+    out of it — which schema it writes (`_expected_schema_version`) and what it
+    can be asked to do (`_declared_capability`) — because they were three
+    separate process launches before: this probe, `manifest --help`, and
+    `build --help`.
+
+    `_manifest_help` used to claim those cost "~140 ms each, measured". They do
+    not, and that figure should not be repeated: measured on a release binary,
+    medians of 15 runs, `manifest --help` is 7.7 ms, `build --help` 7.4 ms and
+    this probe 8.2 ms. Folding the two `--help` launches in saves ~15 ms per
+    `dev map` — worth having, and not on its own why this exists. The reason is
+    that one probe with one memo has one failure mode to get right, and the
+    three separate ones did not: see the note below on why a failure is never
+    cached.
+
+    Keyed by path, mtime and size: every build of this workspace reports the
+    same `devmap 0.1.0`, so the path alone is not an identity.
+
+    `{}` on any failure, which is "no evidence" and never "no". Every caller
+    degrades to the older, slower way of asking rather than concluding anything
+    from silence.
+
+    **A failure is not memoised.** Only an answer is. A probe can fail for
+    reasons that have nothing to do with the binary — the machine was out of
+    file descriptors, the fork failed, something replaced `subprocess.run` for
+    the duration of one call — and caching that verdict turns a transient
+    failure into a permanent one: the binary is condemned for the life of the
+    process and re-probing it, the only thing that could clear it, is exactly
+    what the cache prevents. Retrying a genuinely unprobeable binary costs a
+    failed spawn; not retrying costs "no devmap binary supports this map
+    engine".
     """
     try:
         stat = Path(binary).stat()
         key = (binary, stat.st_mtime_ns, stat.st_size)
     except OSError:
         key = (binary, 0, 0)
-    if key in _SCHEMA_PROBE_CACHE:
-        return _SCHEMA_PROBE_CACHE[key]
+    cached = _STATUS_PROBE_CACHE.get(key)
+    if cached is not None:
+        return cached
 
-    version: Optional[int] = None
+    payload: dict = {}
     # A path under the temp directory that this process never creates. The
     # probe is a question about the *binary*, so it must not touch the store it
     # is being selected for — running `status` against the real store would
@@ -171,12 +209,11 @@ def _expected_schema_version(binary: str) -> Optional[int]:
             text=True,
             timeout=30,
         )
-        payload = json.loads(probe.stdout or "{}")
-        candidate = payload.get("expected_schema_version")
-        if isinstance(candidate, int):
-            version = candidate
+        parsed = json.loads(probe.stdout or "{}")
+        if isinstance(parsed, dict):
+            payload = parsed
     except (OSError, subprocess.SubprocessError, ValueError):
-        version = None
+        payload = {}
     finally:
         # Belt and braces: `status` is verified not to create a store, and if
         # that ever changes the probe must not leave one behind.
@@ -184,11 +221,50 @@ def _expected_schema_version(binary: str) -> Optional[int]:
             probe_db.unlink()
         except OSError:
             pass
-    _SCHEMA_PROBE_CACHE[key] = version
-    return version
+    if payload:
+        _STATUS_PROBE_CACHE[key] = payload
+    return payload
 
 
-_SCHEMA_PROBE_CACHE: dict[tuple[str, int, int], Optional[int]] = {}
+def _declared_capability(binary: str, name: str) -> Optional[bool]:
+    """What the kernel says about one of its own capabilities, or `None`.
+
+    The kernel derives this block from its own argument parser, so a `True` here
+    is a stronger statement than a substring found in help text, and a `False` is
+    a real denial that no `--help` probe should second-guess.
+
+    `None` means the kernel did not say — it is older than the `capabilities`
+    key, or it could not be probed at all. That is the absence of evidence, and
+    the caller must fall back to asking `--help` rather than treating it as a
+    denial: rejecting such a kernel would turn "built before the key existed"
+    into "no devmap binary supports this map engine".
+    """
+    capabilities = _status_probe(binary).get("capabilities")
+    if not isinstance(capabilities, dict):
+        return None
+    value = capabilities.get(name)
+    return value if isinstance(value, bool) else None
+
+
+#: Parsed `status` payloads, per binary identity. Empty dict is a real answer
+#: ("probed, learned nothing"), so `.get` with a `None` default distinguishes it
+#: from "not yet probed".
+_STATUS_PROBE_CACHE: dict[tuple[str, int, int], dict] = {}
+
+
+def _clear_probe_caches() -> None:
+    """Forget everything learned about candidate binaries.
+
+    Every memo in this module is keyed on a binary's identity, which is exactly
+    what a test that writes a new fake kernel to the same path invalidates. One
+    function so a test cannot clear two of the three and be silently judged on a
+    previous fixture's answers — which is what happened when `manifest --help`
+    kept a cache of its own and the schema probe's name changed underneath the
+    `getattr` guards that were meant to be defensive.
+    """
+    _STATUS_PROBE_CACHE.clear()
+    _SUBCOMMAND_HELP_CACHE.clear()
+    _DEBUG_KERNEL_WARNED.clear()
 
 #: Debug-kernel selections already warned about, as `(path, schema)`.
 #:
@@ -273,14 +349,26 @@ def find_engine_binary(root: Optional[Path] = None) -> str:
             if override and str(candidate) == str(Path(override).expanduser()):
                 rejected.append(f"{candidate} (from {BINARY_ENV_VAR}: not an executable file)")
             continue
-        # Through the memoised probe, so the later stamp-capability check reuses
-        # this process launch instead of spending its own.
-        help_text = _manifest_help(str(candidate))
+        # The kernel's own declaration first — it comes out of the `status`
+        # probe this selection runs anyway. Only a kernel that declares nothing
+        # costs the `manifest --help` launch, and then the old rule applies
+        # unchanged: silence is not a denial.
         is_override = bool(override) and str(candidate) == str(Path(override).expanduser())
-        if not help_text:
-            rejected.append(f"{candidate} (did not respond to --help)")
-        elif "--graph-output" not in help_text:
-            rejected.append(f"{candidate} (too old: no --graph-output)")
+        declared = _declared_capability(str(candidate), "manifest_graph_output")
+        if declared is True:
+            graph_output, reason = True, ""
+        elif declared is False:
+            graph_output, reason = False, f"{candidate} (declares no --graph-output)"
+        else:
+            help_text = _manifest_help(str(candidate))
+            graph_output = bool(help_text) and "--graph-output" in help_text
+            reason = (
+                f"{candidate} (did not respond to --help)"
+                if not help_text
+                else f"{candidate} (too old: no --graph-output)"
+            )
+        if not graph_output:
+            rejected.append(reason)
         else:
             if is_override:
                 return str(candidate)
@@ -350,38 +438,12 @@ def find_engine_binary(root: Optional[Path] = None) -> str:
 
 
 def _manifest_help(binary: str) -> str:
-    """`devmap manifest --help`, memoised per binary path.
+    """`devmap manifest --help`, memoised per binary identity.
 
-    `find_engine_binary` already runs this probe to reject a kernel too old to
-    write the graph companion, and asking a second time to test a second
-    capability would spend another process launch (~140 ms measured) answering a
-    question the first answer contains. Keyed by path *and* mtime so a rebuilt
-    binary is re-probed rather than judged on its predecessor's capabilities —
-    every build of this workspace reports the same `devmap 0.1.0`, so the path
-    alone is not an identity.
+    The fallback for a kernel that does not declare its capabilities. There is
+    one memo for every subcommand probe — see `_subcommand_help`.
     """
-    try:
-        stat = Path(binary).stat()
-        key = (binary, stat.st_mtime_ns, stat.st_size)
-    except OSError:
-        key = (binary, 0, 0)
-    cached = _MANIFEST_HELP_CACHE.get(key)
-    if cached is not None:
-        return cached
-    try:
-        probe = subprocess.run(
-            [binary, "manifest", "--help"], capture_output=True, text=True, timeout=30
-        )
-        text = probe.stdout or ""
-    except (OSError, subprocess.SubprocessError):
-        # An unprobeable binary is treated as lacking the capability, never as
-        # having it: the fallback path still produces a correctly stamped map.
-        text = ""
-    _MANIFEST_HELP_CACHE[key] = text
-    return text
-
-
-_MANIFEST_HELP_CACHE: dict[tuple[str, int, int], str] = {}
+    return _subcommand_help(binary, "manifest")
 
 
 def _manifest_accepts_stamp_flags(binary: str) -> bool:
@@ -390,7 +452,13 @@ def _manifest_accepts_stamp_flags(binary: str) -> bool:
     All three are required. A kernel accepting only some of them would need the
     read-modify-write path for the rest, and running both is strictly worse than
     running one — so the capability is all-or-nothing.
+
+    Asked of the kernel's `status` first, which has already run; only a kernel
+    that does not answer there costs the `--help` launch.
     """
+    declared = _declared_capability(binary, "manifest_stamp_flags")
+    if declared is not None:
+        return declared
     help_text = _manifest_help(binary)
     return all(
         flag in help_text
@@ -1052,7 +1120,13 @@ def _build_accepts_manifest(binary: str) -> bool:
     Probed the same way `_manifest_accepts_stamp_flags` probes its flags, and
     memoised by the same `(path, mtime, size)` key. A kernel without it gets the
     old two-invocation path, unchanged.
+
+    Asked of the kernel's `status` first, which has already run; only a kernel
+    that does not answer there costs the `--help` launch.
     """
+    declared = _declared_capability(binary, "build_manifest")
+    if declared is not None:
+        return declared
     return "--manifest" in _build_help(binary)
 
 
@@ -1064,9 +1138,17 @@ def _build_help(binary: str) -> str:
 def _subcommand_help(binary: str, subcommand: str) -> str:
     """`devmap <subcommand> --help`, memoised by binary identity and subcommand.
 
-    One memo for both probes: `manifest --help` was already cached this way, and
-    a second cache keyed the same way for a second subcommand is the kind of
-    near-duplicate that drifts.
+    One memo for every subcommand probe. `manifest --help` used to keep a second
+    cache keyed exactly the same way; it is gone, and `_manifest_help` is a call
+    to this — the near-duplicate this docstring warned about had already grown.
+
+    This is now only the *fallback*: a kernel that declares its capabilities in
+    `status` is never probed this way. It stays because a kernel that declares
+    nothing has told us nothing, and the question still has to be answered.
+
+    Like `_status_probe`, only an *answer* is memoised. Empty output means the
+    probe did not run, and remembering that permanently would let one failed
+    spawn condemn a working kernel for the life of the process.
     """
     try:
         stat = Path(binary).stat()
@@ -1085,7 +1167,8 @@ def _subcommand_help(binary: str, subcommand: str) -> str:
         # An unprobeable binary is treated as lacking the capability, never as
         # having it: the fallback path still produces a correctly stamped map.
         text = ""
-    _SUBCOMMAND_HELP_CACHE[key] = text
+    if text:
+        _SUBCOMMAND_HELP_CACHE[key] = text
     return text
 
 

@@ -381,13 +381,11 @@ def _only_these_candidates(monkeypatch, tmp_path):
 
     monkeypatch.setattr(devmap_engine, "__file__", str(tmp_path / "elsewhere" / "b" / "c.py"))
     monkeypatch.setattr(_shutil, "which", lambda _: None)
-    devmap_engine._MANIFEST_HELP_CACHE.clear()
-    # `getattr` so the red demonstration of these tests is the *selection*
-    # failing, not an AttributeError on a cache that did not exist yet.
-    getattr(devmap_engine, "_SCHEMA_PROBE_CACHE", {}).clear()
-    # The debug-kernel warning fires once per selection; without this a test
-    # asserting it would pass or fail on test *order*.
-    getattr(devmap_engine, "_DEBUG_KERNEL_WARNED", set()).clear()
+    # One call, because clearing some of the memos and not others judges a fresh
+    # fixture on a previous one's answers. It also covers the debug-kernel
+    # warning, which fires once per selection — without that a test asserting it
+    # would pass or fail on test *order*.
+    devmap_engine._clear_probe_caches()
 
 
 def test_an_optimized_build_wins_over_a_newer_debug_build_at_the_same_schema(
