@@ -434,6 +434,8 @@ async fn every_tool_result_conforms_to_the_output_schema_it_declared() {
             "devmap_preview",
             json!({"file": "core.py", "content": "def helper(rows):\n    return 0\n"}),
         ),
+        ("devmap_explore", json!({"query": "helper"})),
+        ("devmap_affected_tests", json!({"targets": ["helper"]})),
     ];
     assert_eq!(
         arguments.len(),

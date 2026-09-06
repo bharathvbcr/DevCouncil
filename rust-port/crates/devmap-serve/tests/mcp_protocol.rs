@@ -75,7 +75,7 @@ fn every_declared_tool_maps_to_a_command() {
     let specs = tool_specs();
     assert_eq!(
         specs.len(),
-        9,
+        11,
         "the tool surface changed; update this count"
     );
     for spec in &specs {
@@ -90,6 +90,8 @@ fn every_declared_tool_maps_to_a_command() {
             "devmap_trace" => json!({"from": "helper"}),
             "devmap_neighbors" => json!({"targets": ["helper"]}),
             "devmap_preview" => json!({"file": "core.py", "content": "def helper():\n    pass\n"}),
+            "devmap_explore" => json!({"query": "helper"}),
+            "devmap_affected_tests" => json!({"targets": ["helper"]}),
             other => panic!("tool {other} has no argument fixture in this test"),
         };
         to_ipc_command(name, Some(&arguments))

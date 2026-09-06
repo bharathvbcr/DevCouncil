@@ -726,12 +726,17 @@ pub fn is_ignored_path(rel_path: &str) -> bool {
     }
     let lower = norm.to_lowercase();
     for part in lower.split('/') {
+        // Both state directory names, always — a repository mid-migration has
+        // `.devmap/` and `.devcouncil/` on disk at once, and indexing either
+        // would put a sqlite store and a 20 MB graph into the graph.
+        if crate::paths::is_state_dir_name(part) {
+            return true;
+        }
         if matches!(
             part,
             "target"
                 | "node_modules"
                 | ".git"
-                | ".devcouncil"
                 | "dist"
                 | "build"
                 | "__pycache__"

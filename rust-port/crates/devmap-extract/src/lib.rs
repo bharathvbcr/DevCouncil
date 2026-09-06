@@ -17,6 +17,9 @@ pub mod langcalls;
 pub(crate) mod langdecl;
 pub mod languages;
 pub mod model;
+// Where state lives. Below the `parse` gate on purpose: a query-only consumer
+// needs to find the store and the artifacts without linking a single grammar.
+pub mod paths;
 // Needs the grammars: a notebook's cells are reconstructed and then handed to
 // the real extractor, so this module is only meaningful with `parse` on.
 #[cfg(feature = "parse")]
@@ -34,6 +37,10 @@ use rayon::prelude::*;
 pub use gomod::{collect_go_modules, git_worktree_root, parse_go_mod, GoModule};
 pub use languages::{detect_language, is_ignored_path, is_indexable_source};
 pub use model::*;
+pub use paths::{
+    code_graph_path, compact_code_graph_path, content_cache_path, plugin_dir, repo_map_path,
+    state_dir, store_path, workspace_path,
+};
 #[cfg(feature = "parse")]
 pub use treesitter::extract_treesitter;
 

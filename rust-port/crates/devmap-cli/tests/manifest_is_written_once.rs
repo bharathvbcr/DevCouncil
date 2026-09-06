@@ -122,7 +122,7 @@ fn identity(path: &Path) -> (u64, i128, u64) {
 }
 
 fn db(root: &Path) -> String {
-    root.join(".devcouncil/codeintel/devmap.sqlite")
+    devmap_extract::paths::store_path(root)
         .to_string_lossy()
         .into_owned()
 }
@@ -150,7 +150,7 @@ fn one_invocation_writes_the_artifacts_and_reports_the_store() {
     assert_eq!(manifest["status"]["generation_id"], built["generation_id"]);
 
     let map: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join(".devcouncil/repo_map.json")).unwrap(),
+        &std::fs::read_to_string(devmap_extract::paths::repo_map_path(&root)).unwrap(),
     )
     .unwrap();
     assert_eq!(map["map_engine"], serde_json::json!("devmap-rust"));
@@ -177,8 +177,8 @@ fn a_second_run_over_an_unchanged_tree_rewrites_nothing() {
     let db = db(&root);
     run_json(&root, &["--db", &db, "build", ".", "--manifest", "--force"]);
 
-    let map_path = root.join(".devcouncil/repo_map.json");
-    let graph_path = root.join(".devcouncil/graph/code_graph.json");
+    let map_path = devmap_extract::paths::repo_map_path(&root);
+    let graph_path = devmap_extract::paths::code_graph_path(&root);
     let before = (identity(&map_path), identity(&graph_path));
 
     let again = run_json(&root, &["--db", &db, "build", ".", "--manifest", "--force"]);
@@ -218,7 +218,7 @@ fn every_input_that_changes_the_artifacts_defeats_the_skip() {
 
     // 1. An artifact edited under us is not the artifact we wrote.
     std::fs::write(
-        root.join(".devcouncil/repo_map.json"),
+        devmap_extract::paths::repo_map_path(&root),
         "{\"map_engine\":\"devmap-rust\"}",
     )
     .unwrap();
@@ -229,13 +229,13 @@ fn every_input_that_changes_the_artifacts_defeats_the_skip() {
     );
 
     // 2. An artifact deleted must be rewritten.
-    std::fs::remove_file(root.join(".devcouncil/graph/code_graph.json")).unwrap();
+    std::fs::remove_file(devmap_extract::paths::code_graph_path(&root)).unwrap();
     assert_eq!(
         run_json(&root, &base)["manifest"]["artifacts_unchanged"],
         serde_json::json!(false),
         "a missing artifact must be rewritten"
     );
-    assert!(root.join(".devcouncil/graph/code_graph.json").is_file());
+    assert!(devmap_extract::paths::code_graph_path(&root).is_file());
 
     // 3. A caller-supplied stamp is a different identity from the kernel's own.
     let stamped = run_json(
@@ -261,7 +261,7 @@ fn every_input_that_changes_the_artifacts_defeats_the_skip() {
         serde_json::json!("caller")
     );
     let map: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join(".devcouncil/repo_map.json")).unwrap(),
+        &std::fs::read_to_string(devmap_extract::paths::repo_map_path(&root)).unwrap(),
     )
     .unwrap();
     assert_eq!(map["generated_head"], serde_json::json!("deadbeef"));
@@ -295,8 +295,8 @@ fn the_skipped_artifacts_equal_the_ones_a_forced_write_produces() {
     let db = db(&root);
     let base: Vec<&str> = vec!["--db", &db, "build", ".", "--manifest", "--force"];
     run_json(&root, &base);
-    let map_after_write = std::fs::read(root.join(".devcouncil/repo_map.json")).unwrap();
-    let graph_after_write = std::fs::read(root.join(".devcouncil/graph/code_graph.json")).unwrap();
+    let map_after_write = std::fs::read(devmap_extract::paths::repo_map_path(&root)).unwrap();
+    let graph_after_write = std::fs::read(devmap_extract::paths::code_graph_path(&root)).unwrap();
 
     let skipped = run_json(&root, &base);
     assert_eq!(
@@ -315,12 +315,12 @@ fn the_skipped_artifacts_equal_the_ones_a_forced_write_produces() {
     );
     assert_eq!(
         map_after_write,
-        std::fs::read(root.join(".devcouncil/repo_map.json")).unwrap(),
+        std::fs::read(devmap_extract::paths::repo_map_path(&root)).unwrap(),
         "the map a skip preserved differs from the one a write produces"
     );
     assert_eq!(
         graph_after_write,
-        std::fs::read(root.join(".devcouncil/graph/code_graph.json")).unwrap(),
+        std::fs::read(devmap_extract::paths::code_graph_path(&root)).unwrap(),
         "the graph a skip preserved differs from the one a write produces"
     );
 

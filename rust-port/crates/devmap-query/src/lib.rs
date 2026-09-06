@@ -12,6 +12,7 @@ pub mod digest;
 pub mod engine;
 pub mod escape;
 pub mod freshness;
+pub mod guides;
 pub mod manifest;
 pub mod model;
 pub mod query_match;
@@ -28,8 +29,7 @@ pub use artifacts::{
 pub use cancel::{cancelled_queries, Cancel, QueryCancelled};
 pub use code_graph::{
     decode_compact, encode_compact, generate_code_graph_encodings, generate_code_graph_json,
-    write_code_graph_atomically, CODE_GRAPH_COMPACT_DEFAULT_OUTPUT, CODE_GRAPH_COMPACT_ENCODING,
-    CODE_GRAPH_DEFAULT_OUTPUT, CODE_GRAPH_SCHEMA_VERSION,
+    write_code_graph_atomically, CODE_GRAPH_COMPACT_ENCODING, CODE_GRAPH_SCHEMA_VERSION,
 };
 pub use engine::{
     budget_take, clone_group_tokens, is_test_path, link_candidates, parse_clone_kind,

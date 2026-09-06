@@ -40,8 +40,13 @@ use serde_json::{json, Map, Value};
 /// `SCHEMA_VERSION` in `src/devcouncil/indexing/graph/schema.py`.
 pub const CODE_GRAPH_SCHEMA_VERSION: u32 = 2;
 
-/// Consumer default path, relative to the indexed repository root.
-pub const CODE_GRAPH_DEFAULT_OUTPUT: &str = ".devcouncil/graph/code_graph.json";
+// The consumer default paths that used to live here — `CODE_GRAPH_DEFAULT_OUTPUT`
+// and `CODE_GRAPH_COMPACT_DEFAULT_OUTPUT` — are gone rather than updated. Which
+// directory holds an artifact is now resolved per repository by
+// `devmap_extract::paths`, so a fixed relative string could only be right for
+// one of the two layouts, and a caller reading it would write the graph
+// somewhere the reader of that repository does not look. Use
+// `devmap_extract::paths::code_graph_path` / `compact_code_graph_path`.
 
 /// Milliconfidence floors for the Python tri-state `Confidence` enum.
 ///
@@ -885,9 +890,6 @@ pub fn generate_code_graph_encodings(
 /// a later version rather than read it as `v1` and answer from a layout it does
 /// not understand.
 pub const CODE_GRAPH_COMPACT_ENCODING: &str = "devmap-compact-v1";
-
-/// Consumer default path for the interned artifact, beside the verbose one.
-pub const CODE_GRAPH_COMPACT_DEFAULT_OUTPUT: &str = ".devcouncil/graph/code_graph.compact.json";
 
 /// The tables worth interning. Both are arrays of uniformly-shaped objects and
 /// together they are 99.7% of the artifact (measured on DevCouncil: edges

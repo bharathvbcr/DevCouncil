@@ -20,7 +20,19 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Where a workspace registry lives, relative to the repository it is rooted in.
-pub const WORKSPACE_RELPATH: &str = ".devcouncil/workspace.json";
+///
+/// Kept as a constant for the messages and tests that name it, but every path
+/// actually opened goes through [`workspace_path`], which resolves the state
+/// directory. A registry written to `.devmap/` in one invocation and read from
+/// `.devcouncil/` in the next is an empty registry reported as "no repositories
+/// registered", which reads exactly like a registry nobody has filled in.
+pub const WORKSPACE_RELPATH: &str = ".devmap/workspace.json";
+
+/// Absolute path to `root`'s workspace registry, in whichever state directory
+/// that repository resolved to.
+pub fn workspace_path(root: &Path) -> PathBuf {
+    devmap_extract::paths::workspace_path(root)
+}
 
 /// One registered repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,8 +46,38 @@ pub struct WorkspaceRepo {
     pub db: String,
 }
 
+/// The store path for an entry whose `db` field is missing from the registry
+/// file.
+///
+/// Only reachable through serde's `default`, i.e. for a registry written before
+/// the field existed. It names the standalone layout because that is what a
+/// fresh repository resolves to; an entry written by [`Workspace::add`] always
+/// carries the path resolved against its own root and never falls back here.
 fn default_db_relpath() -> String {
-    ".devcouncil/codeintel/devmap.sqlite".to_string()
+    format!(
+        "{}/{}",
+        devmap_extract::paths::STATE_DIR,
+        devmap_extract::paths::STORE_RELPATH
+    )
+}
+
+/// The store path to record for `root`, relative to `root` itself.
+///
+/// Relative rather than absolute so a registry stays portable across machines
+/// and checkouts. The *choice* of state directory is resolved here, against the
+/// repository being registered, so a `.devcouncil/` repository and a `.devmap/`
+/// one can sit in the same workspace and each be opened where its store
+/// actually is.
+fn store_relpath_for(root: &Path) -> String {
+    let store = devmap_extract::paths::store_path(root);
+    store
+        .strip_prefix(root)
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        // `$DEVMAP_HOME` can point outside the repository, which no relative
+        // path can express. Record it absolute rather than silently recording a
+        // path that resolves somewhere else: `db_path` joins onto `root`, and
+        // joining an absolute path replaces the root, so this stays correct.
+        .unwrap_or_else(|_| store.to_string_lossy().replace('\\', "/"))
 }
 
 impl WorkspaceRepo {
@@ -69,7 +111,7 @@ impl Workspace {
     /// workspace-wide question with one repository's data and no indication
     /// that the rest were dropped.
     pub fn load(root: &Path) -> anyhow::Result<Self> {
-        let path = root.join(WORKSPACE_RELPATH);
+        let path = workspace_path(root);
         if !path.is_file() {
             return Ok(Self {
                 version: WORKSPACE_VERSION,
@@ -108,7 +150,7 @@ impl Workspace {
     /// serialises the read and the write; this on its own is atomic per write,
     /// not per read-modify-write.
     pub fn save(&self, root: &Path) -> anyhow::Result<PathBuf> {
-        let path = root.join(WORKSPACE_RELPATH);
+        let path = workspace_path(root);
         let body = serde_json::to_string_pretty(self)?;
         crate::write_atomic(&path, body.as_bytes())?;
         Ok(path)
@@ -140,12 +182,16 @@ impl Workspace {
     }
 
     /// Register a repository. Replaces any entry with the same name.
+    ///
+    /// The store path is resolved against `root` *at registration time* rather
+    /// than defaulted, because the two layouts coexist: a repository that keeps
+    /// its state under `.devcouncil/` must be recorded with that path, or every
+    /// later workspace query opens a `.devmap/` store that was never built and
+    /// reports the repository as having no symbols — a confident zero, which is
+    /// the one answer this codebase refuses to give.
     pub fn add(&mut self, name: String, root: PathBuf) {
-        let entry = WorkspaceRepo {
-            name,
-            root,
-            db: default_db_relpath(),
-        };
+        let db = store_relpath_for(&root);
+        let entry = WorkspaceRepo { name, root, db };
         match self.repos.iter_mut().find(|repo| repo.name == entry.name) {
             Some(existing) => *existing = entry,
             None => self.repos.push(entry),
@@ -218,7 +264,11 @@ impl RegistryLock {
 /// Where the registry's advisory lock lives: beside the registry itself, so a
 /// workspace rooted anywhere carries its own.
 fn registry_lock_path(root: &Path) -> PathBuf {
-    root.join(format!("{WORKSPACE_RELPATH}.lock"))
+    let path = workspace_path(root);
+    path.with_file_name(format!(
+        "{}.lock",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ))
 }
 
 /// Derive a workspace name from a repository path.
@@ -300,8 +350,9 @@ mod tests {
     #[test]
     fn a_malformed_registry_is_an_error_not_an_empty_workspace() {
         let dir = scratch("malformed");
-        std::fs::create_dir_all(dir.join(".devcouncil")).unwrap();
-        std::fs::write(dir.join(WORKSPACE_RELPATH), "{ not json").unwrap();
+        let registry = workspace_path(&dir);
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::write(&registry, "{ not json").unwrap();
         let error = Workspace::load(&dir).expect_err("malformed registry must fail");
         assert!(
             error.to_string().contains("not a valid workspace"),
@@ -315,8 +366,9 @@ mod tests {
     #[test]
     fn a_future_registry_version_is_refused() {
         let dir = scratch("future");
-        std::fs::create_dir_all(dir.join(".devcouncil")).unwrap();
-        std::fs::write(dir.join(WORKSPACE_RELPATH), r#"{"version":99,"repos":[]}"#).unwrap();
+        let registry = workspace_path(&dir);
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::write(&registry, r#"{"version":99,"repos":[]}"#).unwrap();
         let error = Workspace::load(&dir).expect_err("future version must fail");
         assert!(error.to_string().contains("version 99"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);

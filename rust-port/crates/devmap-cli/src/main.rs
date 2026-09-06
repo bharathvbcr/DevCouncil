@@ -1,5 +1,5 @@
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -14,7 +14,7 @@ use devmap_query::{
     generate_code_graph_encodings, generate_manifest_with_edges, resolve_manifest_output,
     resolved_edge_from_stored, semantic_snapshots, write_code_graph_atomically,
     write_manifest_atomically, ArtifactStamp, FreshnessInfo, Request, ResolutionAvailability,
-    StampedFreshness, StoreQueryEngine, CODE_GRAPH_DEFAULT_OUTPUT, CODE_GRAPH_SCHEMA_VERSION,
+    StampedFreshness, StoreQueryEngine, CODE_GRAPH_SCHEMA_VERSION,
 };
 use devmap_resolve::{Resolver, UnresolvedClass};
 use devmap_serve::{default_ipc_path_for, Daemon};
@@ -127,12 +127,13 @@ struct Cli {
     ///
     /// `devmap.sqlite`, not `index.sqlite`. The latter is the *Python* engine's
     /// store — `user_version = 2`, a schema this binary has no migration for —
-    /// so the old default aimed every un-flagged invocation at a database that
-    /// could only be refused, while the Python seam
-    /// (`devmap_engine.DEFAULT_DB_RELPATH`) had already moved here. Keep the two
-    /// in step: this string and that constant name the same file.
-    #[arg(short, long, default_value = ".devcouncil/codeintel/devmap.sqlite")]
-    db: PathBuf,
+    /// so an un-flagged invocation must never aim at it.
+    ///
+    /// Unset, it is resolved by [`Cli::db`] rather than fixed to a literal:
+    /// which state directory a repository uses is a property of the repository,
+    /// not of this binary. See `devmap_extract::paths`.
+    #[arg(short, long)]
+    db: Option<PathBuf>,
 
     #[arg(long, default_value_t = false)]
     json: bool,
@@ -143,6 +144,39 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+impl Cli {
+    /// The tree this invocation is about.
+    ///
+    /// Only the subcommands that actually name a repository root contribute
+    /// one. `claude validate <path>` is deliberately absent: its argument is a
+    /// *file* to check, and treating it as a root would resolve the store
+    /// relative to a hooks manifest.
+    fn root_hint(&self) -> &Path {
+        match &self.command {
+            Commands::Build { path, .. }
+            | Commands::Manifest { path, .. }
+            | Commands::Freshness { path, .. }
+            | Commands::Serve { path, .. } => path,
+            _ => Path::new("."),
+        }
+    }
+
+    /// The store this invocation reads and writes.
+    ///
+    /// An explicit `--db` is used as given — the Python seam passes one on
+    /// every call, so DevCouncil's behaviour cannot change here. Otherwise the
+    /// store is resolved against [`Self::root_hint`], which is what makes
+    /// `devmap build /other/repo` index into *that* repository instead of
+    /// creating a state directory under whatever the shell's working directory
+    /// happened to be.
+    fn db(&self) -> PathBuf {
+        match &self.db {
+            Some(explicit) => explicit.clone(),
+            None => devmap_extract::paths::store_path(self.root_hint()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -467,14 +501,16 @@ enum Commands {
         /// that wants it should not have to run a build to get it.
         #[arg(long)]
         manifest: bool,
-        #[arg(
-            long,
-            requires = "manifest",
-            default_value = ".devcouncil/repo_map.json"
-        )]
-        output: PathBuf,
-        #[arg(long, requires = "manifest", default_value = CODE_GRAPH_DEFAULT_OUTPUT)]
-        graph_output: PathBuf,
+        /// Unset, resolved against `path`'s state directory. See
+        /// `devmap_extract::paths`.
+        #[arg(long, requires = "manifest")]
+        output: Option<PathBuf>,
+        /// Unset, resolved against `path`'s state directory.
+        #[arg(long, requires = "manifest")]
+        graph_output: Option<PathBuf>,
+        /// Also write the marker-guarded agent guides. See `manifest --guides`.
+        #[arg(long, requires = "manifest")]
+        guides: bool,
         /// Replace a Python-schema or otherwise foreign repo map / code graph.
         #[arg(long, requires = "manifest", default_value_t = false)]
         force: bool,
@@ -671,11 +707,14 @@ enum Commands {
     Manifest {
         #[arg(default_value = ".")]
         path: PathBuf,
-        #[arg(short, long, default_value = ".devcouncil/repo_map.json")]
-        output: PathBuf,
-        /// Symbol-level graph companion artifact.
-        #[arg(long, default_value = CODE_GRAPH_DEFAULT_OUTPUT)]
-        graph_output: PathBuf,
+        /// Unset, resolved against `path`'s state directory. See
+        /// `devmap_extract::paths`.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Symbol-level graph companion artifact. Unset, resolved against
+        /// `path`'s state directory.
+        #[arg(long)]
+        graph_output: Option<PathBuf>,
         /// Also write the interned encoding of the same graph here.
         ///
         /// Opt-in and additive: the verbose artifact above stays canonical and
@@ -693,6 +732,14 @@ enum Commands {
         /// graph.
         #[arg(long)]
         compact_graph_output: Option<PathBuf>,
+        /// Also write the marker-guarded agent guides, `AGENTS.md` and
+        /// `CLAUDE.md`.
+        ///
+        /// Opt-in: creating two files in somebody's repository is not a thing a
+        /// code index should do unasked. A guide that exists but carries no
+        /// `Managed by devmap` marker is hand-written and is never touched.
+        #[arg(long)]
+        guides: bool,
         /// Replace a Python-schema or otherwise foreign repo map / code graph.
         #[arg(long, default_value_t = false)]
         force: bool,
@@ -843,7 +890,15 @@ enum ClaudeAction {
     ///
     /// Printed, not installed: a settings file is the user's, and merging into
     /// it is their edit to make. Everything needed to make it is here.
-    Hooks,
+    Hooks {
+        /// Command to write into the emitted handlers.
+        ///
+        /// Unset, `devmap` is emitted when that name on `PATH` resolves to this
+        /// binary, and this binary's absolute path otherwise. Set it when the
+        /// install location is known but not yet populated — packaging.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+    },
 
     /// List every documented hook event beside what Dev Map does about it.
     ///
@@ -854,11 +909,22 @@ enum ClaudeAction {
     /// Write the installable plugin bundle: marketplace, manifest, hooks, MCP.
     Plugin {
         /// Directory the bundle is written under.
-        #[arg(long, default_value = ".devcouncil/claude-plugin")]
-        out: PathBuf,
+        ///
+        /// Unset, resolved to `<state dir>/devmap-plugin`. Deliberately *not*
+        /// `<state dir>/claude-plugin`, which is DevCouncil's own bundle: the
+        /// two emitters write a single-repo marketplace to the same
+        /// `.claude-plugin/marketplace.json`, under different names
+        /// (`devcouncil-local` and `devmap-local`), so sharing the directory
+        /// meant whichever ran last silently replaced the other's registration.
+        #[arg(long)]
+        out: Option<PathBuf>,
         /// Render to stdout instead of writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Command to write into the emitted hooks and MCP entry. See
+        /// `claude hooks --binary`.
+        #[arg(long)]
+        binary: Option<PathBuf>,
     },
 
     /// Check an existing hook config, plugin manifest, or marketplace file.
@@ -883,10 +949,17 @@ struct ManifestRequest<'a> {
     force: bool,
     stamps: &'a StampFlags,
     inventory: InventoryLimits,
+    /// Write the marker-guarded agent guides from this generation.
+    guides: bool,
 }
 
 /// What a `manifest` write did, for the caller's `--json` payload.
 struct ManifestOutcome {
+    /// One entry per guide file considered, or empty when guides were not
+    /// requested. Reported in full — including the files left alone and why —
+    /// because "the guide was not refreshed" and "the guide is hand-written and
+    /// therefore ours to leave" are different facts and only one is a problem.
+    guides: Vec<devmap_query::guides::GuideOutcome>,
     output: std::path::PathBuf,
     graph_output: std::path::PathBuf,
     compact_graph_output: Option<std::path::PathBuf>,
@@ -916,6 +989,67 @@ fn artifact_stamp_path(db: &std::path::Path) -> std::path::PathBuf {
 /// from, and each output's `(len, mtime, inode)` as written. When it holds, the
 /// generation is never read out of SQLite and nothing is serialized: the case a
 /// watcher and the PostToolUse hook hit on almost every tick.
+/// Write `AGENTS.md` / `CLAUDE.md` from this generation, when asked.
+///
+/// Returns an empty vector when guides were not requested, which is the one
+/// case that costs nothing: the manifest generation this needs is skipped
+/// entirely rather than computed and discarded.
+///
+/// A failure here is fatal rather than a warning. The guide is what points an
+/// agent at the map; a run that silently failed to refresh it leaves the tree
+/// with a guide describing a generation that no longer exists, and nothing said
+/// so.
+fn write_guides_if_requested(
+    store: &Store,
+    request: &ManifestRequest<'_>,
+    tree: &std::path::Path,
+) -> anyhow::Result<Vec<devmap_query::guides::GuideOutcome>> {
+    if !request.guides {
+        return Ok(Vec::new());
+    }
+    let extractions = store.latest_extractions()?;
+    let analysis = store
+        .latest_analysis()?
+        .ok_or_else(|| anyhow::anyhow!("guides unavailable: build a persisted generation first"))?;
+    let edges = store
+        .latest_edges(0.0)?
+        .into_iter()
+        .map(resolved_edge_from_stored)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    // Stamps the guide never reads. Passing the real ones would mean computing
+    // the digests first, which is the ordering this whole function exists to
+    // avoid; passing placeholders is safe precisely because `guides.rs` reads
+    // `subsystems`, `important_files` and `meta.devmap_rust` and nothing else.
+    let placeholder = FreshnessInfo {
+        head_sha: String::new(),
+        generation_id: 0,
+        pending_count: 0,
+        stamped: StampedFreshness::default(),
+    };
+    let (_manifest, json_str) =
+        generate_manifest_with_edges(&extractions, &analysis, placeholder, &edges);
+    let map: serde_json::Value = serde_json::from_str(&json_str)?;
+
+    let relative = |absolute: &std::path::Path| -> String {
+        let text = absolute
+            .strip_prefix(tree)
+            .unwrap_or(absolute)
+            .to_string_lossy()
+            .replace('\\', "/");
+        // `--db` defaults to a CWD-relative path, so stripping the tree prefix
+        // can leave `./.devmap/...`. The guide is prose an agent reads and
+        // copies; a stray `./` is noise in every line that quotes a path.
+        text.strip_prefix("./").unwrap_or(&text).to_string()
+    };
+    Ok(devmap_query::guides::write_agent_guides(
+        tree,
+        &map,
+        &relative(&devmap_extract::paths::repo_map_path(tree)),
+        &relative(&devmap_extract::paths::code_graph_path(tree)),
+        &relative(request.db),
+    )?)
+}
+
 fn write_consumer_artifacts(
     store: &Store,
     request: ManifestRequest<'_>,
@@ -942,6 +1076,21 @@ fn write_consumer_artifacts(
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| request.path.to_path_buf());
+
+    // The guides go in **before** the digests are taken, not after.
+    //
+    // A guide this run creates or rewrites is a file in the tree, and unless the
+    // repository ignores it, it is part of the inventory `freshness::compute`
+    // hashes. Written afterwards it would move `content_fingerprint` the instant
+    // it landed, and the map would report itself stale against a tree only it
+    // had changed — a false staleness that costs a rebuild on every single run.
+    //
+    // The guide's text depends on the manifest's subsystems and provenance
+    // markers but not on its freshness stamps, so generating the manifest early
+    // to feed the guide and again afterwards with real stamps is well-founded:
+    // the second generation cannot change what the first one said here. The
+    // early generation is skipped entirely unless guides were asked for.
+    let guides = write_guides_if_requested(store, &request, &tree)?;
 
     let (stamped, freshness_source, freshness_unavailable_reason) = match request.stamps.supplied()
     {
@@ -1007,6 +1156,7 @@ fn write_consumer_artifacts(
             compact_graph_output: compact_dest,
             generation_id: gen_id,
             artifacts_unchanged: true,
+            guides,
             freshness_source,
             freshness_unavailable_reason,
         });
@@ -1079,6 +1229,7 @@ fn write_consumer_artifacts(
         compact_graph_output: compact_dest,
         generation_id: gen_id,
         artifacts_unchanged: false,
+        guides,
         freshness_source,
         freshness_unavailable_reason,
     })
@@ -1183,6 +1334,17 @@ fn report_manifest(cli: &Cli, outcome: &ManifestOutcome) -> anyhow::Result<()> {
             println!("Interned code graph written to {:?}", destination);
         }
     }
+    for guide in &outcome.guides {
+        let note = match guide.disposition {
+            devmap_query::guides::GuideDisposition::Created => "created",
+            devmap_query::guides::GuideDisposition::Updated => "updated",
+            devmap_query::guides::GuideDisposition::Unchanged => "already current",
+            devmap_query::guides::GuideDisposition::NotOurs => {
+                "left alone (no `Managed by devmap` marker)"
+            }
+        };
+        println!("  guide {}: {note}", guide.path.display());
+    }
     if !outcome.freshness_unavailable_reason.is_empty() {
         println!(
             "  freshness stamps unavailable: {}",
@@ -1207,7 +1369,41 @@ fn manifest_json(outcome: &ManifestOutcome) -> serde_json::Value {
         "artifacts_unchanged": outcome.artifacts_unchanged,
         "freshness_source": outcome.freshness_source,
         "freshness_unavailable_reason": outcome.freshness_unavailable_reason,
+        // Every file considered, with what happened to it. A guide left alone
+        // because it is hand-written is reported as such rather than omitted:
+        // "not refreshed" and "not ours to refresh" are different facts, and a
+        // caller that cannot tell them apart cannot tell a working install from
+        // a guide that silently stopped tracking the map.
+        "guides": outcome.guides.iter().map(|guide| serde_json::json!({
+            "path": guide.path,
+            "disposition": match guide.disposition {
+                devmap_query::guides::GuideDisposition::Created => "created",
+                devmap_query::guides::GuideDisposition::Updated => "updated",
+                devmap_query::guides::GuideDisposition::Unchanged => "unchanged",
+                devmap_query::guides::GuideDisposition::NotOurs => "not_ours",
+            },
+            "changed": guide.changed(),
+        })).collect::<Vec<_>>(),
     })
+}
+
+/// Where `repo_map.json` goes for this invocation.
+///
+/// An explicit `--output` is used as given. Otherwise the artifact lands in
+/// whichever state directory `root` resolves to, so the map is written beside
+/// the store that produced it rather than into a directory chosen by the
+/// caller's shell.
+fn resolve_map_output(explicit: &Option<PathBuf>, root: &Path) -> PathBuf {
+    explicit
+        .clone()
+        .unwrap_or_else(|| devmap_extract::paths::repo_map_path(root))
+}
+
+/// Where `code_graph.json` goes for this invocation. See [`resolve_map_output`].
+fn resolve_graph_output(explicit: &Option<PathBuf>, root: &Path) -> PathBuf {
+    explicit
+        .clone()
+        .unwrap_or_else(|| devmap_extract::paths::code_graph_path(root))
 }
 
 /// The `--manifest` half of a build: the artifacts and the store's own status,
@@ -1225,6 +1421,7 @@ fn build_manifest_payload(
     path: &std::path::Path,
     output: &std::path::Path,
     graph_output: &std::path::Path,
+    guides: bool,
     force: bool,
     stamps: &StampFlags,
     inventory: InventoryFlags,
@@ -1236,20 +1433,21 @@ fn build_manifest_payload(
         store,
         ManifestRequest {
             path,
-            db: &cli.db,
+            db: &cli.db(),
             output,
             graph_output,
             compact_graph_output: None,
             force,
             stamps,
             inventory: inventory.into(),
+            guides,
         },
     )?;
     let mut payload = manifest_json(&outcome);
     // The store's own view, so a caller does not need a third process to learn
     // whether the generation it just built is fresh, degraded or backed up
     // behind a pending queue.
-    payload["status"] = serde_json::Value::Object(store_status_fields(store, &cli.db)?);
+    payload["status"] = serde_json::Value::Object(store_status_fields(store, &cli.db())?);
     if !cli.json {
         report_manifest(cli, &outcome)?;
     }
@@ -2008,6 +2206,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             manifest: write_manifest,
             output,
             graph_output,
+            guides,
             force,
             stamps,
             inventory,
@@ -2018,7 +2217,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 1,
                 format_args!("scanning and extracting {}", path.display()),
             );
-            ensure_parent(&cli.db)?;
+            ensure_parent(&cli.db())?;
             // K13: take the cross-process writer lock *before* extraction.
             //
             // There was no such lock, so two builds — or a build and the
@@ -2028,8 +2227,8 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // Taking it first means the loser waits for the winner and then
             // does useful work, or fails immediately with a message naming the
             // pid that holds the store.
-            let _writer = Store::lock_writer_at(&cli.db, Store::WRITER_LOCK_WAIT)?;
-            let store = Store::open(&cli.db)?;
+            let _writer = Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)?;
+            let store = Store::open(cli.db())?;
             // K1(e2): stamped before discovery, on the queue's own wall clock.
             //
             // A build that walks the whole tree answers every request queued at
@@ -2211,8 +2410,9 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                         &store,
                         *write_manifest,
                         path,
-                        output,
-                        graph_output,
+                        &resolve_map_output(output, path),
+                        &resolve_graph_output(graph_output, path),
+                        *guides,
                         *force,
                         stamps,
                         *inventory,
@@ -2461,8 +2661,9 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 &store,
                 *write_manifest,
                 path,
-                output,
-                graph_output,
+                &resolve_map_output(output, path),
+                &resolve_graph_output(graph_output, path),
+                *guides,
                 *force,
                 stamps,
                 *inventory,
@@ -2533,7 +2734,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             budget,
             semantic,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let engine = StoreQueryEngine::new(&store);
             let resp = if *semantic {
                 engine.search_semantic(query, *budget)?
@@ -2557,7 +2758,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             min_confidence,
             min_rung,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let engine = StoreQueryEngine::new(&store);
             // Both floors apply, at different places: `min_confidence` goes to
             // the store, which drops rows before the engine sees them, and the
@@ -2584,7 +2785,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             depth,
             min_rung,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let engine = StoreQueryEngine::new(&store);
             let resp = engine.impact_at_rung(
                 Request {
@@ -2609,7 +2810,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             depth,
             min_confidence,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let engine = StoreQueryEngine::new(&store);
             let answers = engine.neighbors(targets, *budget, *min_confidence, *depth)?;
             if cli.json {
@@ -2631,7 +2832,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             depth,
             min_rung,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let engine = StoreQueryEngine::new(&store);
             let rung = min_rung.as_deref().and_then(devmap_query::Rung::parse);
             let resp = if let Some(destination) = to {
@@ -2664,7 +2865,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Dead { budget } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let payload = StoreQueryEngine::new(&store).dead_symbols(*budget)?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&payload)?)?;
@@ -2679,7 +2880,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             depth,
             min_confidence,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let report = StoreQueryEngine::new(&store).explore(
                 query,
                 *limit,
@@ -2699,7 +2900,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             depth,
             min_confidence,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let report = StoreQueryEngine::new(&store).affected_tests(
                 targets,
                 *budget,
@@ -2715,12 +2916,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Workspace { action } => {
             // Rooted at the store's repository, so `devmap --db X workspace` and
             // `dev map workspace` agree on where the registry lives.
-            let root = cli
-                .db
-                .parent()
-                .and_then(|dir| dir.parent())
-                .and_then(|dir| dir.parent())
-                .map(|dir| dir.to_path_buf())
+            let root = devmap_extract::paths::repo_root_from_store(cli.db())
                 .unwrap_or_else(|| PathBuf::from("."));
             // Mutating actions go through `Workspace::update`, which holds an
             // advisory lock across the read and the write. Loading here and
@@ -2905,7 +3101,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Savings { query, budget } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let report = StoreQueryEngine::new(&store).savings(query.as_deref(), *budget)?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&report)?)?;
@@ -2927,7 +3123,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 std::fs::read_to_string(content)
                     .map_err(|e| anyhow::anyhow!("cannot read {content}: {e}"))?
             };
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let report =
                 StoreQueryEngine::new(&store).preview(file, &source, *budget, *min_confidence)?;
             if cli.json {
@@ -2941,7 +3137,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             kind,
             min_nodes,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             // `value_parser` has already rejected anything but the two names,
             // so a `None` here can only be "no filter requested".
             let wanted = kind.as_deref().and_then(devmap_query::parse_clone_kind);
@@ -2957,22 +3153,24 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             output,
             graph_output,
             compact_graph_output,
+            guides,
             force,
             stamps,
             inventory,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let outcome = write_consumer_artifacts(
                 &store,
                 ManifestRequest {
                     path,
-                    db: &cli.db,
-                    output,
-                    graph_output,
+                    db: &cli.db(),
+                    output: &resolve_map_output(output, path),
+                    graph_output: &resolve_graph_output(graph_output, path),
                     compact_graph_output: compact_graph_output.as_deref(),
                     force: *force,
                     stamps,
                     inventory: (*inventory).into(),
+                    guides: *guides,
                 },
             )?;
             report_manifest(cli, &outcome)?;
@@ -3121,7 +3319,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // schema of a store it was only asked to describe, silently, on the
             // one command a health check runs against a store it does not own.
             // Migrating is `build`'s job, where the caller asked for a write.
-            let stored_schema = Store::stored_schema_version(&cli.db)?;
+            let stored_schema = Store::stored_schema_version(cli.db())?;
             let Some(stored_schema) = stored_schema else {
                 let payload = serde_json::json!({
                     "generation_id": serde_json::Value::Null,
@@ -3129,7 +3327,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "node_count": 0,
                     "edge_count": 0,
                     "is_fresh": false,
-                    "db_path": cli.db.display().to_string(),
+                    "db_path": cli.db().display().to_string(),
                     "degraded_reason": "no devmap store at this path (run `devmap build`)",
                     "quarantined_count": 0,
                     "quarantined_paths": Vec::<String>::new(),
@@ -3160,7 +3358,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "node_count": 0,
                     "edge_count": 0,
                     "is_fresh": false,
-                    "db_path": cli.db.display().to_string(),
+                    "db_path": cli.db().display().to_string(),
                     "degraded_reason": format!(
                         "store schema is {version}, this binary speaks {}; \
                          run `devmap build` to migrate it",
@@ -3180,13 +3378,13 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 emit_json(cli, &payload)?;
                 return Ok(());
             }
-            let Some(store) = Store::open_existing(&cli.db)? else {
+            let Some(store) = Store::open_existing(cli.db())? else {
                 anyhow::bail!(
                     "the devmap store at {} vanished between the schema probe and the read",
-                    cli.db.display()
+                    cli.db().display()
                 );
             };
-            let mut payload = store_status_fields(&store, &cli.db)?;
+            let mut payload = store_status_fields(&store, &cli.db())?;
             payload.insert("schema_outdated".into(), serde_json::json!(false));
             payload.insert("schema_version".into(), serde_json::json!(stored_schema));
             payload.insert(
@@ -3196,7 +3394,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             emit_json(cli, &serde_json::Value::Object(payload))?;
         }
         Commands::History { last } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let rows = store.build_history(*last)?;
 
             if cli.json {
@@ -3273,7 +3471,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Repair { fts, pending } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             if !*fts && !*pending {
                 anyhow::bail!("specify a repair target, e.g. --fts or --pending");
             }
@@ -3350,7 +3548,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Snapshots { file, budget } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let extractions = store.latest_extractions()?;
             let resp = semantic_snapshots(
                 &extractions,
@@ -3380,7 +3578,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 // other. It also refuses a non-UTF-8 path rather than writing
                 // `display()`'s replacement characters into a `command` that
                 // then names no file on disk.
-                let entry = claude::mcp_entry(&executable, &cli.db, http.as_deref())?;
+                let entry = claude::mcp_entry(&executable, &cli.db(), http.as_deref())?;
                 emit_json(
                     cli,
                     &serde_json::json!({"mcpServers": {claude::MCP_SERVER_NAME: entry}}),
@@ -3388,7 +3586,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            let slot = std::sync::Arc::new(devmap_serve::StoreSlot::new(cli.db.clone()));
+            let slot = std::sync::Arc::new(devmap_serve::StoreSlot::new(cli.db()));
             match http {
                 Some(address) => {
                     // A bare port means loopback. Spelling the default out here
@@ -3432,13 +3630,13 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            ensure_parent(&cli.db)?;
-            let store = Store::open(&cli.db)?;
+            ensure_parent(&cli.db())?;
+            let store = Store::open(cli.db())?;
             let daemon = Daemon::new(store, root)
                 // So the daemon can notice its own store being deleted and
                 // exit, instead of serving a removed inode until its idle bound
                 // expires half an hour later.
-                .with_store_path(cli.db.clone())
+                .with_store_path(cli.db())
                 .with_ipc_path(ipc_path);
             daemon.run_loop().await?;
         }
@@ -3457,9 +3655,9 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
 fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
     let subcommands = claude::known_subcommands::<Cli>();
     match action {
-        ClaudeAction::Hooks => {
-            let executable = std::env::current_exe()?;
-            let block = claude::hooks_block(&executable, &cli.db, &subcommands)?;
+        ClaudeAction::Hooks { binary } => {
+            let executable = claude::plugin_command(&std::env::current_exe()?, binary.as_deref());
+            let block = claude::hooks_block(&executable, &cli.db(), &subcommands)?;
             emit_json(cli, &block)
         }
         ClaudeAction::Events => {
@@ -3508,13 +3706,20 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
                 Ok(())
             }
         }
-        ClaudeAction::Plugin { out, dry_run } => {
-            let executable = std::env::current_exe()?;
+        ClaudeAction::Plugin {
+            out,
+            dry_run,
+            binary,
+        } => {
+            let executable = claude::plugin_command(&std::env::current_exe()?, binary.as_deref());
             let version = env!("CARGO_PKG_VERSION");
+            let out = &out
+                .clone()
+                .unwrap_or_else(|| devmap_extract::paths::plugin_dir(Path::new(".")));
             if *dry_run {
                 let rendered = claude::render_plugin_bundle(
                     &executable,
-                    &cli.db,
+                    &cli.db(),
                     Some(version),
                     &subcommands,
                 )?;
@@ -3536,7 +3741,7 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
             let written = claude::write_plugin_bundle(
                 out,
                 &executable,
-                &cli.db,
+                &cli.db(),
                 Some(version),
                 &subcommands,
             )?;

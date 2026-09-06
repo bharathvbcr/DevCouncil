@@ -1300,7 +1300,11 @@ mod tests {
             "source change was not observed: {observed:?}"
         );
         assert!(
-            observed.iter().all(|path| !path.contains(".devcouncil")),
+            observed.iter().all(|path| {
+                !devmap_extract::paths::STATE_DIR_NAMES
+                    .iter()
+                    .any(|dir| path.contains(dir))
+            }),
             "internal database change escaped watcher filter: {observed:?}"
         );
         assert!(

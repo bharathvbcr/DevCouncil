@@ -41,23 +41,16 @@ pub const CONTENT_SCHEME: &str = "c2";
 /// while it is hashed.
 const HASH_CHUNK: usize = 1 << 20;
 
-/// `.devcouncil/cache/content_hashes.json`, relative to the repository root.
-///
-/// The *same* file Python memoises into, not a second one beside the store.
-/// Two memos of one computation is how the two implementations come to disagree
-/// about which digest belongs to which stat key, and the file is already
-/// excluded from the inventory (`.devcouncil` is a generated directory name), so
-/// it can never fingerprint itself. It is advisory in both directions: an
-/// absent, unreadable or foreign-scheme cache costs a rehash and nothing else.
-const CONTENT_CACHE_REL: &str = ".devcouncil/cache/content_hashes.json";
-
 /// Directory (and file) names that are never part of the indexed inventory.
 /// Transcribed from `repo_mapper._GENERATED_DIR_NAMES`.
+///
+/// Both state directory names are appended by [`is_generated_dir_name`] rather
+/// than listed here, so the set can never drift from
+/// [`devmap_extract::paths::STATE_DIR_NAMES`].
 const GENERATED_DIR_NAMES: &[&str] = &[
     ".git",
     ".hg",
     ".svn",
-    ".devcouncil",
     ".gitnexus",
     ".pytest_cache",
     ".ruff_cache",
@@ -200,6 +193,17 @@ pub fn git_head(root: &Path) -> String {
 /// as Python's `set(normalized.split("/"))` does — a file literally named
 /// `vendor` is excluded, and that is deliberate rather than incidental, because
 /// the two sides have to agree on it.
+/// True for a path segment that names a generated directory.
+///
+/// The state directories are folded in here rather than listed in
+/// [`GENERATED_DIR_NAMES`] so that adding or renaming one is a single edit in
+/// `devmap_extract::paths`. Both names are excluded at once: a repository
+/// mid-migration has both, and fingerprinting either would make the content
+/// digest depend on the size of the store it is meant to describe.
+fn is_generated_dir_name(part: &str) -> bool {
+    GENERATED_DIR_NAMES.contains(&part) || devmap_extract::paths::is_state_dir_name(part)
+}
+
 pub fn is_runtime_or_generated_file(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
     let name = normalized.rsplit('/').next().unwrap_or("");
@@ -208,10 +212,7 @@ pub fn is_runtime_or_generated_file(path: &str) -> bool {
     if normalized.split('/').any(|part| part == "__pycache__") || normalized.ends_with(".pyc") {
         return true;
     }
-    if normalized
-        .split('/')
-        .any(|part| GENERATED_DIR_NAMES.contains(&part))
-    {
+    if normalized.split('/').any(is_generated_dir_name) {
         return true;
     }
     // `dist`/`build` are only generated at the top level; a source directory
@@ -433,8 +434,16 @@ struct ContentCache {
     entries: BTreeMap<String, Vec<String>>,
 }
 
+/// Where the content-hash memo lives for `root`.
+///
+/// Resolved through `devmap_extract::paths` rather than hardcoded, so it lands
+/// in the *same* state directory as the store this build writes. Two memos of
+/// one computation — one under `.devcouncil/`, one under `.devmap/` — is how the
+/// two implementations come to disagree about which digest belongs to which stat
+/// key. It stays advisory in both directions: an absent, unreadable or
+/// foreign-scheme cache costs a rehash and nothing else.
 fn content_cache_path(root: &Path) -> PathBuf {
-    root.join(CONTENT_CACHE_REL)
+    devmap_extract::paths::content_cache_path(root)
 }
 
 fn load_content_cache(root: &Path) -> BTreeMap<String, Vec<String>> {

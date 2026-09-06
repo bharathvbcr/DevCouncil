@@ -213,7 +213,7 @@ fn the_async_refresh_hook_states_no_timeout_it_cannot_hold() {
 #[test]
 fn the_session_start_hook_succeeds_and_says_so_on_an_unindexed_repository() {
     let dir = scratch("fresh");
-    let db = dir.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(&dir);
     let out = Command::new(DEVMAP)
         .arg("--db")
         .arg(&db)

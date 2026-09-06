@@ -19,8 +19,7 @@ fn build(root: &std::path::Path) -> String {
 }
 
 fn edge_count(root: &std::path::Path) -> usize {
-    let store =
-        devmap_store::Store::open(root.join(".devcouncil/codeintel/devmap.sqlite")).unwrap();
+    let store = devmap_store::Store::open(devmap_extract::paths::store_path(root)).unwrap();
     store.status("x").unwrap().edge_count
 }
 

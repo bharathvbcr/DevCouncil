@@ -24,8 +24,7 @@ fn build(root: &std::path::Path) {
 
 /// Every edge in the committed generation, as a comparable set.
 fn graph(root: &std::path::Path) -> Vec<String> {
-    let store =
-        devmap_store::Store::open(root.join(".devcouncil/codeintel/devmap.sqlite")).unwrap();
+    let store = devmap_store::Store::open(db_path(root)).unwrap();
     let mut rows = store.latest_edges_for_test().unwrap();
     rows.sort();
     rows
@@ -38,8 +37,7 @@ fn graph(root: &std::path::Path) -> Vec<String> {
 /// whole test guards against is a part of the generation nobody thought to
 /// compare.
 fn analysis(root: &std::path::Path) -> String {
-    let store =
-        devmap_store::Store::open(root.join(".devcouncil/codeintel/devmap.sqlite")).unwrap();
+    let store = devmap_store::Store::open(db_path(root)).unwrap();
     let summary = store
         .latest_analysis()
         .unwrap()
@@ -52,8 +50,7 @@ fn analysis(root: &std::path::Path) -> String {
 /// A separate table from the analysis JSON above, and the one a consumer
 /// actually reads, so it is compared separately rather than assumed to agree.
 fn dead(root: &std::path::Path) -> Vec<String> {
-    let store =
-        devmap_store::Store::open(root.join(".devcouncil/codeintel/devmap.sqlite")).unwrap();
+    let store = devmap_store::Store::open(db_path(root)).unwrap();
     let mut rows: Vec<String> = store
         .latest_dead_symbols()
         .unwrap()
@@ -108,7 +105,7 @@ fn an_incremental_build_equals_a_cold_build() {
     let incremental = graph(&root);
 
     // Same tree, no history.
-    std::fs::remove_dir_all(root.join(".devcouncil")).unwrap();
+    std::fs::remove_dir_all(devmap_extract::paths::state_dir(&root)).unwrap();
     build(&root);
     let cold = graph(&root);
 
@@ -185,7 +182,7 @@ fn an_incremental_build_equals_a_cold_build_in_analysis_too() {
     let incremental_dead = dead(&root);
 
     // Same tree, no history.
-    std::fs::remove_dir_all(root.join(".devcouncil")).unwrap();
+    std::fs::remove_dir_all(devmap_extract::paths::state_dir(&root)).unwrap();
     build(&root);
 
     assert_eq!(
@@ -229,8 +226,15 @@ fn write_fixture(src: &std::path::Path, modules: usize) {
     .unwrap();
 }
 
+/// The store the build under test writes.
+///
+/// Resolved rather than spelled out, so these tests follow
+/// `devmap_extract::paths` wherever the state directory goes. They are about
+/// incremental-vs-cold equivalence; which directory holds the store is not
+/// their claim to make, and a literal here would fail the day the layout
+/// changes for reasons that have nothing to do with what they assert.
 fn db_path(root: &std::path::Path) -> std::path::PathBuf {
-    root.join(".devcouncil/codeintel/devmap.sqlite")
+    devmap_extract::paths::store_path(root)
 }
 
 /// Rewrite the stored payload identity of the latest generation, which is what
@@ -258,7 +262,9 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name();
-        if name == std::ffi::OsStr::new(".devcouncil") {
+        // Both state directory names: the source tree may carry either, and a
+        // copy that brought one along would not be a cold build.
+        if devmap_extract::paths::is_state_dir_name(&name.to_string_lossy()) {
             continue;
         }
         let target = to.join(&name);

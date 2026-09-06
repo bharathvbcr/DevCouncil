@@ -1260,6 +1260,65 @@ pub fn known_subcommands<C: clap::CommandFactory>() -> Vec<String> {
 ///
 /// `subcommands` is the parser's own list; a spec naming anything outside it is
 /// refused rather than written.
+/// The command string to write into an emitted hook or MCP entry.
+///
+/// `std::env::current_exe()` is an absolute path into whatever tree the running
+/// binary came from — for a local build, `…/rust-port/target/release/devmap`.
+/// Baked into a bundle, that path is wrong in two ordinary situations: a bundle
+/// committed to the repository names a path that exists on one machine, and a
+/// bundle emitted from a build tree keeps pointing at a stale binary after
+/// `cargo install` puts a current one on `PATH`.
+///
+/// So the bare name `devmap` is emitted when `devmap` on `PATH` *is* this
+/// binary, and the absolute path otherwise. The test is by resolved path rather
+/// than by name: a *different* `devmap` earlier on `PATH` is precisely the case
+/// where the absolute path is the honest answer, because emitting the bare name
+/// would silently hand the hook to some other build.
+///
+/// `explicit` wins over both, for a packager who knows the install location
+/// before anything is installed there.
+pub fn plugin_command(executable: &Path, explicit: Option<&Path>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    let path_var = std::env::var_os("PATH");
+    if resolves_to_self(PLUGIN_NAME, executable, path_var.as_deref()) {
+        return PathBuf::from(PLUGIN_NAME);
+    }
+    executable.to_path_buf()
+}
+
+/// True when looking `name` up on `path_var` finds `executable` itself.
+///
+/// Compares canonicalized paths, so a `PATH` entry that is a symlink to the
+/// binary — which is what `cargo install` and every package manager produce —
+/// counts as the same file rather than as a different one.
+fn resolves_to_self(name: &str, executable: &Path, path_var: Option<&std::ffi::OsStr>) -> bool {
+    let Some(path_var) = path_var else {
+        return false;
+    };
+    let Ok(target) = executable.canonicalize() else {
+        return false;
+    };
+    for dir in std::env::split_paths(path_var) {
+        // An empty `PATH` entry means the working directory on some shells.
+        // Resolving a hook command against wherever the agent happens to be
+        // running is not a behaviour worth reproducing.
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(name);
+        let Ok(resolved) = candidate.canonicalize() else {
+            continue;
+        };
+        // The first hit on PATH decides, exactly as execution would. Continuing
+        // past it would let a *later* entry that happens to be this binary
+        // authorize emitting a bare name that resolves to the earlier one.
+        return resolved == target;
+    }
+    false
+}
+
 pub fn hooks_block(executable: &Path, db: &Path, subcommands: &[String]) -> anyhow::Result<Value> {
     let exe = utf8_path("the devmap executable path", executable)?;
     let db_arg = hook_db_arg(db)?;

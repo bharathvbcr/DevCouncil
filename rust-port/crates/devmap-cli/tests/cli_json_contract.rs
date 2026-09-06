@@ -385,7 +385,7 @@ fn every_json_exit_path_prints_one_json_line_and_nothing_else() {
 #[test]
 fn a_store_with_no_generation_is_not_fresh() {
     let root = fixture("freshness");
-    let db = root.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(&root);
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
     // A real, migrated, empty store: exactly what a build that died before its
     // first commit leaves behind.

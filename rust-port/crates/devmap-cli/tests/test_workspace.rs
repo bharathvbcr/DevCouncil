@@ -30,7 +30,7 @@ fn build_repo(root: &Path, files: &[(&str, &str)]) {
     let resolution = resolver.resolve_all(&extractions);
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
 
-    let db = root.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(root);
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
     let store = Store::open(&db).unwrap();
     store
@@ -57,7 +57,15 @@ fn registry(repos: &[(&str, &Path)]) -> Workspace {
             .map(|(name, root)| WorkspaceRepo {
                 name: (*name).to_string(),
                 root: root.to_path_buf(),
-                db: ".devcouncil/codeintel/devmap.sqlite".to_string(),
+                // Resolved against the repository, exactly as `Workspace::add`
+                // records it. A literal here would name a store the fixture
+                // above did not build, and the search would then report every
+                // repository as having no symbols — a confident zero.
+                db: devmap_extract::paths::store_path(root)
+                    .strip_prefix(root)
+                    .expect("store is inside the repository")
+                    .to_string_lossy()
+                    .into_owned(),
             })
             .collect(),
     }

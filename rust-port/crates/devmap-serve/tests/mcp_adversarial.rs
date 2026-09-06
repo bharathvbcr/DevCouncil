@@ -343,6 +343,8 @@ async fn every_published_default_is_the_default_that_is_applied() {
             "devmap_preview" => {
                 json!({"file": "core.py", "content": "def helper(rows):\n    return 0\n"})
             }
+            "devmap_explore" => json!({"query": "helper"}),
+            "devmap_affected_tests" => json!({"targets": ["helper"]}),
             other => panic!("tool {other} has no fixture in this gate"),
         };
 
