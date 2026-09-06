@@ -1107,6 +1107,29 @@ fn store_status_fields(
         // actionable — "64 path(s) exceeded the retry threshold" told an
         // operator nothing about which 64.
         "quarantined_paths": status.quarantined_paths,
+        // The same argument, one surface over. `degraded_reason` has always
+        // carried "2 file(s) failed to parse, 1 recovered by pattern, 1 refused
+        // by discovery" and never a single path, so an operator could not tell
+        // a correct refusal — this repository's is a 30.6 MB vendored
+        // `parser.c` against a 1 MiB ceiling — from a broken one without
+        // opening the database. Rendered by `devmap_serve::coverage_gaps_json`,
+        // shared with the daemon's own `status`.
+        "coverage_gaps": devmap_serve::coverage_gaps_json(&status),
+        // Whether this generation's edges carry the evidence the resolver
+        // recorded, or a reconstruction standing in for one it never stored.
+        // `null` when there is no generation or it holds no edges — which is
+        // "nothing to say", not "reconstructed".
+        "edge_resolution_source": store
+            .latest_edge_resolution_source()?
+            .map(|source| source.label()),
+        // The read-side half of the honesty invariant: stored edges whose
+        // confidence contradicts the resolution kind recorded for them. On the
+        // way in `ResolvedEdge::resolved` makes the two agree; this reads them
+        // back separately and counts the rows that no longer do. Counted in
+        // SQL because this is a fresh process per call and must not build the
+        // edge index for one number. `null` with no generation; 0 is a
+        // measurement, never a default.
+        "edge_confidence_mismatches": store.edge_confidence_mismatches()?,
     }) else {
         unreachable!("json! of an object literal is an object")
     };
@@ -2222,10 +2245,15 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // persisted `AnalysisSummary` carries the degraded status onward, so
             // a later `devmap manifest` reading the store inherits it rather
             // than recomputing a clean answer.
+            // The inventory, not just its size. `discovery_refused_files` is
+            // `COUNT(*)` over these rows once they are persisted, and the
+            // daemon's drain carries them forward path by path rather than
+            // carrying a number it can only ever raise.
+            let refusal_inventory = devmap_store::discovery_refusals(&discovery);
             let analysis = devmap_analyze::analyze_with_discovery(
                 &extractions,
                 &resolution,
-                devmap_analyze::DiscoveryCoverage::refused(refused.len()),
+                devmap_analyze::DiscoveryCoverage::refused(refusal_inventory.len()),
             );
 
             let opts = GenerationWriteOpts {
@@ -2248,6 +2276,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     .ok()
                     .map(|root| root.to_string_lossy().into_owned()),
                 build_started: Some(build_started),
+                discovery_refusals: Some(refusal_inventory),
             };
             let head_sha = current_git_head(path).unwrap_or_else(|_| "unavailable".to_string());
             progress.stage(
@@ -2998,6 +3027,12 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "degraded_reason": "no devmap store at this path (run `devmap build`)",
                     "quarantined_count": 0,
                     "quarantined_paths": Vec::<String>::new(),
+                    // `null`, never three empty lists. Nothing was measured
+                    // here — there is no store to measure — and an empty
+                    // inventory is the answer of a build that read everything.
+                    "coverage_gaps": serde_json::Value::Null,
+                    "edge_resolution_source": serde_json::Value::Null,
+                    "edge_confidence_mismatches": serde_json::Value::Null,
                     "schema_outdated": false,
                     "schema_version": serde_json::Value::Null,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
@@ -3027,6 +3062,11 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     ),
                     "quarantined_count": 0,
                     "quarantined_paths": Vec::<String>::new(),
+                    // Same reason as the no-store case: this binary refused to
+                    // read the store, so it measured nothing.
+                    "coverage_gaps": serde_json::Value::Null,
+                    "edge_resolution_source": serde_json::Value::Null,
+                    "edge_confidence_mismatches": serde_json::Value::Null,
                     "schema_outdated": true,
                     "schema_version": version,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,

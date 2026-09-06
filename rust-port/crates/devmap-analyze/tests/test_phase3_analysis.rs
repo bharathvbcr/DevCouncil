@@ -18,6 +18,7 @@ fn test_traversal_kernel_enqueued_vs_visited_g21() {
             confidence: Confidence::DETERMINISTIC,
             resolution: None,
             details: None,
+            evidence: None,
         })
         .collect();
     let result = traverse_graph(
@@ -44,6 +45,7 @@ fn test_impact_never_walks_up_defines_edges() {
         confidence: Confidence::DETERMINISTIC,
         resolution: None,
         details: None,
+        evidence: None,
     };
     let result = traverse_graph(
         &["Container.child".to_string()],
@@ -240,6 +242,7 @@ fn edges(pairs: &[(&str, &str, usize)]) -> ResolutionResult {
                 confidence: Confidence::DETERMINISTIC,
                 resolution: None,
                 details: None,
+                evidence: None,
             });
         }
     }

@@ -452,29 +452,49 @@ fn build_code_graph_value(
         }
     }
 
-    // (source, target, kind, confidence) — sorted so the artifact is stable and
-    // deduplicated so a fan-out cannot report the same edge twice.
-    let mut edge_keys: Vec<(&str, &str, &'static str, &'static str)> = edges
+    // (source, target, kind, confidence, resolution, resolution_source) —
+    // sorted so the artifact is stable and deduplicated so a fan-out cannot
+    // report the same edge twice. The edge's identity is the first four; the
+    // evidence pair rides along, and when two edges share an identity but not
+    // an evidence tier (an ambiguous fan-out beside a scoped hit, say) the
+    // sort makes the survivor the smallest label rather than whichever came
+    // first out of the store — deterministic (R4), and stated here.
+    let mut edge_keys: Vec<(
+        &str,
+        &str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    )> = edges
         .iter()
         .map(|edge| {
+            let (resolution, resolution_source) = edge
+                .evidence
+                .map(|evidence| (evidence.kind.label(), evidence.source.label()))
+                .unwrap_or(("", ""));
             (
                 edge.source_symbol.as_str(),
                 edge.target_symbol.as_str(),
                 edge_kind_label(edge.edge_kind),
                 confidence_label(edge.confidence.0),
+                resolution,
+                resolution_source,
             )
         })
         .collect();
     edge_keys.sort_unstable();
     let before_dedup = edge_keys.len();
-    edge_keys.dedup();
+    edge_keys.dedup_by(|left, right| {
+        (left.0, left.1, left.2, left.3) == (right.0, right.1, right.2, right.3)
+    });
     provenance.duplicate_edges_dropped = before_dedup - edge_keys.len();
 
     let mut edge_values: Vec<Value> = Vec::with_capacity(edge_keys.len());
     // Sorted, so the count is a function of the identities and not of edge
     // order, and so a future emitter can list them without a second pass.
     let mut missing_endpoints: BTreeSet<&str> = BTreeSet::new();
-    for (source, target, kind, confidence) in edge_keys {
+    for (source, target, kind, confidence, resolution, resolution_source) in edge_keys {
         let source_missing = !node_index.contains_key(source);
         let target_missing = !node_index.contains_key(target);
         if source_missing || target_missing {
@@ -491,11 +511,17 @@ fn build_code_graph_value(
             "target": target,
             "kind": kind,
             "confidence": confidence,
-            // Not derivable: `generation_edges` persists no reason, and
-            // `ResolvedEdge::resolution` is `None` on every edge read back from
-            // the store. Python's own `compact` export tier blanks this field
-            // for the same reason, so "" is a value consumers already handle.
+            // Not derivable: `generation_edges` persists no reason text.
+            // Python's own `compact` export tier blanks this field for the
+            // same reason, so "" is a value consumers already handle.
             "reason": "",
+            // What the confidence rests on — the resolver's evidence tier
+            // (`ResolutionKind::label`) — and whether that tier was resolved
+            // in this process, read back from the store's column, or
+            // reconstructed from a generation that predates it. "" only on
+            // an edge built by hand with no evidence at all.
+            "resolution": resolution,
+            "resolution_source": resolution_source,
             "extras": {},
         }));
     }
@@ -1111,6 +1137,7 @@ mod tests {
             confidence,
             resolution: None,
             details: None,
+            evidence: None,
         }
     }
 
@@ -1368,7 +1395,16 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["confidence", "extras", "kind", "reason", "source", "target"],
+            [
+                "confidence",
+                "extras",
+                "kind",
+                "reason",
+                "resolution",
+                "resolution_source",
+                "source",
+                "target"
+            ],
             "GraphEdge fields must match schema.py"
         );
         assert_eq!(

@@ -268,9 +268,14 @@ async def with_codeintel_freshness(
             fresh = not client.is_map_stale() and not _map_artifact_is_stale(root)
             contents = await produce()
             if not fresh and contents:
+                # Bound to the narrowed name: inside the class body `client` is
+                # `DevMapClient | None` again, and the closure would be asked
+                # to call `.status()` on a value it cannot prove is there.
+                kernel = client
+
                 class _RustFreshness:
                     def status(self):
-                        st = client.status()
+                        st = kernel.status()
                         return type(
                             "S",
                             (),

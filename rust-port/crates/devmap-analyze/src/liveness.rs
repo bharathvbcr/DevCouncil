@@ -351,19 +351,89 @@ pub const COVERAGE_LOSS_CONFIDENCE_CAP: f32 = 0.35;
 pub const COVERAGE_LOSS_REASON: &str =
     "no inbound call edges, but call extraction did not cover every file — not evidence of death";
 
+/// Which kind of hole one file leaves in call coverage.
+///
+/// The two are not interchangeable and are never folded into one number: a
+/// `ParseFailed` file contributed nothing at all, a `PatternRecovered` one
+/// contributed names and spans but, by construction, no calls and no imports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractionGap {
+    ParseFailed,
+    PatternRecovered,
+}
+
+impl ExtractionGap {
+    /// The stored spelling, and the one a consumer reads back. One owner, so a
+    /// persisted inventory and an in-memory count cannot disagree about what a
+    /// gap is called.
+    pub fn label(self) -> &'static str {
+        match self {
+            ExtractionGap::ParseFailed => "parse_failed",
+            ExtractionGap::PatternRecovered => "pattern_recovered",
+        }
+    }
+}
+
+/// One file that call extraction did not cover, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionGapEntry {
+    pub path: String,
+    pub gap: ExtractionGap,
+    pub reason: String,
+}
+
+/// Name the files whose calls were never extracted.
+///
+/// The owner of the *set*; [`extraction_coverage`] is the fold over it, so a
+/// count and a list of paths cannot disagree about which files they describe.
+/// That mattered as soon as `devmap status` began naming them: a count derived
+/// from one `matches!` chain and a list derived from another is precisely how
+/// "2 file(s) failed to parse" came to sit beside a list of three.
+pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
+    let mut gaps = Vec::new();
+    for ext in extractions {
+        // `Extraction::is_parse_failure` is the canonical owner of the
+        // `Failed`-vs-`NotApplicable` line — a `.md` is not a parse failure —
+        // and asking it here is what keeps this list and the counts below in
+        // step with it.
+        let (gap, reason) = if ext.is_parse_failure() {
+            (
+                ExtractionGap::ParseFailed,
+                match &ext.parse_outcome {
+                    ParseOutcome::Failed { reason } => reason.clone(),
+                    // Unreachable while `is_parse_failure` matches `Failed`,
+                    // and stated rather than `unwrap`ped: a later variant that
+                    // qualifies must still name itself in the inventory.
+                    other => format!("{other:?}"),
+                },
+            )
+        } else if let ParseOutcome::Fallback { reason } = &ext.parse_outcome {
+            (ExtractionGap::PatternRecovered, reason.clone())
+        } else {
+            continue;
+        };
+        gaps.push(ExtractionGapEntry {
+            path: ext.file_path.clone(),
+            gap,
+            reason,
+        });
+    }
+    gaps
+}
+
 /// Count the files whose calls were never extracted.
 ///
 /// One owner for the question, shared with `code_graph.rs`, which needs the
 /// same two numbers for `meta.devmap_rust`. Two independent `matches!` chains
 /// over `parse_outcome` is exactly how the `Failed`-vs-`NotApplicable`
-/// distinction gets lost in one of them.
+/// distinction gets lost in one of them — so this counts
+/// [`extraction_gaps`]'s entries rather than re-deciding them.
 pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
     let mut coverage = ExtractionCoverage::default();
-    for ext in extractions {
-        if ext.is_parse_failure() {
-            coverage.parse_failed_files += 1;
-        } else if matches!(ext.parse_outcome, ParseOutcome::Fallback { .. }) {
-            coverage.pattern_recovered_files += 1;
+    for entry in extraction_gaps(extractions) {
+        match entry.gap {
+            ExtractionGap::ParseFailed => coverage.parse_failed_files += 1,
+            ExtractionGap::PatternRecovered => coverage.pattern_recovered_files += 1,
         }
     }
     coverage
@@ -758,6 +828,7 @@ mod tests {
             confidence: devmap_extract::model::Confidence::DETERMINISTIC,
             resolution: None,
             details: None,
+            evidence: None,
         }
     }
 

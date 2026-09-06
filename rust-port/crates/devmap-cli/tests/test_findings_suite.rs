@@ -27,6 +27,7 @@ fn test_g8_parametric_depth_limits_traversal() {
                 confidence: Confidence::DETERMINISTIC,
                 resolution: None,
                 details: None,
+                evidence: None,
             })
             .collect(),
         receiver_types: BTreeMap::new(),
@@ -230,6 +231,7 @@ fn differential_membership_preserves_full_generation_while_b3_write_amplificatio
                 deleted_paths: vec![],
                 build_started: None,
                 repo_root: None,
+                discovery_refusals: None,
             },
         )
         .unwrap();

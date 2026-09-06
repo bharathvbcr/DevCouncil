@@ -505,6 +505,7 @@ fn impact_exact_symbol_name_still_works_for_short_unique_names() {
         confidence: Confidence::DETERMINISTIC,
         resolution: None,
         details: None,
+        evidence: None,
     };
     let resolution = ResolutionResult {
         edges: vec![edge("a", "b"), edge("b", "c")],

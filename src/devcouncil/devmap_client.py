@@ -77,6 +77,33 @@ SERVE_PROBE_TIMEOUT_SECONDS = 10.0
 #: Set to ``0`` to stop every client in the process from spawning a daemon.
 AUTOSPAWN_ENV_VAR = "DEVMAP_AUTOSPAWN"
 
+
+class Unreported:
+    """The value of a status field this kernel never sent.
+
+    ``None`` is already one of the kernel's own answers — ``coverage_gaps:
+    null`` means "there was no store to inventory" — so "this binary predates
+    the field" needs a value of its own. Folded together, a kernel that cannot
+    list the files it refused would read exactly like one that read the whole
+    corpus and refused none, which is the failure the inventory exists to end.
+
+    Falsy, so ``if not status.coverage_gaps`` still means "nothing to show",
+    and identity-compared (``is UNREPORTED``) everywhere it is tested.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "UNREPORTED"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+#: The single instance; compare with ``is``.
+UNREPORTED = Unreported()
+
+
 @dataclass
 class DevMapStatus:
     generation_id: int
@@ -86,6 +113,20 @@ class DevMapStatus:
     is_fresh: bool = True
     degraded_reason: Optional[str] = None
     quarantined_count: int = 0
+    #: The three coverage-gap listings (``discovery_refused`` /
+    #: ``parse_failed`` / ``pattern_recovered``), each ``{total, shown,
+    #: truncated, paths}``: the paths behind the counts ``degraded_reason``
+    #: states. ``None`` when the kernel read no store, ``UNREPORTED`` when the
+    #: binary predates the listing.
+    coverage_gaps: Union[Dict[str, Any], None, Unreported] = UNREPORTED
+    #: ``"stored"`` when this generation's edge confidences carry the evidence
+    #: the resolver recorded, ``"reconstructed"`` when they were re-derived for
+    #: a generation written before that column existed.
+    edge_resolution_source: Union[str, None, Unreported] = UNREPORTED
+    #: Stored edges whose confidence contradicts the resolution kind recorded
+    #: beside them. ``UNREPORTED`` from a kernel that does not check — which is
+    #: "not measured", never 0.
+    edge_confidence_mismatches: Union[int, None, Unreported] = UNREPORTED
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -418,6 +459,44 @@ class DevMapClient:
         if type(value) is not int or value < 0:
             raise DevMapClientError(
                 f"devmap {field_name} must be a non-negative integer, got {value!r}"
+            )
+        return value
+
+    @staticmethod
+    def _optional_field(
+        resp: Dict[str, Any],
+        field_name: str,
+        types: tuple[type, ...],
+        expected: str,
+    ) -> Any:
+        """A status field a kernel may legitimately not send at all.
+
+        Three outcomes, kept apart: absent is ``UNREPORTED`` (this binary
+        predates the field), ``null`` stays ``None`` (the kernel looked and has
+        nothing to report), and anything else must match *types* or the whole
+        status is refused. Coercing a wrong type here would hand the doctor a
+        value it would render as a finding.
+        """
+        if field_name not in resp:
+            return UNREPORTED
+        value = resp[field_name]
+        if value is None or isinstance(value, types):
+            return value
+        raise DevMapClientError(
+            f"devmap status {field_name} must be {expected}, got {value!r}"
+        )
+
+    @staticmethod
+    def _optional_count(resp: Dict[str, Any], field_name: str) -> Union[int, None, Unreported]:
+        """An optional non-negative integer, with ``bool`` refused like elsewhere."""
+        if field_name not in resp:
+            return UNREPORTED
+        value = resp[field_name]
+        if value is None:
+            return None
+        if type(value) is not int or value < 0:
+            raise DevMapClientError(
+                f"devmap status {field_name} must be a non-negative integer, got {value!r}"
             )
         return value
 
@@ -793,6 +872,18 @@ class DevMapClient:
             ),
             quarantined_count=self._strict_nonnegative_int(
                 resp.get("quarantined_count", 0), "status quarantined_count"
+            ),
+            # Optional: a kernel that predates any of these sends no key, and
+            # the absence is carried through as `UNREPORTED` rather than
+            # flattened into the `null` the kernel itself uses for "no store".
+            coverage_gaps=self._optional_field(
+                resp, "coverage_gaps", (dict,), "an object or null"
+            ),
+            edge_resolution_source=self._optional_field(
+                resp, "edge_resolution_source", (str,), "a string or null"
+            ),
+            edge_confidence_mismatches=self._optional_count(
+                resp, "edge_confidence_mismatches"
             ),
             raw=resp,
         )

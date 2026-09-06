@@ -61,13 +61,31 @@ fn cold_build(root: &Path, db_path: &Path) -> Store {
     let mut resolver = devmap_resolve::Resolver::new();
     resolver.index_extractions(&extractions);
     let resolution = resolver.resolve_all(&extractions);
+    // The inventory, exactly as the CLI build path supplies it: the count a
+    // consumer reads is `COUNT(*)` over these rows, and `save_generation`
+    // refuses a generation whose summary claims a refusal the inventory cannot
+    // name.
+    let refusals = devmap_store::discovery_refusals(&report);
     let analysis = devmap_analyze::analyze_with_discovery(
         &extractions,
         &resolution,
-        devmap_analyze::DiscoveryCoverage::refused(report.refused_count()),
+        devmap_analyze::DiscoveryCoverage::refused(refusals.len()),
     );
     store
-        .save_generation(&extractions, &resolution, &analysis)
+        .save_generation_with_metadata(
+            &extractions,
+            &resolution,
+            &analysis,
+            devmap_store::GenerationWriteOpts {
+                discovery_refusals: Some(refusals),
+                ..Default::default()
+            },
+            // The stamp the daemon's own HEAD reading produces outside a git
+            // repository. Without it `head_moved` is true on the first drain
+            // and the daemon takes the full-rebuild branch — which re-walks
+            // discovery, and so exercises the other path entirely.
+            "unavailable",
+        )
         .unwrap();
     store
 }

@@ -83,6 +83,7 @@ fn edge(source: &str, target: &str) -> ResolvedEdge {
         confidence: Confidence::DETERMINISTIC,
         resolution: None,
         details: None,
+        evidence: None,
     }
 }
 

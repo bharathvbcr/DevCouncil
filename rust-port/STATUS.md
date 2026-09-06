@@ -4505,3 +4505,217 @@ for every subsystem, and the second surviving `xfail` in that file still stands:
 (`[]`/`{}`) where the Python writer detected uv/npm from lockfiles and the LSP
 languages, and `wiki.py` and the MCP map handler render them. Same shape, not
 touched here.
+
+## Refusal inventory and edge resolution (2026-09-06)
+
+Two open items from the previous pass, on branch `claude/devmap-open-items`
+(forked from `main` at `385baa0`; merged forward to `e1ff55f` before the work
+and to `4994695` after it, the second merge conflicting only in this file —
+both sections kept, newest last).
+
+### 1. `discovery_refused_files` became an inventory — **closed**, `5fd2a8c`
+
+**The residual as stated.** The drain's comment in `daemon.rs` recorded it
+itself: the incremental branch never re-walks discovery, so it carried the
+previous generation's *count* and took `max(previous, refused.len())` as a
+floor. Two wrong answers followed, and the comment named the first — a repaired
+file stays counted until a full re-extraction or a `devmap build`. The second is
+the expensive one and was not named: a refusal **this batch met** was only
+counted when it exceeded the carried number, so a new refusal in a repository
+whose last full walk refused two files disappeared into the two. Coverage
+reported as no worse than it already was, when it is worse.
+
+Both fall out of the same thing: a count cannot be maintained, only replaced.
+
+**Red first, watched fail against the pre-fix kernel** (the assertion text is
+`assertion 'left == right' failed`, `left: Some(1)`, `right: Some(0)`):
+
+- `devmap-serve/tests/discovery_refusal_inventory.rs::a_shrunk_file_leaves_the_refusal_inventory`
+  — "a corpus with nothing left unread must say so"
+- `…::a_repaired_symlink_clears_the_refusal_and_lands_in_the_graph`
+  — "the link resolves inside the repository now"
+- `…::a_new_refusal_is_recorded_by_path_and_an_unrelated_batch_leaves_it_alone`
+  — the count half passes on the pre-fix kernel for the wrong reason (the floor
+  holds the number up), so the assertion is on the inventory, which did not
+  exist. Recorded as red-by-non-compilation rather than implied to be more.
+- `devmap-store/tests/coverage_gap_inventory.rs` — four tests, including the
+  write-side guard and the `None`/`Some(0)` distinction.
+- `devmap-cli/tests/status_names_what_it_could_not_read.rs` — two tests through
+  the real binary; the pre-fix `devmap --json status` on the same fixture
+  carries no `coverage_gaps` key at all (captured before the change).
+
+**A fixture defect found while writing them.** `daemon_discovery_refusals.rs::
+an_incremental_resync_does_not_erase_a_recorded_refusal` documents the
+incremental branch and never reached it. `save_generation` stamps `head_sha` as
+`"unknown"`; the daemon's own HEAD reading outside a git repository produces
+`"unavailable"`; so `head_moved` was true on every drain in that fixture and it
+measured the full-rebuild path under a comment saying it did not. The stamp is
+now explicit and the precondition asserted, in that file and in
+`one_symlink_rule_end_to_end.rs`. Both suites still pass (4 and 3 tests).
+
+**The fix, at the owner.** Schema 14 adds `generation_coverage_gaps`: one row
+per path, keyed `(generation_id, gap, path)`, `WITHOUT ROWID`.
+`discovery_refused_files` is `COUNT(*)` over the `discovery_refused` rows,
+derived in `Store::latest_analysis` and never carried. A full walk replaces the
+inventory outright; the drain carries the previous one minus every path in this
+batch's affected set and adds what this batch was turned away from — so a path
+nothing touched keeps its verdict (the watcher would have reported a change) and
+a path this batch touched is re-decided by `candidate_kind`. `PendingDelta`'s
+`refused` became a path→verdict map for that reason. The floor is gone, and so
+is the `max`.
+
+`save_generation` refuses a generation whose summary and inventory disagree, the
+same guard the edge count already gets:
+
+```
+generation would store None discovery refusal(s) but its analysis was computed
+over Some(1); `discovery_refused_files` is derived from the inventory and the
+two must be one measurement
+```
+
+`Some(0)` (measured, nothing refused) and `None` (nobody walked) stay distinct
+end to end — the summary field keeps that, the row count cannot express it.
+
+**`status` now names the files.** The same table carries the two extraction
+gaps, so all three of `degraded_reason`'s numbers have paths behind them. On
+this repository the refusal is `rust-port/vendor/grammars/cobol/parser.c`,
+30,660,349 bytes against the 1,048,576 ceiling — the correct verdict, and until
+now indistinguishable from a broken indexer without opening the database.
+Rendered once by `devmap_serve::coverage_gaps_json` for both `devmap status
+--json` and the daemon's IPC `status`, each list capped at 50 with `{shown,
+total, truncated}`. The extraction gaps are derived at *write* time from
+`devmap_analyze::extraction_gaps` — now the owner `extraction_coverage` folds,
+so a path list and a count cannot describe different files — because deriving
+them on read means walking past a ~47 KB `extraction_json` on every row of the
+generation, which is the scan the v13 index exists to avoid.
+
+They carry forward on a differential write exactly as the file rows do
+(skipping `affected` and `deleted`), because the daemon hands `save_generation`
+only the extractions it re-read. The refusal half is never carried there: this
+function cannot tell a path the caller re-decided from one it never looked at,
+so the caller that walked owns that decision.
+
+### 2. Each edge's `Resolution` kind is persisted — **closed**, `9fa873e`
+
+The limitation recorded in "3. Resolver / liveness honesty": no `resolution`
+column, so `devmap-query`'s `stored_edge_to_resolved` rebuilt every edge with
+`resolution: None` and the invariant on the read path rested on the write-side
+constructor plus a round trip.
+
+Schema 15 adds `generation_edges.resolution`, written through
+`resolution_kind_label` — an exhaustive match on `Resolution`, beside
+`edge_kind_from_stored` and for the same reason. `edge_resolution` decodes it;
+a row without the column is reconstructed from the edge's own file layout and
+labelled `ResolutionSource::Reconstructed`, so a guess can never read as a
+measurement. `GenerationEdges` carries the decoded tier, read in the same
+statement and cached under the same generation id as the rows it labels, and
+`devmap status --json` gains `edge_resolution_source`.
+
+**Red first:** `devmap-store/tests/coverage_gap_inventory.rs::
+a_stored_resolution_kind_beats_the_reconstruction_a_row_would_support` writes a
+`Structural` edge whose endpoints share a file — so the only reconstruction the
+row supports says `SameFile` — and asserts the read returns `Structural`/
+`Stored`; then clears the column and asserts the same read answers `SameFile`/
+`Reconstructed`. Against the pre-fix kernel neither the column nor
+`GenerationEdges::resolution` exists, so this is red by non-compilation; the
+runtime evidence that the surface was absent is the pre-change `devmap --json
+status`, which carries no `edge_resolution_source` key.
+
+`status` reads one row for that field, and that is a property rather than a
+sample: `save_generation` writes a generation's edges in one transaction from
+one `resolution.edges` and never carries edges forward, so the column is present
+for all of a generation's edges or for none.
+
+**Numbers.** Release binaries, this repository copied fresh into
+`<scratchpad>/lane-f/c_{before,after}` and built cold, `devmap --json build .`:
+
+| | store bytes | build (real) | files / symbols / edges |
+|---|---|---|---|
+| before (`5fd2a8c`) | 123,256,832 | 5.55 s | 1,334 / 15,080 / 74,729 |
+| after (`9fa873e`) | 124,301,312 | 5.36 s | 1,334 / 15,080 / 74,729 |
+
+**+1,044,480 bytes, +0.85%** — 14 bytes per edge, which is the column. The build
+times are one run each and differ by less than the run-to-run spread; nothing is
+claimed from them.
+
+`cargo test -p devmap-store`, debug, warm target dirs, five interleaved runs
+each: before 11.31 / 11.70 / 11.78 / 12.65 / 14.48 s, after 11.42 / 13.16 /
+13.46 / 13.52 / 17.09 s. Minima 11.31 vs 11.42 s. The suite gained one test and
+the spread is 3 s wide, so **the medians (11.78 -> 13.46 s) are not evidence of
+a cost in the column** and are reported only because they were measured.
+
+### Left undone, precisely
+
+- `devmap-query/src/engine.rs:2390` `stored_edge_to_resolved` still sets
+  `resolution: None`. Reaching the new column from a bare `StoredEdge` needs
+  either a field on `devmap_store::StoredEdge` — which breaks the five struct
+  literals in `devmap-query` (`engine.rs:3651`, `engine.rs:4255`,
+  `tests/stored_edges_keep_the_confidence_their_evidence_earned.rs`) — or a
+  second entry point taking `(StoredEdge, EdgeResolution)`. Both are edits in a
+  crate this lane does not own. The red test for it is written and left
+  **unstaged** at `devmap-query/tests/stored_edge_resolution_is_read_not_guessed.rs`.
+- The Python doctor (`src/devcouncil/devmap_health.py`) prints the three
+  coverage numbers and not the paths. `coverage_gaps` is now in the kernel's
+  `status` JSON for it to read; the Python change is out of this lane's scope.
+
+## The read path carries the evidence it stored (lead, 2026-09-06)
+
+Closes the item the refusal-inventory lane left undone: schema 15 persisted
+each edge's resolution *kind*, and `devmap_query::resolved_edge_from_stored` —
+the path `devmap manifest` builds `code_graph.json` from — still set
+`resolution: None` on every edge, so the artifact every agent reads asserted
+confidences whose justification nothing could read back. The lane's own red
+test, left unstaged, failed at `left: None / right: Some(Evidence { kind:
+Structural, source: Stored })` against this tree before the change.
+
+**One owner for the kind.** `ResolutionKind` now lives in `devmap-resolve`
+beside `Resolution`: the variant set (`Resolution::kind()` is an exhaustive
+match), the confidence ladder (`ResolutionKind::confidence`, which
+`Resolution::confidence` delegates to) and the stored spelling
+(`label`/`from_label`). `devmap-store`'s `StoredResolutionKind`,
+`ResolutionSource` and `EdgeResolution` are re-exports of the resolver's
+`ResolutionKind`, `ResolutionSource` and `Evidence`; the two hand-written
+tables it held are gone. `ResolutionSource` gained `Resolver` for an edge the
+resolver built in-process, so the three provenances are never spelled the same.
+Pinned by `devmap-resolve/tests/resolution_kind_is_one_owner.rs` (kinds ==
+variants, payload cannot change the tier, spellings round-trip and are exact).
+
+**What a row can answer.** `StoredEdge` carries `resolution: Option<String>`
+(the column as stored), every reader fills it, and
+`edge_resolution(&StoredEdge)` decodes it — `Stored` when present,
+`Reconstructed` from the file layout when the generation predates the column.
+`ResolvedEdge` gained `evidence: Option<Evidence>`: `Some(.., Resolver)` from
+`ResolvedEdge::resolved`, `Some(.., Stored | Reconstructed)` on a re-read edge.
+`resolution` itself stays `None` on the read path on purpose — an
+`ImportScoped` row does not carry `imported_from`, and a `Resolution` invented
+to fill the variant would be a guess wearing the resolver's type.
+
+**The artifact says so.** Every edge in `code_graph.json` (both wires) now
+carries `resolution` (the kind's spelling) and `resolution_source`
+(`resolver` / `stored` / `reconstructed`), mirrored in
+`indexing/graph/schema.py`'s `GraphEdge`. The dedup key stays the four-field
+identity; when two edges share it but not a tier the sort makes the survivor
+the smallest label, deterministic (R4) and stated at the site.
+
+**The read-side half of the honesty invariant.** On the way in,
+`ResolvedEdge::resolved` makes `confidence` a function of the resolution; on
+the way out nothing compared the two, so a row whose confidence had been
+changed under a stored kind read back as a measurement. `GenerationEdges`
+counts such rows when the index is built (`confidence_mismatches()`, in
+milliconfidence, stored kinds only — a reconstruction cannot convict the row)
+and `Store::edge_confidence_mismatches()` answers the same question in SQL for
+a process that holds no index, with the `CASE` ladder generated from
+`ResolutionKind::ALL` so it cannot hold a second copy of the table. Both
+`status` surfaces report it as `edge_confidence_mismatches` beside
+`edge_resolution_source` (the daemon's IPC status gained both). Red first:
+`coverage_gap_inventory.rs::a_stored_confidence_that_contradicts_its_stored_kind_is_counted_not_trusted`
+(index 1 / SQL 1 after one `UPDATE`, 0 / 0 after the column is cleared) and
+`status_names_what_it_could_not_read.rs::status_counts_stored_edges_whose_confidence_contradicts_their_evidence`
+(the real binary, both directions).
+
+**Numbers.** Workspace: fmt and clippy clean, **1,448 tests / 0 failed / 2
+ignored**, feature-off checks green, release `devmap 0.1.0 (store schema 15,
+code graph schema 2)`. Python: ruff and mypy clean, the 40 unit files that
+touch the graph schema 776 passed. Go, against this kernel's artifacts:
+all seven packages `ok` with `MANVI_MAP_BINARY` pointed at it, including `dc/devmap`'s live interop test that builds one `Map` from both wires. `devmap --json status` on a fresh 41,276-node / 271k-edge
+scholarlm store, 21 runs: p50 61 ms / min 54 ms wall, of which the SQL count is p50 33 ms (271,508 rows scanned, 0 mismatches). That cost is paid only by the fresh-process CLI path — the daemon answers from the index it already holds — and it scales with the edge count; a partial index on the mismatch predicate would make it O(mismatches) but would bake the ladder into DDL, a second copy of the table, and was not done.

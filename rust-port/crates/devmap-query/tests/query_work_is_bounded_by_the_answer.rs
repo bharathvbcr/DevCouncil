@@ -109,6 +109,7 @@ fn synthetic_edges(count: usize) -> Vec<ResolvedEdge> {
             confidence: Confidence::DETERMINISTIC,
             resolution: None,
             details: None,
+            evidence: None,
         })
         .collect()
 }

@@ -130,15 +130,23 @@ def store_info(root: Path) -> Dict[str, Any]:
 
 
 def kernel_status(root: Path) -> Dict[str, Any]:
-    """The kernel's own status, or an error — never a fabricated healthy row."""
-    from devcouncil.devmap_client import DevMapClient, DevMapClientError
+    """The kernel's own status, or an error — never a fabricated healthy row.
+
+    Fields a kernel may not send are *omitted* rather than defaulted: the key's
+    absence is how a reader tells "this binary predates the field" from the
+    kernel's own ``null``. The daemon's IPC ``status`` is a real case of the
+    first — it carries ``coverage_gaps`` but not ``edge_resolution_source`` —
+    so this is the difference between a daemon-backed doctor and a CLI-backed
+    one, not a hypothetical old binary.
+    """
+    from devcouncil.devmap_client import UNREPORTED, DevMapClient, DevMapClientError
 
     try:
         # A probe must not start a 30-minute daemon as a side effect.
         status = DevMapClient(root, autospawn=False).status()
     except DevMapClientError as exc:
         return {"error": str(exc)}
-    return {
+    row: Dict[str, Any] = {
         "generation_id": status.generation_id,
         "pending_count": status.pending_count,
         "quarantined_count": status.quarantined_count,
@@ -147,6 +155,14 @@ def kernel_status(root: Path) -> Dict[str, Any]:
         "is_fresh": status.is_fresh,
         "degraded_reason": status.degraded_reason,
     }
+    for name, value in (
+        ("coverage_gaps", status.coverage_gaps),
+        ("edge_resolution_source", status.edge_resolution_source),
+        ("edge_confidence_mismatches", status.edge_confidence_mismatches),
+    ):
+        if value is not UNREPORTED:
+            row[name] = value
+    return row
 
 
 def daemon_info(root: Path) -> Dict[str, Any]:
@@ -579,6 +595,104 @@ def _siblings_verdict(root: Path) -> tuple[Optional[bool], str, str]:
     return True, detail, ""
 
 
+#: The kernel's three coverage-gap kinds, in the order its `degraded_reason`
+#: sentence names them, with the words that sentence uses. Kept in that order so
+#: the paths read as the expansion of the counts directly above them rather than
+#: as a second, differently-ordered list.
+_COVERAGE_GAP_LABELS = (
+    ("parse_failed", "failed to parse"),
+    ("pattern_recovered", "recovered by pattern (no calls extracted)"),
+    ("discovery_refused", "refused by discovery"),
+)
+
+
+def coverage_gap_lines(kernel: Dict[str, Any]) -> List[str]:
+    """The paths behind the kernel's coverage sentence, one line each.
+
+    ``degraded_reason`` has always carried the counts and never a path, so an
+    operator could not tell a correct refusal — this repository's 30.6 MB
+    vendored ``parser.c`` against a 1 MiB ceiling — from a broken one without
+    opening the store.
+
+    Three inputs, three different answers, because they are three different
+    facts: an inventory the kernel took, ``null`` because it read no store, and
+    no key at all from a binary that predates the listing. The last two must
+    never render as an empty inventory — "nothing was refused" is what a build
+    that read everything reports.
+    """
+    if "coverage_gaps" not in kernel:
+        return [
+            "coverage gaps: not listed — this kernel predates the path inventory; "
+            "rebuild the kernel to name them"
+        ]
+    gaps = kernel["coverage_gaps"]
+    if gaps is None:
+        return ["coverage gaps: not measured — this kernel read no store"]
+    if not isinstance(gaps, dict):
+        return [f"coverage gaps: unreadable ({type(gaps).__name__}, expected an object)"]
+    lines: List[str] = []
+    for key, label in _COVERAGE_GAP_LABELS:
+        entry = gaps.get(key)
+        if not isinstance(entry, dict):
+            continue
+        paths = entry.get("paths")
+        rows = paths if isinstance(paths, list) else []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            reason = row.get("reason")
+            path = row.get("path")
+            lines.append(f"{label}: {path} ({reason})" if reason else f"{label}: {path}")
+        # The kernel caps each list; a capped list that does not say so reads
+        # exactly like a complete one.
+        total = entry.get("total")
+        shown = entry.get("shown")
+        if entry.get("truncated") and isinstance(total, int) and isinstance(shown, int):
+            lines.append(f"{label}: and {total - shown} more")
+    return lines
+
+
+def _edges_verdict(kernel: Dict[str, Any]) -> tuple[Optional[bool], str, str]:
+    """``(ok, detail, code)`` for the ``edges`` check.
+
+    Whether any stored edge's confidence contradicts the resolution kind the
+    store recorded beside it. Unknown — not ok — whenever the number could not
+    be obtained: a kernel that does not compute it, and a kernel that read no
+    store at all, both report *nothing*, which is not the same answer as zero.
+    """
+    source = kernel.get("edge_resolution_source")
+    named = source if isinstance(source, str) else "source not reported"
+    if "coverage_gaps" in kernel and kernel["coverage_gaps"] is None:
+        return None, "this kernel read no store, so no edge was checked", ""
+    if "edge_confidence_mismatches" not in kernel:
+        return (
+            None,
+            "this kernel does not check stored edge confidences; rebuild the kernel to report them",
+            "",
+        )
+    mismatches = kernel["edge_confidence_mismatches"]
+    if not isinstance(mismatches, int) or isinstance(mismatches, bool):
+        # `null` is the kernel's own answer when there is no generation to
+        # check — a store that exists but whose build never landed reports an
+        # empty coverage inventory *and* a null count, so the branch above does
+        # not catch it. The client refuses any other non-integer upstream.
+        return None, "this kernel holds no generation, so no edge was checked", ""
+    if mismatches:
+        return (
+            False,
+            f"{mismatches} stored edge(s) carry a confidence that contradicts "
+            f"their recorded evidence ({named})",
+            "edge_confidence_mismatch",
+        )
+    detail = f"every stored edge's confidence matches its recorded evidence ({named})"
+    if source == "reconstructed":
+        detail += (
+            " — warning: this generation predates the persisted resolution column, "
+            "so the evidence was re-derived rather than read"
+        )
+    return True, detail, ""
+
+
 def run_doctor(root: Path) -> Dict[str, Any]:
     """Checks with verdicts. ``ok`` is False when any *critical* check fails.
 
@@ -600,6 +714,7 @@ def run_doctor(root: Path) -> Dict[str, Any]:
         fix: str = "",
         code: str = "",
         fix_command: str = "",
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         # `code` is what an agent branches on; `fix_command` is what it runs.
         # `fix` stays the sentence a person reads. A failing check without a
@@ -607,17 +722,21 @@ def run_doctor(root: Path) -> Dict[str, Any]:
         # derived from the name when the caller gave none.
         if ok is False and not code:
             code = name
-        checks.append(
-            {
-                "name": name,
-                "ok": ok,
-                "detail": detail,
-                "critical": critical,
-                "fix": fix,
-                "code": code,
-                "fix_command": fix_command or (fix.split(" (")[0].split(";")[0].strip() if fix else ""),
-            }
-        )
+        item: Dict[str, Any] = {
+            "name": name,
+            "ok": ok,
+            "detail": detail,
+            "critical": critical,
+            "fix": fix,
+            "code": code,
+            "fix_command": fix_command or (fix.split(" (")[0].split(";")[0].strip() if fix else ""),
+        }
+        # Evidence that does not fit one line of prose. `detail_lines` renders
+        # indented under the check; the rest is there for `--json` so a caller
+        # reads the structure the kernel sent, not a sentence it has to parse.
+        if extra:
+            item.update(extra)
+        checks.append(item)
 
     engine = status["engine"]
     if engine.get("binary"):
@@ -716,6 +835,8 @@ def run_doctor(root: Path) -> Dict[str, Any]:
             )
         else:
             if kernel.get("is_fresh") and not kernel.get("degraded_reason"):
+                # A healthy kernel is not asked to explain itself: the
+                # inventory only answers a question the failing sentence raised.
                 check("kernel", True, f"generation {kernel.get('generation_id')}, no pending paths")
             else:
                 check(
@@ -727,7 +848,33 @@ def run_doctor(root: Path) -> Dict[str, Any]:
                     fix="dev map repair --pending, then dev map",
                     code="pending_paths",
                     fix_command="dev map doctor --fix",
+                    # The paths behind the counts in `degraded_reason`:
+                    # structured under `coverage_gaps` for `--json`, rendered
+                    # indented under the line for a person.
+                    # `coverage_gaps_reported` is what keeps the JSON honest —
+                    # a kernel that never sent the field and one that sent
+                    # `null` both leave `coverage_gaps` null here.
+                    extra={
+                        "coverage_gaps": kernel.get("coverage_gaps"),
+                        "coverage_gaps_reported": "coverage_gaps" in kernel,
+                        "detail_lines": coverage_gap_lines(kernel),
+                    },
                 )
+        if "error" in kernel:
+            check("edges", None, "the kernel status could not be read", critical=False)
+        else:
+            ok_edges, detail_edges, code_edges = _edges_verdict(kernel)
+            check(
+                "edges",
+                ok_edges,
+                detail_edges,
+                critical=False,
+                code=code_edges,
+                fix="dev map (a build rewrites this generation's edges from the resolver)"
+                if ok_edges is False
+                else "",
+                fix_command="dev map" if ok_edges is False else "",
+            )
 
     for name, artifact in status["artifacts"].items():
         if not artifact["exists"]:
@@ -862,6 +1009,11 @@ _BUILD_RESOLVES = {
     "schema_older_than_kernel",
     "store_unreadable",
     "kernel_unreadable",
+    # A build rewrites this generation's edges from the resolver, which is the
+    # only thing that can put a stored confidence back in step with its
+    # evidence. Listed here so `--fix` acts on it rather than dropping a
+    # failing check that belongs to no set.
+    "edge_confidence_mismatch",
 }
 #: Codes no command inside the repository can fix.
 _NEEDS_A_PERSON = {"engine_missing", "schema_newer_than_kernel"}
@@ -1025,6 +1177,12 @@ def render_doctor(result: Dict[str, Any]) -> List[str]:
         if item["ok"] is not True and item.get("fix"):
             line += f" — fix: {item['fix']}"
         lines.append(line)
+        # Evidence a check could not fit on its own line — the paths behind the
+        # kernel's coverage counts. Indented, so the one-line-per-check shape a
+        # reader (and every consumer that greps this output) relies on holds:
+        # every check still starts at column 0.
+        for detail_line in item.get("detail_lines") or []:
+            lines.append(f"     {detail_line}")
     lines.append("verdict: " + ("healthy" if result["ok"] else "NOT healthy"))
     return lines
 

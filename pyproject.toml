@@ -142,6 +142,11 @@ python_version = "3.12"
 warn_return_any = true
 warn_unused_ignores = true
 ignore_missing_imports = true
+# Bodies of untyped functions are checked too. Without this mypy skipped every
+# def without annotations and said so only as three `annotation-unchecked`
+# notes; turning it on cost two fixes. `disallow_untyped_defs` is the next
+# step and was measured at 337 errors in 100 files on 2026-09-05.
+check_untyped_defs = true
 
 [build-system]
 requires = ["hatchling"]

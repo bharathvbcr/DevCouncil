@@ -10,11 +10,14 @@ use devmap_resolve::model::*;
 use rusqlite::{params, Connection, OptionalExtension, Result, TransactionBehavior};
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::coverage::{CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryRefusal};
+use crate::edge_index::ResolutionSource;
 use crate::schema::{
-    BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, CREATE_SCHEMA_V3, CURRENT_SCHEMA_VERSION,
-    MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12, MIGRATION_V12_TO_V13, MIGRATION_V3_TO_V4,
-    MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8,
-    MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
+    BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, COVERAGE_GAPS_TABLE, CREATE_SCHEMA_V3,
+    CURRENT_SCHEMA_VERSION, MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12, MIGRATION_V12_TO_V13,
+    MIGRATION_V14_TO_V15, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6,
+    MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10,
+    UNRESOLVED_TABLE,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -416,7 +419,7 @@ pub struct Store {
     /// bounded by one edge set and not by the number of generations retained.
     /// The cached set is unfiltered; `min_confidence` is applied per request
     /// against the same rounding rule the SQL used, so the answer is unchanged.
-    edge_cache: Mutex<Option<(u32, std::sync::Arc<Vec<StoredEdge>>)>>,
+    edge_cache: Mutex<Option<CachedEdges>>,
     /// Adjacency over the same rows [`Store::edge_cache`] holds, keyed by the
     /// same generation id.
     ///
@@ -493,6 +496,17 @@ impl Drop for WriterLock {
     }
 }
 
+/// One generation's edge rows and the evidence tier behind each of them.
+///
+/// One entry rather than two caches: an evidence tier read from a different
+/// generation than the edge it labels is precisely the drift the index already
+/// refuses to allow for its coverage disclosure.
+type CachedEdges = (
+    u32,
+    std::sync::Arc<Vec<StoredEdge>>,
+    std::sync::Arc<Vec<crate::edge_index::EdgeResolution>>,
+);
+
 #[derive(Debug, Clone)]
 pub struct StoreStatus {
     pub db_path: String,
@@ -516,6 +530,15 @@ pub struct StoreStatus {
     /// total, because a capped list that reads as the whole set is the failure
     /// this codebase treats as worse than a visible gap.
     pub quarantined_paths: Vec<String>,
+    /// What the latest generation could not read, by path.
+    ///
+    /// `degraded_reason` has always carried the three *numbers* — "2 file(s)
+    /// failed to parse, 1 recovered by pattern, 1 refused by discovery" — and
+    /// nothing anywhere carried the paths, so an operator could not tell a
+    /// correct refusal (a 30.6 MB vendored `parser.c` against a 1 MiB ceiling)
+    /// from a broken one without opening the database by hand. Each list is
+    /// capped at [`crate::COVERAGE_GAP_SAMPLE`] and carries its own total.
+    pub coverage_gaps: CoverageGaps,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -614,6 +637,11 @@ pub struct StoredEdge {
     pub target_symbol: String,
     pub edge_kind: String,
     pub confidence: f32,
+    /// `generation_edges.resolution` as stored: the resolver's evidence kind
+    /// (`StoredResolutionKind::label`), or `None` on a row written before the
+    /// column existed. Decoded by `edge_resolution`, which labels the `None`
+    /// case as a reconstruction rather than a reading.
+    pub resolution: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -640,6 +668,22 @@ pub struct GenerationWriteOpts {
     /// own working directory and every span read from elsewhere comes back
     /// empty. `None` stays NULL — "root unknown", never a wrong root.
     pub repo_root: Option<String>,
+    /// Every path discovery refused for this generation, with its verdict.
+    ///
+    /// The whole inventory, not a delta: the generation stores what it could
+    /// not read, and `discovery_refused_files` is `COUNT(*)` over these rows.
+    /// The daemon's incremental drain, which never re-walks discovery, builds
+    /// it by carrying the previous generation's rows minus every path in this
+    /// batch's affected set and adding what this batch was turned away from.
+    ///
+    /// `None` means *this writer did not measure discovery* — a caller that
+    /// supplied its own corpus, which is every test and the single-file preview
+    /// path — and is not the same as `Some(vec![])`, a walk that ran and
+    /// refused nothing. It is the same distinction
+    /// [`devmap_analyze::DiscoveryCoverage::none`] draws, and
+    /// `save_generation_with_metadata` refuses a generation whose two halves
+    /// disagree about which of them it is.
+    pub discovery_refusals: Option<Vec<DiscoveryRefusal>>,
 }
 
 /// One committed build, as recorded by [`Store::build_history`].
@@ -945,7 +989,12 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "target_symbol",
             "edge_kind",
             "confidence",
+            "resolution",
         ],
+    ),
+    (
+        "generation_coverage_gaps",
+        &["generation_id", "gap", "path", "reason"],
     ),
     (
         "generation_unresolved",
@@ -1299,6 +1348,7 @@ impl Store {
                 // never runs the migration chain, so every table added by a
                 // later migration must also be created here.
                 tx.execute_batch(UNRESOLVED_TABLE)?;
+                tx.execute_batch(COVERAGE_GAPS_TABLE)?;
                 Self::validate_schema(&tx)?;
                 tx.execute(
                     &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION),
@@ -1449,9 +1499,35 @@ impl Store {
             // probe — unlike the ADD COLUMN migrations above.
             tx.execute_batch(MIGRATION_V12_TO_V13)?;
             tx.execute("PRAGMA user_version = 13", [])?;
-            Self::validate_schema(&tx)?;
+            // No mid-chain validation: v14 adds the coverage-gap inventory and
+            // the edge resolution column below, and the end-of-chain check is
+            // the authoritative one.
             tx.commit()?;
             version = 13;
+        }
+        if version == 13 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // `CREATE TABLE IF NOT EXISTS` is idempotent, so this needs no
+            // probe — unlike the ADD COLUMN migrations above.
+            tx.execute_batch(COVERAGE_GAPS_TABLE)?;
+            tx.execute("PRAGMA user_version = 14", [])?;
+            // No mid-chain validation: v15 adds the edge resolution column
+            // below, and the end-of-chain check is the authoritative one.
+            tx.commit()?;
+            version = 14;
+        }
+        if version == 14 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Same idempotency probe as v7/v8/v10/v11: `ADD COLUMN` is not
+            // repeatable, and a fresh create applies `CREATE_SCHEMA_V3`, which
+            // already carries the column, before this chain runs.
+            if !Self::has_column(&tx, "generation_edges", "resolution")? {
+                tx.execute_batch(MIGRATION_V14_TO_V15)?;
+            }
+            tx.execute("PRAGMA user_version = 15", [])?;
+            Self::validate_schema(&tx)?;
+            tx.commit()?;
+            version = 15;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
@@ -2635,8 +2711,8 @@ impl Store {
             // highest-frequency statement in the writer: one execution for
             // every resolved edge, 73,000 of them in a DevCouncil generation.
             tx.prepare_cached(
-                "INSERT INTO generation_edges (generation_id, ordinal, source_file_id, target_file_id, source_symbol, target_symbol, edge_kind, confidence)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO generation_edges (generation_id, ordinal, source_file_id, target_file_id, source_symbol, target_symbol, edge_kind, confidence, resolution)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?
             .execute(
                 params![
@@ -2647,7 +2723,16 @@ impl Store {
                     edge.source_symbol,
                     edge.target_symbol,
                     format!("{:?}", edge.edge_kind),
-                    edge.confidence.persist_real()
+                    edge.confidence.persist_real(),
+                    // The evidence tier, so the read path does not have to
+                    // guess it back out of the row's file layout. NULL only for
+                    // an edge built without a resolution at all, which the
+                    // resolver never produces — `ResolvedEdge::new` takes one —
+                    // and which the read path therefore reports as
+                    // `ResolutionSource::Reconstructed`.
+                    edge.resolution
+                        .as_ref()
+                        .map(|resolution| crate::edge_index::resolution_kind_label(resolution)),
                 ],
             )?;
             edge_ord += 1;
@@ -2687,6 +2772,118 @@ impl Store {
                  dead-code and community results would describe a different graph than the one stored",
                 analysis.total_edges
             )));
+        }
+
+        // The inventory of what this generation could not read.
+        //
+        // Two halves with different provenance and one rule. The extraction
+        // gaps are derived here, from the same `extractions` slice the caller
+        // analysed, through `devmap_analyze::extraction_gaps` — the owner
+        // `extraction_coverage` folds — so a stored path list and the counts in
+        // `AnalysisStatus` cannot describe different files. The discovery
+        // refusals cannot be derived from anything: a refused file has no
+        // `Extraction` at all, so they arrive on `opts` from whoever walked the
+        // tree.
+        //
+        // Deleted paths are excluded on both halves. A file the caller is
+        // removing from the generation must not leave a coverage row behind
+        // claiming the graph is missing something it no longer contains.
+        let mut gap_rows: Vec<(String, String, String)> = Vec::new();
+        // The extraction gaps carry forward exactly as the file rows above do,
+        // and for the same reason: a differential write is handed only the
+        // extractions it re-read, so deriving the whole inventory from them
+        // would drop every gap in a file this batch did not touch. Skipping
+        // `affected` and `deleted` is what lets a file that used to fail to
+        // parse leave the list on the build that parses it.
+        if let Some(prev) = prev_gen {
+            if !full_rewrite {
+                let mut stmt = tx.prepare(
+                    "SELECT gap, path, reason FROM generation_coverage_gaps
+                     WHERE generation_id = ?1 AND gap != ?2",
+                )?;
+                let rows = stmt.query_map(
+                    params![prev, crate::coverage::GAP_DISCOVERY_REFUSED],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?;
+                for row in rows {
+                    let (gap, path, reason) = row?;
+                    if deleted.contains(&path) || affected.contains(&path) {
+                        continue;
+                    }
+                    gap_rows.push((gap, path, reason));
+                }
+            }
+        }
+        for entry in devmap_analyze::extraction_gaps(extractions) {
+            if deleted.contains(&entry.path) {
+                continue;
+            }
+            gap_rows.push((entry.gap.label().to_string(), entry.path, entry.reason));
+        }
+        // The refusal half is never carried forward here. It cannot be: a
+        // refused path has no `Extraction`, so this function has no way to tell
+        // a path the caller re-decided from one it never looked at. The caller
+        // that walked the tree owns that decision — the cold walk replaces the
+        // inventory outright, the drain carries it minus its affected set — and
+        // hands the whole answer down.
+        //
+        // Deleted paths are *not* excluded. A containment refusal deliberately
+        // deletes the path's rows while charging the refusal to coverage; that
+        // is the drain agreeing with `devmap build` about where the repository
+        // ends, and dropping the row here would make the refusal invisible on
+        // the one path that produces it most.
+        let measured_refusals = match &opts.discovery_refusals {
+            Some(refusals) => {
+                // Deduplicated by path, because the count below is checked
+                // against `COUNT(*)` of the rows and the table is keyed by
+                // path: a caller that names one file twice would otherwise
+                // claim a refusal the inventory cannot hold.
+                let unique: std::collections::BTreeMap<&str, &str> = refusals
+                    .iter()
+                    .map(|refusal| (refusal.path.as_str(), refusal.reason.as_str()))
+                    .collect();
+                for (path, reason) in &unique {
+                    gap_rows.push((
+                        crate::coverage::GAP_DISCOVERY_REFUSED.to_string(),
+                        (*path).to_string(),
+                        (*reason).to_string(),
+                    ));
+                }
+                Some(unique.len())
+            }
+            None => None,
+        };
+        // The same guard the edge count above gets, for the same reason: the
+        // number a consumer reads and the rows it is supposed to count come
+        // from two places, and nothing but this obliges them to agree. Getting
+        // it wrong is not a cosmetic mismatch — `discovery_refused_files` caps
+        // the dead-code confidence, so a summary claiming a refusal the
+        // inventory cannot name is a graph degraded for a file nobody can look
+        // at, and a summary claiming none while rows exist is the over-claim
+        // this whole inventory exists to end.
+        if measured_refusals != analysis.discovery_refused_files {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "generation would store {measured_refusals:?} discovery refusal(s) but its \
+                 analysis was computed over {:?}; `discovery_refused_files` is derived from \
+                 the inventory and the two must be one measurement",
+                analysis.discovery_refused_files
+            )));
+        }
+        {
+            let mut insert = tx.prepare(
+                "INSERT OR REPLACE INTO generation_coverage_gaps
+                 (generation_id, gap, path, reason)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (gap, path, reason) in &gap_rows {
+                insert.execute(params![gen_id, gap, path, reason])?;
+            }
         }
 
         for (ordinal, dead) in analysis.dead_symbols.iter().enumerate() {
@@ -3115,23 +3312,47 @@ impl Store {
         Ok(root.flatten().filter(|root| !root.is_empty()))
     }
 
+    /// The latest generation's analysis summary.
+    ///
+    /// `discovery_refused_files` is **derived** from the generation's refusal
+    /// inventory rather than read out of the stored JSON, so the number a
+    /// consumer acts on and the paths it can ask for are one measurement. The
+    /// serialized field survives only as the record of whether discovery was
+    /// measured at all: `None` there stays `None` here — nobody walked, and
+    /// `Some(0)` would say the corpus was seen in full. `save_generation`
+    /// refuses a write whose two halves disagree, so the two can only differ
+    /// for a generation written before the inventory existed, whose rows are
+    /// genuinely absent.
     pub fn latest_analysis(&self) -> Result<Option<AnalysisSummary>> {
         let conn = lock_conn(&self.conn)?;
-        let raw: Option<String> = conn
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let raw: Option<String> = snapshot
             .query_row(
-                "SELECT analysis_json FROM generations ORDER BY id DESC LIMIT 1",
-                [],
+                "SELECT analysis_json FROM generations WHERE id = ?1",
+                params![generation],
                 |row| row.get(0),
             )
             .optional()?;
-        raw.map(|json| {
-            serde_json::from_str(&json).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
-                    "stored generation analysis is invalid: {error}"
-                ))
-            })
-        })
-        .transpose()
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let mut summary: AnalysisSummary = serde_json::from_str(&raw).map_err(|error| {
+            rusqlite::Error::InvalidParameterName(format!(
+                "stored generation analysis is invalid: {error}"
+            ))
+        })?;
+        if summary.discovery_refused_files.is_some() {
+            let refused: usize = snapshot.query_row(
+                "SELECT COUNT(*) FROM generation_coverage_gaps
+                 WHERE generation_id = ?1 AND gap = ?2",
+                params![generation, crate::GAP_DISCOVERY_REFUSED],
+                |row| row.get::<_, i64>(0).map(|count| count as usize),
+            )?;
+            summary.discovery_refused_files = Some(refused);
+        }
+        Ok(Some(summary))
     }
 
     /// Node and edge counts for `generation`, counted at most once.
@@ -3282,6 +3503,20 @@ impl Store {
                 .collect::<Result<Vec<_>>>()?;
             rows
         };
+        // Three primary-key range scans over a table whose rows are the
+        // exception rather than the rule — on this repository, four rows. The
+        // alternative, deriving the two extraction gaps from
+        // `generation_files.parse_outcome_json` at read time, has to walk past
+        // a ~47 KB `extraction_json` on every row of the generation to reach
+        // three small columns; that is the scan the v13 index exists to avoid,
+        // and `status` is a surface a health check polls.
+        let coverage_gaps = match latest {
+            Some(generation) => Self::coverage_gaps_locked(&snapshot, generation)?,
+            // No generation, nothing to describe. Empty here means "there is no
+            // generation", which `latest_generation: None` already says; it is
+            // not a claim that a generation read everything.
+            None => CoverageGaps::default(),
+        };
         Ok(StoreStatus {
             db_path: db_path.to_string(),
             latest_generation: latest,
@@ -3312,7 +3547,144 @@ impl Store {
             },
             quarantined_count,
             quarantined_paths,
+            coverage_gaps,
         })
+    }
+
+    /// The latest generation's coverage-gap inventory, capped per kind.
+    ///
+    /// Takes the caller's snapshot for the same reason
+    /// [`Store::generation_counts_locked`] does: the generation id and the rows
+    /// it names have to come from one instant, or a prune between them reports
+    /// a live generation with no gaps.
+    fn coverage_gaps_locked(
+        snapshot: &rusqlite::Transaction<'_>,
+        generation: u32,
+    ) -> Result<CoverageGaps> {
+        let mut gaps = CoverageGaps::default();
+        let mut count = snapshot.prepare(
+            "SELECT COUNT(*) FROM generation_coverage_gaps
+             WHERE generation_id = ?1 AND gap = ?2",
+        )?;
+        let mut page = snapshot.prepare(
+            "SELECT path, reason FROM generation_coverage_gaps
+             WHERE generation_id = ?1 AND gap = ?2
+             ORDER BY path ASC
+             LIMIT ?3",
+        )?;
+        for label in CoverageGaps::labels() {
+            let total: usize = count.query_row(params![generation, label], |row| {
+                row.get::<_, i64>(0).map(|total| total as usize)
+            })?;
+            let shown: Vec<CoverageGapRow> = page
+                .query_map(
+                    params![generation, label, crate::COVERAGE_GAP_SAMPLE as i64],
+                    |row| {
+                        Ok(CoverageGapRow {
+                            path: row.get(0)?,
+                            reason: row.get(1)?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>>>()?;
+            let slot = gaps.slot(label).expect("every label has a slot");
+            *slot = CoverageGapSample { total, shown };
+        }
+        Ok(gaps)
+    }
+
+    /// Every path the latest generation's discovery refused, with its verdict.
+    ///
+    /// The whole inventory, uncapped: the daemon's drain carries it forward
+    /// minus the paths this batch re-decided, and a capped read would silently
+    /// drop verdicts on every drain until the corpus looked clean.
+    pub fn latest_discovery_refusals(&self) -> Result<Vec<DiscoveryRefusal>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = snapshot.prepare(
+            "SELECT path, reason FROM generation_coverage_gaps
+             WHERE generation_id = ?1 AND gap = ?2
+             ORDER BY path ASC",
+        )?;
+        let refusals = stmt
+            .query_map(params![generation, crate::GAP_DISCOVERY_REFUSED], |row| {
+                Ok(DiscoveryRefusal {
+                    path: row.get(0)?,
+                    reason: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>();
+        drop(stmt);
+        drop(snapshot);
+        refusals
+    }
+
+    /// Whether the latest generation's edges carry the resolution the resolver
+    /// recorded, or a reconstruction standing in for one it never stored.
+    ///
+    /// One row answers for the generation, and that is a property rather than a
+    /// sample: `save_generation` writes every edge of a generation in a single
+    /// transaction from one `resolution.edges`, and edges are never carried
+    /// forward from an older generation (see the comment above the edge loop).
+    /// So the column is present for all of a generation's edges or for none of
+    /// them. `None` when there is no generation, or when it holds no edges —
+    /// which is "nothing to say", not "reconstructed".
+    pub fn latest_edge_resolution_source(&self) -> Result<Option<ResolutionSource>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let stored: Option<Option<String>> = snapshot
+            .query_row(
+                "SELECT resolution FROM generation_edges
+                 WHERE generation_id = ?1 ORDER BY ordinal LIMIT 1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored.map(|resolution| match resolution {
+            Some(_) => ResolutionSource::Stored,
+            None => ResolutionSource::Reconstructed,
+        }))
+    }
+
+    /// Stored edges of the latest generation whose confidence contradicts the
+    /// resolution kind recorded for them, counted in SQL.
+    ///
+    /// The same check `GenerationEdges` makes at index-build time, for a
+    /// process that holds no index — `devmap status` is a fresh process per
+    /// call and must not build a 271k-edge index to answer one number. The
+    /// `CASE` table is generated from `ResolutionKind::ALL` so this cannot hold
+    /// a second copy of the confidence ladder; a spelling the enum does not
+    /// know falls to `-1` and counts as a mismatch, which is the honest reading
+    /// of a kind this binary cannot vouch for. Rows without the column are not
+    /// judged: a reconstruction cannot convict the row. `None` when there is no
+    /// generation.
+    pub fn edge_confidence_mismatches(&self) -> Result<Option<usize>> {
+        use devmap_resolve::model::ResolutionKind;
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let ladder: String = ResolutionKind::ALL
+            .iter()
+            .map(|kind| {
+                format!(
+                    " WHEN '{}' THEN {}",
+                    kind.label(),
+                    kind.confidence().to_millis()
+                )
+            })
+            .collect();
+        let sql = format!(
+            "SELECT COUNT(*) FROM generation_edges
+             WHERE generation_id = ?1 AND resolution IS NOT NULL
+               AND CAST(ROUND(confidence * 1000) AS INTEGER) != CASE resolution{ladder} ELSE -1 END"
+        );
+        let count: i64 = snapshot.query_row(&sql, params![generation], |row| row.get(0))?;
+        Ok(Some(count.max(0) as usize))
     }
 
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<(String, String, String)>> {
@@ -3791,7 +4163,7 @@ impl Store {
                 .join(",");
             let sql = format!(
                 "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
-                        e.edge_kind, e.confidence
+                        e.edge_kind, e.confidence, e.resolution
                  FROM generation_edges e
                  JOIN paths sp ON sp.id = e.source_file_id
                  JOIN paths tp ON tp.id = e.target_file_id
@@ -3817,6 +4189,7 @@ impl Store {
                     target_symbol: row.get(3)?,
                     edge_kind: row.get(4)?,
                     confidence: row.get(5)?,
+                    resolution: row.get(6)?,
                 })
             })?;
             for row in rows {
@@ -3848,7 +4221,7 @@ impl Store {
         };
         let mut stmt = snapshot.prepare(
             "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
-                    e.edge_kind, e.confidence
+                    e.edge_kind, e.confidence, e.resolution
              FROM generation_edges e
              JOIN paths sp ON sp.id = e.source_file_id
              JOIN paths tp ON tp.id = e.target_file_id
@@ -3866,6 +4239,7 @@ impl Store {
                 target_symbol: row.get(3)?,
                 edge_kind: row.get(4)?,
                 confidence: row.get(5)?,
+                resolution: row.get(6)?,
             })
         })?;
         rows.collect()
@@ -3886,7 +4260,7 @@ impl Store {
         // comparison that never ran. `checked_min_confidence` refuses the input
         // instead, so neither implementation is asked an unanswerable question.
         let min_confidence = checked_min_confidence(min_confidence)?;
-        let Some((_, all)) = self.latest_edge_rows()? else {
+        let Some((_, all, _)) = self.latest_edge_rows()? else {
             return Ok(Vec::new());
         };
         Ok(all
@@ -3911,7 +4285,7 @@ impl Store {
     /// that can never be hit again, so the cache silently stopped being one
     /// until the next load rewrote it. Labelling the entry with the generation
     /// its rows came from makes the key mean what it says.
-    fn latest_edge_rows(&self) -> Result<Option<(u32, std::sync::Arc<Vec<StoredEdge>>)>> {
+    fn latest_edge_rows(&self) -> Result<Option<CachedEdges>> {
         let current = {
             let conn = lock_conn(&self.conn)?;
             Self::latest_generation_id_locked(&conn)?
@@ -3920,20 +4294,33 @@ impl Store {
             return Ok(None);
         };
         if let Ok(cache) = self.edge_cache.lock() {
-            if let Some((generation, edges)) = cache.as_ref() {
+            if let Some((generation, edges, resolutions)) = cache.as_ref() {
                 if *generation == current {
-                    return Ok(Some((current, std::sync::Arc::clone(edges))));
+                    return Ok(Some((
+                        current,
+                        std::sync::Arc::clone(edges),
+                        std::sync::Arc::clone(resolutions),
+                    )));
                 }
             }
         }
-        let Some((loaded, all)) = self.latest_edges_uncached(0.0)? else {
+        let Some((loaded, all, resolutions)) = self.latest_edges_uncached(0.0)? else {
             return Ok(None);
         };
         let all = std::sync::Arc::new(all);
+        // Decoded once per generation, beside the rows they describe rather
+        // than in a cache of their own: an evidence tier read from a different
+        // generation than the edge it labels is the drift `GenerationEdges`
+        // already refuses to allow for its coverage disclosure.
+        let resolutions = std::sync::Arc::new(resolutions);
         if let Ok(mut cache) = self.edge_cache.lock() {
-            *cache = Some((loaded, std::sync::Arc::clone(&all)));
+            *cache = Some((
+                loaded,
+                std::sync::Arc::clone(&all),
+                std::sync::Arc::clone(&resolutions),
+            ));
         }
-        Ok(Some((loaded, all)))
+        Ok(Some((loaded, all, resolutions)))
     }
 
     /// Adjacency over the latest generation's edges, built once per generation.
@@ -3948,7 +4335,7 @@ impl Store {
     /// conversion used to fail: a store written by a binary that knows an edge
     /// kind this one does not is refused rather than half-read.
     pub fn generation_edges(&self) -> Result<Option<std::sync::Arc<GenerationEdges>>> {
-        let Some((current, rows)) = self.latest_edge_rows()? else {
+        let Some((current, rows, resolutions)) = self.latest_edge_rows()? else {
             return Ok(None);
         };
         if let Ok(cache) = self.edge_index.lock() {
@@ -3971,8 +4358,12 @@ impl Store {
         // which may already be behind the store's latest.
         let analysis = self.analysis_disclosure_for(current)?;
         let index = std::sync::Arc::new(
-            GenerationEdges::build(rows, analysis)
-                .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
+            GenerationEdges::build_with_resolutions(
+                rows,
+                analysis,
+                Some(resolutions.as_ref().clone()),
+            )
+            .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
         );
         if let Ok(mut cache) = self.edge_index.lock() {
             *cache = Some((current, std::sync::Arc::clone(&index)));
@@ -3986,14 +4377,18 @@ impl Store {
     /// caches them under it; returning only the rows left the caller to label
     /// them with a generation it had resolved separately. `None` when the store
     /// holds no generation.
-    fn latest_edges_uncached(&self, min_confidence: f32) -> Result<Option<(u32, Vec<StoredEdge>)>> {
+    #[allow(clippy::type_complexity)]
+    fn latest_edges_uncached(
+        &self,
+        min_confidence: f32,
+    ) -> Result<Option<(u32, Vec<StoredEdge>, Vec<crate::edge_index::EdgeResolution>)>> {
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
         let mut stmt = snapshot.prepare(
             "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
-                    e.edge_kind, e.confidence
+                    e.edge_kind, e.confidence, e.resolution
              FROM generation_edges e
              JOIN paths sp ON sp.id = e.source_file_id
              JOIN paths tp ON tp.id = e.target_file_id
@@ -4001,17 +4396,33 @@ impl Store {
              ORDER BY e.confidence DESC, sp.path, tp.path,
                       e.source_symbol, e.target_symbol, e.edge_kind",
         )?;
+        // The evidence tier is read in the same statement and decoded in the
+        // same pass. Taking it from a second query would let the two describe
+        // different generations, and taking it later would need the ordering
+        // above reproduced somewhere else — which is exactly the alignment a
+        // shifted resolution column would break.
         let rows = stmt.query_map(params![gen, min_confidence], |row| {
-            Ok(StoredEdge {
+            let edge = StoredEdge {
                 source_file: row.get(0)?,
                 target_file: row.get(1)?,
                 source_symbol: row.get(2)?,
                 target_symbol: row.get(3)?,
                 edge_kind: row.get(4)?,
                 confidence: row.get(5)?,
-            })
+                resolution: row.get(6)?,
+            };
+            let resolution = crate::edge_index::edge_resolution(&edge)
+                .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?;
+            Ok((edge, resolution))
         })?;
-        Ok(Some((gen, rows.collect::<Result<Vec<_>>>()?)))
+        let mut edges = Vec::new();
+        let mut resolutions = Vec::new();
+        for row in rows {
+            let (edge, resolution) = row?;
+            edges.push(edge);
+            resolutions.push(resolution);
+        }
+        Ok(Some((gen, edges, resolutions)))
     }
 
     /// The callers of `names` and the unfiltered total, against one generation.
@@ -4796,6 +5207,10 @@ impl Store {
             )?;
             tx.execute(
                 "DELETE FROM generation_unresolved WHERE generation_id = ?1",
+                params![old_gen],
+            )?;
+            tx.execute(
+                "DELETE FROM generation_coverage_gaps WHERE generation_id = ?1",
                 params![old_gen],
             )?;
             tx.execute(

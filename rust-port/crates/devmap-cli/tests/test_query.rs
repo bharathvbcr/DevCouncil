@@ -254,6 +254,7 @@ fn test_g8_impact_depth_expands_the_full_inbound_chain() {
         confidence: Confidence::DETERMINISTIC,
         resolution: None,
         details: None,
+        evidence: None,
     };
     let resolution = ResolutionResult {
         edges: vec![edge("a", "b"), edge("b", "c")],
@@ -526,6 +527,7 @@ fn savings_counts_files_it_could_not_read_rather_than_calling_them_empty() {
                 deleted_paths: Vec::new(),
                 build_started: None,
                 repo_root: Some(dir.to_string_lossy().into_owned()),
+                discovery_refusals: None,
             },
         )
         .unwrap();
@@ -577,6 +579,7 @@ fn savings_reports_the_query_side_without_assuming_a_saving() {
                 deleted_paths: Vec::new(),
                 build_started: None,
                 repo_root: Some(dir.to_string_lossy().into_owned()),
+                discovery_refusals: None,
             },
         )
         .unwrap();

@@ -776,6 +776,7 @@ fn test_liveness_is_scoped_to_the_target_file() {
             confidence: Confidence::DETERMINISTIC,
             resolution: None,
             details: None,
+            evidence: None,
         }],
         receiver_types: std::collections::BTreeMap::new(),
         reexport_chains: std::collections::BTreeMap::new(),
@@ -836,6 +837,7 @@ fn test_community_reports_are_deterministic() {
                 confidence: Confidence::DETERMINISTIC,
                 resolution: None,
                 details: None,
+                evidence: None,
             },
             devmap_resolve::model::ResolvedEdge {
                 source_file: "alpha.py".to_string(),
@@ -846,6 +848,7 @@ fn test_community_reports_are_deterministic() {
                 confidence: Confidence::DETERMINISTIC,
                 resolution: None,
                 details: None,
+                evidence: None,
             },
         ],
         receiver_types: std::collections::BTreeMap::new(),
@@ -908,6 +911,7 @@ fn test_incremental_store() -> anyhow::Result<()> {
         deleted_paths: vec!["src/f1.py".to_string(), "src/f2.py".to_string()],
         build_started: None,
         repo_root: None,
+        discovery_refusals: None,
     };
 
     let gen2 = store.save_generation_with_opts(&exts2, &resolution2, &analysis2, opts)?;

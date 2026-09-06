@@ -64,6 +64,14 @@ class GraphEdge(BaseModel):
     kind: str  # contains | imports | calls | inherits | implements | overrides | decorates | documents
     confidence: Confidence = Confidence.EXTRACTED
     reason: str = ""
+    # The evidence tier the kernel resolved this edge by (the store's
+    # `ResolutionKind` spelling: SameFile, ImportScoped, ReceiverType,
+    # UniqueGlobal, AmbiguousGlobal, Unresolved, Structural) and whether that
+    # tier was resolved in-process, read back from the store, or reconstructed
+    # from a generation that predates the persisted column. Empty on an edge
+    # written by a kernel that did not emit them.
+    resolution: str = ""
+    resolution_source: str = ""
     extras: Dict[str, Any] = Field(default_factory=dict)
 
 

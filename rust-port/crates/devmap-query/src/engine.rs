@@ -2404,6 +2404,10 @@ fn stored_edge_to_resolved(edge: StoredEdge) -> anyhow::Result<ResolvedEdge> {
     // stored spelling is that crate's `format!("{kind:?}")` on the way in, and
     // a second table here could disagree with the one the edge index uses.
     let edge_kind = devmap_store::edge_kind_from_stored(&edge.edge_kind)?;
+    // The evidence tier the row carries, decoded by the same owner the edge
+    // index uses. A row written before the column existed comes back as a
+    // reconstruction and says so; nothing here rounds it up to a reading.
+    let evidence = devmap_store::edge_resolution(&edge)?;
     Ok(ResolvedEdge {
         source_file: edge.source_file,
         target_file: edge.target_file,
@@ -2411,7 +2415,12 @@ fn stored_edge_to_resolved(edge: StoredEdge) -> anyhow::Result<ResolvedEdge> {
         target_symbol: edge.target_symbol,
         edge_kind,
         confidence: Confidence(edge.confidence),
+        // The payload is not persisted — an `ImportScoped` row does not carry
+        // `imported_from` — so the variant is not rebuilt: a `Resolution`
+        // invented to fill it would be a guess wearing the resolver's type.
+        // The kind and its provenance travel in `evidence` instead.
         resolution: None,
+        evidence: Some(evidence),
         details: None,
     })
 }
@@ -3730,6 +3739,7 @@ mod tests {
                 target_symbol: "b.py::to".to_string(),
                 edge_kind: name.to_string(),
                 confidence: 1.0,
+                resolution: None,
             })
             .expect("the store must parse back the name this table emits");
             assert_eq!(
@@ -3922,6 +3932,7 @@ mod tests {
             confidence: Confidence(confidence),
             resolution: None,
             details: None,
+            evidence: None,
         }
     }
 
@@ -4334,6 +4345,7 @@ mod indexed_start_equivalence_tests {
             target_symbol: target_symbol.to_string(),
             edge_kind: edge_kind_name(kind).to_string(),
             confidence,
+            resolution: None,
         }
     }
 

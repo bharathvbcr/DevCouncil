@@ -194,13 +194,31 @@ fn first_generation_with_a_refusal(root: &Path, db_path: &Path) -> Store {
     let mut resolver = devmap_resolve::Resolver::new();
     resolver.index_extractions(&extractions);
     let resolution = resolver.resolve_all(&extractions);
+    // The inventory, exactly as the CLI build path supplies it: the count a
+    // consumer reads is `COUNT(*)` over these rows, and `save_generation`
+    // refuses a generation whose summary claims a refusal the inventory cannot
+    // name.
+    let refusals = devmap_store::discovery_refusals(&report);
     let analysis = devmap_analyze::analyze_with_discovery(
         &extractions,
         &resolution,
-        devmap_analyze::DiscoveryCoverage::refused(report.refused_count()),
+        devmap_analyze::DiscoveryCoverage::refused(refusals.len()),
     );
     store
-        .save_generation(&extractions, &resolution, &analysis)
+        .save_generation_with_metadata(
+            &extractions,
+            &resolution,
+            &analysis,
+            devmap_store::GenerationWriteOpts {
+                discovery_refusals: Some(refusals),
+                ..Default::default()
+            },
+            // The stamp the daemon's own HEAD reading produces outside a git
+            // repository. Without it `head_moved` is true on the first drain
+            // and the daemon takes the full-rebuild branch — which re-walks
+            // discovery, and so exercises the other path entirely.
+            "unavailable",
+        )
         .unwrap();
     store
 }
@@ -235,6 +253,17 @@ fn an_incremental_resync_does_not_erase_a_recorded_refusal() {
         reader.latest_generation_payload_is_current().unwrap(),
         "fixture precondition: the payload must be current, or the drain takes \
          the full-rebuild branch and this tests the other path"
+    );
+    // The other half of the same precondition, and the one this fixture used to
+    // be missing. `save_generation` stamps `head_sha = "unknown"`, while the
+    // daemon's own HEAD reading outside a git repository produces
+    // `"unavailable"` — so `head_moved` was true on every drain here and the
+    // test exercised the full-rebuild branch under a comment saying it did not.
+    assert_eq!(
+        reader.latest_generation_head_sha().unwrap().as_deref(),
+        Some("unavailable"),
+        "fixture precondition: the stored stamp must equal what the daemon reads \
+         here, or `head_moved` sends the drain down the full-rebuild branch"
     );
     daemon
         .drain_pending_batch()

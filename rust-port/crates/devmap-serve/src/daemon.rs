@@ -260,11 +260,16 @@ struct PendingDelta {
     affected: std::collections::BTreeSet<String>,
     deleted: std::collections::BTreeSet<String>,
     fresh: Vec<devmap_extract::Extraction>,
-    /// Paths this delta could not read because discovery refuses them. Carried
-    /// so the drain's coverage number cannot report a corpus fully walked when
-    /// this batch just met a file it was turned away from. Paths, not a count,
-    /// because a batch may name one file through several events.
-    refused: std::collections::BTreeSet<String>,
+    /// Paths this delta could not read because discovery refuses them, each
+    /// with the verdict that says why.
+    ///
+    /// A map from path to `DiscoverySkipReason`'s own `Display`, not a count
+    /// and not a bare set: the generation stores one row per refused path, and
+    /// the drain's number is `COUNT(*)` over those rows. Keyed by path because
+    /// a batch may name one file through several events, and carrying the
+    /// reason because `devmap status` names the paths and an operator reading
+    /// one has to be able to tell a correct refusal from a broken one.
+    refused: std::collections::BTreeMap<String, String>,
 }
 
 /// Default bounded lifetime for an idle daemon, in seconds.
@@ -612,7 +617,7 @@ impl Daemon {
                 );
                 delta.affected.insert(relative.clone());
                 delta.deleted.insert(relative.clone());
-                delta.refused.insert(relative);
+                delta.refused.insert(relative, reason.to_string());
                 return Ok(delta);
             }
             // A link to a directory inside the repository. The walk does not
@@ -671,9 +676,11 @@ impl Daemon {
                     format!("{prefix}{path}")
                 }
             };
-            delta
-                .refused
-                .extend(discovery.refusals().map(|(path, _)| at_root(path)));
+            delta.refused.extend(
+                discovery
+                    .refusals()
+                    .map(|(path, reason)| (at_root(path), reason.to_string())),
+            );
             // Only the refusals that are about *this attempt* keep their rows.
             // A containment refusal says the path is not the repository's, and
             // a full build of the same tree writes nothing for it — so keeping
@@ -897,9 +904,10 @@ impl Daemon {
         let previous = self.store.latest_extractions()?;
         let mut affected = std::collections::BTreeSet::new();
         let mut deleted = std::collections::BTreeSet::new();
-        // Paths this batch met and discovery refused. A set, so a file named by
-        // several events in one batch is one refusal.
-        let mut refused: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        // Paths this batch met and discovery refused, with their verdicts. A
+        // map, so a file named by several events in one batch is one refusal.
+        let mut refused: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
         // Keyed by path, because two queue entries can cover one file: a
         // directory and a file inside it arrive together in a single watcher
         // batch, and a whole-tree rescan sits beside whatever per-path events
@@ -1040,46 +1048,39 @@ impl Daemon {
         // produce one bad answer: the drain *overwrites* the stored
         // `analysis_json`, so it also erases the correct `Partial` that
         // `devmap build` recorded, and one watcher event is enough to do it.
-        let (mut extractions, full_rebuild, discovery) = if payload_is_current && !head_moved {
+        //
+        // The generation stores the refusal *inventory* — one row per refused
+        // path — and the count is `COUNT(*)` over it. This is what replaced
+        // carrying the previous generation's number forward as a floor. The
+        // floor kept the `Partial` alive, which was the point, but it could
+        // only ever move one way: a repaired file stayed counted until a full
+        // re-extraction, and a refusal this batch met vanished into a larger
+        // carried number instead of raising it. A count cannot be maintained,
+        // only replaced; a set of paths can.
+        let (mut extractions, full_rebuild, refusals) = if payload_is_current && !head_moved {
             let mut carried: Vec<_> = previous
                 .into_iter()
                 .filter(|extraction| !affected.contains(&extraction.file_path))
                 .collect();
             carried.extend(fresh.iter().cloned());
-            // This branch never re-walks discovery, so it cannot measure
-            // refusals — but it can decline to *deny* them. The previous
-            // generation measured this same tree, and a file it could not read
-            // is still unread unless something changed it.
-            //
-            // Known residual: once the refused file is fixed — shrunk below the
-            // ceiling, made readable — this count stays high until a full
-            // re-extraction or a `devmap build` re-measures. That under-claims
-            // coverage rather than over-claiming it, which is the side of the
-            // trade the rest of the kernel is built on: an unread file wrongly
-            // reported as read is what deletes working code.
-            let measured = self
+            // This branch never re-walks discovery, so it cannot re-decide the
+            // whole tree — but it does not have to. The previous generation
+            // decided every path in it, and a path this batch did not touch is
+            // still what it was: the watcher would have reported a change.
+            // Every path this batch *did* touch has just been re-decided by
+            // `candidate_kind`/`classify_pending_entry`, so its old verdict is
+            // dropped and this batch's answer stands in its place — which is
+            // how a repaired file leaves the inventory on the very drain that
+            // reads it.
+            let mut inventory: std::collections::BTreeMap<String, String> = self
                 .store
-                .latest_analysis()?
-                .and_then(|summary| summary.discovery_refused_files);
-            let discovery = match measured {
-                // A floor, not a sum: the carried number is a whole-tree
-                // measurement and the batch's is a handful of paths that may
-                // already be inside it, so adding them would double-count. What
-                // must not happen is the other direction — a drain that was
-                // turned away from a file *this batch* reporting the corpus
-                // fully walked because the last full walk happened to refuse
-                // nothing. `max` is the honest reading of two lower bounds.
-                Some(previous) => DiscoveryCoverage::refused(previous.max(refused.len())),
-                // Only reachable for a generation written before the count was
-                // recorded at all. `none()` leaves it honestly unmeasured
-                // instead of asserting zero — and the payload check above sends
-                // a store that old down the full-rebuild branch regardless.
-                None if refused.is_empty() => DiscoveryCoverage::none(),
-                // Except when this batch measured something: one refusal seen
-                // is more than nothing known.
-                None => DiscoveryCoverage::refused(refused.len()),
-            };
-            (carried, false, discovery)
+                .latest_discovery_refusals()?
+                .into_iter()
+                .filter(|refusal| !affected.contains(&refusal.path))
+                .map(|refusal| (refusal.path, refusal.reason))
+                .collect();
+            inventory.extend(refused.clone());
+            (carried, false, inventory)
         } else {
             // The branch that actually walks the tree is the one that can
             // measure it. This report was discarded as `_report`, which is what
@@ -1087,12 +1088,23 @@ impl Daemon {
             // did and the least entitled to be.
             let (whole_tree, report) =
                 devmap_store::extract_tree_cached_with_report(&self.store, &self.root)?;
+            // A full walk replaces the inventory outright rather than merging
+            // into it: it re-decided every path in the tree, so a carried row
+            // could only describe a path this walk has just answered for.
             (
                 whole_tree,
                 true,
-                DiscoveryCoverage::refused(report.refused_count()),
+                devmap_store::discovery_refusals(&report)
+                    .into_iter()
+                    .map(|refusal| (refusal.path, refusal.reason))
+                    .collect(),
             )
         };
+        let refusals: Vec<devmap_store::DiscoveryRefusal> = refusals
+            .into_iter()
+            .map(|(path, reason)| devmap_store::DiscoveryRefusal { path, reason })
+            .collect();
+        let discovery = DiscoveryCoverage::refused(refusals.len());
         extractions.sort_by(|left, right| left.file_path.cmp(&right.file_path));
         let mut resolver = Resolver::new();
         match collect_go_modules(&self.root) {
@@ -1137,6 +1149,10 @@ impl Daemon {
                 },
                 repo_root: Some(root.to_string_lossy().into_owned()),
                 build_started: Some(resync_started),
+                // Always `Some` on this path: both branches above produced a
+                // complete inventory for the tree, so the drain has measured
+                // discovery even when it did not re-walk it.
+                discovery_refusals: Some(refusals),
             },
             &head_sha,
         )?;

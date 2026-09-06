@@ -535,6 +535,7 @@ mod tests {
             confidence: Confidence::DETERMINISTIC,
             resolution: None,
             details: None,
+            evidence: None,
         }
     }
 

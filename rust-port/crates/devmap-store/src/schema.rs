@@ -49,7 +49,16 @@ CREATE TABLE IF NOT EXISTS generation_edges (
     target_symbol  TEXT NOT NULL,
     edge_kind      TEXT NOT NULL,
     confidence     REAL NOT NULL,
+    resolution     TEXT,
     PRIMARY KEY (generation_id, ordinal)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS generation_coverage_gaps (
+    generation_id INTEGER NOT NULL,
+    gap           TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    PRIMARY KEY (generation_id, gap, path)
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS generation_dead_symbols (
@@ -378,7 +387,68 @@ CREATE INDEX IF NOT EXISTS idx_generation_files_cache_identity
     ON generation_files(content_hash, language, grammar_version, analyzer_version);
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 13;
+/// v14: the inventory of what a generation could not read.
+///
+/// One row per path, not a number. `AnalysisSummary.discovery_refused_files`
+/// was a count, and a count cannot be *maintained* — only replaced. That is
+/// what forced the daemon's incremental drain, which never re-walks discovery,
+/// to carry the previous generation's number forward and take
+/// `max(previous, this_batch)` as a floor. The floor bought "a resync must not
+/// erase a recorded refusal" with two wrong answers: a repaired file stayed
+/// counted until a full re-extraction, and a refusal this batch met vanished
+/// into a larger carried number — the second an over-claim, the shape this
+/// codebase treats as the expensive one.
+///
+/// With the paths stored, the drain carries the inventory *minus every path in
+/// this batch's affected set*, plus what this batch was turned away from: a
+/// path nothing touched keeps its verdict, a path this batch touched is
+/// re-decided by `candidate_kind`. The count is then `COUNT(*)` and cannot
+/// drift from the set it counts.
+///
+/// The same table holds the two extraction gaps — files a grammar was wanted
+/// for and did not read, and files recovered by line pattern — for a different
+/// reason: they *are* derivable from `generation_files`, but only by
+/// deserializing `parse_outcome_json` for every file in the generation, and
+/// those rows carry a ~47 KB `extraction_json` each that the scan has to walk
+/// past. Measured on this repository that is the difference between a `status`
+/// costing under a millisecond and one costing tens. The write path derives
+/// them from `devmap_analyze::extraction_gaps`, the same owner
+/// `extraction_coverage` folds, so the stored list cannot disagree with the
+/// counts the analysis reported.
+///
+/// `WITHOUT ROWID` and keyed `(generation_id, gap, path)`: reading one
+/// generation's gaps of one kind is a primary-key range scan, which is what
+/// `status` does three times.
+pub const COVERAGE_GAPS_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS generation_coverage_gaps (
+    generation_id INTEGER NOT NULL,
+    gap           TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    PRIMARY KEY (generation_id, gap, path)
+) WITHOUT ROWID;
+"#;
+
+/// v15: the evidence tier each edge was built from.
+///
+/// `ResolvedEdge::new` is the only constructor the resolver uses, so an edge's
+/// `confidence` cannot disagree with its `Resolution` on the way in. On the way
+/// back out there was nothing: no column held the resolution, so
+/// `devmap-query`'s `stored_edge_to_resolved` rebuilt every edge with
+/// `resolution: None` and the honesty invariant rested on the round trip plus
+/// the write-side constructor — never on a second, independent reading of the
+/// same fact.
+///
+/// Nullable, and NULL is not a tier. It means "written before this column
+/// existed", which is why the read path labels such an edge
+/// `ResolutionSource::Reconstructed`: a variant guessed from the row's file
+/// layout must never be indistinguishable from one the resolver actually
+/// recorded.
+pub const MIGRATION_V14_TO_V15: &str = r#"
+ALTER TABLE generation_edges ADD COLUMN resolution TEXT;
+"#;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 15;
 
 #[cfg(test)]
 mod retention_constant_tests {

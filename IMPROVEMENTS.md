@@ -1547,10 +1547,12 @@ Five tests, each written against the unmodified code and watched fail:
 
 ### Still open
 
-* `mypy src` checks only `src/`. `tests/` is unchecked, and `[tool.mypy]` sets neither
-  `disallow_untyped_defs` nor `check_untyped_defs`, so mypy skipped the bodies of every
-  untyped function — it reported that as three `annotation-unchecked` notes. Turning either on
-  is a much larger pass and a decision for the maintainer, not a side effect of this one.
+* ~~`[tool.mypy]` sets neither `disallow_untyped_defs` nor `check_untyped_defs`, so mypy
+  skipped the bodies of every untyped function.~~ **Half closed 2026-09-05** (`203879e`) —
+  `check_untyped_defs` was measured at two errors and is now on (lease de-duplication's
+  untyped lists; the MCP freshness closure calling `.status()` on a `DevMapClient | None`).
+  `disallow_untyped_defs` was measured at **337 errors in 100 files** and stays a decision for
+  the maintainer; `tests/` is still unchecked.
 
 ## Session guard: live siblings and divergent branches (2026-09-05)
 
@@ -1679,3 +1681,55 @@ what `devcouncil_map`'s `neighbors_computed` row reports and what the kernel's o
 means. Asking only the narrow one at a consumer would have pushed the same defect one level
 up: a map that derived neighbours and capped them would have reported a clean check off a
 relation it holds two entries of.
+
+## `dev map doctor` names the files the kernel could not read (2026-09-06)
+
+`dev map doctor` reported the counts and never the paths:
+
+```
+warn kernel: partial: call extraction did not cover the whole corpus: 2 file(s) failed to
+     parse, 1 recovered by pattern (no calls extracted), 1 refused by discovery and never
+     read at all
+```
+
+Every number there is a file the graph does not contain, and nothing named one. An operator
+could not tell this repository's *correct* refusal — a 30.6 MB vendored `parser.c` against the
+1 MiB source ceiling — from a broken grammar swallowing half a language, without opening the
+store by hand. The kernel now inventories the three gap kinds; this pass carries the inventory
+through the Python seam to the person reading the doctor.
+
+**The seam keeps three answers apart, because they are three different facts.** `coverage_gaps`
+arrives as an object (an inventory the kernel took), as `null` (it read no store — no store at
+that path, or a schema this binary refuses), or not at all (a binary older than the listing).
+`DevMapStatus` gains an `UNREPORTED` sentinel for the third, distinct from `None`, and
+`kernel_status` **omits** a key the kernel did not send rather than defaulting it. Folding the
+last two into an empty inventory would have printed "nothing was refused" — the answer of a
+build that read everything — for a probe that never ran. This is not hypothetical: the daemon's
+IPC `status` sends `coverage_gaps` but not `edge_resolution_source`, so a daemon-backed doctor
+and a CLI-backed one genuinely differ in what they can say.
+
+The doctor's `kernel` check now renders one indented line per path under its own line —
+`refused by discovery: rust-port/vendor/grammars/cobol/parser.c (30660349 bytes exceeds the
+1048576 byte source ceiling…)` — and `and N more` when the kernel's 50-per-kind cap truncated
+the list. `--json` carries the structure itself under `coverage_gaps` on the check, so an agent
+reads the kernel's object rather than parsing a sentence. `render_doctor` keeps one line per
+check at column 0; the evidence rides underneath, indented.
+
+**A new non-critical `edges` check** answers whether any stored edge's confidence contradicts
+the resolution kind the store recorded beside it: ok at 0 (`every stored edge's confidence
+matches its recorded evidence (stored)`), a warning with the count and `dev map` as its fix
+above 0, and `?` — never ok — when the kernel does not compute the number, read no store at
+all, or holds no generation whose edges could disagree (a store that exists but whose build
+never landed answers with an *empty* coverage inventory and a null count, so that case needs its
+own branch rather than the no-store one). An `edge_resolution_source` of `reconstructed` is called out in the same detail: that
+generation predates the persisted resolution column, so its evidence was re-derived rather than
+read. `edge_confidence_mismatch` joins `_BUILD_RESOLVES` so `--fix` acts on it; a failing code
+in none of the doctor's sets is applied by nothing *and* listed by nothing, which is how a
+failing check disappears from `--fix` output.
+
+Measured against the live kernel (`devmap 0.1.0`, store schema 15) on this repository: the four
+gaps are `rust-port/testdata/fixtures/languages/cobol/main.cob` and `scripts/install.ps1`
+(failed to parse), `rust-port/testdata/fixtures/languages/vbnet/Main.vb` (recovered by
+pattern), and `rust-port/vendor/grammars/cobol/parser.c` (refused by discovery) — each with the
+kernel's own reason. That binary does not yet report `edge_confidence_mismatches`, and the
+`edges` check says so rather than passing.
