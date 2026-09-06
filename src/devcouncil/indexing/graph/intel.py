@@ -306,62 +306,6 @@ def god_nodes(graph: CodeGraph, *, top_n: int = 15) -> List[Dict[str, Any]]:
     return out
 
 
-def hotspots(
-    root: Path,
-    graph: CodeGraph,
-    *,
-    since: str = "90.days",
-    top_n: int = 20,
-) -> List[Dict[str, Any]]:
-    """Churn × coupling hotspots: files changed often AND heavily depended on.
-
-    Score = commits touching the file (last ``since``) × (1 + fan-in).
-    High scores are refactor-risk files where a change ripples widest.
-    """
-    import math
-
-    try:
-        from devcouncil.utils.proc import git_output
-
-        raw = git_output(
-            ["log", f"--since={since}", "--name-only", "--pretty=format:"],
-            cwd=root,
-            default="",
-        )
-    except Exception:
-        logger.debug("hotspot churn scan failed", exc_info=True)
-        return []
-    churn: Counter[str] = Counter()
-    for line in raw.splitlines():
-        p = line.strip().replace("\\", "/")
-        if p:
-            churn[p] += 1
-    if not churn:
-        return []
-
-    fan_in: Counter[str] = Counter()
-    for e in graph.edges:
-        if e.kind in _FILE_EDGE_KINDS and "::" not in e.source and "::" not in e.target:
-            fan_in[e.target] += 1
-
-    file_paths = {n.path or n.id for n in graph.nodes if _is_file_node(n)}
-    scored: List[Dict[str, Any]] = []
-    for path, count in churn.items():
-        if path not in file_paths:
-            continue
-        fi = fan_in.get(path, 0)
-        scored.append(
-            {
-                "path": path,
-                "churn": count,
-                "fan_in": fi,
-                "score": round(count * (1 + math.log1p(fi)), 2),
-            }
-        )
-    scored.sort(key=lambda h: (-h["score"], h["path"]))
-    return scored[:top_n]
-
-
 def _is_package_init(path: str) -> bool:
     return Path(path.replace("\\", "/")).name == "__init__.py"
 
@@ -652,32 +596,6 @@ def diff_impact(
         "path_count": len(items),
         "source": "diff" if (use_diff or not paths) else "paths",
     }
-
-
-def enrich_graph_intel(
-    graph: CodeGraph, *, root: Optional[Path] = None, seed: int = 0
-) -> CodeGraph:
-    """Run communities + processes + centrality + hotspots; persist to ``graph.meta``."""
-    community_summary = compute_communities(graph, seed=seed)
-    processes = extract_processes(graph)
-    meta = dict(graph.meta or {})
-    meta["communities"] = community_summary
-    # Per-node community map so downstream consumers (viz) never have to
-    # re-derive it from mutated node attributes.
-    meta["node_communities"] = {
-        n.id: n.community for n in graph.nodes if n.community
-    }
-    meta["processes"] = processes[:12]
-    meta["god_nodes"] = god_nodes(graph)[:15]
-    meta["circular_imports"] = circular_imports(graph)[:30]
-    meta["package_init_import_count"] = sum(
-        any(_is_package_init(node) for node in component["nodes"])
-        for component in _import_components(graph, include_package_inits=True)
-    )
-    if root is not None:
-        meta["hotspots"] = hotspots(root, graph)
-    graph.meta = meta
-    return graph
 
 
 # Re-export leaf helper for callers that still import from intel.

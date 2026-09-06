@@ -1,6 +1,7 @@
 pub mod clones;
 pub mod clustering;
 pub mod dead_clusters;
+pub mod graph_intel;
 pub mod liveness;
 pub mod model;
 pub mod pdg;
@@ -18,6 +19,9 @@ pub use clustering::{detect_communities, CommunityDetection};
 pub use dead_clusters::{
     dead_clusters, DeadClusterReport, DeadClusterScan, DEAD_CLUSTER_CAP, DEAD_CLUSTER_CONFIDENCE,
     DEAD_CLUSTER_MEMBER_CAP, DEAD_CLUSTER_QUALIFIED_CONFIDENCE,
+};
+pub use graph_intel::{
+    graph_intel, GodNode, GraphIntel, ImportCycle, GOD_NODE_CAP, IMPORT_CYCLE_CAP,
 };
 pub use liveness::{
     analyze_liveness, analyze_liveness_with_coverage, extraction_coverage, extraction_gaps,

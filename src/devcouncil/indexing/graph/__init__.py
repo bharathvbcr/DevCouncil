@@ -2,7 +2,7 @@
 
 Public entry points: :func:`load_code_graph`, :func:`write_code_graph`,
 :func:`query_symbol`, :func:`trace_path`, plus graph intelligence
-(:func:`enrich_graph_intel`, :func:`diff_impact`, …).
+(:func:`diff_impact`, :func:`graph_check`, …).
 
 Neither building the graph nor refreshing the artifacts is one of them. The Rust
 kernel extracts and resolves the graph and writes both ``.devcouncil/repo_map.json``
@@ -45,7 +45,6 @@ if TYPE_CHECKING:  # pragma: no cover - import-time cost is the whole point
         circular_imports,
         compute_communities,
         diff_impact,
-        enrich_graph_intel,
         extract_processes,
         god_nodes,
         graph_check,
@@ -82,7 +81,6 @@ _EXPORTS: dict[str, str] = {
     "circular_imports": "intel",
     "compute_communities": "intel",
     "diff_impact": "intel",
-    "enrich_graph_intel": "intel",
     "extract_processes": "intel",
     "god_nodes": "intel",
     "graph_check": "intel",
