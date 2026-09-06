@@ -2564,7 +2564,10 @@ fn a_v16_store_migrates_to_the_payload_split_and_keeps_its_rows() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17, "the chain must reach the current schema");
+    assert_eq!(
+        version, CURRENT_SCHEMA_VERSION,
+        "the chain must reach the current schema"
+    );
 
     // The identity carries the file, so byte-identical twins stay two payloads.
     let payloads: i64 = conn
@@ -2596,5 +2599,87 @@ fn a_v16_store_migrates_to_the_payload_split_and_keeps_its_rows() {
         );
     }
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Every step in the migration chain is re-entrant, at every version.
+///
+/// The v16→v17 step shipped unable to run: its `file_payloads` omitted the
+/// `file_id` the fresh-create schema declares and its own `INSERT` names, and
+/// 1,842 tests passed over it because **a fresh store is built from the current
+/// schema and never walks the chain**. What failed was the first real store the
+/// binary opened, which is every existing installation.
+///
+/// That blind spot is not specific to one step, so this is not a test of one
+/// step. A store carrying the modern shape but stamped at an older
+/// `user_version` walks every migration from there to the top, and each one
+/// meets a database where its work is already done — which is exactly what each
+/// step's idempotency probe exists to detect. `ADD COLUMN` is not repeatable,
+/// `CREATE INDEX` on a renamed relation is not repeatable, and a step that
+/// re-runs its work against a live view raises rather than no-ops. Any step
+/// whose probe is wrong fails here, at the version it is wrong for, instead of
+/// on a user's machine.
+///
+/// Ranged over `CURRENT_SCHEMA_VERSION` rather than a literal, so a v18 added
+/// tomorrow is covered the day it lands. `MIN_MIGRATABLE` is 3 because the
+/// chain's own entry point is 3: below it the store is a foreign Python
+/// `index.sqlite`, which `adversarial_store` covers separately.
+#[test]
+fn every_migration_step_is_re_entrant_from_every_version() {
+    const MIN_MIGRATABLE: i32 = 3;
+    let dir = tmp_dir("migration-reentrancy");
+    let mut checked = 0;
+
+    for stamped in MIN_MIGRATABLE..=CURRENT_SCHEMA_VERSION {
+        let db_path = dir.join(format!("stamped-{stamped}.sqlite"));
+        {
+            // A store at the current shape, then backdated. Every step from
+            // `stamped` up meets work already done.
+            let store = Store::open(&db_path).unwrap();
+            drop(store);
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(&format!("PRAGMA user_version = {stamped}"), [])
+                .unwrap();
+        }
+
+        let store = Store::open(&db_path).unwrap_or_else(|error| {
+            panic!(
+                "a store stamped at v{stamped} must migrate to                  v{CURRENT_SCHEMA_VERSION}, not fail to open: {error}"
+            )
+        });
+        drop(store);
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            version, CURRENT_SCHEMA_VERSION,
+            "a store stamped at v{stamped} stopped at v{version}"
+        );
+        // `Store::open` runs `validate_schema` at the end of the chain, so
+        // reaching here is the shape check. This re-asserts the one relation
+        // the chain's last step creates, because a migration that silently
+        // skipped would leave the version right and the shape wrong.
+        let is_view: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE name = 'generation_files' AND type = 'view'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            is_view, 1,
+            "from v{stamped}, generation_files must end as a view"
+        );
+        checked += 1;
+    }
+
+    assert_eq!(
+        checked,
+        CURRENT_SCHEMA_VERSION - MIN_MIGRATABLE + 1,
+        "the sweep must cover every version, not a subset"
+    );
     let _ = fs::remove_dir_all(&dir);
 }

@@ -235,6 +235,12 @@ pub struct CacheKey {
     pub analyzer_version: String,
 }
 
+/// Building a key means asking "may a payload extracted by *this* build be
+/// reused", and only a build with grammars can answer it. The struct itself
+/// stays available with `parse` off: a query-only consumer reads
+/// `grammar_version` / `analyzer_version` off stored rows, it just cannot
+/// compute what its own build would stamp, because it stamps nothing.
+#[cfg(feature = "parse")]
 impl CacheKey {
     pub fn for_source(language: &str, source: &str) -> Self {
         Self::for_content_hash(language, crate::content_hash(source))
@@ -268,6 +274,13 @@ impl CacheKey {
 /// `save_generation_with_metadata` — 65,615 stored against 65,798 analysed.
 /// Anything that decides whether a stored payload may be reused must ask this
 /// function rather than assemble the string itself.
+/// Needs a compiled grammar to answer, so it exists only with `parse` on.
+///
+/// `devmap-store` already guards this: its own `current_payload_identity`
+/// returns `Option` and documents that this one is `#[cfg(feature = "parse")]`.
+/// The gate that comment relies on had been lost, so `--no-default-features`
+/// did not build and the wrapper guarded a condition that could not arise.
+#[cfg(feature = "parse")]
 pub fn current_payload_identity(language: &str) -> (String, String) {
     (
         grammar_version_for(language),
@@ -286,6 +299,7 @@ pub fn current_payload_identity(language: &str) -> (String, String) {
 /// through [`crate::embedded::permitted_embedded_languages`] rather than
 /// restated here, so the identity can never name a different set from the one
 /// extraction routes to.
+#[cfg(feature = "parse")]
 pub fn grammar_version_for(language: &str) -> String {
     let base = base_grammar_identity(language);
     let embedded = crate::embedded::permitted_embedded_languages(language);
@@ -306,6 +320,7 @@ pub fn grammar_version_for(language: &str) -> String {
 /// a function that cannot itself consult the embedded list: one level, and a
 /// registry entry that named its own language could not send this into
 /// unbounded recursion.
+#[cfg(feature = "parse")]
 pub(crate) fn base_grammar_identity(language: &str) -> String {
     let (package, package_version, variant, grammar): (&str, &str, &str, tree_sitter::Language) =
         match language {
@@ -529,6 +544,10 @@ pub fn cache_admits(outcome: &ParseOutcome) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Grammar-dependent. `cache_admits` is not, and its test below runs in both
+    // configurations on purpose: gating a whole test module because part of it
+    // needs a grammar is coverage removed from the shape an embedder ships.
+    #[cfg(feature = "parse")]
     use crate::extract_file;
 
     #[test]
@@ -548,6 +567,7 @@ mod tests {
     /// languages means one language's payload can be served for another's file.
     /// The existing test only compared Python against JavaScript.
     #[test]
+    #[cfg(feature = "parse")]
     fn every_linked_grammar_has_a_distinct_real_identity() {
         let linked = [
             "python",
@@ -611,6 +631,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "parse")]
     fn test_s14_grammar_version_is_language_specific() {
         let py = grammar_version_for("python");
         let js = grammar_version_for("javascript");
@@ -621,6 +642,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "parse")]
     fn test_s14_cache_key_uses_compiled_grammar_package_and_variant() {
         let ts = grammar_version_for("typescript");
         let tsx = grammar_version_for("tsx");
@@ -632,6 +654,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "parse")]
     fn test_cache_key_changes_with_content_hash() {
         let a = extract_file("a.py", "def a(): pass\n");
         let b = extract_file("b.py", "def b(): pass\n");
@@ -639,6 +662,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "parse")]
     fn extraction_schema_version_is_part_of_cache_identity() {
         let ext = extract_file("worker.py", "worker = Worker()\n");
         let key = CacheKey::for_extraction(&ext);

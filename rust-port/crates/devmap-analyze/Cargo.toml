@@ -83,3 +83,35 @@ required-features = ["parse"]
 [[test]]
 name = "exemption_seams"
 required-features = ["parse"]
+
+[[test]]
+name = "clusters_read_the_defect_ledger"
+required-features = ["parse"]
+
+[[test]]
+name = "coverage_cap_is_graded"
+required-features = ["parse"]
+
+[[test]]
+name = "dead_clusters"
+required-features = ["parse"]
+
+[[test]]
+name = "graded_cap_under_hostile_input"
+required-features = ["parse"]
+
+[[test]]
+name = "heritage_liveness"
+required-features = ["parse"]
+
+[[test]]
+name = "reexport_chain_liveness"
+required-features = ["parse"]
+
+[[test]]
+name = "resolution_rate"
+required-features = ["parse"]
+
+[[test]]
+name = "unresolved_namesake_veto"
+required-features = ["parse"]

@@ -1481,7 +1481,12 @@ impl Resolver {
                         continue;
                     }
                     let hits = self.symbol_index.get(&route.handler_name);
-                    let route_source = format!("{} {}", route.http_method, route.path_pattern);
+                    // The route's node identity, not a bare "VERB /path"
+                    // label. `ExtractedRoute::node_id` owns the shape so the
+                    // graph export can emit a node under the same id; an edge
+                    // whose source names no node leaves every route consumer
+                    // reading an empty graph.
+                    let route_source = route.node_id(&ext.file_path);
                     let mut candidate_count = 0usize;
                     let route_target = hits.and_then(|hits| {
                         let same_file: Vec<_> = hits
@@ -1566,11 +1571,21 @@ impl Resolver {
                         });
                         continue;
                     };
+                    // The handler by its graph identity, the way every
+                    // other edge kind names its target. `route.handler_name`
+                    // is the bare name the source wrote, which matches no node
+                    // and left this edge dangling at both ends.
+                    //
+                    // Liveness is unaffected, and that is checked rather than
+                    // assumed: `called_symbols` inserts both the full target
+                    // and its `rsplit("::")` tail, so a routed handler stays
+                    // reached under either spelling.
+                    let target_symbol = self.qualified_for(&target_f, &route.handler_name);
                     edges.push(ResolvedEdge::resolved(
                         ext.file_path.clone(),
                         target_f,
                         route_source,
-                        route.handler_name.clone(),
+                        target_symbol,
                         EdgeKind::HandlesRoute,
                         Arc::new(resolution),
                         Some(route.framework.clone()),
@@ -3721,6 +3736,12 @@ mod reference_resolution_tests {
     /// it in the route call, FastAPI/Flask name it by decoration, and Express
     /// names it in the argument list. An Express handler written as an arrow
     /// function is genuinely anonymous and correctly binds to nothing.
+    ///
+    /// Both endpoints are node identities — `file::name`, and
+    /// `file::VERB path` for the route, from `ExtractedRoute::node_id`. They
+    /// used to be a bare `"VERB path"` and a bare handler name, neither of
+    /// which names a node, so the graph export emitted this edge dangling at
+    /// both ends and every route consumer read an empty graph.
     #[test]
     #[cfg(feature = "parse")]
     fn a_route_binds_only_to_an_unambiguous_same_family_handler() {
@@ -3732,7 +3753,7 @@ mod reference_resolution_tests {
         let unique = resolve(&[route_file, ("h.rs", "pub async fn list_items() {}\n")]);
         assert_eq!(
             edges_of(&unique, &[EdgeKind::HandlesRoute]),
-            ["GET /items->list_items"],
+            ["srv.rs::GET /items->h.rs::list_items"],
             "a unique handler binds to its route"
         );
 
@@ -3762,7 +3783,7 @@ mod reference_resolution_tests {
         )]);
         assert_eq!(
             edges_of(&python, &[EdgeKind::HandlesRoute]),
-            ["GET /items->read_items"],
+            ["api.py::GET /items->api.py::read_items"],
             "a decorated Python handler binds to its route"
         );
 
@@ -3774,7 +3795,7 @@ mod reference_resolution_tests {
         )]);
         assert_eq!(
             edges_of(&express, &[EdgeKind::HandlesRoute]),
-            ["GET /users->handleUsers"]
+            ["app.js::GET /users->app.js::handleUsers"]
         );
         let imported = resolve(&[
             (
@@ -3785,7 +3806,7 @@ mod reference_resolution_tests {
         ]);
         assert_eq!(
             edges_of(&imported, &[EdgeKind::HandlesRoute]),
-            ["GET /users->handleUsers"],
+            ["app.js::GET /users->h.js::handleUsers"],
             "an imported handler resolves through its import binding"
         );
 

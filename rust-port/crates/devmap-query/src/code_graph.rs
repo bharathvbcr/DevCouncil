@@ -692,6 +692,75 @@ pub fn build_code_graph_value(
                 "extras": Value::Object(extras),
             }));
         }
+
+        // Route nodes.
+        //
+        // The one node kind that is not a declaration: the extractor records a
+        // route from a framework decorator or registration, and the resolver
+        // names it as the source of the `HandlesRoute` edge. Without the node,
+        // that edge names nothing — so `route_map`, `shape_check` and
+        // `api_impact` read an empty graph out of a generation that has the
+        // routes in it, and the handler endpoint dangles beside it.
+        //
+        // `ExtractedRoute::node_id` owns the id shape for both sides.
+        for route in &ext.routes {
+            let id = route.node_id(&ext.file_path);
+            if node_index.contains_key(&id) {
+                // The same method and path declared twice in one file. Two
+                // nodes sharing an id is worse than one, exactly as above.
+                provenance.duplicate_node_ids_dropped += 1;
+                continue;
+            }
+
+            let mut extras = Map::new();
+            let (line, end_line) = match &source {
+                Some(text) => byte_span_to_line_range(text, &route.span),
+                None => {
+                    extras.insert(
+                        "line_resolution".to_string(),
+                        Value::String(
+                            "unavailable: source file could not be read from the \
+                             indexed repository root"
+                                .to_string(),
+                        ),
+                    );
+                    (0, 0)
+                }
+            };
+            // The three fields a route consumer reads. `verb` is whatever the
+            // extractor recorded: `ANY` when the source declares no single
+            // method — a Flask `@app.route` with no `methods=` — which
+            // consumers already read as "matches any verb" rather than as a
+            // missing value.
+            extras.insert(
+                "route".to_string(),
+                Value::String(route.path_pattern.clone()),
+            );
+            extras.insert("verb".to_string(), Value::String(route.http_method.clone()));
+            extras.insert(
+                "framework".to_string(),
+                Value::String(route.framework.clone()),
+            );
+
+            let kind = node_kind_label(SymbolKind::Route);
+            node_index.insert(id.clone(), (line, kind));
+            nodes.push(json!({
+                "id": id,
+                "kind": kind,
+                "path": ext.file_path,
+                "name": format!("{} {}", route.http_method, route.path_pattern),
+                "line": line,
+                "end_line": end_line,
+                "area": area,
+                "language": ext.language,
+                // An HTTP route is reached from outside the program by
+                // definition; there is no module boundary for it to be
+                // private to.
+                "exported": true,
+                "community": community,
+                "extras": Value::Object(extras),
+            }));
+        }
     }
 
     // (source, target, kind, confidence, resolution, resolution_source) —
@@ -2613,5 +2682,127 @@ mod tests {
             json!(2),
             "the number the key's name reads as must be carried too"
         );
+    }
+
+    /// A route is a node, and the edge naming it finds it.
+    ///
+    /// `HandlesRoute` names the route as its source and the handler as its
+    /// target, and neither used to name a node: the source was a bare
+    /// `"VERB path"` and the target a bare handler name. So every consumer
+    /// that walks route nodes — `route_map`, `shape_check`, `api_impact` —
+    /// read an empty graph out of a generation that had the routes in it, and
+    /// the handler endpoint dangled beside it.
+    ///
+    /// The identity belongs to `ExtractedRoute::node_id`, so this runs the
+    /// real resolver over a real file rather than restating the format: if the
+    /// two sides ever disagree, the edge stops finding its node here.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn a_route_is_a_node_and_its_edge_endpoints_resolve() {
+        use std::collections::BTreeSet;
+
+        let source = "@app.route(\"/api/users/<uid>\", methods=[\"POST\"])\n\
+                      def create_user(uid):\n    return uid\n";
+        let dir = tmp_source_dir("api.py", source);
+        let extractions = [extract_file("api.py", source)];
+        assert_eq!(
+            extractions[0].routes.len(),
+            1,
+            "fixture must extract one route, or this tests nothing: {:?}",
+            extractions[0].routes
+        );
+
+        let mut resolver = devmap_resolve::Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions);
+
+        let json = generate_code_graph_json(
+            &extractions,
+            &empty_analysis(),
+            &resolution.edges,
+            &freshness(),
+            Some(dir.to_str().unwrap()),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        let nodes = value["nodes"].as_array().unwrap();
+
+        let route = nodes
+            .iter()
+            .find(|node| node["kind"] == "route")
+            .unwrap_or_else(|| panic!("the graph must carry a route node: {nodes:?}"));
+        assert_eq!(route["path"], "api.py");
+        assert_eq!(route["line"], 1, "a route's line is its decorator's");
+        assert_eq!(route["extras"]["route"], "/api/users/<uid>");
+        assert_eq!(route["extras"]["verb"], "POST");
+        assert!(
+            route["extras"]["framework"]
+                .as_str()
+                .is_some_and(|f| !f.is_empty()),
+            "the node carries the framework the store drops: {route}"
+        );
+
+        let edges = value["edges"].as_array().unwrap();
+        let routes_to = edges
+            .iter()
+            .find(|edge| edge["kind"] == "routes_to")
+            .unwrap_or_else(|| panic!("the graph must carry a routes_to edge: {edges:?}"));
+        assert_eq!(routes_to["source"], route["id"]);
+        assert_eq!(routes_to["target"], "api.py::create_user");
+
+        let ids: BTreeSet<&str> = nodes
+            .iter()
+            .map(|node| node["id"].as_str().unwrap())
+            .collect();
+        for endpoint in ["source", "target"] {
+            let name = routes_to[endpoint].as_str().unwrap();
+            assert!(
+                ids.contains(name),
+                "the route edge's {endpoint} {name:?} must name a node: {ids:?}"
+            );
+        }
+        assert_eq!(
+            value["meta"]["devmap_rust"]["edge_endpoints_without_node"],
+            json!(0),
+            "a bound route leaves no dangling endpoint"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two files declaring the same verb and path are two nodes.
+    ///
+    /// The id carries the file for exactly this reason. Were it just
+    /// `"VERB path"`, the second would collide with the first, be dropped as a
+    /// duplicate, and leave its own `routes_to` edge pointing at the other
+    /// file's route.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn the_same_route_in_two_files_is_two_nodes() {
+        let source = "@app.get(\"/health\")\ndef ping():\n    return 1\n";
+        let dir = tmp_source_dir("a.py", source);
+        std::fs::write(dir.join("b.py"), source).unwrap();
+        let extractions = [extract_file("a.py", source), extract_file("b.py", source)];
+
+        let json = generate_code_graph_json(
+            &extractions,
+            &empty_analysis(),
+            &[],
+            &freshness(),
+            Some(dir.to_str().unwrap()),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        let routes: Vec<&Value> = value["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|node| node["kind"] == "route")
+            .collect();
+        assert_eq!(routes.len(), 2, "one node per declaration: {routes:?}");
+        assert_eq!(
+            value["meta"]["devmap_rust"]["duplicate_node_ids_dropped"],
+            json!(0)
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

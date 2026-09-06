@@ -226,3 +226,19 @@ required-features = ["parse"]
 [[test]]
 name = "cargo_target_roots_are_wired"
 required-features = ["parse"]
+
+[[test]]
+name = "a_minified_bundle_is_not_parsed"
+required-features = ["parse"]
+
+[[test]]
+name = "heritage"
+required-features = ["parse"]
+
+[[test]]
+name = "language_capabilities"
+required-features = ["parse"]
+
+[[test]]
+name = "liquid_script_scanner_limits"
+required-features = ["parse"]

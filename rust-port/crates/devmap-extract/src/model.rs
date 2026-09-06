@@ -828,6 +828,29 @@ pub struct ExtractedRoute {
     pub span: Span,
 }
 
+impl ExtractedRoute {
+    /// The route's identity in the graph.
+    ///
+    /// A route is a node like any other and needs an id in the same
+    /// `file::name` shape the rest of them use: `devmap-resolve` names it as
+    /// the source of the `HandlesRoute` edge, `devmap-query` names it on the
+    /// node it emits, and `api_routes` reads the verb back off it. The three
+    /// must agree, so the format lives here and nowhere else — a second
+    /// `format!` in any of them is how they drift apart in silence.
+    ///
+    /// The file is part of the identity because the method and path are not
+    /// unique without it: two blueprints each declaring `GET /health` are two
+    /// routes, and collapsing them would drop a node and strand its edge.
+    ///
+    /// The verb never contains a space or a colon, so a reader can recover it
+    /// from the id by taking the token before the first space and then
+    /// everything after its last `::` — which is what `api_routes` does, and
+    /// why a path containing `::` cannot confuse it.
+    pub fn node_id(&self, file_path: &str) -> String {
+        format!("{}::{} {}", file_path, self.http_method, self.path_pattern)
+    }
+}
+
 /// Evidence that something outside the resolvable call graph reaches a symbol.
 ///
 /// `target_symbol` carries the scope: a file-level annotation targets the file

@@ -60,3 +60,7 @@ required-features = ["parse"]
 [[test]]
 name = "import_paths_resolve_to_real_files"
 required-features = ["parse"]
+
+[[test]]
+name = "reexport_chains"
+required-features = ["parse"]
