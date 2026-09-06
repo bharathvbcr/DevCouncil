@@ -128,9 +128,15 @@ def test_cli_skills_show_unknown_errors():
     assert result.exit_code == 1
 
 
-def test_prompt_builder_injects_applicable_skills():
+def test_prompt_builder_injects_applicable_skills(tmp_path, monkeypatch):
     from devcouncil.domain.task import PlannedFile, Task
     from devcouncil.execution.prompt_builder import PromptBuilder
+
+    # A default-root `PromptBuilder()` points at the repository the suite runs
+    # in, and `build_task_prompt` indexes it (see `_repo_map_state_is_not_collateral`
+    # in tests/conftest.py, which caught this test by name). Explicit root *and*
+    # cwd, like every other `build_task_prompt` test.
+    monkeypatch.chdir(tmp_path)
 
     android = Task(
         id="T1",
@@ -140,7 +146,7 @@ def test_prompt_builder_injects_applicable_skills():
         expected_tests=["gradlew test"],
         allowed_commands=["gradlew test"],
     )
-    prompt = PromptBuilder().build_task_prompt(android, [])
+    prompt = PromptBuilder(tmp_path).build_task_prompt(android, [])
     assert "## Engineering skills" in prompt
     # The "Applicable skills:" header names exactly the selected skills...
     applicable = next(line for line in prompt.splitlines() if "Applicable skills:" in line)
@@ -152,7 +158,7 @@ def test_prompt_builder_injects_applicable_skills():
     assert "devcouncil_checkout_task" in prompt or "devcouncil_prepare_execution" in prompt
 
     generic = Task(id="T2", title="Fix a typo", description="spelling", planned_files=[], expected_tests=[], allowed_commands=[])
-    generic_prompt = PromptBuilder().build_task_prompt(generic, [])
+    generic_prompt = PromptBuilder(tmp_path).build_task_prompt(generic, [])
     generic_applicable = next(line for line in generic_prompt.splitlines() if "Applicable skills:" in line)
     assert "core-engineering" in generic_applicable
     assert "android" not in generic_applicable
@@ -173,7 +179,7 @@ def test_golden_testdata_does_not_select_foreign_repo_skill(tmp_path):
     assert "ios" not in selected
 
 
-def test_prompt_builder_deferred_skills_list_both_roots(monkeypatch):
+def test_prompt_builder_deferred_skills_list_both_roots(tmp_path, monkeypatch):
     from devcouncil.domain.task import Task
     from devcouncil.execution.prompt_builder import PromptBuilder
     from devcouncil.skills.registry import Skill
@@ -185,7 +191,8 @@ def test_prompt_builder_deferred_skills_list_both_roots(monkeypatch):
         "devcouncil.skills.registry.select_skills",
         lambda **_k: [core, big],
     )
-    prompt = PromptBuilder().build_task_prompt(
+    monkeypatch.chdir(tmp_path)
+    prompt = PromptBuilder(tmp_path).build_task_prompt(
         Task(id="T3", title="t", description="d", planned_files=[], expected_tests=[], allowed_commands=[]),
         [],
     )

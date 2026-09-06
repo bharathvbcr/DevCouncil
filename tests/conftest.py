@@ -115,9 +115,9 @@ def _repo_state_fingerprint() -> dict[str, tuple[int, int]]:
     return fingerprint
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _repo_map_state_is_not_collateral():
-    """Fail the session if a test built the developer's own map.
+@pytest.fixture(autouse=True)
+def _repo_map_state_is_not_collateral(request: pytest.FixtureRequest):
+    """Fail the test that built the developer's own map, by name.
 
     A test that forgets `tmp_path` (or hands a `PromptBuilder`, a
     `RepoMapper` or the codeintel service a default `project_root`) resolves to
@@ -127,14 +127,20 @@ def _repo_map_state_is_not_collateral():
     `load_code_graph(<repo root>)` and imported this repository's 34 MB
     `code_graph.json` into a 94 MB `.devcouncil/codeintel/index.sqlite` — 66 s
     of the file's runtime, inside an `except Exception` that made it silent.
+    Its sibling `test_prompt_builder_injects_applicable_skills` did the same
+    thing and was only found because this check ran per test: the
+    session-scoped version of it said *that* something escaped and left the
+    *which* to a bisect over 4,400 tests on a machine loaded enough to
+    reproduce it.
 
     Two costs, both paid by the developer rather than by the test: the suite
     rewrites the map the developer is working against, and the test's result
     then depends on that machine's map — the same class as picking up a stale
     globally-installed kernel.
 
-    Deliberately a stat comparison and nothing more. This is a tripwire, not a
-    sandbox; a test that legitimately needs a store builds one under `tmp_path`.
+    Deliberately a stat comparison and nothing more, five `stat` calls per
+    test. This is a tripwire, not a sandbox; a test that legitimately needs a
+    store builds one under `tmp_path`.
 
     **Its blind spot, measured rather than guessed.** `index.sqlite` is written
     by `load_code_graph` only when it is *absent*
@@ -142,7 +148,7 @@ def _repo_map_state_is_not_collateral():
     contaminated run has created it, every later run merely reads it and this
     comparison sees nothing move. Observed directly: one full run created it at
     15:47:31 and tripped; the identical run immediately afterwards passed clean
-    while the 94 MB file sat there the whole time. So a green session is only
+    while the 94 MB file sat there the whole time. So a green run is only
     evidence of cleanliness when the cache was absent at session start — delete
     `.devcouncil/codeintel/index.sqlite` before trusting one. The same caveat
     applies to any create-if-absent artifact added to the watched set.
@@ -153,10 +159,10 @@ def _repo_map_state_is_not_collateral():
     moved = sorted(name for name in before if before[name] != after[name])
     if moved:
         pytest.fail(
-            "the test session modified the repository's own map state, which "
-            "means a test escaped its tmp_path and indexed this checkout: "
+            f"{request.node.nodeid} modified the repository's own map state, "
+            "which means it escaped its tmp_path and indexed this checkout: "
             + ", ".join(moved)
-            + " — give the offending test `tmp_path` and "
-            "`monkeypatch.chdir(tmp_path)`, or pass it an explicit project root",
+            + " — give it `tmp_path` and `monkeypatch.chdir(tmp_path)`, or pass "
+            "it an explicit project root",
             pytrace=False,
         )

@@ -143,8 +143,8 @@ def test_build_task_prompt_caps_to_window_budget(tmp_path):
 
 # ---- python symbol outline ----------------------------------------------------
 
-def test_python_symbol_outline_captures_decorators_and_async():
-    pb = PromptBuilder()
+def test_python_symbol_outline_captures_decorators_and_async(tmp_path):
+    pb = PromptBuilder(tmp_path)
     text = (
         "import os\n"
         "async def top():\n    pass\n"
@@ -162,8 +162,8 @@ def test_python_symbol_outline_captures_decorators_and_async():
     assert "async def load" in joined
 
 
-def test_python_symbol_outline_syntax_error_returns_empty():
-    pb = PromptBuilder()
+def test_python_symbol_outline_syntax_error_returns_empty(tmp_path):
+    pb = PromptBuilder(tmp_path)
     assert pb._python_symbol_outline("def broken(:\n") == []
 
 
