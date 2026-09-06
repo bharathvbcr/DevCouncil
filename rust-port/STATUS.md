@@ -4907,9 +4907,32 @@ pass.
 
 ### Numbers
 
-Workspace fmt clean, clippy `-D warnings` clean, `cargo test --workspace`
-green, determinism double-build identical
-(`c613ef69831097b6d2f81f4d0d36b4b7fa18fdd3f6f14cec47ae42b660ca736e`).
+The gate suite, step by step, before and after. "never reached" means the run
+stopped at an earlier step, which is where all of these sat.
+
+| step | before | after |
+|---|---|---|
+| 1 format | **FAIL** — drift in `rung.rs`, `code_graph.rs` | pass |
+| 2 clippy `-D warnings` | **FAIL** — six lints on rustc 1.98 | pass |
+| 3 `cargo test --workspace` | never reached | pass |
+| 4 determinism double-build | never reached | pass — `c613ef69…ca736e`, identical |
+| 5 self-build gates | never reached | pass — build 4,093 ms, 1,506 files, peak RSS 659 MiB against a 774 MiB budget |
+| 6 memory-model probe | never reached | **FAIL** — see the section above; measured, named, not papered over |
+| 7 growth gate | never reached | pass — 925,696 → 1,720,320 → 1,785,856 → 1,789,952 → 1,794,048 B over five builds, 2 generations retained |
+| 8 incremental-vs-cold | never reached | pass — `SOAK SMOKE OK`, digest stable across 5 cycles |
+| 9 mutation testing | optional | not run |
+
+Beyond the suite, a synthetic hostile corpus — 411 files: three-way circular
+imports, a 5,000-function mutually recursive ring, non-ASCII identifiers, a
+200,000-term single line, 400-deep nested braces, 40-deep directories, 200
+same-named modules, a self-importing module, invalid UTF-8, an empty file, a
+symlink loop and a dangling symlink. Cold build **0.64 s**, exit 0, refusing
+exactly two files with named reasons (`Unreadable`, `EscapesRoot`). Every
+subcommand answered without a panic. The ring came back as **one** cluster of
+5,000, not 5,000 findings; the import cycle as a three-member cluster of
+*functions*, not of files; `trace` past its depth bound returned `Unavailable`
+with the bound named rather than "no path". Modify, add and delete cycles
+converged on the cold digest exactly.
 
 ### Step 6 has never run, and it is red — with a named cause
 
