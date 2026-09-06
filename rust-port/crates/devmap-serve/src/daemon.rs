@@ -1223,7 +1223,7 @@ impl Daemon {
             info!("bounded-idle retirement disabled (DEVMAP_MAX_IDLE_SECS=0)");
         }
 
-        let activity = Arc::new(crate::protocol::Activity::default());
+        let state = Arc::new(crate::protocol::ServeState::default());
         let max_idle = self.resolved_max_idle();
 
         // Installed before the endpoint is bound, so a signal arriving at any
@@ -1242,34 +1242,28 @@ impl Daemon {
             .root
             .canonicalize()
             .unwrap_or_else(|_| self.root.clone());
-        let watcher_activity = Arc::clone(&activity);
+        let watcher_state = Arc::clone(&state);
         let _watcher = start_file_watcher(root, move |paths| {
             if paths.is_empty() {
                 return;
             }
-            watcher_activity.touch();
+            watcher_state.activity.touch();
             // K1(a): the watcher emits *absolute* paths while the connect-time
             // sweep emits repo-relative ones, and the queue used to store both
             // verbatim. That is how this repository's store came to hold 64
             // rows naming a directory the checkout had moved out of, none of
             // which any drain could process and nothing could delete. Both
             // producers now write the same canonical, root-checked form.
-            match store.enqueue_pending_paths_under_root(&enqueue_root, &paths) {
-                Ok(report) => {
-                    for (path, reason) in &report.refused {
-                        warn!("watcher emitted a path outside the tree: {path:?} ({reason})");
-                    }
-                    info!("enqueued {} changed path(s)", report.enqueued.len());
-                }
-                Err(err) => warn!("failed to enqueue pending paths: {err}"),
-            }
+            note_watch_batch(&paths, &watcher_state.unapplied, |paths| {
+                Ok(store.enqueue_pending_paths_under_root(&enqueue_root, paths)?)
+            });
         })?;
 
         #[cfg(unix)]
         let mut ipc_task = AbortTaskOnDrop({
             let server = crate::protocol::UnixIpcServer::bind(&self.ipc_path)?;
             let store = Arc::clone(&self.store);
-            tokio::spawn(server.run(store, Arc::clone(&activity)))
+            tokio::spawn(server.run(store, Arc::clone(&state)))
         });
 
         #[cfg(windows)]
@@ -1277,7 +1271,7 @@ impl Daemon {
             let store = Arc::clone(&self.store);
             let name = self.ipc_path.to_string_lossy().into_owned();
             tokio::spawn(async move {
-                crate::protocol::run_named_pipe(store, &name, Arc::clone(&activity)).await
+                crate::protocol::run_named_pipe(store, &name, Arc::clone(&state)).await
             })
         });
 
@@ -1292,8 +1286,23 @@ impl Daemon {
                 if reconciled > 0 {
                     info!("connect-time sweep enqueued {reconciled} changed path(s)");
                 }
+                // The sweep is the only pass that compares every source's
+                // content hash against the stored generation, so a completed
+                // one is the one thing entitled to retire a record of edits
+                // this daemon could not write down: whatever those batches
+                // named is now either indexed or queued by name. Nothing else
+                // clears it — a later ordinary enqueue that happens to succeed
+                // says nothing about the paths an earlier one dropped.
+                state.unapplied.cleared_by_sweep();
             }
-            Err(err) => warn!("connect-time sweep failed; serving stale generation: {err}"),
+            // The sweep is itself an enqueue, so a store that refuses writes
+            // refuses this too — and then the startup pass that would have
+            // caught up with the tree did not happen either. Recorded rather
+            // than only logged, for the same reason the watcher's failure is.
+            Err(err) => {
+                warn!("connect-time sweep failed; serving stale generation: {err}");
+                state.unapplied.record(0, &err);
+            }
         }
 
         let maintenance_store = Arc::clone(&self.store);
@@ -1432,7 +1441,8 @@ impl Daemon {
                         break LoopExit::ReleaseEndpoint(Ok(()));
                     }
                     if let Some(limit) = max_idle {
-                        let idle_for = activity
+                        let idle_for = state
+                            .activity
                             .idle_for()
                             .unwrap_or_else(|| started_at.elapsed());
                         if idle_for >= limit {
@@ -1592,6 +1602,47 @@ pub fn default_ipc_path_for(root: &std::path::Path) -> std::path::PathBuf {
 #[cfg(windows)]
 pub fn default_ipc_path_for(root: &std::path::Path) -> std::path::PathBuf {
     format!(r"\\.\pipe\devmap-{:016x}", ipc_identity_for(root)).into()
+}
+
+/// Record one watcher batch as pending work, or record that it could not be.
+///
+/// Split out of the watcher closure so the failing branch can be driven
+/// deterministically — the same reason `collect_pending_path_with` and
+/// `read_stable_source_with` take their I/O as a parameter. A store that refuses
+/// writes is otherwise reproducible only with a full volume or a read-only
+/// mount, and a branch reachable only by filling a disk is a branch that is
+/// never tested.
+///
+/// The failing branch is the whole point. It used to be
+/// `Err(err) => warn!("failed to enqueue pending paths: {err}")` and nothing
+/// else, and the queue is the only place "this file changed" was ever written
+/// down — so a store that would not take the write left `pending_count` at 0
+/// and `status` answering `is_fresh: true` about a generation that no longer
+/// described the tree. See [`crate::protocol::UnappliedEdits`] for the two
+/// measurements that found it.
+pub(crate) fn note_watch_batch<F>(
+    paths: &[String],
+    unapplied: &crate::protocol::UnappliedEdits,
+    enqueue: F,
+) where
+    F: FnOnce(&[String]) -> anyhow::Result<devmap_store::PendingEnqueueReport>,
+{
+    match enqueue(paths) {
+        Ok(report) => {
+            for (path, reason) in &report.refused {
+                warn!("watcher emitted a path outside the tree: {path:?} ({reason})");
+            }
+            info!("enqueued {} changed path(s)", report.enqueued.len());
+        }
+        Err(err) => {
+            warn!(
+                "failed to enqueue {} changed path(s); they are NOT in the index, and this \
+                 daemon reports itself stale until a connect-time sweep succeeds: {err}",
+                paths.len()
+            );
+            unapplied.record(paths.len(), &err);
+        }
+    }
 }
 
 /// The repo-relative key `candidate` is stored under.
@@ -3547,6 +3598,197 @@ mod tests {
                     .any(|symbol| symbol.name == "new_symbol")
         }));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A store with one indexed file and one real generation.
+    ///
+    /// Built through the drain rather than by hand, so the `StoreStatus` the
+    /// assertions read is the one a live daemon would actually be answering
+    /// from — an `is_fresh` claim about a status assembled by the test is a
+    /// claim about the test.
+    fn drained_store(tag: &str) -> (std::path::PathBuf, Daemon) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("devmap-{tag}-{stamp}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("main.py"), "def main():\n    return 1\n").unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+        store
+            .enqueue_pending_paths(&[root.join("main.py").display().to_string()])
+            .unwrap();
+        let daemon = Daemon::new(store, root.clone());
+        assert_eq!(daemon.drain_pending_batch().unwrap(), 1);
+        (root, daemon)
+    }
+
+    /// A watcher batch the store would not take must not leave `status` fresh.
+    ///
+    /// The pending queue lives in the store, so "this file changed" is normally
+    /// recorded by writing a row, and `pending_count` is then what holds
+    /// `is_fresh` at false until the drain catches up. When the store refuses
+    /// that write there is nowhere to put the fact, and the whole of the
+    /// daemon's handling was one `warn!`.
+    ///
+    /// Measured against the pre-fix release binary, with the store on a full
+    /// 128 MB HFS volume (`hdiutil attach -nomount ram://262144`, filled to
+    /// 192 KB free) and 60 source files rewritten under a live daemon:
+    ///
+    /// ```text
+    /// daemon log:  WARN failed to enqueue pending paths: database or disk is full
+    /// IPC status:  is_fresh=True pending=0 degraded_reason=None gen=1 nodes=180
+    /// ```
+    ///
+    /// — before the failure, during it, and still after the space came back.
+    /// Sixty edits absent from the index, and the one surface that could have
+    /// said so said `fresh`. A `chmod 444` store — a CI cache, a read-only
+    /// mount — is the same shape from a different cause, which is why the
+    /// record is keyed on the enqueue *failing* and not on why it failed.
+    ///
+    /// The store's own answer is asserted here as an explicit control. It still
+    /// says fresh, and it is not wrong to: from the store's side the queue
+    /// really is empty. That is the pre-fix answer, and the fix is that the
+    /// daemon stops repeating it.
+    #[test]
+    fn edits_the_store_would_not_take_are_not_reported_fresh() {
+        use crate::protocol::{daemon_degraded_reason, daemon_index_is_fresh, index_is_fresh};
+
+        let (root, daemon) = drained_store("unapplied");
+        let status = daemon.store.status(":memory:").unwrap();
+        let unapplied = crate::protocol::UnappliedEdits::default();
+        assert!(
+            daemon_index_is_fresh(&status, &unapplied),
+            "fixture precondition: with nothing dropped the daemon agrees with the store"
+        );
+
+        let batch: Vec<String> = (0..60)
+            .map(|n| root.join(format!("m{n}.py")).to_string_lossy().into_owned())
+            .collect();
+        note_watch_batch(&batch, &unapplied, |_| {
+            // Verbatim what SQLite produced on the full volume.
+            Err(anyhow::anyhow!(
+                "database or disk is full: Error code 13: Insertion failed because database is full"
+            ))
+        });
+
+        // The control: the store is answering a narrower question, correctly.
+        assert!(
+            index_is_fresh(&status),
+            "control: the store's own answer is unchanged — its queue really is \
+             empty, which is exactly why it cannot be the one to notice"
+        );
+        assert_eq!(
+            status.pending_count, 0,
+            "control: nothing is queued, because the queue write is what failed"
+        );
+
+        assert!(
+            !daemon_index_is_fresh(&status, &unapplied),
+            "60 changed paths could not be written down, so this daemon's index is \
+             behind the tree and must not be reported fresh"
+        );
+        let reason = daemon_degraded_reason(&status, &unapplied)
+            .expect("a daemon that is not fresh must say why");
+        assert!(
+            reason.contains("60"),
+            "the reason must carry how much was lost, or an operator cannot judge \
+             it: {reason}"
+        );
+        assert!(
+            reason.contains("database or disk is full"),
+            "and must carry the store's own words, which name the cause: {reason}"
+        );
+
+        // A second refusal is more lost coverage, not the same lost coverage.
+        note_watch_batch(&batch[..5], &unapplied, |_| {
+            Err(anyhow::anyhow!("attempt to write a readonly database"))
+        });
+        let reason = daemon_degraded_reason(&status, &unapplied).expect("still not fresh");
+        assert!(
+            reason.contains("65"),
+            "refusals accumulate: 60 then 5 is 65 paths across 2 batches, not 5: {reason}"
+        );
+        assert!(
+            reason.contains("readonly"),
+            "and the reason shown is the most recent: {reason}"
+        );
+
+        // A batch that succeeds does NOT retire the claim: an enqueue that works
+        // now has looked at none of the paths an earlier one dropped.
+        note_watch_batch(&batch[..1], &unapplied, |_| {
+            Ok(devmap_store::PendingEnqueueReport::default())
+        });
+        assert!(
+            !daemon_index_is_fresh(&status, &unapplied),
+            "a later successful enqueue says nothing about the paths already lost"
+        );
+
+        // Only a completed connect-time sweep — the one pass that re-reads every
+        // source's content hash — can.
+        unapplied.cleared_by_sweep();
+        assert!(
+            daemon_index_is_fresh(&status, &unapplied),
+            "a completed sweep has re-examined the whole tree, so the claim retires"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The same fact, through the wire a client actually reads.
+    ///
+    /// `daemon_index_is_fresh` being right is not the claim that matters; the
+    /// claim that matters is that the JSON on the socket carries it. `status`
+    /// has been two separate literals over one `StoreStatus` before — the
+    /// reason `coverage_gaps_json` exists — and a health check that answers
+    /// differently depending on which surface you ask is the defect this whole
+    /// change is about.
+    #[test]
+    fn the_ipc_status_frame_carries_the_unapplied_edits() {
+        let (root, daemon) = drained_store("unapplied-wire");
+        let unapplied = crate::protocol::UnappliedEdits::default();
+
+        let ask = |unapplied: &crate::protocol::UnappliedEdits| {
+            crate::protocol::dispatch(
+                &daemon.store,
+                crate::protocol::IpcRequest {
+                    version: crate::protocol::PROTOCOL_VERSION,
+                    command: crate::protocol::IpcCommand::Status,
+                },
+                &devmap_query::Cancel::new(),
+                unapplied,
+            )
+            .expect("status must answer")
+        };
+
+        let clean = ask(&unapplied);
+        assert_eq!(clean["is_fresh"], serde_json::json!(true));
+        assert_eq!(clean["degraded_reason"], serde_json::Value::Null);
+
+        note_watch_batch(&["m.py".to_string()], &unapplied, |_| {
+            Err(anyhow::anyhow!("database or disk is full"))
+        });
+
+        let degraded = ask(&unapplied);
+        assert_eq!(
+            degraded["is_fresh"],
+            serde_json::json!(false),
+            "the frame must carry the daemon's answer, not the store's: {degraded}"
+        );
+        assert_eq!(
+            degraded["pending_count"],
+            serde_json::json!(0),
+            "and `pending_count` stays 0 — which is precisely why it could not be \
+             the thing that reported this"
+        );
+        let reason = degraded["degraded_reason"]
+            .as_str()
+            .expect("a frame that says stale must say why");
+        assert!(reason.contains("could not be recorded"), "reason: {reason}");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// K-B3: a stability check that could not run must not answer "stable".

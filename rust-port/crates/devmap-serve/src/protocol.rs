@@ -71,6 +71,133 @@ impl Activity {
     }
 }
 
+/// Edits the daemon saw and could not write down.
+///
+/// The pending queue lives in the store, so "this file changed" is normally
+/// recorded by writing a row — and `pending_count` is then what makes `status`
+/// answer `is_fresh: false` until the drain catches up. That accounting has one
+/// hole, and it is the whole reason this type exists: **when the store refuses
+/// the write, there is nowhere to put the fact.**
+///
+/// The watcher callback's entire handling of that case was
+/// `Err(err) => warn!("failed to enqueue pending paths: {err}")`. A `warn!`
+/// nobody reads is exactly what `admitted_watch_path` already names as all that
+/// separates a frozen index from a quiet one, and here it separated them
+/// completely: with the queue write refused, `pending_count` stayed 0 and
+/// `status` answered `is_fresh: true` about a generation that no longer
+/// described the tree.
+///
+/// Measured twice, on two different causes with one shape:
+///
+/// * a store on a full volume — 60 files rewritten, one `warn!`, and `status`
+///   over the daemon's own socket reporting `is_fresh: true, pending_count: 0,
+///   degraded_reason: null`, before *and* after the space came back;
+/// * a `chmod 444` store, which is a legitimate deployment (a CI cache, a
+///   read-only mount) — same answer, with the only trace in a Python run
+///   history nothing consults.
+///
+/// So the fact is kept here, in memory, where a store that will not take writes
+/// cannot swallow it. It is deliberately *not* clearable by a later successful
+/// enqueue: a queue write that works now says nothing about the sixty edits that
+/// were dropped an hour ago. Only a completed connect-time sweep — the one pass
+/// that re-discovers the whole tree by content hash — can honestly retire it.
+#[derive(Default)]
+pub struct UnappliedEdits(std::sync::Mutex<Option<Unapplied>>);
+
+#[derive(Debug, Clone)]
+struct Unapplied {
+    /// Paths, summed across every refusal. An undercount is possible and is the
+    /// right direction to be wrong in: a batch refused before it was counted
+    /// still moves this off zero, and off zero is the whole claim.
+    paths: u64,
+    batches: u64,
+    /// The most recent reason, verbatim from the store.
+    reason: String,
+}
+
+impl UnappliedEdits {
+    /// Record that `paths` changed paths could not be written down.
+    ///
+    /// Never resets the count. Two refusals are more lost coverage than one.
+    pub fn record(&self, paths: usize, reason: impl std::fmt::Display) {
+        let mut slot = self.0.lock().expect("unapplied-edits mutex poisoned");
+        let reason = reason.to_string();
+        match slot.as_mut() {
+            Some(existing) => {
+                existing.paths = existing.paths.saturating_add(paths as u64);
+                existing.batches = existing.batches.saturating_add(1);
+                existing.reason = reason;
+            }
+            None => {
+                *slot = Some(Unapplied {
+                    paths: paths as u64,
+                    batches: 1,
+                    reason,
+                })
+            }
+        }
+    }
+
+    /// Retire the record, because the tree has been re-read from scratch.
+    ///
+    /// The only caller is a *successful* `reconcile_connect_time`, and that is
+    /// the point: it is the one pass that compares every source's content hash
+    /// against the stored generation, so whatever the dropped batches named is
+    /// either already indexed or has just been queued by name. Clearing on a
+    /// successful ordinary enqueue instead would retire a claim about edits that
+    /// enqueue never looked at.
+    pub fn cleared_by_sweep(&self) {
+        *self.0.lock().expect("unapplied-edits mutex poisoned") = None;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0
+            .lock()
+            .expect("unapplied-edits mutex poisoned")
+            .is_none()
+    }
+
+    /// An owned copy of what is recorded right now.
+    ///
+    /// One request's answer must describe one moment. `dispatch` runs on the
+    /// blocking pool and cannot borrow the shared record across the spawn, and
+    /// handing it the live handle would also let the counts move between the
+    /// `is_fresh` field and the `degraded_reason` field of the same JSON object
+    /// — a status that says fresh and then explains why it is not.
+    pub fn snapshot(&self) -> Self {
+        Self(std::sync::Mutex::new(
+            self.0
+                .lock()
+                .expect("unapplied-edits mutex poisoned")
+                .clone(),
+        ))
+    }
+
+    /// How this reads in `status`, or `None` when nothing was lost.
+    pub fn describe(&self) -> Option<String> {
+        let slot = self.0.lock().expect("unapplied-edits mutex poisoned");
+        let record = slot.as_ref()?;
+        Some(format!(
+            "{} changed path(s) in {} batch(es) could not be recorded as pending work and are \
+NOT in this generation: {}. This index is behind the tree by an amount only a rebuild can \
+establish — run `devmap build`, or restart the daemon once the store accepts writes again.",
+            record.paths, record.batches, record.reason
+        ))
+    }
+}
+
+/// The daemon-side state an IPC handler has to see.
+///
+/// One object rather than a parameter per fact. Both members answer questions
+/// the store cannot: how long since a consumer asked for anything, and what this
+/// daemon knows it failed to write down. A handler given only the store answers
+/// both wrongly — the second one silently.
+#[derive(Default)]
+pub struct ServeState {
+    pub activity: Activity,
+    pub unapplied: UnappliedEdits,
+}
+
 fn default_budget() -> u32 {
     2_000
 }
@@ -545,10 +672,39 @@ pub fn freshness_degraded_reason(status: &StoreStatus) -> Option<String> {
     None
 }
 
+/// Whether a *daemon* may call its index fresh.
+///
+/// [`index_is_fresh`] answers for the store, and it is the right answer there:
+/// a generation exists and nothing is queued behind it. A daemon knows one more
+/// thing, and it is the one the store cannot be told — see [`UnappliedEdits`] —
+/// so a daemon that answered with `index_is_fresh` alone reported a clean queue
+/// as a current index, which is exactly what it is not when the queue write was
+/// refused.
+pub fn daemon_index_is_fresh(status: &StoreStatus, unapplied: &UnappliedEdits) -> bool {
+    index_is_fresh(status) && unapplied.is_empty()
+}
+
+/// Why a *daemon's* index is not current, when it is not.
+///
+/// Both reasons, when there are both. A store that is degraded for its own
+/// reasons and a daemon that dropped edits are independent facts, and reporting
+/// only the first would let the louder one hide the one no other surface can
+/// see: `devmap status` opening the store directly cannot know about dropped
+/// edits, so if this does not say it, nothing does.
+pub fn daemon_degraded_reason(status: &StoreStatus, unapplied: &UnappliedEdits) -> Option<String> {
+    match (freshness_degraded_reason(status), unapplied.describe()) {
+        (Some(store), Some(dropped)) => Some(format!("{store} Also: {dropped}")),
+        (Some(store), None) => Some(store),
+        (None, Some(dropped)) => Some(dropped),
+        (None, None) => None,
+    }
+}
+
 pub(crate) fn dispatch(
     store: &Store,
     request: IpcRequest,
     cancel: &devmap_query::Cancel,
+    unapplied: &UnappliedEdits,
 ) -> anyhow::Result<Value> {
     if request.version != PROTOCOL_VERSION {
         anyhow::bail!(
@@ -566,8 +722,12 @@ pub(crate) fn dispatch(
                 "pending_count": status.pending_count,
                 "node_count": status.node_count,
                 "edge_count": status.edge_count,
-                "is_fresh": index_is_fresh(&status),
-                "degraded_reason": freshness_degraded_reason(&status),
+                // The daemon's answer, not the store's: only this process knows
+                // about changed paths whose queue write the store refused, and
+                // a daemon that reported `index_is_fresh` alone reported an
+                // empty queue as a current index. See `UnappliedEdits`.
+                "is_fresh": daemon_index_is_fresh(&status, unapplied),
+                "degraded_reason": daemon_degraded_reason(&status, unapplied),
                 "quarantined_count": status.quarantined_count,
                 // The paths behind the three numbers `degraded_reason` states.
                 // Without them "1 refused by discovery" is a fact an operator
@@ -750,7 +910,7 @@ pub async fn handle_stream<S>(mut stream: S, store: Arc<Store>) -> anyhow::Resul
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    handle_stream_with_activity(&mut stream, store, &Activity::default()).await
+    handle_stream_with_state(&mut stream, store, &ServeState::default()).await
 }
 
 /// Why a request frame could not be read.
@@ -874,10 +1034,10 @@ fn frame_read_refusal(error: &FrameReadError) -> Option<Envelope> {
     }
 }
 
-pub async fn handle_stream_with_activity<S>(
+pub async fn handle_stream_with_state<S>(
     mut stream: S,
     store: Arc<Store>,
-    activity: &Activity,
+    state: &ServeState,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -906,12 +1066,13 @@ where
         Ok(request) => match validate_request(&request) {
             Err(error) => failure("invalid_parameters", error),
             Ok(()) => {
-                activity.touch();
+                state.activity.touch();
                 dispatch_with_timeout(
                     Arc::clone(&store),
                     request,
                     QUERY_TIMEOUT,
                     devmap_query::Cancel::new(),
+                    &state.unapplied,
                 )
                 .await
             }
@@ -939,11 +1100,16 @@ async fn dispatch_with_timeout(
     request: IpcRequest,
     limit: Duration,
     cancel: devmap_query::Cancel,
+    unapplied: &UnappliedEdits,
 ) -> Envelope {
     let worker_cancel = cancel.clone();
+    // Read out of the shared record before the work moves to the blocking pool:
+    // `status` needs the daemon's view of what it failed to write down, and the
+    // closure cannot borrow it across the spawn.
+    let dropped = unapplied.snapshot();
     let dispatched = tokio::time::timeout(
         limit,
-        tokio::task::spawn_blocking(move || dispatch(&store, request, &worker_cancel)),
+        tokio::task::spawn_blocking(move || dispatch(&store, request, &worker_cancel, &dropped)),
     )
     .await;
     match dispatched {
@@ -1145,7 +1311,7 @@ impl UnixIpcServer {
         })
     }
 
-    pub async fn run(self, store: Arc<Store>, activity: Arc<Activity>) -> anyhow::Result<()> {
+    pub async fn run(self, store: Arc<Store>, state: Arc<ServeState>) -> anyhow::Result<()> {
         let admission = crate::admission::Admission::new(MAX_CONCURRENT_CONNECTIONS);
         let mut consecutive_accept_errors: u32 = 0;
         loop {
@@ -1163,12 +1329,10 @@ impl UnixIpcServer {
                         .await
                         .ok_or_else(|| anyhow::anyhow!("connection semaphore closed"))?;
                     let store = Arc::clone(&store);
-                    let activity = Arc::clone(&activity);
+                    let state = Arc::clone(&state);
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(error) =
-                            handle_stream_with_activity(stream, store, &activity).await
-                        {
+                        if let Err(error) = handle_stream_with_state(stream, store, &state).await {
                             tracing::warn!("IPC connection failed: {error}");
                         }
                     });
@@ -1215,7 +1379,7 @@ impl Drop for UnixIpcServer {
 pub async fn run_named_pipe(
     store: Arc<Store>,
     name: &str,
-    activity: Arc<Activity>,
+    state: Arc<ServeState>,
 ) -> anyhow::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
@@ -1254,10 +1418,10 @@ pub async fn run_named_pipe(
         let connected = server;
         server = ServerOptions::new().create(name)?;
         let store = Arc::clone(&store);
-        let activity = Arc::clone(&activity);
+        let state = Arc::clone(&state);
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_stream_with_activity(connected, store, &activity).await {
+            if let Err(error) = handle_stream_with_state(connected, store, &state).await {
                 tracing::warn!("named-pipe IPC connection failed: {error}");
             }
         });
@@ -1533,8 +1697,13 @@ mod tests {
                 min_confidence: 0.0,
             },
         };
-        let value = dispatch(&store, request, &devmap_query::Cancel::new())
-            .expect("a well-formed explore request must dispatch");
+        let value = dispatch(
+            &store,
+            request,
+            &devmap_query::Cancel::new(),
+            &UnappliedEdits::default(),
+        )
+        .expect("a well-formed explore request must dispatch");
 
         for field in ["query", "definitions", "limit", "blast_radius", "budget"] {
             assert!(
@@ -1584,8 +1753,13 @@ mod tests {
                 min_confidence: 0.0,
             },
         };
-        let value = dispatch(&store, request, &devmap_query::Cancel::new())
-            .expect("a well-formed affected request must dispatch");
+        let value = dispatch(
+            &store,
+            request,
+            &devmap_query::Cancel::new(),
+            &UnappliedEdits::default(),
+        )
+        .expect("a well-formed affected request must dispatch");
 
         for field in ["targets", "tests", "blast_radius"] {
             assert!(
@@ -1672,8 +1846,13 @@ mod tests {
                 min_confidence: 0.0,
             },
         };
-        let value = dispatch(&store, request, &devmap_query::Cancel::new())
-            .expect("a well-formed neighbors request must dispatch");
+        let value = dispatch(
+            &store,
+            request,
+            &devmap_query::Cancel::new(),
+            &UnappliedEdits::default(),
+        )
+        .expect("a well-formed neighbors request must dispatch");
 
         let entries = value["neighbors"]
             .as_array()
@@ -1898,8 +2077,14 @@ mod tests {
         let cancel = devmap_query::Cancel::new();
         let abandoned_before = devmap_query::cancelled_queries();
 
-        let envelope =
-            dispatch_with_timeout(store, request, Duration::from_millis(1), cancel.clone()).await;
+        let envelope = dispatch_with_timeout(
+            store,
+            request,
+            Duration::from_millis(1),
+            cancel.clone(),
+            &UnappliedEdits::default(),
+        )
+        .await;
 
         assert!(
             !envelope.ok,
@@ -1945,8 +2130,14 @@ mod tests {
         };
         let cancel = devmap_query::Cancel::new();
 
-        let envelope =
-            dispatch_with_timeout(store, request, Duration::from_secs(30), cancel.clone()).await;
+        let envelope = dispatch_with_timeout(
+            store,
+            request,
+            Duration::from_secs(30),
+            cancel.clone(),
+            &UnappliedEdits::default(),
+        )
+        .await;
 
         assert!(
             envelope.ok,
@@ -2231,7 +2422,7 @@ mod tests {
         );
         let task = tokio::spawn(server.run(
             Arc::new(Store::open_in_memory().unwrap()),
-            Arc::new(Activity::default()),
+            Arc::new(ServeState::default()),
         ));
 
         let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
@@ -2275,6 +2466,7 @@ mod tests {
                 command: IpcCommand::Status,
             },
             &devmap_query::Cancel::new(),
+            &UnappliedEdits::default(),
         )
         .expect("status must answer");
 
@@ -2312,6 +2504,7 @@ mod tests {
                 command: IpcCommand::Status,
             },
             &devmap_query::Cancel::new(),
+            &UnappliedEdits::default(),
         )
         .expect("status must answer");
 

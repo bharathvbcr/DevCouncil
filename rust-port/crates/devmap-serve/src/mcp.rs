@@ -1548,7 +1548,14 @@ async fn call_tool(
     // Dropping a blocking task's handle only detaches it; the flag is the only
     // thing that actually stops the traversal.
     let worker_cancel = cancel.clone();
-    let handle = tokio::task::spawn_blocking(move || dispatch(&store, request, &worker_cancel));
+    // Nothing dropped: an MCP server is its own process with no watcher, so it
+    // has no edits it failed to write down. The empty record is passed
+    // explicitly rather than defaulted inside `dispatch`, so that this claim is
+    // made at the one call site entitled to make it — a transport that *does*
+    // watch a tree has to hand over its own.
+    let unapplied = crate::protocol::UnappliedEdits::default();
+    let handle =
+        tokio::task::spawn_blocking(move || dispatch(&store, request, &worker_cancel, &unapplied));
 
     match tokio::time::timeout(CALL_TIMEOUT, handle).await {
         Ok(Ok(Ok(value))) => Ok(tool_success(&name, value)),
