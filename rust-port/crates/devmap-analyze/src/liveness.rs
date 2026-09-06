@@ -426,6 +426,21 @@ pub enum ExtractionGap {
 }
 
 impl ExtractionGap {
+    /// Every kind, so the store's read side can be checked against the write
+    /// side rather than trusted.
+    ///
+    /// The write path stores whatever `label()` returns; the read path matches
+    /// a fixed list. A variant in the first and not the second is a row written
+    /// on every build and never read back — which is precisely what happened to
+    /// `CallBlind` and `ImportBlind` between their introduction and the test
+    /// that now iterates this.
+    pub const ALL: &'static [ExtractionGap] = &[
+        ExtractionGap::ParseFailed,
+        ExtractionGap::PatternRecovered,
+        ExtractionGap::CallBlind,
+        ExtractionGap::ImportBlind,
+    ];
+
     /// The stored spelling, and the one a consumer reads back. One owner, so a
     /// persisted inventory and an in-memory count cannot disagree about what a
     /// gap is called.
@@ -503,6 +518,31 @@ fn supertypes_by_type(resolution: &ResolutionResult) -> HashMap<(&str, &str), Ve
 /// still matches the *method* by name only — a supertype's `render` and an
 /// override's `render` are joined because they are spelled the same, which is
 /// what an override is.
+/// Whether a member's visibility is a naming convention rather than a keyword.
+///
+/// The distinction decides whether a member may inherit its owner's export.
+///
+/// Java, C#, TypeScript, PHP, Kotlin and Swift all have `private`, and the
+/// extractor reads it: a `private void used()` arrives with
+/// `is_exported: false` and a `public void run()` with `true`. For those, a
+/// member that reaches the dead-symbol branch has already said it is not public
+/// and must keep being reported — measured against
+/// `extraction_coverage_liveness.rs`, whose Java fixture this rule wrongly
+/// exempted on the first attempt.
+///
+/// Python has no such keyword. Every method arrives `is_exported: false`
+/// whatever its intent, so the flag carries no information and the leading
+/// underscore is the whole convention — already applied before this point. What
+/// is left is a public member, and if its class is named in `__all__` then
+/// deleting it breaks consumers outside the corpus.
+///
+/// Deliberately a list of one. Adding a language here is a claim that its
+/// extractor cannot mark a public member exported, which is checkable and
+/// should be checked rather than assumed.
+fn member_visibility_is_conventional(language: &str) -> bool {
+    language == "python"
+}
+
 fn reached_through_a_supertype(
     file: &str,
     identity: &str,
@@ -883,6 +923,11 @@ pub fn analyze_liveness_with_coverage(
                         | WiringKind::FrameworkDecorator
                         | WiringKind::Launcher
                         | WiringKind::ReExportPackage
+                        // An explicit author declaration. The Python side has
+                        // honoured this since it was introduced and the kernel
+                        // did not, so a file whose author had already answered
+                        // the question was reported as dead on every build.
+                        | WiringKind::AllowUnwired
                 )
             });
 
@@ -919,6 +964,28 @@ pub fn analyze_liveness_with_coverage(
                     .collect()
             })
             .unwrap_or_default();
+
+        // Types this file publishes, keyed by the exact `qualified_name` a
+        // member's `parent_symbol` points at.
+        //
+        // Measured on `testdata/fixtures/tier_a/python_app`: `__all__ +=
+        // ["MyClass"]` exempted `MyClass` and not `MyClass.execute`, so the
+        // kernel called a public method of a declared-public class dead at the
+        // `extracted` tier — the tier whose contract is "safe to act on".
+        // Acting on that deletes public API.
+        //
+        // Empty for every language that encodes member visibility itself; see
+        // `member_visibility_is_conventional`.
+        let exported_owners: HashSet<&str> =
+            if member_visibility_is_conventional(&ext.language) {
+                ext.symbols
+                    .iter()
+                    .filter(|sym| sym.is_exported && sym.kind != SymbolKind::File)
+                    .map(|sym| sym.qualified_name.as_str())
+                    .collect()
+            } else {
+                HashSet::new()
+            };
 
         let file_reason = if matches!(ext.parse_outcome, ParseOutcome::Fallback { .. }) {
             Some(
@@ -995,6 +1062,20 @@ pub fn analyze_liveness_with_coverage(
                 // calls the identity it is dead in every variant, and the
                 // confident branch must keep saying so — a build constraint
                 // explains an ambiguity, never an absence of callers.
+                // A member of an exported type, in a language where the member
+                // could not have said so itself.
+                //
+                // Keyed on `parent_symbol`, which is the owner's exact
+                // `qualified_name`. An earlier attempt split the member's own
+                // qualified name on `.` and matched `A.java::A.used` as owner
+                // `A` — the dot it found belonged to the file extension, and it
+                // exempted every method in every Java class.
+                .or_else(|| {
+                    sym.parent_symbol
+                        .as_deref()
+                        .filter(|parent| exported_owners.contains(parent))
+                        .map(|_| "Member of an exported type — public interface")
+                })
                 .or_else(|| {
                     (is_ambiguously_called
                         && go_package_key(ext)

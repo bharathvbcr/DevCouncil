@@ -69,12 +69,21 @@ impl CoverageGapSample {
     }
 }
 
-/// What a generation could not read, in the three kinds it can fail to.
+/// What a generation could not read, in the five kinds it can fail to.
+///
+/// The last two are not failures at all, which is exactly why they were
+/// invisible until W0.2: a `.cfm` or a `.tf` parses `Clean` and this build has
+/// no extractor for its calls or its imports, so the file sailed past every
+/// check that looks for something going wrong.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoverageGaps {
     pub discovery_refused: CoverageGapSample,
     pub parse_failed: CoverageGapSample,
     pub pattern_recovered: CoverageGapSample,
+    /// A grammar read the file and no call extractor exists for its language.
+    pub call_blind: CoverageGapSample,
+    /// A grammar read the file and no import extractor exists for its language.
+    pub import_blind: CoverageGapSample,
 }
 
 impl CoverageGaps {
@@ -90,17 +99,29 @@ impl CoverageGaps {
             Some(&mut self.parse_failed)
         } else if gap == ExtractionGap::PatternRecovered.label() {
             Some(&mut self.pattern_recovered)
+        } else if gap == ExtractionGap::CallBlind.label() {
+            Some(&mut self.call_blind)
+        } else if gap == ExtractionGap::ImportBlind.label() {
+            Some(&mut self.import_blind)
         } else {
             None
         }
     }
 
     /// The labels a reader asks for, in the order `status` reports them.
-    pub(crate) fn labels() -> [&'static str; 3] {
+    ///
+    /// The write side stores whatever `ExtractionGap::label()` returns, and
+    /// this list is the read side. A label present in one and absent from the
+    /// other is a row written to the database on every build and never read
+    /// back — which is what happened to `call_blind` and `import_blind` between
+    /// their introduction and this line.
+    pub(crate) fn labels() -> [&'static str; 5] {
         [
             GAP_DISCOVERY_REFUSED,
             ExtractionGap::ParseFailed.label(),
             ExtractionGap::PatternRecovered.label(),
+            ExtractionGap::CallBlind.label(),
+            ExtractionGap::ImportBlind.label(),
         ]
     }
 }
@@ -121,4 +142,60 @@ pub fn discovery_refusals(report: &DiscoveryReport) -> Vec<DiscoveryRefusal> {
             reason: reason.to_string(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod write_read_symmetry {
+    use super::*;
+
+    /// Every gap the writer can store has a slot the reader can put it in.
+    ///
+    /// The store writes `ExtractionGap::label()` for whatever the analyzer
+    /// produced, and `slot()` matches a fixed list. When W0.2 added `CallBlind`
+    /// and `ImportBlind`, the write side picked them up for free — `label()` is
+    /// one owner — and the read side did not, so both kinds were persisted on
+    /// every build and silently discarded on every read. Nothing failed; the
+    /// counts were simply always zero.
+    ///
+    /// Derived from `ExtractionGap::ALL` rather than restating the list, so a
+    /// sixth kind cannot be added without this failing.
+    #[test]
+    fn every_stored_gap_label_has_a_read_slot() {
+        let mut gaps = CoverageGaps::default();
+        for gap in ExtractionGap::ALL {
+            assert!(
+                gaps.slot(gap.label()).is_some(),
+                "`{}` is written by the store and has no read slot, so every \
+                 row of that kind is discarded on read",
+                gap.label()
+            );
+        }
+    }
+
+    /// And the reverse: every label a reader asks for is one a writer produces.
+    ///
+    /// A slot nothing can fill is a permanently-empty field, which is the
+    /// shape W2.4 spent a work order removing two of.
+    #[test]
+    fn every_read_label_is_one_a_writer_can_produce() {
+        let writable: Vec<&str> = ExtractionGap::ALL
+            .iter()
+            .map(|gap| gap.label())
+            .chain(std::iter::once(GAP_DISCOVERY_REFUSED))
+            .collect();
+        for label in CoverageGaps::labels() {
+            assert!(
+                writable.contains(&label),
+                "`{label}` is read back and nothing writes it"
+            );
+        }
+    }
+
+    /// An unknown label is refused rather than silently folded into a
+    /// neighbouring slot.
+    #[test]
+    fn an_unknown_gap_label_has_no_slot() {
+        let mut gaps = CoverageGaps::default();
+        assert!(gaps.slot("not_a_gap_kind").is_none());
+    }
 }
