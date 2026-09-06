@@ -1152,6 +1152,40 @@ impl Store {
         // which is exactly what happens today whenever the extraction schema
         // changes. Paying an fsync per commit to durably persist a cache of
         // something already durable on disk buys nothing.
+        // 16 KiB pages, against SQLite's 4 KiB default.
+        //
+        // `extraction_json` averages 54 KB per file in this repository, which
+        // is an overflow chain however it is stored — but the chain is ~14
+        // pages at 4 KiB and ~4 at 16 KiB, and every page is a WAL frame that
+        // has to be written and then checkpointed back into the database.
+        //
+        // That is where the write actually goes. A `sample` of the persist
+        // phase puts it in `pwrite` (433 samples), WAL checkpoint (392) and
+        // `fsync` (207), against `sqlite3BtreeInsert` (131): the cost is pages
+        // reaching the disk, not rows being inserted. Fewer, larger pages move
+        // the same bytes in fewer frames.
+        //
+        // Measured on this repository (1,533 files), interleaved, n=7, minimum
+        // reported — page size is the only variable:
+        //
+        //            4 KiB     8 KiB    16 KiB    32 KiB
+        //   cold     3.23 s    2.78 s    2.70 s    2.60 s
+        //   incr     1.84 s    1.56 s    1.49 s    1.48 s
+        //   write    1.02 s    0.81 s    0.74 s    0.79 s
+        //   store     285 MB    290 MB    296 MB    312 MB
+        //
+        // 16 KiB is the knee: 32 KiB buys no more time and costs 9% more
+        // store, and the 4% this one costs over the default is paid back in a
+        // quarter of the write time.
+        //
+        // Like `auto_vacuum` below, this only takes on a database with no
+        // tables yet — which is why it sits here, before `enable_wal` and
+        // `migrate`. An existing 4 KiB store accepts the statement, ignores it,
+        // and keeps its page size until a full vacuum rewrites it; that is the
+        // same conversion path auto_vacuum already relies on, and
+        // `an_existing_small_page_store_opens_and_reads` pins that it is not an
+        // error.
+        conn.pragma_update(None, "page_size", 16384)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "cache_size", Self::CACHE_SIZE_KIB)?;
         // Pruning and vacuuming sort large intermediate result sets. On disk
@@ -4936,7 +4970,30 @@ impl Store {
     /// file), so the steady state reclaims everything in one pass and the cap
     /// only bites when a long-neglected store has accumulated a backlog. That
     /// backlog then drains over consecutive builds instead of stalling one.
-    const INCREMENTAL_VACUUM_MAX_PAGES: i64 = 65_536;
+    /// Expressed in bytes, then converted to pages against the page size the
+    /// database actually has.
+    ///
+    /// This bound is on *time*, and the doc above says why: incremental vacuum
+    /// costs time proportional to the pages it moves. Pages are not a fixed
+    /// amount of work — a page is 4 KiB in a store written before the page size
+    /// was raised and 16 KiB in one written after, so a constant expressed in
+    /// pages means four times the bytes, and four times the stall, depending on
+    /// which store it is applied to. It was 65,536 pages, calibrated at 4 KiB;
+    /// 256 MiB is that same budget stated in the unit the cost is actually
+    /// proportional to.
+    const INCREMENTAL_VACUUM_MAX_BYTES: i64 = 256 * 1024 * 1024;
+
+    /// The cap above in pages, for a database with `page_size`-byte pages.
+    ///
+    /// Never zero: a page size larger than the whole budget would otherwise
+    /// request a reclaim of nothing and report it as a bounded one, which is a
+    /// check that could not run reporting as a check that passed.
+    pub fn incremental_vacuum_max_pages(page_size: i64) -> i64 {
+        if page_size <= 0 {
+            return 1;
+        }
+        (Self::INCREMENTAL_VACUUM_MAX_BYTES / page_size).max(1)
+    }
 
     /// How long a TRUNCATE checkpoint waits for a reader before falling back to
     /// PASSIVE. See [`Store::checkpoint_wal`] for why it is not zero.
@@ -5011,7 +5068,8 @@ impl Store {
         // 0 = NONE, 1 = FULL, 2 = INCREMENTAL. Only 2 supports the pragma.
         let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
         if auto_vacuum == 2 {
-            let requested = freelist_count.min(Self::INCREMENTAL_VACUUM_MAX_PAGES);
+            let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+            let requested = freelist_count.min(Self::incremental_vacuum_max_pages(page_size));
             // Step the pragma to exhaustion, and count what it moved.
             //
             // `PRAGMA incremental_vacuum(N)` is not a statement that does its
@@ -5640,6 +5698,119 @@ mod carry_forward_tests {
 #[cfg(test)]
 mod connection_tests {
     use super::*;
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("devmap-{label}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// The reclaim cap is a byte budget, so it means the same at any page size.
+    ///
+    /// It was `65_536` pages, calibrated when every store had 4 KiB pages. The
+    /// doc on the constant says the bound exists because incremental vacuum
+    /// costs time proportional to the pages it moves — and pages are not a
+    /// fixed amount of work once two page sizes are in play. Left in pages, the
+    /// same constant licensed 256 MiB of moving on a 4 KiB store and 1 GiB on a
+    /// 16 KiB one: a time bound that quietly quadrupled.
+    ///
+    /// 4 KiB reproducing the original 65,536 is the part that pins the budget
+    /// was carried over rather than re-guessed.
+    #[test]
+    fn the_reclaim_cap_is_the_same_budget_at_every_page_size() {
+        assert_eq!(
+            Store::incremental_vacuum_max_pages(4096),
+            65_536,
+            "the original calibration, restated in bytes, must come back unchanged"
+        );
+        assert_eq!(Store::incremental_vacuum_max_pages(16384), 16_384);
+        assert_eq!(Store::incremental_vacuum_max_pages(8192), 32_768);
+        for page in [4096, 8192, 16384, 32768, 65536] {
+            assert_eq!(
+                Store::incremental_vacuum_max_pages(page) * page,
+                Store::INCREMENTAL_VACUUM_MAX_BYTES,
+                "every page size must reclaim the same number of bytes per pass"
+            );
+        }
+    }
+
+    /// A page size larger than the whole budget still reclaims something.
+    ///
+    /// `bytes / page_size` is zero once the page exceeds the budget, and a
+    /// request of zero pages would step the pragma zero times and then report a
+    /// bounded reclaim — a check that could not run reporting as one that ran.
+    /// Zero and negative are included because the value is read from
+    /// `PRAGMA page_size` at runtime, not from a constant.
+    #[test]
+    fn the_reclaim_cap_never_requests_nothing() {
+        for page in [0, -1, i64::MAX, 1 << 30] {
+            assert!(
+                Store::incremental_vacuum_max_pages(page) >= 1,
+                "page size {page} must still request at least one page"
+            );
+        }
+    }
+
+    /// A new store is created with 16 KiB pages.
+    ///
+    /// The pragma is silently ignored on a database that already has tables, so
+    /// "it is in `configure_connection`" is not evidence that it took. This
+    /// reads the page size back off a store the code actually created.
+    #[test]
+    fn a_new_store_is_created_with_the_configured_page_size() {
+        let dir = scratch("pagesize");
+        let store = Store::open(dir.join("devmap.sqlite")).expect("store");
+        let size: i64 = lock_conn(&store.conn)
+            .expect("connection")
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .expect("page_size");
+        assert_eq!(
+            size, 16384,
+            "a store created by this code should use the configured page size"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store written with the old 4 KiB pages still opens, and stays 4 KiB.
+    ///
+    /// Page size is fixed when a database first gets content, so every store
+    /// already on disk is 4 KiB and cannot be changed by a pragma. Raising the
+    /// default is only safe if those stores keep working untouched — the same
+    /// conversion path `auto_vacuum` already depends on. This creates a 4 KiB
+    /// file, opens it with the current code, and writes through it.
+    #[test]
+    fn an_existing_small_page_store_opens_and_reads() {
+        let dir = scratch("pagesize-legacy");
+        let path = dir.join("devmap.sqlite");
+        {
+            let conn = Connection::open(&path).expect("seed connection");
+            conn.pragma_update(None, "page_size", 4096).expect("4 KiB");
+            conn.execute_batch("CREATE TABLE seed (x INTEGER); DROP TABLE seed;")
+                .expect("fix the page size into the file header");
+        }
+
+        let store = Store::open(&path).expect("an existing 4 KiB store must still open");
+        let size: i64 = lock_conn(&store.conn)
+            .expect("connection")
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .expect("page_size");
+        assert_eq!(
+            size, 4096,
+            "an existing store keeps its page size; the pragma is accepted and ignored"
+        );
+        // Not merely openable: usable. A schema that migrated onto the smaller
+        // page is what the next build writes into.
+        assert!(
+            store.latest_generation_id().expect("query").is_none(),
+            "a freshly migrated store has no generation yet"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// S-8: the gate must not drift behind the schema it asserts.
     ///

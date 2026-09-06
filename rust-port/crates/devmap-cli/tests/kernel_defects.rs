@@ -289,7 +289,7 @@ fn k2_a_no_change_build_reclaims_a_large_freelist_from_the_main_file() {
     // re-allocate; it is two orders of magnitude below the freelist under test,
     // so a one-page reclaim cannot hide inside it.
     const SLACK: i64 = 128;
-    let expected_reclaim = freelist_before.min(VACUUM_MAX_PAGES);
+    let expected_reclaim = freelist_before.min(vacuum_max_pages(&db));
     assert!(
         freelist_after <= freelist_before - expected_reclaim + SLACK,
         "the reclaim freed {} of an expected {expected_reclaim} pages \
@@ -310,11 +310,21 @@ fn k2_a_no_change_build_reclaims_a_large_freelist_from_the_main_file() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Mirror of `Store::INCREMENTAL_VACUUM_MAX_PAGES`, which is private. The
-/// fixture's freelist is far below it, so the expected reclaim is the whole
-/// freelist either way; the `min` is here so the assertion stays correct if the
-/// fixture ever grows past the cap.
-const VACUUM_MAX_PAGES: i64 = 65_536;
+/// The reclaim cap, asked of the code that owns it rather than copied.
+///
+/// This was a hand-mirrored `const` carrying the cap's old value in pages. The
+/// cap is a byte budget now, converted against the page size of the database in
+/// front of it, and a mirror would have kept asserting against 65,536 pages —
+/// still passing, because the fixture's freelist is far below either number,
+/// and silently meaning something else. `Store::incremental_vacuum_max_pages`
+/// is public for this: one owner for the policy, no second copy to drift.
+fn vacuum_max_pages(db: &Path) -> i64 {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .unwrap();
+    devmap_store::Store::incremental_vacuum_max_pages(page_size)
+}
 
 fn page_accounting(db: &Path) -> (i64, i64) {
     let conn = rusqlite::Connection::open(db).unwrap();

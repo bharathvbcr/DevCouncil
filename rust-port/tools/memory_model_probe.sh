@@ -150,12 +150,38 @@ field() { # <metrics line> <key>
   printf '%s\n' "$1" | tr ' ' '\n' | awk -F= -v k="$2" '$1==k {print $2; exit}'
 }
 
+# The resolver emits at most `AMBIGUOUS_FANOUT_CAP` edges per ambiguous site,
+# so the corpus's declaration count is not the fan-out the store ends up with.
+# The probe used to compute its expectations from DEFS alone and assert the
+# derived width equalled it. That assertion was written before the cap existed;
+# once the cap landed the probe could not pass at any DEFS above it, and it
+# failed with "derived widest fan-out 16, corpus has 100" — the probe was wrong,
+# not the kernel.
+#
+# Read from the Rust constant rather than repeated here, the same way verify.sh
+# reads DB_SIZE_GATE_PER_FILE: two copies of a policy is how the last one
+# drifted.
+FANOUT_CAP=$(grep -oE 'AMBIGUOUS_FANOUT_CAP: usize = [0-9]+' \
+  crates/devmap-resolve/src/model.rs | grep -oE '[0-9]+$')
+[ -n "$FANOUT_CAP" ] || { echo "PROBE FAIL: cannot read AMBIGUOUS_FANOUT_CAP"; exit 1; }
+EFFECTIVE_DEFS=$DEFS
+[ "$EFFECTIVE_DEFS" -le "$FANOUT_CAP" ] || EFFECTIVE_DEFS=$FANOUT_CAP
+
 FILES=$((DEFS + CALLERS))
 SITES=$((CALLERS * FNS * CALLEES))
-EXPECT_EDGES=$((SITES * DEFS))
-EXPECT_SUM_N2=$((SITES * DEFS * DEFS))
+EXPECT_EDGES=$((SITES * EFFECTIVE_DEFS))
+EXPECT_SUM_N2=$((SITES * EFFECTIVE_DEFS * EFFECTIVE_DEFS))
 
-echo "CAPPED: this probe builds a synthetic ${FILES}-file corpus (Sum(N^2) = ${EXPECT_SUM_N2}, widest fan-out ${DEFS})."
+# The bytes-per-pair bound is valid above a minimum *emitted* width, which is
+# this one and not DEFS: lowering the cap below MIN_DEFS would silently move the
+# probe into the regime where a corpus can exceed PAIR_CAP_MILLI while using no
+# more memory per edge. Fail rather than report a bound that no longer holds.
+[ "$EFFECTIVE_DEFS" -ge "$MIN_DEFS" ] || {
+  echo "PROBE FAIL: emitted fan-out $EFFECTIVE_DEFS (DEFS=$DEFS capped at $FANOUT_CAP) is below the \
+minimum width $MIN_DEFS the bytes-per-pair bound is valid for"
+  exit 1; }
+
+echo "CAPPED: this probe builds a synthetic ${FILES}-file corpus (Sum(N^2) = ${EXPECT_SUM_N2}, widest emitted fan-out ${EFFECTIVE_DEFS} = min(DEFS ${DEFS}, cap ${FANOUT_CAP}))."
 echo "CAPPED: the production corpus is 12,831 files and is NOT built here. This bounds the per-pair and"
 echo "CAPPED: per-edge memory coefficients, which are corpus-size invariant; it does not bound any real"
 echo "CAPPED: repository's absolute peak. Raise DEVMAP_PROBE_CALLERS to scale the probe up locally."
@@ -188,7 +214,7 @@ echo "probe: peak RSS ambiguous $((RSS_AMB / 1024 / 1024)) MiB, control $((RSS_C
 # here at 10^7 scale: a grouping key that were merely plausible would still have
 # to reproduce SITES x DEFS^2 exactly.
 [ "$GOT_SITES" -eq "$SITES" ] || { echo "PROBE FAIL: derived $GOT_SITES ambiguous sites, corpus has $SITES"; exit 1; }
-[ "$GOT_MAX" -eq "$DEFS" ] || { echo "PROBE FAIL: derived widest fan-out $GOT_MAX, corpus has $DEFS"; exit 1; }
+[ "$GOT_MAX" -eq "$EFFECTIVE_DEFS" ] || { echo "PROBE FAIL: derived widest fan-out $GOT_MAX, corpus emits $EFFECTIVE_DEFS (DEFS=$DEFS, cap=$FANOUT_CAP)"; exit 1; }
 [ "$EDGES" -eq "$EXPECT_EDGES" ] || { echo "PROBE FAIL: derived Sum(N)=$EDGES, corpus has $EXPECT_EDGES"; exit 1; }
 [ "$SUM_N2" -eq "$EXPECT_SUM_N2" ] || { echo "PROBE FAIL: derived Sum(N^2)=$SUM_N2, corpus has $EXPECT_SUM_N2"; exit 1; }
 # The control must contain no ambiguity at all, or it is not a base measurement
