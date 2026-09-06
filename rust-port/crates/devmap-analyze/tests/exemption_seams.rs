@@ -35,7 +35,8 @@ fn verdicts(extractions: &[Extraction]) -> (BTreeSet<String>, BTreeSet<String>) 
     (symbols, clustered)
 }
 
-const CYCLE: &str = "def cycle_a():\n    return cycle_b()\n\n\ndef cycle_b():\n    return cycle_a()\n";
+const CYCLE: &str =
+    "def cycle_a():\n    return cycle_b()\n\n\ndef cycle_b():\n    return cycle_a()\n";
 
 /// The baseline both tests below are measured against.
 #[test]
@@ -128,7 +129,10 @@ fn the_exported_member_exemption_does_not_climb_the_whole_tree() {
 fn without_an_exemption_the_findings_come_back() {
     let (symbols, _) = verdicts(&[
         extract_file("setup.py", "from setuptools import setup\n\nsetup()\n"),
-        extract_file("pkg/plain.py", "class NotExported:\n    def method(self):\n        return 1\n"),
+        extract_file(
+            "pkg/plain.py",
+            "class NotExported:\n    def method(self):\n        return 1\n",
+        ),
     ]);
     assert!(
         symbols.contains("pkg/plain.py::NotExported")

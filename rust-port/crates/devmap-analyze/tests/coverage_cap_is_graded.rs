@@ -81,8 +81,19 @@ fn reports(extractions: &[Extraction]) -> (Vec<DeadSymbolReport>, ExtractionCove
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
     let resolution = resolver.resolve_all(extractions);
-    let outcome = analyze_liveness_with_coverage(extractions, &resolution, DiscoveryCoverage::none());
+    let outcome =
+        analyze_liveness_with_coverage(extractions, &resolution, DiscoveryCoverage::none());
     (outcome.reports, outcome.coverage)
+}
+
+/// A coverage record with a chosen blind share and nothing else, built in one
+/// expression so the ratio under test is readable at every call site.
+fn blindness(blind: usize, readable: usize) -> ExtractionCoverage {
+    ExtractionCoverage {
+        call_blind_files: blind,
+        files_with_call_extraction: readable,
+        ..ExtractionCoverage::default()
+    }
 }
 
 fn confidence_of(reports: &[DeadSymbolReport], symbol: &str) -> f32 {
@@ -183,9 +194,7 @@ fn a_complete_corpus_is_not_graded_at_all() {
 #[test]
 fn the_cap_is_monotone_at_every_blind_share() {
     for blind in [0usize, 1, 2, 5, 25, 50, 99, 200] {
-        let mut coverage = ExtractionCoverage::default();
-        coverage.call_blind_files = blind;
-        coverage.files_with_call_extraction = 100;
+        let coverage = blindness(blind, 100);
         let mut previous = f32::NEG_INFINITY;
         for input in [0.3f32, 0.4, 0.5, 0.9] {
             let got = coverage.cap(input);
@@ -212,9 +221,7 @@ fn the_ceiling_falls_as_the_corpus_goes_blind() {
     let mut previous = f32::INFINITY;
     let mut seen: Vec<f32> = Vec::new();
     for blind in [1usize, 2, 5, 10, 25, 50, 100, 200, 400] {
-        let mut coverage = ExtractionCoverage::default();
-        coverage.call_blind_files = blind;
-        coverage.files_with_call_extraction = 100;
+        let coverage = blindness(blind, 100);
         let got = coverage.cap(0.9);
         assert!(
             got <= previous,
@@ -256,12 +263,7 @@ fn the_ceiling_falls_as_the_corpus_goes_blind() {
 /// That is load-bearing rather than lucky, so it is measured here.
 #[test]
 fn the_ceiling_reaches_the_floor_well_before_the_corpus_is_half_unread() {
-    let ceiling_at = |blind: usize, readable: usize| {
-        let mut coverage = ExtractionCoverage::default();
-        coverage.call_blind_files = blind;
-        coverage.files_with_call_extraction = readable;
-        coverage.cap(0.9)
-    };
+    let ceiling_at = |blind: usize, readable: usize| blindness(blind, readable).cap(0.9);
 
     // A quarter of the corpus unread is already all the way down.
     assert!(
@@ -304,9 +306,7 @@ fn the_ceiling_reaches_the_floor_well_before_the_corpus_is_half_unread() {
 /// shared `cap()` made it.
 #[test]
 fn a_cluster_ceiling_is_stricter_than_a_single_symbol_ceiling() {
-    let mut coverage = ExtractionCoverage::default();
-    coverage.call_blind_files = 1;
-    coverage.files_with_call_extraction = 199;
+    let coverage = blindness(1, 199);
 
     let single = coverage.cap(0.9);
     for size in [2usize, 5, 20, 60, 100_000] {
@@ -338,9 +338,11 @@ fn a_cluster_ceiling_is_stricter_than_a_single_symbol_ceiling() {
 /// refused every file it found.
 #[test]
 fn a_coverage_record_with_no_readable_files_falls_to_the_floor() {
-    let mut coverage = ExtractionCoverage::default();
-    coverage.discovery_refused_files = 3;
-    coverage.files_with_call_extraction = 0;
+    let coverage = ExtractionCoverage {
+        discovery_refused_files: 3,
+        files_with_call_extraction: 0,
+        ..ExtractionCoverage::default()
+    };
     assert!(!coverage.is_complete());
     let got = coverage.cap(0.9);
     assert!(

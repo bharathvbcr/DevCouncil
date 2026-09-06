@@ -8,7 +8,6 @@
 pub mod artifacts;
 pub mod cancel;
 pub mod code_graph;
-pub mod rung;
 pub mod digest;
 pub mod engine;
 pub mod escape;
@@ -16,6 +15,7 @@ pub mod freshness;
 pub mod manifest;
 pub mod model;
 pub mod query_match;
+pub mod rung;
 pub mod snapshots;
 
 pub mod semantic;

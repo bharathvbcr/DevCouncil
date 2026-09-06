@@ -20,8 +20,7 @@ pub use liveness::{
     analyze_liveness, analyze_liveness_with_coverage, extraction_coverage, extraction_gaps,
     DiscoveryCoverage, ExtractionCoverage, ExtractionGap, ExtractionGapEntry, LivenessOutcome,
     CALL_BLIND_REASON, COVERAGE_LOSS_CONFIDENCE_CAP, COVERAGE_LOSS_REASON, GO_BUILD_VARIANT_REASON,
-    HIGHEST_DEGRADED_CONFIDENCE,
-    UNRESOLVED_NAMESAKE_REASON,
+    HIGHEST_DEGRADED_CONFIDENCE, UNRESOLVED_NAMESAKE_REASON,
 };
 pub use model::*;
 pub use pdg::*;

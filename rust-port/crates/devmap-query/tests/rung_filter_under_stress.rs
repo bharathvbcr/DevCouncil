@@ -73,6 +73,10 @@ fn the_histogram_accounts_for_every_edge_at_scale() {
 /// it is not guaranteed to equal any constant. Every one of them has to bucket,
 /// and none may bucket twice.
 #[test]
+// Excessive precision is exactly the point. Each neighbour below is the f32
+// immediately either side of a rung floor; rounding one to a literal f32 can
+// hold exactly would delete the boundary this test exists to walk.
+#[allow(clippy::excessive_precision)]
 fn every_representable_confidence_lands_on_exactly_one_rung() {
     let mut probes: Vec<f32> = vec![
         f32::MIN_POSITIVE,
@@ -126,7 +130,11 @@ fn a_nan_confidence_is_counted_rather_than_dropped() {
     let edges = vec![edge(f32::NAN, 0), edge(1.0, 1)];
     for floor in [None, Some(Rung::Deterministic), Some(Rung::Speculative)] {
         let (kept, counts) = narrow(edges.clone(), floor);
-        assert_eq!(counts.total(), 2, "floor={floor:?}: NaN must still be counted");
+        assert_eq!(
+            counts.total(),
+            2,
+            "floor={floor:?}: NaN must still be counted"
+        );
         assert_eq!(counts.total() - counts.filtered_out, kept.len());
     }
 }
@@ -156,6 +164,9 @@ fn filtering_preserves_order() {
 fn an_empty_population_reports_zeroes_and_no_filtering() {
     let counts = histogram(&[], Some(Rung::Deterministic));
     assert_eq!(counts, RungHistogram::default());
-    assert_eq!(counts.filtered_out, 0, "nothing was filtered because nothing was there");
+    assert_eq!(
+        counts.filtered_out, 0,
+        "nothing was filtered because nothing was there"
+    );
     assert_eq!(counts.total(), 0);
 }

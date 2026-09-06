@@ -263,7 +263,13 @@ fn reached_dynamically(path: &str, forms: &BTreeSet<&str>) -> bool {
             return true;
         }
     }
-    for init in ["/__init__.py", "/index.ts", "/index.tsx", "/index.js", "/mod.rs"] {
+    for init in [
+        "/__init__.py",
+        "/index.ts",
+        "/index.tsx",
+        "/index.js",
+        "/mod.rs",
+    ] {
         if let Some(package) = path.strip_suffix(init) {
             if forms.contains(package) {
                 return true;

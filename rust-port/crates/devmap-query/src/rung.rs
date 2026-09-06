@@ -79,10 +79,7 @@ impl Rung {
     /// typo silently answered at full breadth is a filtered answer a caller
     /// believes is narrow, which is worse than an error.
     pub fn parse(name: &str) -> Option<Rung> {
-        Rung::ALL
-            .iter()
-            .copied()
-            .find(|rung| rung.label() == name)
+        Rung::ALL.iter().copied().find(|rung| rung.label() == name)
     }
 
     /// Which rung an edge's confidence sits on.
@@ -172,10 +169,7 @@ pub fn filter_by_rung(edges: Vec<ResolvedEdge>, floor: Rung) -> Vec<ResolvedEdge
 /// unfiltered answer is worth reading too: three edges that are all
 /// `speculative` and three that are all `deterministic` are not the same
 /// answer, and before this they printed identically.
-pub fn narrow(
-    edges: Vec<ResolvedEdge>,
-    floor: Option<Rung>,
-) -> (Vec<ResolvedEdge>, RungHistogram) {
+pub fn narrow(edges: Vec<ResolvedEdge>, floor: Option<Rung>) -> (Vec<ResolvedEdge>, RungHistogram) {
     let counts = histogram(&edges, floor);
     let kept = match floor {
         Some(rung) => filter_by_rung(edges, rung),
@@ -202,7 +196,10 @@ mod tests {
         );
         assert_eq!(Rung::of_millis(Confidence::HIGH.to_millis()), Rung::High);
         assert_eq!(Rung::of_millis(Confidence::MEDIUM.to_millis()), Rung::High);
-        assert_eq!(Rung::of_millis(Confidence::LOW.to_millis()), Rung::Speculative);
+        assert_eq!(
+            Rung::of_millis(Confidence::LOW.to_millis()),
+            Rung::Speculative
+        );
         assert_eq!(
             Rung::of_millis(Confidence::SPECULATIVE.to_millis()),
             Rung::Speculative

@@ -34,13 +34,9 @@
 //! to stop file nodes reading as public API — every circular import in every
 //! repository becomes a dead cluster.
 
-use devmap_analyze::{
-    analyze, dead_clusters, DeadClusterScan, DEAD_CLUSTER_QUALIFIED_CONFIDENCE,
-};
+use devmap_analyze::{analyze, dead_clusters, DeadClusterScan, DEAD_CLUSTER_QUALIFIED_CONFIDENCE};
 use devmap_extract::extract_file;
-use devmap_extract::model::{
-    EdgeKind, Extraction, ExtractedSymbol, Span, SymbolKind,
-};
+use devmap_extract::model::{EdgeKind, ExtractedSymbol, Extraction, Span, SymbolKind};
 use devmap_resolve::model::{Resolution, ResolutionResult, ResolvedEdge};
 use devmap_resolve::Resolver;
 use std::sync::Arc;
@@ -165,7 +161,9 @@ fn a_qualified_cluster_says_what_reaches_it_instead_of_claiming_nothing_does() {
     let cluster = &summary.dead_clusters.clusters[0];
 
     assert!(
-        !cluster.reason.contains("reached by nothing outside the component"),
+        !cluster
+            .reason
+            .contains("reached by nothing outside the component"),
         "an ambiguous edge names a member, so this sentence is false: {:?}",
         cluster.reason
     );
@@ -201,7 +199,9 @@ fn an_unreached_cluster_is_not_demoted() {
         "nothing names these symbols, so the finding keeps its tier: {cluster:?}"
     );
     assert!(
-        cluster.reason.contains("reached by nothing outside the component"),
+        cluster
+            .reason
+            .contains("reached by nothing outside the component"),
         "and keeps its reason: {:?}",
         cluster.reason
     );

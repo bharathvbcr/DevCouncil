@@ -209,23 +209,34 @@ fn declared_type_name<'a>(node: Node, source: &'a str) -> Option<&'a str> {
 /// walk, so the miss has to be one `match` on a `&str`.
 fn heritage_clauses<'a>(node: Node<'a>, lang: &str) -> Option<Vec<(Relation, Node<'a>)>> {
     let container = node.kind();
-    let interesting = match (lang, container) {
-        ("typescript" | "tsx" | "javascript", "class_declaration" | "class")
-        | ("python", "class_definition")
-        | ("java", "class_declaration" | "interface_declaration" | "record_declaration")
-        | ("csharp", "class_declaration" | "struct_declaration" | "interface_declaration")
-        | ("cpp" | "cuda", "class_specifier" | "struct_specifier")
-        | ("ruby", "class")
-        | ("php", "class_declaration" | "interface_declaration")
-        | ("swift", "class_declaration" | "protocol_declaration")
-        | ("kotlin", "class_declaration" | "object_declaration")
-        | ("scala", "class_definition" | "object_definition" | "trait_definition")
-        | ("dart", "class_declaration")
-        | ("rust", "impl_item")
-        | ("objc", "class_interface" | "class_implementation")
-        | ("solidity", "contract_declaration" | "interface_declaration") => true,
-        _ => false,
-    };
+    let interesting = matches!(
+        (lang, container),
+        (
+            "typescript" | "tsx" | "javascript",
+            "class_declaration" | "class"
+        ) | ("python", "class_definition")
+            | (
+                "java",
+                "class_declaration" | "interface_declaration" | "record_declaration"
+            )
+            | (
+                "csharp",
+                "class_declaration" | "struct_declaration" | "interface_declaration"
+            )
+            | ("cpp" | "cuda", "class_specifier" | "struct_specifier")
+            | ("ruby", "class")
+            | ("php", "class_declaration" | "interface_declaration")
+            | ("swift", "class_declaration" | "protocol_declaration")
+            | ("kotlin", "class_declaration" | "object_declaration")
+            | (
+                "scala",
+                "class_definition" | "object_definition" | "trait_definition"
+            )
+            | ("dart", "class_declaration")
+            | ("rust", "impl_item")
+            | ("objc", "class_interface" | "class_implementation")
+            | ("solidity", "contract_declaration" | "interface_declaration")
+    );
     if !interesting {
         return None;
     }

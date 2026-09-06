@@ -35,9 +35,10 @@ fn kinds(path: &str, source: &str) -> Vec<WiringKind> {
 /// files that use it, which is the hardest kind of divergence to notice.
 #[test]
 fn the_marker_is_spelled_exactly_as_python_spells_it() {
-    let python = std::fs::read_to_string(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../src/devcouncil/indexing/wiring.py"),
-    );
+    let python = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../src/devcouncil/indexing/wiring.py"
+    ));
     let Ok(python) = python else {
         // The Rust workspace is vendored on its own in some checkouts.
         eprintln!("skipping parity check: wiring.py not present");
@@ -55,7 +56,8 @@ fn the_marker_is_spelled_exactly_as_python_spells_it() {
 
 #[test]
 fn the_marker_produces_an_allow_unwired_annotation() {
-    let source = format!("# {ALLOW_UNWIRED} — reached by the plugin loader\n\ndef go():\n    pass\n");
+    let source =
+        format!("# {ALLOW_UNWIRED} — reached by the plugin loader\n\ndef go():\n    pass\n");
     assert!(kinds("pkg/plugin.py", &source).contains(&WiringKind::AllowUnwired));
 }
 
@@ -94,9 +96,15 @@ fn importlib_names_a_module() {
         "pkg/loader.py",
         "import importlib\nm = importlib.import_module('pkg.plugins.alpha')\n",
     );
-    assert!(forms.contains(&"pkg.plugins.alpha".to_string()), "{forms:?}");
+    assert!(
+        forms.contains(&"pkg.plugins.alpha".to_string()),
+        "{forms:?}"
+    );
     // Also as a path, so it can match `pkg/plugins/alpha.py`.
-    assert!(forms.contains(&"pkg/plugins/alpha".to_string()), "{forms:?}");
+    assert!(
+        forms.contains(&"pkg/plugins/alpha".to_string()),
+        "{forms:?}"
+    );
 }
 
 #[test]
@@ -109,7 +117,10 @@ fn a_relative_js_import_resolves_against_the_referring_file() {
 fn a_dotted_relative_import_climbs_out_of_its_directory() {
     let forms = dynamic_reference_forms("src/routes/index.tsx", "import('../shared/Panel.tsx')\n");
     assert!(forms.contains(&"src/shared/Panel".to_string()), "{forms:?}");
-    assert!(forms.contains(&"src/shared/Panel.tsx".to_string()), "{forms:?}");
+    assert!(
+        forms.contains(&"src/shared/Panel.tsx".to_string()),
+        "{forms:?}"
+    );
 }
 
 #[test]
@@ -152,17 +163,58 @@ fn python_dash_m_names_a_module_only_when_the_module_is_quoted() {
 fn the_port_agrees_with_the_python_implementation() {
     #[allow(clippy::type_complexity)]
     const CASES: &[(&str, &str, &[&str])] = &[
-        ("pkg/loader.py", "m = importlib.import_module('pkg.plugins.alpha')", &["pkg.plugins.alpha", "pkg/plugins/alpha"]),
-        ("pkg/loader.py", "m = __import__(\"pkg.late\")", &["pkg.late", "pkg/late"]),
-        ("src/routes/index.tsx", "const A = import('./App');", &["src.routes.App", "src/routes/App"]),
-        ("src/routes/index.tsx", "import('../shared/Panel.tsx')", &["src.shared.Panel", "src.shared.Panel.tsx", "src/shared/Panel", "src/shared/Panel.tsx", "src/shared/Panel/tsx"]),
-        ("src/app.ts", "const w = new Worker(new URL('./heavy.worker.ts', import.meta.url));", &["src.heavy.worker", "src.heavy.worker.ts", "src/heavy.worker", "src/heavy.worker.ts", "src/heavy/worker", "src/heavy/worker/ts"]),
-        ("scripts/run.py", "subprocess.run([sys.executable, \"-m\", \"pkg.worker\"])", &["pkg.worker", "pkg/worker"]),
+        (
+            "pkg/loader.py",
+            "m = importlib.import_module('pkg.plugins.alpha')",
+            &["pkg.plugins.alpha", "pkg/plugins/alpha"],
+        ),
+        (
+            "pkg/loader.py",
+            "m = __import__(\"pkg.late\")",
+            &["pkg.late", "pkg/late"],
+        ),
+        (
+            "src/routes/index.tsx",
+            "const A = import('./App');",
+            &["src.routes.App", "src/routes/App"],
+        ),
+        (
+            "src/routes/index.tsx",
+            "import('../shared/Panel.tsx')",
+            &[
+                "src.shared.Panel",
+                "src.shared.Panel.tsx",
+                "src/shared/Panel",
+                "src/shared/Panel.tsx",
+                "src/shared/Panel/tsx",
+            ],
+        ),
+        (
+            "src/app.ts",
+            "const w = new Worker(new URL('./heavy.worker.ts', import.meta.url));",
+            &[
+                "src.heavy.worker",
+                "src.heavy.worker.ts",
+                "src/heavy.worker",
+                "src/heavy.worker.ts",
+                "src/heavy/worker",
+                "src/heavy/worker/ts",
+            ],
+        ),
+        (
+            "scripts/run.py",
+            "subprocess.run([sys.executable, \"-m\", \"pkg.worker\"])",
+            &["pkg.worker", "pkg/worker"],
+        ),
         ("pkg/res.py", "files('pkg.data')", &["pkg.data", "pkg/data"]),
         ("pkg/mod.py", "from pkg import thing", &[]),
         ("pkg/mod.py", "", &[]),
         ("README.md", "import('./App')", &[]),
-        ("src/a.ts", "import('pkg-name/sub')", &["pkg-name.sub", "pkg-name/sub"]),
+        (
+            "src/a.ts",
+            "import('pkg-name/sub')",
+            &["pkg-name.sub", "pkg-name/sub"],
+        ),
     ];
 
     for (path, source, expected) in CASES {
@@ -212,10 +264,8 @@ fn a_non_code_suffix_is_not_scanned() {
 
 #[test]
 fn the_annotation_records_the_target_not_the_referrer() {
-    let annotations = extract_wiring_annotations(
-        "src/routes/index.tsx",
-        "const A = import('./App');\n",
-    );
+    let annotations =
+        extract_wiring_annotations("src/routes/index.tsx", "const A = import('./App');\n");
     let dynamic: Vec<_> = annotations
         .iter()
         .filter(|a| a.kind == WiringKind::DynamicImport)

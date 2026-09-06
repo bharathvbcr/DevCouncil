@@ -21,7 +21,18 @@ use devmap_extract::model::ReferenceKind;
 /// Sources are minimal on purpose: each exercises one grammar's heritage
 /// clause and nothing else, so a failure names the grammar rather than
 /// something incidental about the fixture.
-const MATRIX: &[(&str, &str, &str, &[&str], &[&str])] = &[
+/// One row of [`MATRIX`]: label, path, source, expected `extends`, expected
+/// `implements`. Named because the tuple is wide enough that clippy refuses it
+/// inline, and a name reads better at the use site than five anonymous fields.
+type HeritageCase = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+);
+
+const MATRIX: &[HeritageCase] = &[
     (
         "typescript separates the two clauses",
         "W.ts",
