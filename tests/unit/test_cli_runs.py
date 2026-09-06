@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
@@ -138,3 +139,99 @@ def test_cli_runs_supervise(tmp_path, monkeypatch):
     assert res_json.exit_code == 0
     data = json.loads(res_json.output)
     assert "verdict" in data
+
+
+# --- `--json` contract: exactly one JSON object on stdout, diagnostics on stderr ---
+#
+# Asserting on `result.stdout`, never `result.output`: under Click 8.4 `.output` is the
+# two streams merged, so it parses identically whether or not a line leaked onto stdout.
+
+
+def test_runs_timeline_json_unknown_reference_emits_one_object(tmp_path, monkeypatch):
+    """The lookup failure exits before the timeline payload exists."""
+    _setup_runs_env(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["runs", "timeline", "no-such-run", "--json"])
+
+    assert result.exit_code == 1
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert data["reference"] == "no-such-run"
+    assert data["error"]
+    assert result.stderr
+
+
+def test_runs_supervise_json_unknown_reference_emits_one_object(tmp_path, monkeypatch):
+    _setup_runs_env(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["runs", "supervise", "no-such-run", "--json", "--no-llm"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["ok"] is False
+
+
+def test_runs_supervise_json_revert_advice_trails_off_stdout(tmp_path, monkeypatch):
+    """A 'revert' verdict printed up to two more lines *after* the payload."""
+    import devcouncil.cli.commands.runs as runs_cmd
+    from devcouncil.execution.run_trace import RunTimeline
+
+    _setup_runs_env(tmp_path, monkeypatch)
+
+    verdict = SimpleNamespace(
+        verdict="revert",
+        confidence=0.9,
+        source="heuristic",
+        rationale="looks wrong",
+        findings=["a finding"],
+        model_dump=lambda mode="json": {"verdict": "revert", "confidence": 0.9},
+    )
+    timeline = RunTimeline(run_id="run-123", task_id="TASK-1", reversible=True)
+
+    monkeypatch.setattr(runs_cmd, "_load_timeline_or_exit", lambda *a, **k: timeline)
+    async def _supervise(root, tl, router):
+        return verdict
+
+    monkeypatch.setattr("devcouncil.execution.run_trace.supervise_run", _supervise)
+
+    result = runner.invoke(app, ["runs", "supervise", "run-123", "--json", "--no-llm"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["verdict"] == "revert"
+    # The advice line is a diagnostic and must not trail the payload on stdout.
+    assert "dev runs revert" in result.stderr
+    assert "dev runs revert" not in result.stdout
+
+
+
+def test_runs_supervise_json_no_checkpoint_note_trails_off_stdout(tmp_path, monkeypatch):
+    """The sibling branch of the same `revert` verdict, when nothing can be reverted."""
+    import devcouncil.cli.commands.runs as runs_cmd
+    from devcouncil.execution.run_trace import RunTimeline
+
+    _setup_runs_env(tmp_path, monkeypatch)
+
+    verdict = SimpleNamespace(
+        verdict="revert",
+        confidence=0.5,
+        source="heuristic",
+        rationale="",
+        findings=[],
+        model_dump=lambda mode="json": {"verdict": "revert", "confidence": 0.5},
+    )
+
+    async def _supervise(root, tl, router):
+        return verdict
+
+    monkeypatch.setattr(
+        runs_cmd, "_load_timeline_or_exit",
+        lambda *a, **k: RunTimeline(run_id="run-123", task_id="TASK-1", reversible=False),
+    )
+    monkeypatch.setattr("devcouncil.execution.run_trace.supervise_run", _supervise)
+
+    result = runner.invoke(app, ["runs", "supervise", "run-123", "--json", "--no-llm"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["verdict"] == "revert"
+    assert "no checkpoints to revert with" in result.stderr
+    assert "no checkpoints to revert with" not in result.stdout

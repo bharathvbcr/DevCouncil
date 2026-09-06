@@ -9,6 +9,10 @@ from devcouncil.execution.fs_watcher import FilesystemWatcher
 from devcouncil.telemetry.stages import log_stage, log_step
 
 console = Console()
+# Diagnostics go to stderr unconditionally — same split as `dev map`/`dev graph`/`dev debug`.
+# The watcher's live event feed is one of them: it fires from inside `scan_once()`, so
+# under `--once --json` it was writing a line per changed file in front of the payload.
+status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 
@@ -28,24 +32,34 @@ def watch_fs(
     with log_stage("watch_fs", project_root=root, task_id=task_id, once=once):
         log_step("watch_fs/1: starting filesystem watcher", project_root=root, task_id=task_id, trace=True)
 
-        def _print_event(event: dict) -> None:
+        def _format_event(event: dict) -> str:
             status = "allowed" if event["allowed"] else "denied"
-            console.print(f"[cyan]{event['path']}[/cyan] {status}: {event['reason']}")
+            return f"[cyan]{event['path']}[/cyan] {status}: {event['reason']}"
 
-        watcher = FilesystemWatcher(root, task_id, poll_interval=poll_interval, on_event=_print_event)
+        # Live progress as the watcher walks the tree, distinct from the `--once` result
+        # below: this fires per event during the scan, so it belongs on stderr in both
+        # modes. In `--once` human mode the same events are then rendered to stdout as
+        # the command's actual output.
+        watcher = FilesystemWatcher(
+            root,
+            task_id,
+            poll_interval=poll_interval,
+            on_event=lambda event: status_console.print(_format_event(event)),
+        )
         if once:
             events = watcher.scan_once()
             if json_format:
                 typer.echo(dump_json({"events": events}, indent=2))
             else:
                 for event in events:
-                    status = "allowed" if event["allowed"] else "denied"
-                    console.print(f"[cyan]{event['path']}[/cyan] {status}: {event['reason']}")
+                    console.print(_format_event(event))
             log_step("watch_fs/complete", project_root=root, task_id=task_id, count=len(events), trace=True)
             return
-        console.print(f"[cyan]Watching filesystem for task {task_id}. Ctrl+C to stop.[/cyan]")
+        # Follow mode never reaches a payload — it runs until interrupted — so under
+        # `--json` stdout must stay empty rather than collect these two banners.
+        status_console.print(f"[cyan]Watching filesystem for task {task_id}. Ctrl+C to stop.[/cyan]")
         try:
             watcher.watch()
         except KeyboardInterrupt:
-            console.print("[yellow]Stopped filesystem watcher.[/yellow]")
+            status_console.print("[yellow]Stopped filesystem watcher.[/yellow]")
         log_step("watch_fs/complete", project_root=root, task_id=task_id, trace=True)
