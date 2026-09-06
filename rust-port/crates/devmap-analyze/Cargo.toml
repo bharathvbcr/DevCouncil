@@ -60,3 +60,15 @@ required-features = ["parse"]
 [[test]]
 name = "liveness_honesty_over_the_hard_shapes"
 required-features = ["parse"]
+
+[[test]]
+name = "labelled_corpus_precision"
+required-features = ["parse"]
+
+[[test]]
+name = "resolution_rate_baseline"
+required-features = ["parse"]
+
+[[test]]
+name = "exemption_seams"
+required-features = ["parse"]

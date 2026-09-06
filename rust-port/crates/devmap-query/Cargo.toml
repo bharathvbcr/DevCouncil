@@ -137,3 +137,15 @@ required-features = ["parse"]
 [[test]]
 name = "stored_edges_keep_the_confidence_their_evidence_earned"
 required-features = ["parse"]
+
+[[test]]
+name = "dynamic_references_clear_unwired"
+required-features = ["parse"]
+
+[[test]]
+name = "rung_filter"
+required-features = ["parse"]
+
+[[test]]
+name = "rung_filter_under_stress"
+required-features = ["parse"]

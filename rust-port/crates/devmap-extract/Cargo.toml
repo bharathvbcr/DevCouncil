@@ -210,3 +210,11 @@ required-features = ["parse"]
 [[test]]
 name = "ts_import_export_fabrication"
 required-features = ["parse"]
+
+[[test]]
+name = "allow_unwired_and_dynamic_imports"
+required-features = ["parse"]
+
+[[test]]
+name = "wiring_port_under_stress"
+required-features = ["parse"]
