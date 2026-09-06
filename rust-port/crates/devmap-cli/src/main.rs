@@ -2611,6 +2611,55 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
     }
 }
 
+impl Commands {
+    /// Whether this command stays up to answer other processes.
+    ///
+    /// The daemon and the MCP servers write to sockets and pipes whose peers
+    /// come and go; for them a closed peer is an `EPIPE` to handle, not a
+    /// reason to exit, and the ignored-`SIGPIPE` disposition Rust's runtime
+    /// installs is the right one. Everything else is a one-shot command.
+    fn serves(&self) -> bool {
+        matches!(self, Commands::Serve { .. } | Commands::Mcp { .. })
+    }
+}
+
+/// Let a one-shot command end the way every other CLI does when its reader
+/// goes away.
+///
+/// Rust's runtime ignores `SIGPIPE` at startup so that a write to a closed
+/// pipe surfaces as `EPIPE` — and `println!` answers `EPIPE` with a panic.
+/// `devmap export -o - | head` therefore printed `failed printing to stdout:
+/// Broken pipe` and a backtrace hint, where `git`, `sqlite3` and `rg` end
+/// silently. Restoring the default disposition for one-shot commands makes
+/// the kernel behave like them: the process is terminated by the signal the
+/// moment the reader is gone, with nothing written after it and nothing left
+/// half-done that a later run cannot recover (a build killed at any point
+/// leaves the store consistent — `test_process_recovery` and the crash gate
+/// are the evidence). Only one-shot commands: see [`Commands::serves`].
+///
+/// Declared here rather than through the `libc` crate because that crate is
+/// not a direct dependency of this workspace; `signal(2)` has had this
+/// signature on every Unix this kernel builds for, and `SIGPIPE` is 13 on all
+/// of them. Swap for `libc::signal(libc::SIGPIPE, libc::SIG_DFL)` if `libc`
+/// is ever added.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    const SIGPIPE: std::ffi::c_int = 13;
+    const SIG_DFL: usize = 0;
+    extern "C" {
+        fn signal(signum: std::ffi::c_int, handler: usize) -> usize;
+    }
+    // SAFETY: `signal(2)` with `SIG_DFL` installs the default action for a
+    // signal this process is not otherwise handling; it is called once, on
+    // the main thread, before any other thread exists.
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     // stderr, not the builder's default stdout. Every command that emits a
@@ -2625,6 +2674,9 @@ async fn main() -> std::process::ExitCode {
     tracing::subscriber::set_global_default(subscriber).ok();
 
     let cli = Cli::parse();
+    if !cli.command.serves() {
+        restore_default_sigpipe();
+    }
     let outcome = match validate_limits(&cli.command) {
         Ok(()) => run(&cli).await,
         Err(message) => Err(anyhow::anyhow!(message)),
