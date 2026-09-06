@@ -180,7 +180,11 @@ pub const LATEST_HANDSHAKE_VERSION: &str = "2025-11-25";
 /// Matches the socket protocol's `MAX_REQUEST_BYTES`. The `preview` tool
 /// carries file content, so this cannot be small; it exists so that a peer
 /// which never sends a newline cannot grow this process's heap without bound.
-const MAX_FRAME_BYTES: usize = 1024 * 1024;
+///
+/// Public so a test measuring an amplification can state its fixture in terms of
+/// the bound the server actually enforces. "Well under a megabyte" is a claim
+/// about a number someone typed; `< MAX_FRAME_BYTES` is a claim about this one.
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Upper bound on one tool call's occupancy of the connection.
 ///
@@ -248,7 +252,12 @@ pub const MAX_IN_FLIGHT_REQUESTS: usize = 256;
 /// rather than handed, which is why the refusal below names the multiplication
 /// and the parameter instead of truncating. Truncating is the one thing this
 /// must not do: a cut answer is indistinguishable from a complete one.
-const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
+///
+/// Public for the same reason [`oversized_result_refusal`] is: this is the one
+/// ceiling on anything this server writes, a batch answer included, and a test
+/// asserting the ceiling has to read the same number the server enforces or the
+/// guard and the assertion drift apart.
+pub const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
 
 /// JSON-RPC 2.0's reserved codes, and the ones MCP defines on top of them.
 ///
@@ -1539,7 +1548,14 @@ async fn call_tool(
     // Dropping a blocking task's handle only detaches it; the flag is the only
     // thing that actually stops the traversal.
     let worker_cancel = cancel.clone();
-    let handle = tokio::task::spawn_blocking(move || dispatch(&store, request, &worker_cancel));
+    // Nothing dropped: an MCP server is its own process with no watcher, so it
+    // has no edits it failed to write down. The empty record is passed
+    // explicitly rather than defaulted inside `dispatch`, so that this claim is
+    // made at the one call site entitled to make it — a transport that *does*
+    // watch a tree has to hand over its own.
+    let unapplied = crate::protocol::UnappliedEdits::default();
+    let handle =
+        tokio::task::spawn_blocking(move || dispatch(&store, request, &worker_cancel, &unapplied));
 
     match tokio::time::timeout(CALL_TIMEOUT, handle).await {
         Ok(Ok(Ok(value))) => Ok(tool_success(&name, value)),
@@ -1927,7 +1943,33 @@ async fn dispatch_value(session: &Arc<Session>, value: Value) -> Option<Value> {
                 "a batch must contain at least one request",
             ));
         }
+        let batch_len = items.len();
         let mut responses = Vec::new();
+        // The assembled answer is bounded by the same ceiling as everything else
+        // this server writes, and it is measured *while* the array is built
+        // rather than after.
+        //
+        // Every other size bound here is on the read side — `MAX_FRAME_BYTES` on
+        // stdio, `MAX_BODY_BYTES` over HTTP — and `oversized_result_refusal`
+        // bounds one tool result. A batch answer had none, so the amplification
+        // was the ratio between the cheapest request a member can spell and the
+        // largest answer it can name. `tools/list` is 45 bytes to ask and 23 KB
+        // to answer, and 22,310 of them fit inside one 1 MiB frame: measured on
+        // this repository's corpus, that request was answered with 523,481,842
+        // bytes and took the server's RSS from 9.2 MiB to 3,635 MiB. One legal
+        // frame, nothing refused, nothing logged.
+        //
+        // Checked as each response is appended, so the peak is one member past
+        // the ceiling rather than however far the peer chose to go. Checking the
+        // finished array would report the size of an allocation it had already
+        // failed to prevent — the mistake `read_frame` documents having made.
+        //
+        // The whole batch is refused rather than cut short. A truncated array
+        // leaves every dropped member's id outstanding, and a client correlating
+        // answers to pending ids waits forever on them; that is strictly worse
+        // than one refusal naming the ceiling, which a client can act on by
+        // splitting the batch.
+        let mut assembled = "[]".len();
         for item in items {
             // Sequential inside a batch: the members share one connection and
             // one store, and answering them concurrently would buy nothing
@@ -1940,6 +1982,33 @@ async fn dispatch_value(session: &Arc<Session>, value: Value) -> Option<Value> {
             // levels down. It was also the only unbounded recursion on the
             // request path.
             if let Some(response) = dispatch_single(session, item).await {
+                // Unserializable is not "small enough", for the reason
+                // `oversized_result_refusal` gives: the frame cannot be written
+                // either way, and treating the failure as a zero would let it
+                // reach the transport to fail there with nothing attributing it.
+                let measured = serde_json::to_vec(&response)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(MAX_RESULT_BYTES);
+                // The separating comma is part of what goes on the wire.
+                assembled = assembled
+                    .saturating_add(measured)
+                    .saturating_add(usize::from(!responses.is_empty()));
+                if assembled > MAX_RESULT_BYTES {
+                    return Some(rpc_error_frame(
+                        None,
+                        codes::INVALID_REQUEST,
+                        format!(
+                            "this batch's answers passed {MAX_RESULT_BYTES} bytes at member \
+{} of {}, which is the most this server will write in one frame — the same ceiling it applies \
+to a single tool result, and to what it will read. Nothing is being sent: cutting the array \
+short would leave every remaining id outstanding, and a client waiting on an id that will \
+never be answered is worse than a refusal it can act on. Send fewer requests per batch, or \
+ask for less in each.",
+                            responses.len() + 1,
+                            batch_len
+                        ),
+                    ));
+                }
                 responses.push(response);
             }
         }

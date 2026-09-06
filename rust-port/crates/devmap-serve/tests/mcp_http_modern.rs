@@ -1303,3 +1303,166 @@ async fn a_port_already_in_use_is_refused_and_names_the_address() {
         "the failure must name the address it could not bind, got: {reported}"
     );
 }
+
+/// Every request-smuggling framing shape, and what actually happens to it.
+///
+/// This is a characterisation test, and it is one on purpose. The obvious guard
+/// — refuse a request carrying both `Content-Length` and `Transfer-Encoding`,
+/// which is what RFC 9112 §6.1 means by "ought to be handled as an error" —
+/// **cannot be written at this layer**, and shipping it would have been shipping
+/// a branch that can never be taken. Hyper resolves the ambiguity while parsing
+/// the head and then erases the evidence: `proto/h1/role.rs:279-281` does
+/// `headers.remove(header::CONTENT_LENGTH)` the moment a `Transfer-Encoding` is
+/// seen, and the following arm `continue`s past every later `Content-Length`. By
+/// the time `handle_request` is called the request has one framing header and
+/// looks well-formed. That was verified by writing the guard, watching it never
+/// fire, and reading the parser.
+///
+/// So what protects this endpoint is hyper's own normalisation, and the point of
+/// this test is that the protection is *asserted* rather than assumed. A hyper
+/// upgrade that changed any line below would otherwise change this server's
+/// exposure with nothing saying so.
+///
+/// Measured against the release binary over a real socket, all six shapes:
+///
+/// | shape | answer |
+/// |---|---|
+/// | `Content-Length` + `Transfer-Encoding: chunked` | 200, the *chunked* body is what ran |
+/// | …with a pipelined request trailing the chunked terminator | **one** response, not two |
+/// | two `Content-Length`, different values | 400 |
+/// | two `Content-Length`, identical values | 200 |
+/// | `Transfer-Encoding: identity` (not chunked) | 400 |
+/// | `Transfer-Encoding : chunked` (space before the colon) | 400 |
+///
+/// The row that matters is the second. A desync needs this server to leave bytes
+/// in the buffer that something else reads as a request; it answers once and the
+/// trailing bytes are never answered, so no response is split. The first row is
+/// the RFC's own first sentence ("the Transfer-Encoding overrides the
+/// Content-Length") and is a divergence only for an intermediary that reads it
+/// the other way — which is a fact about that intermediary, in front of an
+/// endpoint `--http` documents as loopback-by-default.
+#[tokio::test]
+async fn contradictory_body_framing_is_resolved_below_this_server_and_never_splits_a_response() {
+    let address = start().await;
+
+    let head = |method: &str| {
+        format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Accept: application/json\r\nMCP-Protocol-Version: 2026-07-28\r\n\
+             Mcp-Method: {method}\r\n"
+        )
+    };
+    let smuggled = with_request_meta(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+    let decoy = with_request_meta(r#"{"jsonrpc":"2.0","id":99,"method":"ping"}"#);
+
+    // 1. Both framings, naming two different bodies. Exactly one runs, and it is
+    //    the chunked one; the `Content-Length` reading is never executed.
+    let raw = format!(
+        "{}Content-Length: {}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+         {:x}\r\n{smuggled}\r\n0\r\n\r\n",
+        head("tools/list"),
+        decoy.len(),
+        smuggled.len()
+    );
+    let (status, _, body) = exchange(&address, &raw).await;
+    assert_eq!(
+        status, 200,
+        "hyper resolves this rather than refusing: {body}"
+    );
+    assert!(
+        body.contains("\"tools\""),
+        "the chunked framing is the one that wins, per RFC 9112 §6.1: {body}"
+    );
+    assert!(
+        !body.contains("\"id\":99"),
+        "the Content-Length reading must never also be answered — two answers to \
+         one exchange is the response split itself: {body}"
+    );
+
+    // 2. The row that decides whether this is exploitable here: a complete second
+    //    request pipelined after the chunked terminator. If the trailing bytes
+    //    were answered, an intermediary reading `Content-Length` would have a
+    //    request in flight that this server also answered separately.
+    let trailing = with_request_meta(r#"{"jsonrpc":"2.0","id":77,"method":"ping"}"#);
+    let second = format!(
+        "{}Content-Length: {}\r\nConnection: close\r\n\r\n{trailing}",
+        head("ping"),
+        trailing.len()
+    );
+    let raw = format!(
+        "{}Content-Length: {}\r\nTransfer-Encoding: chunked\r\n\r\n\
+         {:x}\r\n{smuggled}\r\n0\r\n\r\n{second}",
+        head("tools/list"),
+        decoy.len(),
+        smuggled.len()
+    );
+    let (_, _, _) = exchange(&address, &raw).await;
+    let whole = {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(&address)
+            .await
+            .expect("connect");
+        stream.write_all(raw.as_bytes()).await.expect("write");
+        stream.flush().await.expect("flush");
+        let mut buffer = Vec::new();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut buffer)).await;
+        String::from_utf8_lossy(&buffer).to_string()
+    };
+    assert_eq!(
+        whole.matches("HTTP/1.1 ").count(),
+        1,
+        "one exchange must produce one response. Two would mean the bytes an \
+         intermediary attributes to a second request were answered here as well, \
+         which is the desync: {whole}"
+    );
+    assert!(
+        !whole.contains("\"id\":77"),
+        "the pipelined trailer must not be answered: {whole}"
+    );
+
+    // 3. The shapes hyper does refuse, pinned so a change is visible.
+    let body = with_request_meta(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#);
+    for (shape, extra) in [
+        (
+            "two Content-Length headers with different values",
+            format!(
+                "Content-Length: {}\r\nContent-Length: {}\r\n",
+                body.len(),
+                body.len() + 10
+            ),
+        ),
+        (
+            "a Transfer-Encoding that is not chunked",
+            "Transfer-Encoding: identity\r\n".to_string(),
+        ),
+        (
+            "a header name with a space before its colon",
+            format!(
+                "Transfer-Encoding : chunked\r\nContent-Length: {}\r\n",
+                body.len()
+            ),
+        ),
+    ] {
+        let raw = format!("{}{extra}Connection: close\r\n\r\n{body}", head("ping"));
+        let (status, _, answered) = exchange(&address, &raw).await;
+        assert_eq!(
+            status, 400,
+            "{shape} must stay refused; hyper's normalisation is what this \
+             endpoint's framing safety rests on. Got {status}: {answered}"
+        );
+    }
+
+    // 4. The positive control. Identical repeated Content-Length is one framing
+    //    statement made twice and is served, so the refusals above are about
+    //    disagreement rather than about repetition.
+    let raw = format!(
+        "{}Content-Length: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        head("ping"),
+        body.len(),
+        body.len()
+    );
+    let (status, parsed) = request(&address, &raw).await;
+    assert_eq!(status, 200, "an unambiguous repeat is still one framing");
+    assert_eq!(parsed["id"], json!(2));
+}
