@@ -511,9 +511,23 @@ impl ExtractionCoverage {
 
 /// How many members the cluster ceiling compounds over before it stops caring.
 ///
-/// Past this the ceiling has long since hit [`COVERAGE_LOSS_CONFIDENCE_CAP`]
-/// for any non-trivial blind share, so the clamp costs no fidelity and keeps
-/// `powi` away from an exponent that would underflow silently.
+/// **This clamp is load-bearing, not a rounding convenience.** An earlier
+/// draft of this comment claimed the ceiling "has long since hit the floor for
+/// any non-trivial blind share" by this point, which is false where it matters:
+/// measured on a hostile corpus of 411 files with 2 refused (0.49% blind), a
+/// 5,000-member abandoned ring compounds to `0.99513^5008` — about 2.5e-11, so
+/// the floor — while the same corpus's three-member cycle keeps 0.5. Without
+/// the clamp, *every* large component in *any* corpus with one unreadable file
+/// lands on `ambiguous`, which is the flattening this whole mechanism exists to
+/// undo, reintroduced for clusters.
+///
+/// So the clamp is where the compounding stops being informative and starts
+/// being a size penalty. A 64-member component is already a much weaker claim
+/// than a 2-member one and is priced as such; past that, the extra members say
+/// more about how the subsystem was written than about how likely the scan is
+/// to have missed an edge into it.
+///
+/// It also keeps `powi` away from an exponent that would underflow silently.
 const CLUSTER_COMPOUNDING_MEMBER_CAP: usize = 64;
 
 /// How sharply the coverage ceiling falls as the corpus goes blind.

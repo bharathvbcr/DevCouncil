@@ -4900,6 +4900,56 @@ Workspace fmt clean, clippy `-D warnings` clean, `cargo test --workspace`
 green, determinism double-build identical
 (`c613ef69831097b6d2f81f4d0d36b4b7fa18fdd3f6f14cec47ae42b660ca736e`).
 
+### Step 6 has never run, and it is red — with a named cause
+
+Making `tools/memory_model_probe.sh` executable and pointing it at the right
+binary ran the memory-model probe for what is, as far as this ledger can tell,
+the first time. Its arithmetic preconditions failed immediately:
+
+```
+PROBE FAIL: derived widest fan-out 16, corpus has 100
+```
+
+**16 is `AMBIGUOUS_FANOUT_CAP`.** The probe designs a corpus with 100
+candidates per name and asserts a widest fan-out of 100; audit R-7 capped one
+site's *emission* at 16 edges after this probe was written, and every one of
+its four arithmetic preconditions was stated in terms of `DEFS`. The probe now
+reads the constant from its owner — the pattern `verify.sh` already uses for
+`DB_SIZE_GATE_PER_FILE` — computes the effective width as `min(DEFS, cap)`, and
+fails closed if the constant cannot be read. All four preconditions pass.
+
+**The three coefficient caps then fail, and that is the real finding.** The cap
+bounds edges; it does not bound the candidate list, which the `Arc<Resolution>`
+still holds in full and deliberately so — that is what keeps `impact`
+answerable on candidates 2..N. So since R-7 the memory is proportional to
+*candidates* while every denominator in the probe and in `verify.sh`'s RSS
+budget is derived from *emitted edges*, and the two stopped being the same
+number.
+
+Measured, both runs after the preconditions were corrected:
+
+| corpus | milli-B/pair (cap 40,000) | milli-B/edge (cap 800,000) | % of model (max 125) |
+|---|---:|---:|---:|
+| `DEFS=100` — cap active, 100 candidates → 16 edges | 77,145 | 1,234,329 | 193% |
+| `DEFS=16` — cap inert, 16 candidates → 16 edges | 45,926 | 734,822 | 138% |
+
+Removing the cap's effect alone takes bytes-per-edge from 1,234 to 735 and back
+inside its 800 cap, which is the decoupling measured rather than argued. What
+is left — 46 B/pair against 40, 138% against 125% — is either a real per-edge
+regression from the 410 B the model assumes, or an artifact of comparing a
+16-wide 116-file corpus against coefficients measured on a 100-wide one. **It
+was not settled here, and no number was moved to make the gate green**; that
+would be the "raised to fit" this ledger refuses two sections above.
+
+Fixing the denominator properly needs a schema change. `tools/fanout.sh`
+derives from the persisted graph and `generation_edges` has no `details`
+column — the candidate total lives only on the in-memory `ResolvedEdge`. The
+same staleness reaches `verify.sh` step 5, whose `RSS_PER_FANOUT_EDGE = 600 B`
+is justified as "1.5x the 401-415 B/edge measured by
+tools/memory_model_probe.sh": that measurement was taken on the pre-cap
+resolver. Step 5 passes today (659 MiB against a 774 MiB budget) with a
+denominator that counts the wrong thing.
+
 ### Still open, and deliberately not started here
 
 - **B3/SC2 — write amplification.** Re-measured, and this ledger's

@@ -46,7 +46,10 @@ if [ "$QUICK" -eq 1 ]; then echo "quick mode: skipping determinism/perf/mutants"
 # checkout, which is a layout this repository's own guidance recommends. Before
 # this, such a run reported "could not measure peak RSS", which is true and is
 # the wrong reason: the measurement was fine and the binary was not there.
-DEVMAP_BIN="${CARGO_TARGET_DIR:-./target}/release/devmap"
+DEVMAP_BIN="${CARGO_TARGET_DIR:-$(pwd)/target}/release/devmap"
+# Exported so `tools/memory_model_probe.sh` and `tools/soak.sh` measure the same
+# binary these gates did, rather than each resolving it again.
+export DEVMAP_BIN
 
 step "4/9 determinism — two clean builds must produce identical graph digests"
 TMP1=$(mktemp -d) ; TMP2=$(mktemp -d)

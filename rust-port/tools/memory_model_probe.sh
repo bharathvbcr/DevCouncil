@@ -40,8 +40,15 @@ cd "$(dirname "$0")/.."
 # shellcheck source=tools/peak_rss.sh
 . tools/peak_rss.sh
 
-DEVMAP=./target/release/devmap
-[ -x "$DEVMAP" ] || { echo "PROBE FAIL: $DEVMAP is not built"; exit 1; }
+# Honour CARGO_TARGET_DIR, matching `tools/soak.sh`, which already resolves the
+# binary this way and for the same reason: a lane builds into its own target
+# directory, and a probe that silently measured a stale
+# `rust-port/target/release/devmap` would report the previous kernel's numbers
+# as this one's — or, as here, refuse with a message about a build that in fact
+# succeeded somewhere else.
+TARGET_DIR="${CARGO_TARGET_DIR:-$(pwd)/target}"
+DEVMAP="${DEVMAP_BIN:-$TARGET_DIR/release/devmap}"
+[ -x "$DEVMAP" ] || { echo "PROBE FAIL: no devmap binary at $DEVMAP"; exit 1; }
 command -v sqlite3 >/dev/null 2>&1 || { echo "PROBE FAIL: sqlite3 is not on PATH"; exit 1; }
 
 # Corpus shape. Files = DEFS + CALLERS; ambiguous call sites = CALLERS x FNS x
@@ -65,6 +72,38 @@ CALLEES=${DEVMAP_PROBE_CALLEES:-5}
 # pair is bytes per edge divided by the mean fan-out, so a corpus of width 2
 # would exceed 40 B/pair while using no more memory per edge. DEFS is therefore
 # required to be at least 16 (410/16 = 26 B/pair, comfortably under the cap).
+# **These three caps were calibrated before `AMBIGUOUS_FANOUT_CAP` existed, and
+# have not been re-derived since. They currently fail. Read this before
+# changing a number.**
+#
+# The cap bounds how many *edges* one ambiguous site emits (16). It does not
+# bound the site's *candidate list*, which the `Arc<Resolution>` still holds in
+# full — that is deliberate, and is what keeps `impact` answerable on candidates
+# 2..N. So since audit R-7 the memory is proportional to candidates while every
+# denominator here is derived from emitted edges, and the two stopped being the
+# same number.
+#
+# Measured 2026-09-06, this machine, both runs after the arithmetic
+# preconditions above were corrected:
+#
+#   DEFS=100 (cap active, 100 candidates -> 16 edges):
+#     77,145 milli-B/pair, 1,234,329 milli-B/edge, 193% of model
+#   DEFS=16 (cap inert, 16 candidates -> 16 edges):
+#     45,926 milli-B/pair,   734,822 milli-B/edge, 138% of model
+#
+# Removing the cap's effect alone takes bytes-per-edge from 1,234 to 735 and
+# inside its 800 cap, which is the decoupling stated above, measured. What is
+# left — 46 B/pair against 40, and 138% against 125% — is either a real per-edge
+# regression from the 410 B this model assumes, or an artifact of comparing a
+# 16-wide 116-file corpus against coefficients measured on a 100-wide one. It
+# was not settled, and a number moved to make a gate green would be exactly the
+# "raised to fit" this repository refuses.
+#
+# **Fixing it properly needs a schema change.** `tools/fanout.sh` derives its
+# metrics from the persisted graph, and `generation_edges` has no `details`
+# column — the candidate total lives only on the in-memory `ResolvedEdge`. So
+# the denominator the memory actually tracks is not recoverable from the store
+# today, and making it so is a store change, not a probe change.
 PAIR_CAP_MILLI=40000
 MIN_DEFS=16
 #
@@ -97,8 +136,36 @@ for pair in "DEFS=$DEFS" "CALLERS=$CALLERS" "FNS=$FNS" "CALLEES=$CALLEES"; do
     echo "PROBE FAIL: $pair is not a positive integer; the probe's expected fan-out is computed from it"
     exit 1; }
 done
-[ "$DEFS" -ge "$MIN_DEFS" ] || {
-  echo "PROBE FAIL: DEFS=$DEFS is below the minimum fan-out width $MIN_DEFS the bytes-per-pair bound is valid for"
+# The resolver caps how many edges one ambiguous site may emit, so the width
+# this corpus *gets* is not the width it declares.
+#
+# `AMBIGUOUS_FANOUT_CAP` landed with audit R-7, after this probe was written,
+# and every arithmetic precondition below was stated in terms of `DEFS`. With
+# DEFS=100 and a cap of 16 the probe asserts a widest fan-out of 100, gets 16,
+# and fails — which nobody saw, because `verify.sh` invoked this script as
+# `./tools/memory_model_probe.sh` and it was committed non-executable, so step 6
+# never ran at all.
+#
+# The constant is read from its owner rather than repeated, the same way
+# `verify.sh` reads `DB_SIZE_GATE_PER_FILE`, and a missing constant fails closed:
+# a probe that silently fell back to `DEFS` would be asserting the shape of a
+# resolver that no longer exists.
+FANOUT_CAP=$(grep -oE 'AMBIGUOUS_FANOUT_CAP: usize = [0-9]+' \
+  crates/devmap-resolve/src/model.rs | grep -oE '[0-9]+$')
+[[ "$FANOUT_CAP" =~ ^[1-9][0-9]*$ ]] || {
+  echo "PROBE FAIL: cannot read AMBIGUOUS_FANOUT_CAP from crates/devmap-resolve/src/model.rs"
+  exit 1; }
+# What one site actually emits: the corpus width, bounded by the cap.
+WIDTH=$DEFS
+[ "$WIDTH" -le "$FANOUT_CAP" ] || WIDTH=$FANOUT_CAP
+
+# Asked of the *effective* width, not of `DEFS`. The bytes-per-pair bound is
+# bytes-per-edge divided by the mean fan-out, so it is the width the resolver
+# emits that decides whether the bound is meaningful — raising `DEFS` past the
+# cap buys no width and would leave this check passing on a corpus it no longer
+# describes.
+[ "$WIDTH" -ge "$MIN_DEFS" ] || {
+  echo "PROBE FAIL: effective fan-out width $WIDTH (DEFS=$DEFS capped at $FANOUT_CAP) is below the minimum width $MIN_DEFS the bytes-per-pair bound is valid for"
   exit 1; }
 
 TMP=$(mktemp -d)
@@ -152,10 +219,15 @@ field() { # <metrics line> <key>
 
 FILES=$((DEFS + CALLERS))
 SITES=$((CALLERS * FNS * CALLEES))
-EXPECT_EDGES=$((SITES * DEFS))
-EXPECT_SUM_N2=$((SITES * DEFS * DEFS))
+EXPECT_EDGES=$((SITES * WIDTH))
+EXPECT_SUM_N2=$((SITES * WIDTH * WIDTH))
 
-echo "CAPPED: this probe builds a synthetic ${FILES}-file corpus (Sum(N^2) = ${EXPECT_SUM_N2}, widest fan-out ${DEFS})."
+echo "CAPPED: this probe builds a synthetic ${FILES}-file corpus (Sum(N^2) = ${EXPECT_SUM_N2}, widest fan-out ${WIDTH}"
+if [ "$WIDTH" -lt "$DEFS" ]; then
+  echo "CAPPED: — ${DEFS} candidates per name, bounded by AMBIGUOUS_FANOUT_CAP=${FANOUT_CAP})."
+else
+  echo "CAPPED: )."
+fi
 echo "CAPPED: the production corpus is 12,831 files and is NOT built here. This bounds the per-pair and"
 echo "CAPPED: per-edge memory coefficients, which are corpus-size invariant; it does not bound any real"
 echo "CAPPED: repository's absolute peak. Raise DEVMAP_PROBE_CALLERS to scale the probe up locally."
@@ -188,7 +260,7 @@ echo "probe: peak RSS ambiguous $((RSS_AMB / 1024 / 1024)) MiB, control $((RSS_C
 # here at 10^7 scale: a grouping key that were merely plausible would still have
 # to reproduce SITES x DEFS^2 exactly.
 [ "$GOT_SITES" -eq "$SITES" ] || { echo "PROBE FAIL: derived $GOT_SITES ambiguous sites, corpus has $SITES"; exit 1; }
-[ "$GOT_MAX" -eq "$DEFS" ] || { echo "PROBE FAIL: derived widest fan-out $GOT_MAX, corpus has $DEFS"; exit 1; }
+[ "$GOT_MAX" -eq "$WIDTH" ] || { echo "PROBE FAIL: derived widest fan-out $GOT_MAX, corpus emits $WIDTH (DEFS=$DEFS, AMBIGUOUS_FANOUT_CAP=$FANOUT_CAP)"; exit 1; }
 [ "$EDGES" -eq "$EXPECT_EDGES" ] || { echo "PROBE FAIL: derived Sum(N)=$EDGES, corpus has $EXPECT_EDGES"; exit 1; }
 [ "$SUM_N2" -eq "$EXPECT_SUM_N2" ] || { echo "PROBE FAIL: derived Sum(N^2)=$SUM_N2, corpus has $EXPECT_SUM_N2"; exit 1; }
 # The control must contain no ambiguity at all, or it is not a base measurement
