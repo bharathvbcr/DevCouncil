@@ -186,8 +186,16 @@ class _FakeNode:
 class _FakeGraph:
     def __init__(self, *, head, tier=None, nodes=None):
         self.generated_head = head
-        self.meta = {} if tier is None else {"compatibility_export_tier": tier}
+        self.meta = (
+            {"legacy_dead_symbol_candidates": []}
+            if tier is None
+            else {"compatibility_export_tier": tier, "legacy_dead_symbol_candidates": []}
+        )
         self.nodes = nodes if nodes is not None else [_FakeNode("pkg/lib.py", "helper")]
+        self.entry_roots: list[str] = []
+        self.unwired_candidates: list[str] = []
+        self.unreachable_files: list[str] = []
+        self.dead_code: list[dict] = []
 
 
 def _index(monkeypatch, graph, head):
@@ -196,7 +204,8 @@ def _index(monkeypatch, graph, head):
     monkeypatch.setattr(
         "devcouncil.indexing.graph.build.load_code_graph", lambda _root: graph
     )
-    return liveness_ratchet._symbol_index_from_graph(Path("/nowhere"), head)
+    graph = liveness_ratchet._graph_liveness(Path("/nowhere"), head)
+    return (graph["symbol_index"] if graph else [], graph is not None)
 
 
 def test_a_graph_from_another_generation_is_not_a_symbol_index(monkeypatch):

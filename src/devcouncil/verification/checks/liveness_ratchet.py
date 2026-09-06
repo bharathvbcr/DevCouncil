@@ -28,12 +28,17 @@ LIVENESS_SCHEMA_VERSION = 2
 
 #: A list the kernel truncated cannot support a set difference.
 #:
-#: ``unwired_candidates`` and ``dead_symbol_candidates`` are capped samples in
-#: the manifest, published beside their real totals. Diffing two samples
-#: manufactures regressions from wherever the two cuts fell — a file present in
-#: the baseline's 200 and absent from the current 200 reads as "newly stranded"
-#: when nothing about it changed. So a truncated side makes the snapshot
-#: incomplete, and an incomplete baseline makes the ratchet skip.
+#: Diffing two capped samples manufactures regressions from wherever the two
+#: cuts fell — a file present in the baseline's 200 and absent from the current
+#: 200 reads as "newly stranded" when nothing about it changed. So a truncated
+#: side makes the snapshot incomplete, and an incomplete baseline makes the
+#: ratchet skip.
+#:
+#: :func:`_graph_liveness` avoids the cap entirely by reading the graph rather
+#: than the manifest, and refuses outright when the graph is itself a capped
+#: export — so in practice this fires only on an empty-root corpus. It stays
+#: because "the list was cut" and "the baseline is unusable" are different facts
+#: and a future list may reintroduce the first.
 TRUNCATED_LIST_IS_INCOMPLETE = True
 
 
@@ -105,88 +110,97 @@ def _is_plain_int(value: Any) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _shown_total(meta: Any, key: str) -> tuple[int, int, bool]:
-    """``(shown, total, truncated)`` for one ``liveness_meta`` section.
+def _graph_liveness(project_root: Path, head: str) -> Optional[dict]:
+    """The kernel's own uncapped liveness lists, from `code_graph.json`.
 
-    A section the kernel did not send reports ``truncated=True``: not knowing
-    whether a list was cut is not the same as knowing it was not, and only one
-    of those two can safely feed a set difference.
-    """
-    section = meta.get(key) if isinstance(meta, Mapping) else None
-    if not isinstance(section, Mapping):
-        return (0, 0, True)
-    # Both halves must be present and integral. A section carrying `shown` and
-    # no `total` used to read as `(5, 0, False)` — untruncated — because a
-    # missing total defaulted to zero and `0 > 5` is false. A cut that cannot be
-    # measured is not a cut that did not happen, and that reading is what would
-    # let a capped sample become a ratchet baseline.
-    shown_raw = section.get("shown")
-    total_raw = section.get("total")
-    if not _is_plain_int(shown_raw) or not _is_plain_int(total_raw):
-        return (0, 0, True)
-    shown, total = int(shown_raw), int(total_raw)
-    return (shown, total, bool(section.get("truncated")) or total > shown)
+    The manifest caps `unwired_candidates` and `dead_symbol_candidates` at 200
+    for readability and publishes the real totals beside them. That cap is fine
+    for a reader and fatal for a ratchet: diffing two capped samples
+    manufactures regressions from wherever the two cuts fell. Measured on this
+    repository, the manifest shows 200 of 228 unwired while the graph carries
+    all 228.
 
+    So the lists come from the graph, which the same `devmap manifest` run
+    writes, and `resolution_rate` — which only the manifest carries — is joined
+    to them on `generated_head`.
 
-def _symbol_index_from_graph(project_root: Path, head: str) -> tuple[list[str], bool]:
-    """``path::name`` for every symbol the kernel's graph knows.
+    Returns `None` when the graph cannot be used as a complete inventory:
 
-    Returns ``(index, usable)``. The ratchet needs this to tell a symbol that
-    went dead from one this task just wrote — without it the symbol half of the
-    diff refuses to flag anything, which is the "branch that cannot execute"
-    shape this work order removes.
-
-    ``usable`` is False whenever the index cannot be trusted as a complete
-    inventory:
-
-    * the graph is a size-capped export (``compatibility_export_tier``
-      ``compact`` drops node extras, ``stub`` drops nodes entirely), or
+    * it is a size-capped export (`compatibility_export_tier` `compact` caps the
+      lists and `stub` empties them), or
     * it was generated from a different commit than the manifest beside it —
-      pairing a symbol index from one generation with candidate lists from
-      another turns the difference between two generations into a "regression".
+      pairing lists from one generation with a rate from another turns the
+      difference between two generations into a "regression".
     """
     try:
         from devcouncil.indexing.graph.build import load_code_graph
     except ImportError:
-        return ([], False)
+        return None
     try:
         graph = load_code_graph(project_root)
     except Exception:
-        logger.warning("code graph unreadable for the symbol index", exc_info=True)
-        return ([], False)
+        logger.warning("code graph unreadable for the liveness snapshot", exc_info=True)
+        return None
     if graph is None:
-        return ([], False)
+        return None
 
     meta = getattr(graph, "meta", None) or {}
     tier = meta.get("compatibility_export_tier")
     if tier is not None and tier != "slim":
-        return ([], False)
+        return None
     graph_head = str(getattr(graph, "generated_head", "") or "")
     if head and graph_head and graph_head != head:
-        return ([], False)
+        return None
 
-    index = sorted(
+    # `path::name` for every symbol the graph knows. The ratchet needs it to
+    # tell a symbol that went dead from one this task just wrote; without it the
+    # symbol half refuses to flag anything, which is the "branch that cannot
+    # execute" shape this work order removes.
+    symbol_index = sorted(
         {
             f"{_norm(str(node.path))}::{node.name}"
             for node in (getattr(graph, "nodes", None) or [])
             if getattr(node, "path", "") and getattr(node, "name", "")
         }
     )
-    return (index, bool(index))
+    if not symbol_index:
+        return None
+
+    # The kernel writes the `path::name` form here already, which is exactly
+    # the shape `_symbol_key` parses.
+    dead_symbols = _as_list(meta.get("legacy_dead_symbol_candidates"))
+    if not dead_symbols:
+        dead_symbols = [
+            str(entry.get("id"))
+            for entry in (getattr(graph, "dead_code", None) or [])
+            if isinstance(entry, Mapping) and entry.get("id")
+        ]
+
+    return {
+        "entry_roots": _as_list(getattr(graph, "entry_roots", None)),
+        "unwired_candidates": _as_list(getattr(graph, "unwired_candidates", None)),
+        "unreachable_files": _as_list(getattr(graph, "unreachable_files", None)),
+        "dead_symbol_candidates": dead_symbols,
+        "symbol_index": symbol_index,
+        "liveness_unreachable_unreliable": bool(
+            meta.get("liveness_unreachable_unreliable")
+        ),
+        "generated_head": graph_head,
+    }
 
 
 def kernel_liveness_snapshot(project_root: Path) -> Optional[dict]:
     """Liveness lists from the kernel — the engine that actually ships.
 
-    Replaces ``RepoMapper.liveness_snapshot``, which ran the Python
-    ``_compute_liveness`` and its regex token scanner. Everything else in the
+    Replaces `RepoMapper.liveness_snapshot`, which ran the Python
+    `_compute_liveness` and its regex token scanner. Everything else in the
     system reads the Rust kernel, so the ratchet compared a Python baseline
     against a Python current on a code path nothing else used, and both differed
-    from what ``dev map dead`` reports. A regression in it did not mean what a
+    from what `dev map dead` reports. A regression in it did not mean what a
     user would see.
 
     Both sides of the diff come through this one function, so they cannot drift
-    onto different engines. Returns ``None`` when the kernel cannot answer: the
+    onto different engines. Returns `None` when the kernel cannot answer: the
     caller then declines to write a baseline rather than writing an empty one,
     because an empty baseline reads as "nothing was stranded" and would clear
     every future diff.
@@ -196,10 +210,10 @@ def kernel_liveness_snapshot(project_root: Path) -> Optional[dict]:
 
         client = DevMapClient(project_root)
         try:
-            # Regenerates the map and the graph together, so the lists below and
-            # the symbol index come from one generation. `read_repo_map` would
-            # be cheaper and wrong: the ratchet's current side has to reflect
-            # the tree *after* this task's edits.
+            # Regenerates the map and the graph together, so the lists and the
+            # rate come from one generation. `read_repo_map` would be cheaper
+            # and wrong: the ratchet's current side has to reflect the tree
+            # *after* this task's edits.
             manifest = client.manifest()
         except DevMapClientError as exc:
             logger.warning("kernel liveness snapshot unavailable: %s", exc)
@@ -207,50 +221,41 @@ def kernel_liveness_snapshot(project_root: Path) -> Optional[dict]:
         if not isinstance(manifest, Mapping):
             return None
 
-        meta = manifest.get("liveness_meta")
-        _, _, dead_truncated = _shown_total(meta, "dead_symbol")
-        _, _, unwired_truncated = _shown_total(meta, "unwired")
-        # `unreachable_files` is bounded by the dead-cluster caps rather than by
-        # a `liveness_meta` section; the manifest reports that cut separately.
-        unreachable_truncated = bool(manifest.get("dead_clusters_truncated"))
-
         head = str(manifest.get("generated_head") or "")
-        symbol_index, index_usable = _symbol_index_from_graph(project_root, head)
+        if not head:
+            # Without it the graph beside this manifest cannot be checked for
+            # being the same generation, and the whole point of reading two
+            # artifacts is that they agree. An unstamped manifest is a manifest
+            # nothing can be paired with.
+            logger.warning(
+                "the manifest carries no generated_head, so the graph beside it "
+                "cannot be shown to describe the same generation"
+            )
+            return None
+        graph = _graph_liveness(project_root, head)
+        if graph is None:
+            logger.warning(
+                "no usable code graph beside the manifest, so the liveness lists "
+                "would be the manifest's capped samples — diffing two samples "
+                "manufactures regressions from wherever the cuts fell"
+            )
+            return None
 
         rate = manifest.get("resolution_rate")
         net_permille = None
         if isinstance(rate, Mapping) and _is_plain_int(rate.get("net_permille")):
             net_permille = rate["net_permille"]
 
-        truncated = sorted(
-            name
-            for name, cut in (
-                ("dead_symbol_candidates", dead_truncated),
-                ("unwired_candidates", unwired_truncated),
-                ("unreachable_files", unreachable_truncated),
-                ("symbol_index", not index_usable),
-            )
-            if cut
-        )
         return {
-            "entry_roots": _as_list(manifest.get("entry_roots")),
-            "unwired_candidates": _as_list(manifest.get("unwired_candidates")),
-            "unreachable_files": _as_list(manifest.get("unreachable_files")),
-            "dead_symbol_candidates": _as_list(manifest.get("dead_symbol_candidates")),
-            "symbol_index": symbol_index,
-            # The kernel's own reachability verdict, computed since W1.1 from the
-            # component pass rather than hardcoded `true`. That is what makes the
-            # unreachable half of the diff a live branch again instead of one
-            # that could never fire.
-            "liveness_unreachable_unreliable": bool(
-                manifest.get("liveness_unreachable_unreliable")
-            ),
-            # Named, not counted: a reader is told *which* list was cut, and the
-            # baseline writer refuses to record a snapshot built from any of
-            # them. See :data:`TRUNCATED_LIST_IS_INCOMPLETE`.
-            "truncated_lists": truncated,
+            **graph,
+            # The lists above are the graph's, uncapped, so nothing here is a
+            # sample. `truncated_lists` stays in the payload as an explicit
+            # empty rather than being dropped: a reader checking it must not
+            # have to know whether the key means "nothing was cut" or "nobody
+            # looked".
+            "truncated_lists": [],
             "net_resolution_permille": net_permille,
-            "generated_head": head,
+            "generated_head": head or graph.get("generated_head") or "",
             "engine": "devmap_rust",
         }
     except Exception:
@@ -556,16 +561,25 @@ def snapshot_liveness_baseline(
         from devcouncil.indexing.wiring import LIVENESS_SCAN_VERSION
 
         truncated = list(snap.get("truncated_lists") or [])
-        # Three independent reasons a snapshot cannot be a ratchet input, kept
-        # apart so the log says which one fired:
+        # Two reasons a snapshot cannot be a ratchet input, kept apart so the
+        # log says which one fired:
         #
         # * empty entry roots — every file looks unreachable, so the diff would
         #   flood or, after a fail-soft `unreachable=[]`, falsely look clean;
-        # * the kernel's own `unreachable_unreliable` verdict;
         # * any capped list — see `TRUNCATED_LIST_IS_INCOMPLETE`.
+        #
+        # `liveness_unreachable_unreliable` is deliberately *not* one of them.
+        # It says the reachability answer cannot be trusted, and the diff
+        # already suppresses exactly the unreachable half when either side
+        # reports it (`_liveness_roots_unreliable`). Gating the whole baseline
+        # on it as well threw away the unwired and dead-symbol halves too — and
+        # since W1.1 made it a computed verdict it is true on any corpus with a
+        # parse failure or an import-blind language, which is most real ones.
+        # Measured on this repository: the flag is true, both other halves are
+        # perfectly good, and no baseline was written at all.
         no_roots = not _as_list(snap.get("entry_roots"))
-        unreliable = bool(snap.get("liveness_unreachable_unreliable")) or no_roots
-        complete = not unreliable and not (truncated and TRUNCATED_LIST_IS_INCOMPLETE)
+        complete = not no_roots and not (truncated and TRUNCATED_LIST_IS_INCOMPLETE)
+        unreliable = bool(snap.get("liveness_unreachable_unreliable"))
         payload: dict[str, Any] = {
             "unwired_candidates": _as_list(snap.get("unwired_candidates")),
             "unreachable_files": _as_list(snap.get("unreachable_files")),
@@ -588,11 +602,10 @@ def snapshot_liveness_baseline(
         write_json(out_path, payload)
         if not complete:
             logger.warning(
-                "liveness baseline for %s is not a ratchet input (roots_empty=%s, "
-                "unreliable=%s, truncated=%s)",
+                "liveness baseline for %s is not a ratchet input "
+                "(roots_empty=%s, truncated=%s)",
                 task_id,
                 no_roots,
-                snap.get("liveness_unreachable_unreliable"),
                 truncated or "none",
             )
         return out_path if complete else None
