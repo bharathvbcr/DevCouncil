@@ -183,7 +183,10 @@ fn a_refusal_names_a_stage_the_language_actually_ran() {
         let extraction =
             extract_treesitter_with_budget(path, lang, "def f():\n    return 1\n", Duration::ZERO);
         let ParseOutcome::Failed { reason } = &extraction.parse_outcome else {
-            panic!("a zero budget must refuse {path}: {:?}", extraction.parse_outcome);
+            panic!(
+                "a zero budget must refuse {path}: {:?}",
+                extraction.parse_outcome
+            );
         };
         assert!(
             !reason.contains("Go method sets"),

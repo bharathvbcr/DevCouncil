@@ -695,10 +695,7 @@ fn search_over_a_complete_corpus_claims_nothing() {
     );
 
     let miss = engine.search(request("no_such_symbol_anywhere")).unwrap();
-    assert_eq!(
-        miss.total, 0,
-        "the fixture must actually miss: {miss:?}"
-    );
+    assert_eq!(miss.total, 0, "the fixture must actually miss: {miss:?}");
     assert_eq!(
         miss.walk_incomplete, None,
         "an empty answer over a fully read corpus is a completed check and may \
