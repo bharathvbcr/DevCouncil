@@ -252,3 +252,139 @@ def test_report_github_pr_comment_success(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert posted["pr"] == 42
     assert "Posted DevCouncil PR comment" in result.output
+
+
+# --- `--json` contract: exactly one JSON object on stdout, diagnostics on stderr ---
+#
+# These assert on `result.stdout`, never `result.output`. Under Click 8.4 `.output` is
+# the stdout+stderr streams merged, so it parses identically whether or not a banner
+# leaked onto stdout — it cannot detect this bug, which is why the tests above passed
+# while `dev report --json --evidence-json X` emitted a banner and no payload at all.
+
+
+def _init(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+
+def test_report_json_evidence_json_emits_one_object(tmp_path, monkeypatch):
+    """The branch wrote a file, printed a banner to stdout, and returned before the payload."""
+    _init(tmp_path, monkeypatch)
+    out = tmp_path / "evidence.json"
+
+    result = runner.invoke(app, ["report", "--json", "--evidence-json", str(out)])
+
+    assert result.exit_code == 0
+    assert out.is_file()
+    data = json.loads(result.stdout)
+    assert data["ok"] is True
+    assert data["action"] == "evidence-json"
+    assert data["output_path"] == str(out)
+    assert data["error"] is None
+    assert "Wrote evidence export" in result.stderr
+    assert "Wrote evidence export" not in result.stdout
+
+
+def test_report_json_evidence_html_emits_one_object(tmp_path, monkeypatch):
+    _init(tmp_path, monkeypatch)
+    out = tmp_path / "evidence.html"
+
+    result = runner.invoke(app, ["report", "--json", "--evidence-html", str(out)])
+
+    assert result.exit_code == 0
+    assert out.is_file()
+    data = json.loads(result.stdout)
+    assert data["action"] == "evidence-html"
+    assert data["output_path"] == str(out)
+    assert "Wrote evidence HTML" in result.stderr
+
+
+def test_report_json_evidence_write_failure_emits_one_object(tmp_path, monkeypatch):
+    """A failed write is still a `--json` invocation; it owes stdout an object."""
+    _init(tmp_path, monkeypatch)
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["report", "--json", "--evidence-json", str(blocker / "nested" / "evidence.json")]
+    )
+
+    assert result.exit_code == 1
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert data["action"] == "evidence-json"
+    assert "Failed to write evidence export" in data["error"]
+    assert "Failed to write evidence export" in result.stderr
+
+
+def test_report_json_github_branch_emits_one_object(tmp_path, monkeypatch):
+    """`--github` does its work in a check run and returned with stdout empty."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    _init(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["report", "--json", "--github"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["action"] == "github-checks"
+    assert data["blocking_gaps"] == 0
+    assert "GITHUB_TOKEN and GITHUB_REPOSITORY must be set" in result.stderr
+    assert "GITHUB_TOKEN" not in result.stdout
+
+
+def test_report_json_gitlab_branch_emits_one_object(tmp_path, monkeypatch):
+    monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+    monkeypatch.delenv("GITLAB_PROJECT_ID", raising=False)
+    monkeypatch.delenv("GITLAB_MR_IID", raising=False)
+    _init(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["report", "--json", "--gitlab-pr-comment"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["action"] == "gitlab-mr-comment"
+    assert "GITLAB_TOKEN" in result.stderr
+
+
+def test_report_json_missing_state_emits_one_object(tmp_path, monkeypatch):
+    from devcouncil.cli.commands import report as report_cmd
+
+    _init(tmp_path, monkeypatch)
+    monkeypatch.setattr(report_cmd, "get_db", lambda root: None)
+
+    result = runner.invoke(app, ["report", "--json"])
+
+    assert result.exit_code == 1
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert "state is unavailable" in data["error"]
+    assert "state is unavailable" in result.stderr
+
+
+def test_release_health_json_write_banners_stay_off_stdout(tmp_path, monkeypatch):
+    """Both `--write-baseline` and `--output` printed a banner ahead of the payload."""
+    _init(tmp_path, monkeypatch)
+    out = tmp_path / "release-health.json"
+
+    result = runner.invoke(
+        app, ["report", "release-health", "--json", "--write-baseline", "--output", str(out)]
+    )
+
+    assert result.exit_code == 0
+    assert out.is_file()
+    json.loads(result.stdout)  # the report itself — the sole object on stdout
+    assert "Wrote release-health baseline" in result.stderr
+    assert "Wrote release-health report" in result.stderr
+    assert "Wrote release-health" not in result.stdout
+
+
+def test_release_health_json_missing_state_emits_one_object(tmp_path, monkeypatch):
+    from devcouncil.cli.commands import report as report_cmd
+
+    _init(tmp_path, monkeypatch)
+    monkeypatch.setattr(report_cmd, "get_db", lambda root: None)
+
+    result = runner.invoke(app, ["report", "release-health", "--json"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["ok"] is False

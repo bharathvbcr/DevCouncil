@@ -260,3 +260,41 @@ def test_cli_tasks_edit_no_db(tmp_path, monkeypatch):
     monkeypatch.setattr(tasks_cmd, "get_db", lambda root: None)
     res = runner.invoke(app, ["tasks", "edit", "TASK-1", "--title", "X", "--json"])
     assert res.exit_code == 1
+
+
+# --- `--json` contract: exactly one JSON object on stdout, diagnostics on stderr ---
+#
+# The `cancel`/`reprioritize`/`update` subcommands already emitted an error object; the
+# `dev tasks` listing itself did not — it printed a line and exited, leaving stdout with
+# zero JSON objects. Asserting on `result.stdout`, never `result.output`: under Click 8.4
+# `.output` is the two streams merged and parses identically either way.
+
+
+def test_cli_tasks_json_missing_state_emits_one_object(tmp_path, monkeypatch):
+    from devcouncil.cli.commands import tasks as tasks_cmd
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    monkeypatch.setattr(tasks_cmd, "get_db", lambda root: None)
+
+    result = runner.invoke(app, ["tasks", "--json"])
+
+    assert result.exit_code == 1
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert "state is unavailable" in data["error"]
+    assert "state is unavailable" in result.stderr
+
+
+def test_cli_tasks_human_missing_state_reports_on_stderr(tmp_path, monkeypatch):
+    from devcouncil.cli.commands import tasks as tasks_cmd
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    monkeypatch.setattr(tasks_cmd, "get_db", lambda root: None)
+
+    result = runner.invoke(app, ["tasks"])
+
+    assert result.exit_code == 1
+    assert "state is unavailable" in result.stderr
+    assert result.stdout == ""

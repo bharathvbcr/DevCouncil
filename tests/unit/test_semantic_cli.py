@@ -78,3 +78,25 @@ def test_semantic_diff_detects_import_change(tmp_path):
     types = {item["type"] for item in payload["classifications"]}
     assert "import_dependency_change" in types
     assert payload["summary"]
+
+
+def test_semantic_snapshot_json_bad_stage_emits_one_object(tmp_path, monkeypatch):
+    """The `--stage` guard exits before the snapshot payload exists.
+
+    Asserting on `result.stdout`, never `result.output`: under Click 8.4 `.output` is the
+    stdout and stderr streams merged, so it cannot tell a payload from a bare message.
+    """
+    import json as _json
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    result = runner.invoke(
+        app, ["semantic", "snapshot", "TASK-001", "--json", "--stage", "sideways"]
+    )
+
+    assert result.exit_code == 2
+    data = _json.loads(result.stdout)
+    assert data["ok"] is False
+    assert "--stage must be before or after" in data["error"]
+    assert "--stage must be before or after" in result.stderr

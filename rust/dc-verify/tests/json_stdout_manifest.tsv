@@ -1,0 +1,66 @@
+# DevCouncil `--json` invocations whose stdout must hold exactly one JSON object.
+#
+# Fields are TAB-separated. The first is the mode; the rest are argv, passed to
+# the process directly — there is no shell here, so nothing needs quoting.
+#
+# `{PY}` is replaced with the interpreter the harness resolved and `{ROOT}` with
+# the throwaway project it initialised, so every entry runs against a real,
+# freshly-scaffolded repository rather than the developer's own checkout.
+#
+# Every entry here reproduced a failure against the pre-fix CLI, except where a
+# comment says otherwise. Both outcomes are covered on purpose: a command that
+# succeeds and a command that rejects its arguments owe stdout the same one
+# object, and it was the rejecting paths that were emitting zero.
+
+# --- dev cost: the confirmed leak, both shapes ---------------------------------
+mode=json	{PY}	-m	devcouncil.cli.main	cost	show	--json	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	cost	budget	--json	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	cost	budget	--json	--set	5.00	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	cost	budget	--json	--clear	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	cost	budget	--json	--set	5	--clear	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	cost	budget	--json	--set	-1	--project-root	{ROOT}
+
+# --- dev report: five branches that did their work and returned ----------------
+mode=json	{PY}	-m	devcouncil.cli.main	report	--json	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	report	--json	--evidence-json	{ROOT}/evidence.json	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	report	--json	--evidence-html	{ROOT}/evidence.html	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	report	--json	--github	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	report	--json	--gitlab-pr-comment	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	report	rigor	--json	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	report	release-health	--json	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	report	release-health	--json	--write-baseline	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	report	release-health	--json	--output	{ROOT}/release-health.json	--project-root	{ROOT}
+
+# --- dev go: the orchestrator, whose whole console output was narration --------
+# The second reaches plan.py, which was writing a provider error onto stdout
+# ahead of the payload; the first is rejected before planning starts.
+mode=json	{PY}	-m	devcouncil.cli.main	go	a goal	--json	--executor	nosuchagent	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	go	a goal	--json	--project-root	{ROOT}
+
+# --- dev boot: the whole setup phase used to run onto the payload stream --------
+# `{ROOT}` is already initialised by the harness, so this exercises boot's
+# re-init path plus the doctor table, both of which were writing to stdout.
+# --skip-api-key keeps it non-interactive; boot would force that anyway off a TTY.
+mode=json	{PY}	-m	devcouncil.cli.main	boot	a goal	--json	--skip-map	--skip-skills	--skip-integrations	--skip-api-key	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	boot	a goal	--json	--gemini-scope	nonsense	--project-root	{ROOT}
+
+# --- the small commands' pre-flight guards -------------------------------------
+mode=json	{PY}	-m	devcouncil.cli.main	tasks	--json	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	semantic	snapshot	TASK-001	--json	--stage	sideways	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	apply-patch	--json	--unified-diff	 	--project-root	{ROOT}
+
+# --- streaming commands, whose progress ran around the payload -----------------
+mode=json	{PY}	-m	devcouncil.cli.main	runs	list	--json	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	runs	timeline	no-such-run	--json	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	runs	supervise	no-such-run	--json	--no-llm	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	watch	fs	--task	TASK-001	--once	--json	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	trace	tail	--json	--project-root	{ROOT}
+
+# `--jsonl` is the sibling contract: stdout is a newline-delimited JSON stream,
+# and the cursor line was the last, unparseable thing a consumer read.
+mode=jsonl	{PY}	-m	devcouncil.cli.main	trace	tail	--since	0	--jsonl	--project-root	{ROOT}
+
+# --- commands that already honoured the contract, kept as the control ----------
+# If these ever fail, the harness itself is wrong rather than the CLI.
+mode=json	{PY}	-m	devcouncil.cli.main	verify	--json	--project-root	{ROOT}
+mode=json	{PY}	-m	devcouncil.cli.main	status	--json	--project-root	{ROOT}

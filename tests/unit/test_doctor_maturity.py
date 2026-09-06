@@ -21,12 +21,14 @@ def test_doctor_renders_maturity_section(tmp_path, monkeypatch):
     console = Console(file=StringIO(), width=120)
     from devcouncil.cli.commands import doctor as doctor_mod
 
-    original = doctor_mod.console
-    doctor_mod.console = console
+    # The module's Console is bound to stderr and named `status_console`; the swap
+    # captures whatever it renders, which is what this test is actually about.
+    original = doctor_mod.status_console
+    doctor_mod.status_console = console
     try:
         render_doctor_check(tmp_path)
     finally:
-        doctor_mod.console = original
+        doctor_mod.status_console = original
     output = console.file.getvalue()
     assert "Maturity:" in output or "Subsystem Maturity" in output
     assert "Preview" in output

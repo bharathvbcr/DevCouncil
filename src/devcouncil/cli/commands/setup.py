@@ -33,7 +33,15 @@ from devcouncil.telemetry.stages import log_stage, log_step
 import logging
 
 app = typer.Typer()
-console = Console()
+# `dev setup` configures the project; like `dev init` it produces no stdout document,
+# and it is the second phase of `dev boot --json`, where its notes were prefixing the
+# payload. Binding the only Console here to stderr fixes that at the source.
+#
+# The two `typer.prompt`/`typer.confirm` calls below still write to stdout, which is
+# Typer's default and correct for an interactive prompt. They cannot reach a `--json`
+# run: `dev boot` forces --skip-api-key when stdin is not a TTY, and an agent's stdin
+# never is. Left as they are rather than changed on a path no evidence says is broken.
+status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 
@@ -47,9 +55,9 @@ def _set_model_provider(project_root: Path, provider: str) -> None:
     updated_role_defaults = apply_provider_default_role_models(raw_config, previous, normalized)
     config_path.write_text(yaml.dump(raw_config, default_flow_style=False), encoding="utf-8")
     if previous != normalized:
-        console.print(f"[green]Updated model provider from {previous} to {normalized}.[/green]")
+        status_console.print(f"[green]Updated model provider from {previous} to {normalized}.[/green]")
     if updated_role_defaults:
-        console.print(f"[green]Updated default role models for {normalized}.[/green]")
+        status_console.print(f"[green]Updated default role models for {normalized}.[/green]")
 
 
 def _set_model_roles(
@@ -71,9 +79,9 @@ def _set_model_roles(
     )
     config_path.write_text(yaml.dump(raw_config, default_flow_style=False), encoding="utf-8")
     if model:
-        console.print(f"[green]Updated all model roles to use {model}.[/green]")
+        status_console.print(f"[green]Updated all model roles to use {model}.[/green]")
     for role, selected_model in (role_models or {}).items():
-        console.print(f"[green]Updated {role} to use {selected_model}.[/green]")
+        status_console.print(f"[green]Updated {role} to use {selected_model}.[/green]")
 
 
 def _write_local_secret(project_root: Path, env_var: str, value: str) -> Path:
@@ -105,28 +113,28 @@ def _configure_vertexai_settings(
     local_secrets = load_local_secrets(project_root)
     if vertex_project:
         _write_local_secret(project_root, "VERTEXAI_PROJECT", vertex_project)
-        console.print("[green]Saved VERTEXAI_PROJECT to .devcouncil/secrets.env.[/green]")
+        status_console.print("[green]Saved VERTEXAI_PROJECT to .devcouncil/secrets.env.[/green]")
     elif not (
         os.environ.get("VERTEXAI_PROJECT")
         or os.environ.get("GOOGLE_CLOUD_PROJECT")
         or local_secrets.get("VERTEXAI_PROJECT")
         or local_secrets.get("GOOGLE_CLOUD_PROJECT")
     ):
-        console.print(
+        status_console.print(
             "[yellow]VERTEXAI_PROJECT is not set. "
             "Set it in your shell or rerun setup with --vertex-project PROJECT_ID.[/yellow]"
         )
 
     if vertex_location:
         _write_local_secret(project_root, "VERTEXAI_LOCATION", vertex_location)
-        console.print("[green]Saved VERTEXAI_LOCATION to .devcouncil/secrets.env.[/green]")
+        status_console.print("[green]Saved VERTEXAI_LOCATION to .devcouncil/secrets.env.[/green]")
 
 
 def _configure_api_key(project_root: Path, api_key: str | None, skip_api_key: bool) -> None:
     config = load_config(project_root)
     provider = config.models.provider
     if _normalized_provider_name(provider) == "ollama":
-        console.print(
+        status_console.print(
             "[green]Ollama uses a local server (default http://localhost:11434); no API key required.[/green]"
         )
         return
@@ -134,30 +142,30 @@ def _configure_api_key(project_root: Path, api_key: str | None, skip_api_key: bo
     local_secrets = load_local_secrets(project_root)
 
     if os.environ.get(env_var):
-        console.print(f"[green]{env_var} is already set in the environment.[/green]")
+        status_console.print(f"[green]{env_var} is already set in the environment.[/green]")
         return
     if local_secrets.get(env_var):
-        console.print(f"[green]{env_var} is already set in .devcouncil/secrets.env.[/green]")
+        status_console.print(f"[green]{env_var} is already set in .devcouncil/secrets.env.[/green]")
         return
     if api_key:
         _write_local_secret(project_root, env_var, api_key)
-        console.print(f"[green]Saved {env_var} to .devcouncil/secrets.env.[/green]")
+        status_console.print(f"[green]Saved {env_var} to .devcouncil/secrets.env.[/green]")
         return
     if provider == "vertexai" and get_gcloud_access_token():
-        console.print("[green]Vertex AI access token is available from gcloud auth print-access-token.[/green]")
+        status_console.print("[green]Vertex AI access token is available from gcloud auth print-access-token.[/green]")
         return
     if skip_api_key:
-        console.print(f"[yellow]Skipped {env_var} setup. Model-backed commands will ask again if it is missing.[/yellow]")
+        status_console.print(f"[yellow]Skipped {env_var} setup. Model-backed commands will ask again if it is missing.[/yellow]")
         return
     if not sys.stdin.isatty():
-        console.print(
+        status_console.print(
             f"[yellow]{env_var} is not set.[/yellow] "
             f"Run [bold]dev setup --api-key YOUR_KEY[/bold] or set it in your shell before model-backed commands."
         )
         return
 
-    console.print()
-    console.print(Panel.fit(
+    status_console.print()
+    status_console.print(Panel.fit(
         "\n".join([
             f"Provider: {provider}",
             f"Required key: {env_var}",
@@ -168,10 +176,10 @@ def _configure_api_key(project_root: Path, api_key: str | None, skip_api_key: bo
     ))
     entered = typer.prompt(f"{env_var}", default="", hide_input=True, show_default=False)
     if not entered:
-        console.print(f"[yellow]Skipped {env_var} setup.[/yellow]")
+        status_console.print(f"[yellow]Skipped {env_var} setup.[/yellow]")
         return
     _write_local_secret(project_root, env_var, entered)
-    console.print(f"[green]Saved {env_var} to .devcouncil/secrets.env.[/green]")
+    status_console.print(f"[green]Saved {env_var} to .devcouncil/secrets.env.[/green]")
 
 
 def _is_interactive_terminal() -> bool:
@@ -179,8 +187,8 @@ def _is_interactive_terminal() -> bool:
 
 
 def _configure_coding_cli_integrations(project_root: Path, apply: bool, gemini_scope: str) -> None:
-    console.print()
-    console.print("[bold]Coding CLI integration[/bold]")
+    status_console.print()
+    status_console.print("[bold]Coding CLI integration[/bold]")
     commands = [
         ("Codex CLI", _codex_command(project_root)),
         ("Claude Code", _claude_command(project_root, "local")),
@@ -188,7 +196,7 @@ def _configure_coding_cli_integrations(project_root: Path, apply: bool, gemini_s
     results = []
     for tool, command in commands:
         if apply and not shutil.which(command[0]):
-            console.print(f"[yellow]{tool} CLI not found on PATH. Skipping optional integration.[/yellow]")
+            status_console.print(f"[yellow]{tool} CLI not found on PATH. Skipping optional integration.[/yellow]")
             continue
         results.append(_configure(tool, command, apply))
     results.append(_configure_cursor(project_root, apply))
@@ -205,8 +213,8 @@ def _prompt_for_first_run_integrations(project_root: Path, apply: bool, gemini_s
     if not _is_interactive_terminal():
         return False
 
-    console.print()
-    console.print(Panel.fit(
+    status_console.print()
+    status_console.print(Panel.fit(
         "\n".join([
             "DevCouncil can configure supported coding CLIs now.",
             "This adds MCP setup and native hook config for detected clients.",
@@ -216,7 +224,7 @@ def _prompt_for_first_run_integrations(project_root: Path, apply: bool, gemini_s
         border_style="cyan",
     ))
     if not typer.confirm("Set up coding CLI integrations now?", default=True):
-        console.print("[yellow]Skipped coding CLI integration setup.[/yellow]")
+        status_console.print("[yellow]Skipped coding CLI integration setup.[/yellow]")
         return False
 
     _configure_coding_cli_integrations(project_root, apply=apply, gemini_scope=gemini_scope)
@@ -260,7 +268,7 @@ def setup(
         return
 
     if gemini_scope not in {"project", "user"}:
-        console.print("[red]--gemini-scope must be 'project' or 'user'.[/red]")
+        status_console.print("[red]--gemini-scope must be 'project' or 'user'.[/red]")
         raise typer.Exit(code=2)
 
     root = project_root.expanduser().resolve()
@@ -271,7 +279,7 @@ def setup(
         role_models = parse_role_model_overrides(role_model)
         initial_provider = validate_model_provider(provider) if provider else "openrouter"
     except ValueError as e:
-        console.print(f"[red]{e}[/red]")
+        status_console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=2) from e
 
     with log_stage("setup", project_root=root, integrate=integrate):
@@ -286,7 +294,7 @@ def setup(
 
             host = hardware.describe_host()
             model = host.recommended_ollama_model
-            console.print(
+            status_console.print(
                 f"[green]Detected {host.chip_label} ({host.memory_label}); "
                 f"defaulting Ollama model to {model}.[/green] "
                 "Override with --model, and pull it first: "
@@ -294,7 +302,7 @@ def setup(
             )
         elif initial_provider == "ollama" and model is not None:
             # Model pinned explicitly — still remind the user it must be pulled locally.
-            console.print(
+            status_console.print(
                 f"[green]Using Ollama model {model}.[/green] "
                 f"Pull it first if needed: [bold]ollama pull {model}[/bold]."
             )
@@ -309,13 +317,13 @@ def setup(
             with_skills=not skip_skills,
         )
         if not created:
-            console.print(f"[yellow]DevCouncil is already initialized at {root / '.devcouncil'}.[/yellow]")
+            status_console.print(f"[yellow]DevCouncil is already initialized at {root / '.devcouncil'}.[/yellow]")
 
         if provider:
             try:
                 _set_model_provider(root, provider)
             except ValueError as e:
-                console.print(f"[red]{e}[/red]")
+                status_console.print(f"[red]{e}[/red]")
                 raise typer.Exit(code=2) from e
 
         _set_model_roles(root, model=model, role_models=role_models)
@@ -324,7 +332,7 @@ def setup(
         _configure_vertexai_settings(root, configured_provider, vertex_project, vertex_location)
         _configure_api_key(root, api_key, skip_api_key)
 
-        console.print()
+        status_console.print()
         render_doctor_check(root)
 
         if scaffold_ci:
@@ -332,17 +340,17 @@ def setup(
 
             written = scaffold_ci_workflow(root)
             if written is None:
-                console.print(f"[yellow]{WORKFLOW_RELPATH.as_posix()} already exists; left unchanged.[/yellow]")
+                status_console.print(f"[yellow]{WORKFLOW_RELPATH.as_posix()} already exists; left unchanged.[/yellow]")
             else:
-                console.print(f"[green]Wrote starter CI workflow {written.relative_to(root).as_posix()}.[/green]")
+                status_console.print(f"[green]Wrote starter CI workflow {written.relative_to(root).as_posix()}.[/green]")
 
         if integrate:
             _configure_coding_cli_integrations(root, apply=apply, gemini_scope=gemini_scope)
         elif created and not skip_integrations:
             _prompt_for_first_run_integrations(root, apply=True, gemini_scope=gemini_scope)
 
-        console.print()
-        console.print(Panel.fit(
+        status_console.print()
+        status_console.print(Panel.fit(
             "\n".join([
                 "[bold]Next commands[/bold]",
                 f"Keep running DevCouncil commands in this terminal at: {root}",

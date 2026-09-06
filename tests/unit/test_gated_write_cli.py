@@ -178,7 +178,10 @@ def test_apply_patch_empty_diff_rejected(tmp_path, monkeypatch):
         "apply-patch", "TASK-1", "--lease-token", "t", "--unified-diff", "   ", *_root(tmp_path),
     ])
     assert res.exit_code == 1
-    assert "non-empty" in res.stdout
+    # The rejection is a diagnostic, so it belongs on stderr — and must stay off stdout,
+    # which under `--json` carries the payload.
+    assert "non-empty" in res.stderr
+    assert res.stdout == ""
     # The payload must not be invoked for an empty diff.
     assert called["n"] == 0
 

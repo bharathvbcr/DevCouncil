@@ -22,14 +22,47 @@ from typing import Optional
 
 app = typer.Typer()
 console = Console()
+# Diagnostics go to stderr unconditionally — same split as `dev map`/`dev graph`/`dev debug`.
+# Routing them here rather than behind an `if not json_format` guard makes the `--json`
+# contract (exactly one JSON object on stdout) structural: a "Wrote ..." line physically
+# cannot reach stdout, so a future call site cannot reintroduce the leak by forgetting
+# the flag. Only the report itself — Markdown or JSON — is written to stdout.
+status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
+
+
+def _side_effect_payload(
+    action: str,
+    *,
+    graph: ArtifactGraph,
+    ok: bool = True,
+    output_path: Optional[Path] = None,
+    error: Optional[str] = None,
+) -> dict:
+    """Describe a `dev report` branch whose real output is a side effect, not stdout.
+
+    ``--github``, ``--github-pr-comment``, ``--gitlab-pr-comment``, ``--evidence-json``
+    and ``--evidence-html`` each do their work elsewhere (a check run, a comment, a file)
+    and then return. Under ``--json`` that used to leave stdout with zero JSON objects,
+    which breaks the one-object contract exactly as a stray banner does. Every key is
+    always present so a parser never has to branch on which exit point produced the
+    object; ``blocking_gaps`` carries the number ``--fail-on-blocking`` acts on, so a
+    machine consumer can see the verdict without re-reading the graph.
+    """
+    return {
+        "ok": ok,
+        "action": action,
+        "output_path": str(output_path) if output_path is not None else None,
+        "blocking_gaps": len(graph.blocking_gaps()),
+        "error": error,
+    }
 
 async def run_github_report(graph: ArtifactGraph, project_root: Path):
     token = os.environ.get("GITHUB_TOKEN")
     repo = os.environ.get("GITHUB_REPOSITORY") # e.g. owner/repo
     
     if not token or not repo:
-        console.print("[red]GITHUB_TOKEN and GITHUB_REPOSITORY must be set for GitHub reporting.[/red]")
+        status_console.print("[red]GITHUB_TOKEN and GITHUB_REPOSITORY must be set for GitHub reporting.[/red]")
         return
 
     try:
@@ -40,9 +73,9 @@ async def run_github_report(graph: ArtifactGraph, project_root: Path):
             sha = git_output(["rev-parse", "HEAD"], cwd=project_root).strip()
         integration = GitHubIntegration(token, repo, sha)
         await integration.report_verification(graph)
-        console.print(f"[green]Successfully reported to GitHub PR Checks for {repo} at {sha[:7]}[/green]")
+        status_console.print(f"[green]Successfully reported to GitHub PR Checks for {repo} at {sha[:7]}[/green]")
     except Exception as e:
-        console.print(f"[red]Failed to report to GitHub: {e}[/red]")
+        status_console.print(f"[red]Failed to report to GitHub: {e}[/red]")
 
 
 async def run_github_pr_comment(graph: ArtifactGraph, live_review: dict | None = None):
@@ -50,16 +83,16 @@ async def run_github_pr_comment(graph: ArtifactGraph, live_review: dict | None =
     repo = os.environ.get("GITHUB_REPOSITORY")
     pull_number = os.environ.get("GITHUB_PR_NUMBER") or os.environ.get("PR_NUMBER")
     if not token or not repo or not pull_number:
-        console.print("[red]GITHUB_TOKEN, GITHUB_REPOSITORY, and GITHUB_PR_NUMBER must be set for GitHub PR comments.[/red]")
+        status_console.print("[red]GITHUB_TOKEN, GITHUB_REPOSITORY, and GITHUB_PR_NUMBER must be set for GitHub PR comments.[/red]")
         return
     try:
         pull_number_int = int(pull_number)
     except ValueError:
-        console.print("[red]GITHUB_PR_NUMBER must be an integer.[/red]")
+        status_console.print("[red]GITHUB_PR_NUMBER must be an integer.[/red]")
         return
     commenter = GitHubPRCommenter(token, repo, pull_number_int)
     await commenter.post_comment(build_pr_comment_body(graph, live_review=live_review))
-    console.print(f"[green]Posted DevCouncil PR comment to GitHub PR #{pull_number}.[/green]")
+    status_console.print(f"[green]Posted DevCouncil PR comment to GitHub PR #{pull_number}.[/green]")
 
 
 async def run_gitlab_mr_comment(graph: ArtifactGraph, live_review: dict | None = None):
@@ -68,16 +101,16 @@ async def run_gitlab_mr_comment(graph: ArtifactGraph, live_review: dict | None =
     mr_iid = os.environ.get("GITLAB_MR_IID") or os.environ.get("CI_MERGE_REQUEST_IID")
     base_url = os.environ.get("GITLAB_API_URL", "https://gitlab.com/api/v4")
     if not token or not project_id or not mr_iid:
-        console.print("[red]GITLAB_TOKEN, GITLAB_PROJECT_ID, and GITLAB_MR_IID must be set for GitLab MR comments.[/red]")
+        status_console.print("[red]GITLAB_TOKEN, GITLAB_PROJECT_ID, and GITLAB_MR_IID must be set for GitLab MR comments.[/red]")
         return
     try:
         mr_iid_int = int(mr_iid)
     except ValueError:
-        console.print("[red]GITLAB_MR_IID must be an integer.[/red]")
+        status_console.print("[red]GITLAB_MR_IID must be an integer.[/red]")
         return
     commenter = GitLabMRCommenter(token, project_id, mr_iid_int, base_url=base_url)
     await commenter.post_comment(build_pr_comment_body(graph, live_review=live_review))
-    console.print(f"[green]Posted DevCouncil MR comment to GitLab MR !{mr_iid}.[/green]")
+    status_console.print(f"[green]Posted DevCouncil MR comment to GitLab MR !{mr_iid}.[/green]")
 
 @app.callback(invoke_without_command=True)
 def report(
@@ -128,7 +161,10 @@ def report(
     initialize_project(root, quiet=True)
     db = get_db(root)
     if not db:
-        console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
+        unavailable = "DevCouncil state is unavailable in this directory."
+        status_console.print(f"[red]{unavailable}[/red]")
+        if json_format:
+            typer.echo(dump_json({"ok": False, "error": unavailable}, indent=2))
         raise typer.Exit(code=1)
 
     with log_stage("report", project_root=root, planning_only=planning_only):
@@ -163,6 +199,8 @@ def report(
             if github:
                 log_step("report/2: posting to GitHub checks", project_root=root)
                 asyncio.run(run_github_report(graph, root))
+                if json_format:
+                    typer.echo(dump_json(_side_effect_payload("github-checks", graph=graph), indent=2))
                 if fail_on_blocking and graph.blocking_gaps():
                     raise typer.Exit(code=1)
                 return
@@ -170,6 +208,8 @@ def report(
             if github_pr_comment:
                 log_step("report/2: posting GitHub PR comment", project_root=root)
                 asyncio.run(run_github_pr_comment(graph, live_review=live_review))
+                if json_format:
+                    typer.echo(dump_json(_side_effect_payload("github-pr-comment", graph=graph), indent=2))
                 if fail_on_blocking and graph.blocking_gaps():
                     raise typer.Exit(code=1)
                 return
@@ -177,6 +217,8 @@ def report(
             if gitlab_pr_comment:
                 log_step("report/2: posting GitLab MR comment", project_root=root)
                 asyncio.run(run_gitlab_mr_comment(graph, live_review=live_review))
+                if json_format:
+                    typer.echo(dump_json(_side_effect_payload("gitlab-mr-comment", graph=graph), indent=2))
                 if fail_on_blocking and graph.blocking_gaps():
                     raise typer.Exit(code=1)
                 return
@@ -191,9 +233,18 @@ def report(
                         encoding="utf-8",
                     )
                 except OSError as exc:
-                    console.print(f"[red]Failed to write evidence export to {output_path}: {exc}[/red]")
+                    failure = f"Failed to write evidence export to {output_path}: {exc}"
+                    status_console.print(f"[red]{failure}[/red]")
+                    if json_format:
+                        typer.echo(dump_json(_side_effect_payload(
+                            "evidence-json", graph=graph, ok=False, output_path=output_path, error=failure,
+                        ), indent=2))
                     raise typer.Exit(code=1) from exc
-                console.print(f"[green]Wrote evidence export to {output_path}[/green]")
+                status_console.print(f"[green]Wrote evidence export to {output_path}[/green]")
+                if json_format:
+                    typer.echo(dump_json(_side_effect_payload(
+                        "evidence-json", graph=graph, output_path=output_path,
+                    ), indent=2))
                 if fail_on_blocking and graph.blocking_gaps():
                     raise typer.Exit(code=1)
                 return
@@ -208,9 +259,18 @@ def report(
                         encoding="utf-8",
                     )
                 except OSError as exc:
-                    console.print(f"[red]Failed to write evidence HTML to {output_path}: {exc}[/red]")
+                    failure = f"Failed to write evidence HTML to {output_path}: {exc}"
+                    status_console.print(f"[red]{failure}[/red]")
+                    if json_format:
+                        typer.echo(dump_json(_side_effect_payload(
+                            "evidence-html", graph=graph, ok=False, output_path=output_path, error=failure,
+                        ), indent=2))
                     raise typer.Exit(code=1) from exc
-                console.print(f"[green]Wrote evidence HTML to {output_path}[/green]")
+                status_console.print(f"[green]Wrote evidence HTML to {output_path}[/green]")
+                if json_format:
+                    typer.echo(dump_json(_side_effect_payload(
+                        "evidence-html", graph=graph, output_path=output_path,
+                    ), indent=2))
                 if fail_on_blocking and graph.blocking_gaps():
                     raise typer.Exit(code=1)
                 return
@@ -291,7 +351,10 @@ def release_health_report(
     initialize_project(root, quiet=True)
     db = get_db(root)
     if not db:
-        console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
+        unavailable = "DevCouncil state is unavailable in this directory."
+        status_console.print(f"[red]{unavailable}[/red]")
+        if json_format:
+            typer.echo(dump_json({"ok": False, "error": unavailable}, indent=2))
         raise typer.Exit(code=1)
 
     baseline_path = resolve_baseline_path(root, baseline)
@@ -300,7 +363,7 @@ def release_health_report(
         gaps = list(graph.gaps.values())
         if write_baseline:
             write_baseline_snapshot(baseline_path, gaps, label="cli-write-baseline")
-            console.print(f"[green]Wrote release-health baseline to {baseline_path}[/green]")
+            status_console.print(f"[green]Wrote release-health baseline to {baseline_path}[/green]")
         snapshot = load_baseline_snapshot(baseline_path)
         report = ReportBuilder.build_release_health(
             graph,
@@ -312,7 +375,7 @@ def release_health_report(
         out = output.expanduser()
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(report.to_json() + "\n", encoding="utf-8")
-        console.print(f"[green]Wrote release-health report to {out}[/green]")
+        status_console.print(f"[green]Wrote release-health report to {out}[/green]")
 
     if json_format:
         typer.echo(report.to_json())

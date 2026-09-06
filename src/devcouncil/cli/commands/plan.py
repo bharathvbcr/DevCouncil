@@ -39,7 +39,12 @@ from devcouncil.telemetry.stages import log_stage, log_step
 from devcouncil.utils.json_persist import dump_json
 
 app = typer.Typer()
-console = Console()
+# `dev plan` produces tasks in the DevCouncil database, not a document on stdout: every
+# line this module prints is narration about that work. It is also the planning half of
+# `dev go --json`, whose stdout must hold exactly one JSON object — and a provider error
+# rendered here was landing in the middle of it. Binding the only Console in the module
+# to stderr fixes both at the source rather than at each of the call sites.
+status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 REQUIRED_PLANNING_ROLES = (
@@ -147,7 +152,7 @@ async def run_plan_flow(
     initialize_project(root, quiet=True)
     db = get_db(root)
     if not db:
-        console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
+        status_console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         return []
 
     # Load validated config
@@ -160,7 +165,7 @@ async def run_plan_flow(
             validate_model_provider(config.models.provider)
             api_key = get_api_key(config.models.provider, root)
         except ValueError as e:
-            console.print(f"[red]{e}[/red]")
+            status_console.print(f"[red]{e}[/red]")
             return []
 
     orchestrator = Orchestrator(root, persist_state=persist)
@@ -216,7 +221,7 @@ async def run_plan_flow(
         # but for Dry Run, let's just make the MockProvider return based on the schema requested.
     else:
         if api_key is None:
-            console.print("[red]Missing API key for configured model provider.[/red]")
+            status_console.print("[red]Missing API key for configured model provider.[/red]")
             return []
         provider = create_provider(config.models.provider, api_key, project_root=root, provider_prefs=config.provider)
 
@@ -281,7 +286,7 @@ async def _run_plan_body(
         debate_goal = prompt_enhancement.debate_prompt()
         orchestrator.save_run_artifact("prompt_enhancement.json", prompt_enhancement.model_dump())
         if prompt_enhancement.applied_skills:
-            console.print(
+            status_console.print(
                 "[dim]Domain skills applied:[/dim] "
                 + ", ".join(prompt_enhancement.applied_skills)
             )
@@ -308,7 +313,7 @@ async def _run_plan_body(
         await orchestrator.transition_to(ProjectPhase.REQUIREMENTS_DRAFTED)
         
         if requirements_only:
-            console.print(Panel(f"Found {len(spec_output.requirements)} requirements.", title="Requirements Generated"))
+            status_console.print(Panel(f"Found {len(spec_output.requirements)} requirements.", title="Requirements Generated"))
             return []
 
         requirements_json = dump_json([r.model_dump() for r in spec_output.requirements])
@@ -400,12 +405,12 @@ async def _run_plan_body(
             reconciled_findings = _reconcile_findings([*critique_a.findings, *critique_b.findings], decision)
             final_tasks = [task.model_copy(update={"status": "planned"}) for task in decision.final_tasks]
 
-    console.print("[green]Planning complete![/green]")
-    console.print(f"[blue]Prompt enhancement:[/blue] .devcouncil/runs/{run_id}/prompt_enhancement.json")
+    status_console.print("[green]Planning complete![/green]")
+    status_console.print(f"[blue]Prompt enhancement:[/blue] .devcouncil/runs/{run_id}/prompt_enhancement.json")
     if dry_run:
-        console.print("[blue](DRY RUN: No actual LLM calls were made)[/blue]")
+        status_console.print("[blue](DRY RUN: No actual LLM calls were made)[/blue]")
         if not persist:
-            console.print("[blue](DRY RUN: Final requirements/tasks were not persisted)[/blue]")
+            status_console.print("[blue](DRY RUN: Final requirements/tasks were not persisted)[/blue]")
     # Operationalize the spec's edge-case elaboration: attach every acceptance criterion
     # the planner left unlinked to a task that owns its requirement, so elaborated edges
     # (truncation semantics, error paths, boundaries) are actually built and per-criterion
@@ -413,7 +418,7 @@ async def _run_plan_body(
     # than the raw prompt.
     final_tasks, backfilled_acs = backfill_acceptance_criteria(final_tasks, decision.final_requirements)
     if backfilled_acs:
-        console.print(
+        status_console.print(
             f"[dim]Linked {len(backfilled_acs)} unmapped acceptance criterion(s) to owning task(s) "
             "so every elaborated behavior is verified.[/dim]"
         )
@@ -425,7 +430,7 @@ async def _run_plan_body(
         final_tasks, repo_files_from_map(repo_map)
     )
     for warning in planned_file_warnings:
-        console.print(f"[yellow]{warning}[/yellow]")
+        status_console.print(f"[yellow]{warning}[/yellow]")
 
     # The other half: add the real callers (repo-map dependents) of each writable
     # file so a caller the planner omitted isn't reverted mid-run. Only widens scope.
@@ -433,17 +438,17 @@ async def _run_plan_body(
         final_tasks, repo_map.dependents, repo_files_from_map(repo_map)
     )
     for warning in scope_widen_warnings:
-        console.print(f"[dim]{warning}[/dim]")
+        status_console.print(f"[dim]{warning}[/dim]")
 
     final_tasks, difficulty_warnings = apply_plan_difficulty(final_tasks, decision.final_requirements)
     for warning in difficulty_warnings:
-        console.print(f"[yellow]{warning}[/yellow]")
+        status_console.print(f"[yellow]{warning}[/yellow]")
 
-    console.print(f"Final Requirements: [bold]{len(decision.final_requirements)}[/bold]")
-    console.print(f"Final Tasks: [bold]{len(final_tasks)}[/bold]")
+    status_console.print(f"Final Requirements: [bold]{len(decision.final_requirements)}[/bold]")
+    status_console.print(f"Final Tasks: [bold]{len(final_tasks)}[/bold]")
 
     spec_output = _maybe_convert_blocking_questions(
-        spec_output, config, console, orchestrator=orchestrator,
+        spec_output, config, status_console, orchestrator=orchestrator,
     )
 
     # 8. Check Gates
@@ -473,7 +478,7 @@ async def _run_plan_body(
             # the plan it runs (not a later run's by mtime).
             save_active_prompt_enhancement(root, prompt_enhancement)
 
-        console.print("[green]Plan approved by gates.[/green]")
+        status_console.print("[green]Plan approved by gates.[/green]")
         logger.info("Plan approved by gates: %d task(s)", len(final_tasks))
         await orchestrator.transition_to(ProjectPhase.PLAN_APPROVED)
         log_step("plan/complete: approved", project_root=root, run_id=run_id, trace=True)
@@ -484,7 +489,7 @@ async def _run_plan_body(
                 gap_repo = GapRepository(session)
                 for gap in result.gaps:
                     gap_repo.save(gap)
-        console.print("[yellow]Plan generated but failed gates. See status for gaps.[/yellow]")
+        status_console.print("[yellow]Plan generated but failed gates. See status for gaps.[/yellow]")
         logger.warning("Plan failed approval gates with %d gap(s)", len(result.gaps))
         await orchestrator.transition_to(ProjectPhase.AWAITING_USER_DECISIONS)
         log_step("plan/complete: awaiting user decisions", project_root=root, run_id=run_id, trace=True)
@@ -521,14 +526,14 @@ def approve(
     logger.info("dev plan approve: run_id=%s force=%s", run_id or "latest", force)
     db = get_db(root)
     if not db:
-        console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
+        status_console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
         raise typer.Exit(code=1)
 
     with log_stage("approve", project_root=root, run_id=run_id or "latest", force=force):
         log_step("approve/1: loading plan decision", project_root=root, trace=True)
         run_dir = _latest_run_with_decision(root, run_id)
         if run_dir is None:
-            console.print("[red]No planning run with a decision was found. Run 'dev plan' first.[/red]")
+            status_console.print("[red]No planning run with a decision was found. Run 'dev plan' first.[/red]")
             raise typer.Exit(code=1)
 
         decision = ArbiterDecision.model_validate_json((run_dir / "decision.json").read_text(encoding="utf-8"))
@@ -542,7 +547,7 @@ def approve(
             spec_output = _maybe_convert_blocking_questions(
                 spec_output,
                 config,
-                console,
+                status_console,
                 artifact_path=spec_path if spec_path.exists() else None,
             )
 
@@ -566,11 +571,11 @@ def approve(
             blocking_questions=spec_output.blocking_questions if spec_output else [],
         )
         if not result.passed and not force:
-            console.print("[yellow]Plan still fails approval gates:[/yellow]")
+            status_console.print("[yellow]Plan still fails approval gates:[/yellow]")
             for gap in result.gaps:
                 marker = "[red][BLOCKING][/red] " if gap.blocking else ""
-                console.print(f" - {marker}{gap.description} (Fix: {gap.recommended_fix})")
-            console.print("Resolve the gaps and re-run 'dev plan', or use --force to approve anyway.")
+                status_console.print(f" - {marker}{gap.description} (Fix: {gap.recommended_fix})")
+            status_console.print("Resolve the gaps and re-run 'dev plan', or use --force to approve anyway.")
             raise typer.Exit(code=1)
 
         with db.get_session() as session:
@@ -586,10 +591,10 @@ def approve(
         try:
             asyncio.run(orchestrator.transition_to(ProjectPhase.PLAN_APPROVED))
         except ValueError as exc:
-            console.print(f"[red]Cannot approve from the current project phase: {exc}[/red]")
+            status_console.print(f"[red]Cannot approve from the current project phase: {exc}[/red]")
             raise typer.Exit(code=1)
-        console.print(f"[green]Plan from run {run_dir.name} approved ({len(final_tasks)} tasks).[/green]")
-        console.print("Use 'dev tasks list' to see the planned tasks and 'dev run TASK-ID' to execute one.")
+        status_console.print(f"[green]Plan from run {run_dir.name} approved ({len(final_tasks)} tasks).[/green]")
+        status_console.print("Use 'dev tasks list' to see the planned tasks and 'dev run TASK-ID' to execute one.")
         log_step("approve/complete", project_root=root, run_id=run_dir.name, trace=True)
 
 
@@ -628,16 +633,16 @@ def plan(
 
 def print_planning_error(exc: Exception) -> None:
     """Render a planning/model failure as an actionable message instead of a traceback."""
-    console.print(f"\n[red]Planning could not complete:[/red] {exc}")
+    status_console.print(f"\n[red]Planning could not complete:[/red] {exc}")
     if isinstance(exc, StructuredOutputError):
-        console.print(
+        status_console.print(
             "[yellow]Tip:[/yellow] this role's model could not return valid structured JSON. "
             "Free/very small models often can't. Set a more capable model, e.g.\n"
             f"  [bold]dev config models --role {exc.role} --model anthropic/claude-sonnet-4.6[/bold]\n"
             "  (or set all roles: [bold]dev config models --model <model>[/bold])"
         )
     elif isinstance(exc, ProviderRequestError) and exc.status_code == 402:
-        console.print(
+        status_console.print(
             "[yellow]Tip:[/yellow] add credits at https://openrouter.ai/settings/credits, "
             "or switch to a free/cheaper model with [bold]dev config models --model <model>[/bold]."
         )

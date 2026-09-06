@@ -12,7 +12,12 @@ from devcouncil.repo.gitignore import ensure_gitignore
 from devcouncil.telemetry.stages import log_stage, log_step
 
 app = typer.Typer()
-console = Console()
+# `dev init` scaffolds a project on disk; it writes no document to stdout, and every
+# line below is narration about that work (all of it already behind `quiet`, which is
+# how every other command silences it). It is also the first phase of `dev boot --json`,
+# whose stdout must hold exactly one JSON object — the banner was landing in front of
+# it. Binding the only Console here to stderr fixes that at the source.
+status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 # Per-stack default verification commands. A fresh project gets ONLY the commands
@@ -209,10 +214,10 @@ def _generate_initial_map(project_root: Path, quiet: bool) -> None:
             quiet=quiet,
         )
         if not quiet:
-            console.print("[green]Generated .devcouncil/repo_map.json and agent guides (AGENTS.md, CLAUDE.md).[/green]")
+            status_console.print("[green]Generated .devcouncil/repo_map.json and agent guides (AGENTS.md, CLAUDE.md).[/green]")
     except Exception as exc:  # mapping is best-effort, never fatal
         if not quiet:
-            console.print(f"[yellow]Skipped repo map generation: {exc}. Run 'dev map' later.[/yellow]")
+            status_console.print(f"[yellow]Skipped repo map generation: {exc}. Run 'dev map' later.[/yellow]")
 
 
 def _scaffold_initial_skills(project_root: Path, quiet: bool) -> None:
@@ -228,10 +233,10 @@ def _scaffold_initial_skills(project_root: Path, quiet: bool) -> None:
         written = scaffold_skills(project_root, selected)
         if written and not quiet:
             names = ", ".join(sorted(skill.name for skill in selected))
-            console.print(f"[green]Scaffolded {len(written)} skill(s) into .claude/skills/ ({names}).[/green]")
+            status_console.print(f"[green]Scaffolded {len(written)} skill(s) into .claude/skills/ ({names}).[/green]")
     except Exception as exc:  # skill scaffolding is best-effort, never fatal
         if not quiet:
-            console.print(f"[yellow]Skipped skill scaffolding: {exc}. Run 'dev skills scaffold' later.[/yellow]")
+            status_console.print(f"[yellow]Skipped skill scaffolding: {exc}. Run 'dev skills scaffold' later.[/yellow]")
 
 
 def initialize_project(
@@ -257,7 +262,7 @@ def initialize_project(
     # before init runs. Keying on config.yaml ensures a first init still writes config.
     if not (dev_dir / "config.yaml").exists():
         if not quiet:
-            console.print("Initializing DevCouncil...")
+            status_console.print("Initializing DevCouncil...")
         dev_dir.mkdir(exist_ok=True)
         (dev_dir / "runs").mkdir(exist_ok=True)
         (dev_dir / "cache").mkdir(exist_ok=True)
@@ -286,7 +291,7 @@ def initialize_project(
         db = Database(dev_dir / "state.sqlite")
         db.create_db_and_tables()
         if not quiet:
-            console.print(f"[green]Successfully initialized DevCouncil in {dev_dir}[/green]")
+            status_console.print(f"[green]Successfully initialized DevCouncil in {dev_dir}[/green]")
         created = True
 
         if with_map:
@@ -322,14 +327,14 @@ def init(
     # "Already initialized" means a config.yaml exists — not merely the .devcouncil/
     # directory, which the logging setup pre-creates (.devcouncil/logs/) on startup.
     if (dev_dir / "config.yaml").exists():
-        console.print("[yellow]DevCouncil is already initialized in this directory.[/yellow]")
+        status_console.print("[yellow]DevCouncil is already initialized in this directory.[/yellow]")
         raise typer.Exit()
 
     try:
         role_models = parse_role_model_overrides(role_model)
         model_provider = validate_model_provider(provider)
     except ValueError as e:
-        console.print(f"[red]{e}[/red]")
+        status_console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=2) from e
 
     root = Path(".").expanduser().resolve()

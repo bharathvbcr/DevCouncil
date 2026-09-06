@@ -16,6 +16,10 @@ from devcouncil.utils.json_persist import dump_json
 
 app = typer.Typer(help="Inspect DevCouncil trace events.")
 console = Console()
+# `--jsonl` (the default) makes stdout a newline-delimited JSON stream. The cursor line
+# below is a diagnostic, not a record, so it goes to stderr — otherwise the last line a
+# consumer reads is unparseable. `--json` returns earlier and was never affected.
+status_console = Console(stderr=True)
 
 
 @app.command("tail")
@@ -67,7 +71,7 @@ def tail(
                     f"{event.timestamp} {event.type} "
                     f"{event.task_id or '-'} {event.summary or dump_json(event.details)}"
                 )
-        console.print(f"[dim]next_cursor: {next_cursor}[/dim]")
+        status_console.print(f"[dim]next_cursor: {next_cursor}[/dim]")
         return
 
     printed = 0

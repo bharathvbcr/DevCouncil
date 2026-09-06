@@ -111,7 +111,7 @@ def test_maybe_convert_no_op_when_disabled():
         planning=SimpleNamespace(auto_convert_blocking_questions_in_noninteractive=False)
     )
     spec = SimpleNamespace(blocking_questions=["q"], assumptions=[])
-    assert plan_cmd._maybe_convert_blocking_questions(spec, config, plan_cmd.console) is spec
+    assert plan_cmd._maybe_convert_blocking_questions(spec, config, plan_cmd.status_console) is spec
 
 
 def test_maybe_convert_writes_artifact(tmp_path, monkeypatch):
@@ -140,7 +140,7 @@ def test_maybe_convert_writes_artifact(tmp_path, monkeypatch):
 
     artifact = tmp_path / "requirements.json"
     result = plan_cmd._maybe_convert_blocking_questions(
-        _Spec(), config, plan_cmd.console, artifact_path=artifact
+        _Spec(), config, plan_cmd.status_console, artifact_path=artifact
     )
     assert result.blocking_questions == []
     assert artifact.exists()
@@ -164,15 +164,19 @@ def test_run_plan_flow_db_unavailable(tmp_path, monkeypatch):
 def test_print_planning_error_structured(capsys):
     exc = StructuredOutputError("bad json", role="planner_a", model="tiny/model")
     plan_cmd.print_planning_error(exc)
-    out = capsys.readouterr().out
-    assert "Planning could not complete" in out
-    assert "planner_a" in out
+    captured = capsys.readouterr()
+    assert "Planning could not complete" in captured.err
+    assert "planner_a" in captured.err
+    # `dev go --json` delegates planning here; stdout belongs to its report alone.
+    assert captured.out == ""
 
 
 def test_print_planning_error_payment_required(capsys):
     exc = ProviderRequestError("payment", status_code=402)
     plan_cmd.print_planning_error(exc)
-    assert "credits" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "credits" in captured.err
+    assert captured.out == ""
 
 
 # --- _latest_run_with_decision ----------------------------------------------------

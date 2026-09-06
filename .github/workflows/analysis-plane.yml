@@ -22,12 +22,16 @@ on:
       - "rust/**"
       - "backend/go_orchestrator/**"
       - "rust-port/**"
+      # The interop job drives DevCouncil's own CLI, so a change to the commands
+      # can break a gate here without touching a line of Rust.
+      - "src/devcouncil/cli/**"
       - ".github/workflows/analysis-plane.yml"
   pull_request:
     paths:
       - "rust/**"
       - "backend/go_orchestrator/**"
       - "rust-port/**"
+      - "src/devcouncil/cli/**"
       - ".github/workflows/analysis-plane.yml"
   workflow_dispatch:
 
@@ -104,6 +108,22 @@ jobs:
         env:
           DC_STORE_REQUIRE_INTEROP: "1"
         run: cargo test -p dc-store --test interop
+
+      # The --json stdout contract, driven against the real CLI. It belongs in
+      # this job rather than the `rust` matrix for the same reason the interop
+      # suite does: it needs DevCouncil importable, and without that it can only
+      # skip. DC_JSON_REQUIRE_CLI turns the skip into a failure, so a tree
+      # without `uv sync` cannot report "contract holds" for a run in which no
+      # command was ever executed.
+      #
+      # This is not a hypothetical gate: 17 of its 28 invocations failed against
+      # the pre-fix CLI, several of them while exiting 0, so exit status alone
+      # would have called them passes.
+      - name: --json stdout contract, required
+        working-directory: rust
+        env:
+          DC_JSON_REQUIRE_CLI: "1"
+        run: cargo test -p dc-verify --test json_contract
 
   go:
     name: clients (${{ matrix.os }})

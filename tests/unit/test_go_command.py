@@ -3,6 +3,7 @@ report rendering, and a few `dev go` command branches."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -475,3 +476,109 @@ def test_go_force_approves_when_no_tasks(tmp_path, monkeypatch):
     result = runner.invoke(app, ["go", "build it", "--executor", "claude", "--force"])
     assert result.exit_code == 0
     assert "Proceeding past planning gaps" in result.output
+
+
+# --- `--json` contract: exactly one JSON object on stdout, diagnostics on stderr ---
+#
+# `dev go` writes no payload of its own — the report emitted by the delegated
+# `report_command.report(...)` call is the sole object on stdout. So every one of this
+# module's own lines is a diagnostic, and every abort that happens before that
+# delegation owes stdout an object of its own.
+#
+# These assert on `result.stdout`, never `result.output`: under Click 8.4 `.output` is
+# the two streams merged, so it parses identically whether or not the run's progress
+# narration leaked onto stdout.
+
+
+def test_go_json_unsupported_executor_emits_one_object(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    result = runner.invoke(app, ["go", "Ship it", "--json", "--executor", "nosuchagent"])
+
+    assert result.exit_code == 2
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert "Unsupported executor" in data["error"]
+    assert "Unsupported executor" in result.stderr
+    assert "Unsupported executor" not in result.stdout.replace(data["error"], "")
+
+
+def test_go_json_manual_executor_emits_one_object(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    monkeypatch.setattr(go, "resolve_automated_executor", lambda root, executor: "manual")
+
+    result = runner.invoke(app, ["go", "Ship it", "--json"])
+
+    assert result.exit_code == 2
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert "requires an automated executor" in data["error"]
+    assert "requires an automated executor" in result.stderr
+
+
+def test_go_json_no_approved_tasks_emits_one_object(tmp_path, monkeypatch):
+    """Planning aborts before the report exists, so stdout held zero objects."""
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    monkeypatch.setattr(go, "resolve_automated_executor", lambda root, executor: "claude")
+
+    async def _no_tasks(*a, **k):
+        return []
+
+    monkeypatch.setattr(go.plan_command, "run_plan_flow", _no_tasks)
+
+    result = runner.invoke(app, ["go", "Ship it", "--json"])
+
+    assert result.exit_code == 1
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert "did not produce any approved tasks" in data["error"]
+    # The progress narration that used to prefix the payload is on stderr now.
+    assert "Planning goal:" in result.stderr
+    assert "Planning goal:" not in result.stdout
+
+
+def test_go_json_planning_error_emits_one_object(tmp_path, monkeypatch):
+    from devcouncil.llm.router import StructuredOutputError
+
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    monkeypatch.setattr(go, "resolve_automated_executor", lambda root, executor: "claude")
+
+    async def _boom(*a, **k):
+        raise StructuredOutputError("bad json", role="planner_a", model="tiny/model")
+
+    monkeypatch.setattr(go.plan_command, "run_plan_flow", _boom)
+
+    result = runner.invoke(app, ["go", "Ship it", "--json"])
+
+    assert result.exit_code == 1
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert "Planning could not complete" in data["error"]
+    # print_planning_error lives in plan.py; its output must not reach stdout either.
+    assert "Planning could not complete" in result.stderr
+
+
+def test_go_human_progress_is_a_diagnostic(tmp_path, monkeypatch):
+    """Routed unconditionally, so human mode reports progress on stderr too.
+
+    Both streams land on the same terminal, so this is invisible interactively — and it
+    is what makes the contract structural rather than dependent on a flag check.
+    """
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    monkeypatch.setattr(go, "resolve_automated_executor", lambda root, executor: "claude")
+
+    async def _no_tasks(*a, **k):
+        return []
+
+    monkeypatch.setattr(go.plan_command, "run_plan_flow", _no_tasks)
+
+    result = runner.invoke(app, ["go", "Ship it"])
+
+    assert result.exit_code == 1
+    assert "Planning goal:" in result.stderr
+    assert result.stdout == ""

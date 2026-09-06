@@ -20,11 +20,16 @@ from rich.console import Console
 from rich.table import Table
 
 from devcouncil.utils.redaction import redact_text
-from devcouncil.utils.json_persist import read_json
+from devcouncil.utils.json_persist import dump_json, read_json
 from devcouncil.telemetry.stages import log_stage, log_step
 
 app = typer.Typer(help="List and inspect coding-agent run manifests.")
 console = Console()
+# Diagnostics go to stderr unconditionally — same split as `dev map`/`dev graph`/`dev debug`.
+# This module cannot simply bind its one Console to stderr the way `dev go` does: `console`
+# is also the payload writer here (`console.print_json`) and the renderer for the human
+# tables. So the diagnostics that used to sit around a payload move here explicitly.
+status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 # A run still marked ``running`` whose manifest has not been touched for longer
@@ -257,13 +262,22 @@ def _resolve_root(project_root: Path) -> Path:
     return root
 
 
-def _load_timeline_or_exit(root: Path, reference: str):
+def _load_timeline_or_exit(root: Path, reference: str, *, json_output: bool = False):
+    """Load a run timeline, or exit reporting why.
+
+    `json_output` is not a formatting choice: without it this exit leaves stdout holding
+    a bare message and zero JSON objects, which breaks the one-object `--json` contract
+    as surely as a banner in front of a payload does. `dev runs diff` and `dev runs
+    revert` have no `--json` mode, so they take the default.
+    """
     from devcouncil.execution.run_trace import load_timeline
 
     try:
         return load_timeline(root, reference)
     except ValueError as exc:
-        console.print(f"[red]{exc}[/red]")
+        status_console.print(f"[red]{exc}[/red]")
+        if json_output:
+            typer.echo(dump_json({"ok": False, "error": str(exc), "reference": reference}, indent=2))
         raise typer.Exit(code=1)
 
 
@@ -310,7 +324,7 @@ def timeline(
     root = _resolve_root(project_root)
     logger.info("dev runs timeline: ref=%s", reference)
     with log_stage("runs", project_root=root, subcommand="timeline"):
-        tl = _load_timeline_or_exit(root, reference)
+        tl = _load_timeline_or_exit(root, reference, json_output=json_output)
 
         if json_output:
             data = tl.model_dump(mode="json")
@@ -420,7 +434,7 @@ def supervise(
     root = _resolve_root(project_root)
     logger.info("dev runs supervise: ref=%s llm=%s apply=%s", reference, llm, apply)
     with log_stage("runs", project_root=root, subcommand="supervise"):
-        tl = _load_timeline_or_exit(root, reference)
+        tl = _load_timeline_or_exit(root, reference, json_output=json_output)
         router = _supervisor_router(root) if llm else None
 
         from devcouncil.execution.run_trace import supervise_run
@@ -442,12 +456,14 @@ def supervise(
 
         if verdict.verdict == "revert":
             if not tl.reversible:
-                console.print("[yellow]Verdict is 'revert' but the run has no checkpoints to revert with.[/yellow]")
+                status_console.print(
+                    "[yellow]Verdict is 'revert' but the run has no checkpoints to revert with.[/yellow]"
+                )
             elif apply:
                 from devcouncil.execution.run_trace import revert_run
 
                 result = revert_run(root, reference)
-                console.print(f"[green]Applied revert.[/green] {result.message}")
+                status_console.print(f"[green]Applied revert.[/green] {result.message}")
             else:
-                console.print(f"Run [bold]dev runs revert {reference}[/bold] to apply it.")
+                status_console.print(f"Run [bold]dev runs revert {reference}[/bold] to apply it.")
         log_step("runs/complete", project_root=root, verdict=verdict.verdict, trace=True)

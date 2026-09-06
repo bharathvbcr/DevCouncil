@@ -16,6 +16,7 @@ from devcouncil.cli.commands import report as report_command
 from devcouncil.cli.commands import run as run_command
 from devcouncil.cli.commands import verify as verify_command
 from devcouncil.cli.commands.init import initialize_project
+from devcouncil.utils.json_persist import dump_json
 from devcouncil.executors.agent_registry import (
     AGENT_ALIASES,
     BUILTIN_CODING_EXECUTOR_NAMES,
@@ -34,7 +35,13 @@ from devcouncil.live.summary import live_review_summary
 from devcouncil.reporting.report_builder import ReportBuilder
 
 
-console = Console()
+# `dev go` writes NOTHING to stdout of its own: its sole payload is the report emitted
+# by the delegated `report_command.report(...)` call at the end of the run. Everything
+# this module prints — planning notes, per-task progress, repair-loop narration, the
+# final "Unfinished task(s)" line — is a diagnostic. Binding the only Console in the
+# module to stderr makes the `--json` contract (exactly one JSON object on stdout)
+# structural rather than a rule to remember: there is no stdout handle here to misuse.
+status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 SUPPORTED_EXECUTORS = {
@@ -260,7 +267,7 @@ def _execute_task_with_repair(
         try:
             run_command.run(task.id, executor=executor, profile=profile, stream=stream, project_root=root)
         except Exception as exc:  # noqa: BLE001 - executor faults are non-fatal to the run
-            console.print(f"[red]{task.id}: executor '{executor}' errored: {exc}[/red]")
+            status_console.print(f"[red]{task.id}: executor '{executor}' errored: {exc}[/red]")
 
     # HEAD before this task makes any commit, captured lazily right before the first
     # intermediate commit. On a successful repair we `git reset --soft` back to here
@@ -273,7 +280,7 @@ def _execute_task_with_repair(
     logger.info("Initial run of %s finished as %s (max_repairs=%d)", task.id, status, max_repairs)
 
     if status in {"verified", "done"} and _remediable_incomplete_signature(root, task.id):
-        console.print(
+        status_console.print(
             f"[dim]{task.id}: re-verifying (incomplete acceptance criteria only)...[/dim]"
         )
         status = _reverify_task(root, task.id)
@@ -303,7 +310,7 @@ def _execute_task_with_repair(
                     "%s: executor unavailable (infra); stopping self-repair loop",
                     task.id,
                 )
-                console.print(
+                status_console.print(
                     f"[yellow]{task.id}: executor unavailable (infra failure); "
                     "stopping the self-repair loop.[/yellow]"
                 )
@@ -314,13 +321,13 @@ def _execute_task_with_repair(
                     "continuing the repair budget (infra failure is not no-progress)",
                     task.id,
                 )
-                console.print(
+                status_console.print(
                     f"[yellow]{task.id}: executor failed on the last repair attempt; "
                     "retrying while repair budget remains.[/yellow]"
                 )
             else:
                 logger.warning("%s: repair made no progress (identical gaps) after attempt %d; stopping loop", task.id, attempt)
-                console.print(
+                status_console.print(
                     f"[yellow]{task.id}: repair made no progress (identical blocking gaps); "
                     "stopping the self-repair loop.[/yellow]"
                 )
@@ -331,7 +338,7 @@ def _execute_task_with_repair(
         unavailable = _executor_run_unavailable(root, task.id)
         # Verify-only when incomplete-only OR any infra unavailability (blocked or not).
         if incomplete_only or unavailable:
-            console.print(
+            status_console.print(
                 f"[dim]{task.id}: verify-only pass before repair "
                 f"(attempt {attempt + 1}/{max_repairs})...[/dim]"
             )
@@ -353,7 +360,7 @@ def _execute_task_with_repair(
                     "skipping further executor invocations",
                     task.id,
                 )
-                console.print(
+                status_console.print(
                     f"[yellow]{task.id}: executor unavailable; gaps remain after "
                     "verify-only — not burning more repair budget.[/yellow]"
                 )
@@ -392,7 +399,7 @@ def _execute_task_with_repair(
                 trace=True,
             )
             logger.info("Self-repair attempt %d/%d for %s (was %s); manifest=%s", attempt, max_repairs, task.id, status, manifest_path)
-            console.print(
+            status_console.print(
                 f"\n[bold]Self-repair attempt {attempt}/{max_repairs}[/bold] for "
                 f"[bold]{task.id}[/bold] (was {status})..."
             )
@@ -409,12 +416,12 @@ def _execute_task_with_repair(
 
     if status not in {"verified", "done"} and attempt >= max_repairs and max_repairs > 0:
         logger.warning("%s: gave up after %d repair attempt(s); still %s", task.id, attempt, status)
-        console.print(
+        status_console.print(
             f"[yellow]{task.id}: gave up after {attempt} repair attempt(s); still {status}.[/yellow]"
         )
 
     if _remediable_incomplete_signature(root, task.id):
-        console.print(f"[dim]{task.id}: final verify-only pass for remaining incomplete gaps...[/dim]")
+        status_console.print(f"[dim]{task.id}: final verify-only pass for remaining incomplete gaps...[/dim]")
         status = _reverify_task(root, task.id)
         logger.info("After final verify-only pass, %s is %s", task.id, status)
 
@@ -425,7 +432,7 @@ def _execute_task_with_repair(
     if status in {"verified", "done"} and squash_base and intermediate_commits:
         if _squash_repair_commits(root, task.id, squash_base, status):
             logger.info("Squashed %d blocked attempt commit(s) for %s into one verified commit", intermediate_commits, task.id)
-            console.print(
+            status_console.print(
                 f"[dim]Squashed {intermediate_commits} blocked attempt commit(s) for "
                 f"{task.id} into one verified commit.[/dim]"
             )
@@ -590,6 +597,20 @@ def _render_final_report(root: Path, json_report: bool) -> str:
     return ReportBuilder.build_markdown(graph, live_review=live_review)
 
 
+def _abort(json_report: bool, message: str, *, code: int) -> typer.Exit:
+    """Build the exit signal for a `dev go` run that ends before it can produce a report.
+
+    `dev go`'s stdout payload is the final report, so an abort before planning succeeds
+    used to leave stdout with zero JSON objects — which breaks the one-object `--json`
+    contract exactly as a stray banner does. The `{"ok": false, "error": ...}` shape
+    matches `dev verify`, so a caller parses one key regardless of where the run died.
+    The message itself has already gone to stderr by the time this is called.
+    """
+    if json_report:
+        typer.echo(dump_json({"ok": False, "error": message}, indent=2))
+    return typer.Exit(code=code)
+
+
 def _write_report_file(root: Path, report_file: Path, content: str) -> Path:
     path = report_file.expanduser()
     if not path.is_absolute():
@@ -667,7 +688,7 @@ def go(
     # expand it into the issue/PR title + body (the real intent) via the gh CLI.
     expanded_goal, intent_note = resolve_goal_intent(goal, root)
     if intent_note:
-        console.print(f"[dim]{intent_note}[/dim]")
+        status_console.print(f"[dim]{intent_note}[/dim]")
     goal = expanded_goal
 
     if agent:
@@ -678,31 +699,33 @@ def go(
     normalized_executor = resolve_automated_executor(root, executor)
     command_label = _command_label(ctx)
     if normalized_executor == "manual":
-        console.print(
-            f"[red]`{command_label}` requires an automated executor. "
-            "Set execution.default_executor in .devcouncil/config.yaml or install a coding CLI on PATH.[/red]"
+        needs_executor = (
+            f"`{command_label}` requires an automated executor. Set execution.default_executor "
+            "in .devcouncil/config.yaml or install a coding CLI on PATH."
         )
-        raise typer.Exit(code=2)
+        status_console.print(f"[red]{needs_executor}[/red]")
+        raise _abort(json_report, needs_executor, code=2)
     if executor is None and normalized_executor != "manual":
-        console.print(
+        status_console.print(
             f"[dim]Using automated executor:[/dim] [bold]{normalized_executor}[/bold] "
             "(from config or first coding CLI found on PATH)."
         )
     supported = SUPPORTED_EXECUTORS | _custom_cli_agents(root)
     if normalized_executor not in supported:
-        console.print(
-            f"[red]Unsupported executor for `{command_label}`: "
-            f"{normalized_executor}. Supported: {', '.join(sorted(supported))}.[/red]"
+        unsupported = (
+            f"Unsupported executor for `{command_label}`: {normalized_executor}. "
+            f"Supported: {', '.join(sorted(supported))}."
         )
-        raise typer.Exit(code=2)
+        status_console.print(f"[red]{unsupported}[/red]")
+        raise _abort(json_report, unsupported, code=2)
 
-    console.print(f"[bold]Planning goal:[/bold] {goal}")
+    status_console.print(f"[bold]Planning goal:[/bold] {goal}")
     try:
         with log_stage("plan", project_root=root, quick=quick, dry_run=dry_run):
             planned_task_ids = asyncio.run(plan_command.run_plan_flow(goal, dry_run=dry_run, persist=True, project_root=root, quick=quick))
     except (ProviderRequestError, StructuredOutputError) as exc:
         plan_command.print_planning_error(exc)
-        raise typer.Exit(code=1)
+        raise _abort(json_report, f"Planning could not complete: {exc}", code=1)
 
     task_ids = _unique_task_ids(planned_task_ids or [])
     # The planning council almost always raises advisory gaps (critique findings,
@@ -719,7 +742,7 @@ def go(
                 pass
             tasks = _load_tasks(root)
             if tasks:
-                console.print(
+                status_console.print(
                     "[yellow]Proceeding past planning gaps via --force; "
                     "verification still gates each task.[/yellow]"
                 )
@@ -727,21 +750,22 @@ def go(
             tasks = []
         if not tasks:
             logger.warning("Planning produced no approved tasks; aborting run")
-            console.print("[red]Planning did not produce any approved tasks.[/red]")
-            console.print(
+            status_console.print("[red]Planning did not produce any approved tasks.[/red]")
+            status_console.print(
                 "Review gaps with [bold]dev status[/bold], then run [bold]dev approve[/bold] "
                 "to accept the plan — or re-run with [bold]--force[/bold] to proceed past "
                 "advisory planning gaps automatically."
             )
-            raise typer.Exit(code=1)
+            raise _abort(json_report, "Planning did not produce any approved tasks.", code=1)
     else:
         tasks, missing_task_ids = _load_tasks_by_id(root, task_ids)
         if missing_task_ids:
-            console.print(f"[red]Planning returned task IDs that were not persisted: {', '.join(missing_task_ids)}[/red]")
-            raise typer.Exit(code=1)
+            unpersisted = f"Planning returned task IDs that were not persisted: {', '.join(missing_task_ids)}"
+            status_console.print(f"[red]{unpersisted}[/red]")
+            raise _abort(json_report, unpersisted, code=1)
         if not tasks:
-            console.print("[red]Planning did not produce any approved tasks.[/red]")
-            raise typer.Exit(code=1)
+            status_console.print("[red]Planning did not produce any approved tasks.[/red]")
+            raise _abort(json_report, "Planning did not produce any approved tasks.", code=1)
 
     failed: list[str] = []
     executed_task_ids: list[str] = []
@@ -764,7 +788,7 @@ def go(
     for task in tasks:
         if task.status in {"verified", "done"}:
             logger.info("Skipping %s; already %s", task.id, task.status)
-            console.print(f"[green]Skipping {task.id}; already {task.status}.[/green]")
+            status_console.print(f"[green]Skipping {task.id}; already {task.status}.[/green]")
             completed_ids.add(task.id)
             continue
 
@@ -774,11 +798,11 @@ def go(
         unmet = [dep for dep in task.depends_on if dep not in completed_ids]
         if unmet:
             logger.warning("Skipping %s: upstream %s not completed", task.id, ", ".join(unmet))
-            console.print(f"[yellow]Skipping {task.id}: upstream {', '.join(unmet)} not completed.[/yellow]")
+            status_console.print(f"[yellow]Skipping {task.id}: upstream {', '.join(unmet)} not completed.[/yellow]")
             failed.append(f"{task.id} (skipped: upstream {', '.join(unmet)} unsatisfied)")
             continue
 
-        console.print(f"\n[bold]Executing {task.id}[/bold] with [bold]{normalized_executor}[/bold]...")
+        status_console.print(f"\n[bold]Executing {task.id}[/bold] with [bold]{normalized_executor}[/bold]...")
         executed_task_ids.append(task.id)
         # Run, then self-repair in a bounded loop (closes the autonomous loop: the
         # one-shot executor no longer needs a human to run `dev repair` and re-run).
@@ -815,7 +839,7 @@ def go(
         if _commit_task_changes(root, task.id, latest_status):
             note = f" after {repairs_used} repair attempt(s)" if repairs_used else ""
             logger.info("Committed %s changes (%s)%s", task.id, latest_status, note)
-            console.print(f"[dim]Committed {task.id} changes ({latest_status}){note}.[/dim]")
+            status_console.print(f"[dim]Committed {task.id} changes ({latest_status}){note}.[/dim]")
 
         if latest_status in {"verified", "done"}:
             completed_ids.add(task.id)
@@ -826,10 +850,10 @@ def go(
             # final reconciliation pass judges the integrated result fairly.
             if not continue_on_blocked:
                 logger.warning("Stopping run: %s ended as %s (no --continue-on-blocked)", task.id, latest_status)
-                console.print(f"[red]Stopping because {task.id} ended as {latest_status}.[/red]")
+                status_console.print(f"[red]Stopping because {task.id} ended as {latest_status}.[/red]")
                 break
             logger.info("%s ended as %s; continuing to next task (--continue-on-blocked)", task.id, latest_status)
-            console.print(f"[yellow]{task.id} ended as {latest_status}; continuing to the next task.[/yellow]")
+            status_console.print(f"[yellow]{task.id} ended as {latest_status}; continuing to the next task.[/yellow]")
 
     if not executed_task_ids:
         failed.append("all planned tasks were already completed before execution")
@@ -842,7 +866,7 @@ def go(
     # wrongly blocking). Re-running the same diff is largely an LLM-cache hit, so this
     # refreshes statuses/gaps cheaply for an honest final report.
     if executed_task_ids and _is_git_repo(root):
-        console.print("\n[bold]Reconciling verification against the final integrated state...[/bold]")
+        status_console.print("\n[bold]Reconciling verification against the final integrated state...[/bold]")
         with log_stage("reconcile", project_root=root, tasks=len(executed_task_ids)):
             log_step("reconcile: re-verifying against integrated state", project_root=root)
             try:
@@ -854,7 +878,7 @@ def go(
                 # blocked statuses are refreshed honestly. (Only real errors should skip.)
                 pass
             except Exception as exc:  # pragma: no cover - reconciliation is best-effort
-                console.print(f"[yellow]Reconciliation pass skipped: {exc}[/yellow]")
+                status_console.print(f"[yellow]Reconciliation pass skipped: {exc}[/yellow]")
         reconciled = {item.id: item for item in _load_tasks(root)}
         # Rebuild from the FULL planned set, not just executed_task_ids: a task skipped
         # for an unmet dependency, or one reconciliation downgraded from done->blocked,
@@ -875,7 +899,7 @@ def go(
         _record_project_blocked(root)
 
     log_step("generating final report", project_root=root, trace=True)
-    console.print("\n[bold]Final DevCouncil report[/bold]")
+    status_console.print("\n[bold]Final DevCouncil report[/bold]")
     report_command.report(
         SimpleNamespace(invoked_subcommand=None),  # type: ignore[arg-type]
         planning_only=False,
@@ -890,8 +914,8 @@ def go(
     if report_file is not None:
         output = _render_final_report(root, json_report=json_report)
         written = _write_report_file(root, report_file, output)
-        console.print(f"[green]Final report written to {written}[/green]")
+        status_console.print(f"[green]Final report written to {written}[/green]")
 
     if failed:
-        console.print(f"\n[red]Unfinished task(s): {', '.join(failed)}[/red]")
+        status_console.print(f"\n[red]Unfinished task(s): {', '.join(failed)}[/red]")
         raise typer.Exit(code=1)

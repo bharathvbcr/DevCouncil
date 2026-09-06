@@ -15,6 +15,12 @@ from devcouncil.telemetry.traces import TraceLogger
 
 app = typer.Typer()
 console = Console()
+# Diagnostics go to stderr unconditionally — same split as `dev map`/`dev graph`/`dev debug`.
+# The `cancel`/`reprioritize`/`update` subcommands below render their errors through the
+# `if json_format: ... else: console.print(...)` form instead; that is safe there because
+# the two branches are mutually exclusive, so nothing can precede the payload. This
+# Console is for lines that must never reach stdout whichever mode is active.
+status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 
@@ -70,7 +76,10 @@ def tasks(
     initialize_project(root, quiet=True)
     db = get_db(root)
     if not db:
-        console.print("[red]DevCouncil state is unavailable in this directory.[/red]")
+        unavailable = "DevCouncil state is unavailable in this directory."
+        status_console.print(f"[red]{unavailable}[/red]")
+        if json_format:
+            typer.echo(dump_json({"ok": False, "error": unavailable}, indent=2))
         raise typer.Exit(code=1)
 
     with log_stage("tasks", project_root=root):
