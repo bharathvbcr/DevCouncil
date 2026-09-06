@@ -109,10 +109,28 @@ fn a_route_the_resolver_bound_is_visible_with_its_handler_and_its_caller() {
     assert_eq!(route["normalized_path"], "/api/users/*");
     assert_eq!(route["handlers"][0]["name"], "get_user");
 
-    // Fields with no kernel source are null, and say so once at the top level.
-    assert!(route["framework"].is_null());
+    // The framework comes off the route node, and the view says where it came
+    // from. This used to assert `framework.is_null()`, which was right while
+    // `SymbolKind::Route` was never constructed and wrong the moment
+    // `code_graph` began emitting route nodes.
+    assert_eq!(
+        route["framework"], "fastapi/flask",
+        "the declaring framework is read off the route node: {route}"
+    );
+    assert_eq!(route["framework_resolution"], "node");
+    assert!(
+        route["node_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.len() == 1),
+        "the row names the route node it came from: {route}"
+    );
+    assert_eq!(mapped["capabilities"]["framework_available"], true);
+
+    // Middleware still has no kernel source: there is no `Registers` edge kind,
+    // so it is null by name rather than an empty list that would read as "this
+    // route has none".
     assert!(route["middleware"].is_null());
-    assert_eq!(mapped["capabilities"]["framework_available"], false);
+    assert_eq!(mapped["capabilities"]["middleware_available"], false);
 
     // The scan reached both files and says what "complete" covers.
     assert_eq!(mapped["scan"]["complete"], true);

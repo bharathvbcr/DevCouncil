@@ -828,6 +828,27 @@ pub struct ExtractedRoute {
     pub span: Span,
 }
 
+impl ExtractedRoute {
+    /// The route's identity in the graph.
+    ///
+    /// A route is a node like any other and needs an id in the same
+    /// `file::name` shape the rest of them use: the resolver names it as the
+    /// source of the `HandlesRoute` edge and the graph export names it on the
+    /// node, and the two must agree or the edge points at nothing.
+    ///
+    /// The file is part of the identity because the method and path are not
+    /// unique on their own — two Flask blueprints each declaring `GET /health`
+    /// are two routes, and collapsing them would drop one node and leave its
+    /// edge dangling.
+    ///
+    /// **One owner.** `devmap-resolve` builds the edge and `devmap-query`
+    /// builds the node; if either formatted the id itself the two would drift
+    /// apart silently, which is exactly the state this replaced.
+    pub fn node_id(&self, file_path: &str) -> String {
+        format!("{}::{} {}", file_path, self.http_method, self.path_pattern)
+    }
+}
+
 /// Evidence that something outside the resolvable call graph reaches a symbol.
 ///
 /// `target_symbol` carries the scope: a file-level annotation targets the file

@@ -5,24 +5,26 @@
 //! view that reports zero routes on every repository.
 //!
 //! Python reads nodes of kind `ROUTE` carrying `extras.route` / `extras.verb` /
-//! `extras.framework`, plus `registers` edges for middleware. Against this
-//! kernel all three are empty, and verifiably so:
+//! `extras.framework`, plus `registers` edges for middleware.
 //!
-//! * `SymbolKind::Route` is declared and never constructed — no extractor
-//!   produces one, so a node-kind scan finds nothing.
-//! * There is no `Registers` edge kind at all.
-//! * The framework *is* known at resolve time and is dropped at the store
-//!   boundary: `ResolvedEdge::details` is neither persisted nor emitted into
-//!   `code_graph.json`.
+//! Two of those three now exist here. `code_graph` emits a `route` node per
+//! extracted route with exactly those extras, and `ExtractedRoute::node_id`
+//! gives the `routes_to` edge a source that names it — so this module reads the
+//! node for the verb, the path and the declaring framework, and the edge only
+//! for the handler binding. Until 2026-09-06 none of that was true:
+//! `SymbolKind::Route` was declared and never constructed, the edge source was
+//! a bare `"{http_method} {path_pattern}"`, and the framework was dropped at
+//! the store boundary with `ResolvedEdge::details`.
 //!
-//! What does survive is the `routes_to` edge, whose `source` the resolver
-//! writes as `"{http_method} {path_pattern}"` and whose `target` is the handler
-//! symbol. That is what this module reads.
+//! A graph written before that is still read: an edge source naming no route
+//! node falls back to the old label. Such a route has no framework, and
+//! `framework_resolution: "unavailable"` says so rather than letting the `null`
+//! be read as "declared by none".
 //!
-//! The two fields with no kernel source are reported as **absent, by name** —
-//! `framework: null` with `framework_available: false`, and `middleware: null`
-//! with `middleware_available: false` — never as `""` and `[]`. A route with no
-//! middleware and a kernel that cannot see middleware must not look the same.
+//! **There is still no `Registers` edge kind at all**, so `middleware` is
+//! reported as absent by name — `null` with `middleware_available: false`,
+//! never `[]`. A route with no middleware and a kernel that cannot see
+//! middleware must not look the same.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -389,18 +391,106 @@ fn consumer_keys(window: &[&str], response_var: &str) -> Vec<String> {
 struct RouteRow {
     verb: String,
     path: String,
+    /// The route nodes backing this row, in graph order.
+    ///
+    /// A row is keyed by `(path, verb)` and two files may declare the same one
+    /// — two Flask blueprints each serving `GET /health`. The row stays merged
+    /// so `id` remains unique and `shape_check`/`api_impact` keep correlating
+    /// on it, and this field says which nodes it was merged from.
+    node_ids: Vec<String>,
+    /// The declaring frameworks of those nodes.
+    ///
+    /// Empty when the graph carries no route node for this row — a graph
+    /// written before route nodes existed, whose `routes_to` edges name a bare
+    /// `"VERB path"`. That is a different fact from "declared by no framework"
+    /// and `framework_resolution` keeps the two apart.
+    frameworks: BTreeSet<String>,
     handlers: Vec<String>,
 }
 
-/// Read routes off `routes_to` edges.
+/// One route node, as the graph carries it.
+struct RouteNode {
+    verb: String,
+    path: String,
+    framework: Option<String>,
+}
+
+/// Index the graph's route nodes by id.
 ///
-/// The resolver writes the edge source as `"{http_method} {path_pattern}"`, so
-/// the verb is everything before the first space and the path is the rest. An
-/// edge whose source does not split that way is *not* silently treated as a
-/// path with an unknown verb — that would invent a `GET` nobody declared — it
-/// is returned with an empty verb, which `verbs_compatible` reads as `ANY`.
-fn routes_from_edges(graph: &Value) -> Vec<RouteRow> {
-    let mut by_route: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+/// `extras.verb` / `extras.route` are what `code_graph` writes. The node's
+/// `name` carries the same pair and the id ends with it, but reading the
+/// extras keeps one producer and one consumer of the field rather than three
+/// parsers of a formatted string.
+fn route_nodes(graph: &Value) -> BTreeMap<String, RouteNode> {
+    let mut nodes = BTreeMap::new();
+    for node in graph["nodes"].as_array().into_iter().flatten() {
+        if node["kind"].as_str() != Some("route") {
+            continue;
+        }
+        let Some(id) = node["id"].as_str() else {
+            continue;
+        };
+        let extras = &node["extras"];
+        let Some(path) = extras["route"].as_str() else {
+            // A node labelled `route` with no path is not a route this view can
+            // report. Skipping it is right; silently inventing `""` is not.
+            continue;
+        };
+        nodes.insert(
+            id.to_string(),
+            RouteNode {
+                verb: extras["verb"].as_str().unwrap_or("").to_ascii_uppercase(),
+                path: path.to_string(),
+                framework: extras["framework"]
+                    .as_str()
+                    .filter(|framework| !framework.is_empty())
+                    .map(str::to_string),
+            },
+        );
+    }
+    nodes
+}
+
+/// Read routes off the graph: its route nodes, and the `routes_to` edges that
+/// bind handlers to them.
+///
+/// Both shapes are read, because both exist in the wild:
+///
+/// * **Route nodes.** `code_graph` emits one per extracted route, carrying
+///   `extras.route` / `extras.verb` / `extras.framework`, and the resolver
+///   writes the edge's `source` as that node's id. This is the shape a
+///   generation built by this kernel has, and the only one that can answer
+///   "which framework declares this route".
+/// * **A bare `"VERB path"` edge source.** What a `code_graph.json` written
+///   before route nodes existed carries. Such a route is still reported — the
+///   view must not go blind against an older artifact — but with no framework,
+///   and `framework_resolution` says so rather than letting `null` read as
+///   "declared by none".
+///
+/// A route node with no bound handler is still a route: it is emitted with an
+/// empty handler list rather than dropped, because an unbound handler is a fact
+/// about the *binding*, not about whether the service serves the path.
+///
+/// The returned flag is whether the graph carried route nodes at all, which is
+/// what `capabilities.framework_available` reports.
+fn routes_from_graph(graph: &Value) -> (Vec<RouteRow>, bool) {
+    let nodes = route_nodes(graph);
+    let graph_has_route_nodes = !nodes.is_empty();
+
+    // (path, verb) -> (node ids, frameworks, handler symbols)
+    type Row = (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>);
+    let mut by_route: BTreeMap<(String, String), Row> = BTreeMap::new();
+
+    for (id, node) in &nodes {
+        let entry = by_route
+            .entry((node.path.clone(), node.verb.clone()))
+            .or_default();
+        entry.0.insert(id.clone());
+        if let Some(framework) = &node.framework {
+            entry.1.insert(framework.clone());
+        }
+    }
+
     for edge in graph["edges"].as_array().into_iter().flatten() {
         if edge["kind"].as_str() != Some("routes_to") {
             continue;
@@ -408,23 +498,57 @@ fn routes_from_edges(graph: &Value) -> Vec<RouteRow> {
         let Some(source) = edge["source"].as_str() else {
             continue;
         };
-        let (verb, path) = match source.split_once(' ') {
-            Some((verb, path)) => (verb.to_ascii_uppercase(), path.to_string()),
-            None => (String::new(), source.to_string()),
+        let key = match nodes.get(source) {
+            Some(node) => (node.path.clone(), node.verb.clone()),
+            None => {
+                // No node under this id. Two shapes reach here and both are
+                // read from the source string itself:
+                //
+                // * a graph written before route nodes existed, whose source is
+                //   the bare label `"VERB /path"`;
+                // * a node id whose node is absent — dropped as a duplicate id,
+                //   or an edge read from a store generation whose graph was
+                //   rendered separately.
+                //
+                // The verb is the token before the first space; an HTTP method
+                // contains neither a space nor a colon, so stripping anything
+                // up to its last `::` recovers it from `file::VERB` without
+                // being able to damage a bare verb. A path containing `::`
+                // cannot confuse this, because only the *verb* token is
+                // stripped and the path is everything after the first space.
+                //
+                // A source that does not split that way is *not* silently
+                // treated as a path with an unknown verb — that would invent a
+                // `GET` nobody declared — it keeps an empty verb, which
+                // `verbs_compatible` reads as `ANY`.
+                match source.split_once(' ') {
+                    Some((verb, path)) => {
+                        let verb = verb.rsplit("::").next().unwrap_or(verb);
+                        (path.to_string(), verb.to_ascii_uppercase())
+                    }
+                    None => (source.to_string(), String::new()),
+                }
+            }
         };
-        let entry = by_route.entry((path, verb)).or_default();
+        let entry = by_route.entry(key).or_default();
         if let Some(target) = edge["target"].as_str() {
-            entry.insert(target.to_string());
+            entry.2.insert(target.to_string());
         }
     }
-    by_route
+
+    let rows = by_route
         .into_iter()
-        .map(|((path, verb), handlers)| RouteRow {
-            verb,
-            path,
-            handlers: handlers.into_iter().collect(),
-        })
-        .collect()
+        .map(
+            |((path, verb), (node_ids, frameworks, handlers))| RouteRow {
+                verb,
+                path,
+                node_ids: node_ids.into_iter().collect(),
+                frameworks,
+                handlers: handlers.into_iter().collect(),
+            },
+        )
+        .collect();
+    (rows, graph_has_route_nodes)
 }
 
 /// Index nodes by id and by bare name, since a `routes_to` target is the
@@ -521,8 +645,9 @@ fn handler_return_keys(root: &Path, handler: &Value, budget: &ScanBudget) -> Vec
 pub fn route_map(root: &Path, graph: &Value, budget: &ScanBudget) -> Value {
     let (by_id, by_name) = node_index(graph);
     let (sites, report) = scan_sites(root, graph, budget);
-    let rows = routes_from_edges(graph);
+    let (rows, graph_has_route_nodes) = routes_from_graph(graph);
 
+    let routes_count = rows.len();
     let mut routes = Vec::new();
     for row in &rows {
         let handlers: Vec<Value> = row
@@ -543,6 +668,24 @@ pub fn route_map(root: &Path, graph: &Value, budget: &ScanBudget) -> Value {
             .map(Site::to_json)
             .collect();
 
+        // The framework, and how it was arrived at.
+        //
+        // `framework` is a string only when the route nodes behind this row
+        // agree on one. Two files declaring the same method and path under
+        // different frameworks is a real, if rare, shape, and picking either
+        // one would attribute the route to a stack that may not serve it — so
+        // the value stays null and `frameworks` shows both. `null` alone would
+        // then mean three different things, which is what
+        // `framework_resolution` exists to prevent.
+        let (framework, framework_resolution) = match row.frameworks.len() {
+            0 => (Value::Null, "unavailable"),
+            1 => (
+                Value::String(row.frameworks.iter().next().expect("len 1").clone()),
+                "node",
+            ),
+            _ => (Value::Null, "ambiguous"),
+        };
+
         routes.push(json!({
             "id": format!("{} {}", row.verb, row.path).trim().to_string(),
             "path": row.path,
@@ -551,24 +694,34 @@ pub fn route_map(root: &Path, graph: &Value, budget: &ScanBudget) -> Value {
             "handlers": handlers,
             "handler_keys": handler_keys.into_iter().collect::<Vec<_>>(),
             "consumers": consumers,
-            // Declared absent by name. `framework` is known at resolve time and
-            // dropped at the store boundary; middleware has no edge kind at all.
-            // Emitting `""` and `[]` would make "this kernel cannot see it" and
-            // "this route has none" the same answer.
-            "framework": Value::Null,
+            "framework": framework,
+            "frameworks": row.frameworks.iter().collect::<Vec<_>>(),
+            "framework_resolution": framework_resolution,
+            // The route nodes this row was merged from. Empty against a graph
+            // written before route nodes existed.
+            "node_ids": row.node_ids,
+            // Declared absent by name: middleware has no edge kind at all.
+            // Emitting `[]` would make "this kernel cannot see it" and "this
+            // route has none" the same answer.
             "middleware": Value::Null,
         }));
     }
 
     json!({
         "routes": routes,
-        "count": rows.len(),
+        "count": routes_count,
         "scan": report.to_json(),
         "capabilities": {
-            "framework_available": false,
+            "framework_available": graph_has_route_nodes,
             "middleware_available": false,
-            "reason": "the kernel drops ResolvedEdge::details at the store boundary \
-    and has no `registers` edge kind; both fields are null rather than empty",
+            "reason": if graph_has_route_nodes {
+                "routes are graph nodes carrying extras.framework; middleware has \
+    no `registers` edge kind, so that field is null rather than empty"
+            } else {
+                "this graph carries no route nodes — it predates them, or the \
+    generation extracted none — so every framework is null for want of a source, \
+    not because the route declares none; middleware has no `registers` edge kind"
+            },
         },
     })
 }
@@ -831,6 +984,14 @@ mod tests {
         assert!(!paths_match("/api/users/:id", "/api/accounts/42"));
     }
 
+    /// A graph with no route nodes is still read, and says it has none.
+    ///
+    /// This is the shape a `code_graph.json` written before route nodes existed
+    /// carries: a bare `"VERB path"` edge source and nothing else. The view has
+    /// to keep reporting those routes — going blind against an older artifact
+    /// would be worse than the missing framework — and has to say the framework
+    /// is missing for want of a source rather than emit a null that reads as
+    /// "this route declares no framework".
     #[test]
     fn a_route_verb_is_read_from_the_edge_source_not_assumed() {
         // The resolver writes "VERB /path"; a source with no space must not be
@@ -842,16 +1003,158 @@ mod tests {
                 {"kind": "routes_to", "source": "/api/bare", "target": "h"},
             ]),
         );
-        let rows = routes_from_edges(&g);
+        let (rows, has_nodes) = routes_from_graph(&g);
+        assert!(!has_nodes, "this graph carries no route node");
         let verbs: Vec<(&str, &str)> = rows
             .iter()
             .map(|r| (r.path.as_str(), r.verb.as_str()))
             .collect();
         assert_eq!(verbs, vec![("/api/bare", ""), ("/api/items", "POST")]);
+        assert!(
+            rows.iter().all(|r| r.frameworks.is_empty()),
+            "a legacy edge carries no framework"
+        );
         // An empty verb admits any client verb, rather than claiming GET.
         assert!(verbs_compatible("", "DELETE"));
         assert!(!verbs_compatible("POST", "DELETE"));
         assert!(verbs_compatible("HEAD", "GET"));
+    }
+
+    /// An edge naming a node id whose node is absent still yields its verb.
+    ///
+    /// Reachable two ways: a duplicate route id, whose second node
+    /// `code_graph` drops on purpose, and edges read from a store generation
+    /// whose graph was rendered separately. Splitting on the first space alone
+    /// would have made the verb `A.PY::POST`, which matches no client verb, so
+    /// a route with callers would have reported `none_observed` — the same
+    /// answer as a route nothing calls.
+    #[test]
+    fn a_stranded_node_id_source_yields_its_verb_not_the_file_prefix() {
+        let g = graph(
+            json!([{"id": "a.py::h", "name": "h", "path": "a.py", "line": 2,
+                    "kind": "function"}]),
+            json!([{"kind": "routes_to", "source": "a.py::POST /api/items",
+                    "target": "a.py::h"}]),
+        );
+        let (rows, has_nodes) = routes_from_graph(&g);
+        assert!(
+            !has_nodes,
+            "no route node is present — this is the fallback"
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].verb, "POST");
+        assert_eq!(rows[0].path, "/api/items");
+        assert!(verbs_compatible(&rows[0].verb, "POST"));
+        assert!(!verbs_compatible(&rows[0].verb, "GET"));
+    }
+
+    /// A path containing `::` survives the verb recovery above.
+    ///
+    /// Only the token before the first space is stripped, so a matrix-style
+    /// path segment cannot be eaten by it.
+    #[test]
+    fn a_path_containing_colons_is_not_damaged_by_verb_recovery() {
+        let g = graph(
+            json!([]),
+            json!([{"kind": "routes_to", "source": "svc.rb::GET /a/b::c/d",
+                    "target": "svc.rb::h"}]),
+        );
+        let (rows, _) = routes_from_graph(&g);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].verb, "GET");
+        assert_eq!(rows[0].path, "/a/b::c/d");
+    }
+
+    /// A route node supplies the verb, the path and the framework, and the edge
+    /// that names it binds the handler.
+    ///
+    /// The edge source is the *node id* — `file::VERB path` — so the old
+    /// `split_once(' ')` would have read the verb as `api.py::GET`. Reading the
+    /// node instead is what makes `framework` answerable at all.
+    #[test]
+    fn a_route_node_supplies_the_verb_path_and_framework() {
+        let g = graph(
+            json!([
+                {"id": "api.py::GET /users", "name": "GET /users", "path": "api.py",
+                 "line": 1, "kind": "route",
+                 "extras": {"route": "/users", "verb": "GET", "framework": "flask"}},
+                {"id": "api.py::list_users", "name": "list_users", "path": "api.py",
+                 "line": 2, "kind": "function"},
+            ]),
+            json!([{"kind": "routes_to", "source": "api.py::GET /users",
+                    "target": "api.py::list_users"}]),
+        );
+        let (rows, has_nodes) = routes_from_graph(&g);
+        assert!(has_nodes);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/users");
+        assert_eq!(rows[0].verb, "GET");
+        assert_eq!(
+            rows[0].frameworks.iter().collect::<Vec<_>>(),
+            vec!["flask"],
+            "the framework comes off the node, not the edge label"
+        );
+        assert_eq!(rows[0].handlers, vec!["api.py::list_users"]);
+        assert_eq!(rows[0].node_ids, vec!["api.py::GET /users"]);
+    }
+
+    /// A route whose handler never bound is still a route.
+    ///
+    /// The node exists and no `routes_to` edge names it. Dropping the row would
+    /// report a smaller API surface than the service declares; the empty
+    /// handler list is what says the binding failed.
+    #[test]
+    fn a_route_with_no_bound_handler_is_still_reported() {
+        let g = graph(
+            json!([{"id": "api.py::POST /x", "name": "POST /x", "path": "api.py",
+                    "line": 1, "kind": "route",
+                    "extras": {"route": "/x", "verb": "POST", "framework": "flask"}}]),
+            json!([]),
+        );
+        let (rows, has_nodes) = routes_from_graph(&g);
+        assert!(has_nodes);
+        assert_eq!(rows.len(), 1, "an unbound route is still a route");
+        assert!(rows[0].handlers.is_empty());
+        assert_eq!(rows[0].verb, "POST");
+    }
+
+    /// Two frameworks claiming one method and path is reported, not picked.
+    ///
+    /// `framework` stays null and `framework_resolution` says `ambiguous`, so
+    /// the null cannot be read as "declared by none" — which is what the same
+    /// null means when the graph has no route nodes at all.
+    #[test]
+    fn disagreeing_frameworks_are_reported_not_resolved() {
+        let g = graph(
+            json!([
+                {"id": "a.py::GET /health", "name": "GET /health", "path": "a.py",
+                 "line": 1, "kind": "route",
+                 "extras": {"route": "/health", "verb": "GET", "framework": "flask"}},
+                {"id": "b.py::GET /health", "name": "GET /health", "path": "b.py",
+                 "line": 1, "kind": "route",
+                 "extras": {"route": "/health", "verb": "GET", "framework": "django"}},
+            ]),
+            json!([]),
+        );
+        let (rows, _) = routes_from_graph(&g);
+        assert_eq!(rows.len(), 1, "one method and path is one row");
+        assert_eq!(
+            rows[0].frameworks.iter().collect::<Vec<_>>(),
+            vec!["django", "flask"]
+        );
+        assert_eq!(
+            rows[0].node_ids,
+            vec!["a.py::GET /health", "b.py::GET /health"],
+            "the row says which nodes it merged"
+        );
+
+        let mapped = route_map(Path::new("/nonexistent"), &g, &ScanBudget::default());
+        assert!(
+            mapped["routes"][0]["framework"].is_null(),
+            "neither framework is picked"
+        );
+        assert_eq!(mapped["routes"][0]["framework_resolution"], "ambiguous");
+        assert_eq!(mapped["capabilities"]["framework_available"], json!(true));
     }
 
     #[test]

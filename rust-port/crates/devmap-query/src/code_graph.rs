@@ -692,6 +692,78 @@ pub fn build_code_graph_value(
                 "extras": Value::Object(extras),
             }));
         }
+
+        // Route nodes.
+        //
+        // A route is the one node kind that is not a declaration: the extractor
+        // records it from a framework decorator or registration, and the
+        // resolver's `HandlesRoute` edge names it as the edge's source. Without
+        // the node that edge names nothing, and every consumer that walks
+        // routes — `route_map`, `shape_check`, `api_impact` — read an empty
+        // graph even when the routes were in the store.
+        // `ExtractedRoute::node_id` owns the id shape both sides use.
+        //
+        // Emitted for every extracted route, including one whose handler did
+        // not bind. An unbound route is still a route the service serves, and
+        // dropping it would report a smaller API surface than the code
+        // declares; the missing *edge* is what says the handler is unknown.
+        for route in &ext.routes {
+            let id = route.node_id(&ext.file_path);
+            if node_index.contains_key(&id) {
+                // The same method and path declared twice in one file. Two
+                // nodes sharing an id is worse than one, exactly as above.
+                provenance.duplicate_node_ids_dropped += 1;
+                continue;
+            }
+
+            let mut extras = Map::new();
+            let (line, end_line) = match &source {
+                Some(text) => byte_span_to_line_range(text, &route.span),
+                None => {
+                    extras.insert(
+                        "line_resolution".to_string(),
+                        Value::String(
+                            "unavailable: source file could not be read from the \
+                             indexed repository root"
+                                .to_string(),
+                        ),
+                    );
+                    (0, 0)
+                }
+            };
+            // The three fields a route consumer reads. `verb` is `ANY` when the
+            // source declares no single method — a Flask `@app.route` with no
+            // `methods=` — and consumers already treat that as "matches any
+            // verb" rather than as a missing value.
+            extras.insert(
+                "route".to_string(),
+                Value::String(route.path_pattern.clone()),
+            );
+            extras.insert("verb".to_string(), Value::String(route.http_method.clone()));
+            extras.insert(
+                "framework".to_string(),
+                Value::String(route.framework.clone()),
+            );
+
+            let kind = node_kind_label(SymbolKind::Route);
+            node_index.insert(id.clone(), (line, kind));
+            nodes.push(json!({
+                "id": id,
+                "kind": kind,
+                "path": ext.file_path,
+                "name": format!("{} {}", route.http_method, route.path_pattern),
+                "line": line,
+                "end_line": end_line,
+                "area": area,
+                "language": ext.language,
+                // An HTTP route is reached from outside the program by
+                // definition; there is no module boundary for it to be
+                // private to.
+                "exported": true,
+                "community": community,
+                "extras": Value::Object(extras),
+            }));
+        }
     }
 
     // (source, target, kind, confidence, resolution, resolution_source) —
@@ -2613,5 +2685,122 @@ mod tests {
             json!(2),
             "the number the key's name reads as must be carried too"
         );
+    }
+
+    /// A route is a node, and the edge naming it finds it.
+    ///
+    /// `HandlesRoute` names the route as its source and the handler as its
+    /// target, and neither used to name a node: the source was a bare
+    /// `"VERB path"` and the target a bare handler name. So every consumer that
+    /// walks route nodes — `route_map`, `shape_check`, `api_impact` — read an
+    /// empty graph out of a generation that had the routes in it, and the
+    /// handler endpoint dangled beside it.
+    ///
+    /// The identity belongs to `ExtractedRoute::node_id`, so this runs the real
+    /// resolver over a real file instead of restating the format: if the two
+    /// sides ever disagree, the edge stops finding its node here.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn a_route_is_a_node_and_its_edge_endpoints_resolve() {
+        use std::collections::BTreeSet;
+
+        let source = "@app.route(\"/api/users/<uid>\", methods=[\"POST\"])\n\
+                      def create_user(uid):\n    return uid\n";
+        let dir = tmp_source_dir("api.py", source);
+        let extractions = [extract_file("api.py", source)];
+
+        let mut resolver = devmap_resolve::Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions);
+
+        let json = generate_code_graph_json(
+            &extractions,
+            &empty_analysis(),
+            &resolution.edges,
+            &freshness(),
+            Some(dir.to_str().unwrap()),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        let nodes = value["nodes"].as_array().unwrap();
+
+        let route = nodes
+            .iter()
+            .find(|node| node["kind"] == "route")
+            .unwrap_or_else(|| panic!("the graph must carry a route node: {nodes:?}"));
+        assert_eq!(route["path"], "api.py");
+        assert_eq!(route["line"], 1, "a route's line is its decorator's");
+        assert_eq!(route["extras"]["route"], "/api/users/<uid>");
+        assert_eq!(route["extras"]["verb"], "POST");
+        assert!(
+            route["extras"]["framework"].is_string(),
+            "the node carries the declaring framework: {:?}",
+            route["extras"]
+        );
+
+        let edges = value["edges"].as_array().unwrap();
+        let routes_to = edges
+            .iter()
+            .find(|edge| edge["kind"] == "routes_to")
+            .unwrap_or_else(|| panic!("the graph must carry a routes_to edge: {edges:?}"));
+        assert_eq!(routes_to["source"], route["id"]);
+        assert_eq!(routes_to["target"], "api.py::create_user");
+
+        let ids: BTreeSet<&str> = nodes
+            .iter()
+            .map(|node| node["id"].as_str().unwrap())
+            .collect();
+        for endpoint in ["source", "target"] {
+            let name = routes_to[endpoint].as_str().unwrap();
+            assert!(
+                ids.contains(name),
+                "the route edge's {endpoint} {name:?} must name a node: {ids:?}"
+            );
+        }
+        assert_eq!(
+            value["meta"]["devmap_rust"]["edge_endpoints_without_node"],
+            json!(0),
+            "a bound route leaves no dangling endpoint"
+        );
+    }
+
+    /// A file the export cannot read still gets its route nodes, and says the
+    /// line is unknown rather than reporting the top of the file.
+    ///
+    /// The symbol loop already does this; the route loop is a second place the
+    /// same rule has to hold, and a `0` that means "line 1" would be
+    /// indistinguishable from a `0` that means "no source to count lines in".
+    #[test]
+    #[cfg(feature = "parse")]
+    fn a_route_in_an_unreadable_file_declares_its_line_unknown() {
+        let source = "@app.get(\"/x\")\ndef x():\n    return 1\n";
+        let extractions = [extract_file("api.py", source)];
+        // No repo root, so no file can be read.
+        let json = generate_code_graph_json(
+            &extractions,
+            &empty_analysis(),
+            &[],
+            &freshness(),
+            Some("/nonexistent-root-for-this-test"),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        let route = value["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["kind"] == "route")
+            .expect("the route node is emitted even with no readable source")
+            .clone();
+        assert_eq!(route["line"], 0);
+        assert!(
+            route["extras"]["line_resolution"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("unavailable:"),
+            "an unknown line says so: {:?}",
+            route["extras"]
+        );
+        assert_eq!(route["extras"]["route"], "/x", "the path is still known");
     }
 }
