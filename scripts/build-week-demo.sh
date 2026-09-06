@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Provider-free red→green evidence-gate demo for OpenAI Build Week judges.
+# Provider-free red→green evidence-gate demo.
 #
 # Creates an isolated calculator git repo, runs `dev check --verify` against a
 # deliberately buggy change (blocking / red), applies the real repair + regression
@@ -8,7 +8,7 @@
 # Usage (checkout):
 #   bash scripts/build-week-demo.sh
 #
-# From npm global install (preferred judge path):
+# From npm global install:
 #   npm install -g devcouncil@0.4.2
 #   devcouncil-build-week-demo
 #
@@ -99,17 +99,17 @@ else
   unset _tmp
 fi
 
-echo "DevCouncil Build Week demo"
+echo "DevCouncil provider-free demo"
 echo "  CLI:              ${DEV_BIN}"
 echo "  Sample templates: ${SAMPLE_DIR}"
 echo "  Generated repo:   ${DEMO_ROOT}"
 echo
-echo "Judges: leave this path open to inspect the repaired working tree."
+echo "Leave this path open to inspect the repaired working tree."
 
 cd "${DEMO_ROOT}"
 git init -q
-git config user.email "build-week-demo@devcouncil.local"
-git config user.name "DevCouncil Build Week Demo"
+git config user.email "demo@devcouncil.local"
+git config user.name "DevCouncil Demo"
 
 cat > calc.py <<'EOF'
 def add(a: int, b: int) -> int:

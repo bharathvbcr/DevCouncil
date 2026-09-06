@@ -1,4 +1,4 @@
-"""Tiny calculator sample for the provider-free Build Week demo."""
+"""Tiny calculator sample for the provider-free demo."""
 
 
 def add(a: int, b: int) -> int:

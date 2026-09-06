@@ -1,4 +1,4 @@
-# Build Week calculator sample
+# Calculator demo sample
 
 Tiny provider-free sample used by `scripts/build-week-demo.sh`.
 

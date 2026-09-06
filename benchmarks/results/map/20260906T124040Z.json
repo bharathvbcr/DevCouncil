@@ -1,0 +1,311 @@
+{
+  "binary": {
+    "mtime": "2026-09-06T12:28:28.488189+00:00",
+    "path": "/Users/bharath/Code/devtools/DevCouncil/rust-port/target/release/devmap",
+    "size_bytes": 72461552,
+    "version": "devmap 0.1.0 (store schema 15, code graph schema 2)"
+  },
+  "comparison": {
+    "cold": {
+      "baseline_s": 2.5264642080001067,
+      "current_s": 2.8993138340010773,
+      "pct": 14.75776402532574
+    },
+    "dead": {
+      "baseline_s": 0.015892416000497178,
+      "current_s": 0.009718957997392863,
+      "pct": -38.84530837168612
+    },
+    "e2e": {
+      "baseline_s": 1.237831541999185,
+      "current_s": 0.7507682499999646,
+      "pct": -39.348107999621575
+    },
+    "growth": {
+      "baseline_s": 1.6514702910008054,
+      "current_s": 1.8115679589973297,
+      "pct": 9.694250563811455
+    },
+    "impact": {
+      "baseline_s": 0.12611958299930848,
+      "current_s": 0.1323739579966059,
+      "pct": 4.959083156286452
+    },
+    "manifest": {
+      "baseline_s": 0.4099088330003724,
+      "current_s": 0.06311475000984501,
+      "pct": -84.60273482084547
+    },
+    "path": {
+      "baseline_s": 0.10115908300031151,
+      "current_s": 0.1543742499925429,
+      "pct": 52.60542643715692
+    },
+    "search": {
+      "baseline_s": 0.010120749999259715,
+      "current_s": 0.011479791006422602,
+      "pct": 13.428263787390204
+    },
+    "touch": {
+      "baseline_s": 1.4861328749993845,
+      "current_s": 1.7033265000063693,
+      "pct": 14.614684101317305
+    },
+    "warm": {
+      "baseline_s": 0.2638185420000809,
+      "current_s": 0.3380130420118803,
+      "pct": 28.123307576984725
+    }
+  },
+  "corpus": {
+    "code_bytes": 45501296,
+    "code_files": 1169,
+    "tracked_files": 1533
+  },
+  "corpus_kind": "repository",
+  "generated_at": "2026-09-06T12:40:40+00:00",
+  "label": "post-hardening 2311add",
+  "python": "3.12.13",
+  "repeat": 7,
+  "repo": "/Users/bharath/Code/devtools/DevCouncil",
+  "stages": {
+    "cold": {
+      "max_s": 3.643721667001955,
+      "mean_s": 3.205370434572355,
+      "median_s": 3.221896375005599,
+      "min_s": 2.8993138340010773,
+      "rel_spread": 0.25675310629397746,
+      "rss_bytes": 699072512.0,
+      "samples": 7,
+      "stdev_s": 0.23835149067653602
+    },
+    "dead": {
+      "accuracy_claims": 4.0,
+      "accuracy_fixtures": 6.0,
+      "accuracy_labelled_dead": 4.0,
+      "max_s": 0.015719125003670342,
+      "mean_s": 0.010836565569791543,
+      "median_s": 0.009903124999254942,
+      "min_s": 0.009718957997392863,
+      "precision": 1.0,
+      "recall": 1.0,
+      "rel_spread": 0.6173673152911084,
+      "rss_bytes": 17645568.0,
+      "samples": 7,
+      "stdev_s": 0.002172463727133764
+    },
+    "e2e": {
+      "max_s": 0.8107557079929393,
+      "mean_s": 0.7937765118570367,
+      "median_s": 0.7968892920034705,
+      "min_s": 0.7507682499999646,
+      "rel_spread": 0.0799014316241763,
+      "samples": 7,
+      "stdev_s": 0.02011206082777299
+    },
+    "growth": {
+      "curve": [
+        {
+          "build_s": 3.1096171670069452,
+          "extraction_cache_bytes": 0.0,
+          "extraction_cache_rows": 0.0,
+          "extraction_json_bytes": 81421719.0,
+          "file_bytes": 149053440.0,
+          "freelist_bytes": 0.0,
+          "freelist_ratio": 0.0,
+          "generations": 1.0,
+          "page_bytes": 149053440.0,
+          "round": 0.0
+        },
+        {
+          "build_s": 1.8115679589973297,
+          "extraction_cache_bytes": 0.0,
+          "extraction_cache_rows": 0.0,
+          "extraction_json_bytes": 162843438.0,
+          "file_bytes": 299282432.0,
+          "freelist_bytes": 819200.0,
+          "freelist_ratio": 0.0027372137900830745,
+          "generations": 2.0,
+          "page_bytes": 299282432.0,
+          "round": 1.0
+        },
+        {
+          "build_s": 2.595470458007185,
+          "extraction_cache_bytes": 0.0,
+          "extraction_cache_rows": 0.0,
+          "extraction_json_bytes": 162843438.0,
+          "file_bytes": 299253760.0,
+          "freelist_bytes": 0.0,
+          "freelist_ratio": 0.0,
+          "generations": 2.0,
+          "page_bytes": 299253760.0,
+          "round": 2.0
+        },
+        {
+          "build_s": 2.563398917001905,
+          "extraction_cache_bytes": 0.0,
+          "extraction_cache_rows": 0.0,
+          "extraction_json_bytes": 162843439.0,
+          "file_bytes": 299212800.0,
+          "freelist_bytes": 0.0,
+          "freelist_ratio": 0.0,
+          "generations": 2.0,
+          "page_bytes": 299212800.0,
+          "round": 3.0
+        },
+        {
+          "build_s": 2.5699586660048226,
+          "extraction_cache_bytes": 0.0,
+          "extraction_cache_rows": 0.0,
+          "extraction_json_bytes": 162843440.0,
+          "file_bytes": 299212800.0,
+          "freelist_bytes": 0.0,
+          "freelist_ratio": 0.0,
+          "generations": 2.0,
+          "page_bytes": 299212800.0,
+          "round": 4.0
+        },
+        {
+          "build_s": 2.485280958993826,
+          "extraction_cache_bytes": 0.0,
+          "extraction_cache_rows": 0.0,
+          "extraction_json_bytes": 162843440.0,
+          "file_bytes": 299225088.0,
+          "freelist_bytes": 0.0,
+          "freelist_ratio": 0.0,
+          "generations": 2.0,
+          "page_bytes": 299225088.0,
+          "round": 5.0
+        },
+        {
+          "build_s": 2.4508284170005936,
+          "extraction_cache_bytes": 0.0,
+          "extraction_cache_rows": 0.0,
+          "extraction_json_bytes": 162843440.0,
+          "file_bytes": 299266048.0,
+          "freelist_bytes": 0.0,
+          "freelist_ratio": 0.0,
+          "generations": 2.0,
+          "page_bytes": 299266048.0,
+          "round": 6.0
+        },
+        {
+          "build_s": 2.4621313749958063,
+          "extraction_cache_bytes": 0.0,
+          "extraction_cache_rows": 0.0,
+          "extraction_json_bytes": 162843439.0,
+          "file_bytes": 299294720.0,
+          "freelist_bytes": 0.0,
+          "freelist_ratio": 0.0,
+          "generations": 2.0,
+          "page_bytes": 299294720.0,
+          "round": 7.0
+        },
+        {
+          "build_s": 2.4690623749920633,
+          "extraction_cache_bytes": 0.0,
+          "extraction_cache_rows": 0.0,
+          "extraction_json_bytes": 162843438.0,
+          "file_bytes": 299347968.0,
+          "freelist_bytes": 0.0,
+          "freelist_ratio": 0.0,
+          "generations": 2.0,
+          "page_bytes": 299347968.0,
+          "round": 8.0
+        },
+        {
+          "build_s": 2.524771625001449,
+          "extraction_cache_bytes": 0.0,
+          "extraction_cache_rows": 0.0,
+          "extraction_json_bytes": 162843439.0,
+          "file_bytes": 299372544.0,
+          "freelist_bytes": 0.0,
+          "freelist_ratio": 0.0,
+          "generations": 2.0,
+          "page_bytes": 299372544.0,
+          "round": 9.0
+        }
+      ],
+      "final_bytes": 299372544.0,
+      "final_freelist_ratio": 0.0,
+      "first_generation_bytes": 149053440.0,
+      "growth_ratio": 2.0084913437757628,
+      "max_freelist_ratio": 0.0027372137900830745,
+      "max_s": 3.1096171670069452,
+      "median_s": 2.5050262919976376,
+      "min_s": 1.8115679589973297,
+      "plateau_spread": 0.0004927929037821855,
+      "rounds": 10.0,
+      "samples": 10.0
+    },
+    "impact": {
+      "argument": "rust-port/crates/devmap-analyze/src/pdg.rs::PdgBuilder.new",
+      "max_s": 0.14641658299660776,
+      "mean_s": 0.13680900599657825,
+      "median_s": 0.1346081669908017,
+      "min_s": 0.1323739579966059,
+      "rel_spread": 0.10608298801764256,
+      "rss_bytes": 120356864.0,
+      "samples": 7,
+      "stdev_s": 0.005196230939622141
+    },
+    "manifest": {
+      "explained_sites": 22879.0,
+      "graph_bytes": 32408526.0,
+      "map_bytes": 369582.0,
+      "max_s": 0.596966249999241,
+      "mean_s": 0.14396623814536724,
+      "median_s": 0.0691626250045374,
+      "min_s": 0.06311475000984501,
+      "net_resolution_permille": 424.0,
+      "rel_spread": 8.458426911397456,
+      "resolved_sites": 48605.0,
+      "samples": 7,
+      "stdev_s": 0.19980197013866613,
+      "unresolved_sites": 88890.0
+    },
+    "path": {
+      "argument": "rust-port/crates/devmap-analyze/src/pdg.rs::build_function_pdg rust-port/crates/devmap-analyze/src/pdg.rs::PdgBuilder.new",
+      "max_s": 0.1845837920118356,
+      "mean_s": 0.16210785699825334,
+      "median_s": 0.15827458299463615,
+      "min_s": 0.1543742499925429,
+      "rel_spread": 0.1956902917471793,
+      "rss_bytes": 157712384.0,
+      "samples": 7,
+      "stdev_s": 0.010487549552025998
+    },
+    "search": {
+      "argument": "__init__",
+      "max_s": 0.014672417004476301,
+      "mean_s": 0.012450970291476031,
+      "median_s": 0.012004000003798865,
+      "min_s": 0.011479791006422602,
+      "rel_spread": 0.2781083729022175,
+      "rss_bytes": 19005440.0,
+      "samples": 7,
+      "stdev_s": 0.0010786065480025667
+    },
+    "touch": {
+      "max_s": 2.626583125005709,
+      "mean_s": 2.355418089430064,
+      "median_s": 2.3741429580113618,
+      "min_s": 1.7033265000063693,
+      "rel_spread": 0.5420315042335614,
+      "rss_bytes": 553205760.0,
+      "samples": 7,
+      "stdev_s": 0.3055445926029255
+    },
+    "warm": {
+      "max_s": 0.3517287499998929,
+      "mean_s": 0.3469929644280845,
+      "median_s": 0.3490206249989569,
+      "min_s": 0.3380130420118803,
+      "rel_spread": 0.0405774520011879,
+      "rss_bytes": 181272576.0,
+      "samples": 7,
+      "stdev_s": 0.004988553340064933
+    }
+  },
+  "synthetic_files": 0
+}

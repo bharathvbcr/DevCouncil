@@ -1,4 +1,4 @@
-"""Regression checks for the Build Week calculator demo."""
+"""Regression checks for the calculator demo."""
 
 from calc import add, sub
 
