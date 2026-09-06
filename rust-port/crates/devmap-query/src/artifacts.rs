@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::escape::html_escape;
+use crate::manifest::CONSUMER_MAP_ENGINE;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactFingerprint {
@@ -85,6 +86,17 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> std::io::Result<bool> {
 /// What one written artifact looked like immediately after it was written.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactRecord {
+    /// Which artifact this is — `repo_map`, `code_graph`, `compact_graph`.
+    ///
+    /// The stamp used to identify an output by its path alone, which made it
+    /// unusable to any consumer that had not reproduced the writer's exact
+    /// spelling: the paths are recorded *as resolved*, so a default run stores
+    /// `/repo/./.devcouncil/repo_map.json` — with the `./` the CLI's default
+    /// argument leaves in — and a consumer joining the repository root with the
+    /// relative path builds a string that names the same file and does not
+    /// compare equal. The role is the stable key; the path is what the role
+    /// resolved to on the run that wrote it.
+    pub role: String,
     pub path: String,
     pub len: u64,
     pub mtime_ns: i128,
@@ -117,15 +129,30 @@ fn unknown_ctime() -> i128 {
 }
 
 impl ArtifactRecord {
-    fn of(path: &Path) -> std::io::Result<Self> {
+    fn of(role: &str, path: &Path) -> std::io::Result<Self> {
         let meta = fs::metadata(path)?;
         Ok(Self {
+            role: role.to_string(),
             path: path.to_string_lossy().into_owned(),
             len: meta.len(),
             mtime_ns: mtime_ns(&meta),
             ino: ino_of(&meta),
             ctime_ns: ctime_ns(&meta),
         })
+    }
+
+    /// Whether the file this record names is still, byte for byte, the file it
+    /// was taken from.
+    ///
+    /// The one owner of that question: [`ArtifactStamp::still_current`] asks it
+    /// of every output before allowing a skip, and a consumer asks it before
+    /// believing the engine the stamp names.
+    ///
+    /// Fail-closed. A path that will not stat is **not** a match, because "the
+    /// file is gone" and "the file is the one we wrote" are the two answers this
+    /// may never conflate.
+    pub fn still_describes_disk(&self) -> bool {
+        ArtifactRecord::of(&self.role, Path::new(&self.path)).is_ok_and(|current| &current == self)
     }
 }
 
@@ -163,10 +190,17 @@ fn ctime_ns(_meta: &fs::Metadata) -> i128 {
 
 /// The layout of the sidecar. A stamp written under a different layout is not
 /// read as though it were this one; it is a miss, and the artifacts regenerate.
-const ARTIFACT_STAMP_VERSION: u32 = 2;
+///
+/// `3` is the first version that is *readable*. Under `2` every `inputs` value
+/// was a Rust `Debug` rendering — `"Some(\"c2:8261…\")"`, `"None"`, `"1"` — so
+/// the file was JSON in syntax only and nothing outside this crate could take a
+/// value out of it without reimplementing `Debug for Option<String>`. The values
+/// are now real JSON: strings are strings, numbers are numbers, and a digest
+/// that could not be computed is `null` rather than the four characters `None`.
+const ARTIFACT_STAMP_VERSION: u32 = 3;
 
 /// The sidecar: what produced the consumer artifacts, and from what.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ArtifactStamp {
     pub version: u32,
     /// Identity of the kernel that wrote these artifacts — see
@@ -174,12 +208,31 @@ pub struct ArtifactStamp {
     /// same generation emitted by a different binary is a different artifact,
     /// and that is exactly what an extractor or emitter change *is*.
     pub writer: String,
+    /// The `map_engine` these artifacts declare of themselves — the one identity
+    /// a consumer asking "did the kernel write this" is looking for.
+    ///
+    /// Taken from the manifest writer's own constant rather than passed in, so
+    /// the sidecar cannot name an engine the artifacts do not.
+    pub map_engine: String,
+    /// The head the artifacts were written from, or `null` where no digest could
+    /// be computed.
+    ///
+    /// Also one of the [`Self::inputs`] the skip decision compares. Repeated
+    /// here as a typed field because a *reader* must not have to know which keys
+    /// the input bag happens to carry: that bag is free to gain and lose keys,
+    /// and every change to it is only ever meant to cost a regeneration.
+    pub generated_head: Option<String>,
     /// Every input the artifacts' bytes derive from, named. A map rather than a
     /// struct so that adding an input can only ever cause a regeneration:
     /// an unknown key on either side makes the maps unequal, where a new struct
     /// field would quietly default and compare equal to a stamp that never
     /// carried it.
-    pub inputs: BTreeMap<String, String>,
+    ///
+    /// The values are `serde_json::Value`, which keeps the property the `{:?}`
+    /// renderings were reaching for — `Value::Null` and `Value::String("")` are
+    /// unequal, so a digest that could not be computed still cannot compare
+    /// equal to one that came out empty — while leaving the file readable.
+    pub inputs: BTreeMap<String, serde_json::Value>,
     pub outputs: Vec<ArtifactRecord>,
 }
 
@@ -201,17 +254,31 @@ pub fn writer_identity() -> String {
 }
 
 impl ArtifactStamp {
-    /// Stamp `outputs` as they are on disk right now.
-    pub fn of(inputs: BTreeMap<String, String>, outputs: &[&Path]) -> std::io::Result<Self> {
+    /// Stamp `outputs` — each a `(role, path)` — as they are on disk right now.
+    pub fn of(
+        inputs: BTreeMap<String, serde_json::Value>,
+        generated_head: Option<String>,
+        outputs: &[(&str, &Path)],
+    ) -> std::io::Result<Self> {
         Ok(Self {
             version: ARTIFACT_STAMP_VERSION,
             writer: writer_identity(),
+            map_engine: CONSUMER_MAP_ENGINE.to_string(),
+            generated_head,
             inputs,
             outputs: outputs
                 .iter()
-                .map(|path| ArtifactRecord::of(path))
+                .map(|(role, path)| ArtifactRecord::of(role, path))
                 .collect::<std::io::Result<Vec<_>>>()?,
         })
+    }
+
+    /// The record for one role, or `None` when the stamp does not describe it.
+    ///
+    /// Role, never path: see [`ArtifactRecord::role`] for why the path a stamp
+    /// carries is not a key a consumer can reconstruct.
+    pub fn record(&self, role: &str) -> Option<&ArtifactRecord> {
+        self.outputs.iter().find(|record| record.role == role)
     }
 
     pub fn read(path: &Path) -> Option<Self> {
@@ -233,8 +300,15 @@ impl ArtifactStamp {
     /// a stat that will not answer, a different writer, one differing input —
     /// each is a miss, and a miss regenerates. The only way to skip is for every
     /// question to have been asked and answered the same.
-    pub fn still_current(&self, inputs: &BTreeMap<String, String>, outputs: &[&Path]) -> bool {
+    pub fn still_current(
+        &self,
+        inputs: &BTreeMap<String, serde_json::Value>,
+        outputs: &[(&str, &Path)],
+    ) -> bool {
         if self.writer != writer_identity() || &self.inputs != inputs {
+            return false;
+        }
+        if self.map_engine != CONSUMER_MAP_ENGINE {
             return false;
         }
         if self.outputs.len() != outputs.len() {
@@ -243,9 +317,10 @@ impl ArtifactStamp {
         outputs
             .iter()
             .zip(self.outputs.iter())
-            .all(|(path, record)| {
-                record.path == path.to_string_lossy()
-                    && ArtifactRecord::of(path).is_ok_and(|current| &current == record)
+            .all(|((role, path), record)| {
+                record.role == *role
+                    && record.path == path.to_string_lossy()
+                    && record.still_describes_disk()
             })
     }
 }
@@ -308,10 +383,10 @@ mod tests {
         base
     }
 
-    fn inputs(generation: &str) -> std::collections::BTreeMap<String, String> {
+    fn inputs(generation: u32) -> std::collections::BTreeMap<String, serde_json::Value> {
         let mut map = std::collections::BTreeMap::new();
-        map.insert("generation_id".to_string(), generation.to_string());
-        map.insert("content_fingerprint".to_string(), "c2:abc".to_string());
+        map.insert("generation_id".to_string(), generation.into());
+        map.insert("content_fingerprint".to_string(), "c2:abc".into());
         map
     }
 
@@ -325,34 +400,39 @@ mod tests {
         let sidecar = dir.join("devmap.sqlite.artifacts.json");
         fs::write(&map, br#"{"map_engine":"devmap-rust"}"#).unwrap();
         fs::write(&graph, br#"{"meta":{}}"#).unwrap();
-        let outputs = [map.as_path(), graph.as_path()];
+        let outputs = [("repo_map", map.as_path()), ("code_graph", graph.as_path())];
 
         // Nothing written yet: there is no stamp, so nothing may be skipped.
         assert!(ArtifactStamp::read(&sidecar).is_none());
 
-        ArtifactStamp::of(inputs("7"), &outputs)
+        ArtifactStamp::of(inputs(7), Some("abc123".to_string()), &outputs)
             .unwrap()
             .write(&sidecar)
             .unwrap();
         let stamp = ArtifactStamp::read(&sidecar).expect("the stamp reads back");
-        assert!(stamp.still_current(&inputs("7"), &outputs));
+        assert!(stamp.still_current(&inputs(7), &outputs));
 
         // A moved generation is a different artifact.
-        assert!(!stamp.still_current(&inputs("8"), &outputs));
+        assert!(!stamp.still_current(&inputs(8), &outputs));
 
         // An input this run does not know about must not compare equal to a
         // stamp that never carried it.
-        let mut extra = inputs("7");
-        extra.insert("pending_count".to_string(), "3".to_string());
+        let mut extra = inputs(7);
+        extra.insert("pending_count".to_string(), 3.into());
         assert!(!stamp.still_current(&extra, &outputs));
+
+        // A role that moved to a different file is a different artifact set,
+        // even when both paths still stat exactly as recorded.
+        let swapped = [("repo_map", graph.as_path()), ("code_graph", map.as_path())];
+        assert!(!stamp.still_current(&inputs(7), &swapped));
 
         // An artifact edited or replaced under us is not the one we wrote.
         fs::write(&graph, br#"{"meta":{"tampered":true}}"#).unwrap();
-        assert!(!stamp.still_current(&inputs("7"), &outputs));
+        assert!(!stamp.still_current(&inputs(7), &outputs));
 
         // …and one that is simply gone certainly is not.
         fs::remove_file(&graph).unwrap();
-        assert!(!stamp.still_current(&inputs("7"), &outputs));
+        assert!(!stamp.still_current(&inputs(7), &outputs));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -368,6 +448,14 @@ mod tests {
             b"not json at all",
             br#"{"version": 999, "writer": "x", "inputs": {}, "outputs": []}"#,
             br#"{"version": 1, "writer": "x"}"#,
+            // The version-2 layout: string inputs, no engine, no roles. It is a
+            // miss, so the artifacts regenerate once and the next stamp is
+            // readable — rather than being read as a stamp whose engine and
+            // roles happen to be absent.
+            br#"{"version": 2, "writer": "x",
+                 "inputs": {"generation_id": "7"},
+                 "outputs": [{"path": "/tmp/repo_map.json", "len": 2,
+                              "mtime_ns": 1, "ino": 1, "ctime_ns": 1}]}"#,
         ] {
             fs::write(&sidecar, body).unwrap();
             assert!(
@@ -385,11 +473,59 @@ mod tests {
         let dir = stamp_dir("writer");
         let artifact = dir.join("repo_map.json");
         fs::write(&artifact, b"{}").unwrap();
-        let outputs = [artifact.as_path()];
-        let mut stamp = ArtifactStamp::of(inputs("1"), &outputs).unwrap();
-        assert!(stamp.still_current(&inputs("1"), &outputs));
+        let outputs = [("repo_map", artifact.as_path())];
+        let mut stamp = ArtifactStamp::of(inputs(1), None, &outputs).unwrap();
+        assert!(stamp.still_current(&inputs(1), &outputs));
         stamp.writer = "/some/other/devmap:123:456".to_string();
-        assert!(!stamp.still_current(&inputs("1"), &outputs));
+        assert!(!stamp.still_current(&inputs(1), &outputs));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A stamp naming an engine that is not this kernel's is not this kernel's
+    /// evidence either.
+    ///
+    /// `map_engine` is what a consumer reads out of the sidecar *instead of*
+    /// parsing the artifact, so a stamp whose engine has been edited must not
+    /// go on authorising skips: the skip is what keeps the artifacts — and the
+    /// engine they declare — on disk unexamined.
+    #[test]
+    fn a_stamp_naming_another_engine_never_matches() {
+        let dir = stamp_dir("engine");
+        let artifact = dir.join("repo_map.json");
+        fs::write(&artifact, b"{}").unwrap();
+        let outputs = [("repo_map", artifact.as_path())];
+        let mut stamp = ArtifactStamp::of(inputs(1), None, &outputs).unwrap();
+        assert_eq!(stamp.map_engine, CONSUMER_MAP_ENGINE);
+        assert!(stamp.still_current(&inputs(1), &outputs));
+        stamp.map_engine = "some-other-mapper".to_string();
+        assert!(!stamp.still_current(&inputs(1), &outputs));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The record for a role is found by role, and it is the one that answers
+    /// for the file on disk.
+    #[test]
+    fn a_consumer_reads_an_artifact_by_role_and_checks_it_against_disk() {
+        let dir = stamp_dir("role");
+        let map = dir.join("repo_map.json");
+        let graph = dir.join("code_graph.json");
+        fs::write(&map, br#"{"map_engine":"devmap-rust"}"#).unwrap();
+        fs::write(&graph, br#"{"meta":{}}"#).unwrap();
+        let outputs = [("repo_map", map.as_path()), ("code_graph", graph.as_path())];
+        let stamp = ArtifactStamp::of(inputs(1), None, &outputs).unwrap();
+
+        let record = stamp.record("code_graph").expect("the role is described");
+        assert_eq!(record.path, graph.to_string_lossy());
+        assert!(record.still_describes_disk());
+        assert!(stamp.record("no_such_role").is_none());
+
+        // Once the file moves, the stamp no longer answers for it — which is
+        // what stops a consumer quoting an engine for bytes it never saw.
+        fs::write(&graph, br#"{"meta":{"tampered":true}}"#).unwrap();
+        assert!(!stamp
+            .record("code_graph")
+            .expect("still described")
+            .still_describes_disk());
         let _ = fs::remove_dir_all(&dir);
     }
 }

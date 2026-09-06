@@ -1362,33 +1362,50 @@ fn write_consumer_artifacts(
         .compact_graph_output
         .map(|destination| resolve_manifest_output(repo_root.as_deref(), destination));
 
-    // Every input the artifacts' bytes derive from. `{:?}` on the options so a
-    // digest that could not be computed (`None`) can never compare equal to one
-    // that came out empty (`Some("")`).
-    let mut inputs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    inputs.insert("generation_id".into(), gen_id.to_string());
-    inputs.insert("pending_count".into(), status.pending_count.to_string());
-    inputs.insert("built_head".into(), built_head.clone());
-    inputs.insert("repo_root".into(), format!("{repo_root:?}"));
+    // Every input the artifacts' bytes derive from, as real JSON. These values
+    // are compared for equality to decide a skip, and they are also the only
+    // record of *why* a given set of artifacts exists, so a consumer has to be
+    // able to read them. `serde_json::Value` keeps the property the previous
+    // `{:?}` renderings were reaching for — `null` and `""` are different
+    // values, so a digest that could not be computed can never compare equal to
+    // one that came out empty — without the file being JSON in syntax only.
+    let mut inputs: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    inputs.insert("generation_id".into(), gen_id.into());
+    inputs.insert("pending_count".into(), status.pending_count.into());
+    inputs.insert("built_head".into(), built_head.clone().into());
+    inputs.insert("repo_root".into(), repo_root.clone().into());
     inputs.insert(
         "generated_head".into(),
-        format!("{:?}", stamped.generated_head),
+        stamped.generated_head.clone().into(),
     );
-    inputs.insert("indexed_hash".into(), format!("{:?}", stamped.indexed_hash));
+    inputs.insert("indexed_hash".into(), stamped.indexed_hash.clone().into());
     inputs.insert(
         "content_fingerprint".into(),
-        format!("{:?}", stamped.content_fingerprint),
+        stamped.content_fingerprint.clone().into(),
     );
+    inputs.insert("code_graph_schema".into(), CODE_GRAPH_SCHEMA_VERSION.into());
     inputs.insert(
-        "code_graph_schema".into(),
-        CODE_GRAPH_SCHEMA_VERSION.to_string(),
+        "compact".into(),
+        match &compact_dest {
+            Some(path) => path.to_string_lossy().into_owned().into(),
+            None => serde_json::Value::Null,
+        },
     );
-    inputs.insert("compact".into(), format!("{compact_dest:?}"));
+
+    // Taken before `stamped` is consumed below; the stamp is written at the end
+    // of the run, long after it has been moved into the manifest.
+    let stamp_generated_head = stamped.generated_head.clone();
 
     let stamp_path = artifact_stamp_path(request.db);
-    let mut outputs: Vec<&std::path::Path> = vec![dest.as_path(), graph_dest.as_path()];
+    // Role, not position: the sidecar is read by consumers that cannot rebuild
+    // the writer's spelling of these paths, so each output is named.
+    let mut outputs: Vec<(&str, &std::path::Path)> = vec![
+        ("repo_map", dest.as_path()),
+        ("code_graph", graph_dest.as_path()),
+    ];
     if let Some(compact) = &compact_dest {
-        outputs.push(compact.as_path());
+        outputs.push(("compact_graph", compact.as_path()));
     }
     if ArtifactStamp::read(&stamp_path).is_some_and(|stamp| stamp.still_current(&inputs, &outputs))
     {
@@ -1449,7 +1466,7 @@ fn write_consumer_artifacts(
     // artifacts that were never written is a skip that skips nothing real.
     // A stamp that cannot be written is not fatal — it costs the next run a
     // regeneration, which is the behaviour that existed before the stamp.
-    match ArtifactStamp::of(inputs, &outputs) {
+    match ArtifactStamp::of(inputs, stamp_generated_head, &outputs) {
         Ok(stamp) => {
             if let Err(error) = stamp.write(&stamp_path) {
                 eprintln!(
