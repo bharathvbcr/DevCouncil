@@ -689,16 +689,44 @@ def _run(
     for reader in readers:
         reader.start()
     timed_out = False
-    try:
+    # `proc.wait(timeout=...)` is a busy loop on POSIX: CPython retries
+    # `waitpid(WNOHANG)` on a backoff capped at 50 ms and `time.sleep`s in
+    # between (`subprocess.py`, `Popen._wait`), so the parent notices the
+    # kernel's exit up to a poll interval late on *every* invocation — the
+    # largest single entry in a cProfile of a warm `dev map`. The bare
+    # `proc.wait()` below is a blocking `waitpid` that returns the moment the
+    # kernel does, and the deadline it stops enforcing is enforced here
+    # instead, by a watchdog blocked on an Event rather than spinning.
+    #
+    # The readers are deliberately not used as the completion signal: EOF on
+    # the pipes is the kernel *closing* them, and a kernel that spawns the
+    # daemon leaves them held open by a process that outlives it.
+    finished = threading.Event()
+
+    def _watchdog() -> None:
+        nonlocal timed_out
+        if finished.wait(timeout):
+            return  # the kernel exited inside its deadline
+        if proc.poll() is not None:
+            return  # it exited in the gap before `finished` was set
+        timed_out = True
         try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
             proc.kill()
-            proc.wait()
+        except OSError:  # pragma: no cover - already reaped
+            logger.debug("could not kill the timed-out kernel", exc_info=True)
+
+    watchdog = threading.Thread(target=_watchdog, daemon=True)
+    watchdog.start()
+    try:
+        # Blocking; the watchdog above turns a stall into a kill, which lands
+        # here as a normal exit and is reported as `kernel_timeout` below.
+        proc.wait()
+        finished.set()
         for reader in readers:
             reader.join(timeout=5.0)
     finally:
+        finished.set()
+        watchdog.join(timeout=1.0)
         if live_path is not None:
             try:
                 live_path.unlink()
