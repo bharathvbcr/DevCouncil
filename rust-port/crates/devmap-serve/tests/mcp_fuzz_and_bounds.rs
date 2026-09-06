@@ -730,3 +730,89 @@ async fn a_hostile_batch_answers_every_request_and_no_notification() {
         members.len()
     );
 }
+
+/// A batch's *answer* must be bounded, not just its request frame.
+///
+/// The read side has three bounds — `MAX_FRAME_BYTES` on stdio, `MAX_BODY_BYTES`
+/// over HTTP, `MAX_RESULT_BYTES` on one tool result — and `oversized_result_refusal`
+/// states the invariant they exist to keep: "this server refuses to write a frame
+/// larger than it would agree to read". The batch path broke it. `dispatch_value`
+/// answered every member of an array with no ceiling on the assembled response,
+/// so the amplification was the ratio between the cheapest request a member can
+/// spell and the largest answer it can name — and `tools/list`, which takes 45
+/// bytes to ask and 23 KB to answer, is a 500x lever sitting in the published
+/// tool surface.
+///
+/// Measured against the pre-fix binary on this repository's corpus: one frame of
+/// 1,048,571 bytes (22,310 `tools/list` members, filling the 1 MiB frame limit
+/// exactly) was answered with **523,481,842 bytes** and drove the server's RSS
+/// from 9.2 MiB to **3,635 MiB**. Nothing was refused and nothing was logged; the
+/// client asked one legal question and the server chose to allocate 3.5 GiB.
+///
+/// The batch below is deliberately smaller than that maximum. It only has to
+/// exceed the ceiling to prove the ceiling is absent, and a test that has to
+/// allocate 3.5 GiB to fail is a test that gets deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_answer_is_bounded_by_the_same_ceiling_a_single_result_is() {
+    let slot = corpus();
+    // Every member is the cheapest request with an expensive answer.
+    const MEMBERS: usize = 2_000;
+    let members: Vec<String> = (0..MEMBERS)
+        .map(|id| format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list"}}"#))
+        .collect();
+    let input = format!("[{}]", members.join(","));
+    assert!(
+        input.len() < devmap_serve::mcp::MAX_FRAME_BYTES,
+        "fixture assumption: the attack must fit in one frame this server accepts, \
+         so what is being measured is the answer and not the question ({} bytes)",
+        input.len()
+    );
+
+    let frame = handle_line(&slot, &input)
+        .await
+        .expect("a batch of requests is answered");
+    let written = serde_json::to_vec(&frame)
+        .expect("the response frame serializes")
+        .len();
+
+    assert!(
+        written <= devmap_serve::mcp::MAX_RESULT_BYTES,
+        "a {MEMBERS}-member batch was answered with {written} bytes, over the \
+         {}-byte ceiling this server enforces on everything else it writes. The \
+         request was {} bytes, so one legal frame bought {:.0}x its own size in \
+         response — and the whole array is materialised in memory before a byte \
+         of it is written.",
+        devmap_serve::mcp::MAX_RESULT_BYTES,
+        input.len(),
+        written as f64 / input.len() as f64
+    );
+
+    // The refusal must be a refusal, not a truncation: a cut batch leaves ids
+    // the client is still waiting on, which is the failure mode the size bound
+    // exists to avoid. Either every member is answered, or none is and the
+    // frame says why.
+    match &frame {
+        Value::Array(items) => assert_eq!(
+            items.len(),
+            MEMBERS,
+            "a batch that fits must be answered in full; truncating it strands \
+             the ids that were dropped"
+        ),
+        Value::Object(object) => {
+            assert_eq!(
+                object.get("id"),
+                Some(&Value::Null),
+                "a batch-level refusal is answered against a null id"
+            );
+            let code = object["error"]["code"]
+                .as_i64()
+                .expect("a refusal carries a numeric code");
+            assert_eq!(
+                code,
+                devmap_serve::mcp::codes::INVALID_REQUEST,
+                "an oversized batch is a bad request, not a server fault"
+            );
+        }
+        other => panic!("a batch is answered with an array or one refusal, got {other}"),
+    }
+}
