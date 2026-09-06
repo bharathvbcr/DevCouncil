@@ -2686,6 +2686,17 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // pid that holds the store.
             let _writer = Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)?;
             let store = Store::open(cli.db())?;
+            // A store this process can only read opens fine — queries need it
+            // to — and would otherwise fail at the first write with a bare
+            // SQLite code, after paying for the whole scan. Refuse before the
+            // scan, in the store's own words.
+            if store.is_read_only() {
+                anyhow::bail!(
+                    "devmap store {} is read-only: the file or its directory is not writable \
+                     by this process, so it can be queried but not rebuilt",
+                    cli.db().display()
+                );
+            }
             // K1(e2): stamped before discovery, on the queue's own wall clock.
             //
             // A build that walks the whole tree answers every request queued at

@@ -1519,7 +1519,18 @@ impl Store {
         // moment — a vacuum, a competing opener — must make `status` and
         // `doctor` wait, not report a failure.
         conn.busy_timeout(Self::BUSY_TIMEOUT)?;
-        let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version: i32 = match conn.query_row("PRAGMA user_version", [], |row| row.get(0)) {
+            Ok(version) => version,
+            // A WAL store in a directory this process cannot write: the same
+            // shape `Store::open` handles, reached here first because `status`
+            // and `doctor` probe the schema before opening.
+            Err(error) if Self::directory_refused_the_wal(&error) => {
+                let conn = Self::open_immutable(path)?;
+                conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+                conn.query_row("PRAGMA user_version", [], |row| row.get(0))?
+            }
+            Err(error) => return Err(error),
+        };
         Ok(Some(version))
     }
 
@@ -1799,6 +1810,11 @@ impl Store {
 
     pub fn open<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let path = db_path.as_ref();
+        // Before the connection exists: SQLite maps the `-shm` sidecar as it
+        // opens a WAL database, with whatever mode the sidecar has, so a
+        // repair after `Connection::open` is a repair the connection never
+        // sees. See `repair_sidecar_modes`.
+        Self::repair_sidecar_modes(path);
         let mut conn = Connection::open(path)?;
         let store = path.display().to_string();
 
@@ -1906,6 +1922,53 @@ impl Store {
         self.read_only
     }
 
+    /// Give a writable store's WAL sidecars the write bit the store has.
+    ///
+    /// SQLite creates `-wal` and `-shm` with the *database file's* mode. A
+    /// read of a `chmod 444` store therefore leaves 444 sidecars behind, and
+    /// when the operator later restores the store's write bit the sidecars
+    /// keep theirs off — so the next build fails with "attempt to write a
+    /// readonly database" against a file that is, by every check the
+    /// operator would make, writable. Measured on 2026-09-06: a 444 store
+    /// read once, `chmod 644`, then `devmap build` — code 8, `user_version`
+    /// unchanged. The sidecars are this kernel's, so their mode is this
+    /// kernel's to keep consistent. Best-effort and owner-only: a sidecar
+    /// another user owns is left for that user, and the write that follows
+    /// reports it.
+    #[cfg(unix)]
+    fn repair_sidecar_modes(db_path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        const OWNER_WRITE: u32 = 0o200;
+        let Ok(own) = std::fs::metadata(db_path) else {
+            return;
+        };
+        // Runs before the connection exists, so "writable" is the store's own
+        // owner-write bit: a store without it is read-only and its sidecars
+        // are left exactly as SQLite made them.
+        if own.permissions().mode() & OWNER_WRITE == 0 {
+            return;
+        }
+        let target = own.permissions().mode() | OWNER_WRITE;
+        let name = db_path.as_os_str().to_os_string();
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = name.clone();
+            sidecar.push(suffix);
+            let sidecar = std::path::PathBuf::from(sidecar);
+            let Ok(meta) = std::fs::metadata(&sidecar) else {
+                continue;
+            };
+            let mode = meta.permissions().mode();
+            if mode & OWNER_WRITE == 0 {
+                let mut permissions = meta.permissions();
+                permissions.set_mode(target & 0o7777 | (mode & 0o7777));
+                let _ = std::fs::set_permissions(&sidecar, permissions);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn repair_sidecar_modes(_db_path: &Path) {}
+
     /// The one place a write against a read-only store is refused, so the
     /// refusal is the same sentence from every writer and names the store
     /// rather than an SQLite error code.
@@ -2004,7 +2067,14 @@ impl Store {
             .read(true)
             .write(true)
             .truncate(false)
-            .open(&lock_path)?;
+            .open(&lock_path)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot create the writer lock {}: {error}; a build needs the store's \
+                     directory to be writable, though the store can still be queried",
+                    lock_path.display()
+                )
+            })?;
 
         Self::poll_writer_lock(|| file.try_lock(), wait, Self::WRITER_LOCK_POLL, &lock_path)?;
 

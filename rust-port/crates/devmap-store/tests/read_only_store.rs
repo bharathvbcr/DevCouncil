@@ -162,3 +162,49 @@ fn a_write_to_a_read_only_store_is_refused_by_name() {
         "the refusal must name the store as read-only, got: {error}"
     );
 }
+
+/// SQLite creates a store's `-wal` and `-shm` with the database file's mode.
+/// So a read of a 444 store leaves 444 sidecars, and once the operator gives
+/// the store its write bit back the sidecars still lack theirs — the next
+/// build then fails against a store that is, by every check the operator
+/// would make, writable. The kernel owns those sidecars, so it restores their
+/// mode when the store itself is writable.
+#[test]
+fn a_store_made_writable_again_is_writable_despite_read_only_sidecars() {
+    let dir = scratch_dir("sidecars");
+    let db = dir.join("devmap.sqlite");
+    write_one_generation(&db);
+    set_mode(&db, 0o444);
+    {
+        // The read that leaves 444 sidecars behind.
+        let store = Store::open(&db).expect("a read-only store opens");
+        assert_eq!(store.search_symbols("keep", 10).expect("read").len(), 1);
+    }
+    let shm = PathBuf::from(format!("{}-shm", db.display()));
+    assert!(
+        shm.exists(),
+        "precondition: the read-only open must have created the WAL index sidecar"
+    );
+    set_mode(&db, 0o644);
+
+    let outcome = (|| -> anyhow::Result<u32> {
+        let store = Store::open(&db)?;
+        let extractions = vec![extract_file("lib.py", "def keep():\n    return 2\n")];
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions);
+        let analysis = analyze(&extractions, &resolution);
+        Ok(store.save_generation(&extractions, &resolution, &analysis)?)
+    })();
+
+    set_mode(&shm, 0o644);
+    set_mode(&db, 0o644);
+    let _ = fs::remove_dir_all(&dir);
+
+    match outcome {
+        Ok(generation) => assert_eq!(generation, 2, "the second generation must persist"),
+        Err(error) => {
+            panic!("a store given its write bit back must accept a write, got: {error:#}")
+        }
+    }
+}
