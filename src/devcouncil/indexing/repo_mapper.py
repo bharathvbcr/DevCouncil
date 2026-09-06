@@ -232,8 +232,54 @@ class RepoMap(BaseModel):
     # (fail-soft) so unreachable_files is not meaningful.
     liveness_unreachable_unreliable: bool = False
     liveness_meta: Dict[str, object] = Field(default_factory=dict)
+    # The producer's account of its own run, under the key `code_graph.json`
+    # uses for the same purpose — currently `devmap_rust.neighbors_computed` and
+    # `devmap_rust.handoff_paths_computed`, which say whether those subsystem
+    # fields were derived or left at a literal.
+    #
+    # Declared because the model is a *filter*: the artifact carried this block
+    # and validation dropped it, so every consumer reading the map through
+    # `RepoMap` (the wiki builder among them) lost the only positive evidence
+    # that an empty `neighbors` / `handoff_paths` is an answer rather than a
+    # stub, and fell back to guessing from the lists themselves.
+    meta: Dict[str, object] = Field(default_factory=dict)
     # Top call-flow processes from the code graph (entry-root BFS), when available.
     processes: List[Dict[str, object]] = Field(default_factory=list)
+
+
+def handoffs_computed(repo_map: "RepoMap") -> bool:
+    """Whether ``repo_map`` computed the cross-subsystem crossing relation.
+
+    The one adapter from this model to the dependency-free reader in
+    :mod:`devcouncil.indexing.subsystem_map`, which answers about plain
+    mappings. Lives here because it is a question about :class:`RepoMap`, and it
+    is a function rather than two copies of the same four lines: the wiki
+    builder and the agent-guide writer both ask it, and a second copy is how the
+    guide comes to promise a field the wiki knows is absent.
+    """
+    from devcouncil.indexing.subsystem_map import handoff_paths_established
+
+    return handoff_paths_established({
+        "meta": repo_map.meta,
+        "subsystems": [{"handoff_paths": s.handoff_paths} for s in repo_map.subsystems],
+    })
+
+
+def role_buckets_computed(repo_map: "RepoMap") -> bool:
+    """Whether ``repo_map`` computed the subsystem role buckets.
+
+    The role-bucket twin of :func:`handoffs_computed`, and one adapter for the
+    same reason: the wiki builder and the agent-guide writer both ask, and a
+    second copy is how the guide comes to promise a field the wiki knows is
+    absent.
+    """
+    from devcouncil.indexing.subsystem_map import role_files_established
+
+    return role_files_established({
+        "meta": repo_map.meta,
+        "subsystems": [{"role_files": s.role_files} for s in repo_map.subsystems],
+    })
+
 
 class RepoMapper:
     def __init__(

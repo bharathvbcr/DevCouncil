@@ -38,7 +38,12 @@ from typing import TYPE_CHECKING, Optional
 
 from pydantic import BaseModel, Field
 
-from devcouncil.indexing.repo_mapper import RepoMap, RepoSubsystem
+from devcouncil.indexing.repo_mapper import (
+    RepoMap,
+    RepoSubsystem,
+    handoffs_computed,
+    role_buckets_computed,
+)
 from devcouncil.knowledge.okf import OKFBundle, OKFDocument, read_bundle, validate_bundle, write_bundle
 from devcouncil.utils.json_persist import read_json, write_json
 
@@ -203,6 +208,8 @@ def _subsystem_body(
     prose: Optional[WikiProse] = None,
     *,
     project_root: Path | None = None,
+    handoffs_computed: bool = True,
+    roles_computed: bool = True,
 ) -> str:
     lines: list[str] = [f"# {subsystem.area}", "", subsystem.summary.strip()]
 
@@ -218,7 +225,22 @@ def _subsystem_body(
         lines += ["", "## Files by role", ""]
         for role, paths in subsystem.role_files.items():
             if paths:
-                lines.append(f"- **{role}**: " + ", ".join(f"`{p}`" for p in paths[:8]))
+                shown = paths[:8]
+                line = f"- **{role}**: " + ", ".join(f"`{p}`" for p in shown)
+                # The bucket is a capped sample. Printing it bare made a
+                # subsystem with 356 unclassified files look like one with four.
+                total = (subsystem.role_file_counts or {}).get(role)
+                if isinstance(total, int) and total > len(shown):
+                    line += f" _(showing {len(shown)} of {total})_"
+                lines.append(line)
+    elif not roles_computed:
+        lines += [
+            "",
+            "## Files by role",
+            "",
+            "_Not computed by the map this page was built from — "
+            "absence here is not evidence that this subsystem has no roles._",
+        ]
 
     if prose and prose.key_flows:
         lines += ["", "## Key flows", ""] + _bullets(prose.key_flows, code=False)
@@ -233,6 +255,18 @@ def _subsystem_body(
                 lines.append(f"- `{neighbor}`")
     if subsystem.handoff_paths:
         lines += ["", "## Handoff paths", ""] + _bullets(subsystem.handoff_paths)
+    elif not handoffs_computed:
+        # A missing section reads as "there are none". Say which it is: the
+        # kernel emitted this field as a literal `[]` for its whole life, so on
+        # any map built before that was fixed the empty list is the producer
+        # declining to answer, not the subsystem standing alone.
+        lines += [
+            "",
+            "## Handoff paths",
+            "",
+            "_Not computed by the map this page was built from — "
+            "absence here is not evidence that nothing crosses._",
+        ]
 
     wired = _wired_to_links(project_root, subsystem)
     if wired:
@@ -314,6 +348,9 @@ def _build_skeleton(
             rel_path="overview/development.md",
         ),
     ]
+    # One question about the artifact, asked once rather than per page.
+    handoffs_are_computed = handoffs_computed(repo_map)
+    roles_are_computed = role_buckets_computed(repo_map)
     for subsystem in repo_map.subsystems:
         slug = slug_by_area[subsystem.area]
         docs.append(
@@ -329,6 +366,8 @@ def _build_skeleton(
                     slug_by_area,
                     prose_by_area.get(subsystem.area),
                     project_root=project_root,
+                    handoffs_computed=handoffs_are_computed,
+                    roles_computed=roles_are_computed,
                 ),
                 rel_path=f"subsystems/{slug}.md",
             )

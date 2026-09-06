@@ -23,7 +23,12 @@ from typing import Any
 from rich.console import Console
 
 from devcouncil.indexing.graph.schema import CodeGraph
-from devcouncil.indexing.repo_mapper import RepoMap, RepoMapper
+from devcouncil.indexing.repo_mapper import (
+    RepoMap,
+    RepoMapper,
+    handoffs_computed,
+    role_buckets_computed,
+)
 
 logger = logging.getLogger(__name__)
 status_console = Console(stderr=True)
@@ -81,6 +86,55 @@ def _wiki_index_rel(repo_root: Path) -> str | None:
         return str(index)
 
 
+def _role_buckets_step(repo_map: RepoMap) -> str:
+    """Step 5 of the workflow, told against what this map actually holds.
+
+    The same correction step 6 needed. While the kernel emitted `role_files` as
+    `{}`, this line sent every agent to an empty mapping and the emptiness read
+    as "this subsystem has no roles". When the field *is* computed the line also
+    has to say the buckets are a capped sample, because four names in `tests`
+    otherwise reads as "this subsystem has four tests".
+    """
+    if role_buckets_computed(repo_map):
+        return (
+            "5. Use `role_files` in `subsystems` for subsystem role buckets "
+            "(tests, entry, api, models, services, config, docs, other). Each bucket "
+            "is a capped **sample** for orientation, not an inventory — "
+            "`role_file_counts` carries the real per-role total, and `files` is the "
+            "complete list."
+        )
+    return (
+        "5. `role_files` in `subsystems` was NOT computed by the writer that "
+        "produced this map — an empty bucket there is the producer declining to "
+        "answer, not a subsystem without roles. Use `files` (filtered by `area`) "
+        "instead, and re-run `dev map` with a current kernel to get the buckets."
+    )
+
+
+def _cross_subsystem_step(repo_map: RepoMap) -> str:
+    """Step 6 of the workflow, told against what this map actually holds.
+
+    The guide sent every agent to `handoff_paths` while the kernel emitted it as
+    a literal `[]`, so an instruction to "follow cross-subsystem flow" resolved
+    to an empty list and read as "there is no flow here". An instruction is a
+    claim about the artifact; when the artifact does not carry the field, the
+    guide has to say so rather than keep pointing at it.
+    """
+    if handoffs_computed(repo_map):
+        return (
+            "6. Use `neighbors` and `handoff_paths` in `subsystems` to follow "
+            "cross-subsystem flow. `handoff_paths` names the ordered file pairs "
+            "a subsystem reaches other subsystems through; both are capped, and "
+            "`liveness_meta.subsystems` reports what was cut."
+        )
+    return (
+        "6. Use `neighbors` in `subsystems` to follow cross-subsystem flow. "
+        "`handoff_paths` was NOT computed by the writer that produced this map — "
+        "an empty list there is the producer declining to answer, not evidence "
+        "that nothing crosses. Re-run `dev map` with a current kernel to get it."
+    )
+
+
 def agent_guide_text(repo_map_path: Path, repo_root: Path, repo_map: RepoMap) -> str:
     wiki_index = _wiki_index_rel(repo_root)
     wiki_lines = (
@@ -108,8 +162,8 @@ def agent_guide_text(repo_map_path: Path, repo_root: Path, repo_map: RepoMap) ->
             "2. Use the `files` list to resolve module ownership and nearby siblings.",
             "3. Use `subsystems` for subsystem-level navigation.",
             "4. In `subsystems`, use `entry_points` + `critical_files` for entry points and starting context.",
-            "5. Use `role_files` in `subsystems` for subsystem role buckets (entry, runtime, policy, adapters, etc.).",
-            "6. Use `neighbors` and `handoff_paths` in `subsystems` to follow cross-subsystem flow.",
+            _role_buckets_step(repo_map),
+            _cross_subsystem_step(repo_map),
             "7. Prefer `dev map dead --confidence extracted` + file greps for dead code. "
             "Treat `inferred` as unconfirmed. Prefer `unwired_candidates` / "
             "`dead_symbol_candidates` over `unreachable_files` (static BFS is often "
