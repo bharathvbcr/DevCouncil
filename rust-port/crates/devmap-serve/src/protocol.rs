@@ -413,6 +413,35 @@ pub fn index_is_fresh(status: &StoreStatus) -> bool {
 /// it is only the *freshness* claim that an empty store falsifies. Returning
 /// `None` while `index_is_fresh` is false would leave a caller told the index
 /// is stale with no way to find out why, which is the same defect one step on.
+/// The three coverage-gap listings, in the shape every `status` surface
+/// renders them.
+///
+/// One owner because `devmap status` and the daemon's IPC `status` are two
+/// separate JSON literals over the same `StoreStatus`, and a list added to one
+/// and not the other is a health check that answers differently depending on
+/// whether a daemon happens to be running. Each entry carries `{shown, total,
+/// truncated}` beside its paths: the lists are capped at
+/// `devmap_store::COVERAGE_GAP_SAMPLE`, and a capped list that does not say so
+/// reads exactly like a complete one.
+pub fn coverage_gaps_json(status: &StoreStatus) -> serde_json::Value {
+    let sample = |gap: &devmap_store::CoverageGapSample| {
+        json!({
+            "total": gap.total,
+            "shown": gap.shown.len(),
+            "truncated": gap.truncated(),
+            "paths": gap.shown.iter().map(|row| json!({
+                "path": row.path,
+                "reason": row.reason,
+            })).collect::<Vec<_>>(),
+        })
+    };
+    json!({
+        "discovery_refused": sample(&status.coverage_gaps.discovery_refused),
+        "parse_failed": sample(&status.coverage_gaps.parse_failed),
+        "pattern_recovered": sample(&status.coverage_gaps.pattern_recovered),
+    })
+}
+
 pub fn freshness_degraded_reason(status: &StoreStatus) -> Option<String> {
     if let Some(reason) = status.degraded_reason.clone() {
         return Some(reason);
@@ -450,6 +479,10 @@ pub(crate) fn dispatch(
                 "is_fresh": index_is_fresh(&status),
                 "degraded_reason": freshness_degraded_reason(&status),
                 "quarantined_count": status.quarantined_count,
+                // The paths behind the three numbers `degraded_reason` states.
+                // Without them "1 refused by discovery" is a fact an operator
+                // cannot act on or check.
+                "coverage_gaps": coverage_gaps_json(&status),
             }))
         }
         IpcCommand::Search {

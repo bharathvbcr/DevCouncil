@@ -230,6 +230,7 @@ fn differential_membership_preserves_full_generation_while_b3_write_amplificatio
                 deleted_paths: vec![],
                 build_started: None,
                 repo_root: None,
+                discovery_refusals: None,
             },
         )
         .unwrap();

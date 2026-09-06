@@ -43,6 +43,7 @@ fn build_repo(root: &Path, files: &[(&str, &str)]) {
                 deleted_paths: Vec::new(),
                 build_started: None,
                 repo_root: Some(root.to_string_lossy().into_owned()),
+                discovery_refusals: None,
             },
         )
         .unwrap();

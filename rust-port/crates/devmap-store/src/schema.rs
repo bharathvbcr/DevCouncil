@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS generation_edges (
     PRIMARY KEY (generation_id, ordinal)
 ) WITHOUT ROWID;
 
+CREATE TABLE IF NOT EXISTS generation_coverage_gaps (
+    generation_id INTEGER NOT NULL,
+    gap           TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    PRIMARY KEY (generation_id, gap, path)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS generation_dead_symbols (
     generation_id    INTEGER NOT NULL,
     ordinal          INTEGER NOT NULL,
@@ -378,7 +386,49 @@ CREATE INDEX IF NOT EXISTS idx_generation_files_cache_identity
     ON generation_files(content_hash, language, grammar_version, analyzer_version);
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 13;
+/// v14: the inventory of what a generation could not read.
+///
+/// One row per path, not a number. `AnalysisSummary.discovery_refused_files`
+/// was a count, and a count cannot be *maintained* — only replaced. That is
+/// what forced the daemon's incremental drain, which never re-walks discovery,
+/// to carry the previous generation's number forward and take
+/// `max(previous, this_batch)` as a floor. The floor bought "a resync must not
+/// erase a recorded refusal" with two wrong answers: a repaired file stayed
+/// counted until a full re-extraction, and a refusal this batch met vanished
+/// into a larger carried number — the second an over-claim, the shape this
+/// codebase treats as the expensive one.
+///
+/// With the paths stored, the drain carries the inventory *minus every path in
+/// this batch's affected set*, plus what this batch was turned away from: a
+/// path nothing touched keeps its verdict, a path this batch touched is
+/// re-decided by `candidate_kind`. The count is then `COUNT(*)` and cannot
+/// drift from the set it counts.
+///
+/// The same table holds the two extraction gaps — files a grammar was wanted
+/// for and did not read, and files recovered by line pattern — for a different
+/// reason: they *are* derivable from `generation_files`, but only by
+/// deserializing `parse_outcome_json` for every file in the generation, and
+/// those rows carry a ~47 KB `extraction_json` each that the scan has to walk
+/// past. Measured on this repository that is the difference between a `status`
+/// costing under a millisecond and one costing tens. The write path derives
+/// them from `devmap_analyze::extraction_gaps`, the same owner
+/// `extraction_coverage` folds, so the stored list cannot disagree with the
+/// counts the analysis reported.
+///
+/// `WITHOUT ROWID` and keyed `(generation_id, gap, path)`: reading one
+/// generation's gaps of one kind is a primary-key range scan, which is what
+/// `status` does three times.
+pub const COVERAGE_GAPS_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS generation_coverage_gaps (
+    generation_id INTEGER NOT NULL,
+    gap           TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    PRIMARY KEY (generation_id, gap, path)
+) WITHOUT ROWID;
+"#;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 14;
 
 #[cfg(test)]
 mod retention_constant_tests {

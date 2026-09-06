@@ -735,10 +735,15 @@ fn describe_output(cmd: &str) -> Value {
                     "description": "Why the index is not trustworthy, or null when it is."},
                 "quarantined_count": {"type": "integer",
                     "description": "Files the indexer could not take. Their symbols are absent \
-        from every answer without being reported as missing."}
+        from every answer without being reported as missing."},
+                "coverage_gaps": {"type": "object",
+                    "description": "The paths behind `degraded_reason`'s three numbers: \
+        `discovery_refused`, `parse_failed` and `pattern_recovered`, each a capped listing with \
+        its own `total`, `shown` and `truncated`. A file named here is absent from the graph or \
+        contributes no call edges, so an empty answer about it means 'not examined'."}
             },
             "required": ["generation_id", "pending_count", "node_count", "edge_count",
-                "is_fresh", "degraded_reason", "quarantined_count"],
+                "is_fresh", "degraded_reason", "quarantined_count", "coverage_gaps"],
             "additionalProperties": true
         }),
         "search" => budgeted_envelope("Ranked symbol hits: name, file, kind, span and source."),

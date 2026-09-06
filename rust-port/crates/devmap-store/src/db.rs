@@ -10,11 +10,12 @@ use devmap_resolve::model::*;
 use rusqlite::{params, Connection, OptionalExtension, Result, TransactionBehavior};
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::coverage::{CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryRefusal};
 use crate::schema::{
-    BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, CREATE_SCHEMA_V3, CURRENT_SCHEMA_VERSION,
-    MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12, MIGRATION_V12_TO_V13, MIGRATION_V3_TO_V4,
-    MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8,
-    MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
+    BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, COVERAGE_GAPS_TABLE, CREATE_SCHEMA_V3,
+    CURRENT_SCHEMA_VERSION, MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12, MIGRATION_V12_TO_V13,
+    MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
+    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -516,6 +517,15 @@ pub struct StoreStatus {
     /// total, because a capped list that reads as the whole set is the failure
     /// this codebase treats as worse than a visible gap.
     pub quarantined_paths: Vec<String>,
+    /// What the latest generation could not read, by path.
+    ///
+    /// `degraded_reason` has always carried the three *numbers* — "2 file(s)
+    /// failed to parse, 1 recovered by pattern, 1 refused by discovery" — and
+    /// nothing anywhere carried the paths, so an operator could not tell a
+    /// correct refusal (a 30.6 MB vendored `parser.c` against a 1 MiB ceiling)
+    /// from a broken one without opening the database by hand. Each list is
+    /// capped at [`crate::COVERAGE_GAP_SAMPLE`] and carries its own total.
+    pub coverage_gaps: CoverageGaps,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -640,6 +650,22 @@ pub struct GenerationWriteOpts {
     /// own working directory and every span read from elsewhere comes back
     /// empty. `None` stays NULL — "root unknown", never a wrong root.
     pub repo_root: Option<String>,
+    /// Every path discovery refused for this generation, with its verdict.
+    ///
+    /// The whole inventory, not a delta: the generation stores what it could
+    /// not read, and `discovery_refused_files` is `COUNT(*)` over these rows.
+    /// The daemon's incremental drain, which never re-walks discovery, builds
+    /// it by carrying the previous generation's rows minus every path in this
+    /// batch's affected set and adding what this batch was turned away from.
+    ///
+    /// `None` means *this writer did not measure discovery* — a caller that
+    /// supplied its own corpus, which is every test and the single-file preview
+    /// path — and is not the same as `Some(vec![])`, a walk that ran and
+    /// refused nothing. It is the same distinction
+    /// [`devmap_analyze::DiscoveryCoverage::none`] draws, and
+    /// `save_generation_with_metadata` refuses a generation whose two halves
+    /// disagree about which of them it is.
+    pub discovery_refusals: Option<Vec<DiscoveryRefusal>>,
 }
 
 /// One committed build, as recorded by [`Store::build_history`].
@@ -946,6 +972,10 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "edge_kind",
             "confidence",
         ],
+    ),
+    (
+        "generation_coverage_gaps",
+        &["generation_id", "gap", "path", "reason"],
     ),
     (
         "generation_unresolved",
@@ -1299,6 +1329,7 @@ impl Store {
                 // never runs the migration chain, so every table added by a
                 // later migration must also be created here.
                 tx.execute_batch(UNRESOLVED_TABLE)?;
+                tx.execute_batch(COVERAGE_GAPS_TABLE)?;
                 Self::validate_schema(&tx)?;
                 tx.execute(
                     &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION),
@@ -1449,9 +1480,21 @@ impl Store {
             // probe — unlike the ADD COLUMN migrations above.
             tx.execute_batch(MIGRATION_V12_TO_V13)?;
             tx.execute("PRAGMA user_version = 13", [])?;
-            Self::validate_schema(&tx)?;
+            // No mid-chain validation: v14 adds the coverage-gap inventory and
+            // the edge resolution column below, and the end-of-chain check is
+            // the authoritative one.
             tx.commit()?;
             version = 13;
+        }
+        if version == 13 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // `CREATE TABLE IF NOT EXISTS` is idempotent, so this needs no
+            // probe — unlike the ADD COLUMN migrations above.
+            tx.execute_batch(COVERAGE_GAPS_TABLE)?;
+            tx.execute("PRAGMA user_version = 14", [])?;
+            Self::validate_schema(&tx)?;
+            tx.commit()?;
+            version = 14;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
@@ -2689,6 +2732,118 @@ impl Store {
             )));
         }
 
+        // The inventory of what this generation could not read.
+        //
+        // Two halves with different provenance and one rule. The extraction
+        // gaps are derived here, from the same `extractions` slice the caller
+        // analysed, through `devmap_analyze::extraction_gaps` — the owner
+        // `extraction_coverage` folds — so a stored path list and the counts in
+        // `AnalysisStatus` cannot describe different files. The discovery
+        // refusals cannot be derived from anything: a refused file has no
+        // `Extraction` at all, so they arrive on `opts` from whoever walked the
+        // tree.
+        //
+        // Deleted paths are excluded on both halves. A file the caller is
+        // removing from the generation must not leave a coverage row behind
+        // claiming the graph is missing something it no longer contains.
+        let mut gap_rows: Vec<(String, String, String)> = Vec::new();
+        // The extraction gaps carry forward exactly as the file rows above do,
+        // and for the same reason: a differential write is handed only the
+        // extractions it re-read, so deriving the whole inventory from them
+        // would drop every gap in a file this batch did not touch. Skipping
+        // `affected` and `deleted` is what lets a file that used to fail to
+        // parse leave the list on the build that parses it.
+        if let Some(prev) = prev_gen {
+            if !full_rewrite {
+                let mut stmt = tx.prepare(
+                    "SELECT gap, path, reason FROM generation_coverage_gaps
+                     WHERE generation_id = ?1 AND gap != ?2",
+                )?;
+                let rows = stmt.query_map(
+                    params![prev, crate::coverage::GAP_DISCOVERY_REFUSED],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?;
+                for row in rows {
+                    let (gap, path, reason) = row?;
+                    if deleted.contains(&path) || affected.contains(&path) {
+                        continue;
+                    }
+                    gap_rows.push((gap, path, reason));
+                }
+            }
+        }
+        for entry in devmap_analyze::extraction_gaps(extractions) {
+            if deleted.contains(&entry.path) {
+                continue;
+            }
+            gap_rows.push((entry.gap.label().to_string(), entry.path, entry.reason));
+        }
+        // The refusal half is never carried forward here. It cannot be: a
+        // refused path has no `Extraction`, so this function has no way to tell
+        // a path the caller re-decided from one it never looked at. The caller
+        // that walked the tree owns that decision — the cold walk replaces the
+        // inventory outright, the drain carries it minus its affected set — and
+        // hands the whole answer down.
+        //
+        // Deleted paths are *not* excluded. A containment refusal deliberately
+        // deletes the path's rows while charging the refusal to coverage; that
+        // is the drain agreeing with `devmap build` about where the repository
+        // ends, and dropping the row here would make the refusal invisible on
+        // the one path that produces it most.
+        let measured_refusals = match &opts.discovery_refusals {
+            Some(refusals) => {
+                // Deduplicated by path, because the count below is checked
+                // against `COUNT(*)` of the rows and the table is keyed by
+                // path: a caller that names one file twice would otherwise
+                // claim a refusal the inventory cannot hold.
+                let unique: std::collections::BTreeMap<&str, &str> = refusals
+                    .iter()
+                    .map(|refusal| (refusal.path.as_str(), refusal.reason.as_str()))
+                    .collect();
+                for (path, reason) in &unique {
+                    gap_rows.push((
+                        crate::coverage::GAP_DISCOVERY_REFUSED.to_string(),
+                        (*path).to_string(),
+                        (*reason).to_string(),
+                    ));
+                }
+                Some(unique.len())
+            }
+            None => None,
+        };
+        // The same guard the edge count above gets, for the same reason: the
+        // number a consumer reads and the rows it is supposed to count come
+        // from two places, and nothing but this obliges them to agree. Getting
+        // it wrong is not a cosmetic mismatch — `discovery_refused_files` caps
+        // the dead-code confidence, so a summary claiming a refusal the
+        // inventory cannot name is a graph degraded for a file nobody can look
+        // at, and a summary claiming none while rows exist is the over-claim
+        // this whole inventory exists to end.
+        if measured_refusals != analysis.discovery_refused_files {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "generation would store {measured_refusals:?} discovery refusal(s) but its \
+                 analysis was computed over {:?}; `discovery_refused_files` is derived from \
+                 the inventory and the two must be one measurement",
+                analysis.discovery_refused_files
+            )));
+        }
+        {
+            let mut insert = tx.prepare(
+                "INSERT OR REPLACE INTO generation_coverage_gaps
+                 (generation_id, gap, path, reason)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (gap, path, reason) in &gap_rows {
+                insert.execute(params![gen_id, gap, path, reason])?;
+            }
+        }
+
         for (ordinal, dead) in analysis.dead_symbols.iter().enumerate() {
             let ordinal = u32::try_from(ordinal).map_err(|_| {
                 rusqlite::Error::InvalidParameterName(
@@ -3115,23 +3270,47 @@ impl Store {
         Ok(root.flatten().filter(|root| !root.is_empty()))
     }
 
+    /// The latest generation's analysis summary.
+    ///
+    /// `discovery_refused_files` is **derived** from the generation's refusal
+    /// inventory rather than read out of the stored JSON, so the number a
+    /// consumer acts on and the paths it can ask for are one measurement. The
+    /// serialized field survives only as the record of whether discovery was
+    /// measured at all: `None` there stays `None` here — nobody walked, and
+    /// `Some(0)` would say the corpus was seen in full. `save_generation`
+    /// refuses a write whose two halves disagree, so the two can only differ
+    /// for a generation written before the inventory existed, whose rows are
+    /// genuinely absent.
     pub fn latest_analysis(&self) -> Result<Option<AnalysisSummary>> {
         let conn = lock_conn(&self.conn)?;
-        let raw: Option<String> = conn
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let raw: Option<String> = snapshot
             .query_row(
-                "SELECT analysis_json FROM generations ORDER BY id DESC LIMIT 1",
-                [],
+                "SELECT analysis_json FROM generations WHERE id = ?1",
+                params![generation],
                 |row| row.get(0),
             )
             .optional()?;
-        raw.map(|json| {
-            serde_json::from_str(&json).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
-                    "stored generation analysis is invalid: {error}"
-                ))
-            })
-        })
-        .transpose()
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let mut summary: AnalysisSummary = serde_json::from_str(&raw).map_err(|error| {
+            rusqlite::Error::InvalidParameterName(format!(
+                "stored generation analysis is invalid: {error}"
+            ))
+        })?;
+        if summary.discovery_refused_files.is_some() {
+            let refused: usize = snapshot.query_row(
+                "SELECT COUNT(*) FROM generation_coverage_gaps
+                 WHERE generation_id = ?1 AND gap = ?2",
+                params![generation, crate::GAP_DISCOVERY_REFUSED],
+                |row| row.get::<_, i64>(0).map(|count| count as usize),
+            )?;
+            summary.discovery_refused_files = Some(refused);
+        }
+        Ok(Some(summary))
     }
 
     /// Node and edge counts for `generation`, counted at most once.
@@ -3282,6 +3461,20 @@ impl Store {
                 .collect::<Result<Vec<_>>>()?;
             rows
         };
+        // Three primary-key range scans over a table whose rows are the
+        // exception rather than the rule — on this repository, four rows. The
+        // alternative, deriving the two extraction gaps from
+        // `generation_files.parse_outcome_json` at read time, has to walk past
+        // a ~47 KB `extraction_json` on every row of the generation to reach
+        // three small columns; that is the scan the v13 index exists to avoid,
+        // and `status` is a surface a health check polls.
+        let coverage_gaps = match latest {
+            Some(generation) => Self::coverage_gaps_locked(&snapshot, generation)?,
+            // No generation, nothing to describe. Empty here means "there is no
+            // generation", which `latest_generation: None` already says; it is
+            // not a claim that a generation read everything.
+            None => CoverageGaps::default(),
+        };
         Ok(StoreStatus {
             db_path: db_path.to_string(),
             latest_generation: latest,
@@ -3312,7 +3505,78 @@ impl Store {
             },
             quarantined_count,
             quarantined_paths,
+            coverage_gaps,
         })
+    }
+
+    /// The latest generation's coverage-gap inventory, capped per kind.
+    ///
+    /// Takes the caller's snapshot for the same reason
+    /// [`Store::generation_counts_locked`] does: the generation id and the rows
+    /// it names have to come from one instant, or a prune between them reports
+    /// a live generation with no gaps.
+    fn coverage_gaps_locked(
+        snapshot: &rusqlite::Transaction<'_>,
+        generation: u32,
+    ) -> Result<CoverageGaps> {
+        let mut gaps = CoverageGaps::default();
+        let mut count = snapshot.prepare(
+            "SELECT COUNT(*) FROM generation_coverage_gaps
+             WHERE generation_id = ?1 AND gap = ?2",
+        )?;
+        let mut page = snapshot.prepare(
+            "SELECT path, reason FROM generation_coverage_gaps
+             WHERE generation_id = ?1 AND gap = ?2
+             ORDER BY path ASC
+             LIMIT ?3",
+        )?;
+        for label in CoverageGaps::labels() {
+            let total: usize = count.query_row(params![generation, label], |row| {
+                row.get::<_, i64>(0).map(|total| total as usize)
+            })?;
+            let shown: Vec<CoverageGapRow> = page
+                .query_map(
+                    params![generation, label, crate::COVERAGE_GAP_SAMPLE as i64],
+                    |row| {
+                        Ok(CoverageGapRow {
+                            path: row.get(0)?,
+                            reason: row.get(1)?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>>>()?;
+            let slot = gaps.slot(label).expect("every label has a slot");
+            *slot = CoverageGapSample { total, shown };
+        }
+        Ok(gaps)
+    }
+
+    /// Every path the latest generation's discovery refused, with its verdict.
+    ///
+    /// The whole inventory, uncapped: the daemon's drain carries it forward
+    /// minus the paths this batch re-decided, and a capped read would silently
+    /// drop verdicts on every drain until the corpus looked clean.
+    pub fn latest_discovery_refusals(&self) -> Result<Vec<DiscoveryRefusal>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = snapshot.prepare(
+            "SELECT path, reason FROM generation_coverage_gaps
+             WHERE generation_id = ?1 AND gap = ?2
+             ORDER BY path ASC",
+        )?;
+        let refusals = stmt
+            .query_map(params![generation, crate::GAP_DISCOVERY_REFUSED], |row| {
+                Ok(DiscoveryRefusal {
+                    path: row.get(0)?,
+                    reason: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>();
+        drop(stmt);
+        drop(snapshot);
+        refusals
     }
 
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<(String, String, String)>> {
@@ -4796,6 +5060,10 @@ impl Store {
             )?;
             tx.execute(
                 "DELETE FROM generation_unresolved WHERE generation_id = ?1",
+                params![old_gen],
+            )?;
+            tx.execute(
+                "DELETE FROM generation_coverage_gaps WHERE generation_id = ?1",
                 params![old_gen],
             )?;
             tx.execute(

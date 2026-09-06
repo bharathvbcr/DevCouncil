@@ -78,6 +78,7 @@ fn test_deletion_reconciliation_and_incremental_write() -> anyhow::Result<()> {
             deleted_paths: vec!["src/f2.py".to_string()],
             build_started: None,
             repo_root: None,
+            discovery_refusals: None,
         },
     )?;
     assert_eq!(gen2, 2);

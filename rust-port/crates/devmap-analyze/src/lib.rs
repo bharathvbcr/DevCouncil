@@ -11,9 +11,9 @@ pub use clones::{
 };
 pub use clustering::{detect_communities, CommunityDetection};
 pub use liveness::{
-    analyze_liveness, analyze_liveness_with_coverage, extraction_coverage, DiscoveryCoverage,
-    ExtractionCoverage, LivenessOutcome, COVERAGE_LOSS_CONFIDENCE_CAP, COVERAGE_LOSS_REASON,
-    GO_BUILD_VARIANT_REASON,
+    analyze_liveness, analyze_liveness_with_coverage, extraction_coverage, extraction_gaps,
+    DiscoveryCoverage, ExtractionCoverage, ExtractionGap, ExtractionGapEntry, LivenessOutcome,
+    COVERAGE_LOSS_CONFIDENCE_CAP, COVERAGE_LOSS_REASON, GO_BUILD_VARIANT_REASON,
 };
 pub use model::*;
 pub use pdg::*;

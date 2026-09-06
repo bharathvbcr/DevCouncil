@@ -136,6 +136,7 @@ fn deletion_reconciliation_removes_live_nodes() {
                 deleted_paths: vec!["b.py".into()],
                 build_started: None,
                 repo_root: None,
+                discovery_refusals: None,
             },
         )
         .unwrap();
@@ -1514,6 +1515,7 @@ fn body_signatures_survive_an_incremental_carry_forward() {
                 deleted_paths: vec![],
                 build_started: None,
                 repo_root: None,
+                discovery_refusals: None,
             },
         )
         .unwrap();
@@ -1957,6 +1959,7 @@ fn s2_build_history_counts_the_whole_generation_not_the_written_slice() {
                 deleted_paths: vec![],
                 build_started: None,
                 repo_root: None,
+                discovery_refusals: None,
             },
             "warm-head",
         )
@@ -2419,6 +2422,7 @@ fn the_stored_parse_failure_rule_matches_the_canonical_classifier() {
                 deleted_paths: vec![],
                 build_started: None,
                 repo_root: None,
+                discovery_refusals: None,
             },
         )
         .unwrap();
