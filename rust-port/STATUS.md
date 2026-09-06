@@ -4719,3 +4719,201 @@ code graph schema 2)`. Python: ruff and mypy clean, the 40 unit files that
 touch the graph schema 776 passed. Go, against this kernel's artifacts:
 all seven packages `ok` with `MANVI_MAP_BINARY` pointed at it, including `dc/devmap`'s live interop test that builds one `Map` from both wires. `devmap --json status` on a fresh 41,276-node / 271k-edge
 scholarlm store, 21 runs: p50 61 ms / min 54 ms wall, of which the SQL count is p50 33 ms (271,508 rows scanned, 0 mismatches). That cost is paid only by the fresh-process CLI path — the daemon answers from the index it already holds — and it scales with the edge count; a partial index on the mismatch predicate would make it O(mismatches) but would bake the ladder into DDL, a second copy of the table, and was not done.
+
+---
+
+## Coverage as a ratio, not a flag (2026-09-06)
+
+An audit of the shipped P0–P4 work orders, run against a real corpus rather
+than against fixtures. Five defects, each reproduced by measurement before it
+was fixed, each with a test watched go red against the pre-fix tree.
+
+### The confidence ladder was collapsing on every real repository
+
+`ExtractionCoverage::cap` was a **binary** gate. `is_complete()` asks whether
+any of four corpus-wide counters is non-zero; if one is, every non-exempt
+finding in the generation is set to `COVERAGE_LOSS_CONFIDENCE_CAP`.
+
+Measured on this repository: 1,502 files, **10 of them blind** — 3 parse
+failures, 2 pattern-recovered, 1 oversized vendored `parser.c`, 4 in a
+call-blind language. **0.67% of the corpus.** All **214** dead findings came
+back at exactly 0.35.
+
+Two consequences:
+
+- `generation_dead_symbols` is read `ORDER BY confidence DESC, file_path`, so
+  with every confidence tied the ranked list an agent reads degenerated to
+  **alphabetical order**. The default 2,000-token budget showed it the first
+  ~66 filenames rather than the strongest evidence.
+- Three claims printed as one number: "no edge in the generation names this
+  symbol" (0.9), "something calls it and the resolver could not say which"
+  (0.4), and "an unresolved site names it" (0.4). The first is evidence *for*
+  death and the other two are evidence *against* it. That is not conservatism.
+  Conservatism lowers the ceiling and keeps the order.
+
+The ceiling now tracks the size of the hole: `(1 - blind_share)^8`, clamped
+into `[0.35, 0.89]`. `files_with_call_extraction` is the denominator the five
+gap counters never had, counted from the same two predicates `extraction_gaps`
+charges `CallBlind` from. Prose is in neither side — in the numerator it would
+mark every repository degraded, in the denominator a README would raise a
+broken repository's confidence.
+
+The exponent is a policy dial and is documented as one. At 8 the ceiling reaches
+the floor at a blind share of **12.3%**, so a substantially-unread corpus keeps
+exactly the previous behaviour and only a small hole buys grading. Every older
+coverage fixture in `devmap-analyze` is a two- or three-file corpus — 33% to
+50% blind — which is why all of them still pass unchanged; that is pinned by
+`the_ceiling_reaches_the_floor_well_before_the_corpus_is_half_unread`, not left
+to luck.
+
+Nothing is promoted. `cap` never raises a confidence, and
+`HIGHEST_DEGRADED_CONFIDENCE` (0.89, rendering 890 millis) keeps an incomplete
+scan below `EXTRACTED_FLOOR_MILLIS` at **any** blind share.
+
+**Measured after, same corpus, same command:** the same 214 findings, now 49 at
+0.89 and 165 at 0.40, ranked by evidence. `dev map dead --confidence inferred`
+returns the 49 rows with no inbound edge at all; before, it returned nothing on
+this repository, because `extracted` was structurally unreachable and
+everything else was `ambiguous`.
+
+### A cluster outranked the single-symbol verdict on identical evidence
+
+`is_reaching_edge` excludes ambiguous and unresolved edges — correctly, since a
+cluster kept alive by a guess is a finding silently suppressed — and then
+nothing looked at them again.
+
+Reproduced with one call site, `it.alpha()`, and two candidates:
+`Widget.alpha` came back at 0.4 with `only_ambiguous_callers`; `Task.alpha`,
+reached by the *same* ambiguity, came back inside a cluster at **0.5** saying it
+was "reached by nothing outside the component", which the edge list contradicts.
+`Task.alpha` never appears in the single-symbol list at all — its sibling calls
+it deterministically — so the cluster row was the only thing naming it, at the
+wrong tier with the more absolute prose.
+
+A component something names through an unbindable call now carries
+`DEAD_CLUSTER_QUALIFIED_CONFIDENCE` (0.4) and a reason that says what reaches
+it. The unresolved ledger reaches it through `unresolved_namesake_names`, now
+shared with liveness rather than copied. A component nothing reaches is
+untouched, which is pinned.
+
+`cap_cluster` also prices the component claim separately: it compounds the
+coverage ceiling over the membership, because a missed edge into a component
+makes the whole finding wrong where the same edge costs a single-symbol finding
+only itself — which `dead_clusters` already argued in prose and nothing
+implemented.
+
+### A circular import was a dead cluster waiting for one unrelated change
+
+`Imports` edges carry the file path in **both** symbol positions, so
+`a.py -> b.py -> a.py` is a two-node strongly connected component in the graph
+Tarjan walks. Nothing came of it only because all three `File`-symbol
+construction sites emit `is_exported: true`, putting every file into
+`externally_reachable_symbols`. Nothing stated that dependency and nothing
+tested it — and the day a `File` node stops reading as exported, which is a
+reasonable change since a file node is not public API, every circular import in
+every TypeScript barrel and Python package becomes a dead cluster.
+
+Import edges are excluded from the component graph outright. They connect file
+nodes only, liveness never reports a `SymbolKind::File`, and "a cluster of
+files" is not this pass's claim — so the exclusion costs nothing that could have
+been a finding, and shrinks the graph by one node per file plus every import
+edge. Pinned with a hand-built extraction whose `File` symbol is *not* exported,
+because that state is unreachable from `extract_file` and is exactly the point.
+
+### Two numbers for one fact
+
+`devmap status --json` reports `coverage_gaps.import_blind.total = 71` on this
+repository; the manifest beside it, same generation, reports
+`liveness_meta.unwired.excluded_import_blind = 355`.
+
+The gap is prose. `extraction_gaps` charges `ImportBlind` only for files a
+grammar read; `unwired_candidates` never asked — it runs the parse-failure
+branch first, which `is_parse_failure` deliberately answers `false` for prose,
+then charges everything left with no `Imports` capability, Markdown included.
+
+The predicate now has one owner, `Extraction::grammar_read_this_file`, beside
+`is_parse_failure` where the same line is already drawn.
+
+The *exclusion* was load-bearing and older than the reason given for it: before
+the W0.3 capability gate, every `.md`, `.json` and `.yaml` in every repository
+was an unwired candidate, and the gate swept them up by accident. They are now
+excluded on their own grounds and counted in neither number.
+
+### `verify.sh` had never run past step 5 from a clean checkout
+
+Every shell script under `rust-port/` is committed `100644`. `verify.sh` invokes
+`./tools/fanout.sh`, `./tools/memory_model_probe.sh` and `./tools/soak.sh`
+directly, so **steps 5 through 9 have never run** for anyone who did not
+`chmod` their own working tree. CI runs `bash ./verify.sh`, which starts the
+script and then hits the same wall inside it.
+
+It failed the way this ledger's own discipline warns against, twice: a true
+sentence with the wrong cause. `GATE FAIL: could not derive the ambiguity
+fan-out` was about neither the fan-out nor the derivation.
+
+Steps 1 and 2 were also red at HEAD on rustc 1.98 — six clippy lints and a
+formatting drift, none of them in code this pass had touched — so steps 3
+onward did not run either. And step 5 hardcoded `./target/release/devmap` while
+step 4 builds it with `cargo run --release`, so any run with `CARGO_TARGET_DIR`
+set reported "could not measure peak RSS" when the measurement was fine and the
+binary was elsewhere.
+
+### Adversarial input found three overflow panics in the new code
+
+`blind_files()` and `blind_share()` summed `usize` counters with a plain `+`.
+Four of the five are bounded by a file count, but `discovery_refused_files` is
+folded in from outside — `DiscoveryCoverage::refused(n)` takes whatever a caller
+passes — and it is the numerator of a division. Debug panics; **release wraps a
+saturated blind count round to a small one and hands a near-`extracted` ceiling
+to a corpus nothing read.** Saturating adds, and the ratio clamped after the
+division.
+
+`graded_cap_under_hostile_input.rs` carries twelve cases: saturated counters
+together and singly, `NaN`/`INFINITY`/`f32::MAX` as confidences, a cluster of
+`usize::MAX` members against a `powi` exponent, a corpus that is entirely
+refusals, ratio-independence from corpus size, a 100,000-node ring through the
+public entry point, the oversized-graph refusal stated rather than returned as
+an empty result, degenerate self-loops and empty names, a symbol named only by
+`::` and `.` separators, and a determinism sweep over the new qualification
+pass.
+
+### Examined and found not to be defects
+
+- **The Python resolution-rate ratchet has zero tolerance where the Rust CI
+  fence has 10 permille.** Predicted as a false-positive generator; **measured
+  and refuted.** On a 423-file corpus with ~44k attribution sites, adding one
+  unresolvable call moves the net rate by **0 permille** (372 → 372); ~93 new
+  unresolvable sites are needed to move it by one. The two thresholds are
+  calibrated for different denominators — tiny deterministic fixtures against a
+  whole repository — and the divergence is explained rather than accidental.
+- **A file with both a `CallBlind` and an `ImportBlind` gap writes two rows.**
+  `generation_coverage_gaps` is keyed `(generation_id, gap, path)` and every
+  count is `WHERE gap = ?`, so neither bucket double-counts.
+- **`unwired_candidates` counts ambiguous and unresolved `Imports` edges as
+  wiring** where liveness and the component pass exclude them. Inconsistent, but
+  in the conservative direction for this question — an ambiguous import edge is
+  evidence the file *may* be imported — so it errs toward fewer findings.
+
+### Numbers
+
+Workspace fmt clean, clippy `-D warnings` clean, `cargo test --workspace`
+green, determinism double-build identical
+(`c613ef69831097b6d2f81f4d0d36b4b7fa18fdd3f6f14cec47ae42b660ca736e`).
+
+### Still open, and deliberately not started here
+
+- **B3/SC2 — write amplification.** Re-measured, and this ledger's
+  characterisation is stale. On a 1,060-file / 58,651-edge corpus a one-file
+  edit costs: extract 0.565 s, **resolve 0.340 s (15%)**, analyze 0.109 s (5%),
+  **persist 1.221 s (55%)**. The "resolve and analyze are 54% of a rebuild"
+  figure was measured on a different corpus and does not hold here. The narrowed
+  write and a `--full` write cost about the same (~1.2 s each), which is write
+  amplification measured rather than argued. The fix is the validity-range
+  schema redesign AGENT_PLAN marks **decision (#2)**; it is a store-schema
+  rewrite and was not started unilaterally.
+- **W0.3 move 2 — import extraction for the C family and the JVM/CLR
+  languages.** `#include` still has no handler anywhere in the extractor, and 23
+  of 35 languages declare no `IMPORTS` capability, so `unwired_candidates` is
+  permanently empty for them. On this repository that is 71 files; in a Java or
+  C++ shop it is the whole tree. The W0.3 plan shipped move 1 ("stop the
+  bleeding") deliberately and named move 2 as the follow-up.
