@@ -21,7 +21,20 @@ use devmap_extract::model::ReferenceKind;
 /// Sources are minimal on purpose: each exercises one grammar's heritage
 /// clause and nothing else, so a failure names the grammar rather than
 /// something incidental about the fixture.
-const MATRIX: &[(&str, &str, &str, &[&str], &[&str])] = &[
+/// `(what the case proves, path, source, expected supertypes, expected interfaces)`.
+///
+/// A named alias rather than the tuple inline: the shape is five fields wide
+/// and two of them are `&[&str]`, so at the use site nothing says which is
+/// which.
+type HeritageCase = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+);
+
+const MATRIX: &[HeritageCase] = &[
     (
         "typescript separates the two clauses",
         "W.ts",

@@ -280,7 +280,12 @@ fn dependencies_takes_the_same_floor() {
         .dependencies_at_rung(request("app.py"), Some(Rung::Deterministic))
         .expect("deps at rung");
 
-    assert!(open.total > floored.total, "{} vs {}", open.total, floored.total);
+    assert!(
+        open.total > floored.total,
+        "{} vs {}",
+        open.total,
+        floored.total
+    );
     let hist = histogram_of(&floored);
     assert_eq!(hist.total(), histogram_of(&open).total());
     assert_eq!(hist.total() - hist.filtered_out, floored.total as usize);
@@ -302,11 +307,14 @@ fn an_unmeasured_population_reports_no_histogram_and_an_empty_one_reports_zero()
     // Measured: the file is indexed and parsed, and holds no outbound edges.
     let measured = engine.dependencies(request("orphan.py")).expect("deps");
     assert!(
-        matches!(measured.resolution, ResolutionAvailability::Available { .. }),
+        matches!(measured.resolution, ResolutionAvailability::Available),
         "{:?}",
         measured.resolution
     );
-    assert_eq!(measured.total, 0, "`orphan.py` has no edges in either direction");
+    assert_eq!(
+        measured.total, 0,
+        "`orphan.py` has no edges in either direction"
+    );
     assert_eq!(
         histogram_of(&measured),
         RungHistogram::default(),
@@ -318,7 +326,10 @@ fn an_unmeasured_population_reports_no_histogram_and_an_empty_one_reports_zero()
         .trace_at_rung(request("orphan.py"), Some(Rung::Deterministic))
         .expect("trace at rung");
     assert!(
-        matches!(unmeasured.resolution, ResolutionAvailability::Unavailable { .. }),
+        matches!(
+            unmeasured.resolution,
+            ResolutionAvailability::Unavailable { .. }
+        ),
         "{:?}",
         unmeasured.resolution
     );

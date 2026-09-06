@@ -976,16 +976,15 @@ pub fn analyze_liveness_with_coverage(
         //
         // Empty for every language that encodes member visibility itself; see
         // `member_visibility_is_conventional`.
-        let exported_owners: HashSet<&str> =
-            if member_visibility_is_conventional(&ext.language) {
-                ext.symbols
-                    .iter()
-                    .filter(|sym| sym.is_exported && sym.kind != SymbolKind::File)
-                    .map(|sym| sym.qualified_name.as_str())
-                    .collect()
-            } else {
-                HashSet::new()
-            };
+        let exported_owners: HashSet<&str> = if member_visibility_is_conventional(&ext.language) {
+            ext.symbols
+                .iter()
+                .filter(|sym| sym.is_exported && sym.kind != SymbolKind::File)
+                .map(|sym| sym.qualified_name.as_str())
+                .collect()
+        } else {
+            HashSet::new()
+        };
 
         let file_reason = if matches!(ext.parse_outcome, ParseOutcome::Fallback { .. }) {
             Some(

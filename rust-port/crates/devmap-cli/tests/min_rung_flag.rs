@@ -137,7 +137,9 @@ fn the_flag_narrows_and_says_what_it_hid() {
     // filtered answer from a sparse graph.
     let hist = &floored["rungs"];
     assert_eq!(
-        hist["deterministic"].as_u64().unwrap() + hist["high"].as_u64().unwrap() + hist["speculative"].as_u64().unwrap(),
+        hist["deterministic"].as_u64().unwrap()
+            + hist["high"].as_u64().unwrap()
+            + hist["speculative"].as_u64().unwrap(),
         open["rungs"]["deterministic"].as_u64().unwrap()
             + open["rungs"]["high"].as_u64().unwrap()
             + open["rungs"]["speculative"].as_u64().unwrap(),

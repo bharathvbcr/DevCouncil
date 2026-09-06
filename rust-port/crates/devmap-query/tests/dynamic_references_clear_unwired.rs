@@ -36,8 +36,9 @@ fn unwired(extractions: &[Extraction]) -> Vec<String> {
         pending_count: 0,
         stamped: Default::default(),
     };
-    let json = generate_code_graph_json(extractions, &analysis, &resolution.edges, &freshness, None)
-        .expect("code graph builds");
+    let json =
+        generate_code_graph_json(extractions, &analysis, &resolution.edges, &freshness, None)
+            .expect("code graph builds");
     let value: serde_json::Value = serde_json::from_str(&json).expect("graph is JSON");
     value["unwired_candidates"]
         .as_array()
@@ -86,12 +87,18 @@ fn an_importlib_reference_clears_the_file_it_names() {
 #[test]
 fn a_code_split_route_is_not_unwired() {
     let extractions = vec![
-        extract_file("package.json", "{\"name\":\"x\",\"main\":\"src/index.ts\"}\n"),
+        extract_file(
+            "package.json",
+            "{\"name\":\"x\",\"main\":\"src/index.ts\"}\n",
+        ),
         extract_file(
             "src/index.ts",
             "export const routes = [{ load: () => import('./routes/Settings') }];\n",
         ),
-        extract_file("src/routes/Settings.tsx", "export const Settings = () => null;\n"),
+        extract_file(
+            "src/routes/Settings.tsx",
+            "export const Settings = () => null;\n",
+        ),
     ];
     let paths = unwired(&extractions);
     assert!(

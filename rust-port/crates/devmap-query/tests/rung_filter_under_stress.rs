@@ -74,22 +74,17 @@ fn the_histogram_accounts_for_every_edge_at_scale() {
 /// and none may bucket twice.
 #[test]
 fn every_representable_confidence_lands_on_exactly_one_rung() {
-    let mut probes: Vec<f32> = vec![
-        f32::MIN_POSITIVE,
-        -0.0,
-        0.0,
-        0.399_999_97,
-        0.4,
-        0.400_000_03,
-        0.699_999_94,
-        0.7,
-        0.700_000_1,
-        0.899_999_94,
-        0.9,
-        0.900_000_04,
-        0.999_999_94,
-        1.0,
-    ];
+    // The neighbours of each boundary, computed rather than written out.
+    // `next_down`/`next_up` give the adjacent representable `f32`, which is
+    // exactly what a value that made a round trip through SQLite REAL can come
+    // back as — and unlike a decimal literal it cannot silently round to the
+    // boundary itself and make the probe test nothing.
+    let mut probes: Vec<f32> = vec![f32::MIN_POSITIVE, -0.0, 0.0];
+    for boundary in [0.4_f32, 0.7, 0.9, 1.0] {
+        probes.push(boundary.next_down());
+        probes.push(boundary);
+        probes.push(boundary.next_up());
+    }
     // Values outside [0, 1] should not exist, but a corrupted store can hold
     // them and a panic there would take down every query over that generation.
     probes.extend([-1.0, 2.0, f32::MAX, f32::MIN]);
@@ -126,7 +121,11 @@ fn a_nan_confidence_is_counted_rather_than_dropped() {
     let edges = vec![edge(f32::NAN, 0), edge(1.0, 1)];
     for floor in [None, Some(Rung::Deterministic), Some(Rung::Speculative)] {
         let (kept, counts) = narrow(edges.clone(), floor);
-        assert_eq!(counts.total(), 2, "floor={floor:?}: NaN must still be counted");
+        assert_eq!(
+            counts.total(),
+            2,
+            "floor={floor:?}: NaN must still be counted"
+        );
         assert_eq!(counts.total() - counts.filtered_out, kept.len());
     }
 }
@@ -156,6 +155,9 @@ fn filtering_preserves_order() {
 fn an_empty_population_reports_zeroes_and_no_filtering() {
     let counts = histogram(&[], Some(Rung::Deterministic));
     assert_eq!(counts, RungHistogram::default());
-    assert_eq!(counts.filtered_out, 0, "nothing was filtered because nothing was there");
+    assert_eq!(
+        counts.filtered_out, 0,
+        "nothing was filtered because nothing was there"
+    );
     assert_eq!(counts.total(), 0);
 }

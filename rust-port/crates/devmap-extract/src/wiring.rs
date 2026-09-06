@@ -529,6 +529,189 @@ pub fn extract_wiring_annotations(path: &str, source: &str) -> Vec<WiringAnnotat
     annotations
 }
 
+// ---------------------------------------------------------------------------
+// W3.3 — the two rules the Python wiring module held and the kernel did not
+// ---------------------------------------------------------------------------
+
+/// The author's explicit "this file is intentionally unwired" declaration.
+///
+/// One spelling, matching `devcouncil.indexing.wiring.ALLOW_UNWIRED` exactly.
+/// The two are asserted equal by `tests/allow_unwired_and_dynamic_imports.rs`,
+/// because a marker the kernel spells differently is a marker the kernel
+/// ignores — silently, and only for the files that use it.
+pub const ALLOW_UNWIRED: &str = "devcouncil: allow-unwired";
+
+/// Suffixes whose source is worth scanning for dynamic references.
+///
+/// Mirrors `_CODE_CONFIG_SUFFIXES`. Config formats are in the list because
+/// `pyproject.toml`, `package.json` and friends name entry points that no
+/// import edge records.
+const CODE_CONFIG_SUFFIXES: &[&str] = &[
+    "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "toml", "json", "yaml", "yml", "cfg", "ini",
+];
+
+/// Extensions a relative JS specifier resolves through. Mirrors `_JS_RESOLVE_EXTS`.
+const JS_RESOLVE_EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
+
+fn dynamic_reference_patterns() -> &'static [regex::Regex] {
+    use std::sync::OnceLock;
+    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        // Ported verbatim from `devcouncil.indexing.wiring`, each beside the
+        // constant it mirrors. Rust's `regex` has no lookaround, and none of
+        // these need it.
+        [
+            // _IMPORTLIB_RE
+            r#"(?:importlib(?:\.import_module)?|__import__)\s*\(\s*['"]([^'"]+)['"]"#,
+            // _DYNAMIC_IMPORT_RE — `import('./App')`
+            r#"import\s*\(\s*['"]([^'"]+)['"]\s*\)"#,
+            // _WORKER_URL_RE — Vite/webpack worker entry points
+            r#"new\s+URL\s*\(\s*['"]([^'"]+)['"]\s*,\s*import\.meta\.url"#,
+            // _PYTHON_DASH_M_RE, both argv shapes
+            r#"(?:^|[^\w-])(?:-m|--module)(?:\s+|\s*,\s*)['"]([A-Za-z_][\w.]*)['"]"#,
+            r#"['"](?:-m|--module)['"]\s*,\s*['"]([A-Za-z_][\w.]*)['"]"#,
+            // _PACKAGE_RESOURCES_RE
+            r#"(?:resources\.)?files\s*\(\s*['"]([A-Za-z_][\w.]*)['"]"#,
+        ]
+        .iter()
+        .map(|pattern| regex::Regex::new(pattern).expect("dynamic-reference pattern compiles"))
+        .collect()
+    })
+}
+
+/// `a/b/../c` → `a/c`, and `./x` → `x`. Mirrors `_normalize_rel_path`.
+fn normalize_rel_path(target: &str) -> String {
+    let normalized = target.replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for component in normalized.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
+/// Comparable dotted + slash forms, extensions stripped, for boundary matching.
+///
+/// A verbatim port of `wiring._module_forms`. The set it produces is
+/// deliberately generous — `src/shared/Panel.tsx` yields `src/shared/Panel/tsx`
+/// among others — because it is one side of a set intersection, not a claim
+/// that every member names a real file. Reproducing the generosity exactly is
+/// the point: a kernel that generated a *tidier* set would clear a different
+/// set of files than Python does, which is the disagreement this work order
+/// exists to end.
+fn module_forms(value: &str) -> Vec<String> {
+    let normalized = normalize_path(value);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    let mut forms = vec![
+        normalized.clone(),
+        normalized.replace('/', "."),
+        normalized.replace('.', "/"),
+    ];
+    for ext in MODULE_FORM_EXTS {
+        if let Some(base) = normalized.strip_suffix(ext) {
+            if !base.is_empty() {
+                forms.push(base.to_string());
+                forms.push(base.replace('/', "."));
+                forms.push(base.replace('.', "/"));
+            }
+            break;
+        }
+    }
+    forms.retain(|form| !form.is_empty());
+    forms.sort();
+    forms.dedup();
+    forms
+}
+
+/// Extensions `module_forms` strips. Mirrors the tuple inlined in `_module_forms`,
+/// which is `_JS_RESOLVE_EXTS` with `.py` in front.
+const MODULE_FORM_EXTS: &[&str] = &[".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
+
+/// `wiring._norm`: forward slashes, no leading `./`.
+fn normalize_path(value: &str) -> String {
+    let mut normalized = value.replace('\\', "/");
+    while let Some(rest) = normalized.strip_prefix("./") {
+        normalized = rest.to_string();
+    }
+    normalized
+}
+
+/// Resolve one specifier to the specs Python would collect for it.
+///
+/// A relative specifier resolves against the referring file and contributes
+/// *both* the resolved path and its extension-stripped stem, so `import('./App')`
+/// and `import('./App.tsx')` each reach `App.tsx`. A bare specifier contributes
+/// itself.
+fn specs_for(referrer: &str, spec: &str) -> Vec<String> {
+    if !spec.starts_with('.') {
+        return vec![spec.to_string()];
+    }
+    let parent = match normalize_path(referrer).rsplit_once('/') {
+        Some((dir, _)) => dir.to_string(),
+        None => String::new(),
+    };
+    let joined = if parent.is_empty() {
+        spec.to_string()
+    } else {
+        format!("{parent}/{spec}")
+    };
+    let resolved = normalize_rel_path(&joined);
+    if resolved.is_empty() {
+        return Vec::new();
+    }
+    let mut stem = resolved.clone();
+    for ext in JS_RESOLVE_EXTS {
+        if let Some(base) = resolved.strip_suffix(ext) {
+            stem = base.to_string();
+            break;
+        }
+    }
+    vec![resolved, stem]
+}
+
+fn file_suffix(path: &str) -> &str {
+    path.rsplit_once('/')
+        .map_or(path, |(_, name)| name)
+        .rsplit_once('.')
+        .map_or("", |(_, ext)| ext)
+}
+
+/// Dynamic references made *by* `path`, as normalized target forms.
+///
+/// The one heuristic the Python wiring module held that the kernel lacked. A
+/// lazily imported plugin, a code-split route and a worker entry point are all
+/// reachable and all invisible to an import-edge walk, so without this the
+/// kernel calls them unwired — confidently, and on every build.
+pub fn dynamic_reference_forms(path: &str, source: &str) -> Vec<String> {
+    let suffix = file_suffix(path).to_ascii_lowercase();
+    if !CODE_CONFIG_SUFFIXES.contains(&suffix.as_str()) {
+        return Vec::new();
+    }
+    let mut specs: Vec<String> = Vec::new();
+    for pattern in dynamic_reference_patterns() {
+        for capture in pattern.captures_iter(source) {
+            let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
+                continue;
+            };
+            if spec.is_empty() {
+                continue;
+            }
+            specs.extend(specs_for(path, spec));
+        }
+    }
+    let mut forms: Vec<String> = specs.iter().flat_map(|spec| module_forms(spec)).collect();
+    forms.sort();
+    forms.dedup();
+    forms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,190 +941,4 @@ mod tests {
             );
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// W3.3 — the two rules the Python wiring module held and the kernel did not
-// ---------------------------------------------------------------------------
-
-/// The author's explicit "this file is intentionally unwired" declaration.
-///
-/// One spelling, matching `devcouncil.indexing.wiring.ALLOW_UNWIRED` exactly.
-/// The two are asserted equal by `tests/allow_unwired_and_dynamic_imports.rs`,
-/// because a marker the kernel spells differently is a marker the kernel
-/// ignores — silently, and only for the files that use it.
-pub const ALLOW_UNWIRED: &str = "devcouncil: allow-unwired";
-
-/// Suffixes whose source is worth scanning for dynamic references.
-///
-/// Mirrors `_CODE_CONFIG_SUFFIXES`. Config formats are in the list because
-/// `pyproject.toml`, `package.json` and friends name entry points that no
-/// import edge records.
-const CODE_CONFIG_SUFFIXES: &[&str] = &[
-    "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "toml", "json", "yaml", "yml", "cfg", "ini",
-];
-
-/// Extensions a relative JS specifier resolves through. Mirrors `_JS_RESOLVE_EXTS`.
-const JS_RESOLVE_EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
-
-fn dynamic_reference_patterns() -> &'static [regex::Regex] {
-    use std::sync::OnceLock;
-    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        // Ported verbatim from `devcouncil.indexing.wiring`, each beside the
-        // constant it mirrors. Rust's `regex` has no lookaround, and none of
-        // these need it.
-        [
-            // _IMPORTLIB_RE
-            r#"(?:importlib(?:\.import_module)?|__import__)\s*\(\s*['"]([^'"]+)['"]"#,
-            // _DYNAMIC_IMPORT_RE — `import('./App')`
-            r#"import\s*\(\s*['"]([^'"]+)['"]\s*\)"#,
-            // _WORKER_URL_RE — Vite/webpack worker entry points
-            r#"new\s+URL\s*\(\s*['"]([^'"]+)['"]\s*,\s*import\.meta\.url"#,
-            // _PYTHON_DASH_M_RE, both argv shapes
-            r#"(?:^|[^\w-])(?:-m|--module)(?:\s+|\s*,\s*)['"]([A-Za-z_][\w.]*)['"]"#,
-            r#"['"](?:-m|--module)['"]\s*,\s*['"]([A-Za-z_][\w.]*)['"]"#,
-            // _PACKAGE_RESOURCES_RE
-            r#"(?:resources\.)?files\s*\(\s*['"]([A-Za-z_][\w.]*)['"]"#,
-        ]
-        .iter()
-        .map(|pattern| regex::Regex::new(pattern).expect("dynamic-reference pattern compiles"))
-        .collect()
-    })
-}
-
-/// `a/b/../c` → `a/c`, and `./x` → `x`. Mirrors `_normalize_rel_path`.
-fn normalize_rel_path(target: &str) -> String {
-    let normalized = target.replace('\\', "/");
-    let mut parts: Vec<&str> = Vec::new();
-    for component in normalized.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            other => parts.push(other),
-        }
-    }
-    parts.join("/")
-}
-
-/// Comparable dotted + slash forms, extensions stripped, for boundary matching.
-///
-/// A verbatim port of `wiring._module_forms`. The set it produces is
-/// deliberately generous — `src/shared/Panel.tsx` yields `src/shared/Panel/tsx`
-/// among others — because it is one side of a set intersection, not a claim
-/// that every member names a real file. Reproducing the generosity exactly is
-/// the point: a kernel that generated a *tidier* set would clear a different
-/// set of files than Python does, which is the disagreement this work order
-/// exists to end.
-fn module_forms(value: &str) -> Vec<String> {
-    let normalized = normalize_path(value);
-    if normalized.is_empty() {
-        return Vec::new();
-    }
-    let mut forms = vec![
-        normalized.clone(),
-        normalized.replace('/', "."),
-        normalized.replace('.', "/"),
-    ];
-    for ext in MODULE_FORM_EXTS {
-        if let Some(base) = normalized.strip_suffix(ext) {
-            if !base.is_empty() {
-                forms.push(base.to_string());
-                forms.push(base.replace('/', "."));
-                forms.push(base.replace('.', "/"));
-            }
-            break;
-        }
-    }
-    forms.retain(|form| !form.is_empty());
-    forms.sort();
-    forms.dedup();
-    forms
-}
-
-/// Extensions `module_forms` strips. Mirrors the tuple inlined in `_module_forms`,
-/// which is `_JS_RESOLVE_EXTS` with `.py` in front.
-const MODULE_FORM_EXTS: &[&str] = &[".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
-
-/// `wiring._norm`: forward slashes, no leading `./`.
-fn normalize_path(value: &str) -> String {
-    let mut normalized = value.replace('\\', "/");
-    while let Some(rest) = normalized.strip_prefix("./") {
-        normalized = rest.to_string();
-    }
-    normalized
-}
-
-/// Resolve one specifier to the specs Python would collect for it.
-///
-/// A relative specifier resolves against the referring file and contributes
-/// *both* the resolved path and its extension-stripped stem, so `import('./App')`
-/// and `import('./App.tsx')` each reach `App.tsx`. A bare specifier contributes
-/// itself.
-fn specs_for(referrer: &str, spec: &str) -> Vec<String> {
-    if !spec.starts_with('.') {
-        return vec![spec.to_string()];
-    }
-    let parent = match normalize_path(referrer).rsplit_once('/') {
-        Some((dir, _)) => dir.to_string(),
-        None => String::new(),
-    };
-    let joined = if parent.is_empty() {
-        spec.to_string()
-    } else {
-        format!("{parent}/{spec}")
-    };
-    let resolved = normalize_rel_path(&joined);
-    if resolved.is_empty() {
-        return Vec::new();
-    }
-    let mut stem = resolved.clone();
-    for ext in JS_RESOLVE_EXTS {
-        if let Some(base) = resolved.strip_suffix(ext) {
-            stem = base.to_string();
-            break;
-        }
-    }
-    vec![resolved, stem]
-}
-
-fn file_suffix(path: &str) -> &str {
-    path.rsplit_once('/')
-        .map_or(path, |(_, name)| name)
-        .rsplit_once('.')
-        .map_or("", |(_, ext)| ext)
-}
-
-/// Dynamic references made *by* `path`, as normalized target forms.
-///
-/// The one heuristic the Python wiring module held that the kernel lacked. A
-/// lazily imported plugin, a code-split route and a worker entry point are all
-/// reachable and all invisible to an import-edge walk, so without this the
-/// kernel calls them unwired — confidently, and on every build.
-pub fn dynamic_reference_forms(path: &str, source: &str) -> Vec<String> {
-    let suffix = file_suffix(path).to_ascii_lowercase();
-    if !CODE_CONFIG_SUFFIXES.contains(&suffix.as_str()) {
-        return Vec::new();
-    }
-    let mut specs: Vec<String> = Vec::new();
-    for pattern in dynamic_reference_patterns() {
-        for capture in pattern.captures_iter(source) {
-            let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
-                continue;
-            };
-            if spec.is_empty() {
-                continue;
-            }
-            specs.extend(specs_for(path, spec));
-        }
-    }
-    let mut forms: Vec<String> = specs
-        .iter()
-        .flat_map(|spec| module_forms(spec))
-        .collect();
-    forms.sort();
-    forms.dedup();
-    forms
 }

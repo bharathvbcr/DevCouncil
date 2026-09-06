@@ -824,7 +824,7 @@ impl Resolver {
         }
 
         let mut chains = BTreeMap::new();
-        for (key, _) in hops.iter() {
+        for key in hops.keys() {
             let mut seen: BTreeSet<String> = BTreeSet::new();
             let mut cursor = key.clone();
             let mut terminal = None;
