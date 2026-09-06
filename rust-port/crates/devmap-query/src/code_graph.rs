@@ -114,6 +114,31 @@ fn node_kind_label(kind: SymbolKind) -> &'static str {
     }
 }
 
+/// Every edge-kind string this writer can emit, in the order of [`EdgeKind`].
+///
+/// `pub` so a query surface can validate a caller's relationship name against
+/// exactly what the emitter produces. Restating the list somewhere else is how
+/// `EXTENDS` came to be an accepted relationship type in the Python Cypher
+/// subset while the graph emitted `inherits`: the query parsed, the name was
+/// "supported", and it matched zero edges — reported as an empty result rather
+/// than as a name nothing can match.
+pub const EDGE_KIND_LABELS: &[&str] = &[
+    "imports",
+    "calls",
+    "contains",
+    "defines",
+    "instantiates",
+    "inherits",
+    "implements",
+    "subscribes",
+    "routes_to",
+    "wired_to",
+    "member_of",
+    "depends_on",
+    "taint_flow",
+    "references",
+];
+
 /// Rust `EdgeKind` as the edge-kind string Python consumers match on.
 ///
 /// `GraphEdge.kind` is a free `str`, so this is not validated on import — which

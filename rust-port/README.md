@@ -75,8 +75,23 @@ State lives in `.devmap/` by default. See **Where state lives** below.
 | `devmap clones` | Duplicated and structurally similar bodies |
 | `devmap preview --file f --content -` | What an *unsaved* edit would break |
 | `devmap savings` | What the index cost against reading the files |
+| `devmap cypher '<query>'` | A small openCypher subset over the graph |
 
-Add `--json` to any of them for a machine-readable answer.
+Add `--json` to any of them for a machine-readable answer — on either side of
+the subcommand.
+
+`cypher` supports one shape:
+
+```
+MATCH (a)-[r:calls|imports|…]->(b) WHERE … RETURN a, b LIMIT n
+```
+
+with `contains(a.name, '…')` and `starts with(b.path, '…')` joined by `AND`.
+Anything outside it is **refused rather than widened** — a `WHERE` term it
+cannot evaluate would otherwise return every row in the graph under a successful
+status, and a relationship name the graph cannot emit would return zero rows
+that read as "nothing matches" rather than "that name cannot match". Refusals
+exit non-zero, so a script can tell "not run" from "matched nothing".
 
 ### See
 

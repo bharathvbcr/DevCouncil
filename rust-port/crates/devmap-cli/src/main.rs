@@ -877,6 +877,25 @@ enum Commands {
         print_config: bool,
     },
 
+    /// Run a small openCypher subset over the graph.
+    ///
+    /// Supported: `MATCH (a)-[r:calls|imports|…]->(b) WHERE … RETURN a, b
+    /// LIMIT n`, with `contains(a.name, '…')` and `starts with(b.path, '…')`
+    /// joined by `AND`.
+    ///
+    /// Anything outside that is **refused**, never silently widened: a `WHERE`
+    /// term this cannot evaluate would otherwise return every row in the graph
+    /// under a successful status.
+    Cypher {
+        /// The query.
+        query: String,
+        /// Rows to return when the query states no `LIMIT`. A query's own
+        /// `LIMIT` is a request; the server's ceiling still applies, and both
+        /// numbers are reported.
+        #[arg(short, long, default_value_t = 50)]
+        limit: usize,
+    },
+
     /// Render the graph as one self-contained HTML file.
     ///
     /// No network and no build step: the renderer is embedded, so the page
@@ -1080,6 +1099,47 @@ fn write_guides_if_requested(
         &relative(&devmap_extract::paths::code_graph_path(tree)),
         &relative(request.db),
     )?)
+}
+
+/// The graph model, read from the store, for a surface that only wants to look.
+///
+/// One owner for `html` and `cypher`: both project the same value the artifact
+/// writer builds, so a picture and a query cannot describe different
+/// generations — and neither pays to parse a 20 MB `code_graph.json` back off
+/// disk to answer.
+///
+/// The freshness stamps are the store's own and are deliberately not computed
+/// here. These surfaces describe the generation, not the working tree, and
+/// digesting the tree would make rendering a picture cost a full rehash.
+fn graph_value_for_read(store: &Store, db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    let gen_id = store
+        .latest_generation_id()?
+        .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
+    let extractions = store.latest_extractions()?;
+    let analysis = store
+        .latest_analysis()?
+        .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
+    let edges = store
+        .latest_edges(0.0)?
+        .into_iter()
+        .map(resolved_edge_from_stored)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let freshness = FreshnessInfo {
+        head_sha: store
+            .latest_generation_head()?
+            .unwrap_or_else(|| "unavailable".to_string()),
+        generation_id: gen_id,
+        pending_count: store.status(&db.display().to_string())?.pending_count,
+        stamped: StampedFreshness::default(),
+    };
+    let repo_root = store.latest_repo_root()?;
+    devmap_query::build_code_graph_value(
+        &extractions,
+        &analysis,
+        &edges,
+        &freshness,
+        repo_root.as_deref(),
+    )
 }
 
 fn write_consumer_artifacts(
@@ -2186,6 +2246,7 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         | Commands::Serve { .. }
         | Commands::Mcp { .. }
         | Commands::Html { .. }
+        | Commands::Cypher { .. }
         | Commands::Claude { .. } => Ok(()),
     }
 }
@@ -3673,6 +3734,46 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 .with_ipc_path(ipc_path);
             daemon.run_loop().await?;
         }
+        Commands::Cypher { query, limit } => {
+            let store = open_for_read(&cli.db())?;
+            let graph = graph_value_for_read(&store, &cli.db())?;
+            let result = devmap_query::cypher::run(&graph, query, *limit);
+            if cli.json {
+                emit_json(cli, &result)?;
+            } else if result["ok"].as_bool() == Some(true) {
+                for row in result["rows"].as_array().into_iter().flatten() {
+                    match row.get("rel").and_then(serde_json::Value::as_str) {
+                        Some(rel) => println!(
+                            "{}  -[{rel}]->  {}",
+                            row["a_id"].as_str().unwrap_or(""),
+                            row["b_id"].as_str().unwrap_or("")
+                        ),
+                        None => println!("{}", row["a_id"].as_str().unwrap_or("")),
+                    }
+                }
+                // Both numbers, always: a page reported as a count reads as a
+                // total, and this surface exists to answer "how many".
+                println!(
+                    "  {} of {} row(s){}",
+                    result["shown"].as_u64().unwrap_or(0),
+                    result["total"].as_u64().unwrap_or(0),
+                    if result["limit_capped"].as_bool() == Some(true) {
+                        format!(
+                            " (LIMIT {} capped to {})",
+                            result["limit_requested"].as_u64().unwrap_or(0),
+                            result["limit_applied"].as_u64().unwrap_or(0)
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
+            } else {
+                // A refusal is an error exit, not a zero-row success: a caller
+                // that scripts this must be able to tell "your query was not
+                // run" from "your query matched nothing".
+                anyhow::bail!("{}", result["error"].as_str().unwrap_or("query refused"));
+            }
+        }
         Commands::Html {
             path,
             out,
@@ -3680,37 +3781,9 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             max_nodes,
         } => {
             let store = open_for_read(&cli.db())?;
-            let gen_id = store.latest_generation_id()?.ok_or_else(|| {
-                anyhow::anyhow!("html unavailable: build a persisted generation first")
-            })?;
-            let extractions = store.latest_extractions()?;
-            let analysis = store.latest_analysis()?.ok_or_else(|| {
-                anyhow::anyhow!("html unavailable: build a persisted generation first")
-            })?;
-            let edges = store
-                .latest_edges(0.0)?
-                .into_iter()
-                .map(resolved_edge_from_stored)
-                .collect::<anyhow::Result<Vec<_>>>()?;
+            let graph = graph_value_for_read(&store, &cli.db())?;
+            let gen_id = store.latest_generation_id()?.unwrap_or(0);
             let repo_root = store.latest_repo_root()?;
-            // The page describes the generation, not the working tree, so the
-            // freshness fields it would carry are the store's own. Digesting
-            // the tree here would make rendering a picture cost a full rehash.
-            let freshness = FreshnessInfo {
-                head_sha: store
-                    .latest_generation_head()?
-                    .unwrap_or_else(|| "unavailable".to_string()),
-                generation_id: gen_id,
-                pending_count: store.status(&cli.db().display().to_string())?.pending_count,
-                stamped: StampedFreshness::default(),
-            };
-            let graph = devmap_query::build_code_graph_value(
-                &extractions,
-                &analysis,
-                &edges,
-                &freshness,
-                repo_root.as_deref(),
-            )?;
 
             let title = repo_root
                 .as_deref()
