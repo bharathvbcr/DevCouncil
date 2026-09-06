@@ -174,10 +174,28 @@ fn a_prose_file_with_no_grammar_is_not_lost_coverage() {
     );
     extractions.push(readme);
 
+    let coverage = extraction_coverage(&extractions);
     assert_eq!(
-        extraction_coverage(&extractions),
-        ExtractionCoverage::default(),
+        ExtractionCoverage {
+            files_with_call_extraction: coverage.files_with_call_extraction,
+            ..ExtractionCoverage::default()
+        },
+        coverage,
         "a file no grammar was ever expected for is not a gap in coverage"
+    );
+    // Prose sits in **neither** side of the ratio, which is the stronger claim
+    // and the one that matters now that `cap()` grades on it. In the numerator
+    // it would mark every repository degraded; in the denominator it would
+    // dilute the blind share with files nobody ever asked a grammar to read, so
+    // adding a README to a broken repository would raise its confidence.
+    //
+    // Written as a whole-struct comparison with the denominator threaded
+    // through so a *new* gap counter still fails this test, and then pinned
+    // exactly on the line below.
+    assert_eq!(
+        coverage.files_with_call_extraction, 2,
+        "the two Python files are the corpus; the README is not part of the \
+         question: {coverage:?}"
     );
 
     let summary = summarize(&extractions);
