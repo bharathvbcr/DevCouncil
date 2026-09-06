@@ -155,7 +155,7 @@ def _call_edges(
         # asked without it — the refusal arrives below as `(None, reason)`,
         # which is this function's whole contract: not measured, and why.
         call = getattr(client, method)
-        kwargs = {"depth": 1}
+        kwargs: dict[str, object] = {"depth": 1}
         if _sends_min_rung(call, method, min_rung):
             kwargs["min_rung"] = min_rung
         resp = call(target, **kwargs)
@@ -1323,6 +1323,47 @@ def graph_trace(
     console.print(" → ".join(result.get("path") or []))
 
 
+def _string_members(value: object) -> list[str]:
+    """Members as a list of strings, or none at all.
+
+    ``members`` is a ``Vec<String>`` on the wire (`dead_clusters.rs:80`), but
+    this renderer does not read the wire — it reads ``code_graph.json`` off
+    disk, which a half-written build, a truncated copy or a hand edit can leave
+    in any shape. Two shapes escaped: a non-iterable raised ``TypeError`` out of
+    the whole render, taking the well-formed findings beside it, and a *string*
+    did not raise at all — ``[str(m) for m in "abc"]`` is ``["a", "b", "c"]``, so
+    the reader saw a three-symbol dead cluster that does not exist. Fabricating
+    a finding is the worse of the two, and it is the one nothing would have
+    reported.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(member) for member in value]
+
+
+def _whole_number(value: object, fallback: int) -> int:
+    """A count as declared, or the fallback — never an exception.
+
+    ``int("many")`` raises ``ValueError`` and ``int([1])`` raises ``TypeError``;
+    both used to escape ``dev map dead``. A ``bool`` is rejected because
+    ``int(True)`` is ``1``, which would print a one-symbol cluster from a field
+    that carried no count at all.
+
+    An integral float is accepted. JSON has one number type, so a hand edit or a
+    non-Rust writer can spell a count ``3.0``, and the fallback here is
+    ``len(members)`` — the *sample* length, capped at 25 — so refusing it would
+    under-report the size of a dead subsystem, which is the specific mistake the
+    size field exists to prevent.
+    """
+    if isinstance(value, bool):
+        return fallback
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return fallback
+
+
 def _render_dead_clusters(
     console_, clusters: Optional[list], truncated: int, incomplete: Optional[str] = None
 ) -> None:
@@ -1361,13 +1402,17 @@ def _render_dead_clusters(
     for cluster in clusters:
         if not isinstance(cluster, dict):
             continue
-        members = [str(m) for m in (cluster.get("members") or [])]
-        size = int(cluster.get("size") or len(members))
+        members = _string_members(cluster.get("members"))
+        size = _whole_number(cluster.get("size"), len(members))
+        # A confidence that is absent, null or not a number prints as "?"
+        # rather than as a number the payload never carried.
         confidence = cluster.get("confidence")
-        try:
-            confidence_txt = f"{float(confidence):.2f}"
-        except (TypeError, ValueError):
-            confidence_txt = "?"
+        confidence_txt = "?"
+        if isinstance(confidence, (int, float, str)):
+            try:
+                confidence_txt = f"{float(confidence):.2f}"
+            except ValueError:
+                confidence_txt = "?"
         sample = members[:sample_cap]
         more = size - len(sample)
         tail = f", +{more} more" if more > 0 else ""
@@ -1436,7 +1481,7 @@ def graph_dead(
 
         entries = [_DeadEntry(row) for row in rust_dead.get("dead_code") or []]
         clusters = rust_dead.get("dead_clusters")
-        clusters_truncated = int(rust_dead.get("dead_clusters_truncated") or 0)
+        clusters_truncated = _whole_number(rust_dead.get("dead_clusters_truncated"), 0)
         clusters_incomplete = rust_dead.get("dead_clusters_incomplete")
         # Skip Python graph load on successful Rust path.
         graph = None

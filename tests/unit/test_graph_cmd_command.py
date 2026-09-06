@@ -845,3 +845,159 @@ def test_a_direction_that_cannot_take_the_floor_is_unmeasured_not_unfiltered():
         _OldAnswering(), "impact", "a.py::f", "source_symbol", "source_file"
     )
     assert reason is None and edges == ["b.py::g"], (edges, reason)
+
+
+# --- `Abandoned cycles`: the state that had no test was the one with output ---
+#
+# `test_graph_dead_distinguishes_all_three_cluster_outcomes` above pins the
+# three *absences* — refused, not recorded, none — through the whole command,
+# which is where the branch order matters. The fourth state, a scan that ran and
+# found something, had no assertion anywhere: not the size-versus-sample
+# distinction (the line prints a four-name sample and the *true* membership, and
+# a reader who reads the sample as the size under-counts a dead subsystem), not
+# the truncation tail, and not what a confidence the payload did not carry
+# renders as.
+#
+# These drive `_render_dead_clusters` directly rather than through `runner`.
+# The absence cases are deliberately re-covered at this level: when the branch
+# order breaks, a renderer test says which branch, and the command test says the
+# reader sees it.
+
+
+class _Lines:
+    """A console that keeps what was printed, in order."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def print(self, text: str = "") -> None:
+        self.lines.append(str(text))
+
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
+def _render(clusters, truncated=0, incomplete=None) -> str:
+    from devcouncil.cli.commands.graph_cmd import _render_dead_clusters
+
+    console_ = _Lines()
+    _render_dead_clusters(console_, clusters, truncated, incomplete)
+    return console_.text()
+
+
+def test_a_refused_component_scan_says_so_and_does_not_advise_a_rebuild():
+    """The refusal is checked first: the next build refuses the same graph."""
+    out = _render([], incomplete="the call graph exceeded 400000 distinct symbols")
+
+    assert "not computed" in out
+    assert "exceeded 400000 distinct symbols" in out
+    assert "none" not in out, "a refusal must not read as a finding of none"
+    assert "dev map" not in out, "advising a rebuild of a scan that refuses is wrong"
+
+
+def test_a_generation_predating_the_pass_is_not_a_finding_of_none():
+    out = _render(None)
+
+    assert "not recorded for this generation" in out
+    assert "dev map" in out, "this is the one state where a rebuild does help"
+
+
+def test_a_scan_that_ran_and_found_nothing_says_none():
+    out = _render([])
+
+    assert out.strip() == "Abandoned cycles: none."
+
+
+def test_a_capped_list_carries_what_the_cap_cut():
+    out = _render(
+        [{"members": ["a", "b"], "size": 2, "confidence": 0.75}],
+        truncated=7,
+    )
+
+    assert "1 component(s)" in out
+    assert "0.75  2 symbols: a, b" in out
+    assert "7 further component(s) were found and not listed" in out
+
+
+def test_a_sampled_cluster_prints_its_true_size_not_its_sample_size():
+    """The sample is four; the size is what the kernel counted."""
+    out = _render([{"members": [f"s{i}" for i in range(9)], "size": 9, "confidence": 1.0}])
+
+    assert "1.00  9 symbols: s0, s1, s2, s3, +5 more" in out
+
+
+@pytest.mark.parametrize(
+    "confidence",
+    [None, "", "n/a", [], {}, {"value": 1}, float("nan")],
+)
+def test_a_confidence_the_payload_did_not_carry_prints_as_unknown(confidence):
+    """No non-number is ever rendered as a number.
+
+    ``nan`` is the exception that proves the rule: it is a float, so it formats,
+    and it formats as ``nan`` — which is not a confidence a reader can mistake
+    for one.
+    """
+    out = _render([{"members": ["a"], "size": 1, "confidence": confidence}])
+
+    body = out.splitlines()[-1].strip()
+    assert body.startswith("?") or body.startswith("nan"), body
+
+
+def test_a_cluster_of_the_wrong_shape_is_skipped_not_crashed_on():
+    out = _render(["not-a-dict", {"members": ["a"], "size": 1, "confidence": 0.5}])
+
+    assert "0.50  1 symbols: a" in out
+    assert "not-a-dict" not in out
+
+
+# The wire shape is `members: Vec<String>`, `size: usize`, `confidence: f32`
+# (`dead_clusters.rs:77`), so a well-formed generation cannot carry anything
+# else. This renderer does not read a generation, though — it reads
+# `code_graph.json` off disk, which a half-written build, a truncated copy or a
+# hand edit can leave in any shape at all. A wrong type here used to raise
+# through `dev map dead`: `int("many")` and iterating a non-iterable both
+# escape, and a traceback is a worse answer than a missing field, because the
+# reader loses the findings that *were* well-formed alongside it.
+@pytest.mark.parametrize(
+    "cluster",
+    [
+        {"members": 5, "size": 5, "confidence": 0.5},
+        {"members": {"a": 1}, "size": 1, "confidence": 0.5},
+        {"members": "abc", "size": 3, "confidence": 0.5},
+        {"members": ["a"], "size": "many", "confidence": 0.5},
+        {"members": ["a"], "size": [1], "confidence": 0.5},
+        {"members": ["a"], "size": 1.7, "confidence": 0.5},
+        {},
+    ],
+)
+def test_a_malformed_cluster_does_not_take_the_well_formed_ones_with_it(cluster):
+    out = _render([cluster, {"members": ["real"], "size": 1, "confidence": 0.9}])
+
+    assert "0.90  1 symbols: real" in out, out
+
+
+@pytest.mark.parametrize(
+    ("members", "fabricated"),
+    [("abc", "a, b, c"), ({"alpha": 1}, "alpha")],
+)
+def test_a_member_field_that_is_not_a_list_invents_no_members(members, fabricated):
+    """Both of these are iterable, so a naive comprehension makes members of them.
+
+    This is the failure that does not crash and so does not announce itself: the
+    line reads as a dead cluster whose symbols do not exist. A crash at least
+    tells the reader something is wrong with the file.
+    """
+    out = _render([{"members": members, "size": 3, "confidence": 0.5}])
+
+    assert fabricated not in out
+
+
+def test_a_count_spelled_as_an_integral_float_is_not_thrown_away():
+    """JSON has one number type, and the fallback is the *sample* length.
+
+    Refusing `3.0` would print `1 symbols` for a three-symbol component — an
+    under-report of exactly the kind the `size` field exists to prevent.
+    """
+    out = _render([{"members": ["a"], "size": 3.0, "confidence": 0.5}])
+
+    assert "0.50  3 symbols: a, +2 more" in out, out

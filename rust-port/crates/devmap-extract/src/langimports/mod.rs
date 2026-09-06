@@ -56,7 +56,7 @@ pub(crate) mod solidity;
 /// language, `extraction_gaps` charges every one of its files `ImportBlind`, and
 /// `unwired_candidates` excludes them and says how many. The registry and this
 /// dispatcher are checked against each other in both directions by
-/// `language_import_capabilities.rs`, so a module added without its flag — or a
+/// `tests/language_capabilities.rs`, so a module added without its flag — or a
 /// flag added without its module — fails the build rather than quietly
 /// producing an answer nobody can account for.
 pub(crate) fn extract_imports(

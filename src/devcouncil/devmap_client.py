@@ -261,7 +261,9 @@ def _norm_repo_path(path: str) -> str:
     Matches ``devcouncil.indexing.wiring._norm`` exactly. Not imported from
     there because this module sits below ``indexing`` in the dependency order
     and must stay importable without it; the rule is two lines and frozen by
-    ``test_symbol_is_reached.py``, which asserts the two agree.
+    ``tests/unit/test_dead_symbol_reach.py``'s
+    ``test_the_hand_copied_normaliser_answers_what_wiring_answers``, which
+    runs both over the same paths and asserts the answers agree.
     """
     normalized = path.replace("\\", "/")
     while normalized.startswith("./"):

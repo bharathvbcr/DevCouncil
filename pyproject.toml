@@ -103,14 +103,16 @@ testpaths = ["tests"]
 # type: `npm-publish.yml`, `codeintel-platform.yml` and
 # `devcouncil-evidence.yml` all run it, while `ci.yml` runs `coverage run -m
 # pytest` and so collected a different set from the other three.
-# `tests/unit/test_suite_collection.py` and
-# `tests/unit/test_collection_is_entry_point_independent.py` hold this.
+# `tests/unit/test_suite_collection.py` holds this, in three parts: the setting
+# itself, the eighteen package-importing modules, and
+# `test_both_entry_points_collect_the_same_count`, which runs both entry points
+# and compares what each collected.
 #
-# The alternative — adding `tests/__init__.py` — also works, and was not taken:
-# it moves every module's import name from `unit.test_x` to `tests.unit.test_x`
-# for the three directories that have an `__init__.py` and leaves
-# `tests/integration`, `tests/stress` and `tests/benchmarks` where they are,
-# which is a larger change to how modules are named than the defect warrants.
+# The alternative — adding an `__init__.py` under tests/ — also works, and was
+# not taken: it moves every module's import name from `unit.test_x` to
+# `tests.unit.test_x` for the three directories that have an `__init__.py`, and
+# leaves `tests/integration`, `tests/stress` and `tests/benchmarks` where they
+# are — a larger change to how modules are named than the defect warrants.
 pythonpath = ["src", "."]
 
 [tool.coverage.run]
