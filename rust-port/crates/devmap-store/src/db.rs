@@ -408,6 +408,18 @@ pub struct Store {
     /// `.writer.lock`. `None` for an in-memory store, which no other process
     /// can reach and therefore has nothing to serialise against.
     db_path: Option<std::path::PathBuf>,
+    /// Whether this process can write the store at all.
+    ///
+    /// A store on a read-only mount, in a CI cache restored without write
+    /// bits, or `chmod 444`'d by an operator is an ordinary store that can be
+    /// *read*. SQLite opens such a file read-only without complaint and only
+    /// fails at the first write — which, before this flag existed, was a
+    /// header rewrite in [`Store::configure_connection`], so every query
+    /// refused with "attempt to write a readonly database" and a readable map
+    /// looked like no map at all. Recorded once at open so a write can be
+    /// refused by name ([`Store::refuse_if_read_only`]) instead of by SQLite
+    /// error code.
+    read_only: bool,
     /// The latest generation's full edge set, kept for the life of that
     /// generation.
     ///
@@ -1259,7 +1271,19 @@ impl Store {
         // it sits in `configure_connection` — called before `migrate` creates
         // the schema. On an existing mode-NONE store the statement is accepted
         // and ignored; that store is converted on its next full vacuum instead.
-        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        // Read before set. Setting `auto_vacuum` rewrites the database header
+        // even when the mode is already the one being set — measured with the
+        // sqlite3 shell on a `chmod 444` store: every other pragma here is
+        // silent, this one fails with "attempt to write a readonly database
+        // (8)". A store this process can only read must not be refused by its
+        // own open, so the write happens only when the mode actually differs;
+        // and a read-only store whose mode differs keeps its mode, because
+        // reclaim is the only thing that mode serves and reclaim is a write.
+        const INCREMENTAL: i64 = 2;
+        let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+        if auto_vacuum != INCREMENTAL && !conn.is_readonly(rusqlite::DatabaseName::Main)? {
+            conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        }
         Ok(())
     }
 
@@ -1280,6 +1304,14 @@ impl Store {
     /// attribute to this.
     fn enable_wal(conn: &Connection) -> Result<()> {
         const ATTEMPTS: usize = 10;
+        // Switching the journal mode is a write. A read-only store is read in
+        // whatever mode it was left in — WAL if the writer finished cleanly,
+        // rollback-journal otherwise — and both serve reads; retrying the
+        // switch would spend the whole back-off below to report a mode this
+        // process could never change.
+        if conn.is_readonly(rusqlite::DatabaseName::Main)? {
+            return Ok(());
+        }
         let mut last: Option<rusqlite::Error> = None;
         for attempt in 0..ATTEMPTS {
             match conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
@@ -1782,14 +1814,44 @@ impl Store {
         // This can only refuse, never admit: `migrate` re-reads the version
         // itself, under the write lock, so a store migrated by another process
         // between these two reads is still handled there.
-        let stamped: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let stamped: i32 = match conn.query_row("PRAGMA user_version", [], |row| row.get(0)) {
+            Ok(stamped) => stamped,
+            // A WAL-mode store in a directory this process cannot write has no
+            // `-shm` and no way to create one, so even the first read fails
+            // with `SQLITE_READONLY_DIRECTORY`. SQLite's documented answer for
+            // that shape is an *immutable* read-only open: nothing can be
+            // writing a file in a directory nobody can write to, so the shared
+            // memory the WAL index needs can live in this process alone. Only
+            // taken for a file that exists — a missing store in a read-only
+            // directory is a missing store, and creating one is impossible
+            // rather than immutable.
+            Err(error) if path.is_file() && Self::directory_refused_the_wal(&error) => {
+                conn = Self::open_immutable(path)?;
+                conn.query_row("PRAGMA user_version", [], |row| row.get(0))?
+            }
+            Err(error) => return Err(error),
+        };
         if !Self::schema_is_migratable(stamped) {
             return Err(Self::unsupported_schema(&store, stamped));
+        }
+        let read_only = conn.is_readonly(rusqlite::DatabaseName::Main)?;
+        if read_only && stamped != CURRENT_SCHEMA_VERSION {
+            // Migration is a write. A read-only store at an older schema can
+            // neither be migrated nor, with the columns this kernel reads
+            // missing, be answered from; say which, rather than letting the
+            // first `ALTER TABLE` report a bare SQLite code.
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "devmap store {store} is read-only and at schema {stamped}, which this kernel \
+                 (schema {CURRENT_SCHEMA_VERSION}) would have to migrate before reading; make \
+                 it writable and run `devmap build`, or rebuild it elsewhere"
+            )));
         }
 
         Self::configure_connection(&conn)?;
         Self::enable_wal(&conn)?;
-        Self::migrate(&mut conn, &store)?;
+        if !read_only {
+            Self::migrate(&mut conn, &store)?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             edge_cache: Mutex::new(None),
@@ -1797,7 +1859,69 @@ impl Store {
             generation_counts: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
+            read_only,
         })
+    }
+
+    /// `SQLITE_READONLY_DIRECTORY`: the database is read-only because the
+    /// directory holding it is, so the `-shm` a WAL read needs cannot be made.
+    /// Spelled out because `libsqlite3-sys` exposes the extended codes as bare
+    /// integers, and this is the one [`Store::open`] must tell apart from every
+    /// other read-only failure.
+    const SQLITE_READONLY_DIRECTORY: i32 = 1544;
+
+    fn directory_refused_the_wal(error: &rusqlite::Error) -> bool {
+        matches!(
+            error,
+            rusqlite::Error::SqliteFailure(failure, _)
+                if failure.extended_code == Self::SQLITE_READONLY_DIRECTORY
+        )
+    }
+
+    /// Open `path` read-only and immutable, for a store in a directory this
+    /// process cannot write. See the fallback in [`Store::open`].
+    fn open_immutable(path: &Path) -> Result<Connection> {
+        // A URI filename: `%`, `?` and `#` in the path would be read as URI
+        // syntax, so they are percent-encoded — the only three characters the
+        // SQLite URI grammar reserves inside the path component.
+        let mut encoded = String::with_capacity(path.as_os_str().len() + 8);
+        for byte in path.to_string_lossy().bytes() {
+            match byte {
+                b'%' => encoded.push_str("%25"),
+                b'?' => encoded.push_str("%3F"),
+                b'#' => encoded.push_str("%23"),
+                other => encoded.push(other as char),
+            }
+        }
+        Connection::open_with_flags(
+            format!("file:{encoded}?immutable=1"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+    }
+
+    /// Whether this store can only be read. See the `read_only` field.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// The one place a write against a read-only store is refused, so the
+    /// refusal is the same sentence from every writer and names the store
+    /// rather than an SQLite error code.
+    fn refuse_if_read_only(&self) -> Result<()> {
+        if !self.read_only {
+            return Ok(());
+        }
+        let store = self
+            .db_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| ":memory:".to_string());
+        Err(rusqlite::Error::InvalidParameterName(format!(
+            "devmap store {store} is read-only: the file or its directory is not writable by \
+             this process, so it can be queried but not rebuilt"
+        )))
     }
 
     /// The file this store was opened from, or `None` for an in-memory store.
@@ -2008,6 +2132,7 @@ impl Store {
             generation_counts: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
             db_path: None,
+            read_only: false,
         })
     }
 
@@ -2088,6 +2213,7 @@ impl Store {
     /// normalisation and no containment check, which is exactly what made the
     /// queue rot: see K1 on `enqueue_pending_paths_under_root`.
     pub fn enqueue_pending_paths(&self, paths: &[String]) -> Result<()> {
+        self.refuse_if_read_only()?;
         let now = Self::now_secs();
         let conn = lock_conn(&self.conn)?;
         let tx = conn.unchecked_transaction()?;
@@ -2543,6 +2669,7 @@ impl Store {
         opts: GenerationWriteOpts,
         head_sha: &str,
     ) -> Result<u32> {
+        self.refuse_if_read_only()?;
         if head_sha.is_empty() || head_sha.len() > 128 || head_sha.chars().any(char::is_whitespace)
         {
             return Err(rusqlite::Error::InvalidParameterName(
