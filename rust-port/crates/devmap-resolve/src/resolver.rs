@@ -755,14 +755,38 @@ impl Resolver {
                         // `import "strings"`, `import react from "react"`. The
                         // local name is the package handle, so a later
                         // `strings.TrimSpace` can be recognised by its receiver.
-                        let local = alias.map(str::to_string).unwrap_or_else(|| {
-                            Self::import_local_name(&ext.language, &imp.module_specifier)
-                        });
+                        //
+                        // `.` is not a handle — it is the marker for "bind
+                        // everything this module exports", so a glob whose
+                        // module resolved to nothing must fall back to the
+                        // specifier's own last segment. Keying `external_imports`
+                        // under `"."` would file the evidence under a name no
+                        // call site can ever mention.
+                        let local = alias
+                            .filter(|alias| *alias != ".")
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                Self::import_local_name(&ext.language, &imp.module_specifier)
+                            });
                         unresolved_import(local, &imp.module_specifier);
                         continue;
                     };
                     if alias == Some(".") {
                         for file in &targets {
+                            // X41. A glob of the file's *own* module —
+                            // `mod tests { use super::*; }` — is skipped, and
+                            // not as an optimisation. `import_bindings` is
+                            // per-file and rung 2a consults it with **no scope
+                            // test**, so binding every symbol of this file into
+                            // it would let a bare `run()` anywhere in the file
+                            // reach `class C: def run(self)` at DETERMINISTIC —
+                            // the fabricated-caller defect rung 2c's
+                            // `bare_name_is_in_scope` exists to stop. The
+                            // same-file rungs already reach everything this
+                            // binding could, and they apply that test.
+                            if file == &ext.file_path {
+                                continue;
+                            }
                             if let Some(syms) = self.file_symbols.get(file) {
                                 for name in syms {
                                     file_bindings
@@ -1111,6 +1135,19 @@ impl Resolver {
                         targets
                     };
                     for target_f in edge_targets {
+                        // X41. An import that names the file it is written in
+                        // is a real statement about the module tree — `mod
+                        // tests { use super::*; }` — and not a dependency
+                        // between files. `langimports/rust.rs` already declines
+                        // to emit one for the `mod` half of the same fact, for
+                        // the same reason: "emitting an import for it would be
+                        // an edge from a file to itself". The import is still
+                        // *resolved*, so it stops being recorded as an
+                        // unresolved relative import; only the self-loop is
+                        // withheld.
+                        if target_f == ext.file_path {
+                            continue;
+                        }
                         edges.push(ResolvedEdge::resolved(
                             ext.file_path.clone(),
                             target_f.clone(),
@@ -1826,10 +1863,88 @@ impl Resolver {
         crate::importpath::normalize_rel(base_dir, spec)
     }
 
+    /// The directories a Rust module's children can live in, best first.
+    ///
+    /// `src/lib.rs` and `src/deep/mod.rs` keep their children in their own
+    /// directory; `src/deep/leaf.rs` keeps them in `src/deep/leaf/`. The second
+    /// is the rule the module system states and the one this resolver never
+    /// applied — it used the file's directory for both, so `super::sibling`
+    /// written in `src/deep/leaf.rs` probed `src/sibling.rs` when the statement
+    /// names `src/deep/sibling.rs`.
+    ///
+    /// Both readings are returned rather than one chosen, because "is this file
+    /// a crate root" is not decidable from its path: `lib.rs` and `main.rs` are,
+    /// and so is every file directly under `tests/`, `benches/`, `examples/` and
+    /// `src/bin/` — a list that goes stale against Cargo's auto-discovery and
+    /// against a hand-written `[[test]] path = …`. The module-system reading is
+    /// tried first and the indexed file universe decides; neither can invent a
+    /// file that is not there, so the worst case is the answer this rung gave
+    /// before.
+    fn rust_module_dirs(file: &str) -> Vec<String> {
+        let dir = Self::parent_dir(file);
+        let stem = file
+            .rsplit('/')
+            .next()
+            .unwrap_or(file)
+            .strip_suffix(".rs")
+            .unwrap_or_default();
+        // A directory module's file: its children are its siblings, not its
+        // descendants.
+        if stem.is_empty() || matches!(stem, "mod" | "lib" | "main") {
+            return vec![dir];
+        }
+        let nested = if dir.is_empty() {
+            stem.to_string()
+        } else {
+            format!("{dir}/{stem}")
+        };
+        if nested == dir {
+            vec![dir]
+        } else {
+            vec![nested, dir]
+        }
+    }
+
+    /// The source root of the crate `file` belongs to — what `crate::` is
+    /// relative to.
+    ///
+    /// The longest ancestor path whose last component is `src`. Cargo requires
+    /// a crate's root to be `src/lib.rs` or `src/main.rs` (or a path named in
+    /// the manifest), so the innermost `src` above a file is its crate's root
+    /// in every layout this resolver can be pointed at, single-crate and
+    /// workspace alike.
+    ///
+    /// Falls back to the literal `src`, which is what this rung probed
+    /// unconditionally before: a file with no `src` ancestor — `build.rs`, a
+    /// `tests/` integration crate, a bare script — keeps exactly the behaviour
+    /// it had rather than gaining a guess.
+    fn rust_crate_src_root(file: &str) -> String {
+        let mut components: Vec<&str> = file.split('/').collect();
+        components.pop();
+        while let Some(last) = components.last() {
+            if *last == "src" {
+                return components.join("/");
+            }
+            components.pop();
+        }
+        "src".to_string()
+    }
+
     fn import_local_name(lang: &str, specifier: &str) -> String {
         if lang == "go" {
             specifier
                 .rsplit('/')
+                .next()
+                .unwrap_or(specifier)
+                .to_string()
+        } else if lang == "rust" {
+            // Rust's path separator is `::`, and splitting on `.` returns the
+            // whole specifier — so `use serde_json::*;` used to record its
+            // module handle as the literal `"serde_json::*"`, a name no call
+            // site can mention. Nothing depended on that before X41 because no
+            // Rust `use` reached this function with a real path at all.
+            specifier
+                .rsplit("::")
                 .next()
                 .unwrap_or(specifier)
                 .to_string()
@@ -2540,15 +2655,63 @@ impl Resolver {
             }
         }
 
+        // X41. `use` now arrives here as a real module path, so the three
+        // module roots it can name have to be answerable **bare** as well as
+        // prefixed: `use super::*;` inside `mod tests { … }` is rewritten by
+        // the extractor to the bare `self`, naming the file it is written in.
+        if lang == "rust" {
+            if clean_spec == "self" {
+                return self
+                    .file_symbols
+                    .contains_key(current_file)
+                    .then(|| current_file.to_string());
+            }
+            if clean_spec == "crate" {
+                let root = Self::rust_crate_src_root(current_file);
+                for candidate in [format!("{root}/lib.rs"), format!("{root}/main.rs")] {
+                    if self.file_symbols.contains_key(&candidate) {
+                        return Some(candidate);
+                    }
+                }
+            }
+            // The parent module *as a file*: `src/deep/leaf.rs` is `deep::leaf`,
+            // so its `super` is `deep`, which lives in `src/deep/mod.rs` or
+            // `src/deep.rs`.
+            if clean_spec == "super" {
+                for module_dir in Self::rust_module_dirs(current_file)
+                    .iter()
+                    .map(|module_dir| Self::parent_dir(module_dir))
+                {
+                    for candidate in [
+                        format!("{module_dir}/mod.rs"),
+                        format!("{module_dir}.rs"),
+                        format!("{module_dir}/lib.rs"),
+                        format!("{module_dir}/main.rs"),
+                    ] {
+                        if self.file_symbols.contains_key(&candidate) {
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+
         if lang == "rust" && clean_spec.starts_with("crate::") {
             let crate_tail = clean_spec.strip_prefix("crate::")?;
+            // The **crate's** source root, not the repository's. `crate::` is
+            // relative to the crate the file belongs to, and a workspace puts
+            // that at `crates/<name>/src`, so probing a literal `src/…` from
+            // the tree root answered nothing for every workspace member. That
+            // is why this repository produced no `Imports` edge at all for the
+            // hundreds of `use crate::…` lines in its own kernel.
+            let root = Self::rust_crate_src_root(current_file);
             let mut parts: Vec<&str> = crate_tail.split("::").collect();
             self.trim_to_indexed_depth(&mut parts);
             while !parts.is_empty() {
                 let rust_path = parts.join("/");
                 let candidates = [
-                    format!("src/{}.rs", rust_path),
-                    format!("src/{}/mod.rs", rust_path),
+                    format!("{root}/{rust_path}.rs"),
+                    format!("{root}/{rust_path}/mod.rs"),
                 ];
                 for cand in &candidates {
                     if self.file_symbols.contains_key(cand) {
@@ -2561,31 +2724,46 @@ impl Resolver {
 
         if lang == "rust" && (clean_spec.starts_with("self::") || clean_spec.starts_with("super::"))
         {
-            let mut module_dir = dir.clone();
             let mut tail = clean_spec;
+            let mut hops = 0usize;
             if let Some(stripped) = tail.strip_prefix("self::") {
                 tail = stripped;
             } else {
                 while let Some(stripped) = tail.strip_prefix("super::") {
-                    module_dir = Self::parent_dir(&module_dir);
+                    hops += 1;
                     tail = stripped;
                 }
             }
             let mut parts: Vec<&str> = tail.split("::").collect();
             self.trim_to_indexed_depth(&mut parts);
+            // Both readings of "where does this module keep its children", best
+            // first — see `rust_module_dirs`. Each `super::` walks one directory
+            // up from whichever base is being tried.
+            let bases: Vec<String> = Self::rust_module_dirs(current_file)
+                .into_iter()
+                .map(|mut module_dir| {
+                    for _ in 0..hops {
+                        module_dir = Self::parent_dir(&module_dir);
+                    }
+                    module_dir
+                })
+                .collect();
             while !parts.is_empty() {
                 let module_path = parts.join("/");
-                let base = Self::normalize_rel(&module_dir, &module_path);
-                // `base` itself, before the two conventional forms: a
-                // `#[path = "generated/tables.rs"] mod tables;` reaches this
-                // rung as `self::generated/tables.rs`, and the extension is
-                // already on it. Appending `.rs` to a path that has one probes
-                // `tables.rs.rs` and finds nothing — which is precisely the
-                // case the attribute exists to declare, so failing it would
-                // leave the real file reported as imported by nothing.
-                for candidate in [base.clone(), format!("{base}.rs"), format!("{base}/mod.rs")] {
-                    if self.file_symbols.contains_key(&candidate) {
-                        return Some(candidate);
+                for module_dir in &bases {
+                    let base = Self::normalize_rel(module_dir, &module_path);
+                    // `base` itself, before the two conventional forms: a
+                    // `#[path = "generated/tables.rs"] mod tables;` reaches this
+                    // rung as `self::generated/tables.rs`, and the extension is
+                    // already on it. Appending `.rs` to a path that has one probes
+                    // `tables.rs.rs` and finds nothing — which is precisely the
+                    // case the attribute exists to declare, so failing it would
+                    // leave the real file reported as imported by nothing.
+                    for candidate in [base.clone(), format!("{base}.rs"), format!("{base}/mod.rs")]
+                    {
+                        if self.file_symbols.contains_key(&candidate) {
+                            return Some(candidate);
+                        }
                     }
                 }
                 parts.pop();

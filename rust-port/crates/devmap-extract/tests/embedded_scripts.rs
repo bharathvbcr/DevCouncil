@@ -640,8 +640,14 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // `references` loses the inferred-type placeholder `_`, so a v33 row still
     // holds one per turbofish argument. Both feed the unresolved classifier,
     // and a stale row makes it answer with the old tier while looking fresh.
+    //
+    // v35 is the subtractive kind again: a v34 row for a `.rs` file carries
+    // one import per `use` whose module specifier is the statement's own
+    // source text, which matches no file and binds no name. Served warm, it
+    // reports zero `Imports` edges and zero `External` classifications for
+    // every Rust file, and both look like findings rather than stale rows.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "34",
+        EXTRACTION_SCHEMA_VERSION, "35",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

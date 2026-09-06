@@ -235,7 +235,15 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// turbofish argument, each of which resolves to nothing by construction.
 /// Reusing either would leave a warm cache reporting the old classification
 /// with no sign that it is the old one.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "34";
+///
+/// v35 (X41) changes what a Rust `use` statement contributes. A v34 row for a
+/// `.rs` file carries one import per statement whose `module_specifier` is the
+/// statement's own source text (`"tree_sitter::{Language, Node, Parser}"`) and
+/// whose `imported_names` is empty — a specifier that matches no file and binds
+/// no name. The rows are not merely thinner: they are the shape that made every
+/// `.rs` file in a warm cache report zero `Imports` edges and zero `External`
+/// classifications while looking completely indexed.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "35";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

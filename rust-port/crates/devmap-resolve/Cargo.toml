@@ -68,3 +68,7 @@ required-features = ["parse"]
 [[test]]
 name = "type_position_classification"
 required-features = ["parse"]
+
+[[test]]
+name = "rust_module_paths"
+required-features = ["parse"]

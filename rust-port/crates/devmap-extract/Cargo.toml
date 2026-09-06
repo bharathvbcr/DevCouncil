@@ -242,3 +242,7 @@ required-features = ["parse"]
 [[test]]
 name = "liquid_script_scanner_limits"
 required-features = ["parse"]
+
+[[test]]
+name = "rust_use_declarations"
+required-features = ["parse"]

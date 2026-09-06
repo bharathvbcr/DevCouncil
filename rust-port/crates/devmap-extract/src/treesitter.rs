@@ -3053,21 +3053,7 @@ fn extract_node(
             // Emitting them here as well produced the same method twice.
             "impl_item" => {}
             "use_declaration" => {
-                let text = get_node_text(node, source);
-                let spec = text
-                    .trim_start_matches("pub ")
-                    .trim_start_matches("use ")
-                    .trim_end_matches(';')
-                    .trim()
-                    .to_string();
-                imports.push(ExtractedImport {
-                    raw_import: text,
-                    module_specifier: spec,
-                    imported_names: vec![],
-                    local_names: vec![],
-                    alias: None,
-                    span,
-                });
+                rust_use_imports(node, source, span, imports);
             }
             "call_expression" => {
                 if let Some(f) = node.child_by_field_name("function") {
@@ -4667,6 +4653,279 @@ fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// One leaf of a `use` tree: the module it comes from and the name it binds.
+struct RustUseLeaf {
+    /// The path segments before the imported name — `["std", "collections"]`
+    /// for `std::collections::BTreeMap`.
+    module: Vec<String>,
+    /// The name imported from that module, or `None` for a glob.
+    name: Option<String>,
+    /// The local binding, when `as` renamed it.
+    alias: Option<String>,
+}
+
+/// How deeply a `use` tree may nest before recovery stops.
+///
+/// A `use` group is a tree and this walk recurses per level, so an adversarially
+/// nested statement is a stack-overflow shape — the same reason
+/// [`rust_type_name`] is bounded. There is deliberately **no cap on the number
+/// of leaves**: leaves cost source bytes, which `MAX_SOURCE_BYTES` already
+/// bounds, and a leaf cap would silently truncate an import list — presenting a
+/// capped sample as the file's complete set of imports, which is exactly the
+/// shape that makes "nothing imports this" mean two different things.
+const RUST_USE_MAX_DEPTH: usize = 32;
+
+/// The path segments of a `use` path node, appended to `out`.
+///
+/// Returns `false` for a node shape this does not recognise, and the caller
+/// abandons the leaf rather than recording a partial path — half a module path
+/// resolves to a *different* module, which is worse than not resolving.
+fn rust_path_segments(node: Node, source: &str, depth: usize, out: &mut Vec<String>) -> bool {
+    if depth > RUST_USE_MAX_DEPTH {
+        return false;
+    }
+    match node.kind() {
+        "scoped_identifier" | "scoped_type_identifier" => {
+            if let Some(path) = node.child_by_field_name("path") {
+                if !rust_path_segments(path, source, depth + 1, out) {
+                    return false;
+                }
+            }
+            match node.child_by_field_name("name") {
+                Some(name) => rust_path_segments(name, source, depth + 1, out),
+                None => false,
+            }
+        }
+        "identifier" | "type_identifier" | "primitive_type" | "super" | "crate" | "self"
+        | "metavariable" => {
+            let text = get_node_text(node, source);
+            if text.is_empty() {
+                return false;
+            }
+            out.push(text);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Flatten a `use` tree into one leaf per name it binds.
+fn collect_rust_use_leaves(
+    node: Node,
+    source: &str,
+    prefix: &[String],
+    depth: usize,
+    out: &mut Vec<RustUseLeaf>,
+) {
+    if depth > RUST_USE_MAX_DEPTH {
+        return;
+    }
+    match node.kind() {
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_rust_use_leaves(child, source, prefix, depth + 1, out);
+            }
+        }
+        "scoped_use_list" => {
+            let mut nested = prefix.to_vec();
+            if let Some(path) = node.child_by_field_name("path") {
+                if !rust_path_segments(path, source, 0, &mut nested) {
+                    return;
+                }
+            }
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_rust_use_leaves(list, source, &nested, depth + 1, out);
+            }
+        }
+        "use_as_clause" => {
+            let mut segments = prefix.to_vec();
+            let Some(path) = node.child_by_field_name("path") else {
+                return;
+            };
+            if !rust_path_segments(path, source, 0, &mut segments) {
+                return;
+            }
+            let alias = node
+                .child_by_field_name("alias")
+                .map(|child| get_node_text(child, source))
+                .filter(|alias| !alias.is_empty());
+            if let Some(name) = segments.pop() {
+                out.push(RustUseLeaf {
+                    module: segments,
+                    name: Some(name),
+                    alias,
+                });
+            }
+        }
+        "use_wildcard" => {
+            let mut segments = prefix.to_vec();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if !rust_path_segments(child, source, 0, &mut segments) {
+                    return;
+                }
+            }
+            out.push(RustUseLeaf {
+                module: segments,
+                name: None,
+                alias: None,
+            });
+        }
+        _ => {
+            let mut segments = prefix.to_vec();
+            if !rust_path_segments(node, source, 0, &mut segments) {
+                return;
+            }
+            if let Some(name) = segments.pop() {
+                out.push(RustUseLeaf {
+                    module: segments,
+                    name: Some(name),
+                    alias: None,
+                });
+            }
+        }
+    }
+}
+
+/// How many **inline** `mod { … }` blocks enclose this node.
+///
+/// Rust's `super` is relative to the module, not to the file, and an inline
+/// module is one module deeper without being one file deeper. `mod tests { use
+/// super::*; }` therefore names the *file it is written in*; the same statement
+/// at file level names the parent directory's module. This repository contains
+/// 87 of the first spelling and none of the resolver's rungs could tell them
+/// apart.
+fn rust_inline_module_depth(node: Node) -> usize {
+    let mut depth = 0usize;
+    let mut current = bounded_parent(node);
+    while let Some(parent) = current {
+        if parent.kind() == "mod_item" && parent.child_by_field_name("body").is_some() {
+            depth += 1;
+        }
+        current = bounded_parent(parent);
+    }
+    depth
+}
+
+/// The module specifier a leaf's path denotes, with `super` resolved against
+/// the inline-module nesting it was written inside.
+///
+/// `super` spent against an inline module does not leave the file, so once the
+/// nesting is used up the target is this file — spelled `self`, which the
+/// resolver reads as "the file this import is written in".
+///
+/// Known limit, stated rather than papered over: where the nesting absorbs every
+/// `super` and segments remain (`mod tests { use super::helpers::thing; }`),
+/// the remainder is emitted as `self::helpers`, which resolves to a sibling
+/// *file* module. That is right when `helpers` is `mod helpers;` and wrong when
+/// it is `mod helpers { … }` in this same file — and telling those apart needs
+/// the file's own inline-module table, which this function does not have. The
+/// wrong case resolves to nothing, which is where it already sat.
+fn rust_use_specifier(module: &[String], inline_depth: usize) -> String {
+    let leading_super = module
+        .iter()
+        .take_while(|segment| *segment == "super")
+        .count();
+    let spent = leading_super.min(inline_depth);
+    let remaining = leading_super - spent;
+    let mut segments: Vec<&str> = Vec::with_capacity(module.len());
+    if leading_super > 0 && remaining == 0 {
+        segments.push("self");
+    } else {
+        segments.extend(std::iter::repeat_n("super", remaining));
+    }
+    segments.extend(module[leading_super..].iter().map(String::as_str));
+    segments.join("::")
+}
+
+/// Read a `use_declaration` into one [`ExtractedImport`] per module it names.
+///
+/// The arm this replaces stored the statement's own text as the module
+/// specifier: `use tree_sitter::{Language, Node, Parser};` became one import
+/// whose module was the literal string `"tree_sitter::{Language, Node,
+/// Parser}"`, with an empty `imported_names`. Both fields are what every
+/// consumer of an import reads, so nothing downstream worked at all — measured
+/// on this repository, no `.rs` file produced a single `Imports` edge and
+/// `UnresolvedClass::External` never fired once for Rust, while the same ladder
+/// produced 8,734 External rows for Python from the same evidence shape.
+///
+/// A glob is emitted as the `.` alias rather than as a name. That spelling
+/// already exists for Go's dot-import and means exactly this — bind everything
+/// this module exports — so the resolver needs no second rung for it.
+fn rust_use_imports(
+    node: Node,
+    source: &str,
+    span: Span,
+    imports: &mut Vec<ExtractedImport>,
+) -> Option<()> {
+    let raw = get_node_text(node, source);
+    let argument = node.child_by_field_name("argument")?;
+    let inline_depth = rust_inline_module_depth(node);
+    let mut leaves: Vec<RustUseLeaf> = Vec::new();
+    collect_rust_use_leaves(argument, source, &[], 0, &mut leaves);
+
+    // Grouped by module so `use std::{fmt, io}` is one import of `std` naming
+    // two symbols, the shape every other language's extractor produces. Ordered
+    // by module for determinism (R4); names keep source order within a module.
+    let mut named: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
+    let mut whole_module: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for leaf in leaves {
+        // `use serde;` and `use super::{self, thing};` import the module
+        // itself, not a name out of it.
+        let names_the_module = leaf.module.is_empty() || leaf.name.as_deref() == Some("self");
+        if names_the_module {
+            let mut module = leaf.module.clone();
+            if leaf.name.as_deref() != Some("self") {
+                if let Some(name) = leaf.name.clone() {
+                    module.push(name);
+                }
+            }
+            if module.is_empty() {
+                continue;
+            }
+            whole_module.insert(rust_use_specifier(&module, inline_depth), leaf.alias);
+            continue;
+        }
+        let specifier = rust_use_specifier(&leaf.module, inline_depth);
+        match leaf.name {
+            // A glob binds the module's whole surface, which is what the
+            // resolver's `.` alias means.
+            None => {
+                whole_module.insert(specifier, Some(".".to_string()));
+            }
+            Some(name) => {
+                let local = leaf.alias.unwrap_or_else(|| name.clone());
+                let entry = named.entry(specifier).or_default();
+                entry.0.push(name);
+                entry.1.push(local);
+            }
+        }
+    }
+
+    for (specifier, (imported_names, local_names)) in named {
+        imports.push(ExtractedImport {
+            raw_import: raw.clone(),
+            module_specifier: specifier,
+            imported_names,
+            local_names,
+            alias: None,
+            span: span.clone(),
+        });
+    }
+    for (specifier, alias) in whole_module {
+        imports.push(ExtractedImport {
+            raw_import: raw.clone(),
+            module_specifier: specifier,
+            imported_names: vec![],
+            local_names: vec![],
+            alias,
+            span: span.clone(),
+        });
+    }
+    Some(())
 }
 
 /// Parameter name → declared type, for languages whose parameters carry one.
@@ -6907,11 +7166,17 @@ mod tests {
                 "rust",
                 "use std::collections::BTreeMap;\nuse crate::thing::{One, Two as Three};\n                 pub use inner::Exported;\n",
                 vec![
-                    ("std::collections::BTreeMap", vec![], vec![], None),
-                    // Grouped `use` is recorded as its raw specifier rather than
-                    // split into names; pinned as current behavior, not intent.
-                    ("crate::thing::{One, Two as Three}", vec![], vec![], None),
-                    ("inner::Exported", vec![], vec![], None),
+                    // X41. Each `use` names a module and the names it takes out
+                    // of it, the shape every other grammar here produces. This
+                    // expectation used to read
+                    // `("crate::thing::{One, Two as Three}", [], [], None)` and
+                    // said so in a comment — "pinned as current behavior, not
+                    // intent". The intent is this: a module specifier that is
+                    // the statement's own source text matches no file and binds
+                    // no name, so nothing downstream could use it.
+                    ("std::collections", vec!["BTreeMap"], vec!["BTreeMap"], None),
+                    ("crate::thing", vec!["One", "Two"], vec!["One", "Three"], None),
+                    ("inner", vec!["Exported"], vec!["Exported"], None),
                 ],
                 vec!["f.rs"],
             ),
