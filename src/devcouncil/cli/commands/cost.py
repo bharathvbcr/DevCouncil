@@ -11,7 +11,27 @@ from devcouncil.telemetry.stages import log_stage, log_step
 
 app = typer.Typer(help="Inspect DevCouncil model-call cost, grouped by task and run.")
 console = Console()
+# Diagnostics go to stderr unconditionally — same split as `dev map`/`dev graph`/`dev debug`.
+# Routing them here rather than behind an `if not json_format` guard makes the `--json`
+# contract (exactly one JSON object on stdout) structural: a confirmation line physically
+# cannot reach stdout, so a future call site cannot reintroduce the leak by forgetting
+# the flag.
+status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
+
+
+def _budget_error(json_format: bool, message: str, *, code: int) -> typer.Exit:
+    """Report a `dev cost budget` pre-flight failure and build its exit signal.
+
+    An error path is still a `--json` path: emitting nothing leaves zero JSON objects on
+    stdout, which violates the one-object contract exactly as a stray banner does. The
+    payload mirrors `dev verify`'s ``{"ok": false, "error": ...}`` shape so a parser can
+    branch on one key regardless of which command failed.
+    """
+    status_console.print(f"[red]{message}[/red]")
+    if json_format:
+        typer.echo(dump_json({"ok": False, "error": message}, indent=2))
+    return typer.Exit(code=code)
 
 
 @app.command("show")
@@ -92,8 +112,7 @@ def budget(
     logger.info("dev cost budget: set=%s clear=%s json=%s", set_value, clear, json_format)
 
     if set_value is not None and clear:
-        console.print("[red]Use either --set or --clear, not both.[/red]")
-        raise typer.Exit(code=2)
+        raise _budget_error(json_format, "Use either --set or --clear, not both.", code=2)
 
     with log_stage("cost", project_root=root, subcommand="budget"):
         if set_value is not None or clear:
@@ -101,11 +120,13 @@ def budget(
 
             config_path = root / ".devcouncil" / "config.yaml"
             if not config_path.exists():
-                console.print(f"[red]Config not found at {config_path}. Run 'dev init' first.[/red]")
-                raise typer.Exit(code=1)
+                raise _budget_error(
+                    json_format, f"Config not found at {config_path}. Run 'dev init' first.", code=1
+                )
             if set_value is not None and set_value <= 0:
-                console.print("[red]--set expects a positive USD amount (e.g. --set 5.00).[/red]")
-                raise typer.Exit(code=2)
+                raise _budget_error(
+                    json_format, "--set expects a positive USD amount (e.g. --set 5.00).", code=2
+                )
 
             log_step("cost/1: updating telemetry.cost_budget_usd", project_root=root, trace=True)
             with open(config_path, encoding="utf-8") as f:
@@ -121,9 +142,9 @@ def budget(
             with open(config_path, "w", encoding="utf-8") as f:
                 yaml.dump(raw_config, f, default_flow_style=False)
             if set_value is not None:
-                console.print(f"[green]Set telemetry.cost_budget_usd = {float(set_value):.2f}[/green]")
+                status_console.print(f"[green]Set telemetry.cost_budget_usd = {float(set_value):.2f}[/green]")
             else:
-                console.print("[green]Cleared telemetry.cost_budget_usd.[/green]")
+                status_console.print("[green]Cleared telemetry.cost_budget_usd.[/green]")
 
         log_step("cost/2: aggregating model-call ledger", project_root=root, trace=True)
         try:

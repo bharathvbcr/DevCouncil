@@ -179,3 +179,96 @@ def test_cost_budget_set_without_config_errors(tmp_path, monkeypatch):
 
     assert result.exit_code == 1
     assert "Config not found" in result.output
+
+
+# --- `--json` contract: exactly one JSON object on stdout, diagnostics on stderr ---
+#
+# These assert on `result.stdout`, never `result.output`. Under Click 8.4 `.output` is
+# the stdout+stderr streams merged, so it parses identically whether or not a banner
+# leaked onto stdout — it cannot detect this bug at all, which is why the pre-existing
+# tests above passed while `dev cost budget --json --set 5.00` emitted unparseable
+# stdout. `tests/e2e/test_json_stdout_contract.py` re-proves the same contract through a
+# real subprocess, where the streams are genuinely separate rather than emulated.
+
+
+def _init(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DEVCOUNCIL_LOG_DIR", raising=False)
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+
+def test_cost_budget_json_set_keeps_confirmation_off_stdout(tmp_path, monkeypatch):
+    _init(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["cost", "budget", "--json", "--set", "5.00"])
+
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["budget_usd"] == 5.0
+    assert "cost_budget_usd = 5.00" in result.stderr
+    assert "cost_budget_usd = 5.00" not in result.stdout
+
+
+def test_cost_budget_json_clear_keeps_confirmation_off_stdout(tmp_path, monkeypatch):
+    _init(tmp_path, monkeypatch)
+    assert runner.invoke(app, ["cost", "budget", "--set", "5.00"]).exit_code == 0
+
+    result = runner.invoke(app, ["cost", "budget", "--json", "--clear"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["budget_usd"] is None
+    assert "Cleared" in result.stderr
+    assert "Cleared" not in result.stdout
+
+
+def test_cost_budget_human_set_confirmation_is_a_diagnostic(tmp_path, monkeypatch):
+    """The confirmation is routed unconditionally, so human mode reports it on stderr too.
+
+    Both streams land on the same terminal, so this is invisible to an interactive user —
+    and it is what makes the contract structural rather than dependent on a flag check.
+    """
+    _init(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["cost", "budget", "--set", "5.00"])
+
+    assert result.exit_code == 0
+    assert "cost_budget_usd = 5.00" in result.stderr
+
+
+def test_cost_budget_json_set_and_clear_together_still_emits_one_object(tmp_path, monkeypatch):
+    """An error path is a `--json` path: zero objects on stdout breaks the contract too."""
+    _init(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["cost", "budget", "--json", "--set", "5.00", "--clear"])
+
+    assert result.exit_code == 2
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert "not both" in data["error"]
+    assert "not both" in result.stderr
+
+
+def test_cost_budget_json_non_positive_set_still_emits_one_object(tmp_path, monkeypatch):
+    _init(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["cost", "budget", "--json", "--set", "-1"])
+
+    assert result.exit_code == 2
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert "positive USD amount" in data["error"]
+
+
+def test_cost_budget_json_missing_config_still_emits_one_object(tmp_path, monkeypatch):
+    project = tmp_path / "empty"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app, ["cost", "budget", "--json", "--set", "5.00", "--project-root", str(project)]
+    )
+
+    assert result.exit_code == 1
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert "Config not found" in data["error"]
