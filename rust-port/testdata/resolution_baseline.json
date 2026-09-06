@@ -1,0 +1,13 @@
+{
+  "_comment": "W4.2 — per-language net call-resolution rate over the labelled fixtures, in permille. Frozen so a grammar bump that silently stops matching a node kind fails CI on the language it broke, which no golden identity fixture can catch. Regenerate with DEVMAP_UPDATE_RESOLUTION_BASELINE=1 cargo test -p devmap-analyze --test resolution_rate_baseline, and only after reading why the number moved.",
+  "_tolerance_permille": 10,
+  "_null_means": "The language extracts calls but this fixture contains no call site, so no rate was attempted. Not zero: a baseline of null and a current of 0 are different facts, and the test refuses to read either as the other.",
+  "fixtures": {
+    "go_app": { "go": 600 },
+    "liveness_truth": { "python": 1000 },
+    "python_app": { "python": 1000 },
+    "rust_app": { "rust": 235 },
+    "solidity_app": { "solidity": null },
+    "ts_app": { "typescript": 800 }
+  }
+}
