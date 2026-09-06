@@ -1349,3 +1349,210 @@ fn a_reader_never_answers_from_a_generation_another_process_pruned() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Class A again — an edge the reader could not resolve must not read as an
+// edge the generation never held.
+// ---------------------------------------------------------------------------
+
+/// A generation edge whose `paths` row is gone is a **refusal**, not a silent
+/// omission.
+///
+/// `latest_edges_uncached` reached the two file paths through
+/// `JOIN paths sp ON sp.id = e.source_file_id`. An inner join answers "this
+/// row's path is missing" by *dropping the row*, so a store that had lost a
+/// `paths` entry — a partial restore, a truncated copy, a foreign writer, a
+/// prune that ran against the wrong generation — served an edge set with holes
+/// in it under a successful status. Nothing in the result said so, and the
+/// holes then propagate as positive claims: `impact` reports a smaller blast
+/// radius, `dead` reports a called symbol as callerless, `deps` reports a
+/// dependency that exists as absent.
+///
+/// The same shape `edge_kind_from_stored` already refuses for an unknown edge
+/// kind, and the one Class A is named for: what a lookup that could not run
+/// returns must not be what a lookup that ran and found nothing returns.
+#[test]
+fn an_edge_whose_path_row_is_missing_is_refused_not_dropped() {
+    let dir = tmp_dir("orphan-path");
+    let db_path = dir.join("devmap.sqlite");
+    let before_len = {
+        let (extractions, resolution, analysis) = pipeline(&[
+            (
+                "src/lib.py",
+                "def target():\n    return 1\n\ndef caller():\n    return target()\n",
+            ),
+            (
+                "src/other.py",
+                "from src.lib import target\n\ndef second():\n    return target()\n",
+            ),
+        ]);
+        let store = Store::open(&db_path).unwrap();
+        store
+            .save_generation(&extractions, &resolution, &analysis)
+            .unwrap();
+        let before = store.latest_edges(0.0).expect("healthy read");
+        assert!(
+            before.len() >= 2,
+            "fixture is inert: {} edges, nothing to lose",
+            before.len()
+        );
+        before.len()
+    };
+
+    // Remove exactly one `paths` row that a generation edge names. Foreign keys
+    // are off for the surgery itself: this models the *state* a damaged store
+    // is in, not a write the kernel would ever make.
+    let orphaned: String = {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        let (id, path): (i64, String) = conn
+            .query_row(
+                "SELECT p.id, p.path FROM paths p
+                 WHERE p.id IN (SELECT source_file_id FROM generation_edges)
+                 ORDER BY p.id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("a path some edge names");
+        conn.execute("DELETE FROM paths WHERE id = ?1", [id])
+            .unwrap();
+        path
+    };
+
+    let store = Store::open(&db_path).expect("the store still opens");
+    match store.latest_edges(0.0) {
+        Err(error) => {
+            let text = error.to_string();
+            assert!(
+                text.contains("paths"),
+                "the refusal must name what is missing, not merely fail: {text}"
+            );
+        }
+        Ok(rows) => panic!(
+            "reading a generation whose `paths` row for {orphaned:?} is gone \
+             returned {} of {before_len} edges under a successful status. Every \
+             edge touching that path was dropped, and a dropped edge is \
+             indistinguishable from an edge the generation never held.",
+            rows.len()
+        ),
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The edge read order is still the one SQL produced, key for key.
+///
+/// `latest_edges_uncached` no longer asks SQLite to sort: the `ORDER BY` over
+/// two joined `paths` strings was `USE TEMP B-TREE FOR ORDER BY` across every
+/// row of the generation and ~72 ms of the ~133 ms a cold `devmap impact`
+/// spends arriving at its index. The rows are read unordered and ordered in
+/// Rust instead.
+///
+/// That order is the final tie-break of every answer derived from a graph walk
+/// (R4), so it is not enough for it to be *an* order. This runs the exact SQL
+/// that was removed against the same store and requires the two sequences to
+/// agree row for row — the check that would catch a comparator drifting from
+/// SQLite's BINARY collation, from its `DESC` on REAL, or from its key order.
+#[test]
+fn the_rust_edge_order_is_the_sql_order_it_replaced() {
+    let dir = tmp_dir("edge-order");
+    let db_path = dir.join("devmap.sqlite");
+    // Several files and several edge kinds, so the comparison actually reaches
+    // past `confidence` into the path, symbol and kind keys.
+    let (extractions, resolution, analysis) = pipeline(&[
+        (
+            "src/zeta.py",
+            "import os\n\ndef alpha():\n    return 1\n\ndef beta():\n    return alpha() + os.getpid()\n",
+        ),
+        (
+            "src/alpha.py",
+            "from src.zeta import alpha, beta\n\nclass Thing:\n    def run(self):\n        return alpha() + beta()\n",
+        ),
+        (
+            "src/mid.py",
+            "from src.alpha import Thing\n\ndef make():\n    return Thing()\n\ndef use():\n    return make().run()\n",
+        ),
+        (
+            "src/dup.py",
+            "from src.zeta import alpha\n\ndef one():\n    return alpha()\n\ndef two():\n    return alpha()\n",
+        ),
+    ]);
+    let store = Store::open(&db_path).unwrap();
+    store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+    let actual = store.latest_edges(0.0).expect("read");
+    assert!(
+        actual.len() > 10,
+        "fixture is inert: {} edges is too few to order",
+        actual.len()
+    );
+    drop(store);
+
+    // The statement `latest_edges_uncached` used to run, verbatim.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let generation: u32 = conn
+        .query_row("SELECT MAX(generation_id) FROM generation_edges", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
+                    e.edge_kind, e.confidence
+             FROM generation_edges e
+             JOIN paths sp ON sp.id = e.source_file_id
+             JOIN paths tp ON tp.id = e.target_file_id
+             WHERE e.generation_id = ?1
+             ORDER BY e.confidence DESC, sp.path, tp.path,
+                      e.source_symbol, e.target_symbol, e.edge_kind",
+        )
+        .unwrap();
+    let expected: Vec<(String, String, String, String, String, f64)> = stmt
+        .query_map([generation], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "the unordered read returned a different number of edges than the \
+         ordered one; the two must differ only in order"
+    );
+    for (position, (got, want)) in actual.iter().zip(&expected).enumerate() {
+        let got_key = (
+            got.source_file.as_str(),
+            got.target_file.as_str(),
+            got.source_symbol.as_str(),
+            got.target_symbol.as_str(),
+            got.edge_kind.as_str(),
+        );
+        let want_key = (
+            want.0.as_str(),
+            want.1.as_str(),
+            want.2.as_str(),
+            want.3.as_str(),
+            want.4.as_str(),
+        );
+        assert_eq!(
+            got_key, want_key,
+            "row {position} of the Rust-ordered read is not row {position} of \
+             the SQL-ordered read"
+        );
+        assert_eq!(
+            devmap_extract::model::confidence_millis(got.confidence),
+            (want.5 * 1000.0).round() as i64,
+            "row {position} carries a different confidence than SQL read for it"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

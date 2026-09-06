@@ -1362,33 +1362,50 @@ fn write_consumer_artifacts(
         .compact_graph_output
         .map(|destination| resolve_manifest_output(repo_root.as_deref(), destination));
 
-    // Every input the artifacts' bytes derive from. `{:?}` on the options so a
-    // digest that could not be computed (`None`) can never compare equal to one
-    // that came out empty (`Some("")`).
-    let mut inputs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    inputs.insert("generation_id".into(), gen_id.to_string());
-    inputs.insert("pending_count".into(), status.pending_count.to_string());
-    inputs.insert("built_head".into(), built_head.clone());
-    inputs.insert("repo_root".into(), format!("{repo_root:?}"));
+    // Every input the artifacts' bytes derive from, as real JSON. These values
+    // are compared for equality to decide a skip, and they are also the only
+    // record of *why* a given set of artifacts exists, so a consumer has to be
+    // able to read them. `serde_json::Value` keeps the property the previous
+    // `{:?}` renderings were reaching for — `null` and `""` are different
+    // values, so a digest that could not be computed can never compare equal to
+    // one that came out empty — without the file being JSON in syntax only.
+    let mut inputs: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    inputs.insert("generation_id".into(), gen_id.into());
+    inputs.insert("pending_count".into(), status.pending_count.into());
+    inputs.insert("built_head".into(), built_head.clone().into());
+    inputs.insert("repo_root".into(), repo_root.clone().into());
     inputs.insert(
         "generated_head".into(),
-        format!("{:?}", stamped.generated_head),
+        stamped.generated_head.clone().into(),
     );
-    inputs.insert("indexed_hash".into(), format!("{:?}", stamped.indexed_hash));
+    inputs.insert("indexed_hash".into(), stamped.indexed_hash.clone().into());
     inputs.insert(
         "content_fingerprint".into(),
-        format!("{:?}", stamped.content_fingerprint),
+        stamped.content_fingerprint.clone().into(),
     );
+    inputs.insert("code_graph_schema".into(), CODE_GRAPH_SCHEMA_VERSION.into());
     inputs.insert(
-        "code_graph_schema".into(),
-        CODE_GRAPH_SCHEMA_VERSION.to_string(),
+        "compact".into(),
+        match &compact_dest {
+            Some(path) => path.to_string_lossy().into_owned().into(),
+            None => serde_json::Value::Null,
+        },
     );
-    inputs.insert("compact".into(), format!("{compact_dest:?}"));
+
+    // Taken before `stamped` is consumed below; the stamp is written at the end
+    // of the run, long after it has been moved into the manifest.
+    let stamp_generated_head = stamped.generated_head.clone();
 
     let stamp_path = artifact_stamp_path(request.db);
-    let mut outputs: Vec<&std::path::Path> = vec![dest.as_path(), graph_dest.as_path()];
+    // Role, not position: the sidecar is read by consumers that cannot rebuild
+    // the writer's spelling of these paths, so each output is named.
+    let mut outputs: Vec<(&str, &std::path::Path)> = vec![
+        ("repo_map", dest.as_path()),
+        ("code_graph", graph_dest.as_path()),
+    ];
     if let Some(compact) = &compact_dest {
-        outputs.push(compact.as_path());
+        outputs.push(("compact_graph", compact.as_path()));
     }
     if ArtifactStamp::read(&stamp_path).is_some_and(|stamp| stamp.still_current(&inputs, &outputs))
     {
@@ -1449,7 +1466,7 @@ fn write_consumer_artifacts(
     // artifacts that were never written is a skip that skips nothing real.
     // A stamp that cannot be written is not fatal — it costs the next run a
     // regeneration, which is the behaviour that existed before the stamp.
-    match ArtifactStamp::of(inputs, &outputs) {
+    match ArtifactStamp::of(inputs, stamp_generated_head, &outputs) {
         Ok(stamp) => {
             if let Err(error) = stamp.write(&stamp_path) {
                 eprintln!(
@@ -1484,6 +1501,46 @@ fn write_consumer_artifacts(
 /// to spawn a third process to learn what the store it just wrote looks like.
 /// The schema keys are *not* here — they come from a probe `status` runs before
 /// it opens the store at all, and a build has already opened it.
+///
+/// What this kernel can be asked to do, read out of its own parser.
+///
+/// The seam used to learn this by running `devmap manifest --help` and
+/// `devmap build --help` and grepping the output — two extra process launches
+/// (~140 ms each, measured) per `dev map`, on top of the `status` probe it
+/// already runs to rank candidate binaries. `status` is the probe that has to
+/// happen anyway, so it is the one that should answer.
+///
+/// Derived from clap's command tree rather than asserted, because a hand-written
+/// `true` is a claim that drifts the moment a flag is renamed: this cannot
+/// declare a flag the binary does not actually accept. A kernel too old to carry
+/// this key declares nothing, and the seam falls back to the `--help` probe —
+/// "no evidence" must not read as "does not support it".
+fn kernel_capabilities() -> serde_json::Value {
+    use clap::CommandFactory;
+    let command = Cli::command();
+    let accepts = |subcommand: &str, flag: &str| -> bool {
+        command
+            .get_subcommands()
+            .find(|candidate| candidate.get_name() == subcommand)
+            .is_some_and(|candidate| {
+                candidate
+                    .get_arguments()
+                    .any(|argument| argument.get_long() == Some(flag))
+            })
+    };
+    // All three or none: a kernel accepting only some of the digests would need
+    // the read-modify-write path for the rest, and running both is strictly
+    // worse than running one.
+    let stamp_flags = ["generated-head", "indexed-hash", "content-fingerprint"]
+        .iter()
+        .all(|flag| accepts("manifest", flag));
+    serde_json::json!({
+        "manifest_graph_output": accepts("manifest", "graph-output"),
+        "manifest_stamp_flags": stamp_flags,
+        "build_manifest": accepts("build", "manifest"),
+    })
+}
+
 fn store_status_fields(
     store: &Store,
     db: &std::path::Path,
@@ -3966,6 +4023,10 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "schema_outdated": false,
                     "schema_version": serde_json::Value::Null,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
+                    // A property of the binary, not of the store — so it is
+                    // answered even here, where there is no store. This is the
+                    // exit the seam's own probe takes.
+                    "capabilities": kernel_capabilities(),
                 });
                 // Through `emit_json` like every other exit from this command.
                 // Printed pretty regardless of `--json`, this was the one
@@ -4000,6 +4061,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "schema_outdated": true,
                     "schema_version": version,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
+                    "capabilities": kernel_capabilities(),
                 });
                 emit_json(cli, &payload)?;
                 return Ok(());
@@ -4017,6 +4079,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 "expected_schema_version".into(),
                 serde_json::json!(devmap_store::CURRENT_SCHEMA_VERSION),
             );
+            payload.insert("capabilities".into(), kernel_capabilities());
             emit_json(cli, &serde_json::Value::Object(payload))?;
         }
         Commands::History { last } => {

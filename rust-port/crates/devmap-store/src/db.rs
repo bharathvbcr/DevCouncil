@@ -667,6 +667,102 @@ pub struct StoredEdge {
     pub resolution: Option<String>,
 }
 
+/// One generation's `paths` rows, ordered once so a path comparison is a `u32`
+/// comparison.
+///
+/// The edge read orders ~100k rows on two path strings. Interning them here
+/// costs one scan of a 1,567-row table and turns both keys into ranks whose
+/// integer order *is* the byte order of the paths they stand for — see
+/// [`edge_read_order`].
+struct PathRanks {
+    /// Paths in ascending byte order. A rank indexes this.
+    ordered: Vec<String>,
+    /// `paths.id` to its rank in [`Self::ordered`].
+    rank_by_id: std::collections::HashMap<i64, u32>,
+}
+
+impl PathRanks {
+    fn read(conn: &Connection) -> Result<Self> {
+        let mut stmt = conn.prepare("SELECT id, path FROM paths")?;
+        let mut rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        // Byte order, which is what SQLite's default BINARY collation compares
+        // and therefore what the `ORDER BY sp.path, tp.path` this replaces was.
+        rows.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+        let rank_by_id = rows
+            .iter()
+            .enumerate()
+            .map(|(rank, (id, _))| (*id, rank as u32))
+            .collect();
+        Ok(Self {
+            ordered: rows.into_iter().map(|(_, path)| path).collect(),
+            rank_by_id,
+        })
+    }
+
+    /// The rank of a `paths.id`, or an error.
+    ///
+    /// An edge naming a path row that is not there is a **refusal**, not a
+    /// dropped edge. The `INNER JOIN` this replaces answered the same question
+    /// by omitting the row, so a store whose `paths` table had lost an entry
+    /// answered "nothing depends on this" from a graph it had only partly
+    /// read — the same failure `edge_kind_from_stored` refuses for an unknown
+    /// kind. `generation_edges.source_file_id` is `REFERENCES paths(id)`, so a
+    /// well-formed store cannot reach this.
+    fn rank_of(&self, id: i64) -> Result<u32> {
+        self.rank_by_id.get(&id).copied().ok_or_else(|| {
+            rusqlite::Error::InvalidParameterName(format!(
+                "generation edge names path id {id}, which is not in `paths`; \
+                 the store is inconsistent and answering over the edges that \
+                 remain would be a wrong answer rather than a partial one"
+            ))
+        })
+    }
+
+    fn path_of(&self, rank: u32) -> &str {
+        &self.ordered[rank as usize]
+    }
+}
+
+/// A generation edge before it has been put in read order.
+///
+/// Holds the ranks rather than the paths, and the `f64` confidence SQLite
+/// stored rather than the `f32` [`StoredEdge`] narrows it to, because both are
+/// sort keys and both must compare exactly as SQL compared them.
+struct UnorderedEdge {
+    source_rank: u32,
+    target_rank: u32,
+    source_symbol: String,
+    target_symbol: String,
+    edge_kind: String,
+    confidence: f64,
+    resolution: Option<String>,
+    ordinal: u32,
+}
+
+/// The order every reader of a generation's edges sees, as one comparator.
+///
+/// `confidence DESC, source path, target path, source symbol, target symbol,
+/// edge kind` — the key `latest_edges_uncached`'s SQL used to hand to SQLite —
+/// and then `ordinal`, which SQL had no equivalent of and which makes the tail
+/// of the order defined instead of arbitrary. This order is the final
+/// tie-break of every answer derived from a walk (R4), so it has exactly one
+/// owner.
+fn edge_read_order(left: &UnorderedEdge, right: &UnorderedEdge) -> std::cmp::Ordering {
+    right
+        .confidence
+        .total_cmp(&left.confidence)
+        .then_with(|| left.source_rank.cmp(&right.source_rank))
+        .then_with(|| left.target_rank.cmp(&right.target_rank))
+        .then_with(|| left.source_symbol.cmp(&right.source_symbol))
+        .then_with(|| left.target_symbol.cmp(&right.target_symbol))
+        .then_with(|| left.edge_kind.cmp(&right.edge_kind))
+        .then_with(|| left.ordinal.cmp(&right.ordinal))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredFile {
     pub path: String,
@@ -4786,6 +4882,45 @@ impl Store {
     /// caches them under it; returning only the rows left the caller to label
     /// them with a generation it had resolved separately. `None` when the store
     /// holds no generation.
+    ///
+    /// # Why the order is not SQL's any more
+    ///
+    /// This read is the whole fixed cost of arriving at [`GenerationEdges`],
+    /// which is what a one-shot `devmap impact` pays and never amortises. Split
+    /// on this repository's 101,503 edges, minima of three runs each:
+    ///
+    /// | part | cost |
+    /// |---|---|
+    /// | `ORDER BY confidence DESC, sp.path, tp.path, …` | **~72 ms** |
+    /// | the two `paths` joins | ~9 ms |
+    /// | the row scan and its string materialisation | ~19 ms |
+    /// | building the adjacency in [`GenerationEdges::build_with_resolutions`] | ~23 ms |
+    ///
+    /// The sort is the single biggest term and it is the one SQLite is worst
+    /// at here: the key spans two joined `paths` strings, so no index can
+    /// supply it (`generation_edges` is keyed `(generation_id, ordinal)`, and
+    /// `ordinal` is the *resolver's* emission order, not this one), and the
+    /// plan is `USE TEMP B-TREE FOR ORDER BY` over every row of the
+    /// generation — ~15 MB of records through SQLite's sorter to order a Vec
+    /// that is about to be built in memory anyway.
+    ///
+    /// So the ordering moves to Rust, and with it the joins: the `paths` table
+    /// is 1,567 rows, read once and *ranked* once, which turns the two most
+    /// discriminating string keys of the comparison into `u32` compares.
+    /// Measured end to end, the same rows in the same order: **~100 ms → ~39
+    /// ms**.
+    ///
+    /// # Why the result is the same order
+    ///
+    /// [`edge_read_order`] is the comparator, and it is SQL's key by key:
+    /// SQLite's default collation is BINARY, which is `str`'s byte ordering,
+    /// and the confidence is compared as the `f64` SQLite stored rather than
+    /// the `f32` [`StoredEdge`] narrows it to, so no pair that SQL separated
+    /// can collapse into a tie here. It then adds `ordinal` as a final key,
+    /// which SQL had no equivalent of: SQLite's sorter is not stable, so rows
+    /// equal on all six of its keys came back in an order nothing defined.
+    /// The extra key can only order pairs SQL left unordered, and it makes the
+    /// result reproducible instead of merely unspecified.
     #[allow(clippy::type_complexity)]
     fn latest_edges_uncached(
         &self,
@@ -4795,41 +4930,51 @@ impl Store {
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
+        let paths = PathRanks::read(&snapshot)?;
         let mut stmt = snapshot.prepare(
-            "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
-                    e.edge_kind, e.confidence, e.resolution
+            "SELECT e.source_file_id, e.target_file_id, e.source_symbol,
+                    e.target_symbol, e.edge_kind, e.confidence, e.resolution,
+                    e.ordinal
              FROM generation_edges e
-             JOIN paths sp ON sp.id = e.source_file_id
-             JOIN paths tp ON tp.id = e.target_file_id
-             WHERE e.generation_id = ?1 AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?2 * 1000) AS INTEGER)
-             ORDER BY e.confidence DESC, sp.path, tp.path,
-                      e.source_symbol, e.target_symbol, e.edge_kind",
+             WHERE e.generation_id = ?1 AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?2 * 1000) AS INTEGER)",
         )?;
-        // The evidence tier is read in the same statement and decoded in the
-        // same pass. Taking it from a second query would let the two describe
-        // different generations, and taking it later would need the ordering
-        // above reproduced somewhere else — which is exactly the alignment a
-        // shifted resolution column would break.
         let rows = stmt.query_map(params![gen, min_confidence], |row| {
-            let edge = StoredEdge {
-                source_file: row.get(0)?,
-                target_file: row.get(1)?,
+            Ok(UnorderedEdge {
+                source_rank: paths.rank_of(row.get(0)?)?,
+                target_rank: paths.rank_of(row.get(1)?)?,
                 source_symbol: row.get(2)?,
                 target_symbol: row.get(3)?,
                 edge_kind: row.get(4)?,
                 confidence: row.get(5)?,
                 resolution: row.get(6)?,
-            };
-            let resolution = crate::edge_index::edge_resolution(&edge)
-                .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?;
-            Ok((edge, resolution))
+                ordinal: row.get(7)?,
+            })
         })?;
-        let mut edges = Vec::new();
-        let mut resolutions = Vec::new();
-        for row in rows {
-            let (edge, resolution) = row?;
+        let mut unordered = rows.collect::<Result<Vec<_>>>()?;
+        unordered.sort_unstable_by(edge_read_order);
+
+        // The evidence tier is decoded in the same pass that materialises the
+        // rows, from the row it describes. Taking it from a second query would
+        // let the two describe different generations, and taking it later would
+        // need this ordering reproduced somewhere else — which is exactly the
+        // alignment a shifted resolution column would break.
+        let mut edges = Vec::with_capacity(unordered.len());
+        let mut resolutions = Vec::with_capacity(unordered.len());
+        for row in unordered {
+            let edge = StoredEdge {
+                source_file: paths.path_of(row.source_rank).to_string(),
+                target_file: paths.path_of(row.target_rank).to_string(),
+                source_symbol: row.source_symbol,
+                target_symbol: row.target_symbol,
+                edge_kind: row.edge_kind,
+                confidence: row.confidence as f32,
+                resolution: row.resolution,
+            };
+            resolutions.push(
+                crate::edge_index::edge_resolution(&edge)
+                    .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
+            );
             edges.push(edge);
-            resolutions.push(resolution);
         }
         Ok(Some((gen, edges, resolutions)))
     }
