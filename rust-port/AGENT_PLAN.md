@@ -471,6 +471,18 @@ never run `devmap build` against the repository root's store from a test.
 | Seam: one kernel invocation per map refresh, skip-on-unchanged artifacts, kernel-side freshness digests (`hook.py` import cost 149 ms -> 31 ms) | `035fe1e` |
 | `devmap build --manifest` and `devmap freshness` | `3231018` |
 
+**What closed on the open-items line (2026-09-05).** Detail, tests and numbers in
+STATUS.md's "Symlink rule, soak plateau, resolver honesty (2026-09-05)" section; the
+commits are on `claude/devmap-open-items`.
+
+| Item | Commit |
+|---|---|
+| One symlink rule for the cold walk and the drain: `devmap_extract::candidate_kind` is the single owner, `classify_pending_entry` and the daemon's drain ask it. Closes the disagreement that made a cold build index `src/util.py -> shared/util.py` and the next drain drop the queued edit as "not a regular file or directory". Three further defects fell out: a dangling or looping link was skipped in complete silence, `MAX_SOURCE_BYTES` was measured on the link rather than on the bytes read, and the drain met an escaping link with `bail!` instead of removing the rows a full build would not have written | `e466c29` |
+| `subsystems[].neighbors` computed from cross-area `extracted` edges instead of emitted as a literal `[]` — the field `subsystem_map.are_neighbors` reads, so `policy_engine`'s neighbour rung could never fire. 0 -> 12 non-empty of 16 subsystems on this repository; provenance under `liveness_meta.subsystems` so an empty list can be told from a stubbed field | `696e1b8`, `4522f8e` |
+| Resolver honesty pass over nine hard shapes; `Resolution::Structural` split off `SameFile` for the Go package star edge, which was the one place `resolution` and the edge disagreed about where the target lives. Liveness and the stored-edge round trip both survived the attack and are now pinned | `85c00f8` |
+| `tools/soak.sh` read the *Python* engine's store, so its digest and growth checks had been vacuous for their whole life; now reads `devmap.sqlite`, samples RSS and store bytes per cycle, gained a `--daemon` mode, and asserts a plateau by comparing half-means after a warm-up quarter | `51b7c93` |
+| `devmap-query`'s huge-file read-bound test made independent of wall time — it was failing at HEAD `385baa0` because a 50 MB fixture overran `DEFAULT_PARSE_BUDGET` whenever the machine was busy | `ec31350` |
+
 Status is one of: **open** (not started), **partial** (started, gated), **decision** (blocked
 on a human). Nothing here is "done" — closed items live in STATUS.md's dated sections.
 
@@ -487,6 +499,9 @@ on a human). Nothing here is "done" — closed items live in STATUS.md's dated s
 | G4 | Speculative edit preview — "what breaks if I change this" without writing | PLAN.md §3 | **closed** — `devmap preview` ships with `crates/devmap-cli/tests/test_preview.rs`, so the R2 objection below is answered. The paragraph that follows is retained only as the record of why it was once fenced off |
 | G6 | Compact wire format — `code_graph.json` is 84 MB / ~21M tokens on a 3,674-file corpus | PLAN.md §3 · `DIVERGENCES.md` X39 | **closed 2026-09-05** — `devmap manifest --compact-graph-output`; interned encoding of the same model from the same traversal, 21,186,034 B -> 5,001,998 B (-76.4%) on this repository, round-trip asserted. Note it does **not** make the graph agent-readable (5.3M tokens -> 1.25M), and **its first consumer landed 2026-09-05** — `backend/go_orchestrator/repomap.Load` reads both wires (85,001,360 B -> 17,104,715 B, `Load` 405.0 ms -> 114.9 ms, 242.6 MiB -> 112.0 MiB on a 4,499-file corpus; equivalence asserted against the real producer by `TestTheLiveCompactGraphBuildsTheSameMap`). See STATUS.md -> "Go: the compact graph has a reader" |
 | G7 | Savings accounting — tokens saved versus reading the files | PLAN.md §3 | **already closed** — `devmap savings` exists and PLAN.md §3 records it closed; this row was stale |
+| NBR-1 | `subsystems[].neighbors` was a literal `[]`, so `subsystem_map.are_neighbors` answered "not adjacent" for every distinct pair and `policy_engine.py:628`'s neighbour rung could never fire | STATUS.md | **closed 2026-09-05** — computed from cross-area `calls`/`references`/`imports` edges at `extracted` confidence, symmetric, ranked and capped, with `neighbors_computed` / `neighbors_shown` / `neighbors_total` / `neighbors_truncated` / `neighbors_endpoints_unresolved` under `liveness_meta.subsystems`. Reason 1 in `backend/go_orchestrator/repomap`'s package doc is answered; the Go side still derives adjacency itself and may stay that way |
+| SYM-1 | The cold walk and the drain held two different symlink rules, so a queued edit to an in-repository symlink was deleted as unprocessable while `status` reported fresh | STATUS.md | **closed 2026-09-05** — `devmap_extract::candidate_kind` is the one owner both call |
+| SOAK-2 | `tools/soak.sh` measured the Python engine's store, so its digest and growth gates were vacuous; nothing measured RSS across cycles (the other half of GATE-1) | STATUS.md | **closed 2026-09-05** — per-cycle RSS and store-byte sampling, a `--daemon` mode, and a plateau assertion measured from the data. GATE-1's "nothing measures RSS" is answered for the soak; wiring it into `verify.sh` is still decision #8 |
 
 **Superseded 2026-09-05 — G4 is closed and this paragraph is history, not instruction.** `crates/devmap-cli/tests/test_preview.rs` exists and passes, so the "ships no tests yet" objection no longer holds; do not read the "do not start" below as current. The original note follows.
 

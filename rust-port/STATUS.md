@@ -3812,3 +3812,352 @@ two owners and not to this lane:
   from the code graph instead of reading the stubbed field, and until then have
   `are_neighbors` report *unknown* rather than *not adjacent* so the deny reason
   does not claim something the map never established.
+
+
+## Symlink rule, soak plateau, resolver honesty (2026-09-05)
+
+Four items on the `claude/devmap-open-items` line: the one symlink rule, the
+soak's memory-plateau half, an adversarial pass over the resolver/liveness
+honesty surface, and — handed to this lane mid-pass by the Go lane — the
+`subsystems[].neighbors` literal the policy gate reads.
+
+### 1. One symlink rule for the cold walk and the drain — **closed**
+
+The two halves of the kernel decided independently what a symlink means and
+reached opposite answers. `collect_sources_with_report` kept a symlinked file
+whose target resolves inside the repository (a monorepo's shared config, a
+vendored header: the bytes are the repository's either way) and refused only one
+that escapes it, recording `DiscoverySkipReason::EscapesRoot` as coverage loss.
+`classify_pending_entry` refused **every** symlink as "not a regular file or
+directory". Measured against the pre-fix tree:
+
+```text
+# src/util.py -> shared/util.py, both inside the repository
+devmap build .                 -> both indexed (util_v1)
+<edit shared/util.py>
+reconcile_pending_paths(root)  -> dropped: [("src/util.py",
+                                     "not a regular file or directory")]
+drain                          -> src/util.py still says util_v1
+
+# src/creds.py replaced by a link out of the repository
+drain                          -> Err: all 1 claimed path(s) failed:
+                                    watched file resolves outside daemon root
+```
+
+The queued edit was deleted as structurally unprocessable, the stored extraction
+stayed at whatever the cold build had read, and `status` reported fresh.
+
+**Decision applied: the cold walk's rule wins**, stated once in
+`devmap_extract::candidate_kind` (`devmap-extract/src/lib.rs`). Both callers ask
+it; neither re-derives it.
+
+| Shape | Cold walk | Drain |
+|---|---|---|
+| symlink -> file inside the root | indexed under the link's name | ordinary work |
+| symlink -> outside the root | `EscapesRoot`, counted as coverage loss | rows removed as a full build would, refusal charged |
+| symlink with no target (ENOENT) | `EscapesRoot` | same |
+| symlink that will not resolve (ELOOP, EACCES parent, stale mount) | `Unreadable`, a refusal | **retried**, never read as absence |
+| symlink -> directory inside the root | not descended | refused; its files are queued under their own names |
+
+Three defects the one owner exposed, each with a red test watched failing:
+
+1. `is_file()` follows a link and answers `false` for a dangling link, a loop and
+   a directory link alike, so a `src/x.py -> /nowhere` was not indexed, not
+   refused and not mentioned. Now recorded.
+   (`discovery_stays_inside_the_root.rs::a_dangling_symlink_is_recorded_as_a_refusal_rather_than_passed_over_in_silence`,
+   pre-fix: "a link whose target will not resolve is coverage loss, not
+   silence: []"; and `::a_symlink_loop_is_recorded_as_a_refusal`.)
+2. `ignore::DirEntry::metadata()` reports the *link's* size, so a file over
+   `MAX_SOURCE_BYTES` reached through an in-root symlink walked straight through
+   the ceiling that bounds the walk's memory. `CandidateKind::File` now carries
+   the size of the bytes that will actually be read.
+   (`::a_file_over_the_ceiling_reached_through_an_in_root_symlink_is_still_refused_by_size`.)
+3. The drain met an escaping link with `bail!`, charging retries toward
+   quarantine while the rows a full build had stopped writing stayed in the
+   generation. It now reconciles it as a deletion and charges the refusal to
+   coverage. `DiscoverySkipReason::is_containment_refusal` draws the line
+   between a refusal about *this attempt* (`Oversized`, `Unreadable` — the file
+   may shrink or regain `+r`, so its last good extraction is kept) and one about
+   the path itself (`EscapesRoot` — a full build writes no rows for it), and the
+   directory branch of the drain reads the same predicate.
+
+The carried-forward `discovery_refused_files` on the incremental drain is now
+read as a **floor** (`previous.max(this batch's refusals)`): a drain turned away
+from a file cannot report the corpus fully walked because the last full walk
+happened to refuse nothing. `max`, not a sum — the carried number is a
+whole-tree measurement and the batch's is a handful of paths that may already be
+inside it.
+
+One invariant was deliberately preserved rather than overridden. A link whose
+`canonicalize` fails is split by errno: ENOENT is a fact about the link (a
+refusal, rows removed), everything else is a question that could not be answered
+(`Undecidable`, retried). Collapsing the two would have made
+`daemon::tests::a_path_whose_existence_is_undecidable_is_not_reported_deleted`
+fail, and that test is right: a wrongly-kept row is stale, a wrongly-dropped one
+is a symbol the dead-code pass is free to call unreferenced.
+
+Red tests, all watched failing against the pre-fix tree:
+`devmap-store/tests/one_symlink_rule.rs` (4 of 5; the ordinary-paths control was
+green throughout), `devmap-serve/tests/one_symlink_rule_end_to_end.rs` (2 of 3),
+`devmap-extract/tests/discovery_stays_inside_the_root.rs` (3 new of 7).
+Commit `e466c29`.
+
+### 2. The soak's memory-plateau half — **closed, with one defect in the harness itself**
+
+`tools/soak.sh` read `.devcouncil/codeintel/index.sqlite` — the **Python**
+engine's store. The Rust kernel writes `devmap.sqlite`. So for this script's
+whole life `digest()` returned the empty string and `db_bytes()` returned 0 on
+every cycle: the digest comparison held trivially (`"" == ""`) and the growth
+limit compared 0 against `0 * 3 + 1048576`. A check that could not run reported
+exactly what a check that ran and passed reports, in the one script whose entire
+job is to notice drift. Every "SOAK OK" this repository has recorded was that.
+
+The harness now: reads the kernel's store and **fails** if the baseline digest
+is empty; counts the main database *plus* its WAL, because a WAL that never
+checkpoints is exactly the unbounded growth this looks for; honours
+`CARGO_TARGET_DIR`/`DEVMAP_BIN` so a lane cannot silently measure a stale
+binary; samples `(cycle, RSS, store bytes)` into a CSV every cycle; and asserts
+a plateau against a **baseline cycle** rather than against cycle 1, because the
+first cycles are still filling the extraction and page caches and calling that
+growth a leak would fail every healthy kernel. A run shorter than twice the
+baseline cycle is reported as a smoke test, not as a plateau measurement.
+
+A second mode, `--daemon`, drives a long-lived `devmap serve` through the same
+edit cycles with `status`/`search`/`impact` over IPC — the process an agent host
+keeps open, and the only one where a leak accumulates across hours. Two further
+harness defects were found by running it: the socket was named beside the corpus,
+where a scratch path is routinely longer than `sun_path`'s 104 bytes (the daemon
+then never binds and the failure says nothing about why), and a failed start
+killed the `/usr/bin/time` wrapper while leaving the daemon serving — one such
+orphan ran for five minutes beside a build-mode soak **on the same corpus**, so
+every number that soak produced described two writers rather than one. Both are
+fixed; the daemon's pid is now found through its own socket and released by a
+trap on every exit path.
+
+**The runs.** Both on the settled 4,499-file Go/TS/Py corpus (41,276 nodes /
+271,543 edges) — the daemon half on a copy of the 15,080-node corpus, because a
+long-lived process there sees the same shape at a size that fits the session —
+against one release binary saved aside for the whole run (`DEVMAP_BIN`), so a
+rebuild could not change the thing being measured halfway through.
+
+`devmap build`, 200 cycles (edit -> build -> query -> restore -> build), RSS is
+the build process's peak per cycle:
+
+| cycle | peak RSS | store bytes |
+|---|---|---|
+| 1 | 1,592.3 MB | 1,292.9 MB |
+| 20 | 1,598.8 MB | 1,292.8 MB |
+| 50 | 1,603.0 MB | 1,292.8 MB |
+| 100 | 1,596.8 MB | 1,292.8 MB |
+| 150 | 1,601.7 MB | 1,292.8 MB |
+| 200 | 1,595.6 MB | 1,292.9 MB |
+
+```text
+plateau ok: rss mean(51-125) 1597314389 -> mean(126-200) 1597455291 (limit 1757045827)
+plateau ok: db  mean(51-125) 1292865426 -> mean(126-200) 1292879189 (limit 1422151968)
+SOAK OK (200 cycles, digest stable, growth bounded)
+```
+
+RSS moved **+0.01%** and the store **+0.001%** between the two halves; every
+sample after cycle 50 sat between 1,591.6 MB and 1,604.0 MB, a ±0.4% band. The
+edge digest was identical on all 200 restored builds.
+
+`devmap serve`, 200 edit-and-query cycles, RSS sampled per cycle with `ps` and
+the process's peak read from `/usr/bin/time` at exit:
+
+| cycle | resident RSS | store bytes |
+|---|---|---|
+| 1 | 239.6 MB | 247.3 MB |
+| 20 | 239.7 MB | 247.3 MB |
+| 50 | 743.4 MB | 497.9 MB |
+| 100 | 853.9 MB | 497.9 MB |
+| 150 | 892.2 MB | 497.9 MB |
+| 200 | 906.2 MB | 497.9 MB |
+
+```text
+plateau ok: rss mean(51-125) 900551365 -> mean(126-200) 844318201 (limit 990606501)
+plateau ok: db  mean(51-125) 497900216 -> mean(126-200) 497900216 (limit 547690237)
+```
+
+**Tolerance: 10%, chosen from these numbers.** The daemon's second-half mean is
+**6.24% below** its first-half mean and the store is flat to the byte from cycle
+50 on; the build half moves +0.01%. Ten percent is four times the largest
+observed drift and an order of magnitude under what growth looks like — the
+daemon's own warm-up quarter moved **+210%**.
+
+**Cycle 20 is not a warm baseline, and that is a finding rather than a
+convenience.** The daemon's first full drain lands between cycles 20 and 50 and
+takes RSS from 240 MB to ~900 MB and the store from 247 MB to 498 MB: the
+process loading what it is for. Asserting cycle 200 against cycle 20 would fail
+on every healthy kernel, which is why the harness excludes a warm-up quarter and
+compares the two halves of the remainder by mean. The build half needs no such
+allowance — its store reaches its steady size inside cycle 1 — and passes the
+same rule at +0.01%.
+
+**No leak was found, so none was fixed.** The edge cache, adjacency index,
+extract cache, WAL and generation retention all hold: the store is byte-stable
+from cycle 50 to cycle 200 on both runs, which is what a WAL that checkpoints
+and a retention policy that prunes look like. The daemon's per-cycle RSS swings
+±12% around its mean (755-1,062 MB) with no trend — allocator behaviour, not
+accumulation.
+
+### 3. Resolver / liveness honesty — **one defect, two surviving surfaces**
+
+Nine shapes where a resolver is tempted to claim more than it knows — a bare
+name a same-named instance method could absorb, an import shadowing a builtin,
+one class declared twice in a package, a re-export chain whose middle file
+declares nothing, a decorator-registered route, a receiver typed two statements
+above the call and then reassigned, `self.method()` declared only by a parent, a
+Go interface method against a concrete method of the same name, and a TypeScript
+default export renamed at the import — held to four invariants over the whole
+corpus rather than shape by shape
+(`devmap-resolve/tests/resolution_honesty.rs`):
+
+1. every emitted edge's confidence is exactly what its `Resolution` entitles it
+   to, re-derived in the test rather than obtained from the owner;
+2. no `DETERMINISTIC` edge without deterministic evidence;
+3. ambiguity never picks a winner — the fan-out at `SPECULATIVE` or no edge,
+   never one confident edge among equals;
+4. a deterministic edge points where its evidence points.
+
+**The defect, found by invariant 4.** The Go package star edge (G20) ran from
+`geo/measure.go` to the synthetic node `package:geo/geo` carrying
+`Resolution::SameFile`, whose documented meaning is "the declaration is in this
+very file" — the only shape in the emitted graph where `resolution` and the edge
+disagreed about where the target lives. Split into `Resolution::Structural`: a
+relation the graph asserts about its own shape, deterministic for the reason it
+always was (a Go package clause is written at the top of the file), now saying
+so. One construction site; `confidence()` and `target()` extended; the two
+exhaustive matches in `audit_regressions.rs` extended rather than widened.
+
+**Surviving surfaces, recorded as results.**
+
+- Liveness never reported a symbol dead at `extracted` confidence — the tier
+  `CLAUDE.md` tells agents to act on by deleting code — while any non-structural
+  edge reached it, across all nine shapes. With the off-direction control that a
+  symbol nothing reaches is still found, so the rule is not vacuous.
+  (`devmap-analyze/tests/liveness_honesty_over_the_hard_shapes.rs`.)
+- `devmap-query::resolved_edge_from_stored` round-trips every edge of the same
+  corpus at the confidence the resolver gave it, and the ambiguous fan-out does
+  not gain confidence by passing through SQLite's REAL column.
+  (`devmap-query/tests/stored_edges_keep_the_confidence_their_evidence_earned.rs`.)
+  **What that file cannot assert, and says so rather than implying otherwise:** a
+  re-read edge carries no evidence, because no `resolution` column is persisted,
+  so the invariant on the read path rests on the round trip plus the write-side
+  constructor — never on a second independent reading of the same fact.
+
+Commit `85c00f8`.
+
+### 4. `subsystems[].neighbors` was a literal — **closed** (handed over mid-pass)
+
+`build_repo_map_value` emitted `"neighbors": []` for every subsystem, for the
+field's whole life in this kernel. `subsystem_map.are_neighbors` reads exactly
+that field, so `policy_engine.py`'s "File is in a neighboring subsystem of a
+planned file" rung could never fire and `verification/checks/subsystem_boundary.py`
+raised `architecture_drift` for every cross-area change.
+`backend/go_orchestrator/repomap` had already given up on the field and derives
+adjacency itself, saying so in its package doc. Measured before: this
+repository's `.devcouncil/repo_map.json` had 16 subsystems and 0 with a
+non-empty `neighbors`; the scholarlm map, 12 and 0.
+
+Derived exactly as the Go reader derives it, so the two cannot disagree: two
+areas are neighbours when a `calls`/`references`/`imports` edge at `extracted`
+confidence runs between them, symmetrically. Ambiguous edges are excluded — this
+relation *widens* what a task may write, and a scope decision may not rest on a
+resolution the analyser declined to make. Areas are resolved by
+`subsystem_map.area_for_path`'s own rule (longest declared subsystem prefix,
+else the file's parent directory), because a relation keyed by a vocabulary the
+lookup does not use is an empty relation with extra steps — the
+`community-4`-against-a-directory-path defect this field already had once.
+
+A second defect fell out of running it on a real store: not every endpoint is a
+file. The resolver emits one synthetic node per Go package and points the
+package's imports at it, so `backend/go_orchestrator/dc/dcgrep` named both
+`backend/go_orchestrator/internal/proc` and
+`package:backend/go_orchestrator/internal/proc` — the same coupling twice, once
+in a vocabulary no consumer can match, spending a slot of the cap to say it.
+Resolved through the graph rather than by knowing how the node is spelled: every
+file of a package carries a `MemberOf` edge to its package node, so the node's
+area is the area of any member. Dropping the endpoint would also have removed
+the synthetic name and would have been *worse* than the duplicate, because on a
+pure-Go pair the only edge recording the import points at the package node; the
+test asserts the coupling survives, not just that the name is gone.
+
+`liveness_meta.subsystems` now carries `neighbors_computed`, `neighbors_shown`,
+`neighbors_total`, `neighbors_truncated` and `neighbors_endpoints_unresolved`,
+so a consumer can tell a computed empty list from a producer that stubs the
+field — which is reason 1 in `repomap`'s package doc, answered.
+
+Verified with the release binary against the settled 15,080-node corpus:
+
+| | before | after |
+|---|---|---|
+| subsystems | 16 | 16 |
+| with a non-empty `neighbors` | 0 | 12 |
+| synthetic `package:` names | — | 0 |
+| `neighbors_shown` / `neighbors_total` | — | 155 / 170 |
+| `neighbors_endpoints_unresolved` | — | 0 |
+
+Commits `696e1b8` and `4522f8e`.
+
+### Out of band: a pre-existing red in `devmap-query`
+
+`engine::search_bounds_tests::a_hit_near_the_top_of_a_huge_file_reads_a_bounded_prefix`
+was failing at HEAD `385baa0`, before any change in this pass — verified by
+restoring the four source files this lane had touched and re-running. It
+extracted its 50 MB fixture through `extract_file`, and `extract_treesitter`
+shares one `DEFAULT_PARSE_BUDGET` (5 s) between the parse and the walk, so in a
+debug build the budget is overrun whenever the machine is busy, the generation
+holds no symbol, and the search finds nothing — reported as "the fixture must
+produce exactly one hit", which points at the read bound rather than at the
+clock. Green as the only test in the filter, red with either of its two module
+siblings and red under `--test-threads=1`: neither ordering nor parallelism, but
+wall time.
+
+The generation is now extracted from the head — a prefix of the file, so the
+recorded span is identical — while `huge.py` on disk stays 50 MB, which is the
+only half `hit_from_stored` reads and the only half the bound is about. The
+fixture premise is asserted rather than assumed. The `devmap-query` lib suite
+drops from 12.2 s to 0.8 s as a side effect. Commit `ec31350`.
+
+### Verification
+
+```text
+$ cargo fmt --all -- --check
+(no output)
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.80s
+
+$ cargo test --workspace --no-fail-fast          # logged, `test result: FAILED` counted
+exit=0
+"test result: FAILED" occurrences: 0
+passed=1410 failed=0 ignored=2
+
+$ cargo check -p devmap-{extract,query,store,analyze} --no-default-features --all-targets
+devmap-extract   Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.45s
+devmap-query     Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.05s
+devmap-store     Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.58s
+devmap-analyze   Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.29s
+
+$ cargo build --release
+    Finished `release` profile [optimized] target(s) in 58.87s
+```
+
+`devmap manifest` on the 15,080-node corpus, five forced rewrites each, with the
+soak running beside both: p50 0.90 s before the neighbour derivation and 0.90 s
+after — no measurable cost.
+
+**Left undone by this lane, precisely.** `tools/soak.sh` reports "did not
+plateau" when a run is too short for its warm-up quarter to cover the
+working-set load — a 40-cycle daemon run on the 15,080-node corpus does exactly
+that, because the first full drain lands at cycle ~33, inside the compared
+window. The reading is not wrong but the *message* names the wrong cause. The
+fix is a step guard before the comparison, and here are the numbers to set its
+threshold from: the largest cycle-to-cycle ratio inside the compared range is
+x1.05 (daemon) and x1.00 (build) once warm, against x1.57 and x2.01 during
+warm-up, so x1.25 separates them cleanly. On a step, refuse the assertion with
+"the working set was still loading at cycle N" and exit non-zero rather than
+reporting a leak. This lane did not apply it because the script was executing
+throughout the window in which it could have been; whoever does owns the change
+in `tools/soak.sh`'s plateau block.
