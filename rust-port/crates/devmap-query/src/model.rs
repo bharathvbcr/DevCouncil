@@ -79,6 +79,19 @@ pub struct Response<T> {
     /// form, so nothing changes for a query that ran to completion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk_incomplete: Option<String>,
+    /// How the edges behind this answer were distributed across the resolution
+    /// ladder, **before** any `min_rung` floor was applied.
+    ///
+    /// The population, not the survivors: its job is to answer "what did I not
+    /// see", which a histogram of what came back cannot do. Without it,
+    /// `min_rung: deterministic` returning three edges is indistinguishable
+    /// from a graph that only had three — and the second reading is the one
+    /// that leads somebody to conclude the code is unreferenced.
+    ///
+    /// `None` on a query that does not walk edges, and omitted from the wire
+    /// form, so nothing changes for callers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rungs: Option<crate::rung::RungHistogram>,
 }
 
 /// What a map query cost, against what answering it by reading files would have.

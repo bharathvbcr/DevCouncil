@@ -499,6 +499,16 @@ enum Commands {
         budget: u32,
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
+        /// Keep only edges at or above a named rung on the resolution ladder:
+        /// `deterministic`, `high` or `speculative`. Omitted filters nothing.
+        ///
+        /// A name rather than a `--min-confidence` float, because the ladder
+        /// has named rungs and a caller wanting deterministic edges should not
+        /// have to know that means 1.0. The answer carries a `rungs` histogram
+        /// of the population *before* the cut, so a short list is never
+        /// mistaken for a sparse graph.
+        #[arg(long)]
+        min_rung: Option<String>,
     },
     Impact {
         target: String,
@@ -506,6 +516,16 @@ enum Commands {
         budget: u32,
         #[arg(long, default_value_t = 3)]
         depth: usize,
+        /// Keep only edges at or above a named rung on the resolution ladder:
+        /// `deterministic`, `high` or `speculative`. Omitted filters nothing.
+        ///
+        /// A name rather than a `--min-confidence` float, because the ladder
+        /// has named rungs and a caller wanting deterministic edges should not
+        /// have to know that means 1.0. The answer carries a `rungs` histogram
+        /// of the population *before* the cut, so a short list is never
+        /// mistaken for a sparse graph.
+        #[arg(long)]
+        min_rung: Option<String>,
     },
     /// Callers and callees for several targets in one invocation.
     ///
@@ -531,6 +551,16 @@ enum Commands {
         budget: u32,
         #[arg(long, default_value_t = 3)]
         depth: usize,
+        /// Keep only edges at or above a named rung on the resolution ladder:
+        /// `deterministic`, `high` or `speculative`. Omitted filters nothing.
+        ///
+        /// A name rather than a `--min-confidence` float, because the ladder
+        /// has named rungs and a caller wanting deterministic edges should not
+        /// have to know that means 1.0. The answer carries a `rungs` histogram
+        /// of the population *before* the cut, so a short list is never
+        /// mistaken for a sparse graph.
+        #[arg(long)]
+        min_rung: Option<String>,
     },
     Dead {
         #[arg(short, long, default_value_t = 2000)]
@@ -1315,6 +1345,24 @@ fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedEdge>) {
         );
     }
     emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
+    // What a `--min-rung` floor cost, printed only when it cost something.
+    //
+    // Without it a narrowed answer is indistinguishable at the terminal from a
+    // sparse graph, and the second reading is the one that gets a live symbol
+    // deleted. Silent when nothing was filtered, so an unfiltered query reads
+    // exactly as it did before the flag existed.
+    if let Some(rungs) = &resp.rungs {
+        if rungs.filtered_out > 0 {
+            println!(
+                "note: --min-rung hid {} of {} edges (deterministic {}, high {}, speculative {})",
+                rungs.filtered_out,
+                rungs.total(),
+                rungs.deterministic,
+                rungs.high,
+                rungs.speculative
+            );
+        }
+    }
     // Distinct from the truncation line, which describes the token budget. This
     // one says the walk that produced `items` stopped before the graph ran out,
     // so `total` is the size of a partial answer.
@@ -1795,6 +1843,18 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         }
         Ok(())
     };
+    // Refused, never defaulted. A typo silently answered at full breadth is a
+    // filtered answer the caller believes is narrow — worse than an error,
+    // because they will act on the short list.
+    let check_rung = |value: &Option<String>| -> Result<(), String> {
+        match value.as_deref() {
+            None => Ok(()),
+            Some(name) if devmap_query::Rung::parse(name).is_some() => Ok(()),
+            Some(name) => Err(format!(
+                "--min-rung must be one of deterministic, high, speculative; got {name:?}"
+            )),
+        }
+    };
 
     match command {
         Commands::Search { budget, .. }
@@ -1804,12 +1864,26 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         Commands::Deps {
             budget,
             min_confidence,
+            min_rung,
             ..
         } => {
             check_budget(*budget)?;
+            check_rung(min_rung)?;
             check_confidence(*min_confidence)
         }
-        Commands::Impact { budget, depth, .. } | Commands::Trace { budget, depth, .. } => {
+        Commands::Impact {
+            budget,
+            depth,
+            min_rung,
+            ..
+        }
+        | Commands::Trace {
+            budget,
+            depth,
+            min_rung,
+            ..
+        } => {
+            check_rung(min_rung)?;
             check_budget(*budget)?;
             check_depth(*depth)
         }
@@ -2481,15 +2555,23 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             file,
             budget,
             min_confidence,
+            min_rung,
         } => {
             let store = open_for_read(&cli.db)?;
             let engine = StoreQueryEngine::new(&store);
-            let resp = engine.dependencies(Request {
-                query: file.clone(),
-                token_budget: *budget,
-                min_confidence: *min_confidence,
-                max_depth: 1,
-            })?;
+            // Both floors apply, at different places: `min_confidence` goes to
+            // the store, which drops rows before the engine sees them, and the
+            // rung is applied over what came back — so only the rung's cut is
+            // countable in the histogram.
+            let resp = engine.dependencies_at_rung(
+                Request {
+                    query: file.clone(),
+                    token_budget: *budget,
+                    min_confidence: *min_confidence,
+                    max_depth: 1,
+                },
+                min_rung.as_deref().and_then(devmap_query::Rung::parse),
+            )?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&resp)?)?;
             } else {
@@ -2500,15 +2582,21 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             target,
             budget,
             depth,
+            min_rung,
         } => {
             let store = open_for_read(&cli.db)?;
             let engine = StoreQueryEngine::new(&store);
-            let resp = engine.impact(Request {
-                query: target.clone(),
-                token_budget: *budget,
-                min_confidence: 0.0,
-                max_depth: *depth,
-            })?;
+            let resp = engine.impact_at_rung(
+                Request {
+                    query: target.clone(),
+                    token_budget: *budget,
+                    min_confidence: 0.0,
+                    max_depth: *depth,
+                },
+                // Already validated above, so `None` here means "none was
+                // asked for", never "one was asked for and did not parse".
+                min_rung.as_deref().and_then(devmap_query::Rung::parse),
+            )?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&resp)?)?;
             } else {
@@ -2541,23 +2629,33 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             to,
             budget,
             depth,
+            min_rung,
         } => {
             let store = open_for_read(&cli.db)?;
             let engine = StoreQueryEngine::new(&store);
+            let rung = min_rung.as_deref().and_then(devmap_query::Rung::parse);
             let resp = if let Some(destination) = to {
+                // The path variant answers with one path rather than an edge
+                // population, so there is nothing for a histogram to describe
+                // and the floor goes to the walk as a confidence. Exact all the
+                // same: `floor_millis / 1000.0` reconstructs the float the
+                // confidence constants were built from, bit for bit.
                 engine.trace_between(Request {
                     query: (from.clone(), destination.clone()),
                     token_budget: *budget,
-                    min_confidence: 0.0,
+                    min_confidence: rung.map_or(0.0, |r| r.floor_millis() as f32 / 1000.0),
                     max_depth: *depth,
                 })?
             } else {
-                engine.trace(Request {
-                    query: from.clone(),
-                    token_budget: *budget,
-                    min_confidence: 0.0,
-                    max_depth: *depth,
-                })?
+                engine.trace_at_rung(
+                    Request {
+                        query: from.clone(),
+                        token_budget: *budget,
+                        min_confidence: 0.0,
+                        max_depth: *depth,
+                    },
+                    rung,
+                )?
             };
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&resp)?)?;

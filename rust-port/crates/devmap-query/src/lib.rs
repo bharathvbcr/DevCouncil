@@ -8,6 +8,7 @@
 pub mod artifacts;
 pub mod cancel;
 pub mod code_graph;
+pub mod rung;
 pub mod digest;
 pub mod engine;
 pub mod escape;
@@ -43,3 +44,5 @@ pub use manifest::{
 };
 pub use model::*;
 pub use snapshots::{semantic_snapshot_for_file, semantic_snapshots, SemanticSnapshot};
+
+pub use rung::{filter_by_rung, histogram as rung_histogram, Rung, RungHistogram};

@@ -106,6 +106,16 @@ pub enum IpcCommand {
         budget: u32,
         #[serde(default)]
         min_confidence: f32,
+        /// A named floor on the resolution ladder — `deterministic`, `high` or
+        /// `speculative`. Absent means no floor, which is the behaviour every
+        /// existing caller already gets, so adding this shifts nothing.
+        ///
+        /// Preferred over `min_confidence` for the reason `EXTRACTED_FLOOR_MILLIS`
+        /// exists: the float goes through SQLite REAL, where `>= 0.9` is a
+        /// comparison whose answer depends on rounding, and a caller wanting
+        /// deterministic edges should not have to know that means 1.0.
+        #[serde(default)]
+        min_rung: Option<String>,
     },
     Impact {
         target: String,
@@ -113,6 +123,11 @@ pub enum IpcCommand {
         budget: u32,
         #[serde(default = "default_depth")]
         depth: usize,
+        /// See `Deps::min_rung`. `impact` and `trace` took no threshold at all
+        /// before this, so the two queries a refactor actually runs were the
+        /// two that could not be narrowed.
+        #[serde(default)]
+        min_rung: Option<String>,
     },
     Trace {
         from: String,
@@ -122,6 +137,9 @@ pub enum IpcCommand {
         budget: u32,
         #[serde(default = "default_depth")]
         depth: usize,
+        /// See `Deps::min_rung`.
+        #[serde(default)]
+        min_rung: Option<String>,
     },
     /// Both call-graph directions for several targets in one exchange.
     ///
@@ -253,7 +271,58 @@ fn failure(code: &'static str, message: impl Into<String>) -> Envelope {
     }
 }
 
+/// The `min_confidence` floor a named rung means.
+///
+/// Constructed as `floor_millis / 1000.0`, which is **the same construction the
+/// stored value uses**: `Confidence::persist_real` is `to_millis() / 1000.0`.
+/// Both sides of the comparison therefore come from one integer through one
+/// division, so the boundary is exact — `>= high` admits `Confidence::MEDIUM`
+/// and rejects `LOW` with no dependence on how `0.7` rounds. Writing the float
+/// literal here instead would break that, which is the trap
+/// `EXTRACTED_FLOOR_MILLIS` exists to name.
+///
+/// `None` means no floor, and yields `0.0` — the default every existing caller
+/// already sends.
+fn rung_floor(min_rung: &Option<String>) -> f32 {
+    parsed_min_rung(min_rung)
+        .map(|rung| rung.floor_millis() as f32 / 1000.0)
+        .unwrap_or(0.0)
+}
+
+/// The requested rung, parsed.
+///
+/// Safe to unwrap to `None` here because [`validate_request`] has already
+/// refused any name that does not parse — a `None` at this point means the
+/// caller sent no rung, never that they sent a bad one.
+fn parsed_min_rung(min_rung: &Option<String>) -> Option<devmap_query::Rung> {
+    min_rung.as_deref().and_then(devmap_query::Rung::parse)
+}
+
+/// The `min_rung` a command carries, if it accepts one.
+///
+/// Named rather than matched inline at each site so a command that gains the
+/// parameter and forgets the validation is one edit, not two.
+fn request_min_rung(command: &IpcCommand) -> Option<&str> {
+    match command {
+        IpcCommand::Deps { min_rung, .. }
+        | IpcCommand::Impact { min_rung, .. }
+        | IpcCommand::Trace { min_rung, .. } => min_rung.as_deref(),
+        _ => None,
+    }
+}
+
 pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
+    // Refused, never defaulted. A typo silently answered at full breadth is a
+    // filtered answer the caller believes is narrow — the same class of error
+    // as `Clones::kind`, which this mirrors deliberately.
+    if let Some(name) = request_min_rung(&request.command) {
+        if devmap_query::Rung::parse(name).is_none() {
+            return Err(format!(
+                "min_rung must be one of deterministic, high, speculative; got {name:?}"
+            ));
+        }
+    }
+
     let (text, budget, depth, min_confidence) = match &request.command {
         IpcCommand::Status => return Ok(()),
         IpcCommand::Search { query, budget, .. } => (query.as_str(), *budget, 1, None),
@@ -261,17 +330,20 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
             target,
             budget,
             min_confidence,
+            ..
         } => (target.as_str(), *budget, 1, Some(*min_confidence)),
         IpcCommand::Impact {
             target,
             budget,
             depth,
+            ..
         } => (target.as_str(), *budget, *depth, None),
         IpcCommand::Trace {
             from,
             to,
             budget,
             depth,
+            ..
         } => {
             if to
                 .as_ref()
@@ -439,6 +511,13 @@ pub fn coverage_gaps_json(status: &StoreStatus) -> serde_json::Value {
         "discovery_refused": sample(&status.coverage_gaps.discovery_refused),
         "parse_failed": sample(&status.coverage_gaps.parse_failed),
         "pattern_recovered": sample(&status.coverage_gaps.pattern_recovered),
+        // Not failures: the grammar succeeded and this build has no extractor
+        // for the language. Reported alongside the three failure kinds because
+        // a reader deciding whether to act on a finding needs to know which
+        // kind of blindness produced it — a transient hole a re-index may fill,
+        // or a permanent one no re-run will.
+        "call_blind": sample(&status.coverage_gaps.call_blind),
+        "import_blind": sample(&status.coverage_gaps.import_blind),
     })
 }
 
@@ -519,42 +598,66 @@ pub(crate) fn dispatch(
             target,
             budget,
             min_confidence,
-        } => Ok(serde_json::to_value(engine.dependencies(Request {
-            query: target,
-            token_budget: budget,
-            min_confidence,
-            max_depth: 1,
-        })?)?),
+            min_rung,
+            // The two floors are applied at different places, and both are
+            // applied. `min_confidence` goes to the store, which drops rows
+            // below it before the engine sees them; the rung is applied in the
+            // engine, over the population the store returned, so the histogram
+            // can report what it removed. A caller sending both means the
+            // intersection, and gets it — but only the rung's cut is
+            // *countable*, which is why the named parameter exists.
+        } => Ok(serde_json::to_value(engine.dependencies_at_rung(
+            Request {
+                query: target,
+                min_confidence,
+                token_budget: budget,
+                max_depth: 1,
+            },
+            parsed_min_rung(&min_rung),
+        )?)?),
         IpcCommand::Impact {
             target,
             budget,
             depth,
-        } => Ok(serde_json::to_value(engine.impact(Request {
-            query: target,
-            token_budget: budget,
-            min_confidence: 0.0,
-            max_depth: depth,
-        })?)?),
+            min_rung,
+        } => Ok(serde_json::to_value(engine.impact_at_rung(
+            Request {
+                query: target,
+                token_budget: budget,
+                min_confidence: 0.0,
+                max_depth: depth,
+            },
+            parsed_min_rung(&min_rung),
+        )?)?),
         IpcCommand::Trace {
             from,
             to,
             budget,
             depth,
+            min_rung,
         } => {
             let response = if let Some(destination) = to {
+                // The path variant answers with one path, not an edge
+                // population, so there is nothing for a histogram to describe
+                // and the floor goes to the walk as a confidence. Exact all the
+                // same: `floor_millis / 1000.0` reconstructs the float the
+                // confidence constants were built from, bit for bit.
                 engine.trace_between(Request {
                     query: (from, destination),
                     token_budget: budget,
-                    min_confidence: 0.0,
+                    min_confidence: rung_floor(&min_rung),
                     max_depth: depth,
                 })?
             } else {
-                engine.trace(Request {
-                    query: from,
-                    token_budget: budget,
-                    min_confidence: 0.0,
-                    max_depth: depth,
-                })?
+                engine.trace_at_rung(
+                    Request {
+                        query: from,
+                        token_budget: budget,
+                        min_confidence: 0.0,
+                        max_depth: depth,
+                    },
+                    parsed_min_rung(&min_rung),
+                )?
             };
             Ok(serde_json::to_value(response)?)
         }
@@ -1324,6 +1427,7 @@ mod tests {
                 target: "a.go".to_string(),
                 budget: 10,
                 min_confidence,
+                min_rung: None,
             },
         };
 
@@ -1674,6 +1778,7 @@ mod tests {
                 target: "a.go::T.m".to_string(),
                 budget: 10,
                 depth,
+                min_rung: None,
             },
         };
         assert!(validate_request(&impact(MAX_TRAVERSAL_DEPTH)).is_ok());
@@ -1687,6 +1792,7 @@ mod tests {
                 to: Some(to),
                 budget: 10,
                 depth: 1,
+                min_rung: None,
             },
         };
         assert!(validate_request(&trace("t".repeat(MAX_QUERY_BYTES))).is_ok());
@@ -2088,6 +2194,7 @@ mod tests {
                 to: Some(destination),
                 budget: 2_000,
                 depth: 3,
+                min_rung: None,
             },
         };
         assert!(validate_request(&request)

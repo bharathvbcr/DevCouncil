@@ -181,6 +181,25 @@ impl<'a> StoreQueryEngine<'a> {
     }
 
     pub fn dependencies(&self, req: Request<String>) -> anyhow::Result<Response<ResolvedEdge>> {
+        self.dependencies_at_rung(req, None)
+    }
+
+    /// [`Self::dependencies`], narrowed to a named rung on the resolution
+    /// ladder.
+    ///
+    /// The floor is applied here rather than folded into `min_confidence` at
+    /// the transport, because the store drops rows below its threshold before
+    /// this function ever sees them — a histogram computed on what survived
+    /// that could only ever report `filtered_out: 0`, which is the precise
+    /// shape of "a structural absence read as an observed negative" this whole
+    /// pass exists to remove. Filtering after the load and before the budget
+    /// means the count is measured, and means the budget packs edges the caller
+    /// actually asked for rather than spending itself on rows about to be cut.
+    pub fn dependencies_at_rung(
+        &self,
+        req: Request<String>,
+        min_rung: Option<crate::rung::Rung>,
+    ) -> anyhow::Result<Response<ResolvedEdge>> {
         let Some(file) = self.store.latest_file(&req.query)? else {
             return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: format!("{} is not indexed", req.query),
@@ -201,7 +220,9 @@ impl<'a> StoreQueryEngine<'a> {
             .into_iter()
             .map(stored_edge_to_resolved)
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let (edges, rungs) = crate::rung::narrow(edges, min_rung);
         let mut response = budget_take(edges, req.token_budget, |_| 25);
+        response.rungs = Some(rungs);
         // Composed, not assigned: `budget_take` may already have set a reason
         // of its own, and a reader deciding whether to act on this list needs
         // every qualification the answer holds, not the last one written.
@@ -211,7 +232,17 @@ impl<'a> StoreQueryEngine<'a> {
     }
 
     pub fn impact(&self, req: Request<String>) -> anyhow::Result<Response<ResolvedEdge>> {
-        self.traverse(req, true)
+        self.traverse(req, true, None)
+    }
+
+    /// [`Self::impact`], narrowed to a named rung. See
+    /// [`Self::dependencies_at_rung`] for why the floor is not a confidence.
+    pub fn impact_at_rung(
+        &self,
+        req: Request<String>,
+        min_rung: Option<crate::rung::Rung>,
+    ) -> anyhow::Result<Response<ResolvedEdge>> {
+        self.traverse(req, true, min_rung)
     }
 
     /// Answer both call-graph directions for several targets in one pass.
@@ -387,6 +418,7 @@ impl<'a> StoreQueryEngine<'a> {
                     min_confidence,
                     max_depth,
                 },
+                None,
             )?;
             // Outbound edges come from whichever query can actually answer
             // for this target's shape.
@@ -445,6 +477,7 @@ impl<'a> StoreQueryEngine<'a> {
                     min_confidence,
                     max_depth,
                 },
+                None,
             )?;
             answers.push(Neighbors {
                 target: target.clone(),
@@ -456,7 +489,17 @@ impl<'a> StoreQueryEngine<'a> {
     }
 
     pub fn trace(&self, req: Request<String>) -> anyhow::Result<Response<ResolvedEdge>> {
-        self.traverse(req, false)
+        self.traverse(req, false, None)
+    }
+
+    /// [`Self::trace`], narrowed to a named rung. See
+    /// [`Self::dependencies_at_rung`] for why the floor is not a confidence.
+    pub fn trace_at_rung(
+        &self,
+        req: Request<String>,
+        min_rung: Option<crate::rung::Rung>,
+    ) -> anyhow::Result<Response<ResolvedEdge>> {
+        self.traverse(req, false, min_rung)
     }
 
     /// Return one deterministic shortest path from `from` to `to`.
@@ -571,6 +614,7 @@ impl<'a> StoreQueryEngine<'a> {
         &self,
         req: Request<String>,
         reverse: bool,
+        min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
         // Before the generation lookup, not after: an unevaluable threshold is
         // a refusal whatever the store holds, and answering "no persisted
@@ -587,7 +631,7 @@ impl<'a> StoreQueryEngine<'a> {
             }));
         };
         let direction = index.directed(reverse, req.min_confidence);
-        self.traverse_over(&index, &direction, req)
+        self.traverse_over(&index, &direction, req, min_rung)
     }
 
     /// The traversal itself, over an index the caller already holds.
@@ -604,6 +648,7 @@ impl<'a> StoreQueryEngine<'a> {
         index: &GenerationEdges,
         direction: &devmap_store::DirectedEdges<'_>,
         req: Request<String>,
+        min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
         let min_confidence = devmap_store::checked_min_confidence(req.min_confidence)?;
         // The direction is the view's, not a second argument that could
@@ -655,7 +700,12 @@ impl<'a> StoreQueryEngine<'a> {
                 .then_with(|| a.target_file.cmp(&b.target_file))
                 .then_with(|| a.source_symbol.cmp(&b.source_symbol))
         });
+        // Before the budget, deliberately: a floor applied to the packed slice
+        // would report a distribution of whatever happened to fit, and would
+        // spend the budget on edges it was about to discard.
+        let (traversed, rungs) = crate::rung::narrow(traversed, min_rung);
         let mut response = budget_take(traversed, req.token_budget, |_| EDGE_TOKENS);
+        response.rungs = Some(rungs);
         // Two independent qualifications, composed rather than ranked.
         //
         // The budgeter counts what it received. When the walk itself stopped
@@ -834,6 +884,7 @@ impl<'a> StoreQueryEngine<'a> {
                     min_confidence,
                     max_depth: 1,
                 },
+                None,
             )?;
             definition.callees = self.traverse_over(
                 &index,
@@ -844,6 +895,7 @@ impl<'a> StoreQueryEngine<'a> {
                     min_confidence,
                     max_depth: 1,
                 },
+                None,
             )?;
         }
 
@@ -1366,6 +1418,7 @@ impl<'a> StoreQueryEngine<'a> {
             tokens_used: 0,
             resolution: ResolutionAvailability::Available,
             walk_incomplete: None,
+            rungs: None,
         };
 
         if let ParseOutcome::Failed { reason } = &candidate.parse_outcome {
@@ -2444,6 +2497,7 @@ impl<'a> QueryEngine<'a> {
                 tokens_used: 0,
                 resolution: ResolutionAvailability::Available,
                 walk_incomplete: None,
+                rungs: None,
             };
         }
         let q_lower = req.query.to_lowercase();
@@ -3153,6 +3207,7 @@ fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
         tokens_used: 0,
         resolution,
         walk_incomplete: None,
+        rungs: None,
     }
 }
 
@@ -3639,6 +3694,7 @@ where
         items: out,
         resolution: ResolutionAvailability::Available,
         walk_incomplete: None,
+        rungs: None,
     }
 }
 
@@ -3660,6 +3716,7 @@ where
             tokens_used: 0,
             resolution: ResolutionAvailability::Available,
             walk_incomplete: None,
+            rungs: None,
         };
     }
     Response {
@@ -3671,6 +3728,7 @@ where
         items,
         resolution: ResolutionAvailability::Available,
         walk_incomplete: None,
+        rungs: None,
     }
 }
 

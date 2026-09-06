@@ -127,6 +127,7 @@ pub fn semantic_snapshots(
         items: resp.items,
         resolution: resp.resolution,
         walk_incomplete: None,
+        rungs: None,
     }
 }
 
