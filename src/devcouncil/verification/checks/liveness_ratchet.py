@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Callable, List, Mapping, Optional, Set
+from typing import Any, Callable, List, Mapping, Optional, Set, TypeGuard
 
 from devcouncil.domain.gap import Gap
 from devcouncil.domain.task import Task
@@ -94,6 +94,17 @@ def _symbol_display(entry: str) -> tuple[str, Optional[int], str]:
     return _norm(text), None, ""
 
 
+def _is_plain_int(value: Any) -> TypeGuard[int]:
+    """An integer, and not a bool wearing one's clothes.
+
+    `bool` subclasses `int` in Python, so `isinstance(True, int)` is true and a
+    manifest carrying `"net_permille": true` would arrive as the integer 1. The
+    ratchet compares two ints and would then report a fall from 500 permille to
+    1 as a catastrophic resolution collapse that never happened.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _shown_total(meta: Any, key: str) -> tuple[int, int, bool]:
     """``(shown, total, truncated)`` for one ``liveness_meta`` section.
 
@@ -104,11 +115,16 @@ def _shown_total(meta: Any, key: str) -> tuple[int, int, bool]:
     section = meta.get(key) if isinstance(meta, Mapping) else None
     if not isinstance(section, Mapping):
         return (0, 0, True)
-    try:
-        shown = int(section.get("shown") or 0)
-        total = int(section.get("total") or 0)
-    except (TypeError, ValueError):
+    # Both halves must be present and integral. A section carrying `shown` and
+    # no `total` used to read as `(5, 0, False)` — untruncated — because a
+    # missing total defaulted to zero and `0 > 5` is false. A cut that cannot be
+    # measured is not a cut that did not happen, and that reading is what would
+    # let a capped sample become a ratchet baseline.
+    shown_raw = section.get("shown")
+    total_raw = section.get("total")
+    if not _is_plain_int(shown_raw) or not _is_plain_int(total_raw):
         return (0, 0, True)
+    shown, total = int(shown_raw), int(total_raw)
     return (shown, total, bool(section.get("truncated")) or total > shown)
 
 
@@ -203,7 +219,7 @@ def kernel_liveness_snapshot(project_root: Path) -> Optional[dict]:
 
         rate = manifest.get("resolution_rate")
         net_permille = None
-        if isinstance(rate, Mapping) and isinstance(rate.get("net_permille"), int):
+        if isinstance(rate, Mapping) and _is_plain_int(rate.get("net_permille")):
             net_permille = rate["net_permille"]
 
         truncated = sorted(
@@ -312,7 +328,10 @@ def detect_liveness_regressions(
         # not a drop to zero.
         base_rate = baseline.get("net_resolution_permille")
         cur_rate = current.get("net_resolution_permille")
-        if isinstance(base_rate, int) and isinstance(cur_rate, int) and cur_rate < base_rate:
+        # `_is_plain_int` on both sides: a legacy or hand-edited baseline can
+        # carry `true`, which `isinstance(_, int)` accepts and which would
+        # compare as 1 — a fall from 500 permille to 1 that never happened.
+        if _is_plain_int(base_rate) and _is_plain_int(cur_rate) and cur_rate < base_rate:
             gaps.append(Gap(
                 id=gap_id(task_id, "RESRATE"),
                 severity="high" if blocking else "medium",

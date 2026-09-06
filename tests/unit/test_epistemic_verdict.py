@@ -157,3 +157,23 @@ def test_a_malformed_gap_entry_does_not_crash_or_silently_pass():
     verdict, boundaries = epistemic_verdict(coverage_gaps=gaps)
     assert verdict == LOWER_BOUND
     assert any("failed to parse" in line for line in boundaries)
+
+
+def test_a_boolean_count_is_not_read_as_a_number():
+    """`bool` subclasses `int`, so every naive guard lets `True` through as 1.
+
+    A gap entry of ``{"total": true}`` would render "1 file(s) in a language
+    with no call extractor", and ``shown=True`` would render "truncated: True of
+    9". Both are counts invented from a value that was never one.
+    """
+    gaps = _gaps()
+    gaps["call_blind"] = {"total": True}  # type: ignore[assignment]
+    verdict, boundaries = epistemic_verdict(coverage_gaps=gaps)
+    assert verdict == EXACT, boundaries
+    assert boundaries == []
+
+    _, boundaries = epistemic_verdict(
+        coverage_gaps=_gaps(), truncated=True, shown=True, total=9  # type: ignore[arg-type]
+    )
+    assert not any("True" in line for line in boundaries), boundaries
+    assert any("sample" in line for line in boundaries)

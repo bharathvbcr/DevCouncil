@@ -64,8 +64,13 @@ def _gap_boundaries(coverage_gaps: Any) -> list[str]:
         entry = coverage_gaps.get(kind)
         if not isinstance(entry, Mapping):
             continue
+        raw = entry.get("total")
+        # `bool` first: `int(True)` is 1, so `call_blind: {"total": true}` would
+        # render as one file with no extractor.
+        if isinstance(raw, bool):
+            continue
         try:
-            total = int(entry.get("total") or 0)
+            total = int(raw or 0)
         except (TypeError, ValueError):
             continue
         if total > 0:
@@ -96,7 +101,15 @@ def epistemic_verdict(
     boundaries.extend(_gap_boundaries(coverage_gaps))
 
     if truncated:
-        if isinstance(shown, int) and isinstance(total, int) and total > shown:
+        # Not bare `isinstance(_, int)`: `bool` subclasses `int`, so a caller
+        # passing `shown=True` would render "results truncated: True of ...".
+        if (
+            isinstance(shown, int)
+            and not isinstance(shown, bool)
+            and isinstance(total, int)
+            and not isinstance(total, bool)
+            and total > shown
+        ):
             boundaries.append(
                 f"results truncated: {shown} of {total} shown, so the list is a sample and the count is the real total"
             )
