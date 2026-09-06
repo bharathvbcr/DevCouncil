@@ -75,7 +75,35 @@ type edge struct {
 // another. `contains` and `member_of` are structural relations inside a single
 // file and never cross an area; listing them would be harmless but misleading
 // about what the relation means.
-var couplingKinds = map[string]bool{"calls": true, "references": true, "imports": true}
+//
+// This set and `is_area_coupling` in the kernel's manifest.rs are one relation
+// computed twice — that writer's doc comment says as much — so they move
+// together or they disagree about repository structure.
+//
+// `inherits`, `implements` and `routes_to` were missing while the weaker
+// relations were admitted. Inheritance is the strongest coupling there is: a
+// subclass cannot be understood or compiled without its base, which binds more
+// tightly than any call. The omission was not evenly spread, either — imports
+// are absent entirely in 24 of the 35 languages the extractor handles,
+// including Java, C#, Swift, Kotlin and Scala, where inheritance is the
+// primary way one area binds to another. Measured against the release binary
+// on a two-directory Ruby corpus with no `require_relative`, the whole graph
+// between the two areas was one edge:
+//
+//	inherits extracted | web/user.rb::UserRecord -> core/base.rb::BaseRecord
+//
+// Under the narrow set those areas were not adjacent, so the gate would have
+// refused an edit spanning a subclass and the base class it derives from.
+//
+// Kinds the kernel emits and this set still excludes — `instantiates`,
+// `subscribes_to`, `wired_to`, `depends_on`, `taint_flow` — are each arguably
+// a coupling. This relation *widens* what a task may touch, so each needs its
+// own evidence that it is a dependency rather than a coincidence before it
+// earns that. They are a separate question, not an oversight.
+var couplingKinds = map[string]bool{
+	"calls": true, "references": true, "imports": true,
+	"inherits": true, "implements": true, "routes_to": true,
+}
 
 // ConfidenceExtracted marks an edge whose target the analyser resolved rather
 // than guessed.
