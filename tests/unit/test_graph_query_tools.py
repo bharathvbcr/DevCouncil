@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 from devcouncil.cli.commands.graph_cmd import app as graph_app
 from devcouncil.indexing.graph.build import write_code_graph
-from tests.unit.graph_fixtures import kernel_graph
+from tests.unit.graph_fixtures import NodeKind, kernel_graph
 from devcouncil.integrations.mcp.handlers import map as map_handlers
 
 
@@ -132,11 +132,23 @@ def api_repo(tmp_path):
         },
     )
     _commit(tmp_path)
-    write_code_graph(tmp_path, kernel_graph(tmp_path))
+    graph = kernel_graph(tmp_path)
+    # The kernel has to have written route nodes, or every assertion below
+    # fails on an empty answer and says nothing about the consumer under test.
+    # These were seven strict `xfail`s until the kernel emitted them; a kernel
+    # binary older than that emission is the one way they can regress to
+    # nothing, and this names it once instead of seven times.
+    routes = [node for node in graph.nodes if node.kind == NodeKind.ROUTE]
+    assert routes, (
+        "the kernel wrote no route nodes, so route_map / shape_check / "
+        "api_impact have no input. Build the kernel from this tree "
+        "(cargo build --release -p devmap-cli), or point DEVMAP_BINARY at one "
+        "that emits them."
+    )
+    write_code_graph(tmp_path, graph)
     return tmp_path
 
 
-@pytest.mark.xfail(strict=True, reason="the kernel exports no route/decorator metadata for indexing.graph.api_routes (HandlesRoute edges exist in the store but are not in code_graph.json); recorded in IMPROVEMENTS.md as a kernel gap")
 def test_api_route_map_links_handlers_and_consumers(api_repo):
     from devcouncil.indexing.graph.api_routes import route_map
 
@@ -156,7 +168,25 @@ def test_normalize_route_path_template_literal_segments():
     assert paths_match("/api/users/{user_id}", "/api/users/${id}")
 
 
-@pytest.mark.xfail(strict=True, reason="the kernel exports no route/decorator metadata for indexing.graph.api_routes (HandlesRoute edges exist in the store but are not in code_graph.json); recorded in IMPROVEMENTS.md as a kernel gap")
+def test_a_flask_converter_normalises_whole_rather_than_from_its_colon():
+    """`<int:uid>` is one parameter, not a literal `<int` and a `:uid`.
+
+    The `:\\w+` alternative matches the `:uid` inside the angle brackets on its
+    own, which left `<int` behind as a literal segment: `/api/users/<int:uid>`
+    normalised to `/api/users/<int*>`, so no client path could ever match it
+    and every Flask route with a converter reported no consumers — in a scan
+    that reported itself complete.
+    """
+    from devcouncil.indexing.graph.api_routes import normalize_route_path, paths_match
+
+    assert normalize_route_path("/api/users/<uid>") == "/api/users/*"
+    assert normalize_route_path("/api/users/<int:uid>") == "/api/users/*"
+    assert paths_match("/api/users/<int:uid>", "/api/users/42")
+    # A converter containing a slash still yields one segment, rather than
+    # splitting the path in two.
+    assert normalize_route_path("/f/<path:rest>/x") == "/f/*/x"
+
+
 def test_api_route_map_matches_template_literal_fetch(api_repo):
     from devcouncil.indexing.graph.api_routes import route_map
 
@@ -166,7 +196,6 @@ def test_api_route_map_matches_template_literal_fetch(api_repo):
     assert any(c["url"] == "/api/users/${id}" for c in users["consumers"])
 
 
-@pytest.mark.xfail(strict=True, reason="the kernel exports no route/decorator metadata for indexing.graph.api_routes (HandlesRoute edges exist in the store but are not in code_graph.json); recorded in IMPROVEMENTS.md as a kernel gap")
 def test_api_shape_check_flags_missing_handler_keys(api_repo):
     from devcouncil.indexing.graph.api_routes import shape_check
 
@@ -175,7 +204,6 @@ def test_api_shape_check_flags_missing_handler_keys(api_repo):
     assert "price" in result["checks"][0]["missing_in_handler"]
 
 
-@pytest.mark.xfail(strict=True, reason="the kernel exports no route/decorator metadata for indexing.graph.api_routes (HandlesRoute edges exist in the store but are not in code_graph.json); recorded in IMPROVEMENTS.md as a kernel gap")
 def test_api_impact_reports_risk(api_repo):
     from devcouncil.indexing.graph.api_routes import api_impact
 
@@ -185,7 +213,6 @@ def test_api_impact_reports_risk(api_repo):
     assert result["shape_mismatches"]
 
 
-@pytest.mark.xfail(strict=True, reason="the kernel exports no route/decorator metadata for indexing.graph.api_routes (HandlesRoute edges exist in the store but are not in code_graph.json); recorded in IMPROVEMENTS.md as a kernel gap")
 def test_cli_graph_routes_command(api_repo):
     runner = CliRunner()
     result = runner.invoke(
@@ -195,7 +222,6 @@ def test_cli_graph_routes_command(api_repo):
     assert json.loads(result.stdout).get("count", 0) >= 1
 
 
-@pytest.mark.xfail(strict=True, reason="the kernel exports no route/decorator metadata for indexing.graph.api_routes (HandlesRoute edges exist in the store but are not in code_graph.json); recorded in IMPROVEMENTS.md as a kernel gap")
 def test_mcp_route_map(api_repo):
     contents = asyncio.run(map_handlers.handle_route_map(api_repo, {}))
     payload = json.loads(contents[0].text)
@@ -203,7 +229,6 @@ def test_mcp_route_map(api_repo):
     assert payload.get("count", 0) >= 1
 
 
-@pytest.mark.xfail(strict=True, reason="the kernel exports no route/decorator metadata for indexing.graph.api_routes (HandlesRoute edges exist in the store but are not in code_graph.json); recorded in IMPROVEMENTS.md as a kernel gap")
 def test_cli_graph_demo_cypher_corpus_and_text_outputs(mapped, api_repo):
     runner = CliRunner()
     demo = runner.invoke(graph_app, ["demo", "--project-root", str(mapped), "--json"])
