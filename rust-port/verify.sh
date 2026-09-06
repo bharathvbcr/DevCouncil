@@ -205,8 +205,11 @@ step "8/9 incremental-vs-cold equivalence — a rebuild must not drift"
 # failing on graph drift or unbounded growth.
 SOAK_DIR=$(mktemp -d)
 rsync -a --chmod=u+w ./testdata/ "$SOAK_DIR/" >/dev/null 2>&1
-if ./tools/soak.sh "$SOAK_DIR" 5 2>&1 | tail -2 | grep -q "SOAK OK"; then
-  echo "incremental equivalence OK (5 cycles)"
+# Five cycles is a smoke run: the soak asserts the digest returns after every
+# restore and says in its verdict that growth was not measured. The plateau
+# needs 40 cycles or more and is a separate, longer run.
+if ./tools/soak.sh "$SOAK_DIR" 5 2>&1 | tail -2 | grep -q "SOAK SMOKE OK"; then
+  echo "incremental equivalence OK (5 cycles, growth not asserted)"
 else
   echo "GATE FAIL: incremental build drifted from cold"; rm -rf "$SOAK_DIR"; exit 1
 fi

@@ -151,3 +151,79 @@ fn a_large_well_formed_file_stays_within_budget() {
         extraction.symbols.len()
     );
 }
+
+/// A refusal must name a stage where time could actually have been spent.
+///
+/// The checkpoint after the syntax-tree walk labelled itself *"deriving Go
+/// method sets"* for every language, but the block it follows is gated on
+/// `lang == "go"` and is a no-op for anything else. A Python file that ran out
+/// of budget therefore reported:
+///
+/// ```text
+/// extraction of 25 bytes exceeded the 5s budget for grammar python while
+/// deriving Go method sets; no symbols are claimed for this file
+/// ```
+///
+/// — naming a stage that did not run, for a language that has no method sets.
+/// The refusal itself was right and the accounting was not, which is the worse
+/// half: a maintainer reading that line goes looking for a Go pass that never
+/// executed, and the walk tail where the time actually went stays invisible.
+///
+/// A zero budget reaches this checkpoint rather than the parse one: the source
+/// is small enough that tree-sitter never polls its cancellation callback and
+/// the walk finishes inside one `DEADLINE_CHECK_STRIDE`, so the first check
+/// that can observe the expired deadline is this one.
+#[test]
+fn a_refusal_names_a_stage_the_language_actually_ran() {
+    for (path, lang) in [
+        ("mod.py", "python"),
+        ("mod.rs", "rust"),
+        ("mod.ts", "typescript"),
+    ] {
+        let extraction =
+            extract_treesitter_with_budget(path, lang, "def f():\n    return 1\n", Duration::ZERO);
+        let ParseOutcome::Failed { reason } = &extraction.parse_outcome else {
+            panic!(
+                "a zero budget must refuse {path}: {:?}",
+                extraction.parse_outcome
+            );
+        };
+        assert!(
+            !reason.contains("Go method sets"),
+            "{lang} has no Go method sets and spent no time deriving them; a refusal \
+             that names that stage sends a maintainer after a pass which never ran. \
+             Got: {reason:?}"
+        );
+        assert!(
+            reason.contains("budget"),
+            "the refusal must still say the budget was what stopped it: {reason:?}"
+        );
+    }
+}
+
+/// The Go label is still correct for Go, which is the half worth keeping.
+///
+/// Without this, relabelling the checkpoint unconditionally would pass the test
+/// above while deleting the one accurate attribution it had: on a Go file the
+/// method-set derivation really does run between the walk and this check, and
+/// it is a real place for the budget to go.
+#[test]
+fn a_go_refusal_at_that_checkpoint_still_names_the_go_pass() {
+    let extraction = extract_treesitter_with_budget(
+        "mod.go",
+        "go",
+        "package main\n\nfunc f() int { return 1 }\n",
+        Duration::ZERO,
+    );
+    let ParseOutcome::Failed { reason } = &extraction.parse_outcome else {
+        panic!(
+            "a zero budget must refuse mod.go: {:?}",
+            extraction.parse_outcome
+        );
+    };
+    assert!(
+        reason.contains("Go method sets"),
+        "for Go the method-set pass does run at this checkpoint and is a real place \
+         for the budget to have gone: {reason:?}"
+    );
+}

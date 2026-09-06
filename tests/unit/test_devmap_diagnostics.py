@@ -325,3 +325,53 @@ def test_dev_map_prints_the_code_the_fix_and_the_run_id_on_failure(tmp_path: Pat
     assert "[store_locked]" in result.output
     assert "fix: dev map abort" in result.output
     assert "run: abc123def456" in result.output
+
+
+def test_a_foreign_process_under_a_devmap_named_directory_is_not_the_kernel(tmp_path: Path) -> None:
+    """The predicate must name the binary, not grep the command line.
+
+    Found by the round-3 gate: in a worktree called ``devmap-open-items`` the
+    test interpreter's own path contains "devmap", so ``abort_build`` took the
+    foreign sleeper in the test above for a kernel build and signalled it.
+    """
+    root = _root(tmp_path)
+    marker = root / LIVE_BUILD_RELPATH
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    link_dir = tmp_path / "devmap-open-items" / "bin"
+    link_dir.mkdir(parents=True)
+    interpreter = link_dir / "python"
+    interpreter.symlink_to(sys.executable)
+    other = subprocess.Popen([str(interpreter), "-c", "import time; time.sleep(30)"])
+    try:
+        marker.write_text(
+            json.dumps({"run_id": "r3", "pid": other.pid, "started_at": time.time(), "updated_at": time.time()}),
+            encoding="utf-8",
+        )
+        activity = build_activity(root)
+        assert activity["in_progress"] is False, activity
+        assert activity["stale_marker"] is True
+        result = abort_build(root)
+        assert result["aborted"] is False, result
+        assert other.poll() is None, "a foreign process must be left alone"
+    finally:
+        other.kill()
+        other.wait()
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("/repo/rust-port/target/release/devmap build .", True),
+        ("/bin/sh /tmp/x/bin/devmap", True),
+        ("devmap serve . --socket /tmp/s.sock", True),
+        ("C:\\tools\\devmap.exe build .", True),
+        ("/x/devmap-open-items/.venv/bin/python -c import time; time.sleep(30)", False),
+        ("cargo test -p devmap-store", False),
+        ("vim /x/devmap-open-items/notes.md", False),
+        ("", False),
+    ],
+)
+def test_the_kernel_predicate_matches_the_binary_not_the_substring(command: str, expected: bool) -> None:
+    from devcouncil.devmap_health import _is_devmap_command
+
+    assert _is_devmap_command(command) is expected

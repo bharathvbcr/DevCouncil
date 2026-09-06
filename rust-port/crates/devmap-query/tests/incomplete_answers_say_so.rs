@@ -557,3 +557,207 @@ fn a_complete_traversal_over_a_complete_corpus_claims_nothing() {
         "a complete walk over a fully read corpus must claim nothing: {blast:?}"
     );
 }
+
+/// `search` reported "no such symbol" over a corpus with a hole in it.
+///
+/// The last member of the class the tests above close, and the one that reads
+/// as the most definitive: `total=0 shown=0 hidden=0 truncated=false
+/// resolution=Available walk_incomplete=None` is this kernel's way of saying
+/// *"there are zero matches in this corpus"* as a completed check. When a file
+/// was refused — a parse that blew its budget, a grammar that would not load, a
+/// NUL byte at the boundary — every symbol in it is absent from the index, and
+/// a name that lives only there answers exactly the same way as a name that
+/// exists nowhere.
+///
+/// The distinction matters most for the reading a caller acts on: "this symbol
+/// does not exist, so I can name my new one that" and "this symbol may exist in
+/// a file nothing read" are different facts, and they were the same answer.
+#[test]
+fn search_over_a_corpus_with_a_refused_file_says_so() {
+    let store = store_of(
+        &[
+            ("lib.py", "def helper():\n    return 1\n"),
+            ("unread.py", "def only_declared_here():\n    return 2\n"),
+        ],
+        &["unread.py"],
+    );
+    let found = StoreQueryEngine::new(&store)
+        .search(Request {
+            query: "only_declared_here".to_string(),
+            token_budget: 10_000,
+            min_confidence: 0.0,
+            max_depth: 3,
+        })
+        .unwrap();
+
+    assert_eq!(
+        found.total, 0,
+        "the fixture must actually hide the symbol, or this test proves nothing: {found:?}"
+    );
+    let reason = found.walk_incomplete.as_deref().unwrap_or_else(|| {
+        panic!("a search over a partly read corpus must not report zero matches as a completed check: {found:?}")
+    });
+    assert!(
+        reason.contains("did not cover the whole corpus"),
+        "the qualification must carry the coverage numbers, not just an adjective: {reason:?}"
+    );
+    assert!(
+        reason.contains("1 file(s) failed to parse"),
+        "the reason must name how many files went unread: {reason:?}"
+    );
+    assert!(
+        reason.contains("not indexed") || reason.contains("not a complete read"),
+        "the reason must say what the gap means for a *search*, not only for the \
+         dead-code surface the counts were first written for: {reason:?}"
+    );
+}
+
+/// A non-empty page over the same corpus carries it too.
+///
+/// The caveat is about the corpus, not about the answer being empty: a caller
+/// reading `total=1` has just as much reason to know a second definition may
+/// sit in a file nothing read.
+#[test]
+fn a_non_empty_search_over_a_refused_file_carries_the_same_caveat() {
+    let store = store_of(
+        &[
+            ("lib.py", "def helper():\n    return 1\n"),
+            ("unread.py", "def helper_two():\n    return 2\n"),
+        ],
+        &["unread.py"],
+    );
+    let found = StoreQueryEngine::new(&store)
+        .search(Request {
+            query: "helper".to_string(),
+            token_budget: 10_000,
+            min_confidence: 0.0,
+            max_depth: 3,
+        })
+        .unwrap();
+
+    assert!(
+        !found.items.is_empty(),
+        "the fixture must return hits, or the assertion below is vacuous: {found:?}"
+    );
+    assert!(
+        found.walk_incomplete.is_some(),
+        "a page drawn from a partly read corpus is a lower bound whether or not it \
+         is empty: {found:?}"
+    );
+}
+
+/// The OFF direction, and the load-bearing one.
+///
+/// A marker that rides on every search tells a reader nothing. `unresolved_calls`
+/// is deliberately *not* folded in here for exactly that reason: unattributed
+/// call edges are non-zero on essentially every real corpus and say nothing
+/// about whether a symbol was indexed.
+#[test]
+fn search_over_a_complete_corpus_claims_nothing() {
+    let store = store_of(
+        &[
+            ("lib.py", "def helper():\n    return 1\n"),
+            (
+                "app.py",
+                "def run(thing):\n    return thing.mystery_method()\n",
+            ),
+        ],
+        &[],
+    );
+    let engine = StoreQueryEngine::new(&store);
+    let request = |query: &str| Request {
+        query: query.to_string(),
+        token_budget: 10_000,
+        min_confidence: 0.0,
+        max_depth: 3,
+    };
+
+    // `mystery_method` is unattributable, so this generation really does hold
+    // unresolved calls — the condition that must *not* qualify a search.
+    let dead = engine.dead_symbols(10_000).unwrap();
+    assert!(
+        dead.walk_incomplete
+            .as_deref()
+            .unwrap_or_default()
+            .contains("unattributed"),
+        "the fixture must actually hold unattributed calls, or the assertions \
+         below are vacuous: {dead:?}"
+    );
+
+    let hit = engine.search(request("helper")).unwrap();
+    assert_eq!(
+        hit.walk_incomplete, None,
+        "every file in this corpus was read; a search over it must claim nothing: {hit:?}"
+    );
+    assert!(
+        !hit.items.is_empty(),
+        "the fixture must return hits, or the assertion above is vacuous: {hit:?}"
+    );
+
+    let miss = engine.search(request("no_such_symbol_anywhere")).unwrap();
+    assert_eq!(miss.total, 0, "the fixture must actually miss: {miss:?}");
+    assert_eq!(
+        miss.walk_incomplete, None,
+        "an empty answer over a fully read corpus is a completed check and may \
+         say so: {miss:?}"
+    );
+}
+
+/// The in-memory engine shares the defect and must share the fix.
+///
+/// `QueryEngine::search` scans the extraction slice it was handed, so a refused
+/// file in that slice hides its symbols exactly as a refused row does in the
+/// store. One surface fixed and the other not would let the same corpus answer
+/// differently depending on which engine the caller reached.
+#[test]
+fn the_in_memory_search_carries_the_same_caveat() {
+    let mut extractions = vec![
+        extract_file("lib.py", "def helper():\n    return 1\n"),
+        extract_file("unread.py", "def only_declared_here():\n    return 2\n"),
+    ];
+    degrade(
+        &mut extractions[1],
+        ParseOutcome::Failed {
+            reason: "forced parse failure".to_string(),
+        },
+    );
+    extractions[1]
+        .symbols
+        .retain(|sym| sym.kind == SymbolKind::File);
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+
+    let found = QueryEngine::new(&extractions, &resolution).search(Request {
+        query: "only_declared_here".to_string(),
+        token_budget: 10_000,
+        min_confidence: 0.0,
+        max_depth: 3,
+    });
+    assert_eq!(
+        found.total, 0,
+        "the fixture must actually hide the symbol: {found:?}"
+    );
+    assert!(
+        found.walk_incomplete.is_some(),
+        "the in-memory engine must carry the same caveat as the store-backed one: {found:?}"
+    );
+
+    let clean = vec![
+        extract_file("lib.py", "def helper():\n    return 1\n"),
+        extract_file("other.py", "def spare():\n    return 2\n"),
+    ];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&clean);
+    let resolution = resolver.resolve_all(&clean);
+    let complete = QueryEngine::new(&clean, &resolution).search(Request {
+        query: "helper".to_string(),
+        token_budget: 10_000,
+        min_confidence: 0.0,
+        max_depth: 3,
+    });
+    assert_eq!(
+        complete.walk_incomplete, None,
+        "a fully read slice must leave the marker off: {complete:?}"
+    );
+}

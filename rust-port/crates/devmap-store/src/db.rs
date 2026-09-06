@@ -576,7 +576,8 @@ pub struct DeadPage {
 }
 
 /// One consistent snapshot of a search: the matching rows, the count they were
-/// drawn from, and the repo root they resolve against — all from the same
+/// drawn from, the repo root they resolve against, and the disclosure that says
+/// how much of the repository the corpus behind them covers — all from the same
 /// generation. See [`Store::search_page`] for why they must travel together.
 #[derive(Debug, Clone)]
 pub struct SearchPage {
@@ -584,6 +585,14 @@ pub struct SearchPage {
     pub total: u32,
     pub rows: Vec<StoredSymbol>,
     pub repo_root: Option<String>,
+    /// How much of the repository this generation actually read.
+    ///
+    /// Travels with the rows for the reason [`DeadPage`] states: a disclosure
+    /// resolved by a second "latest" read could describe a generation the
+    /// answer did not come from, and a coverage claim about the wrong corpus is
+    /// worse than none. `None` means the analysis blob could not be read, which
+    /// is itself a check that did not run — not a clean corpus.
+    pub analysis: Option<AnalysisDisclosure>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3424,6 +3433,11 @@ impl Store {
             total: Self::count_search_symbols_locked(&snapshot, generation, query)?,
             rows: Self::search_symbols_locked(&snapshot, generation, query, limit)?,
             repo_root: repo_root.flatten().filter(|root| !root.is_empty()),
+            // Inside the same snapshot as the rows and the count, through the
+            // one reader that strips the summary's two vectors in SQLite. A
+            // search that finds nothing is only a completed check if the corpus
+            // it searched was complete, and that is the fact this carries.
+            analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
         }))
     }
 
