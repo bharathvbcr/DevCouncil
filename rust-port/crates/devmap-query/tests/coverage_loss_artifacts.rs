@@ -286,6 +286,7 @@ fn dead_symbol_candidates_rank_by_confidence_before_truncating() {
         status: devmap_analyze::model::AnalysisStatus::Ok,
         unresolved_calls: 0,
         clone_coverage: Default::default(),
+        resolution_rate: Default::default(),
     };
     let extractions = vec![
         extract_file("a_low.py", "def x(): pass\n"),

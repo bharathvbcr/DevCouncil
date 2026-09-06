@@ -1,4 +1,5 @@
 use crate::model::*;
+use devmap_extract::languages::{capabilities_for_language, Capability};
 use devmap_extract::model::*;
 use devmap_resolve::model::*;
 use std::collections::{HashMap, HashSet};
@@ -233,6 +234,21 @@ pub struct ExtractionCoverage {
     /// deleting `helper` at 0.9 — the confident tier — because the file that
     /// calls it was never read.
     pub discovery_refused_files: usize,
+    /// Files a grammar read cleanly whose language has no call extractor.
+    ///
+    /// The gap the other three could not represent, because it is not a
+    /// failure of any kind: the parse succeeded. `CALL_EXTRACTION_LANGUAGES`
+    /// was supposed to be read by "the coverage report" so this would be a
+    /// stated fact — no such reader existed, and a CFML or Terraform file
+    /// therefore reported full coverage while contributing not one call edge.
+    pub call_blind_files: usize,
+    /// Files a grammar read cleanly whose language has no import extractor.
+    ///
+    /// Counted, published, and deliberately kept out of `is_complete()` — see
+    /// the note there. Its consumer is `unwired_candidates`, whose entire
+    /// question is "does an inbound `Imports` edge exist", and which for 24 of
+    /// 35 languages was answering it from an absence the extractor created.
+    pub import_blind_files: usize,
 }
 
 /// What discovery refused, for the analysis that cannot see it.
@@ -290,15 +306,26 @@ impl DiscoveryCoverage {
 
 impl ExtractionCoverage {
     /// Whether every file in the corpus had its calls looked for.
+    ///
+    /// `import_blind_files` is deliberately **not** here. It is a hole in a
+    /// different claim: no `Imports` edge is evidence about
+    /// `unwired_candidates`, which is where W0.3 charges it, and folding it in
+    /// would cap every dead-code finding in every Java, C++, Ruby, Swift, C#
+    /// and PHP repository at `ambiguous` — that is most of the world's code,
+    /// demoted for a blindness that is not the one the verdict rests on. The
+    /// existing two counters are kept apart for exactly this reason ("different
+    /// claims"), and a third that means something else again gets the same
+    /// treatment.
     pub fn is_complete(&self) -> bool {
         self.parse_failed_files == 0
             && self.pattern_recovered_files == 0
             && self.discovery_refused_files == 0
+            && self.call_blind_files == 0
     }
 
-    /// Files that contributed no call edges, of either kind.
+    /// Files that contributed no call edges, of any kind.
     pub fn files_without_call_extraction(&self) -> usize {
-        self.parse_failed_files + self.pattern_recovered_files
+        self.parse_failed_files + self.pattern_recovered_files + self.call_blind_files
     }
 
     /// Why the corpus-level scan is incomplete, or `None` when it is complete.
@@ -311,13 +338,27 @@ impl ExtractionCoverage {
         if self.is_complete() {
             return None;
         }
-        Some(format!(
+        let mut reason = format!(
             "call extraction did not cover the whole corpus: {} file(s) failed to parse, \
              {} recovered by pattern (no calls extracted), {} refused by discovery and never \
              read at all — dead-code and unwired findings are a lower bound and are capped \
              below the confident tier",
             self.parse_failed_files, self.pattern_recovered_files, self.discovery_refused_files
-        ))
+        );
+        // Appended rather than folded into the sentence above, because it is a
+        // different kind of fact and a permanent one. The other three describe
+        // this run — a file that happened to fail, a walk that happened to
+        // refuse. This one describes the build: no amount of re-running
+        // extracts a call from a `.cfm`, and a reader deciding whether to
+        // re-index needs to know which of the two they are looking at.
+        if self.call_blind_files > 0 {
+            reason.push_str(&format!(
+                "; {} file(s) in a language with no call extractor at all \
+                 (permanent for this build, not a transient failure)",
+                self.call_blind_files
+            ));
+        }
+        Some(reason)
     }
 
     /// Ceiling applied to a non-exempt dead-code confidence while the scan has
@@ -360,6 +401,23 @@ pub const COVERAGE_LOSS_REASON: &str =
 pub enum ExtractionGap {
     ParseFailed,
     PatternRecovered,
+    /// A grammar read the file cleanly and this build has no call extractor for
+    /// its language.
+    ///
+    /// The hole the other two could not see. A `.cfm` or a `.tf` parses
+    /// `Clean`, so `is_parse_failure` is false and `Fallback` never matches —
+    /// the file sailed past both gaps, `is_complete()` stayed true, and every
+    /// top-level symbol in it was published at the `extracted` tier, the one
+    /// `CLAUDE.md` tells agents is safe to act on. "Nothing calls it" was a
+    /// statement about the extractor and read as a statement about the code.
+    CallBlind,
+    /// A grammar read the file cleanly and this build extracts no imports for
+    /// its language.
+    ///
+    /// Charged separately from [`Self::CallBlind`] and **not** folded into
+    /// `is_complete()`: it undermines `unwired_candidates`, not the dead-symbol
+    /// verdict. See `ExtractionCoverage::is_complete`.
+    ImportBlind,
 }
 
 impl ExtractionGap {
@@ -370,8 +428,114 @@ impl ExtractionGap {
         match self {
             ExtractionGap::ParseFailed => "parse_failed",
             ExtractionGap::PatternRecovered => "pattern_recovered",
+            ExtractionGap::CallBlind => "call_blind",
+            ExtractionGap::ImportBlind => "import_blind",
         }
     }
+}
+
+/// Reason carried by a finding an unresolved call site vetoed.
+///
+/// States the imprecision in the reason itself rather than in a code comment,
+/// because the reason is what a reader acts on. `UnresolvedReference` carries
+/// no `target_file`, so the join is name-only and corpus-wide — the same trade
+/// `c_header_exported_names` already makes for C headers, and for the same
+/// reason: the alternative is a confident verdict resting on a resolver's
+/// failure.
+pub const UNRESOLVED_NAMESAKE_REASON: &str =
+    "an unresolved call site names this symbol — the resolver could not bind that site to \
+     anything, so \"nothing calls this\" is a statement about the resolver, not the code \
+     (matched by name across the whole corpus; the ledger records no target file)";
+
+/// Names that some call site meant and the resolver could not bind.
+///
+/// The kernel keeps a six-tier ledger of every site the resolution ladder gave
+/// up on, and the dead-code pass never read it. If an unresolved site names
+/// `foo`, then "nothing calls `foo`" describes the resolver rather than the
+/// code, and publishing it at the `extracted` tier — whose contract is "safe to
+/// act on" — is the unattributed tier silently manufacturing confident
+/// findings.
+///
+/// **Only two classes qualify, not the five that are not `Builtin`.** Every
+/// other class carries affirmative evidence that the site meant something else,
+/// and admitting it would veto real findings on a coincidence of spelling:
+///
+/// * `Builtin` — the name is declared by the language (`len`, `print`). A
+///   closed set; no indexed file can declare these.
+/// * `HostGlobal` — declared by the runtime (`setTimeout`, `fetch`), with the
+///   authority named in the row.
+/// * `LocalBinding` — the *enclosing symbol itself* declares the name, as a
+///   parameter or a local closure. Its own documentation calls the ladder
+///   failing here "the correct outcome rather than a defect". Admitting it
+///   would mean any function with a local named `render` resurrects every dead
+///   `render` in the corpus.
+/// * `External { module }` — bound by an import whose specifier names no
+///   indexed file. The import statement is the evidence. A *repo-relative*
+///   specifier is filed under `Unresolved` instead, precisely so this class
+///   stays import-proven.
+///
+/// What is left is exactly the two tiers where the resolver admits it does not
+/// know: `UninferredReceiver` (the receiver exists and could not be typed) and
+/// `Unresolved` (a bare name nothing explains — "the only tier that indicates a
+/// defect").
+///
+/// `Route` joins `Call` and `Reference` as an admitted kind because a route
+/// handler that failed to bind is the strongest version of this case: the
+/// `HandlesRoute` edge is what tells liveness a handler is reached from outside
+/// the call graph at all, so an unbound one leaves a live handler looking dead.
+/// `Import` is excluded because its `callee_name` is a *module specifier*, not
+/// a symbol name, and matching specifiers against symbols is noise.
+fn unresolved_namesakes(resolution: &ResolutionResult) -> HashSet<&str> {
+    resolution
+        .unresolved
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.kind,
+                UnresolvedKind::Call | UnresolvedKind::Reference | UnresolvedKind::Route
+            ) && matches!(
+                row.class,
+                UnresolvedClass::UninferredReceiver | UnresolvedClass::Unresolved
+            )
+        })
+        .map(|row| row.callee_name.as_str())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Reason carried by a finding the call-blind cap demoted.
+///
+/// Distinct from [`COVERAGE_LOSS_REASON`] on purpose. That one says extraction
+/// "did not cover every file", which invites the reader to re-index. For a
+/// language with no extractor there is nothing to re-run: the fact is about
+/// this build's capabilities, it is permanent until someone writes the
+/// extractor, and saying so is the difference between a transient gap and a
+/// structural one.
+pub const CALL_BLIND_REASON: &str =
+    "no inbound call edges, but this file's language has no call extractor in this build — \
+     the absence is the extractor's, not the code's";
+
+/// Whether a grammar actually read this file.
+///
+/// The gate that keeps call-blindness from swallowing the tree. Prose and data
+/// formats report `NotApplicable` and declare no capabilities, so without this
+/// every `.md`, `.json` and `.yaml` would be charged as call-blind — 294 of
+/// this repository's 1,310 files — and `is_complete()` would be false on every
+/// corpus in existence. A degraded flag that is always on carries no
+/// information, which is the same trap `ExtractionCoverage::parse_failed_files`
+/// documents for its own count.
+///
+/// `RegexFallback` and `Unavailable` are excluded for a different reason: they
+/// are already charged, as `PatternRecovered` and `ParseFailed` respectively.
+/// Charging them again would double-count one file's single hole.
+fn a_grammar_read_this_file(ext: &Extraction) -> bool {
+    matches!(
+        ext.engine,
+        ExtractionEngine::TreeSitter { .. } | ExtractionEngine::Notebook { .. }
+    ) && matches!(
+        ext.parse_outcome,
+        ParseOutcome::Clean | ParseOutcome::Partial { .. }
+    )
 }
 
 /// One file that call extraction did not cover, and why.
@@ -409,6 +573,27 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
             )
         } else if let ParseOutcome::Fallback { reason } = &ext.parse_outcome {
             (ExtractionGap::PatternRecovered, reason.clone())
+        } else if a_grammar_read_this_file(ext) {
+            // A clean parse in a language this build has no extractor for.
+            // Both bits are asked independently: HCL is call-blind *and*
+            // import-blind, Java only the second, and collapsing them would
+            // make a file with one hole indistinguishable from a file with two.
+            let capabilities = capabilities_for_language(&ext.language);
+            if !capabilities.contains(Capability::Calls) {
+                gaps.push(ExtractionGapEntry {
+                    path: ext.file_path.clone(),
+                    gap: ExtractionGap::CallBlind,
+                    reason: format!("`{}` has no call extractor in this build", ext.language),
+                });
+            }
+            if !capabilities.contains(Capability::Imports) {
+                gaps.push(ExtractionGapEntry {
+                    path: ext.file_path.clone(),
+                    gap: ExtractionGap::ImportBlind,
+                    reason: format!("`{}` has no import extractor in this build", ext.language),
+                });
+            }
+            continue;
         } else {
             continue;
         };
@@ -434,6 +619,8 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
         match entry.gap {
             ExtractionGap::ParseFailed => coverage.parse_failed_files += 1,
             ExtractionGap::PatternRecovered => coverage.pattern_recovered_files += 1,
+            ExtractionGap::CallBlind => coverage.call_blind_files += 1,
+            ExtractionGap::ImportBlind => coverage.import_blind_files += 1,
         }
     }
     coverage
@@ -468,6 +655,9 @@ pub fn analyze_liveness_with_coverage(
     // file discovery never read may hold the only call to a symbol here, so a
     // refusal has to reach `coverage.cap()` the same way a parse failure does.
     coverage.discovery_refused_files = discovery.charged();
+    // Computed once for the whole corpus: the join is name-only, so it has no
+    // per-file component to recompute.
+    let unresolved_names = unresolved_namesakes(resolution);
     let go_interface_specs = go_interface_specs_by_package(extractions);
     let c_header_exports = c_header_exported_names(extractions);
     let go_build_variants = go_build_variant_identities(extractions);
@@ -552,6 +742,15 @@ pub fn analyze_liveness_with_coverage(
             ext.parse_outcome,
             ParseOutcome::Failed { .. } | ParseOutcome::Fallback { .. }
         );
+
+        // The same sentence as `is_parse_failed`, one step further out: a file
+        // whose grammar succeeded but whose language has no call extractor also
+        // extracted no calls, so every symbol in it is uncalled by
+        // construction. `is_parse_failed` could not see this because the parse
+        // did not fail — that is exactly how CFML and Terraform symbols reached
+        // the `extracted` tier.
+        let file_is_call_blind = a_grammar_read_this_file(ext)
+            && !capabilities_for_language(&ext.language).contains(Capability::Calls);
 
         // A wiring annotation is file-scoped only when it targets the file
         // itself. Symbol-scoped annotations must never be read as file-scoped:
@@ -711,6 +910,30 @@ pub fn analyze_liveness_with_coverage(
                 && !is_file_exempt
                 && symbol_exemption.is_none()
                 && !overlaps_parse_error
+                && unresolved_names.contains(sym.name.as_str())
+            {
+                // The defect ledger, read at last. Same tier as
+                // `only_ambiguous_callers` — both mean "there is evidence
+                // something reaches this and we could not prove which" — but a
+                // distinct reason, because the two are different evidence and
+                // `only_ambiguous_callers` is a machine token three tests match
+                // exactly.
+                //
+                // Placed after the ambiguity branch so a symbol with both keeps
+                // the older, more specific token rather than silently changing
+                // what those tests observe.
+                reports.push(DeadSymbolReport {
+                    symbol_name: dead_symbol_identity(sym, &ext.file_path),
+                    file_path: ext.file_path.clone(),
+                    confidence: coverage.cap(0.4),
+                    is_exempt: false,
+                    exemption_reason: Some(UNRESOLVED_NAMESAKE_REASON.to_string()),
+                });
+            } else if !is_called
+                && !is_exported
+                && !is_file_exempt
+                && symbol_exemption.is_none()
+                && !overlaps_parse_error
             {
                 // The corpus-level half of X6. A confident finding here means
                 // "no edge in the whole generation names this symbol" — which
@@ -723,7 +946,15 @@ pub fn analyze_liveness_with_coverage(
                     file_path: ext.file_path.clone(),
                     confidence: coverage.cap(0.9),
                     is_exempt: false,
-                    exemption_reason: if coverage.is_complete() {
+                    // Most specific reason wins, matching the exempt branch
+                    // below. A symbol in a call-blind file is not merely
+                    // downstream of somebody else's coverage hole — its own
+                    // file is the hole, and the reader's next move differs:
+                    // corpus loss invites a re-index, a missing extractor does
+                    // not.
+                    exemption_reason: if file_is_call_blind {
+                        Some(CALL_BLIND_REASON.to_string())
+                    } else if coverage.is_complete() {
                         None
                     } else {
                         Some(COVERAGE_LOSS_REASON.to_string())

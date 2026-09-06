@@ -50,7 +50,8 @@ fn swift_and_kotlin_do_not_share_a_resolution_bucket() {
     // the shared bucket only if nothing claims it emits calls.
     for quiet in ["cobol", "html", "css", "json", "yaml", "toml", "markdown"] {
         assert!(
-            !devmap_extract::langcalls::CALL_EXTRACTION_LANGUAGES.contains(&quiet),
+            !devmap_extract::languages::capabilities_for_language(quiet)
+                .contains(devmap_extract::languages::Capability::Calls),
             "{quiet} is listed as a call-extracting language, so it can no longer \
              be used here as an example of one that is not"
         );
@@ -133,7 +134,19 @@ fn each_primary_language_reads_its_own_standard_library() {
 /// read this file.
 #[test]
 fn every_call_extracting_language_owns_its_bucket() {
-    for lang in devmap_extract::langcalls::CALL_EXTRACTION_LANGUAGES {
+    let call_extracting: Vec<&str> = devmap_extract::languages::LANGUAGE_SPECS
+        .iter()
+        .map(|spec| spec.grammar)
+        .filter(|grammar| {
+            devmap_extract::languages::capabilities_for_language(grammar)
+                .contains(devmap_extract::languages::Capability::Calls)
+        })
+        .collect();
+    assert!(
+        !call_extracting.is_empty(),
+        "no language declares call extraction; the loop below would hold vacuously"
+    );
+    for lang in call_extracting {
         let family = LangFamily::from_lang(lang);
         assert_ne!(
             family,

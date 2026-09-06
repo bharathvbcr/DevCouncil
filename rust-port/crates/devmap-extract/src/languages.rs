@@ -84,6 +84,110 @@ impl ExtractorId {
     }
 }
 
+/// One thing the extractor is able to observe in a language.
+///
+/// The discriminants are bit positions in [`Capabilities`]; they are part of no
+/// serialized format and may be renumbered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Capability {
+    /// The extractor produces `Extraction::calls` — invocations with a callee
+    /// name. Without it, "nothing calls this symbol" is a statement about the
+    /// extractor, not about the code.
+    Calls = 1,
+    /// The extractor produces `Extraction::imports` — module specifiers that
+    /// become `EdgeKind::Imports`. Without it, "nothing imports this file" is
+    /// likewise vacuous, which is what `unwired_candidates` reads.
+    Imports = 2,
+    /// The extractor produces `Extraction::references` — non-call uses.
+    References = 4,
+    /// The extractor produces `ReferenceKind::Heritage` — a supertype named in
+    /// a declaration, which is what an `Extends`/`Implements` edge needs.
+    Heritage = 8,
+}
+
+impl Capability {
+    /// Every capability, in bit order. The single list the derivation test
+    /// iterates, so a new variant cannot be added without the test covering it.
+    pub const ALL: &'static [Capability] = &[
+        Capability::Calls,
+        Capability::Imports,
+        Capability::References,
+        Capability::Heritage,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Capability::Calls => "calls",
+            Capability::Imports => "imports",
+            Capability::References => "references",
+            Capability::Heritage => "heritage",
+        }
+    }
+}
+
+/// What a language's extractor demonstrably produces.
+///
+/// A *derived* fact, not a remembered one. `CALL_EXTRACTION_LANGUAGES` — the
+/// hand-written list this replaces — claimed in its own doc comment to be read
+/// by a coverage report that did not exist, had zero production readers, and
+/// was wrong by omission for 14 languages. The failure mode was structural: a
+/// list nothing checks against behaviour rots the moment behaviour moves.
+///
+/// So the contract here is that every bit is pinned, in **both directions**,
+/// against an observation over `testdata/capabilities/` — see
+/// `tests/language_capabilities.rs`. A language that gains a `langcalls`
+/// module and forgets the flag fails CI; so does a flag set for a language
+/// that produces nothing.
+///
+/// Keyed on the **grammar**, not the language name: `detect_language` returns
+/// `spec.grammar`, every dispatch site matches on it, and `Extraction::language`
+/// stores it. ArkTS and TypeScript share `typescript`; Metal and C++ share
+/// `cpp`. Two specs naming one grammar therefore must declare identical
+/// capabilities, which `capabilities_agree_within_a_grammar` asserts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+pub struct Capabilities(u8);
+
+impl Capabilities {
+    /// The extractor observes nothing for this language.
+    ///
+    /// Not the same as "this language has nothing to observe" — it is the
+    /// fail-closed default, and the value that makes a blind spot say so.
+    pub const NONE: Capabilities = Capabilities(0);
+
+    pub const fn new(bits: u8) -> Capabilities {
+        Capabilities(bits)
+    }
+
+    pub const fn contains(self, capability: Capability) -> bool {
+        self.0 & (capability as u8) != 0
+    }
+
+    pub const fn is_none(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The capabilities this language has, in bit order. Used to report a
+    /// blind spot by name rather than as a bare boolean.
+    pub fn iter(self) -> impl Iterator<Item = Capability> {
+        Capability::ALL
+            .iter()
+            .copied()
+            .filter(move |cap| self.contains(*cap))
+    }
+}
+
+/// `Capabilities::new(CALLS | REFERENCES)` — bare `u8` constants so the set
+/// composes with `|` inside a `static` initializer, which a `BitOr` impl
+/// cannot do on stable.
+pub const CALLS: u8 = Capability::Calls as u8;
+pub const IMPORTS: u8 = Capability::Imports as u8;
+pub const REFERENCES: u8 = Capability::References as u8;
+/// Declared by no language yet: no extractor emits `ReferenceKind::Heritage`.
+/// Present so the bit exists for the producer work to turn on, and so the
+/// derivation test already fails if one starts emitting it silently.
+#[allow(dead_code)]
+pub const HERITAGE: u8 = Capability::Heritage as u8;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LanguageSpec {
     pub name: &'static str,
@@ -93,6 +197,14 @@ pub struct LanguageSpec {
     pub extractor_id: ExtractorId,
     pub lsp_id: &'static str,
     pub viz_color: &'static str,
+    /// What this language's extractor produces. See [`Capabilities`].
+    ///
+    /// Not compared against `testdata/golden/language_specs.json`: that frozen
+    /// manifest records what *Python* declared, and Python declared nothing
+    /// about capability. `FrozenLanguageSpec` names its five fields explicitly
+    /// and the parity test compares field by field, so this one is invisible
+    /// to it by construction rather than by an exemption.
+    pub capabilities: Capabilities,
 }
 
 pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
@@ -104,6 +216,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::TypeScript,
         lsp_id: "typescript",
         viz_color: "#3178c6",
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
     },
     LanguageSpec {
         name: "TSX",
@@ -113,6 +226,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Tsx,
         lsp_id: "typescript",
         viz_color: "#3178c6",
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
     },
     LanguageSpec {
         name: "JavaScript",
@@ -122,6 +236,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::JavaScript,
         lsp_id: "javascript",
         viz_color: "#f7df1e",
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
     },
     LanguageSpec {
         name: "ArkTS",
@@ -131,6 +246,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::ArkTs,
         lsp_id: "typescript",
         viz_color: "#002b36",
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
     },
     LanguageSpec {
         name: "Python",
@@ -140,6 +256,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Python,
         lsp_id: "python",
         viz_color: "#3572A5",
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
     },
     LanguageSpec {
         name: "Go",
@@ -149,6 +266,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Go,
         lsp_id: "gopls",
         viz_color: "#00ADD8",
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
     },
     LanguageSpec {
         name: "Rust",
@@ -158,6 +276,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Rust,
         lsp_id: "rust-analyzer",
         viz_color: "#dea584",
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
     },
     LanguageSpec {
         name: "Java",
@@ -167,6 +286,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Java,
         lsp_id: "jdtls",
         viz_color: "#b07219",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "C#",
@@ -176,6 +296,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::CSharp,
         lsp_id: "omnisharp",
         viz_color: "#178600",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "VB.NET",
@@ -185,6 +306,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::VbNet,
         lsp_id: "vbnet",
         viz_color: "#945db7",
+        capabilities: Capabilities::NONE,
     },
     LanguageSpec {
         name: "PHP",
@@ -194,6 +316,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Php,
         lsp_id: "intelephense",
         viz_color: "#4F5D95",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "Ruby",
@@ -203,6 +326,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Ruby,
         lsp_id: "solargraph",
         viz_color: "#701516",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "C",
@@ -212,6 +336,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::C,
         lsp_id: "clangd",
         viz_color: "#555555",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "C++",
@@ -221,6 +346,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Cpp,
         lsp_id: "clangd",
         viz_color: "#f34b7d",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "Objective-C",
@@ -230,6 +356,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::ObjC,
         lsp_id: "clangd",
         viz_color: "#438eff",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "Metal",
@@ -239,6 +366,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Metal,
         lsp_id: "clangd",
         viz_color: "#8f14e9",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "CUDA",
@@ -248,6 +376,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Cuda,
         lsp_id: "clangd",
         viz_color: "#3A4E3A",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "Swift",
@@ -257,6 +386,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Swift,
         lsp_id: "sourcekit-lsp",
         viz_color: "#F05138",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "Kotlin",
@@ -266,6 +396,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Kotlin,
         lsp_id: "kotlin-language-server",
         viz_color: "#A97BFF",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "Scala",
@@ -275,6 +406,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Scala,
         lsp_id: "metals",
         viz_color: "#c22d40",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "Dart",
@@ -284,6 +416,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Dart,
         lsp_id: "dart-analysis-server",
         viz_color: "#00B4AB",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "Svelte",
@@ -293,6 +426,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Svelte,
         lsp_id: "svelte-language-server",
         viz_color: "#ff3e00",
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
     },
     LanguageSpec {
         name: "Vue",
@@ -310,6 +444,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Vue,
         lsp_id: "volar",
         viz_color: "#41b883",
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
     },
     LanguageSpec {
         name: "Astro",
@@ -319,6 +454,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Astro,
         lsp_id: "astro-ls",
         viz_color: "#ff5a03",
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
     },
     LanguageSpec {
         name: "Liquid",
@@ -328,6 +464,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Liquid,
         lsp_id: "theme-check",
         viz_color: "#67b8de",
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
     },
     LanguageSpec {
         name: "Pascal/Delphi",
@@ -337,6 +474,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Pascal,
         lsp_id: "pascal-lsp",
         viz_color: "#E3F171",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "Lua",
@@ -346,6 +484,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Lua,
         lsp_id: "lua-language-server",
         viz_color: "#000080",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "Luau",
@@ -355,6 +494,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Luau,
         lsp_id: "luau-lsp",
         viz_color: "#00A2FF",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "R",
@@ -364,6 +504,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::R,
         lsp_id: "r-languageserver",
         viz_color: "#198CE7",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "CFML",
@@ -373,6 +514,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Cfml,
         lsp_id: "cfls",
         viz_color: "#224f80",
+        capabilities: Capabilities::NONE,
     },
     LanguageSpec {
         name: "COBOL",
@@ -382,6 +524,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Cobol,
         lsp_id: "cobol-ls",
         viz_color: "#005ca5",
+        capabilities: Capabilities::NONE,
     },
     LanguageSpec {
         name: "Erlang",
@@ -391,6 +534,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Erlang,
         lsp_id: "erlang-ls",
         viz_color: "#B83998",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "Solidity",
@@ -400,6 +544,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Solidity,
         lsp_id: "solc",
         viz_color: "#AA6746",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
     LanguageSpec {
         name: "Terraform/OpenTofu",
@@ -409,6 +554,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Terraform,
         lsp_id: "terraform-ls",
         viz_color: "#5C4EE5",
+        capabilities: Capabilities::new(REFERENCES),
     },
     LanguageSpec {
         name: "Nix",
@@ -418,6 +564,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Nix,
         lsp_id: "nil",
         viz_color: "#7e71de",
+        capabilities: Capabilities::new(CALLS | REFERENCES),
     },
 ];
 
@@ -491,6 +638,79 @@ pub fn detect_language(path: &Path) -> &'static str {
             _ => "generic",
         }
     }
+}
+
+/// Grammars reachable through `detect_language`'s fallback table rather than
+/// through `LANGUAGE_SPECS`.
+///
+/// `find_spec_by_extension` misses these entirely — `.sh` and `.sql` are named
+/// only in the `match ext` arm below `detect_language`'s registry lookup — yet
+/// both reach a real grammar and both extract calls (`langcalls::shell`,
+/// `langcalls::sql`). A capability lookup that consulted only the registry
+/// would report them blind and charge working extraction as a coverage hole,
+/// which is the same class of error as the list this replaces.
+///
+/// The prose and data formats are listed at `NONE` deliberately rather than
+/// left to the fallback: an explicit row is a decision, an absence is an
+/// oversight, and `every_reachable_grammar_declares_capabilities` cannot tell
+/// them apart otherwise.
+const NON_REGISTRY_CAPABILITIES: &[(&str, Capabilities)] = &[
+    ("shell", Capabilities::new(CALLS | REFERENCES)),
+    ("sql", Capabilities::new(CALLS | REFERENCES)),
+    // No linked grammar. Both reach `crate::fallback`, which recovers
+    // declarations by line pattern and by construction extracts nothing else —
+    // already charged to coverage as `PatternRecovered`.
+    ("protobuf", Capabilities::NONE),
+    ("powershell", Capabilities::NONE),
+    // Prose, data and config. No grammar is wanted and none will come; these
+    // report `ExtractionEngine::NotApplicable` and are excluded from coverage
+    // by `Extraction::is_parse_failure`.
+    ("markdown", Capabilities::NONE),
+    ("json", Capabilities::NONE),
+    ("yaml", Capabilities::NONE),
+    ("toml", Capabilities::NONE),
+    ("html", Capabilities::NONE),
+    ("css", Capabilities::NONE),
+    ("config", Capabilities::NONE),
+    ("generic", Capabilities::NONE),
+    // A notebook is re-parsed with its kernel's grammar, so its capabilities
+    // are that grammar's, resolved per file rather than declared here.
+    ("notebook", Capabilities::NONE),
+];
+
+/// What the extractor can observe in `language`, where `language` is the
+/// **grammar** string `detect_language` returns and `Extraction::language`
+/// stores.
+///
+/// The canonical owner. Every consumer asking "did we even look for calls in
+/// this file" asks here, so a blind spot and a genuine negative cannot become
+/// indistinguishable in one caller while staying distinct in another.
+///
+/// An unrecognised language is [`Capabilities::NONE`] — fail closed, so a new
+/// grammar wired up without a capability row reports as blind rather than
+/// silently inheriting a confident verdict it has not earned.
+pub fn capabilities_for_language(language: &str) -> Capabilities {
+    if let Some(spec) = LANGUAGE_SPECS.iter().find(|s| s.grammar == language) {
+        return spec.capabilities;
+    }
+    NON_REGISTRY_CAPABILITIES
+        .iter()
+        .find(|(name, _)| *name == language)
+        .map(|(_, caps)| *caps)
+        .unwrap_or(Capabilities::NONE)
+}
+
+/// Whether `language` is one this build has a capability row for at all.
+///
+/// Distinct from `capabilities_for_language(..).is_none()`, which cannot tell
+/// "declared to observe nothing" from "never heard of it". Only the matrix
+/// test needs the difference, and it needs it precisely so an unrowed grammar
+/// fails loudly instead of defaulting quietly.
+pub fn language_capability_is_declared(language: &str) -> bool {
+    LANGUAGE_SPECS.iter().any(|s| s.grammar == language)
+        || NON_REGISTRY_CAPABILITIES
+            .iter()
+            .any(|(name, _)| *name == language)
 }
 
 /// Whether a relative path is inside a VCS, build, environment, or devmap-owned

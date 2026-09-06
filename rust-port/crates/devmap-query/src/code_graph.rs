@@ -30,6 +30,7 @@ use crate::engine::{byte_span_to_line_range, resolve_source_path};
 use crate::manifest::{entry_root_paths, is_entry_root, CONSUMER_MAP_ENGINE};
 use crate::model::FreshnessInfo;
 use devmap_analyze::model::{AnalysisStatus, AnalysisSummary};
+use devmap_extract::languages::{capabilities_for_language, Capability};
 use devmap_extract::model::{
     confidence_millis, EdgeKind, ExtractedSymbol, Extraction, ParseOutcome, SymbolKind, WiringKind,
 };
@@ -223,6 +224,24 @@ pub(crate) struct UnwiredScan {
     /// total is how "we did not look" comes to read as "we looked and found
     /// nothing".
     pub(crate) excluded_coverage_loss: usize,
+    /// Files dropped because **no importer could ever have been seen** — their
+    /// language has no import extractor in this build.
+    ///
+    /// The largest false-positive surface the kernel had. `unwired_candidates`
+    /// asks whether a file has an inbound `Imports` edge from a non-test file,
+    /// and there are only five `imports.push` sites in the entire extractor:
+    /// Python, JS/TS/TSX, Rust `use`, Go `import_spec`, and the embedded-script
+    /// merge. For the other 24 of 35 languages the answer was structurally
+    /// always no, so in a Java, C++, Ruby, Swift or C# repository *every*
+    /// non-entry-root, non-exempt file was reported unwired — and these files
+    /// parse `Clean`, so `excluded_coverage_loss` above never fired for them.
+    /// Capped at 200, the agent saw 200 confidently-wrong filenames.
+    ///
+    /// Counted apart from `excluded_coverage_loss` rather than added to it,
+    /// because the two are different facts with different remedies: one is a
+    /// file this run could not read and a re-index might, the other is a
+    /// language this build cannot read imports for and no re-run will change.
+    pub(crate) excluded_import_blind: usize,
 }
 
 pub(crate) fn unwired_candidates(
@@ -247,6 +266,7 @@ pub(crate) fn unwired_candidates(
     }
 
     let mut excluded_coverage_loss = 0usize;
+    let mut excluded_import_blind = 0usize;
     let mut candidates: Vec<String> = extractions
         .iter()
         .filter(|ext| {
@@ -275,6 +295,20 @@ pub(crate) fn unwired_candidates(
                 excluded_coverage_loss += 1;
                 return false;
             }
+            // The kernel never looked for an import of this file, so its
+            // absence is not evidence of one.
+            //
+            // Gated on the file's **own** language rather than on its potential
+            // importers'. An import names a module in the importer's own
+            // language — no `.ts` file imports a `.java` — so the set of files
+            // that could ever produce an inbound `Imports` edge for this one
+            // shares its language, and that language's capability is the whole
+            // answer. Checked after the parse-failure branch so a file with
+            // both holes is charged once, to the more specific of the two.
+            if !capabilities_for_language(&ext.language).contains(Capability::Imports) {
+                excluded_import_blind += 1;
+                return false;
+            }
             true
         })
         .map(|ext| ext.file_path.clone())
@@ -284,6 +318,7 @@ pub(crate) fn unwired_candidates(
     UnwiredScan {
         paths: candidates,
         excluded_coverage_loss,
+        excluded_import_blind,
     }
 }
 
@@ -329,6 +364,9 @@ struct GraphProvenance {
     parse_failed_files: usize,
     /// Files the unwired filter dropped because their imports were never read.
     unwired_excluded_coverage_loss: usize,
+    /// Files excluded because their language has no import extractor. See
+    /// `UnwiredScan::excluded_import_blind`.
+    unwired_excluded_import_blind: usize,
 }
 
 /// Render `code_graph.json` from a committed generation.
@@ -583,6 +621,7 @@ fn build_code_graph_value(
 
     let unwired = unwired_candidates(extractions, edges);
     provenance.unwired_excluded_coverage_loss = unwired.excluded_coverage_loss;
+    provenance.unwired_excluded_import_blind = unwired.excluded_import_blind;
 
     let analysis_status = match &analysis.status {
         AnalysisStatus::Ok => "ok".to_string(),
@@ -695,6 +734,9 @@ fn build_code_graph_value(
                 // how much of *it* the same hole removed.
                 "parse_failed_files": provenance.parse_failed_files,
                 "unwired_excluded_coverage_loss": provenance.unwired_excluded_coverage_loss,
+                // Reported beside it rather than summed into it: a re-index can
+                // fix the first number and can never fix this one.
+                "unwired_excluded_import_blind": provenance.unwired_excluded_import_blind,
                 "unavailable": unavailable,
             },
         },
@@ -1120,6 +1162,7 @@ mod tests {
             status: AnalysisStatus::Ok,
             unresolved_calls: 0,
             clone_coverage: Default::default(),
+            resolution_rate: Default::default(),
         }
     }
 

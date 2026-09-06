@@ -1,0 +1,10 @@
+<script>
+  import { helper } from "./helper.js";
+
+  export function render(name) {
+    return helper(name);
+  }
+
+  const value = render("x");
+</script>
+{% if value %}{{ value }}{% endif %}

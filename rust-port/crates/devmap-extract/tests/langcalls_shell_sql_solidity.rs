@@ -16,8 +16,9 @@
 //! Solidity contract is never like. Every test below was run against that tree
 //! first and its pre-fix answer is recorded beside the assertion.
 
+use devmap_extract::extract_file;
+use devmap_extract::languages::{capabilities_for_language, Capability};
 use devmap_extract::model::{Extraction, SymbolKind};
-use devmap_extract::{extract_file, langcalls::CALL_EXTRACTION_LANGUAGES};
 
 const SHELL: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -388,7 +389,7 @@ fn the_coverage_list_and_the_dispatcher_agree_for_shell_sql_and_solidity() {
             "contract C { function m() public { helper(1); } }\n",
         ),
     ] {
-        let listed = CALL_EXTRACTION_LANGUAGES.contains(&language);
+        let listed = capabilities_for_language(language).contains(Capability::Calls);
         let extracted = !extract_file(path, source).calls.is_empty();
         assert_eq!(
             listed, extracted,

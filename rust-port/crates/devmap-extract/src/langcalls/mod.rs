@@ -86,29 +86,3 @@ pub(crate) fn extract_calls(
         _ => {}
     }
 }
-
-/// Languages whose calls this module extracts.
-///
-/// Read by the coverage report so "this language has no call graph" is a stated
-/// fact rather than an indistinguishable zero. Kept sorted; the test pins it.
-pub const CALL_EXTRACTION_LANGUAGES: &[&str] = &[
-    "csharp", "dart", "erlang", "java", "kotlin", "lua", "luau", "nix", "pascal", "php", "r",
-    "ruby", "scala", "shell", "solidity", "sql", "swift",
-];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_covered_language_list_is_sorted_and_unique() {
-        let mut sorted = CALL_EXTRACTION_LANGUAGES.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(
-            sorted.as_slice(),
-            CALL_EXTRACTION_LANGUAGES,
-            "the list is binary-searched and reported to consumers; keep it sorted and unique"
-        );
-    }
-}

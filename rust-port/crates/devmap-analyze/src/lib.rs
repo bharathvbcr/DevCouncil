@@ -3,6 +3,7 @@ pub mod clustering;
 pub mod liveness;
 pub mod model;
 pub mod pdg;
+pub mod resolution_rate;
 pub mod traversal;
 
 pub use clones::{
@@ -13,10 +14,12 @@ pub use clustering::{detect_communities, CommunityDetection};
 pub use liveness::{
     analyze_liveness, analyze_liveness_with_coverage, extraction_coverage, extraction_gaps,
     DiscoveryCoverage, ExtractionCoverage, ExtractionGap, ExtractionGapEntry, LivenessOutcome,
-    COVERAGE_LOSS_CONFIDENCE_CAP, COVERAGE_LOSS_REASON, GO_BUILD_VARIANT_REASON,
+    CALL_BLIND_REASON, COVERAGE_LOSS_CONFIDENCE_CAP, COVERAGE_LOSS_REASON, GO_BUILD_VARIANT_REASON,
+    UNRESOLVED_NAMESAKE_REASON,
 };
 pub use model::*;
 pub use pdg::*;
+pub use resolution_rate::{resolution_rate, LanguageResolution, Permille, ResolutionRate};
 pub use traversal::*;
 
 use devmap_extract::model::*;
@@ -83,6 +86,11 @@ pub fn analyze_with_discovery(
         // `None`, and the difference is what lets the daemon carry a real
         // measurement forward without inventing one.
         discovery_refused_files: discovery.refused_files(),
+        // Computed here rather than in the CLI so every consumer of a summary
+        // reads one number: the CLI renders it, the store persists it, and the
+        // Python ratchet fences it. A rate computed at the point of printing is
+        // a rate nothing else can ratchet.
+        resolution_rate: crate::resolution_rate::resolution_rate(extractions, resolution),
     }
 }
 

@@ -589,6 +589,8 @@ class C {
 /// graph" rather than leaving it as an indistinguishable zero.
 #[test]
 fn ruby_and_php_are_reported_as_covered() {
-    assert!(devmap_extract::langcalls::CALL_EXTRACTION_LANGUAGES.contains(&"ruby"));
-    assert!(devmap_extract::langcalls::CALL_EXTRACTION_LANGUAGES.contains(&"php"));
+    assert!(devmap_extract::languages::capabilities_for_language("ruby")
+        .contains(devmap_extract::languages::Capability::Calls));
+    assert!(devmap_extract::languages::capabilities_for_language("php")
+        .contains(devmap_extract::languages::Capability::Calls));
 }

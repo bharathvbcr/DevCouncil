@@ -263,3 +263,261 @@ fn both_liveness_entry_points_apply_the_same_cap() {
         .filter(|report| !report.is_exempt)
         .all(|report| report.confidence <= COVERAGE_LOSS_CONFIDENCE_CAP));
 }
+
+// ---------------------------------------------------------------------------
+// W0.2 — a clean parse in a language with no call extractor is a coverage hole
+// ---------------------------------------------------------------------------
+//
+// The three gaps above all begin with a failure: a parse that did not finish, a
+// grammar that was not linked, a walk that refused a file. CFML and Terraform
+// fail at none of them. They parse `Clean`, `is_parse_failure` is false,
+// `Fallback` never matches, and no arm of `extract_node` or `langcalls` pushes
+// a call for either language — so the file contributed zero call edges and
+// `is_complete()` stayed true.
+//
+// Measured against the pre-change kernel, `probe.cfm`'s and `probe.tf`'s
+// symbols were reported at confidence 0.9 with `exemption_reason: None`, which
+// `confidence_label` renders `extracted` — the tier whose contract is "safe to
+// act on". That is the same maximum-confidence-from-a-check-that-did-not-run
+// shape as Q-1, arriving through a door the coverage machinery had no way to
+// see.
+
+/// Terraform: parses `Clean`, extracts references, extracts no calls.
+const TERRAFORM: &str = r#"module "helper" {
+  source = "./helper"
+}
+
+resource "aws_s3_bucket" "b" {
+  bucket = lower(var.name)
+}
+"#;
+
+/// CFML: parses `Clean` and extracts nothing at all.
+const CFML: &str = r#"<cfscript>
+    component Widget {
+        function render() {
+            return help(this.name);
+        }
+    }
+</cfscript>
+"#;
+
+/// The language really is call-blind, and really does parse cleanly.
+///
+/// Stated separately so that if a CFML or HCL call extractor ever lands, this
+/// is the test that fails first and explains why the ones below changed —
+/// rather than leaving a reader to guess whether the fixture or the kernel
+/// moved.
+#[test]
+fn the_call_blind_fixtures_parse_clean_and_extract_no_calls() {
+    for (path, source) in [("main.tf", TERRAFORM), ("Widget.cfm", CFML)] {
+        let extraction = extract_file(path, source);
+        assert!(
+            matches!(extraction.parse_outcome, ParseOutcome::Clean),
+            "{path} must parse cleanly, or it would be charged as a parse \
+             failure and this whole class of hole would already be covered: {:?}",
+            extraction.parse_outcome
+        );
+        assert!(
+            !extraction.is_parse_failure(),
+            "{path} must not read as a parse failure"
+        );
+        assert!(
+            extraction.calls.is_empty(),
+            "{path} is expected to extract no calls"
+        );
+    }
+
+    // Terraform declares symbols; CFML declares none at all. Asserted apart
+    // rather than with a shared `> 1`, because the two are blind in different
+    // amounts and a test that hid the difference would let CFML's extractor
+    // start producing symbols without anyone noticing that it now has
+    // something to report dead.
+    assert!(
+        extract_file("main.tf", TERRAFORM).symbols.len() > 1,
+        "Terraform must declare something, or `a_call_blind_corpus_cannot_\
+         reach_the_confident_tier` holds vacuously"
+    );
+    assert_eq!(
+        extract_file("Widget.cfm", CFML)
+            .symbols
+            .iter()
+            .filter(|s| s.kind != SymbolKind::File)
+            .count(),
+        0,
+        "CFML extracts no declarations at all; if that changes, its symbols \
+         become reportable and the call-blind cap is what stands between them \
+         and the `extracted` tier"
+    );
+}
+
+/// A pure-Terraform corpus yields no `extracted`-tier findings, and says why.
+#[test]
+fn a_call_blind_corpus_cannot_reach_the_confident_tier() {
+    let extractions = vec![extract_file("main.tf", TERRAFORM)];
+    let summary = summarize(&extractions);
+
+    let reason = match &summary.status {
+        AnalysisStatus::Partial { reason } => reason.clone(),
+        other => panic!(
+            "a corpus whose only language has no call extractor is not a complete scan: {other:?}"
+        ),
+    };
+    assert!(
+        reason.contains("no call extractor at all"),
+        "the status must name the blindness as permanent, not as a transient \
+         coverage loss: {reason}"
+    );
+
+    for report in summary.dead_symbols.iter().filter(|r| !r.is_exempt) {
+        assert!(
+            report.confidence <= COVERAGE_LOSS_CONFIDENCE_CAP,
+            "an `extracted`-tier finding in a call-blind file: {report:?}"
+        );
+        assert_eq!(
+            report.exemption_reason.as_deref(),
+            Some(CALL_BLIND_REASON),
+            "a call-blind finding must name its own blindness, not the \
+             corpus-level coverage loss: {report:?}"
+        );
+    }
+}
+
+/// The same, for CFML, plus the counter.
+#[test]
+fn a_cfml_file_is_charged_as_call_blind() {
+    let extractions = vec![extract_file("Widget.cfm", CFML)];
+    let outcome = {
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions);
+        analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none())
+    };
+
+    assert_eq!(outcome.coverage.call_blind_files, 1);
+    assert_eq!(outcome.coverage.import_blind_files, 1, "CFML is both");
+    assert_eq!(
+        outcome.coverage.parse_failed_files, 0,
+        "a clean parse must not be charged as a failure; the two are different \
+         facts and a reader acts on them differently"
+    );
+    assert!(!outcome.coverage.is_complete());
+    assert_eq!(outcome.coverage.files_without_call_extraction(), 1);
+}
+
+/// The OFF direction, and the one that keeps the gate from swallowing the tree.
+///
+/// Prose and data formats declare no capabilities either, and they outnumber
+/// source files in most repositories — 294 of this one's 1,310. If the
+/// call-blind charge were driven by capability alone rather than by "a grammar
+/// actually read this file", `is_complete()` would be false on every corpus in
+/// existence and the cap would fire on every finding, which is indistinguishable
+/// from having deleted dead-code detection.
+#[test]
+fn prose_and_data_files_are_not_call_blind() {
+    let mut extractions = fixture();
+    extractions.push(extract_file("README.md", "# Title\n\nProse.\n"));
+    extractions.push(extract_file("package-lock.json", "{\"a\": 1}\n"));
+    extractions.push(extract_file("ci.yaml", "steps:\n  - run: make\n"));
+
+    let outcome = {
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions);
+        analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none())
+    };
+
+    assert_eq!(
+        outcome.coverage.call_blind_files, 0,
+        "a `.md` is not a call-extraction hole; no grammar was ever wanted for it"
+    );
+    assert_eq!(outcome.coverage.import_blind_files, 0);
+    assert!(
+        outcome.coverage.is_complete(),
+        "a Python corpus with a README must still report a complete scan: {:?}",
+        outcome.coverage
+    );
+
+    let dangling = outcome
+        .reports
+        .iter()
+        .find(|r| r.file_path == "lib.py" && r.symbol_name == "dangling")
+        .expect("the uncalled symbol must still be reported");
+    assert_eq!(
+        dangling.confidence, 0.9,
+        "adding a README must not demote a finding about Python"
+    );
+}
+
+/// A pattern-recovered file is charged once, not twice.
+///
+/// `.ps1` reaches `RegexFallback`, which extracts no calls and no imports — so
+/// it satisfies the call-blind predicate on capability alone. It is already
+/// charged as `PatternRecovered`, and charging it again would report two holes
+/// where the file has one, inflating `files_without_call_extraction()` past the
+/// number of files that actually have a hole.
+#[test]
+fn a_pattern_recovered_file_is_not_also_charged_as_call_blind() {
+    let extractions = vec![extract_file(
+        "build.ps1",
+        "function Render {\n  Help $args\n}\nRender\n",
+    )];
+    let outcome = {
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions);
+        analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none())
+    };
+
+    assert_eq!(outcome.coverage.pattern_recovered_files, 1);
+    assert_eq!(
+        outcome.coverage.call_blind_files, 0,
+        "double-charged: one file, two holes reported"
+    );
+    assert_eq!(outcome.coverage.files_without_call_extraction(), 1);
+}
+
+/// Import-blindness must not demote a dead-code verdict.
+///
+/// A Java corpus is import-blind — there is no `imports.push` on any Java path
+/// — but its calls are extracted normally, and the dead-symbol verdict rests on
+/// call edges. Folding import-blindness into `is_complete()` would cap every
+/// finding in every Java, C++, Ruby, Swift, C# and PHP repository at
+/// `ambiguous`, which is most of the world's code demoted for a blindness the
+/// verdict does not rest on. It is charged, published, and consumed by
+/// `unwired_candidates` instead.
+#[test]
+fn import_blindness_is_charged_without_capping_the_call_verdict() {
+    let extractions = vec![extract_file(
+        "A.java",
+        "class A {\n  private void used() {}\n  private void unused() {}\n  \
+         private void run() { used(); }\n}\n",
+    )];
+    let outcome = {
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions);
+        analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none())
+    };
+
+    assert_eq!(outcome.coverage.import_blind_files, 1);
+    assert_eq!(
+        outcome.coverage.call_blind_files, 0,
+        "Java extracts calls; only its imports are missing"
+    );
+    assert!(
+        outcome.coverage.is_complete(),
+        "import blindness is not a call-coverage hole: {:?}",
+        outcome.coverage
+    );
+    assert!(
+        outcome
+            .reports
+            .iter()
+            .any(|r| r.symbol_name.contains("unused")
+                && !r.is_exempt
+                && r.confidence > COVERAGE_LOSS_CONFIDENCE_CAP),
+        "a genuinely uncalled Java method must still reach the confident tier: {:?}",
+        outcome.reports
+    );
+}

@@ -2415,6 +2415,13 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                         "unresolved_external": external_calls,
                         "unresolved_uninferred_receiver": uninferred_receiver_calls,
                         "unresolved_unattributed": unattributed_calls,
+                        // The arithmetic over the six counters above, done
+                        // once and published, rather than left to a reader who
+                        // will not do it. `net` excludes the misses that are
+                        // explained — a language builtin, a runtime global, a
+                        // name an import proves is outside the corpus — and is
+                        // the figure worth ratcheting.
+                        "resolution_rate": analysis.resolution_rate,
                         // The per-stage breakdown, so a caller profiling a slow
                         // build reads it from the result rather than scraping
                         // the human progress lines off stderr.
@@ -2438,6 +2445,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 println!("  Edges resolved: {}", analysis.total_edges);
                 // R5: a call we could not attribute is reported, not dropped.
                 println!("  Unresolved calls: {}", analysis.unresolved_calls);
+                print_resolution_rate(&analysis.resolution_rate);
                 println!("    language builtins:  {builtin_calls}");
                 println!("    host globals:       {host_global_calls}");
                 println!("    local bindings:     {local_binding_calls}");
@@ -3495,6 +3503,68 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
         }
     }
 }
+
+/// Render the resolution rate under the human build summary.
+///
+/// Per language and sorted worst-first, because the corpus figure is not
+/// actionable and the ordering is the whole point: a language sitting at zero
+/// is a missing extractor, and it should be the first line a reader sees rather
+/// than one they have to find. This is the readout that would have surfaced
+/// W0.2's bug class — CFML and Terraform contributing no call edges while
+/// reporting complete coverage — without anyone going looking for it.
+fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
+    let Some(net) = rate.net_permille else {
+        // No site was attempted. Saying "0.0%" here would report a failure that
+        // never happened; the `Option` exists precisely to keep the two apart.
+        println!("  Resolution rate: not measured (no attribution sites)");
+        return;
+    };
+    println!(
+        "  Resolution rate: {}.{}% net, {}.{}% gross ({} resolved / {} unresolved, {} explained)",
+        net / 10,
+        net % 10,
+        rate.gross_permille.map(|g| g / 10).unwrap_or(0),
+        rate.gross_permille.map(|g| g % 10).unwrap_or(0),
+        rate.resolved_sites,
+        rate.unresolved_sites,
+        rate.explained_sites,
+    );
+
+    let mut rows: Vec<(&String, &devmap_analyze::LanguageResolution)> =
+        rate.by_language.iter().collect();
+    // Worst first; a language that attempted nothing sorts last rather than
+    // first, because `None` is "not measured" and not "measured at zero".
+    rows.sort_by_key(|(language, row)| (row.net_permille.unwrap_or(u32::MAX), (*language).clone()));
+    for (language, row) in rows.iter().take(RESOLUTION_RATE_LANGUAGES_SHOWN) {
+        match row.net_permille {
+            Some(net) => println!(
+                "    {language:<12} {}.{}%  ({} resolved / {} unresolved)",
+                net / 10,
+                net % 10,
+                row.resolved_sites,
+                row.unresolved_sites
+            ),
+            None if !row.extracts_calls => {
+                println!("    {language:<12} no call extractor in this build (0 attribution sites)")
+            }
+            None => println!("    {language:<12} not measured (no attribution sites)"),
+        }
+    }
+    if rows.len() > RESOLUTION_RATE_LANGUAGES_SHOWN {
+        println!(
+            "    … {} more language(s); the full breakdown is in `--json`",
+            rows.len() - RESOLUTION_RATE_LANGUAGES_SHOWN
+        );
+    }
+}
+
+/// How many languages the human readout names before deferring to `--json`.
+///
+/// Capped because a 35-language corpus would otherwise bury the build summary,
+/// and the truncation is *stated* rather than silent — a capped list presented
+/// as a whole one is the same error this work order exists to correct, one
+/// level down.
+const RESOLUTION_RATE_LANGUAGES_SHOWN: usize = 8;
 
 #[cfg(test)]
 mod tests {

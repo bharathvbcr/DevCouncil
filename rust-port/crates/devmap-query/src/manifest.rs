@@ -411,6 +411,7 @@ fn consumer_manifest_json(
     let entry_root_total = entry_root_paths(extractions).len();
     let all_unwired = crate::code_graph::unwired_candidates(extractions, edges);
     let unwired_excluded = all_unwired.excluded_coverage_loss;
+    let unwired_excluded_import_blind = all_unwired.excluded_import_blind;
     let unwired_total = all_unwired.paths.len();
     let unwired_shown: Vec<String> = all_unwired
         .paths
@@ -565,6 +566,11 @@ fn consumer_manifest_json(
                 // were excluded travels with the count that would otherwise
                 // read as the whole story.
                 "excluded_coverage_loss": unwired_excluded,
+                // A file whose language has no import extractor was never a
+                // candidate to begin with. Published so a caller reading an
+                // empty `unwired_candidates` list can tell "nothing is unwired"
+                // from "we cannot see imports in this language at all".
+                "excluded_import_blind": unwired_excluded_import_blind,
             },
             "unavailable": {
                 "unreachable_files": "file-level reachability BFS is not \
@@ -645,6 +651,7 @@ mod wire_format_tests {
             status: AnalysisStatus::Ok,
             unresolved_calls: 0,
             clone_coverage: Default::default(),
+            resolution_rate: Default::default(),
         };
         let freshness = FreshnessInfo::new("head".into(), 1, 0);
         let (_, json) = generate_manifest_with_edges(&extractions, &analysis, freshness, &[]);
@@ -1282,6 +1289,7 @@ mod tests {
             status: AnalysisStatus::Ok,
             unresolved_calls: 0,
             clone_coverage: Default::default(),
+            resolution_rate: Default::default(),
         }
     }
 

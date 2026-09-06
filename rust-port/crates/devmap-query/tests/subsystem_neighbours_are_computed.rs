@@ -65,6 +65,7 @@ fn manifest() -> serde_json::Value {
         status: AnalysisStatus::Ok,
         unresolved_calls: 0,
         clone_coverage: Default::default(),
+        resolution_rate: Default::default(),
     };
     let (_, json) = generate_manifest_with_edges(
         &extractions,
@@ -201,6 +202,7 @@ fn no_neighbour_is_a_synthetic_node_the_consumer_can_never_match() {
         status: AnalysisStatus::Ok,
         unresolved_calls: 0,
         clone_coverage: Default::default(),
+        resolution_rate: Default::default(),
     };
     let (_, json) = generate_manifest_with_edges(
         &extractions,

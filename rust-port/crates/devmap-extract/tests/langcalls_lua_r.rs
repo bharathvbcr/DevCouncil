@@ -15,7 +15,8 @@
 //! in `langcalls::mod` is applied separately; `the_coverage_list_and_the_
 //! dispatcher_agree` is the one test that fails if the two ever disagree.
 
-use devmap_extract::langcalls::{lua, r, CALL_EXTRACTION_LANGUAGES};
+use devmap_extract::langcalls::{lua, r};
+use devmap_extract::languages::{capabilities_for_language, Capability};
 use devmap_extract::model::{ExtractedCall, ExtractedReference};
 use devmap_extract::{extract_file, Extraction};
 use tree_sitter::{Language, Parser};
@@ -513,7 +514,7 @@ fn a_broken_source_yields_no_calls_rather_than_a_panic() {
 /// The coverage list must never claim a language the dispatcher does not
 /// route, and must never omit one it does.
 ///
-/// `CALL_EXTRACTION_LANGUAGES` exists so "this language has no call graph" is a
+/// `LanguageSpec::capabilities` exists so "this language has no call graph" is a
 /// stated fact rather than an indistinguishable zero; a list that disagrees
 /// with the dispatcher turns it into a lie. This is the one test here that
 /// changes answer when the dispatcher arm is applied, and it stays green on
@@ -525,7 +526,7 @@ fn the_coverage_list_and_the_dispatcher_agree() {
         ("luau", "w.luau", "function m() helper(1) end\n"),
         ("r", "w.R", "m <- function() { helper(1) }\n"),
     ] {
-        let listed = CALL_EXTRACTION_LANGUAGES.contains(&language);
+        let listed = capabilities_for_language(language).contains(Capability::Calls);
         let extracted = !extract_file(path, source).calls.is_empty();
         assert_eq!(
             listed, extracted,

@@ -72,6 +72,7 @@ fn render(extractions: &[Extraction], communities: Vec<CommunityReport>) -> Valu
         status: AnalysisStatus::Ok,
         unresolved_calls: 0,
         clone_coverage: Default::default(),
+        resolution_rate: Default::default(),
     };
     let (_, json) = generate_manifest_with_edges(extractions, &analysis, freshness(), &[]);
     serde_json::from_str(&json).expect("the consumer manifest is JSON")

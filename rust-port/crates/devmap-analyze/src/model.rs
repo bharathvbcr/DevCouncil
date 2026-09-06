@@ -90,6 +90,19 @@ pub struct AnalysisSummary {
     /// before this field existed, which is the honest reading of them.
     #[serde(default)]
     pub discovery_refused_files: Option<usize>,
+    /// How much of what the resolver tried to attribute, it attributed —
+    /// corpus-wide and per language. See [`crate::resolution_rate`].
+    ///
+    /// Persisted rather than derived on read, because the unresolved ledger it
+    /// divides is not kept on the generation: a later reader has the edges but
+    /// not the misses, so the denominator cannot be reconstructed.
+    ///
+    /// `serde(default)` yields an all-zero rate with `None` percentages for
+    /// generations written before this existed, which reads as "never
+    /// measured" rather than as "measured zero" — the distinction the
+    /// `Permille` alias exists to preserve.
+    #[serde(default)]
+    pub resolution_rate: crate::resolution_rate::ResolutionRate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +135,7 @@ mod disclosure_tests {
             unresolved_calls: 13,
             clone_coverage: crate::clones::CloneCoverage::default(),
             discovery_refused_files: Some(2),
+            resolution_rate: crate::resolution_rate::ResolutionRate::default(),
         }
     }
 

@@ -66,6 +66,7 @@ fn test_manifest_budget_t1() {
         status: AnalysisStatus::Ok,
         unresolved_calls: 0,
         clone_coverage: Default::default(),
+        resolution_rate: Default::default(),
     };
 
     let (_manifest, json_str) = generate_manifest(&extractions, &analysis, freshness());
@@ -92,6 +93,7 @@ fn manifest_reports_supplied_head_and_pending_count() {
         status: AnalysisStatus::Ok,
         unresolved_calls: 0,
         clone_coverage: Default::default(),
+        resolution_rate: Default::default(),
     };
     let (manifest, _) = generate_manifest(
         &[],
@@ -128,6 +130,7 @@ fn test_manifest_budget_resists_hostile_paths() {
         status: AnalysisStatus::Ok,
         unresolved_calls: 0,
         clone_coverage: Default::default(),
+        resolution_rate: Default::default(),
     };
 
     let (manifest, json) = generate_manifest(&[], &analysis, freshness());
@@ -203,6 +206,7 @@ fn test_manifest_order_is_deterministic_for_tied_communities() {
         status: AnalysisStatus::Ok,
         unresolved_calls: 0,
         clone_coverage: Default::default(),
+        resolution_rate: Default::default(),
     };
 
     let (_manifest, json) = generate_manifest(&extractions, &analysis, freshness());

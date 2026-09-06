@@ -12,8 +12,9 @@
 //! the same file. That is what earns the module, and the last two tests record
 //! why the same question got the opposite answer for HCL and CFML.
 
+use devmap_extract::extract_file;
+use devmap_extract::languages::{capabilities_for_language, Capability};
 use devmap_extract::model::Extraction;
-use devmap_extract::{extract_file, langcalls::CALL_EXTRACTION_LANGUAGES};
 
 /// A flake of the shape most repositories actually contain.
 const FLAKE: &str = r#"{
@@ -269,7 +270,7 @@ resource "aws_instance" "web" {
 "#;
     let extraction = extract_file("main.tf", source);
     assert!(
-        !CALL_EXTRACTION_LANGUAGES.contains(&"hcl"),
+        !capabilities_for_language("hcl").contains(Capability::Calls),
         "HCL has no user-defined function syntax; every callee would be a \
          built-in that resolves to nothing"
     );
@@ -303,7 +304,7 @@ resource "aws_instance" "web" {
 #[test]
 fn cfml_is_deliberately_left_without_a_call_graph() {
     assert!(
-        !CALL_EXTRACTION_LANGUAGES.contains(&"cfml"),
+        !capabilities_for_language("cfml").contains(Capability::Calls),
         "the grammar cannot see inside a script-syntax component"
     );
     for (path, source) in [
@@ -338,7 +339,7 @@ fn the_coverage_list_and_the_dispatcher_agree_for_nix_hcl_and_cfml() {
         ("hcl", "w.tf", "locals {\n  a = lower(\"X\")\n}\n"),
         ("cfml", "w.cfm", "<cfset x = helper(1)>\n"),
     ] {
-        let listed = CALL_EXTRACTION_LANGUAGES.contains(&language);
+        let listed = capabilities_for_language(language).contains(Capability::Calls);
         let extracted = !extract_file(path, source).calls.is_empty();
         assert_eq!(
             listed, extracted,

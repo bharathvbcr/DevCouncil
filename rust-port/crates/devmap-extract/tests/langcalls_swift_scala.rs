@@ -620,11 +620,13 @@ fn extraction_order_is_stable_across_runs() {
 #[test]
 fn the_dispatcher_routes_swift_and_scala_to_these_extractors() {
     assert!(
-        devmap_extract::langcalls::CALL_EXTRACTION_LANGUAGES.contains(&"swift"),
+        devmap_extract::languages::capabilities_for_language("swift")
+            .contains(devmap_extract::languages::Capability::Calls),
         "swift must be reported as covered"
     );
     assert!(
-        devmap_extract::langcalls::CALL_EXTRACTION_LANGUAGES.contains(&"scala"),
+        devmap_extract::languages::capabilities_for_language("scala")
+            .contains(devmap_extract::languages::Capability::Calls),
         "scala must be reported as covered"
     );
     for (path, lang, source) in [

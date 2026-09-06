@@ -55,6 +55,7 @@ fn manifest_for(extractions: Vec<devmap_extract::model::Extraction>) -> serde_js
         status: AnalysisStatus::Ok,
         unresolved_calls: 0,
         clone_coverage: Default::default(),
+        resolution_rate: Default::default(),
     };
     let (_, json) = generate_manifest_with_edges(
         &extractions,

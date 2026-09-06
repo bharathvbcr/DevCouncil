@@ -14,8 +14,9 @@
 //! answer is recorded beside the assertion, so a regression is recognisable
 //! rather than merely red.
 
+use devmap_extract::extract_file;
+use devmap_extract::languages::{capabilities_for_language, Capability};
 use devmap_extract::model::{Extraction, SymbolKind};
-use devmap_extract::{extract_file, langcalls::CALL_EXTRACTION_LANGUAGES};
 
 const ERLANG: &str = r#"-module(worker).
 -export([run/1]).
@@ -413,15 +414,19 @@ fn no_erlang_or_pascal_edge_is_orphaned() {
     );
 }
 
-/// The coverage list must never claim a language the dispatcher does not route,
-/// and must never omit one it does.
+/// The declared capability must never claim a language the dispatcher does not
+/// route, and must never omit one it does.
+///
+/// Repointed from `CALL_EXTRACTION_LANGUAGES`, which had no production reader
+/// and was wrong by omission for 14 languages; `LanguageSpec::capabilities` is
+/// the registry that replaced it.
 #[test]
 fn the_coverage_list_and_the_dispatcher_agree_for_erlang_and_pascal() {
     for (language, path, source) in [
         ("erlang", "w.erl", "-module(w).\nm() -> helper(1).\n"),
         ("pascal", "w.pas", "program W;\nbegin\n  Helper(1);\nend.\n"),
     ] {
-        let listed = CALL_EXTRACTION_LANGUAGES.contains(&language);
+        let listed = capabilities_for_language(language).contains(Capability::Calls);
         let extracted = !extract_file(path, source).calls.is_empty();
         assert_eq!(
             listed, extracted,
