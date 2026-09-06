@@ -4421,24 +4421,31 @@ Verified with the release binary against this repository's store
 | `meta.devmap_rust.role_files_computed` / `file_kinds_computed` | absent | `true` |
 | `repo_map.json` | 349,490 B | 371,086 B (+6.2%) |
 
-**This one has a real cost, unlike the two before it.** `devmap manifest` on the
-same store and machine:
+**Cost: none measurable — but only a controlled A/B says so, and the first
+answer here was wrong.** Sequential sampling across this session said p50
+0.17 s before the pass and 0.19 s after, and that was written up as a real
++0.02 s. It was not. Re-measured back-to-back on the merged tree, same binary
+target, same store, nothing else changed but `manifest.rs`:
 
-| | p50 | min | n |
+| `manifest.rs` | p50 | min | n |
 |---|---|---|---|
-| before this pass (baseline) | 0.17 s | 0.13 s | 11 |
-| after `handoff_paths` only | 0.17 s | 0.13 s | 11 |
-| roles + kinds, first cut | 0.20 s | 0.17 s | 21 |
-| roles + kinds, after the fix below | **0.19 s** | 0.15 s | 21 |
+| main's (no `handoff_paths`, `role_files` or `kind`) | 0.14 s | 0.11 s | 21 |
+| this branch's | **0.13 s** | 0.09 s | 21 |
 
-So roughly **+0.02 s at p50** against the baseline, and it is not measurement
-noise — the minimum moved too. It is stated rather than rounded away: the field
-was a constant, and classifying 1,417 files and bucketing them across 16 nested
-areas is work that did not previously exist. The baseline rows were sampled
-earlier in the same session at n=11 and the later rows at n=21, so the two are
-not perfectly matched; the p50 figures use this ledger's minimum-p50 convention.
+The two are the same within noise, and the branch is if anything marginally
+faster. What moved in the earlier series was the *machine*: the floor of the
+sample dropped from 0.13 s to 0.09 s between the first reading and the last,
+which is a 30% shift in the least noisy statistic available and larger than the
+effect being claimed. A sequential before/after separated by an hour of builds
+measures the hour, not the diff.
 
-The first cut was 0.20 s and two avoidable costs were removed to reach 0.19 s:
+Recorded this way deliberately: the discarded numbers are left visible above
+because "we measured a regression that was not there" is the more useful entry.
+The rule it cost: **a perf delta smaller than the drift in the sample floor is
+not a result** — rebuild both sides and interleave them, or report no answer.
+
+Two avoidable costs were removed along the way regardless, because they were
+real work the field did not need:
 `file_kind` ran six independent `split('/')` scans per file (now one pass
 setting both flags), and `role_buckets` normalized each path *once per area* —
 areas nest, so `src/devcouncil/cli/main.py` was lowercased once for
