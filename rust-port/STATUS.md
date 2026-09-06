@@ -5381,3 +5381,33 @@ step probes for the view rather than for a column.
 | `cargo fmt --all --check` | clean |
 | `cargo clippy --workspace --all-targets -D warnings` | clean |
 | cold-build store, this repository | 143 MiB |
+
+### B3's second half, with the design its measurement points at
+
+Recorded here rather than left implicit. `generation_edges` (96,525 rows,
+**50.2% of them byte-identical across generations**) and
+`generation_unresolved` (89,537) are ~67 MB of the remaining per-generation
+growth, and `generation_nodes` is 50.0% duplicated on the same measure.
+
+The obvious move — apply v17's content-addressing again — does not work here,
+and the reason is measurable rather than stylistic. Both tables carry composite
+indexes spanning the generation **and** a row column:
+
+```
+idx_generation_edges_source       (generation_id, source_file_id)
+idx_generation_edges_target       (generation_id, target_file_id)
+idx_generation_unresolved_callee  (generation_id, callee_name)
+idx_generation_unresolved_class   (generation_id, classification)
+```
+
+Splitting the row from its membership puts the two halves of every one of those
+in different tables, and no index can span a join. `generation_files` had no
+such index, which is exactly why the same pattern was safe there.
+
+A row carrying its own `[valid_from, valid_to)` keeps them intact. The open
+decision is what that costs on the read side: `generation_id = ?` becomes a
+range predicate rather than an equality, so the latest generation wants a
+partial index on `valid_to IS NULL` and reads of an older generation fall back
+to a scan. That is a behaviour change in about ten query sites and needs its own
+latency measurement, which is why it stays a decision rather than being taken
+here.
