@@ -18,10 +18,7 @@ use devmap_query::{
 };
 use devmap_resolve::{Resolver, UnresolvedClass};
 use devmap_serve::{default_ipc_path_for, Daemon};
-use devmap_store::{
-    current_git_head, extract_tree_cached_with_report, GenerationWriteOpts, Store,
-    GENERATION_RETENTION,
-};
+use devmap_store::{current_git_head, GenerationWriteOpts, Store, GENERATION_RETENTION};
 
 /// One line describing what a reclaim decided, did, and whether it landed.
 ///
@@ -2765,16 +2762,16 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 );
             }
 
-            // K4: `--full` re-parses rather than consulting the extraction
-            // cache. Reading the cache would defeat the point — a cache hit
-            // returns the payload this build is trying to reproduce from
-            // source, so a "full" rebuild that used it would recommit exactly
-            // the rows the operator is asking to replace.
-            let (extractions, discovery) = if *full {
-                devmap_extract::extract_tree_with_report(path)?
-            } else {
-                extract_tree_cached_with_report(&store, path)?
-            };
+            // Discovery, once, before anything decides whether to extract.
+            //
+            // The unchanged check below needs only `(path, content_hash)`, and
+            // that is a pure function of the bytes discovery already read — so
+            // scanning first lets a no-change build answer without paying for
+            // an extraction round-trip per file (measured on this repository:
+            // 213–254 ms of a ~300 ms no-op scan, every byte of it discarded).
+            // `--full` reuses the same scan rather than walking and reading the
+            // corpus a second time.
+            let scanned = devmap_extract::scan_tree(path)?;
             // Report what discovery refused. A file dropped for being oversized
             // or unreadable used to vanish with no record: `repo_map.json` would
             // say five files while two more existed, and nothing distinguished
@@ -2783,7 +2780,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // and nowhere else — the daemon reads the same report and must reach
             // the same verdict, and it cannot do that against a copy of the rule.
             let refused: Vec<&(String, devmap_extract::model::DiscoverySkipReason)> =
-                discovery.refusals().collect();
+                scanned.report.refusals().collect();
             if !refused.is_empty() {
                 // Both numbers in the header. A bare list of twenty under a
                 // count of two hundred is a capped sample presented as the set,
@@ -2821,19 +2818,25 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // on DevCouncil: the first `dev map` after two schema bumps printed
             // "No source changes; generation #412 still current (1,152 files)"
             // while every row in it came from `extract-v23`.
+            //
+            // The comparison itself is made against the scan rather than
+            // against extractions. `ScannedTree::matches_file_hashes` compares
+            // the same `(path, content_hash)` pairs the extractions carry —
+            // every `Extraction` is built with `content_hash(source)` over the
+            // bytes discovery read, and a cached payload is only ever served
+            // for a key built from those same bytes and a matching `file_path`
+            // — so the verdict is the one extraction would have produced, for
+            // the cost of an FNV pass instead of 1,311 store round-trips.
             let previous = store.latest_file_hashes()?;
             if !*full
                 && !previous.is_empty()
-                && previous.len() == extractions.len()
+                && previous.len() == scanned.sources.len()
                 && store.latest_generation_payload_is_current()?
             {
-                let unchanged = extractions.iter().all(|extraction| {
-                    previous
-                        .get(&extraction.file_path)
-                        .is_some_and(|hash| *hash == extraction.content_hash)
-                });
+                let unchanged = scanned.matches_file_hashes(&previous);
                 if unchanged {
-                    progress.stage(2, format_args!("{} files unchanged", extractions.len()));
+                    let file_count = scanned.sources.len();
+                    progress.stage(2, format_args!("{file_count} files unchanged"));
                     let generation = store.latest_generation_id()?.unwrap_or(0);
                     // K2: reclaim runs on the warm path too.
                     //
@@ -2901,7 +2904,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                             cli,
                             &serde_json::json!({
                                 "unchanged": true,
-                                "files": extractions.len(),
+                                "files": file_count,
                                 // Recomputed by this scan, not carried over: a
                                 // build that proves nothing changed has just
                                 // re-asked discovery the same question, and the
@@ -2918,15 +2921,51 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                         )?;
                     } else {
                         println!(
-                            "No source changes; generation #{} still current ({} files).",
-                            generation,
-                            extractions.len()
+                            "No source changes; generation #{generation} still current \
+                             ({file_count} files)."
                         );
                         println!("  Reclaim: {}", reclaim_note(&vacuum));
                     }
                     return Ok(());
                 }
             }
+
+            // Only now, with the tree known to have moved, is extraction worth
+            // its cost.
+            //
+            // K4: `--full` re-parses rather than consulting the extraction
+            // cache. Reading the cache would defeat the point — a cache hit
+            // returns the payload this build is trying to reproduce from
+            // source, so a "full" rebuild that used it would recommit exactly
+            // the rows the operator is asking to replace.
+            let extractions = if *full {
+                let refs: Vec<devmap_extract::FileRef<'_>> = scanned
+                    .sources
+                    .iter()
+                    .map(|(file, source)| devmap_extract::FileRef {
+                        path: file.as_str(),
+                        source: source.as_str(),
+                    })
+                    .collect();
+                devmap_extract::extract_all(&refs)
+            } else {
+                devmap_store::extract_scanned_cached(&store, &scanned)?
+            };
+            // The corpus text is dead the moment extraction has consumed it,
+            // but it is bound in this scope and would otherwise stay resident
+            // through resolve, analyze and persist — the stages that set the
+            // peak. It is the one cost the scan-before-extract split would
+            // otherwise have added, and it is not hypothetical: measured A/B on
+            // scholarlm (4,278 files), holding it cost 23 MiB of peak RSS.
+            //
+            // The *report* has to outlive it — `discovery_refusals` below turns
+            // it into the analysis disclosure — so this destructures rather
+            // than dropping the pair, and only the source text goes.
+            let devmap_extract::ScannedTree {
+                sources,
+                report: discovery,
+            } = scanned;
+            drop(sources);
 
             // B3/SC2: `affected` narrows what this generation *writes*. It no
             // longer narrows what is *resolved*.
