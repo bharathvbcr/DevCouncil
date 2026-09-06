@@ -40,6 +40,14 @@ cargo test --workspace
 
 if [ "$QUICK" -eq 1 ]; then echo "quick mode: skipping determinism/perf/mutants"; exit 0; fi
 
+# Where `cargo` actually put the release binary. Steps 5 and 8 run it directly
+# rather than through `cargo run`, so they have to agree with cargo about the
+# path — and `CARGO_TARGET_DIR` is set by anyone running two lanes against one
+# checkout, which is a layout this repository's own guidance recommends. Before
+# this, such a run reported "could not measure peak RSS", which is true and is
+# the wrong reason: the measurement was fine and the binary was not there.
+DEVMAP_BIN="${CARGO_TARGET_DIR:-./target}/release/devmap"
+
 step "4/9 determinism — two clean builds must produce identical graph digests"
 TMP1=$(mktemp -d) ; TMP2=$(mktemp -d)
 trap 'rm -rf "$TMP1" "$TMP2"' EXIT
@@ -68,7 +76,9 @@ step "5/9 self-build gates — DevCouncil repo, release"
 . tools/peak_rss.sh
 
 START=$(now_ns)
-RSS=$(peak_rss_bytes "$TMP1/self.rss" ./target/release/devmap --db "$TMP1/self.sqlite" --progress never build ..) || {
+[ -x "$DEVMAP_BIN" ] || {
+  echo "GATE FAIL: no release binary at $DEVMAP_BIN — step 4 builds it with \`cargo run --release\`, so this means cargo wrote it somewhere else (check CARGO_TARGET_DIR)"; exit 1; }
+RSS=$(peak_rss_bytes "$TMP1/self.rss" "$DEVMAP_BIN" --db "$TMP1/self.sqlite" --progress never build ..) || {
   echo "GATE FAIL: could not measure peak RSS — refusing to report an unmeasured build as passing"; exit 1; }
 END=$(now_ns)
 MS=$(( (END - START) / 1000000 ))
@@ -172,7 +182,7 @@ cp -R testdata/. "$GROWTH_SRC/" 2>/dev/null || true
 SIZES=""
 for round in 1 2 3 4 5; do
   printf '\n# growth probe %s\n' "$round" >> "$GROWTH_SRC/churn.py"
-  ./target/release/devmap --db "$GROWTH_DB" --progress never build "$GROWTH_SRC" >/dev/null
+  "$DEVMAP_BIN" --db "$GROWTH_DB" --progress never build "$GROWTH_SRC" >/dev/null
   SIZES="$SIZES $(stat -f%z "$GROWTH_DB" 2>/dev/null || stat -c%s "$GROWTH_DB")"
 done
 set -- $SIZES

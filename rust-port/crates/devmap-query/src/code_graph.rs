@@ -348,6 +348,26 @@ pub(crate) fn unwired_candidates(
                 excluded_coverage_loss += 1;
                 return false;
             }
+            // A file no grammar read is not a candidate for anything.
+            //
+            // Prose and data formats have no imports because they are prose,
+            // which is a different fact from a source language whose imports
+            // this build cannot read — and charging them to the capability
+            // counter below made `unwired_excluded_import_blind` disagree with
+            // `coverage_gaps.import_blind` by five times on this repository,
+            // 355 against 71, for one question with one answer.
+            //
+            // The exclusion itself is load-bearing and predates the reason
+            // given for it: before the capability gate landed, every `.md`,
+            // `.json` and `.yaml` in every repository was an unwired candidate,
+            // and the gate swept them up by accident. They are excluded here on
+            // their own grounds — nothing read them, they declare nothing to
+            // strand — and counted in neither number, exactly as
+            // `extraction_coverage` already keeps them out of both sides of its
+            // own ratio.
+            if !ext.grammar_read_this_file() {
+                return false;
+            }
             // The kernel never looked for an import of this file, so its
             // absence is not evidence of one.
             //

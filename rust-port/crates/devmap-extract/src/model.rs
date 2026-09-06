@@ -1013,6 +1013,35 @@ impl Extraction {
             && !matches!(self.engine, ExtractionEngine::NotApplicable { .. })
     }
 
+    /// Whether a grammar actually read this file.
+    ///
+    /// The other half of the same line [`Self::is_parse_failure`] draws, and
+    /// the one that decides whether a file is *in the population* a coverage
+    /// question is asked about at all. Prose and data formats are not: no
+    /// grammar read them, none ever will, and they declare nothing that could
+    /// be called dead or stranded.
+    ///
+    /// The canonical owner, because two crates were answering it and one of
+    /// them was not asking. `devmap-analyze` charges `ExtractionGap::ImportBlind`
+    /// only for files this returns `true` for; `devmap-query`'s
+    /// `unwired_candidates` charged everything that survived the parse-failure
+    /// branch, which for prose is `false` by design. So the same fact — "this
+    /// file's language has no import extractor" — was published as 71 by
+    /// `devmap status` and as 355 by the manifest beside it, on this
+    /// repository, for the same generation.
+    ///
+    /// `RegexFallback` and `Unavailable` are excluded: a grammar was *wanted*
+    /// there and did not run, which is a failure and is charged as one.
+    pub fn grammar_read_this_file(&self) -> bool {
+        matches!(
+            self.engine,
+            ExtractionEngine::TreeSitter { .. } | ExtractionEngine::Notebook { .. }
+        ) && matches!(
+            self.parse_outcome,
+            ParseOutcome::Clean | ParseOutcome::Partial { .. }
+        )
+    }
+
     /// Method `qualified_name` to declared parameter count, for the Go
     /// interface-satisfaction join.
     pub fn go_method_param_counts(&self) -> BTreeMap<&str, usize> {

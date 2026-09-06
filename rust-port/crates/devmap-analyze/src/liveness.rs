@@ -850,13 +850,10 @@ pub const CALL_BLIND_REASON: &str =
 /// are already charged, as `PatternRecovered` and `ParseFailed` respectively.
 /// Charging them again would double-count one file's single hole.
 fn a_grammar_read_this_file(ext: &Extraction) -> bool {
-    matches!(
-        ext.engine,
-        ExtractionEngine::TreeSitter { .. } | ExtractionEngine::Notebook { .. }
-    ) && matches!(
-        ext.parse_outcome,
-        ParseOutcome::Clean | ParseOutcome::Partial { .. }
-    )
+    // Delegated rather than repeated. `devmap-query` asks the same question of
+    // the same files and used to answer it differently — see
+    // `Extraction::grammar_read_this_file` for the two numbers that disagreed.
+    ext.grammar_read_this_file()
 }
 
 /// One file that call extraction did not cover, and why.
