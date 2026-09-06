@@ -13,12 +13,16 @@
 # keeps open and the only one where a leak accumulates across hours.
 #
 # Every cycle is sampled (cycle, peak/resident RSS, store bytes) into a CSV, and
-# the plateau assertion compares the last cycle against a baseline cycle rather
-# than against the first: the first few cycles are still filling caches, and a
-# soak that called that growth a leak would fail on every healthy kernel.
+# the plateau assertion compares the means of two halves taken after a warm-up
+# — in daemon mode, a warm-up that ends where the samples show the first drain
+# landing, because the first cycles are the process loading its graph and a
+# soak that called that growth a leak would fail on every healthy kernel. A run
+# too short to compare says so; it never reports growth it did not measure.
 set -u
 ROOT="${1:?usage: soak.sh <workdir> [cycles] [--daemon]}"
 CYCLES="${2:-40}"
+# Under 40 cycles the run is a smoke test: the digest must return after every
+# restore, and growth is reported but not asserted. `verify.sh` uses that.
 MODE="${3:-build}"
 TOOLS="$(cd "$(dirname "$0")" && pwd)"
 # Honour CARGO_TARGET_DIR: lanes build into their own target directory, and a
@@ -195,48 +199,87 @@ rm -f "$TIMEOUT_LOG"
 END_DB=$(db_bytes)
 echo "soak end: db=$END_DB (baseline $BASE_DB)"
 
-# The plateau, measured the way the data supports.
+# --- plateau begin
+# assert_plateau <csv> <cycles> <mode> <baseline_db_bytes> <tolerance_pct>
 #
-# Not "cycle N against cycle 20": on both corpora the working set is not
-# established at cycle 20. The daemon's first full drain lands between cycles 20
-# and 50 and takes RSS from 240 MB to ~900 MB and the store from 247 MB to
-# 498 MB — growth that is the process loading what it is for, not a leak, and a
-# check that called it one would fail on every healthy kernel.
+# Prints one verdict line per sampled column and returns non-zero on a failed
+# comparison — or on a comparison that could not run, which is reported as a
+# failure and never as a plateau.
 #
-# So: the first quarter of the run is warm-up and is reported but not compared.
-# The rest is split in half and the two *means* are compared, because a single
-# sample carries allocator noise a mean does not — over the last hundred cycles
-# of the run that set this tolerance the daemon's per-cycle RSS swung between
-# 755 MB and 953 MB (±12% around its mean) while the mean itself moved -6.24%.
+# Warm-up is reported but not compared, and it is not a fixed fraction of the
+# run. In build mode every cycle is a whole `devmap build`, so the first quarter
+# is allocator settling and the data has been flat from cycle 1 on both corpora.
+# In daemon mode the working set arrives with the first drain: the watcher holds
+# a burst of edits for its 2 s quiet window and at most 10 s, then writes a
+# generation and builds its index — RSS 240 MB -> ~900 MB and the store 247 MB
+# -> 498 MB on the scholarlm corpus. That is wall-clock, while a cycle on a small
+# corpus takes half a second; so the cycle it lands on is read from the samples
+# (the first store-bytes change after the baseline) rather than assumed. A
+# 40-cycle daemon run on this repository's corpus put the first drain at cycle
+# 30 and then compared cycles 11-25 against 26-40, calling the process loading
+# its graph a leak.
 #
-# TOLERANCE_PCT is the ceiling on that movement, 10% by default: four times the
-# observed drift, and far below what a leak does — the same run's *warm-up*
-# quarter moved +210%, which is the shape this is looking for.
-if [ "$FAILS" -eq 0 ] && [ "$CYCLES" -ge 40 ]; then
-  WARMUP=$(( CYCLES / 4 ))
-  MID=$(( WARMUP + (CYCLES - WARMUP) / 2 ))
+# After warm-up the rest is split in half and the two *means* are compared: a
+# single sample carries allocator noise a mean does not — over the last hundred
+# cycles of the run that set the tolerance the daemon's per-cycle RSS swung
+# between 755 MB and 953 MB (±12% around its mean) while the mean moved -6.24%.
+# The tolerance is the ceiling on that movement, 10% by default: four times the
+# observed drift, and far below what a leak does — the same run's warm-up moved
+# +210%, which is the shape this looks for.
+assert_plateau() {
+  local csv=$1 cycles=$2 mode=$3 base_db=$4 tol=$5
+  local warmup
+  if [ "$mode" = "--daemon" ]; then
+    local first_drain
+    first_drain=$(awk -F, -v b="$base_db" 'NR>1 && $3!=b {print $1; exit}' "$csv")
+    if [ -z "$first_drain" ]; then
+      echo "SOAK FAIL: the daemon never wrote a generation in $cycles cycles, so the plateau check could not run"
+      return 1
+    fi
+    # The generations that follow the first, and the index built over them,
+    # keep arriving for a while after it: a quarter of what remains is settle.
+    warmup=$(( first_drain + (cycles - first_drain) / 4 ))
+    echo "daemon first drain landed at cycle $first_drain; warm-up ends at cycle $warmup"
+  else
+    warmup=$(( cycles / 4 ))
+  fi
+  local remaining=$(( cycles - warmup ))
+  if [ "$remaining" -lt 30 ]; then
+    echo "SOAK FAIL: $remaining cycles after warm-up (which ends at cycle $warmup of $cycles) is fewer than the 30 a two-half comparison needs — run more cycles"
+    return 1
+  fi
+  local mid=$(( warmup + remaining / 2 ))
+  local fails=0 column name col first second limit
   for column in "rss:2" "db:3"; do
     name=${column%%:*}; col=${column#*:}
-    first=$(awk -F, -v c="$col" -v a="$(( WARMUP + 1 ))" -v b="$MID" \
-      'NR>1 && $1>=a && $1<=b {s+=$c; n++} END {if (n) printf "%d", s/n}' "$CSV")
-    second=$(awk -F, -v c="$col" -v a="$(( MID + 1 ))" -v b="$CYCLES" \
-      'NR>1 && $1>=a && $1<=b {s+=$c; n++} END {if (n) printf "%d", s/n}' "$CSV")
+    first=$(awk -F, -v c="$col" -v a="$(( warmup + 1 ))" -v b="$mid" \
+      'NR>1 && $1>=a && $1<=b {s+=$c; n++} END {if (n) printf "%d", s/n}' "$csv")
+    second=$(awk -F, -v c="$col" -v a="$(( mid + 1 ))" -v b="$cycles" \
+      'NR>1 && $1>=a && $1<=b {s+=$c; n++} END {if (n) printf "%d", s/n}' "$csv")
     if [ -z "$first" ] || [ -z "$second" ] || [ "$first" -eq 0 ]; then
       echo "SOAK FAIL: $name has no samples in one of the halves — the plateau check could not run"
-      FAILS=1
+      fails=1
       continue
     fi
-    limit=$(( first + first * TOLERANCE_PCT / 100 ))
+    limit=$(( first + first * tol / 100 ))
     if [ "$second" -gt "$limit" ]; then
-      echo "SOAK FAIL: $name did not plateau — mean($(( WARMUP + 1 ))-$MID) $first -> mean($(( MID + 1 ))-$CYCLES) $second (limit $limit)"
-      FAILS=1
+      echo "SOAK FAIL: $name did not plateau — mean($(( warmup + 1 ))-$mid) $first -> mean($(( mid + 1 ))-$cycles) $second (limit $limit)"
+      fails=1
     else
-      echo "plateau ok: $name mean($(( WARMUP + 1 ))-$MID) $first -> mean($(( MID + 1 ))-$CYCLES) $second (limit $limit)"
+      echo "plateau ok: $name mean($(( warmup + 1 ))-$mid) $first -> mean($(( mid + 1 ))-$cycles) $second (limit $limit)"
     fi
   done
-elif [ "$FAILS" -eq 0 ]; then
-  echo "plateau not asserted: $CYCLES cycles is under the 40-cycle minimum, so this run is a smoke test only"
-fi
+  return $fails
+}
+# --- plateau end
 
-[ "$FAILS" -eq 0 ] && echo "SOAK OK ($CYCLES cycles, digest stable, growth bounded); samples in $CSV"
+if [ "$FAILS" -eq 0 ] && [ "$CYCLES" -ge 40 ]; then
+  assert_plateau "$CSV" "$CYCLES" "$MODE" "$BASE_DB" "$TOLERANCE_PCT" || FAILS=1
+  [ "$FAILS" -eq 0 ] && echo "SOAK OK ($CYCLES cycles, digest stable, growth bounded); samples in $CSV"
+elif [ "$FAILS" -eq 0 ]; then
+  # Two verdict words on purpose. `verify.sh` runs five cycles for incremental
+  # equivalence and greps for this one; the old single "SOAK OK (growth
+  # bounded)" was printed here too, for a check that had not run.
+  echo "SOAK SMOKE OK ($CYCLES cycles, digest stable; growth NOT asserted — under the 40-cycle minimum); samples in $CSV"
+fi
 exit "$FAILS"
