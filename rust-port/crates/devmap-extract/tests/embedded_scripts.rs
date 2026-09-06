@@ -626,10 +626,14 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // `EXTRACTION_SCHEMA_VERSION`'s doc comment and write a rationale paragraph
     // before changing what a cached payload contains. It has fired three times
     // — 30 -> 31 for reading `<script>` blocks, 31 -> 32 for W1.2's heritage
-    // references and W3.3's wiring annotations, and 32 -> 33 for W0.3 move 2's
-    // import extraction across nineteen grammar keys. All three are additive,
-    // which is exactly why each needed the bump: an additive change leaves a
-    // stale row looking perfectly complete.
+    // references and W3.3's wiring annotations, 32 -> 33 for W0.3 move 2's import
+    // extraction across nineteen grammar keys, and for declining to parse
+    // minified bundles. The first three are additive, which is exactly why each
+    // needed the bump: an additive change leaves a stale row looking perfectly
+    // complete. The last is the one case where the stale rows are *subtractive*
+    // — a v32 row for a bundle can hold several hundred `Clean` symbols this
+    // build no longer claims, and `Clean` is cache-admitted, so without the bump
+    // they would be served indefinitely.
     assert_eq!(
         EXTRACTION_SCHEMA_VERSION, "33",
         "reading <script> blocks changes what a cached payload means, and so does \

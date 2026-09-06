@@ -1421,7 +1421,14 @@ impl<'a> StoreQueryEngine<'a> {
             rungs: None,
         };
 
-        if let ParseOutcome::Failed { reason } = &candidate.parse_outcome {
+        // `Skipped` is here for the same reason `Failed` is, and the reason is
+        // the sentence below rather than the variant: a file that yielded no
+        // symbols cannot be diffed against one that did without the diff
+        // reading as a deletion of every symbol in it. Which of the two
+        // produced the empty symbol list does not change that.
+        if let ParseOutcome::Failed { reason } | ParseOutcome::Skipped { reason } =
+            &candidate.parse_outcome
+        {
             return Ok(PreviewReport {
                 file_path: path.to_string(),
                 parse_status,
@@ -1429,7 +1436,7 @@ impl<'a> StoreQueryEngine<'a> {
                 file_is_indexed: self.store.latest_extraction_for_path(path)?.is_some(),
                 compared_against: "nothing".to_string(),
                 degraded_reason: Some(format!(
-                    "the buffer did not parse ({reason}); no delta is reported,                      because an unparsed file yields no symbols and would read                      as a deletion of every symbol in it"
+                    "the buffer was not parsed ({reason}); no delta is reported,                      because an unparsed file yields no symbols and would read                      as a deletion of every symbol in it"
                 )),
                 symbols: Vec::new(),
                 bodies_not_compared: 0,
@@ -2061,6 +2068,9 @@ fn parse_status_name(outcome: &ParseOutcome) -> &'static str {
         ParseOutcome::Partial { .. } => "partial",
         ParseOutcome::Fallback { .. } => "fallback",
         ParseOutcome::Failed { .. } => "failed",
+        // Not "failed". This word is what a human reads next to the file, and
+        // the whole point of the outcome is that nothing went wrong here.
+        ParseOutcome::Skipped { .. } => "skipped",
     }
 }
 
@@ -3353,6 +3363,14 @@ fn file_edge_coverage_gap(outcome: &ParseOutcome) -> Option<String> {
             "this file parsed with {} error range(s); a call or import inside an error region \
              is invisible to extraction, so this list is a lower bound",
             error_ranges.len()
+        )),
+        // Unlike `Failed`, the callers do *not* refuse this file — it is
+        // indexed and its `File` node is a real node — so if the caveat were
+        // `None` here the answer would be an empty dependency list presented as
+        // a fact about the file. It is a fact about the extractor.
+        ParseOutcome::Skipped { reason } => Some(format!(
+            "this file was not parsed ({reason}); no calls or imports were extracted from it \
+             at all, so an empty list here is not evidence the file has no dependencies"
         )),
     }
 }

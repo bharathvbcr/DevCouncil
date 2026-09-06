@@ -263,6 +263,21 @@ pub struct ExtractionCoverage {
     /// different corpora. Prose and data formats are in neither: no grammar
     /// read them and none ever will, so they are not part of the question.
     pub files_with_call_extraction: usize,
+    /// Files the extractor chose not to parse.
+    ///
+    /// Counted and published so the decision is visible, and — like
+    /// `import_blind_files` — deliberately kept out of `is_complete()`. The
+    /// files this counts are minified bundles: third-party output already
+    /// exempt from liveness through `WiringKind::Vendored`, whose every
+    /// identifier is a minifier's `t`, `e` or `n`. Folding them in would cap
+    /// every dead-code finding in every repository that vendors one bundle,
+    /// which is the trade `import_blind_files` was kept out of `is_complete()`
+    /// to avoid.
+    ///
+    /// Published rather than dropped because the alternative is the silence
+    /// `discovery_refused_files` documents: a file nothing read, counted as a
+    /// file whose calls were looked for.
+    pub not_parsed_files: usize,
 }
 
 /// What discovery refused, for the analysis that cannot see it.
@@ -345,10 +360,16 @@ impl ExtractionCoverage {
     /// passes — and this feeds a division. A wrap would turn a huge blind count
     /// into a small one and hand a confident ceiling to a corpus nothing read,
     /// which is the flattering direction and therefore the one to bound.
+    ///
+    /// A count of fact, where [`Self::is_complete`] is a verdict, which is why
+    /// `not_parsed_files` is in this one and not in that one: a skipped file
+    /// really did contribute no call edges, and saying otherwise would make the
+    /// method's name false, but it is not a reason to distrust the corpus.
     pub fn files_without_call_extraction(&self) -> usize {
         self.parse_failed_files
             .saturating_add(self.pattern_recovered_files)
             .saturating_add(self.call_blind_files)
+            .saturating_add(self.not_parsed_files)
     }
 
     /// Why the corpus-level scan is incomplete, or `None` when it is complete.
@@ -610,6 +631,16 @@ pub enum ExtractionGap {
     /// `is_complete()`: it undermines `unwired_candidates`, not the dead-symbol
     /// verdict. See `ExtractionCoverage::is_complete`.
     ImportBlind,
+    /// The extractor decided not to parse the file at all.
+    ///
+    /// Its own kind because the alternative is silence. A skipped file is not a
+    /// parse failure (nothing failed), is not pattern-recovered (nothing was
+    /// matched) and no grammar read it — so it matched none of the four arms
+    /// above and fell out of the inventory entirely, reported as a file whose
+    /// calls were looked for and found to be none. `discovery_refused_files`
+    /// exists because that exact silence, for a file discovery dropped, cost a
+    /// `helper()` a confident delete verdict.
+    NotParsed,
 }
 
 impl ExtractionGap {
@@ -626,6 +657,7 @@ impl ExtractionGap {
         ExtractionGap::PatternRecovered,
         ExtractionGap::CallBlind,
         ExtractionGap::ImportBlind,
+        ExtractionGap::NotParsed,
     ];
 
     /// The stored spelling, and the one a consumer reads back. One owner, so a
@@ -637,6 +669,7 @@ impl ExtractionGap {
             ExtractionGap::PatternRecovered => "pattern_recovered",
             ExtractionGap::CallBlind => "call_blind",
             ExtractionGap::ImportBlind => "import_blind",
+            ExtractionGap::NotParsed => "not_parsed",
         }
     }
 }
@@ -905,6 +938,12 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
             )
         } else if let ParseOutcome::Fallback { reason } = &ext.parse_outcome {
             (ExtractionGap::PatternRecovered, reason.clone())
+        } else if let ParseOutcome::Skipped { reason } = &ext.parse_outcome {
+            // Before the arm existed this file matched nothing here and fell to
+            // the `else { continue }` below — indistinguishable from a `.md`,
+            // which is a file with no declarations to find rather than a file
+            // whose declarations nobody looked for.
+            (ExtractionGap::NotParsed, reason.clone())
         } else if a_grammar_read_this_file(ext) {
             // A clean parse in a language this build has no extractor for.
             // Both bits are asked independently: HCL is call-blind *and*
@@ -953,6 +992,7 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
             ExtractionGap::PatternRecovered => coverage.pattern_recovered_files += 1,
             ExtractionGap::CallBlind => coverage.call_blind_files += 1,
             ExtractionGap::ImportBlind => coverage.import_blind_files += 1,
+            ExtractionGap::NotParsed => coverage.not_parsed_files += 1,
         }
     }
     // The other side of the same partition, counted from the same two
@@ -1083,9 +1123,19 @@ pub fn analyze_liveness_with_coverage(
         // construction, and reporting them would hand `devmap dead` one false
         // candidate per declaration in every `.proto`, `.ps1` and `.vb` in the
         // tree. "Nothing calls it" is only evidence when calls were looked for.
+        //
+        // `Skipped` joins them under the same sentence. Today its only symbol
+        // is the `File` node, which the loop below exempts anyway, so this
+        // changes no verdict — it is here because the rule is "nothing calls it
+        // is only evidence when calls were looked for", and a file nobody
+        // parsed is the clearest case of calls not being looked for. Leaving it
+        // out would make the guard depend on the `File`-node exemption holding
+        // somewhere else.
         let is_parse_failed = matches!(
             ext.parse_outcome,
-            ParseOutcome::Failed { .. } | ParseOutcome::Fallback { .. }
+            ParseOutcome::Failed { .. }
+                | ParseOutcome::Fallback { .. }
+                | ParseOutcome::Skipped { .. }
         );
 
         // The same sentence as `is_parse_failed`, one step further out: a file
@@ -1188,6 +1238,12 @@ pub fn analyze_liveness_with_coverage(
                  excluded from dead code candidates"
                     .to_string(),
             )
+        } else if let ParseOutcome::Skipped { reason } = &ext.parse_outcome {
+            // Ahead of the `is_parse_failed` arm, which now covers this outcome
+            // and would label it "Parse failed" — the exact sentence this
+            // outcome exists to stop the map from printing about a file that
+            // was never handed to a grammar.
+            Some(format!("{reason} — excluded from dead code candidates"))
         } else if is_parse_failed {
             Some("Parse failed — excluded from dead code candidates".to_string())
         } else {
@@ -1215,7 +1271,8 @@ pub fn analyze_liveness_with_coverage(
                 // The file is exempt wholesale via `is_parse_failed` above.
                 ParseOutcome::Clean
                 | ParseOutcome::Failed { .. }
-                | ParseOutcome::Fallback { .. } => false,
+                | ParseOutcome::Fallback { .. }
+                | ParseOutcome::Skipped { .. } => false,
             };
 
             let is_exported = sym.is_exported;

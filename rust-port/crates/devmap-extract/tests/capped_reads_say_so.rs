@@ -90,7 +90,12 @@ fn a_capped_notebook_says_so_in_its_durable_outcome() {
 
     let reason = match &durable.parse_outcome {
         ParseOutcome::Partial { .. } => "partial".to_string(),
-        ParseOutcome::Failed { reason } | ParseOutcome::Fallback { reason } => reason.clone(),
+        ParseOutcome::Failed { reason }
+        | ParseOutcome::Fallback { reason }
+        // A notebook is never skipped — the rule matches minified bundles by
+        // name — but if one ever were, its reason is the string this asserts
+        // on just as much as the other two.
+        | ParseOutcome::Skipped { reason } => reason.clone(),
         ParseOutcome::Clean => String::new(),
     };
     assert!(

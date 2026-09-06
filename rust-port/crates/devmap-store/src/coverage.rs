@@ -69,12 +69,15 @@ impl CoverageGapSample {
     }
 }
 
-/// What a generation could not read, in the five kinds it can fail to.
+/// What a generation could not read, in the six kinds it can fail to.
 ///
-/// The last two are not failures at all, which is exactly why they were
+/// The last three are not failures at all, which is exactly why they were
 /// invisible until W0.2: a `.cfm` or a `.tf` parses `Clean` and this build has
 /// no extractor for its calls or its imports, so the file sailed past every
-/// check that looks for something going wrong.
+/// check that looks for something going wrong. `not_parsed` is the same shape
+/// arrived at from the other side — the extractor declined before any grammar
+/// ran, so there is no failure to find and nothing to report unless the
+/// decision itself is reported.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoverageGaps {
     pub discovery_refused: CoverageGapSample,
@@ -84,6 +87,8 @@ pub struct CoverageGaps {
     pub call_blind: CoverageGapSample,
     /// A grammar read the file and no import extractor exists for its language.
     pub import_blind: CoverageGapSample,
+    /// The extractor declined to parse the file — a minified bundle.
+    pub not_parsed: CoverageGapSample,
 }
 
 impl CoverageGaps {
@@ -103,6 +108,8 @@ impl CoverageGaps {
             Some(&mut self.call_blind)
         } else if gap == ExtractionGap::ImportBlind.label() {
             Some(&mut self.import_blind)
+        } else if gap == ExtractionGap::NotParsed.label() {
+            Some(&mut self.not_parsed)
         } else {
             None
         }
@@ -115,13 +122,14 @@ impl CoverageGaps {
     /// other is a row written to the database on every build and never read
     /// back — which is what happened to `call_blind` and `import_blind` between
     /// their introduction and this line.
-    pub(crate) fn labels() -> [&'static str; 5] {
+    pub(crate) fn labels() -> [&'static str; 6] {
         [
             GAP_DISCOVERY_REFUSED,
             ExtractionGap::ParseFailed.label(),
             ExtractionGap::PatternRecovered.label(),
             ExtractionGap::CallBlind.label(),
             ExtractionGap::ImportBlind.label(),
+            ExtractionGap::NotParsed.label(),
         ]
     }
 }

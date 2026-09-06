@@ -216,6 +216,15 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// carry either, and which decides whether a file is an entry root. One bump
 /// covers both for the reason the v31 note records: the version answers "may a
 /// stored row be reused?", and either change on its own already answers no.
+///
+/// v33 stops parsing minified bundles (`wiring::is_minified_bundle`) and
+/// reports them `ParseOutcome::Skipped`. Every v32 row for such a file is one
+/// of the three answers the coin flip produced — `Clean` with several hundred
+/// mangled symbols, `Partial`, or `Failed` with a budget reason — and each is a
+/// claim this build no longer makes. The `Clean` rows are the reason the bump
+/// is not optional: they are cache-admitted, they look freshly indexed, and
+/// they would keep publishing a minifier's `t`, `e` and `n` as declarations of
+/// the repository long after the extractor stopped producing them.
 pub const EXTRACTION_SCHEMA_VERSION: &str = "33";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

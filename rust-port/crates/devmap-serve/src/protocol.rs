@@ -524,6 +524,11 @@ pub fn coverage_gaps_json(status: &StoreStatus) -> serde_json::Value {
         // or a permanent one no re-run will.
         "call_blind": sample(&status.coverage_gaps.call_blind),
         "import_blind": sample(&status.coverage_gaps.import_blind),
+        // Also not a failure, and the only kind here the extractor chose. A
+        // minified bundle contributes no edges because nobody asked it to; the
+        // path is listed so that absence is a stated decision rather than an
+        // empty answer indistinguishable from a file with no dependencies.
+        "not_parsed": sample(&status.coverage_gaps.not_parsed),
     })
 }
 

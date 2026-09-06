@@ -302,7 +302,15 @@ fn assert_invariants(label: &str, path: &str, source: &str, extraction: &Extract
                 );
             }
         }
-        ParseOutcome::Failed { reason } | ParseOutcome::Fallback { reason } => {
+        // `Skipped` is here because this suite is where the defect that
+        // introduced it was found: a minified bundle in the corpus straddled
+        // the parse budget, so two extractions of identical bytes disagreed and
+        // the determinism assertion above fired. The bundle is now declined
+        // before the grammar runs, and a declined file owes the same debt as
+        // any other non-clean outcome — it must say why.
+        ParseOutcome::Failed { reason }
+        | ParseOutcome::Fallback { reason }
+        | ParseOutcome::Skipped { reason } => {
             assert!(
                 !reason.trim().is_empty(),
                 "{label}: a non-clean outcome with no reason is unactionable"
