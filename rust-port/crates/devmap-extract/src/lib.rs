@@ -15,6 +15,9 @@ pub mod heritage;
 pub mod langcalls;
 #[cfg(feature = "parse")]
 pub(crate) mod langdecl;
+// Every extractor here takes a `tree_sitter::Node`, and the only caller is
+// `treesitter::extract_treesitter`, which is itself behind the gate.
+#[cfg(feature = "parse")]
 pub mod langimports;
 pub mod languages;
 pub mod model;
