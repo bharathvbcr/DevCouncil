@@ -28,6 +28,7 @@ from devcouncil.campaign import (
     ROLES,
     Rank,
     Campaign,
+    CampaignResult,
     build_coding_executor_factory,
     build_verifier_fn,
 )
@@ -36,6 +37,11 @@ from devcouncil.telemetry.stages import log_stage, log_step
 
 app = typer.Typer(help="Run a multi-agent campaign over the planned task graph.")
 console = Console()
+# Diagnostics go to stderr unconditionally — same split as `dev map`/`dev graph`/`dev debug`.
+# Routing them here rather than behind an `if not json_format` guard makes the `--json`
+# contract (exactly one JSON object on stdout) structural: a banner physically cannot
+# reach stdout, so a future call site cannot reintroduce the leak by forgetting the flag.
+status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 # Task statuses that still need work (everything else is a satisfied prerequisite).
@@ -54,6 +60,39 @@ def _load_plan(root: Path):
         tasks = TaskRepository(session).get_all()
         reqs = RequirementRepository(session).get_all()
     return tasks, reqs
+
+
+def _json_payload(result: CampaignResult, *, dry_run: bool, error: Optional[str] = None) -> dict:
+    """Serialize a campaign result for ``--json``.
+
+    Every key is always present, including on the no-plan path, so an agent parsing
+    stdout never has to branch on which exit point produced the object. ``dry_run``
+    carries the fact the human-mode banner states, which is why suppressing that
+    banner from stdout loses no information for machine consumers.
+    """
+    return {
+        "goal": result.goal,
+        "dry_run": dry_run,
+        "error": error,
+        "success": result.success,
+        "halted": result.halted,
+        "halt_reason": result.halt_reason,
+        "verified": result.verified,
+        "blocked": result.blocked,
+        "skipped": result.skipped,
+        "dashboard": str(result.dashboard_path) if result.dashboard_path else None,
+        "outcomes": [
+            {
+                "task_id": o.task_id,
+                "title": o.title,
+                "owner": o.owner,
+                "bloom": o.bloom,
+                "status": o.status,
+                "blocking_gaps": o.blocking_gaps,
+            }
+            for o in result.outcomes
+        ],
+    }
 
 
 def _persist_statuses(root: Path, tasks) -> None:
@@ -123,21 +162,25 @@ def run_campaign(
         initialize_project(root, quiet=True)
         log_step("campaign/1: loading plan", project_root=root, trace=True)
         tasks, reqs = _load_plan(root)
+        dry_run = executor is None
         if not tasks:
-            console.print(
+            no_plan = "No plan found. Run `dev plan` first to create tasks for the Director."
+            status_console.print(
                 "[yellow]No plan found. Run [bold]dev plan[/bold] first to create tasks for the Director.[/yellow]"
             )
+            if json_format:
+                empty = CampaignResult(goal=goal, outcomes=[], dashboard_path=None)
+                typer.echo(dump_json(_json_payload(empty, dry_run=dry_run, error=no_plan), indent=2))
             raise typer.Exit(code=0)
 
-        dry_run = executor is None
         if len(tasks) >= 5 and not dry_run:
-            console.print(
+            status_console.print(
                 f"[dim]Large plan ({len(tasks)} tasks) — campaign parallelizes dependency waves "
                 f"with Reviewer QC. See .devcouncil/campaign/dashboard.md for progress.[/dim]"
             )
 
         if dry_run:
-            console.print(
+            status_console.print(
                 "[cyan]Dry run — no --executor given. The Coordinator will assign and route, "
                 "but Worker will not touch the repo.[/cyan]"
             )
@@ -189,28 +232,7 @@ def run_campaign(
             _persist_statuses(root, [t for t in tasks if t.id in touched])
 
         if json_format:
-            payload = {
-                "goal": result.goal,
-                "success": result.success,
-                "halted": result.halted,
-                "halt_reason": result.halt_reason,
-                "verified": result.verified,
-                "blocked": result.blocked,
-                "skipped": result.skipped,
-                "dashboard": str(result.dashboard_path) if result.dashboard_path else None,
-                "outcomes": [
-                    {
-                        "task_id": o.task_id,
-                        "title": o.title,
-                        "owner": o.owner,
-                        "bloom": o.bloom,
-                        "status": o.status,
-                        "blocking_gaps": o.blocking_gaps,
-                    }
-                    for o in result.outcomes
-                ],
-            }
-            typer.echo(dump_json(payload, indent=2))
+            typer.echo(dump_json(_json_payload(result, dry_run=dry_run), indent=2))
         else:
             _render_result(result)
 

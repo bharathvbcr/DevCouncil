@@ -92,12 +92,10 @@ def test_cli_campaign_run_dry_run(tmp_path, monkeypatch):
         
     res = runner.invoke(app, ["campaign", "run", "Implement settings", "--json"])
     assert res.exit_code == 0
-    
-    # Parse json portion only
-    json_start = res.output.find("{")
-    assert json_start != -1
-    json_str = res.output[json_start:]
-    data = json.loads(json_str)
-    
+
+    # `--json` contract: stdout carries the payload and nothing else.
+    data = json.loads(res.stdout)
+
     assert data["success"] is True
+    assert data["dry_run"] is True
     assert any(o["task_id"] == "TASK-1" for o in data["outcomes"])

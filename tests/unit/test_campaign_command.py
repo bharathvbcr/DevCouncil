@@ -14,17 +14,18 @@ from typer.testing import CliRunner
 runner = CliRunner()
 
 
-def _tasks():
-    return [Task(id="TASK-001", title="First task", description="d")]
+def _tasks(count: int = 1):
+    return [Task(id=f"TASK-{i:03d}", title=f"Task {i}" if i > 1 else "First task", description="d")
+            for i in range(1, count + 1)]
 
 
-def _result(**kw):
+def _result(count: int = 1, **kw):
     outcomes = kw.pop(
         "outcomes",
         [TaskOutcome(
-            task_id="TASK-001", title="First task", owner="worker1", bloom="apply",
-            executed=True, verified=True, status="verified",
-        )],
+            task_id=f"TASK-{i:03d}", title=f"Task {i}" if i > 1 else "First task", owner="worker1",
+            bloom="apply", executed=True, verified=True, status="verified",
+        ) for i in range(1, count + 1)],
     )
     defaults = dict(goal="Ship it", outcomes=outcomes, dashboard_path=None)
     defaults.update(kw)
@@ -58,9 +59,11 @@ def test_campaign_run_dry_run_human(tmp_path, monkeypatch):
 
     result = runner.invoke(app, ["campaign", "run", "Ship it", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
-    assert "Dry run" in result.output
-    assert "First task" in result.output
-    assert "verified" in result.output
+    # The banner is a diagnostic and belongs on stderr; the rendered result is the stdout payload.
+    assert "Dry run" in result.stderr
+    assert "Dry run" not in result.stdout
+    assert "First task" in result.stdout
+    assert "verified" in result.stdout
 
 
 def test_campaign_run_dry_run_json(tmp_path, monkeypatch):
@@ -70,10 +73,51 @@ def test_campaign_run_dry_run_json(tmp_path, monkeypatch):
 
     result = runner.invoke(app, ["campaign", "run", "Ship it", "--json", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
-    # The dry-run banner is printed before the JSON payload; parse from the first brace.
-    data = json.loads(result.stdout[result.stdout.index("{"):])
+    # `--json` contract: stdout is exactly one JSON object; the banner goes to stderr.
+    data = json.loads(result.stdout)
     assert data["goal"] == "Ship it"
     assert data["outcomes"][0]["task_id"] == "TASK-001"
+    assert data["dry_run"] is True
+    assert data["error"] is None
+    assert "Dry run" in result.stderr
+
+
+def test_campaign_run_json_no_plan_still_emits_one_object(tmp_path, monkeypatch):
+    """No plan is a diagnostic, not a reason to emit zero JSON objects."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(campaign_cmd, "_load_plan", lambda root: ([], []))
+
+    result = runner.invoke(app, ["campaign", "run", "Ship it", "--json", "--project-root", str(tmp_path)])
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["goal"] == "Ship it"
+    assert data["outcomes"] == []
+    assert data["success"] is False
+    assert "No plan found" in data["error"]
+    # The human-readable banner is on stderr; stdout is pure JSON (proved by the parse above,
+    # which is why we do not also assert on the phrase — it legitimately appears in "error").
+    assert "No plan found" in result.stderr
+
+
+def test_campaign_run_json_large_plan_hint_goes_to_stderr(tmp_path, monkeypatch):
+    """The >=5-task hint is the other banner that used to land on stdout."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(campaign_cmd, "_load_plan", lambda root: (_tasks(6), []))
+    monkeypatch.setattr(campaign_cmd, "Campaign", _fake_campaign(_result(6)))
+    monkeypatch.setattr(campaign_cmd, "build_coding_executor_factory", lambda *a, **k: object())
+    monkeypatch.setattr(campaign_cmd, "_persist_statuses", lambda root, tasks: None)
+
+    result = runner.invoke(
+        app,
+        ["campaign", "run", "Ship it", "--json", "--executor", "claude", "--no-verify",
+         "--project-root", str(tmp_path)],
+    )
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["dry_run"] is False
+    assert len(data["outcomes"]) == 6
+    assert "Large plan" in result.stderr
+    assert "Large plan" not in result.stdout
 
 
 def test_campaign_run_with_executor_persists(tmp_path, monkeypatch):
