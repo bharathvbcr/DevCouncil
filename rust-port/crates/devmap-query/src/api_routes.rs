@@ -104,7 +104,13 @@ fn param_re() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(concat!(
-            r":\w+",         // FastAPI / Flask
+            // Flask and Django, converter included: `<uid>`, `<int:uid>`.
+            // Before `:\w+`, and matched whole — otherwise the inner `:uid`
+            // substitutes first, `<int` survives as a literal segment, and
+            // `/api/users/<int:uid>` normalises to `/api/users/<int*>`, which
+            // no client path can match.
+            r"<[^>]*>",
+            r"|:\w+",        // FastAPI
             r"|\{[^}]*\}",   // Express / Spring
             r"|\[[^\]]*\]",  // Next.js dynamic segments
             r"|\$\{[^}]*\}", // JS template-literal fetch URLs
@@ -801,6 +807,20 @@ mod tests {
         assert_eq!(normalize_route_path("/api/users/{id}"), "/api/users/*");
         assert_eq!(normalize_route_path("/api/users/[id]"), "/api/users/*");
         assert_eq!(normalize_route_path("api/users"), "/api/users");
+    }
+
+    #[test]
+    fn a_flask_converter_normalises_whole_rather_than_from_its_colon() {
+        // `:uid` matches the FastAPI alternative too. If that one wins, `<int`
+        // survives as a literal and the route can never match a real request.
+        assert_eq!(normalize_route_path("/api/users/<int:uid>"), "/api/users/*");
+        assert_eq!(normalize_route_path("/api/users/<uid>"), "/api/users/*");
+        assert_eq!(
+            normalize_route_path("/f/<path:rest>/x"),
+            "/f/*/x",
+            "a converter containing a slash still yields one segment"
+        );
+        assert!(paths_match("/api/users/<int:uid>", "/api/users/42"));
     }
 
     #[test]
