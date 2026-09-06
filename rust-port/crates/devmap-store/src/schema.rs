@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS generation_edges (
     edge_kind      TEXT NOT NULL,
     confidence     REAL NOT NULL,
     resolution     TEXT,
+    candidate_total INTEGER,
     PRIMARY KEY (generation_id, ordinal)
 ) WITHOUT ROWID;
 
@@ -448,7 +449,35 @@ pub const MIGRATION_V14_TO_V15: &str = r#"
 ALTER TABLE generation_edges ADD COLUMN resolution TEXT;
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 15;
+/// How many candidates an ambiguous resolution actually held.
+///
+/// `AMBIGUOUS_FANOUT_CAP` (audit R-7) bounds how many **edges** one ambiguous
+/// site emits — 16. It does not bound the site's candidate list, which the
+/// `Arc<Resolution>` still holds in full, deliberately: that list is what keeps
+/// `impact` answerable on candidates 2..N. So resolver memory is proportional
+/// to *candidates* while every number derivable from the store counted
+/// *emitted edges*, and since R-7 the two have not been the same quantity.
+///
+/// `verify.sh` step 6 has been red because of it. Its three coefficient caps
+/// were calibrated on a resolver with no cap, and re-deriving them needs the
+/// denominator the memory actually tracks — which was not in the store at all:
+/// the candidate list lives only on the in-memory `ResolvedEdge`, and
+/// `generation_edges` had no column that could carry any part of it. Fixing the
+/// gate by moving a coefficient instead would have been the "raised to fit"
+/// this repository refuses.
+///
+/// One integer, on the ambiguous rows only. NULL means one of two things and
+/// the reader must not conflate them: the edge is not an `AmbiguousGlobal` (no
+/// candidate list exists), or the row predates this column. `resolution` tells
+/// them apart — an ambiguous row written by this binary always carries a
+/// count, so `resolution = 'AmbiguousGlobal' AND candidate_total IS NULL` is an
+/// older row and a query that needs the denominator must refuse rather than
+/// treat it as zero.
+pub const MIGRATION_V15_TO_V16: &str = r#"
+ALTER TABLE generation_edges ADD COLUMN candidate_total INTEGER;
+"#;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 16;
 
 #[cfg(test)]
 mod retention_constant_tests {

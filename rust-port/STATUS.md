@@ -5167,3 +5167,110 @@ repository asks for; loosening the precondition to make it green would be the
 `import_paths_resolve_to_real_files.rs`, 7 in `cargo_target_roots_are_wired.rs`,
 plus the widened-evidence and Go-package cases in `unwired_is_not_import_blind.rs`
 and the registry/dispatcher agreement test in `language_capabilities.rs`.
+
+## The denominator the memory actually tracks (2026-09-06)
+
+`verify.sh` step 6 has been red, and the cause was understood but not fixed:
+its three coefficient caps were calibrated on a resolver that had no
+`AMBIGUOUS_FANOUT_CAP`. **All nine gates are now green**, and step 6 is green
+because its denominator changed, not because a number moved.
+
+### What was wrong
+
+The cap (16, `devmap-resolve/src/model.rs`, audit R-7) bounds how many **edges**
+one ambiguous site emits. It does not bound the site's **candidate list**, which
+the `Arc<Resolution>` still holds in full — deliberately, because that list is
+what keeps `impact` answerable on candidates 2..N. So since R-7 resolver memory
+has been proportional to candidates while every number derivable from the store
+counted emitted edges, and the two stopped being the same quantity.
+
+The candidate total was not in the store at all: it lived only on the in-memory
+`ResolvedEdge`, and `generation_edges` had no column that could carry any part
+of it. **Schema v16** adds `candidate_total INTEGER`, written on the ambiguous
+rows only. NULL means one of two things and the reader must not conflate them —
+the edge is not an `AmbiguousGlobal`, or the row predates the column —
+so `fanout.sh` refuses a store with `resolution = 'AmbiguousGlobal' AND
+candidate_total IS NULL` rather than summing a NULL as zero, which would
+understate the denominator and inflate every coefficient computed from it.
+
+### The re-derivation
+
+Seven shapes, sweeping fan-out width 16..200 (12.5×) at a fixed 80,000 emitted
+edges and site count 100..400 (4×) at a fixed width, each an ambiguous corpus
+minus its own unique-name control:
+
+| DEFS | CALLERS | edges | candidates | delta bytes | B/edge | B/candidate |
+|---|---|---|---|---|---|---|
+| 16 | 100 | 80,000 | 80,000 | 59,883,520 | 748.5 | 748.5 |
+| 32 | 100 | 80,000 | 160,000 | 71,598,080 | 895.0 | 447.5 |
+| 64 | 100 | 80,000 | 320,000 | 86,081,536 | 1076.0 | 269.0 |
+| 100 | 100 | 80,000 | 500,000 | 100,483,072 | 1256.0 | 201.0 |
+| 200 | 100 | 80,000 | 1,000,000 | 141,819,904 | 1772.7 | 141.8 |
+| 100 | 200 | 160,000 | 1,000,000 | 196,771,840 | 1229.8 | 196.8 |
+| 100 | 400 | 320,000 | 2,000,000 | 391,495,680 | 1223.4 | 195.7 |
+
+Neither single-term coefficient is scale-invariant. Bytes per emitted edge moves
+2.4× across the width sweep. **Bytes per candidate pair — the old
+`PAIR_CAP_MILLI` denominator — moves 66×**, from 46,784 to 709 milli-B/pair. A
+gate on a number that varies 66× with corpus shape is not a bound, and the only
+reason it read as one for so long is that it sat ten times under its cap at the
+single shape it was calibrated on.
+
+A two-term model fits all seven points. Least squares with no intercept, since
+the control *is* the base and is measured rather than modelled:
+
+```
+fan-out cost = 694 B x emitted_edges + 86 B x candidates
+```
+
+Measured against predicted: 96.1, 103.5, 103.9, 102.2, 100.5, 100.1, 99.6 — a
+**96.1%–103.9% band across a 12.5× width range and a 4× site range**. That is
+the scale invariance the probe exists to assert, now asserted on a model that
+describes the code.
+
+### What is gated now
+
+| gate | value | measured |
+|---|---|---|
+| bytes per candidate | cap 150 B | 88.0 B |
+| width invariance — per-candidate cost when the list doubles | max 125% | **99%** |
+| the two-term model, on the delta | 85–115% | **100%** |
+
+The model band is computed on the **delta**, not on total-vs-total. The base
+term sits in both sides of a total ratio and dilutes it; the delta is what the
+coefficients describe and what they were measured against, so the band is both
+tighter (85–115 against 60–125) and better founded.
+
+The width-invariance check is the direct test of the shared-`Arc` invariant and
+is what the retired pair cap was reaching for. SC3 measured the pre-`Arc`
+resolver at 112–128 B per candidate *pair*, because each of a site's N edges
+owned its own clone of the N-element list: cost was quadratic in width. A single
+per-candidate cap cannot tell a clone revert from a corpus that simply got
+bigger; measuring the coefficient at two widths can, because a clone makes it
+grow linearly with width. The probe now builds four corpora rather than two.
+
+The two retired coefficients are still **printed**, ungated, because this ledger
+quotes them and a reader comparing runs needs the same numbers to compare.
+
+### verify.sh step 5
+
+Its `RSS_PER_FANOUT_EDGE=600` had the same wrong denominator. Now two terms with
+the same 1.5× headroom the single term had — 1050 B/edge and 130 B/candidate —
+and the budget line names both. Measured on this repository: **59,309 candidates
+weighed against 38,006 edges emitted**, 1.56×, and a corpus with wider ambiguity
+separates them further.
+
+### Gate ledger
+
+| check | result |
+|---|---|
+| `bash ./verify.sh` | **ALL GATES GREEN** (9/9; step 9 skipped without `--mutants`) |
+| `cargo test --workspace` | **1,697 passed / 0 failed** |
+| `cargo fmt --all --check` | clean |
+| `cargo clippy --workspace --all-targets -D warnings` | clean |
+
+`test_fanout_metric.rs` gains the hand-counted candidate totals and a
+cap-*active* fixture — 40 declarations of one name, 16 edges emitted, 40
+candidates weighed. That second fixture is the one the old one could not be: on
+a 3-candidate corpus candidates and edges coincide, so a column that merely
+echoed the group size would pass there and fail here.

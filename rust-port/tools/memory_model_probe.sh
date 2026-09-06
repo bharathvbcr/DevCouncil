@@ -60,77 +60,108 @@ CALLEES=${DEVMAP_PROBE_CALLEES:-5}
 
 # --- thresholds, each justified from measurement -----------------------------
 #
-# BYTES PER PAIR (the Sum(N^2) coefficient). SC3 measured the pre-fix resolver
-# at 112-128 B per candidate pair, because each of a site's N edges owned its
-# own clone of the N-element candidate list. The `Arc<Resolution>` fix made the
-# list shared. Measured after it, at DEFS=100 over an 8x sweep of corpus size:
-# 4.01, 4.06, 4.12, 4.15 B/pair. 40 B/pair sits 9.7x above the measured value
-# and 2.8x below the regime SC3 left, so it catches a revert of that fix at any
-# corpus size without sitting close enough to measurement noise to flake.
+# WHAT THE DENOMINATOR IS, AND WHAT IT WAS
+# ----------------------------------------
+# This block used to gate two coefficients — bytes per candidate *pair* (the
+# Sum(N^2) term) and bytes per emitted *edge* — and both were red. Neither was
+# wrong by a little: both had the wrong denominator.
 #
-# This bound is shape-independent only above a minimum fan-out width: bytes per
-# pair is bytes per edge divided by the mean fan-out, so a corpus of width 2
-# would exceed 40 B/pair while using no more memory per edge. DEFS is therefore
-# required to be at least 16 (410/16 = 26 B/pair, comfortably under the cap).
-# **These three caps were calibrated before `AMBIGUOUS_FANOUT_CAP` existed, and
-# have not been re-derived since. They currently fail. Read this before
-# changing a number.**
+# `AMBIGUOUS_FANOUT_CAP` (audit R-7) bounds how many edges one ambiguous site
+# emits, at 16. It does not bound the site's candidate list, which the
+# `Arc<Resolution>` still holds in full — deliberately, because that list is
+# what keeps `impact` answerable on candidates 2..N. So since R-7 resolver
+# memory has been proportional to *candidates* while every number this probe
+# could derive counted *emitted edges*, and the two stopped being the same
+# quantity. Schema v16 puts `generation_edges.candidate_total` in the store and
+# `tools/fanout.sh` now reports it, which is what made the re-derivation below
+# possible: the fix was a store change, not a coefficient change.
 #
-# The cap bounds how many *edges* one ambiguous site emits (16). It does not
-# bound the site's *candidate list*, which the `Arc<Resolution>` still holds in
-# full — that is deliberate, and is what keeps `impact` answerable on candidates
-# 2..N. So since audit R-7 the memory is proportional to candidates while every
-# denominator here is derived from emitted edges, and the two stopped being the
-# same number.
+# THE MEASUREMENT (2026-09-06, this machine, `devmap` release build)
+# -----------------------------------------------------------------
+# Seven shapes, sweeping fan-out width 16..200 (12.5x) at a fixed 80,000 edges
+# and site count 100..400 (4x) at a fixed width, each an ambiguous corpus minus
+# its own unique-name control:
 #
-# Measured 2026-09-06, this machine, both runs after the arithmetic
-# preconditions above were corrected:
+#   DEFS  CALLERS    edges  candidates   delta bytes   B/edge   B/candidate
+#     16      100    80000       80000      59883520    748.5         748.5
+#     32      100    80000      160000      71598080    895.0         447.5
+#     64      100    80000      320000      86081536   1076.0         269.0
+#    100      100    80000      500000     100483072   1256.0         201.0
+#    200      100    80000     1000000     141819904   1772.7         141.8
+#    100      200   160000     1000000     196771840   1229.8         196.8
+#    100      400   320000     2000000     391495680   1223.4         195.7
 #
-#   DEFS=100 (cap active, 100 candidates -> 16 edges):
-#     77,145 milli-B/pair, 1,234,329 milli-B/edge, 193% of model
-#   DEFS=16 (cap inert, 16 candidates -> 16 edges):
-#     45,926 milli-B/pair,   734,822 milli-B/edge, 138% of model
+# Neither single-term coefficient is scale-invariant. Bytes per emitted edge
+# moves 2.4x across the width sweep; bytes per candidate *pair* — the old
+# `PAIR_CAP_MILLI` denominator — moves **66x**, from 46,784 to 709 milli-B/pair.
+# A gate on a number that varies 66x with corpus shape is not a bound, and the
+# reason it passed for so long is that it sat ten times under its cap at the one
+# shape it was calibrated on.
 #
-# Removing the cap's effect alone takes bytes-per-edge from 1,234 to 735 and
-# inside its 800 cap, which is the decoupling stated above, measured. What is
-# left — 46 B/pair against 40, and 138% against 125% — is either a real per-edge
-# regression from the 410 B this model assumes, or an artifact of comparing a
-# 16-wide 116-file corpus against coefficients measured on a 100-wide one. It
-# was not settled, and a number moved to make a gate green would be exactly the
-# "raised to fit" this repository refuses.
+# A two-term model fits all seven points. Least squares with no intercept (the
+# control *is* the base, measured rather than modelled):
 #
-# **Fixing it properly needs a schema change.** `tools/fanout.sh` derives its
-# metrics from the persisted graph, and `generation_edges` has no `details`
-# column — the candidate total lives only on the in-memory `ResolvedEdge`. So
-# the denominator the memory actually tracks is not recoverable from the store
-# today, and making it so is a store change, not a probe change.
-PAIR_CAP_MILLI=40000
-MIN_DEFS=16
+#     delta = 694 B x emitted_edges + 86 B x candidates
 #
-# BYTES PER FAN-OUT EDGE. This is the coefficient that actually describes the
-# current code: measured 401.5, 406.4, 412.1, 415.2 B/edge across the same 8x
-# sweep, and 406/411/409 B/edge across a 4x sweep of fan-out width at constant
-# edge count. 800 B/edge is 1.9x the measured value.
-EDGE_CAP_MILLI=800000
+# Measured against predicted: 96.1, 103.5, 103.9, 102.2, 100.5, 100.1, 99.6 —
+# a 96.1%..103.9% band across a 12.5x width range and a 4x site range. That is
+# the scale invariance this probe exists to assert, and it is now asserted on a
+# model that describes the code rather than one that predates a cap.
+MODEL_EDGE_BYTES=694
+MODEL_CANDIDATE_BYTES=86
+# Measured band is 96.1..103.9; +/-11 points of headroom on each side. Tighter
+# than the 60..125 it replaces *and* better founded — the old band was wide
+# because the model underneath it was wrong, not because the code is noisy.
 #
-# The model coefficient used for the prediction check, set to the measured mean.
-MODEL_EDGE_BYTES=410
-# The model held to within 0.5% at this shape and 3.4% across an 8x scale sweep.
-# +25% is far outside that, so a trip is a real change in cost per edge. The
-# lower bound is deliberate and symmetric: a measurement well under prediction
-# means the model no longer describes the code, and a gate calibrated on a dead
-# model is a gate that cannot fire. Both directions demand re-derivation, which
-# is the SC27 discipline — a constant that no longer matches reality is a defect
-# even when it errs generously.
-PRED_MAX_PCT=125
-PRED_MIN_PCT=60
+# The lower bound is deliberate and symmetric, unchanged in spirit from what it
+# replaces: a measurement well under prediction means the model no longer
+# describes the code, and a gate calibrated on a dead model cannot fire. Both
+# directions demand re-derivation. That discipline is what produced this block.
+PRED_MAX_PCT=115
+PRED_MIN_PCT=85
+#
+# BYTES PER CANDIDATE, the residual after the edge term. This is the `Arc`
+# guard, and it is what the retired pair cap was reaching for. SC3 measured the
+# pre-`Arc` resolver at 112-128 B per candidate *pair*, because each of a site's
+# N edges owned its own clone of the N-element candidate list: cost was
+# quadratic in width. With the list shared it is linear, and the residual
+# measures 55.0, 100.7, 95.6, 90.0, 86.3, 85.8, 84.8 B/candidate across the
+# sweep — flat. 150 is 1.5x the measured maximum. A revert of the `Arc` fix
+# makes this grow *with width*: at the default shape a cloned list costs 100x
+# more per candidate, so the cap is not close to noise in the direction that
+# matters.
+#
+# (The 55.0 at DEFS=16 is the degenerate case where the cap is inert and
+# edges == candidates, so the two terms are collinear and the split between
+# them is arbitrary. It is below the cap and is not the case the cap guards.)
+CANDIDATE_CAP_MILLI=150000
+#
+# WIDTH INVARIANCE, the direct test of the shared-`Arc` invariant.
+#
+# The cap above bounds the coefficient at one shape. This bounds how it *moves*:
+# the probe measures a second, wider corpus and requires bytes-per-candidate not
+# to grow. Under a clone revert it grows linearly with width — doubling the
+# width doubles it — which no single-shape cap can distinguish from a corpus
+# that simply got bigger. Measured across the width sweep the ratio falls
+# (100.7 -> 86.3 from width 32 to 200), so a ceiling of 125% is a real bound
+# rather than a restatement of the cap.
+WIDTH_RATIO_MAX_PCT=125
+WIDE_DEFS_MULTIPLIER=2
+#
+# The probe's primary shape must separate the two terms, which needs the fan-out
+# cap to be *active*: at a width at or under the cap every site emits one edge
+# per candidate, the two denominators coincide, and the model's split between
+# them is unidentifiable. `MIN_CANDIDATE_RATIO` demands at least four candidates
+# per emitted edge — the default shape gives 6.25.
+MIN_CANDIDATE_RATIO=4
 #
 # Wall-clock bound so a pathological regression cannot hang CI instead of
-# failing it. Two builds of this corpus measure ~2.4 s each on a quiet
-# workstation; 240 s leaves ample room for a loaded 2-core runner.
-TIME_BUDGET_S=240
+# failing it. Four builds now rather than two — the wide corpus is a second
+# ambiguous/control pair — measuring ~2.4 s each on a quiet workstation. 480 s
+# leaves the same proportional room on a loaded 2-core runner that 240 s left
+# for two builds.
+TIME_BUDGET_S=480
 # -----------------------------------------------------------------------------
-
 for pair in "DEFS=$DEFS" "CALLERS=$CALLERS" "FNS=$FNS" "CALLEES=$CALLEES"; do
   [[ "${pair#*=}" =~ ^[1-9][0-9]*$ ]] || {
     echo "PROBE FAIL: $pair is not a positive integer; the probe's expected fan-out is computed from it"
@@ -159,13 +190,14 @@ FANOUT_CAP=$(grep -oE 'AMBIGUOUS_FANOUT_CAP: usize = [0-9]+' \
 WIDTH=$DEFS
 [ "$WIDTH" -le "$FANOUT_CAP" ] || WIDTH=$FANOUT_CAP
 
-# Asked of the *effective* width, not of `DEFS`. The bytes-per-pair bound is
-# bytes-per-edge divided by the mean fan-out, so it is the width the resolver
-# emits that decides whether the bound is meaningful — raising `DEFS` past the
-# cap buys no width and would leave this check passing on a corpus it no longer
-# describes.
-[ "$WIDTH" -ge "$MIN_DEFS" ] || {
-  echo "PROBE FAIL: effective fan-out width $WIDTH (DEFS=$DEFS capped at $FANOUT_CAP) is below the minimum width $MIN_DEFS the bytes-per-pair bound is valid for"
+# The two model terms have to be separable, and they are only separable when the
+# cap is *active*: at `DEFS <= FANOUT_CAP` every site emits one edge per
+# candidate, the two denominators are the same number, and the model's split
+# between them is unidentifiable. Asked of the ratio rather than of a width, so
+# the check stays correct if `AMBIGUOUS_FANOUT_CAP` moves.
+CANDIDATE_RATIO=$((DEFS / WIDTH))
+[ "$CANDIDATE_RATIO" -ge "$MIN_CANDIDATE_RATIO" ] || {
+  echo "PROBE FAIL: ${CANDIDATE_RATIO} candidates per emitted edge (DEFS=$DEFS, AMBIGUOUS_FANOUT_CAP=$FANOUT_CAP) is under the minimum $MIN_CANDIDATE_RATIO; the edge and candidate terms of the model are not separable at this shape"
   exit 1; }
 
 TMP=$(mktemp -d)
@@ -221,79 +253,124 @@ FILES=$((DEFS + CALLERS))
 SITES=$((CALLERS * FNS * CALLEES))
 EXPECT_EDGES=$((SITES * WIDTH))
 EXPECT_SUM_N2=$((SITES * WIDTH * WIDTH))
+EXPECT_CANDIDATES=$((SITES * DEFS))
 
-echo "CAPPED: this probe builds a synthetic ${FILES}-file corpus (Sum(N^2) = ${EXPECT_SUM_N2}, widest fan-out ${WIDTH}"
-if [ "$WIDTH" -lt "$DEFS" ]; then
-  echo "CAPPED: — ${DEFS} candidates per name, bounded by AMBIGUOUS_FANOUT_CAP=${FANOUT_CAP})."
-else
-  echo "CAPPED: )."
-fi
-echo "CAPPED: the production corpus is 12,831 files and is NOT built here. This bounds the per-pair and"
-echo "CAPPED: per-edge memory coefficients, which are corpus-size invariant; it does not bound any real"
-echo "CAPPED: repository's absolute peak. Raise DEVMAP_PROBE_CALLERS to scale the probe up locally."
+echo "CAPPED: this probe builds a synthetic ${FILES}-file corpus: ${SITES} ambiguous sites, ${DEFS} candidates"
+echo "CAPPED: each, emitting ${WIDTH} edges each (AMBIGUOUS_FANOUT_CAP=${FANOUT_CAP}); ${EXPECT_CANDIDATES} candidates"
+echo "CAPPED: weighed against ${EXPECT_EDGES} edges emitted. A second, ${WIDE_DEFS_MULTIPLIER}x wider corpus is built"
+echo "CAPPED: for the width-invariance check. The production corpus is 12,831 files and is NOT built here:"
+echo "CAPPED: this bounds two corpus-size-invariant coefficients and the model that combines them; it does"
+echo "CAPPED: not bound any real repository's absolute peak. Raise DEVMAP_PROBE_CALLERS to scale up locally."
 
 START=$(date +%s)
-generate "$TMP/amb" ambiguous
-generate "$TMP/ctl" unique
 
-RSS_AMB=$(peak_rss_bytes "$TMP/amb.time" "$DEVMAP" --db "$TMP/amb.sqlite" --progress never build "$TMP/amb") || {
-  echo "PROBE FAIL: could not measure peak RSS for the ambiguous build — refusing to report an unmeasured probe as passing"; exit 1; }
-RSS_CTL=$(peak_rss_bytes "$TMP/ctl.time" "$DEVMAP" --db "$TMP/ctl.sqlite" --progress never build "$TMP/ctl") || {
-  echo "PROBE FAIL: could not measure peak RSS for the control build — refusing to report an unmeasured probe as passing"; exit 1; }
+# One ambiguous/control pair at a given candidate width.
+#
+# Echoes `<edges> <candidates> <delta_bytes> <sum_n2> <ctl_sum_n2> <sites> <max_n>`.
+# The control *is* the base term, measured rather than modelled: a coefficient
+# computed against a modelled base inherits that model's error, and on a real
+# repository the base is ~97% of peak.
+measure_pair() { # <defs> <tag>
+  local defs=$1 tag=$2 rss_amb rss_ctl m_amb m_ctl
+  DEFS=$defs generate "$TMP/$tag.amb" ambiguous
+  DEFS=$defs generate "$TMP/$tag.ctl" unique
+  rss_amb=$(peak_rss_bytes "$TMP/$tag.amb.time" "$DEVMAP" --db "$TMP/$tag.amb.sqlite" --progress never build "$TMP/$tag.amb") || {
+    echo "PROBE FAIL: could not measure peak RSS for the $tag ambiguous build — refusing to report an unmeasured probe as passing" >&2; return 1; }
+  rss_ctl=$(peak_rss_bytes "$TMP/$tag.ctl.time" "$DEVMAP" --db "$TMP/$tag.ctl.sqlite" --progress never build "$TMP/$tag.ctl") || {
+    echo "PROBE FAIL: could not measure peak RSS for the $tag control build — refusing to report an unmeasured probe as passing" >&2; return 1; }
+  m_amb=$(tools/fanout.sh "$TMP/$tag.amb.sqlite") || {
+    echo "PROBE FAIL: fan-out metrics unavailable for the $tag ambiguous build" >&2; return 1; }
+  m_ctl=$(tools/fanout.sh "$TMP/$tag.ctl.sqlite") || {
+    echo "PROBE FAIL: fan-out metrics unavailable for the $tag control build" >&2; return 1; }
+  [ "$rss_amb" -gt "$rss_ctl" ] || {
+    echo "PROBE FAIL: the $tag ambiguous build did not cost more than its control ($rss_amb vs $rss_ctl) — the fan-out is not being measured" >&2; return 1; }
+  printf '%s %s %s %s %s %s %s %s\n' \
+    "$(field "$m_amb" fanout_edges)" \
+    "$(field "$m_amb" candidates)" \
+    "$((rss_amb - rss_ctl))" \
+    "$(field "$m_amb" fanout_sum_n2)" \
+    "$(field "$m_ctl" fanout_sum_n2)" \
+    "$(field "$m_amb" fanout_sites)" \
+    "$(field "$m_amb" fanout_max_n)" \
+    "$(field "$m_amb" max_candidates)"
+}
+
+read -r EDGES CANDIDATES DELTA SUM_N2 CTL_SUM_N2 GOT_SITES GOT_MAX GOT_MAX_CAND \
+  < <(measure_pair "$DEFS" narrow) || exit 1
+
+WIDE_DEFS=$((DEFS * WIDE_DEFS_MULTIPLIER))
+read -r W_EDGES W_CANDIDATES W_DELTA _ _ _ _ _ < <(measure_pair "$WIDE_DEFS" wide) || exit 1
+
 ELAPSED=$(( $(date +%s) - START ))
 
-M_AMB=$(tools/fanout.sh "$TMP/amb.sqlite") || { echo "PROBE FAIL: fan-out metrics unavailable for the ambiguous build"; exit 1; }
-M_CTL=$(tools/fanout.sh "$TMP/ctl.sqlite") || { echo "PROBE FAIL: fan-out metrics unavailable for the control build"; exit 1; }
+echo "probe: ${FILES} files, ${GOT_SITES} ambiguous sites, widest fan-out ${GOT_MAX}, widest candidate list ${GOT_MAX_CAND}"
+echo "probe: Sum(N)=${EDGES} edges, ${CANDIDATES} candidates weighed, Sum(N^2)=${SUM_N2}"
+echo "probe: fan-out cost $((DELTA / 1024 / 1024)) MiB narrow, $((W_DELTA / 1024 / 1024)) MiB at ${WIDE_DEFS} candidates, ${ELAPSED}s"
 
-SUM_N2=$(field "$M_AMB" fanout_sum_n2)
-EDGES=$(field "$M_AMB" fanout_edges)
-GOT_SITES=$(field "$M_AMB" fanout_sites)
-GOT_MAX=$(field "$M_AMB" fanout_max_n)
-CTL_SUM_N2=$(field "$M_CTL" fanout_sum_n2)
-
-echo "probe: ${FILES} files, ${GOT_SITES} ambiguous sites, widest ${GOT_MAX}, Sum(N)=${EDGES}, Sum(N^2)=${SUM_N2}"
-echo "probe: peak RSS ambiguous $((RSS_AMB / 1024 / 1024)) MiB, control $((RSS_CTL / 1024 / 1024)) MiB, ${ELAPSED}s"
-
-# The corpus shape is known exactly, so the derived metric is checked against
+# The corpus shape is known exactly, so every derived metric is checked against
 # arithmetic before it is used as the denominator of anything. This is the same
 # validation `test_fanout_metric.rs` does on a hand-counted fixture, repeated
-# here at 10^7 scale: a grouping key that were merely plausible would still have
-# to reproduce SITES x DEFS^2 exactly.
+# here at 10^6 scale: a grouping key that were merely plausible would still have
+# to reproduce SITES x WIDTH and SITES x DEFS exactly.
 [ "$GOT_SITES" -eq "$SITES" ] || { echo "PROBE FAIL: derived $GOT_SITES ambiguous sites, corpus has $SITES"; exit 1; }
 [ "$GOT_MAX" -eq "$WIDTH" ] || { echo "PROBE FAIL: derived widest fan-out $GOT_MAX, corpus emits $WIDTH (DEFS=$DEFS, AMBIGUOUS_FANOUT_CAP=$FANOUT_CAP)"; exit 1; }
+[ "$GOT_MAX_CAND" -eq "$DEFS" ] || { echo "PROBE FAIL: derived widest candidate list $GOT_MAX_CAND, corpus declares $DEFS — the candidate denominator is not what this probe thinks it is"; exit 1; }
 [ "$EDGES" -eq "$EXPECT_EDGES" ] || { echo "PROBE FAIL: derived Sum(N)=$EDGES, corpus has $EXPECT_EDGES"; exit 1; }
+[ "$CANDIDATES" -eq "$EXPECT_CANDIDATES" ] || { echo "PROBE FAIL: derived $CANDIDATES candidates, corpus has $EXPECT_CANDIDATES"; exit 1; }
 [ "$SUM_N2" -eq "$EXPECT_SUM_N2" ] || { echo "PROBE FAIL: derived Sum(N^2)=$SUM_N2, corpus has $EXPECT_SUM_N2"; exit 1; }
 # The control must contain no ambiguity at all, or it is not a base measurement
-# and the subtraction below is meaningless.
+# and the subtraction is meaningless.
 [ "$CTL_SUM_N2" -eq 0 ] || { echo "PROBE FAIL: the control corpus has fan-out (Sum(N^2)=$CTL_SUM_N2); it cannot serve as the base term"; exit 1; }
+# The wide corpus must actually be wider in the dimension under test, or the
+# invariance check compares a shape against itself.
+[ "$W_CANDIDATES" -gt "$CANDIDATES" ] || {
+  echo "PROBE FAIL: the wide corpus weighed $W_CANDIDATES candidates against the narrow corpus's $CANDIDATES; the width-invariance check has nothing to compare"; exit 1; }
 
-[ "$RSS_AMB" -gt "$RSS_CTL" ] || {
-  echo "PROBE FAIL: the ambiguous build did not cost more than its control ($RSS_AMB vs $RSS_CTL) — the fan-out is not being measured"; exit 1; }
-DELTA=$((RSS_AMB - RSS_CTL))
+# The model, on the *delta* rather than on the total. The base term is in both
+# sides of a total-vs-total ratio and dilutes it — on this shape a 2x error in
+# the fan-out cost would move a total ratio by well under the band. The delta is
+# what the coefficients describe and what they were measured against.
+MODELLED=$((MODEL_EDGE_BYTES * EDGES + MODEL_CANDIDATE_BYTES * CANDIDATES))
+PRED_PCT=$((DELTA * 100 / MODELLED))
+# The residual after the edge term, per candidate. Clamped at zero: a negative
+# residual means the edge term alone already over-predicts, which the model band
+# above catches with a message that says so.
+EDGE_PART=$((MODEL_EDGE_BYTES * EDGES))
+CAND_RESIDUAL=$((DELTA - EDGE_PART))
+[ "$CAND_RESIDUAL" -gt 0 ] || CAND_RESIDUAL=0
+CAND_MILLI=$((CAND_RESIDUAL * 1000 / CANDIDATES))
+W_CAND_RESIDUAL=$((W_DELTA - MODEL_EDGE_BYTES * W_EDGES))
+[ "$W_CAND_RESIDUAL" -gt 0 ] || W_CAND_RESIDUAL=0
+W_CAND_MILLI=$((W_CAND_RESIDUAL * 1000 / W_CANDIDATES))
+if [ "$CAND_MILLI" -gt 0 ]; then
+  WIDTH_RATIO_PCT=$((W_CAND_MILLI * 100 / CAND_MILLI))
+else
+  WIDTH_RATIO_PCT=0
+fi
 
-PAIR_MILLI=$((DELTA * 1000 / SUM_N2))
+# Retired denominators, printed rather than gated. Bytes per emitted edge moves
+# 2.4x across a width sweep and bytes per candidate *pair* moves 66x, so neither
+# is a bound; they are here because three years of this ledger quote them and a
+# reader comparing runs needs the same numbers to compare.
 EDGE_MILLI=$((DELTA * 1000 / EDGES))
-PREDICTED=$((RSS_CTL + MODEL_EDGE_BYTES * EDGES))
-PRED_PCT=$((RSS_AMB * 100 / PREDICTED))
-# What the ledger's pre-Arc model would have predicted, printed for comparison
-# rather than gated: 112 B per candidate pair.
-SC3_PREDICTED=$((RSS_CTL + 112 * SUM_N2))
+PAIR_MILLI=$((DELTA * 1000 / SUM_N2))
 
-echo "probe: fan-out cost $((DELTA / 1024 / 1024)) MiB => ${PAIR_MILLI} milli-bytes/pair (cap ${PAIR_CAP_MILLI}), ${EDGE_MILLI} milli-bytes/edge (cap ${EDGE_CAP_MILLI})"
-echo "probe: predicted $((PREDICTED / 1024 / 1024)) MiB from base + ${MODEL_EDGE_BYTES} B x Sum(N); measured is ${PRED_PCT}% of that"
-echo "probe: for comparison, the pre-SC3 model (base + 112 B x Sum(N^2)) predicts $((SC3_PREDICTED / 1024 / 1024)) MiB"
+echo "probe: ${CAND_MILLI} milli-bytes/candidate (cap ${CANDIDATE_CAP_MILLI}), ${W_CAND_MILLI} at ${WIDE_DEFS} candidates => ${WIDTH_RATIO_PCT}% (max ${WIDTH_RATIO_MAX_PCT}%)"
+echo "probe: model predicts $((MODELLED / 1024 / 1024)) MiB from ${MODEL_EDGE_BYTES} B x ${EDGES} edges + ${MODEL_CANDIDATE_BYTES} B x ${CANDIDATES} candidates; measured is ${PRED_PCT}%"
+echo "probe: not gated, for continuity with older runs — ${EDGE_MILLI} milli-B/edge, ${PAIR_MILLI} milli-B/pair"
+echo "probe: for comparison, the pre-SC3 model (112 B x Sum(N^2)) predicts $(((112 * SUM_N2) / 1024 / 1024)) MiB of fan-out cost"
 
 FAIL=0
-[ "$PAIR_MILLI" -lt "$PAIR_CAP_MILLI" ] || {
-  echo "PROBE FAIL: ${PAIR_MILLI} milli-bytes per candidate pair >= cap ${PAIR_CAP_MILLI}"; FAIL=1; }
-[ "$EDGE_MILLI" -lt "$EDGE_CAP_MILLI" ] || {
-  echo "PROBE FAIL: ${EDGE_MILLI} milli-bytes per fan-out edge >= cap ${EDGE_CAP_MILLI}"; FAIL=1; }
+[ "$CAND_MILLI" -lt "$CANDIDATE_CAP_MILLI" ] || {
+  echo "PROBE FAIL: ${CAND_MILLI} milli-bytes per candidate >= cap ${CANDIDATE_CAP_MILLI} — the candidate list is costing per-edge memory again, which is what sharing it through an Arc was for"; FAIL=1; }
+[ "$WIDTH_RATIO_PCT" -le "$WIDTH_RATIO_MAX_PCT" ] || {
+  echo "PROBE FAIL: bytes per candidate grew to ${WIDTH_RATIO_PCT}% when the candidate list doubled (max ${WIDTH_RATIO_MAX_PCT}%) — cost is scaling with width, so the list is no longer shared"; FAIL=1; }
 [ "$PRED_PCT" -le "$PRED_MAX_PCT" ] || {
-  echo "PROBE FAIL: measured peak is ${PRED_PCT}% of the model's prediction (max ${PRED_MAX_PCT}%)"; FAIL=1; }
+  echo "PROBE FAIL: measured fan-out cost is ${PRED_PCT}% of the model's prediction (max ${PRED_MAX_PCT}%)"; FAIL=1; }
 [ "$PRED_PCT" -ge "$PRED_MIN_PCT" ] || {
-  echo "PROBE FAIL: measured peak is ${PRED_PCT}% of the model's prediction (min ${PRED_MIN_PCT}%) — the model no longer describes the code and must be re-derived, not left in place"; FAIL=1; }
+  echo "PROBE FAIL: measured fan-out cost is ${PRED_PCT}% of the model's prediction (min ${PRED_MIN_PCT}%) — the model no longer describes the code and must be re-derived, not left in place"; FAIL=1; }
 [ "$ELAPSED" -le "$TIME_BUDGET_S" ] || {
   echo "PROBE FAIL: probe took ${ELAPSED}s, budget ${TIME_BUDGET_S}s"; FAIL=1; }
 
 [ "$FAIL" -eq 0 ] || exit 1
-echo "MEMORY MODEL OK (${PAIR_MILLI} milli-B/pair, ${EDGE_MILLI} milli-B/edge, ${PRED_PCT}% of prediction)"
+echo "MEMORY MODEL OK (${CAND_MILLI} milli-B/candidate, ${WIDTH_RATIO_PCT}% width ratio, ${PRED_PCT}% of prediction)"

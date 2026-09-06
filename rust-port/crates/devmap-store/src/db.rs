@@ -15,9 +15,9 @@ use crate::edge_index::ResolutionSource;
 use crate::schema::{
     BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, COVERAGE_GAPS_TABLE, CREATE_SCHEMA_V3,
     CURRENT_SCHEMA_VERSION, MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12, MIGRATION_V12_TO_V13,
-    MIGRATION_V14_TO_V15, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6,
-    MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10,
-    UNRESOLVED_TABLE,
+    MIGRATION_V14_TO_V15, MIGRATION_V15_TO_V16, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5,
+    MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9,
+    MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -990,6 +990,7 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "edge_kind",
             "confidence",
             "resolution",
+            "candidate_total",
         ],
     ),
     (
@@ -1528,6 +1529,17 @@ impl Store {
             Self::validate_schema(&tx)?;
             tx.commit()?;
             version = 15;
+        }
+        if version == 15 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Same idempotency probe as v7/v8/v10/v11/v14.
+            if !Self::has_column(&tx, "generation_edges", "candidate_total")? {
+                tx.execute_batch(MIGRATION_V15_TO_V16)?;
+            }
+            tx.execute("PRAGMA user_version = 16", [])?;
+            Self::validate_schema(&tx)?;
+            tx.commit()?;
+            version = 16;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
@@ -2711,8 +2723,8 @@ impl Store {
             // highest-frequency statement in the writer: one execution for
             // every resolved edge, 73,000 of them in a DevCouncil generation.
             tx.prepare_cached(
-                "INSERT INTO generation_edges (generation_id, ordinal, source_file_id, target_file_id, source_symbol, target_symbol, edge_kind, confidence, resolution)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO generation_edges (generation_id, ordinal, source_file_id, target_file_id, source_symbol, target_symbol, edge_kind, confidence, resolution, candidate_total)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?
             .execute(
                 params![
@@ -2733,6 +2745,13 @@ impl Store {
                     edge.resolution
                         .as_ref()
                         .map(|resolution| crate::edge_index::resolution_kind_label(resolution)),
+                    // How many candidates the ambiguous rung actually weighed,
+                    // which since `AMBIGUOUS_FANOUT_CAP` is no longer the number
+                    // of rows this site produces. NULL for every other rung: a
+                    // resolution that names one target has no candidate list,
+                    // and writing 1 there would make a certain edge look like a
+                    // one-candidate ambiguity.
+                    crate::edge_index::ambiguous_candidate_total(edge.resolution.as_deref()),
                 ],
             )?;
             edge_ord += 1;

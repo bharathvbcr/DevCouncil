@@ -84,6 +84,30 @@ pub fn resolution_kind_label(resolution: &devmap_resolve::model::Resolution) -> 
     resolution.kind().label()
 }
 
+/// How many candidates an `AmbiguousGlobal` resolution weighed, or `None` for
+/// every other rung.
+///
+/// The one owner of what `generation_edges.candidate_total` means. `None` is
+/// written as SQL NULL, and NULL is deliberately *not* zero and not one: a
+/// resolution that names a single target has no candidate list at all, and
+/// storing `1` there would make a certain edge indistinguishable from a
+/// one-candidate ambiguity in every aggregate that reads the column.
+///
+/// This is the denominator resolver memory actually tracks. Since
+/// `AMBIGUOUS_FANOUT_CAP` bounds emitted edges but not the candidate list the
+/// `Arc<Resolution>` holds, the two stopped being the same number, and every
+/// metric derived from the store was counting the wrong one.
+pub fn ambiguous_candidate_total(
+    resolution: Option<&devmap_resolve::model::Resolution>,
+) -> Option<i64> {
+    match resolution? {
+        devmap_resolve::model::Resolution::AmbiguousGlobal { candidates, .. } => {
+            i64::try_from(candidates.len()).ok()
+        }
+        _ => None,
+    }
+}
+
 /// Decode a stored resolution kind.
 ///
 /// An unknown spelling is an error, never a default — the same rule
