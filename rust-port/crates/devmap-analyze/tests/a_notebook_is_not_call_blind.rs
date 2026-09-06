@@ -208,3 +208,114 @@ fn an_empty_notebook_is_read_not_blind() {
          extractor that cannot read it: {gaps:?}"
     );
 }
+
+/// The capability answer under every way a notebook can be malformed.
+///
+/// `Extraction::capabilities()` reads the *engine*, and the engine is chosen by
+/// parsing the file — so the question this closes is whether any input can make
+/// the two disagree. Two directions, and they fail in opposite ways:
+///
+/// * **Over-claim.** A file nothing could read declaring Python's capabilities
+///   would leave it out of every gap count while contributing no edges, which
+///   is the coverage hole rendered as full coverage.
+/// * **Under-claim.** A file the kernel grammar read cleanly declaring none is
+///   R10 exactly: charged `CallBlind` for a build limitation that does not
+///   exist, dropped from the denominator of the blind share, and every symbol
+///   it declares pinned to the loss cap.
+///
+/// The inputs are the shapes a real `.ipynb` arrives in when something has gone
+/// wrong: truncated downloads, a kernel this build has no grammar for, `nbformat`
+/// 3's string `source`, and a metadata block naming the container format back
+/// at itself — which is the one that could have recursed.
+#[test]
+fn no_malformed_notebook_makes_the_declaration_and_the_delivery_disagree() {
+    const CELL: &str = r#"{"cell_type":"code","source":["import os\n","\n","\n","def probe():\n","    return os.getcwd()\n"]}"#;
+    let with_kernel = |name: &str| {
+        format!(
+            r#"{{"cells":[{CELL}],"metadata":{{"language_info":{{"name":"{name}"}}}},"nbformat":4}}"#
+        )
+    };
+    let cases: Vec<(&str, String)> = vec![
+        ("no metadata at all", format!(r#"{{"cells":[{CELL}],"nbformat":4}}"#)),
+        ("an empty kernel name", with_kernel("")),
+        // Names the container format as its own kernel. `capabilities_for_language`
+        // takes a `&str` and cannot recurse, but nothing said so.
+        ("a self-referential kernel", with_kernel("notebook")),
+        ("a kernel this build has no grammar for", with_kernel("haskell")),
+        ("a kernel name that is not a language", with_kernel("../../etc/passwd")),
+        ("no cells array", r#"{"cells":null,"metadata":{"language_info":{"name":"python"}},"nbformat":4}"#.to_string()),
+        ("an empty cells array", r#"{"cells":[],"metadata":{"language_info":{"name":"python"}},"nbformat":4}"#.to_string()),
+        ("source text that is not JSON", "def probe():\n    return 1\n".to_string()),
+        ("nothing at all", String::new()),
+        // nbformat 3 wrote `source` as one string rather than a line array.
+        (
+            "a string source",
+            r#"{"cells":[{"cell_type":"code","source":"import os\ndef probe():\n    return os.getcwd()\n"}],"metadata":{"language_info":{"name":"python"}},"nbformat":4}"#.to_string(),
+        ),
+        // The kernel is declared under `kernelspec` instead.
+        (
+            "only a kernelspec",
+            r#"{"cells":[{"cell_type":"code","source":["import os\n","def probe():\n","    return os.getcwd()\n"]}],"metadata":{"kernelspec":{"language":"python","name":"python3"}},"nbformat":4}"#.to_string(),
+        ),
+        ("an upper-cased kernel name", with_kernel("PYTHON")),
+    ];
+
+    for (label, source) in cases {
+        let ext = extract_file("probe.ipynb", &source);
+        let capabilities = ext.capabilities();
+        let readable = matches!(ext.parse_outcome, ParseOutcome::Clean);
+
+        // Never over-claim: a file nothing read declares nothing.
+        if !readable {
+            assert_eq!(
+                capabilities,
+                devmap_extract::languages::Capabilities::NONE,
+                "{label}: an unread notebook must claim no capability, or it \
+                 leaves every gap count while contributing no edges — \
+                 {:?}",
+                ext.engine
+            );
+            let coverage = extraction_coverage(std::slice::from_ref(&ext));
+            assert!(
+                !coverage.is_complete(),
+                "{label}: and it must be charged as a hole: {coverage:?}"
+            );
+            continue;
+        }
+
+        // Never under-claim: whatever it delivered, it declared.
+        if !ext.calls.is_empty() {
+            assert!(
+                capabilities.contains(Capability::Calls),
+                "{label}: delivered {} calls while declaring {capabilities:?}",
+                ext.calls.len()
+            );
+        }
+        if !ext.imports.is_empty() {
+            assert!(
+                capabilities.contains(Capability::Imports),
+                "{label}: delivered {} imports while declaring {capabilities:?}",
+                ext.imports.len()
+            );
+        }
+        if !ext.references.is_empty() {
+            assert!(
+                capabilities.contains(Capability::References)
+                    || capabilities.contains(Capability::Heritage),
+                "{label}: delivered {} references while declaring {capabilities:?}",
+                ext.references.len()
+            );
+        }
+        // And a readable notebook is never charged a capability gap, whatever
+        // it happened to contain.
+        let gaps = extraction_gaps(std::slice::from_ref(&ext));
+        assert!(
+            gaps.iter().all(|gap| !matches!(
+                gap.gap,
+                ExtractionGap::CallBlind | ExtractionGap::ImportBlind
+            )),
+            "{label}: the grammar read this file; blindness names a build \
+             limitation that does not exist here: {gaps:?}"
+        );
+    }
+}

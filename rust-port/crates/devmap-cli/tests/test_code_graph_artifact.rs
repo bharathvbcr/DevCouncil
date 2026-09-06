@@ -122,27 +122,11 @@ fn one_manifest_invocation_publishes_both_consumer_artifacts() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        [
-            "content_fingerprint",
-            // Added by W1.1, additively: the Python models ignore
-            // unknown keys (pydantic's default), so a consumer that
-            // predates the component pass reads the artifact
-            // unchanged. `CODE_GRAPH_SCHEMA_VERSION` therefore does
-            // not move: nothing that was readable stopped being so.
-            "dead_clusters",
-            "dead_clusters_truncated",
-            "dead_code",
-            "edges",
-            "entry_roots",
-            "generated_head",
-            "indexed_hash",
-            "meta",
-            "nodes",
-            "schema_version",
-            "unreachable_files",
-            "unwired_candidates",
-        ],
-        "the artifact must carry the schema Python consumers validate"
+        devmap_query::CODE_GRAPH_TOP_LEVEL_KEYS,
+        "the artifact must carry the schema Python consumers validate, which \
+         `CODE_GRAPH_TOP_LEVEL_KEYS` declares once for the writer, this test and \
+         `schema.py` alike — a fourth hand-written copy is how the last key \
+         landed on one side only"
     );
     assert_eq!(graph["schema_version"], 2);
 

@@ -213,8 +213,31 @@ class _DeadEntry:
         return {"path": self.path, "line": self.line, "id": self.id, "reason": self.reason}
 
 
-def _fake_graph(dead=None, edges=None):
-    return SimpleNamespace(dead_code=list(dead or []), edges=list(edges or []))
+def _fake_graph(
+    dead=None, edges=None, clusters=None, clusters_truncated=0, clusters_incomplete=None
+):
+    """A stand-in for a loaded ``CodeGraph``, derived from the model itself.
+
+    Hand-listing the fields is how this fake went stale twice: ``graph_dead``
+    reads whatever ``CodeGraph`` declares, and a ``SimpleNamespace`` missing a
+    field raises ``AttributeError`` for the fake's reason rather than the
+    production one. Taking the defaults off ``model_fields`` means a new field
+    on the model appears here with its real default and nothing has to remember.
+    """
+    from devcouncil.indexing.graph.schema import CodeGraph
+
+    fields = {
+        name: field.get_default(call_default_factory=True)
+        for name, field in CodeGraph.model_fields.items()
+    }
+    fields.update(
+        dead_code=list(dead or []),
+        edges=list(edges or []),
+        dead_clusters=clusters,
+        dead_clusters_truncated=clusters_truncated,
+        dead_clusters_incomplete=clusters_incomplete,
+    )
+    return SimpleNamespace(**fields)
 
 
 # --- dead -------------------------------------------------------------------------
@@ -257,6 +280,68 @@ def test_graph_dead_empty_with_hidden(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert "No dead-code entries" in result.output
     assert "hidden" in result.output
+
+
+def test_graph_dead_distinguishes_all_three_cluster_outcomes(tmp_path, monkeypatch):
+    """The component scan has three outcomes and two of them look alike.
+
+    "not computed" (the kernel refused an oversized graph), "not recorded" (this
+    generation predates the pass) and "none" (it ran and found nothing) differ
+    by a word, and the first two give *opposite* advice: rebuilding fixes the
+    second and re-refuses on the first. What is pinned here is the branch order,
+    which no single-state test can see.
+    """
+    cases = [
+        # (kwargs, must contain, must not contain)
+        (
+            {"clusters_incomplete": "the call graph exceeded 400000 symbols"},
+            ["not computed", "400000"],
+            ["rebuild", "run `dev map`", "none."],
+        ),
+        ({"clusters": None}, ["not recorded", "dev map"], ["not computed"]),
+        ({"clusters": []}, ["none."], ["not computed", "not recorded"]),
+    ]
+    for kwargs, expected, forbidden in cases:
+        monkeypatch.setattr(
+            graph_build, "load_code_graph", lambda root, k=kwargs: _fake_graph(**k)
+        )
+        result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
+        assert result.exit_code == 0, result.output
+        for text in expected:
+            assert text in result.output, f"{kwargs} must print {text!r}: {result.output}"
+        for text in forbidden:
+            assert text not in result.output, (
+                f"{kwargs} must not print {text!r}: {result.output}"
+            )
+
+    # A refusal that also carries a list is the kernel contradicting itself; the
+    # readout must not silently pick the reassuring half.
+    monkeypatch.setattr(
+        graph_build,
+        "load_code_graph",
+        lambda root: _fake_graph(clusters=[], clusters_incomplete="graph too large"),
+    )
+    result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "not computed" in result.output and "none." not in result.output
+
+
+def test_graph_dead_json_carries_the_refusal(tmp_path, monkeypatch):
+    """And the machine-readable path, which is what agents read."""
+    monkeypatch.setattr(
+        graph_build,
+        "load_code_graph",
+        lambda root: _fake_graph(clusters_incomplete="graph too large"),
+    )
+    result = runner.invoke(
+        app, ["map", "dead", "--json", "--project-root", str(tmp_path)]
+    )
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["dead_clusters"] is None, (
+        "an empty list here would say the pass ran and found nothing"
+    )
+    assert data["dead_clusters_incomplete"] == "graph too large"
 
 
 # --- check ------------------------------------------------------------------------

@@ -4,6 +4,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use crate::edge_index::GenerationEdges;
 use devmap_analyze::clones::CloneCandidate;
 use devmap_analyze::model::*;
+use devmap_analyze::DeadClusterScan;
 use devmap_extract::model::*;
 #[cfg(feature = "parse")]
 use devmap_resolve::model::*;
@@ -597,6 +598,20 @@ pub struct CallersPage {
 pub struct DeadPage {
     pub generation: u32,
     pub analysis: Option<AnalysisDisclosure>,
+    /// Abandoned cycles found in the same generation, or `None` when the
+    /// generation predates the pass or its analysis could not be read.
+    ///
+    /// Carried on the page rather than fetched separately for the reason the
+    /// disclosure is: a cluster list from one generation beside single-symbol
+    /// rows from another is the "safe to delete" upgrade
+    /// [`Self::analysis`] exists to prevent, one level out.
+    ///
+    /// Bounded at the source — `DEAD_CLUSTER_CAP` clusters of
+    /// `DEAD_CLUSTER_MEMBER_CAP` members — so this is at most a few tens of
+    /// kilobytes and needs no budget of its own. It is read with its own
+    /// `json_extract` rather than folded into `AnalysisDisclosure`, which is
+    /// parsed on many query paths that have no use for it.
+    pub dead_clusters: Option<DeadClusterScan>,
     /// Non-exempt rows, ranked, at most the requested limit.
     pub rows: Vec<DeadSymbolReport>,
     /// Every non-exempt row in this generation, independent of the limit.
@@ -4792,6 +4807,40 @@ impl Store {
         .transpose()
     }
 
+    /// The abandoned cycles one generation's analysis recorded.
+    ///
+    /// `None` means the column could not be read as a scan: no analysis row, or
+    /// a generation written before `dead_clusters` existed. That is *not* an
+    /// empty scan, and the two must not render alike — an empty list is "the
+    /// pass ran and found nothing", which is a finding.
+    ///
+    /// Read with its own `json_extract` rather than through
+    /// `AnalysisDisclosure`, which is deserialized on search, edge and status
+    /// paths that have no use for a cluster list and would pay for parsing one.
+    fn dead_clusters_in(snapshot: &Connection, generation: u32) -> Result<Option<DeadClusterScan>> {
+        let raw: Option<String> = snapshot
+            .query_row(
+                "SELECT json_extract(analysis_json, '$.dead_clusters')
+                 FROM generations WHERE id = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        // A malformed blob is an error, not an absence, for the same reason
+        // `analysis_disclosure_in` refuses to round one to the other.
+        serde_json::from_str::<DeadClusterScan>(&raw)
+            .map(Some)
+            .map_err(|error| {
+                rusqlite::Error::InvalidParameterName(format!(
+                    "stored dead-cluster scan is invalid: {error}"
+                ))
+            })
+    }
+
     /// [`Self::analysis_disclosure_in`] for a generation the caller already
     /// resolved.
     ///
@@ -4814,9 +4863,11 @@ impl Store {
             return Ok(None);
         };
         let analysis = Self::analysis_disclosure_in(&snapshot, generation)?;
+        let dead_clusters = Self::dead_clusters_in(&snapshot, generation)?;
         Ok(Some(DeadPage {
             generation,
             analysis,
+            dead_clusters,
             rows: Self::dead_symbols_page_in(&snapshot, generation, limit)?,
             total_non_exempt: Self::count_dead_non_exempt_in(&snapshot, generation)?,
         }))

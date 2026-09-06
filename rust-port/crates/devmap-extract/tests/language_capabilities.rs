@@ -450,6 +450,35 @@ fn the_import_dispatcher_and_the_registry_agree() {
     let dispatched: BTreeSet<&str> = IMPORT_EXTRACTION_LANGUAGES.iter().copied().collect();
     let specialised: BTreeSet<&str> = SPECIALISED.iter().copied().collect();
 
+    // **R11.** The list and the dispatcher, checked against each other rather
+    // than the list against a second list.
+    //
+    // `IMPORT_EXTRACTION_LANGUAGES` claimed to be "derived from the dispatcher
+    // above by the test that reads it" and was a hand-written const compared
+    // only against `LANGUAGE_SPECS` — two hand lists, with nothing looking at
+    // the `match` arms. An arm added for a grammar with no registry row, or
+    // removed while the const stayed, was caught only incidentally by the probe
+    // corpus. `extracts_imports` asks the arms, so this closes both directions.
+    let every_key: BTreeSet<&str> = LANGUAGE_SPECS
+        .iter()
+        .map(|spec| spec.grammar)
+        .chain(dispatched.iter().copied())
+        .chain(specialised.iter().copied())
+        .collect();
+    let arms: BTreeSet<&str> = every_key
+        .iter()
+        .copied()
+        .filter(|grammar| devmap_extract::langimports::extracts_imports(grammar))
+        .collect();
+    assert_eq!(
+        arms,
+        dispatched,
+        "IMPORT_EXTRACTION_LANGUAGES disagrees with the dispatcher it names: \
+         arms without an entry {:?}, entries without an arm {:?}",
+        arms.difference(&dispatched).collect::<Vec<_>>(),
+        dispatched.difference(&arms).collect::<Vec<_>>()
+    );
+
     let dispatched_without_flag: Vec<&&str> = dispatched.difference(&declared).collect();
     assert!(
         dispatched_without_flag.is_empty(),

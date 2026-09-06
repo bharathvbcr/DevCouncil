@@ -459,3 +459,42 @@ fn a_coverage_record_with_no_readable_files_falls_to_the_floor() {
     );
     assert!(got.is_finite(), "the ceiling must be a number: {got}");
 }
+
+/// **M9.** The two boundary inputs the cluster ceiling accepts, priced.
+///
+/// Neither is reachable from the producer — Tarjan emits no empty component,
+/// and the node cap refuses long before a component of `usize::MAX` — so both
+/// are clamps over inputs the type allows and the caller cannot supply. Pinned
+/// anyway, because a clamp whose behaviour nobody has stated is a clamp a later
+/// edit will "simplify".
+#[test]
+fn the_cluster_ceiling_is_total_over_the_sizes_its_type_permits() {
+    let coverage = blindness(5, 95);
+
+    // Zero members is priced as one: `(1 - s)^8`, the single-symbol ceiling. A
+    // claim about nothing must not come back stronger than a claim about
+    // something, and `powi(8 + 0)` would be exactly that.
+    assert!(
+        (coverage.cap_cluster(0.9, 0) - coverage.cap_cluster(0.9, 1)).abs() < 1e-6,
+        "a zero-member component is priced as a one-member one: {} vs {}",
+        coverage.cap_cluster(0.9, 0),
+        coverage.cap_cluster(0.9, 1)
+    );
+    assert!(
+        coverage.cap_cluster(0.9, 0) <= coverage.cap(0.9),
+        "and never above the single-symbol ceiling"
+    );
+
+    // And the upper end saturates rather than overflowing `powi`'s exponent.
+    let huge = coverage.cap_cluster(0.9, usize::MAX);
+    assert!(
+        huge.is_finite()
+            && (COVERAGE_LOSS_CONFIDENCE_CAP..=HIGHEST_DEGRADED_CONFIDENCE).contains(&huge),
+        "an absurd membership must stay inside the band: {huge}"
+    );
+    assert!(
+        (huge - coverage.cap_cluster(0.9, 64)).abs() < 1e-6,
+        "past `CLUSTER_COMPOUNDING_MEMBER_CAP` the size stops being informative \
+         and the ceiling stops moving: {huge}"
+    );
+}

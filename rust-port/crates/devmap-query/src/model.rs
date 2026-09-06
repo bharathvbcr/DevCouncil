@@ -92,6 +92,60 @@ pub struct Response<T> {
     /// form, so nothing changes for callers that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rungs: Option<crate::rung::RungHistogram>,
+    /// Abandoned cycles found in the same generation as `items`.
+    ///
+    /// Set by `dead_symbols` alone, exactly as `rungs` is set only by the
+    /// edge-walking queries: this envelope is the answer plus whatever that
+    /// answer's producer also knows, and a second shape for "a dead-code answer"
+    /// is a second thing for every consumer to miss.
+    ///
+    /// **It had no consumer at all.** `dead_clusters.rs` is the highest-recall
+    /// pass in the analysis — the one that finds subsystems a one-hop inbound
+    /// join structurally cannot see — and its output reached two artifacts and
+    /// no query path: not `StoreQueryEngine::dead_symbols`, not `devmap dead`,
+    /// not the IPC `Dead` response, not `DevMapClient`, not the MCP envelope,
+    /// not `dev graph dead`. `CodeGraph` had no field for it, so pydantic
+    /// dropped it at load. The only reader in the repository was a benchmark
+    /// script.
+    ///
+    /// `None` means the generation could not be read for clusters — it predates
+    /// the pass, or has no analysis row. An empty `Vec` means the pass ran and
+    /// found none, which is a finding. The two must not render alike.
+    ///
+    /// Bounded at the source (`DEAD_CLUSTER_CAP` × `DEAD_CLUSTER_MEMBER_CAP`),
+    /// so it needs no budget of its own; `dead_clusters_truncated` carries what
+    /// the cap left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_clusters: Option<Vec<devmap_analyze::DeadClusterReport>>,
+    /// Clusters found but not listed, because of `DEAD_CLUSTER_CAP`.
+    ///
+    /// Beside the list rather than folded into `hidden`, which counts what the
+    /// *token budget* trimmed. A capped producer and a trimmed page are
+    /// different failures and `shown + hidden == total` is enforced against the
+    /// second.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dead_clusters_truncated: usize,
+    /// Why `dead_clusters` is absent, when the pass ran and refused.
+    ///
+    /// The scan has three outcomes and `Option<Vec<_>>` holds two. A graph
+    /// past `DEAD_CLUSTER_MAX_NODES` comes back with an empty `clusters` and a
+    /// `refused_oversized_graph` flag, so mapping the struct field-for-field
+    /// would render "too large to walk" as `Some([])` — *the pass ran and found
+    /// no abandoned subsystems* — which is the strongest possible reading of
+    /// the weakest possible evidence, and the one that gets acted on.
+    ///
+    /// So a refusal sets `dead_clusters` to `None`, which every consumer
+    /// already reads as "not measured", and puts the reason here. Old consumers
+    /// fail closed on the absence; new ones can say why. Parallel to
+    /// `walk_incomplete`, which does the same job for `items` — kept separate
+    /// because the two producers fail independently and a caller that conflated
+    /// them would report a complete dead-symbol list as partial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_clusters_incomplete: Option<String>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// What a map query cost, against what answering it by reading files would have.

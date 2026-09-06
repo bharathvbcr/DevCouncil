@@ -583,6 +583,15 @@ impl ExtractionCoverage {
     /// `size` is clamped rather than trusted: `powi` on a 400,000-member
     /// component would underflow to zero, which the floor would catch anyway,
     /// but the clamp says so rather than relying on it.
+    ///
+    /// The clamp's *lower* bound is 1, so `cap_cluster(x, 0)` prices a
+    /// zero-member component as a one-member one. No such component exists —
+    /// Tarjan emits no empty component and the pass discards single nodes that
+    /// do not self-loop — so this is a total function over an input the
+    /// producer cannot supply, not a rounding of a real case. It is 1 rather
+    /// than 0 because `(1 - s)^8` is the *single-symbol* ceiling, and a claim
+    /// about nothing must not be priced more cheaply than a claim about
+    /// something.
     pub fn cap_cluster(&self, confidence: f32, size: usize) -> f32 {
         if self.is_complete() {
             return confidence;

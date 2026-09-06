@@ -23,6 +23,7 @@ from mcp.types import TextContent, Tool
 
 from devcouncil.codeintel.service import canonical_project_root
 from devcouncil.devmap_client import (
+    MIN_RUNG_NAMES,
     BudgetedResponse,
     DevMapClient,
     DevMapClientError,
@@ -65,6 +66,31 @@ def _schema(properties: dict, required: list[str] | None = None) -> dict:
     return schema
 
 
+#: The resolution-rung floor, offered on every edge-walking tool.
+#:
+#: W2.3's whole point was that an agent should be able to ask for
+#: deterministic-only edges. The CLI has taken `--min-rung` since it landed and
+#: the IPC commands take `min_rung`, and **no Python or MCP surface exposed
+#: one** — so the caller the feature exists for still could not use it.
+#:
+#: Absent means no floor, which is what every existing caller already gets. The
+#: response's `rungs` histogram describes the population *before* the floor, so a
+#: narrowed answer stays readable as a narrowed one rather than as a small graph.
+_MIN_RUNG_PROPERTY = {
+    "type": "string",
+    # The client's list, not a fourth copy of it. The client validates against
+    # the same names before the request goes out, so a schema that drifted from
+    # it would advertise a value the client refuses.
+    "enum": list(MIN_RUNG_NAMES),
+    "description": (
+        "Keep only edges at this resolution rung or stronger. `deterministic` is "
+        "evidence the resolver proved; `speculative` is every edge. Omit for no "
+        "floor. The `rungs` histogram in the answer counts the population before "
+        "this filter, so an empty result is distinguishable from a small graph."
+    ),
+}
+
+
 def tools() -> list[Tool]:
     return [
         Tool(
@@ -90,6 +116,7 @@ def tools() -> list[Tool]:
                 "from": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
                 "to": {"type": "string", "maxLength": _MAX_STRING_LENGTH},
                 "maxDepth": {"type": "integer", "minimum": 1, "maximum": 64, "default": 32},
+                "minRung": _MIN_RUNG_PROPERTY,
             }, ["from", "to"]),
         ),
         Tool(
@@ -102,12 +129,23 @@ def tools() -> list[Tool]:
                     "maxItems": _MAX_ARRAY_ITEMS,
                 },
                 "maxDepth": {"type": "integer", "minimum": 1, "maximum": 8, "default": 3},
+                "minRung": _MIN_RUNG_PROPERTY,
             }, ["targets"]),
         ),
         Tool(
             name="devcouncil_code_dead",
             description=(
                 "Confidence-tiered dead-code candidates; never deletes code. "
+                "Returns two populations and both matter: `dead_code` is symbols "
+                "nothing calls, and `dead_clusters` is whole components that call "
+                "only each other and that nothing outside reaches — a one-hop "
+                "inbound-edge check structurally cannot report those, because every "
+                "member has a caller. Each cluster carries its true `size` and a "
+                "capped `members` sample; `dead_clusters: null` means this "
+                "generation predates the component pass, which is not the same as "
+                "an empty list. When null is accompanied by "
+                "`dead_clusters_incomplete`, the pass ran and refused — the graph "
+                "was too large to walk — so rebuilding will not produce one. "
                 "Read `epistemic` before acting: `exact` means every file in the corpus "
                 "contributed its call edges, `lower_bound` means some did not — a parse failure, "
                 "a refused file, or a language this build has no call extractor for — and "
@@ -580,7 +618,9 @@ def _search_via_client(root: Path, query: str, limit: int) -> dict[str, Any]:
         return _unavailable(root, "search", str(exc), {"matches": [], "shown": 0, "total": 0, "truncated": False})
 
 
-def _path_via_client(root: Path, start: str, end: str, max_depth: int) -> dict[str, Any]:
+def _path_via_client(
+    root: Path, start: str, end: str, max_depth: int, min_rung: str | None = None
+) -> dict[str, Any]:
     client = try_connect(root)
     if client is None:
         return _unavailable(
@@ -591,7 +631,7 @@ def _path_via_client(root: Path, start: str, end: str, max_depth: int) -> dict[s
         )
     try:
         depth = max(1, min(64, max_depth))
-        resp = client.trace(start, depth=depth, to_symbol=end)
+        resp = client.trace(start, depth=depth, to_symbol=end, min_rung=min_rung)
         reason = resolution_unavailable_reason(resp.resolution)
         if reason:
             # "The index could not answer" is not "there is no path". This
@@ -655,7 +695,9 @@ def _path_via_client(root: Path, start: str, end: str, max_depth: int) -> dict[s
         return _unavailable(root, "path", str(exc), {"found": False, "path": [], "length": 0, "truncated": False})
 
 
-def _impact_via_client(root: Path, targets: list[str], max_depth: int) -> dict[str, Any]:
+def _impact_via_client(
+    root: Path, targets: list[str], max_depth: int, min_rung: str | None = None
+) -> dict[str, Any]:
     client = try_connect(root)
     if client is None:
         return _unavailable(
@@ -671,7 +713,7 @@ def _impact_via_client(root: Path, targets: list[str], max_depth: int) -> dict[s
         truncated = False
         incomplete_notes: list[str] = []
         for target in targets:
-            resp = client.impact(str(target), depth=depth)
+            resp = client.impact(str(target), depth=depth, min_rung=min_rung)
             reason = resolution_unavailable_reason(resp.resolution)
             if reason:
                 raise DevMapClientError(f"impact unavailable for {target}: {reason}")
@@ -772,9 +814,28 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
                     else "unconfirmed/unwired"
                 ),
             })
+        # The component pass's findings, carried whatever the single-symbol
+        # list did. A one-hop inbound-edge join structurally cannot report a
+        # subsystem whose functions call each other — every member has an
+        # inbound edge from another member — so `dead_code` without this is not
+        # a shorter answer, it is an answer missing a class of finding. The
+        # kernel has computed it since W1.1 and no MCP consumer could see it.
+        #
+        # `None` is preserved rather than defaulted to `[]`: "the pass ran and
+        # found none" and "this generation predates the pass" are different
+        # facts and an agent acting on the first must not be handed the second.
+        clusters = resp.dead_clusters
+        # And the third outcome the pair cannot express. A refused scan sends no
+        # list at all, so dropping this key would leave the refusal reading as
+        # "predates the pass" — an agent told to rebuild, and the rebuild
+        # refusing again.
+        clusters_incomplete = resp.dead_clusters_incomplete
         capped = _incomplete_walk_envelope(
             root, "dead", resp, rows,
             {"minimum_confidence": minimum_confidence, "dead_code": [],
+             "dead_clusters": clusters,
+             "dead_clusters_truncated": resp.dead_clusters_truncated,
+             "dead_clusters_incomplete": clusters_incomplete,
              "total": resp.total, "truncated": resp.truncated},
         )
         if capped is not None:
@@ -791,6 +852,9 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
                 {
                 "minimum_confidence": minimum_confidence,
                 "dead_code": rows,
+                "dead_clusters": clusters,
+                "dead_clusters_truncated": resp.dead_clusters_truncated,
+                "dead_clusters_incomplete": clusters_incomplete,
                 "index_freshness": {
                     "fresh": status.is_fresh,
                     "generation": status.generation_id,
@@ -806,7 +870,11 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
                 truncated=resp.truncated,
                 shown=len(rows),
                 total=resp.total,
-                extra_boundaries=[walk_incomplete_reason(resp)],
+                # The refusal is a boundary on the answer, not a footnote:
+                # `epistemic.boundaries` is what an agent is told to read, and a
+                # class of finding that could not be computed belongs there
+                # beside the coverage gaps.
+                extra_boundaries=[walk_incomplete_reason(resp), clusters_incomplete],
             ),
             operation="dead",
         )
@@ -820,7 +888,13 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
             root,
             "dead",
             str(exc),
-            {"dead_code": [], "total": 0, "truncated": False},
+            # `None`, not `[]`: nothing was read, so nothing is known about
+            # abandoned cycles either. An empty list here would say the pass ran.
+            {"dead_code": [], "dead_clusters": None, "dead_clusters_truncated": 0,
+             # Not a refusal either — nothing ran at all. A reason string here
+             # would name a cause this path does not know.
+             "dead_clusters_incomplete": None,
+             "total": 0, "truncated": False},
         )
 
 
@@ -935,6 +1009,24 @@ async def _search(root: Path, arguments: dict) -> list[TextContent]:
     return json_text(await asyncio.to_thread(_search_via_client, root, query, limit))
 
 
+def _min_rung_of(arguments: dict) -> str | None:
+    """The requested rung floor, or ``None`` for no floor.
+
+    Refuses an unknown name rather than dropping it. A typo silently answered at
+    full breadth is a filtered answer the caller believes is narrow, which is the
+    reading that gets acted on — the same rule the kernel's own parser follows.
+    """
+    raw = arguments.get("minRung")
+    if raw is None:
+        return None
+    name = str(raw)
+    if name not in ("deterministic", "high", "speculative"):
+        raise ValueError(
+            f"minRung must be deterministic, high or speculative; got {name!r}"
+        )
+    return name
+
+
 async def _path(root: Path, arguments: dict) -> list[TextContent]:
     start = str(arguments["from"])
     end = str(arguments["to"])
@@ -944,7 +1036,11 @@ async def _path(root: Path, arguments: dict) -> list[TextContent]:
     # which one answered is the SC23 shape, and an unavailable answer a
     # caller can see beats a confident one from an engine it did not ask
     # for.
-    return json_text(await asyncio.to_thread(_path_via_client, root, start, end, max_depth))
+    return json_text(
+        await asyncio.to_thread(
+            _path_via_client, root, start, end, max_depth, _min_rung_of(arguments)
+        )
+    )
 
 
 async def _impact(root: Path, arguments: dict) -> list[TextContent]:
@@ -955,7 +1051,11 @@ async def _impact(root: Path, arguments: dict) -> list[TextContent]:
     # which one answered is the SC23 shape, and an unavailable answer a
     # caller can see beats a confident one from an engine it did not ask
     # for.
-    return json_text(await asyncio.to_thread(_impact_via_client, root, targets, max_depth))
+    return json_text(
+        await asyncio.to_thread(
+            _impact_via_client, root, targets, max_depth, _min_rung_of(arguments)
+        )
+    )
 
 
 async def _dead(root: Path, arguments: dict) -> list[TextContent]:

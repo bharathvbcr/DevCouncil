@@ -360,3 +360,54 @@ fn the_cluster_seed_contains_every_hoisted_exemption() {
         );
     }
 }
+
+/// The hoisted exemption must not widen as it crosses passes.
+///
+/// `exempt_symbol_names` drops the file half of `symbol_exemption_index`'s
+/// `(file, name)` key and returns the names alone, and the cluster pass matches
+/// its members against that set. Whether that widens the exemption turns
+/// entirely on whether `qualified_name` is file-scoped — it is, `pkg/a.py::
+/// Widget.render` — and a load-bearing property of a *different* crate's naming
+/// scheme is exactly the kind of thing that is true until someone shortens a
+/// name for a display and nothing fails.
+///
+/// The fixture is two files declaring the same class with the same members,
+/// where only one is published. Under a name-scoped exemption `pkg/b.py` would
+/// inherit `pkg/a.py`'s, and its genuinely abandoned cycle would go unreported
+/// — a silent recall loss with nothing in any output to show for it.
+#[test]
+fn an_exemption_in_one_file_does_not_exempt_a_namesake_in_another() {
+    const BODY: &str = "class Widget:\n    def render(self):\n        return self.paint()\n\n    def paint(self):\n        return self.render()\n";
+    let published = format!("__all__ = [\"Widget\"]\n\n\n{BODY}");
+    let files: Vec<(&str, &str)> = vec![("pkg/a.py", published.as_str()), ("pkg/b.py", BODY)];
+
+    let (extractions, resolution) = resolve(&files);
+    let exempt = devmap_analyze::exempt_symbol_names(&extractions, &resolution);
+    assert!(
+        exempt.contains("pkg/a.py::Widget.render"),
+        "fixture assumption: the published class's members are exempt: {exempt:?}"
+    );
+    assert!(
+        !exempt.contains("pkg/b.py::Widget.render"),
+        "the exemption is file-scoped and must stay so: {exempt:?}"
+    );
+    // The set is keyed by the same string the cluster pass compares against, so
+    // a bare short name in it would silently match both files' members.
+    assert!(
+        exempt.iter().all(|name| name.contains("::")),
+        "an unqualified name in this set exempts every namesake in the corpus: \
+         {exempt:?}"
+    );
+
+    let scan = scan(&files);
+    let members = clustered(&scan);
+    assert!(
+        members.contains("pkg/b.py::Widget.render") && members.contains("pkg/b.py::Widget.paint"),
+        "the unpublished twin is an abandoned cycle and must be reported: \
+         {members:?}"
+    );
+    assert!(
+        !members.iter().any(|name| name.starts_with("pkg/a.py::")),
+        "and the published one must not be: {members:?}"
+    );
+}

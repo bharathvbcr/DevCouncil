@@ -21,7 +21,7 @@
 //! many — and `import Foundation` names a *module*, which is the one thing that
 //! cannot explain intra-module wiring because same-module Swift files need no
 //! import at all. Those two are declined here with reasons, and the decline is
-//! pinned by `language_import_capabilities.rs` so it stays a decision rather
+//! pinned by `tests/language_capabilities.rs` so it stays a decision rather
 //! than becoming an oversight.
 //!
 //! Each language lives in its own module, mirroring `langcalls`, which is the
@@ -65,42 +65,89 @@ pub(crate) fn extract_imports(
     source: &str,
     imports: &mut Vec<ExtractedImport>,
 ) {
-    match lang {
+    if let Some(extract) = extractor_for(lang) {
+        extract(node, source, imports);
+    }
+}
+
+/// One node's import extractor for `lang`, or `None` when this build has none.
+///
+/// **Split out so the list below can be derived rather than restated.** The
+/// dispatcher's own doc claimed `IMPORT_EXTRACTION_LANGUAGES` was "derived from
+/// the dispatcher above by the test that reads it, never hand-maintained" — and
+/// it was a hand-written `const &[&str]` whose only reader compared it against
+/// `LANGUAGE_SPECS`. Two hand-written lists checked against each other, with
+/// nothing parsing the `match` arms: a dispatcher arm added for a grammar with
+/// no registry row, or removed while the const stayed, was caught only
+/// incidentally by the probe corpus. That is precisely the failure this module
+/// condemns `CALL_EXTRACTION_LANGUAGES` for, reintroduced in the documentation
+/// of its replacement.
+///
+/// Returning the function pointer rather than routing to it costs nothing —
+/// the compiler builds the same string match — and makes the arms *askable*:
+/// `extracts_imports` is now the derivation, and the const is checked against
+/// the dispatcher itself rather than against a second opinion.
+///
+/// This runs per AST node in `treesitter.rs`'s walk, which is the hottest loop
+/// in the workspace, so the shape is a single `match` and not a table scan.
+fn extractor_for(lang: &str) -> Option<ImportExtractor> {
+    Some(match lang {
         // `#include` and `#import` are one preprocessor node in every C-family
         // grammar, ObjC included, so one module serves all four keys. Metal
         // borrows the `cpp` grammar and arrives here as `cpp`.
-        "c" | "cpp" | "objc" | "cuda" => cfamily::extract_include(node, source, imports),
-        "dart" => dart::extract_import(node, source, imports),
-        "cfml" => cfml::extract_template_attribute(node, source, imports),
-        "erlang" => erlang::extract_include(node, source, imports),
+        "c" | "cpp" | "objc" | "cuda" => cfamily::extract_include,
+        "dart" => dart::extract_import,
+        "cfml" => cfml::extract_template_attribute,
+        "erlang" => erlang::extract_include,
         // Terraform and OpenTofu share one grammar key.
-        "hcl" => hcl::extract_module_source(node, source, imports),
-        "java" => java::extract_import(node, source, imports),
-        "kotlin" => kotlin::extract_import(node, source, imports),
+        "hcl" => hcl::extract_module_source,
+        "java" => java::extract_import,
+        "kotlin" => kotlin::extract_import,
         // Luau is a Lua superset and shares `function_call`; the same reasoning
         // `langcalls` records for its own shared arm.
-        "lua" | "luau" => lua::extract_require(node, source, imports),
-        "nix" => nix::extract_import(node, source, imports),
-        "pascal" => pascal::extract_uses(node, source, imports),
-        "php" => php::extract_use_and_require(node, source, imports),
-        "r" => r::extract_source(node, source, imports),
-        "ruby" => ruby::extract_require(node, source, imports),
+        "lua" | "luau" => lua::extract_require,
+        "nix" => nix::extract_import,
+        "pascal" => pascal::extract_uses,
+        "php" => php::extract_use_and_require,
+        "r" => r::extract_source,
+        "ruby" => ruby::extract_require,
         // Only `mod`; the `use_declaration` arm stays in
         // `treesitter.rs`. See `rust.rs` for why the split is the
         // rule this module applies rather than an accident.
-        "rust" => rust::extract_mod(node, source, imports),
-        "scala" => scala::extract_import(node, source, imports),
-        "solidity" => solidity::extract_import(node, source, imports),
-        _ => {}
-    }
+        "rust" => rust::extract_mod,
+        "scala" => scala::extract_import,
+        "solidity" => solidity::extract_import,
+        _ => return None,
+    })
+}
+
+/// The shape every `langimports` entry point has.
+type ImportExtractor = fn(Node, &str, &mut Vec<ExtractedImport>);
+
+/// Whether this build extracts imports for `lang` through this dispatcher.
+///
+/// The derivation `IMPORT_EXTRACTION_LANGUAGES` claimed to be. Asks the `match`
+/// itself, so a language cannot be in one and out of the other.
+pub fn extracts_imports(lang: &str) -> bool {
+    extractor_for(lang).is_some()
 }
 
 /// The language keys this module extracts imports for.
 ///
-/// Derived from the dispatcher above by the test that reads it, never
-/// hand-maintained — that is exactly how `CALL_EXTRACTION_LANGUAGES` rotted into
-/// a constant with zero production readers and a wrong list, which is the defect
-/// W0.1 exists to have fixed once.
+/// **Hand-written, and now checked against the dispatcher rather than against a
+/// second hand-written list.** Its own doc used to claim it was "derived from
+/// the dispatcher above by the test that reads it, never hand-maintained",
+/// which was false twice over: it is a `const &[&str]`, and its only reader
+/// compared it to `LANGUAGE_SPECS` — one hand list against another, with
+/// nothing looking at the `match` arms at all. A claim of provenance that the
+/// code does not support is the exact defect `CALL_EXTRACTION_LANGUAGES` was
+/// retired for.
+///
+/// It survives because a `&[&str]` is what the registry test wants to iterate;
+/// [`extracts_imports`] is the derivation, and
+/// `the_import_dispatcher_and_the_registry_agree` now checks this list against
+/// *it* — so an arm added without an entry, or an entry without an arm, fails
+/// the build.
 pub const IMPORT_EXTRACTION_LANGUAGES: &[&str] = &[
     "c", "cfml", "cpp", "cuda", "dart", "erlang", "hcl", "java", "kotlin", "lua", "luau", "nix",
     "objc", "pascal", "php", "r", "ruby", "rust", "scala", "solidity",

@@ -11,8 +11,8 @@
 //! * `a_call_blind_corpus_cannot_reach_the_confident_tier` — a **pure**
 //!   Terraform corpus, 100% blind, so it exercises the floor and nothing else;
 //! * `a_lost_caller_is_not_confident_evidence_of_death` — two files, 50% blind;
-//! * `a_pattern_recovered_file_is_lost_call_coverage_even_though_it_parsed` —
-//!   likewise;
+//! * `a_pattern_recovered_file_is_lost_call_coverage_and_is_counted_apart` —
+//!   likewise (the audit abbreviates the name; this is the one that exists);
 //! * `coverage_loss_caps_a_cluster_finding` — two files, and at repository scale
 //!   the cap it is named for does nothing at all for a small component.
 //!

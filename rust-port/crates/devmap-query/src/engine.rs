@@ -1194,6 +1194,26 @@ impl<'a> StoreQueryEngine<'a> {
         response.hidden = response.total.saturating_sub(response.shown);
         response.truncated = response.hidden > 0;
         response.walk_incomplete = analysis_coverage_gap(page.analysis.as_ref());
+        // The other half of the answer, and until now the half nothing could
+        // see. A one-hop inbound-edge join structurally cannot report a
+        // subsystem whose functions call each other, so a `dead` answer without
+        // the component pass is not a shorter list — it is a list missing an
+        // entire class of finding. `DeadClusterScan::clusters` is capped at
+        // `DEAD_CLUSTER_CAP` by the producer, so this needs no budget of its
+        // own; what the cap dropped travels beside it.
+        if let Some(scan) = page.dead_clusters {
+            if scan.refused_oversized_graph {
+                // The one outcome an `Option<Vec<_>>` cannot hold. Leaving the
+                // empty list here would say the walk ran and found nothing.
+                response.dead_clusters_incomplete = Some(format!(
+                    "the call graph exceeded {} distinct symbols, so no                      component scan ran for this generation",
+                    devmap_analyze::dead_clusters::DEAD_CLUSTER_MAX_NODES
+                ));
+            } else {
+                response.dead_clusters_truncated = scan.truncated_clusters;
+                response.dead_clusters = Some(scan.clusters);
+            }
+        }
         Ok(response)
     }
 
@@ -1419,6 +1439,9 @@ impl<'a> StoreQueryEngine<'a> {
             resolution: ResolutionAvailability::Available,
             walk_incomplete: None,
             rungs: None,
+            dead_clusters: None,
+            dead_clusters_truncated: 0,
+            dead_clusters_incomplete: None,
         };
 
         // `Skipped` is here for the same reason `Failed` is, and the reason is
@@ -2508,6 +2531,9 @@ impl<'a> QueryEngine<'a> {
                 resolution: ResolutionAvailability::Available,
                 walk_incomplete: None,
                 rungs: None,
+                dead_clusters: None,
+                dead_clusters_truncated: 0,
+                dead_clusters_incomplete: None,
             };
         }
         let q_lower = req.query.to_lowercase();
@@ -3218,6 +3244,9 @@ fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
         resolution,
         walk_incomplete: None,
         rungs: None,
+        dead_clusters: None,
+        dead_clusters_truncated: 0,
+        dead_clusters_incomplete: None,
     }
 }
 
@@ -3713,6 +3742,9 @@ where
         resolution: ResolutionAvailability::Available,
         walk_incomplete: None,
         rungs: None,
+        dead_clusters: None,
+        dead_clusters_truncated: 0,
+        dead_clusters_incomplete: None,
     }
 }
 
@@ -3735,6 +3767,9 @@ where
             resolution: ResolutionAvailability::Available,
             walk_incomplete: None,
             rungs: None,
+            dead_clusters: None,
+            dead_clusters_truncated: 0,
+            dead_clusters_incomplete: None,
         };
     }
     Response {
@@ -3747,6 +3782,9 @@ where
         resolution: ResolutionAvailability::Available,
         walk_incomplete: None,
         rungs: None,
+        dead_clusters: None,
+        dead_clusters_truncated: 0,
+        dead_clusters_incomplete: None,
     }
 }
 

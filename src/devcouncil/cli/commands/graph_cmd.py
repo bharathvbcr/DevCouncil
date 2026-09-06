@@ -527,6 +527,16 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
             return {
                 "dead_code": entries,
                 "dead_code_hidden": resp.hidden,
+                # The other half of the answer. A one-hop inbound-edge join
+                # cannot see a subsystem whose functions call each other, so
+                # `dead_code` without this is not a shorter list — it is a list
+                # missing an entire class of finding.
+                "dead_clusters": resp.dead_clusters,
+                "dead_clusters_truncated": resp.dead_clusters_truncated,
+                # The third outcome. A refused scan sends no list, so without
+                # this key the payload would say only "not recorded" and the
+                # reader would be told to rebuild, which refuses again.
+                "dead_clusters_incomplete": resp.dead_clusters_incomplete,
                 "source": "devmap",
                 "truncated": resp.truncated,
                 "total": resp.total,
@@ -1186,6 +1196,63 @@ def graph_trace(
     console.print(" → ".join(result.get("path") or []))
 
 
+def _render_dead_clusters(
+    console_, clusters: Optional[list], truncated: int, incomplete: Optional[str] = None
+) -> None:
+    """One line per abandoned cycle, with a member sample and the real size.
+
+    Reported beside the single-symbol list rather than inside it: a forty-symbol
+    dead subsystem is *one* thing a reader acts on, and forty rows would push
+    real single-symbol findings past the display. The size printed is the true
+    membership; the names are a sample and say so.
+
+    ``None`` and ``[]`` print differently on purpose. "No abandoned cycles" is a
+    finding. "This generation predates the pass" is not, and a reader deciding
+    whether to rebuild needs to know which one they are looking at.
+
+    ``incomplete`` is the third case and is checked first: the kernel ran the
+    pass and refused it, so the rebuild advice below is not merely unhelpful
+    but wrong — the next build walks the same graph and refuses again.
+    """
+    sample_cap = 4
+    console_.print("")
+    if incomplete:
+        console_.print(f"Abandoned cycles: not computed — {incomplete}")
+        return
+    if clusters is None:
+        console_.print(
+            "Abandoned cycles: not recorded for this generation "
+            "(run `dev map` to compute them)."
+        )
+        return
+    if not clusters:
+        console_.print("Abandoned cycles: none.")
+        return
+    console_.print(
+        f"Abandoned cycles: {len(clusters)} component(s) nothing outside reaches."
+    )
+    for cluster in clusters:
+        if not isinstance(cluster, dict):
+            continue
+        members = [str(m) for m in (cluster.get("members") or [])]
+        size = int(cluster.get("size") or len(members))
+        confidence = cluster.get("confidence")
+        try:
+            confidence_txt = f"{float(confidence):.2f}"
+        except (TypeError, ValueError):
+            confidence_txt = "?"
+        sample = members[:sample_cap]
+        more = size - len(sample)
+        tail = f", +{more} more" if more > 0 else ""
+        console_.print(
+            f"  {confidence_txt}  {size} symbols: {', '.join(sample)}{tail}"
+        )
+    if truncated:
+        console_.print(
+            f"  … {truncated} further component(s) were found and not listed."
+        )
+
+
 @app.command("dead")
 def graph_dead(
     project_root: Path = typer.Option(Path("."), "--project-root"),
@@ -1206,7 +1273,13 @@ def graph_dead(
         "than HEAD (default: exit 3 so stale results cannot pass as evidence).",
     ),
 ) -> None:
-    """Full dead-code report with confidence tiers and reasons."""
+    """Full dead-code report with confidence tiers, reasons, and abandoned cycles.
+
+    Two populations, and the second is the one a one-hop check cannot find:
+    single symbols nothing calls, and whole components that call only each other
+    and that nothing outside reaches. Every member of such a component has an
+    inbound edge, so it never appears in the first list at any confidence.
+    """
     from collections import Counter
 
     from devcouncil.indexing.graph.liveness import confidence_at_least, confidence_label
@@ -1235,11 +1308,20 @@ def graph_dead(
                 }
 
         entries = [_DeadEntry(row) for row in rust_dead.get("dead_code") or []]
+        clusters = rust_dead.get("dead_clusters")
+        clusters_truncated = int(rust_dead.get("dead_clusters_truncated") or 0)
+        clusters_incomplete = rust_dead.get("dead_clusters_incomplete")
         # Skip Python graph load on successful Rust path.
         graph = None
     else:
         graph = _require_graph(root, warn_stale=False)
         entries = list(graph.dead_code)
+        # `None` survives as `None`: a graph written before the component pass
+        # existed did not run it, and copying that into an empty list would say
+        # it ran and found nothing.
+        clusters = None if graph.dead_clusters is None else list(graph.dead_clusters)
+        clusters_truncated = graph.dead_clusters_truncated
+        clusters_incomplete = graph.dead_clusters_incomplete
     if confidence:
         entries = [e for e in entries if confidence_label(e.confidence) == confidence]
     before_min = len(entries)
@@ -1258,6 +1340,12 @@ def graph_dead(
                 {
                     "dead_code": [e.model_dump() for e in entries],
                     "dead_code_hidden": hidden,
+                    # `None` and `[]` are different answers and both are kept:
+                    # "the pass ran and found none" is a finding, "this
+                    # generation predates the pass" is not.
+                    "dead_clusters": clusters,
+                    "dead_clusters_truncated": clusters_truncated,
+                    "dead_clusters_incomplete": clusters_incomplete,
                     "index_freshness": freshness,
                     **degraded,
                 },
@@ -1279,6 +1367,11 @@ def graph_dead(
                 f"{hidden} lower-confidence entries hidden "
                 "(--min-confidence ambiguous to show)."
             )
+        # Printed even with no single-symbol findings, and especially then: an
+        # empty `dead_code` list beside an unreported cluster is the shape that
+        # says "nothing to clean up" about a repository with an abandoned
+        # subsystem in it.
+        _render_dead_clusters(console, clusters, clusters_truncated, clusters_incomplete)
         if stale and not allow_stale:
             status.print(
                 "[red]refusing to treat a stale dead-code report as evidence "
@@ -1297,6 +1390,7 @@ def graph_dead(
     console.print("Reason summary:")
     for reason, n in reason_counts.most_common():
         console.print(f"  {n:4d}  {reason}")
+    _render_dead_clusters(console, clusters, clusters_truncated, clusters_incomplete)
     if hidden:
         console.print("")
         console.print(

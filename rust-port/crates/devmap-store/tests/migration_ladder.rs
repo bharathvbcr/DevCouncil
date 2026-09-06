@@ -59,7 +59,8 @@ fn tmp_dir(label: &str) -> PathBuf {
 /// Below 5 there is no `generations` table to hold rows, and the `version == 3`
 /// and `version == 4` blocks re-run `CREATE_SCHEMA_V3` — which builds the
 /// *current* shape — so those two rungs are covered by
-/// `test_s2_migration_v3_to_v4` and its neighbour in `store_hardening.rs` and
+/// `test_s2_migration_v3_to_v4_preserves_cache_rows` and its neighbour in
+/// `store_hardening.rs` and
 /// are structurally incapable of the divergence this file hunts.
 const OLDEST_REDUCIBLE: i32 = 5;
 
@@ -338,7 +339,8 @@ fn row_census(conn: &Connection) -> BTreeMap<&'static str, i64> {
 
 /// **R1.** A store at any rung from 5 up must open.
 ///
-/// This is the assertion that was missing. `test_s2_migration_v3_to_v4` builds
+/// This is the assertion that was missing.
+/// `test_s2_migration_v3_to_v4_preserves_cache_rows` builds
 /// a v3 store with no `generation_edges` at all, the v4→v5 case likewise, v5→v6
 /// reconstructs from a *current* store, and the v16 case starts above the break
 /// — so nothing in 1,842 tests ever handed the ladder a store that had to walk
@@ -537,5 +539,208 @@ fn a_migrated_store_reopens_without_migrating_again() {
             "reopening a store migrated from v{target} changed its schema"
         );
     }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// --- the ladder under duress ------------------------------------------------
+//
+// The four tests above walk the chain the way it is meant to be walked. These
+// three attack it: a step that cannot finish, several processes walking it at
+// once, and a database carrying objects the schema never declared. Each is a
+// real shape on a user's disk — an interrupted build, a daemon racing an editor
+// hook, an operator's ad-hoc index — and none of them was covered.
+
+/// A step that fails its own gate must not advance `user_version`.
+///
+/// The v16→v17 arm stamps 17 and *then* validates, both inside one
+/// transaction, so a failed validation has to take the stamp down with it. That
+/// rests on `PRAGMA user_version` being transactional in SQLite — true, and
+/// load-bearing enough to be worth a test rather than a comment: if it ever
+/// were not, a store that failed validation would reopen claiming to be at 17,
+/// skip the chain entirely, and every later read would run against a shape
+/// nothing had checked.
+///
+/// Failure is induced the way it actually happens: `already_split` sees a
+/// database whose `generation_files` is already a view, skips the DDL batch,
+/// and the index a previous partial attempt never created stays missing.
+#[test]
+fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
+    let dir = tmp_dir("migration-halfway");
+    let db_path = dir.join("halfway.sqlite");
+    seed_current_store(&db_path);
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_file_payloads_cache_identity;
+             PRAGMA user_version = 16;",
+        )
+        .unwrap();
+    }
+
+    let error = Store::open(&db_path)
+        .err()
+        .expect("a store missing a declared index must not open");
+    let text = error.to_string();
+    assert!(
+        text.contains("idx_file_payloads_cache_identity"),
+        "the refusal must name what is missing, or an operator cannot act on \
+         it: {text}"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        version, 16,
+        "the step failed, so the store is still at the rung it started on; a \
+         stamp that survived its own failed validation would make the next \
+         open skip the chain and trust an unchecked shape"
+    );
+    // And the failure left nothing else behind: the store is exactly what it
+    // was, so a rebuild has a clean base.
+    let is_view: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE name = 'generation_files' AND type = 'view'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(is_view, 1, "the rollback must not have unmade the view");
+
+    // The same store opens once the missing object is restored, which proves
+    // the refusal was about the index and not about some other damage.
+    conn.execute_batch(
+        "CREATE INDEX idx_file_payloads_cache_identity
+             ON file_payloads(content_hash, language, grammar_version, analyzer_version);",
+    )
+    .unwrap();
+    drop(conn);
+    let store = Store::open(&db_path).expect("with the index back, the step completes");
+    drop(store);
+    let conn = Connection::open(&db_path).unwrap();
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Several openers walking the chain at once all reach the top, and the rows
+/// survive.
+///
+/// Only the `version == 0` branch re-reads the version under the write lock;
+/// every rung above it samples once and runs its step, so two openers at the
+/// same rung both execute it — the second against a database where the work is
+/// already done. That is exactly what each step's idempotency probe exists for,
+/// and it had never been exercised *concurrently*: the re-entrancy test in
+/// `store_hardening.rs` re-runs steps one after another in a single thread.
+///
+/// A daemon, an editor hook and a manual `devmap build` opening the same store
+/// on the first run after an upgrade is the ordinary case, not an exotic one.
+#[test]
+fn concurrent_openers_of_a_legacy_store_all_reach_the_current_schema() {
+    let dir = tmp_dir("migration-race");
+    let db_path = store_at_version(&dir, OLDEST_REDUCIBLE);
+    let expected = {
+        // What one uncontended migration produces, as the yardstick.
+        let reference_dir = tmp_dir("migration-race-reference");
+        let reference = store_at_version(&reference_dir, OLDEST_REDUCIBLE);
+        let store = Store::open(&reference).expect("reference migration");
+        drop(store);
+        let conn = Connection::open(&reference).unwrap();
+        let census = row_census(&conn);
+        drop(conn);
+        let _ = fs::remove_dir_all(&reference_dir);
+        census
+    };
+
+    let outcomes: Vec<std::result::Result<(), String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = db_path.clone();
+                scope.spawn(move || {
+                    Store::open(&path)
+                        .map(drop)
+                        .map_err(|error| error.to_string())
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("no opener may panic"))
+            .collect()
+    });
+    let failures: Vec<&String> = outcomes.iter().filter_map(|r| r.as_ref().err()).collect();
+    assert!(
+        failures.is_empty(),
+        "every opener must reach the current schema; a step that is not \
+         re-entrant under contention fails only some of them, which is the \
+         hardest kind of failure to reproduce: {failures:?}"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    assert_eq!(
+        row_census(&conn),
+        expected,
+        "a contended migration must move the same rows as an uncontended one; \
+         a step run twice that appends rather than probes shows up here as a \
+         doubled count"
+    );
+    drop(conn);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Objects the schema never declared are left alone, not treated as damage.
+///
+/// The index gate added in this pass asserts that every *declared* index is
+/// present. The inverse — that nothing undeclared may exist — would be a very
+/// different and much worse contract: an operator's ad-hoc index, a leftover
+/// table from a rolled-back experiment, or a shadow relation from a tool
+/// nothing here owns would all become an unopenable store.
+///
+/// The OFF direction for the gate, in other words. Without it the cheapest way
+/// to write the gate — set equality — passes every other test in this file.
+#[test]
+fn objects_the_schema_does_not_declare_do_not_fail_the_gate() {
+    let dir = tmp_dir("migration-extras");
+    let db_path = store_at_version(&dir, OLDEST_REDUCIBLE);
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE operator_scratch (id INTEGER PRIMARY KEY, note TEXT);
+             CREATE INDEX idx_operator_scratch_note ON operator_scratch(note);
+             CREATE INDEX idx_paths_path_extra ON paths(path);",
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&db_path).unwrap_or_else(|error| {
+        panic!("undeclared objects must not make a store unopenable: {error}")
+    });
+    drop(store);
+
+    let conn = Connection::open(&db_path).unwrap();
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    let survived: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'operator_scratch'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        survived, 1,
+        "and the migration must not delete what it does not own"
+    );
+    drop(conn);
     let _ = fs::remove_dir_all(&dir);
 }

@@ -111,13 +111,59 @@ pub struct DeadClusterScan {
     pub refused_oversized_graph: bool,
 }
 
-/// Beyond this many distinct symbols in the call graph, the scan refuses.
+impl DeadClusterScan {
+    /// The clusters to publish, or `None` when the pass refused to walk.
+    ///
+    /// Every surface that carries this scan needs the same conditional, and
+    /// three of them wrote it — or rather, three of them wrote `clusters`
+    /// straight through and rendered "the graph was too large to walk" as *the
+    /// pass ran and found no abandoned subsystems*: the query response, the
+    /// `code_graph.json` artifact, and the consumer manifest. A refusal leaves
+    /// `clusters` empty, so a field-for-field copy is indistinguishable from a
+    /// clean corpus at every one of them.
+    ///
+    /// Answered here rather than at each surface, with [`Self::incomplete_reason`]
+    /// as its other half, so a fourth consumer inherits the distinction instead
+    /// of having to know about it.
+    pub fn reported_clusters(&self) -> Option<&[DeadClusterReport]> {
+        if self.refused_oversized_graph {
+            None
+        } else {
+            Some(&self.clusters)
+        }
+    }
+
+    /// Why [`Self::reported_clusters`] is `None`, when it is `None` because the
+    /// pass ran and refused.
+    ///
+    /// A reader told only that no scan is recorded will rebuild, and the
+    /// rebuild walks the same graph and refuses again — so the ceiling is named
+    /// rather than merely alluded to, which also lets a reader judge how far
+    /// past it their repository is.
+    pub fn incomplete_reason(&self) -> Option<String> {
+        self.refused_oversized_graph.then(|| {
+            format!(
+                "the call graph exceeded {DEAD_CLUSTER_MAX_NODES} distinct symbols, \
+                 so no component scan ran for this generation"
+            )
+        })
+    }
+}
+
+/// The most distinct symbols the scan will hold before refusing.
 ///
 /// Tarjan is linear, so this is not about asymptotics — it is about the memory
 /// three index vectors over every node cost on a graph this kernel has measured
 /// at 944,000 edges. Refusing loudly beats a walk that succeeds by consuming
 /// the machine, and `refused_oversized_graph` says which happened rather than
 /// leaving an empty result to read as "no dead clusters".
+///
+/// **Exactly this many, inclusive.** The guard is `names.len() >= MAX` *before*
+/// a push, so a graph of exactly 400,000 distinct symbols is walked and the
+/// 400,001st refuses the whole scan. The old wording — "beyond this many" —
+/// described the same behaviour ambiguously enough that a reader could take the
+/// boundary either way, and a bound whose edge is a matter of interpretation is
+/// how an off-by-one becomes a load-bearing accident.
 pub const DEAD_CLUSTER_MAX_NODES: usize = 400_000;
 
 /// Whether this edge relates two *symbols* at all.

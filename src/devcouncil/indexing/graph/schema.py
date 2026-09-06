@@ -6,7 +6,7 @@ devcouncil: allow-unwired — package-private types; imported by sibling graph m
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -89,6 +89,31 @@ class CodeGraph(BaseModel):
     nodes: List[GraphNode] = Field(default_factory=list)
     edges: List[GraphEdge] = Field(default_factory=list)
     dead_code: List[DeadCodeEntry] = Field(default_factory=list)
+    #: Abandoned cycles: components of the call graph nothing outside reaches.
+    #:
+    #: ``code_graph.json`` has carried these since the component pass landed and
+    #: this model had no field for them, so pydantic dropped every one at load
+    #: and the highest-recall finding in the analysis was invisible to every
+    #: Python consumer. The claim is narrow and deliberately not a BFS from entry
+    #: roots: every symbol the component declares belongs to a group that nothing
+    #: outside reaches, where "reaches" already excludes ambiguous edges and
+    #: already exempts anything exported or wired.
+    #:
+    #: Untyped rows rather than a model, matching ``meta``: the kernel owns the
+    #: shape, it is capped at the source, and a second declaration here is a
+    #: second thing to keep in step.
+    #: ``None``, not ``[]``, when the key is absent: a ``code_graph.json``
+    #: written before the component pass existed did not run it, and an empty
+    #: list would say it ran and found nothing. That is the same distinction
+    #: ``AnalysisSummary.discovery_refused_files`` keeps for the same reason.
+    dead_clusters: Optional[List[Dict[str, Any]]] = None
+    #: Components found and not listed, because the kernel's cap cut them.
+    dead_clusters_truncated: int = 0
+    # Why ``dead_clusters`` is ``None`` when the kernel ran the pass and refused
+    # it. Without a field here pydantic drops the key, and the refusal renders
+    # as the generation simply predating the pass — which tells a reader to
+    # rebuild, and the rebuild refuses again.
+    dead_clusters_incomplete: Optional[str] = None
     entry_roots: List[str] = Field(default_factory=list)
     unwired_candidates: List[str] = Field(default_factory=list)
     unreachable_files: List[str] = Field(default_factory=list)
