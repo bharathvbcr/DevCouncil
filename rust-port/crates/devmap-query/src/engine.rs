@@ -4613,14 +4613,45 @@ mod search_bounds_tests {
 
     /// A store whose only file is `path`, holding `source`.
     fn store_of(path: &str, source: &str) -> Store {
+        store_rooted_at(path, source, None)
+    }
+
+    /// The same, recording `repo_root` as the directory the engine resolves a
+    /// hit's path against when it reads that hit's span off disk.
+    fn store_rooted_at(path: &str, source: &str, repo_root: Option<&str>) -> Store {
         let ext = extract_file(path, source);
+        // The fixture's own precondition, checked rather than assumed.
+        //
+        // `extract_file` is bounded by `DEFAULT_PARSE_BUDGET` — five *wall
+        // clock* seconds — and a refusal returns an extraction holding only the
+        // File node. Saved unchecked, that is a store with no symbols in it,
+        // and every assertion below then reads as a defect in the query engine.
+        // This module's huge-file case failed at `shown == 1` on a loaded
+        // machine for precisely that reason: its 50 MiB fixture ran 4 s of
+        // extraction on an idle machine, went over the budget under load, and
+        // the test reported zero hits while measuring nothing at all. A fixture
+        // that could not be built must never look like one that was.
+        assert!(
+            matches!(ext.parse_outcome, ParseOutcome::Clean),
+            "the fixture for {path} was not extracted cleanly, so nothing below \
+             is a statement about the query engine: {:?}",
+            ext.parse_outcome
+        );
         let mut resolver = Resolver::new();
         resolver.index_extractions(std::slice::from_ref(&ext));
         let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
         let analysis = analyze(std::slice::from_ref(&ext), &resolution);
         let store = Store::open_in_memory().expect("store");
         store
-            .save_generation(std::slice::from_ref(&ext), &resolution, &analysis)
+            .save_generation_with_opts(
+                std::slice::from_ref(&ext),
+                &resolution,
+                &analysis,
+                devmap_store::GenerationWriteOpts {
+                    repo_root: repo_root.map(str::to_string),
+                    ..Default::default()
+                },
+            )
             .expect("generation");
         store
     }
@@ -4632,6 +4663,22 @@ mod search_bounds_tests {
     /// was from the end. On a repository carrying a generated or vendored
     /// bundle that is tens of megabytes of I/O and tens of megabytes resident,
     /// per hit, per query — bounded by nothing.
+    ///
+    /// What is indexed here is the two-line function; what sits on disk is that
+    /// function followed by 50 MiB of filler. The two differ on purpose, and
+    /// the difference is the only production shape there is:
+    /// `devmap_extract::MAX_SOURCE_BYTES` refuses anything over 1 MiB at
+    /// discovery, so a 50 MiB file can carry a stored span *only* from a
+    /// generation written while it was smaller — which is exactly the case
+    /// `read_source_prefix` documents, the working tree having moved on.
+    ///
+    /// Handing the filler to the extractor as well, which this fixture used to
+    /// do twice over, bought no coverage of the read under test and cost the
+    /// test its determinism: 4 s of `extract_file` against a five-second wall
+    /// clock budget. Under load from other builds the extraction was refused,
+    /// the generation held no `findable_symbol` row, and this test failed at
+    /// `shown == 1` — reporting a query defect while asserting nothing about
+    /// the bound it exists to guard.
     #[test]
     fn a_hit_near_the_top_of_a_huge_file_reads_a_bounded_prefix() {
         let dir = std::env::temp_dir().join(format!(
@@ -4645,38 +4692,25 @@ mod search_bounds_tests {
         std::fs::create_dir_all(&dir).expect("fixture dir");
 
         // The symbol is in the first 100 bytes; the rest is filler the answer
-        // never names.
+        // never names, and no part of the index describes.
+        const INDEXED: &str = "def findable_symbol():\n    return 1\n";
         const FILLER: usize = 50 * 1024 * 1024;
-        let mut source = String::with_capacity(FILLER + 128);
-        source.push_str("def findable_symbol():\n    return 1\n");
-        let head = source.len();
-        source.push_str("# ");
-        while source.len() < FILLER {
-            source.push('x');
+        let head = INDEXED.len();
+        let mut on_disk = String::with_capacity(FILLER + head + 8);
+        on_disk.push_str(INDEXED);
+        on_disk.push_str("# ");
+        while on_disk.len() < FILLER {
+            on_disk.push('x');
         }
-        source.push('\n');
-        std::fs::write(dir.join("huge.py"), &source).expect("write fixture");
+        on_disk.push('\n');
+        std::fs::write(dir.join("huge.py"), &on_disk).expect("write fixture");
+        assert!(
+            on_disk.len() as u64 > devmap_extract::MAX_SOURCE_BYTES,
+            "the file on disk must dwarf the span, or this bounds nothing"
+        );
 
-        let store = store_of("huge.py", &source);
         // The engine resolves spans against the generation's recorded root.
-        {
-            let ext = extract_file("huge.py", &source);
-            let mut resolver = Resolver::new();
-            resolver.index_extractions(std::slice::from_ref(&ext));
-            let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
-            let analysis = analyze(std::slice::from_ref(&ext), &resolution);
-            store
-                .save_generation_with_opts(
-                    std::slice::from_ref(&ext),
-                    &resolution,
-                    &analysis,
-                    devmap_store::GenerationWriteOpts {
-                        repo_root: Some(dir.to_string_lossy().to_string()),
-                        ..Default::default()
-                    },
-                )
-                .expect("generation with a root");
-        }
+        let store = store_rooted_at("huge.py", INDEXED, Some(&dir.to_string_lossy()));
 
         SOURCE_SPAN_READS.with(|reads| reads.set(0));
         SOURCE_SPAN_BYTES.with(|bytes| bytes.set(0));
