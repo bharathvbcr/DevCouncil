@@ -1692,7 +1692,10 @@ fn member_access_receiver(node: Node, source: &str) -> Option<String> {
         return None;
     }
     let object = parent.child_by_field_name(object_field)?;
-    let text = get_node_text(object, source);
+    // X44. The object's *identity*, not its source text: `runner.invoke(app,
+    // ["init"]).output` names the call it reads from, and a receiver that is a
+    // block copied into a column groups with nothing.
+    let text = receiver_identity(object, source, 0);
     (!text.is_empty()).then_some(text)
 }
 
@@ -4322,6 +4325,142 @@ pub(crate) fn is_anonymous_callable(kind: &str) -> bool {
     )
 }
 
+/// The longest a receiver expression may be recorded as.
+///
+/// X44. `receiver_expr` is documented as existing "so the classification can be
+/// audited rather than trusted", which means being grouped and read. A receiver
+/// that is a unique 38,644-character string — the measured maximum on this
+/// repository, the whole body of one function, stored as the "receiver" of a
+/// method called on the end of it — groups with nothing and answers no
+/// question, while costing the store a megabyte of duplicated source.
+///
+/// 64 characters holds every receiver that is genuinely a path of names, which
+/// is what this field is for. Past it the value is cut and **marked** cut, so a
+/// truncated string can never be read as a whole expression.
+const MAX_RECEIVER_CHARS: usize = 64;
+
+/// A receiver expression reduced to something a reader can group by.
+///
+/// One line, bounded, and marked when it was cut. Collapsing whitespace is part
+/// of the identity and not cosmetic: 4,973 receivers on this repository contain
+/// a newline, and every one of them is a block that was copied into a column
+/// whose job is to name a value.
+fn bound_receiver_text(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX_RECEIVER_CHARS {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(MAX_RECEIVER_CHARS).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Grammar keys for a call, across the languages this crate splits receivers
+/// for. A call's identity is the callee it names, never its argument list.
+fn is_call_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "call"
+            | "call_expression"
+            | "function_call_expression"
+            | "invocation_expression"
+            | "macro_invocation"
+            | "member_call_expression"
+            | "method_call"
+            | "method_invocation"
+            | "new_expression"
+            | "object_creation_expression"
+            | "scoped_call_expression"
+    )
+}
+
+/// Grammar keys for member access — the same three spellings
+/// `member_access_receiver` already reconciles, plus Rust's and C's.
+fn member_access_fields(kind: &str) -> Option<(&'static str, &'static str)> {
+    match kind {
+        "attribute" => Some(("object", "attribute")),
+        "member_expression" => Some(("object", "property")),
+        "selector_expression" => Some(("operand", "field")),
+        "field_expression" => Some(("value", "field")),
+        _ => None,
+    }
+}
+
+/// What a receiver expression *is*, rather than what it says.
+///
+/// X44. The receiver used to be `get_node_text` of the receiver node, whole, so
+/// `runner.invoke(app, ["init"]).output.strip()` recorded its entire left-hand
+/// side. The classifier reads only the receiver's leftmost segment, and a
+/// reader auditing the ledger needs rows that group — neither is served by a
+/// copy of the source.
+///
+/// The reduction is structural, not textual: a receiver that is a **call** is
+/// named by that call's callee, and a member access is `<object identity>.
+/// <property>`. Anything this walk does not recognise keeps its text, bounded.
+pub(crate) fn receiver_identity(node: Node, source: &str, depth: usize) -> String {
+    if depth > 16 {
+        return bound_receiver_text(&get_node_text(node, source));
+    }
+    let fallback = || bound_receiver_text(&get_node_text(node, source));
+    let kind = node.kind();
+    if matches!(
+        kind,
+        "await_expression" | "parenthesized_expression" | "non_null_expression"
+    ) {
+        return match node.named_child(0) {
+            Some(inner) => receiver_identity(inner, source, depth + 1),
+            None => fallback(),
+        };
+    }
+    if is_call_node(kind) {
+        return node
+            .child_by_field_name("function")
+            .or_else(|| node.child_by_field_name("constructor"))
+            .map(|target| {
+                // The inner call's callee **with its own receiver**, not the
+                // callee alone. Measured: reducing `runner.invoke(app, [...])`
+                // to `invoke` cost 1,235 `External` classifications on this
+                // repository, because the classifier roots its answer at the
+                // receiver's leftmost segment and `runner` is where the
+                // declared type `CliRunner` — and the import that proves it
+                // external — is recorded. `runner.invoke` keeps that root and
+                // still drops the argument list, which is the part that made
+                // the string unique.
+                let (name, receiver) = split_call_target_inner(target, source, depth + 1);
+                match receiver.filter(|receiver| !receiver.is_empty()) {
+                    Some(receiver) if !name.is_empty() => format!("{receiver}.{name}"),
+                    _ => name,
+                }
+            })
+            .map(|identity| bound_receiver_text(&identity))
+            .filter(|identity| !identity.is_empty())
+            .unwrap_or_else(fallback);
+    }
+    if let Some((object_field, member_field)) = member_access_fields(kind) {
+        let member = node
+            .child_by_field_name(member_field)
+            .map(|child| get_node_text(child, source))
+            .filter(|text| !text.is_empty());
+        let object = node
+            .child_by_field_name(object_field)
+            .or_else(|| node.child_by_field_name("argument"))
+            .map(|child| receiver_identity(child, source, depth + 1))
+            .filter(|text| !text.is_empty());
+        return match (object, member) {
+            (Some(object), Some(member)) => bound_receiver_text(&format!("{object}.{member}")),
+            _ => fallback(),
+        };
+    }
+    fallback()
+}
+
+/// The receiver named by `field` on `node`, as an identity.
+fn receiver_from_field(node: Node, field: &str, source: &str, depth: usize) -> Option<String> {
+    node.child_by_field_name(field)
+        .map(|child| receiver_identity(child, source, depth + 1))
+        .filter(|text| !text.is_empty())
+}
+
 fn split_call_target_inner(
     function_node: Node,
     source: &str,
@@ -4370,11 +4509,11 @@ fn split_call_target_inner(
         }
         "attribute" => (
             get_child_text(function_node, "attribute", source).unwrap_or_default(),
-            get_child_text(function_node, "object", source),
+            receiver_from_field(function_node, "object", source, depth),
         ),
         "member_expression" => (
             get_child_text(function_node, "property", source).unwrap_or_default(),
-            get_child_text(function_node, "object", source),
+            receiver_from_field(function_node, "object", source, depth),
         ),
         // C++ scope resolution: `ns::fn()`, `S::sm()`, `a::b::c()`.
         //
@@ -4417,8 +4556,8 @@ fn split_call_target_inner(
         // field here, so the fallback cannot change a Rust split.
         "field_expression" => {
             let field = get_child_text(function_node, "field", source);
-            let value = get_child_text(function_node, "value", source)
-                .or_else(|| get_child_text(function_node, "argument", source));
+            let value = receiver_from_field(function_node, "value", source, depth)
+                .or_else(|| receiver_from_field(function_node, "argument", source, depth));
             match (field, value) {
                 (Some(field), value) if !field.is_empty() => (field, value),
                 _ => (get_node_text(function_node, source), None),
@@ -4427,7 +4566,7 @@ fn split_call_target_inner(
         "selector_expression" => {
             let field = get_child_text(function_node, "field", source)
                 .or_else(|| get_child_text(function_node, "selector", source));
-            let operand = get_child_text(function_node, "operand", source);
+            let operand = receiver_from_field(function_node, "operand", source, depth);
             match (field, operand) {
                 (Some(field), Some(operand)) if !field.is_empty() => (field, Some(operand)),
                 _ => (get_node_text(function_node, source), None),

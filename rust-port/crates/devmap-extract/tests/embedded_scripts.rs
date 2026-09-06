@@ -646,8 +646,13 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // source text, which matches no file and binds no name. Served warm, it
     // reports zero `Imports` edges and zero `External` classifications for
     // every Rust file, and both look like findings rather than stale rows.
+    //
+    // v36 changes the *meaning* of a field rather than its presence:
+    // `receiver_expr` becomes the receiver's identity instead of a copy of its
+    // source text, so a v35 row and a v36 row spell the same receiver two ways
+    // and every grouping over the column splits silently across the boundary.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "35",
+        EXTRACTION_SCHEMA_VERSION, "36",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

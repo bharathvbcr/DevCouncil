@@ -243,7 +243,16 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// no name. The rows are not merely thinner: they are the shape that made every
 /// `.rs` file in a warm cache report zero `Imports` edges and zero `External`
 /// classifications while looking completely indexed.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "35";
+///
+/// v36 (X44) changes what `receiver_expr` means, on calls and on references
+/// alike. A v35 row carries `get_node_text` of the receiver node, whole: the
+/// entire left-hand expression of a chained call, newlines included — 13,387
+/// such rows on this repository, 4,973 of them multi-line, the longest 38,644
+/// characters. A v36 row carries the receiver's *identity* — the callee name of
+/// an inner call, a bounded dotted path otherwise. That is a different string
+/// for the same source, so mixing generations would put two spellings of one
+/// receiver in one ledger and split every grouping over it without saying so.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "36";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
