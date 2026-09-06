@@ -32,6 +32,8 @@ from devcouncil.devmap_client import (
 )
 from devcouncil.integrations.mcp.util import error_text, json_text, with_codeintel_freshness
 
+from .epistemic import with_epistemic
+
 logger = logging.getLogger(__name__)
 
 Handler = Callable[[Path, dict], Awaitable[list[TextContent]]]
@@ -104,7 +106,14 @@ def tools() -> list[Tool]:
         ),
         Tool(
             name="devcouncil_code_dead",
-            description="Confidence-tiered dead-code candidates; never deletes code.",
+            description=(
+                "Confidence-tiered dead-code candidates; never deletes code. "
+                "Read `epistemic` before acting: `exact` means every file in the corpus "
+                "contributed its call edges, `lower_bound` means some did not — a parse failure, "
+                "a refused file, or a language this build has no call extractor for — and "
+                "`boundaries` names each one. A finding at the `extracted` tier under a "
+                "`lower_bound` verdict is still a floor, not a fact."
+            ),
             input_schema=_schema({
                 "minimumConfidence": {
                     "type": "string",
@@ -774,7 +783,12 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
         return _client_envelope(
             root,
             client,
-            {
+            # W2.2: the caveat this tool's description used to state as prose an
+            # agent had to remember and apply. Every boundary is something the
+            # kernel already computed — coverage-gap counts including the two
+            # capability kinds, the degraded reason, this response's truncation.
+            with_epistemic(
+                {
                 "minimum_confidence": minimum_confidence,
                 "dead_code": rows,
                 "index_freshness": {
@@ -783,10 +797,17 @@ def _dead_via_client(root: Path, minimum_confidence: str) -> dict[str, Any]:
                     "pending_count": status.pending_count,
                     "reason": status.degraded_reason,
                 },
-                "truncated": resp.truncated,
-                "total": resp.total,
-                "walk_incomplete": walk_incomplete_reason(resp),
-            },
+                    "truncated": resp.truncated,
+                    "total": resp.total,
+                    "walk_incomplete": walk_incomplete_reason(resp),
+                },
+                coverage_gaps=status.coverage_gaps,
+                degraded_reason=status.degraded_reason,
+                truncated=resp.truncated,
+                shown=len(rows),
+                total=resp.total,
+                extra_boundaries=[walk_incomplete_reason(resp)],
+            ),
             operation="dead",
         )
     except DevMapClientError as exc:

@@ -463,8 +463,9 @@ def _tools() -> list[Tool]:
                 "When a code graph exists, also returns structured confidence-tagged dead_code "
                 "(default min_confidence=inferred; pass ambiguous to include all tiers). "
                 "Prefer extracted confidence + greps; treat inferred as unconfirmed. "
-                "If entry_roots are empty or unreachable_unreliable is true, ignore unreachable_files "
-                "and mass inferred dead."
+                "Read `epistemic` before acting: `exact` means the answer accounts for everything "
+                "in scope, `lower_bound` means it does not and `boundaries` names every reason why. "
+                "That replaces the rule this description used to ask you to remember."
             ),
             input_schema={
                 "type": "object",

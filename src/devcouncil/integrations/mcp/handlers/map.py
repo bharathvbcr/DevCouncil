@@ -52,6 +52,8 @@ from devcouncil.integrations.mcp.util import (
 )
 from devcouncil.utils.json_persist import read_json
 
+from .epistemic import with_epistemic
+
 
 def _load_repo_map(root: Path) -> dict[str, Any] | None:
     map_path = root / ".devcouncil" / "repo_map.json"
@@ -823,6 +825,38 @@ async def handle_liveness(root: Path, arguments: dict) -> list[TextContent]:
             payload["dead_code_reason"] = dead_scan.reason
         if warn:
             payload["warning"] = warn
+        # W2.2: the structured form of the caveat this tool's description used to
+        # carry as prose ("if entry_roots are empty or unreachable_unreliable is
+        # true, ignore unreachable_files"). Every boundary is something the map
+        # already recorded; the field only stops a caller from having to remember
+        # the rule and recombine the keys themselves.
+        with_epistemic(
+            payload,
+            coverage_gaps=(data.get("liveness_meta") or {}).get("coverage_gaps"),
+            degraded_reason=(
+                "graph_degraded: the map is lean, so liveness and dead tiers are a lower bound"
+                if data.get("graph_degraded")
+                else None
+            ),
+            truncated=bool(dead_scan.ok and dead_scan.total and dead_scan.total > len(dead_scan.items)),
+            shown=len(dead_scan.items),
+            total=dead_scan.total if dead_scan.ok else None,
+            extra_boundaries=[
+                (
+                    "unreachable_files omitted: entry roots are empty or the component pass "
+                    "could not answer reachability"
+                    if unreachable_unreliable
+                    else ""
+                ),
+                (f"dead-code scan unavailable: {dead_scan.reason}" if not dead_scan.ok else ""),
+                (
+                    f"scoped to area={area!r} path_prefix={path_prefix!r}: findings outside "
+                    "that scope are not counted"
+                    if (area or path_prefix)
+                    else ""
+                ),
+            ],
+        )
         return json_text(payload)
 
     async def _run() -> list[TextContent]:
