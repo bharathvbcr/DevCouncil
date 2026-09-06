@@ -19,6 +19,14 @@ _PARAM_RE = re.compile(
     r"|\{[^}]+\}"  # Express / Spring
     r"|\[[^\]]+\]"  # Next.js dynamic segments
     r"|\$\{[^}]+\}"  # JS template-literal fetch URLs
+    # Flask and Django, converter included: `<uid>`, `<int:uid>`. Matched
+    # whole, because the `:\w+` above matches the `:uid` inside it on its own
+    # and leaves `<int` behind as a literal segment: `/api/users/<int:uid>`
+    # normalised to `/api/users/<int*>`, which no client path can match, so
+    # every Flask route with a converter reported no consumers. The kernel's
+    # `param_re()` in `devmap-query/src/api_routes.rs` carries the same
+    # alternative for the same reason.
+    r"|<[^>]+>"
 )
 
 _FETCH_LITERAL = re.compile(

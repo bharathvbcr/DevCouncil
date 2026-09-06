@@ -832,18 +832,20 @@ impl ExtractedRoute {
     /// The route's identity in the graph.
     ///
     /// A route is a node like any other and needs an id in the same
-    /// `file::name` shape the rest of them use: the resolver names it as the
-    /// source of the `HandlesRoute` edge and the graph export names it on the
-    /// node, and the two must agree or the edge points at nothing.
+    /// `file::name` shape the rest of them use: `devmap-resolve` names it as
+    /// the source of the `HandlesRoute` edge, `devmap-query` names it on the
+    /// node it emits, and `api_routes` reads the verb back off it. The three
+    /// must agree, so the format lives here and nowhere else — a second
+    /// `format!` in any of them is how they drift apart in silence.
     ///
     /// The file is part of the identity because the method and path are not
-    /// unique on their own — two Flask blueprints each declaring `GET /health`
-    /// are two routes, and collapsing them would drop one node and leave its
-    /// edge dangling.
+    /// unique without it: two blueprints each declaring `GET /health` are two
+    /// routes, and collapsing them would drop a node and strand its edge.
     ///
-    /// **One owner.** `devmap-resolve` builds the edge and `devmap-query`
-    /// builds the node; if either formatted the id itself the two would drift
-    /// apart silently, which is exactly the state this replaced.
+    /// The verb never contains a space or a colon, so a reader can recover it
+    /// from the id by taking the token before the first space and then
+    /// everything after its last `::` — which is what `api_routes` does, and
+    /// why a path containing `::` cannot confuse it.
     pub fn node_id(&self, file_path: &str) -> String {
         format!("{}::{} {}", file_path, self.http_method, self.path_pattern)
     }

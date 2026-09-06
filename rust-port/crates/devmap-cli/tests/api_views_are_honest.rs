@@ -35,10 +35,10 @@ fn fixture(label: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("api")).unwrap();
     std::fs::create_dir_all(root.join("web")).unwrap();
-    // `@app.get`, not `@app.route`: the extractor's pattern names the verb, so
-    // Flask's classic decorator is not one it binds. Using a shape the kernel
-    // does not extract would make this test pass or fail on the fixture rather
-    // than on the view.
+    // `@app.get`, so the verb is named by the decorator itself. Flask's
+    // classic `@app.route(..., methods=[...])` is bound too and is covered by
+    // the graph tests; keeping this fixture on the simpler shape means a
+    // failure here is a failure of the view, not of the extractor.
     std::fs::write(
         root.join("api/server.py"),
         "from fastapi import FastAPI\n\
@@ -108,29 +108,51 @@ fn a_route_the_resolver_bound_is_visible_with_its_handler_and_its_caller() {
     assert_eq!(route["path"], "/api/users/{uid}");
     assert_eq!(route["normalized_path"], "/api/users/*");
     assert_eq!(route["handlers"][0]["name"], "get_user");
+    // Resolved by id, not by name: both endpoints of the `routes_to` edge are
+    // node identities now, so the handler is found without a name lookup that
+    // two same-named functions could make ambiguous.
+    assert_eq!(route["handlers"][0]["resolution"], "id");
+    // The declaring file and the node's own id, which the row is keyed on:
+    // two files serving one verb and path are two rows, not one merged one.
+    assert_eq!(route["file"], "api/server.py");
+    assert_eq!(route["id"], "api/server.py::GET /api/users/{uid}");
+    assert_eq!(route["line"], 4);
 
-    // The framework comes off the route node, and the view says where it came
-    // from. This used to assert `framework.is_null()`, which was right while
-    // `SymbolKind::Route` was never constructed and wrong the moment
-    // `code_graph` began emitting route nodes.
+    // The caller, and the verb that finds it.
+    //
+    // Both endpoints of the `routes_to` edge are node identities now — the
+    // source is `api/server.py::GET /api/users/{uid}` — so anything that reads
+    // the verb out of that string instead of off the route node produces
+    // `API/SERVER.PY::GET`, which `verbs_compatible` matches against no client
+    // verb at all. The route then reports no consumers while the scan reports
+    // itself complete, which is the one answer this view must never give.
+    // Checked by mutation: replacing the node read with the raw id fails
+    // exactly here.
+    let consumers = route["consumers"].as_array().expect("consumers array");
+    assert_eq!(
+        consumers.len(),
+        1,
+        "the client in web/client.js calls this route: {route}"
+    );
+    assert!(consumers[0]["path"]
+        .as_str()
+        .unwrap_or_default()
+        .ends_with("client.js"));
+
+    // The framework is the route node's, no longer dropped at the store
+    // boundary. Middleware still has no `registers` edge kind to be read from,
+    // and stays null.
     assert_eq!(
         route["framework"], "fastapi/flask",
-        "the declaring framework is read off the route node: {route}"
+        "the route node carries the framework the resolver knew: {route}"
     );
-    assert_eq!(route["framework_resolution"], "node");
-    assert!(
-        route["node_ids"]
-            .as_array()
-            .is_some_and(|ids| ids.len() == 1),
-        "the row names the route node it came from: {route}"
-    );
-    assert_eq!(mapped["capabilities"]["framework_available"], true);
-
-    // Middleware still has no kernel source: there is no `Registers` edge kind,
-    // so it is null by name rather than an empty list that would read as "this
-    // route has none".
     assert!(route["middleware"].is_null());
+    assert_eq!(mapped["capabilities"]["framework_available"], true);
     assert_eq!(mapped["capabilities"]["middleware_available"], false);
+    assert_eq!(
+        mapped["capabilities"]["routes_without_a_route_node"], 0,
+        "a freshly built generation has a node for every route it bound"
+    );
 
     // The scan reached both files and says what "complete" covers.
     assert_eq!(mapped["scan"]["complete"], true);

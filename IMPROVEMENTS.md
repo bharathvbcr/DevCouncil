@@ -835,17 +835,14 @@ coherent again:
   navigate by, so the guide currently promises what the manifest does not fill. Every file
   is `kind: "code"` (1,298 of 1,298, `README.md` included) where the Python writer
   classified doc/config/test; no `src/` consumer branches on `kind`, so that one is
-  degraded rather than broken. **Route metadata — closed 2026-09-06.** It used to be that
-  no route reached `code_graph.json` (the `HandlesRoute` edges were in the store but not the
-  export), which left `indexing/graph/api_routes.py` — the route map, shape check, api
-  impact, `dev map routes` and the MCP `route_map` — without input, and pinned seven tests
-  in `tests/unit/test_graph_query_tools.py` as strict `xfail`. `code_graph.rs` now emits a
-  `route` node per extracted route carrying `extras.route` / `extras.verb` /
-  `extras.framework`, and both ends of the `routes_to` edge name nodes —
-  `ExtractedRoute::node_id` owns the `file::VERB path` shape for the resolver and the export
-  alike. The seven markers are gone and the tests pass; if they come back, the node emission
-  regressed. `registrations` is still empty, for the `registers` reason recorded above.
-  And `dev map query <leaf> --json` reports
+  degraded rather than broken. **Route metadata is no longer one of these:** `code_graph.rs` emits a node
+  per `ExtractedRoute` — keyed `file::VERB path` by `ExtractedRoute::node_id`, carrying
+  `extras.route` / `extras.verb` / `extras.framework` — and both endpoints of the
+  `routes_to` edge are node identities, so `route_map`, `shape_check`, `api_impact`,
+  `dev map routes` and the MCP `route_map` all have input. The seven strict `xfail`s in
+  `tests/unit/test_graph_query_tools.py` did exactly what they were for: they turned into
+  `XPASS(strict)` failures the moment the kernel filled the gap, and are gone. `registrations`
+  above is still empty — there is still no `registers` edge kind. And `dev map query <leaf> --json` reports
   `callees_unavailable: "… is not indexed"` for a symbol that *is* indexed and simply has
   no callees, which is a wording bug that reads as a data-loss bug. Subsystem granularity
   also changed (14 whole-repo areas against the old per-package split under

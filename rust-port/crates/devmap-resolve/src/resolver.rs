@@ -1481,11 +1481,11 @@ impl Resolver {
                         continue;
                     }
                     let hits = self.symbol_index.get(&route.handler_name);
-                    // The route's node identity, not a bare "METHOD /path"
+                    // The route's node identity, not a bare "VERB /path"
                     // label. `ExtractedRoute::node_id` owns the shape so the
-                    // graph export can name the same node; an edge whose source
-                    // names nothing leaves every route consumer reading an
-                    // empty graph.
+                    // graph export can emit a node under the same id; an edge
+                    // whose source names no node leaves every route consumer
+                    // reading an empty graph.
                     let route_source = route.node_id(&ext.file_path);
                     let mut candidate_count = 0usize;
                     let route_target = hits.and_then(|hits| {
@@ -1571,14 +1571,15 @@ impl Resolver {
                         });
                         continue;
                     };
-                    // The handler by its graph identity, the way every other
-                    // edge kind names its target. `route.handler_name` is the
-                    // bare name the source wrote, which matches no node and
-                    // left this edge dangling at both ends.
+                    // The handler by its graph identity, the way every
+                    // other edge kind names its target. `route.handler_name`
+                    // is the bare name the source wrote, which matches no node
+                    // and left this edge dangling at both ends.
                     //
-                    // Liveness is unaffected: `called_symbols` inserts both the
-                    // full target and its `rsplit("::")` tail, so a handler
-                    // stays reached under either spelling.
+                    // Liveness is unaffected, and that is checked rather than
+                    // assumed: `called_symbols` inserts both the full target
+                    // and its `rsplit("::")` tail, so a routed handler stays
+                    // reached under either spelling.
                     let target_symbol = self.qualified_for(&target_f, &route.handler_name);
                     edges.push(ResolvedEdge::resolved(
                         ext.file_path.clone(),
@@ -3736,10 +3737,11 @@ mod reference_resolution_tests {
     /// names it in the argument list. An Express handler written as an arrow
     /// function is genuinely anonymous and correctly binds to nothing.
     ///
-    /// Both endpoints are node identities — `file::name`, and `file::VERB path`
-    /// for the route. They used to be a bare `"VERB path"` and a bare handler
-    /// name, neither of which names a node, so the graph export emitted this
-    /// edge dangling at both ends and every route consumer read an empty graph.
+    /// Both endpoints are node identities — `file::name`, and
+    /// `file::VERB path` for the route, from `ExtractedRoute::node_id`. They
+    /// used to be a bare `"VERB path"` and a bare handler name, neither of
+    /// which names a node, so the graph export emitted this edge dangling at
+    /// both ends and every route consumer read an empty graph.
     #[test]
     #[cfg(feature = "parse")]
     fn a_route_binds_only_to_an_unambiguous_same_family_handler() {

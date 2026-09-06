@@ -88,17 +88,29 @@ devcouncil-codeintel-grammars = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# `src` for the package under test; `.` because eighteen modules under
+# `src` for the package under test. `.` because eighteen modules under
 # `tests/unit/` import their helpers as `tests.unit.support_maps` /
 # `tests.unit.graph_fixtures`, and `tests/` has no `__init__.py`, so `tests` is
-# only importable when the repository root is on `sys.path`.
+# importable only with the repository root on `sys.path`.
 #
-# Without the `.`, `python -m pytest` collected them (it puts the working
-# directory on `sys.path` itself) and bare `pytest` did not — 4462 tests against
-# 4178, from the same tree, decided by which of the two you typed. The eighteen
-# raised `ModuleNotFoundError: No module named 'tests'`, which pytest reports as
-# a collection error rather than a failure, so a run with
-# `--continue-on-collection-errors` would have reported the other 4178 green.
+# Without the `.` the suite's size depended on how it was invoked. `python -m
+# pytest` puts the working directory on `sys.path` itself and collected 4462
+# tests; the bare `pytest` console script does not, and aborted with
+# `ModuleNotFoundError: No module named 'tests'` on those eighteen — a
+# collection *error*, so `--continue-on-collection-errors` would have reported
+# the remaining 4178 green. `uv run pytest` behaves as the bare script, not as
+# `-m` (measured, not assumed), which is what three of the four CI workflows
+# type: `npm-publish.yml`, `codeintel-platform.yml` and
+# `devcouncil-evidence.yml` all run it, while `ci.yml` runs `coverage run -m
+# pytest` and so collected a different set from the other three.
+# `tests/unit/test_suite_collection.py` and
+# `tests/unit/test_collection_is_entry_point_independent.py` hold this.
+#
+# The alternative — adding `tests/__init__.py` — also works, and was not taken:
+# it moves every module's import name from `unit.test_x` to `tests.unit.test_x`
+# for the three directories that have an `__init__.py` and leaves
+# `tests/integration`, `tests/stress` and `tests/benchmarks` where they are,
+# which is a larger change to how modules are named than the defect warrants.
 pythonpath = ["src", "."]
 
 [tool.coverage.run]

@@ -695,18 +695,14 @@ pub fn build_code_graph_value(
 
         // Route nodes.
         //
-        // A route is the one node kind that is not a declaration: the extractor
-        // records it from a framework decorator or registration, and the
-        // resolver's `HandlesRoute` edge names it as the edge's source. Without
-        // the node that edge names nothing, and every consumer that walks
-        // routes — `route_map`, `shape_check`, `api_impact` — read an empty
-        // graph even when the routes were in the store.
-        // `ExtractedRoute::node_id` owns the id shape both sides use.
+        // The one node kind that is not a declaration: the extractor records a
+        // route from a framework decorator or registration, and the resolver
+        // names it as the source of the `HandlesRoute` edge. Without the node,
+        // that edge names nothing — so `route_map`, `shape_check` and
+        // `api_impact` read an empty graph out of a generation that has the
+        // routes in it, and the handler endpoint dangles beside it.
         //
-        // Emitted for every extracted route, including one whose handler did
-        // not bind. An unbound route is still a route the service serves, and
-        // dropping it would report a smaller API surface than the code
-        // declares; the missing *edge* is what says the handler is unknown.
+        // `ExtractedRoute::node_id` owns the id shape for both sides.
         for route in &ext.routes {
             let id = route.node_id(&ext.file_path);
             if node_index.contains_key(&id) {
@@ -731,10 +727,11 @@ pub fn build_code_graph_value(
                     (0, 0)
                 }
             };
-            // The three fields a route consumer reads. `verb` is `ANY` when the
-            // source declares no single method — a Flask `@app.route` with no
-            // `methods=` — and consumers already treat that as "matches any
-            // verb" rather than as a missing value.
+            // The three fields a route consumer reads. `verb` is whatever the
+            // extractor recorded: `ANY` when the source declares no single
+            // method — a Flask `@app.route` with no `methods=` — which
+            // consumers already read as "matches any verb" rather than as a
+            // missing value.
             extras.insert(
                 "route".to_string(),
                 Value::String(route.path_pattern.clone()),
@@ -2691,14 +2688,14 @@ mod tests {
     ///
     /// `HandlesRoute` names the route as its source and the handler as its
     /// target, and neither used to name a node: the source was a bare
-    /// `"VERB path"` and the target a bare handler name. So every consumer that
-    /// walks route nodes — `route_map`, `shape_check`, `api_impact` — read an
-    /// empty graph out of a generation that had the routes in it, and the
-    /// handler endpoint dangled beside it.
+    /// `"VERB path"` and the target a bare handler name. So every consumer
+    /// that walks route nodes — `route_map`, `shape_check`, `api_impact` —
+    /// read an empty graph out of a generation that had the routes in it, and
+    /// the handler endpoint dangled beside it.
     ///
-    /// The identity belongs to `ExtractedRoute::node_id`, so this runs the real
-    /// resolver over a real file instead of restating the format: if the two
-    /// sides ever disagree, the edge stops finding its node here.
+    /// The identity belongs to `ExtractedRoute::node_id`, so this runs the
+    /// real resolver over a real file rather than restating the format: if the
+    /// two sides ever disagree, the edge stops finding its node here.
     #[test]
     #[cfg(feature = "parse")]
     fn a_route_is_a_node_and_its_edge_endpoints_resolve() {
@@ -2708,6 +2705,12 @@ mod tests {
                       def create_user(uid):\n    return uid\n";
         let dir = tmp_source_dir("api.py", source);
         let extractions = [extract_file("api.py", source)];
+        assert_eq!(
+            extractions[0].routes.len(),
+            1,
+            "fixture must extract one route, or this tests nothing: {:?}",
+            extractions[0].routes
+        );
 
         let mut resolver = devmap_resolve::Resolver::new();
         resolver.index_extractions(&extractions);
@@ -2733,9 +2736,10 @@ mod tests {
         assert_eq!(route["extras"]["route"], "/api/users/<uid>");
         assert_eq!(route["extras"]["verb"], "POST");
         assert!(
-            route["extras"]["framework"].is_string(),
-            "the node carries the declaring framework: {:?}",
-            route["extras"]
+            route["extras"]["framework"]
+                .as_str()
+                .is_some_and(|f| !f.is_empty()),
+            "the node carries the framework the store drops: {route}"
         );
 
         let edges = value["edges"].as_array().unwrap();
@@ -2762,45 +2766,43 @@ mod tests {
             json!(0),
             "a bound route leaves no dangling endpoint"
         );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A file the export cannot read still gets its route nodes, and says the
-    /// line is unknown rather than reporting the top of the file.
+    /// Two files declaring the same verb and path are two nodes.
     ///
-    /// The symbol loop already does this; the route loop is a second place the
-    /// same rule has to hold, and a `0` that means "line 1" would be
-    /// indistinguishable from a `0` that means "no source to count lines in".
+    /// The id carries the file for exactly this reason. Were it just
+    /// `"VERB path"`, the second would collide with the first, be dropped as a
+    /// duplicate, and leave its own `routes_to` edge pointing at the other
+    /// file's route.
     #[test]
     #[cfg(feature = "parse")]
-    fn a_route_in_an_unreadable_file_declares_its_line_unknown() {
-        let source = "@app.get(\"/x\")\ndef x():\n    return 1\n";
-        let extractions = [extract_file("api.py", source)];
-        // No repo root, so no file can be read.
+    fn the_same_route_in_two_files_is_two_nodes() {
+        let source = "@app.get(\"/health\")\ndef ping():\n    return 1\n";
+        let dir = tmp_source_dir("a.py", source);
+        std::fs::write(dir.join("b.py"), source).unwrap();
+        let extractions = [extract_file("a.py", source), extract_file("b.py", source)];
+
         let json = generate_code_graph_json(
             &extractions,
             &empty_analysis(),
             &[],
             &freshness(),
-            Some("/nonexistent-root-for-this-test"),
+            Some(dir.to_str().unwrap()),
         )
         .unwrap();
         let value: Value = serde_json::from_str(&json).unwrap();
-        let route = value["nodes"]
+        let routes: Vec<&Value> = value["nodes"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|node| node["kind"] == "route")
-            .expect("the route node is emitted even with no readable source")
-            .clone();
-        assert_eq!(route["line"], 0);
-        assert!(
-            route["extras"]["line_resolution"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("unavailable:"),
-            "an unknown line says so: {:?}",
-            route["extras"]
+            .filter(|node| node["kind"] == "route")
+            .collect();
+        assert_eq!(routes.len(), 2, "one node per declaration: {routes:?}");
+        assert_eq!(
+            value["meta"]["devmap_rust"]["duplicate_node_ids_dropped"],
+            json!(0)
         );
-        assert_eq!(route["extras"]["route"], "/x", "the path is still known");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

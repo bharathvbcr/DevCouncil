@@ -124,7 +124,15 @@ devmap shape-check .                  # where producer and consumer disagree
 devmap api-impact /api/users/{id} .   # blast radius for one route
 ```
 
-Routes come from the resolver's `routes_to` edges. Client call sites come from
+Routes come from the graph's route nodes — one per `@app.get` / `@app.route` /
+`router.post` the extractor found, keyed `file::VERB path` and carrying the
+framework — with the resolver's `routes_to` edges attaching handlers. One row
+per declaration: three files here declare `GET /health`, and they are three
+routes with three files and two frameworks, not one row claiming both. A route
+whose handler never bound is still reported, with no handler, because "nothing
+in this index serves it" is an answer. A generation built before route nodes
+existed has only the edges, and is still read: those routes carry no framework
+and are counted separately. Client call sites come from
 a **pattern scan** — `fetch`, `axios`, `requests`, `httpx` — over the files the
 graph names, so a `fetch` inside a comment is a hit and a caller built from a
 computed URL is not. Every site is labelled `evidence: "regex"`.
@@ -137,10 +145,12 @@ not — never a band that reads as "safe to change", because absence from an
 unfinished, pattern-based search is not evidence of no caller. `scope` says what
 `complete` covers: the files the graph names, not the whole working tree.
 
-Two fields this kernel cannot answer are `null` rather than empty:
-`framework` (known at resolve time, dropped at the store boundary) and
-`middleware` (there is no registration edge kind). `capabilities` says so once
-per answer. `[]` would mean "this route has none", which is a different claim.
+`middleware` is `null` rather than empty on every route: there is no
+registration edge kind for it to be read from. `framework` is `null` only on a
+route recovered from an edge with no route node. `capabilities` carries
+`route_nodes` and `routes_without_a_route_node` beside the two availability
+flags, so a null can be told apart from an empty one — `[]` would mean "this
+route has none", which is a different claim.
 
 ### See
 
