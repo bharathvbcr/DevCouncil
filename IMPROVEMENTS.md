@@ -1547,10 +1547,12 @@ Five tests, each written against the unmodified code and watched fail:
 
 ### Still open
 
-* `mypy src` checks only `src/`. `tests/` is unchecked, and `[tool.mypy]` sets neither
-  `disallow_untyped_defs` nor `check_untyped_defs`, so mypy skipped the bodies of every
-  untyped function — it reported that as three `annotation-unchecked` notes. Turning either on
-  is a much larger pass and a decision for the maintainer, not a side effect of this one.
+* ~~`[tool.mypy]` sets neither `disallow_untyped_defs` nor `check_untyped_defs`, so mypy
+  skipped the bodies of every untyped function.~~ **Half closed 2026-09-05** (`203879e`) —
+  `check_untyped_defs` was measured at two errors and is now on (lease de-duplication's
+  untyped lists; the MCP freshness closure calling `.status()` on a `DevMapClient | None`).
+  `disallow_untyped_defs` was measured at **337 errors in 100 files** and stays a decision for
+  the maintainer; `tests/` is still unchecked.
 
 ## Session guard: live siblings and divergent branches (2026-09-05)
 
