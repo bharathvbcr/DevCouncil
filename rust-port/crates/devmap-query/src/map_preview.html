@@ -427,15 +427,32 @@ if (typeof Graph !== 'function') {
 }
 const g = typeof Graph === 'function' ? Graph()(elem) : null;
 
-// Capped so one dominant subsystem cannot swallow its neighbours: an uncapped
-// sqrt drew a disc wide enough to cover four other nodes on this repository.
-const R_MIN = 4, R_MAX = 20;
-function nodeRadius(n, sizeMode) {
+// Node size is a *screen* measurement, in CSS pixels at 100% zoom.
+//
+// It was a graph-space one, and graph space is multiplied by the zoom: a
+// subsystem of 85 files drew an 18.7-unit disc, which zoom-to-fit's 175% turned
+// into 65px of solid colour with a 12px label under it. Every disc read as a
+// blob and the edges between them disappeared. The cap hid the worst of it and
+// hid the cause with it — the radius was never in the units the reader sees.
+//
+// The span is deliberately narrow. Size here encodes one number (files, or
+// degree) that the sidebar already prints exactly; its job is to rank nodes at
+// a glance, not to be measured, so 2:1 across the whole repository is enough.
+const R_MIN = 5, R_MAX = 11;
+function nodeScreenRadius(n, sizeMode) {
   if (sizeMode === 'constant') return 7;
   const raw = sizeMode === 'files'
-    ? 3 + Math.sqrt(Math.max(1, n.file_count || 1)) * 1.7
-    : 3 + Math.sqrt(Math.max(1, n.val || 1)) * 2.4;
+    ? 4 + Math.sqrt(Math.max(1, n.file_count || 1)) * 1.1
+    : 4 + Math.sqrt(Math.max(1, n.val || 1)) * 1.5;
   return Math.max(R_MIN, Math.min(R_MAX, raw));
+}
+
+// The canvas is already scaled by `globalScale`, so a radius drawn as-is grows
+// with the zoom. Dividing it out entirely pins nodes to an exact screen size,
+// which makes zooming feel inert; `sqrt` is the partial compensation Sigma uses
+// — zoom in and nodes grow, but far more slowly than the layout around them.
+function drawnRadius(n, sizeMode, globalScale) {
+  return nodeScreenRadius(n, sizeMode) / Math.sqrt(Math.max(0.2, globalScale));
 }
 
 function ctrlValue(id, fallback) {
@@ -447,16 +464,24 @@ function applyNodeStyle() {
   if (!g) return;
   const sizeMode = ctrlValue('sizeMode', 'files');
   const labelMode = ctrlValue('labelMode', 'always');
-  g.nodeVal(n => sizeMode === 'constant' ? 1 : (sizeMode === 'files' ? Math.max(1, n.file_count || 1) : (n.val || 1)));
+  // force-graph derives the pointer area *and* `zoomToFit`'s bbox padding from
+  // `sqrt(nodeVal) * nodeRelSize`. Left at the raw file count with the default
+  // relSize of 4, an 85-file subsystem claimed a 37-unit hit radius around an
+  // 18.7-unit disc, and padded the fit by the same wrong amount. At relSize 1,
+  // `nodeVal = r²` makes both agree with what is actually drawn.
+  g.nodeRelSize(1).nodeVal(n => Math.pow(nodeScreenRadius(n, sizeMode), 2));
   g.nodeCanvasObject((node, ctx, globalScale) => {
     const isSel = selected.indexOf(node.id) >= 0;
     const show = labelMode === 'always' || (labelMode === 'selected' && isSel) || isSel;
-    const r = nodeRadius(node, sizeMode);
+    const r = drawnRadius(node, sizeMode, globalScale);
+    // Strokes and text divide by the scale outright: a 1px hairline and a 12px
+    // label should stay a 1px hairline and a 12px label at every zoom.
+    const px = 1 / globalScale;
     if (node.entry) {
       ctx.beginPath();
-      ctx.arc(node.x, node.y, r + 2.5, 0, 2 * Math.PI, false);
+      ctx.arc(node.x, node.y, r + 2.5 * px, 0, 2 * Math.PI, false);
       ctx.strokeStyle = '#34d399';
-      ctx.lineWidth = 1.5 / globalScale + 0.6;
+      ctx.lineWidth = 1.5 * px;
       ctx.stroke();
     }
     ctx.beginPath();
@@ -465,17 +490,16 @@ function applyNodeStyle() {
     ctx.fill();
     if (isSel) {
       ctx.strokeStyle = '#e7ecf3';
-      ctx.lineWidth = 2 / globalScale + 0.5;
+      ctx.lineWidth = 2 * px;
       ctx.stroke();
     }
     if (show) {
       const label = node.name || node.id;
-      const fontSize = Math.max(9, 12 / globalScale);
-      ctx.font = fontSize + 'px ui-sans-serif, system-ui, sans-serif';
+      ctx.font = (12 * px) + 'px ui-sans-serif, system-ui, sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
       ctx.fillStyle = isSel ? '#e7ecf3' : '#8b9bb4';
-      ctx.fillText(label, node.x, node.y + r + 3);
+      ctx.fillText(label, node.x, node.y + r + 4 * px);
     }
   });
 }
