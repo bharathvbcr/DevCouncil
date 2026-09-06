@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 pub use gomod::{collect_go_modules, git_worktree_root, parse_go_mod, GoModule};
-pub use languages::{detect_language, is_ignored_path, is_indexable_source};
+pub use languages::{declared_language_ids, detect_language, is_ignored_path, is_indexable_source};
 pub use model::*;
 #[cfg(feature = "parse")]
 pub use treesitter::extract_treesitter;

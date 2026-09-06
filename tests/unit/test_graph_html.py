@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from pathlib import Path
+
+import pytest
 
 from devcouncil.indexing.graph.build import write_code_graph
 from tests.unit.graph_fixtures import kernel_graph
@@ -263,10 +266,11 @@ def test_graph_html_canvas_controls_and_vendor_apis():
 
 
 def _sample_repo_map_payload() -> dict:
+    """A repo map shaped like the kernel's, for the Rust preview to render."""
     return {
         "languages": ["python"],
         "files": [
-            {"path": "src/devcouncil/cli/main.py", "area": "src/devcouncil/cli", "kind": "code", "summary": "x"},
+            {"path": "src/devcouncil/cli/main.py", "area": "src/devcouncil/cli", "kind": "code", "language": "python"},
         ],
         "subsystems": [
             {
@@ -275,85 +279,81 @@ def _sample_repo_map_payload() -> dict:
                 "entry_points": ["src/devcouncil/cli/main.py"],
                 "critical_files": ["src/devcouncil/cli/commands/map.py"],
                 "neighbors": ["src/devcouncil/indexing"],
-                "handoff_paths": [
-                    "cli/commands/map.py -> indexing/repo_mapper.py",
-                    "cli/main.py -> executors/*",
-                ],
+                "handoff_paths": ["cli/commands/map.py -> indexing/repo_mapper.py"],
                 "role_files": {"entrypoints": ["src/devcouncil/cli/main.py"]},
             },
-            {
-                "area": "src/devcouncil/indexing",
-                "summary": "Repo mapping",
-                "entry_points": ["src/devcouncil/indexing/repo_mapper.py"],
-                "critical_files": ["src/devcouncil/indexing/repo_mapper.py"],
-                "neighbors": ["src/devcouncil/cli"],
-                "handoff_paths": ["indexing/repo_mapper.py -> cli/commands/map.py"],
-                "role_files": {},
-            },
-            {
-                "area": "src/devcouncil/executors",
-                "summary": "Executors",
-                "entry_points": [],
-                "critical_files": [],
-                "neighbors": [],
-                "handoff_paths": [],
-                "role_files": {},
-            },
         ],
-        "dependents": {"src/devcouncil/cli/main.py": ["x"]},
         "entry_roots": ["src/devcouncil/cli/main.py"],
-        "unwired_candidates": ["a.py"] * 400,
-        "unreachable_files": [],
-        "dead_symbol_candidates": [],
-        "liveness_unreachable_unreliable": False,
     }
 
 
-def test_map_html_payload_and_handoffs():
-    from devcouncil.indexing.map_viz import (
-        _LIVENESS_VIZ_CAP,
-        build_map_viz_payload,
-        match_area,
-        render_map_html,
-        resolve_handoff,
-    )
-
-    areas = ["src/devcouncil/cli", "src/devcouncil/indexing", "src/devcouncil/executors"]
-    assert match_area("cli/commands/map.py", areas) == "src/devcouncil/cli"
-    assert match_area("executors/*", areas) == "src/devcouncil/executors"
-    src, dst, display = resolve_handoff("cli/main.py -> executors/*", areas)
-    assert src == "src/devcouncil/cli" and dst == "src/devcouncil/executors" and "->" in display
-
-    payload = build_map_viz_payload(_sample_repo_map_payload())
-    assert "files" not in payload
-    assert "dependents" not in payload
-    assert len(payload["liveness"]["unwired_candidates"]) == _LIVENESS_VIZ_CAP
-    assert any(link["kind"] == "neighbor" for link in payload["links"])
-    assert any(
-        link["kind"] == "handoff" and link["target"] == "src/devcouncil/executors"
-        for link in payload["links"]
-    )
-
-    raw_map = _sample_repo_map_payload()
-    raw_map["subsystems"][0]["summary"] = "</script><script>alert(1)</script>"
-    html = render_map_html(raw_map)
-    assert "</script><script>" not in html
-    assert "\\u003c" in html
-    assert "DevCouncil Repo Map" in html
-    assert "onNodeDblClick" not in html
-    assert "graph/graph.html" in html
-    assert "zoomPct" in html or "canvasControls" in html
-    data_blob = html.split("const DATA = ", 1)[1].split(";\n", 1)[0]
-    assert '"files"' not in data_blob
-    assert '"dependents"' not in data_blob
+# The map preview is rendered by the Rust kernel (`devmap map-html`), not here.
+# What Python still owns is the seam: build the right argv, and turn each kernel
+# refusal into something the operator can act on. The page's own contract —
+# payload shape, escaping, colours, coverage arithmetic — is pinned in
+# `rust-port/crates/devmap-query/src/map_preview.rs`.
 
 
-def test_write_map_html_artifact(tmp_path):
-    from devcouncil.indexing.map_viz import write_map_html
+def test_map_html_delegates_to_the_kernel(tmp_path, monkeypatch):
+    from devcouncil import devmap_engine
 
     dc = tmp_path / ".devcouncil"
     dc.mkdir()
     (dc / "repo_map.json").write_text(json.dumps(_sample_repo_map_payload()), encoding="utf-8")
-    out = write_map_html(tmp_path)
+
+    seen = {}
+
+    def fake_run(argv, *, cwd, timeout, stage=""):
+        seen["argv"] = argv
+        seen["cwd"] = cwd
+        seen["stage"] = stage
+        # Stand in for the kernel: the seam must check the artifact landed.
+        Path(argv[argv.index("--output") + 1]).write_text("<html>map</html>", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(devmap_engine, "find_engine_binary", lambda root=None: "/fake/devmap")
+    monkeypatch.setattr(devmap_engine, "_run", fake_run)
+
+    out = devmap_engine.render_map_html(tmp_path)
     assert out == dc / "map.html"
-    assert "DevCouncil Repo Map" in out.read_text(encoding="utf-8")
+    assert seen["stage"] == "map-html"
+    assert seen["argv"][0] == "/fake/devmap"
+    assert "map-html" in seen["argv"]
+    # No --db: the preview reads repo_map.json and must not need a store, so it
+    # answers for a checkout that has never been indexed.
+    assert "--db" not in seen["argv"]
+    assert str(out) in seen["argv"]
+
+
+def test_map_html_reports_a_kernel_too_old_for_the_subcommand(tmp_path, monkeypatch):
+    from devcouncil import devmap_engine
+
+    def fake_run(argv, *, cwd, timeout, stage=""):
+        raise devmap_engine.DevMapEngineError(
+            "devmap exited 2: error: unrecognized subcommand 'map-html'",
+            code="kernel_failed",
+        )
+
+    monkeypatch.setattr(devmap_engine, "find_engine_binary", lambda root=None: "/fake/devmap")
+    monkeypatch.setattr(devmap_engine, "_run", fake_run)
+
+    with pytest.raises(devmap_engine.DevMapEngineError) as excinfo:
+        devmap_engine.render_map_html(tmp_path)
+    # Clap names the flag; the operator needs the remedy.
+    assert excinfo.value.code == "binary_too_old"
+    assert "cargo build" in excinfo.value.fix
+
+
+def test_map_html_refuses_to_claim_a_page_the_kernel_did_not_write(tmp_path, monkeypatch):
+    from devcouncil import devmap_engine
+
+    monkeypatch.setattr(devmap_engine, "find_engine_binary", lambda root=None: "/fake/devmap")
+    monkeypatch.setattr(
+        devmap_engine,
+        "_run",
+        lambda argv, *, cwd, timeout, stage="": subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+
+    with pytest.raises(devmap_engine.DevMapEngineError) as excinfo:
+        devmap_engine.render_map_html(tmp_path)
+    assert excinfo.value.code == "artifact_missing"

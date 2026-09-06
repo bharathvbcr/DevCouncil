@@ -12,7 +12,9 @@ pub mod digest;
 pub mod engine;
 pub mod escape;
 pub mod freshness;
+pub mod linguist;
 pub mod manifest;
+pub mod map_preview;
 pub mod model;
 pub mod query_match;
 pub mod rung;
@@ -22,8 +24,8 @@ pub mod semantic;
 pub mod workspace;
 
 pub use artifacts::{
-    render_subsystem_map_html, render_symbol_explorer_html, should_regenerate, write_atomic,
-    writer_identity, ArtifactFingerprint, ArtifactRecord, ArtifactStamp,
+    render_symbol_explorer_html, should_regenerate, write_atomic, writer_identity,
+    ArtifactFingerprint, ArtifactRecord, ArtifactStamp,
 };
 pub use cancel::{cancelled_queries, Cancel, QueryCancelled};
 pub use code_graph::{
@@ -38,9 +40,14 @@ pub use engine::{
     MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH, PREVIEW_CALLER_MIN_CONFIDENCE,
 };
 pub use escape::{html_escape, render_symbol_label};
+pub use linguist::{palette, swatch, Swatch, LINGUIST_VERSION, NEUTRAL_COLOR};
 pub use manifest::{
     generate_lean_manifest_json, generate_manifest, generate_manifest_with_edges,
     resolve_manifest_output, write_manifest_atomically,
+};
+pub use map_preview::{
+    build_preview_payload, fingerprint_for, render_map_preview_html, write_map_preview,
+    FileAttribution,
 };
 pub use model::*;
 pub use snapshots::{semantic_snapshot_for_file, semantic_snapshots, SemanticSnapshot};
