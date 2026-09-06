@@ -5,13 +5,16 @@
 // across several builders.
 #![recursion_limit = "512"]
 
+pub mod api_routes;
 pub mod artifacts;
+pub mod ast;
 pub mod cancel;
 pub mod code_graph;
 pub mod cypher;
 pub mod digest;
 pub mod engine;
 pub mod escape;
+pub mod export;
 pub mod freshness;
 pub mod guides;
 pub mod manifest;

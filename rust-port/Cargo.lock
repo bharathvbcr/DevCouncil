@@ -295,6 +295,7 @@ dependencies = [
  "devmap-extract",
  "devmap-resolve",
  "devmap-store",
+ "regex",
  "serde",
  "serde_json",
 ]

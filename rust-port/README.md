@@ -77,6 +77,11 @@ State lives in `.devmap/` by default. See **Where state lives** below.
 | `devmap savings` | What the index cost against reading the files |
 | `devmap cypher '<query>'` | A small openCypher subset over the graph |
 | `devmap pdg <file>` | Control/data dependency graph per function (Python) |
+| `devmap routes` | HTTP routes, their handlers, and the clients that call them |
+| `devmap shape-check` | Keys a handler returns against the keys its callers read |
+| `devmap api-impact <route>` | What changing one route reaches, with a risk band |
+| `devmap ast <query>` | Symbols by kind, language and name, with an exact total |
+| `devmap export` | The graph as GraphML, for Gephi, yEd, Cytoscape or networkx |
 
 Add `--json` to any of them for a machine-readable answer — on either side of
 the subcommand.
@@ -111,6 +116,32 @@ A reported sink is evidence. **Its absence is not a safety claim** — the sink
 patterns are a heuristic list of well-known ones, and the analysis has no scope
 resolution, no alias tracking and no cross-function reasoning.
 
+### Routes
+
+```bash
+devmap routes .                       # every route, its handler, its callers
+devmap shape-check .                  # where producer and consumer disagree
+devmap api-impact /api/users/{id} .   # blast radius for one route
+```
+
+Routes come from the resolver's `routes_to` edges. Client call sites come from
+a **pattern scan** — `fetch`, `axios`, `requests`, `httpx` — over the files the
+graph names, so a `fetch` inside a comment is a hit and a caller built from a
+computed URL is not. Every site is labelled `evidence: "regex"`.
+
+The scan is bounded (`--max-files`, `--max-file-bytes`) and reports itself:
+`files_read`, `files_skipped_budget`, `files_over_size`, `files_unreadable`, and
+a `complete` flag. **This is what the risk band is built on.** A route with no
+caller found is `none_observed` when the scan finished and `unknown` when it did
+not — never a band that reads as "safe to change", because absence from an
+unfinished, pattern-based search is not evidence of no caller. `scope` says what
+`complete` covers: the files the graph names, not the whole working tree.
+
+Two fields this kernel cannot answer are `null` rather than empty:
+`framework` (known at resolve time, dropped at the store boundary) and
+`middleware` (there is no registration edge kind). `capabilities` says so once
+per answer. `[]` would mean "this route has none", which is a different claim.
+
 ### See
 
 ```bash
@@ -138,6 +169,41 @@ The view is capped — a force layout over 12,000 nodes is a hairball that pins 
 CPU — so nodes are ranked by degree and the most connected survive. The cap is
 never silent: the page header reads `1,000 of 12,103 nodes`, and the same two
 numbers ride in `--json`.
+
+### Structural search
+
+```bash
+devmap ast handler --kind Function --language rust
+devmap ast --facets              # the kinds and languages this index holds
+```
+
+`search` ranks by name relevance and budgets its answer; `ast` enumerates
+everything matching a filter and reports the **exact** total, so a page of 3 out
+of 309 says so. A filter naming a kind or language the generation does not hold
+is reported by name rather than answered as zero — a typo and a genuine
+no-match need different reactions.
+
+Every hit carries the extraction that produced it —
+`TreeSitter { grammar: "rust", grammar_version: 14 }`, `RegexFallback`,
+`Unavailable { requested_language: "powershell" }` — because a pattern-matched
+symbol and a parsed one are different claims.
+
+### Export
+
+```bash
+devmap export .                 # -> .devmap/graph.graphml
+devmap export . --out -         # stdout
+```
+
+Attributed GraphML: node kind, path, area, community, language, line and the
+dead/unwired/unreachable flags; edge kind and confidence. Two repairs are
+counted and reported rather than made silently — an edge whose endpoint is not
+a declared node (GraphML cannot express one) and a character XML 1.0 forbids.
+On this repository: 17,130 nodes, 94,350 edges, 370 edges omitted.
+
+`liveness_reliable` rides on the graph element: when the liveness pass withdrew
+its answer, every `unreachable` flag is false because nothing was established,
+not because every file is reached.
 
 ### Serve
 

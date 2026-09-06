@@ -166,7 +166,11 @@ impl Cli {
             | Commands::Manifest { path, .. }
             | Commands::Freshness { path, .. }
             | Commands::Serve { path, .. }
-            | Commands::Html { path, .. } => path,
+            | Commands::Html { path, .. }
+            | Commands::Export { path, .. }
+            | Commands::Routes { path, .. }
+            | Commands::ShapeCheck { path, .. }
+            | Commands::ApiImpact { path, .. } => path,
             _ => Path::new("."),
         }
     }
@@ -943,6 +947,88 @@ enum Commands {
         limit: usize,
     },
 
+    /// Find symbols by kind, language and name, from the parsed index.
+    ///
+    /// The structural counterpart to `search`: `search` ranks by name relevance
+    /// and budgets its answer; this enumerates everything matching a filter and
+    /// reports the exact total.
+    Ast {
+        /// Case-insensitive substring of the name or qualified name.
+        #[arg(default_value = "")]
+        query: String,
+        /// Only this symbol kind. `--facets` lists the ones this index holds.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only this language.
+        #[arg(long)]
+        language: Option<String>,
+        /// Rows to return. The total is reported whatever this is.
+        #[arg(short, long, default_value_t = 100)]
+        limit: usize,
+        /// List the kinds and languages this generation holds, and stop.
+        #[arg(long)]
+        facets: bool,
+    },
+
+    /// Write the graph as GraphML, for Gephi, yEd, Cytoscape or networkx.
+    ///
+    /// Attributed: every node carries its kind, path, area, community and its
+    /// dead/unwired/unreachable flags; every edge its kind and confidence.
+    Export {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Where to write. Defaults to `<state dir>/graph.graphml`; `-` is stdout.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+
+    /// HTTP routes, their handlers, and the clients that call them.
+    ///
+    /// Routes come from `routes_to` edges, whose source the resolver writes as
+    /// `"VERB /path"`. Client call sites are found by pattern, over a bounded
+    /// walk of the files the graph names — so every answer carries what the
+    /// scan read and whether it finished.
+    Routes {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Only routes matching this path or id.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Files the client scan may open before it stops.
+        #[arg(long, default_value_t = 5_000)]
+        max_files: usize,
+        /// Largest file the client scan will read, in bytes.
+        #[arg(long, default_value_t = 1 << 20)]
+        max_file_bytes: u64,
+    },
+
+    /// Compare what a handler returns against what its callers read.
+    #[command(name = "shape-check")]
+    ShapeCheck {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Only routes matching this path or id.
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long, default_value_t = 5_000)]
+        max_files: usize,
+        #[arg(long, default_value_t = 1 << 20)]
+        max_file_bytes: u64,
+    },
+
+    /// What changing one route reaches: callers, shape, and a risk band.
+    #[command(name = "api-impact")]
+    ApiImpact {
+        /// The route path or `"VERB /path"` id.
+        route: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value_t = 5_000)]
+        max_files: usize,
+        #[arg(long, default_value_t = 1 << 20)]
+        max_file_bytes: u64,
+    },
+
     /// Render the graph as one self-contained HTML file.
     ///
     /// No network and no build step: the renderer is embedded, so the page
@@ -1550,6 +1636,209 @@ fn resolve_graph_output(explicit: &Option<PathBuf>, root: &Path) -> PathBuf {
     explicit
         .clone()
         .unwrap_or_else(|| devmap_extract::paths::code_graph_path(root))
+}
+
+/// One line per symbol, then the counts — never a page length alone.
+fn report_ast(answer: &serde_json::Value) {
+    for hit in answer["matches"].as_array().into_iter().flatten() {
+        println!(
+            "{:<10} {:<12} {}  {}",
+            hit["kind"].as_str().unwrap_or(""),
+            hit["language"].as_str().unwrap_or(""),
+            hit["qualified_name"].as_str().unwrap_or(""),
+            hit["path"].as_str().unwrap_or(""),
+        );
+    }
+    let shown = answer["shown"].as_u64().unwrap_or(0);
+    let total = answer["total"].as_u64().unwrap_or(0);
+    if answer["truncated"].as_bool().unwrap_or(false) {
+        println!("{shown} of {total} match(es); raise --limit to see the rest");
+    } else {
+        println!("{total} match(es)");
+    }
+    // An empty answer because the filter names something the index does not
+    // hold is a different problem from an empty answer because nothing matched.
+    for unmatched in answer["unmatched_filters"].as_array().into_iter().flatten() {
+        println!(
+            "  --{} {:?}: {}",
+            unmatched["filter"].as_str().unwrap_or(""),
+            unmatched["value"].as_str().unwrap_or(""),
+            unmatched["detail"].as_str().unwrap_or(""),
+        );
+    }
+}
+
+/// The client scan's bounds, from the flags.
+fn scan_budget(max_files: usize, max_file_bytes: u64) -> devmap_query::api_routes::ScanBudget {
+    devmap_query::api_routes::ScanBudget {
+        max_files,
+        max_file_bytes,
+        ..Default::default()
+    }
+}
+
+/// The tree the scan reads, which is the one the store was built from.
+///
+/// The path argument names a repository; the store records the root it indexed.
+/// Those disagree when `--db` points elsewhere, and the file paths in the graph
+/// are relative to the *store's* root — resolving them against the argument
+/// would read a different tree, or nothing.
+fn repo_root_for(store: &Store, path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    Ok(store
+        .latest_repo_root()?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| path.to_path_buf()))
+}
+
+/// Keep only routes matching the filter, leaving the scan report intact.
+fn retain_matching_routes(mapped: &mut serde_json::Value, filter: &str) {
+    let kept: Vec<serde_json::Value> = mapped["routes"]
+        .as_array()
+        .map(|routes| {
+            routes
+                .iter()
+                .filter(|route| {
+                    let path = route["path"].as_str().unwrap_or("");
+                    let id = route["id"].as_str().unwrap_or("");
+                    path.contains(filter)
+                        || id.contains(filter)
+                        || devmap_query::api_routes::paths_match(path, filter)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    // `count` stays the number of routes the graph holds; `shown` is what the
+    // filter kept. Overwriting `count` would make a filtered view read as the
+    // whole surface.
+    mapped["shown"] = serde_json::json!(kept.len());
+    mapped["routes"] = serde_json::Value::Array(kept);
+}
+
+/// One line per route, then the scan's own limits.
+fn report_routes(mapped: &serde_json::Value) {
+    let routes = mapped["routes"].as_array().cloned().unwrap_or_default();
+    if routes.is_empty() {
+        println!("No routes in this generation.");
+    }
+    for route in &routes {
+        let handlers: Vec<String> = route["handlers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|h| match h["resolution"].as_str() {
+                Some("ambiguous") => format!(
+                    "{} (ambiguous: {} candidates)",
+                    h["id"].as_str().unwrap_or("?"),
+                    h["candidates"].as_array().map(Vec::len).unwrap_or(0)
+                ),
+                Some("unresolved") => format!("{} (unresolved)", h["id"].as_str().unwrap_or("?")),
+                _ => h["id"].as_str().unwrap_or("?").to_string(),
+            })
+            .collect();
+        println!(
+            "{:<7} {}  -> {}",
+            route["verb"].as_str().unwrap_or("ANY"),
+            route["path"].as_str().unwrap_or(""),
+            if handlers.is_empty() {
+                "(no handler)".to_string()
+            } else {
+                handlers.join(", ")
+            }
+        );
+        let consumers = route["consumers"].as_array().map(Vec::len).unwrap_or(0);
+        if consumers > 0 {
+            println!("        {consumers} client call site(s)");
+        }
+    }
+    report_scan(mapped);
+}
+
+fn report_shape_check(checked: &serde_json::Value) {
+    let checks = checked["checks"].as_array().cloned().unwrap_or_default();
+    for check in &checks {
+        let verdict = check["verdict"].as_str().unwrap_or("");
+        println!(
+            "{:<7} {}  {}",
+            check["verb"].as_str().unwrap_or("ANY"),
+            check["route"].as_str().unwrap_or(""),
+            verdict
+        );
+        if verdict == "mismatch" {
+            let missing: Vec<&str> = check["missing_in_handler"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|k| k.as_str())
+                .collect();
+            println!(
+                "        consumers read, handler never returns: {}",
+                missing.join(", ")
+            );
+        }
+    }
+    println!(
+        "{} of {} route(s) mismatch",
+        checked["mismatch_count"].as_u64().unwrap_or(0),
+        checks.len()
+    );
+    report_scan(checked);
+}
+
+fn report_api_impact(impact: &serde_json::Value) {
+    if impact["found"] != serde_json::json!(true) {
+        println!(
+            "No route matched {:?}.",
+            impact["route"].as_str().unwrap_or("")
+        );
+        report_scan(impact);
+        return;
+    }
+    println!(
+        "{} {}",
+        impact["verb"].as_str().unwrap_or("ANY"),
+        impact["route"].as_str().unwrap_or("")
+    );
+    println!(
+        "  risk: {} — {}",
+        impact["risk"].as_str().unwrap_or("unknown"),
+        impact["risk_reason"].as_str().unwrap_or("")
+    );
+    for consumer in impact["consumers"].as_array().into_iter().flatten() {
+        println!(
+            "  called from {}:{}",
+            consumer["path"].as_str().unwrap_or(""),
+            consumer["line"].as_u64().unwrap_or(0)
+        );
+    }
+    for mismatch in impact["shape_mismatches"].as_array().into_iter().flatten() {
+        let missing: Vec<&str> = mismatch["missing_in_handler"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|k| k.as_str())
+            .collect();
+        println!("  shape: consumers read {}", missing.join(", "));
+    }
+    report_scan(impact);
+}
+
+/// What the scan read, and what it did not. Printed whenever it did not finish,
+/// because every count above it is then a lower bound.
+fn report_scan(payload: &serde_json::Value) {
+    let scan = &payload["scan"];
+    if scan["complete"].as_bool().unwrap_or(true) {
+        return;
+    }
+    println!(
+        "  scan incomplete: read {} of {} file(s); {} skipped for budget, \
+{} over size, {} unreadable. Counts above are lower bounds.",
+        scan["files_read"].as_u64().unwrap_or(0),
+        scan["files_eligible"].as_u64().unwrap_or(0),
+        scan["files_skipped_budget"].as_u64().unwrap_or(0),
+        scan["files_over_size"].as_u64().unwrap_or(0),
+        scan["files_unreadable"].as_u64().unwrap_or(0),
+    );
 }
 
 /// The `--manifest` half of a build: the artifacts and the store's own status,
@@ -2302,6 +2591,11 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         | Commands::Html { .. }
         | Commands::Cypher { .. }
         | Commands::Pdg { .. }
+        | Commands::Ast { .. }
+        | Commands::Export { .. }
+        | Commands::Routes { .. }
+        | Commands::ShapeCheck { .. }
+        | Commands::ApiImpact { .. }
         | Commands::Claude { .. } => Ok(()),
     }
 }
@@ -3975,6 +4269,153 @@ empty graph, which would read as 'this file has no control flow'.",
                 // that scripts this must be able to tell "your query was not
                 // run" from "your query matched nothing".
                 anyhow::bail!("{}", result["error"].as_str().unwrap_or("query refused"));
+            }
+        }
+        Commands::Ast {
+            query,
+            kind,
+            language,
+            limit,
+            facets,
+        } => {
+            let store = open_for_read(&cli.db())?;
+            if *facets {
+                let facets = devmap_query::ast::ast_facets(&store)?;
+                if cli.json {
+                    emit_json(cli, &facets)?;
+                } else {
+                    println!("kinds:");
+                    for (name, count) in facets["kinds"].as_object().into_iter().flatten() {
+                        println!("  {name:<16} {count}");
+                    }
+                    println!("languages:");
+                    for (name, count) in facets["languages"].as_object().into_iter().flatten() {
+                        println!("  {name:<16} {count}");
+                    }
+                }
+                return Ok(());
+            }
+            let filter = devmap_query::ast::AstFilter {
+                query: query.clone(),
+                kind: kind.clone(),
+                language: language.clone(),
+                limit: *limit,
+            };
+            let answer = devmap_query::ast::ast_query(&store, &filter)?;
+            if cli.json {
+                emit_json(cli, &answer)?;
+            } else {
+                report_ast(&answer);
+            }
+        }
+        Commands::Export { path, out } => {
+            let store = open_for_read(&cli.db())?;
+            let graph = graph_value_for_read(&store, &cli.db())?;
+            let gen_id = store.latest_generation_id()?.unwrap_or(0);
+            let (xml, report) = devmap_query::export::export_graphml(&graph);
+
+            let to_stdout = out.as_deref() == Some(std::path::Path::new("-"));
+            let destination = out
+                .clone()
+                .filter(|_| !to_stdout)
+                .unwrap_or_else(|| devmap_extract::paths::state_dir(path).join("graph.graphml"));
+            if to_stdout {
+                print!("{xml}");
+            } else {
+                ensure_parent(&destination)?;
+                std::fs::write(&destination, &xml)?;
+            }
+
+            if cli.json {
+                emit_json(
+                    cli,
+                    &serde_json::json!({
+                        "output": if to_stdout { serde_json::Value::Null }
+                                  else { serde_json::json!(destination) },
+                        "generation_id": gen_id,
+                        "nodes": report.nodes,
+                        "edges": report.edges,
+                        // GraphML cannot express an edge to an undeclared node,
+                        // and a symbol name can hold bytes XML forbids. Both are
+                        // repairs, and a repair nobody is told about is a
+                        // difference between the graph and its export.
+                        "edges_dangling": report.edges_dangling,
+                        "characters_replaced": report.characters_replaced,
+                        "bytes": xml.len(),
+                    }),
+                )?;
+            } else if !to_stdout {
+                println!("Wrote {}", destination.display());
+                println!("  {} nodes, {} edges", report.nodes, report.edges);
+                if report.edges_dangling > 0 {
+                    println!(
+                        "  {} edge(s) omitted: an endpoint is not a declared node \
+(GraphML cannot express one)",
+                        report.edges_dangling
+                    );
+                }
+                if report.characters_replaced > 0 {
+                    println!(
+                        "  {} character(s) replaced with U+FFFD: XML 1.0 cannot \
+represent them",
+                        report.characters_replaced
+                    );
+                }
+            }
+        }
+        Commands::Routes {
+            path,
+            filter,
+            max_files,
+            max_file_bytes,
+        } => {
+            let store = open_for_read(&cli.db())?;
+            let graph = graph_value_for_read(&store, &cli.db())?;
+            let budget = scan_budget(*max_files, *max_file_bytes);
+            let root = repo_root_for(&store, path)?;
+            let mut mapped = devmap_query::api_routes::route_map(&root, &graph, &budget);
+            if let Some(filter) = filter {
+                retain_matching_routes(&mut mapped, filter);
+            }
+            if cli.json {
+                emit_json(cli, &mapped)?;
+            } else {
+                report_routes(&mapped);
+            }
+        }
+        Commands::ShapeCheck {
+            path,
+            filter,
+            max_files,
+            max_file_bytes,
+        } => {
+            let store = open_for_read(&cli.db())?;
+            let graph = graph_value_for_read(&store, &cli.db())?;
+            let budget = scan_budget(*max_files, *max_file_bytes);
+            let root = repo_root_for(&store, path)?;
+            let checked =
+                devmap_query::api_routes::shape_check(&root, &graph, &budget, filter.as_deref());
+            if cli.json {
+                emit_json(cli, &checked)?;
+            } else {
+                report_shape_check(&checked);
+            }
+        }
+        Commands::ApiImpact {
+            route,
+            path,
+            max_files,
+            max_file_bytes,
+        } => {
+            let store = open_for_read(&cli.db())?;
+            let graph = graph_value_for_read(&store, &cli.db())?;
+            let budget = scan_budget(*max_files, *max_file_bytes);
+            let root = repo_root_for(&store, path)?;
+            let impact = devmap_query::api_routes::api_impact(&root, &graph, &budget, route);
+            if cli.json {
+                emit_json(cli, &impact)?;
+            } else {
+                report_api_impact(&impact);
             }
         }
         Commands::Html {
