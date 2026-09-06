@@ -23,7 +23,7 @@ def test_cli_status_json_auto_inits_empty_directory(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     res = runner.invoke(app, ["status", "--json"])
     assert res.exit_code == 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["initialized"] is True
     assert data["phase"] == "NEW"
 
@@ -57,7 +57,7 @@ def test_cli_status_initialized(tmp_path, monkeypatch):
     # Test --json flag
     res_json = runner.invoke(app, ["status", "--json"])
     assert res_json.exit_code == 0
-    data = json.loads(res_json.output)
+    data = json.loads(res_json.stdout)
     assert data["initialized"] is True
     assert len(data["blocking_gaps"]) == 1
     

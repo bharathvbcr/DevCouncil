@@ -102,7 +102,7 @@ def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
     assert ok.exit_code == 0
     js = runner.invoke(app, ["map", "sync", "--json", "--project-root", str(tmp_path)])
     assert js.exit_code == 0
-    assert json.loads(js.output)["generation"] == 2
+    assert json.loads(js.stdout)["generation"] == 2
 
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",
@@ -151,7 +151,7 @@ def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
     )
     ingest = runner.invoke(app, ["map", "ingest", "--json", "--project-root", str(tmp_path)])
     assert ingest.exit_code == 0
-    assert json.loads(ingest.output)["mode"] == "devmap-rust"
+    assert json.loads(ingest.stdout)["mode"] == "devmap-rust"
 
     monkeypatch.setattr(
         "devcouncil.indexing.map_artifacts.refresh_map_artifacts",

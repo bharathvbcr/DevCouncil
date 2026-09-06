@@ -41,7 +41,7 @@ def test_cli_show_json(tmp_path, monkeypatch):
     
     res = runner.invoke(app, ["show", "TASK-1", "--json"])
     assert res.exit_code == 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["task"]["id"] == "TASK-1"
     assert data["task"]["title"] == "Original Title"
 

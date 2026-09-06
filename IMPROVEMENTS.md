@@ -1773,3 +1773,54 @@ sentence saying what would change it (raise the ceiling, link a grammar) and no 
 — `check()` accepts `fix_command=None` to mean "there is no command", where before an empty
 value was replaced by the first clause of the prose. Pinned in
 `tests/unit/test_devmap_coverage_gaps.py`.
+
+## The stdout/stderr conflation in tests was not closed, only sampled (2026-09-06)
+
+The 2026-09-05 entry above reports 39 `json.loads(result.output)` sites converted to
+`result.stdout` and reads as if the class were closed. It was not: **81 sites across 21 files**
+survived, because that sweep fixed the inventory it had found rather than the shape. `.output`
+is Click 8.2+'s *merged* stdout+stderr stream, so every one of them asserted "the `--json`
+surface emits JSON **and nothing logged a warning**" — and would have accepted a diagnostic
+wrongly written to stdout, which is the failure the assertion exists to catch.
+
+The class had also grown four disguises that a `json.loads(<name>.output)` search cannot see:
+
+* the parse split across two statements —
+  `output = res.output[res.output.index("{"):]` … `json.loads(output)` (six in `test_cli_verify.py`);
+* across three, with `find` instead of `index` (`test_cli_campaign.py`);
+* an assertion on stream *order* rather than content —
+  `result.output.startswith("# Implement TASK-001")`, where `dev prompt` promises raw markdown
+  on stdout (`test_cli_commands.py`);
+* an assertion on stream *line count* — `test_trace_tail_jsonl_remains_one_json_object_per_line`
+  counted `result.output.splitlines()` and required exactly 1, so any warning made the JSONL
+  surface look like it had emitted two records.
+
+**Falsified before it was fixed.** A single `logger.warning` in the root `@app.callback()`,
+which runs ahead of every command, took the pre-fix files to **61 failed / 311 passed with 171
+`JSONDecodeError`s**; after conversion the same probe leaves **393 passed, 0**. The probe
+message deliberately contained a `{`, which is precisely what the `index("{")` / `find("{")`
+workarounds sliced to: they did not skip *past* stderr, they would have *selected* it the first
+time a log line contained a brace.
+
+**Then the probe was run against the whole suite**, which is how the last two sites were found
+at all — they are in files the shape-search never reached. Under the probe the suite now fails
+only on the pre-existing `test_devmap_engine` kernel-freshness case, which is unrelated (a
+stale global `devmap` binary that still advertises `unreachable_files` as uncomputed).
+
+Two of the comments guarding those workarounds were stale claims, not facts.
+`# Strip any prefix warnings/log lines` in `test_cli_verify.py` described a real merged-stream
+warning that is simply absent from `.stdout`; `# CliRunner merges the stderr staleness banner
+with stdout` in `test_map_hardening.py` was measured and found false — that command writes
+nothing to stderr and its stdout is already clean JSON. A third comment was accurate and the
+slice it guards was kept: `dev campaign run --json` really does print its dry-run banner to
+**stdout** ahead of the payload, so both campaign tests still parse from the first brace — but
+now on `.stdout`, where a stderr diagnostic can no longer be what `find` locates. That banner
+is a live `--json` contract violation in the command, not in the test, and is recorded here
+rather than fixed.
+
+Left deliberately: six `assert result.output == ""` assertions in `test_hook_commands.py`.
+They are silence-dependent in the same way, but `.stdout` there would be *looser* — it would
+stop checking that the hook writes nothing to stderr either — so the correct assertion is a
+design question about the hook's contract, not a mechanical substitution.
+
+No production code changed; `src/` is byte-identical. Net −8 lines as the workarounds came out.

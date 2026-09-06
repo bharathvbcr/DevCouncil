@@ -591,7 +591,7 @@ def test_cli_show_json_not_found(tmp_path, monkeypatch):
     runner.invoke(app, ["init"])
     res = runner.invoke(app, ["show", "MISSING", "--json"])
     assert res.exit_code != 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["ok"] is False
 
 

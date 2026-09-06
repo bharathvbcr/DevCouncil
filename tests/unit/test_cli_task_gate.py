@@ -42,7 +42,7 @@ def test_cli_next_task(tmp_path, monkeypatch):
     # Test next-task when current task is leased (should return None/no task available)
     res1 = runner.invoke(app, ["next-task", "--json"])
     assert res1.exit_code == 0
-    data1 = json.loads(res1.output)
+    data1 = json.loads(res1.stdout)
     assert data1["ok"] is True
     assert data1["task"] is None
 
@@ -59,7 +59,7 @@ def test_cli_next_task(tmp_path, monkeypatch):
 
     res2 = runner.invoke(app, ["next-task", "--json"])
     assert res2.exit_code == 0
-    data2 = json.loads(res2.output)
+    data2 = json.loads(res2.stdout)
     assert data2["ok"] is True
     assert data2["task"]["id"] == "TASK-2"
 
@@ -95,7 +95,7 @@ def test_cli_scope_update(tmp_path, monkeypatch):
         ],
     )
     assert res.exit_code == 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["ok"] is True
     assert "pytest tests/unit" in data["allowed_commands"]
     assert "pytest tests/unit" in data["expected_tests"]
@@ -127,7 +127,7 @@ def test_cli_policy_check(tmp_path, monkeypatch):
 
     res = runner.invoke(app, ["policy-check", "src/a.py", "--json"])
     assert res.exit_code == 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["allowed"] is True
 
     # Non-json format
@@ -154,7 +154,7 @@ def test_cli_record_command(tmp_path, monkeypatch):
         ],
     )
     assert res.exit_code == 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["ok"] is True
     assert data["recorded"] is True
 
@@ -192,7 +192,7 @@ def test_cli_run_cmd(tmp_path, monkeypatch):
         ],
     )
     assert res.exit_code == 0, f"res.output: {res.output}\nres.exception: {res.exception}"
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["ok"] is True
 
     # Command is not allowed
@@ -209,7 +209,7 @@ def test_cli_run_cmd(tmp_path, monkeypatch):
         ],
     )
     assert res2.exit_code == 0  # it returns payload saying code=command_not_allowed
-    data2 = json.loads(res2.output)
+    data2 = json.loads(res2.stdout)
     assert data2["ok"] is False
     assert data2["code"] == "command_not_allowed"
 
@@ -230,7 +230,7 @@ def test_cli_verify_leased(tmp_path, monkeypatch):
         ],
     )
     assert res.exit_code != 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["ok"] is False
     assert data["code"] == "unsupported_sandbox"
 
@@ -255,13 +255,13 @@ def test_cli_evidence_append_and_list(tmp_path, monkeypatch):
         ],
     )
     assert res.exit_code == 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["ok"] is True
 
     # List evidence
     res2 = runner.invoke(app, ["evidence-list", task_id, "--json"])
     assert res2.exit_code == 0
-    data2 = json.loads(res2.output)
+    data2 = json.loads(res2.stdout)
     assert data2["ok"] is True
     assert len(data2["evidence"]) == 1
     assert data2["evidence"][0]["command"] == "pytest"
@@ -292,6 +292,6 @@ def test_cli_handoff_leased(tmp_path, monkeypatch):
         ],
     )
     assert res.exit_code == 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["ok"] is True
     assert "manifest_path" in data

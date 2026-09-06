@@ -87,7 +87,7 @@ def test_cli_release_health_json_and_fail_on_regression(tmp_path, monkeypatch):
     # Empty project has no blocking gaps → passed relative to baseline that expected one.
     ok = runner.invoke(app, ["report", "release-health", "--json"])
     assert ok.exit_code == 0
-    payload = json.loads(ok.output)
+    payload = json.loads(ok.stdout)
     assert payload["verdict"] in {"passed", "historical_debt", "regressed"}
     assert "release_ready" in payload
 

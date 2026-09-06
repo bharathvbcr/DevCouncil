@@ -93,11 +93,12 @@ def test_cli_campaign_run_dry_run(tmp_path, monkeypatch):
     res = runner.invoke(app, ["campaign", "run", "Implement settings", "--json"])
     assert res.exit_code == 0
     
-    # Parse json portion only
-    json_start = res.output.find("{")
+    # `--json` prints the dry-run banner ahead of the payload on stdout, so parse
+    # from the first brace — on stdout alone, since a stderr diagnostic may itself
+    # contain a brace and would otherwise be what find() locates.
+    json_start = res.stdout.find("{")
     assert json_start != -1
-    json_str = res.output[json_start:]
-    data = json.loads(json_str)
+    data = json.loads(res.stdout[json_start:])
     
     assert data["success"] is True
     assert any(o["task_id"] == "TASK-1" for o in data["outcomes"])

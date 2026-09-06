@@ -991,7 +991,7 @@ def test_graph_cli_init_watch_doctor_and_hooks(
     assert initialized.exit_code == 0, initialized.output
     # The kernel decides incrementality; `init` passes only `full` through.
     assert generated[0][1]["full"] is False
-    assert json.loads(initialized.output)["generation"] == 7
+    assert json.loads(initialized.stdout)["generation"] == 7
 
     # `watch` is the kernel watcher: interrupt it at the first wait.
     monkeypatch.setattr(
@@ -1019,7 +1019,7 @@ def test_graph_cli_init_watch_doctor_and_hooks(
         app, ["map", "doctor", "--json", "--project-root", str(tmp_path)]
     )
     assert doctor.exit_code == 0
-    assert json.loads(doctor.output)["ok"] is True
+    assert json.loads(doctor.stdout)["ok"] is True
 
     no_git = runner.invoke(
         app, ["map", "hooks", "install", "--project-root", str(tmp_path)]

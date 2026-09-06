@@ -82,11 +82,7 @@ def test_cli_verify_json_format(tmp_path, monkeypatch):
     res = runner.invoke(app, ["verify", "TASK-1", "--json"])
     assert res.exit_code == 0
     
-    # Strip any prefix warnings/log lines
-    output = res.output
-    if "{" in output:
-        output = output[output.index("{"):]
-    data = json.loads(output)
+    data = json.loads(res.stdout)
     assert data["ok"] is True
 
 
@@ -120,8 +116,7 @@ def test_verify_db_unavailable_json(tmp_path, monkeypatch):
 
     res = runner.invoke(app, ["verify", "--json"])
     assert res.exit_code == 0
-    output = res.output[res.output.index("{"):]
-    assert json.loads(output)["ok"] is False
+    assert json.loads(res.stdout)["ok"] is False
 
 
 # --- no tasks found ---------------------------------------------------------------
@@ -140,8 +135,7 @@ def test_verify_no_tasks_json(tmp_path, monkeypatch):
     runner.invoke(app, ["init"])
     res = runner.invoke(app, ["verify", "--json"])
     assert res.exit_code == 0
-    output = res.output[res.output.index("{"):]
-    assert json.loads(output)["ok"] is False
+    assert json.loads(res.stdout)["ok"] is False
 
 
 # --- sandbox (non-local) branches -------------------------------------------------
@@ -199,7 +193,7 @@ def test_verify_sandbox_failure_is_advisory_in_advisory_mode(tmp_path, monkeypat
     res = runner.invoke(app, ["verify", "TASK-1", "--sandbox", "docker", "--json"])
 
     assert res.exit_code == 0
-    payload = json.loads(res.output[res.output.index("{"):])
+    payload = json.loads(res.stdout)
     assert payload["tasks"][0]["status"] == "verified"
     assert payload["tasks"][0]["blocking_gap_count"] == 0
     assert payload["tasks"][0]["gap_count"] == 1
@@ -220,7 +214,7 @@ def test_verify_off_skips_requested_sandbox_and_records_done(tmp_path, monkeypat
     res = runner.invoke(app, ["verify", "TASK-1", "--sandbox", "docker", "--json"])
 
     assert res.exit_code == 0
-    payload = json.loads(res.output[res.output.index("{"):])
+    payload = json.loads(res.stdout)
     assert payload["completed_without_verification"] == 1
     assert payload["tasks"][0]["status"] == "done"
     assert payload["tasks"][0]["verification_skipped"] is True
@@ -336,8 +330,7 @@ def test_verify_all_cross_task_reconciliation(tmp_path, monkeypatch):
     monkeypatch.setattr(Verifier, "verify_task", fake_verify_task)
     res = runner.invoke(app, ["verify", "--json"])
     # Reconciliation clears TASK-B's only blocking gap → overall ok.
-    output = res.output[res.output.index("{"):]
-    data = json.loads(output)
+    data = json.loads(res.stdout)
     assert data["blocked_tasks"] == 0
     assert res.exit_code == 0
 

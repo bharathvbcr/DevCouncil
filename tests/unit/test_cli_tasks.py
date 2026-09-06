@@ -41,7 +41,7 @@ def test_cli_tasks_list(tmp_path, monkeypatch):
     # JSON list
     res_json = runner.invoke(app, ["tasks", "--json"])
     assert res_json.exit_code == 0
-    data = json.loads(res_json.output)
+    data = json.loads(res_json.stdout)
     assert data["total"] == 1
     assert data["tasks"][0]["id"] == "TASK-1"
     assert data["tasks"][0]["lease"] is None
@@ -83,7 +83,7 @@ def test_cli_tasks_list_includes_active_lease(tmp_path, monkeypatch):
 
     res_json = runner.invoke(app, ["tasks", "--json"])
     assert res_json.exit_code == 0
-    data = json.loads(res_json.output)
+    data = json.loads(res_json.stdout)
     lease = data["tasks"][0]["lease"]
     assert lease is not None
     assert lease["owner"] == "agent:codex"
@@ -102,14 +102,14 @@ def test_cli_tasks_cancel(tmp_path, monkeypatch):
     # Cancel task
     res = runner.invoke(app, ["tasks", "cancel", "TASK-1", "--json"])
     assert res.exit_code == 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["ok"] is True
     assert data["status"] == "cancelled"
     
     # Try cancelling again (should fail)
     res2 = runner.invoke(app, ["tasks", "cancel", "TASK-1", "--json"])
     assert res2.exit_code != 0
-    data2 = json.loads(res2.output)
+    data2 = json.loads(res2.stdout)
     assert data2["ok"] is False
 
 
@@ -119,7 +119,7 @@ def test_cli_tasks_reprioritize(tmp_path, monkeypatch):
     # Set to high
     res = runner.invoke(app, ["tasks", "reprioritize", "TASK-1", "--priority", "high", "--json"])
     assert res.exit_code == 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["ok"] is True
     assert data["priority"] == "high"
     
@@ -134,7 +134,7 @@ def test_cli_tasks_edit(tmp_path, monkeypatch):
     # Edit title & desc
     res = runner.invoke(app, ["tasks", "edit", "TASK-1", "--title", "New Title", "--description", "New Desc", "--json"])
     assert res.exit_code == 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["ok"] is True
     assert data["changes"]["title"]["to"] == "New Title"
     
@@ -198,7 +198,7 @@ def test_cli_tasks_status_filter_and_pagination(tmp_path, monkeypatch):
 
     res = runner.invoke(app, ["tasks", "--status", "done", "--json", "--limit", "1", "--offset", "0"])
     assert res.exit_code == 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["total"] == 1
     assert data["tasks"][0]["id"] == "TASK-B"
 
@@ -230,14 +230,14 @@ def test_cli_tasks_cancel_no_db_json(tmp_path, monkeypatch):
     monkeypatch.setattr(tasks_cmd, "get_db", lambda root: None)
     res = runner.invoke(app, ["tasks", "cancel", "TASK-1", "--json"])
     assert res.exit_code == 1
-    assert json.loads(res.output)["ok"] is False
+    assert json.loads(res.stdout)["ok"] is False
 
 
 def test_cli_tasks_reprioritize_invalid_json(tmp_path, monkeypatch):
     _setup_tasks_db(tmp_path, monkeypatch)
     res = runner.invoke(app, ["tasks", "reprioritize", "TASK-1", "--priority", "urgent", "--json"])
     assert res.exit_code == 2
-    assert json.loads(res.output)["ok"] is False
+    assert json.loads(res.stdout)["ok"] is False
 
 
 def test_cli_tasks_reprioritize_not_found(tmp_path, monkeypatch):

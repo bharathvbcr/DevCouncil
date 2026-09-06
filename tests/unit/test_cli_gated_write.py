@@ -62,7 +62,7 @@ def test_cli_write_allowed_and_denied(tmp_path, monkeypatch):
         ],
     )
     assert res.exit_code == 0
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["ok"] is True
     assert a_py.read_text(encoding="utf-8") == "x = 2\n"
 
@@ -82,7 +82,7 @@ def test_cli_write_allowed_and_denied(tmp_path, monkeypatch):
         ],
     )
     assert res2.exit_code != 0
-    data2 = json.loads(res2.output)
+    data2 = json.loads(res2.stdout)
     assert data2["ok"] is False
 
 
@@ -118,7 +118,7 @@ def test_cli_apply_patch_allowed_and_denied(tmp_path, monkeypatch):
         ],
     )
     assert res.exit_code == 0, f"res.output: {res.output}\nres.exception: {res.exception}"
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["ok"] is True
     assert a_py.read_text(encoding="utf-8") == "x = 42\n"
 
@@ -143,5 +143,5 @@ def test_cli_apply_patch_allowed_and_denied(tmp_path, monkeypatch):
         ],
     )
     assert res2.exit_code != 0
-    data2 = json.loads(res2.output)
+    data2 = json.loads(res2.stdout)
     assert data2["ok"] is False
