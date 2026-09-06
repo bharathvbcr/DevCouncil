@@ -207,10 +207,29 @@ fn consumer_manifest_json(
     edges: &[ResolvedEdge],
 ) -> String {
     let mut languages: BTreeSet<String> = BTreeSet::new();
+    // Frameworks, from the routes that prove them.
+    //
+    // This was the literal `[]` while `wiki.py:285` rendered a "## Frameworks"
+    // section from it and `mcp/handlers/map.py:327` put it in the map envelope,
+    // so both were permanently blank with nothing saying why.
+    //
+    // The evidence is the route extractor's own `framework` field: a framework
+    // is named here because `frameworks.rs` matched its route syntax in this
+    // repository's source, not because a filename or a dependency list looked
+    // like it. That is a narrower claim than the Python writer's — it can only
+    // see frameworks that declare routes — and it is a claim this producer can
+    // actually support. A `BTreeSet` because the order has to be the same on
+    // two renderings of one generation (R4).
+    let mut frameworks: BTreeSet<String> = BTreeSet::new();
     let mut files = Vec::new();
     for ext in extractions {
         if !ext.language.is_empty() && ext.language != "unknown" {
             languages.insert(ext.language.clone());
+        }
+        for route in &ext.routes {
+            if !route.framework.is_empty() {
+                frameworks.insert(route.framework.clone());
+            }
         }
         // No `summary` key. It was emitted as a constant `""` on every one of
         // these entries — 1,306 of them on this repository — and nothing reads
@@ -380,7 +399,7 @@ fn consumer_manifest_json(
             role_files_total += bucket_counts.values().sum::<usize>();
             json!({
                 "area": area,
-                "summary": "",
+                "summary": subsystem_summary(area, &area_files, &bucket_counts, extractions),
                 "entry_points": entry.entry_points,
                 "critical_files": [entry.path],
                 "neighbors": names,
@@ -436,10 +455,36 @@ fn consumer_manifest_json(
         .collect();
     let payload = json!({
         "languages": languages.into_iter().collect::<Vec<_>>(),
-        "frameworks": [],
+        // Computed. See the derivation above, and `frameworks_computed` in
+        // `meta` for the claim that goes with it: an empty list here means this
+        // repository declares no routes any matcher recognises, not that
+        // nothing looked.
+        "frameworks": frameworks.into_iter().collect::<Vec<_>>(),
+        // Still constants, and now marked as such in `meta`. Each is a
+        // question this kernel cannot answer from what it is given:
+        //
+        // - `package_managers` is a lockfile question — the Python writer read
+        //   `uv.lock`/`package-lock.json`, and `tests/unit/test_cli_commands.py`
+        //   pins that a bare `pyproject.toml` is *not* evidence of uv. Lock
+        //   files are not indexed: `.lock` matches no language spec, so
+        //   `detect_language` returns `generic` and `is_indexable_source`
+        //   excludes them, which means they never reach `extractions`.
+        // - `test_commands` needs the *contents* of `pyproject.toml` /
+        //   `package.json`, not their declarations.
+        //
+        // Both become computable the day this function is handed the repository
+        // inventory rather than only the indexed extractions. Marked false
+        // until then, because a consumer acting on an empty list has to know
+        // which kind of empty it is.
         "package_managers": [],
         "test_commands": [],
         "important_files": lean.important_files,
+        // A goal-ranked list, and this producer is given no goal. `dev map
+        // --goal` fills it in `map_artifacts.py:379` with the ripgrep scorer;
+        // absent that flag it is empty because nobody asked, which is what
+        // `candidate_files_computed: false` says. The marker is this kernel's
+        // account of its own run and stays false even after that enrichment
+        // overwrites the list.
         "candidate_files": [],
         "files": files,
         "subsystems": subsystems,
@@ -465,7 +510,18 @@ fn consumer_manifest_json(
         // `verify`.
         "graph_degraded": graph_degraded,
         "graph_degraded_reason": graph_degraded_reason,
+        // No language server is consulted by this kernel and no `src/` consumer
+        // reads this key off the manifest — `semantic_index.py:61` builds an
+        // `lsp` block for a different artifact entirely. Kept rather than
+        // removed because removing a key needs the readers gone first, and
+        // marked so the empty object is not read as "the servers found
+        // nothing".
         "lsp": {},
+        // An opt-in software-composition audit. `dev map --scan-deps` fills it
+        // in `map_artifacts.py:383`; without that flag nothing ran, and
+        // `prompt_builder.py:830` renders the list into the agent's prompt. An
+        // empty list there has meant "no risks" and "no audit" identically,
+        // which is the one thing a security finding must never do.
         "dependency_risks": [],
         "entry_roots": lean.entry_roots,
         // Computed, not asserted empty. `code_graph.json` has always derived
@@ -621,6 +677,10 @@ fn consumer_manifest_json(
             },
             "unavailable": unreachable_unavailable,
         },
+        // Process/dataflow chains. Nothing in this kernel derives them and no
+        // `src/` consumer reads this key off the manifest; `viz.py` reads a
+        // `processes` key off the *code graph's* meta, which is a different
+        // artifact. Marked rather than removed, for the same reason as `lsp`.
         "processes": [],
         "map_engine": CONSUMER_MAP_ENGINE,
         "freshness": freshness,
@@ -656,6 +716,31 @@ fn consumer_manifest_json(
                 // had computed yet.
                 "role_files_computed": true,
                 "file_kinds_computed": true,
+                // The eight fields that shipped in every response at the same
+                // constant value with nothing saying whether anyone had looked.
+                // One key each, on the rule established above: a single
+                // "extras_computed" boolean would let a reader vouch for seven
+                // fields on the evidence of one.
+                //
+                // `true` means this producer derived the value and an empty
+                // result is the answer. `false` means it emitted a constant —
+                // the field is still there because its readers index it
+                // directly, but nothing computed it.
+                "frameworks_computed": true,
+                "subsystem_summaries_computed": true,
+                // Lock files are not indexed, so the evidence never arrives.
+                "package_managers_computed": false,
+                // Needs manifest contents, not manifest declarations.
+                "test_commands_computed": false,
+                // Goal-dependent; `dev map --goal` fills it downstream.
+                "candidate_files_computed": false,
+                // No language server is consulted by this kernel.
+                "lsp_computed": false,
+                // Opt-in SCA; `dev map --scan-deps` fills it downstream. The
+                // one field here where a wrong reading is a security claim.
+                "dependency_risks_computed": false,
+                // No producer in this kernel.
+                "processes_computed": false,
             },
         },
     });
@@ -947,6 +1032,76 @@ fn file_kind(path: &str, language: &str) -> &'static str {
         _ if !language.is_empty() && language != "unknown" => "module",
         _ => "file",
     }
+}
+
+/// One subsystem described by what it is made of.
+///
+/// This field was the literal `""` for the whole life of the kernel writer,
+/// and six consumers render it as prose: `wiki.py:214` opens a subsystem page
+/// with it, `wiki.py:311` writes `- [area](…) — ` and `map_artifacts.py:69`
+/// writes ``1. `area/` — ``, both of which have been emitting a dangling dash.
+///
+/// A generated sentence about *purpose* would be a fabrication — this producer
+/// has no way to know why a subsystem exists. Composition it does know, from
+/// the same `role_buckets` and language data the entry beside it already
+/// carries, so the summary states that and nothing more: how many files, which
+/// languages, and which roles are present. Every clause is a count this
+/// function can point at.
+///
+/// Deterministic by construction (R4): the inputs are sorted maps and a slice
+/// in the map's own file order, and the language tally is resolved by count
+/// then by name so a tie cannot be broken by hash order.
+fn subsystem_summary(
+    area: &str,
+    area_files: &[&str],
+    role_counts: &BTreeMap<&'static str, usize>,
+    extractions: &[Extraction],
+) -> String {
+    let file_count = area_files.len();
+    // The area's own files, by language. Built from the extraction list rather
+    // than from the path, because the language is a decision `detect_language`
+    // already made and re-deriving it here would be a second answer to one
+    // question.
+    let members: BTreeSet<&str> = area_files.iter().copied().collect();
+    let mut by_language: BTreeMap<&str, usize> = BTreeMap::new();
+    for ext in extractions {
+        if members.contains(ext.file_path.as_str())
+            && !ext.language.is_empty()
+            && ext.language != "unknown"
+        {
+            *by_language.entry(ext.language.as_str()).or_insert(0) += 1;
+        }
+    }
+    let mut ranked: Vec<(&&str, &usize)> = by_language.iter().collect();
+    ranked.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+
+    let mut summary = format!(
+        "{area}: {file_count} file{}",
+        if file_count == 1 { "" } else { "s" }
+    );
+    match ranked.len() {
+        0 => {}
+        1 => summary.push_str(&format!(", {}", ranked[0].0)),
+        _ => {
+            // The top three by file count. "mostly" is a claim about rank, not
+            // a majority, and the cap is why: naming every language of a
+            // 400-file area would be an inventory, not a summary.
+            let named: Vec<&str> = ranked.iter().take(3).map(|(name, _)| **name).collect();
+            summary.push_str(&format!(", mostly {}", named.join(", ")));
+        }
+    }
+    // Roles, in the order `role_buckets` keys them, so two renderings agree.
+    // `other` is deliberately not recited: it is the residue, and naming it
+    // would pad every summary with a word that distinguishes nothing.
+    let roles: Vec<String> = role_counts
+        .iter()
+        .filter(|(role, count)| **role != "other" && **count > 0)
+        .map(|(role, count)| format!("{count} {role}"))
+        .collect();
+    if !roles.is_empty() {
+        summary.push_str(&format!(" ({})", roles.join(", ")));
+    }
+    summary
 }
 
 /// Bucket one subsystem's files by the role they play, with the real totals.
