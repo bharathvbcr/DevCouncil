@@ -76,6 +76,7 @@ State lives in `.devmap/` by default. See **Where state lives** below.
 | `devmap preview --file f --content -` | What an *unsaved* edit would break |
 | `devmap savings` | What the index cost against reading the files |
 | `devmap cypher '<query>'` | A small openCypher subset over the graph |
+| `devmap pdg <file>` | Control/data dependency graph per function (Python) |
 
 Add `--json` to any of them for a machine-readable answer — on either side of
 the subcommand.
@@ -92,6 +93,23 @@ cannot evaluate would otherwise return every row in the graph under a successful
 status, and a relationship name the graph cannot emit would return zero rows
 that read as "nothing matches" rather than "that name cannot match". Refusals
 exit non-zero, so a script can tell "not run" from "matched nothing".
+
+### Dependence and taint
+
+```bash
+devmap pdg src/handlers.py           # CFG + data dependencies, per function
+devmap pdg src/handlers.py --taint   # only functions reaching a sink
+```
+
+Intra-procedural: a closure's body is its own graph, not part of its enclosing
+function's control flow. Python only — that is the language the analysis this
+replaces covered, and claiming a language whose statement tree nothing produces
+would return an empty result that reads as *this file has no control flow*.
+Every other language is refused by name.
+
+A reported sink is evidence. **Its absence is not a safety claim** — the sink
+patterns are a heuristic list of well-known ones, and the analysis has no scope
+resolution, no alias tracking and no cross-function reasoning.
 
 ### See
 

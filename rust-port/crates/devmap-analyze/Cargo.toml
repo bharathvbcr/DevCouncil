@@ -10,12 +10,23 @@ devmap-resolve = { path = "../devmap-resolve", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+# `pdgsrc` walks a Python tree to build the statement tree `pdg` consumes. Both
+# are already workspace dependencies built for `devmap-extract`, so nothing new
+# enters the tree; they are optional here so the `parse`-off shape an embedder
+# links stays free of grammars.
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
 
 [features]
 default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter
 # and answers questions about a persisted map rather than building one.
-parse = ["devmap-extract/parse", "devmap-resolve/parse"]
+parse = [
+    "devmap-extract/parse",
+    "devmap-resolve/parse",
+    "dep:tree-sitter",
+    "dep:tree-sitter-python",
+]
 
 # Which targets need a grammar.
 #
