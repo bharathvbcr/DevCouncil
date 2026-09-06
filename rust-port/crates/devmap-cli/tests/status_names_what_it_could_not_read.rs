@@ -180,3 +180,60 @@ fn a_corpus_with_nothing_to_report_reports_nothing_rather_than_saying_nothing() 
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `edge_confidence_mismatches` on the CLI surface, both directions: a clean
+/// generation reports 0 as a measurement, and a row whose confidence no longer
+/// matches its stored kind is counted. The tamper is done through SQL because
+/// that is the only way such a row can exist — every writer routes through
+/// `ResolvedEdge::resolved`.
+#[test]
+fn status_counts_stored_edges_whose_confidence_contradicts_their_evidence() {
+    let root = fixture("confidence-mismatch");
+    std::fs::write(root.join("lib.py"), "def helper():\n    return 42\n").unwrap();
+    std::fs::write(
+        root.join("app.py"),
+        "from lib import helper\n\n\ndef main():\n    return helper()\n",
+    )
+    .unwrap();
+    let (stdout, stderr) = run(&root, &["build", "."]);
+    assert!(
+        stderr.is_empty() || !stdout.is_empty(),
+        "build failed: {stderr}"
+    );
+
+    let before = json(&root, &["--json", "status"]);
+    assert_eq!(
+        before["edge_resolution_source"], "stored",
+        "a generation written by this kernel stores its evidence: {before}"
+    );
+    assert_eq!(
+        before["edge_confidence_mismatches"], 0,
+        "a clean generation reports zero as a measurement: {before}"
+    );
+
+    let db = root.join(".devcouncil/codeintel/devmap.sqlite");
+    let changed = {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        // Every `Calls` edge with a stored deterministic-or-high kind is moved
+        // to the floor; the count of rows touched is what status must report.
+        conn.execute(
+            "UPDATE generation_edges SET confidence = 0.2
+             WHERE edge_kind = 'Calls'
+               AND resolution IN ('ImportScoped', 'SameFile', 'UniqueGlobal', 'ReceiverType')",
+            [],
+        )
+        .unwrap()
+    };
+    assert!(
+        changed >= 1,
+        "the fixture must hold a resolved call edge to tamper with"
+    );
+
+    let after = json(&root, &["--json", "status"]);
+    assert_eq!(
+        after["edge_confidence_mismatches"],
+        serde_json::json!(changed),
+        "every tampered row must be counted: {after}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

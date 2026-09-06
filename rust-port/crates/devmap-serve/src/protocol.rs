@@ -483,6 +483,19 @@ pub(crate) fn dispatch(
                 // Without them "1 refused by discovery" is a fact an operator
                 // cannot act on or check.
                 "coverage_gaps": coverage_gaps_json(&status),
+                // Whether this generation's edges carry the evidence the
+                // resolver recorded or a reconstruction; `null` with no
+                // generation or no edges. Same owner as the CLI's `status`.
+                "edge_resolution_source": store
+                    .latest_edge_resolution_source()?
+                    .map(|source| source.label()),
+                // The read-side half of the honesty invariant: stored edges
+                // whose confidence contradicts their stored kind. Counted when
+                // the generation's index is built, which this process keeps,
+                // so the answer is free here; `null` with no generation.
+                "edge_confidence_mismatches": store
+                    .generation_edges()?
+                    .map(|index| index.confidence_mismatches()),
             }))
         }
         IpcCommand::Search {

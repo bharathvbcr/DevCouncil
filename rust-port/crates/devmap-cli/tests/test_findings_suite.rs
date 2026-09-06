@@ -27,6 +27,7 @@ fn test_g8_parametric_depth_limits_traversal() {
                 confidence: Confidence::DETERMINISTIC,
                 resolution: None,
                 details: None,
+                evidence: None,
             })
             .collect(),
         receiver_types: BTreeMap::new(),

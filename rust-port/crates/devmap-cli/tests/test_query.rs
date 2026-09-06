@@ -254,6 +254,7 @@ fn test_g8_impact_depth_expands_the_full_inbound_chain() {
         confidence: Confidence::DETERMINISTIC,
         resolution: None,
         details: None,
+        evidence: None,
     };
     let resolution = ResolutionResult {
         edges: vec![edge("a", "b"), edge("b", "c")],

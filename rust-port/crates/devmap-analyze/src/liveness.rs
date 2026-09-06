@@ -828,6 +828,7 @@ mod tests {
             confidence: devmap_extract::model::Confidence::DETERMINISTIC,
             resolution: None,
             details: None,
+            evidence: None,
         }
     }
 

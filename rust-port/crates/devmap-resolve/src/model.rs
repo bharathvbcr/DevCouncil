@@ -129,6 +129,130 @@ impl LangFamily {
     }
 }
 
+/// The evidence tier of a [`Resolution`], without its payload.
+///
+/// This is what the honesty invariants are stated over — [`Self::confidence`]
+/// is a function of the kind alone — and it is the kind, not the payload, that
+/// the store persists per edge (`generation_edges.resolution`) and that the
+/// artifacts label each edge with. One enum, one spelling, one confidence
+/// table: a variant added to [`Resolution`] stops compiling in
+/// [`Resolution::kind`] until someone decides how it is persisted and what it
+/// entitles, and no second hand-written table in another crate can drift from
+/// this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ResolutionKind {
+    SameFile,
+    ImportScoped,
+    ReceiverType,
+    UniqueGlobal,
+    AmbiguousGlobal,
+    Unresolved,
+    Structural,
+}
+
+impl ResolutionKind {
+    /// Every kind, in declaration order. What [`Self::from_label`] searches and
+    /// what a table generated from the enum (the store's SQL check) iterates.
+    pub const ALL: [ResolutionKind; 7] = [
+        ResolutionKind::SameFile,
+        ResolutionKind::ImportScoped,
+        ResolutionKind::ReceiverType,
+        ResolutionKind::UniqueGlobal,
+        ResolutionKind::AmbiguousGlobal,
+        ResolutionKind::Unresolved,
+        ResolutionKind::Structural,
+    ];
+
+    /// The confidence a rung entitles an edge to.
+    ///
+    /// - `SameFile`, `ImportScoped`, `ReceiverType` — deterministic: the
+    ///   declaration is in this file, or the import or the receiver's type
+    ///   names it outright.
+    /// - `UniqueGlobal` — exactly one declaration of that name in the family.
+    /// - `AmbiguousGlobal` — several matches and no way to choose (G5).
+    /// - `Unresolved` — no edge is ever built from this variant. It scores at
+    ///   the floor so that an edge built from it by mistake sorts below every
+    ///   honest one rather than above them.
+    /// - `Structural` — not a resolved reference at all: a relation the graph
+    ///   asserts about its own shape, whose certainty comes from a declaration
+    ///   the file carries outright (a Go package clause).
+    pub fn confidence(self) -> Confidence {
+        match self {
+            ResolutionKind::SameFile
+            | ResolutionKind::ImportScoped
+            | ResolutionKind::ReceiverType
+            | ResolutionKind::Structural => Confidence::DETERMINISTIC,
+            ResolutionKind::UniqueGlobal => Confidence::HIGH,
+            ResolutionKind::AmbiguousGlobal | ResolutionKind::Unresolved => Confidence::SPECULATIVE,
+        }
+    }
+
+    /// The stored spelling. The one owner of it: `save_generation` writes this
+    /// and [`Self::from_label`] reads it back, so the two cannot disagree.
+    pub fn label(self) -> &'static str {
+        match self {
+            ResolutionKind::SameFile => "SameFile",
+            ResolutionKind::ImportScoped => "ImportScoped",
+            ResolutionKind::ReceiverType => "ReceiverType",
+            ResolutionKind::UniqueGlobal => "UniqueGlobal",
+            ResolutionKind::AmbiguousGlobal => "AmbiguousGlobal",
+            ResolutionKind::Unresolved => "Unresolved",
+            ResolutionKind::Structural => "Structural",
+        }
+    }
+
+    /// Decode a stored spelling. `None` for one this binary does not know —
+    /// which the caller must treat as an error, never as some neighbouring
+    /// tier: it means the store was written by a binary that knows a rung this
+    /// one does not, and rounding it would put a confidence claim on an edge
+    /// whose evidence this binary cannot read.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|kind| kind.label() == label)
+    }
+}
+
+/// Where an edge's evidence tier came from.
+///
+/// The distinction is the point of persisting the kind. An edge the resolver
+/// just built carries its own evidence; one re-read from a generation written
+/// after the column existed carries what the resolver recorded; one re-read
+/// from an older generation carries a guess made from the row's file layout.
+/// A guess that presents itself as a reading is the shape this codebase treats
+/// as the expensive failure, so the three are never spelled the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ResolutionSource {
+    /// The resolver built this edge in this process; the payload is in
+    /// [`ResolvedEdge::resolution`].
+    Resolver,
+    /// Read from `generation_edges.resolution`, as the resolver recorded it.
+    Stored,
+    /// Inferred from the row, because the generation predates the column.
+    Reconstructed,
+}
+
+impl ResolutionSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            ResolutionSource::Resolver => "resolver",
+            ResolutionSource::Stored => "stored",
+            ResolutionSource::Reconstructed => "reconstructed",
+        }
+    }
+}
+
+/// An edge's evidence tier, and whether it was resolved, read or guessed.
+///
+/// What travels with an edge across the store round trip. The full
+/// [`Resolution`] payload does not — an `ImportScoped` row does not carry
+/// `imported_from` — so this is the type a re-read edge answers "what was this
+/// resolved by" with, and [`ResolvedEdge::resolution`] stays `None` on that
+/// path rather than holding a payload invented to fill the variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Evidence {
+    pub kind: ResolutionKind,
+    pub source: ResolutionSource,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Resolution {
     SameFile {
@@ -176,45 +300,28 @@ pub enum Resolution {
 }
 
 impl Resolution {
-    /// The confidence this evidence entitles an edge to. **The only place the
-    /// mapping exists.**
+    /// The evidence tier, without the payload. See [`ResolutionKind`].
     ///
-    /// It used to live at each construction site, which is how three of them
-    /// drifted: `reference_edge` stamped every `References` edge
-    /// `DETERMINISTIC`, including the bare-name `UniqueGlobal` rung — the same
-    /// evidence the call ladder rates `HIGH`. A `min_confidence = 1.0` query
-    /// then kept the fabricated reference and dropped the honest call, so the
-    /// overclaim did not merely inflate a number, it inverted the ranking.
-    ///
-    /// The tiers are evidence, not taste:
-    ///
-    /// - `SameFile` — the declaration is in this very file, and this file
-    ///   declares the name exactly once. A fact.
-    /// - `ImportScoped` — an import statement in this file names the target.
-    ///   Also a fact, written by the author.
-    /// - `ReceiverType` — the receiver's type is known and that type declares
-    ///   exactly one method of this name.
-    /// - `UniqueGlobal` — nothing ties the target to this file; it is simply
-    ///   the only match in the language family. Strong, not certain: adding one
-    ///   file elsewhere in the repository can make it wrong.
-    /// - `AmbiguousGlobal` — several matches and no way to choose (G5).
-    /// - `Unresolved` — no edge is ever built from this variant. It scores at
-    ///   the floor so that an edge built from it by mistake sorts below every
-    ///   honest one rather than above them.
-    /// - `Structural` — not a resolved reference at all: a relation the graph
-    ///   asserts about its own shape, whose certainty comes from a declaration
-    ///   the file carries outright (a Go package clause).
-    pub fn confidence(&self) -> Confidence {
+    /// Exhaustive on purpose: a new variant must say here which rung it is
+    /// before anything can persist or score it.
+    pub fn kind(&self) -> ResolutionKind {
         match self {
-            Resolution::SameFile { .. }
-            | Resolution::ImportScoped { .. }
-            | Resolution::ReceiverType { .. }
-            | Resolution::Structural { .. } => Confidence::DETERMINISTIC,
-            Resolution::UniqueGlobal { .. } => Confidence::HIGH,
-            Resolution::AmbiguousGlobal { .. } | Resolution::Unresolved { .. } => {
-                Confidence::SPECULATIVE
-            }
+            Resolution::SameFile { .. } => ResolutionKind::SameFile,
+            Resolution::ImportScoped { .. } => ResolutionKind::ImportScoped,
+            Resolution::ReceiverType { .. } => ResolutionKind::ReceiverType,
+            Resolution::UniqueGlobal { .. } => ResolutionKind::UniqueGlobal,
+            Resolution::AmbiguousGlobal { .. } => ResolutionKind::AmbiguousGlobal,
+            Resolution::Unresolved { .. } => ResolutionKind::Unresolved,
+            Resolution::Structural { .. } => ResolutionKind::Structural,
         }
+    }
+
+    /// The confidence this evidence entitles an edge to — a function of the
+    /// kind alone, so the table lives on [`ResolutionKind::confidence`] where
+    /// the store's read-side check can apply it to a kind it decoded without
+    /// the payload.
+    pub fn confidence(&self) -> Confidence {
+        self.kind().confidence()
     }
 
     /// The single `(file, symbol)` this resolution names, or `None` for the two
@@ -287,6 +394,12 @@ pub struct ResolvedEdge {
     /// `Serialize` to `T`, so the sort comparator, the dedup predicate and any
     /// serialized form are byte-for-byte what they were before.
     pub resolution: Option<Arc<Resolution>>,
+    /// The evidence tier and where it came from — the part of `resolution`
+    /// that survives the store round trip. `Some(.., Resolver)` from
+    /// [`Self::resolved`]; `Some(.., Stored | Reconstructed)` on an edge
+    /// re-read from a generation; `None` only on an edge built by hand.
+    #[serde(default)]
+    pub evidence: Option<Evidence>,
     pub details: Option<String>,
 }
 
@@ -295,11 +408,14 @@ impl ResolvedEdge {
     /// uses**, so `confidence` cannot disagree with `resolution`.
     ///
     /// The fields stay public because `devmap-query`'s `stored_edge_to_resolved`
-    /// rebuilds an edge from a database row that carries no `resolution`
-    /// column, and that read path lives in another crate. Until it gets a type
-    /// of its own, the invariant is held by routing every *write* through here
-    /// and by `every_edge_confidence_matches_the_evidence_it_names`, which
-    /// re-checks it over the whole emitted graph rather than trusting it.
+    /// rebuilds an edge from a database row, and that read path lives in
+    /// another crate. The row carries the evidence *kind*
+    /// (`generation_edges.resolution`) and not the payload, so a re-read edge
+    /// fills `evidence` and leaves `resolution` `None`; the invariant is held
+    /// by routing every *write* through here, by the store's read-side check
+    /// that a stored confidence matches its stored kind, and by
+    /// `every_edge_confidence_matches_the_evidence_it_names`, which re-checks
+    /// it over the whole emitted graph rather than trusting it.
     pub fn resolved(
         source_file: String,
         target_file: String,
@@ -316,6 +432,10 @@ impl ResolvedEdge {
             target_symbol,
             edge_kind,
             confidence: resolution.confidence(),
+            evidence: Some(Evidence {
+                kind: resolution.kind(),
+                source: ResolutionSource::Resolver,
+            }),
             resolution: Some(resolution),
             details,
         }

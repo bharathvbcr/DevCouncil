@@ -637,6 +637,11 @@ pub struct StoredEdge {
     pub target_symbol: String,
     pub edge_kind: String,
     pub confidence: f32,
+    /// `generation_edges.resolution` as stored: the resolver's evidence kind
+    /// (`StoredResolutionKind::label`), or `None` on a row written before the
+    /// column existed. Decoded by `edge_resolution`, which labels the `None`
+    /// case as a reconstruction rather than a reading.
+    pub resolution: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3645,6 +3650,43 @@ impl Store {
         }))
     }
 
+    /// Stored edges of the latest generation whose confidence contradicts the
+    /// resolution kind recorded for them, counted in SQL.
+    ///
+    /// The same check `GenerationEdges` makes at index-build time, for a
+    /// process that holds no index — `devmap status` is a fresh process per
+    /// call and must not build a 271k-edge index to answer one number. The
+    /// `CASE` table is generated from `ResolutionKind::ALL` so this cannot hold
+    /// a second copy of the confidence ladder; a spelling the enum does not
+    /// know falls to `-1` and counts as a mismatch, which is the honest reading
+    /// of a kind this binary cannot vouch for. Rows without the column are not
+    /// judged: a reconstruction cannot convict the row. `None` when there is no
+    /// generation.
+    pub fn edge_confidence_mismatches(&self) -> Result<Option<usize>> {
+        use devmap_resolve::model::ResolutionKind;
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let ladder: String = ResolutionKind::ALL
+            .iter()
+            .map(|kind| {
+                format!(
+                    " WHEN '{}' THEN {}",
+                    kind.label(),
+                    kind.confidence().to_millis()
+                )
+            })
+            .collect();
+        let sql = format!(
+            "SELECT COUNT(*) FROM generation_edges
+             WHERE generation_id = ?1 AND resolution IS NOT NULL
+               AND CAST(ROUND(confidence * 1000) AS INTEGER) != CASE resolution{ladder} ELSE -1 END"
+        );
+        let count: i64 = snapshot.query_row(&sql, params![generation], |row| row.get(0))?;
+        Ok(Some(count.max(0) as usize))
+    }
+
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<(String, String, String)>> {
         if query.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -4121,7 +4163,7 @@ impl Store {
                 .join(",");
             let sql = format!(
                 "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
-                        e.edge_kind, e.confidence
+                        e.edge_kind, e.confidence, e.resolution
                  FROM generation_edges e
                  JOIN paths sp ON sp.id = e.source_file_id
                  JOIN paths tp ON tp.id = e.target_file_id
@@ -4147,6 +4189,7 @@ impl Store {
                     target_symbol: row.get(3)?,
                     edge_kind: row.get(4)?,
                     confidence: row.get(5)?,
+                    resolution: row.get(6)?,
                 })
             })?;
             for row in rows {
@@ -4178,7 +4221,7 @@ impl Store {
         };
         let mut stmt = snapshot.prepare(
             "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
-                    e.edge_kind, e.confidence
+                    e.edge_kind, e.confidence, e.resolution
              FROM generation_edges e
              JOIN paths sp ON sp.id = e.source_file_id
              JOIN paths tp ON tp.id = e.target_file_id
@@ -4196,6 +4239,7 @@ impl Store {
                 target_symbol: row.get(3)?,
                 edge_kind: row.get(4)?,
                 confidence: row.get(5)?,
+                resolution: row.get(6)?,
             })
         })?;
         rows.collect()
@@ -4365,9 +4409,9 @@ impl Store {
                 target_symbol: row.get(3)?,
                 edge_kind: row.get(4)?,
                 confidence: row.get(5)?,
+                resolution: row.get(6)?,
             };
-            let stored: Option<String> = row.get(6)?;
-            let resolution = crate::edge_index::edge_resolution(stored.as_deref(), &edge)
+            let resolution = crate::edge_index::edge_resolution(&edge)
                 .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?;
             Ok((edge, resolution))
         })?;

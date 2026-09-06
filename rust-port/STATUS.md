@@ -4657,3 +4657,65 @@ a cost in the column** and are reported only because they were measured.
 - The Python doctor (`src/devcouncil/devmap_health.py`) prints the three
   coverage numbers and not the paths. `coverage_gaps` is now in the kernel's
   `status` JSON for it to read; the Python change is out of this lane's scope.
+
+## The read path carries the evidence it stored (lead, 2026-09-06)
+
+Closes the item the refusal-inventory lane left undone: schema 15 persisted
+each edge's resolution *kind*, and `devmap_query::resolved_edge_from_stored` —
+the path `devmap manifest` builds `code_graph.json` from — still set
+`resolution: None` on every edge, so the artifact every agent reads asserted
+confidences whose justification nothing could read back. The lane's own red
+test, left unstaged, failed at `left: None / right: Some(Evidence { kind:
+Structural, source: Stored })` against this tree before the change.
+
+**One owner for the kind.** `ResolutionKind` now lives in `devmap-resolve`
+beside `Resolution`: the variant set (`Resolution::kind()` is an exhaustive
+match), the confidence ladder (`ResolutionKind::confidence`, which
+`Resolution::confidence` delegates to) and the stored spelling
+(`label`/`from_label`). `devmap-store`'s `StoredResolutionKind`,
+`ResolutionSource` and `EdgeResolution` are re-exports of the resolver's
+`ResolutionKind`, `ResolutionSource` and `Evidence`; the two hand-written
+tables it held are gone. `ResolutionSource` gained `Resolver` for an edge the
+resolver built in-process, so the three provenances are never spelled the same.
+Pinned by `devmap-resolve/tests/resolution_kind_is_one_owner.rs` (kinds ==
+variants, payload cannot change the tier, spellings round-trip and are exact).
+
+**What a row can answer.** `StoredEdge` carries `resolution: Option<String>`
+(the column as stored), every reader fills it, and
+`edge_resolution(&StoredEdge)` decodes it — `Stored` when present,
+`Reconstructed` from the file layout when the generation predates the column.
+`ResolvedEdge` gained `evidence: Option<Evidence>`: `Some(.., Resolver)` from
+`ResolvedEdge::resolved`, `Some(.., Stored | Reconstructed)` on a re-read edge.
+`resolution` itself stays `None` on the read path on purpose — an
+`ImportScoped` row does not carry `imported_from`, and a `Resolution` invented
+to fill the variant would be a guess wearing the resolver's type.
+
+**The artifact says so.** Every edge in `code_graph.json` (both wires) now
+carries `resolution` (the kind's spelling) and `resolution_source`
+(`resolver` / `stored` / `reconstructed`), mirrored in
+`indexing/graph/schema.py`'s `GraphEdge`. The dedup key stays the four-field
+identity; when two edges share it but not a tier the sort makes the survivor
+the smallest label, deterministic (R4) and stated at the site.
+
+**The read-side half of the honesty invariant.** On the way in,
+`ResolvedEdge::resolved` makes `confidence` a function of the resolution; on
+the way out nothing compared the two, so a row whose confidence had been
+changed under a stored kind read back as a measurement. `GenerationEdges`
+counts such rows when the index is built (`confidence_mismatches()`, in
+milliconfidence, stored kinds only — a reconstruction cannot convict the row)
+and `Store::edge_confidence_mismatches()` answers the same question in SQL for
+a process that holds no index, with the `CASE` ladder generated from
+`ResolutionKind::ALL` so it cannot hold a second copy of the table. Both
+`status` surfaces report it as `edge_confidence_mismatches` beside
+`edge_resolution_source` (the daemon's IPC status gained both). Red first:
+`coverage_gap_inventory.rs::a_stored_confidence_that_contradicts_its_stored_kind_is_counted_not_trusted`
+(index 1 / SQL 1 after one `UPDATE`, 0 / 0 after the column is cleared) and
+`status_names_what_it_could_not_read.rs::status_counts_stored_edges_whose_confidence_contradicts_their_evidence`
+(the real binary, both directions).
+
+**Numbers.** Workspace: fmt and clippy clean, **1,448 tests / 0 failed / 2
+ignored**, feature-off checks green, release `devmap 0.1.0 (store schema 15,
+code graph schema 2)`. Python: ruff and mypy clean, the 40 unit files that
+touch the graph schema 776 passed. Go, against this kernel's artifacts:
+all seven packages `ok` with `MANVI_MAP_BINARY` pointed at it, including `dc/devmap`'s live interop test that builds one `Map` from both wires. `devmap --json status` on a fresh 41,276-node / 271k-edge
+scholarlm store, 21 runs: p50 61 ms / min 54 ms wall, of which the SQL count is p50 33 ms (271,508 rows scanned, 0 mismatches). That cost is paid only by the fresh-process CLI path — the daemon answers from the index it already holds — and it scales with the edge count; a partial index on the mismatch predicate would make it O(mismatches) but would bake the ladder into DDL, a second copy of the table, and was not done.

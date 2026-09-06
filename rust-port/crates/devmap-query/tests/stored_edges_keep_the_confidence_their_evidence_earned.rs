@@ -151,6 +151,25 @@ fn a_stored_edge_reads_back_at_the_confidence_the_resolver_gave_it() {
             "a stored edge read back above the ceiling: {identity:?} at {}",
             edge.confidence.0
         );
+        // Schema 15: the generation stored the kind, so the read path must
+        // hand it back as a reading — and the confidence it read must be the
+        // one that kind entitles, which is the invariant this file exists for,
+        // now checked against stored evidence rather than a round trip.
+        let evidence = edge
+            .evidence
+            .unwrap_or_else(|| panic!("{identity:?} came back with no evidence at all"));
+        assert_eq!(
+            evidence.source,
+            devmap_resolve::model::ResolutionSource::Stored,
+            "{identity:?}: a generation written with the column must not be read as a guess"
+        );
+        assert_eq!(
+            edge.confidence,
+            evidence.kind.confidence(),
+            "{identity:?}: confidence {} does not match the stored {:?}",
+            edge.confidence.0,
+            evidence.kind
+        );
         checked += 1;
     }
     assert_eq!(

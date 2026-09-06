@@ -776,6 +776,7 @@ fn test_liveness_is_scoped_to_the_target_file() {
             confidence: Confidence::DETERMINISTIC,
             resolution: None,
             details: None,
+            evidence: None,
         }],
         receiver_types: std::collections::BTreeMap::new(),
         reexport_chains: std::collections::BTreeMap::new(),
@@ -836,6 +837,7 @@ fn test_community_reports_are_deterministic() {
                 confidence: Confidence::DETERMINISTIC,
                 resolution: None,
                 details: None,
+                evidence: None,
             },
             devmap_resolve::model::ResolvedEdge {
                 source_file: "alpha.py".to_string(),
@@ -846,6 +848,7 @@ fn test_community_reports_are_deterministic() {
                 confidence: Confidence::DETERMINISTIC,
                 resolution: None,
                 details: None,
+                evidence: None,
             },
         ],
         receiver_types: std::collections::BTreeMap::new(),

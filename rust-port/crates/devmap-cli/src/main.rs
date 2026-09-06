@@ -1122,6 +1122,14 @@ fn store_status_fields(
         "edge_resolution_source": store
             .latest_edge_resolution_source()?
             .map(|source| source.label()),
+        // The read-side half of the honesty invariant: stored edges whose
+        // confidence contradicts the resolution kind recorded for them. On the
+        // way in `ResolvedEdge::resolved` makes the two agree; this reads them
+        // back separately and counts the rows that no longer do. Counted in
+        // SQL because this is a fresh process per call and must not build the
+        // edge index for one number. `null` with no generation; 0 is a
+        // measurement, never a default.
+        "edge_confidence_mismatches": store.edge_confidence_mismatches()?,
     }) else {
         unreachable!("json! of an object literal is an object")
     };
@@ -3024,6 +3032,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     // inventory is the answer of a build that read everything.
                     "coverage_gaps": serde_json::Value::Null,
                     "edge_resolution_source": serde_json::Value::Null,
+                    "edge_confidence_mismatches": serde_json::Value::Null,
                     "schema_outdated": false,
                     "schema_version": serde_json::Value::Null,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
@@ -3057,6 +3066,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     // read the store, so it measured nothing.
                     "coverage_gaps": serde_json::Value::Null,
                     "edge_resolution_source": serde_json::Value::Null,
+                    "edge_confidence_mismatches": serde_json::Value::Null,
                     "schema_outdated": true,
                     "schema_version": version,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,

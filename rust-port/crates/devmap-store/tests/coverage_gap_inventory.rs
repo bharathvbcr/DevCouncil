@@ -363,3 +363,131 @@ fn a_stored_resolution_kind_beats_the_reconstruction_a_row_would_support() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The read-side half of the honesty invariant. `ResolvedEdge::resolved` makes
+/// `confidence` a function of the resolution on the way in; nothing re-checked
+/// the two on the way out, so a row whose confidence had been changed under a
+/// stored kind read back as a measurement. Now the index counts such rows when
+/// it is built, and the SQL count answers the same question for a process that
+/// holds no index. A reconstructed kind is not judged: a guess about the row
+/// cannot convict the row.
+#[test]
+fn a_stored_confidence_that_contradicts_its_stored_kind_is_counted_not_trusted() {
+    let dir = tmp_dir("confidence-mismatch");
+    let db = dir.join("devmap.sqlite");
+    let store = Store::open(&db).unwrap();
+    let extractions = vec![
+        python("a.py", "def helper():\n    return 1\n"),
+        python(
+            "b.py",
+            "from a import helper\n\n\ndef caller():\n    return helper()\n",
+        ),
+    ];
+    let resolution = ResolutionResult {
+        edges: vec![
+            ResolvedEdge::resolved(
+                "b.py".to_string(),
+                "a.py".to_string(),
+                "caller".to_string(),
+                "helper".to_string(),
+                EdgeKind::Calls,
+                Arc::new(Resolution::ImportScoped {
+                    target_symbol: "helper".to_string(),
+                    target_file: "a.py".to_string(),
+                    imported_from: "a".to_string(),
+                }),
+                None,
+            ),
+            ResolvedEdge::resolved(
+                "a.py".to_string(),
+                "a.py".to_string(),
+                "helper".to_string(),
+                "helper".to_string(),
+                EdgeKind::Contains,
+                Arc::new(Resolution::SameFile {
+                    target_symbol: "helper".to_string(),
+                    target_file: "a.py".to_string(),
+                }),
+                None,
+            ),
+        ],
+        receiver_types: Default::default(),
+        reexport_chains: Default::default(),
+        unresolved: Vec::new(),
+    };
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+    let index = store.generation_edges().unwrap().expect("a generation");
+    assert_eq!(index.len(), 2);
+    assert_eq!(
+        index.confidence_mismatches(),
+        0,
+        "a generation a correct writer produced has nothing to report"
+    );
+    assert_eq!(store.edge_confidence_mismatches().unwrap(), Some(0));
+    drop(index);
+    drop(store);
+
+    // One row's confidence is moved under it while its stored kind stays
+    // `ImportScoped`, which entitles 1.0.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE generation_edges SET confidence = 0.2 WHERE resolution = 'ImportScoped'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            changed, 1,
+            "the fixture must have exactly one ImportScoped edge"
+        );
+    }
+    let reread = Store::open(&db).unwrap();
+    let index = reread.generation_edges().unwrap().expect("a generation");
+    assert_eq!(
+        index.confidence_mismatches(),
+        1,
+        "the row now claims 0.2 under evidence that entitles 1.0, and the index must say so"
+    );
+    assert_eq!(
+        reread.edge_confidence_mismatches().unwrap(),
+        Some(1),
+        "the SQL count must agree with the index"
+    );
+    // The row itself is left as evidence: the count reports, it does not repair.
+    let tampered: Vec<&devmap_store::StoredEdge> = index
+        .edges()
+        .iter()
+        .filter(|edge| edge.source_symbol == "caller")
+        .collect();
+    assert_eq!(tampered.len(), 1);
+    assert!((tampered[0].confidence - 0.2).abs() < 1e-6);
+    assert_eq!(tampered[0].resolution.as_deref(), Some("ImportScoped"));
+    drop(index);
+    drop(reread);
+
+    // Clearing the column turns the kind into a reconstruction, and a
+    // reconstruction cannot convict the row: the count drops to zero and the
+    // generation's source says why.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE generation_edges SET resolution = NULL", [])
+            .unwrap();
+    }
+    let reread = Store::open(&db).unwrap();
+    let index = reread.generation_edges().unwrap().expect("a generation");
+    assert_eq!(
+        index.confidence_mismatches(),
+        0,
+        "a guess must not convict the row"
+    );
+    assert_eq!(reread.edge_confidence_mismatches().unwrap(), Some(0));
+    assert_eq!(
+        reread.latest_edge_resolution_source().unwrap(),
+        Some(ResolutionSource::Reconstructed)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
