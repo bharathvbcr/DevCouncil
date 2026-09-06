@@ -1252,7 +1252,18 @@ impl Daemon {
             .canonicalize()
             .unwrap_or_else(|_| self.root.clone());
         let watcher_state = Arc::clone(&state);
+        // This daemon's own socket and endpoint lock, which it creates and
+        // unlinks itself. See `endpoint_artifacts`.
+        let own_artifacts = endpoint_artifacts(&self.ipc_path);
         let _watcher = start_file_watcher(root, move |paths| {
+            let paths: Vec<String> = paths
+                .into_iter()
+                .filter(|path| {
+                    !own_artifacts
+                        .iter()
+                        .any(|artifact| artifact.as_os_str() == path.as_str())
+                })
+                .collect();
             if paths.is_empty() {
                 return;
             }
@@ -1701,6 +1712,49 @@ pub(crate) fn note_watch_batch<F>(
             unapplied.record(paths.len(), &err);
         }
     }
+}
+
+/// The daemon's own runtime artifacts, in the form the watcher emits.
+///
+/// `watcher_never_reports_its_own_database_files` establishes the rule for the
+/// store: a daemon must not report its own files as repository changes. The IPC
+/// endpoint is the same class of thing and was not covered, because in the
+/// default layout it lives under `std::env::temp_dir()` and never falls inside a
+/// watched tree — `--socket` is what puts it there, and `serve_stress`'s fixture
+/// is what does.
+///
+/// It surfaced only once the watcher started flushing its buffer on the way out:
+/// `UnixIpcServer::drop` unlinks the socket during shutdown, the watcher sees a
+/// removal, and `admitted_watch_path` admits *any* vanished path — correctly,
+/// since a deleted directory has to reach deletion reconciliation and a deleted
+/// path cannot be stat'd to find out what it was. So the daemon queued its own
+/// socket's disappearance as repository work, which is a row no drain can do
+/// anything with and one more reason for `status` to answer "not fresh".
+///
+/// Filtered here rather than in `admitted_watch_path`, which has no idea what
+/// this process's endpoint is, and must not learn: it is a pure function of the
+/// tree, and the endpoint is a property of this daemon.
+///
+/// The parent is canonicalized and the file name re-joined, rather than
+/// canonicalizing the whole path: at the moment this matters the socket has just
+/// been unlinked, so canonicalizing it fails. The watcher's own root is
+/// canonical, so the paths it emits are, and this is the form they take.
+fn endpoint_artifacts(ipc_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let normalise = |path: &std::path::Path| -> Option<std::path::PathBuf> {
+        let parent = path.parent()?;
+        let name = path.file_name()?;
+        let parent = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        Some(parent.join(name))
+    };
+    [
+        normalise(ipc_path),
+        normalise(&crate::protocol::ipc_lock_path(ipc_path)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Whether a daemon that dropped edits should try the sweep that repairs it.
@@ -3675,6 +3729,109 @@ mod tests {
                     .any(|symbol| symbol.name == "new_symbol")
         }));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A daemon must not queue its own endpoint as repository work.
+    ///
+    /// `watcher_never_reports_its_own_database_files` states the rule for the
+    /// store. The IPC endpoint was not covered, because in the default layout it
+    /// lives under `std::env::temp_dir()` and never falls inside a watched tree
+    /// — `--socket` is what puts it there.
+    ///
+    /// It was invisible until the watcher began flushing its buffer on the way
+    /// out: `UnixIpcServer::drop` unlinks the socket during shutdown, so the
+    /// removal event always landed inside the debounce window and was always
+    /// dropped with it. Flushed instead, it reached the queue —
+    /// `admitted_watch_path` admits *any* vanished path, correctly, since a
+    /// deleted directory has to reach deletion reconciliation and a path that is
+    /// gone cannot be stat'd to find out what it was. So the first run of the
+    /// full suite after the flush landed showed
+    /// `fifty_spawn_retire_cycles_and_a_kill_mid_drain_leave_the_store_usable`
+    /// failing with `left: 2, right: 1`, the second row being `d.sock`.
+    ///
+    /// A row naming a socket is one no drain can act on and one more reason for
+    /// `status` to answer "not fresh", so it is filtered at the one place that
+    /// knows which endpoint is this process's own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_daemon_does_not_queue_its_own_endpoint_as_repository_work() {
+        let dir = short_unix_fixture_dir("own-endpoint");
+        let root = dir.join("tree");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+
+        // The endpoint inside the watched tree, which is the layout that makes
+        // this reachable at all.
+        let socket = root.join("d.sock");
+        let db = dir.join("index.sqlite");
+
+        for cycle in 0..3 {
+            let store = Store::open(&db).expect("store");
+            let daemon = Daemon::new(store, root.clone())
+                .with_ipc_path(socket.clone())
+                .with_store_path(db.clone())
+                .with_idle_poll(Duration::from_millis(10))
+                .with_max_idle(Some(Duration::from_millis(20)));
+            tokio::time::timeout(Duration::from_secs(60), daemon.run_loop())
+                .await
+                .unwrap_or_else(|_| panic!("cycle {cycle} never retired"))
+                .unwrap_or_else(|err| panic!("cycle {cycle}: {err}"));
+
+            let store = Store::open(&db).expect("store");
+            let pending = store.get_pending_paths().unwrap();
+            assert!(
+                !pending.iter().any(|path| path.contains("d.sock")),
+                "cycle {cycle} queued this daemon's own endpoint as repository \
+                 work: {pending:?}"
+            );
+        }
+
+        // The positive control: the filter is by identity, not by suffix. A
+        // *source* file the daemon did not create is still queued.
+        fs::write(root.join("late.py"), "def late():\n    return 1\n").unwrap();
+        let store = Store::open(&db).expect("store");
+        store
+            .enqueue_pending_paths(&["late.py".to_string()])
+            .expect("enqueue");
+        assert_eq!(
+            store.get_pending_paths().unwrap(),
+            vec!["late.py".to_string()],
+            "the endpoint filter must remove the endpoint and nothing else"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The filter names both artifacts, and names them in the form the watcher
+    /// emits.
+    ///
+    /// The lock is easy to forget: it is created beside the socket and unlinked
+    /// with it, so it is the same event class. And the parent is canonicalized
+    /// rather than the whole path, because at the moment this matters the socket
+    /// has just been unlinked and canonicalizing it fails — a `Vec` that came
+    /// back empty there would filter nothing while looking like it worked.
+    #[test]
+    fn the_endpoint_filter_covers_the_socket_and_its_lock_after_they_are_gone() {
+        let dir = short_unix_fixture_dir("endpoint-artifacts");
+        let socket = dir.join("d.sock");
+        let lock = crate::protocol::ipc_lock_path(&socket);
+
+        // Deliberately with neither on disk: that is the state at shutdown.
+        assert!(!socket.exists() && !lock.exists());
+        let artifacts = endpoint_artifacts(&socket);
+        let canonical_dir = dir.canonicalize().unwrap();
+        assert!(
+            artifacts.contains(&canonical_dir.join("d.sock")),
+            "the socket must be filtered even though it no longer exists: {artifacts:?}"
+        );
+        assert!(
+            artifacts.iter().any(|path| path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains("lock"))),
+            "and so must its endpoint lock, which is unlinked in the same breath: \
+             {artifacts:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The repair fires only when there is something to repair, and not oftener.
