@@ -786,7 +786,7 @@ pub const UNRESOLVED_NAMESAKE_REASON: &str =
 /// the call graph at all, so an unbound one leaves a live handler looking dead.
 /// `Import` is excluded because its `callee_name` is a *module specifier*, not
 /// a symbol name, and matching specifiers against symbols is noise.
-fn unresolved_namesakes(resolution: &ResolutionResult) -> HashSet<&str> {
+pub(crate) fn unresolved_namesake_names(resolution: &ResolutionResult) -> HashSet<&str> {
     resolution
         .unresolved
         .iter()
@@ -970,7 +970,7 @@ pub fn analyze_liveness_with_coverage(
     coverage.discovery_refused_files = discovery.charged();
     // Computed once for the whole corpus: the join is name-only, so it has no
     // per-file component to recompute.
-    let unresolved_names = unresolved_namesakes(resolution);
+    let unresolved_names = unresolved_namesake_names(resolution);
     let supertypes = supertypes_by_type(resolution);
     let go_interface_specs = go_interface_specs_by_package(extractions);
     let c_header_exports = c_header_exported_names(extractions);

@@ -14,7 +14,7 @@ pub use clones::{
 pub use clustering::{detect_communities, CommunityDetection};
 pub use dead_clusters::{
     dead_clusters, DeadClusterReport, DeadClusterScan, DEAD_CLUSTER_CAP, DEAD_CLUSTER_CONFIDENCE,
-    DEAD_CLUSTER_MEMBER_CAP,
+    DEAD_CLUSTER_MEMBER_CAP, DEAD_CLUSTER_QUALIFIED_CONFIDENCE,
 };
 pub use liveness::{
     analyze_liveness, analyze_liveness_with_coverage, extraction_coverage, extraction_gaps,
