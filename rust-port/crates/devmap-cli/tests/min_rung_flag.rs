@@ -185,7 +185,14 @@ fn the_human_output_names_the_cost_only_when_there_is_one() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// `deps` and `impact` take the flag too, and refuse the same typos.
+/// `deps`, `impact`, `trace` — and `neighbors`, which is the first two composed.
+///
+/// `neighbors` pinned the floor to `None` inside its fan-out while both halves
+/// took one, so `dev map query` — whose edge lists come from this command —
+/// could not ask for deterministic-only edges even though the two queries
+/// behind it could. Included in the same sweep as its parts, because a
+/// composition that accepts fewer filters than what it composes is the defect,
+/// not a separate feature.
 #[test]
 fn the_flag_reaches_every_query_the_plan_named() {
     let root = corpus("every-query");
@@ -193,6 +200,7 @@ fn the_flag_reaches_every_query_the_plan_named() {
         vec!["deps", "app.py"],
         vec!["impact", "lib_a.py::shared"],
         vec!["trace", "app.py::main"],
+        vec!["neighbors", "app.py::main"],
     ] {
         let mut good = args.clone();
         good.extend(["--min-rung", "high"]);
@@ -208,5 +216,61 @@ fn the_flag_reaches_every_query_the_plan_named() {
         let out = run(&root, &bad);
         assert!(!out.status.success(), "{args:?} accepted an invalid rung");
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// And the composed command really narrows, at the binary a caller runs.
+///
+/// The engine-level parity lives in `devmap-query/tests/neighbors_composition.rs`.
+/// This is the other half of "usable from the outside": a floor the engine
+/// honours and the CLI drops is a flag that does nothing, and the answer looks
+/// exactly like a correctly narrowed one.
+#[test]
+fn the_composed_query_narrows_at_the_binary() {
+    let root = corpus("composed-narrows");
+    let count = |value: &serde_json::Value| -> usize {
+        value["neighbors"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| {
+                        entry["callers"]["items"].as_array().map_or(0, Vec::len)
+                            + entry["callees"]["items"].as_array().map_or(0, Vec::len)
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    };
+
+    let open = json(
+        &run(&root, &["--json", "neighbors", "app.py", "app.py::helper"]),
+        "unfiltered neighbors",
+    );
+    let floored = json(
+        &run(
+            &root,
+            &[
+                "--json",
+                "neighbors",
+                "app.py",
+                "app.py::helper",
+                "--min-rung",
+                "deterministic",
+            ],
+        ),
+        "floored neighbors",
+    );
+
+    let (before, after) = (count(&open), count(&floored));
+    assert!(
+        before > 0,
+        "the corpus must produce edges, or this compares two empty answers"
+    );
+    assert!(
+        after < before,
+        "`--min-rung deterministic` must cut the composed answer as it cuts \
+         `deps` and `impact`: {before} edges unfiltered, {after} floored"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

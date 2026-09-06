@@ -44,7 +44,7 @@ class _RecordingClient(DevMapClient):
     def _request(self, payload: dict[str, Any], args: list[str]) -> dict[str, Any]:
         self.payloads.append(payload)
         self.argvs.append(args)
-        return {
+        empty = {
             "shown": 0,
             "hidden": 0,
             "total": 0,
@@ -52,6 +52,16 @@ class _RecordingClient(DevMapClient):
             "tokens_used": 0,
             "items": [],
         }
+        if payload.get("cmd") == "neighbors":
+            # The composed shape, so `neighbors` validates its answer the way
+            # it would against the kernel rather than tripping on the fake.
+            return {
+                "neighbors": [
+                    {"target": target, "callers": dict(empty), "callees": dict(empty)}
+                    for target in payload["targets"]
+                ]
+            }
+        return empty
 
 
 @pytest.mark.parametrize("rung", MIN_RUNG_NAMES)
@@ -427,4 +437,105 @@ def test_the_artifact_and_the_model_declare_the_same_top_level_keys() -> None:
         "the artifact writer and CodeGraph disagree; keys only the kernel "
         f"writes: {sorted(declared - set(CodeGraph.model_fields))}, fields only "
         f"the model declares: {sorted(set(CodeGraph.model_fields) - declared)}"
+    )
+
+
+@pytest.mark.parametrize("rung", MIN_RUNG_NAMES)
+def test_the_composed_neighbors_query_carries_the_floor_too(rung: str) -> None:
+    """A composition must accept every filter its parts accept.
+
+    ``neighbors`` *is* ``impact`` and ``deps`` answered in one exchange, and it
+    pinned ``min_rung`` to nothing while both halves took a floor — so
+    ``dev map query``, whose edge lists come from this command, could not be
+    asked for deterministic-only edges even though the two queries behind it
+    could.
+
+    Third parameter this fan-out has pinned, and the other two were both
+    defects: ``min_confidence`` hardcoded on the inbound side, and ``max_depth``
+    pinned to 1 where the composition test compared at depth 1 and could not
+    see it. A dropped filter answers the *broader* question, which is the one
+    reading a caller never guards against.
+    """
+    client = _RecordingClient()
+    client.neighbors(["a.py::f", "b.py::g"], min_rung=rung)
+    payload = client.payloads[-1]
+    argv = client.argvs[-1]
+    assert payload["min_rung"] == rung, f"the IPC payload must carry it: {payload}"
+    assert argv[argv.index("--min-rung") + 1] == rung, (
+        f"and so must the CLI fallback, or the answer's breadth depends on "
+        f"whether a daemon is running: {argv}"
+    )
+    # The flag takes a value, so it must not sit between the command and its
+    # positional targets in a way that swallows one.
+    assert argv.index("--min-rung") < argv.index("a.py::f")
+    assert "b.py::g" in argv
+
+
+def test_omitting_the_floor_leaves_the_composed_query_untouched() -> None:
+    """The OFF direction, at the shape every existing caller sends."""
+    client = _RecordingClient()
+    client.neighbors(["a.py::f"])
+    assert "min_rung" not in client.payloads[-1]
+    assert "--min-rung" not in client.argvs[-1]
+
+
+@pytest.mark.parametrize("bad", ["exact", "DETERMINISTIC", "", "1.0"])
+def test_the_composed_query_refuses_an_unknown_floor(bad: str) -> None:
+    client = _RecordingClient()
+    with pytest.raises(DevMapClientError, match="min_rung"):
+        client.neighbors(["a.py::f"], min_rung=bad)
+    assert not client.payloads, (
+        "a refused floor must not reach the kernel; the request would come "
+        "back at full breadth and read as the narrow answer that was asked for"
+    )
+
+
+def test_the_kernel_accepts_the_floor_on_every_command_the_client_sends_it_on() -> None:
+    """The two processes must agree about which commands take a floor.
+
+    Read out of the kernel's own dispatcher rather than restated: ``deps``,
+    ``impact``, ``trace`` and ``neighbors`` are listed in one ``match`` arm in
+    ``protocol.rs`` — the arm whose comment says a command that gains the
+    parameter and forgets the validation should be one edit, not two. A client
+    sending ``min_rung`` on a command that arm does not name would have it
+    accepted unvalidated or ignored outright.
+    """
+    import re
+    from pathlib import Path
+
+    protocol = (
+        Path(__file__).resolve().parents[2]
+        / "rust-port"
+        / "crates"
+        / "devmap-serve"
+        / "src"
+        / "protocol.rs"
+    )
+    if not protocol.exists():  # pragma: no cover - source tree only
+        pytest.skip("kernel source is not present in this checkout")
+    text = protocol.read_text(encoding="utf-8")
+    marker = "fn request_min_rung("
+    assert marker in text, "the kernel's rung-bearing command list has moved"
+    end = text.index(chr(10) + "}", text.index(marker))
+    body = text[text.index(marker) : end]
+    accepted = {
+        name.lower() for name in re.findall(r"IpcCommand::(\w+) \{ min_rung", body)
+    }
+    assert accepted, f"no commands parsed out of the kernel arm: {body!r}"
+
+    sent = set()
+    for name in ("deps", "impact", "trace", "neighbors"):
+        client = _RecordingClient()
+        if name == "neighbors":
+            client.neighbors(["a.py::f"], min_rung="deterministic")
+        elif name == "trace":
+            client.trace("a.py::f", to_symbol="b.py::g", min_rung="deterministic")
+        else:
+            getattr(client, name)("a.py::f", min_rung="deterministic")
+        if "min_rung" in client.payloads[-1]:
+            sent.add(name)
+    assert sent == accepted, (
+        f"the client sends a floor on {sorted(sent)} and the kernel validates "
+        f"it on {sorted(accepted)}; a command on one list and not the other "
+        "either ignores the floor or accepts an unchecked one"
     )

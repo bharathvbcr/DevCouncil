@@ -600,6 +600,14 @@ enum Commands {
         depth: usize,
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
+        /// Keep only edges at or above a named rung on the resolution ladder:
+        /// `deterministic`, `high` or `speculative`. Omitted filters nothing.
+        ///
+        /// Accepted here because this command *is* `impact` and `deps` composed,
+        /// and both take the floor. A composition that drops a filter its parts
+        /// accept answers the narrower question its caller did not ask.
+        #[arg(long)]
+        min_rung: Option<String>,
     },
     Trace {
         from: String,
@@ -2626,7 +2634,9 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
             budget,
             depth,
             min_confidence,
+            min_rung,
         } => {
+            check_rung(min_rung)?;
             // Refused, not trimmed, exactly as `validate_request` does over the
             // socket: answering the first sixteen of twenty hands back a short
             // list that reads like a complete one.
@@ -3354,10 +3364,20 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             budget,
             depth,
             min_confidence,
+            min_rung,
         } => {
             let store = open_for_read(&cli.db())?;
             let engine = StoreQueryEngine::new(&store);
-            let answers = engine.neighbors(targets, *budget, *min_confidence, *depth)?;
+            // `check_rung` above has already refused an unparseable name, so a
+            // `None` here means no floor was asked for and never that one was
+            // asked for and dropped.
+            let answers = engine.neighbors_at_rung(
+                targets,
+                *budget,
+                *min_confidence,
+                *depth,
+                min_rung.as_deref().and_then(devmap_query::Rung::parse),
+            )?;
             if cli.json {
                 emit_json(cli, &serde_json::json!({ "neighbors": answers }))?;
             } else {

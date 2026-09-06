@@ -1089,7 +1089,11 @@ class DevMapClient:
         return self._budgeted(resp, budget)
 
     def neighbors(
-        self, targets: List[str], depth: int = 1, min_confidence: float = 0.0
+        self,
+        targets: List[str],
+        depth: int = 1,
+        min_confidence: float = 0.0,
+        min_rung: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Callers and callees for several targets in one exchange.
 
@@ -1107,31 +1111,41 @@ class DevMapClient:
         Each direction is validated by :meth:`_budgeted` exactly as it would be
         on its own, so a composed answer cannot smuggle past the count and
         truncation invariants the separate calls enforce.
+
+        ``min_rung`` is accepted for the same reason: this is the two queries
+        composed, both of them take a floor, and a composition that drops a
+        filter its parts accept answers a broader question than the caller
+        asked while looking like it answered theirs.
         """
         if not isinstance(targets, list):
             raise DevMapClientError("devmap neighbors targets must be a list")
         for target in targets:
             self._validate_query(target, "target")
+        rung = _validated_min_rung(min_rung)
         budget = 2000
-        resp = self._request(
-            {
-                "cmd": "neighbors",
-                "targets": list(targets),
-                "budget": budget,
-                "depth": depth,
-                "min_confidence": min_confidence,
-            },
-            [
-                "neighbors",
-                "--budget",
-                str(budget),
-                "--depth",
-                str(depth),
-                "--min-confidence",
-                str(min_confidence),
-                *_positional(*targets),
-            ],
-        )
+        payload: Dict[str, Any] = {
+            "cmd": "neighbors",
+            "targets": list(targets),
+            "budget": budget,
+            "depth": depth,
+            "min_confidence": min_confidence,
+        }
+        args = [
+            "neighbors",
+            "--budget",
+            str(budget),
+            "--depth",
+            str(depth),
+            "--min-confidence",
+            str(min_confidence),
+        ]
+        if rung is not None:
+            payload["min_rung"] = rung
+            args += ["--min-rung", rung]
+        # Positional last: `--min-rung` takes a value, and clap would read the
+        # first target as it if the flag trailed the list.
+        args += _positional(*targets)
+        resp = self._request(payload, args)
         entries = resp.get("neighbors")
         if not isinstance(entries, list):
             raise DevMapClientError("devmap neighbors response must carry a list")

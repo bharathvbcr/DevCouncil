@@ -114,7 +114,14 @@ def _index_freshness_fields(root: Path) -> dict[str, object]:
 _CALL_EDGE_KINDS = frozenset({"Calls"})
 
 
-def _call_edges(client, method: str, target: str, symbol_key: str, file_key: str):
+def _call_edges(
+    client,
+    method: str,
+    target: str,
+    symbol_key: str,
+    file_key: str,
+    min_rung: Optional[str] = None,
+):
     """Return ``(edges, unavailable_reason)`` for one direction of the call graph.
 
     Fail-closed, deliberately. The previous form was::
@@ -142,7 +149,16 @@ def _call_edges(client, method: str, target: str, symbol_key: str, file_key: str
     )
 
     try:
-        resp = getattr(client, method)(target, depth=1)
+        # The floor is passed, not defaulted away: `deps`, `impact` and `trace`
+        # all take one, and this dispatcher is the only thing between them and
+        # the caller. A client that cannot apply it is refused rather than
+        # asked without it — the refusal arrives below as `(None, reason)`,
+        # which is this function's whole contract: not measured, and why.
+        call = getattr(client, method)
+        kwargs = {"depth": 1}
+        if _sends_min_rung(call, method, min_rung):
+            kwargs["min_rung"] = min_rung
+        resp = call(target, **kwargs)
     except DevMapClientError as exc:
         return None, f"{method} failed: {exc}"
 
@@ -170,7 +186,46 @@ def _edge_nodes(items, symbol_key: str, file_key: str) -> list:
     return edges
 
 
-def _neighbor_edges(client, targets: list) -> dict:
+def _sends_min_rung(call, what: str, min_rung: Optional[str]) -> bool:
+    """Whether to pass the floor to ``call`` — refusing if it cannot take one.
+
+    Three-way on purpose. No floor asked for: send nothing, and the call is
+    byte-identical to what every existing caller already makes. A floor the
+    method accepts: send it. A floor it cannot accept: refuse, because the one
+    outcome that must never happen is the request going out *without* the floor
+    — that answers the broader question and hands back a wide list the caller
+    reads as the narrow one they asked for.
+
+    Probed rather than caught. An `except TypeError` around the call would also
+    swallow one raised inside the response handling, which is a genuine shape
+    error; that is the rule :func:`_neighbor_edges` already states for
+    `AttributeError`, for the same reason.
+
+    Older client shapes are a supported case here, not a hypothetical:
+    `test_neighbors_batching.py` models a partially upgraded install, and the
+    per-target path this routes back to has taken a floor since it landed.
+    """
+    if min_rung is None:
+        return False
+    import inspect
+
+    from devcouncil.devmap_client import DevMapClientError
+
+    if "min_rung" not in inspect.signature(call).parameters:
+        raise DevMapClientError(
+            f"this devmap client cannot apply a rung floor to {what}"
+        )
+    return True
+
+
+def _batched_neighbors(batched, targets: list, min_rung: Optional[str]):
+    """Call the batched command, passing the floor only when one was asked for."""
+    if _sends_min_rung(batched, "the batched neighbors query", min_rung):
+        return batched(targets, min_rung=min_rung)
+    return batched(targets)
+
+
+def _neighbor_edges(client, targets: list, min_rung: Optional[str] = None) -> dict:
     """Both directions for every target, in one kernel exchange where possible.
 
     Returns ``{target: (callers, callers_unavailable, callees,
@@ -198,7 +253,12 @@ def _neighbor_edges(client, targets: list) -> dict:
     batched = getattr(client, "neighbors", None)
     if targets and callable(batched):
         try:
-            for entry in batched(targets):
+            # A floor honoured on one transport and dropped on the other is an
+            # answer whose breadth depends on which code path happened to run —
+            # so the batched call takes it too, and a client that cannot apply
+            # it falls through to the per-target path below rather than
+            # answering at full breadth.
+            for entry in _batched_neighbors(batched, targets, min_rung):
                 target = entry["target"]
                 # Four slots, alternating: the edges for a direction (or None
                 # when it could not be measured) then the reason (or None).
@@ -242,10 +302,10 @@ def _neighbor_edges(client, targets: list) -> dict:
 
     for target in targets:
         callers, callers_unavailable = _call_edges(
-            client, "impact", target, "source_symbol", "source_file"
+            client, "impact", target, "source_symbol", "source_file", min_rung
         )
         callees, callees_unavailable = _call_edges(
-            client, "deps", target, "target_symbol", "target_file"
+            client, "deps", target, "target_symbol", "target_file", min_rung
         )
         # `trace` is likewise probed rather than assumed: a client old enough
         # to lack `neighbors` may lack this too, and a missing method must
@@ -260,7 +320,7 @@ def _neighbor_edges(client, targets: list) -> dict:
             # paths that silently answer differently is worse than one that is
             # merely slower.
             traced, _traced_unavailable = _call_edges(
-                client, "trace", target, "target_symbol", "target_file"
+                client, "trace", target, "target_symbol", "target_file", min_rung
             )
             if traced is not None:
                 callees, callees_unavailable = traced, None
@@ -305,6 +365,40 @@ def _render_edge_field(definition: dict, field: str) -> str:
         reason = definition.get(f"{field}_unavailable") or "not measured"
         return f"[yellow](unknown — {reason})[/yellow]"
     return ", ".join(value) or "(none)"
+
+
+#: `--min-rung`, worded once for every command that offers it.
+#:
+#: A name rather than a `--min-confidence` float because the ladder has named
+#: rungs and a caller wanting deterministic-only edges should not have to know
+#: that means 1.0. Validated by `DevMapClient`, which refuses an unknown name
+#: rather than sending the request without it — a dropped floor produces a
+#: *broad* answer the caller reads as narrow.
+_MIN_RUNG_HELP = (
+    "Keep only edges at this resolution rung or stronger: deterministic, high, "
+    "or speculative. Omitted filters nothing."
+)
+
+
+def _checked_min_rung(min_rung: Optional[str]) -> Optional[str]:
+    """Refuse an unknown rung name here, before the request is attempted.
+
+    `DevMapClient` validates too, but it raises `DevMapClientError` — and
+    `_devmap_query_payload` catches that and returns `None`, which every caller
+    reads as "no kernel available". A typo would therefore be reported as a
+    missing index and the caller would go build one, twice, and still not get
+    their filter. The names are read from the client so this cannot drift from
+    what the kernel accepts.
+    """
+    from devcouncil.devmap_client import MIN_RUNG_NAMES
+
+    if min_rung is None or min_rung in MIN_RUNG_NAMES:
+        return min_rung
+    status.print(
+        f"[red]--min-rung must be one of {', '.join(MIN_RUNG_NAMES)}; "
+        f"got {min_rung!r}[/red]"
+    )
+    raise typer.Exit(code=2)
 
 
 def _devmap_query_payload(root: Path, kind: str, **kwargs):
@@ -378,7 +472,9 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
         if kind == "trace":
             start = str(kwargs["start"])
             end = str(kwargs["end"])
-            resp = client.trace(start, depth=3, to_symbol=end)
+            resp = client.trace(
+                start, depth=3, to_symbol=end, min_rung=kwargs.get("min_rung")
+            )
             reason = resolution_unavailable_reason(resp.resolution)
             if reason:
                 return {
@@ -453,7 +549,7 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
                 target = _target_of(item)
                 if target not in batch:
                     batch.append(target)
-            edges_by_target = _neighbor_edges(client, batch)
+            edges_by_target = _neighbor_edges(client, batch, kwargs.get("min_rung"))
 
             for position, item in enumerate(ranked):
                 path_s = str(item.get("file_path") or "")
@@ -1138,10 +1234,26 @@ def graph_query(
     name_or_path: str = typer.Argument(..., help="Symbol name or file path."),
     project_root: Path = typer.Option(Path("."), "--project-root"),
     json_output: bool = typer.Option(False, "--json"),
+    min_rung: Optional[str] = typer.Option(None, "--min-rung", help=_MIN_RUNG_HELP),
 ) -> None:
-    """360° view: definition, callers, callees, importers."""
+    """360° view: definition, callers, callees, importers.
+
+    --min-rung narrows every edge list here to the resolution rungs it names.
+    The fallback graph has no ladder to filter on, so a floor is refused there
+    rather than silently ignored: an unfiltered answer to a request for
+    deterministic-only edges is the reading that gets acted on.
+    """
     root = _root(project_root)
-    result = _devmap_query_payload(root, "query", name_or_path=name_or_path)
+    min_rung = _checked_min_rung(min_rung)
+    result = _devmap_query_payload(
+        root, "query", name_or_path=name_or_path, min_rung=min_rung
+    )
+    if result is None and min_rung is not None:
+        status.print(
+            "[red]--min-rung needs the devmap index; the fallback graph carries "
+            "no resolution ladder to filter on (run `dev map` to build one)[/red]"
+        )
+        raise typer.Exit(code=3)
     if result is None:
         from devcouncil.indexing.graph import query_symbol
 
@@ -1172,10 +1284,25 @@ def graph_trace(
     end: str = typer.Argument(..., help="End node (name or path)."),
     project_root: Path = typer.Option(Path("."), "--project-root"),
     json_output: bool = typer.Option(False, "--json"),
+    min_rung: Optional[str] = typer.Option(None, "--min-rung", help=_MIN_RUNG_HELP),
 ) -> None:
-    """Shortest path between two graph nodes."""
+    """Shortest path between two graph nodes.
+
+    --min-rung restricts the walk to the named rungs, so a path can be asked
+    for on evidence the resolver proved rather than on evidence it guessed.
+    Refused against the fallback graph, which has no ladder.
+    """
     root = _root(project_root)
-    result = _devmap_query_payload(root, "trace", start=start, end=end)
+    min_rung = _checked_min_rung(min_rung)
+    result = _devmap_query_payload(
+        root, "trace", start=start, end=end, min_rung=min_rung
+    )
+    if result is None and min_rung is not None:
+        status.print(
+            "[red]--min-rung needs the devmap index; the fallback graph carries "
+            "no resolution ladder to filter on (run `dev map` to build one)[/red]"
+        )
+        raise typer.Exit(code=3)
     if result is None:
         from devcouncil.indexing.graph import trace_path
 

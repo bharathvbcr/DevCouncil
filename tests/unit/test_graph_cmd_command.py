@@ -3,6 +3,8 @@ missing-graph guard on graph-backed subcommands)."""
 
 import json
 
+import pytest
+
 import devcouncil.indexing.graph as graph_pkg
 import devcouncil.indexing.graph.build as graph_build
 import devcouncil.indexing.viz as viz
@@ -576,7 +578,14 @@ class _FakeResp:
 
 
 class _FakeClient:
-    """Records the targets it is asked about so scoping can be asserted."""
+    """Records the targets and floors it is asked about, so both can be asserted.
+
+    The signatures mirror `DevMapClient`'s, checked below by
+    `test_the_edge_fake_matches_the_client_it_stands_in_for`: a fake that
+    accepts fewer arguments than the real client turns a production call into a
+    `TypeError` here and nowhere else, which is how it went stale when
+    `min_rung` landed.
+    """
 
     def __init__(self, *, deps_items=None, impact_items=None, deps_exc=None,
                  impact_resolution="Available"):
@@ -586,6 +595,7 @@ class _FakeClient:
         self.impact_resolution = impact_resolution
         self.deps_targets = []
         self.impact_targets = []
+        self.rungs = []
 
     def search(self, query, limit=2000):
         return _FakeResp([{
@@ -595,23 +605,95 @@ class _FakeClient:
             "span": (12, 20),
         }])
 
-    def impact(self, target, depth=1):
+    def impact(self, target, depth=1, min_rung=None):
         self.impact_targets.append(target)
+        self.rungs.append(("impact", min_rung))
         return _FakeResp(self.impact_items, resolution=self.impact_resolution)
 
-    def deps(self, target, depth=1):
+    def deps(self, target, depth=1, min_rung=None):
         self.deps_targets.append(target)
+        self.rungs.append(("deps", min_rung))
         if self.deps_exc is not None:
             raise self.deps_exc
         return _FakeResp(self.deps_items)
 
 
-def _query(monkeypatch, tmp_path, client):
+def _query(monkeypatch, tmp_path, client, min_rung=None):
     from devcouncil.cli.commands import graph_cmd
     import devcouncil.devmap_client as devmap_client
 
     monkeypatch.setattr(devmap_client, "try_connect", lambda root: client)
-    return graph_cmd._devmap_query_payload(tmp_path, "query", name_or_path="widget")
+    return graph_cmd._devmap_query_payload(
+        tmp_path, "query", name_or_path="widget", min_rung=min_rung
+    )
+
+
+def test_the_edge_fake_matches_the_client_it_stands_in_for():
+    """The fake's edge methods must accept what the real client accepts.
+
+    `_call_edges` passes `min_rung` to whichever method it was named, so a fake
+    one argument short raises `TypeError` from production code — an error that
+    says nothing about the behaviour under test and everything about the
+    double. Derived from the real signatures rather than restated, so the next
+    parameter to land is caught here instead of in five unrelated tests.
+    """
+    import inspect
+
+    from devcouncil.devmap_client import DevMapClient
+
+    for name in ("impact", "deps"):
+        real = set(inspect.signature(getattr(DevMapClient, name)).parameters)
+        fake = set(inspect.signature(getattr(_FakeClient, name)).parameters)
+        assert real <= fake, (
+            f"_FakeClient.{name} is missing {sorted(real - fake)}, which "
+            "`_call_edges` will pass and production code will raise on"
+        )
+
+
+def test_the_query_payload_carries_the_floor_to_both_directions(monkeypatch, tmp_path):
+    """`dev map query`'s edge lists must be filterable, on both sides.
+
+    A floor applied to callers and not callees — or to neither — produces one
+    answer whose halves were measured against different evidence. The kernel
+    already guards that for `min_confidence`; this is the same rule for the
+    rung, at the surface a human types.
+    """
+    client = _FakeClient(
+        deps_items=[{"edge_kind": "Calls", "target_symbol": "pkg/mod.py::helper"}],
+        impact_items=[{"edge_kind": "Calls", "source_symbol": "pkg/other.py::caller"}],
+    )
+    _query(monkeypatch, tmp_path, client, min_rung="deterministic")
+    assert set(client.rungs) == {("impact", "deterministic"), ("deps", "deterministic")}, (
+        f"both directions must carry the floor: {client.rungs}"
+    )
+
+    # OFF: no floor asked for, none sent — the shape every existing call makes.
+    plain = _FakeClient()
+    _query(monkeypatch, tmp_path, plain)
+    assert {rung for _, rung in plain.rungs} == {None}, plain.rungs
+
+
+def test_an_unknown_floor_is_refused_not_reported_as_a_missing_index(monkeypatch, tmp_path):
+    """A typo must not be diagnosed as "no devmap index".
+
+    `_devmap_query_payload` catches `DevMapClientError` and returns `None`, and
+    every caller reads `None` as "the kernel could not answer". A rung name the
+    client rejects would therefore surface as a missing index, and the reader
+    would go and build one — twice — and still not get their filter. So the
+    name is checked at the command, before the request is attempted.
+    """
+    for command in (
+        ["map", "query", "widget", "--min-rung", "exact"],
+        ["map", "trace", "a", "b", "--min-rung", "exact"],
+    ):
+        result = runner.invoke(app, [*command, "--project-root", str(tmp_path)])
+        assert result.exit_code == 2, f"{command}: {result.output}"
+        assert "deterministic" in result.output, (
+            f"{command}: the refusal must name the values that work: {result.output}"
+        )
+        assert "index" not in result.output.lower(), (
+            f"{command}: a typo is not a missing index: {result.output}"
+        )
 
 
 def test_query_scopes_callees_to_the_symbol_not_the_file(monkeypatch, tmp_path):
@@ -687,3 +769,79 @@ def test_query_distinguishes_empty_from_unknown_when_rendering(monkeypatch, tmp_
         {"callers": None, "callers_unavailable": "impact failed: boom"}, "callers"
     )
     assert "unknown" in rendered and "boom" in rendered
+
+
+def test_a_client_that_cannot_apply_the_floor_takes_the_slow_path_not_a_broad_answer():
+    """A batched command without the parameter must not answer at full breadth.
+
+    The batched `neighbors` call is an optimisation; the per-target path asks
+    `impact`/`deps` directly and has taken a floor since it landed. So a client
+    too old for the batched floor has a correct answer available and must be
+    routed to it — the failure mode being guarded is the other one, where the
+    floor is quietly dropped and a broad edge list comes back looking exactly
+    like the narrow one that was asked for.
+
+    Probed rather than caught: `except TypeError` around the call would also
+    swallow one raised inside the response handling, which is a genuine shape
+    error and the reason `_neighbor_edges` probes for `neighbors` in the first
+    place.
+    """
+    from devcouncil.cli.commands import graph_cmd
+    from devcouncil.devmap_client import DevMapClientError
+
+    calls = []
+
+    def old_batched(targets):  # no `min_rung` parameter
+        calls.append(targets)
+        return []
+
+    # No floor: unchanged, and the batched path is used.
+    assert graph_cmd._batched_neighbors(old_batched, ["a.py::f"], None) == []
+    assert calls == [["a.py::f"]]
+
+    # A floor it cannot apply: refused, so the caller falls through.
+    with pytest.raises(DevMapClientError, match="rung floor"):
+        graph_cmd._batched_neighbors(old_batched, ["a.py::f"], "deterministic")
+    assert calls == [["a.py::f"]], "the broad call must not have been made"
+
+    # And a client that does accept it gets it.
+    seen = {}
+
+    def new_batched(targets, min_rung=None):
+        seen["min_rung"] = min_rung
+        return []
+
+    graph_cmd._batched_neighbors(new_batched, ["a.py::f"], "high")
+    assert seen == {"min_rung": "high"}
+
+
+def test_a_direction_that_cannot_take_the_floor_is_unmeasured_not_unfiltered():
+    """The per-target path applies the same rule, through its own contract.
+
+    `_call_edges` returns `(None, reason)` for a direction it could not measure
+    — never `[]`, which would read as "nothing calls this". A client that cannot
+    apply a rung floor has not measured the direction the caller asked about, so
+    that is exactly what it reports. The alternative — asking without the floor
+    — returns a *wider* edge list under the caller's narrow question.
+    """
+    from devcouncil.cli.commands import graph_cmd
+
+    class _Old:
+        def impact(self, target, depth=1):  # no `min_rung`
+            raise AssertionError("must not be called when the floor cannot be applied")
+
+    edges, reason = graph_cmd._call_edges(
+        _Old(), "impact", "a.py::f", "source_symbol", "source_file", "deterministic"
+    )
+    assert edges is None, "an unfilterable direction is unknown, not empty"
+    assert "rung floor" in reason, reason
+
+    # OFF: with no floor asked for, the same old client answers normally.
+    class _OldAnswering(_Old):
+        def impact(self, target, depth=1):
+            return _FakeResp([{"edge_kind": "Calls", "source_symbol": "b.py::g"}])
+
+    edges, reason = graph_cmd._call_edges(
+        _OldAnswering(), "impact", "a.py::f", "source_symbol", "source_file"
+    )
+    assert reason is None and edges == ["b.py::g"], (edges, reason)
