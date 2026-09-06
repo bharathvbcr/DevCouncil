@@ -338,8 +338,17 @@ impl ExtractionCoverage {
     }
 
     /// Files that contributed no call edges, of any kind.
+    ///
+    /// Saturating rather than wrapping. Every counter here is bounded by a file
+    /// count in production, but `discovery_refused_files` is folded in from
+    /// *outside* — `DiscoveryCoverage::refused(n)` takes whatever a caller
+    /// passes — and this feeds a division. A wrap would turn a huge blind count
+    /// into a small one and hand a confident ceiling to a corpus nothing read,
+    /// which is the flattering direction and therefore the one to bound.
     pub fn files_without_call_extraction(&self) -> usize {
-        self.parse_failed_files + self.pattern_recovered_files + self.call_blind_files
+        self.parse_failed_files
+            .saturating_add(self.pattern_recovered_files)
+            .saturating_add(self.call_blind_files)
     }
 
     /// Why the corpus-level scan is incomplete, or `None` when it is complete.
@@ -381,7 +390,8 @@ impl ExtractionCoverage {
     /// deliberately absent for the same reason it is absent from
     /// `is_complete()`: it is a hole in a different claim.
     fn blind_files(&self) -> usize {
-        self.files_without_call_extraction() + self.discovery_refused_files
+        self.files_without_call_extraction()
+            .saturating_add(self.discovery_refused_files)
     }
 
     /// The share of the corpus whose calls were never extracted, in `[0, 1]`.
@@ -390,13 +400,23 @@ impl ExtractionCoverage {
     /// [`Self::default`] record with no file counts behind it has not observed
     /// a complete corpus; it has observed nothing, and the two must not read
     /// alike.
+    ///
+    /// Saturating throughout, and the ratio is clamped after the division. Both
+    /// guards were written after `graded_cap_under_hostile_input.rs` found the
+    /// plain adds: a debug build panics on the overflow, and a **release** build
+    /// wraps a saturated blind count round to a small one and hands a near-
+    /// `extracted` ceiling to a corpus nothing read. Saturating turns the same
+    /// input into "entirely blind", which is the answer it should have had.
     fn blind_share(&self) -> Option<f32> {
         let blind = self.blind_files();
-        let considered = blind + self.files_with_call_extraction;
+        let considered = blind.saturating_add(self.files_with_call_extraction);
         if considered == 0 {
             return None;
         }
-        Some(blind as f32 / considered as f32)
+        // `as f32` on a saturated `usize` is lossy but monotone, and both sides
+        // lose the same way, so the ratio survives. Clamped anyway: a ratio
+        // outside `[0, 1]` would put `powi`'s base outside it too.
+        Some((blind as f32 / considered as f32).clamp(0.0, 1.0))
     }
 
     /// Ceiling applied to a non-exempt dead-code confidence while the scan has
