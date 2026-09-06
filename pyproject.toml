@@ -88,7 +88,25 @@ devcouncil-codeintel-grammars = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+# `src` for the package under test. `.` because eighteen modules under
+# `tests/unit/` import their helpers as `tests.unit.support_maps` /
+# `tests.unit.graph_fixtures`, and `tests/` has no `__init__.py`, so `tests` is
+# importable only with the repository root on `sys.path`.
+#
+# Without the `.` the suite's size depended on how it was invoked: `python -m
+# pytest` and `uv run pytest` put the working directory on `sys.path`
+# themselves and collected 4462 tests; the bare `pytest` console script does
+# not, and aborted with `ModuleNotFoundError: No module named 'tests'` on those
+# eighteen — a collection *error*, so `--continue-on-collection-errors` would
+# have reported the remaining 4178 green. `tests/unit/test_suite_collection.py`
+# holds this to all three.
+#
+# The alternative — adding `tests/__init__.py` — also works, and was not taken:
+# it moves every module's import name from `unit.test_x` to `tests.unit.test_x`
+# for the three directories that have an `__init__.py` and leaves
+# `tests/integration`, `tests/stress` and `tests/benchmarks` where they are,
+# which is a larger change to how modules are named than the defect warrants.
+pythonpath = ["src", "."]
 
 [tool.coverage.run]
 source = ["src/devcouncil"]
