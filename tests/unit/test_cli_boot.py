@@ -71,3 +71,38 @@ def test_cli_boot_skip_integrations(tmp_path, monkeypatch):
     result = runner.invoke(app, ["boot", "Goal", "--skip-integrations"])
     assert result.exit_code == 0
     assert setup_calls["skip_integrations"] is True
+
+
+# --- `--json` contract: exactly one JSON object on stdout, diagnostics on stderr ---
+#
+# `dev boot` delegates its payload to the go flow, so a pre-flight failure exits before
+# any object is produced. Asserting on `result.stdout`, never `result.output` — under
+# Click 8.4 `.output` is the two streams merged and cannot detect the difference.
+
+
+def test_boot_json_bad_gemini_scope_emits_one_object(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["boot", "Goal", "--json", "--gemini-scope", "nonsense"])
+
+    assert result.exit_code == 2
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert "--gemini-scope must be" in data["error"]
+    assert "--gemini-scope must be" in result.stderr
+
+
+def test_boot_json_bad_provider_emits_one_object(tmp_path, monkeypatch):
+    import json
+
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["boot", "Goal", "--json", "--provider", "nonsense-provider"])
+
+    assert result.exit_code == 2
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert data["error"]
+    assert result.stderr

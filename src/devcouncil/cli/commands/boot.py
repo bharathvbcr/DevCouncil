@@ -11,7 +11,7 @@ from rich.console import Console
 
 from devcouncil.app.config import load_config
 from devcouncil.cli.commands.doctor import render_doctor_check
-from devcouncil.cli.commands.go import go as go_command
+from devcouncil.cli.commands.go import _abort, go as go_command
 from devcouncil.cli.commands.init import initialize_project, parse_role_model_overrides
 from devcouncil.cli.commands.setup import (
     _configure_api_key,
@@ -25,7 +25,11 @@ from devcouncil.repo.ci_scaffold import EVIDENCE_WORKFLOW_RELPATH, WORKFLOW_RELP
 from devcouncil.telemetry.logging_setup import set_log_dir
 from devcouncil.telemetry.stages import log_stage, log_step
 
-console = Console()
+# `dev boot` is `dev init` + integrations + `dev go`: its stdout payload is the report
+# the delegated go flow emits, and every line this module prints is setup narration.
+# Binding the only Console here to stderr keeps the `--json` contract (exactly one JSON
+# object on stdout) structural, the same way `dev go` and `dev plan` do.
+status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 
@@ -55,7 +59,7 @@ def _run_setup_path(
         with_skills=not skip_skills,
     )
     if not created:
-        console.print(f"[yellow]DevCouncil is already initialized at {root / '.devcouncil'}.[/yellow]")
+        status_console.print(f"[yellow]DevCouncil is already initialized at {root / '.devcouncil'}.[/yellow]")
 
     if provider:
         _set_model_provider(root, provider)
@@ -66,24 +70,24 @@ def _run_setup_path(
     _configure_vertexai_settings(root, configured_provider, None, None)
     _configure_api_key(root, api_key, skip_api_key)
 
-    console.print()
+    status_console.print()
     render_doctor_check(root)
 
     if scaffold_ci_flag:
         written = scaffold_ci(root)
         if written is None:
-            console.print(f"[yellow]{WORKFLOW_RELPATH.as_posix()} already exists; left unchanged.[/yellow]")
+            status_console.print(f"[yellow]{WORKFLOW_RELPATH.as_posix()} already exists; left unchanged.[/yellow]")
         else:
-            console.print(f"[green]Wrote starter CI workflow {written.relative_to(root).as_posix()}.[/green]")
+            status_console.print(f"[green]Wrote starter CI workflow {written.relative_to(root).as_posix()}.[/green]")
 
     if scaffold_ci_evidence:
         evidence_written = scaffold_evidence_ci(root)
         if evidence_written is None:
-            console.print(
+            status_console.print(
                 f"[yellow]{EVIDENCE_WORKFLOW_RELPATH.as_posix()} already exists; left unchanged.[/yellow]"
             )
         else:
-            console.print(
+            status_console.print(
                 f"[green]Wrote evidence CI workflow {evidence_written.relative_to(root).as_posix()}.[/green]"
             )
 
@@ -165,8 +169,9 @@ def boot(
     Initialize the repo, apply integrations, and run the full DevCouncil loop.
     """
     if gemini_scope not in {"project", "user"}:
-        console.print("[red]--gemini-scope must be 'project' or 'user'.[/red]")
-        raise typer.Exit(code=2)
+        bad_scope = "--gemini-scope must be 'project' or 'user'."
+        status_console.print(f"[red]{bad_scope}[/red]")
+        raise _abort(json_report, bad_scope, code=2)
 
     root = project_root.expanduser().resolve()
     set_log_dir(root)
@@ -177,8 +182,8 @@ def boot(
         if provider:
             validate_model_provider(provider)
     except ValueError as exc:
-        console.print(f"[red]{exc}[/red]")
-        raise typer.Exit(code=2) from exc
+        status_console.print(f"[red]{exc}[/red]")
+        raise _abort(json_report, str(exc), code=2) from exc
 
     effective_skip_api_key = skip_api_key or not sys.stdin.isatty()
 
