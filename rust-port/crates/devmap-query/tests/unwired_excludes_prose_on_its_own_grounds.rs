@@ -102,20 +102,42 @@ fn the_prose_fixtures_are_not_parse_failures_and_declare_no_capability() {
     }
 }
 
-/// The two published numbers must describe the same population.
+/// The filter's count must be a **subset** of the population's.
+///
+/// The two are not the same number and are not meant to be.
+/// `coverage_gaps.import_blind` is every file whose language has no import
+/// extractor; `unwired_excluded_import_blind` is only those the filter actually
+/// dropped, which excludes any that returned earlier for being an entry root, a
+/// test, vendored, or already imported. Measured on this repository after the
+/// fix: 57 against 71, and the 14 are exactly that.
+///
+/// So `<=` is the law, and it is the law the defect broke in the one direction
+/// that cannot be explained away: **355 against 71**. A filter cannot drop more
+/// files than exist for it to drop, and that impossibility is what an equality
+/// assertion here would have hidden behind a fixture where the two happen to
+/// coincide.
 #[test]
-fn the_import_blind_counter_agrees_with_the_coverage_gap_inventory() {
+fn the_import_blind_counter_is_a_subset_of_the_coverage_gap_inventory() {
     let extractions = corpus();
     let coverage = devmap_analyze::extraction_coverage(&extractions);
     let excluded = counter(&graph(&extractions), "unwired_excluded_import_blind");
 
+    assert!(
+        excluded <= coverage.import_blind_files as u64,
+        "the filter dropped {excluded} files for having no import extractor, \
+         but only {} exist — a subset cannot outnumber its population, which \
+         is what counting prose here did",
+        coverage.import_blind_files
+    );
+
+    // On *this* fixture nothing is an entry root, a test or imported, so the
+    // two do coincide — pinned separately so the subset law above is not the
+    // only thing holding, and so a filter that started dropping nothing at all
+    // would still fail.
     assert_eq!(
         excluded, coverage.import_blind_files as u64,
-        "`unwired_excluded_import_blind` and `coverage_gaps.import_blind` are \
-         two publications of one fact — a file whose language has no import \
-         extractor — and a reader who compares them must not find a \
-         contradiction. Coverage counts only files a grammar read; this one \
-         counted prose too"
+        "every import-blind file in this fixture reaches the filter, so here \
+         the subset is the whole population"
     );
 }
 

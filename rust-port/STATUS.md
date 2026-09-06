@@ -4832,7 +4832,18 @@ branch first, which `is_parse_failure` deliberately answers `false` for prose,
 then charges everything left with no `Imports` capability, Markdown included.
 
 The predicate now has one owner, `Extraction::grammar_read_this_file`, beside
-`is_parse_failure` where the same line is already drawn.
+`is_parse_failure` where the same line is already drawn. **Measured after:
+355 -> 57**, against a population of 71.
+
+The two are not meant to be equal, and that is the sharper form of the defect.
+`coverage_gaps.import_blind` is every file whose language has no import
+extractor; `unwired_excluded_import_blind` is only those the filter dropped,
+which excludes any that returned earlier for being an entry root, a test,
+vendored, or already imported. So the law is `<=`, and 355 against 71 broke it
+in the one direction that cannot be explained away: a filter cannot drop more
+files than exist for it to drop. The test asserts the subset law first, and the
+fixture's coincidental equality second, so a fixture where the two happen to
+match cannot hide the impossibility.
 
 The *exclusion* was load-bearing and older than the reason given for it: before
 the W0.3 capability gate, every `.md`, `.json` and `.yaml` in every repository
