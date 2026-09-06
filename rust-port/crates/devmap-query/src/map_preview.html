@@ -287,6 +287,9 @@ function filtered() {
       || (n.name || '').toLowerCase().includes(q)
       || (sub.summary || '').toLowerCase().includes(q);
   });
+  // Drawn in this order, and the label collision pass below is first-come —
+  // so ranking by size here is what decides whose label survives a clash.
+  nodes.sort((a, b) => (b.file_count || 0) - (a.file_count || 0));
   const ids = new Set(nodes.map(n => n.id));
   const links = (DATA.links || []).filter(l => ids.has(lid(l, 'source')) && ids.has(lid(l, 'target')));
   return {nodes, links};
@@ -435,29 +438,50 @@ const g = typeof Graph === 'function' ? Graph()(elem) : null;
 // blob and the edges between them disappeared. The cap hid the worst of it and
 // hid the cause with it — the radius was never in the units the reader sees.
 //
-// The span is deliberately narrow. Size here encodes one number (files, or
-// degree) that the sidebar already prints exactly; its job is to rank nodes at
-// a glance, not to be measured, so 2:1 across the whole repository is enough.
-const R_MIN = 5, R_MAX = 11;
+// The band is taken from the renderers this preview is measured against, not
+// from taste: cosmos.gl ships `pointDefaultSize: 4` and sigma.js hides a label
+// once a node renders below 6px. Both draw a *marker* — a small dot whose job
+// is to anchor a label and a colour — and let edges and text carry the picture.
+// Earlier passes here drew 65px and then 35px discs, which turn a 14-node graph
+// into a bubble chart and hide the edges behind the bubbles.
+//
+// Size still encodes one number, but over a deliberately narrow span: the exact
+// file count is printed in the sidebar, so the dot only has to rank at a glance.
+const R_MIN = 3, R_MAX = 8;
 function nodeScreenRadius(n, sizeMode) {
-  if (sizeMode === 'constant') return 7;
+  if (sizeMode === 'constant') return 4;
   const raw = sizeMode === 'files'
-    ? 4 + Math.sqrt(Math.max(1, n.file_count || 1)) * 1.1
-    : 4 + Math.sqrt(Math.max(1, n.val || 1)) * 1.5;
+    ? 2.5 + Math.sqrt(Math.max(1, n.file_count || 1)) * 0.6
+    : 2.5 + Math.sqrt(Math.max(1, n.val || 1)) * 0.9;
   return Math.max(R_MIN, Math.min(R_MAX, raw));
 }
 
-// The canvas is already scaled by `globalScale`, so a radius drawn as-is grows
-// with the zoom. Dividing it out entirely pins nodes to an exact screen size,
-// which makes zooming feel inert; `sqrt` is the partial compensation Sigma uses
-// — zoom in and nodes grow, but far more slowly than the layout around them.
+// cosmos.gl's `scalePointsOnZoom: false`, which is its default. Dividing the
+// canvas transform out entirely holds the dot at an exact pixel size at every
+// zoom, so zooming spreads the layout and leaves the markers alone. sigma.js
+// grows them by `sqrt(ratio)` instead; that was the previous pass here, and at
+// a 256% opening fit it still opened at 35px.
 function drawnRadius(n, sizeMode, globalScale) {
-  return nodeScreenRadius(n, sizeMode) / Math.sqrt(Math.max(0.2, globalScale));
+  return nodeScreenRadius(n, sizeMode) / Math.max(0.05, globalScale);
 }
 
 function ctrlValue(id, fallback) {
   const el = document.getElementById(id);
   return el ? el.value : fallback;
+}
+
+// Labels are a fixed pixel size, so at a low zoom they collide long before the
+// dots do — five subsystems stacked their names into one smudge at the opening
+// fit. sigma.js answers this by simply not drawing a label that would overlap
+// one already placed, and so does this: boxes are collected per frame, in draw
+// order, and a clash means the later (smaller) node goes unlabelled until you
+// zoom in and the collision clears itself.
+let labelBoxes = [];
+function labelFits(x, y, w, h) {
+  for (const b of labelBoxes) {
+    if (x < b[0] + b[2] && x + w > b[0] && y < b[1] + b[3] && y + h > b[1]) return false;
+  }
+  return true;
 }
 
 function applyNodeStyle() {
@@ -479,9 +503,9 @@ function applyNodeStyle() {
     const px = 1 / globalScale;
     if (node.entry) {
       ctx.beginPath();
-      ctx.arc(node.x, node.y, r + 2.5 * px, 0, 2 * Math.PI, false);
+      ctx.arc(node.x, node.y, r + 2 * px, 0, 2 * Math.PI, false);
       ctx.strokeStyle = '#34d399';
-      ctx.lineWidth = 1.5 * px;
+      ctx.lineWidth = 1.25 * px;
       ctx.stroke();
     }
     ctx.beginPath();
@@ -490,16 +514,25 @@ function applyNodeStyle() {
     ctx.fill();
     if (isSel) {
       ctx.strokeStyle = '#e7ecf3';
-      ctx.lineWidth = 2 * px;
+      ctx.lineWidth = 1.75 * px;
       ctx.stroke();
     }
     if (show) {
       const label = node.name || node.id;
-      ctx.font = (12 * px) + 'px ui-sans-serif, system-ui, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'top';
-      ctx.fillStyle = isSel ? '#e7ecf3' : '#8b9bb4';
-      ctx.fillText(label, node.x, node.y + r + 4 * px);
+      ctx.font = (11 * px) + 'px ui-sans-serif, system-ui, sans-serif';
+      const w = ctx.measureText(label).width;
+      const h = 12 * px;
+      const x = node.x - w / 2;
+      const y = node.y + r + 3 * px;
+      // The selection is what the reader just asked for, so it is drawn even
+      // when it clashes — and it still claims its box, so nothing lands on it.
+      if (isSel || labelFits(x, y, w, h)) {
+        labelBoxes.push([x, y, w, h]);
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillStyle = isSel ? '#e7ecf3' : '#8b9bb4';
+        ctx.fillText(label, node.x, y);
+      }
     }
   });
 }
@@ -604,6 +637,7 @@ if (g) {
     .linkDirectionalParticles(l => l.kind === 'handoff' ? 2 : 1)
     .linkDirectionalParticleWidth(1.5)
     .cooldownTicks(120)
+    .onRenderFramePre(() => { labelBoxes = []; })
     .onNodeClick(n => select(n.id))
     .onZoom(z => updateZoomPct(z && typeof z.k === 'number' ? z.k : z))
     .onEngineStop(() => { if (!userAdjusted) fitView(); })
