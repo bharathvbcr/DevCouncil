@@ -30,7 +30,7 @@ use crate::engine::{byte_span_to_line_range, resolve_source_path};
 use crate::manifest::{entry_root_paths, is_entry_root, CONSUMER_MAP_ENGINE};
 use crate::model::FreshnessInfo;
 use devmap_analyze::model::{AnalysisStatus, AnalysisSummary};
-use devmap_extract::languages::{capabilities_for_language, Capability};
+use devmap_extract::languages::Capability;
 use devmap_extract::model::{
     confidence_millis, EdgeKind, ExtractedSymbol, Extraction, ParseOutcome, SymbolKind, WiringKind,
 };
@@ -503,7 +503,7 @@ pub(crate) fn unwired_candidates(
             // shares its language, and that language's capability is the whole
             // answer. Checked after the parse-failure branch so a file with
             // both holes is charged once, to the more specific of the two.
-            if !capabilities_for_language(&ext.language).contains(Capability::Imports) {
+            if !ext.capabilities().contains(Capability::Imports) {
                 excluded_import_blind += 1;
                 return false;
             }

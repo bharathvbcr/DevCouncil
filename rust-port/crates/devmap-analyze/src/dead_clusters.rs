@@ -294,8 +294,28 @@ fn strongly_connected_components(adjacency: &[Vec<u32>]) -> Vec<Vec<u32>> {
 /// point is live for the same reason and by the same rule. Without it, a
 /// perfectly ordinary set of mutually recursive exported functions is a
 /// "cluster nothing reaches".
-fn externally_reachable_symbols(extractions: &[Extraction]) -> BTreeSet<String> {
-    let mut reachable = BTreeSet::new();
+///
+/// **It was only seeded from two of them.** `is_exported` and wiring
+/// annotations were here; every exemption the single-symbol cascade computes —
+/// a C-family header export, a Go interface implementation, a heritage
+/// override, a member of an exported type, a Go build variant — was not,
+/// because the cascade computed them one function later and kept them local.
+///
+/// The failure is not a tier disagreement. `__all__ += ["MyClass"]` with
+/// `MyClass.a()` and `MyClass.b()` calling each other is exempted twice by the
+/// single-symbol pass as declared public API, and was reported here at
+/// `DEAD_CLUSTER_CONFIDENCE` with the reason "reached by nothing outside the
+/// component" — a live proposal to delete public API. Two mutually recursive C
+/// functions declared in a shared header are the same shape, and neither had a
+/// test: `an_exported_member_keeps_the_cluster_alive` exercises `is_exported`
+/// and stops there.
+///
+/// `liveness::exempt_symbol_names` is now the one owner and both passes read it.
+fn externally_reachable_symbols(
+    extractions: &[Extraction],
+    resolution: &ResolutionResult,
+) -> BTreeSet<String> {
+    let mut reachable = crate::liveness::exempt_symbol_names(extractions, resolution);
     for ext in extractions {
         for symbol in &ext.symbols {
             if symbol.is_exported {
@@ -397,7 +417,7 @@ pub fn dead_clusters(extractions: &[Extraction], resolution: &ResolutionResult) 
         }
     }
 
-    let externally_reachable = externally_reachable_symbols(extractions);
+    let externally_reachable = externally_reachable_symbols(extractions, resolution);
     let qualifying = qualifying_symbols(resolution);
 
     let mut clustered_symbols: BTreeSet<String> = BTreeSet::new();

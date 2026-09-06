@@ -20,10 +20,10 @@ pub use dead_clusters::{
     DEAD_CLUSTER_MEMBER_CAP, DEAD_CLUSTER_QUALIFIED_CONFIDENCE,
 };
 pub use liveness::{
-    analyze_liveness, analyze_liveness_with_coverage, extraction_coverage, extraction_gaps,
-    DiscoveryCoverage, ExtractionCoverage, ExtractionGap, ExtractionGapEntry, LivenessOutcome,
-    CALL_BLIND_REASON, COVERAGE_LOSS_CONFIDENCE_CAP, COVERAGE_LOSS_REASON, GO_BUILD_VARIANT_REASON,
-    HIGHEST_DEGRADED_CONFIDENCE, UNRESOLVED_NAMESAKE_REASON,
+    analyze_liveness, analyze_liveness_with_coverage, exempt_symbol_names, extraction_coverage,
+    extraction_gaps, DiscoveryCoverage, ExtractionCoverage, ExtractionGap, ExtractionGapEntry,
+    LivenessOutcome, CALL_BLIND_REASON, COVERAGE_LOSS_CONFIDENCE_CAP, COVERAGE_LOSS_REASON,
+    GO_BUILD_VARIANT_REASON, HIGHEST_DEGRADED_CONFIDENCE, UNRESOLVED_NAMESAKE_REASON,
 };
 pub use model::*;
 pub use pdg::*;
@@ -108,10 +108,25 @@ pub fn analyze_with_discovery(
         // as a two-symbol cluster in a corpus that is one file short.
         dead_clusters: {
             let mut scan = crate::dead_clusters::dead_clusters(extractions, resolution);
+            let degraded = !liveness.coverage.is_complete();
             for cluster in &mut scan.clusters {
                 cluster.confidence = liveness
                     .coverage
                     .cap_cluster(cluster.confidence, cluster.size);
+                // The reason has to move with the number. It said "reached by
+                // nothing outside the component" — an absolute claim — beside a
+                // confidence the coverage hole had already demoted, so a reader
+                // taking the prose at face value saw no caveat at all. The
+                // single-symbol path swaps in `COVERAGE_LOSS_REASON` for exactly
+                // this; a cluster is the *stronger* claim and had the weaker
+                // disclosure.
+                if degraded {
+                    cluster.reason.push_str(
+                        " — but call extraction did not cover every file, and one \
+                         missed call edge into this component makes the whole \
+                         finding wrong",
+                    );
+                }
             }
             scan
         },

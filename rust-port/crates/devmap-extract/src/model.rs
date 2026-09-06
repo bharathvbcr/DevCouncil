@@ -1106,6 +1106,40 @@ impl Extraction {
         )
     }
 
+    /// What the extractor could observe **in this file**, as opposed to in a
+    /// language named by a string.
+    ///
+    /// The canonical owner for every coverage charge. `capabilities_for_language`
+    /// answers about a grammar key, and for one engine that key is not the
+    /// grammar that ran: a `.ipynb` stores `language: "notebook"` while the
+    /// parse ran under the kernel's grammar, so `extraction.imports` and
+    /// `extraction.calls` are filled by `notebook.rs` and
+    /// `grammar_read_this_file()` reports `true`.
+    ///
+    /// The registry's own row said so — `("notebook", Capabilities::NONE)` with
+    /// the comment "its capabilities are that grammar's, resolved per file
+    /// rather than declared here" — and nothing resolved it, because nothing
+    /// could: every charge site had only the string. The consequence for every
+    /// clean notebook was four wrong answers at once. It was charged both
+    /// `CallBlind` and `ImportBlind` with the reason "`notebook` has no call
+    /// extractor in this build"; dropped from `files_with_call_extraction`, so
+    /// it left the denominator of the blind share while staying in its
+    /// numerator; made `file_is_call_blind`, so every symbol in it took the
+    /// call-blind ceiling; and counted into `unwired_candidates`'
+    /// `excluded_import_blind`.
+    ///
+    /// Asking the *extraction* is the fix, and it is the fix for the class: any
+    /// future engine that re-dispatches to another grammar answers here rather
+    /// than at four call sites that would each have to remember.
+    pub fn capabilities(&self) -> crate::languages::Capabilities {
+        match &self.engine {
+            ExtractionEngine::Notebook { kernel_language } => {
+                crate::languages::capabilities_for_language(kernel_language)
+            }
+            _ => crate::languages::capabilities_for_language(&self.language),
+        }
+    }
+
     /// Method `qualified_name` to declared parameter count, for the Go
     /// interface-satisfaction join.
     pub fn go_method_param_counts(&self) -> BTreeMap<&str, usize> {
