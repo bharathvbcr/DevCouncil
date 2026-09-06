@@ -10,6 +10,8 @@ from devcouncil.telemetry.stages import log_stage, log_step
 
 app = typer.Typer(help="Semantic snapshots and diffs.")
 console = Console()
+# Diagnostics go to stderr unconditionally — same split as `dev map`/`dev graph`/`dev debug`.
+status_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 
@@ -26,7 +28,12 @@ def snapshot(
     logger.info("dev semantic snapshot: task=%s stage=%s", task_id, stage)
     initialize_project(root, quiet=True)
     if stage not in {"before", "after"}:
-        console.print("[red]--stage must be before or after[/red]")
+        # An error path is a `--json` path too: exiting silently would leave stdout with
+        # zero JSON objects, which breaks the one-object contract as surely as a banner.
+        bad_stage = "--stage must be before or after"
+        status_console.print(f"[red]{bad_stage}[/red]")
+        if json_format:
+            typer.echo(dump_json({"ok": False, "error": bad_stage}, indent=2))
         raise typer.Exit(code=2)
     with log_stage("semantic", project_root=root, subcommand="snapshot", task_id=task_id):
         log_step("semantic/1: creating snapshot", project_root=root, task_id=task_id, trace=True)

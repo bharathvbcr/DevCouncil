@@ -63,7 +63,15 @@ def apply_patch(
     set_log_dir(root)
     diff_body = unified_diff if unified_diff is not None else sys.stdin.read()
     if not diff_body.strip():
-        typer.echo("unified_diff must be a non-empty string")
+        # This guard runs before `apply_patch_payload`, so under `--json` it used to exit
+        # with a human line on stdout and no payload behind it — zero JSON objects, which
+        # breaks the one-object contract. The message goes to stderr unconditionally and
+        # the payload mirrors the `{"ok": ..., "error": ...}` shape that helper returns,
+        # so a caller parses failures from this guard exactly as it parses the rest.
+        empty_diff = "unified_diff must be a non-empty string"
+        typer.echo(empty_diff, err=True)
+        if json_format:
+            typer.echo(dump_json({"ok": False, "error": empty_diff}, indent=2))
         raise typer.Exit(code=1)
     logger.info("dev apply-patch: task=%s", task_id)
 

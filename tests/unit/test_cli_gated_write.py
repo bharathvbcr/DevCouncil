@@ -145,3 +145,30 @@ def test_cli_apply_patch_allowed_and_denied(tmp_path, monkeypatch):
     assert res2.exit_code != 0
     data2 = json.loads(res2.output)
     assert data2["ok"] is False
+
+
+def test_cli_apply_patch_json_empty_diff_emits_one_object(tmp_path, monkeypatch):
+    """The empty-diff guard runs before `apply_patch_payload`, so it owed stdout an object.
+
+    Asserting on `result.stdout`, never `result.output`: under Click 8.4 `.output` is the
+    stdout and stderr streams merged, so it cannot tell a payload from a bare message.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["apply-patch", "--json", "--unified-diff", "   "])
+
+    assert result.exit_code == 1
+    data = json.loads(result.stdout)
+    assert data["ok"] is False
+    assert "unified_diff must be a non-empty string" in data["error"]
+    assert "unified_diff must be a non-empty string" in result.stderr
+
+
+def test_cli_apply_patch_human_empty_diff_reports_on_stderr(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["apply-patch", "--unified-diff", "   "])
+
+    assert result.exit_code == 1
+    assert "unified_diff must be a non-empty string" in result.stderr
+    assert result.stdout == ""
