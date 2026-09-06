@@ -24,5 +24,7 @@ pub use edge_index::{
     UnknownEdgeKind, UnknownResolutionKind,
 };
 #[cfg(feature = "parse")]
-pub use extract_cache::{extract_tree_cached, extract_tree_cached_with_report};
+pub use extract_cache::{
+    extract_scanned_cached, extract_tree_cached, extract_tree_cached_with_report,
+};
 pub use schema::*;
