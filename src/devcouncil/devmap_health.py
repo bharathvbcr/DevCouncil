@@ -192,6 +192,33 @@ def _process_command(pid: int) -> str:
     return (probe.stdout or "").strip()
 
 
+def _is_devmap_command(command: str) -> bool:
+    """Is this command line the kernel binary?
+
+    Names the binary rather than grepping for "devmap": some argument's
+    basename must *be* ``devmap`` (a ``.exe`` suffix allowed), or the basename
+    of the binary ``DEVMAP_BINARY`` points at when it is set. A substring test
+    took ``…/devmap-open-items/.venv/bin/python -c …`` for the kernel in a
+    worktree of that name, and ``abort_build`` signalled it — the exact
+    process-inherited-the-number case the check exists to prevent. The
+    ``/bin/sh …/bin/devmap`` shape a script by that name reports still counts:
+    the second argument's basename is the binary.
+    """
+    from devcouncil.devmap_engine import BINARY_ENV_VAR
+
+    names = {"devmap"}
+    configured = os.environ.get(BINARY_ENV_VAR, "").strip()
+    if configured:
+        names.add(os.path.basename(configured))
+    for token in command.split():
+        base = os.path.basename(token.replace("\\", "/"))
+        if base.lower().endswith(".exe"):
+            base = base[:-4]
+        if base in names:
+            return True
+    return False
+
+
 def build_activity(root: Path) -> Dict[str, Any]:
     """Is a kernel build running right now, and is it making progress?
 
@@ -229,7 +256,7 @@ def build_activity(root: Path) -> Dict[str, Any]:
         updated = float(data.get("updated_at") or started)
         result["elapsed_s"] = round(now - started, 1)
         result["since_progress_s"] = round(now - updated, 1)
-        alive = _pid_alive(pid) and "devmap" in _process_command(int(pid))
+        alive = _pid_alive(pid) and _is_devmap_command(_process_command(int(pid)))
         if alive:
             result["in_progress"] = True
             result["stuck"] = (now - updated) > BUILD_STUCK_AFTER_SECONDS
@@ -955,7 +982,7 @@ def abort_build(root: Path, *, grace_seconds: float = 5.0) -> Dict[str, Any]:
         return {"ok": True, "aborted": False, "code": "no_build_in_progress"}
     pid = int(activity["pid"])
     command = _process_command(pid)
-    if "devmap" not in command:
+    if not _is_devmap_command(command):
         return {"ok": False, "aborted": False, "code": "not_a_devmap_process", "pid": pid, "command": command}
     sent = "SIGTERM"
     try:
