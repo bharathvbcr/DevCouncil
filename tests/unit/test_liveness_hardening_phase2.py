@@ -1,4 +1,16 @@
-"""Unit tests for Phase 2 liveness hardening features."""
+"""Unit tests for Phase 2 liveness hardening features.
+
+``test_reachability_gap_points`` lived here and was retired with
+``graph.liveness.file_liveness`` in W3.3. Its expectation — a disconnected
+island is unwired or unreachable — did not go with it: the unwired half is
+``devmap-query/tests/dynamic_references_clear_unwired.rs::
+a_file_nothing_references_is_still_unwired`` and the unreachable half is
+``devmap-analyze/tests/dead_clusters.rs``, both against the kernel that now
+decides it.
+
+The three tests below exercise ``devcouncil.indexing.wiring`` helpers, which
+stay: they are still imported by the verification-side gates.
+"""
 
 from pathlib import Path
 from devcouncil.indexing.wiring import (
@@ -6,7 +18,6 @@ from devcouncil.indexing.wiring import (
     _cargo_toml_script_targets,
     _conventional_main_seeds,
 )
-from devcouncil.indexing.graph.liveness import file_liveness
 
 
 def test_package_json_depth_sort(tmp_path: Path):
@@ -43,21 +54,3 @@ def test_go_cmd_main_seeds(tmp_path: Path):
     seeds = _conventional_main_seeds(tmp_path, file_set)
     assert "cmd/server/app.go" in seeds
     assert "pkg/util/helper.go" not in seeds
-
-
-def test_reachability_gap_points(tmp_path: Path):
-    files = ["src/main.py", "src/wired.py", "src/orphan.py"]
-    call_edges = [("src/main.py", "src/wired.py"), ("src/wired.py", "src/orphan.py")]
-    # Note: if src/main.py is entry_root, all are reachable.
-    # If we have entry root = src/main.py, but disconnected island:
-    files = ["src/main.py", "src/entry.py", "src/island_a.py", "src/island_b.py"]
-    (tmp_path / "src").mkdir(parents=True)
-    (tmp_path / "src" / "entry.py").write_text("def main(): pass\nif __name__ == '__main__': main()")
-    (tmp_path / "src" / "island_a.py").write_text("import island_b")
-    (tmp_path / "src" / "island_b.py").write_text("def foo(): pass")
-
-    call_edges = [("src/entry.py", "src/entry.py"), ("src/island_a.py", "src/island_b.py")]
-    prod_roots, unwired, unreachable, unreliable = file_liveness(
-        tmp_path, files, call_edges
-    )
-    assert "src/island_b.py" in unreachable or "src/island_a.py" in unwired

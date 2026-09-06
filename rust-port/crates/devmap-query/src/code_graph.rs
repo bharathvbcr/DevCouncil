@@ -244,6 +244,35 @@ pub(crate) struct UnwiredScan {
     pub(crate) excluded_import_blind: usize,
 }
 
+/// Whether any dynamic reference in the corpus names this file.
+///
+/// Three spellings, because a specifier does not have to name a file the way
+/// the filesystem does:
+///
+/// * the path as written — `import('./src/App.tsx')`;
+/// * the path without its extension — `import('./src/App')`, and `pkg.mod`
+///   arriving as the form `pkg/mod` for `pkg/mod.py`;
+/// * the package directory, for `importlib.import_module("pkg")` reaching
+///   `pkg/__init__.py`.
+fn reached_dynamically(path: &str, forms: &BTreeSet<&str>) -> bool {
+    if forms.contains(path) {
+        return true;
+    }
+    if let Some((stem, _)) = path.rsplit_once('.') {
+        if forms.contains(stem) {
+            return true;
+        }
+    }
+    for init in ["/__init__.py", "/index.ts", "/index.tsx", "/index.js", "/mod.rs"] {
+        if let Some(package) = path.strip_suffix(init) {
+            if forms.contains(package) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn unwired_candidates(
     extractions: &[Extraction],
     edges: &[ResolvedEdge],
@@ -265,6 +294,22 @@ pub(crate) fn unwired_candidates(
         imported_by_production.insert(edge.target_file.as_str());
     }
 
+    // W3.3: files a *dynamic* reference reaches, which no import edge records.
+    //
+    // A lazily imported plugin, a code-split route and a worker entry point are
+    // all reachable and all invisible to the edge walk above. The Python wiring
+    // module has cleared them since it was written; the kernel did not, so it
+    // called them unwired on every build. Test files are skipped here for the
+    // same reason they are skipped for import edges: a reference from a test is
+    // not production wiring.
+    let dynamic_forms: BTreeSet<&str> = extractions
+        .iter()
+        .filter(|ext| !test_files.contains(ext.file_path.as_str()))
+        .flat_map(|ext| ext.wiring.iter())
+        .filter(|wiring| wiring.kind == WiringKind::DynamicImport)
+        .map(|wiring| wiring.target_symbol.as_str())
+        .collect();
+
     let mut excluded_coverage_loss = 0usize;
     let mut excluded_import_blind = 0usize;
     let mut candidates: Vec<String> = extractions
@@ -279,9 +324,11 @@ pub(crate) fn unwired_candidates(
                             | WiringKind::GeneratedFile
                             | WiringKind::ReExportPackage
                             | WiringKind::Launcher
+                            | WiringKind::AllowUnwired
                     )
                 })
                 || imported_by_production.contains(ext.file_path.as_str())
+                || reached_dynamically(&ext.file_path, &dynamic_forms)
             {
                 return false;
             }

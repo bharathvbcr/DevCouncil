@@ -438,58 +438,6 @@ def test_dependents_for_exception_returns_empty(mapper, monkeypatch):
     monkeypatch.setattr(mapper, "import_edges_for", boom)
     assert mapper.dependents_for(["a.py"]) == {}
 
-
-# ----------------------------------------------------------------------
-# liveness snapshot (drives _compute_liveness + _dead_symbol_candidates)
-# ----------------------------------------------------------------------
-
-
-def test_liveness_snapshot_small_repo(tmp_path):
-    pkg = tmp_path / "pkg"
-    pkg.mkdir()
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "__main__.py").write_text("from pkg import core\ncore.run()\n", encoding="utf-8")
-    (pkg / "core.py").write_text(
-        "def run():\n    return helper()\n\n\ndef helper():\n    return 1\n",
-        encoding="utf-8",
-    )
-    # An orphan module nothing imports and a dead public symbol inside it.
-    (pkg / "orphan.py").write_text(
-        "def never_used():\n    return 2\n", encoding="utf-8"
-    )
-    m = RepoMapper(tmp_path)
-    snap = m.liveness_snapshot()
-    assert set(snap) == {
-        "entry_roots",
-        "unwired_candidates",
-        "unreachable_files",
-        "dead_symbol_candidates",
-        "symbol_index",
-        "liveness_unreachable_unreliable",
-    }
-    assert "pkg/orphan.py" in snap["unwired_candidates"]
-    assert any("never_used" in s for s in snap["dead_symbol_candidates"])
-
-
-def test_liveness_snapshot_handles_failure(mapper, monkeypatch):
-    monkeypatch.setattr(mapper, "get_git_files", lambda: (_ for _ in ()).throw(RuntimeError()))
-    snap = mapper.liveness_snapshot()
-    assert snap["entry_roots"] == []
-    assert snap["dead_symbol_candidates"] == []
-
-
-def test_dead_symbol_candidates_with_index(tmp_path):
-    (tmp_path / "m.py").write_text(
-        "def used():\n    return 1\n\n\ndef dead():\n    return 2\n\n\nprint(used())\n",
-        encoding="utf-8",
-    )
-    m = RepoMapper(tmp_path)
-    dead, index = m._dead_symbol_candidates(["m.py"], with_index=True)
-    assert any("dead" in d for d in dead)
-    assert "m.py::used" in index
-    assert "m.py::dead" in index
-
-
 # ----------------------------------------------------------------------
 # freshness (content fingerprint + get_git_files fallback)
 # ----------------------------------------------------------------------
@@ -848,71 +796,6 @@ def test_probe_rust_module_empty_and_keywords(mapper):
     file_set = {"nested/mod.rs"}
     hits = mapper._probe_rust_module("", ["nested", "mod"], file_set)
     assert "nested/mod.rs" in hits
-
-
-# ----------------------------------------------------------------------
-# generic subsystems + important files
-# ----------------------------------------------------------------------
-
-
-# ----------------------------------------------------------------------
-# liveness / dead symbols / map_repo fallbacks
-# ----------------------------------------------------------------------
-
-
-def test_compute_liveness_respects_cap_and_lsp_flag(tmp_path, monkeypatch):
-    (tmp_path / "orphan.py").write_text("x = 1\n", encoding="utf-8")
-    m = RepoMapper(tmp_path)
-    files = ["orphan.py"]
-    roots, unwired, unreachable, dead, index, unreliable = m._compute_liveness(
-        files, [], cap=1, lsp_refs=False
-    )
-    assert isinstance(roots, list)
-    assert len(unwired) <= 1
-    assert isinstance(index, list)
-    assert isinstance(unreliable, bool)
-
-
-def test_dead_symbol_candidates_lsp_and_decorator_skips(tmp_path, monkeypatch):
-    (tmp_path / "api.py").write_text(
-        "@app.get('/x')\ndef wired():\n    return 1\n\n"
-        "def dead_fn():\n    return 2\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "ui.ts").write_text(
-        "@Component()\nexport function shown() {}\nexport function deadExport() {}\n",
-        encoding="utf-8",
-    )
-    m = RepoMapper(tmp_path)
-
-    def fake_filter(root, entries, pool=None, own_pool=True):
-        return [e for e in entries if "dead" in e]
-
-    monkeypatch.setattr(
-        "devcouncil.indexing.lsp_client.filter_dead_symbols_with_lsp", fake_filter
-    )
-    dead, index = m._dead_symbol_candidates(
-        ["api.py", "ui.ts"], cap=0, with_index=True, lsp_refs=True
-    )
-    assert any("dead_fn" in d for d in dead)
-    assert any("deadExport" in d for d in dead)
-    assert not any("wired" in d for d in dead)
-    assert any("api.py::dead_fn" in s for s in index)
-
-
-def test_dead_symbol_candidates_protected_and_uncapped_list_only(tmp_path):
-    (tmp_path / "pkg.py").write_text(
-        "__all__ = ['public']\n"
-        "def public():\n    return 1\n\n"
-        "def hidden():\n    return 2\n",
-        encoding="utf-8",
-    )
-    m = RepoMapper(tmp_path)
-    dead_only = m._dead_symbol_candidates(["pkg.py"], cap=0, with_index=False)
-    assert isinstance(dead_only, list)
-    assert any("hidden" in d for d in dead_only)
-    assert not any("public" in d for d in dead_only)
-
 
 def test_map_is_stale_content_fingerprint_error(monkeypatch, mapper):
     monkeypatch.setattr(mapper, "get_git_files", lambda: ["a.py"])

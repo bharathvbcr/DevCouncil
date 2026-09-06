@@ -209,27 +209,6 @@ def test_pool_shutdown_on_close(tmp_path, monkeypatch):
     pool.close()
     assert clients[0].shutdown_called is True
 
-
-def test_repo_mapper_lsp_refs_filters_dead(tmp_path, monkeypatch):
-    """Light hook: map dead-symbol path confirms via LSP filter."""
-    (tmp_path / "pkg").mkdir()
-    (tmp_path / "pkg" / "mod.py").write_text("def unused():\n    return 1\n", encoding="utf-8")
-
-    monkeypatch.setattr(
-        "devcouncil.indexing.lsp_client.filter_dead_symbols_with_lsp",
-        lambda root, cands, pool=None: [c for c in cands if "unused" not in c],
-    )
-
-    from devcouncil.indexing.repo_mapper import RepoMapper
-
-    mapper = RepoMapper(tmp_path)
-    dead = mapper._dead_symbol_candidates(["pkg/mod.py"], lsp_refs=True)
-    assert not any("unused" in d for d in dead)
-    # Without lsp_refs, token-scan still reports it.
-    dead_raw = mapper._dead_symbol_candidates(["pkg/mod.py"], lsp_refs=False)
-    assert any("unused" in d for d in dead_raw)
-
-
 @pytest.mark.anyio
 async def test_mcp_impact_precise_uses_lsp(tmp_path, monkeypatch):
     import json

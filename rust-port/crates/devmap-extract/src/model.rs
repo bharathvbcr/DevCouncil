@@ -828,6 +828,29 @@ pub enum WiringKind {
     /// explicit call anywhere in the corpus (`func init`, `#[test]`,
     /// `componentDidMount`, `pytest_*`, …).
     RuntimeEntryPoint,
+    /// The author declared this file intentionally unwired, with the
+    /// `devcouncil: allow-unwired` marker.
+    ///
+    /// The Python side has honoured this since it was introduced; the kernel
+    /// did not, so `dev map dead` and `unwired_candidates` reported files whose
+    /// author had already answered the question. An explicit human declaration
+    /// outranks a static inference, and one implementation should decide what
+    /// "wired" means.
+    AllowUnwired,
+    /// A dynamic reference to another file that no import edge records.
+    ///
+    /// `target_symbol` carries one normalized module form of the reference —
+    /// `importlib.import_module("pkg.mod")`, `import('./App')`,
+    /// `new Worker(new URL('./w.js', import.meta.url))`, `python -m pkg.mod`.
+    /// The annotation lives on the file that *makes* the reference; the join
+    /// that clears the file being referenced happens in `devmap-analyze`, where
+    /// the whole corpus is in scope.
+    ///
+    /// This is the one thing the Python wiring module held that the kernel
+    /// lacked, and it is real false-positive protection: a lazily imported
+    /// plugin, a code-split route and a worker entry point are all reachable
+    /// and all invisible to an import-edge walk.
+    DynamicImport,
 }
 
 /// One `m(...)` entry of a `type X interface { ... }` declaration.

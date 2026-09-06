@@ -554,6 +554,17 @@ def filter_dead_symbols_with_lsp(
     """Drop token-scan dead symbols that LSP finds referenced.
 
     When LSP is unavailable for a candidate, keep it (token-scan stands).
+
+    .. note::
+
+       Callerless in production since W3.3 retired
+       ``RepoMapper._dead_symbol_candidates``, which was its only caller. The
+       behaviour it wraps survives — ``verification.checks.dead_symbols`` and
+       ``mcp.handlers.map`` both drive ``LspSessionPool.confirm_unreferenced``
+       directly — so this is a wrapper without a user, not a capability without
+       a home. Kept rather than deleted in the same change because it is a
+       public helper with its own tests and removing it is a separate concern
+       from the wiring collapse.
     """
     if not candidates:
         return candidates
