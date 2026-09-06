@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS generation_edges (
     target_symbol  TEXT NOT NULL,
     edge_kind      TEXT NOT NULL,
     confidence     REAL NOT NULL,
+    resolution     TEXT,
     PRIMARY KEY (generation_id, ordinal)
 ) WITHOUT ROWID;
 
@@ -428,7 +429,26 @@ CREATE TABLE IF NOT EXISTS generation_coverage_gaps (
 ) WITHOUT ROWID;
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 14;
+/// v15: the evidence tier each edge was built from.
+///
+/// `ResolvedEdge::new` is the only constructor the resolver uses, so an edge's
+/// `confidence` cannot disagree with its `Resolution` on the way in. On the way
+/// back out there was nothing: no column held the resolution, so
+/// `devmap-query`'s `stored_edge_to_resolved` rebuilt every edge with
+/// `resolution: None` and the honesty invariant rested on the round trip plus
+/// the write-side constructor — never on a second, independent reading of the
+/// same fact.
+///
+/// Nullable, and NULL is not a tier. It means "written before this column
+/// existed", which is why the read path labels such an edge
+/// `ResolutionSource::Reconstructed`: a variant guessed from the row's file
+/// layout must never be indistinguishable from one the resolver actually
+/// recorded.
+pub const MIGRATION_V14_TO_V15: &str = r#"
+ALTER TABLE generation_edges ADD COLUMN resolution TEXT;
+"#;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 15;
 
 #[cfg(test)]
 mod retention_constant_tests {

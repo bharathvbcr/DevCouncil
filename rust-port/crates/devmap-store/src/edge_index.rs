@@ -59,9 +59,152 @@ pub fn edge_kind_from_stored(kind: &str) -> Result<EdgeKind, UnknownEdgeKind> {
     })
 }
 
+/// The evidence tier an edge was built from, as it is spelled in the store.
+///
+/// A mirror of `devmap_resolve::Resolution`'s variant set and nothing more: the
+/// column holds the *kind*, not the payload, because the payload is either
+/// already in the row (`SameFile`'s target) or is evidence the row cannot carry
+/// (`AmbiguousGlobal`'s candidate list). The kind is what the honesty
+/// invariants are stated over — `confidence()` is a function of it alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredResolutionKind {
+    SameFile,
+    ImportScoped,
+    ReceiverType,
+    UniqueGlobal,
+    AmbiguousGlobal,
+    Unresolved,
+    Structural,
+}
+
+/// The stored spelling of a resolution kind. **The one owner of the mapping**,
+/// beside [`edge_kind_from_stored`] and for the same reason: a second
+/// hand-written table anywhere else is a table that can drift from this one.
+///
+/// Written as an exhaustive `match` on `Resolution`, so a variant added to the
+/// resolver stops compiling here until someone decides how it is persisted. The
+/// default a wildcard would pick — some existing tier — is the one that loses
+/// the distinction silently.
+pub fn resolution_kind_label(resolution: &devmap_resolve::model::Resolution) -> &'static str {
+    use devmap_resolve::model::Resolution;
+    match resolution {
+        Resolution::SameFile { .. } => "SameFile",
+        Resolution::ImportScoped { .. } => "ImportScoped",
+        Resolution::ReceiverType { .. } => "ReceiverType",
+        Resolution::UniqueGlobal { .. } => "UniqueGlobal",
+        Resolution::AmbiguousGlobal { .. } => "AmbiguousGlobal",
+        Resolution::Unresolved { .. } => "Unresolved",
+        Resolution::Structural { .. } => "Structural",
+    }
+}
+
+/// Decode a stored resolution kind.
+///
+/// An unknown spelling is an error, never a default — the same rule
+/// [`edge_kind_from_stored`] states: it means the store was written by a binary
+/// that knows a tier this one does not, and quietly rounding it to some
+/// neighbouring tier would put a confidence claim on an edge whose evidence
+/// this binary cannot read.
+pub fn resolution_kind_from_stored(
+    kind: &str,
+) -> Result<StoredResolutionKind, UnknownResolutionKind> {
+    Ok(match kind {
+        "SameFile" => StoredResolutionKind::SameFile,
+        "ImportScoped" => StoredResolutionKind::ImportScoped,
+        "ReceiverType" => StoredResolutionKind::ReceiverType,
+        "UniqueGlobal" => StoredResolutionKind::UniqueGlobal,
+        "AmbiguousGlobal" => StoredResolutionKind::AmbiguousGlobal,
+        "Unresolved" => StoredResolutionKind::Unresolved,
+        "Structural" => StoredResolutionKind::Structural,
+        other => return Err(UnknownResolutionKind(other.to_string())),
+    })
+}
+
+/// Where an edge's resolution kind came from.
+///
+/// The distinction is the point of the column. A row written before it existed
+/// carries no evidence at all, and the read path has only the edge's own file
+/// layout to go on — which is a guess. A guess that presents itself as a
+/// reading is exactly the shape this codebase treats as the expensive failure,
+/// so the two are never spelled the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionSource {
+    /// Read from `generation_edges.resolution`, as the resolver recorded it.
+    Stored,
+    /// Inferred from the row, because the generation predates the column.
+    Reconstructed,
+}
+
+impl ResolutionSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            ResolutionSource::Stored => "stored",
+            ResolutionSource::Reconstructed => "reconstructed",
+        }
+    }
+}
+
+/// An edge's evidence tier, and whether it was read or guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdgeResolution {
+    pub kind: StoredResolutionKind,
+    pub source: ResolutionSource,
+}
+
+/// The resolution an edge row carries, or the reconstruction that stands in for
+/// one it does not.
+///
+/// The fallback is deliberately the *naive* reading — the only one a row
+/// without the column supports — and it is labelled
+/// [`ResolutionSource::Reconstructed`] so nothing can mistake it for the
+/// resolver's own record. It gets `Structural` wrong on purpose-built edges
+/// whose endpoints share a file, and `ImportScoped` wrong on every cross-file
+/// edge; that is what "this generation did not store its evidence" looks like
+/// when it is said out loud instead of guessed over.
+pub fn edge_resolution(
+    stored: Option<&str>,
+    edge: &StoredEdge,
+) -> Result<EdgeResolution, UnknownResolutionKind> {
+    match stored {
+        Some(kind) => Ok(EdgeResolution {
+            kind: resolution_kind_from_stored(kind)?,
+            source: ResolutionSource::Stored,
+        }),
+        None => Ok(reconstructed_resolution(edge)),
+    }
+}
+
+/// The guess a row without the column supports, always labelled as one.
+fn reconstructed_resolution(edge: &StoredEdge) -> EdgeResolution {
+    EdgeResolution {
+        kind: if edge.source_file == edge.target_file {
+            StoredResolutionKind::SameFile
+        } else {
+            StoredResolutionKind::UniqueGlobal
+        },
+        source: ResolutionSource::Reconstructed,
+    }
+}
+
 /// A stored edge kind this binary does not know.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownEdgeKind(pub String);
+
+/// A stored resolution kind this binary does not know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownResolutionKind(pub String);
+
+impl std::fmt::Display for UnknownResolutionKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "stored generation has unknown resolution kind {:?}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnknownResolutionKind {}
 
 impl std::fmt::Display for UnknownEdgeKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -107,6 +250,13 @@ pub struct GenerationEdges {
     /// Parsed once. The stored `edge_kind` string stays available for the
     /// `EdgeIdentity` label, so nothing formats a kind per crossed edge.
     kinds: Vec<EdgeKind>,
+    /// The evidence tier behind each edge, decoded once, in edge-id order.
+    ///
+    /// Travels with the adjacency for the same reason `analysis` does: a
+    /// consumer holding an edge has to be able to ask what it was resolved by
+    /// *and* whether that answer was read or reconstructed, and taking the two
+    /// from separate reads lets them describe different generations.
+    resolutions: Vec<EdgeResolution>,
     by_source_symbol: HashMap<Box<str>, Vec<u32>>,
     by_target_symbol: HashMap<Box<str>, Vec<u32>>,
     by_source_file: HashMap<Box<str>, Vec<u32>>,
@@ -140,6 +290,24 @@ impl GenerationEdges {
         edges: Arc<Vec<StoredEdge>>,
         analysis: Option<AnalysisDisclosure>,
     ) -> Result<Self, UnknownEdgeKind> {
+        // No stored resolutions: every edge's tier is reconstructed, and says
+        // so. That is the truth for a hand-built index in a test, and for a
+        // generation written before the column existed.
+        Self::build_with_resolutions(edges, analysis, None)
+    }
+
+    /// [`Self::build`] with the generation's decoded resolution column.
+    ///
+    /// `resolutions` is one entry per edge, in the same order. `None` means the
+    /// generation carries no resolution column at all, and every edge's tier is
+    /// then reconstructed — which each entry says of itself. A length mismatch
+    /// is refused rather than zipped short: a shifted alignment would attach
+    /// one edge's evidence to another's, which is worse than having none.
+    pub fn build_with_resolutions(
+        edges: Arc<Vec<StoredEdge>>,
+        analysis: Option<AnalysisDisclosure>,
+        resolutions: Option<Vec<EdgeResolution>>,
+    ) -> Result<Self, UnknownEdgeKind> {
         // Ids are `u32`. A generation with more edges than that cannot be
         // addressed, and answering over a silently truncated prefix would be a
         // wrong answer rather than a bounded one, so it is refused by the
@@ -148,10 +316,22 @@ impl GenerationEdges {
             edges.len() <= u32::MAX as usize,
             "a generation with more than u32::MAX edges cannot be indexed"
         );
+        if let Some(resolutions) = &resolutions {
+            assert_eq!(
+                resolutions.len(),
+                edges.len(),
+                "a resolution column that does not line up with its edges would \
+                 attribute one edge's evidence to another"
+            );
+        }
         let mut kinds = Vec::with_capacity(edges.len());
         for edge in edges.iter() {
             kinds.push(edge_kind_from_stored(&edge.edge_kind)?);
         }
+        let resolutions = match resolutions {
+            Some(resolutions) => resolutions,
+            None => edges.iter().map(reconstructed_resolution).collect(),
+        };
         let mut by_source_symbol: HashMap<Box<str>, Vec<u32>> = HashMap::new();
         let mut by_target_symbol: HashMap<Box<str>, Vec<u32>> = HashMap::new();
         let mut by_source_file: HashMap<Box<str>, Vec<u32>> = HashMap::new();
@@ -167,6 +347,7 @@ impl GenerationEdges {
             edges,
             analysis,
             kinds,
+            resolutions,
             by_source_symbol,
             by_target_symbol,
             by_source_file,
@@ -202,6 +383,11 @@ impl GenerationEdges {
 
     pub fn kind(&self, id: u32) -> EdgeKind {
         self.kinds[id as usize]
+    }
+
+    /// The evidence tier behind an edge, and whether it was read or guessed.
+    pub fn resolution(&self, id: u32) -> EdgeResolution {
+        self.resolutions[id as usize]
     }
 
     /// Whether the confidence floor admits this edge.

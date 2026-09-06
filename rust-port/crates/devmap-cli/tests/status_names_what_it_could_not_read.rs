@@ -169,5 +169,14 @@ fn a_corpus_with_nothing_to_report_reports_nothing_rather_than_saying_nothing() 
     }
     assert!(status["degraded_reason"].is_null(), "{status}");
 
+    // Item 2's disclosure, on the same surface: this generation's edges carry
+    // the evidence the resolver recorded rather than a reconstruction of it.
+    assert_eq!(
+        status["edge_resolution_source"], "stored",
+        "an edge re-read from a generation this kernel wrote must not be \
+         indistinguishable from one whose tier was guessed back out of its file \
+         layout: {status}"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }

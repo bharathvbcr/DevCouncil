@@ -1115,6 +1115,13 @@ fn store_status_fields(
         // opening the database. Rendered by `devmap_serve::coverage_gaps_json`,
         // shared with the daemon's own `status`.
         "coverage_gaps": devmap_serve::coverage_gaps_json(&status),
+        // Whether this generation's edges carry the evidence the resolver
+        // recorded, or a reconstruction standing in for one it never stored.
+        // `null` when there is no generation or it holds no edges — which is
+        // "nothing to say", not "reconstructed".
+        "edge_resolution_source": store
+            .latest_edge_resolution_source()?
+            .map(|source| source.label()),
     }) else {
         unreachable!("json! of an object literal is an object")
     };
@@ -3016,6 +3023,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     // here — there is no store to measure — and an empty
                     // inventory is the answer of a build that read everything.
                     "coverage_gaps": serde_json::Value::Null,
+                    "edge_resolution_source": serde_json::Value::Null,
                     "schema_outdated": false,
                     "schema_version": serde_json::Value::Null,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
@@ -3048,6 +3056,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     // Same reason as the no-store case: this binary refused to
                     // read the store, so it measured nothing.
                     "coverage_gaps": serde_json::Value::Null,
+                    "edge_resolution_source": serde_json::Value::Null,
                     "schema_outdated": true,
                     "schema_version": version,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,

@@ -1,18 +1,30 @@
-//! What a generation could not read is an inventory of rows, not a number.
+//! What a generation could not read, and what its edges were resolved by, are
+//! rows rather than numbers.
 //!
-//! `discovery_refused_files` was a number in `analysis_json`, so the only way to
-//! maintain it across an incremental write was to carry it forward — and a
-//! number can only be replaced, never edited. It is now `COUNT(*)` over an
-//! inventory the writer supplies, and `save_generation` refuses a summary that
-//! disagrees with the rows beside it.
+//! Two facts a generation used to carry only as a count, or not at all:
+//!
+//! - `discovery_refused_files` was a number in `analysis_json`, so the only way
+//!   to maintain it across an incremental write was to carry it forward — and a
+//!   number can only be replaced, never edited. It is now `COUNT(*)` over an
+//!   inventory the writer supplies, and `save_generation` refuses a summary
+//!   that disagrees with the rows beside it.
+//! - the evidence tier behind an edge was not persisted at all, so a re-read
+//!   edge carried none and the honesty invariant on the read path rested on the
+//!   write-side constructor plus a round trip. It is now a column, and a row
+//!   without one reads back as `ResolutionSource::Reconstructed` — a guess that
+//!   says it is one.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use devmap_extract::extract_file;
-use devmap_extract::model::Extraction;
-use devmap_store::{DiscoveryRefusal, GenerationWriteOpts, Store};
+use devmap_extract::model::{EdgeKind, Extraction};
+use devmap_resolve::model::{Resolution, ResolutionResult, ResolvedEdge};
+use devmap_store::{
+    DiscoveryRefusal, GenerationWriteOpts, ResolutionSource, Store, StoredResolutionKind,
+};
 
 fn tmp_dir(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -255,6 +267,98 @@ fn status_names_the_paths_behind_every_coverage_number() {
             .all(|row| row.path != "lib.py"),
         "a file the grammar read is not a coverage gap: {:?}",
         status.coverage_gaps
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Item 2: the stored kind wins over what a reconstruction would guess.
+///
+/// The edge is `Structural` — the relation a Go package star edge asserts — and
+/// its two endpoints share a file, so the only reconstruction a row supports
+/// says `SameFile`. Before the column existed there was no third possibility:
+/// the read path returned no resolution at all, and every honesty claim about a
+/// re-read edge rested on the write-side constructor.
+#[test]
+fn a_stored_resolution_kind_beats_the_reconstruction_a_row_would_support() {
+    let dir = tmp_dir("edge-resolution");
+    let db = dir.join("index.sqlite");
+    let store = Store::open(&db).unwrap();
+
+    let extractions = vec![python(
+        "geo/measure.py",
+        "def area():\n    return 1\n\n\ndef perimeter():\n    return area()\n",
+    )];
+    let structural = Arc::new(Resolution::Structural {
+        target_symbol: "area".to_string(),
+        target_file: "geo/measure.py".to_string(),
+    });
+    let resolution = ResolutionResult {
+        edges: vec![ResolvedEdge::resolved(
+            "geo/measure.py".to_string(),
+            "geo/measure.py".to_string(),
+            "perimeter".to_string(),
+            "area".to_string(),
+            EdgeKind::MemberOf,
+            Arc::clone(&structural),
+            None,
+        )],
+        receiver_types: Default::default(),
+        reexport_chains: Default::default(),
+        unresolved: Vec::new(),
+    };
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+
+    let index = store
+        .generation_edges()
+        .unwrap()
+        .expect("a generation was persisted");
+    assert_eq!(index.len(), 1);
+    let read = index.resolution(0);
+    assert_eq!(
+        read.source,
+        ResolutionSource::Stored,
+        "the generation was written by this kernel, so its evidence is on the row"
+    );
+    assert_eq!(
+        read.kind,
+        StoredResolutionKind::Structural,
+        "the row's own file layout says `SameFile`, and the resolver said \
+         `Structural`. The stored answer is the one that was measured"
+    );
+    assert_eq!(
+        store.latest_edge_resolution_source().unwrap(),
+        Some(ResolutionSource::Stored)
+    );
+    drop(index);
+
+    // Now the pre-column case, made by clearing the very column that was added.
+    // A reconstruction is allowed to be wrong; what it may not do is look like
+    // a reading.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE generation_edges SET resolution = NULL", [])
+            .unwrap();
+    }
+    let reread = Store::open(&db).unwrap();
+    let index = reread.generation_edges().unwrap().unwrap();
+    let guessed = index.resolution(0);
+    assert_eq!(
+        guessed.source,
+        ResolutionSource::Reconstructed,
+        "a generation that stored no evidence must not answer as though it had"
+    );
+    assert_eq!(
+        guessed.kind,
+        StoredResolutionKind::SameFile,
+        "which is exactly the wrong answer, and why the label matters"
+    );
+    assert_eq!(
+        reread.latest_edge_resolution_source().unwrap(),
+        Some(ResolutionSource::Reconstructed)
     );
 
     let _ = std::fs::remove_dir_all(&dir);

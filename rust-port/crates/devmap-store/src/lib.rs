@@ -17,7 +17,11 @@ pub use db::{
     SearchPage, Store, StoreStatus, StoredEdge, StoredFile, StoredSymbol, VacuumAction,
     VacuumOutcome, WalCheckpointMode, WalCheckpointResult, WriterLock, MAX_PENDING_ATTEMPTS,
 };
-pub use edge_index::{edge_kind_from_stored, DirectedEdges, GenerationEdges, UnknownEdgeKind};
+pub use edge_index::{
+    edge_kind_from_stored, edge_resolution, resolution_kind_from_stored, resolution_kind_label,
+    DirectedEdges, EdgeResolution, GenerationEdges, ResolutionSource, StoredResolutionKind,
+    UnknownEdgeKind, UnknownResolutionKind,
+};
 #[cfg(feature = "parse")]
 pub use extract_cache::{extract_tree_cached, extract_tree_cached_with_report};
 pub use schema::*;

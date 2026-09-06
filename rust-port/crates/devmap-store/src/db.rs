@@ -11,11 +11,13 @@ use rusqlite::{params, Connection, OptionalExtension, Result, TransactionBehavio
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::coverage::{CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryRefusal};
+use crate::edge_index::ResolutionSource;
 use crate::schema::{
     BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, COVERAGE_GAPS_TABLE, CREATE_SCHEMA_V3,
     CURRENT_SCHEMA_VERSION, MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12, MIGRATION_V12_TO_V13,
-    MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
-    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
+    MIGRATION_V14_TO_V15, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6,
+    MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10,
+    UNRESOLVED_TABLE,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -417,7 +419,7 @@ pub struct Store {
     /// bounded by one edge set and not by the number of generations retained.
     /// The cached set is unfiltered; `min_confidence` is applied per request
     /// against the same rounding rule the SQL used, so the answer is unchanged.
-    edge_cache: Mutex<Option<(u32, std::sync::Arc<Vec<StoredEdge>>)>>,
+    edge_cache: Mutex<Option<CachedEdges>>,
     /// Adjacency over the same rows [`Store::edge_cache`] holds, keyed by the
     /// same generation id.
     ///
@@ -493,6 +495,17 @@ impl Drop for WriterLock {
         }
     }
 }
+
+/// One generation's edge rows and the evidence tier behind each of them.
+///
+/// One entry rather than two caches: an evidence tier read from a different
+/// generation than the edge it labels is precisely the drift the index already
+/// refuses to allow for its coverage disclosure.
+type CachedEdges = (
+    u32,
+    std::sync::Arc<Vec<StoredEdge>>,
+    std::sync::Arc<Vec<crate::edge_index::EdgeResolution>>,
+);
 
 #[derive(Debug, Clone)]
 pub struct StoreStatus {
@@ -971,6 +984,7 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "target_symbol",
             "edge_kind",
             "confidence",
+            "resolution",
         ],
     ),
     (
@@ -1492,9 +1506,23 @@ impl Store {
             // probe — unlike the ADD COLUMN migrations above.
             tx.execute_batch(COVERAGE_GAPS_TABLE)?;
             tx.execute("PRAGMA user_version = 14", [])?;
-            Self::validate_schema(&tx)?;
+            // No mid-chain validation: v15 adds the edge resolution column
+            // below, and the end-of-chain check is the authoritative one.
             tx.commit()?;
             version = 14;
+        }
+        if version == 14 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Same idempotency probe as v7/v8/v10/v11: `ADD COLUMN` is not
+            // repeatable, and a fresh create applies `CREATE_SCHEMA_V3`, which
+            // already carries the column, before this chain runs.
+            if !Self::has_column(&tx, "generation_edges", "resolution")? {
+                tx.execute_batch(MIGRATION_V14_TO_V15)?;
+            }
+            tx.execute("PRAGMA user_version = 15", [])?;
+            Self::validate_schema(&tx)?;
+            tx.commit()?;
+            version = 15;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
@@ -2678,8 +2706,8 @@ impl Store {
             // highest-frequency statement in the writer: one execution for
             // every resolved edge, 73,000 of them in a DevCouncil generation.
             tx.prepare_cached(
-                "INSERT INTO generation_edges (generation_id, ordinal, source_file_id, target_file_id, source_symbol, target_symbol, edge_kind, confidence)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO generation_edges (generation_id, ordinal, source_file_id, target_file_id, source_symbol, target_symbol, edge_kind, confidence, resolution)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?
             .execute(
                 params![
@@ -2690,7 +2718,16 @@ impl Store {
                     edge.source_symbol,
                     edge.target_symbol,
                     format!("{:?}", edge.edge_kind),
-                    edge.confidence.persist_real()
+                    edge.confidence.persist_real(),
+                    // The evidence tier, so the read path does not have to
+                    // guess it back out of the row's file layout. NULL only for
+                    // an edge built without a resolution at all, which the
+                    // resolver never produces — `ResolvedEdge::new` takes one —
+                    // and which the read path therefore reports as
+                    // `ResolutionSource::Reconstructed`.
+                    edge.resolution
+                        .as_ref()
+                        .map(|resolution| crate::edge_index::resolution_kind_label(resolution)),
                 ],
             )?;
             edge_ord += 1;
@@ -3579,6 +3616,35 @@ impl Store {
         refusals
     }
 
+    /// Whether the latest generation's edges carry the resolution the resolver
+    /// recorded, or a reconstruction standing in for one it never stored.
+    ///
+    /// One row answers for the generation, and that is a property rather than a
+    /// sample: `save_generation` writes every edge of a generation in a single
+    /// transaction from one `resolution.edges`, and edges are never carried
+    /// forward from an older generation (see the comment above the edge loop).
+    /// So the column is present for all of a generation's edges or for none of
+    /// them. `None` when there is no generation, or when it holds no edges —
+    /// which is "nothing to say", not "reconstructed".
+    pub fn latest_edge_resolution_source(&self) -> Result<Option<ResolutionSource>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let stored: Option<Option<String>> = snapshot
+            .query_row(
+                "SELECT resolution FROM generation_edges
+                 WHERE generation_id = ?1 ORDER BY ordinal LIMIT 1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored.map(|resolution| match resolution {
+            Some(_) => ResolutionSource::Stored,
+            None => ResolutionSource::Reconstructed,
+        }))
+    }
+
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<(String, String, String)>> {
         if query.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -4150,7 +4216,7 @@ impl Store {
         // comparison that never ran. `checked_min_confidence` refuses the input
         // instead, so neither implementation is asked an unanswerable question.
         let min_confidence = checked_min_confidence(min_confidence)?;
-        let Some((_, all)) = self.latest_edge_rows()? else {
+        let Some((_, all, _)) = self.latest_edge_rows()? else {
             return Ok(Vec::new());
         };
         Ok(all
@@ -4175,7 +4241,7 @@ impl Store {
     /// that can never be hit again, so the cache silently stopped being one
     /// until the next load rewrote it. Labelling the entry with the generation
     /// its rows came from makes the key mean what it says.
-    fn latest_edge_rows(&self) -> Result<Option<(u32, std::sync::Arc<Vec<StoredEdge>>)>> {
+    fn latest_edge_rows(&self) -> Result<Option<CachedEdges>> {
         let current = {
             let conn = lock_conn(&self.conn)?;
             Self::latest_generation_id_locked(&conn)?
@@ -4184,20 +4250,33 @@ impl Store {
             return Ok(None);
         };
         if let Ok(cache) = self.edge_cache.lock() {
-            if let Some((generation, edges)) = cache.as_ref() {
+            if let Some((generation, edges, resolutions)) = cache.as_ref() {
                 if *generation == current {
-                    return Ok(Some((current, std::sync::Arc::clone(edges))));
+                    return Ok(Some((
+                        current,
+                        std::sync::Arc::clone(edges),
+                        std::sync::Arc::clone(resolutions),
+                    )));
                 }
             }
         }
-        let Some((loaded, all)) = self.latest_edges_uncached(0.0)? else {
+        let Some((loaded, all, resolutions)) = self.latest_edges_uncached(0.0)? else {
             return Ok(None);
         };
         let all = std::sync::Arc::new(all);
+        // Decoded once per generation, beside the rows they describe rather
+        // than in a cache of their own: an evidence tier read from a different
+        // generation than the edge it labels is the drift `GenerationEdges`
+        // already refuses to allow for its coverage disclosure.
+        let resolutions = std::sync::Arc::new(resolutions);
         if let Ok(mut cache) = self.edge_cache.lock() {
-            *cache = Some((loaded, std::sync::Arc::clone(&all)));
+            *cache = Some((
+                loaded,
+                std::sync::Arc::clone(&all),
+                std::sync::Arc::clone(&resolutions),
+            ));
         }
-        Ok(Some((loaded, all)))
+        Ok(Some((loaded, all, resolutions)))
     }
 
     /// Adjacency over the latest generation's edges, built once per generation.
@@ -4212,7 +4291,7 @@ impl Store {
     /// conversion used to fail: a store written by a binary that knows an edge
     /// kind this one does not is refused rather than half-read.
     pub fn generation_edges(&self) -> Result<Option<std::sync::Arc<GenerationEdges>>> {
-        let Some((current, rows)) = self.latest_edge_rows()? else {
+        let Some((current, rows, resolutions)) = self.latest_edge_rows()? else {
             return Ok(None);
         };
         if let Ok(cache) = self.edge_index.lock() {
@@ -4235,8 +4314,12 @@ impl Store {
         // which may already be behind the store's latest.
         let analysis = self.analysis_disclosure_for(current)?;
         let index = std::sync::Arc::new(
-            GenerationEdges::build(rows, analysis)
-                .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
+            GenerationEdges::build_with_resolutions(
+                rows,
+                analysis,
+                Some(resolutions.as_ref().clone()),
+            )
+            .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
         );
         if let Ok(mut cache) = self.edge_index.lock() {
             *cache = Some((current, std::sync::Arc::clone(&index)));
@@ -4250,14 +4333,18 @@ impl Store {
     /// caches them under it; returning only the rows left the caller to label
     /// them with a generation it had resolved separately. `None` when the store
     /// holds no generation.
-    fn latest_edges_uncached(&self, min_confidence: f32) -> Result<Option<(u32, Vec<StoredEdge>)>> {
+    #[allow(clippy::type_complexity)]
+    fn latest_edges_uncached(
+        &self,
+        min_confidence: f32,
+    ) -> Result<Option<(u32, Vec<StoredEdge>, Vec<crate::edge_index::EdgeResolution>)>> {
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
         let mut stmt = snapshot.prepare(
             "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
-                    e.edge_kind, e.confidence
+                    e.edge_kind, e.confidence, e.resolution
              FROM generation_edges e
              JOIN paths sp ON sp.id = e.source_file_id
              JOIN paths tp ON tp.id = e.target_file_id
@@ -4265,17 +4352,33 @@ impl Store {
              ORDER BY e.confidence DESC, sp.path, tp.path,
                       e.source_symbol, e.target_symbol, e.edge_kind",
         )?;
+        // The evidence tier is read in the same statement and decoded in the
+        // same pass. Taking it from a second query would let the two describe
+        // different generations, and taking it later would need the ordering
+        // above reproduced somewhere else — which is exactly the alignment a
+        // shifted resolution column would break.
         let rows = stmt.query_map(params![gen, min_confidence], |row| {
-            Ok(StoredEdge {
+            let edge = StoredEdge {
                 source_file: row.get(0)?,
                 target_file: row.get(1)?,
                 source_symbol: row.get(2)?,
                 target_symbol: row.get(3)?,
                 edge_kind: row.get(4)?,
                 confidence: row.get(5)?,
-            })
+            };
+            let stored: Option<String> = row.get(6)?;
+            let resolution = crate::edge_index::edge_resolution(stored.as_deref(), &edge)
+                .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?;
+            Ok((edge, resolution))
         })?;
-        Ok(Some((gen, rows.collect::<Result<Vec<_>>>()?)))
+        let mut edges = Vec::new();
+        let mut resolutions = Vec::new();
+        for row in rows {
+            let (edge, resolution) = row?;
+            edges.push(edge);
+            resolutions.push(resolution);
+        }
+        Ok(Some((gen, edges, resolutions)))
     }
 
     /// The callers of `names` and the unfiltered total, against one generation.
