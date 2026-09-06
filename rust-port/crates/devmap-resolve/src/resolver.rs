@@ -45,6 +45,22 @@ pub struct Resolver {
     /// abstaining is correct, answering with the winner of a race is not.
     poisoned_receiver_keys: BTreeSet<String>,
     type_methods: BTreeMap<(LangFamily, String, String), Vec<(String, String)>>,
+    /// `(family, type name)` -> the type names it declares as supertypes.
+    ///
+    /// X42. Built from the `Heritage` / `HeritageInterface` references the
+    /// extractor already emits — the same rows that produce `Extends` and
+    /// `Implements` edges — so nothing new is parsed and no naming convention
+    /// is consulted. It exists because `self.m()` where `m` is declared by a
+    /// base class is a *receiver-type* fact, and until this map there was no
+    /// way to state it: the ladder fell through to the global rung and bound
+    /// the call by bare name, at HIGH, to whichever declaration happened to be
+    /// unique.
+    ///
+    /// Flat by bare type name, exactly as `type_methods` is, so it adds no
+    /// namespace imprecision that map does not already carry — and the walk
+    /// that reads it refuses to continue through a type name two files declare,
+    /// where the chain stops being identifiable.
+    supertypes: BTreeMap<(LangFamily, String), BTreeSet<String>>,
     /// Per-file local import name → (target file, exported symbol) for import-scoped calls (G6).
     import_bindings: BTreeMap<String, BTreeMap<String, (String, String)>>,
     /// `file:scope:var` and `file:var` → the *declared* type name of a value,
@@ -174,6 +190,7 @@ impl Resolver {
             scoped_receiver_types: BTreeMap::new(),
             poisoned_receiver_keys: BTreeSet::new(),
             type_methods: BTreeMap::new(),
+            supertypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             external_imports: BTreeMap::new(),
@@ -537,6 +554,7 @@ impl Resolver {
         self.scoped_receiver_types.clear();
         self.poisoned_receiver_keys.clear();
         self.type_methods.clear();
+        self.supertypes.clear();
         self.import_bindings.clear();
         self.declared_types.clear();
         self.external_imports.clear();
@@ -817,6 +835,45 @@ impl Resolver {
             }
 
             let family = LangFamily::from_lang(&ext.language);
+            // X42. The supertype table, read from the heritage references the
+            // extractor emits. `enclosing_symbol` on one of these is the
+            // *declaring* type — that is what makes the `Extends` edge have two
+            // endpoints — so its tail is the subtype's name and the reference's
+            // own name is the supertype's.
+            for reference in &ext.references {
+                if !matches!(
+                    reference.kind,
+                    ReferenceKind::Heritage | ReferenceKind::HeritageInterface
+                ) {
+                    continue;
+                }
+                let Some(subtype) = reference
+                    .enclosing_symbol
+                    .as_deref()
+                    .filter(|symbol| *symbol != ext.file_path)
+                    .and_then(|symbol| symbol.rsplit("::").next())
+                    .filter(|subtype| !subtype.is_empty())
+                else {
+                    continue;
+                };
+                // A qualified base (`base.Widget`, `crate::m::Widget`) reduces
+                // to the bare name, which is the key `type_methods` uses.
+                let supertype = reference
+                    .name
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&reference.name)
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&reference.name);
+                if supertype.is_empty() || supertype == subtype {
+                    continue;
+                }
+                self.supertypes
+                    .entry((family, subtype.to_string()))
+                    .or_default()
+                    .insert(supertype.to_string());
+            }
             for reference in &ext.references {
                 let Some(receiver) = &reference.assigned_to else {
                     continue;
@@ -1210,8 +1267,53 @@ impl Resolver {
                         }
                     }
 
+                    // Whether the receiver is the enclosing object itself.
+                    // Several rungs below turn on it, and it was previously
+                    // recomputed at each of them.
+                    let implicit_receiver = call
+                        .receiver_expr
+                        .as_deref()
+                        .is_some_and(Self::receiver_is_self);
+
+                    // 1b. X42. An implicit receiver dispatches on the type the
+                    // call is written inside, and on that type's supertypes.
+                    //
+                    // Runs after rung 1 on purpose: a scope that writes
+                    // `self = Other()` has stated what `self` is, and written
+                    // evidence in this very scope outranks the enclosing type's
+                    // default. It runs *before* the import rungs for the
+                    // opposite reason — `self.run()` cannot mean an imported
+                    // free function, in any language here, so an import binding
+                    // of that bare name is not evidence about this call.
+                    if resolution.is_none() && implicit_receiver {
+                        if let Some(caller) = call.caller_symbol.as_deref() {
+                            if let Some((target_file, target_symbol, receiver_type)) = self
+                                .implicit_receiver_target(
+                                    &ext.file_path,
+                                    family,
+                                    caller,
+                                    &call.callee_name,
+                                )
+                            {
+                                resolution = Some(Arc::new(Resolution::ReceiverType {
+                                    target_symbol,
+                                    target_file,
+                                    receiver_type,
+                                }));
+                            }
+                        }
+                    }
+
                     // 2a. Import-scoped named binding (G6 — no silent global widen)
-                    if resolution.is_none() {
+                    //
+                    // Refused for an implicit receiver. This rung reads
+                    // `import_bindings` by the **bare callee name** and never
+                    // looked at the receiver, so `self.run()` in a file carrying
+                    // `from helpers import run` bound to `helpers.run` at
+                    // DETERMINISTIC — a confident edge to a function the code
+                    // demonstrably does not call, and one that also hands the
+                    // real method one fewer caller than it has.
+                    if resolution.is_none() && !implicit_receiver {
                         if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
                             if let Some((target_f, target_sym)) = bindings.get(&call.callee_name) {
                                 if let Some((resolved_file, resolved_sym)) =
@@ -1377,8 +1479,22 @@ impl Resolver {
                             let bare_call = call.receiver_expr.is_none();
                             let family_hits: Vec<_> = hits
                                 .iter()
-                                .filter(|(path, _, candidate_family)| {
+                                .filter(|(path, kind, candidate_family)| {
                                     family.admits(*candidate_family)
+                                        // X42. `self.m()` names a *member* of
+                                        // the receiver's type. A module-level
+                                        // function of the same name is not one,
+                                        // so binding to it is a wrong edge in
+                                        // both directions: the call gets a
+                                        // target it cannot reach, and the free
+                                        // function gets a caller it does not
+                                        // have — which shields it from the
+                                        // dead-code pass. Measured shape:
+                                        // `self.run()` fanning out to both
+                                        // `Service.run` and an unrelated
+                                        // `other.py::run`.
+                                        && (!implicit_receiver
+                                            || matches!(kind, SymbolKind::Method))
                                         && (*candidate_family != LangFamily::Go
                                             || Self::go_symbol_visible_from(
                                                 &ext.file_path,
@@ -2040,6 +2156,122 @@ impl Resolver {
     /// matching it against this file's symbols by bare name is a guess.
     fn receiver_is_self(receiver: &str) -> bool {
         matches!(receiver, "self" | "this" | "cls" | "$this" | "me" | "Self")
+    }
+
+    /// How far the supertype walk may climb.
+    ///
+    /// A bound rather than a cycle check alone: `class A(B)` / `class B(A)` is
+    /// not the only pathology, and a generated hierarchy thousands deep would
+    /// cost a lookup per level per call site. Eight covers every hierarchy this
+    /// resolver has been pointed at; past it the rung abstains, which loses an
+    /// edge and invents nothing.
+    const HERITAGE_WALK_MAX_DEPTH: usize = 8;
+
+    /// The type `symbol` is declared by, or `None` when it is declared at file
+    /// level.
+    ///
+    /// Read from `symbol_parents` — the extractor's own answer — and reduced to
+    /// the bare name the same way `type_methods` reduces `parent_symbol` when
+    /// it is built, so the two cannot key differently. Deliberately **not** a
+    /// split of the method's qualified name on `.`: `Outer.Inner.method` and a
+    /// module-level `a.b` are the same string to that rule and different facts.
+    fn declaring_type_of(&self, file: &str, symbol: &str) -> Option<&str> {
+        self.symbol_parents
+            .get(&(file.to_string(), symbol.to_string()))
+            .filter(|parent| *parent != file)
+            .and_then(|parent| parent.rsplit("::").next())
+            .filter(|type_name| !type_name.is_empty())
+    }
+
+    /// Whether exactly one indexed file declares a type of this name.
+    ///
+    /// The identifiability test for the supertype walk. `type_methods` and
+    /// `supertypes` are both flat by bare type name, so a chain that passes
+    /// through a name two files declare is a chain this resolver cannot follow
+    /// — and following it anyway would dispatch on whichever declaration the
+    /// merge happened to produce.
+    fn type_name_is_identifiable(&self, family: LangFamily, type_name: &str) -> bool {
+        let mut files: BTreeSet<&str> = BTreeSet::new();
+        for (path, kind, candidate_family) in self.symbol_index.get(type_name).into_iter().flatten()
+        {
+            if family.admits(*candidate_family)
+                && matches!(
+                    kind,
+                    SymbolKind::Class
+                        | SymbolKind::Struct
+                        | SymbolKind::Enum
+                        | SymbolKind::Interface
+                        | SymbolKind::Trait
+                )
+            {
+                files.insert(path.as_str());
+            }
+        }
+        files.len() <= 1
+    }
+
+    /// X42. Where `self.m()` / `cls.m()` / `this.m()` / a Go receiver's `s.M()`
+    /// goes, given the type the call is written inside.
+    ///
+    /// The receiver of such a call *is* the enclosing type — that is what the
+    /// keyword means — so this is `ReceiverType` evidence and not a new rung.
+    /// The type's own methods answer first; failing that, its declared
+    /// supertypes do, breadth-first, because an inherited method is still a
+    /// method of the receiver's type.
+    ///
+    /// Abstains, rather than choosing, on every ambiguity: a type that declares
+    /// the name twice, a level of the hierarchy where two supertypes declare
+    /// it, and a type name two files declare. Returns
+    /// `(target file, target symbol, the type that declared it)`.
+    fn implicit_receiver_target(
+        &self,
+        file: &str,
+        family: LangFamily,
+        caller_symbol: &str,
+        method: &str,
+    ) -> Option<(String, String, String)> {
+        let enclosing = self.declaring_type_of(file, caller_symbol)?.to_string();
+        let mut frontier = vec![enclosing];
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            let mut found: BTreeSet<(String, String, String)> = BTreeSet::new();
+            let mut next: Vec<String> = Vec::new();
+            for type_name in &frontier {
+                if !visited.insert(type_name.clone()) {
+                    continue;
+                }
+                if !self.type_name_is_identifiable(family, type_name) {
+                    return None;
+                }
+                if let Some(hits) =
+                    self.type_methods
+                        .get(&(family, type_name.clone(), method.to_string()))
+                {
+                    // One type declaring the same method twice is an ambiguity
+                    // inside that type, and nothing here can choose.
+                    if hits.len() != 1 {
+                        return None;
+                    }
+                    found.insert((hits[0].0.clone(), hits[0].1.clone(), type_name.clone()));
+                }
+                if let Some(bases) = self.supertypes.get(&(family, type_name.clone())) {
+                    next.extend(bases.iter().cloned());
+                }
+            }
+            match found.len() {
+                1 => return found.into_iter().next(),
+                0 => {}
+                // Two supertypes at one level declare the name. The language's
+                // own MRO might pick one; this resolver has no MRO, and a guess
+                // at DETERMINISTIC is the one answer it must not give.
+                _ => return None,
+            }
+            if next.is_empty() {
+                return None;
+            }
+            frontier = next;
+        }
+        None
     }
 
     fn lookup_in_package(&self, file: &str, name: &str) -> Option<(String, String)> {

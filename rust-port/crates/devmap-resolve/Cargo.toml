@@ -72,3 +72,7 @@ required-features = ["parse"]
 [[test]]
 name = "rust_module_paths"
 required-features = ["parse"]
+
+[[test]]
+name = "implicit_receiver_dispatch"
+required-features = ["parse"]
