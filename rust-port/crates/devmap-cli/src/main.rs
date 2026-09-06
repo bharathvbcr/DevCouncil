@@ -1,5 +1,5 @@
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -14,7 +14,7 @@ use devmap_query::{
     generate_code_graph_encodings, generate_manifest_with_edges, resolve_manifest_output,
     resolved_edge_from_stored, semantic_snapshots, write_code_graph_atomically,
     write_manifest_atomically, ArtifactStamp, FreshnessInfo, Request, ResolutionAvailability,
-    StampedFreshness, StoreQueryEngine, CODE_GRAPH_DEFAULT_OUTPUT, CODE_GRAPH_SCHEMA_VERSION,
+    StampedFreshness, StoreQueryEngine, CODE_GRAPH_SCHEMA_VERSION,
 };
 use devmap_resolve::{Resolver, UnresolvedClass};
 use devmap_serve::{default_ipc_path_for, Daemon};
@@ -127,22 +127,68 @@ struct Cli {
     ///
     /// `devmap.sqlite`, not `index.sqlite`. The latter is the *Python* engine's
     /// store — `user_version = 2`, a schema this binary has no migration for —
-    /// so the old default aimed every un-flagged invocation at a database that
-    /// could only be refused, while the Python seam
-    /// (`devmap_engine.DEFAULT_DB_RELPATH`) had already moved here. Keep the two
-    /// in step: this string and that constant name the same file.
-    #[arg(short, long, default_value = ".devcouncil/codeintel/devmap.sqlite")]
-    db: PathBuf,
+    /// so an un-flagged invocation must never aim at it.
+    ///
+    /// Unset, it is resolved by [`Cli::db`] rather than fixed to a literal:
+    /// which state directory a repository uses is a property of the repository,
+    /// not of this binary. See `devmap_extract::paths`.
+    ///
+    /// `global`, so it is accepted on either side of the subcommand. A flag that
+    /// parses as `devmap --db X status` and fails as `devmap status --db X` is a
+    /// papercut every caller hits once, and the generated agent guide hit it in
+    /// writing: it told agents to run `devmap dead --json`, which did not parse.
+    #[arg(short, long, global = true)]
+    db: Option<PathBuf>,
 
-    #[arg(long, default_value_t = false)]
+    /// Machine-readable output. Global; see `--db`.
+    #[arg(long, global = true, default_value_t = false)]
     json: bool,
 
-    /// Build progress policy. Auto writes progress to stderr only for an interactive terminal.
-    #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
+    /// Build progress policy. Auto writes progress to stderr only for an
+    /// interactive terminal. Global; see `--db`.
+    #[arg(long, value_enum, global = true, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
 
     #[command(subcommand)]
     command: Commands,
+}
+
+impl Cli {
+    /// The tree this invocation is about.
+    ///
+    /// Only the subcommands that actually name a repository root contribute
+    /// one. `claude validate <path>` is deliberately absent: its argument is a
+    /// *file* to check, and treating it as a root would resolve the store
+    /// relative to a hooks manifest.
+    fn root_hint(&self) -> &Path {
+        match &self.command {
+            Commands::Build { path, .. }
+            | Commands::Manifest { path, .. }
+            | Commands::Freshness { path, .. }
+            | Commands::Serve { path, .. }
+            | Commands::Html { path, .. }
+            | Commands::Export { path, .. }
+            | Commands::Routes { path, .. }
+            | Commands::ShapeCheck { path, .. }
+            | Commands::ApiImpact { path, .. } => path,
+            _ => Path::new("."),
+        }
+    }
+
+    /// The store this invocation reads and writes.
+    ///
+    /// An explicit `--db` is used as given — the Python seam passes one on
+    /// every call, so DevCouncil's behaviour cannot change here. Otherwise the
+    /// store is resolved against [`Self::root_hint`], which is what makes
+    /// `devmap build /other/repo` index into *that* repository instead of
+    /// creating a state directory under whatever the shell's working directory
+    /// happened to be.
+    fn db(&self) -> PathBuf {
+        match &self.db {
+            Some(explicit) => explicit.clone(),
+            None => devmap_extract::paths::store_path(self.root_hint()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -338,6 +384,22 @@ impl ProgressReporter {
     }
 }
 
+/// Which graph the HTML view draws.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum HtmlLevel {
+    /// Files and their imports.
+    Files,
+    /// Symbols and their calls, inheritance and named imports.
+    Symbols,
+    /// Subsystems, their neighbours and the file-level handoffs between them.
+    ///
+    /// Read from `repo_map.json` rather than the store: subsystems are derived
+    /// when the manifest is written, and drawing a second, in-memory grouping
+    /// here would let the picture disagree with the file every other consumer
+    /// reads.
+    Subsystems,
+}
+
 #[derive(Subcommand)]
 enum WorkspaceAction {
     /// Register a repository in this workspace.
@@ -467,14 +529,16 @@ enum Commands {
         /// that wants it should not have to run a build to get it.
         #[arg(long)]
         manifest: bool,
-        #[arg(
-            long,
-            requires = "manifest",
-            default_value = ".devcouncil/repo_map.json"
-        )]
-        output: PathBuf,
-        #[arg(long, requires = "manifest", default_value = CODE_GRAPH_DEFAULT_OUTPUT)]
-        graph_output: PathBuf,
+        /// Unset, resolved against `path`'s state directory. See
+        /// `devmap_extract::paths`.
+        #[arg(long, requires = "manifest")]
+        output: Option<PathBuf>,
+        /// Unset, resolved against `path`'s state directory.
+        #[arg(long, requires = "manifest")]
+        graph_output: Option<PathBuf>,
+        /// Also write the marker-guarded agent guides. See `manifest --guides`.
+        #[arg(long, requires = "manifest")]
+        guides: bool,
         /// Replace a Python-schema or otherwise foreign repo map / code graph.
         #[arg(long, requires = "manifest", default_value_t = false)]
         force: bool,
@@ -671,11 +735,14 @@ enum Commands {
     Manifest {
         #[arg(default_value = ".")]
         path: PathBuf,
-        #[arg(short, long, default_value = ".devcouncil/repo_map.json")]
-        output: PathBuf,
-        /// Symbol-level graph companion artifact.
-        #[arg(long, default_value = CODE_GRAPH_DEFAULT_OUTPUT)]
-        graph_output: PathBuf,
+        /// Unset, resolved against `path`'s state directory. See
+        /// `devmap_extract::paths`.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Symbol-level graph companion artifact. Unset, resolved against
+        /// `path`'s state directory.
+        #[arg(long)]
+        graph_output: Option<PathBuf>,
         /// Also write the interned encoding of the same graph here.
         ///
         /// Opt-in and additive: the verbose artifact above stays canonical and
@@ -693,6 +760,14 @@ enum Commands {
         /// graph.
         #[arg(long)]
         compact_graph_output: Option<PathBuf>,
+        /// Also write the marker-guarded agent guides, `AGENTS.md` and
+        /// `CLAUDE.md`.
+        ///
+        /// Opt-in: creating two files in somebody's repository is not a thing a
+        /// code index should do unasked. A guide that exists but carries no
+        /// `Managed by devmap` marker is hand-written and is never touched.
+        #[arg(long)]
+        guides: bool,
         /// Replace a Python-schema or otherwise foreign repo map / code graph.
         #[arg(long, default_value_t = false)]
         force: bool,
@@ -856,6 +931,159 @@ enum Commands {
         print_config: bool,
     },
 
+    /// Control and data dependency graphs for the functions in a file.
+    ///
+    /// Intra-procedural: a closure's body is its own PDG, not part of its
+    /// enclosing function's control flow.
+    ///
+    /// Python only. That is the language the analysis this ports covered, and
+    /// claiming a language whose statement tree nothing produces would return an
+    /// empty result that reads as "this file has no control flow".
+    Pdg {
+        /// File to analyse. Read from disk, not from the index, so it answers
+        /// about the buffer on disk right now.
+        file: PathBuf,
+        /// Report only statements that reach a security-sensitive sink.
+        ///
+        /// A sink is evidence. Its *absence* is not a safety claim: the patterns
+        /// are a heuristic list of well-known sinks, transcribed from the
+        /// implementation this replaces.
+        #[arg(long)]
+        taint: bool,
+    },
+
+    /// Run a small openCypher subset over the graph.
+    ///
+    /// Supported: `MATCH (a)-[r:calls|imports|…]->(b) WHERE … RETURN a, b
+    /// LIMIT n`, with `contains(a.name, '…')` and `starts with(b.path, '…')`
+    /// joined by `AND`.
+    ///
+    /// Anything outside that is **refused**, never silently widened: a `WHERE`
+    /// term this cannot evaluate would otherwise return every row in the graph
+    /// under a successful status.
+    Cypher {
+        /// The query.
+        query: String,
+        /// Rows to return when the query states no `LIMIT`. A query's own
+        /// `LIMIT` is a request; the server's ceiling still applies, and both
+        /// numbers are reported.
+        #[arg(short, long, default_value_t = 50)]
+        limit: usize,
+    },
+
+    /// Find symbols by kind, language and name, from the parsed index.
+    ///
+    /// The structural counterpart to `search`: `search` ranks by name relevance
+    /// and budgets its answer; this enumerates everything matching a filter and
+    /// reports the exact total.
+    Ast {
+        /// Case-insensitive substring of the name or qualified name.
+        #[arg(default_value = "")]
+        query: String,
+        /// Only this symbol kind. `--facets` lists the ones this index holds.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only this language.
+        #[arg(long)]
+        language: Option<String>,
+        /// Rows to return. The total is reported whatever this is.
+        #[arg(short, long, default_value_t = 100)]
+        limit: usize,
+        /// List the kinds and languages this generation holds, and stop.
+        #[arg(long)]
+        facets: bool,
+    },
+
+    /// Write the graph as GraphML, for Gephi, yEd, Cytoscape or networkx.
+    ///
+    /// Attributed: every node carries its kind, path, area, community and its
+    /// dead/unwired/unreachable flags; every edge its kind and confidence.
+    Export {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Where to write. Defaults to `<state dir>/graph.graphml`; `-` is stdout.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+
+    /// HTTP routes, their handlers, and the clients that call them.
+    ///
+    /// Routes come from `routes_to` edges, whose source the resolver writes as
+    /// `"VERB /path"`. Client call sites are found by pattern, over a bounded
+    /// walk of the files the graph names — so every answer carries what the
+    /// scan read and whether it finished.
+    Routes {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Only routes matching this path or id.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Files the client scan may open before it stops.
+        #[arg(long, default_value_t = 5_000)]
+        max_files: usize,
+        /// Largest file the client scan will read, in bytes.
+        #[arg(long, default_value_t = 1 << 20)]
+        max_file_bytes: u64,
+    },
+
+    /// Compare what a handler returns against what its callers read.
+    #[command(name = "shape-check")]
+    ShapeCheck {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Only routes matching this path or id.
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long, default_value_t = 5_000)]
+        max_files: usize,
+        #[arg(long, default_value_t = 1 << 20)]
+        max_file_bytes: u64,
+    },
+
+    /// What changing one route reaches: callers, shape, and a risk band.
+    #[command(name = "api-impact")]
+    ApiImpact {
+        /// The route path or `"VERB /path"` id.
+        route: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value_t = 5_000)]
+        max_files: usize,
+        #[arg(long, default_value_t = 1 << 20)]
+        max_file_bytes: u64,
+    },
+
+    /// Render the graph as one self-contained HTML file.
+    ///
+    /// No network and no build step: the renderer is embedded, so the page
+    /// opens from a `file://` URL on a machine that has never seen a package
+    /// manager. Capped by node count and honest about it — see `--max-nodes`.
+    Html {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Where to write. Defaults to `<state dir>/graph.html`.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// What a node is: files and their imports, symbols and their calls,
+        /// or subsystems and the crossings between them.
+        ///
+        /// One choice rather than stacked booleans, because two flags for three
+        /// views leaves a combination that has to mean something and does not.
+        #[arg(long, value_enum, default_value_t = HtmlLevel::Files)]
+        level: HtmlLevel,
+        /// Read subsystems from this `repo_map.json` instead of the state dir.
+        #[arg(long)]
+        map: Option<PathBuf>,
+        /// Most nodes to draw, ranked by degree so the hubs survive.
+        ///
+        /// A force layout stops converging in a browser tab well before a real
+        /// repository's node count, so this is a cap rather than a preference.
+        /// Whatever it cuts is stated in the payload *and* in the page header:
+        /// "1,000 of 12,103 nodes", never "1,000 nodes".
+        #[arg(long, default_value_t = 1_500)]
+        max_nodes: usize,
+    },
+
     /// Emit and check Dev Map's own Claude Code integration.
     ///
     /// Hook specs and a plugin manifest, built and validated here rather than
@@ -877,7 +1105,15 @@ enum ClaudeAction {
     ///
     /// Printed, not installed: a settings file is the user's, and merging into
     /// it is their edit to make. Everything needed to make it is here.
-    Hooks,
+    Hooks {
+        /// Command to write into the emitted handlers.
+        ///
+        /// Unset, `devmap` is emitted when that name on `PATH` resolves to this
+        /// binary, and this binary's absolute path otherwise. Set it when the
+        /// install location is known but not yet populated — packaging.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+    },
 
     /// List every documented hook event beside what Dev Map does about it.
     ///
@@ -888,11 +1124,22 @@ enum ClaudeAction {
     /// Write the installable plugin bundle: marketplace, manifest, hooks, MCP.
     Plugin {
         /// Directory the bundle is written under.
-        #[arg(long, default_value = ".devcouncil/claude-plugin")]
-        out: PathBuf,
+        ///
+        /// Unset, resolved to `<state dir>/devmap-plugin`. Deliberately *not*
+        /// `<state dir>/claude-plugin`, which is DevCouncil's own bundle: the
+        /// two emitters write a single-repo marketplace to the same
+        /// `.claude-plugin/marketplace.json`, under different names
+        /// (`devcouncil-local` and `devmap-local`), so sharing the directory
+        /// meant whichever ran last silently replaced the other's registration.
+        #[arg(long)]
+        out: Option<PathBuf>,
         /// Render to stdout instead of writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Command to write into the emitted hooks and MCP entry. See
+        /// `claude hooks --binary`.
+        #[arg(long)]
+        binary: Option<PathBuf>,
     },
 
     /// Check an existing hook config, plugin manifest, or marketplace file.
@@ -917,10 +1164,17 @@ struct ManifestRequest<'a> {
     force: bool,
     stamps: &'a StampFlags,
     inventory: InventoryLimits,
+    /// Write the marker-guarded agent guides from this generation.
+    guides: bool,
 }
 
 /// What a `manifest` write did, for the caller's `--json` payload.
 struct ManifestOutcome {
+    /// One entry per guide file considered, or empty when guides were not
+    /// requested. Reported in full — including the files left alone and why —
+    /// because "the guide was not refreshed" and "the guide is hand-written and
+    /// therefore ours to leave" are different facts and only one is a problem.
+    guides: Vec<devmap_query::guides::GuideOutcome>,
     output: std::path::PathBuf,
     graph_output: std::path::PathBuf,
     compact_graph_output: Option<std::path::PathBuf>,
@@ -950,6 +1204,108 @@ fn artifact_stamp_path(db: &std::path::Path) -> std::path::PathBuf {
 /// from, and each output's `(len, mtime, inode)` as written. When it holds, the
 /// generation is never read out of SQLite and nothing is serialized: the case a
 /// watcher and the PostToolUse hook hit on almost every tick.
+/// Write `AGENTS.md` / `CLAUDE.md` from this generation, when asked.
+///
+/// Returns an empty vector when guides were not requested, which is the one
+/// case that costs nothing: the manifest generation this needs is skipped
+/// entirely rather than computed and discarded.
+///
+/// A failure here is fatal rather than a warning. The guide is what points an
+/// agent at the map; a run that silently failed to refresh it leaves the tree
+/// with a guide describing a generation that no longer exists, and nothing said
+/// so.
+fn write_guides_if_requested(
+    store: &Store,
+    request: &ManifestRequest<'_>,
+    tree: &std::path::Path,
+) -> anyhow::Result<Vec<devmap_query::guides::GuideOutcome>> {
+    if !request.guides {
+        return Ok(Vec::new());
+    }
+    let extractions = store.latest_extractions()?;
+    let analysis = store
+        .latest_analysis()?
+        .ok_or_else(|| anyhow::anyhow!("guides unavailable: build a persisted generation first"))?;
+    let edges = store
+        .latest_edges(0.0)?
+        .into_iter()
+        .map(resolved_edge_from_stored)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    // Stamps the guide never reads. Passing the real ones would mean computing
+    // the digests first, which is the ordering this whole function exists to
+    // avoid; passing placeholders is safe precisely because `guides.rs` reads
+    // `subsystems`, `important_files` and `meta.devmap_rust` and nothing else.
+    let placeholder = FreshnessInfo {
+        head_sha: String::new(),
+        generation_id: 0,
+        pending_count: 0,
+        stamped: StampedFreshness::default(),
+    };
+    let (_manifest, json_str) =
+        generate_manifest_with_edges(&extractions, &analysis, placeholder, &edges);
+    let map: serde_json::Value = serde_json::from_str(&json_str)?;
+
+    let relative = |absolute: &std::path::Path| -> String {
+        let text = absolute
+            .strip_prefix(tree)
+            .unwrap_or(absolute)
+            .to_string_lossy()
+            .replace('\\', "/");
+        // `--db` defaults to a CWD-relative path, so stripping the tree prefix
+        // can leave `./.devmap/...`. The guide is prose an agent reads and
+        // copies; a stray `./` is noise in every line that quotes a path.
+        text.strip_prefix("./").unwrap_or(&text).to_string()
+    };
+    Ok(devmap_query::guides::write_agent_guides(
+        tree,
+        &map,
+        &relative(&devmap_extract::paths::repo_map_path(tree)),
+        &relative(&devmap_extract::paths::code_graph_path(tree)),
+        &relative(request.db),
+    )?)
+}
+
+/// The graph model, read from the store, for a surface that only wants to look.
+///
+/// One owner for `html` and `cypher`: both project the same value the artifact
+/// writer builds, so a picture and a query cannot describe different
+/// generations — and neither pays to parse a 20 MB `code_graph.json` back off
+/// disk to answer.
+///
+/// The freshness stamps are the store's own and are deliberately not computed
+/// here. These surfaces describe the generation, not the working tree, and
+/// digesting the tree would make rendering a picture cost a full rehash.
+fn graph_value_for_read(store: &Store, db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    let gen_id = store
+        .latest_generation_id()?
+        .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
+    let extractions = store.latest_extractions()?;
+    let analysis = store
+        .latest_analysis()?
+        .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
+    let edges = store
+        .latest_edges(0.0)?
+        .into_iter()
+        .map(resolved_edge_from_stored)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let freshness = FreshnessInfo {
+        head_sha: store
+            .latest_generation_head()?
+            .unwrap_or_else(|| "unavailable".to_string()),
+        generation_id: gen_id,
+        pending_count: store.status(&db.display().to_string())?.pending_count,
+        stamped: StampedFreshness::default(),
+    };
+    let repo_root = store.latest_repo_root()?;
+    devmap_query::build_code_graph_value(
+        &extractions,
+        &analysis,
+        &edges,
+        &freshness,
+        repo_root.as_deref(),
+    )
+}
+
 fn write_consumer_artifacts(
     store: &Store,
     request: ManifestRequest<'_>,
@@ -976,6 +1332,21 @@ fn write_consumer_artifacts(
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| request.path.to_path_buf());
+
+    // The guides go in **before** the digests are taken, not after.
+    //
+    // A guide this run creates or rewrites is a file in the tree, and unless the
+    // repository ignores it, it is part of the inventory `freshness::compute`
+    // hashes. Written afterwards it would move `content_fingerprint` the instant
+    // it landed, and the map would report itself stale against a tree only it
+    // had changed — a false staleness that costs a rebuild on every single run.
+    //
+    // The guide's text depends on the manifest's subsystems and provenance
+    // markers but not on its freshness stamps, so generating the manifest early
+    // to feed the guide and again afterwards with real stamps is well-founded:
+    // the second generation cannot change what the first one said here. The
+    // early generation is skipped entirely unless guides were asked for.
+    let guides = write_guides_if_requested(store, &request, &tree)?;
 
     let (stamped, freshness_source, freshness_unavailable_reason) = match request.stamps.supplied()
     {
@@ -1041,6 +1412,7 @@ fn write_consumer_artifacts(
             compact_graph_output: compact_dest,
             generation_id: gen_id,
             artifacts_unchanged: true,
+            guides,
             freshness_source,
             freshness_unavailable_reason,
         });
@@ -1113,6 +1485,7 @@ fn write_consumer_artifacts(
         compact_graph_output: compact_dest,
         generation_id: gen_id,
         artifacts_unchanged: false,
+        guides,
         freshness_source,
         freshness_unavailable_reason,
     })
@@ -1217,6 +1590,17 @@ fn report_manifest(cli: &Cli, outcome: &ManifestOutcome) -> anyhow::Result<()> {
             println!("Interned code graph written to {:?}", destination);
         }
     }
+    for guide in &outcome.guides {
+        let note = match guide.disposition {
+            devmap_query::guides::GuideDisposition::Created => "created",
+            devmap_query::guides::GuideDisposition::Updated => "updated",
+            devmap_query::guides::GuideDisposition::Unchanged => "already current",
+            devmap_query::guides::GuideDisposition::NotOurs => {
+                "left alone (no `Managed by devmap` marker)"
+            }
+        };
+        println!("  guide {}: {note}", guide.path.display());
+    }
     if !outcome.freshness_unavailable_reason.is_empty() {
         println!(
             "  freshness stamps unavailable: {}",
@@ -1241,7 +1625,244 @@ fn manifest_json(outcome: &ManifestOutcome) -> serde_json::Value {
         "artifacts_unchanged": outcome.artifacts_unchanged,
         "freshness_source": outcome.freshness_source,
         "freshness_unavailable_reason": outcome.freshness_unavailable_reason,
+        // Every file considered, with what happened to it. A guide left alone
+        // because it is hand-written is reported as such rather than omitted:
+        // "not refreshed" and "not ours to refresh" are different facts, and a
+        // caller that cannot tell them apart cannot tell a working install from
+        // a guide that silently stopped tracking the map.
+        "guides": outcome.guides.iter().map(|guide| serde_json::json!({
+            "path": guide.path,
+            "disposition": match guide.disposition {
+                devmap_query::guides::GuideDisposition::Created => "created",
+                devmap_query::guides::GuideDisposition::Updated => "updated",
+                devmap_query::guides::GuideDisposition::Unchanged => "unchanged",
+                devmap_query::guides::GuideDisposition::NotOurs => "not_ours",
+            },
+            "changed": guide.changed(),
+        })).collect::<Vec<_>>(),
     })
+}
+
+/// Where `repo_map.json` goes for this invocation.
+///
+/// An explicit `--output` is used as given. Otherwise the artifact lands in
+/// whichever state directory `root` resolves to, so the map is written beside
+/// the store that produced it rather than into a directory chosen by the
+/// caller's shell.
+fn resolve_map_output(explicit: &Option<PathBuf>, root: &Path) -> PathBuf {
+    explicit
+        .clone()
+        .unwrap_or_else(|| devmap_extract::paths::repo_map_path(root))
+}
+
+/// Where `code_graph.json` goes for this invocation. See [`resolve_map_output`].
+fn resolve_graph_output(explicit: &Option<PathBuf>, root: &Path) -> PathBuf {
+    explicit
+        .clone()
+        .unwrap_or_else(|| devmap_extract::paths::code_graph_path(root))
+}
+
+/// One line per symbol, then the counts — never a page length alone.
+fn report_ast(answer: &serde_json::Value) {
+    for hit in answer["matches"].as_array().into_iter().flatten() {
+        println!(
+            "{:<10} {:<12} {}  {}",
+            hit["kind"].as_str().unwrap_or(""),
+            hit["language"].as_str().unwrap_or(""),
+            hit["qualified_name"].as_str().unwrap_or(""),
+            hit["path"].as_str().unwrap_or(""),
+        );
+    }
+    let shown = answer["shown"].as_u64().unwrap_or(0);
+    let total = answer["total"].as_u64().unwrap_or(0);
+    if answer["truncated"].as_bool().unwrap_or(false) {
+        println!("{shown} of {total} match(es); raise --limit to see the rest");
+    } else {
+        println!("{total} match(es)");
+    }
+    // An empty answer because the filter names something the index does not
+    // hold is a different problem from an empty answer because nothing matched.
+    for unmatched in answer["unmatched_filters"].as_array().into_iter().flatten() {
+        println!(
+            "  --{} {:?}: {}",
+            unmatched["filter"].as_str().unwrap_or(""),
+            unmatched["value"].as_str().unwrap_or(""),
+            unmatched["detail"].as_str().unwrap_or(""),
+        );
+    }
+}
+
+/// The client scan's bounds, from the flags.
+fn scan_budget(max_files: usize, max_file_bytes: u64) -> devmap_query::api_routes::ScanBudget {
+    devmap_query::api_routes::ScanBudget {
+        max_files,
+        max_file_bytes,
+        ..Default::default()
+    }
+}
+
+/// The tree the scan reads, which is the one the store was built from.
+///
+/// The path argument names a repository; the store records the root it indexed.
+/// Those disagree when `--db` points elsewhere, and the file paths in the graph
+/// are relative to the *store's* root — resolving them against the argument
+/// would read a different tree, or nothing.
+fn repo_root_for(store: &Store, path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    Ok(store
+        .latest_repo_root()?
+        .map(PathBuf::from)
+        .unwrap_or_else(|| path.to_path_buf()))
+}
+
+/// Keep only routes matching the filter, leaving the scan report intact.
+fn retain_matching_routes(mapped: &mut serde_json::Value, filter: &str) {
+    let kept: Vec<serde_json::Value> = mapped["routes"]
+        .as_array()
+        .map(|routes| {
+            routes
+                .iter()
+                .filter(|route| {
+                    let path = route["path"].as_str().unwrap_or("");
+                    let id = route["id"].as_str().unwrap_or("");
+                    path.contains(filter)
+                        || id.contains(filter)
+                        || devmap_query::api_routes::paths_match(path, filter)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    // `count` stays the number of routes the graph holds; `shown` is what the
+    // filter kept. Overwriting `count` would make a filtered view read as the
+    // whole surface.
+    mapped["shown"] = serde_json::json!(kept.len());
+    mapped["routes"] = serde_json::Value::Array(kept);
+}
+
+/// One line per route, then the scan's own limits.
+fn report_routes(mapped: &serde_json::Value) {
+    let routes = mapped["routes"].as_array().cloned().unwrap_or_default();
+    if routes.is_empty() {
+        println!("No routes in this generation.");
+    }
+    for route in &routes {
+        let handlers: Vec<String> = route["handlers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|h| match h["resolution"].as_str() {
+                Some("ambiguous") => format!(
+                    "{} (ambiguous: {} candidates)",
+                    h["id"].as_str().unwrap_or("?"),
+                    h["candidates"].as_array().map(Vec::len).unwrap_or(0)
+                ),
+                Some("unresolved") => format!("{} (unresolved)", h["id"].as_str().unwrap_or("?")),
+                _ => h["id"].as_str().unwrap_or("?").to_string(),
+            })
+            .collect();
+        println!(
+            "{:<7} {}  -> {}",
+            route["verb"].as_str().unwrap_or("ANY"),
+            route["path"].as_str().unwrap_or(""),
+            if handlers.is_empty() {
+                "(no handler)".to_string()
+            } else {
+                handlers.join(", ")
+            }
+        );
+        let consumers = route["consumers"].as_array().map(Vec::len).unwrap_or(0);
+        if consumers > 0 {
+            println!("        {consumers} client call site(s)");
+        }
+    }
+    report_scan(mapped);
+}
+
+fn report_shape_check(checked: &serde_json::Value) {
+    let checks = checked["checks"].as_array().cloned().unwrap_or_default();
+    for check in &checks {
+        let verdict = check["verdict"].as_str().unwrap_or("");
+        println!(
+            "{:<7} {}  {}",
+            check["verb"].as_str().unwrap_or("ANY"),
+            check["route"].as_str().unwrap_or(""),
+            verdict
+        );
+        if verdict == "mismatch" {
+            let missing: Vec<&str> = check["missing_in_handler"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|k| k.as_str())
+                .collect();
+            println!(
+                "        consumers read, handler never returns: {}",
+                missing.join(", ")
+            );
+        }
+    }
+    println!(
+        "{} of {} route(s) mismatch",
+        checked["mismatch_count"].as_u64().unwrap_or(0),
+        checks.len()
+    );
+    report_scan(checked);
+}
+
+fn report_api_impact(impact: &serde_json::Value) {
+    if impact["found"] != serde_json::json!(true) {
+        println!(
+            "No route matched {:?}.",
+            impact["route"].as_str().unwrap_or("")
+        );
+        report_scan(impact);
+        return;
+    }
+    println!(
+        "{} {}",
+        impact["verb"].as_str().unwrap_or("ANY"),
+        impact["route"].as_str().unwrap_or("")
+    );
+    println!(
+        "  risk: {} — {}",
+        impact["risk"].as_str().unwrap_or("unknown"),
+        impact["risk_reason"].as_str().unwrap_or("")
+    );
+    for consumer in impact["consumers"].as_array().into_iter().flatten() {
+        println!(
+            "  called from {}:{}",
+            consumer["path"].as_str().unwrap_or(""),
+            consumer["line"].as_u64().unwrap_or(0)
+        );
+    }
+    for mismatch in impact["shape_mismatches"].as_array().into_iter().flatten() {
+        let missing: Vec<&str> = mismatch["missing_in_handler"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|k| k.as_str())
+            .collect();
+        println!("  shape: consumers read {}", missing.join(", "));
+    }
+    report_scan(impact);
+}
+
+/// What the scan read, and what it did not. Printed whenever it did not finish,
+/// because every count above it is then a lower bound.
+fn report_scan(payload: &serde_json::Value) {
+    let scan = &payload["scan"];
+    if scan["complete"].as_bool().unwrap_or(true) {
+        return;
+    }
+    println!(
+        "  scan incomplete: read {} of {} file(s); {} skipped for budget, \
+{} over size, {} unreadable. Counts above are lower bounds.",
+        scan["files_read"].as_u64().unwrap_or(0),
+        scan["files_eligible"].as_u64().unwrap_or(0),
+        scan["files_skipped_budget"].as_u64().unwrap_or(0),
+        scan["files_over_size"].as_u64().unwrap_or(0),
+        scan["files_unreadable"].as_u64().unwrap_or(0),
+    );
 }
 
 /// The `--manifest` half of a build: the artifacts and the store's own status,
@@ -1259,6 +1880,7 @@ fn build_manifest_payload(
     path: &std::path::Path,
     output: &std::path::Path,
     graph_output: &std::path::Path,
+    guides: bool,
     force: bool,
     stamps: &StampFlags,
     inventory: InventoryFlags,
@@ -1270,20 +1892,21 @@ fn build_manifest_payload(
         store,
         ManifestRequest {
             path,
-            db: &cli.db,
+            db: &cli.db(),
             output,
             graph_output,
             compact_graph_output: None,
             force,
             stamps,
             inventory: inventory.into(),
+            guides,
         },
     )?;
     let mut payload = manifest_json(&outcome);
     // The store's own view, so a caller does not need a third process to learn
     // whether the generation it just built is fresh, degraded or backed up
     // behind a pending queue.
-    payload["status"] = serde_json::Value::Object(store_status_fields(store, &cli.db)?);
+    payload["status"] = serde_json::Value::Object(store_status_fields(store, &cli.db())?);
     if !cli.json {
         report_manifest(cli, &outcome)?;
     }
@@ -1990,6 +2613,14 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         | Commands::Workspace { .. }
         | Commands::Serve { .. }
         | Commands::Mcp { .. }
+        | Commands::Html { .. }
+        | Commands::Cypher { .. }
+        | Commands::Pdg { .. }
+        | Commands::Ast { .. }
+        | Commands::Export { .. }
+        | Commands::Routes { .. }
+        | Commands::ShapeCheck { .. }
+        | Commands::ApiImpact { .. }
         | Commands::Claude { .. } => Ok(()),
     }
 }
@@ -2043,6 +2674,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             manifest: write_manifest,
             output,
             graph_output,
+            guides,
             force,
             stamps,
             inventory,
@@ -2053,7 +2685,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 1,
                 format_args!("scanning and extracting {}", path.display()),
             );
-            ensure_parent(&cli.db)?;
+            ensure_parent(&cli.db())?;
             // K13: take the cross-process writer lock *before* extraction.
             //
             // There was no such lock, so two builds — or a build and the
@@ -2063,8 +2695,8 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // Taking it first means the loser waits for the winner and then
             // does useful work, or fails immediately with a message naming the
             // pid that holds the store.
-            let _writer = Store::lock_writer_at(&cli.db, Store::WRITER_LOCK_WAIT)?;
-            let store = Store::open(&cli.db)?;
+            let _writer = Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)?;
+            let store = Store::open(cli.db())?;
             // K1(e2): stamped before discovery, on the queue's own wall clock.
             //
             // A build that walks the whole tree answers every request queued at
@@ -2246,8 +2878,9 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                         &store,
                         *write_manifest,
                         path,
-                        output,
-                        graph_output,
+                        &resolve_map_output(output, path),
+                        &resolve_graph_output(graph_output, path),
+                        *guides,
                         *force,
                         stamps,
                         *inventory,
@@ -2496,8 +3129,9 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 &store,
                 *write_manifest,
                 path,
-                output,
-                graph_output,
+                &resolve_map_output(output, path),
+                &resolve_graph_output(graph_output, path),
+                *guides,
                 *force,
                 stamps,
                 *inventory,
@@ -2568,7 +3202,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             budget,
             semantic,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let engine = StoreQueryEngine::new(&store);
             let resp = if *semantic {
                 engine.search_semantic(query, *budget)?
@@ -2592,7 +3226,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             min_confidence,
             min_rung,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let engine = StoreQueryEngine::new(&store);
             // Both floors apply, at different places: `min_confidence` goes to
             // the store, which drops rows before the engine sees them, and the
@@ -2619,7 +3253,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             depth,
             min_rung,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let engine = StoreQueryEngine::new(&store);
             let resp = engine.impact_at_rung(
                 Request {
@@ -2644,7 +3278,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             depth,
             min_confidence,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let engine = StoreQueryEngine::new(&store);
             let answers = engine.neighbors(targets, *budget, *min_confidence, *depth)?;
             if cli.json {
@@ -2666,7 +3300,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             depth,
             min_rung,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let engine = StoreQueryEngine::new(&store);
             let rung = min_rung.as_deref().and_then(devmap_query::Rung::parse);
             let resp = if let Some(destination) = to {
@@ -2699,7 +3333,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Dead { budget } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let payload = StoreQueryEngine::new(&store).dead_symbols(*budget)?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&payload)?)?;
@@ -2714,7 +3348,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             depth,
             min_confidence,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let report = StoreQueryEngine::new(&store).explore(
                 query,
                 *limit,
@@ -2734,7 +3368,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             depth,
             min_confidence,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let report = StoreQueryEngine::new(&store).affected_tests(
                 targets,
                 *budget,
@@ -2750,12 +3384,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
         Commands::Workspace { action } => {
             // Rooted at the store's repository, so `devmap --db X workspace` and
             // `dev map workspace` agree on where the registry lives.
-            let root = cli
-                .db
-                .parent()
-                .and_then(|dir| dir.parent())
-                .and_then(|dir| dir.parent())
-                .map(|dir| dir.to_path_buf())
+            let root = devmap_extract::paths::repo_root_from_store(cli.db())
                 .unwrap_or_else(|| PathBuf::from("."));
             // Mutating actions go through `Workspace::update`, which holds an
             // advisory lock across the read and the write. Loading here and
@@ -2940,7 +3569,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Savings { query, budget } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let report = StoreQueryEngine::new(&store).savings(query.as_deref(), *budget)?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&report)?)?;
@@ -2962,7 +3591,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 std::fs::read_to_string(content)
                     .map_err(|e| anyhow::anyhow!("cannot read {content}: {e}"))?
             };
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let report =
                 StoreQueryEngine::new(&store).preview(file, &source, *budget, *min_confidence)?;
             if cli.json {
@@ -2976,7 +3605,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             kind,
             min_nodes,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             // `value_parser` has already rejected anything but the two names,
             // so a `None` here can only be "no filter requested".
             let wanted = kind.as_deref().and_then(devmap_query::parse_clone_kind);
@@ -2992,22 +3621,24 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             output,
             graph_output,
             compact_graph_output,
+            guides,
             force,
             stamps,
             inventory,
         } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let outcome = write_consumer_artifacts(
                 &store,
                 ManifestRequest {
                     path,
-                    db: &cli.db,
-                    output,
-                    graph_output,
+                    db: &cli.db(),
+                    output: &resolve_map_output(output, path),
+                    graph_output: &resolve_graph_output(graph_output, path),
                     compact_graph_output: compact_graph_output.as_deref(),
                     force: *force,
                     stamps,
                     inventory: (*inventory).into(),
+                    guides: *guides,
                 },
             )?;
             report_manifest(cli, &outcome)?;
@@ -3223,7 +3854,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // schema of a store it was only asked to describe, silently, on the
             // one command a health check runs against a store it does not own.
             // Migrating is `build`'s job, where the caller asked for a write.
-            let stored_schema = Store::stored_schema_version(&cli.db)?;
+            let stored_schema = Store::stored_schema_version(cli.db())?;
             let Some(stored_schema) = stored_schema else {
                 let payload = serde_json::json!({
                     "generation_id": serde_json::Value::Null,
@@ -3231,7 +3862,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "node_count": 0,
                     "edge_count": 0,
                     "is_fresh": false,
-                    "db_path": cli.db.display().to_string(),
+                    "db_path": cli.db().display().to_string(),
                     "degraded_reason": "no devmap store at this path (run `devmap build`)",
                     "quarantined_count": 0,
                     "quarantined_paths": Vec::<String>::new(),
@@ -3262,7 +3893,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "node_count": 0,
                     "edge_count": 0,
                     "is_fresh": false,
-                    "db_path": cli.db.display().to_string(),
+                    "db_path": cli.db().display().to_string(),
                     "degraded_reason": format!(
                         "store schema is {version}, this binary speaks {}; \
                          run `devmap build` to migrate it",
@@ -3282,13 +3913,13 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 emit_json(cli, &payload)?;
                 return Ok(());
             }
-            let Some(store) = Store::open_existing(&cli.db)? else {
+            let Some(store) = Store::open_existing(cli.db())? else {
                 anyhow::bail!(
                     "the devmap store at {} vanished between the schema probe and the read",
-                    cli.db.display()
+                    cli.db().display()
                 );
             };
-            let mut payload = store_status_fields(&store, &cli.db)?;
+            let mut payload = store_status_fields(&store, &cli.db())?;
             payload.insert("schema_outdated".into(), serde_json::json!(false));
             payload.insert("schema_version".into(), serde_json::json!(stored_schema));
             payload.insert(
@@ -3298,7 +3929,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             emit_json(cli, &serde_json::Value::Object(payload))?;
         }
         Commands::History { last } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let rows = store.build_history(*last)?;
 
             if cli.json {
@@ -3379,7 +4010,9 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             pending,
             page_size,
         } => {
-            let store = open_for_read(&cli.db)?;
+            // `cli.db()` rather than `cli.db`: the store path is resolved per
+            // repository now, and `--db` is an `Option`.
+            let store = open_for_read(&cli.db())?;
             if !*fts && !*pending && !*page_size {
                 anyhow::bail!("specify a repair target, e.g. --fts, --pending or --page-size");
             }
@@ -3476,7 +4109,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Snapshots { file, budget } => {
-            let store = open_for_read(&cli.db)?;
+            let store = open_for_read(&cli.db())?;
             let extractions = store.latest_extractions()?;
             let resp = semantic_snapshots(
                 &extractions,
@@ -3506,7 +4139,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 // other. It also refuses a non-UTF-8 path rather than writing
                 // `display()`'s replacement characters into a `command` that
                 // then names no file on disk.
-                let entry = claude::mcp_entry(&executable, &cli.db, http.as_deref())?;
+                let entry = claude::mcp_entry(&executable, &cli.db(), http.as_deref())?;
                 emit_json(
                     cli,
                     &serde_json::json!({"mcpServers": {claude::MCP_SERVER_NAME: entry}}),
@@ -3514,7 +4147,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            let slot = std::sync::Arc::new(devmap_serve::StoreSlot::new(cli.db.clone()));
+            let slot = std::sync::Arc::new(devmap_serve::StoreSlot::new(cli.db()));
             match http {
                 Some(address) => {
                     // A bare port means loopback. Spelling the default out here
@@ -3558,15 +4191,425 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            ensure_parent(&cli.db)?;
-            let store = Store::open(&cli.db)?;
+            ensure_parent(&cli.db())?;
+            let store = Store::open(cli.db())?;
             let daemon = Daemon::new(store, root)
                 // So the daemon can notice its own store being deleted and
                 // exit, instead of serving a removed inode until its idle bound
                 // expires half an hour later.
-                .with_store_path(cli.db.clone())
+                .with_store_path(cli.db())
                 .with_ipc_path(ipc_path);
             daemon.run_loop().await?;
+        }
+        Commands::Pdg { file, taint } => {
+            let language = devmap_extract::detect_language(file);
+            if language != "python" {
+                anyhow::bail!(
+                    "pdg supports python; {} is {language}. Refusing rather than returning an \
+empty graph, which would read as 'this file has no control flow'.",
+                    file.display()
+                );
+            }
+            let source = std::fs::read_to_string(file)
+                .map_err(|error| anyhow::anyhow!("cannot read {}: {error}", file.display()))?;
+            let qualifier = file.to_string_lossy().replace('\\', "/");
+            let inputs = devmap_analyze::pdgsrc::python_function_pdgs(&source, &qualifier, 0, 0);
+
+            let mut graphs = Vec::new();
+            let mut refused = Vec::new();
+            for input in &inputs {
+                match devmap_analyze::pdg::build_function_pdg(input) {
+                    Ok(graph) => graphs.push((input, graph)),
+                    // A function the builder refuses is named with its reason
+                    // rather than dropped: a short list that looks complete is
+                    // the failure this whole analysis is careful about.
+                    Err(error) => refused.push(serde_json::json!({
+                        "function": input.function_name,
+                        "reason": format!("{error:#}"),
+                    })),
+                }
+            }
+
+            let sinks_of = |input: &devmap_analyze::pdg::FunctionPdgInput| -> Vec<String> {
+                fn walk(statements: &[devmap_analyze::pdg::PdgStatement], out: &mut Vec<String>) {
+                    use devmap_analyze::pdg::PdgStatementKind as K;
+                    for statement in statements {
+                        for sink in &statement.taint_sinks {
+                            out.push(format!("{}:{}", statement.line, sink));
+                        }
+                        match &statement.kind {
+                            K::Branch {
+                                then_body,
+                                else_body,
+                            } => {
+                                walk(then_body, out);
+                                walk(else_body, out);
+                            }
+                            K::Loop { body } => walk(body, out),
+                            K::Try {
+                                body,
+                                handlers,
+                                finally_body,
+                            } => {
+                                walk(body, out);
+                                for handler in handlers {
+                                    walk(handler, out);
+                                }
+                                walk(finally_body, out);
+                            }
+                            K::Basic | K::Return | K::Raise => {}
+                        }
+                    }
+                }
+                let mut out = Vec::new();
+                walk(&input.body, &mut out);
+                out
+            };
+
+            let rows: Vec<serde_json::Value> = graphs
+                .iter()
+                .filter_map(|(input, graph)| {
+                    let sinks = sinks_of(input);
+                    if *taint && sinks.is_empty() {
+                        return None;
+                    }
+                    Some(serde_json::json!({
+                        "function": graph.function_name,
+                        "start_line": input.start_line,
+                        "end_line": input.end_line,
+                        "params": input.params,
+                        "nodes": graph.nodes.len(),
+                        "edges": graph.edges.len(),
+                        "taint_sinks": sinks,
+                    }))
+                })
+                .collect();
+
+            if cli.json {
+                emit_json(
+                    cli,
+                    &serde_json::json!({
+                        "file": file,
+                        "language": language,
+                        "functions": rows,
+                        // Both numbers: a filtered view reported as a count
+                        // reads as a total.
+                        "shown": rows.len(),
+                        "total": graphs.len(),
+                        "refused": refused,
+                    }),
+                )?;
+            } else {
+                for row in &rows {
+                    println!(
+                        "{}  lines {}-{}  {} node(s), {} edge(s)",
+                        row["function"].as_str().unwrap_or(""),
+                        row["start_line"],
+                        row["end_line"],
+                        row["nodes"],
+                        row["edges"]
+                    );
+                    for sink in row["taint_sinks"].as_array().into_iter().flatten() {
+                        println!("    sink {}", sink.as_str().unwrap_or(""));
+                    }
+                }
+                println!("  {} of {} function(s)", rows.len(), graphs.len());
+                for entry in &refused {
+                    println!(
+                        "  refused {}: {}",
+                        entry["function"].as_str().unwrap_or(""),
+                        entry["reason"].as_str().unwrap_or("")
+                    );
+                }
+            }
+        }
+        Commands::Cypher { query, limit } => {
+            let store = open_for_read(&cli.db())?;
+            let graph = graph_value_for_read(&store, &cli.db())?;
+            let result = devmap_query::cypher::run(&graph, query, *limit);
+            if cli.json {
+                emit_json(cli, &result)?;
+            } else if result["ok"].as_bool() == Some(true) {
+                for row in result["rows"].as_array().into_iter().flatten() {
+                    match row.get("rel").and_then(serde_json::Value::as_str) {
+                        Some(rel) => println!(
+                            "{}  -[{rel}]->  {}",
+                            row["a_id"].as_str().unwrap_or(""),
+                            row["b_id"].as_str().unwrap_or("")
+                        ),
+                        None => println!("{}", row["a_id"].as_str().unwrap_or("")),
+                    }
+                }
+                // Both numbers, always: a page reported as a count reads as a
+                // total, and this surface exists to answer "how many".
+                println!(
+                    "  {} of {} row(s){}",
+                    result["shown"].as_u64().unwrap_or(0),
+                    result["total"].as_u64().unwrap_or(0),
+                    if result["limit_capped"].as_bool() == Some(true) {
+                        format!(
+                            " (LIMIT {} capped to {})",
+                            result["limit_requested"].as_u64().unwrap_or(0),
+                            result["limit_applied"].as_u64().unwrap_or(0)
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
+            } else {
+                // A refusal is an error exit, not a zero-row success: a caller
+                // that scripts this must be able to tell "your query was not
+                // run" from "your query matched nothing".
+                anyhow::bail!("{}", result["error"].as_str().unwrap_or("query refused"));
+            }
+        }
+        Commands::Ast {
+            query,
+            kind,
+            language,
+            limit,
+            facets,
+        } => {
+            let store = open_for_read(&cli.db())?;
+            if *facets {
+                let facets = devmap_query::ast::ast_facets(&store)?;
+                if cli.json {
+                    emit_json(cli, &facets)?;
+                } else {
+                    println!("kinds:");
+                    for (name, count) in facets["kinds"].as_object().into_iter().flatten() {
+                        println!("  {name:<16} {count}");
+                    }
+                    println!("languages:");
+                    for (name, count) in facets["languages"].as_object().into_iter().flatten() {
+                        println!("  {name:<16} {count}");
+                    }
+                }
+                return Ok(());
+            }
+            let filter = devmap_query::ast::AstFilter {
+                query: query.clone(),
+                kind: kind.clone(),
+                language: language.clone(),
+                limit: *limit,
+            };
+            let answer = devmap_query::ast::ast_query(&store, &filter)?;
+            if cli.json {
+                emit_json(cli, &answer)?;
+            } else {
+                report_ast(&answer);
+            }
+        }
+        Commands::Export { path, out } => {
+            let store = open_for_read(&cli.db())?;
+            let graph = graph_value_for_read(&store, &cli.db())?;
+            let gen_id = store.latest_generation_id()?.unwrap_or(0);
+            let (xml, report) = devmap_query::export::export_graphml(&graph);
+
+            let to_stdout = out.as_deref() == Some(std::path::Path::new("-"));
+            let destination = out
+                .clone()
+                .filter(|_| !to_stdout)
+                .unwrap_or_else(|| devmap_extract::paths::state_dir(path).join("graph.graphml"));
+            if to_stdout {
+                print!("{xml}");
+            } else {
+                ensure_parent(&destination)?;
+                std::fs::write(&destination, &xml)?;
+            }
+
+            if cli.json {
+                emit_json(
+                    cli,
+                    &serde_json::json!({
+                        "output": if to_stdout { serde_json::Value::Null }
+                                  else { serde_json::json!(destination) },
+                        "generation_id": gen_id,
+                        "nodes": report.nodes,
+                        "edges": report.edges,
+                        // GraphML cannot express an edge to an undeclared node,
+                        // and a symbol name can hold bytes XML forbids. Both are
+                        // repairs, and a repair nobody is told about is a
+                        // difference between the graph and its export.
+                        "edges_dangling": report.edges_dangling,
+                        "characters_replaced": report.characters_replaced,
+                        "bytes": xml.len(),
+                    }),
+                )?;
+            } else if !to_stdout {
+                println!("Wrote {}", destination.display());
+                println!("  {} nodes, {} edges", report.nodes, report.edges);
+                if report.edges_dangling > 0 {
+                    println!(
+                        "  {} edge(s) omitted: an endpoint is not a declared node \
+(GraphML cannot express one)",
+                        report.edges_dangling
+                    );
+                }
+                if report.characters_replaced > 0 {
+                    println!(
+                        "  {} character(s) replaced with U+FFFD: XML 1.0 cannot \
+represent them",
+                        report.characters_replaced
+                    );
+                }
+            }
+        }
+        Commands::Routes {
+            path,
+            filter,
+            max_files,
+            max_file_bytes,
+        } => {
+            let store = open_for_read(&cli.db())?;
+            let graph = graph_value_for_read(&store, &cli.db())?;
+            let budget = scan_budget(*max_files, *max_file_bytes);
+            let root = repo_root_for(&store, path)?;
+            let mut mapped = devmap_query::api_routes::route_map(&root, &graph, &budget);
+            if let Some(filter) = filter {
+                retain_matching_routes(&mut mapped, filter);
+            }
+            if cli.json {
+                emit_json(cli, &mapped)?;
+            } else {
+                report_routes(&mapped);
+            }
+        }
+        Commands::ShapeCheck {
+            path,
+            filter,
+            max_files,
+            max_file_bytes,
+        } => {
+            let store = open_for_read(&cli.db())?;
+            let graph = graph_value_for_read(&store, &cli.db())?;
+            let budget = scan_budget(*max_files, *max_file_bytes);
+            let root = repo_root_for(&store, path)?;
+            let checked =
+                devmap_query::api_routes::shape_check(&root, &graph, &budget, filter.as_deref());
+            if cli.json {
+                emit_json(cli, &checked)?;
+            } else {
+                report_shape_check(&checked);
+            }
+        }
+        Commands::ApiImpact {
+            route,
+            path,
+            max_files,
+            max_file_bytes,
+        } => {
+            let store = open_for_read(&cli.db())?;
+            let graph = graph_value_for_read(&store, &cli.db())?;
+            let budget = scan_budget(*max_files, *max_file_bytes);
+            let root = repo_root_for(&store, path)?;
+            let impact = devmap_query::api_routes::api_impact(&root, &graph, &budget, route);
+            if cli.json {
+                emit_json(cli, &impact)?;
+            } else {
+                report_api_impact(&impact);
+            }
+        }
+        Commands::Html {
+            path,
+            out,
+            level,
+            map,
+            max_nodes,
+        } => {
+            let store = open_for_read(&cli.db())?;
+            let gen_id = store.latest_generation_id()?.unwrap_or(0);
+            let repo_root = store.latest_repo_root()?;
+
+            let title = repo_root
+                .as_deref()
+                .and_then(|root| Path::new(root).file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Dev Map".to_string());
+
+            let (payload, html) = if *level == HtmlLevel::Subsystems {
+                let map_path = map
+                    .clone()
+                    .unwrap_or_else(|| devmap_extract::paths::repo_map_path(path));
+                let text = std::fs::read_to_string(&map_path).map_err(|err| {
+                    // Naming the remedy, because "No such file" here is not a
+                    // missing index — the store may be perfectly current and
+                    // this one derived artifact simply never written.
+                    anyhow::anyhow!(
+                        "cannot read {} ({err}). Subsystems come from the manifest: \
+run `devmap manifest {}` first, or pass --map <path>.",
+                        map_path.display(),
+                        path.display(),
+                    )
+                })?;
+                let repo_map: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
+                    anyhow::anyhow!("{} is not valid JSON: {err}", map_path.display())
+                })?;
+                (
+                    devmap_query::viz::build_map_payload(&repo_map),
+                    devmap_query::viz::render_map_html(&repo_map, &title),
+                )
+            } else {
+                let graph = graph_value_for_read(&store, &cli.db())?;
+                let options = devmap_query::viz::VizOptions {
+                    symbols: *level == HtmlLevel::Symbols,
+                    max_nodes: *max_nodes,
+                    title,
+                };
+                (
+                    devmap_query::viz::build_payload(&graph, &options),
+                    devmap_query::viz::render_html(&graph, &options),
+                )
+            };
+
+            let destination = out
+                .clone()
+                .unwrap_or_else(|| devmap_extract::paths::state_dir(path).join("graph.html"));
+            ensure_parent(&destination)?;
+            std::fs::write(&destination, &html)?;
+
+            let counts = &payload["counts"];
+            if cli.json {
+                emit_json(
+                    cli,
+                    &serde_json::json!({
+                        "output": destination,
+                        "generation_id": gen_id,
+                        "level": payload["level"],
+                        // Both numbers travel with the answer, as they do in the
+                        // page: a capped view reported as a node count is a
+                        // capped view nobody knows is capped.
+                        "counts": counts,
+                        // Same rule for crossings the view could not attribute to
+                        // a subsystem. Reporting only the edges that were drawn
+                        // would let a partial attribution read as a complete map.
+                        "unresolved_handoffs": payload["unresolved_handoffs"],
+                        "unresolved_handoffs_total": payload["unresolved_handoffs_total"],
+                        "bytes": html.len(),
+                    }),
+                )?;
+            } else {
+                println!("Wrote {}", destination.display());
+                let shown = counts["nodes_shown"].as_u64().unwrap_or(0);
+                let total = counts["nodes_total"].as_u64().unwrap_or(0);
+                if counts["nodes_truncated"].as_bool().unwrap_or(false) {
+                    println!(
+                        "  {shown} of {total} nodes drawn (most connected first); \
+raise --max-nodes to widen"
+                    );
+                } else {
+                    println!("  {total} nodes drawn");
+                }
+                if let Some(unplaced) = payload["unresolved_handoffs_total"].as_u64() {
+                    if unplaced > 0 {
+                        let drawn = counts["links_total"].as_u64().unwrap_or(0);
+                        println!(
+                            "  {unplaced} handoff(s) not drawn: an endpoint fell outside \
+every subsystem in this map ({drawn} drawn); the page lists them"
+                        );
+                    }
+                }
+            }
         }
         Commands::Claude { action } => run_claude(cli, action)?,
     }
@@ -3583,9 +4626,9 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
 fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
     let subcommands = claude::known_subcommands::<Cli>();
     match action {
-        ClaudeAction::Hooks => {
-            let executable = std::env::current_exe()?;
-            let block = claude::hooks_block(&executable, &cli.db, &subcommands)?;
+        ClaudeAction::Hooks { binary } => {
+            let executable = claude::plugin_command(&std::env::current_exe()?, binary.as_deref());
+            let block = claude::hooks_block(&executable, &cli.db(), &subcommands)?;
             emit_json(cli, &block)
         }
         ClaudeAction::Events => {
@@ -3634,13 +4677,20 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
                 Ok(())
             }
         }
-        ClaudeAction::Plugin { out, dry_run } => {
-            let executable = std::env::current_exe()?;
+        ClaudeAction::Plugin {
+            out,
+            dry_run,
+            binary,
+        } => {
+            let executable = claude::plugin_command(&std::env::current_exe()?, binary.as_deref());
             let version = env!("CARGO_PKG_VERSION");
+            let out = &out
+                .clone()
+                .unwrap_or_else(|| devmap_extract::paths::plugin_dir(Path::new(".")));
             if *dry_run {
                 let rendered = claude::render_plugin_bundle(
                     &executable,
-                    &cli.db,
+                    &cli.db(),
                     Some(version),
                     &subcommands,
                 )?;
@@ -3662,7 +4712,7 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
             let written = claude::write_plugin_bundle(
                 out,
                 &executable,
-                &cli.db,
+                &cli.db(),
                 Some(version),
                 &subcommands,
             )?;

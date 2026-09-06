@@ -232,7 +232,13 @@ fn default_explore_budget() -> u32 {
 /// Ceiling on `explore`'s definition list. The budget usually bites first; this
 /// bounds the work a caller can ask for before the budget is even consulted —
 /// each definition costs two traversals.
-const MAX_EXPLORE_LIMIT: usize = 100;
+/// Most definitions `explore` will expand in one call.
+///
+/// `pub` so `mcp::describe` declares this exact number instead of restating it.
+/// A published `maximum` that disagrees with the value enforced here is the
+/// failure the schema checker exists to prevent, one level up: a client-side
+/// validator would accept a call this server refuses.
+pub const MAX_EXPLORE_LIMIT: usize = 100;
 
 #[derive(Debug, Serialize)]
 struct ErrorBody {

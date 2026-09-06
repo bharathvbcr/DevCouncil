@@ -12,6 +12,7 @@ devmap-store = { path = "../devmap-store", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+regex.workspace = true
 
 [features]
 default = ["parse"]

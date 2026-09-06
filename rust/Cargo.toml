@@ -5,7 +5,7 @@ members = ["dc-glob", "dc-grep", "dc-store", "dc-verify"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 
 # No shared external dependencies, deliberately. Every crate a member pulls in
 # is a dependency-audit surface paid for weekly; the analysis plane earns one

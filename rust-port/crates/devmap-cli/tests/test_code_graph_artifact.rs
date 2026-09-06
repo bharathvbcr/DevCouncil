@@ -90,8 +90,8 @@ fn one_manifest_invocation_publishes_both_consumer_artifacts() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let map_path = root.join(".devcouncil/repo_map.json");
-    let graph_path = root.join(".devcouncil/graph/code_graph.json");
+    let map_path = devmap_extract::paths::repo_map_path(&root);
+    let graph_path = devmap_extract::paths::code_graph_path(&root);
     assert!(map_path.is_file(), "repo_map.json must be written");
     assert!(
         graph_path.is_file(),
@@ -105,7 +105,7 @@ fn one_manifest_invocation_publishes_both_consumer_artifacts() {
     assert!(
         payload["graph_output"]
             .as_str()
-            .is_some_and(|p| p.ends_with(".devcouncil/graph/code_graph.json")),
+            .is_some_and(|p| p.ends_with(".devmap/graph/code_graph.json")),
         "the JSON result must name the graph it wrote: {payload}"
     );
 
@@ -249,7 +249,7 @@ fn a_python_written_graph_is_protected_until_forced() {
     build(&root, &db);
     assert!(run_manifest(&root, &db, &[]).status.success());
 
-    let graph_path = root.join(".devcouncil/graph/code_graph.json");
+    let graph_path = devmap_extract::paths::code_graph_path(&root);
     // The live Python artifact's shape: a real meta dict with no engine marker.
     let python =
         r#"{"schema_version": 2, "nodes": [], "edges": [], "meta": {"parse_cache_version": 8}}"#;
@@ -305,7 +305,7 @@ fn two_cold_builds_produce_a_byte_identical_code_graph() {
         assert!(run_manifest(&root, &db, &[]).status.success());
         rendered.push((
             root.clone(),
-            fs::read_to_string(root.join(".devcouncil/graph/code_graph.json")).unwrap(),
+            fs::read_to_string(devmap_extract::paths::code_graph_path(&root)).unwrap(),
         ));
     }
 
@@ -340,7 +340,7 @@ fn an_unbuilt_store_publishes_no_graph_at_all() {
         "an unbuilt store must not produce artifacts"
     );
     assert!(
-        !root.join(".devcouncil/graph/code_graph.json").exists(),
+        !devmap_extract::paths::code_graph_path(&root).exists(),
         "no graph may be left behind"
     );
 
@@ -361,8 +361,8 @@ fn the_interned_graph_is_opt_in_and_decodes_to_the_verbose_one() {
     write_fixture(&root);
     build(&root, &db);
 
-    let compact_path = root.join(".devcouncil/graph/code_graph.compact.json");
-    let graph_path = root.join(".devcouncil/graph/code_graph.json");
+    let compact_path = devmap_extract::paths::compact_code_graph_path(&root);
+    let graph_path = devmap_extract::paths::code_graph_path(&root);
 
     // Off by default: the flag is the only thing that writes it, and the
     // absence must be reported as absent rather than as an empty path.
@@ -385,7 +385,7 @@ fn the_interned_graph_is_opt_in_and_decodes_to_the_verbose_one() {
         &db,
         &[
             "--compact-graph-output",
-            ".devcouncil/graph/code_graph.compact.json",
+            ".devmap/graph/code_graph.compact.json",
             "--force",
         ],
     );
@@ -429,7 +429,7 @@ fn the_interned_graph_is_opt_in_and_decodes_to_the_verbose_one() {
         &db,
         &[
             "--compact-graph-output",
-            ".devcouncil/graph/code_graph.compact.json",
+            ".devmap/graph/code_graph.compact.json",
         ],
     );
     assert!(

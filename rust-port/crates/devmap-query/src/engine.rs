@@ -1337,7 +1337,7 @@ impl<'a> StoreQueryEngine<'a> {
 
         let repo_map_bytes = repo_root
             .as_ref()
-            .map(|root| Path::new(root).join(".devcouncil/repo_map.json"))
+            .map(devmap_extract::paths::repo_map_path)
             .and_then(|path| std::fs::metadata(path).ok())
             .map(|m| m.len());
 

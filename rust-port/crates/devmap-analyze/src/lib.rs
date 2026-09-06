@@ -4,6 +4,9 @@ pub mod dead_clusters;
 pub mod liveness;
 pub mod model;
 pub mod pdg;
+// The producer for `pdg`: source in, `FunctionPdgInput` out. Behind `parse`,
+// because it needs a grammar.
+pub mod pdgsrc;
 pub mod resolution_rate;
 pub mod traversal;
 

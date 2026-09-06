@@ -218,6 +218,8 @@ dependencies = [
  "devmap-resolve",
  "serde",
  "serde_json",
+ "tree-sitter",
+ "tree-sitter-python",
 ]
 
 [[package]]
@@ -293,6 +295,7 @@ dependencies = [
  "devmap-extract",
  "devmap-resolve",
  "devmap-store",
+ "regex",
  "serde",
  "serde_json",
 ]

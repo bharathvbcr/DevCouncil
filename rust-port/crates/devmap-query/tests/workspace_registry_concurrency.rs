@@ -71,7 +71,7 @@ fn eight_concurrent_registrations_all_survive() {
     }
 
     // A temp file left behind is what the next writer trips over.
-    let strays: Vec<String> = std::fs::read_dir(dir.join(".devcouncil"))
+    let strays: Vec<String> = std::fs::read_dir(devmap_extract::paths::state_dir(&dir))
         .expect("registry directory")
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())

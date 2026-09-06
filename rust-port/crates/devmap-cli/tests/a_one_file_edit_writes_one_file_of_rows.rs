@@ -77,8 +77,7 @@ struct Stored {
 }
 
 fn stored(root: &Path) -> Stored {
-    let conn =
-        rusqlite::Connection::open(root.join(".devcouncil/codeintel/devmap.sqlite")).unwrap();
+    let conn = rusqlite::Connection::open(devmap_extract::paths::store_path(&root)).unwrap();
     let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     Stored {
         generations: one("SELECT COUNT(*) FROM generations"),
@@ -195,8 +194,7 @@ fn two_files_with_identical_content_keep_their_own_paths() {
     std::fs::write(root.join("src/two.rs"), identical).unwrap();
     build(&root);
 
-    let conn =
-        rusqlite::Connection::open(root.join(".devcouncil/codeintel/devmap.sqlite")).unwrap();
+    let conn = rusqlite::Connection::open(devmap_extract::paths::store_path(&root)).unwrap();
     let mut stmt = conn
         .prepare(
             "SELECT p.path FROM generation_files f

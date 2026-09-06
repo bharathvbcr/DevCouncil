@@ -211,7 +211,7 @@ fn status_counts_stored_edges_whose_confidence_contradicts_their_evidence() {
         "a clean generation reports zero as a measurement: {before}"
     );
 
-    let db = root.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(&root);
     let changed = {
         let conn = rusqlite::Connection::open(&db).unwrap();
         // Every `Calls` edge with a stored deterministic-or-high kind is moved

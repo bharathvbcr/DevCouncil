@@ -40,8 +40,13 @@ use serde_json::{json, Map, Value};
 /// `SCHEMA_VERSION` in `src/devcouncil/indexing/graph/schema.py`.
 pub const CODE_GRAPH_SCHEMA_VERSION: u32 = 2;
 
-/// Consumer default path, relative to the indexed repository root.
-pub const CODE_GRAPH_DEFAULT_OUTPUT: &str = ".devcouncil/graph/code_graph.json";
+// The consumer default paths that used to live here — `CODE_GRAPH_DEFAULT_OUTPUT`
+// and `CODE_GRAPH_COMPACT_DEFAULT_OUTPUT` — are gone rather than updated. Which
+// directory holds an artifact is now resolved per repository by
+// `devmap_extract::paths`, so a fixed relative string could only be right for
+// one of the two layouts, and a caller reading it would write the graph
+// somewhere the reader of that repository does not look. Use
+// `devmap_extract::paths::code_graph_path` / `compact_code_graph_path`.
 
 /// Milliconfidence floors for the Python tri-state `Confidence` enum.
 ///
@@ -108,6 +113,31 @@ fn node_kind_label(kind: SymbolKind) -> &'static str {
         SymbolKind::Community => "namespace",
     }
 }
+
+/// Every edge-kind string this writer can emit, in the order of [`EdgeKind`].
+///
+/// `pub` so a query surface can validate a caller's relationship name against
+/// exactly what the emitter produces. Restating the list somewhere else is how
+/// `EXTENDS` came to be an accepted relationship type in the Python Cypher
+/// subset while the graph emitted `inherits`: the query parsed, the name was
+/// "supported", and it matched zero edges — reported as an empty result rather
+/// than as a name nothing can match.
+pub const EDGE_KIND_LABELS: &[&str] = &[
+    "imports",
+    "calls",
+    "contains",
+    "defines",
+    "instantiates",
+    "inherits",
+    "implements",
+    "subscribes",
+    "routes_to",
+    "wired_to",
+    "member_of",
+    "depends_on",
+    "taint_flow",
+    "references",
+];
 
 /// Rust `EdgeKind` as the edge-kind string Python consumers match on.
 ///
@@ -549,7 +579,13 @@ struct GraphProvenance {
 /// interned form `encode_compact` produces — are rendered from *this* value.
 /// A second traversal would be a second place for a field to be dropped, and
 /// the two artifacts would then disagree with nothing to notice it.
-fn build_code_graph_value(
+/// The graph model both artifacts and the HTML view are projections of.
+///
+/// `pub` so `viz` can render from the same value the writer serializes rather
+/// than reading `code_graph.json` back off disk. The picture and the artifact
+/// must not be able to describe different generations, and the cheapest way to
+/// guarantee that is for there to be only one of them.
+pub fn build_code_graph_value(
     extractions: &[Extraction],
     analysis: &AnalysisSummary,
     edges: &[ResolvedEdge],
@@ -1000,9 +1036,6 @@ pub fn generate_code_graph_encodings(
 /// a later version rather than read it as `v1` and answer from a layout it does
 /// not understand.
 pub const CODE_GRAPH_COMPACT_ENCODING: &str = "devmap-compact-v1";
-
-/// Consumer default path for the interned artifact, beside the verbose one.
-pub const CODE_GRAPH_COMPACT_DEFAULT_OUTPUT: &str = ".devcouncil/graph/code_graph.compact.json";
 
 /// The tables worth interning. Both are arrays of uniformly-shaped objects and
 /// together they are 99.7% of the artifact (measured on DevCouncil: edges

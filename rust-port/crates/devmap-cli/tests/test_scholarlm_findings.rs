@@ -633,7 +633,7 @@ fn manifest_emits_consumer_keys_agents_are_told_to_read() {
 #[test]
 fn manifest_refuses_to_overwrite_a_python_schema_map() {
     let root = temp_dir("manifest-guard");
-    let map_path = root.join(".devcouncil/repo_map.json");
+    let map_path = devmap_extract::paths::repo_map_path(&root);
     fs::create_dir_all(map_path.parent().unwrap()).unwrap();
     fs::write(
         &map_path,

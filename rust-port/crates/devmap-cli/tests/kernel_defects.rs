@@ -75,15 +75,23 @@ fn k6_default_db_is_the_rust_store_the_python_seam_uses() {
         "build failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let resolved = devmap_extract::paths::store_path(&root);
     assert!(
-        root.join(".devcouncil/codeintel/devmap.sqlite").is_file(),
-        "the default --db must be .devcouncil/codeintel/devmap.sqlite (the path \
-         src/devcouncil/devmap_engine.py names as DEFAULT_DB_RELPATH)"
+        resolved.is_file(),
+        "the default --db must be the store devmap_extract::paths resolves for \
+         the tree being built, got nothing at {}",
+        resolved.display()
     );
-    assert!(
-        !root.join(".devcouncil/codeintel/index.sqlite").exists(),
-        "the default must no longer touch the Python engine's store"
-    );
+    // The claim this test exists to make, unchanged: whatever directory the
+    // default resolves to, it is never the Python engine's store. Checked under
+    // both layouts, because a fixture that already had `.devcouncil/` would
+    // resolve there and the assertion must still bite.
+    for dir in [".devmap", ".devcouncil"] {
+        assert!(
+            !root.join(dir).join("codeintel/index.sqlite").exists(),
+            "the default must no longer touch the Python engine's store ({dir})"
+        );
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -125,7 +133,7 @@ fn k3_version_reports_the_schema_version_alongside_the_package_version() {
 fn k3_status_reports_an_outdated_schema_instead_of_migrating_it() {
     let root = fixture("k3-status-nomigrate");
     assert!(run(&root, &["build", "."]).status.success());
-    let db = root.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(&root);
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute("PRAGMA user_version = 11", []).unwrap();
@@ -183,7 +191,7 @@ fn k4_full_forces_a_new_generation_over_an_unchanged_tree() {
         "precondition: a second build over an unchanged tree is skipped: {warm}"
     );
 
-    let db = root.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(&root);
     let before = devmap_store::Store::open(&db)
         .unwrap()
         .latest_generation_id()
@@ -228,7 +236,7 @@ fn k4_full_forces_a_new_generation_over_an_unchanged_tree() {
 fn k2_a_no_change_build_reclaims_a_large_freelist_from_the_main_file() {
     let root = fixture("k2-warm-reclaim");
     assert!(run(&root, &["build", "."]).status.success());
-    let db = root.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(&root);
 
     // Manufacture waste: write ~8 MB into a scratch table and drop it. The
     // pages go to the freelist; only a vacuum returns them to the filesystem.
@@ -351,7 +359,7 @@ fn page_accounting(db: &Path) -> (i64, i64) {
 fn k1_build_reconciles_the_pending_queue_and_restores_freshness() {
     let root = fixture("k1-build-reconcile");
     assert!(run(&root, &["build", "."]).status.success());
-    let db = root.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(&root);
 
     std::fs::write(
         root.join("huge.c"),
@@ -438,7 +446,7 @@ fn k1_build_reconciles_the_pending_queue_and_restores_freshness() {
 fn k1_a_warm_build_still_drops_unprocessable_pending_rows() {
     let root = fixture("k1-warm-reconcile");
     assert!(run(&root, &["build", "."]).status.success());
-    let db = root.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(&root);
     {
         let store = devmap_store::Store::open(&db).unwrap();
         store
@@ -467,7 +475,7 @@ fn k1_a_warm_build_still_drops_unprocessable_pending_rows() {
 fn k1_repair_pending_drops_stuck_rows_and_reports_them() {
     let root = fixture("k1-repair-pending");
     assert!(run(&root, &["build", "."]).status.success());
-    let db = root.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(&root);
     // A real, indexable file: the structural pass has no reason to touch it, so
     // only the quarantine pass can drop it. That separation is the point —
     // otherwise this test could pass with the quarantine drop missing entirely.
@@ -539,7 +547,7 @@ fn k1_repair_pending_drops_stuck_rows_and_reports_them() {
 fn k13_a_build_waits_for_a_held_writer_lock_and_never_reports_database_is_locked() {
     let root = fixture("k13-build-waits");
     assert!(run(&root, &["build", "."]).status.success());
-    let db = root.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(&root);
     std::fs::write(root.join("src/c.py"), "def c():\n    return 3\n").unwrap();
 
     let held = devmap_store::Store::lock_writer_at(&db, std::time::Duration::from_millis(100))
@@ -592,7 +600,7 @@ fn k13_a_build_waits_for_a_held_writer_lock_and_never_reports_database_is_locked
 fn k1_a_whole_tree_build_supersedes_directory_rows_queued_before_it() {
     let root = fixture("k1-directory-rows");
     assert!(run(&root, &["build", "."]).status.success());
-    let db = root.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(&root);
     {
         let store = devmap_store::Store::open(&db).unwrap();
         store
@@ -686,7 +694,7 @@ fn k7_a_cachedir_tagged_directory_is_never_walked_or_indexed() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let db = root.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(&root);
     let indexed: Vec<String> = devmap_store::Store::open(&db)
         .unwrap()
         .latest_file_hashes()

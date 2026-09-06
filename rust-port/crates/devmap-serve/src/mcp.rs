@@ -398,6 +398,8 @@ const TOOLS: &[(&str, &str)] = &[
     ("devmap_dead_symbols", "dead"),
     ("devmap_clones", "clones"),
     ("devmap_preview", "preview"),
+    ("devmap_explore", "explore"),
+    ("devmap_affected_tests", "affected"),
 ];
 
 /// The declared tool names, in published order.
@@ -655,6 +657,60 @@ writes nothing.",
                 "additionalProperties": false
             }),
         ),
+        "explore" => (
+            "Definitions matching a query, each with its source, its callers, its callees and a layered blast radius — the whole neighbourhood in one call. Prefer this over search followed by dependencies and impact: it is one round trip, and the budget division across the four parts is reported in `budget`, so a thin edge list is attributable to the allowance rather than mistaken for a symbol nothing calls.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "maxLength": 4096,
+                        "description": "Symbol name or fragment to explore around."},
+                    // Bound and default both read from the parser's own
+                    // constants: 20 is `protocol::default_explore_limit`, and
+                    // the maximum is the value `validate_request` refuses above.
+                    "limit": {"type": "integer", "minimum": 1,
+                        "maximum": crate::protocol::MAX_EXPLORE_LIMIT, "default": 20,
+                        "description": "Maximum definitions to expand. Echoed in the response so a \
+short list is attributable to the cap rather than to the index."},
+                    // Not `budget_prop`: this budget is divided across four
+                    // parts rather than spent once, and the shared description
+                    // says it is spent once.
+                    "budget": {
+                        "type": "integer", "minimum": 1, "maximum": 100_000,
+                        "default": devmap_query::Budget::EXPLORE,
+                        "description": "Token budget for the whole answer, divided across \
+definitions, both edge directions and the blast radius. The division actually used is reported in \
+the response's `budget`."
+                    },
+                    "depth": depth_prop(3),
+                    "min_confidence": confidence_prop()
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        ),
+        "affected" => (
+            "Test files reachable through the inbound blast radius of some symbols — which tests to run for a change. Ranked nearest-first, so a budget-trimmed list keeps the tests closest to the change. Targets that match nothing are named in the response rather than dropped, because a target that resolved to nothing and a target with no tests are different facts.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "targets": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 4096},
+                        "minItems": 1,
+                        // Declared because it is enforced: `validate_request`
+                        // refuses a longer list rather than trimming it.
+                        "maxItems": devmap_query::MAX_NEIGHBOR_TARGETS,
+                        "description": "Symbols or file paths the change touches. More than the \
+maximum is refused, never silently trimmed."
+                    },
+                    "budget": budget_prop(2000),
+                    "depth": depth_prop(3),
+                    "min_confidence": confidence_prop()
+                },
+                "required": ["targets"],
+                "additionalProperties": false
+            }),
+        ),
         other => unreachable!("command tag {other} has no schema"),
     }
 }
@@ -809,6 +865,45 @@ to verify, not a delete list.",
             },
             "required": ["file_path", "parse_status", "delta_available", "file_is_indexed",
                 "compared_against", "symbols", "broken_callers"],
+            "additionalProperties": true
+        }),
+        // Fields transcribed from `ExploreReport` in `devmap-query/src/model.rs`;
+        // `required` names only what that struct always serializes.
+        "explore" => json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "definitions": {"type": "object",
+                    "description": "A budgeted envelope of matching definitions. Read its \
+        `total` before concluding the list is complete: it is the measured match count for the whole \
+        index, not the size of the page the budget could show."},
+                "limit": {"type": "integer",
+                    "description": "The cap that was applied, echoed so a short list is \
+        attributable to the request rather than to the index."},
+                "blast_radius": {"type": "object",
+                    "description": "Layered reach. A walk stopped by the depth cap says so, so \
+        an empty layer means 'we stopped looking', not 'nothing is there'."},
+                "budget": {"type": "object",
+                    "description": "How the token budget was divided across definitions, edges \
+        and blast radius. A thin answer is attributable to the division rather than to the graph."}
+            },
+            "required": ["query", "definitions", "limit", "blast_radius", "budget"],
+            "additionalProperties": true
+        }),
+        // Fields transcribed from `AffectedTestsReport`.
+        "affected" => json!({
+            "type": "object",
+            "properties": {
+                "targets": {"type": "array",
+                    "description": "The targets as asked, so one that matched nothing is named \
+        rather than silently absent from the answer."},
+                "tests": {"type": "object",
+                    "description": "A budgeted envelope of test files, nearest-first. Read its \
+        `truncated` before treating the list as the complete set to run."},
+                "blast_radius": {"type": "object",
+                    "description": "The inbound walk the test list was derived from."}
+            },
+            "required": ["targets", "tests", "blast_radius"],
             "additionalProperties": true
         }),
         other => unreachable!("command tag {other} has no output schema"),

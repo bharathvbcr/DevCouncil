@@ -269,7 +269,7 @@ fn the_cli_refuses_to_preview_a_path_outside_the_repository() {
         "def api_key():\n    return 'hunter2'\n",
     )
     .unwrap();
-    let db = repo.join(".devcouncil/codeintel/devmap.sqlite");
+    let db = devmap_extract::paths::store_path(&repo);
 
     let built = Command::new(env!("CARGO_BIN_EXE_devmap"))
         .arg("--db")
