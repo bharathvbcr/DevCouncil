@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -78,14 +79,6 @@ def _graph_degraded_fields(root: Path) -> dict[str, object]:
         return {"graph_degraded": False}
 
 
-def _canonical_store_health(root: Path) -> str:
-    from devcouncil.codeintel import get_codeintel_service
-    from devcouncil.indexing.graph.communities import store_health_from_state
-
-    state = get_codeintel_service(root).status()
-    return store_health_from_state(str(state.get("state") or ""))
-
-
 def _emit_limit(out: Console, limit_dict: dict) -> None:
     if not limit_dict.get("degraded"):
         return
@@ -97,14 +90,35 @@ def _emit_limit(out: Console, limit_dict: dict) -> None:
 
 
 def _index_freshness_fields(root: Path) -> dict[str, object]:
-    """Freshness probe for read commands; never raises."""
-    try:
-        from devcouncil.codeintel.service import index_freshness
+    """Freshness probe for read commands; never raises.
 
-        return index_freshness(root)
+    This asked ``codeintel.service.index_freshness``, which compared the Python
+    store's committed generation against git HEAD. Nothing had committed a
+    generation since the kernel became the only writer, so it returned
+    ``{"fresh": None, "reason": "no committed index generation"}`` on every
+    repository — and :func:`_warn_if_stale`'s "index STALE" banner, added after a
+    frozen index misled a deletion decision, could not fire at all.
+
+    ``devmap_health.map_freshness`` is the surviving owner of the same question:
+    it asks whether ``repo_map.json`` is the map of the tree as it stands, by the
+    same rule ``dev map --if-stale`` uses. ``age_seconds`` comes from the
+    artifact this verdict is about.
+    """
+    try:
+        from devcouncil.devmap_health import map_freshness
+
+        fields: dict[str, object] = dict(map_freshness(root))
+        try:
+            from devcouncil.devmap_engine import map_path
+
+            fields["age_seconds"] = max(
+                0.0, time.time() - map_path(root).stat().st_mtime
+            )
+        except OSError:
+            fields["age_seconds"] = None
+        return fields
     except Exception as exc:  # noqa: BLE001 - probe must not break reads
         return {"fresh": None, "reason": f"freshness probe failed: {exc}"}
-
 
 
 #: Which edge kinds count as calls, and how to read one direction's edge list,
@@ -733,7 +747,11 @@ def _warn_if_stale(
             f"[red]index STALE: {fields.get('reason') or 'index head does not match HEAD'}"
             f"{age_text} — results reflect the old commit; run `dev map` to refresh[/red]"
         )
-    elif note_unknown and fields.get("fresh") is None and fields.get("generation") is not None:
+    elif note_unknown and fields.get("fresh") is None:
+        # `generation is not None` used to gate this, meaning "we have an index
+        # but cannot judge it". The generation came from the Python store and
+        # was always None, so the branch never ran. The verdict now comes from
+        # the map artifact, and `fresh is None` is exactly "could not judge".
         status.print(
             f"[yellow]index freshness unknown: {fields.get('reason') or ''}[/yellow]"
         )
@@ -892,51 +910,6 @@ def graph_status(
         return
     for line in render_status(result):
         console.print(line, markup=False, highlight=False)
-
-
-@app.command("unlock")
-def graph_unlock(
-    project_root: Path = typer.Option(Path("."), "--project-root"),
-    force: bool = typer.Option(
-        False,
-        "--force",
-        help="Kill the holder even if build_status still looks like progress.",
-    ),
-    json_output: bool = typer.Option(False, "--json"),
-) -> None:
-    """Free a stuck *legacy* Python writer lease (`.devcouncil/codeintel/writer.lock`).
-
-    The kernel's own writer lock is an advisory file lock released by the OS
-    when the holder dies, so a killed `dev map` never needs unlocking. This
-    command remains for the Python query cache's lease, which `load_code_graph`
-    still takes when it imports the kernel's graph.
-
-    Default recovery: free when the recorded holder is dead; if status is
-    stalled/timed_out/stale or the holder is older than the stall timeout,
-    SIGTERM then SIGKILL. Use ``--force`` to kill a still-progressing holder.
-    """
-    from devcouncil.codeintel.build_control import unlock_writer_lease
-
-    root = _root(project_root)
-    result = unlock_writer_lease(root, force=force)
-    if json_output:
-        typer.echo(json.dumps(result, indent=2))
-    else:
-        action = str(result.get("action") or "unknown")
-        reason = str(result.get("reason") or "")
-        color = "green" if result.get("ok") else "yellow"
-        status.print(f"[{color}]unlock {action}: {reason}[/{color}]")
-        if result.get("target_pid") is not None:
-            status.print(f"target pid: {result['target_pid']}")
-        if result.get("build_state"):
-            status.print(
-                f"build: {result.get('build_state')} "
-                f"(pid={result.get('build_pid') or result.get('holder_pid') or 'n/a'})"
-            )
-        if result.get("hint") and not result.get("ok"):
-            status.print(f"[dim]hint: {result['hint']}[/dim]")
-    if not result.get("ok"):
-        raise typer.Exit(code=1)
 
 
 @app.command("sync")

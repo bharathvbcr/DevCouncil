@@ -229,12 +229,6 @@ def test_graph_liveness_never_touches_the_python_store(tmp_path, monkeypatch):
     """
     from devcouncil.verification.checks import liveness_ratchet
 
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda _root: (_ for _ in ()).throw(
-            AssertionError("the ratchet must not read the Python graph store")
-        ),
-    )
     _write_graph(tmp_path, head="h", unwired_candidates=["pkg/orphan.py"])
 
     got = liveness_ratchet._graph_liveness(tmp_path, "h")

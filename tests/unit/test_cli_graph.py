@@ -43,9 +43,9 @@ def _setup_graph_env(tmp_path: Path, monkeypatch) -> Path:
     
     # Persist via canonical SQLite path — writing JSON alone is ignored when a
     # store already exists from ``dev init``.
-    from devcouncil.indexing.graph.build import write_code_graph
+    from tests.unit.graph_fixtures import write_graph_artifact
 
-    write_code_graph(tmp_path, cg)
+    write_graph_artifact(tmp_path, cg)
     
     return tmp_path
 

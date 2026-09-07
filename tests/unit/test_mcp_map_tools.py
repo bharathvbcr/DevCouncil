@@ -496,7 +496,7 @@ def test_symbols_for_path_never_answers_from_the_python_graph(tmp_path, monkeypa
         ),
     ]
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
+        "devcouncil.indexing.graph.build.read_code_graph",
         lambda root: SimpleNamespace(nodes=nodes),
     )
 
@@ -668,7 +668,7 @@ def test_structured_dead_code_never_answers_from_the_python_graph(tmp_path, monk
         model_dump=lambda: {"id": "a.py::f", "path": "a.py", "confidence": "extracted"},
     )
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
+        "devcouncil.indexing.graph.build.read_code_graph",
         lambda root: SimpleNamespace(dead_code=[entry]),
     )
 
@@ -738,7 +738,7 @@ async def test_graph_impact_missing_paths(tmp_path):
 
 @pytest.mark.anyio
 async def test_graph_impact_no_graph(tmp_path, monkeypatch):
-    monkeypatch.setattr("devcouncil.indexing.graph.build.load_code_graph", lambda root: None)
+    monkeypatch.setattr("devcouncil.indexing.graph.build.read_code_graph", lambda root: None)
     out = _parse(await mapmod.handle_graph_impact(tmp_path, {"paths": ["a.py"]}))
     assert out["code"] == "graph_missing"
 
@@ -758,7 +758,6 @@ async def test_graph_impact_ok(tmp_path, monkeypatch):
             "handle_graph_impact reached the retired Python engine's whole-graph read"
         )
 
-    monkeypatch.setattr("devcouncil.indexing.graph.build.load_code_graph", _never)
     monkeypatch.setattr(
         "devcouncil.indexing.graph.intel.working_tree_changed_paths",
         lambda root: ["a.py"],

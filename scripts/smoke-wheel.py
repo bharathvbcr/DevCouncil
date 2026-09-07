@@ -144,10 +144,10 @@ def main() -> int:
                 stdout=subprocess.DEVNULL,
             )
             code = (
-                "from devcouncil.codeintel.store import CodeIntelStore; "
+                "from devcouncil.codeintel.store import RuntimeEvidenceStore; "
                 "from devcouncil.integrations.mcp.handlers.tool_specs import all_tools; "
                 "names={tool.name for tool in all_tools()}; "
-                "assert 'devcouncil_code_explore' in names; print(CodeIntelStore.__name__)"
+                "assert 'devcouncil_code_explore' in names; print(RuntimeEvidenceStore.__name__)"
             )
             subprocess.run([str(executable), "-c", code], check=True)
     return 0

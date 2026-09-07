@@ -21,9 +21,9 @@ try:
 except ImportError:  # Windows has no resource module
     resource = None  # type: ignore[assignment]
 
-from devcouncil.codeintel.service import get_codeintel_service
 from devcouncil.devmap_client import DevMapClient
-from devcouncil.indexing.graph.build import graph_path, load_code_graph
+from devcouncil.devmap_engine import store_path
+from devcouncil.indexing.graph.build import graph_path, read_code_graph
 from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
 THRESHOLDS_PATH = Path(__file__).with_name("thresholds.json")
@@ -163,17 +163,20 @@ def run_benchmark(root: Path, *, profile: str = "fast") -> dict[str, Any]:
     started = time.perf_counter()
     refresh_map_artifacts(root, root / ".devcouncil" / "repo_map.json", quiet=True)
     cold_seconds = time.perf_counter() - started
-    # Fill the Python query cache from that export so the storage ratio below
-    # compares the cache against the artifact it was built from.
-    graph = load_code_graph(root)
-    assert graph is not None, "the kernel's export must load into the query cache"
-
-    service = get_codeintel_service(root)
     # Storage is measured against the cold build's own artifacts, before the
     # kernel rewrites `code_graph.json`: a SQLite-to-JSON ratio across two
     # different engines' outputs would not be a ratio of anything.
+    #
+    # Both sides are the *kernel's* now. This filled the Python `index.sqlite`
+    # query cache with `load_code_graph` and measured that against the JSON --
+    # a ratchet on a store no production code wrote to, which guards nothing.
+    # `devmap.sqlite` is the store the same build actually produced.
     compatibility_path = graph_path(root)
-    database = _database_metrics(service.store.path)
+    database = _database_metrics(store_path(root))
+    # The node/edge counts reported below come from the same artifact the ratio
+    # is measured against, read the way production reads it.
+    graph = read_code_graph(root)
+    assert graph is not None, "the kernel's export must be readable"
     compatibility_bytes = compatibility_path.stat().st_size
     database_ratio = float(database["allocated_bytes"]) / max(1, compatibility_bytes)
 

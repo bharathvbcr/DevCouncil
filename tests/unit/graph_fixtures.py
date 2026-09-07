@@ -19,6 +19,7 @@ Extraction and resolution themselves are covered by the kernel's own suites
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -164,6 +165,30 @@ def git_init_commit(root: Path) -> None:
     _git(*identity, "commit", "-m", "init")
 
 
+def write_graph_artifact(root: Path, graph: CodeGraph) -> Path:
+    """Put ``graph`` on disk where the kernel puts ``code_graph.json``.
+
+    Tests that need a consumer to *find* a graph used ``build.write_code_graph``
+    for this. That function was the Python SQLite store's write path: it took a
+    writer lease, persisted every node and edge into ``index.sqlite``, and only
+    then wrote the JSON through a slim/compact/stub size-tiering ladder. It was
+    deleted with the store — the kernel is the only writer of this artifact, and
+    the last production caller of the Python writer went in Lane M3.
+
+    What a consumer test actually needs is the file, so this writes the file:
+    one ``json.dump`` in the same shape ``read_code_graph`` validates. Untiered,
+    which is what the kernel's own artifact is, so a test fixture cannot
+    accidentally assert against a capped export.
+    """
+    path = root / ".devcouncil" / "graph" / "code_graph.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(graph.model_dump(mode="json"), ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    return path
+
+
 __all__ = [
     "CodeGraph",
     "Confidence",
@@ -173,6 +198,7 @@ __all__ = [
     "NodeKind",
     "code_graph",
     "git_init_commit",
+    "write_graph_artifact",
     "write_sources",
 ]
 

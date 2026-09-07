@@ -10,7 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 from devcouncil.cli.commands.graph_cmd import app as graph_app
-from devcouncil.indexing.graph.build import write_code_graph
+from tests.unit.graph_fixtures import write_graph_artifact
 from tests.unit.graph_fixtures import NodeKind, kernel_graph
 from devcouncil.integrations.mcp.handlers import map as map_handlers
 
@@ -41,7 +41,7 @@ def mapped(tmp_path):
         "pkg/util.py": "def run():\n    return 1\n",
     })
     _commit(tmp_path)
-    write_code_graph(tmp_path, kernel_graph(tmp_path))
+    write_graph_artifact(tmp_path, kernel_graph(tmp_path))
     return tmp_path
 
 
@@ -145,7 +145,7 @@ def api_repo(tmp_path):
         "(cargo build --release -p devmap-cli), or point DEVMAP_BINARY at one "
         "that emits them."
     )
-    write_code_graph(tmp_path, graph)
+    write_graph_artifact(tmp_path, graph)
     return tmp_path
 
 
@@ -219,12 +219,6 @@ def test_the_route_cli_commands_do_not_load_the_python_graph(api_repo, monkeypat
     All three ran `_require_graph(root)` — `load_code_graph`, the retired
     engine's whole-graph read — and then a Python route scanner over it.
     """
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: (_ for _ in ()).throw(
-            AssertionError("the route CLI must not load the Python graph")
-        ),
-    )
     runner = CliRunner()
     for argv in (
         ["routes", "--project-root", str(api_repo), "--json"],

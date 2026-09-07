@@ -1,50 +1,18 @@
-"""Wave-9: graph doctor/cypher/explore/corpus/pdg, lease tip-over."""
+"""Wave-9: graph doctor/cypher/explore/corpus/pdg.
+
+The lease tip-over case went with ``codeintel/sync/lease.py``: the Python
+writer lease guarded the Python store, and nothing takes it now.
+"""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
-from devcouncil.codeintel.sync.lease import WriterLease
 
 runner = CliRunner()
-
-
-def test_writer_lease_busy_and_context(tmp_path, monkeypatch):
-    path = tmp_path / "lease.lock"
-    first = WriterLease(path)
-    assert first.acquire() is True
-    second = WriterLease(path)
-    assert second.acquire() is False
-    first.release()
-    first.release()  # idempotent
-
-    with WriterLease(path) as held:
-        assert held._handle is not None
-    with pytest.raises(BlockingIOError):
-        lease = WriterLease(path)
-        monkeypatch.setattr(lease, "acquire", lambda: False)
-        with lease:
-            pass
-
-    # Bounded retry eventually succeeds when the holder releases mid-wait.
-    holder = WriterLease(path)
-    assert holder.acquire()
-    waits: list[float] = []
-
-    def release_on_sleep(seconds: float) -> None:
-        waits.append(seconds)
-        if len(waits) == 1:
-            holder.release()
-
-    contender = WriterLease(path)
-    assert contender.acquire_with_retry(
-        timeout=1.0, initial_delay=0.01, max_delay=0.05, sleep=release_on_sleep
-    )
-    contender.release()
 
 
 def test_graph_doctor_cypher_explore_affected_corpus(tmp_path, monkeypatch):
@@ -154,7 +122,7 @@ def test_graph_explain_pdg_query(tmp_path, monkeypatch):
 
     initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
     monkeypatch.setattr(
-        graph_build, "load_code_graph", lambda root: SimpleNamespace(meta={}, dead_code=[])
+        graph_build, "read_code_graph", lambda root: SimpleNamespace(meta={}, dead_code=[])
     )
     monkeypatch.setattr(
         "devcouncil.indexing.graph.query.explain_pdg_taint",
@@ -277,8 +245,6 @@ def test_graph_pdg_build_never_writes_the_compatibility_export(tmp_path, monkeyp
             "writer of code_graph.json"
         )
 
-    monkeypatch.setattr(graph_build, "write_code_graph", _must_not_be_called)
-    monkeypatch.setattr(graph_build, "load_code_graph", _must_not_be_called)
     monkeypatch.setattr(
         graph_build,
         "write_pdg_layer",

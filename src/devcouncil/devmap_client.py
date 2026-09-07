@@ -1729,7 +1729,9 @@ class DevMapClient:
         )
 
     def manifest(self, write_path: Optional[pathlib.Path] = None) -> Dict[str, Any]:
-        out = write_path or (self.root_dir / ".devcouncil" / "repo_map.json")
+        from devcouncil.devmap_engine import map_path
+
+        out = write_path or map_path(self.root_dir)
         self._run_cli_command(["manifest", str(self.root_dir), "--output", str(out)])
         if not out.is_file():
             raise DevMapClientError(f"devmap manifest was not created at {out}")
@@ -1740,7 +1742,9 @@ class DevMapClient:
         return self._decode_json_object(raw_manifest, "manifest")
 
     def read_repo_map(self) -> Dict[str, Any]:
-        path = self.root_dir / ".devcouncil" / "repo_map.json"
+        from devcouncil.devmap_engine import map_path
+
+        path = map_path(self.root_dir)
         if path.is_file():
             try:
                 raw_map = path.read_text(encoding="utf-8")

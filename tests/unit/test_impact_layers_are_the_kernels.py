@@ -198,16 +198,18 @@ def test_an_unindexed_path_is_answered_rather_than_falling_back(four_link_chain)
 
 
 def test_mcp_graph_impact_does_not_read_the_python_graph(four_link_chain, monkeypatch):
-    """The last MCP graph tool on `load_code_graph`."""
-    from devcouncil.indexing.graph import build as build_module
+    """The last MCP graph tool on `load_code_graph`.
 
-    def _refuse(*args, **kwargs):
-        raise AssertionError(
-            "handle_graph_impact reached the retired Python engine's whole-graph "
-            "read; the kernel is the only engine"
-        )
-
-    monkeypatch.setattr(build_module, "load_code_graph", _refuse)
+    The patch that made that function raise is gone with the function itself;
+    the whole-graph read that is left is `read_code_graph`, and this tool must
+    not reach that either -- it asks the kernel for a banded walk.
+    """
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.read_code_graph",
+        lambda root: (_ for _ in ()).throw(
+            AssertionError("handle_graph_impact read the whole graph in Python")
+        ),
+    )
 
     contents = asyncio.run(
         mapmod.handle_graph_impact(four_link_chain, {"paths": ["pkg/d.py"]})

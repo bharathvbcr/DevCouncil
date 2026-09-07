@@ -26,7 +26,6 @@ from devcouncil.codeintel.debug.protocol import (
 from devcouncil.codeintel.debug.python_trace_runner import run_trace
 from devcouncil.codeintel.debug.session import DebugSession, DebugSessionManager
 from devcouncil.codeintel.service import CodeIntelService
-from devcouncil.codeintel.store.sqlite import CodeIntelStore
 from devcouncil.indexing.graph.schema import (
     CodeGraph,
     Confidence,
@@ -145,7 +144,6 @@ class _FakeKernelClient:
             shown=1, hidden=0, total=1, truncated=False, tokens_used=0,
             items=items, resolution="Available",
         )
-
 
 
 class _FakeManager:
@@ -497,40 +495,15 @@ def _query_graph() -> CodeGraph:
     )
 
 
-def test_generation_keyed_query_cache_memoises_within_a_generation(tmp_path: Path) -> None:
-    """The service's per-generation cache answers a repeated key once.
-
-    What is left of a set of assertions that also exercised
-    ``CodeIntelQueryEngine``'s ``explore``/``path``/``impact``/
-    ``affected_tests``/``dead``. That engine was deleted: every one of those
-    surfaces is answered by the Rust kernel now, and the kernel's own tests
-    (``rust-port/crates/devmap-query/tests/explore_and_affected.rs``) cover the
-    behaviour with fixtures that do not need a Python graph. The cache is not
-    part of that migration — it belongs to the service — so it keeps its test.
-    """
-    service = CodeIntelService(tmp_path)
-    service.persist(_query_graph())
-
-    calls = 0
-
-    def load():
-        nonlocal calls
-        calls += 1
-        return {"calls": calls}
-
-    assert service.cached_query("fixture", "key", load) == {"calls": 1}
-    assert service.cached_query("fixture", "key", load) == {"calls": 1}
-    assert calls == 1
-
-
 def test_runtime_merge_skips_fingerprinting_without_runtime_observations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Fingerprinting shells out to git, so it runs only when it can match.
 
     Retargeted from ``CodeIntelQueryEngine._graph`` to
-    ``CodeIntelService.load_with_runtime_observations``, which is where that
-    loader now lives — ``run_cypher`` is its one production caller. The
+    ``CodeIntelService.merge_runtime_observations``, which is where the merge
+    now lives — ``run_cypher`` is its one production caller, and it supplies the
+    kernel's graph rather than one loaded out of a Python store. The
     dead-candidate suppression the second half of this test used to assert went
     with the engine; see
     ``test_codeintel_debug.test_matching_runtime_observation_becomes_a_graph_edge``
@@ -538,7 +511,6 @@ def test_runtime_merge_skips_fingerprinting_without_runtime_observations(
     """
     (tmp_path / "app.py").write_text("def target():\n    return 1\n", encoding="utf-8")
     service = CodeIntelService(tmp_path)
-    service.persist(_query_graph())
 
     def _boom(root: Path) -> str:
         raise AssertionError("source_fingerprint must not run without runtime evidence")
@@ -546,7 +518,7 @@ def test_runtime_merge_skips_fingerprinting_without_runtime_observations(
     monkeypatch.setattr(
         "devcouncil.codeintel.debug.fingerprint.source_fingerprint", _boom
     )
-    graph = service.load_with_runtime_observations()
+    graph = service.merge_runtime_observations(_query_graph())
     assert not [edge for edge in graph.edges if edge.extras.get("provenance") == "runtime"]
 
     session = service.store.start_runtime_session(
@@ -565,7 +537,7 @@ def test_runtime_merge_skips_fingerprinting_without_runtime_observations(
         "devcouncil.codeintel.debug.fingerprint.source_fingerprint",
         lambda root: "fp",
     )
-    merged = service.load_with_runtime_observations()
+    merged = service.merge_runtime_observations(_query_graph())
     runtime = [edge for edge in merged.edges if edge.extras.get("provenance") == "runtime"]
     assert [(edge.source, edge.target) for edge in runtime] == [
         ("app.py::caller", "app.py::target")
@@ -1103,96 +1075,6 @@ def test_advisor_preflight_probe_and_pairing_branches(
     ) == ("skip", None, None)
 
 
-def test_store_uninitialized_and_payload_edge_cases(tmp_path: Path) -> None:
-    from devcouncil.codeintel.store import sqlite as store_module
-
-    store = CodeIntelStore(tmp_path)
-    assert store.compatibility_export_state() == ("", None)
-    assert store.load_graph() is None
-    assert store.current_generation() is None
-    assert store.search("target") == []
-    assert store.content_for_path("app.py") is None
-    assert store.file_metadata() == {}
-    assert store.analysis_shards() == {}
-    assert store.unresolved_references() == []
-    assert store.aliases() == []
-    assert store.get_extraction(
-        content_hash="none",
-        language="python",
-        grammar_version="1",
-        config_hash="cfg",
-    ) is None
-    assert store.runtime_observations() == []
-    assert store.status().state == "uninitialized"
-
-    extracted = GraphEdge(
-        source="a",
-        target="b",
-        kind="calls",
-        extras={"confidence_score": 2.0, "provenance": "runtime"},
-    )
-    assert store_module._confidence_score(extracted) == 1.0
-    assert store_module._provenance(extracted) == "runtime"
-    inferred = GraphEdge(
-        source="a",
-        target="b",
-        kind="calls",
-        confidence=Confidence.INFERRED,
-        extras={"provenance": "invalid"},
-    )
-    assert store_module._confidence_score(inferred) == 0.7
-    assert store_module._provenance(inferred) == "inferred"
-
-    evidence = list(range(store_module.AMBIGUOUS_EVIDENCE_LIMIT + 3))
-    ambiguous = GraphEdge(
-        source="a",
-        target="b",
-        kind="calls",
-        confidence=Confidence.AMBIGUOUS,
-        extras={"evidence": evidence},
-    )
-    payload = store._edge_payload(ambiguous)
-    assert len(payload["extras"]["evidence"]) == store_module.AMBIGUOUS_EVIDENCE_LIMIT
-    assert payload["extras"]["evidence_truncated"] == 3
-
-
-def test_store_missing_files_analysis_runtime_and_search_fallback(
-    tmp_path: Path,
-) -> None:
-    store = CodeIntelStore(tmp_path)
-    graph = CodeGraph(
-        nodes=[
-            GraphNode(
-                id="missing.py",
-                kind=NodeKind.FILE,
-                path="missing.py",
-                name="missing.py",
-                language="python",
-            )
-        ],
-        meta={
-            "unresolved_references": [
-                {
-                    "source_id": "missing.py",
-                    "name": "dynamic_name",
-                    "path": "missing.py",
-                },
-                "invalid",
-            ]
-        },
-    )
-    generation = store.save_graph(
-        graph, analysis_shards={"missing.py": {"symbols": ["dynamic_name"]}}
-    )
-    assert generation == 1
-    assert store.content_for_path("missing.py") is None
-    assert store.analysis_shards()["missing.py"]["symbols"] == ["dynamic_name"]
-    assert store.unresolved_references(name="dynamic_name")[0]["line"] == 0
-    assert store.search("missing.py", limit=0)[0]["id"] == "missing.py"
-    assert store.search("   ") == []
-    assert store.add_runtime_observations("absent", []) == 0
-
-
 def test_debug_session_manager_control_inspect_evaluate_stop_and_errors(
     tmp_path: Path,
 ) -> None:
@@ -1512,13 +1394,6 @@ def test_graph_cli_remaining_output_branches(
     # retired store read is patched to raise so a regression onto it is loud.
     monkeypatch.setattr(graph_build, "read_code_graph", lambda _root: fake_graph)
     monkeypatch.setattr(
-        graph_build,
-        "load_code_graph",
-        lambda _root: (_ for _ in ()).throw(
-            AssertionError("these commands must not reach the retired Python store")
-        ),
-    )
-    monkeypatch.setattr(
         intel,
         "graph_check",
         lambda _graph, top_n: {"god_nodes": [], "circular_imports": []},
@@ -1579,68 +1454,3 @@ def test_graph_cli_remaining_output_branches(
     )
     assert links.exit_code == 0
     assert out.read_text(encoding="utf-8") == "a --imports--> b"
-
-
-def test_store_export_status_search_and_runtime_filter_branches(
-    tmp_path: Path,
-) -> None:
-    store = CodeIntelStore(tmp_path)
-    store.initialize()
-    assert store.status().state == "empty"
-    source = tmp_path / "app.py"
-    source.write_text("def target(): return 1\n", encoding="utf-8")
-    graph = CodeGraph(
-        nodes=[
-            GraphNode(
-                id="app.py",
-                kind=NodeKind.FILE,
-                path="app.py",
-                name="app.py",
-            ),
-            GraphNode(
-                id="app.py::target",
-                kind=NodeKind.FUNCTION,
-                path="app.py",
-                name="target",
-                line=1,
-                end_line=1,
-            ),
-        ]
-    )
-    store.save_graph(graph)
-    export = tmp_path / "graph.json"
-    export.write_text("{}", encoding="utf-8")
-    store.record_compatibility_export(export, graph)
-    digest, mtime = store.compatibility_export_state()
-    assert digest and mtime == export.stat().st_mtime_ns
-    assert store.search('"target') == []
-    assert store.search("target", limit=999)[0]["name"] == "target"
-    assert store.content_for_path("unknown.py") is None
-    assert store.analysis_shards(generation=999) == {}
-
-    session = store.start_runtime_session(
-        provider="fixture",
-        source_fingerprint="source",
-        build_fingerprint="build",
-        executable_hash="exe",
-        session_id="runtime",
-    )
-    assert session == "runtime"
-    # Rows without both endpoints are dropped and must not inflate the count.
-    assert (
-        store.add_runtime_observations(
-            session,
-            [
-                {"source": "a", "target": "b", "count": 0},
-                {"source": "", "target": "ignored"},
-            ],
-        )
-        == 1
-    )
-    store.end_runtime_session(session)
-    rows = store.runtime_observations(
-        source_fingerprint="other",
-        include_stale=True,
-        limit=200_000,
-    )
-    assert rows[0]["fingerprint_matches"] is False

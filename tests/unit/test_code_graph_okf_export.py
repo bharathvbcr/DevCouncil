@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 
-from devcouncil.indexing.graph.build import write_code_graph
+from tests.unit.graph_fixtures import write_graph_artifact
 from tests.unit.graph_fixtures import kernel_graph
 from devcouncil.indexing.graph.export import (
     build_code_graph_okf,
@@ -55,7 +55,7 @@ def test_file_doc_rel_convention():
 
 def test_code_graph_okf_bundle_valid(tmp_path):
     graph = _tiny_graph(tmp_path)
-    write_code_graph(tmp_path, graph)
+    write_graph_artifact(tmp_path, graph)
     out = tmp_path / "okf-out"
     written_dir, paths = write_code_graph_okf(tmp_path, out, graph=graph, project_name="demo")
     assert written_dir == out

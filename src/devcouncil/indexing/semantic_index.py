@@ -13,6 +13,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from devcouncil.devmap_engine import map_path
 from devcouncil.indexing.ast_matcher import AstMatcher
 from devcouncil.indexing.lsp import LspInspector
 from devcouncil.indexing.walk import iter_project_files
@@ -52,7 +53,7 @@ class SemanticIndex:
         payload = {
             "task_id": task_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "repo_map_path": str(self.project_root / ".devcouncil" / "repo_map.json"),
+            "repo_map_path": str(map_path(self.project_root)),
             "files": self._config_file_entries(),
             "source_files": source_files,
             "symbols": symbols,
