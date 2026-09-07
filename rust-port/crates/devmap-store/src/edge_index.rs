@@ -8,11 +8,23 @@
 //! target. On the ScholarLM corpus that was 92 ms for a question whose answer
 //! touches a few dozen edges, against 3 ms for `status`.
 //!
-//! The cost is not the walk; it is arriving at it. This index moves that work
-//! to once per *generation* instead of once per *question*: the edge rows are
-//! the ones the store already caches, and what is added is four maps of
-//! `u32` edge ids — forward and reverse by symbol, forward and reverse by file
-//! — so a question costs the edges it reaches plus a hash lookup.
+//! The cost is not the walk; it is arriving at it. This index moved that work
+//! to once per *generation* instead of once per *question* — which fixed the
+//! daemon and left the CLI exactly where it was, because a one-shot process
+//! asks one question and never gets a second to amortise the arrival against.
+//! Measured on this repository's 102,239 edges, cold: **63.1 ms to arrive,
+//! 1.5 ms to walk.**
+//!
+//! So the generation is not materialised at all. A generation's rows are mostly
+//! repetition — 102,239 edges naming 17,869 distinct symbols, 1,602 paths, 8
+//! kinds and 7 resolution labels — and the row shape paid for that twice, once
+//! copying 13 MB of symbol text into `StoredEdge`s and again hashing four of
+//! its columns per edge to build the adjacency. What this holds instead is an
+//! [`EdgeText`] — each distinct string stored once, ranked in byte order — and
+//! six `u32` columns over it, with the adjacency a counting sort into two
+//! integer vectors per direction. A `StoredEdge` is built by
+//! [`GenerationEdges::stored_edge`], one row at a time, for the edges an answer
+//! actually contains.
 //!
 //! Freshness is by construction. The index is keyed by generation id, so a
 //! build that commits a new generation invalidates it by existing; there is no
