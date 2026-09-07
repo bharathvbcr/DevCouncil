@@ -241,8 +241,22 @@ def test_graph_html_missing_graph(tmp_path, monkeypatch):
 
 from types import SimpleNamespace  # noqa: E402
 
+import devcouncil.cli.commands.graph_cmd as graph_cmd_mod  # noqa: E402
 import devcouncil.indexing.graph.intel as intel_mod  # noqa: E402
 import devcouncil.indexing.graph.export as export_mod  # noqa: E402
+
+
+def _never_load_the_python_graph(root):
+    """Two-signal proof for the commands that have left the Python read path.
+
+    Patched over ``load_code_graph`` so a command that still reaches the retired
+    engine's whole-graph read fails here loudly, rather than passing because the
+    fixture happened to have no graph to load.
+    """
+    raise AssertionError(
+        "this command reached the retired Python engine's whole-graph read; "
+        "the kernel is the only graph engine"
+    )
 
 
 class _DeadEntry:
@@ -454,32 +468,62 @@ def test_graph_impact_requires_paths_or_diff(tmp_path, monkeypatch):
 
 
 def test_graph_impact_human_with_results(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    """Rewritten: this fed the renderer `diff_impact`'s Python output.
+
+    There is no Python engine under `dev map impact` any more — the kernel bands
+    its own walk and the command renders that. The double is now the kernel
+    payload, and the assertions cover what the Python shape could not carry: a
+    band's measured confidence, its unlisted remainder, and the walk's own "I
+    stopped early".
+    """
+    monkeypatch.setattr(graph_build, "load_code_graph", _never_load_the_python_graph)
     monkeypatch.setattr(
-        intel_mod, "diff_impact",
-        lambda root, graph, paths=None, use_diff=False, max_depth=3: {
+        graph_cmd_mod,
+        "_devmap_query_payload",
+        lambda root, kind, **kw: {
+            "ok": True,
+            "source": "devmap",
             "paths": [{
                 "path": "a.py",
-                "symbols": [{"id": "a.f"}],
-                "blast": {"layers": [{"depth": 1, "confidence": "high", "nodes": ["b.g", "c.h"]}]},
-            }]
+                "symbols": [{"id": "a.py::f"}],
+                "symbols_are_walk_seeds": True,
+                "blast": {
+                    "seeds": ["a.py::f"],
+                    "layers": [{
+                        "depth": 1,
+                        "nodes": ["b.g", "c.h"],
+                        "count": 9,
+                        "confidence": "extracted",
+                        "confidence_score": 1.0,
+                        "nodes_omitted": 7,
+                    }],
+                    "total_impacted": 9,
+                    "walk_incomplete": "the walk did not complete: stopped at depth 3",
+                },
+            }],
         },
     )
     result = runner.invoke(app, ["map", "impact", "a.py", "--project-root", str(tmp_path)])
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert "a.py" in result.output
     assert "depth 1" in result.output
+    # Square brackets here were eaten by Rich as console markup, so the tier
+    # never printed on either engine. See the renderer's own note.
+    assert "(extracted)" in result.output, result.output
+    assert "7 not listed" in result.output, result.output
+    assert "stopped at depth 3" in result.output, result.output
 
 
 def test_graph_impact_no_paths(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    monkeypatch.setattr(graph_build, "load_code_graph", _never_load_the_python_graph)
     monkeypatch.setattr(
-        intel_mod, "diff_impact",
-        lambda root, graph, paths=None, use_diff=False, max_depth=3: {"paths": []},
+        graph_cmd_mod,
+        "_devmap_query_payload",
+        lambda root, kind, **kw: {"ok": True, "source": "devmap", "paths": []},
     )
     result = runner.invoke(app, ["map", "impact", "--diff", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
-    assert "No impacted paths" in result.output
+    assert "No paths to analyse" in result.output
 
 
 # --- export -----------------------------------------------------------------------
@@ -691,7 +735,7 @@ class _FakeClient:
             "span": (12, 20),
         }])
 
-    def impact(self, target, depth=1, min_rung=None):
+    def impact(self, target, depth=1, min_rung=None, *, layers=False):
         self.impact_targets.append(target)
         self.rungs.append(("impact", min_rung))
         return _FakeResp(self.impact_items, resolution=self.impact_resolution)
