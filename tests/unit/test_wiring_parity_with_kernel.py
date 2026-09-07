@@ -17,27 +17,40 @@ Nothing here re-implements the kernel: the rule tables and the fixture lists are
 its shape changes, these tests fail rather than skip: a parity check that could
 not run must not report what a parity check that ran and passed reports.
 
-What is pinned is the rule *tables* and the kernel's own fixture set, not
-every input: three divergences outside that set are known, and are *not*
-asserted here, because on all three Python is the more precise side and the
-kernel is what needs the change:
+What is pinned is the rule *tables*, the kernel's own fixture sets, and — since
+the kernel converged onto the Python rules — the matching rules themselves.
 
-* ``is_test_path`` — ``wiring.rs`` returns early on ``/src/test/`` and
-  ``/src/androidTest/``, which skips the dotfile exclusion its own
+Four divergences used to be named here and deliberately left unasserted,
+because on all four Python was the more precise side and the kernel was what
+needed the change. All four are now closed in the kernel and asserted:
+
+* ``is_test_path`` — ``wiring.rs`` returned early on ``/src/test/`` and
+  ``/src/androidTest/``, which skipped the dotfile exclusion its own
   ``test_path_rule_ignores_dotfiles_inside_a_test_directory`` documents:
-  ``app/src/test/.eslintrc`` is a test path to the kernel and not to Python.
-* ``is_wiring_decorator`` — the kernel matches its hints as bare substrings, so
-  ``@FastAPI_thing``, ``@multitask`` and ``@preregister`` are all wiring to it;
+  ``app/src/test/.eslintrc`` was a test path to the kernel and not to Python.
+  The kernel's ``the_dotfile_exclusion_survives_the_jvm_test_directories``
+  fixtures are read below and run through ``wiring.is_test_path``.
+* ``is_wiring_decorator`` — the kernel matched its hints as bare substrings, so
+  ``@FastAPI_thing``, ``@multitask`` and ``@preregister`` were all wiring to it;
   ``is_wiring_decorated`` matches dotted hints as prefixes and bare hints as
-  whole segments, on purpose (see its docstring). The *hint table* is pinned
-  below; the matching rule is not.
-* ``is_generated_path`` — the kernel misses ``*_pb2_grpc.pyi`` (grpcio-tools
-  writes it) and accepts any ``zz_generated*`` basename where the Python regex
-  requires the ``.go`` kubebuilder writes.
+  whole segments, on purpose (see its docstring). The kernel now does the same,
+  and both the hint table *and* the kernel's own decorator fixtures are pinned.
+* ``is_generated_path`` — the kernel missed ``*_pb2_grpc.pyi`` (grpcio-tools
+  writes it) and accepted any ``zz_generated*`` basename where the Python regex
+  requires the ``.go`` kubebuilder writes. Both arms are in the kernel's
+  fixture list now, so the shared-fixture run covers them.
+* console-script entry points — ``[project.scripts] cli = "pkg.mod:func"``
+  named a symbol nothing resolved, so the entry function stayed a dead-symbol
+  candidate. ``wiring.entry_point_symbols`` was the only implementation and was
+  deleted as callerless in ``c9f9202``; the kernel's
+  ``config_entry_point_symbols`` now owns the rule, and the four module-path
+  candidates it tries are pinned equal to the ones ``wiring._add_module_file``
+  still uses for ``entry_roots``.
 """
 
 from __future__ import annotations
 
+import inspect
 import re
 from pathlib import Path
 
@@ -92,6 +105,29 @@ def _fixture_blocks(source: str) -> list[tuple[str, bool, list[str]]]:
             continue
         blocks.append((f"is_{assertion.group(2)}", assertion.group(1) != "!", paths))
     assert blocks, "wiring.rs's #[test] fixture lists are no longer `for path in [...]`"
+    return blocks
+
+
+def _decorator_fixture_blocks(source: str) -> list[tuple[bool, list[str]]]:
+    """``(expected, decorators)`` for every ``for decorator in [...] { assert!... }``.
+
+    The decorator counterpart of :func:`_fixture_blocks`. Same discipline: the
+    inputs and the kernel's verdict on them are read out of ``wiring.rs``'s own
+    ``#[test]`` blocks, never restated here.
+    """
+    blocks: list[tuple[bool, list[str]]] = []
+    for match in re.finditer(
+        r"for decorator in \[(.*?)\] \{(.*?)\n        \}", source, re.DOTALL
+    ):
+        decorators = re.findall(r'"((?:[^"\\]|\\.)*)"', match.group(1))
+        assertion = re.search(r"assert!\(\s*(!?)is_wiring_decorator\(decorator", match.group(2))
+        if not assertion or not decorators:
+            continue
+        blocks.append((assertion.group(1) != "!", decorators))
+    assert blocks, (
+        "wiring.rs's is_wiring_decorator fixtures are no longer "
+        "`for decorator in [...]`; this parity check cannot run"
+    )
     return blocks
 
 
@@ -166,14 +202,50 @@ def test_the_two_code_config_suffix_tables_are_the_same_set() -> None:
 
 
 def test_the_two_wiring_decorator_hint_tables_are_the_same_set() -> None:
-    # The *table* only. The kernel matches a hint as a bare substring and
-    # `is_wiring_decorated` matches dotted hints as prefixes and bare hints as
-    # whole segments; see this module's docstring.
     body = _fn_body(_kernel_source(), "is_wiring_decorator")
     hints = re.search(r"let hints = \[(.*?)\];", body, re.DOTALL)
     assert hints, "is_wiring_decorator no longer holds its hints in a `let hints = [...]`"
     kernel = set(re.findall(r'"([^"]*)"', hints.group(1)))
     assert kernel == set(wiring._WIRING_DECORATOR_HINTS)
+
+
+def test_the_two_entry_point_candidate_tables_are_the_same_set() -> None:
+    """The module paths a ``pkg.mod:func`` target is tried against.
+
+    ``wiring.entry_point_symbols`` owned this rule until ``c9f9202`` deleted it
+    as callerless, and the kernel had no equivalent — so a console-script entry
+    function with no in-repo caller stayed a dead-symbol candidate at the tier
+    agents act on. ``config_entry_point_symbols`` owns it now; the four
+    candidates it tries must be the four ``_add_module_file`` still tries for
+    :func:`wiring.entry_roots`, or the two disagree about which file a console
+    script names.
+    """
+    body = _fn_body(_kernel_source(), "config_entry_point_symbols")
+    kernel_block = re.search(r"for candidate in \[(.*?)\n        \] \{", body, re.DOTALL)
+    assert kernel_block, (
+        "config_entry_point_symbols no longer holds its module-path candidates "
+        "in a `for candidate in [...]`; this parity check cannot run, and must "
+        "not be read as one that passed"
+    )
+    kernel = {
+        template.replace("{base}", "").replace("{module_path}", "{parts}")
+        for template in re.findall(r'format!\("([^"]*)"\)', kernel_block.group(1))
+    }
+
+    python_source = inspect.getsource(wiring._add_module_file)
+    python_block = re.search(r"candidates = \[(.*?)\n    \]", python_source, re.DOTALL)
+    assert python_block, (
+        "wiring._add_module_file no longer holds its candidates in a "
+        "`candidates = [...]`; this parity check cannot run"
+    )
+    python = set(re.findall(r'f"([^"]*)"', python_block.group(1)))
+
+    assert kernel and python, "one side's candidate list read as empty"
+    assert kernel == python, (
+        "the kernel resolves a `pkg.mod:func` entry point against different "
+        f"module paths from the Python side: kernel={sorted(kernel)} "
+        f"python={sorted(python)}"
+    )
 
 
 def test_the_two_generated_header_windows_are_the_same() -> None:
@@ -226,4 +298,46 @@ def test_python_agrees_with_the_kernels_own_fixtures(
     assert answer is expected, (
         f"{predicate}({path!r}): the kernel's own test asserts {expected} and the "
         f"Python copy answers {answer}"
+    )
+
+
+DECORATOR_FIXTURES = [
+    (expected, decorator)
+    for expected, decorators in _decorator_fixture_blocks(_kernel_source())
+    for decorator in decorators
+]
+
+
+def test_the_decorator_fixture_list_was_actually_read() -> None:
+    """A capped or empty read must not pass as full agreement."""
+    assert len(DECORATOR_FIXTURES) >= 20, (
+        "wiring.rs's is_wiring_decorator fixtures no longer parse into "
+        f"decorator/verdict pairs; only {len(DECORATOR_FIXTURES)} were read, so "
+        "agreement below proves nothing"
+    )
+    assert {expected for expected, _ in DECORATOR_FIXTURES} == {True, False}, (
+        "the decorator fixtures now assert in only one direction, and a rule "
+        "that answers True to everything would satisfy them"
+    )
+
+
+@pytest.mark.parametrize(("expected", "decorator"), DECORATOR_FIXTURES)
+def test_python_agrees_with_the_kernels_decorator_fixtures(
+    expected: bool, decorator: str
+) -> None:
+    """The matching *rule*, not just the hint table.
+
+    The kernel used to compare a hint as a bare substring of the whole line, so
+    ``@multitask`` was a ``task`` and ``@preregister`` a ``register``. Because
+    the annotation it feeds targets the *file* and ``is_file_exempt`` exempts
+    every symbol in that file, one such line hid a whole file from the dead-code
+    scan while the Python gates still reported on it. The kernel now matches
+    dotted hints as prefixes and bare hints as whole segments, exactly as
+    :func:`wiring.is_wiring_decorated` does, and this runs the kernel's own
+    fixtures through the Python one to keep it that way.
+    """
+    answer = wiring.is_wiring_decorated([decorator])
+    assert answer is expected, (
+        f"is_wiring_decorator({decorator!r}): the kernel's own test asserts "
+        f"{expected} and `is_wiring_decorated` answers {answer}"
     )

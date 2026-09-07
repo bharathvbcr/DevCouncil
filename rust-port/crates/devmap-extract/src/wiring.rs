@@ -1331,11 +1331,13 @@ mod tests {
     /// and kubebuilder writes Go, so a bare `starts_with` claimed prose.
     #[test]
     fn generated_paths_match_what_the_generator_writes() {
-        assert!(
-            is_generated_path("api/service_pb2_grpc.pyi"),
-            "grpcio-tools writes the grpc type stub too"
-        );
-        assert!(is_generated_path("k8s/zz_generated.deepcopy.go"));
+        for path in ["api/service_pb2_grpc.pyi", "k8s/zz_generated.deepcopy.go"] {
+            assert!(
+                is_generated_path(path),
+                "{path}: grpcio-tools writes the grpc type stub beside the module, \
+                 and kubebuilder writes Go"
+            );
+        }
         for path in [
             "docs/zz_generated.txt",
             "docs/zz_generated_notes.md",
