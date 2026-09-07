@@ -65,7 +65,7 @@ class GraphEdge(BaseModel):
     confidence: Confidence = Confidence.EXTRACTED
     reason: str = ""
     # The evidence tier the kernel resolved this edge by (the store's
-    # `ResolutionKind` spelling: SameFile, ImportScoped, ReceiverType,
+    # `ResolutionKind` spelling: SameFile, SamePackage, ImportScoped, ReceiverType,
     # UniqueGlobal, AmbiguousGlobal, Unresolved, Structural) and whether that
     # tier was resolved in-process, read back from the store, or reconstructed
     # from a generation that predates the persisted column. Empty on an edge
