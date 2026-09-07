@@ -18,6 +18,7 @@ import json
 import logging
 from dataclasses import dataclass
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -643,7 +644,14 @@ def _manifest_accepts_stamp_flags(binary: str) -> bool:
     )
 
 
-_FUTURE_SCHEMA_MARKER = "unsupported future schema version"
+#: The phrase the store's refusal spells when the store is newer than the
+#: binary (`devmap-store/src/db.rs`, `unsupported_schema`). It was
+#: "unsupported future schema version" until the kernel rewrote the refusal to
+#: name the store, both versions and the remedy — and the seam kept looking
+#: for the old phrase, so a real future-schema failure classified as
+#: `kernel_failed` and the explanation below never fired. Pinned to the
+#: store's source by `test_the_future_schema_marker_is_a_phrase_the_store_actually_emits`.
+_FUTURE_SCHEMA_MARKER = "this devmap binary is older than the store"
 
 #: Written while a kernel build runs, removed when it ends. `dev map status`
 #: reads it from another process to say "building: stage X, pid N, 12 s"; a
@@ -1100,17 +1108,16 @@ def render_map_html(
 def _explain_kernel_failure(argv: List[str], output: str) -> Optional[str]:
     """Turn a kernel refusal the operator cannot act on into one they can.
 
-    The kernel's "unsupported future schema version N" is correct and useless:
-    it names neither the binary that is too old, nor the store that is newer,
-    nor what to run. Measured cost of that gap on this machine: every `dev map`
-    failing for a day while a fresh build sat in `rust-port/target`.
+    The kernel's refusal names the store path, both schema versions and the
+    remedy, but not *which* binary ran or when it was built — and this seam
+    chose the binary, so it is the one that can say. Measured cost of that gap
+    on this machine: every `dev map` failing for a day while a fresh build sat
+    in `rust-port/target`.
     """
     if _FUTURE_SCHEMA_MARKER not in output:
         return None
-    version = ""
-    for token in output.split():
-        if token.isdigit():
-            version = token
+    found = re.search(r"schema version (\d+)", output)
+    version = found.group(1) if found else ""
     binary = argv[0]
     built = "unknown build time"
     try:

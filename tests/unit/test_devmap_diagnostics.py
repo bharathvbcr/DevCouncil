@@ -54,7 +54,11 @@ def _root(tmp_path: Path) -> Path:
 @pytest.mark.parametrize(
     "output, code",
     [
-        ("Error: unsupported future schema version 13", "schema_newer_than_kernel"),
+        (
+            "Error: devmap store /x/devmap.sqlite: schema version 13 is not supported by "
+            "this binary (schema 12); this devmap binary is older than the store; rebuild it",
+            "schema_newer_than_kernel",
+        ),
         ("another devmap writer holds \"/x/devmap.sqlite.writer.lock\" (pid 4242)", "store_locked"),
         ("Error: database disk image is malformed", "store_corrupt"),
         ("Error: attempt to write a readonly database", "store_unwritable"),

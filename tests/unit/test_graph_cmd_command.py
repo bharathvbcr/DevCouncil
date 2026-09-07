@@ -43,7 +43,7 @@ def test_graph_doctor_reports_a_kernel_older_than_the_store(tmp_path, monkeypatc
     )
     monkeypatch.setattr(
         "devcouncil.devmap_health.kernel_status",
-        lambda root: {"error": "unsupported future schema version 12"},
+        lambda root: {"error": "devmap store x: schema version 12 is not supported by this binary (schema 11); this devmap binary is older than the store"},
     )
 
     result = runner.invoke(app, ["map", "doctor", "--project-root", str(tmp_path)])
