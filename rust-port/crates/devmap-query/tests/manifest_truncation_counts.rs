@@ -78,7 +78,7 @@ fn render(extractions: &[Extraction], communities: Vec<CommunityReport>) -> Valu
         // `analyze()` still names every field exhaustively.
         ..Default::default()
     };
-    let (_, json) = generate_manifest_with_edges(extractions, &analysis, freshness(), &[]);
+    let (_, json) = generate_manifest_with_edges(extractions, &analysis, freshness(), &[], None);
     serde_json::from_str(&json).expect("the consumer manifest is JSON")
 }
 

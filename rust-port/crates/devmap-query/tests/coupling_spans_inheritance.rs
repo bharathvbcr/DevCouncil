@@ -75,6 +75,7 @@ fn manifest() -> serde_json::Value {
         &analysis,
         FreshnessInfo::new("head".into(), 1, 0),
         &resolution.edges,
+        None,
     );
     serde_json::from_str(&json).expect("the manifest is JSON")
 }

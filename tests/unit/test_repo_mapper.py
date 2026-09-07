@@ -124,22 +124,49 @@ def test_repo_map_subsystem_roles_handoffs_and_file_kinds():
         assert marker.get(flag) is True, f"missing provenance marker {flag}: {marker}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the kernel manifest writes package_managers=[], candidate_files=[] and lsp={} as constants "
-        "(rust-port/crates/devmap-query/src/manifest.rs); the Python writer detected "
-        "uv/npm from lockfiles and the LSP languages. wiki.py and the MCP map handler "
-        "render these fields, so they are silently empty until the kernel fills them."
-    ),
-)
-def test_repo_map_package_managers_and_lsp_are_detected():
+def test_repo_map_package_managers_and_test_commands_are_detected():
+    """The kernel reads the repository's own manifests, not a constant.
+
+    Split out of the xfail below when `inventory::scan` landed: this half is
+    computed now, from `uv.lock` / `package-lock.json` / `Cargo.toml` /
+    `go.mod` under a bounded walk of the repository root, and the marker says
+    so. The other half — `lsp` and `candidate_files` — still has no producer
+    in the kernel and keeps its xfail.
+    """
     map_path = Path(".") / ".devcouncil" / "repo_map.json"
     if not map_path.is_file():
         pytest.skip("no kernel-built map on disk: run `dev map`")
     raw = json.loads(map_path.read_text(encoding="utf-8"))
-    assert "uv" in raw["package_managers"]
-    assert "npm" in raw["package_managers"]
+    marker = (raw.get("meta") or {}).get("devmap_rust") or {}
+    assert marker.get("package_managers_computed") is True, (
+        "an empty package_managers from a pass that ran must be "
+        f"distinguishable from one nothing looked at: {marker}"
+    )
+    assert marker.get("test_commands_computed") is True, marker
+    assert "uv" in raw["package_managers"], raw["package_managers"]
+    assert "npm" in raw["package_managers"], raw["package_managers"]
+    assert "cargo" in raw["package_managers"], raw["package_managers"]
+    assert "pytest" in raw["test_commands"], raw["test_commands"]
+    assert "cargo test" in raw["test_commands"], raw["test_commands"]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "the kernel manifest writes candidate_files=[] and lsp={} as constants "
+        "(rust-port/crates/devmap-query/src/manifest.rs): `candidate_files` is "
+        "goal-ranked and this producer is given no goal, and no language server "
+        "is consulted by the kernel at all. Both are marked "
+        "`*_computed: false` so a reader can tell the constant from an answer; "
+        "package_managers/test_commands were split out above once "
+        "`inventory::scan` made them real."
+    ),
+)
+def test_repo_map_lsp_and_candidate_files_are_detected():
+    map_path = Path(".") / ".devcouncil" / "repo_map.json"
+    if not map_path.is_file():
+        pytest.skip("no kernel-built map on disk: run `dev map`")
+    raw = json.loads(map_path.read_text(encoding="utf-8"))
     assert "python" in raw["lsp"]["languages"]
     assert len(raw["candidate_files"]) > 0  # manifest.rs writes `candidate_files: []`
 
@@ -181,6 +208,24 @@ def test_kernel_map_shape_on_a_fixture_repo(tmp_path):
 
     assert "python" in repo_map.languages
     assert "pyproject.toml" in repo_map.important_files
+
+    # The inventory pass ran over this fixture's root. It declares a bare
+    # `pyproject.toml` and no lock file, so the honest answer is an empty
+    # `package_managers` — and the marker is what makes that empty list an
+    # answer rather than the constant it used to be.
+    marker = (raw.get("meta") or {}).get("devmap_rust") or {}
+    assert marker.get("package_managers_computed") is True, (
+        f"the inventory did not run over {root}: {marker}"
+    )
+    assert marker.get("test_commands_computed") is True, marker
+    assert "uv" not in repo_map.package_managers, (
+        "a bare pyproject.toml is not evidence of uv "
+        f"(tests/unit/test_cli_commands.py:91): {repo_map.package_managers}"
+    )
+    assert repo_map.test_commands == [], (
+        "this fixture declares no test runner, no [tool.pytest] and no test "
+        f"files: {repo_map.test_commands}"
+    )
     paths = [item.path for item in repo_map.files]
     assert "src/pkg/cli/main.py" in paths
     assert all("__pycache__" not in path for path in paths)
