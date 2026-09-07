@@ -47,24 +47,29 @@ def test_graph_query_prefers_the_kernel(tmp_path, monkeypatch):
     assert payload["definitions"] == [{"id": "a.py::f"}]
 
 
-def test_graph_query_falls_back_to_python_and_says_so(tmp_path, monkeypatch):
+def test_graph_query_without_a_kernel_is_an_error_not_a_python_answer(
+    tmp_path, monkeypatch
+):
+    """Rewritten: this test used to assert the Python fallback names itself.
+
+    Naming the second engine was the right rule while there were two. There is
+    one. `query_symbol` walked `load_code_graph` — the retired engine's
+    whole-graph read, 855 ms and ~690 MB RSS on this repository, 3.8 s and a
+    102 MB `index.sqlite` write on the first call — from a tool an agent reads
+    as read-only, and its answers do not agree with the kernel's (see the
+    trace case below, where the disagreement is a *false path*).
+    """
     monkeypatch.setattr(
         mapmod, "_devmap_query_payload", lambda *a, **k: None, raising=False
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.query_symbol",
-        lambda root, name: {"definitions": [], "matches": []},
-        raising=False,
     )
 
     payload = _payload(
         asyncio.run(mapmod.handle_graph_query(tmp_path, {"name_or_path": "f"}))
     )
 
-    assert payload.get("source") == "code_graph", (
-        "a Python answer must name itself, or a caller cannot tell which engine "
-        f"replied: {payload}"
-    )
+    assert payload.get("ok") is False, payload
+    assert payload.get("source") != "code_graph", payload
+    assert "devmap" in json.dumps(payload).lower(), payload
 
 
 def test_graph_trace_prefers_the_kernel(tmp_path, monkeypatch):
@@ -84,20 +89,27 @@ def test_graph_trace_prefers_the_kernel(tmp_path, monkeypatch):
     assert payload["source"] == "devmap"
 
 
-def test_graph_trace_falls_back_to_python_and_says_so(tmp_path, monkeypatch):
+def test_graph_trace_without_a_kernel_is_an_error_not_a_python_answer(
+    tmp_path, monkeypatch
+):
+    """The Python tracer was not merely slower; it was wrong.
+
+    Its BFS was *undirected* over `imports`/`calls`/`contains`/`defines`/
+    `inherits`, while the kernel walks resolved edges directionally. On a real
+    probe Python reported a two-hop path between two functions through a shared
+    test module where the kernel correctly reported no indexed path — a
+    fabricated path is worse than an absent answer, because a caller acts on it.
+    """
     monkeypatch.setattr(
         mapmod, "_devmap_query_payload", lambda *a, **k: None, raising=False
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.trace_path",
-        lambda root, a, b: {"path": []},
-        raising=False,
     )
 
     payload = _payload(
         asyncio.run(mapmod.handle_graph_trace(tmp_path, {"from": "a", "to": "b"}))
     )
-    assert payload.get("source") == "code_graph", payload
+    assert payload.get("ok") is False, payload
+    assert payload.get("source") != "code_graph", payload
+    assert "devmap" in json.dumps(payload).lower(), payload
 
 
 def test_handlers_call_the_kernel_with_the_kwargs_it_actually_declares(tmp_path, monkeypatch):
@@ -127,16 +139,6 @@ def test_handlers_call_the_kernel_with_the_kwargs_it_actually_declares(tmp_path,
         return real(root, kind, **kwargs)
 
     monkeypatch.setattr(mapmod, "_devmap_query_payload", _record)
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.query_symbol",
-        lambda root, name: {"definitions": []},
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.trace_path",
-        lambda root, a, b: {"path": []},
-        raising=False,
-    )
 
     asyncio.run(mapmod.handle_graph_query(tmp_path, {"name_or_path": "f"}))
     asyncio.run(mapmod.handle_graph_trace(tmp_path, {"from": "a", "to": "b"}))

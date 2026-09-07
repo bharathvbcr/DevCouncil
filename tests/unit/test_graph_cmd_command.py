@@ -5,7 +5,6 @@ import json
 
 import pytest
 
-import devcouncil.indexing.graph as graph_pkg
 import devcouncil.indexing.graph.build as graph_build
 import devcouncil.indexing.viz as viz
 from devcouncil.cli.main import app
@@ -64,26 +63,38 @@ def test_graph_doctor_reports_a_kernel_older_than_the_store(tmp_path, monkeypatc
 
 
 # --- query ------------------------------------------------------------------------
+#
+# These render whatever payload the engine returns. The engine used to be either
+# the kernel or `indexing.graph.query.query_symbol` over `load_code_graph`; it is
+# now only the kernel, so the double is `_devmap_query_payload` — the one seam
+# both `dev map query` and the MCP tool go through. The rendering assertions are
+# unchanged.
+
+
+def _kernel_says(monkeypatch, payload):
+    from devcouncil.cli.commands import graph_cmd
+
+    monkeypatch.setattr(
+        graph_cmd, "_devmap_query_payload", lambda *a, **k: payload, raising=False
+    )
 
 
 def test_graph_query_json(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        graph_pkg, "query_symbol",
-        lambda root, name: {"definitions": [{"id": "m.f", "kind": "function", "path": "m.py", "line": 1}]},
-    )
+    _kernel_says(monkeypatch, {
+        "definitions": [{"id": "m.f", "kind": "function", "path": "m.py", "line": 1}]
+    })
     result = runner.invoke(app, ["map", "query", "f", "--json", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert json.loads(result.stdout)["definitions"][0]["id"] == "m.f"
 
 
 def test_graph_query_human_with_defs(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        graph_pkg, "query_symbol",
-        lambda root, name: {"definitions": [{
+    _kernel_says(monkeypatch, {
+        "definitions": [{
             "id": "m.f", "kind": "function", "path": "m.py", "line": 1,
             "callers": ["m.g"], "callees": [], "importers": [],
-        }]},
-    )
+        }]
+    })
     result = runner.invoke(app, ["map", "query", "f", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "m.f" in result.output
@@ -91,51 +102,83 @@ def test_graph_query_human_with_defs(tmp_path, monkeypatch):
 
 
 def test_graph_query_no_matches(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_pkg, "query_symbol", lambda root, name: {"definitions": []})
+    _kernel_says(monkeypatch, {"definitions": []})
     result = runner.invoke(app, ["map", "query", "ghost", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "No matches" in result.output
 
 
 def test_graph_query_error_exits(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_pkg, "query_symbol", lambda root, name: {"error": "no graph"})
+    _kernel_says(monkeypatch, {"error": "no graph"})
     result = runner.invoke(app, ["map", "query", "f", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
+
+
+def test_graph_query_without_a_kernel_refuses_rather_than_answering(tmp_path, monkeypatch):
+    """No kernel is an error naming it, not a second engine's answer.
+
+    `query_symbol` walked the whole Python graph out of `index.sqlite` to
+    answer this — and the sibling `trace` fallback did not merely cost more, it
+    returned *different* paths (its BFS was undirected).
+    """
+    monkeypatch.setattr(
+        graph_build,
+        "load_code_graph",
+        lambda root: (_ for _ in ()).throw(
+            AssertionError("`dev map query` must not read the Python graph")
+        ),
+    )
+    _kernel_says(monkeypatch, None)
+    result = runner.invoke(app, ["map", "query", "f", "--project-root", str(tmp_path)])
+    assert result.exit_code != 0, result.output
+    assert not isinstance(result.exception, AssertionError), result.exception
+    assert "dev map" in result.output or "devmap" in result.output, result.output
 
 
 # --- trace ------------------------------------------------------------------------
 
 
 def test_graph_trace_found(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        graph_pkg, "trace_path",
-        lambda root, start, end: {"found": True, "path": ["a", "b", "c"]},
-    )
+    _kernel_says(monkeypatch, {"found": True, "path": ["a", "b", "c"]})
     result = runner.invoke(app, ["map", "trace", "a", "c", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "a" in result.output and "c" in result.output
 
 
 def test_graph_trace_json(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        graph_pkg, "trace_path", lambda root, start, end: {"found": True, "path": ["a", "b"]}
-    )
+    _kernel_says(monkeypatch, {"found": True, "path": ["a", "b"]})
     result = runner.invoke(app, ["map", "trace", "a", "b", "--json", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert json.loads(result.stdout)["found"] is True
 
 
 def test_graph_trace_no_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_pkg, "trace_path", lambda root, start, end: {"found": False})
+    _kernel_says(monkeypatch, {"found": False})
     result = runner.invoke(app, ["map", "trace", "a", "z", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
     assert "No path" in result.output
 
 
 def test_graph_trace_error(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_pkg, "trace_path", lambda root, start, end: {"error": "boom"})
+    _kernel_says(monkeypatch, {"error": "boom"})
     result = runner.invoke(app, ["map", "trace", "a", "z", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
+
+
+def test_graph_trace_without_a_kernel_refuses_rather_than_answering(tmp_path, monkeypatch):
+    """A fabricated path is worse than an absent answer: a caller acts on it."""
+    monkeypatch.setattr(
+        graph_build,
+        "load_code_graph",
+        lambda root: (_ for _ in ()).throw(
+            AssertionError("`dev map trace` must not read the Python graph")
+        ),
+    )
+    _kernel_says(monkeypatch, None)
+    result = runner.invoke(app, ["map", "trace", "a", "z", "--project-root", str(tmp_path)])
+    assert result.exit_code != 0, result.output
+    assert not isinstance(result.exception, AssertionError), result.exception
+    assert "dev map" in result.output or "devmap" in result.output, result.output
 
 
 # --- graph-backed commands: missing-graph guard -----------------------------------

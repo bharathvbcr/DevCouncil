@@ -1212,22 +1212,15 @@ async def handle_graph_query(root: Path, arguments: dict) -> list[TextContent]:
                 "Missing name_or_path", code="missing_argument", argument="name_or_path"
             )
         kernel = _devmap_query_payload(root, "query", name_or_path=name)
-        if kernel is not None:
-            # The CLI's payload shape carries `definitions` but not `matches`,
-            # which this tool has always emitted and agents branch on. Switching
-            # engines must not silently drop a field of the tool's contract, so
-            # it is derived here from the definitions the kernel returned rather
-            # than left absent (which a caller reads as zero matches).
-            kernel.setdefault("matches", len(kernel.get("definitions") or []))
-            return json_text(kernel)
-        from devcouncil.indexing.graph import query_symbol
-
-        payload = _graph_payload(root, query_symbol(root, name))
-        # Provenance is not optional here. Two engines can answer this tool and
-        # they do not agree in every case, so a caller that cannot tell which
-        # replied cannot interpret the answer.
-        payload.setdefault("source", "code_graph")
-        return json_text(payload)
+        if kernel is None:
+            return error_text(_NO_KERNEL_TEXT, code="graph_missing")
+        # The CLI's payload shape carries `definitions` but not `matches`,
+        # which this tool has always emitted and agents branch on. Switching
+        # engines must not silently drop a field of the tool's contract, so
+        # it is derived here from the definitions the kernel returned rather
+        # than left absent (which a caller reads as zero matches).
+        kernel.setdefault("matches", len(kernel.get("definitions") or []))
+        return json_text(kernel)
 
     async def _run() -> list[TextContent]:
         return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
@@ -1257,13 +1250,9 @@ async def handle_graph_trace(root: Path, arguments: dict) -> list[TextContent]:
         if not end:
             return error_text("Missing to", code="missing_argument", argument="to")
         kernel = _devmap_query_payload(root, "trace", start=start, end=end)
-        if kernel is not None:
-            return json_text(kernel)
-        from devcouncil.indexing.graph import trace_path
-
-        payload = _graph_payload(root, trace_path(root, start, end))
-        payload.setdefault("source", "code_graph")
-        return json_text(payload)
+        if kernel is None:
+            return error_text(_NO_KERNEL_TEXT, code="graph_missing")
+        return json_text(kernel)
 
     async def _run() -> list[TextContent]:
         return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
@@ -1313,10 +1302,10 @@ async def handle_graph_impact(root: Path, arguments: dict) -> list[TextContent]:
     return await with_codeintel_freshness(root, _run)
 
 
-#: Said when no kernel can be reached, by every route tool. The kernel is the
-#: engine for these three; there is no Python route scanner to fall back to.
+#: Said when no kernel can be reached, by every graph tool here. The kernel is
+#: the engine; there is no second one to fall back to.
 _NO_KERNEL_TEXT = (
-    "No devmap store found. Run `dev map` to build the index the route tools read."
+    "No devmap store found. Run `dev map` to build the index these tools read."
 )
 
 

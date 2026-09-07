@@ -709,6 +709,14 @@ def _require_graph(root: Path, *, warn_stale: bool = True):
     return graph
 
 
+#: Printed when no kernel can answer. Named so `query` and `trace` cannot drift
+#: into saying different things about the same condition.
+_NO_KERNEL_MESSAGE = (
+    "[red]No devmap store; run `dev map` first. "
+    "The kernel is the only graph engine — there is no Python fallback.[/red]"
+)
+
+
 def _require_kernel(root: Path, *, warn_stale: bool = True):
     """A live client, or exit naming the kernel — the sibling of `_require_graph`.
 
@@ -1258,25 +1266,21 @@ def graph_query(
     """360° view: definition, callers, callees, importers.
 
     --min-rung narrows every edge list here to the resolution rungs it names.
-    The fallback graph has no ladder to filter on, so a floor is refused there
-    rather than silently ignored: an unfiltered answer to a request for
-    deterministic-only edges is the reading that gets acted on.
+
+    The kernel is the only engine. This used to fall back to
+    `indexing.graph.query.query_symbol` over `load_code_graph` — the retired
+    engine's whole-graph read, 855 ms and ~690 MB RSS on this repository — and
+    that fallback carried no resolution ladder, so `--min-rung` had to be
+    refused against it separately. Both refusals are now the same one.
     """
     root = _root(project_root)
     min_rung = _checked_min_rung(min_rung)
     result = _devmap_query_payload(
         root, "query", name_or_path=name_or_path, min_rung=min_rung
     )
-    if result is None and min_rung is not None:
-        status.print(
-            "[red]--min-rung needs the devmap index; the fallback graph carries "
-            "no resolution ladder to filter on (run `dev map` to build one)[/red]"
-        )
-        raise typer.Exit(code=3)
     if result is None:
-        from devcouncil.indexing.graph import query_symbol
-
-        result = {**query_symbol(root, name_or_path), **_graph_degraded_fields(root)}
+        status.print(_NO_KERNEL_MESSAGE)
+        raise typer.Exit(code=3 if min_rung is not None else 1)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -1309,23 +1313,23 @@ def graph_trace(
 
     --min-rung restricts the walk to the named rungs, so a path can be asked
     for on evidence the resolver proved rather than on evidence it guessed.
-    Refused against the fallback graph, which has no ladder.
+
+    The kernel is the only engine, and here that is a correctness rule rather
+    than a performance one: the Python `trace_path` this fell back to ran an
+    *undirected* BFS over `imports`/`calls`/`contains`/`defines`/`inherits`
+    while the kernel walks resolved edges directionally. On a real probe Python
+    reported a two-hop path between two functions through a shared test module
+    where the kernel correctly reported none. A fabricated path is worse than an
+    absent answer, because a caller acts on it.
     """
     root = _root(project_root)
     min_rung = _checked_min_rung(min_rung)
     result = _devmap_query_payload(
         root, "trace", start=start, end=end, min_rung=min_rung
     )
-    if result is None and min_rung is not None:
-        status.print(
-            "[red]--min-rung needs the devmap index; the fallback graph carries "
-            "no resolution ladder to filter on (run `dev map` to build one)[/red]"
-        )
-        raise typer.Exit(code=3)
     if result is None:
-        from devcouncil.indexing.graph import trace_path
-
-        result = {**trace_path(root, start, end), **_graph_degraded_fields(root)}
+        status.print(_NO_KERNEL_MESSAGE)
+        raise typer.Exit(code=3 if min_rung is not None else 1)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return

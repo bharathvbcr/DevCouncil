@@ -709,7 +709,10 @@ def test_structured_dead_code_reports_the_error_it_used_to_swallow(tmp_path, mon
 async def test_graph_query_missing_and_ok(tmp_path, monkeypatch):
     missing = _parse(await mapmod.handle_graph_query(tmp_path, {}))
     assert missing["code"] == "missing_argument"
-    monkeypatch.setattr("devcouncil.indexing.graph.query_symbol", lambda root, name: {"symbol": name})
+    # The engine is the kernel; `query_symbol` no longer exists to stand in.
+    monkeypatch.setattr(
+        mapmod, "_devmap_query_payload", lambda root, kind, **kw: {"ok": True, "symbol": "foo"}
+    )
     ok = _parse(await mapmod.handle_graph_query(tmp_path, {"name_or_path": "foo"}))
     assert ok["ok"] is True and ok["symbol"] == "foo"
 
@@ -719,7 +722,9 @@ async def test_graph_trace_missing_and_ok(tmp_path, monkeypatch):
     assert _parse(await mapmod.handle_graph_trace(tmp_path, {"to": "b"}))["argument"] == "from"
     assert _parse(await mapmod.handle_graph_trace(tmp_path, {"from": "a"}))["argument"] == "to"
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.trace_path", lambda root, a, b: {"path": [a, b]}
+        mapmod,
+        "_devmap_query_payload",
+        lambda root, kind, **kw: {"ok": True, "path": [kw["start"], kw["end"]]},
     )
     ok = _parse(await mapmod.handle_graph_trace(tmp_path, {"from": "a", "to": "b"}))
     assert ok["ok"] is True and ok["path"] == ["a", "b"]
@@ -991,25 +996,26 @@ def test_graph_degraded_fields_known_with_a_map(tmp_path):
 
 @pytest.mark.anyio
 async def test_graph_query_error_payload_is_not_ok(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.query_symbol",
-        lambda root, name: {"error": "no code graph; run `dev map` first", "query": name},
-    )
+    """An engine that could not answer is `ok: False`, and names the kernel.
+
+    This used to drive the Python fallback's own `{"error": ...}` payload
+    through `_graph_payload`. There is no fallback: an absent kernel is the
+    only way this tool fails to answer, and it says so.
+    """
+    monkeypatch.setattr(mapmod, "_devmap_query_payload", lambda root, kind, **kw: None)
     out = _parse(await mapmod.handle_graph_query(tmp_path, {"name_or_path": "foo"}))
     assert out["ok"] is False
-    assert out["code"] == "graph_unavailable"
-    assert out["error"] == "no code graph; run `dev map` first"
+    assert out["code"] == "graph_missing"
+    assert "devmap" in out["error"].lower()
 
 
 @pytest.mark.anyio
 async def test_graph_trace_error_payload_is_not_ok(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.trace_path",
-        lambda root, a, b: {"error": "no code graph; run `dev map` first", "from": a, "to": b},
-    )
+    monkeypatch.setattr(mapmod, "_devmap_query_payload", lambda root, kind, **kw: None)
     out = _parse(await mapmod.handle_graph_trace(tmp_path, {"from": "a", "to": "b"}))
     assert out["ok"] is False
-    assert out["code"] == "graph_unavailable"
+    assert out["code"] == "graph_missing"
+    assert "devmap" in out["error"].lower()
 
 
 # ---- Class A: impact always says which engine answered ------------------------
