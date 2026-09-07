@@ -280,7 +280,9 @@ Resolved per repository, in this order:
 
 `--db` overrides the store path directly. The state directory holds
 `codeintel/devmap.sqlite` (canonical), `repo_map.json`, `graph/code_graph.json`
-and `workspace.json`.
+and `workspace.json`. `devmap paths` prints the resolved layout — and whether
+each part exists — without opening the store, so a wrapper can ask instead of
+re-deriving the rule.
 
 ## Across repositories
 

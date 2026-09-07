@@ -25,11 +25,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from devcouncil.devmap_engine import (
-    DEFAULT_DB_RELPATH,
-    DEFAULT_GRAPH_RELPATH,
-    DEFAULT_MAP_RELPATH,
     DevMapEngineError,
     find_engine_binary,
+    graph_path,
+    map_path,
+    store_path,
 )
 from devcouncil.utils.git_siblings import inspect_session_siblings, session_guard_detail
 
@@ -93,7 +93,7 @@ def store_info(root: Path) -> Dict[str, Any]:
     tables (the system SQLite here lacks the module) but pragmas and
     `sqlite_master` do not need them.
     """
-    path = root / DEFAULT_DB_RELPATH
+    path = store_path(root)
     info: Dict[str, Any] = {
         "path": str(path),
         "exists": path.is_file(),
@@ -243,7 +243,7 @@ def build_activity(root: Path) -> Dict[str, Any]:
     was killed: reported, never silently discarded, because a build that
     vanished is exactly the event an agent needs to know about.
     """
-    from devcouncil.devmap_engine import DEFAULT_DB_RELPATH, LIVE_BUILD_RELPATH
+    from devcouncil.devmap_engine import live_build_path, store_path
 
     root = Path(root).expanduser().resolve()
     result: Dict[str, Any] = {
@@ -257,7 +257,7 @@ def build_activity(root: Path) -> Dict[str, Any]:
         "since_progress_s": None,
         "writer_lock": None,
     }
-    marker = root / LIVE_BUILD_RELPATH
+    marker = live_build_path(root)
     if marker.is_file():
         try:
             data = json.loads(marker.read_text(encoding="utf-8"))
@@ -278,7 +278,7 @@ def build_activity(root: Path) -> Dict[str, Any]:
             result["stuck"] = (now - updated) > BUILD_STUCK_AFTER_SECONDS
         else:
             result["stale_marker"] = True
-    lock = root / (DEFAULT_DB_RELPATH + ".writer.lock")
+    lock = Path(str(store_path(root)) + ".writer.lock")
     if lock.is_file():
         try:
             holder = int((lock.read_text(encoding="utf-8") or "0").strip() or 0)
@@ -330,7 +330,7 @@ def read_artifact_stamp(root: Path) -> Optional[Dict[str, Any]]:
     direction — the caller then falls back to reading the artifact itself, which
     is what it did before the sidecar existed.
     """
-    path = root / (DEFAULT_DB_RELPATH + ".artifacts.json")
+    path = Path(str(store_path(root)) + ".artifacts.json")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -443,10 +443,10 @@ def artifacts_info(root: Path) -> Dict[str, Any]:
     stamp = read_artifact_stamp(root)
     return {
         "repo_map": _artifact(
-            root / DEFAULT_MAP_RELPATH, engine_key="top", role="repo_map", stamp=stamp
+            map_path(root), engine_key="top", role="repo_map", stamp=stamp
         ),
         "code_graph": _artifact(
-            root / DEFAULT_GRAPH_RELPATH, engine_key="meta", role="code_graph", stamp=stamp
+            graph_path(root), engine_key="meta", role="code_graph", stamp=stamp
         ),
     }
 
@@ -455,13 +455,13 @@ def map_freshness(root: Path) -> Dict[str, Any]:
     """Is `repo_map.json` the map of the tree as it stands? Same rule as `--if-stale`."""
     from devcouncil.indexing.repo_mapper import RepoMapper
 
-    map_path = root / DEFAULT_MAP_RELPATH
+    map_file = map_path(root)
     result: Dict[str, Any] = {"fresh": None, "reason": "", "map_head": "", "current_head": ""}
-    if not map_path.is_file():
+    if not map_file.is_file():
         result["reason"] = "no repo_map.json; run `dev map`"
         return result
     try:
-        payload = json.loads(map_path.read_text(encoding="utf-8"))
+        payload = json.loads(map_file.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         result["reason"] = f"repo_map.json unreadable: {exc}"
         return result
@@ -488,28 +488,6 @@ def map_freshness(root: Path) -> Dict[str, Any]:
     return result
 
 
-def python_query_cache_info(root: Path) -> Dict[str, Any]:
-    """The Python `index.sqlite`, now a read cache for the graph JSON.
-
-    It is not the engine and never written by `dev map`; `load_code_graph`
-    imports the kernel's `code_graph.json` into it on first use after a build so
-    the Python-only query commands answer from the current generation.
-    """
-    path = root / ".devcouncil" / "codeintel" / "index.sqlite"
-    info: Dict[str, Any] = {"path": str(path), "exists": path.is_file(), "generation": None}
-    if not path.is_file():
-        return info
-    try:
-        from devcouncil.codeintel import get_codeintel_service
-
-        state = get_codeintel_service(root).status()
-        info["generation"] = state.get("generation")
-        info["state"] = state.get("state")
-    except Exception as exc:  # noqa: BLE001 - informational only
-        info["error"] = f"{type(exc).__name__}: {exc}"
-    return info
-
-
 def collect_map_status(root: Path) -> Dict[str, Any]:
     """Everything `dev map status` prints, as one JSON-able dict.
 
@@ -524,7 +502,6 @@ def collect_map_status(root: Path) -> Dict[str, Any]:
     daemon = daemon_info(root)
     artifacts = artifacts_info(root)
     freshness = map_freshness(root)
-    cache = python_query_cache_info(root)
     build = build_activity(root)
     runs = last_build(root)
 
@@ -550,7 +527,6 @@ def collect_map_status(root: Path) -> Dict[str, Any]:
         "kernel": kernel,
         "daemon": daemon,
         "artifacts": artifacts,
-        "python_query_cache": cache,
         "build": build,
         "last_build": runs,
         "sync": {
@@ -623,12 +599,6 @@ def render_status(result: Dict[str, Any]) -> List[str]:
             )
         else:
             lines.append(f"{name}: missing ({artifact['path']})")
-    cache = result["python_query_cache"]
-    if cache["exists"]:
-        lines.append(
-            f"python query cache: generation {cache.get('generation') or '(none)'} "
-            "(imported from code_graph.json on first read; not the engine)"
-        )
     lines.extend(render_build_lines(result))
     return lines
 
@@ -1199,9 +1169,9 @@ _REPORT_ONLY = {"live_sibling", "divergent_branch"}
 
 def _quarantine_store(root: Path) -> Dict[str, Any]:
     """Move an unreadable store aside, keeping it as evidence, so a build starts clean."""
-    from devcouncil.devmap_engine import DEFAULT_DB_RELPATH
+    from devcouncil.devmap_engine import store_path
 
-    store = root / DEFAULT_DB_RELPATH
+    store = store_path(root)
     stamp = time.strftime("%Y%m%dT%H%M%S")
     moved: List[str] = []
     for suffix in ("", "-wal", "-shm"):
@@ -1221,7 +1191,7 @@ def apply_fixes(root: Path) -> Dict[str, Any]:
     kernel binary) are listed, not attempted. Ends with a fresh doctor pass so
     the caller sees the state it left behind, not the state it found.
     """
-    from devcouncil.devmap_engine import DevMapEngineError, LIVE_BUILD_RELPATH, repair_pending
+    from devcouncil.devmap_engine import DevMapEngineError, live_build_path, repair_pending
     from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
     root = Path(root).expanduser().resolve()
@@ -1248,7 +1218,7 @@ def apply_fixes(root: Path) -> Dict[str, Any]:
         ):
             not_applied.append({"code": item["code"], "fix": item["fix"], "fix_command": item["fix_command"]})
     if "stale_build_marker" in codes:
-        marker = root / LIVE_BUILD_RELPATH
+        marker = live_build_path(root)
         try:
             marker.unlink()
             actions.append({"action": "clear_build_marker", "ok": True, "path": str(marker)})
@@ -1267,7 +1237,7 @@ def apply_fixes(root: Path) -> Dict[str, Any]:
             actions.append({"action": "repair_pending", "ok": False, **exc.to_dict()})
     if codes & _BUILD_RESOLVES and not codes & _NEEDS_A_PERSON:
         try:
-            refresh = refresh_map_artifacts(root, root / ".devcouncil" / "repo_map.json", quiet=True)
+            refresh = refresh_map_artifacts(root, map_path(root), quiet=True)
             actions.append({"action": "build", "ok": True, "generation": refresh.generation})
         except DevMapEngineError as exc:
             actions.append({"action": "build", "ok": False, **exc.to_dict()})
@@ -1291,11 +1261,11 @@ def abort_build(root: Path, *, grace_seconds: float = 5.0) -> Dict[str, Any]:
     a pid whose command line is not a devmap process — a stale marker must
     never become a signal to whatever process inherited the number.
     """
-    from devcouncil.devmap_engine import LIVE_BUILD_RELPATH
+    from devcouncil.devmap_engine import live_build_path
 
     root = Path(root).expanduser().resolve()
     activity = build_activity(root)
-    marker = root / LIVE_BUILD_RELPATH
+    marker = live_build_path(root)
     if activity.get("stale_marker"):
         try:
             marker.unlink()

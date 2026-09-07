@@ -1556,3 +1556,239 @@ fn the_rust_edge_order_is_the_sql_order_it_replaced() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// The columnar index and a scan of the rows it replaced must answer the same
+// question. Every one of them.
+// ---------------------------------------------------------------------------
+
+/// `GenerationEdges` holds ranks into interned text, not `StoredEdge` rows, and
+/// its adjacency is a counting sort rather than four `HashMap<Box<str>, …>`.
+/// Both changes are invisible in an answer *until* one of them is wrong, and
+/// then they are wrong everywhere at once: the ranks are the sort keys of the
+/// read order (R4), and the read order is the final tie-break of every answer
+/// derived from a walk.
+///
+/// So this asserts the equivalence directly and exhaustively, against the one
+/// thing that is not derived from the columns — the row list
+/// `Store::latest_edges` hands out, whose order
+/// `the_rust_edge_order_is_the_sql_order_it_replaced` separately pins to
+/// SQLite's own.
+///
+/// The fixture is deliberately hostile to the interning: a self-call, a cycle,
+/// the *same* call written twice in one body, files whose paths order
+/// differently from the symbols in them, a symbol whose name is a byte-order
+/// trap next to another (`alpha` / `alpha_`, where the shorter is a prefix of
+/// the longer), and non-ASCII identifiers, because a rank comparison is only
+/// the byte comparison it stands in for if the ranks were assigned in byte
+/// order over the *whole* distinct set.
+#[test]
+fn the_columns_answer_what_a_scan_of_the_rows_answers() {
+    let store = store_with(&[
+        (
+            "src/zeta.py",
+            "def alpha():\n    return alpha()\n\n\ndef alpha_():\n    return alpha()\n\n\ndef beta():\n    return alpha() + alpha_() + alpha()\n",
+        ),
+        (
+            "src/alpha.py",
+            "from src.zeta import alpha, beta\n\n\nclass Thing:\n    def run(self):\n        return alpha() + beta()\n\n\ndef cycle_a():\n    return cycle_b()\n\n\ndef cycle_b():\n    return cycle_a()\n",
+        ),
+        (
+            "src/caf\u{e9}.py",
+            "from src.alpha import Thing\n\n\ndef m\u{f3}dulo():\n    return Thing()\n\n\ndef use():\n    return m\u{f3}dulo().run()\n",
+        ),
+    ]);
+
+    let rows = store.latest_edges(0.0).expect("rows");
+    let index = store
+        .generation_edges()
+        .expect("index")
+        .expect("a generation");
+    assert!(
+        rows.len() > 15,
+        "fixture is inert: {} edges is too few for the adjacency to be interesting",
+        rows.len()
+    );
+    assert_eq!(
+        index.len(),
+        rows.len(),
+        "the index and the row list describe different generations"
+    );
+
+    // 1. Every column, against the row it stands for.
+    for (id, row) in rows.iter().enumerate() {
+        let id = id as u32;
+        assert_eq!(index.stored_edge(id), *row, "row {id} rebuilt differently");
+        assert_eq!(index.source_symbol(id), row.source_symbol, "row {id}");
+        assert_eq!(index.target_symbol(id), row.target_symbol, "row {id}");
+        assert_eq!(index.source_file(id), row.source_file, "row {id}");
+        assert_eq!(index.target_file(id), row.target_file, "row {id}");
+        assert_eq!(index.kind_label(id), row.edge_kind, "row {id}");
+        assert_eq!(index.confidence(id), row.confidence, "row {id}");
+        assert_eq!(
+            index.resolution_label(id),
+            row.resolution.as_deref(),
+            "row {id}"
+        );
+    }
+
+    // 2. Every adjacency run, against a scan for the same key. The expected
+    //    shape is the one the `HashMap<Box<str>, Vec<u32>>` this replaced held:
+    //    ascending ids, which is to say the generation's own edge order.
+    let scan = |key: &str, reverse: bool| -> Vec<u32> {
+        rows.iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                key == if reverse {
+                    &row.target_symbol
+                } else {
+                    &row.source_symbol
+                }
+            })
+            .map(|(id, _)| id as u32)
+            .collect()
+    };
+    let mut symbols: Vec<&str> = rows
+        .iter()
+        .flat_map(|row| [row.source_symbol.as_str(), row.target_symbol.as_str()])
+        .collect();
+    symbols.sort_unstable();
+    symbols.dedup();
+    assert!(symbols.len() > 8, "fixture has too few distinct symbols");
+    for symbol in &symbols {
+        assert_eq!(
+            index.from_source_symbol(symbol),
+            scan(symbol, false),
+            "outbound run for {symbol:?}"
+        );
+        assert_eq!(
+            index.into_target_symbol(symbol),
+            scan(symbol, true),
+            "inbound run for {symbol:?}"
+        );
+    }
+    // A symbol the generation never names has an empty run, not a panic and
+    // not somebody else's run.
+    assert!(index.from_source_symbol("nothing at all").is_empty());
+    assert!(index.into_target_symbol("nothing at all").is_empty());
+
+    // 3. The two group iterators, against the same scan. These are what the
+    //    traversal-start matcher runs its predicate over, so a missing group is
+    //    a start the walk never finds.
+    let mut files: Vec<&str> = rows
+        .iter()
+        .flat_map(|row| [row.source_file.as_str(), row.target_file.as_str()])
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    for reverse in [false, true] {
+        let mut got: Vec<(String, Vec<u32>)> = index
+            .symbols(reverse)
+            .map(|(name, ids)| (name.to_string(), ids.to_vec()))
+            .collect();
+        let mut expected: Vec<(String, Vec<u32>)> = symbols
+            .iter()
+            .map(|symbol| (symbol.to_string(), scan(symbol, reverse)))
+            .filter(|(_, ids)| !ids.is_empty())
+            .collect();
+        got.sort();
+        expected.sort();
+        assert_eq!(got, expected, "symbol groups, reverse={reverse}");
+
+        let file_scan = |key: &str| -> Vec<u32> {
+            rows.iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    key == if reverse {
+                        &row.target_file
+                    } else {
+                        &row.source_file
+                    }
+                })
+                .map(|(id, _)| id as u32)
+                .collect()
+        };
+        let mut got: Vec<(String, Vec<u32>)> = index
+            .files(reverse)
+            .map(|(name, ids)| (name.to_string(), ids.to_vec()))
+            .collect();
+        let mut expected: Vec<(String, Vec<u32>)> = files
+            .iter()
+            .map(|file| (file.to_string(), file_scan(file)))
+            .filter(|(_, ids)| !ids.is_empty())
+            .collect();
+        got.sort();
+        expected.sort();
+        assert_eq!(got, expected, "file groups, reverse={reverse}");
+    }
+
+    // 4. The interned tables are in byte order, which is the property that makes
+    //    a rank comparison the byte comparison `edge_read_order` needs. Asserted
+    //    through the iterator rather than on the private field: the groups come
+    //    out in rank order, so their names must come out sorted.
+    let names: Vec<&str> = index.symbols(false).map(|(name, _)| name).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        names, sorted,
+        "the symbol table is not in byte order, so a rank comparison is not the \
+         byte comparison the read order is defined in terms of"
+    );
+    let paths: Vec<&str> = index.files(false).map(|(name, _)| name).collect();
+    let mut sorted = paths.clone();
+    sorted.sort_unstable();
+    assert_eq!(paths, sorted, "the path table is not in byte order");
+}
+
+/// A duplicated edge keeps both ids, and a self-edge appears on both sides.
+///
+/// The counting sort that builds the adjacency is only equivalent to the maps
+/// it replaced if it is *stable* — ids ascending within a run — and if a row
+/// whose two endpoints are the same symbol lands in both the outbound and the
+/// inbound run rather than in one of them twice.
+#[test]
+fn self_edges_and_duplicates_survive_the_counting_sort() {
+    let store = store_with(&[(
+        "src/loop.py",
+        "def recur():\n    return recur()\n\n\ndef twice():\n    return recur() + recur()\n",
+    )]);
+    let rows = store.latest_edges(0.0).expect("rows");
+    let index = store
+        .generation_edges()
+        .expect("index")
+        .expect("a generation");
+
+    let self_edges: Vec<u32> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.source_symbol == row.target_symbol)
+        .map(|(id, _)| id as u32)
+        .collect();
+    assert!(
+        !self_edges.is_empty(),
+        "fixture must hold a self-edge, or this checks nothing"
+    );
+    for id in &self_edges {
+        let symbol = index.source_symbol(*id);
+        assert!(
+            index.from_source_symbol(symbol).contains(id),
+            "self-edge {id} is missing from its outbound run"
+        );
+        assert!(
+            index.into_target_symbol(symbol).contains(id),
+            "self-edge {id} is missing from its inbound run"
+        );
+    }
+
+    for reverse in [false, true] {
+        for (name, ids) in index.symbols(reverse) {
+            let mut ascending = ids.to_vec();
+            ascending.sort_unstable();
+            assert_eq!(
+                ids, ascending,
+                "the run for {name:?} is not in ascending id order, so the \
+                 generation's edge order (R4) no longer survives the adjacency"
+            );
+        }
+    }
+}

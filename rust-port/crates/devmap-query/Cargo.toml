@@ -38,6 +38,10 @@ parse = ["devmap-extract/parse", "devmap-resolve/parse", "devmap-analyze/parse",
 # no-parse configuration. See the note below the list for the examples.
 
 [[test]]
+name = "a_cold_query_pays_for_its_answer_not_the_generation"
+required-features = ["parse"]
+
+[[test]]
 name = "coverage_loss_artifacts"
 required-features = ["parse"]
 
@@ -180,5 +184,13 @@ name = "graph_intel_is_emitted"
 required-features = ["parse"]
 
 [[test]]
+name = "the_core_graph_is_the_artifacts_nodes_and_edges"
+required-features = ["parse"]
+
+[[test]]
 name = "dead_clusters_reach_a_query"
+required-features = ["parse"]
+
+[[test]]
+name = "impact_layers_come_from_the_kernel"
 required-features = ["parse"]

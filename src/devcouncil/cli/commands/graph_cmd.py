@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -78,14 +79,6 @@ def _graph_degraded_fields(root: Path) -> dict[str, object]:
         return {"graph_degraded": False}
 
 
-def _canonical_store_health(root: Path) -> str:
-    from devcouncil.codeintel import get_codeintel_service
-    from devcouncil.indexing.graph.communities import store_health_from_state
-
-    state = get_codeintel_service(root).status()
-    return store_health_from_state(str(state.get("state") or ""))
-
-
 def _emit_limit(out: Console, limit_dict: dict) -> None:
     if not limit_dict.get("degraded"):
         return
@@ -97,21 +90,44 @@ def _emit_limit(out: Console, limit_dict: dict) -> None:
 
 
 def _index_freshness_fields(root: Path) -> dict[str, object]:
-    """Freshness probe for read commands; never raises."""
-    try:
-        from devcouncil.codeintel.service import index_freshness
+    """Freshness probe for read commands; never raises.
 
-        return index_freshness(root)
+    This asked ``codeintel.service.index_freshness``, which compared the Python
+    store's committed generation against git HEAD. Nothing had committed a
+    generation since the kernel became the only writer, so it returned
+    ``{"fresh": None, "reason": "no committed index generation"}`` on every
+    repository — and :func:`_warn_if_stale`'s "index STALE" banner, added after a
+    frozen index misled a deletion decision, could not fire at all.
+
+    ``devmap_health.map_freshness`` is the surviving owner of the same question:
+    it asks whether ``repo_map.json`` is the map of the tree as it stands, by the
+    same rule ``dev map --if-stale`` uses. ``age_seconds`` comes from the
+    artifact this verdict is about.
+    """
+    try:
+        from devcouncil.devmap_health import map_freshness
+
+        fields: dict[str, object] = dict(map_freshness(root))
+        try:
+            from devcouncil.devmap_engine import map_path
+
+            fields["age_seconds"] = max(
+                0.0, time.time() - map_path(root).stat().st_mtime
+            )
+        except OSError:
+            fields["age_seconds"] = None
+        return fields
     except Exception as exc:  # noqa: BLE001 - probe must not break reads
         return {"fresh": None, "reason": f"freshness probe failed: {exc}"}
 
 
-
-#: Edge kinds that represent one symbol invoking another. The devmap store also
-#: emits structural edges (`Contains` for file→symbol, `MemberOf` for
-#: symbol→type); including those in a caller/callee list makes a symbol look like
-#: it calls itself and inflates blast radius with edges nobody can act on.
-_CALL_EDGE_KINDS = frozenset({"Calls"})
+#: Which edge kinds count as calls, and how to read one direction's edge list,
+#: moved to :mod:`devcouncil.devmap_client` — the one seam every kernel consumer
+#: already goes through — when the task prompt's impact block became a second
+#: reader of the same raw edges. Re-bound under the private name this module's
+#: own call sites already use. `CALL_EDGE_KINDS` itself had no reader outside
+#: `edge_nodes` (`rg -uu` over `src/` and `tests/`), so it did not come along.
+from devcouncil.devmap_client import edge_nodes as _edge_nodes  # noqa: E402
 
 
 def _call_edges(
@@ -167,23 +183,6 @@ def _call_edges(
         return None, f"{method} resolution unavailable: {reason}"
 
     return _edge_nodes(resp.items, symbol_key, file_key), None
-
-
-def _edge_nodes(items, symbol_key: str, file_key: str) -> list:
-    """Call-graph node names from one direction's raw edge list.
-
-    Split out of :func:`_call_edges` so the batched and single-target paths
-    share it verbatim. Two copies of this filter would drift, and the drift
-    would be silent: it decides which edge kinds count as calls at all.
-    """
-    edges = []
-    for edge in items:
-        if str(edge.get("edge_kind") or "") not in _CALL_EDGE_KINDS:
-            continue
-        node = str(edge.get(symbol_key) or edge.get(file_key) or "")
-        if node:
-            edges.append(node)
-    return edges
 
 
 def _sends_min_rung(call, what: str, min_rung: Optional[str]) -> bool:
@@ -402,7 +401,13 @@ def _checked_min_rung(min_rung: Optional[str]) -> Optional[str]:
 
 
 def _devmap_query_payload(root: Path, kind: str, **kwargs):
-    """Try DevMapClient for query surfaces; return payload or None for Python fallback."""
+    """The kernel's answer for a query surface, or ``None`` when it cannot answer.
+
+    ``None`` used to mean "fall back to the Python engine". There is no Python
+    engine for `query` or `trace` any more; ``None`` now means the caller
+    refuses, naming the kernel. The signal is unchanged so the surfaces that
+    still branch on it (`status`, and the MCP siblings) read it the same way.
+    """
     from devcouncil.devmap_client import (
         DevMapClientError,
         DevMapRequestRefused,
@@ -640,34 +645,71 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
                 **_graph_degraded_fields(root),
             }
         if kind == "impact":
-            paths = list(kwargs.get("paths") or [])
-            depth = int(kwargs.get("max_depth", 3))
+            # One renderer for a banded blast radius, shared with
+            # `devcouncil_code_explore` / `_affected`. The alternative is a
+            # second place that decides what `confidence` on a band means, and
+            # the last time there were two, this one meant "distance" and the
+            # other meant "evidence".
+            from devcouncil.integrations.mcp.handlers.codeintel import (
+                _blast_radius_payload,
+            )
+
+            paths = [str(p).replace("\\", "/") for p in (kwargs.get("paths") or [])]
+            depth = max(1, min(3, int(kwargs.get("max_depth", 3))))
             items = []
             for path_s in paths:
-                resp = client.impact(path_s, depth=max(1, min(3, depth)))
-                reason = resolution_unavailable_reason(resp.resolution)
-                if reason:
-                    raise DevMapClientError(f"{path_s}: {reason}")
-                nodes = sorted({
-                    str(edge.get("source_symbol") or edge.get("source_file") or "")
-                    for edge in resp.items
-                    if edge.get("source_symbol") or edge.get("source_file")
-                })
+                # `layers=True`: the bands are the kernel's, computed over the
+                # edges of the walk it just performed. What stood here derived
+                # them from the returned edge list, which cannot carry distance,
+                # and so published every symbol a depth-3 walk reached as
+                # `depth: 1, confidence: "extracted"`.
+                resp = client.impact(path_s, depth=depth, layers=True)
+                blast = _blast_radius_payload(resp.blast_radius or {})
+                # The seeds are what the walk started from: the symbols in this
+                # file that the generation holds an inbound edge for, plus the
+                # file node itself. Not "every symbol defined here" — the key
+                # says which, because an empty list used to read as the latter.
                 items.append({
                     "path": path_s,
-                    "symbols": [],
-                    "blast": {
-                        "layers": [{
-                            "depth": 1,
-                            "nodes": nodes,
-                            "confidence": "extracted",
-                            "count": len(nodes),
-                        }] if nodes else [],
-                        "total_impacted": len(nodes),
-                    },
+                    "symbols": [
+                        {
+                            "id": seed,
+                            "path": seed.split("::", 1)[0],
+                            "name": seed.split("::", 1)[1] if "::" in seed else seed,
+                        }
+                        for seed in blast.get("seeds") or []
+                    ],
+                    "symbols_are_walk_seeds": True,
+                    "blast": blast,
+                    # A target with no indexed inbound edge is an *answer* —
+                    # "nothing reaches this" — and it used to be raised as a
+                    # client error, which sent the whole command to
+                    # `load_code_graph`. A correct answer must not trigger a
+                    # whole-graph read.
+                    "unavailable": blast.get("unavailable")
+                    or resolution_unavailable_reason(resp.resolution),
+                    # The edge half's own counters, so "3 callers listed" can
+                    # never be read as "3 callers exist".
+                    "edges_shown": resp.shown,
+                    "edges_total": resp.total,
+                    "edges_truncated": resp.truncated,
                     "resolution": "devmap",
                 })
-            return {"ok": True, "paths": items, "source": "devmap", **_graph_degraded_fields(root)}
+            # No `aggregate`. The retired Python engine computed one blast over
+            # every path's seeds at once, which is not the union of the per-path
+            # radii — a node two hops from one path can be one hop from another
+            # — and the kernel answers one target per call, so a union published
+            # under that name would be a different number wearing it. Nothing
+            # reads the key: `rg -uu aggregate` finds only the producer, and the
+            # kernel branch that has served this command since the M2 lane never
+            # emitted it.
+            return {
+                "ok": True,
+                "paths": items,
+                "path_count": len(items),
+                "source": "devmap",
+                **_graph_degraded_fields(root),
+            }
     except DevMapRequestRefused as exc:
         # The request, not the kernel, was refused: over the byte cap, not
         # UTF-8, a depth out of range. No engine can serve it, so it is an
@@ -705,7 +747,11 @@ def _warn_if_stale(
             f"[red]index STALE: {fields.get('reason') or 'index head does not match HEAD'}"
             f"{age_text} — results reflect the old commit; run `dev map` to refresh[/red]"
         )
-    elif note_unknown and fields.get("fresh") is None and fields.get("generation") is not None:
+    elif note_unknown and fields.get("fresh") is None:
+        # `generation is not None` used to gate this, meaning "we have an index
+        # but cannot judge it". The generation came from the Python store and
+        # was always None, so the branch never ran. The verdict now comes from
+        # the map artifact, and `fresh is None` is exactly "could not judge".
         status.print(
             f"[yellow]index freshness unknown: {fields.get('reason') or ''}[/yellow]"
         )
@@ -713,15 +759,57 @@ def _warn_if_stale(
 
 
 def _require_graph(root: Path, *, warn_stale: bool = True):
-    from devcouncil.indexing.graph.build import load_code_graph
+    """The kernel's whole graph, read from the artifact the kernel writes.
 
-    graph = load_code_graph(root)
+    This went through `load_code_graph` — the retired engine's read path, which
+    imports `code_graph.json` into the Python `index.sqlite` cache on first read
+    (a ~94 MB write, under a writer lease, from a command that only reads) and
+    re-materialises every node and edge out of SQLite afterwards. The commands
+    below want the whole graph and the whole graph is already on disk.
+    """
+    from devcouncil.indexing.graph.build import GRAPH_INCOMPLETE_META, read_code_graph
+
+    graph = read_code_graph(root)
     if graph is None:
-        status.print("[red]No code graph; run `dev map` first.[/red]")
+        status.print(
+            "[red]No code graph at .devcouncil/graph/code_graph.json; "
+            "run `dev map` first.[/red]"
+        )
         raise typer.Exit(code=1)
+    # Named, never silent. A capped export answers in the shape of a complete
+    # one, and the store that used to hide the cap is no longer in the path.
+    incomplete = (graph.meta or {}).get(GRAPH_INCOMPLETE_META)
+    if incomplete:
+        status.print(f"[yellow]{incomplete}[/yellow]")
     if warn_stale:
         _warn_if_stale(root)
     return graph
+
+
+#: Printed when no kernel can answer. Named so `query` and `trace` cannot drift
+#: into saying different things about the same condition.
+_NO_KERNEL_MESSAGE = (
+    "[red]No devmap store; run `dev map` first. "
+    "The kernel is the only graph engine — there is no Python fallback.[/red]"
+)
+
+
+def _require_kernel(root: Path, *, warn_stale: bool = True):
+    """A live client, or exit naming the kernel — the sibling of `_require_graph`.
+
+    For the commands the kernel answers directly. It reads the store the kernel
+    wrote, rather than materialising the whole graph out of the Python
+    `index.sqlite` cache first.
+    """
+    from devcouncil.devmap_client import try_connect
+
+    client = try_connect(root)
+    if client is None:
+        status.print("[red]No devmap store; run `dev map` first.[/red]")
+        raise typer.Exit(code=1)
+    if warn_stale:
+        _warn_if_stale(root)
+    return client
 
 
 def _kernel_build_payload(refresh) -> dict:  # noqa: ANN001
@@ -822,51 +910,6 @@ def graph_status(
         return
     for line in render_status(result):
         console.print(line, markup=False, highlight=False)
-
-
-@app.command("unlock")
-def graph_unlock(
-    project_root: Path = typer.Option(Path("."), "--project-root"),
-    force: bool = typer.Option(
-        False,
-        "--force",
-        help="Kill the holder even if build_status still looks like progress.",
-    ),
-    json_output: bool = typer.Option(False, "--json"),
-) -> None:
-    """Free a stuck *legacy* Python writer lease (`.devcouncil/codeintel/writer.lock`).
-
-    The kernel's own writer lock is an advisory file lock released by the OS
-    when the holder dies, so a killed `dev map` never needs unlocking. This
-    command remains for the Python query cache's lease, which `load_code_graph`
-    still takes when it imports the kernel's graph.
-
-    Default recovery: free when the recorded holder is dead; if status is
-    stalled/timed_out/stale or the holder is older than the stall timeout,
-    SIGTERM then SIGKILL. Use ``--force`` to kill a still-progressing holder.
-    """
-    from devcouncil.codeintel.build_control import unlock_writer_lease
-
-    root = _root(project_root)
-    result = unlock_writer_lease(root, force=force)
-    if json_output:
-        typer.echo(json.dumps(result, indent=2))
-    else:
-        action = str(result.get("action") or "unknown")
-        reason = str(result.get("reason") or "")
-        color = "green" if result.get("ok") else "yellow"
-        status.print(f"[{color}]unlock {action}: {reason}[/{color}]")
-        if result.get("target_pid") is not None:
-            status.print(f"target pid: {result['target_pid']}")
-        if result.get("build_state"):
-            status.print(
-                f"build: {result.get('build_state')} "
-                f"(pid={result.get('build_pid') or result.get('holder_pid') or 'n/a'})"
-            )
-        if result.get("hint") and not result.get("ok"):
-            status.print(f"[dim]hint: {result['hint']}[/dim]")
-    if not result.get("ok"):
-        raise typer.Exit(code=1)
 
 
 @app.command("sync")
@@ -1259,25 +1302,21 @@ def graph_query(
     """360° view: definition, callers, callees, importers.
 
     --min-rung narrows every edge list here to the resolution rungs it names.
-    The fallback graph has no ladder to filter on, so a floor is refused there
-    rather than silently ignored: an unfiltered answer to a request for
-    deterministic-only edges is the reading that gets acted on.
+
+    The kernel is the only engine. This used to fall back to
+    `indexing.graph.query.query_symbol` over `load_code_graph` — the retired
+    engine's whole-graph read, 855 ms and ~690 MB RSS on this repository — and
+    that fallback carried no resolution ladder, so `--min-rung` had to be
+    refused against it separately. Both refusals are now the same one.
     """
     root = _root(project_root)
     min_rung = _checked_min_rung(min_rung)
     result = _devmap_query_payload(
         root, "query", name_or_path=name_or_path, min_rung=min_rung
     )
-    if result is None and min_rung is not None:
-        status.print(
-            "[red]--min-rung needs the devmap index; the fallback graph carries "
-            "no resolution ladder to filter on (run `dev map` to build one)[/red]"
-        )
-        raise typer.Exit(code=3)
     if result is None:
-        from devcouncil.indexing.graph import query_symbol
-
-        result = {**query_symbol(root, name_or_path), **_graph_degraded_fields(root)}
+        status.print(_NO_KERNEL_MESSAGE)
+        raise typer.Exit(code=3 if min_rung is not None else 1)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -1310,23 +1349,23 @@ def graph_trace(
 
     --min-rung restricts the walk to the named rungs, so a path can be asked
     for on evidence the resolver proved rather than on evidence it guessed.
-    Refused against the fallback graph, which has no ladder.
+
+    The kernel is the only engine, and here that is a correctness rule rather
+    than a performance one: the Python `trace_path` this fell back to ran an
+    *undirected* BFS over `imports`/`calls`/`contains`/`defines`/`inherits`
+    while the kernel walks resolved edges directionally. On a real probe Python
+    reported a two-hop path between two functions through a shared test module
+    where the kernel correctly reported none. A fabricated path is worse than an
+    absent answer, because a caller acts on it.
     """
     root = _root(project_root)
     min_rung = _checked_min_rung(min_rung)
     result = _devmap_query_payload(
         root, "trace", start=start, end=end, min_rung=min_rung
     )
-    if result is None and min_rung is not None:
-        status.print(
-            "[red]--min-rung needs the devmap index; the fallback graph carries "
-            "no resolution ladder to filter on (run `dev map` to build one)[/red]"
-        )
-        raise typer.Exit(code=3)
     if result is None:
-        from devcouncil.indexing.graph import trace_path
-
-        result = {**trace_path(root, start, end), **_graph_degraded_fields(root)}
+        status.print(_NO_KERNEL_MESSAGE)
+        raise typer.Exit(code=3 if min_rung is not None else 1)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -1963,45 +2002,83 @@ def graph_impact(
     json_output: bool = typer.Option(False, "--json"),
     max_depth: int = typer.Option(3, "--max-depth", help="Inbound blast depth (1–3)."),
 ) -> None:
-    """Diff / path blast radius via enclosing symbols and inbound callers."""
+    """Diff / path blast radius: inbound callers, banded by distance.
+
+    `--diff` names the seed set from the working tree; the walk itself is the
+    kernel's, per path, and so are the bands. There is no Python engine below
+    this: what used to sit here loaded the whole graph out of `index.sqlite`
+    and re-ran the walk in Python, and it was reached not only when the kernel
+    was absent but whenever a path had no indexed inbound edge — that is, every
+    time the kernel correctly answered "nothing depends on this".
+    """
     root = _root(project_root)
     if not diff and not paths:
         status.print("[red]Provide paths or --diff.[/red]")
         raise typer.Exit(code=1)
-    result = None
-    if not diff and paths:
-        result = _devmap_query_payload(
-            root, "impact", paths=list(paths), max_depth=max_depth
-        )
-    if result is None:
-        from devcouncil.indexing.graph.intel import diff_impact
+    if diff:
+        from devcouncil.indexing.graph.intel import working_tree_changed_paths
 
-        graph = _require_graph(root)
-        result = diff_impact(
-            root,
-            graph,
-            paths=paths,
-            use_diff=diff,
-            max_depth=max(1, min(3, max_depth)),
-        )
+        # Reads `git diff`, not the graph. When the caller also named paths,
+        # they narrow the diff rather than replace it, as they always did.
+        changed = working_tree_changed_paths(root)
+        if paths:
+            wanted = {str(p).replace("\\", "/") for p in paths}
+            changed = [p for p in changed if p in wanted]
+        seeds = changed
+    else:
+        seeds = [str(p) for p in (paths or [])]
+    result = _devmap_query_payload(root, "impact", paths=seeds, max_depth=max_depth)
+    if result is None:
+        status.print(_NO_KERNEL_MESSAGE)
+        raise typer.Exit(code=1)
+    if result.get("ok") is False:
+        status.print(f"[red]devmap: {result.get('error') or 'refused'}[/red]")
+        raise typer.Exit(code=1)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
     if not result.get("paths"):
-        console.print("No impacted paths.")
+        console.print(
+            "No paths to analyse." if diff else "No impacted paths."
+        )
         return
     for item in result["paths"]:
         console.print(f"[bold]{item['path']}[/bold]")
+        unavailable = item.get("unavailable")
+        if unavailable:
+            # Printed instead of an empty radius: "nothing looked" and "nothing
+            # found" are the two readings this line exists to separate.
+            console.print(f"  [yellow]{unavailable}[/yellow]")
         syms = item.get("symbols") or []
         if syms:
-            console.print("  symbols: " + ", ".join(s["id"] for s in syms[:8]))
-        for layer in (item.get("blast") or {}).get("layers") or []:
+            label = "walk seeds" if item.get("symbols_are_walk_seeds") else "symbols"
+            console.print(f"  {label}: " + ", ".join(s["id"] for s in syms[:8]))
+        blast = item.get("blast") or {}
+        for layer in blast.get("layers") or []:
             nodes = layer.get("nodes") or []
+            # `confidence` is now the weakest edge that reached the band, and
+            # `None` when the band holds no measured edge — printed as "-"
+            # rather than as a tier name nothing measured.
+            #
+            # Round brackets, not square. This line read `[{confidence}]` and
+            # Rich took `[extracted]` for console markup and *dropped it*: the
+            # tier has never actually appeared in the output, for any band, on
+            # either engine.
+            tier = layer.get("confidence") or "-"
+            omitted = layer.get("nodes_omitted") or 0
             console.print(
-                f"  depth {layer['depth']} [{layer['confidence']}]: "
-                f"{len(nodes)} — " + ", ".join(nodes[:6])
+                f"  depth {layer['depth']} ({tier}): "
+                f"{layer.get('count', len(nodes))} — " + ", ".join(nodes[:6])
                 + (" …" if len(nodes) > 6 else "")
+                + (f"  ({omitted} not listed)" if omitted else "")
             )
+        if blast.get("layers_truncated"):
+            console.print(
+                f"  showing {blast.get('layers_shown')} of "
+                f"{blast.get('layers_total')} bands (token budget)"
+            )
+        if blast.get("walk_incomplete"):
+            console.print(f"  [yellow]warning: {blast['walk_incomplete']}[/yellow]")
 
 
 @app.command("html")
@@ -2161,11 +2238,8 @@ def graph_routes(
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Map HTTP routes to handlers and client fetch consumers."""
-    from devcouncil.indexing.graph.api_routes import route_map
-
     root = _root(project_root)
-    graph = _require_graph(root)
-    result = route_map(root, graph)
+    result = _require_kernel(root).routes()
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -2196,11 +2270,8 @@ def graph_shape_check(
     route: Optional[str] = typer.Option(None, "--route", help="Filter to one route path or id."),
 ) -> None:
     """Compare handler response keys vs client accessed keys."""
-    from devcouncil.indexing.graph.api_routes import shape_check
-
     root = _root(project_root)
-    graph = _require_graph(root)
-    result = shape_check(root, graph, route_filter=route)
+    result = _require_kernel(root).shape_check(route_filter=route)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -2222,11 +2293,8 @@ def graph_api_impact(
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """API blast radius: consumers, middleware, shape mismatches, risk tier."""
-    from devcouncil.indexing.graph.api_routes import api_impact
-
     root = _root(project_root)
-    graph = _require_graph(root)
-    result = api_impact(root, route_or_path, graph)
+    result = _require_kernel(root).api_impact(route_or_path)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -2337,39 +2405,40 @@ def graph_pdg_build(
     project_root: Path = typer.Option(Path("."), "--project-root"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Build or refresh the PDG layer for Python files."""
+    """Build or refresh the PDG layer for Python files.
+
+    The layer lands in `.devcouncil/graph/pdg.json`. It used to be merged into
+    the `CodeGraph` and written back with `write_code_graph`, which rewrites
+    `code_graph.json` — the artifact the kernel is the only writer of — and
+    persists the whole graph into the Python store on the way. Nothing outside
+    these PDG commands ever read it back, and the next `dev map` run overwrote
+    it anyway.
+    """
     from devcouncil.indexing.graph.build import (
-        CompatibilityGraphTooLarge,
         build_pdg_for_paths,
-        merge_pdg_into_graph,
-        write_code_graph,
+        python_paths_for_pdg,
+        write_pdg_layer,
     )
 
     root = _root(project_root)
-    graph = _require_graph(root)
-    layer = build_pdg_for_paths(root, graph, paths=paths or None)
-    shards = merge_pdg_into_graph(graph, layer)
-    merged: dict = {}
-    try:
-        from devcouncil.codeintel import get_codeintel_service
-
-        merged = dict(get_codeintel_service(root).store.analysis_shards())
-    except Exception:
-        pass
-    for path, payload in shards.items():
-        merged.setdefault(path, {}).update(payload)
-    export_warning = ""
-    try:
-        write_code_graph(root, graph, analysis_shards=merged)
-    except CompatibilityGraphTooLarge as exc:
-        # SQLite committed the PDG shards and a stub/pointer JSON is on disk;
-        # only the compatibility export is degraded — not the PDG build.
-        export_warning = str(exc)
-    stats = (graph.meta.get("pdg") or {}).get("stats") or {}
-    payload = {"ok": True, "stats": stats, "files": sorted(layer.files.keys())}
-    if export_warning:
-        payload["compatibility_export"] = "degraded"
-        payload["compatibility_export_reason"] = export_warning
+    wanted = list(paths or [])
+    if not wanted:
+        wanted = python_paths_for_pdg(root)
+        if not wanted:
+            status.print(
+                "[red]No file inventory at .devcouncil/repo_map.json; "
+                "run `dev map` first.[/red]"
+            )
+            raise typer.Exit(code=1)
+    layer = build_pdg_for_paths(root, paths=wanted)
+    out = write_pdg_layer(root, layer)
+    stats = (layer.to_meta() or {}).get("stats") or {}
+    payload = {
+        "ok": True,
+        "stats": stats,
+        "files": sorted(layer.files.keys()),
+        "artifact": str(out.relative_to(root)) if out.is_relative_to(root) else str(out),
+    }
     if json_output:
         typer.echo(json.dumps(payload, indent=2))
         return
@@ -2377,8 +2446,7 @@ def graph_pdg_build(
         f"PDG: {stats.get('function_count', 0)} functions, "
         f"{stats.get('taint_count', 0)} taint findings across {stats.get('file_count', 0)} files"
     )
-    if export_warning:
-        console.print(f"[yellow]compatibility export degraded: {export_warning}[/yellow]")
+    console.print(f"Wrote {payload['artifact']}")
 
 
 @app.command("explain")

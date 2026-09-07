@@ -10,6 +10,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const PROTOCOL_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a peer may sit on a fresh connection before sending anything.
+///
+/// A connection holds one of [`MAX_CONCURRENT_CONNECTIONS`] admission permits
+/// from `accept` until its frame is read, so a peer that connects and sends
+/// nothing holds a permit for the whole per-read timeout. Measured with the
+/// release binary: 120 idle connections made a legitimate `status` wait
+/// 5,003 ms — the whole [`IO_TIMEOUT`] — on a socket whose baseline answer is
+/// milliseconds. Every client this daemon has writes the moment it connects,
+/// so the first byte is due sooner than the rest; a slow writer that has
+/// started gets the ordinary timeout for every read after it.
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Upper bound on how long one query may occupy its connection task.
 ///
 /// Queries share the store connection with the drain loop's generation writes,
@@ -255,6 +266,14 @@ pub enum IpcCommand {
         /// two that could not be narrowed.
         #[serde(default)]
         min_rung: Option<String>,
+        /// Band the reached symbols by distance as well as listing the edges.
+        ///
+        /// Defaulted false, so a client that predates this sends the request it
+        /// always sent and reads the response it always read. Refused together
+        /// with `min_rung`: the band walk takes a confidence floor and no rung,
+        /// so honouring one would narrow half the answer.
+        #[serde(default)]
+        layers: bool,
     },
     Trace {
         from: String,
@@ -462,6 +481,25 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
         }
     }
 
+    // Refused rather than half-applied, exactly as the CLI refuses
+    // `--layers --min-rung`: the band walk takes a confidence floor and knows
+    // nothing of rungs, so serving both would return edges cut to the floor
+    // beside bands that were not — one answer whose halves describe different
+    // graphs, and nothing in it saying so.
+    if let IpcCommand::Impact {
+        layers: true,
+        min_rung: Some(_),
+        ..
+    } = &request.command
+    {
+        return Err(
+            "impact cannot take both layers and min_rung: the distance bands are walked \
+             without a rung floor, so the two halves of the answer would describe \
+             different graphs"
+                .to_string(),
+        );
+    }
+
     let (text, budget, depth, min_confidence) = match &request.command {
         IpcCommand::Status => return Ok(()),
         IpcCommand::Search { query, budget, .. } => (query.as_str(), *budget, 1, None),
@@ -587,8 +625,24 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
     if text.len() > MAX_QUERY_BYTES {
         return Err(format!("query exceeds {MAX_QUERY_BYTES} bytes"));
     }
+    // The CLI refuses `--budget 0` for the same reason, and the two
+    // transports must agree: a zero budget returns an empty page that cannot
+    // be told apart from a complete answer.
+    if budget == 0 {
+        return Err(
+            "token budget must be at least 1: a zero budget returns an empty page \
+                    that cannot be told apart from a complete answer"
+                .to_string(),
+        );
+    }
     if budget > MAX_TOKEN_BUDGET {
         return Err(format!("token budget exceeds {MAX_TOKEN_BUDGET}"));
+    }
+    // Same rule as the CLI's `--depth`: a walk of depth 0 visits nothing and
+    // answers with an empty radius that reads as "nothing is affected".
+    // Commands without a traversal carry depth 1 here and never see this.
+    if depth == 0 {
+        return Err("traversal depth must be at least 1: depth 0 walks nothing".to_string());
     }
     if depth > MAX_TRAVERSAL_DEPTH {
         return Err(format!("traversal depth exceeds {MAX_TRAVERSAL_DEPTH}"));
@@ -798,6 +852,24 @@ pub(crate) fn dispatch(
             budget,
             depth,
             min_rung,
+            layers: true,
+        } => {
+            // `min_rung` alongside `layers` was refused in `validate_request`,
+            // so it is `None` here by construction rather than by being dropped.
+            debug_assert!(min_rung.is_none());
+            Ok(serde_json::to_value(engine.impact_layered(Request {
+                query: target,
+                token_budget: budget,
+                min_confidence: 0.0,
+                max_depth: depth,
+            })?)?)
+        }
+        IpcCommand::Impact {
+            target,
+            budget,
+            depth,
+            min_rung,
+            layers: false,
         } => Ok(serde_json::to_value(engine.impact_at_rung(
             Request {
                 query: target,
@@ -984,13 +1056,20 @@ where
         if std::time::Instant::now() >= deadline {
             return Err(FrameReadError::DeadlineExceeded);
         }
-        let read = tokio::time::timeout(io_timeout, stream.read(&mut chunk))
+        // The first byte is due within `FIRST_BYTE_TIMEOUT`; see its doc. The
+        // `min` keeps a caller-supplied shorter timeout meaningful.
+        let (timeout, what) = if payload.is_empty() {
+            (
+                FIRST_BYTE_TIMEOUT.min(io_timeout),
+                "IPC peer sent nothing after connecting",
+            )
+        } else {
+            (io_timeout, "IPC request read timed out")
+        };
+        let read = tokio::time::timeout(timeout, stream.read(&mut chunk))
             .await
             .map_err(|_| {
-                FrameReadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "IPC request read timed out",
-                ))
+                FrameReadError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, what))
             })??;
         if read == 0 {
             return if payload.is_empty() {
@@ -2076,6 +2155,7 @@ mod tests {
                 budget: 10,
                 depth,
                 min_rung: None,
+                layers: false,
             },
         };
         assert!(validate_request(&impact(MAX_TRAVERSAL_DEPTH)).is_ok());
@@ -2098,6 +2178,56 @@ mod tests {
             "an oversized trace destination must be rejected even when the \
              source is small"
         );
+    }
+
+    /// `layers` and `min_rung` together are refused, not half-honoured.
+    ///
+    /// The distance bands are derived from the traversal's own edges before the
+    /// rung cut; the edge list is packed after it. Serving both would return
+    /// edges narrowed to the floor beside bands that were not, in one object,
+    /// with nothing saying which half the filter reached. Refusing is the only
+    /// answer that cannot be misread.
+    #[test]
+    fn impact_refuses_layers_together_with_a_rung_floor() {
+        let request = |layers: bool, min_rung: Option<&str>| IpcRequest {
+            version: 1,
+            command: IpcCommand::Impact {
+                target: "a.py::f".to_string(),
+                budget: 10,
+                depth: 2,
+                min_rung: min_rung.map(str::to_string),
+                layers,
+            },
+        };
+        assert!(validate_request(&request(false, None)).is_ok());
+        assert!(validate_request(&request(true, None)).is_ok());
+        assert!(
+            validate_request(&request(false, Some("deterministic"))).is_ok(),
+            "a rung floor on its own is exactly what impact has always accepted"
+        );
+        let refused = validate_request(&request(true, Some("deterministic")))
+            .expect_err("layers with a rung floor must be refused");
+        assert!(
+            refused.contains("min_rung") && refused.contains("layers"),
+            "the refusal must name both halves so the caller knows what to drop: \
+             {refused:?}"
+        );
+    }
+
+    /// A client that predates `layers` sends no such key and must still parse.
+    #[test]
+    fn an_impact_request_without_layers_defaults_to_the_flat_answer() {
+        let parsed: IpcRequest =
+            serde_json::from_str(r#"{"version":1,"cmd":"impact","target":"a.py::f"}"#)
+                .expect("an impact request may omit every optional field");
+        match parsed.command {
+            IpcCommand::Impact { layers, .. } => assert!(
+                !layers,
+                "an absent `layers` must mean the answer a pre-existing client \
+                 expects, never the composed one"
+            ),
+            other => panic!("expected an impact command, got {other:?}"),
+        }
     }
 
     /// A second binder must be refused while the first holds the endpoint,
@@ -2409,6 +2539,79 @@ mod tests {
         assert_eq!(value["ok"], true);
         assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(value["result"]["pending_count"], 0);
+    }
+
+    /// `search` with `budget: 0` answered `ok: true, shown: 0, hidden: 26`
+    /// over the socket — read back from the release binary — while the CLI
+    /// refuses the same request: a zero budget returns an empty page that
+    /// cannot be told apart from a complete answer. One rule, both transports.
+    #[tokio::test]
+    async fn protocol_refuses_a_zero_token_budget_like_the_cli_does() {
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let task = tokio::spawn(handle_stream(server, store));
+        client
+            .write_all(b"{\"version\":1,\"cmd\":\"search\",\"query\":\"x\",\"budget\":0}\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        task.await.unwrap().unwrap();
+        let value: Value = serde_json::from_str(response.trim()).unwrap();
+        assert_eq!(value["ok"], false, "{value}");
+        assert_eq!(value["error"]["code"], "invalid_parameters", "{value}");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("budget"),
+            "{value}"
+        );
+    }
+
+    /// A peer that connects and sends nothing holds one of the admission
+    /// permits until the per-read timeout. Measured with the release binary:
+    /// 120 idle connections made a legitimate `status` wait 5,003 ms — the
+    /// whole `IO_TIMEOUT` — on a socket whose baseline answer is milliseconds.
+    /// The first byte of a frame is due sooner than the rest: every client
+    /// this daemon has writes the moment it connects.
+    #[tokio::test]
+    async fn an_idle_peer_is_dropped_before_the_per_read_timeout() {
+        let (_held_open, server) = tokio::io::duplex(64);
+        let started = std::time::Instant::now();
+        let outcome = read_frame(
+            server,
+            IO_TIMEOUT,
+            std::time::Instant::now() + REQUEST_DEADLINE,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(matches!(outcome, Err(FrameReadError::Io(_))), "{outcome:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "an idle peer held its permit for {elapsed:?}; the first byte must be due \
+             well before the {IO_TIMEOUT:?} per-read timeout"
+        );
+
+        // Once the first byte has arrived, the per-read timeout is the ordinary
+        // one: a slow writer that has started is not an idle peer.
+        let (mut client, server) = tokio::io::duplex(64);
+        let reader = tokio::spawn(read_frame(
+            server,
+            IO_TIMEOUT,
+            std::time::Instant::now() + REQUEST_DEADLINE,
+        ));
+        client.write_all(b"{").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        client
+            .write_all(b"\"version\":1,\"cmd\":\"status\"}\n")
+            .await
+            .unwrap();
+        let payload = reader
+            .await
+            .unwrap()
+            .expect("a frame whose first byte arrived in time is read to its newline");
+        assert_eq!(payload, b"{\"version\":1,\"cmd\":\"status\"}");
     }
 
     #[tokio::test]

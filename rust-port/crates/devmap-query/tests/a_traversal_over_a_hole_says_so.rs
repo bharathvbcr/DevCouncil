@@ -183,3 +183,76 @@ fn a_fully_read_corpus_carries_no_coverage_caveat() {
     assert_eq!(answers[0].callers.walk_incomplete, None);
     assert_eq!(answers[0].callees.walk_incomplete, None);
 }
+
+/// A five-symbol chain, so a trace can be stopped by `--depth` short of the
+/// target and the reason it gives can be read.
+fn chain() -> Store {
+    let extractions = vec![extract_file(
+        "chain.py",
+        "def e():\n    return 1\n\n\ndef d():\n    return e()\n\n\ndef c():\n    return d()\n\n\n\
+         def b():\n    return c()\n\n\ndef a():\n    return b()\n",
+    )];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().expect("in-memory store");
+    store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
+        .expect("generation writes");
+    store
+}
+
+fn trace(store: &Store, from: &str, to: &str, max_depth: usize) -> String {
+    let response = StoreQueryEngine::new(store)
+        .trace_between(Request {
+            query: (from.to_string(), to.to_string()),
+            token_budget: 2_000,
+            min_confidence: 0.0,
+            max_depth,
+        })
+        .expect("trace runs");
+    match response.resolution {
+        devmap_query::ResolutionAvailability::Unavailable { reason } => reason,
+        other => panic!("{from}->{to} at depth {max_depth} must be Unavailable, got {other:?}"),
+    }
+}
+
+/// The reason a stopped trace gives is one sentence a reader can act on.
+///
+/// The `format!` literal behind it had been re-wrapped without `\`
+/// continuations, so the text the CLI printed carried runs of 26 spaces
+/// inside the sentence: "stopped at depth 3 after                          visiting
+/// 44 nodes". Read back from the release binary on a real store.
+#[test]
+fn a_stopped_trace_gives_its_reason_on_one_line() {
+    let reason = trace(&chain(), "a", "e", 1);
+    assert!(
+        reason.contains("stopped at depth 1") && reason.contains("--depth"),
+        "the reason must name the limit and the remedy: {reason}"
+    );
+    assert!(
+        !reason.contains("  "),
+        "the reason carries runs of whitespace from a broken literal: {reason:?}"
+    );
+}
+
+/// A trace from a symbol to itself is not a search that ran out of budget.
+///
+/// `trace X X` walked the graph from `X` looking for `X`, never counted the
+/// start as reached, and reported "stopped at depth 3 after visiting 44 nodes
+/// without reaching the target; whether a path exists is unknown" — an
+/// answer about the walk's budget for a question the walk cannot answer.
+#[test]
+fn a_trace_from_a_symbol_to_itself_says_so_instead_of_walking() {
+    let reason = trace(&chain(), "a", "a", 3);
+    assert!(
+        reason.contains("same symbol"),
+        "the reason must say the endpoints are the same symbol, not report a budget: {reason}"
+    );
+}

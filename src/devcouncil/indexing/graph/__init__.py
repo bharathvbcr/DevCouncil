@@ -1,8 +1,16 @@
 """Symbol-level code knowledge graph for DevCouncil repo mapping.
 
-Public entry points: :func:`load_code_graph`, :func:`write_code_graph`,
-:func:`query_symbol`, :func:`trace_path`, plus graph intelligence
-(:func:`diff_impact`, :func:`graph_check`, …).
+Public entry points: :func:`read_code_graph` (in :mod:`.build`) plus graph
+intelligence (:func:`graph_check`, :func:`extract_processes`, …).
+
+``load_code_graph``, ``write_code_graph`` and ``diff_impact`` were re-exported
+here until they had no production caller anywhere in the tree; the first two
+were the Python SQLite store's read and write paths and went with it.
+
+Symbol lookup and path tracing are **not** here any more. `query_symbol` and
+`trace_path` were the fallback engine for `dev map query` / `dev map trace` and
+their MCP siblings; the kernel is the only graph engine now, and those two are
+gone from :mod:`devcouncil.indexing.graph.query`.
 
 Neither building the graph nor refreshing the artifacts is one of them. The Rust
 kernel extracts and resolves the graph and writes both ``.devcouncil/repo_map.json``
@@ -30,10 +38,6 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - import-time cost is the whole point
     # Type checkers resolve the facade statically; only the interpreter defers.
-    from devcouncil.indexing.graph.build import (  # noqa: F401
-        load_code_graph,
-        write_code_graph,
-    )
     from devcouncil.indexing.graph.export import (  # noqa: F401
         build_code_graph_okf,
         file_doc_rel,
@@ -43,7 +47,6 @@ if TYPE_CHECKING:  # pragma: no cover - import-time cost is the whole point
         blast_radius,
         circular_imports,
         compute_communities,
-        diff_impact,
         extract_processes,
         god_nodes,
         graph_check,
@@ -51,10 +54,6 @@ if TYPE_CHECKING:  # pragma: no cover - import-time cost is the whole point
     from devcouncil.indexing.graph.okf_export import (  # noqa: F401
         build_graph_okf_bundle,
         export_graph_okf,
-    )
-    from devcouncil.indexing.graph.query import (  # noqa: F401
-        query_symbol,
-        trace_path,
     )
     from devcouncil.indexing.graph.schema import (  # noqa: F401
         SCHEMA_VERSION,
@@ -69,20 +68,15 @@ if TYPE_CHECKING:  # pragma: no cover - import-time cost is the whole point
 #: Public name -> the submodule that defines it. The single source of truth for
 #: both the deferral and ``__all__``; a name added to one is added to both.
 _EXPORTS: dict[str, str] = {
-    "load_code_graph": "build",
-    "write_code_graph": "build",
     "build_code_graph_okf": "export",
     "file_doc_rel": "export",
     "write_code_graph_okf": "export",
     "blast_radius": "intel",
     "circular_imports": "intel",
     "compute_communities": "intel",
-    "diff_impact": "intel",
     "extract_processes": "intel",
     "god_nodes": "intel",
     "graph_check": "intel",
-    "query_symbol": "query",
-    "trace_path": "query",
     "SCHEMA_VERSION": "schema",
     "CodeGraph": "schema",
     "Confidence": "schema",

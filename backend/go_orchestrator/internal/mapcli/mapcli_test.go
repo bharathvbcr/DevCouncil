@@ -220,12 +220,34 @@ func TestParseGlobalsDoubleDashEndsGlobalFlags(t *testing.T) {
 	}
 }
 
-func TestDiscoveryPrefersAnExplicitBinaryOverPath(t *testing.T) {
+// An explicit override wins over a local build and PATH alike when it answers
+// the probe; the two refusals are tested further down. Asserted through
+// discoverBinary, not binaryCandidates: the override is a decision taken
+// before the candidate list exists.
+func TestDiscoveryPrefersAnExplicitBinaryOverLocalBuildsAndPath(t *testing.T) {
 	explicit := fakeKernel(t, kernelStatusOK)
+	onPath := fakeKernel(t, kernelStatusOK)
+	root := t.TempDir()
+	local := filepath.Join(root, "rust-port", "target", "release", "devmap")
+	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script, err := os.ReadFile(explicit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(local, script, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("DEVMAP_BINARY", explicit)
-	got := binaryCandidates(t.TempDir())
-	if len(got) == 0 || got[0] != explicit {
-		t.Fatalf("candidates[0] = %v, want %s first", got, explicit)
+	t.Setenv("PATH", filepath.Dir(onPath))
+
+	got, err := discoverBinary(context.Background(), root)
+	if err != nil {
+		t.Fatalf("a capable explicit override must be used: %v", err)
+	}
+	if got != explicit {
+		t.Fatalf("discoverBinary = %s, want the explicit %s over local %s and PATH %s", got, explicit, local, onPath)
 	}
 }
 
@@ -342,4 +364,45 @@ esac
 		t.Fatal(err)
 	}
 	return path
+}
+
+// An operator naming a binary is entitled to have that binary used — or told
+// why it cannot be. Measured with the built dcmap: DEVMAP_BINARY pointing at a
+// script that printed garbage, hung, or exited 3 was silently replaced by
+// ~/.cargo/bin/devmap, and `status` answered with that binary's name — the
+// exact substitution binaryCandidates' own comment says must never happen.
+func TestAnExplicitBinaryThatFailsTheProbeIsRefusedNotSubstituted(t *testing.T) {
+	broken := filepath.Join(t.TempDir(), "devmap-broken")
+	if err := os.WriteFile(broken, []byte("#!/bin/sh\necho kernel exploded >&2\nexit 3\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	capable := fakeKernel(t, kernelStatusOK)
+	t.Setenv("DEVMAP_BINARY", broken)
+	t.Setenv("PATH", filepath.Dir(capable))
+
+	got, err := discoverBinary(context.Background(), t.TempDir())
+	if err == nil {
+		t.Fatalf("DEVMAP_BINARY=%s failed the probe and was silently replaced by %s", broken, got)
+	}
+	if !strings.Contains(err.Error(), broken) {
+		t.Errorf("the refusal must name the override: %v", err)
+	}
+	if errors.Is(err, ErrNoBinary) {
+		t.Errorf("an override that failed is not %q: %v", ErrNoBinary, err)
+	}
+}
+
+func TestAnExplicitBinaryThatDoesNotExistIsRefusedByName(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-such-devmap")
+	capable := fakeKernel(t, kernelStatusOK)
+	t.Setenv("DEVMAP_BINARY", missing)
+	t.Setenv("PATH", filepath.Dir(capable))
+
+	got, err := discoverBinary(context.Background(), t.TempDir())
+	if err == nil {
+		t.Fatalf("DEVMAP_BINARY=%s does not exist and was silently replaced by %s", missing, got)
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("the refusal must name the override: %v", err)
+	}
 }

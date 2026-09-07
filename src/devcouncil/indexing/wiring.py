@@ -105,7 +105,16 @@ _WIRING_DECORATOR_HINTS = (
 # instead of being compared against a current side that measured something else.
 LIVENESS_SCAN_VERSION = 5
 
-_VENDOR_DIR_NAMES = frozenset({"vendor", "vendored", "node_modules"})
+# Kept equal to `devmap-extract/src/wiring.rs`'s `is_vendored_path` segment list
+# and `MINIFIED_SUFFIXES`, and pinned there by
+# `tests/unit/test_wiring_parity_with_kernel.py`. `third_party` and the
+# `.min.mjs` / `.min.cjs` bundles were in the kernel's tables and not in these,
+# so the map exempted them from liveness while the verify gates below still
+# reported on them.
+_VENDOR_DIR_NAMES = frozenset({"vendor", "vendored", "node_modules", "third_party"})
+# The compound suffix, not the substring `min`: `src/mining.js` and
+# `src/minify.js` are hand-written.
+_MINIFIED_SUFFIXES = (".min.js", ".min.mjs", ".min.cjs", ".min.css")
 
 
 def _norm(path: str) -> str:
@@ -124,8 +133,12 @@ def is_test_path(path: str) -> bool:
     name_l = name.lower()
     parts = norm_l.split("/")
     in_test_dir = any(p in _TEST_DIR_NAMES for p in parts[:-1])
-    # Android / JVM: src/test/, src/androidTest/
-    if "/src/test/" in f"/{norm_l}/" or "/src/androidtest/" in f"/{norm_l}/":
+    # Android / JVM: src/test/, src/androidTest/. A verdict on the directory
+    # the file sits in, so only the directory part is searched: wrapping the
+    # whole path in slashes made a *file* named `test` under `src/` a test
+    # path (and exempt from liveness). The kernel reads the directory part.
+    directory = "/".join(parts[:-1])
+    if "/src/test/" in f"/{directory}/" or "/src/androidtest/" in f"/{directory}/":
         in_test_dir = True
     looks_like_test = (
         name_l.startswith("test_")
@@ -179,16 +192,12 @@ def is_private_symbol(name: str) -> bool:
     return bool(name) and name.startswith("_")
 
 
-def is_dunder_symbol(name: str) -> bool:
-    """True for ``__dunder__`` names (methods exempt from dead-code reports)."""
-    return bool(name) and len(name) >= 4 and name.startswith("__") and name.endswith("__")
-
-
 def is_vendored_path(path: str) -> bool:
     """True when ``path`` is a vendored/minified bundle, not first-class source.
 
-    Matches ``vendor`` / ``vendored`` / ``node_modules`` path segments and
-    ``.min.js`` / ``.min.css`` basenames — same convention
+    Matches the :data:`_VENDOR_DIR_NAMES` path segments and the
+    :data:`_MINIFIED_SUFFIXES` basenames — the same two tables the kernel's
+    ``is_vendored_path`` holds, and the same convention
     :func:`structural_exemptions` already encodes for file-level liveness.
     """
     try:
@@ -197,9 +206,7 @@ def is_vendored_path(path: str) -> bool:
         parts = norm.lower().split("/")
         if any(p in _VENDOR_DIR_NAMES for p in parts):
             return True
-        if name.endswith(".min.js") or name.endswith(".min.css"):
-            return True
-        return False
+        return name.lower().endswith(_MINIFIED_SUFFIXES)
     except Exception:
         logger.debug("is_vendored_path failed for %s", path, exc_info=True)
         return False
@@ -1386,52 +1393,6 @@ def entry_roots(
     return roots
 
 
-def entry_point_symbols(root: Path, files: Iterable[str]) -> Set[str]:
-    """Return ``path::attr`` keys for pyproject ``module:attr`` script targets.
-
-    Used by graph dead-code so CLI entry functions (e.g. ``pkg.b:main``) are not
-    flagged merely because nothing in-repo calls them.
-    """
-    out: Set[str] = set()
-    try:
-        file_set = {_norm(f) for f in files}
-        text = _read_text(root, "pyproject.toml")
-        if not text:
-            return out
-        try:
-            import tomllib
-        except ImportError:  # pragma: no cover
-            import tomli as tomllib  # type: ignore
-
-        data = tomllib.loads(text)
-        project = data.get("project") or {}
-        entry_maps: list = []
-        for key in ("scripts", "gui-scripts"):
-            val = project.get(key)
-            if isinstance(val, dict):
-                entry_maps.append(val)
-        eps = project.get("entry-points") or {}
-        if isinstance(eps, dict):
-            for group in eps.values():
-                if isinstance(group, dict):
-                    entry_maps.append(group)
-        for mapping in entry_maps:
-            for target in mapping.values():
-                if not isinstance(target, str) or ":" not in target:
-                    continue
-                mod, _, attr = target.partition(":")
-                mod, attr = mod.strip(), attr.strip()
-                if not mod or not attr:
-                    continue
-                found: Set[str] = set()
-                _add_module_file(mod, file_set, found)
-                for path in found:
-                    out.add(f"{path}::{attr}")
-    except Exception:
-        logger.debug("entry_point_symbols failed", exc_info=True)
-    return out
-
-
 _SHORT_STEM_MAX = 12
 
 
@@ -1490,17 +1451,6 @@ def _module_forms(value: str) -> Set[str]:
             forms.add(base.replace(".", "/"))
             break
     return {f for f in forms if f}
-
-
-def import_spec_matches(spec: str, tokens: Set[str]) -> bool:
-    """True when an import string matches ``tokens`` on a module/path boundary."""
-    if not spec or not tokens:
-        return False
-    spec_forms = _module_forms(spec)
-    for t in tokens:
-        if spec_forms & _module_forms(t):
-            return True
-    return False
 
 
 def has_allow_unwired(project_root: Path, path: str) -> bool:

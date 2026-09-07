@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from devcouncil.indexing.graph.build import write_code_graph
+from tests.unit.graph_fixtures import write_graph_artifact
 from tests.unit.graph_fixtures import kernel_graph
 from devcouncil.indexing.graph.schema import DeadCodeEntry, Confidence
 from devcouncil.indexing.viz import (
@@ -61,7 +61,7 @@ def test_render_escapes_script_breakout(tmp_path):
 def test_write_graph_html(tmp_path):
     _write(tmp_path, {"pkg/__init__.py": "", "pkg/a.py": "def f():\n    return 1\n"})
     _commit(tmp_path)
-    write_code_graph(tmp_path, kernel_graph(tmp_path))
+    write_graph_artifact(tmp_path, kernel_graph(tmp_path))
     out = write_graph_html(tmp_path)
     assert out.is_file()
     text = out.read_text(encoding="utf-8")
@@ -153,7 +153,7 @@ def test_html_has_tabs_lenses_and_path_helpers(tmp_path):
 def test_write_graph_html_symbols_flag(tmp_path):
     _write(tmp_path, {"pkg/__init__.py": "", "pkg/a.py": "def f():\n    return 1\n"})
     _commit(tmp_path)
-    write_code_graph(tmp_path, kernel_graph(tmp_path))
+    write_graph_artifact(tmp_path, kernel_graph(tmp_path))
     out = write_graph_html(tmp_path, symbols=True)
     text = out.read_text(encoding="utf-8")
     assert '"mode":"symbol"' in text or '"mode": "symbol"' in text

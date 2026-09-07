@@ -19,6 +19,7 @@ Extraction and resolution themselves are covered by the kernel's own suites
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -164,6 +165,30 @@ def git_init_commit(root: Path) -> None:
     _git(*identity, "commit", "-m", "init")
 
 
+def write_graph_artifact(root: Path, graph: CodeGraph) -> Path:
+    """Put ``graph`` on disk where the kernel puts ``code_graph.json``.
+
+    Tests that need a consumer to *find* a graph used ``build.write_code_graph``
+    for this. That function was the Python SQLite store's write path: it took a
+    writer lease, persisted every node and edge into ``index.sqlite``, and only
+    then wrote the JSON through a slim/compact/stub size-tiering ladder. It was
+    deleted with the store — the kernel is the only writer of this artifact, and
+    the last production caller of the Python writer went in Lane M3.
+
+    What a consumer test actually needs is the file, so this writes the file:
+    one ``json.dump`` in the same shape ``read_code_graph`` validates. Untiered,
+    which is what the kernel's own artifact is, so a test fixture cannot
+    accidentally assert against a capped export.
+    """
+    path = root / ".devcouncil" / "graph" / "code_graph.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(graph.model_dump(mode="json"), ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    return path
+
+
 __all__ = [
     "CodeGraph",
     "Confidence",
@@ -173,6 +198,7 @@ __all__ = [
     "NodeKind",
     "code_graph",
     "git_init_commit",
+    "write_graph_artifact",
     "write_sources",
 ]
 
@@ -192,13 +218,22 @@ def kernel_graph(root: Path) -> "CodeGraph":
 
     For consumer tests that keep their source fixtures: the graph comes from the
     real producer (``devmap build`` through ``refresh_map_artifacts``) and is read
-    back through ``load_code_graph``, exactly as production does. Skips when no
+    back through ``read_code_graph``, exactly as production does. Skips when no
     kernel binary is built, so the suite stays honest rather than green by
     accident.
+
+    It read back through ``load_code_graph`` until this lane. That imports
+    ``code_graph.json`` into the Python ``index.sqlite`` cache on first read, so
+    every test using this fixture created and populated a store no production
+    consumer reads any more -- and a fixture that keeps the retired path warm is
+    how a consumer that regressed onto it would go on passing. The two routes
+    were measured to return the same graph on this repository as a corpus
+    (1,637 files): identical node, edge and dead-entry counts and identical
+    node-id sets.
     """
     import pytest
 
-    from devcouncil.indexing.graph.build import load_code_graph
+    from devcouncil.indexing.graph.build import read_code_graph
     from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
     if not _have_kernel():
@@ -206,6 +241,34 @@ def kernel_graph(root: Path) -> "CodeGraph":
     root = Path(root)
     (root / ".devcouncil").mkdir(exist_ok=True)
     refresh_map_artifacts(root, root / ".devcouncil" / "repo_map.json", quiet=True)
-    graph = load_code_graph(root)
+    graph = read_code_graph(root)
     assert graph is not None, "the kernel wrote no graph the Python side could read"
     return graph
+
+
+def kernel_client(root: Path):
+    """A live ``DevMapClient`` over a store the kernel just built under ``root``.
+
+    The sibling of :func:`kernel_graph` for consumers that have moved off the
+    retired Python read path: same producer, same sources, but the answer comes
+    back over the client rather than as a whole materialised ``CodeGraph``.
+    Nothing here touches ``index.sqlite``.
+
+    Skips when no kernel binary is built, and when the build committed a store
+    with nothing in it — ``try_connect`` refuses that case in production too,
+    and a test that accepted it would assert against confident zeroes.
+    """
+    import pytest
+
+    from devcouncil.devmap_client import try_connect
+    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
+
+    if not _have_kernel():
+        pytest.skip("devmap kernel not built (cargo build --release -p devmap-cli)")
+    root = Path(root)
+    (root / ".devcouncil").mkdir(exist_ok=True)
+    refresh_map_artifacts(root, root / ".devcouncil" / "repo_map.json", quiet=True)
+    client = try_connect(root)
+    if client is None:
+        pytest.skip("the kernel built no usable generation over this fixture tree")
+    return client

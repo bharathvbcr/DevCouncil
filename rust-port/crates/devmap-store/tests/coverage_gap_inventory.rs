@@ -340,7 +340,9 @@ fn a_stored_resolution_kind_beats_the_reconstruction_a_row_would_support() {
     // a reading.
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute("UPDATE generation_edges SET resolution = NULL", [])
+        // `generation_edges` is a view over the validity ranges since v18
+        // and is not updatable; the column lives on `edge_rows`.
+        conn.execute("UPDATE edge_rows SET resolution = NULL", [])
             .unwrap();
     }
     let reread = Store::open(&db).unwrap();
@@ -436,7 +438,7 @@ fn a_stored_confidence_that_contradicts_its_stored_kind_is_counted_not_trusted()
         let conn = rusqlite::Connection::open(&db).unwrap();
         let changed = conn
             .execute(
-                "UPDATE generation_edges SET confidence = 0.2 WHERE resolution = 'ImportScoped'",
+                "UPDATE edge_rows SET confidence = 0.2 WHERE resolution = 'ImportScoped'",
                 [],
             )
             .unwrap();
@@ -458,10 +460,9 @@ fn a_stored_confidence_that_contradicts_its_stored_kind_is_counted_not_trusted()
         "the SQL count must agree with the index"
     );
     // The row itself is left as evidence: the count reports, it does not repair.
-    let tampered: Vec<&devmap_store::StoredEdge> = index
-        .edges()
-        .iter()
-        .filter(|edge| edge.source_symbol == "caller")
+    let tampered: Vec<devmap_store::StoredEdge> = (0..index.len() as u32)
+        .filter(|id| index.source_symbol(*id) == "caller")
+        .map(|id| index.stored_edge(id))
         .collect();
     assert_eq!(tampered.len(), 1);
     assert!((tampered[0].confidence - 0.2).abs() < 1e-6);
@@ -474,7 +475,9 @@ fn a_stored_confidence_that_contradicts_its_stored_kind_is_counted_not_trusted()
     // generation's source says why.
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute("UPDATE generation_edges SET resolution = NULL", [])
+        // `generation_edges` is a view over the validity ranges since v18
+        // and is not updatable; the column lives on `edge_rows`.
+        conn.execute("UPDATE edge_rows SET resolution = NULL", [])
             .unwrap();
     }
     let reread = Store::open(&db).unwrap();

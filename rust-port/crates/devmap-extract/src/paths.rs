@@ -179,16 +179,30 @@ pub fn plugin_dir(root: impl AsRef<Path>) -> PathBuf {
 /// which silently answers the *grandparent's* directory the moment the store
 /// layout gains or loses a level.
 ///
-/// `None` when the path has no such ancestor — a bare `devmap.sqlite`, or a
-/// `$DEVMAP_HOME` shallow enough that walking up leaves the filesystem. Callers
-/// decide what to do about it rather than being handed `/` as a repository.
+/// `None` unless the path is `<root>/<state>/codeintel/devmap.sqlite` — a bare
+/// `devmap.sqlite`, a store under `$DEVMAP_HOME`, or any other location names
+/// no repository, and the caller uses the root it was invoked for. This used to
+/// answer the grandparent of *any* path: `--db /x/elsewhere/devmap.sqlite
+/// workspace add` wrote the registry under `/x`, a directory that was nobody's
+/// repository.
 pub fn repo_root_from_store(store: impl AsRef<Path>) -> Option<PathBuf> {
-    store
-        .as_ref()
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
+    let store = store.as_ref();
+    let layout = Path::new(STORE_RELPATH);
+    let codeintel = store.parent()?;
+    let state = codeintel.parent()?;
+    if store.file_name() != layout.file_name()
+        || codeintel.file_name() != layout.parent().and_then(Path::file_name)
+    {
+        return None;
+    }
+    if !state
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_state_dir_name)
+    {
+        return None;
+    }
+    state.parent().map(Path::to_path_buf)
 }
 
 /// True when `name` is one of the state directory names.
@@ -323,6 +337,26 @@ mod tests {
         for root in [Path::new("/repo"), Path::new("/a/b/c/deep")] {
             let store = store_path(root);
             assert_eq!(repo_root_from_store(&store).as_deref(), Some(root));
+        }
+    }
+
+    /// `--db /x/elsewhere/devmap.sqlite workspace add` wrote the registry under
+    /// `/x`: the inverse answered the grandparent of *any* path, and the CLI
+    /// took that for a repository. A store that is not at
+    /// `<root>/<state>/codeintel/devmap.sqlite` names no repository.
+    #[test]
+    fn a_store_outside_the_standard_layout_names_no_repository() {
+        for store in [
+            "/x/elsewhere/devmap.sqlite",
+            "/x/.devmap/devmap.sqlite",
+            "/x/.devcouncil/codeintel/index.sqlite",
+            "/x/codeintel/devmap.sqlite",
+        ] {
+            assert_eq!(
+                repo_root_from_store(Path::new(store)),
+                None,
+                "{store}: not the store layout, so no repository can be read off it"
+            );
         }
     }
 

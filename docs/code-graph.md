@@ -30,7 +30,7 @@ All map and graph operations live under **`dev map`**. `dev graph …` is a comp
 | `.devcouncil/repo_map.json` | File inventory, subsystems, entry roots, unwired/unreachable/dead-symbol candidate lists, reverse-import dependents |
 | `.devcouncil/graph/code_graph.json` | Compact export of symbol nodes + edges (imports, named imports, calls, inherits, contains) and tiered `dead_code`, written by the kernel from the same generation as the map. **The kernel store is canonical**; prefer `dev map query` / `trace` / `dead` when the JSON is missing. |
 | `.devcouncil/codeintel/devmap.sqlite` | **Canonical.** The Rust kernel's WAL-mode store: generations, nodes, edges, unresolved references, FTS5, the pending-path queue, build history. Written only by `devmap build` (every `dev map`, `init`, `ingest`, `sync`, verify/checkout refresh and MCP `devcouncil_graph_ingest` go through it). |
-| `.devcouncil/codeintel/index.sqlite` | The Python query cache. Not an engine: `load_code_graph` imports the kernel's `code_graph.json` into it on first read after a build, and the Python-only commands (`check`, `process`, `routes`, `cypher`, `pdg`, …) answer from that cache. Safe to delete; it is rebuilt from the JSON. |
+| `.devcouncil/codeintel/index.sqlite` | Runtime evidence only: debugger sessions and the call edges they witnessed, written by the opt-in tracer (`dev debug`, the `devcouncil_debug_*` MCP tools) and merged into the graph by `dev map cypher`. It held the Python query cache until that store was deleted; nothing creates the file unless a debug session runs. Safe to delete — it is evidence, not an index, and losing it loses only past sessions. |
 | `.devcouncil/graph/graph.html` | Self-contained interactive visualizer (`dev map graph-html` / `dev map html --symbols` / alias `dev graph html`; **not** written by default on bare `dev map`) |
 | `.devcouncil/map.html` | Self-contained subsystem map visualizer (`dev map html`, rendered by the kernel's `devmap map-html`). Nodes are coloured by dominant language in GitHub Linguist's own palette; the header carries a repo-wide language bar and states how many indexed files the subsystems actually cover. Slim payload — the `files[]` inventory is aggregated into per-subsystem language histograms and not embedded, and `dependents{}` is dropped. |
 | `.devcouncil/graph/demo.html` | Sample self-contained interactive UI from `dev map demo` (no map required; primary demo artifact) |
@@ -58,7 +58,7 @@ dev map sync                # Same build
 dev map status              # Engine binary, store (schema, size, free pages, WAL), kernel freshness, daemon, artifacts
 dev map doctor              # Verdicts with fixes: kernel present/capable, store no newer than kernel, artifacts kernel-written, reclaim/WAL pressure
 dev map repair --pending    # Drop pending-queue entries the kernel can never index
-dev map unlock              # Free a stuck *legacy* Python query-cache lease (the kernel's lock is released on process death)
+dev map abort               # Stop the kernel build running for this repository (SIGTERM, then SIGKILL)
 ```
 
 `--no-liveness` and `--lsp-refs` are gone: the kernel always computes liveness, and the LSP adjunct was cut with the Python engine. A flag that is accepted and ignored is worse than one that is rejected, so both are rejected.
@@ -208,17 +208,18 @@ Python seam is two files: `src/devcouncil/devmap_engine.py` runs `devmap build` 
 newline-framed JSON IPC to a `devmap serve` daemon (one per repository, socket derived from the
 canonical root; spawned on demand, never by a status probe, and never when `DEVMAP_AUTOSPAWN=0`)
 with a CLI fallback for every request. The kernel binary is located by one rule for both:
-`DEVMAP_BINARY` if set, else the newest capable build among `<repo>/rust-port/target/{release,debug}`,
+`DEVMAP_BINARY` if set (used or refused by name, never replaced by another kernel), else the newest capable build among `<repo>/rust-port/target/{release,debug}`,
 `<package>/rust-port/target/{release,debug}` and `PATH` — "capable" being what `manifest --help`
 advertises, because every build reports the same version string.
 
 Query surfaces that still run on the Python side (`check`, `process`, `routes`, `shape-check`,
 `api-impact`, `cypher`, `pdg`, the HTML visualizers, and the MCP tools `devcouncil_graph_impact`,
 `devcouncil_route_map`, `devcouncil_shape_check`, `devcouncil_api_impact`, `devcouncil_pdg_query`,
-`devcouncil_explain`) read the Python query cache, which `load_code_graph` fills from the kernel's
-`code_graph.json` after each build. `explore` and `affected` left that list on 2026-09-05; every
-`devcouncil_code_*` MCP tool is now kernel-only and reports `Unavailable` rather than substituting
-a second engine's answer.
+`devcouncil_explain`) parse the kernel's own `code_graph.json`. They read it through a Python
+`index.sqlite` cache until 2026-09-07, when that store was deleted: its writer had already lost
+every caller, so `cypher` in particular answered "No committed graph generation." on every
+repository. `explore` and `affected` left this list on 2026-09-05; every `devcouncil_code_*` MCP
+tool is kernel-only and reports `Unavailable` rather than substituting a second engine's answer.
 
 ```bash
 cd rust-port && ./verify.sh
@@ -273,9 +274,13 @@ an unambiguous `routes_to` (kernel `EdgeKind::HandlesRoute`) or `subscribes`
 Exemptions: `WiringKind` marks a symbol the runtime invokes with no observable call site
 at all — `FrameworkDecorator`, `RuntimeEntryPoint` (`func init`, `#[test]`,
 `componentDidMount`, `pytest_*`), `ScriptEntry`, `Launcher`, `ReExportPackage`,
-`StructuralExempt` (a Rust trait-impl method cannot carry `pub`, so `is_exported` says
-nothing about it) — and an exempt symbol reports the reason it was exempted, per symbol
-or per file. Ambiguous name matches stay unresolved and never suppress a dead-code
+`ConfigEntryPoint` (a `[project.scripts] cli = "pkg.mod:func"` declaration, resolved to
+`pkg/mod.py::func` — the launcher that calls it is generated at install time and is not
+in the corpus), `StructuralExempt` (a Rust trait-impl method cannot carry `pub`, so
+`is_exported` says nothing about it) — and an exempt symbol reports the reason it was
+exempted, per symbol or per file. `ScriptEntry` and `ConfigEntryPoint` come from the same
+declaration and answer different questions: the first is a claim about the manifest
+*file*, the second about the symbol it names. Ambiguous name matches stay unresolved and never suppress a dead-code
 candidate.
 
 The Python framework manifest that used to do this — `codeintel/resolution/frameworks/`,

@@ -5,7 +5,6 @@ import json
 
 import pytest
 
-import devcouncil.indexing.graph as graph_pkg
 import devcouncil.indexing.graph.build as graph_build
 import devcouncil.indexing.viz as viz
 from devcouncil.cli.main import app
@@ -44,7 +43,7 @@ def test_graph_doctor_reports_a_kernel_older_than_the_store(tmp_path, monkeypatc
     )
     monkeypatch.setattr(
         "devcouncil.devmap_health.kernel_status",
-        lambda root: {"error": "unsupported future schema version 12"},
+        lambda root: {"error": "devmap store x: schema version 12 is not supported by this binary (schema 11); this devmap binary is older than the store"},
     )
 
     result = runner.invoke(app, ["map", "doctor", "--project-root", str(tmp_path)])
@@ -64,26 +63,38 @@ def test_graph_doctor_reports_a_kernel_older_than_the_store(tmp_path, monkeypatc
 
 
 # --- query ------------------------------------------------------------------------
+#
+# These render whatever payload the engine returns. The engine used to be either
+# the kernel or `indexing.graph.query.query_symbol` over `load_code_graph`; it is
+# now only the kernel, so the double is `_devmap_query_payload` — the one seam
+# both `dev map query` and the MCP tool go through. The rendering assertions are
+# unchanged.
+
+
+def _kernel_says(monkeypatch, payload):
+    from devcouncil.cli.commands import graph_cmd
+
+    monkeypatch.setattr(
+        graph_cmd, "_devmap_query_payload", lambda *a, **k: payload, raising=False
+    )
 
 
 def test_graph_query_json(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        graph_pkg, "query_symbol",
-        lambda root, name: {"definitions": [{"id": "m.f", "kind": "function", "path": "m.py", "line": 1}]},
-    )
+    _kernel_says(monkeypatch, {
+        "definitions": [{"id": "m.f", "kind": "function", "path": "m.py", "line": 1}]
+    })
     result = runner.invoke(app, ["map", "query", "f", "--json", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert json.loads(result.stdout)["definitions"][0]["id"] == "m.f"
 
 
 def test_graph_query_human_with_defs(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        graph_pkg, "query_symbol",
-        lambda root, name: {"definitions": [{
+    _kernel_says(monkeypatch, {
+        "definitions": [{
             "id": "m.f", "kind": "function", "path": "m.py", "line": 1,
             "callers": ["m.g"], "callees": [], "importers": [],
-        }]},
-    )
+        }]
+    })
     result = runner.invoke(app, ["map", "query", "f", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "m.f" in result.output
@@ -91,83 +102,101 @@ def test_graph_query_human_with_defs(tmp_path, monkeypatch):
 
 
 def test_graph_query_no_matches(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_pkg, "query_symbol", lambda root, name: {"definitions": []})
+    _kernel_says(monkeypatch, {"definitions": []})
     result = runner.invoke(app, ["map", "query", "ghost", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "No matches" in result.output
 
 
 def test_graph_query_error_exits(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_pkg, "query_symbol", lambda root, name: {"error": "no graph"})
+    _kernel_says(monkeypatch, {"error": "no graph"})
     result = runner.invoke(app, ["map", "query", "f", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
+
+
+def test_graph_query_without_a_kernel_refuses_rather_than_answering(tmp_path, monkeypatch):
+    """No kernel is an error naming it, not a second engine's answer.
+
+    `query_symbol` walked the whole Python graph out of `index.sqlite` to
+    answer this — and the sibling `trace` fallback did not merely cost more, it
+    returned *different* paths (its BFS was undirected).
+    """
+    _kernel_says(monkeypatch, None)
+    result = runner.invoke(app, ["map", "query", "f", "--project-root", str(tmp_path)])
+    assert result.exit_code != 0, result.output
+    assert not isinstance(result.exception, AssertionError), result.exception
+    assert "dev map" in result.output or "devmap" in result.output, result.output
 
 
 # --- trace ------------------------------------------------------------------------
 
 
 def test_graph_trace_found(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        graph_pkg, "trace_path",
-        lambda root, start, end: {"found": True, "path": ["a", "b", "c"]},
-    )
+    _kernel_says(monkeypatch, {"found": True, "path": ["a", "b", "c"]})
     result = runner.invoke(app, ["map", "trace", "a", "c", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "a" in result.output and "c" in result.output
 
 
 def test_graph_trace_json(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        graph_pkg, "trace_path", lambda root, start, end: {"found": True, "path": ["a", "b"]}
-    )
+    _kernel_says(monkeypatch, {"found": True, "path": ["a", "b"]})
     result = runner.invoke(app, ["map", "trace", "a", "b", "--json", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert json.loads(result.stdout)["found"] is True
 
 
 def test_graph_trace_no_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_pkg, "trace_path", lambda root, start, end: {"found": False})
+    _kernel_says(monkeypatch, {"found": False})
     result = runner.invoke(app, ["map", "trace", "a", "z", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
     assert "No path" in result.output
 
 
 def test_graph_trace_error(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_pkg, "trace_path", lambda root, start, end: {"error": "boom"})
+    _kernel_says(monkeypatch, {"error": "boom"})
     result = runner.invoke(app, ["map", "trace", "a", "z", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
+
+
+def test_graph_trace_without_a_kernel_refuses_rather_than_answering(tmp_path, monkeypatch):
+    """A fabricated path is worse than an absent answer: a caller acts on it."""
+    _kernel_says(monkeypatch, None)
+    result = runner.invoke(app, ["map", "trace", "a", "z", "--project-root", str(tmp_path)])
+    assert result.exit_code != 0, result.output
+    assert not isinstance(result.exception, AssertionError), result.exception
+    assert "dev map" in result.output or "devmap" in result.output, result.output
 
 
 # --- graph-backed commands: missing-graph guard -----------------------------------
 
 
 def test_graph_dead_requires_graph(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: None)
+    _kernel_artifact(monkeypatch, None)
     result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
     assert "No code graph" in result.output
 
 
 def test_graph_check_requires_graph(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: None)
+    _kernel_artifact(monkeypatch, None)
     result = runner.invoke(app, ["map", "check", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
 
 
 def test_graph_process_requires_graph(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: None)
+    _kernel_artifact(monkeypatch, None)
     result = runner.invoke(app, ["map", "process", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
 
 
 def test_graph_impact_requires_graph(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: None)
+    _kernel_artifact(monkeypatch, None)
     result = runner.invoke(app, ["map", "impact", "--diff", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
 
 
 def test_graph_export_requires_graph(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: None)
+    _kernel_artifact(monkeypatch, None)
     result = runner.invoke(app, ["map", "export", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
 
@@ -198,8 +227,46 @@ def test_graph_html_missing_graph(tmp_path, monkeypatch):
 
 from types import SimpleNamespace  # noqa: E402
 
+import devcouncil.cli.commands.graph_cmd as graph_cmd_mod  # noqa: E402
 import devcouncil.indexing.graph.intel as intel_mod  # noqa: E402
 import devcouncil.indexing.graph.export as export_mod  # noqa: E402
+
+
+def _never_load_the_python_graph(root):
+    """Two-signal proof for the commands that have left the Python read path.
+
+    Patched over ``load_code_graph`` so a command that still reaches the retired
+    engine's whole-graph read fails here loudly, rather than passing because the
+    fixture happened to have no graph to load.
+    """
+    raise AssertionError(
+        "this command reached the retired Python engine's whole-graph read; "
+        "the kernel is the only graph engine"
+    )
+
+
+def _kernel_artifact(monkeypatch, graph, root=None):
+    """Feed the graph-backed commands the kernel's own artifact.
+
+    These are renderer tests: they assert what ``dev map check`` / ``process`` /
+    ``dead`` / ``export`` *print* for a given graph, and the double is how the
+    graph arrives. The seam moved. ``_require_graph`` used to call
+    ``load_code_graph`` — the retired engine's read through the Python
+    ``index.sqlite`` cache — and now calls ``read_code_graph``, a bounded
+    ``json.load`` of ``code_graph.json``, the artifact the kernel writes.
+
+    ``root`` writes an unstamped ``repo_map.json`` beside it. The staleness
+    banner used to read the Python store's generation, found none, and printed
+    nothing; it reads the map artifact now, so a root with a graph and no map is
+    "freshness unknown" and says so. The kernel writes both files in one run, so
+    the fixture writes both. Unstamped is deliberate: a map with no
+    ``generated_head`` has nothing to compare and is not stale.
+    """
+    monkeypatch.setattr(graph_build, "read_code_graph", lambda _root: graph)
+    if root is not None:
+        map_path = root / ".devcouncil" / "repo_map.json"
+        map_path.parent.mkdir(parents=True, exist_ok=True)
+        map_path.write_text('{"files": []}', encoding="utf-8")
 
 
 class _DeadEntry:
@@ -250,7 +317,7 @@ def test_graph_dead_human_with_entries(tmp_path, monkeypatch):
         _DeadEntry("a.py", 3, "a.f", "function", "no callers"),
         _DeadEntry("b.py", 5, "b.g", "function", "no callers"),
     ]
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph(dead=entries))
+    _kernel_artifact(monkeypatch, _fake_graph(dead=entries))
     result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "a.f" in result.output
@@ -262,7 +329,7 @@ def test_graph_dead_json_and_confidence_filter(tmp_path, monkeypatch):
         _DeadEntry("a.py", 3, "a.f", "function", "no callers", confidence="extracted"),
         _DeadEntry("b.py", 5, "b.g", "function", "no callers", confidence="ambiguous"),
     ]
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph(dead=entries))
+    _kernel_artifact(monkeypatch, _fake_graph(dead=entries))
     result = runner.invoke(
         app,
         ["map", "dead", "--json", "--confidence", "extracted", "--project-root", str(tmp_path)],
@@ -276,7 +343,7 @@ def test_graph_dead_json_and_confidence_filter(tmp_path, monkeypatch):
 
 def test_graph_dead_empty_with_hidden(tmp_path, monkeypatch):
     entries = [_DeadEntry("b.py", 5, "b.g", "function", "no callers", confidence="ambiguous")]
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph(dead=entries))
+    _kernel_artifact(monkeypatch, _fake_graph(dead=entries))
     # default min-confidence "inferred" hides the ambiguous entry.
     result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
@@ -304,9 +371,7 @@ def test_graph_dead_distinguishes_all_three_cluster_outcomes(tmp_path, monkeypat
         ({"clusters": []}, ["none."], ["not computed", "not recorded"]),
     ]
     for kwargs, expected, forbidden in cases:
-        monkeypatch.setattr(
-            graph_build, "load_code_graph", lambda root, k=kwargs: _fake_graph(**k)
-        )
+        _kernel_artifact(monkeypatch, _fake_graph(**kwargs), root=tmp_path)
         result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
         assert result.exit_code == 0, result.output
         for text in expected:
@@ -318,10 +383,8 @@ def test_graph_dead_distinguishes_all_three_cluster_outcomes(tmp_path, monkeypat
 
     # A refusal that also carries a list is the kernel contradicting itself; the
     # readout must not silently pick the reassuring half.
-    monkeypatch.setattr(
-        graph_build,
-        "load_code_graph",
-        lambda root: _fake_graph(clusters=[], clusters_incomplete="graph too large"),
+    _kernel_artifact(
+        monkeypatch, _fake_graph(clusters=[], clusters_incomplete="graph too large")
     )
     result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
     assert result.exit_code == 0, result.output
@@ -330,11 +393,7 @@ def test_graph_dead_distinguishes_all_three_cluster_outcomes(tmp_path, monkeypat
 
 def test_graph_dead_json_carries_the_refusal(tmp_path, monkeypatch):
     """And the machine-readable path, which is what agents read."""
-    monkeypatch.setattr(
-        graph_build,
-        "load_code_graph",
-        lambda root: _fake_graph(clusters_incomplete="graph too large"),
-    )
+    _kernel_artifact(monkeypatch, _fake_graph(clusters_incomplete="graph too large"))
     result = runner.invoke(
         app, ["map", "dead", "--json", "--project-root", str(tmp_path)]
     )
@@ -350,7 +409,7 @@ def test_graph_dead_json_carries_the_refusal(tmp_path, monkeypatch):
 
 
 def test_graph_check_human(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     monkeypatch.setattr(
         intel_mod, "graph_check",
         lambda graph, top_n=15: {
@@ -368,7 +427,7 @@ def test_graph_check_human(tmp_path, monkeypatch):
 
 
 def test_graph_check_json_no_cycles(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     monkeypatch.setattr(
         intel_mod, "graph_check",
         lambda graph, top_n=15: {"god_nodes": [], "circular_imports": []},
@@ -382,7 +441,7 @@ def test_graph_check_json_no_cycles(tmp_path, monkeypatch):
 
 
 def test_graph_process_human(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     monkeypatch.setattr(
         intel_mod, "extract_processes",
         lambda graph, entry=None, max_depth=6: [{"name": "flow", "depth": 2, "steps": ["a", "b"]}],
@@ -393,7 +452,7 @@ def test_graph_process_human(tmp_path, monkeypatch):
 
 
 def test_graph_process_empty(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     monkeypatch.setattr(intel_mod, "extract_processes", lambda graph, entry=None, max_depth=6: [])
     result = runner.invoke(app, ["map", "process", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
@@ -404,39 +463,67 @@ def test_graph_process_empty(tmp_path, monkeypatch):
 
 
 def test_graph_impact_requires_paths_or_diff(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     result = runner.invoke(app, ["map", "impact", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
     assert "Provide paths or --diff" in result.output
 
 
 def test_graph_impact_human_with_results(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    """Rewritten: this fed the renderer `diff_impact`'s Python output.
+
+    There is no Python engine under `dev map impact` any more — the kernel bands
+    its own walk and the command renders that. The double is now the kernel
+    payload, and the assertions cover what the Python shape could not carry: a
+    band's measured confidence, its unlisted remainder, and the walk's own "I
+    stopped early".
+    """
     monkeypatch.setattr(
-        intel_mod, "diff_impact",
-        lambda root, graph, paths=None, use_diff=False, max_depth=3: {
+        graph_cmd_mod,
+        "_devmap_query_payload",
+        lambda root, kind, **kw: {
+            "ok": True,
+            "source": "devmap",
             "paths": [{
                 "path": "a.py",
-                "symbols": [{"id": "a.f"}],
-                "blast": {"layers": [{"depth": 1, "confidence": "high", "nodes": ["b.g", "c.h"]}]},
-            }]
+                "symbols": [{"id": "a.py::f"}],
+                "symbols_are_walk_seeds": True,
+                "blast": {
+                    "seeds": ["a.py::f"],
+                    "layers": [{
+                        "depth": 1,
+                        "nodes": ["b.g", "c.h"],
+                        "count": 9,
+                        "confidence": "extracted",
+                        "confidence_score": 1.0,
+                        "nodes_omitted": 7,
+                    }],
+                    "total_impacted": 9,
+                    "walk_incomplete": "the walk did not complete: stopped at depth 3",
+                },
+            }],
         },
     )
     result = runner.invoke(app, ["map", "impact", "a.py", "--project-root", str(tmp_path)])
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert "a.py" in result.output
     assert "depth 1" in result.output
+    # Square brackets here were eaten by Rich as console markup, so the tier
+    # never printed on either engine. See the renderer's own note.
+    assert "(extracted)" in result.output, result.output
+    assert "7 not listed" in result.output, result.output
+    assert "stopped at depth 3" in result.output, result.output
 
 
 def test_graph_impact_no_paths(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
     monkeypatch.setattr(
-        intel_mod, "diff_impact",
-        lambda root, graph, paths=None, use_diff=False, max_depth=3: {"paths": []},
+        graph_cmd_mod,
+        "_devmap_query_payload",
+        lambda root, kind, **kw: {"ok": True, "source": "devmap", "paths": []},
     )
     result = runner.invoke(app, ["map", "impact", "--diff", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
-    assert "No impacted paths" in result.output
+    assert "No paths to analyse" in result.output
 
 
 # --- export -----------------------------------------------------------------------
@@ -448,7 +535,6 @@ def _no_python_graph(monkeypatch):
     def _never(root):
         raise AssertionError("graphml export must not load the Python code graph")
 
-    monkeypatch.setattr(graph_build, "load_code_graph", _never)
 
 
 def test_graph_export_graphml_stdout(tmp_path, monkeypatch):
@@ -505,14 +591,14 @@ def test_graph_export_graphml_kernel_failure_is_red(tmp_path, monkeypatch):
 
 
 def test_graph_export_okf_requires_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     result = runner.invoke(app, ["map", "export", "--format", "okf", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
     assert "requires -o" in result.output
 
 
 def test_graph_export_okf_writes_bundle(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     out_dir = tmp_path / "okf"
     monkeypatch.setattr(
         export_mod, "write_code_graph_okf",
@@ -526,7 +612,7 @@ def test_graph_export_okf_writes_bundle(tmp_path, monkeypatch):
 
 
 def test_graph_export_okf_missing_graph_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
 
     def boom(root, target, graph=None):
         raise FileNotFoundError("no okf source")
@@ -544,7 +630,7 @@ def test_graph_export_okf_links(tmp_path, monkeypatch):
         SimpleNamespace(kind="calls", source="b", target="c"),
         SimpleNamespace(kind="inherits", source="c", target="d"),
     ]
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph(edges=edges))
+    _kernel_artifact(monkeypatch, _fake_graph(edges=edges))
     result = runner.invoke(app, ["map", "export", "--format", "okf-links", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "a --imports--> b" in result.output
@@ -552,7 +638,7 @@ def test_graph_export_okf_links(tmp_path, monkeypatch):
 
 
 def test_graph_export_unknown_format(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     result = runner.invoke(app, ["map", "export", "--format", "bogus", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
     assert "Unknown format" in result.output
@@ -648,7 +734,7 @@ class _FakeClient:
             "span": (12, 20),
         }])
 
-    def impact(self, target, depth=1, min_rung=None):
+    def impact(self, target, depth=1, min_rung=None, *, layers=False):
         self.impact_targets.append(target)
         self.rungs.append(("impact", min_rung))
         return _FakeResp(self.impact_items, resolution=self.impact_resolution)
@@ -1075,13 +1161,13 @@ def test_a_malformed_graph_file_is_refused_at_load_not_rendered(tmp_path, docume
     The message is the missing-graph one, and that is the right advice — a
     rebuild replaces a truncated or hand-edited export.
     """
-    from devcouncil.indexing.graph.build import load_code_graph
+    from devcouncil.indexing.graph.build import read_code_graph
 
     graph_file = tmp_path / ".devcouncil" / "graph" / "code_graph.json"
     graph_file.parent.mkdir(parents=True)
     graph_file.write_text(json.dumps({"schema_version": 2, **document}))
 
-    assert load_code_graph(tmp_path) is None
+    assert read_code_graph(tmp_path) is None
 
     result = runner.invoke(app, ["map", "check", "--project-root", str(tmp_path)])
     assert result.exit_code == 1

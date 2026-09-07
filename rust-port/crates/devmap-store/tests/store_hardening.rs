@@ -137,6 +137,7 @@ fn deletion_reconciliation_removes_live_nodes() {
                 build_started: None,
                 repo_root: None,
                 discovery_refusals: None,
+                verify_every_row: false,
             },
         )
         .unwrap();
@@ -1519,6 +1520,7 @@ fn body_signatures_survive_an_incremental_carry_forward() {
                 build_started: None,
                 repo_root: None,
                 discovery_refusals: None,
+                verify_every_row: false,
             },
         )
         .unwrap();
@@ -1963,6 +1965,7 @@ fn s2_build_history_counts_the_whole_generation_not_the_written_slice() {
                 build_started: None,
                 repo_root: None,
                 discovery_refusals: None,
+                verify_every_row: false,
             },
             "warm-head",
         )
@@ -2469,6 +2472,7 @@ fn the_stored_parse_failure_rule_matches_the_canonical_classifier() {
                 build_started: None,
                 repo_root: None,
                 discovery_refusals: None,
+                verify_every_row: false,
             },
         )
         .unwrap();
@@ -2644,7 +2648,8 @@ fn every_migration_step_is_re_entrant_from_every_version() {
 
         let store = Store::open(&db_path).unwrap_or_else(|error| {
             panic!(
-                "a store stamped at v{stamped} must migrate to                  v{CURRENT_SCHEMA_VERSION}, not fail to open: {error}"
+                "a store stamped at v{stamped} must migrate to \
+                 v{CURRENT_SCHEMA_VERSION}, not fail to open: {error}"
             )
         });
         drop(store);

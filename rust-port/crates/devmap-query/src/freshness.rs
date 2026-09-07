@@ -24,9 +24,11 @@
 //! leaves the stamping to Python exactly as before.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
 
+use devmap_extract::subprocess::{self, run_bounded, Bounds};
 use serde::{Deserialize, Serialize};
 
 use crate::digest::{hex, sha1_hex, Blake2b};
@@ -173,18 +175,40 @@ pub struct FreshnessDigests {
 /// with no commits still gets a usable map, and staleness then rests on the two
 /// fingerprints.
 pub fn git_head(root: &Path) -> String {
-    let Ok(output) = Command::new("git")
-        .arg("rev-parse")
-        .arg("HEAD")
-        .current_dir(root)
-        .output()
-    else {
-        return String::new();
+    git_head_with_program(OsStr::new("git"), root)
+}
+
+/// Wall clock allowed for `git rev-parse HEAD`: the same constant the store
+/// applies to its own `HEAD` sentinel, re-exported so the two cannot drift.
+pub use devmap_extract::subprocess::GIT_HEAD_DEADLINE;
+
+/// Wall clock allowed for one `git ls-files` pass. Generous: the listing is
+/// the whole tracked tree, and a monorepo's is seconds, not milliseconds.
+pub const GIT_LS_FILES_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Bytes of `git ls-files -z` output kept. A listing past this is refused as
+/// incomplete rather than hashed as if it were the tree — a fingerprint of a
+/// prefix would report a stale map fresh.
+pub const GIT_LS_FILES_OUTPUT_CAP: usize = 64 * 1024 * 1024;
+
+/// [`git_head`] with the program named, so a test can stand a script in for it.
+#[doc(hidden)]
+pub fn git_head_with_program(program: &OsStr, root: &Path) -> String {
+    let mut command = subprocess::git_with_program(program, root);
+    command.args(["rev-parse", "HEAD"]);
+    let bounds = Bounds {
+        deadline: GIT_HEAD_DEADLINE,
+        stdout_cap: 4096,
+        stderr_cap: 4096,
     };
-    if !output.status.success() {
-        return String::new();
+    match run_bounded(&mut command, bounds) {
+        Ok(captured) if captured.status.success() && !captured.stdout_truncated => {
+            captured.stdout_lossy().trim().to_string()
+        }
+        // Not a repository, no commits, no git, or a git that stalled past
+        // the deadline: all "cannot be answered", per the contract above.
+        Ok(_) | Err(_) => String::new(),
     }
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 /// `RepoMapper._is_runtime_or_generated_file`.
@@ -237,26 +261,39 @@ pub fn is_runtime_or_generated_file(path: &str) -> bool {
     name.ends_with('~')
 }
 
-fn ls_files(root: &Path, flags: &[&str]) -> Result<Vec<String>, String> {
-    let output = Command::new("git")
-        .arg("ls-files")
-        .arg("-z")
-        .args(flags)
-        .current_dir(root)
-        .output()
-        .map_err(|error| format!("could not run git: {error}"))?;
-    if !output.status.success() {
+fn ls_files(program: &OsStr, root: &Path, flags: &[&str]) -> Result<Vec<String>, String> {
+    let mut command = subprocess::git_with_program(program, root);
+    command.arg("ls-files").arg("-z").args(flags);
+    let bounds = Bounds {
+        deadline: GIT_LS_FILES_DEADLINE,
+        stdout_cap: GIT_LS_FILES_OUTPUT_CAP,
+        stderr_cap: 4096,
+    };
+    let captured = run_bounded(&mut command, bounds)
+        .map_err(|failure| format!("git ls-files {}: {failure}", flags.join(" ")))?;
+    if !captured.status.success() {
         return Err(format!(
             "git ls-files {} exited {}: {}",
             flags.join(" "),
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).trim()
+            captured.status.code().unwrap_or(-1),
+            captured.stderr_trimmed()
+        ));
+    }
+    if captured.stdout_truncated {
+        // A prefix of the tree fingerprints as a different tree, and a map
+        // compared against it would read stale as fresh. Refused by name.
+        return Err(format!(
+            "git ls-files {} produced more than {} bytes; the listing is \
+             incomplete and was not fingerprinted",
+            flags.join(" "),
+            GIT_LS_FILES_OUTPUT_CAP
         ));
     }
     // `-z` so non-ASCII paths arrive unquoted; lossy decoding matches the
     // Python reader's `errors="replace"`, so a path neither side can decode
     // still hashes to the same string on both.
-    Ok(String::from_utf8_lossy(&output.stdout)
+    Ok(captured
+        .stdout_lossy()
         .split('\0')
         .filter(|entry| !entry.is_empty())
         .map(|entry| entry.replace('\\', "/"))
@@ -342,6 +379,12 @@ fn keep_indexable(
 
 /// `RepoMapper.get_git_files`, git path only.
 pub fn inventory(root: &Path, limits: InventoryLimits) -> Inventory {
+    inventory_with_program(OsStr::new("git"), root, limits)
+}
+
+/// [`inventory`] with the program named, so a test can stand a script in for it.
+#[doc(hidden)]
+pub fn inventory_with_program(program: &OsStr, root: &Path, limits: InventoryLimits) -> Inventory {
     // One memo for both `ls-files` passes: the tagged-ancestor lookup costs one
     // `open` per *distinct directory* rather than one per path, and it stops at
     // the first tagged prefix — so a cache directory holding 50,000 files is
@@ -349,7 +392,7 @@ pub fn inventory(root: &Path, limits: InventoryLimits) -> Inventory {
     let mut caches = devmap_extract::CacheDirectoryCache::default();
     let mut keep = |paths: Vec<String>| keep_indexable(root, &mut caches, paths);
 
-    let tracked = match ls_files(root, &["--cached"]) {
+    let tracked = match ls_files(program, root, &["--cached"]) {
         Ok(paths) => keep(paths),
         Err(reason) => {
             return Inventory {
@@ -360,7 +403,7 @@ pub fn inventory(root: &Path, limits: InventoryLimits) -> Inventory {
         }
     };
     let untracked = if limits.include_untracked {
-        match ls_files(root, &["--others", "--exclude-standard"]) {
+        match ls_files(program, root, &["--others", "--exclude-standard"]) {
             Ok(paths) => {
                 let tracked_set: std::collections::HashSet<&str> =
                     tracked.iter().map(String::as_str).collect();

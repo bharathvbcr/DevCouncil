@@ -70,7 +70,11 @@ fn k3_future_schema_refusal_names_the_store_the_versions_and_the_remedy() {
 ///
 /// `user_version = 2` is the Python engine's store — exactly what the old
 /// default `--db` pointed at (K6) — and the refusal was
-/// `unsupported schema version 2`.
+/// `unsupported schema version 2`. This test then asked for `devmap build` as
+/// the remedy, which is not one: there is no migration from the Python
+/// engine's database, and `build` against it refuses by the same name. The
+/// remedy is to point `--db` at a devmap store, and the number is the one
+/// the store owns (`PYTHON_INDEX_SCHEMA_VERSION`).
 #[test]
 fn k3_outdated_schema_refusal_names_the_store_the_versions_and_the_remedy() {
     let dir = tmp_dir("k3-outdated");
@@ -94,8 +98,13 @@ fn k3_outdated_schema_refusal_names_the_store_the_versions_and_the_remedy() {
         "the refusal must state this binary's schema version: {error}"
     );
     assert!(
-        error.contains("devmap build"),
-        "the refusal must name the remedy for an older store: {error}"
+        error.contains("Python engine's database") && error.contains("--db"),
+        "the refusal must name the Python database and the remedy (point `--db` at a \
+         devmap store): {error}"
+    );
+    assert!(
+        !error.contains("run `devmap build`"),
+        "`devmap build` is not a remedy for a database that has no migration: {error}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

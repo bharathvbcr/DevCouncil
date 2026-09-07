@@ -307,3 +307,50 @@ fn only_genuine_refusals_are_charged_against_coverage() {
         "a walk that refused nothing is not the same as no walk"
     );
 }
+
+/// A build pointed at a regular file is refused, and leaves no generation.
+///
+/// Measured with the release binary before the fix: `devmap build <file>`
+/// exited 0, reported `files_indexed: 0` and wrote a generation — a check that
+/// could not run reporting as one that ran — while `devmap build <missing>`
+/// exited 1. The owner is `devmap_extract::scan_tree`; this pins that the
+/// build arm propagates its refusal rather than swallowing it.
+#[test]
+fn a_build_whose_root_is_a_regular_file_is_refused_and_writes_nothing() {
+    let root = fixture("fileroot");
+    let file = root.join("notes.txt");
+    std::fs::write(&file, "not a repository\n").unwrap();
+    let db = root.join("store").join("devmap.sqlite");
+    let db_arg = db.to_string_lossy().into_owned();
+    let file_arg = file.to_string_lossy().into_owned();
+    let out = Command::new(devmap())
+        .args([
+            "--json",
+            "--db",
+            &db_arg,
+            "build",
+            "--progress",
+            "never",
+            &file_arg,
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("devmap runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "a root that is a file must be refused, not built as empty: {stdout}"
+    );
+    assert!(
+        stderr.contains("not a directory") && stderr.contains("notes.txt"),
+        "the refusal must name the root and say why: {stderr}"
+    );
+    let status = json(&root, &["--json", "--db", &db_arg, "status"]);
+    assert_eq!(
+        status["generation_id"],
+        serde_json::Value::Null,
+        "no generation may be written for a root that was never walked: {status}"
+    );
+}

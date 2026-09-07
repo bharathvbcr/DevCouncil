@@ -238,44 +238,264 @@ def test_skills_section_swallows_errors(tmp_path, monkeypatch):
 
 
 # ---- graph impact lines -------------------------------------------------------
+#
+# `_graph_impact_lines` is paid on *every* task prompt. It used to call
+# `indexing.graph.build.load_code_graph`, the retired Python engine's read path:
+# measured on this repository's tree (18,121 nodes / 102,646 edges) that read
+# costs 3.79 s and a 102 MB `index.sqlite` write on the first call, and 855 ms
+# (p50 of 11) at ~690 MB RSS on every one after, to answer a depth-1 inbound
+# question the kernel answers for eight paths at once in 95 ms.
 
-def test_graph_impact_lines_from_code_graph(tmp_path, monkeypatch):
+
+class _FakeCallers:
+    """Stands in for `BudgetedResponse` on the callers side of `neighbors`."""
+
+    def __init__(
+        self,
+        items,
+        *,
+        total=None,
+        truncated=False,
+        walk_incomplete=None,
+        resolution="Available",
+    ):
+        self.items = items
+        self.shown = len(items)
+        self.total = len(items) if total is None else total
+        self.hidden = self.total - self.shown
+        self.truncated = truncated
+        self.tokens_used = 0
+        self.walk_incomplete = walk_incomplete
+        self.resolution = resolution
+
+
+class _FakeKernel:
+    """A `DevMapClient` double for the one method `_graph_impact_lines` calls."""
+
+    def __init__(self, answers, *, exc=None):
+        self._answers = answers
+        self._exc = exc
+        self.targets: list[list[str]] = []
+        self.depths: list[int] = []
+
+    def neighbors(self, targets, depth=1, min_confidence=0.0, min_rung=None):
+        self.targets.append(list(targets))
+        self.depths.append(depth)
+        if self._exc is not None:
+            raise self._exc
+        return [
+            {
+                "target": t,
+                "callers": self._answers.get(t, _FakeCallers([])),
+                "callees": _FakeCallers([]),
+            }
+            for t in targets
+        ]
+
+
+def _edge(source_symbol, source_file="src/x.py", edge_kind="Calls"):
+    return {
+        "edge_kind": edge_kind,
+        "source_symbol": source_symbol,
+        "source_file": source_file,
+        "target_symbol": "src/a.py::f",
+        "target_file": "src/a.py",
+    }
+
+
+def _with_kernel(monkeypatch, client):
+    import devcouncil.devmap_client as devmap_client
+
+    monkeypatch.setattr(devmap_client, "try_connect", lambda root: client)
+
+
+def test_the_graph_impact_lines_fake_matches_the_client_it_stands_in_for():
+    """The double must accept what `DevMapClient.neighbors` accepts.
+
+    Same rule as `test_graph_cmd_command._FakeClient`: a fake one keyword short
+    turns a production call into a `TypeError` here and nowhere else.
+    """
+    import inspect
+
+    from devcouncil.devmap_client import DevMapClient
+
+    real = set(inspect.signature(DevMapClient.neighbors).parameters)
+    fake = set(inspect.signature(_FakeKernel.neighbors).parameters)
+    assert real <= fake, f"_FakeKernel.neighbors is missing {sorted(real - fake)}"
+
+
+def test_graph_impact_lines_ask_the_kernel_not_the_python_graph(tmp_path, monkeypatch):
+    """The depth-1 inbound blast comes from the kernel, never `load_code_graph`.
+
+    `load_code_graph` is monkeypatched to raise, so a run that still reaches it
+    lands in the handler's `except` and produces no caller lines at all.
+    """
+    client = _FakeKernel({
+        "src/a.py": _FakeCallers([
+            _edge("src/api/checkout.py::charge"),
+            _edge("src/api/refund.py::refund"),
+            _edge("src/api/checkout.py", edge_kind="Imports"),
+        ]),
+    })
+    _with_kernel(monkeypatch, client)
+
     pb = PromptBuilder(tmp_path)
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph", lambda root: object()
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.intel.diff_impact",
-        lambda *a, **k: {
-            "paths": [
-                {
-                    "path": "src/a.py",
-                    "blast": {"layers": [{"depth": 1, "nodes": ["caller_one", "caller_two"]}]},
-                },
-                {"path": "src/b.py", "blast": {"layers": [{"depth": 1, "nodes": []}]}},
-            ]
-        },
-    )
     task = _task([PlannedFile(path="src/a.py", reason="x", allowed_change="modify")])
     lines = pb._graph_impact_lines(task)
-    assert any("caller_one" in ln for ln in lines)
 
-
-def test_graph_impact_lines_no_graph(tmp_path, monkeypatch):
-    pb = PromptBuilder(tmp_path)
-    monkeypatch.setattr("devcouncil.indexing.graph.build.load_code_graph", lambda root: None)
-    task = _task([PlannedFile(path="src/a.py", reason="x", allowed_change="modify")])
-    assert pb._graph_impact_lines(task) == []
-
-
-def test_graph_impact_lines_swallows_error(tmp_path, monkeypatch):
-    pb = PromptBuilder(tmp_path)
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: (_ for _ in ()).throw(RuntimeError("boom")),
+    assert client.targets == [["src/a.py"]], (
+        f"the kernel was asked for {client.targets}, expected one batched call"
     )
+    assert client.depths == [1]
+    body = "\n".join(lines)
+    assert "src/api/checkout.py::charge" in body
+    assert "src/api/refund.py::refund" in body
+    # `Imports` is structural, not a call; counting it inflates the blast radius
+    # with edges nobody can act on (see `devmap_client.CALL_EDGE_KINDS`).
+    assert "`src/api/checkout.py`" not in body
+
+
+def test_graph_impact_lines_batch_every_planned_file_in_one_exchange(
+    tmp_path, monkeypatch
+):
+    """One `neighbors` call for all planned files, not one `impact` call each.
+
+    Eleven process spawns is what the per-target shape cost before `neighbors`
+    existed; re-introducing it here would be paid on every task prompt.
+    """
+    client = _FakeKernel({
+        "src/a.py": _FakeCallers([_edge("src/api/one.py::a")]),
+        "src/b.py": _FakeCallers([_edge("src/api/two.py::b")]),
+    })
+    _with_kernel(monkeypatch, client)
+
+    pb = PromptBuilder(tmp_path)
+    task = _task([
+        PlannedFile(path="src/a.py", reason="x", allowed_change="modify"),
+        PlannedFile(path="src/b.py", reason="x", allowed_change="modify"),
+        PlannedFile(path="src/new.py", reason="x", allowed_change="create"),
+    ])
+    lines = pb._graph_impact_lines(task)
+
+    assert client.targets == [["src/a.py", "src/b.py"]], (
+        "planned files must go to the kernel in one batch, and a `create` is "
+        f"not asked about at all; got {client.targets}"
+    )
+    assert len(lines) == 2
+
+
+def test_graph_impact_lines_render_the_truncation_the_kernel_reports(
+    tmp_path, monkeypatch
+):
+    """A capped answer must not be rendered as a complete one."""
+    client = _FakeKernel({
+        "src/a.py": _FakeCallers(
+            [_edge(f"src/api/m{i}.py::f") for i in range(6)], total=41, truncated=True
+        ),
+    })
+    _with_kernel(monkeypatch, client)
+
+    pb = PromptBuilder(tmp_path)
     task = _task([PlannedFile(path="src/a.py", reason="x", allowed_change="modify")])
+    body = "\n".join(pb._graph_impact_lines(task))
+
+    # `_IMPACT_MAX_DEPS` shows five of the 41 the kernel counted.
+    assert "+36" in body, (
+        f"41 callers with 5 shown must carry the remainder; got {body!r}"
+    )
+
+
+def test_graph_impact_lines_say_a_walk_stopped_rather_than_show_nothing(
+    tmp_path, monkeypatch
+):
+    """An empty list from a walk that stopped early reads as 'nothing calls this'.
+
+    Same rule `graph_cmd._call_edges` applies: no nodes plus a `walk_incomplete`
+    reason is reported as "I stopped looking", never as a finding.
+    """
+    client = _FakeKernel({
+        "src/a.py": _FakeCallers([], walk_incomplete="stopped at depth 1"),
+    })
+    _with_kernel(monkeypatch, client)
+
+    pb = PromptBuilder(tmp_path)
+    task = _task([PlannedFile(path="src/a.py", reason="x", allowed_change="modify")])
+    body = "\n".join(pb._graph_impact_lines(task))
+
+    assert "walk incomplete" in body and "src/a.py" in body, (
+        f"a stopped walk must be said out loud, not dropped; got {body!r}"
+    )
+
+
+def test_graph_impact_lines_name_the_kernel_when_it_cannot_answer(
+    tmp_path, monkeypatch
+):
+    """No kernel is an absence, reported as one — never a Python answer.
+
+    The old shape returned `[]` here, which is the same output as "the kernel
+    ran and found no callers".
+    """
+    import devcouncil.devmap_client as devmap_client
+
+    monkeypatch.setattr(devmap_client, "try_connect", lambda root: None)
+
+    pb = PromptBuilder(tmp_path)
+    task = _task([PlannedFile(path="src/a.py", reason="x", allowed_change="modify")])
+    body = "\n".join(pb._graph_impact_lines(task))
+
+    assert "devmap" in body, (
+        f"the unavailable kernel must be named, not silently skipped; got {body!r}"
+    )
+
+
+def test_graph_impact_lines_report_a_raising_kernel(tmp_path, monkeypatch):
+    """A client that raises is unavailability too, and says so."""
+    _with_kernel(monkeypatch, _FakeKernel({}, exc=RuntimeError("boom")))
+
+    pb = PromptBuilder(tmp_path)
+    task = _task([PlannedFile(path="src/a.py", reason="x", allowed_change="modify")])
+    body = "\n".join(pb._graph_impact_lines(task))
+
+    assert "devmap" in body, f"got {body!r}"
+
+
+def test_graph_impact_lines_skip_a_task_with_only_new_files(tmp_path, monkeypatch):
+    """Nothing to ask about means the kernel is not asked, and nothing is said."""
+    client = _FakeKernel({})
+    _with_kernel(monkeypatch, client)
+
+    pb = PromptBuilder(tmp_path)
+    task = _task([PlannedFile(path="src/new.py", reason="x", allowed_change="create")])
     assert pb._graph_impact_lines(task) == []
+    assert client.targets == []
+
+
+def test_graph_impact_lines_end_to_end_against_the_real_kernel(tmp_path, monkeypatch):
+    """The doubles above agree with the real producer on a real tree.
+
+    A fake that has drifted from the kernel passes every test written against
+    it. Skips (rather than passes) when no kernel is built.
+    """
+    from tests.unit.graph_fixtures import git_init_commit, kernel_client, write_sources
+
+    write_sources(tmp_path, {
+        "src/lib.py": "def widget():\n    return 1\n",
+        "src/caller.py": (
+            "from src.lib import widget\n\n\ndef use_widget():\n    return widget()\n"
+        ),
+    })
+    git_init_commit(tmp_path)
+    client = kernel_client(tmp_path)
+    _with_kernel(monkeypatch, client)
+
+    pb = PromptBuilder(tmp_path)
+    task = _task([PlannedFile(path="src/lib.py", reason="x", allowed_change="modify")])
+    body = "\n".join(pb._graph_impact_lines(task))
+
+    assert "src/lib.py" in body, f"the kernel said nothing about src/lib.py: {body!r}"
+    assert "src/caller.py::use_widget" in body, (
+        f"the real kernel's depth-1 caller is missing from {body!r}"
+    )
 
 
 # ---- liveness debt section ----------------------------------------------------

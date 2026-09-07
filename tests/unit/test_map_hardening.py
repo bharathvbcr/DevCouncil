@@ -1,28 +1,27 @@
 """Hardening regressions for the dev map build pipeline.
 
-Each test here encodes a defect observed in production on 2026-08-11:
-- ``_prune`` deleting FTS5 rows via the UNINDEXED ``generation_id`` column ran a
-  single statement for 2+ hours at 100% CPU (full vtab scan + inverted-index
-  churn inside one ever-growing WAL transaction).
-- ``dev map dead`` reported dead-code results from an index frozen at a commit
-  five days behind HEAD with no staleness signal at all.
+``dev map dead`` reported dead-code results from an index frozen at a commit
+five days behind HEAD with no staleness signal at all (observed in production on
+2026-08-11). That gate is what is left here.
 
-The supervised-worker regressions that used to live here (self-enforced
-deadline, group SIGKILL for SIGTERM-ignoring stragglers, ``changed-*.txt``
-handoff GC) went with ``build_worker`` / ``run_isolated_full_build``: the Rust
-kernel builds in its own process and supervises itself.
+The FTS5 ``_prune`` regressions -- a single DELETE by the UNINDEXED
+``generation_id`` column running 2+ hours at 100% CPU -- went with
+``CodeIntelStore``: they were regressions in a Python store that nothing writes
+any more. So did ``interrupt_writes`` and the FK-index check. The
+supervised-worker regressions (self-enforced deadline, group SIGKILL for
+SIGTERM-ignoring stragglers, ``changed-*.txt`` handoff GC) went earlier, with
+``build_worker`` / ``run_isolated_full_build``: the Rust kernel builds in its
+own process and supervises itself.
 """
 
 from __future__ import annotations
 
-import sqlite3
+import json
 import subprocess
-import time
 from pathlib import Path
 
 from typer.testing import CliRunner
 
-from devcouncil.codeintel.store import CodeIntelStore
 from devcouncil.indexing.graph.schema import CodeGraph, GraphEdge, GraphNode, NodeKind
 
 
@@ -69,141 +68,41 @@ def _init_repo_with_commit(root: Path) -> str:
     return _git(root, "rev-parse", "HEAD")
 
 
+def _seed_graph(root: Path, graph: CodeGraph) -> None:
+    """Put a graph where both the freshness probe and the readers look.
+
+    Both artifacts, because they answer different halves of these tests: the
+    dead-code list comes from `code_graph.json`, and the staleness verdict from
+    `repo_map.json`'s `generated_head`.
+
+    This wrote them with `write_code_graph`, which also persisted a generation
+    into the Python `index.sqlite` store -- which is where the freshness probe
+    read `generated_head` from. Production had had no caller of that writer
+    since Lane M3, so on a real repository the probe found no generation,
+    returned `fresh: None`, and `dev map dead` exited 0 on an index built at
+    another commit. The gate below passed only because its fixture used a writer
+    production no longer had. The probe reads the map artifact now, so the
+    fixture writes the map artifact.
+    """
+    from tests.unit.graph_fixtures import write_graph_artifact
+
+    write_graph_artifact(root, graph)
+    map_path = root / ".devcouncil" / "repo_map.json"
+    map_path.parent.mkdir(parents=True, exist_ok=True)
+    map_path.write_text(
+        json.dumps({"generated_head": graph.generated_head, "files": []}),
+        encoding="utf-8",
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1. FTS prune must never delete by the UNINDEXED generation_id column.
 # ---------------------------------------------------------------------------
 
 
-def test_prune_avoids_unindexed_fts_delete_scan(tmp_path: Path) -> None:
-    store = CodeIntelStore(tmp_path)
-    for name in ("first", "second", "third"):
-        store.save_graph(_graph(name))
-
-    statements: list[str] = []
-    conn = sqlite3.connect(store.path)
-    try:
-        conn.row_factory = sqlite3.Row
-        conn.set_trace_callback(statements.append)
-        conn.execute("BEGIN IMMEDIATE")
-        CodeIntelStore._prune(conn, keep=1, current=3)
-        conn.commit()
-
-        bad = [
-            stmt
-            for stmt in statements
-            if "DELETE" in stmt.upper()
-            and "NODES_FTS" in stmt.upper()
-            and "GENERATION_ID" in stmt.upper()
-        ]
-        assert not bad, (
-            "prune still deletes FTS rows via the UNINDEXED generation_id "
-            f"column (full-scan + index churn): {bad}"
-        )
-
-        gens = {
-            int(row[0])
-            for row in conn.execute("SELECT DISTINCT generation_id FROM nodes_fts")
-        }
-        assert gens == {3}, f"FTS should hold only the kept generation, got {gens}"
-        committed = {
-            int(row[0]) for row in conn.execute("SELECT id FROM generations")
-        }
-        assert committed == {3}
-        match = conn.execute(
-            "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'third' AND generation_id=3"
-        ).fetchone()[0]
-        assert match >= 1, "FTS MATCH must still work after prune rebuild"
-    finally:
-        conn.close()
-
-
-def test_prune_with_no_stale_generations_is_a_noop(tmp_path: Path) -> None:
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph("only"))
-    statements: list[str] = []
-    conn = sqlite3.connect(store.path)
-    try:
-        conn.set_trace_callback(statements.append)
-        conn.execute("BEGIN IMMEDIATE")
-        CodeIntelStore._prune(conn, keep=2, current=1)
-        conn.commit()
-        assert not any("DROP TABLE" in stmt.upper() for stmt in statements)
-    finally:
-        conn.close()
-
-
-def test_search_survives_repeated_prune_rebuilds(tmp_path: Path) -> None:
-    store = CodeIntelStore(tmp_path)
-    for index in range(5):
-        store.save_graph(_graph(f"handler_{index}"))
-    hits = store.search("handler_4")
-    assert hits and hits[0]["name"] == "handler_4"
-    # Older-generation rows are gone from FTS but the retained previous
-    # generation is still searchable through load_graph.
-    assert store.load_graph(4) is not None
-
-
-def test_fk_child_columns_are_indexed(tmp_path: Path) -> None:
-    """Payload compaction deletes ~N parent rows per build; without child-side
-    indexes SQLite enforces each delete with a full membership-table scan
-    (quadratic — 533s of a 536s save at 50k nodes, hours at repo scale)."""
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph("one"))
-    with sqlite3.connect(store.path) as conn:
-        indexes = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='index'"
-            )
-        }
-    for required in (
-        "idx_generation_nodes_payload",
-        "idx_generation_edges_payload",
-        "idx_generation_dead_payload",
-        "idx_generation_analysis_payload",
-    ):
-        assert required in indexes, f"missing FK child index {required}"
-
-
 # ---------------------------------------------------------------------------
 # 2. A long write must be abortable.
 # ---------------------------------------------------------------------------
-
-
-def test_store_interrupt_writes_aborts_running_statement(tmp_path: Path) -> None:
-    import threading
-
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph("victim"))
-
-    started = threading.Event()
-    errors: list[BaseException] = []
-
-    def long_write() -> None:
-        try:
-            with store._connect() as conn:
-                started.set()
-                conn.execute(
-                    """WITH RECURSIVE spin(x) AS (
-                           SELECT 1 UNION ALL SELECT x + 1 FROM spin WHERE x < 300000000
-                       )
-                       INSERT INTO metadata(key, value)
-                       SELECT 'spin', COUNT(*) FROM spin"""
-                )
-        except BaseException as exc:  # noqa: BLE001 - captured for assertion
-            errors.append(exc)
-
-    thread = threading.Thread(target=long_write, daemon=True)
-    thread.start()
-    assert started.wait(5.0)
-    time.sleep(0.2)
-    for _ in range(50):
-        if store.interrupt_writes():
-            break
-        time.sleep(0.1)
-    thread.join(timeout=10.0)
-    assert not thread.is_alive(), "interrupt_writes must abort the running write statement"
-    assert errors and isinstance(errors[0], sqlite3.OperationalError)
 
 
 # ---------------------------------------------------------------------------
@@ -213,30 +112,36 @@ def test_store_interrupt_writes_aborts_running_statement(tmp_path: Path) -> None
 
 
 def test_index_freshness_reports_stale_and_fresh_heads(tmp_path: Path) -> None:
-    from devcouncil.codeintel.service import index_freshness
+    """The verdict comes from the artifact the kernel writes.
+
+    `codeintel.service.index_freshness` answered this from the Python store's
+    committed generation. Nothing had written one since the kernel took over, so
+    it returned "no committed index generation" on every repository and the
+    banner below could not fire. `devmap_health.map_freshness` is the surviving
+    owner of the question and reads `repo_map.json`.
+    """
+    from devcouncil.cli.commands.graph_cmd import _index_freshness_fields
 
     head = _init_repo_with_commit(tmp_path)
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph("one", head="0000000000000000000000000000000000000000"))
+    _seed_graph(tmp_path, _graph("one", head="0" * 40))
 
-    stale = index_freshness(tmp_path)
+    stale = _index_freshness_fields(tmp_path)
     assert stale["fresh"] is False
     assert stale["current_head"] == head
-    assert stale["index_head"] == "0000000000000000000000000000000000000000"
-    assert stale["generation"] == 1
+    assert stale["map_head"] == "0" * 40
+    assert isinstance(stale["age_seconds"], float)
 
-    store.save_graph(_graph("two", head=head))
-    fresh = index_freshness(tmp_path)
+    _seed_graph(tmp_path, _graph("two", head=head))
+    fresh = _index_freshness_fields(tmp_path)
     assert fresh["fresh"] is True
-    assert fresh["index_head"] == head
+    assert fresh["map_head"] == head
 
 
-def test_index_freshness_unknown_without_git(tmp_path: Path) -> None:
-    from devcouncil.codeintel.service import index_freshness
+def test_index_freshness_unknown_without_a_map(tmp_path: Path) -> None:
+    """No map is "cannot judge", never "fresh"."""
+    from devcouncil.cli.commands.graph_cmd import _index_freshness_fields
 
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph("one"))
-    result = index_freshness(tmp_path)
+    result = _index_freshness_fields(tmp_path)
     assert result["fresh"] is None
     assert result["reason"]
 
@@ -245,8 +150,7 @@ def test_graph_dead_fails_loud_on_stale_index(tmp_path: Path) -> None:
     from devcouncil.cli.commands.graph_cmd import app
 
     _init_repo_with_commit(tmp_path)
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph("one", head="0000000000000000000000000000000000000000"))
+    _seed_graph(tmp_path, _graph("one", head="0" * 40))
 
     runner = CliRunner()
     result = runner.invoke(app, ["dead", "--project-root", str(tmp_path)])
@@ -275,8 +179,7 @@ def test_graph_dead_exits_zero_when_index_matches_head(tmp_path: Path) -> None:
     from devcouncil.cli.commands.graph_cmd import app
 
     head = _init_repo_with_commit(tmp_path)
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph("one", head=head))
+    _seed_graph(tmp_path, _graph("one", head=head))
 
     runner = CliRunner()
     result = runner.invoke(app, ["dead", "--project-root", str(tmp_path)])

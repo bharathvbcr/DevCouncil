@@ -167,7 +167,8 @@ impl Cli {
             | Commands::Export { path, .. }
             | Commands::Routes { path, .. }
             | Commands::ShapeCheck { path, .. }
-            | Commands::ApiImpact { path, .. } => path,
+            | Commands::ApiImpact { path, .. }
+            | Commands::Paths { path } => path,
             _ => Path::new("."),
         }
     }
@@ -195,14 +196,22 @@ enum ProgressMode {
     Never,
 }
 
-/// One completed stage and the sub-phases that ran inside it.
+/// One completed span and the spans that ran inside it.
+///
+/// Recursive, because the breakdown is. A stage contains sub-phases, and a
+/// sub-phase contains the split its own implementation measured — the
+/// generation write reports what each relation cost, and only the store can,
+/// since the node and full-text inserts are one interleaved loop. Two levels
+/// were enough while `persist:write` was one number; a third would have needed
+/// a second, near-identical struct, and the rule below is the same at every
+/// depth.
 struct StageTiming {
     label: String,
     seconds: f64,
-    /// Sub-phases closed while this stage was open. Their durations are
-    /// *included* in `seconds`; they break the stage down, they do not add to
-    /// it. Summing both levels would double-count the build.
-    sub: Vec<(String, f64)>,
+    /// Spans closed while this one was open. Their durations are *included* in
+    /// `seconds`; they break it down, they do not add to it. Summing two levels
+    /// would double-count the build.
+    sub: Vec<StageTiming>,
 }
 
 /// The stage in flight: its label, when it began, and the sub-phases closed
@@ -211,7 +220,7 @@ struct StageTiming {
 /// Named rather than written inline because the tuple appears in a field, a
 /// borrow and two closures, and a reader meeting `(String, Instant, Vec<(String,
 /// f64)>)` in any of them has to reconstruct which position means what.
-type OpenStage = (String, Instant, Vec<(String, f64)>);
+type OpenStage = (String, Instant, Vec<StageTiming>);
 
 struct ProgressReporter {
     enabled: bool,
@@ -304,17 +313,69 @@ impl ProgressReporter {
         if self.enabled {
             eprintln!("      {label} (+{:.0}ms)", elapsed * 1000.0);
         }
-        match self.open.borrow_mut().as_mut() {
-            Some((_, _, sub)) => sub.push((label.to_string(), elapsed)),
-            // A sub-phase outside any stage would otherwise be dropped
-            // silently. Record it as a stage of its own rather than lose it.
-            None => self.timings.borrow_mut().push(StageTiming {
-                label: label.to_string(),
-                seconds: elapsed,
-                sub: Vec::new(),
-            }),
-        }
+        self.record(StageTiming {
+            label: label.to_string(),
+            seconds: elapsed,
+            sub: Vec::new(),
+        });
         outcome
+    }
+
+    /// Time one sub-phase whose implementation reports its own split.
+    ///
+    /// Some phases can only be broken down from the inside. `persist:write` is
+    /// the case that forced this: it is 0.30 s of a 1.10 s one-file incremental
+    /// build on this repository, the relations under it have nothing in common
+    /// as fixes, and the node and full-text writes are one interleaved loop
+    /// that nothing outside the store can separate. The store measures them and
+    /// hands the labelled spans back here.
+    ///
+    /// The parts nest inside the sub-phase and are already counted in its
+    /// `seconds`, exactly as sub-phases are counted in their stage's.
+    fn timed_split<T, E>(
+        &self,
+        label: &str,
+        work: impl FnOnce() -> std::result::Result<(T, Vec<(String, f64)>), E>,
+    ) -> std::result::Result<T, E> {
+        let started = Instant::now();
+        let outcome = work();
+        let elapsed = started.elapsed().as_secs_f64();
+        if self.enabled {
+            eprintln!("      {label} (+{:.0}ms)", elapsed * 1000.0);
+        }
+        // An error path reports the phase with no split rather than no phase:
+        // a write that failed halfway still took the time, and the parts it
+        // managed to charge are not a breakdown of what it did.
+        let parts = match &outcome {
+            Ok((_, parts)) => parts.clone(),
+            Err(_) => Vec::new(),
+        };
+        self.record(StageTiming {
+            label: label.to_string(),
+            seconds: elapsed,
+            sub: parts
+                .into_iter()
+                .map(|(label, seconds)| StageTiming {
+                    label,
+                    seconds,
+                    sub: Vec::new(),
+                })
+                .collect(),
+        });
+        outcome.map(|(value, _)| value)
+    }
+
+    /// File a closed span under the stage that was open when it ran.
+    ///
+    /// One owner for that decision, so `timed` and `timed_split` cannot come to
+    /// disagree about where a sub-phase lands. A span closed outside any stage
+    /// becomes a stage of its own rather than being dropped: silence there is
+    /// how a phase goes unattributed and its time is charged to nothing.
+    fn record(&self, timing: StageTiming) {
+        match self.open.borrow_mut().as_mut() {
+            Some((_, _, sub)) => sub.push(timing),
+            None => self.timings.borrow_mut().push(timing),
+        }
     }
 
     /// An untimed detail line under the current stage. Does not disturb the
@@ -352,19 +413,19 @@ impl ProgressReporter {
     /// time so far and `"open": true`, because omitting it would make the
     /// stages silently fail to account for the total.
     fn timings_json(&self) -> serde_json::Value {
-        let render = |label: &str, secs: f64, sub: &[(String, f64)], open: bool| {
+        fn render(label: &str, secs: f64, sub: &[StageTiming], open: bool) -> serde_json::Value {
             let mut entry = serde_json::json!({"stage": label, "seconds": secs});
             if !sub.is_empty() {
                 entry["sub"] = sub
                     .iter()
-                    .map(|(l, s)| serde_json::json!({"stage": l, "seconds": s}))
+                    .map(|t| render(&t.label, t.seconds, &t.sub, false))
                     .collect();
             }
             if open {
                 entry["open"] = serde_json::Value::Bool(true);
             }
             entry
-        };
+        }
         let mut stages: Vec<serde_json::Value> = self
             .timings
             .borrow()
@@ -504,6 +565,22 @@ enum Commands {
         /// stand in: it narrows the write, it does not widen the read.
         #[arg(long)]
         full: bool,
+        /// Re-derive the validity of every stored edge and unresolved call,
+        /// instead of comparing only the files whose freshly resolved rows
+        /// disagree with the digest schema 19 recorded beside the previous
+        /// generation.
+        ///
+        /// The cheap half of `--full`. `--full` re-parses every source, which
+        /// on a large repository is minutes; this keeps the incremental
+        /// extraction and widens only the comparison the *write* makes, which
+        /// is the ~200 ms the scoping saves. It is the recovery for a store
+        /// whose digests an operator distrusts, and it is what
+        /// `digest_scoped_delta.rs` compares the scoped path against.
+        ///
+        /// `--full` implies it: an empty affected set is the full-rewrite
+        /// signal, and a full rewrite never scopes.
+        #[arg(long)]
+        verify_rows: bool,
         /// Also write `repo_map.json` and `code_graph.json` from the generation
         /// this build leaves current, in this same process.
         ///
@@ -580,6 +657,18 @@ enum Commands {
         /// mistaken for a sparse graph.
         #[arg(long)]
         min_rung: Option<String>,
+        /// Also band the reached symbols by distance from the target.
+        ///
+        /// The flat edge list says *what* reaches the target; it cannot say how
+        /// far, because an edge does not carry the hop the walk found it at. A
+        /// consumer that needs "3 call it directly and 39 are reached through
+        /// those 3" gets it from the kernel here rather than inventing it.
+        ///
+        /// Refused together with `--min-rung`: the band walk filters on
+        /// confidence and has no rung, so honouring one would narrow the edges
+        /// and leave the bands wide.
+        #[arg(long)]
+        layers: bool,
     },
     /// Callers and callees for several targets in one invocation.
     ///
@@ -830,6 +919,20 @@ enum Commands {
         inventory: InventoryFlags,
     },
     Status,
+    /// Where this repository's state lives — the state directory, the store, the
+    /// artifacts, the workspace registry — resolved exactly as every other
+    /// command resolves them, and reported without opening anything.
+    ///
+    /// The Python seam's state-directory resolver asked `status` for `db_path`
+    /// once per process; `status` opens the store to count nodes, so that cost
+    /// 29 ms against a 168 MB store to answer a question the kernel settles
+    /// before it opens anything, and could not be answered at all for a store
+    /// `status` cannot open. Existence is reported, never inferred: a resolved
+    /// directory that is on disk is where the state actually is.
+    Paths {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Longitudinal view: how the map has moved across recent builds.
     History {
         #[arg(short, long, default_value_t = 10)]
@@ -1236,7 +1339,7 @@ fn write_guides_if_requested(
         stamped: StampedFreshness::default(),
     };
     let (_manifest, json_str) =
-        generate_manifest_with_edges(&extractions, &analysis, placeholder, &edges);
+        generate_manifest_with_edges(&extractions, &analysis, placeholder, &edges, Some(tree));
     let map: serde_json::Value = serde_json::from_str(&json_str)?;
 
     let relative = |absolute: &std::path::Path| -> String {
@@ -1298,6 +1401,32 @@ fn graph_value_for_read(store: &Store, db: &std::path::Path) -> anyhow::Result<s
         &freshness,
         repo_root.as_deref(),
     )
+}
+
+/// The graph the read-only surfaces answer from: the artifact's `nodes` and
+/// `edges` from the latest generation, and none of its panels — no `git log`,
+/// no intel, no dead-code list, no freshness. `build_graph_core_value` says
+/// what building the whole artifact cost these commands.
+fn graph_core_for_read(store: &Store) -> anyhow::Result<serde_json::Value> {
+    store
+        .latest_generation_id()?
+        .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
+    let extractions = store.latest_extractions()?;
+    let analysis = store
+        .latest_analysis()?
+        .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
+    let edges = store
+        .latest_edges(0.0)?
+        .into_iter()
+        .map(resolved_edge_from_stored)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let repo_root = store.latest_repo_root()?;
+    Ok(devmap_query::build_graph_core_value(
+        &extractions,
+        &analysis,
+        &edges,
+        repo_root.as_deref(),
+    ))
 }
 
 fn write_consumer_artifacts(
@@ -1393,6 +1522,16 @@ fn write_consumer_artifacts(
         stamped.content_fingerprint.clone().into(),
     );
     inputs.insert("code_graph_schema".into(), CODE_GRAPH_SCHEMA_VERSION.into());
+    // The one input that moves with the clock rather than the tree: churn is
+    // `git log --since=90.days`, relative to now, so the same repository on a
+    // later day is a different window. Without this the artifacts of a quiet
+    // repository matched every input for months while their hotspot counts
+    // silently shrank. Day granularity: one regeneration per calendar day at
+    // most, and only on a run that would otherwise have skipped.
+    inputs.insert(
+        "churn_window_day".into(),
+        devmap_query::inventory::churn_window_day().into(),
+    );
     inputs.insert(
         "compact".into(),
         match &compact_dest {
@@ -1446,8 +1585,13 @@ fn write_consumer_artifacts(
         pending_count: status.pending_count,
         stamped,
     };
-    let (_manifest, json_str) =
-        generate_manifest_with_edges(&extractions, &analysis, freshness.clone(), &edges);
+    let (_manifest, json_str) = generate_manifest_with_edges(
+        &extractions,
+        &analysis,
+        freshness.clone(),
+        &edges,
+        Some(tree.as_path()),
+    );
     let (graph_json, compact_graph_json) = generate_code_graph_encodings(
         &extractions,
         &analysis,
@@ -2588,6 +2732,30 @@ fn affected_closure(
 // holds over the socket also holds over argv without a second spelling.
 use devmap_query::{MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH};
 
+/// The path a root-taking subcommand names must be a directory that exists.
+///
+/// Measured through the release binary: `manifest <missing path>` created
+/// `<missing path>/.devmap/` and wrote the artifacts of the store's *other*
+/// repository into it; `routes`, `shape-check` and `api-impact` answered from
+/// the store's recorded root and never said the path they were given does not
+/// exist; `build <file>` walked the file as an empty tree. A path the caller
+/// named and this binary could not examine is not a repository root, and
+/// answering — or writing — as if it were is the check that could not run
+/// reporting as one that ran. Only [`Cli::root_hint`]'s subcommands carry a
+/// root, and the default `.` always exists, so only a path the caller actually
+/// spelled can fail here.
+fn validate_root(cli: &Cli) -> Result<(), String> {
+    let root = cli.root_hint();
+    match std::fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(format!(
+            "{}: not a directory; the path a subcommand names must be a repository root",
+            root.display()
+        )),
+        Err(error) => Err(format!("{}: {error}", root.display())),
+    }
+}
+
 /// Reject a numeric argument the engine cannot honour, before it reaches the
 /// engine.
 ///
@@ -2671,9 +2839,26 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
             budget,
             depth,
             min_rung,
+            layers,
             ..
+        } => {
+            check_rung(min_rung)?;
+            check_budget(*budget)?;
+            // Refused rather than half-applied. The band walk filters on
+            // confidence and knows nothing of rungs, so a request for both
+            // would return edges cut to the floor beside bands that were not —
+            // one answer whose two halves disagree about the question.
+            if *layers && min_rung.is_some() {
+                return Err(
+                    "--layers cannot be combined with --min-rung: the distance bands are \
+                     walked without a rung floor, so the two halves of the answer would \
+                     describe different graphs"
+                        .to_string(),
+                );
+            }
+            check_depth(*depth)
         }
-        | Commands::Trace {
+        Commands::Trace {
             budget,
             depth,
             min_rung,
@@ -2747,6 +2932,7 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         // No numeric query arguments reach the engine from these.
         Commands::Build { .. }
         | Commands::Status
+        | Commands::Paths { .. }
         | Commands::Manifest { .. }
         | Commands::MapHtml { .. }
         | Commands::Freshness { .. }
@@ -2792,23 +2978,13 @@ impl Commands {
 /// leaves the store consistent — `test_process_recovery` and the crash gate
 /// are the evidence). Only one-shot commands: see [`Commands::serves`].
 ///
-/// Declared here rather than through the `libc` crate because that crate is
-/// not a direct dependency of this workspace; `signal(2)` has had this
-/// signature on every Unix this kernel builds for, and `SIGPIPE` is 13 on all
-/// of them. Swap for `libc::signal(libc::SIGPIPE, libc::SIG_DFL)` if `libc`
-/// is ever added.
 #[cfg(unix)]
 fn restore_default_sigpipe() {
-    const SIGPIPE: std::ffi::c_int = 13;
-    const SIG_DFL: usize = 0;
-    extern "C" {
-        fn signal(signum: std::ffi::c_int, handler: usize) -> usize;
-    }
     // SAFETY: `signal(2)` with `SIG_DFL` installs the default action for a
     // signal this process is not otherwise handling; it is called once, on
     // the main thread, before any other thread exists.
     unsafe {
-        signal(SIGPIPE, SIG_DFL);
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 
@@ -2832,7 +3008,7 @@ async fn main() -> std::process::ExitCode {
     if !cli.command.serves() {
         restore_default_sigpipe();
     }
-    let outcome = match validate_limits(&cli.command) {
+    let outcome = match validate_limits(&cli.command).and_then(|()| validate_root(&cli)) {
         Ok(()) => run(&cli).await,
         Err(message) => Err(anyhow::anyhow!(message)),
     };
@@ -2864,6 +3040,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             affected: affected_flag,
             deleted,
             full,
+            verify_rows,
             manifest: write_manifest,
             output,
             graph_output,
@@ -3265,6 +3442,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     .map(|root| root.to_string_lossy().into_owned()),
                 build_started: Some(build_started),
                 discovery_refusals: Some(refusal_inventory),
+                verify_every_row: *verify_rows,
             };
             let head_sha = current_git_head(path).unwrap_or_else(|_| "unavailable".to_string());
             progress.stage(
@@ -3289,14 +3467,24 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // An earlier version of this comment called persistence "the
             // largest phase of a build" — that was read off the shifted
             // attribution and was never true.
-            let gen_id = progress.timed("persist:write", || {
-                store.save_generation_with_metadata(
-                    &extractions,
-                    &resolution,
-                    &analysis,
-                    opts,
-                    &head_sha,
-                )
+            // Split by relation, because the phase as one number cannot be
+            // acted on: v18 put the edges and the unresolved ledger on validity
+            // ranges and left the nodes, the full-text map, the file rows, the
+            // dead symbols and the coverage gaps as full per-generation copies,
+            // and those have nothing in common as fixes. The store measures the
+            // split — the node and full-text inserts are one interleaved loop,
+            // so nothing out here can separate them.
+            let gen_id = progress.timed_split("persist:write", || {
+                store
+                    .save_generation_timed(&extractions, &resolution, &analysis, opts, &head_sha)
+                    .map(|(gen_id, spent)| {
+                        let parts = spent
+                            .parts()
+                            .into_iter()
+                            .map(|(label, seconds)| (label.to_string(), seconds))
+                            .collect();
+                        (gen_id, parts)
+                    })
             })?;
 
             // Every generation carries a full carry-forward copy of the
@@ -3498,24 +3686,39 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             budget,
             depth,
             min_rung,
+            layers,
         } => {
             let store = open_for_read(&cli.db())?;
             let engine = StoreQueryEngine::new(&store);
-            let resp = engine.impact_at_rung(
-                Request {
-                    query: target.clone(),
-                    token_budget: *budget,
-                    min_confidence: 0.0,
-                    max_depth: *depth,
-                },
-                // Already validated above, so `None` here means "none was
-                // asked for", never "one was asked for and did not parse".
-                min_rung.as_deref().and_then(devmap_query::Rung::parse),
-            )?;
-            if cli.json {
-                emit_json(cli, &serde_json::to_value(&resp)?)?;
+            let req = Request {
+                query: target.clone(),
+                token_budget: *budget,
+                min_confidence: 0.0,
+                max_depth: *depth,
+            };
+            if *layers {
+                // `--min-rung` with `--layers` was refused in validation, so
+                // dropping the floor here cannot silently widen an answer a
+                // caller asked to narrow.
+                let resp = engine.impact_layered(req)?;
+                if cli.json {
+                    emit_json(cli, &serde_json::to_value(&resp)?)?;
+                } else {
+                    emit_edges(&resp.edges);
+                    emit_blast_radius(&resp.blast_radius);
+                }
             } else {
-                emit_edges(&resp);
+                let resp = engine.impact_at_rung(
+                    req,
+                    // Already validated above, so `None` here means "none was
+                    // asked for", never "one was asked for and did not parse".
+                    min_rung.as_deref().and_then(devmap_query::Rung::parse),
+                )?;
+                if cli.json {
+                    emit_json(cli, &serde_json::to_value(&resp)?)?;
+                } else {
+                    emit_edges(&resp);
+                }
             }
         }
         Commands::Neighbors {
@@ -3638,10 +3841,23 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Workspace { action } => {
-            // Rooted at the store's repository, so `devmap --db X workspace` and
-            // `dev map workspace` agree on where the registry lives.
-            let root = devmap_extract::paths::repo_root_from_store(cli.db())
-                .unwrap_or_else(|| PathBuf::from("."));
+            // Rooted at the store's repository when `--db` names a store in its
+            // standard place, so `devmap --db X workspace` and `dev map workspace`
+            // agree on where the registry lives. A store anywhere else — a
+            // `$DEVMAP_HOME` layout, a scratch path — names no repository, and
+            // the registry belongs to the repository this command ran in. The
+            // inverse used to answer the grandparent of *any* path, and an
+            // off-layout `--db` put the registry two directories above the
+            // store, in a directory that was nobody's repository.
+            let root = match &cli.db {
+                Some(explicit) => devmap_extract::paths::repo_root_from_store(explicit)
+                    .unwrap_or_else(|| cli.root_hint().to_path_buf()),
+                None => cli.root_hint().to_path_buf(),
+            };
+            // Absolute in the answer: the registry records absolute roots, and
+            // a `registry` of `./.devmap/workspace.json` tells a caller in
+            // another directory nothing.
+            let root = root.canonicalize().unwrap_or(root);
             // Mutating actions go through `Workspace::update`, which holds an
             // advisory lock across the read and the write. Loading here and
             // saving later — which is what this did — let two concurrent
@@ -3655,10 +3871,11 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     let label = name
                         .clone()
                         .unwrap_or_else(|| devmap_query::workspace::name_for(&canonical));
-                    let (_, written) =
+                    let (added, written) =
                         devmap_query::workspace::Workspace::update(&root, |workspace| {
-                            workspace.add(label.clone(), canonical.clone());
+                            workspace.add(label.clone(), canonical.clone())
                         })?;
+                    let replaced = added?;
                     if cli.json {
                         emit_json(
                             cli,
@@ -3666,11 +3883,13 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                                 "added": label,
                                 "root": canonical,
                                 "registry": written,
+                                "replaced": replaced,
                             }),
                         )?;
                     } else {
                         println!(
-                            "added {label} -> {} ({})",
+                            "{} {label} -> {} ({})",
+                            if replaced { "replaced" } else { "added" },
                             canonical.display(),
                             written.display()
                         );
@@ -4099,6 +4318,44 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 }),
             )?;
         }
+        Commands::Paths { path } => {
+            // Absolute, so a caller in another directory can use every field
+            // as given; `validate_root` has already checked the directory exists.
+            let root = path.canonicalize()?;
+            let state_dir = devmap_extract::paths::state_dir(&root);
+            let db_path = cli.db();
+            let db_path = if db_path.is_absolute() {
+                db_path
+            } else {
+                root.join(db_path)
+            };
+            let payload = serde_json::json!({
+                "root": root,
+                "state_dir": state_dir,
+                "state_dir_exists": state_dir.is_dir(),
+                "db_path": db_path,
+                "store_exists": db_path.is_file(),
+                "repo_map": devmap_extract::paths::repo_map_path(&root),
+                "code_graph": devmap_extract::paths::code_graph_path(&root),
+                "workspace": devmap_extract::paths::workspace_path(&root),
+                "plugin_dir": devmap_extract::paths::plugin_dir(&root),
+            });
+            if cli.json {
+                emit_json(cli, &payload)?;
+            } else {
+                for key in [
+                    "root",
+                    "state_dir",
+                    "db_path",
+                    "repo_map",
+                    "code_graph",
+                    "workspace",
+                    "plugin_dir",
+                ] {
+                    println!("{key:<12} {}", payload[key].as_str().unwrap_or(""));
+                }
+            }
+        }
         Commands::Status => {
             // Answers even with no store, but never creates one. The client
             // treats a missing store as "not built yet"; creating it here made
@@ -4154,11 +4411,26 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "edge_count": 0,
                     "is_fresh": false,
                     "db_path": cli.db().display().to_string(),
-                    "degraded_reason": format!(
-                        "store schema is {version}, this binary speaks {}; \
-                         run `devmap build` to migrate it",
-                        devmap_store::CURRENT_SCHEMA_VERSION
-                    ),
+                    // `user_version = 2` is the Python engine's `index.sqlite`, a
+                    // schema this kernel has no migration for. `devmap build`
+                    // against it already refuses by name (the store's own
+                    // message); telling `status` readers to run it is advice
+                    // that cannot work, for a file the other command names.
+                    "degraded_reason": if version == devmap_store::PYTHON_INDEX_SCHEMA_VERSION {
+                        format!(
+                            "store schema is {version}: this is the Python engine's database \
+                             (`.devcouncil/codeintel/index.sqlite`), not a devmap store, and \
+                             this kernel cannot convert it — point `--db` at `devmap.sqlite` \
+                             (this binary speaks {})",
+                            devmap_store::CURRENT_SCHEMA_VERSION
+                        )
+                    } else {
+                        format!(
+                            "store schema is {version}, this binary speaks {}; \
+                             run `devmap build` to migrate it",
+                            devmap_store::CURRENT_SCHEMA_VERSION
+                        )
+                    },
                     "quarantined_count": 0,
                     "quarantined_paths": Vec::<String>::new(),
                     // Same reason as the no-store case: this binary refused to
@@ -4587,7 +4859,7 @@ empty graph, which would read as 'this file has no control flow'.",
         }
         Commands::Cypher { query, limit } => {
             let store = open_for_read(&cli.db())?;
-            let graph = graph_value_for_read(&store, &cli.db())?;
+            let graph = graph_core_for_read(&store)?;
             let result = devmap_query::cypher::run(&graph, query, *limit);
             if cli.json {
                 emit_json(cli, &result)?;
@@ -4724,7 +4996,7 @@ represent them",
             max_file_bytes,
         } => {
             let store = open_for_read(&cli.db())?;
-            let graph = graph_value_for_read(&store, &cli.db())?;
+            let graph = graph_core_for_read(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
             let mut mapped = devmap_query::api_routes::route_map(&root, &graph, &budget);
@@ -4744,7 +5016,7 @@ represent them",
             max_file_bytes,
         } => {
             let store = open_for_read(&cli.db())?;
-            let graph = graph_value_for_read(&store, &cli.db())?;
+            let graph = graph_core_for_read(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
             let checked =
@@ -4762,7 +5034,7 @@ represent them",
             max_file_bytes,
         } => {
             let store = open_for_read(&cli.db())?;
-            let graph = graph_value_for_read(&store, &cli.db())?;
+            let graph = graph_core_for_read(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
             let impact = devmap_query::api_routes::api_impact(&root, &graph, &budget, route);

@@ -335,7 +335,8 @@ fn an_unmeasured_population_reports_no_histogram_and_an_empty_one_reports_zero()
     );
     assert!(
         unmeasured.rungs.is_none(),
-        "an answer that never walked must not publish a distribution of zero,          which reads as `I looked and found none`: got {:?}",
+        "an answer that never walked must not publish a distribution of zero, \
+         which reads as `I looked and found none`: got {:?}",
         unmeasured.rungs
     );
 }

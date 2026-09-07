@@ -1162,6 +1162,11 @@ impl Daemon {
                 // complete inventory for the tree, so the drain has measured
                 // discovery even when it did not re-walk it.
                 discovery_refusals: Some(refusals),
+                // The daemon is the most frequent writer there is, and the
+                // scoping exists for exactly its shape: an edit batch that
+                // changes a handful of files. A full rebuild takes the
+                // unscoped path anyway, off the empty affected set above.
+                verify_every_row: false,
             },
             &head_sha,
         )?;

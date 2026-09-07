@@ -548,6 +548,7 @@ fn savings_counts_files_it_could_not_read_rather_than_calling_them_empty() {
                 build_started: None,
                 repo_root: Some(dir.to_string_lossy().into_owned()),
                 discovery_refusals: None,
+                verify_every_row: false,
             },
         )
         .unwrap();
@@ -600,6 +601,7 @@ fn savings_reports_the_query_side_without_assuming_a_saving() {
                 build_started: None,
                 repo_root: Some(dir.to_string_lossy().into_owned()),
                 discovery_refusals: None,
+                verify_every_row: false,
             },
         )
         .unwrap();

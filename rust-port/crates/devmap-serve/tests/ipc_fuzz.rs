@@ -882,13 +882,64 @@ async fn a_neighbors_list_is_bounded_entry_by_entry_over_the_wire() {
     );
 }
 
+/// A zero budget or depth is refused on the socket exactly as on the CLI.
+///
+/// Read back from the release binary: `search` with `budget: 0` answered
+/// `ok: true, shown: 0, hidden: 26` over the socket while `devmap search
+/// --budget 0` is refused ("a zero token budget returns an empty result that
+/// cannot be told apart from a complete one"); `depth: 0` walked nothing and
+/// answered an empty radius. The sweep above used to include both zeros and
+/// asserted they were *served*; they are refusals, and the reason names the
+/// parameter.
+#[tokio::test]
+async fn a_zero_budget_or_depth_is_refused_on_the_socket_as_on_the_cli() {
+    let store = corpus();
+    let cases: [(&str, &[u8], &str); 4] = [
+        (
+            "search budget 0",
+            br#"{"version":1,"cmd":"search","query":"helper","budget":0}"#,
+            "budget",
+        ),
+        (
+            "impact depth 0",
+            br#"{"version":1,"cmd":"impact","target":"core.py::helper","depth":0}"#,
+            "depth",
+        ),
+        (
+            "neighbors depth 0",
+            br#"{"version":1,"cmd":"neighbors","targets":["core.py::helper"],"depth":0}"#,
+            "depth",
+        ),
+        (
+            "trace budget 0",
+            br#"{"version":1,"cmd":"trace","from":"caller.py::main","to":"core.py::helper","budget":0}"#,
+            "budget",
+        ),
+    ];
+    for (label, frame, parameter) in cases {
+        let value = parse_envelope(label, &exchange(Arc::clone(&store), frame).await);
+        assert_eq!(value["ok"], Value::Bool(false), "{label}: {value}");
+        assert_eq!(
+            value["error"]["code"], "invalid_parameters",
+            "{label}: a zero is a parameter refusal, not a request-shape one: {value}"
+        );
+        let message = value["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains(parameter) && message.contains("at least 1"),
+            "{label}: the refusal must name the parameter and its floor: {message:?}"
+        );
+    }
+}
+
 /// Every `neighbors` response the daemon will serve satisfies the invariants
 /// `DevMapClient._budgeted` enforces on both directions of every entry.
 ///
 /// The client raises on a violation, so a break here is a production error and
-/// not a cosmetic one. Swept over hostile target shapes, both bounds of the
-/// budget, and depths on either side of the traversal clamp, with the coverage
-/// accounted for.
+/// not a cosmetic one. Swept over hostile target shapes, the budget's floor and
+/// ceiling, and depths on either side of the traversal clamp, with the coverage
+/// accounted for. Zero is not in either list: a zero budget or depth is refused
+/// before dispatch, on the socket as on the CLI — pinned in
+/// `a_zero_budget_or_depth_is_refused_on_the_socket_as_on_the_cli` below.
 #[tokio::test]
 async fn every_served_neighbors_response_survives_the_client_s_invariants() {
     let store = corpus();
@@ -904,8 +955,8 @@ async fn every_served_neighbors_response_survives_the_client_s_invariants() {
         "nope.py",
         "\u{1F600}.py",
     ];
-    let budgets = [0u32, 1, 25, 2000, MAX_TOKEN_BUDGET];
-    let depths = [0usize, 1, MAX_TRAVERSAL_DEPTH];
+    let budgets = [1u32, 25, 2000, MAX_TOKEN_BUDGET];
+    let depths = [1usize, MAX_TRAVERSAL_DEPTH];
 
     let mut checked = 0usize;
     let mut refused = 0usize;

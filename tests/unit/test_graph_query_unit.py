@@ -4,16 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from devcouncil.indexing.graph.query import (
     _match_nodes,
     explain_pdg_taint,
     query_pdg_controls,
     query_pdg_flows,
-    query_symbol,
     symbol_has_non_test_inbound,
-    trace_path,
 )
 from devcouncil.indexing.graph.schema import CodeGraph, GraphEdge, GraphNode, NodeKind
 
@@ -33,26 +31,6 @@ def _graph() -> CodeGraph:
         GraphEdge(source="tests/t.py::test_foo", target="pkg/a.py::foo", kind="calls"),
     ]
     return CodeGraph(nodes=nodes, edges=edges)
-
-
-def test_query_symbol_missing_graph(tmp_path: Path):
-    result = query_symbol(tmp_path, "foo", graph=None)
-    assert "error" in result
-    assert result["query"] == "foo"
-
-
-def test_query_symbol_no_matches(tmp_path: Path):
-    result = query_symbol(tmp_path, "missing", graph=_graph())
-    assert result["matches"] == []
-    assert result["definitions"] == []
-
-
-def test_query_symbol_match_by_suffix_and_edges(tmp_path: Path):
-    result = query_symbol(tmp_path, "foo", graph=_graph())
-    assert result["matches"] >= 1
-    defs = result["definitions"]
-    assert defs
-    assert "pkg/b.py::bar" in defs[0]["callers"]
 
 
 def test_match_nodes_path_and_id_suffix():
@@ -79,69 +57,84 @@ def test_symbol_has_non_test_inbound_ignores_test_only(tmp_path: Path):
     assert symbol_has_non_test_inbound(tmp_path, "pkg/a.py", "foo", graph=g) is False
 
 
-def test_trace_path_missing_graph_and_endpoints(tmp_path: Path):
-    assert "error" in trace_path(tmp_path, "a", "b", graph=None)
-    missing = trace_path(tmp_path, "zzz", "yyy", graph=_graph())
-    assert missing["found"] is False
-    assert missing["reason"] == "endpoint not found"
-
-
-def test_trace_path_found_and_not_found(tmp_path: Path):
-    found = trace_path(tmp_path, "pkg/b.py", "pkg/a.py", graph=_graph())
-    assert found["found"] is True
-    assert found["path"]
-    orphan = CodeGraph(
-        nodes=[
-            GraphNode(id="alpha", kind=NodeKind.FILE, path="alpha.py", name="alpha"),
-            GraphNode(id="beta", kind=NodeKind.FILE, path="beta.py", name="beta"),
-        ],
-        edges=[],
-    )
-    assert trace_path(tmp_path, "alpha", "beta", graph=orphan, max_depth=0)["found"] is False
-
-
 def test_explain_pdg_taint_no_graph(tmp_path: Path):
     result = explain_pdg_taint(tmp_path, graph=None)
     assert result["ok"] is False
 
 
-def test_explain_pdg_taint_from_meta_and_filters(tmp_path: Path):
-    g = CodeGraph(
-        nodes=[],
-        edges=[],
-        meta={
-            "pdg": {
-                "taint_findings": [
-                    {
-                        "path": "a.py",
-                        "function": "f",
-                        "category": "sql",
-                        "source_line": 1,
-                        "sink_line": 2,
-                        "variable": "q",
-                        "source_expr": "input",
-                        "sink_expr": "execute",
-                    },
-                    {
-                        "path": "b.py",
-                        "function": "g",
-                        "category": "cmd",
-                        "source_line": 1,
-                        "sink_line": 2,
-                        "variable": "c",
-                        "source_expr": "argv",
-                        "sink_expr": "system",
-                    },
-                ]
-            }
-        },
+def _sidecar(tmp_path: Path, findings) -> None:
+    """Build the PDG sidecar the query surfaces now read.
+
+    The layer used to arrive as ``graph.meta["pdg"]``, so these tests handed
+    `explain_pdg_taint` a `CodeGraph` with a hand-written meta blob. The layer
+    lives in `.devcouncil/graph/pdg.json` now, written by `dev map --pdg` /
+    `dev map pdg build`, so the fixture writes that file instead. Going through
+    `write_pdg_layer` rather than hand-rolling JSON keeps the fixture honest
+    about the on-disk shape.
+    """
+    from devcouncil.indexing.graph.build import write_pdg_layer
+    from devcouncil.indexing.graph.pdg.schema import FilePDG, FunctionPDG, PDGLayer
+
+    layer = PDGLayer()
+    for finding in findings:
+        file_pdg = layer.files.setdefault(
+            finding.path, FilePDG(path=finding.path, language="python", functions=[])
+        )
+        file_pdg.functions.append(
+            FunctionPDG(
+                path=finding.path,
+                qualname=finding.function,
+                start_line=finding.source_line,
+                end_line=finding.sink_line,
+                taint=[finding],
+            )
+        )
+    write_pdg_layer(tmp_path, layer)
+
+
+def test_explain_pdg_taint_from_the_sidecar_and_filters(tmp_path: Path):
+    from devcouncil.indexing.graph.pdg.schema import TaintFinding
+
+    _sidecar(
+        tmp_path,
+        [
+            TaintFinding(
+                path="a.py", function="f", category="sql", source_line=1, sink_line=2,
+                variable="q", source_expr="input", sink_expr="execute",
+            ),
+            TaintFinding(
+                path="b.py", function="g", category="cmd", source_line=1, sink_line=2,
+                variable="c", source_expr="argv", sink_expr="system",
+            ),
+        ],
     )
-    with patch("devcouncil.indexing.graph.build.load_pdg_layer", return_value=None):
-        all_findings = explain_pdg_taint(tmp_path, graph=g)
-        assert all_findings["ok"] is True
-        assert all_findings["count"] == 2
-        filtered = explain_pdg_taint(tmp_path, graph=g, path="a.py", category="sql")
-        assert filtered["count"] == 1
+    all_findings = explain_pdg_taint(tmp_path)
+    assert all_findings["ok"] is True
+    assert all_findings["count"] == 2
+    filtered = explain_pdg_taint(tmp_path, path="a.py", category="sql")
+    assert filtered["count"] == 1
+
+
+def test_explain_pdg_taint_is_complete_not_the_first_five_hundred(tmp_path: Path):
+    """The answer to "what reaches a sink" must not be a silently capped sample.
+
+    The findings used to come from ``graph.meta["pdg"]``, and ``PDGLayer.to_meta``
+    trims ``taint_findings`` to ``findings[:500]`` while ``stats.taint_count``
+    keeps the true total — so a repository with more than 500 findings had the
+    first 500 published as the whole answer, with nothing in the payload saying
+    so. The sidecar carries every function's findings.
+    """
+    from devcouncil.indexing.graph.pdg.schema import TaintFinding
+
+    findings = [
+        TaintFinding(
+            path=f"m{i:04d}.py", function=f"f{i}", category="sql", source_line=1,
+            sink_line=2, variable="q", source_expr="input", sink_expr="execute",
+        )
+        for i in range(600)
+    ]
+    _sidecar(tmp_path, findings)
+    assert explain_pdg_taint(tmp_path)["count"] == 600
 
 
 def test_query_pdg_controls_and_flows_no_graph(tmp_path: Path):
@@ -150,7 +143,6 @@ def test_query_pdg_controls_and_flows_no_graph(tmp_path: Path):
 
 
 def test_query_pdg_controls_and_flows_with_mock_functions(tmp_path: Path):
-    g = _graph()
     cdg_edge = SimpleNamespace(to_dict=lambda: {"kind": "cdg"})
     rd_edge = SimpleNamespace(variable="x", to_dict=lambda: {"variable": "x"})
     fn = SimpleNamespace(
@@ -159,78 +151,50 @@ def test_query_pdg_controls_and_flows_with_mock_functions(tmp_path: Path):
         cdg=[cdg_edge],
         reaching_def=[rd_edge, SimpleNamespace(variable="y", to_dict=lambda: {"variable": "y"})],
     )
-    with patch("devcouncil.indexing.graph.query._match_pdg_functions", return_value=[fn]):
-        controls = query_pdg_controls(tmp_path, "foo", graph=g)
-        assert controls["ok"] is True
-        assert controls["functions"][0]["cdg"] == [{"kind": "cdg"}]
-        flows = query_pdg_flows(tmp_path, "foo", variable="x", graph=g)
-        assert flows["ok"] is True
-        assert len(flows["functions"][0]["reaching_def"]) == 1
+    # The layer is what these read now, not a `CodeGraph`: `_pdg_layer` stands in
+    # for the sidecar so the rendering assertions stay on `_match_pdg_functions`.
+    layer = SimpleNamespace(files={"pkg/a.py": SimpleNamespace(functions=[fn])})
+    with patch("devcouncil.indexing.graph.query._pdg_layer", return_value=layer):
+        with patch("devcouncil.indexing.graph.query._match_pdg_functions", return_value=[fn]):
+            controls = query_pdg_controls(tmp_path, "foo")
+            assert controls["ok"] is True
+            assert controls["functions"][0]["cdg"] == [{"kind": "cdg"}]
+            flows = query_pdg_flows(tmp_path, "foo", variable="x")
+            assert flows["ok"] is True
+            assert len(flows["functions"][0]["reaching_def"]) == 1
 
-    with patch("devcouncil.indexing.graph.query._match_pdg_functions", return_value=[]):
-        assert query_pdg_controls(tmp_path, "missing", graph=g)["ok"] is False
-        assert query_pdg_flows(tmp_path, "missing", graph=g)["ok"] is False
+        with patch("devcouncil.indexing.graph.query._match_pdg_functions", return_value=[]):
+            assert query_pdg_controls(tmp_path, "missing")["ok"] is False
+            assert query_pdg_flows(tmp_path, "missing")["ok"] is False
 
 
-def test_load_file_pdg_and_match_functions(tmp_path: Path):
-    from devcouncil.indexing.graph.pdg.schema import FilePDG, FunctionPDG
-    from devcouncil.indexing.graph.query import _load_file_pdg_from_store, _match_pdg_functions
+def test_match_pdg_functions_resolves_a_path_or_a_bare_name(tmp_path: Path):
+    """Matching is the layer's own job now, with no graph involved.
 
-    assert _load_file_pdg_from_store(tmp_path, "a.py") is None
+    This used to load one file's PDG out of the Python store's analysis shards
+    (`_load_file_pdg_from_store`, gone) and resolve a bare name to files by
+    scanning `graph.nodes` — a whole-graph read to answer a question the layer's
+    own `qualname`s answer, since a function with no PDG entry cannot be in the
+    result either way.
+    """
+    from devcouncil.indexing.graph.build import read_pdg_layer_file, write_pdg_layer
+    from devcouncil.indexing.graph.pdg.schema import FilePDG, FunctionPDG, PDGLayer
+    from devcouncil.indexing.graph.query import _match_pdg_functions
 
-    file_pdg = FilePDG(
+    assert read_pdg_layer_file(tmp_path) is None, "no sidecar is None, not an empty layer"
+
+    layer = PDGLayer()
+    layer.files["pkg/a.py"] = FilePDG(
         path="pkg/a.py",
         language="python",
         functions=[
             FunctionPDG(path="pkg/a.py", qualname="pkg.a.foo", start_line=1, end_line=5)
         ],
     )
-    store = MagicMock()
-    store.analysis_shards.return_value = {"pkg/a.py": {"pdg": file_pdg.to_dict()}}
-    service = MagicMock(store=store)
-    with patch("devcouncil.codeintel.get_codeintel_service", return_value=service):
-        loaded = _load_file_pdg_from_store(tmp_path, "pkg/a.py")
-        assert loaded is not None
-        hits = _match_pdg_functions(tmp_path, _graph(), "pkg/a.py")
-        assert hits
-        hits2 = _match_pdg_functions(tmp_path, _graph(), "foo")
-        assert hits2
+    write_pdg_layer(tmp_path, layer)
 
-
-def _wide_graph(match_count: int = 25, caller_count: int = 60) -> CodeGraph:
-    nodes = [
-        GraphNode(id=f"pkg/a.py::foo_{i}", kind=NodeKind.FUNCTION, path="pkg/a.py", name=f"foo_{i}")
-        for i in range(match_count)
-    ]
-    edges = []
-    for i in range(caller_count):
-        nodes.append(
-            GraphNode(
-                id=f"pkg/c{i}.py::caller_{i}",
-                kind=NodeKind.FUNCTION,
-                path=f"pkg/c{i}.py",
-                name=f"caller_{i}",
-            )
-        )
-        edges.append(
-            GraphEdge(source=f"pkg/c{i}.py::caller_{i}", target="pkg/a.py::foo_0", kind="calls")
-        )
-    return CodeGraph(nodes=nodes, edges=edges)
-
-
-def test_query_symbol_reports_definition_totals_beside_the_cap(tmp_path: Path):
-    result = query_symbol(tmp_path, "foo_", graph=_wide_graph())
-    assert len(result["definitions"]) == 20
-    assert result["definitions_shown"] == 20
-    assert result["definitions_total"] == 25
-    assert result["definitions_truncated"] is True
-
-
-def test_query_symbol_reports_edge_totals_beside_the_cap(tmp_path: Path):
-    result = query_symbol(tmp_path, "foo_", graph=_wide_graph())
-    definition = next(d for d in result["definitions"] if d["id"] == "pkg/a.py::foo_0")
-    assert len(definition["callers"]) == 50
-    assert definition["callers_total"] == 60
-    assert definition["callers_truncated"] is True
-    assert definition["callees_total"] == 0
-    assert definition["callees_truncated"] is False
+    round_tripped = read_pdg_layer_file(tmp_path)
+    assert round_tripped is not None
+    assert _match_pdg_functions(round_tripped, "pkg/a.py"), "a path must match"
+    assert _match_pdg_functions(round_tripped, "foo"), "a bare name must match"
+    assert not _match_pdg_functions(round_tripped, "pkg/absent.py")

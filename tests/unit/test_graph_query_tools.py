@@ -10,7 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 from devcouncil.cli.commands.graph_cmd import app as graph_app
-from devcouncil.indexing.graph.build import write_code_graph
+from tests.unit.graph_fixtures import write_graph_artifact
 from tests.unit.graph_fixtures import NodeKind, kernel_graph
 from devcouncil.integrations.mcp.handlers import map as map_handlers
 
@@ -41,7 +41,7 @@ def mapped(tmp_path):
         "pkg/util.py": "def run():\n    return 1\n",
     })
     _commit(tmp_path)
-    write_code_graph(tmp_path, kernel_graph(tmp_path))
+    write_graph_artifact(tmp_path, kernel_graph(tmp_path))
     return tmp_path
 
 
@@ -145,72 +145,91 @@ def api_repo(tmp_path):
         "(cargo build --release -p devmap-cli), or point DEVMAP_BINARY at one "
         "that emits them."
     )
-    write_code_graph(tmp_path, graph)
+    write_graph_artifact(tmp_path, graph)
     return tmp_path
 
 
-def test_api_route_map_links_handlers_and_consumers(api_repo):
-    from devcouncil.indexing.graph.api_routes import route_map
+# The route surfaces are the kernel's. `indexing/graph/api_routes.py` was a
+# Python re-implementation of `devmap routes` / `shape-check` / `api-impact`
+# reading `load_code_graph`; measured on a tmp copy of this repository it cost
+# 2.1-2.7 s against the kernel's 0.8-1.0 s and carried no record of what its own
+# bounded client scan read. These tests keep their assertions and change the
+# producer — they now drive the real kernel through the one client seam.
+#
+# The pure-helper tests that lived here (`normalize_route_path`, `paths_match`,
+# and the Flask-converter regression) went with the module: the canonical owner
+# is `devmap_query::api_routes`, whose suite carries the same regression under
+# the same name (`a_flask_converter_normalises_whole_rather_than_from_its_colon`,
+# `rust-port/crates/devmap-query/src/api_routes.rs:972`).
 
-    result = route_map(api_repo)
+
+def _kernel_client(root):
+    from devcouncil.devmap_client import try_connect
+
+    client = try_connect(root)
+    assert client is not None, "the kernel built no usable generation for api_repo"
+    return client
+
+
+def test_api_route_map_links_handlers_and_consumers(api_repo):
+    result = _kernel_client(api_repo).routes()
     routes = {r["path"]: r for r in result["routes"]}
     assert "/api/items" in routes
     items = routes["/api/items"]
     assert items["verb"] == "GET"
-    assert any(h["name"] == "list_items" for h in items["handlers"])
+    assert any(h.get("name") == "list_items" for h in items["handlers"])
     assert any(c["path"] == "web/client.ts" for c in items["consumers"])
 
 
-def test_normalize_route_path_template_literal_segments():
-    from devcouncil.indexing.graph.api_routes import normalize_route_path, paths_match
+def test_api_route_map_carries_the_scan_coverage_python_never_did(api_repo):
+    """The answer says what the client scan read and whether it finished.
 
-    assert normalize_route_path("/api/users/${id}") == "/api/users/*"
-    assert paths_match("/api/users/{user_id}", "/api/users/${id}")
-
-
-def test_a_flask_converter_normalises_whole_rather_than_from_its_colon():
-    """`<int:uid>` is one parameter, not a literal `<int` and a `:uid`.
-
-    The `:\\w+` alternative matches the `:uid` inside the angle brackets on its
-    own, which left `<int` behind as a literal segment: `/api/users/<int:uid>`
-    normalised to `/api/users/<int*>`, so no client path could ever match it
-    and every Flask route with a converter reported no consumers — in a scan
-    that reported itself complete.
+    The Python `route_map` returned `{"routes": ..., "count": ...}` and nothing
+    else, so a scan that stopped at its file cap was indistinguishable from one
+    that read every file — "no consumers" from a scan that never looked.
     """
-    from devcouncil.indexing.graph.api_routes import normalize_route_path, paths_match
-
-    assert normalize_route_path("/api/users/<uid>") == "/api/users/*"
-    assert normalize_route_path("/api/users/<int:uid>") == "/api/users/*"
-    assert paths_match("/api/users/<int:uid>", "/api/users/42")
-    # A converter containing a slash still yields one segment, rather than
-    # splitting the path in two.
-    assert normalize_route_path("/f/<path:rest>/x") == "/f/*/x"
+    result = _kernel_client(api_repo).routes()
+    assert "scan" in result and "complete" in result["scan"], result.keys()
+    assert "capabilities" in result
 
 
 def test_api_route_map_matches_template_literal_fetch(api_repo):
-    from devcouncil.indexing.graph.api_routes import route_map
-
-    result = route_map(api_repo)
+    result = _kernel_client(api_repo).routes()
     routes = {r["path"]: r for r in result["routes"]}
     users = routes["/api/users/{user_id}"]
     assert any(c["url"] == "/api/users/${id}" for c in users["consumers"])
 
 
 def test_api_shape_check_flags_missing_handler_keys(api_repo):
-    from devcouncil.indexing.graph.api_routes import shape_check
-
-    result = shape_check(api_repo, route_filter="/api/items")
+    result = _kernel_client(api_repo).shape_check(route_filter="/api/items")
     assert result["mismatch_count"] >= 1
     assert "price" in result["checks"][0]["missing_in_handler"]
 
 
 def test_api_impact_reports_risk(api_repo):
-    from devcouncil.indexing.graph.api_routes import api_impact
-
-    result = api_impact(api_repo, "/api/items")
+    result = _kernel_client(api_repo).api_impact("/api/items")
     assert result["found"] is True
     assert result["risk"] in {"medium", "high"}
     assert result["shape_mismatches"]
+
+
+def test_the_route_cli_commands_do_not_load_the_python_graph(api_repo, monkeypatch):
+    """`dev map routes` / `shape-check` / `api-impact` ask the kernel.
+
+    All three ran `_require_graph(root)` — `load_code_graph`, the retired
+    engine's whole-graph read — and then a Python route scanner over it.
+    """
+    runner = CliRunner()
+    for argv in (
+        ["routes", "--project-root", str(api_repo), "--json"],
+        ["shape-check", "--project-root", str(api_repo), "--json"],
+        ["api-impact", "/api/items", "--project-root", str(api_repo), "--json"],
+    ):
+        result = runner.invoke(graph_app, argv)
+        assert result.exit_code == 0, (
+            f"{argv[0]} exited {result.exit_code}: {result.output}\n{result.exception!r}"
+        )
+        assert json.loads(result.stdout)
 
 
 def test_cli_graph_routes_command(api_repo):

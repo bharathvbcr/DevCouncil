@@ -103,20 +103,6 @@ SELECT m.generation_id      AS generation_id,
   FROM generation_file_rows m
   JOIN file_payloads p ON p.payload_id = m.payload_id;
 
-CREATE TABLE IF NOT EXISTS generation_edges (
-    generation_id  INTEGER NOT NULL,
-    ordinal        INTEGER NOT NULL,
-    source_file_id INTEGER NOT NULL REFERENCES paths(id),
-    target_file_id INTEGER NOT NULL REFERENCES paths(id),
-    source_symbol  TEXT NOT NULL,
-    target_symbol  TEXT NOT NULL,
-    edge_kind      TEXT NOT NULL,
-    confidence     REAL NOT NULL,
-    resolution     TEXT,
-    candidate_total INTEGER,
-    PRIMARY KEY (generation_id, ordinal)
-) WITHOUT ROWID;
-
 CREATE TABLE IF NOT EXISTS generation_coverage_gaps (
     generation_id INTEGER NOT NULL,
     gap           TEXT NOT NULL,
@@ -124,6 +110,12 @@ CREATE TABLE IF NOT EXISTS generation_coverage_gaps (
     reason        TEXT NOT NULL,
     PRIMARY KEY (generation_id, gap, path)
 ) WITHOUT ROWID;
+
+-- v18's two relations are created by `VALIDITY_RANGE_TABLES`, which the fresh
+-- path applies straight after this batch. They are not inlined here for the
+-- reason `MIGRATION_V16_TO_V17` learned the hard way: v17 kept a second copy of
+-- the payload split's DDL in this constant and the migration's copy silently
+-- lost an index. One owner, applied by both paths.
 
 CREATE TABLE IF NOT EXISTS generation_dead_symbols (
     generation_id    INTEGER NOT NULL,
@@ -138,10 +130,6 @@ CREATE TABLE IF NOT EXISTS generation_dead_symbols (
 
 CREATE INDEX IF NOT EXISTS idx_generation_nodes_file
     ON generation_nodes(generation_id, file_id);
-CREATE INDEX IF NOT EXISTS idx_generation_edges_source
-    ON generation_edges(generation_id, source_file_id);
-CREATE INDEX IF NOT EXISTS idx_generation_edges_target
-    ON generation_edges(generation_id, target_file_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     name, qualified_name, path, tokenize='unicode61'
@@ -302,6 +290,19 @@ CREATE TABLE IF NOT EXISTS generation_dead_symbols (
 
 CREATE INDEX IF NOT EXISTS idx_generation_nodes_file
     ON generation_nodes(generation_id, file_id);
+"#;
+
+/// The v5 edge indexes, split out of [`MIGRATION_V4_TO_V5`] because they are
+/// legal only while `generation_edges` is still a base table.
+///
+/// The v3 and v4 rungs re-run `CREATE_SCHEMA_V3`, which carries the *current*
+/// shape — so by the time this batch would run on a fresh-then-migrated store,
+/// `generation_edges` is v18's view and `CREATE INDEX` on a view is an error,
+/// `IF NOT EXISTS` or not. Exactly the shape `MIGRATION_V12_TO_V13` hit when
+/// `generation_files` became a view in v17, and guarded the same way: the
+/// caller asks `relation_is_table` first. The successors on `edge_rows` live in
+/// [`VALIDITY_RANGE_TABLES`].
+pub const MIGRATION_V4_TO_V5_EDGE_INDEXES: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_generation_edges_source
     ON generation_edges(generation_id, source_file_id);
 CREATE INDEX IF NOT EXISTS idx_generation_edges_target
@@ -721,23 +722,359 @@ SELECT m.generation_id      AS generation_id,
   JOIN file_payloads p ON p.payload_id = m.payload_id;
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 17;
+/// v18: edges and unresolved calls live for a *range* of generations.
+///
+/// Measured on this repository, release kernel at schema 17, six consecutive
+/// builds with one line appended to one file between each:
+///
+/// ```text
+///   cold    store 158,416,896  generation_edges 102,078  generation_unresolved  89,743
+///   edit 1  store 228,196,352  generation_edges 204,157  generation_unresolved 179,486
+/// ```
+///
+/// **One changed file rewrote 191,822 rows and added 70 MB to the store.** What
+/// actually differed between those two generations, compared NULL-safe over the
+/// whole stored tuple, was **one edge and zero unresolved calls**. The rows were
+/// not re-derived because they had changed; they were re-derived because the
+/// relation was keyed by generation and nothing else could express "still true".
+///
+/// v17 solved this shape for *files* by content-addressing the payload. Edges
+/// cannot get that treatment — they are deliberately never carried forward,
+/// because an edge's target depends on the whole corpus and copying a prior
+/// row preserves a stale answer across extractor upgrades and moved-identity
+/// targets (see the comment above the edge loop in `db.rs`). A validity range
+/// keeps that property exactly: the build still resolves the whole tree and
+/// still compares the whole resolved tuple multiset, but the *write* is the
+/// difference between that multiset and the one already valid.
+///
+/// `generation_edges` and `generation_unresolved` keep their names and their
+/// exact column sets as views over the ranges, so all twenty-odd read sites,
+/// `tools/fanout.sql`, `tools/soak.sh`, `verify.sh`'s determinism digest and
+/// the tests are unchanged. `ordinal` is the row's own id: it is still unique
+/// within a generation, and nothing reads it as a position any more — see
+/// `edge_read_order`, whose final key was the resolver's emission ordinal and
+/// is now `resolution`, the last column a reader can observe.
+///
+/// # What the ranges mean
+///
+/// A row is valid for generation `g` when `valid_from <= g AND (valid_to IS
+/// NULL OR g < valid_to)`. Half-open on purpose: `valid_to` is the generation
+/// that *stopped* seeing the row, so closing a row and inserting its successor
+/// in the same build gives them adjacent ranges rather than an overlap, and the
+/// `CHECK` refuses the inverted case outright rather than letting a reader
+/// silently see nothing where a row should be.
+pub const VALIDITY_RANGE_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS edge_rows (
+    edge_id         INTEGER PRIMARY KEY,
+    source_file_id  INTEGER NOT NULL REFERENCES paths(id),
+    target_file_id  INTEGER NOT NULL REFERENCES paths(id),
+    source_symbol   TEXT NOT NULL,
+    target_symbol   TEXT NOT NULL,
+    edge_kind       TEXT NOT NULL,
+    confidence      REAL NOT NULL,
+    resolution      TEXT,
+    candidate_total INTEGER,
+    valid_from      INTEGER NOT NULL,
+    valid_to        INTEGER,
+    CHECK (valid_to IS NULL OR valid_to > valid_from)
+);
+
+CREATE TABLE IF NOT EXISTS unresolved_rows (
+    unresolved_id  INTEGER PRIMARY KEY,
+    source_file    TEXT NOT NULL,
+    source_symbol  TEXT NOT NULL,
+    callee_name    TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    classification TEXT NOT NULL DEFAULT 'unresolved',
+    receiver       TEXT,
+    valid_from     INTEGER NOT NULL,
+    valid_to       INTEGER,
+    CHECK (valid_to IS NULL OR valid_to > valid_from)
+);
+
+-- The successors of `idx_generation_edges_source`/`_target`, which led with
+-- `generation_id` because the row carried one. A range row does not, and the
+-- generation is now supplied by the view's join, so the file id leads.
+CREATE INDEX IF NOT EXISTS idx_edge_rows_source ON edge_rows(source_file_id);
+CREATE INDEX IF NOT EXISTS idx_edge_rows_target ON edge_rows(target_file_id);
+
+-- The prune's index, and **only** the prune's.
+--
+-- The design this came from called for a partial index on `valid_to IS NULL`
+-- to serve the write path's diff scan. Measured, that index made the *reads*
+-- 36% slower and was withdrawn. With both halves of `valid_to IS NULL OR
+-- valid_to > ?` indexed, SQLite plans the reader's scan as a MULTI-INDEX OR:
+--
+--   |--SEARCH g USING INTEGER PRIMARY KEY (rowid=?)
+--   `--MULTI-INDEX OR
+--      |--SEARCH e USING INDEX idx_edge_rows_open (valid_from<?)
+--      `--SEARCH e USING INDEX idx_edge_rows_closed (valid_to>?)
+--
+-- — 102,083 rowid lookups instead of one sequential pass, and a cold
+-- `devmap impact` on this repository went 111 ms to 151 ms (p50, n=21,
+-- interleaved, half-run min drift 1-2 ms). Leaving only the `IS NOT NULL` half
+-- indexed makes the OR unindexable, the plan `SCAN e`, and the reader whole,
+-- while the prune's `valid_to <= ?` still gets its index.
+--
+-- The diff scan wants every live row, so a sequential pass is the right plan
+-- for it too: an index on `valid_to IS NULL` would have read the same rows in
+-- rowid order through one more level of indirection.
+--
+-- These stay tiny by construction: with two retained generations the closed
+-- set is one build's churn, and the prune empties it.
+CREATE INDEX IF NOT EXISTS idx_edge_rows_closed
+    ON edge_rows(valid_to) WHERE valid_to IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_unresolved_rows_callee
+    ON unresolved_rows(callee_name);
+CREATE INDEX IF NOT EXISTS idx_unresolved_rows_class
+    ON unresolved_rows(classification);
+CREATE INDEX IF NOT EXISTS idx_unresolved_rows_closed
+    ON unresolved_rows(valid_to) WHERE valid_to IS NOT NULL;
+
+-- The one owner of the range predicate. Every reader keyed on
+-- `generation_id = ?` keeps that spelling and gets the range semantics from
+-- here, rather than each one carrying its own copy of
+-- `valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)` to get wrong
+-- separately.
+CREATE VIEW IF NOT EXISTS generation_edges AS
+SELECT g.id            AS generation_id,
+       e.edge_id       AS ordinal,
+       e.source_file_id  AS source_file_id,
+       e.target_file_id  AS target_file_id,
+       e.source_symbol   AS source_symbol,
+       e.target_symbol   AS target_symbol,
+       e.edge_kind       AS edge_kind,
+       e.confidence      AS confidence,
+       e.resolution      AS resolution,
+       e.candidate_total AS candidate_total
+  FROM edge_rows e
+  JOIN generations g
+    ON g.id >= e.valid_from
+   AND (e.valid_to IS NULL OR g.id < e.valid_to);
+
+CREATE VIEW IF NOT EXISTS generation_unresolved AS
+SELECT g.id             AS generation_id,
+       u.unresolved_id  AS ordinal,
+       u.source_file    AS source_file,
+       u.source_symbol  AS source_symbol,
+       u.callee_name    AS callee_name,
+       u.reason         AS reason,
+       u.classification AS classification,
+       u.receiver       AS receiver
+  FROM unresolved_rows u
+  JOIN generations g
+    ON g.id >= u.valid_from
+   AND (u.valid_to IS NULL OR g.id < u.valid_to);
+"#;
+
+/// Move a v17 store's per-generation rows onto ranges, without recomputing
+/// anything.
+///
+/// The rows are copied as they stand, each generation's set becoming the range
+/// `[g, next_g)` — so a row present in two generations becomes two rows and the
+/// store is no smaller the instant it migrates. That is deliberate. Collapsing
+/// them would mean deciding, in SQL, which of two generations' rows are "the
+/// same edge", and the answer to that is precisely what the *write* path
+/// computes from a freshly resolved tuple multiset. The next build closes and
+/// reclaims what has genuinely gone; the migration only changes where the rows
+/// live, which is the one thing it can do without inventing an answer.
+///
+/// `MIN(g2.id) WHERE g2.id > e.generation_id` is NULL for the newest
+/// generation, which is exactly "still valid" — the same NULL the write path
+/// leaves open.
+/// The two relations are moved **independently**, because a store can arrive at
+/// this rung with one of them and not the other.
+///
+/// `test_s2_migration_v3_to_v4_preserves_cache_rows` is exactly that store: a
+/// hand-built v3 fixture with an `extraction_cache` and nothing else. It walks
+/// the chain, picks up `generation_unresolved` as a table at rung 9, and never
+/// acquires a `generation_edges` at all — `CREATE_SCHEMA_V3` stopped creating
+/// one in v18. A single "is the old shape here?" probe would have read that
+/// store as already migrated and left it with no edge relation whatsoever,
+/// which `validate_schema` then refuses by name at the end of the chain. Each
+/// half asks about its own relation.
+pub const MIGRATION_V17_TO_V18_RENAME_EDGES: &str = r#"
+ALTER TABLE generation_edges RENAME TO generation_edges_v17;
+"#;
+
+pub const MIGRATION_V17_TO_V18_RENAME_UNRESOLVED: &str = r#"
+ALTER TABLE generation_unresolved RENAME TO generation_unresolved_v17;
+"#;
+
+/// The edge backfill, applied after [`VALIDITY_RANGE_TABLES`] has created the
+/// new shape beside the renamed original.
+pub const MIGRATION_V17_TO_V18_BACKFILL_EDGES: &str = r#"
+INSERT INTO edge_rows
+    (source_file_id, target_file_id, source_symbol, target_symbol, edge_kind,
+     confidence, resolution, candidate_total, valid_from, valid_to)
+SELECT e.source_file_id, e.target_file_id, e.source_symbol, e.target_symbol,
+       e.edge_kind, e.confidence, e.resolution, e.candidate_total,
+       e.generation_id,
+       (SELECT MIN(g.id) FROM generations g WHERE g.id > e.generation_id)
+  FROM generation_edges_v17 e
+ ORDER BY e.generation_id, e.ordinal;
+
+DROP TABLE generation_edges_v17;
+"#;
+
+pub const MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED: &str = r#"
+INSERT INTO unresolved_rows
+    (source_file, source_symbol, callee_name, reason, classification, receiver,
+     valid_from, valid_to)
+SELECT u.source_file, u.source_symbol, u.callee_name, u.reason,
+       u.classification, u.receiver,
+       u.generation_id,
+       (SELECT MIN(g.id) FROM generations g WHERE g.id > u.generation_id)
+  FROM generation_unresolved_v17 u
+ ORDER BY u.generation_id, u.ordinal;
+
+DROP TABLE generation_unresolved_v17;
+"#;
+
+/// v19: each generation records, per source file, a digest of the rows it holds
+/// in the two ranged relations.
+///
+/// v18 made the *write* the difference between the freshly resolved multiset
+/// and the one already valid. It did not make the *comparison* a difference:
+/// deciding which stored rows are still wanted read back every live row of
+/// `edge_rows` and `unresolved_rows` and compared it field by field against the
+/// resolver's output. On this repository that is 107,257 edge rows and 91,703
+/// ledger rows re-read on a build that stores one, and `save_generation_timed`
+/// charges it at 66% of `persist:write` — the number the v19-for-nodes note
+/// below points at.
+///
+/// An edge belongs to its source file, and so does an unresolved call. A file
+/// whose freshly resolved rows digest to what the previous generation recorded
+/// holds exactly the rows already stored, so there is nothing in it to compare
+/// and nothing to write. The digest is over the resolver's *output*, not over
+/// the file's bytes, which is why it may be trusted where the affected set may
+/// not: an edge from an unchanged file into a target whose identity moved
+/// resolves differently today, its source file's digest moves with it, and the
+/// comparison for that file runs. That case is the carry-forward staleness the
+/// edge loop in `db.rs` refuses by construction, and it is why this rung keys
+/// on what was resolved rather than on what was edited.
+///
+/// # Why a table of its own rather than columns on `generation_file_rows`
+///
+/// That row is already per file per generation and would have held the columns.
+/// It is also the base table under the `generation_files` view, which every
+/// payload read joins, and it is `WITHOUT ROWID` — so six more columns widen
+/// the b-tree that a read walks. 2b98fef is the precedent for what a change of
+/// that shape costs when it is not measured: one index on this store's hottest
+/// read path cost every read 36%. A separate table is read by the write path
+/// and by nothing else, so no reader's plan can change.
+///
+/// # What a missing row means
+///
+/// Absent, never assumed. There is no backfill: a v18 store migrates with an
+/// empty digest table, every file reads as "unknown", and the first build after
+/// the migration compares every row exactly as v18 did — then records the
+/// digests it computed on the way. Absence is the safe direction at every
+/// point, which is what lets this rung be additive.
+pub const MIGRATION_V18_TO_V19: &str = r#"
+CREATE TABLE IF NOT EXISTS generation_file_digests (
+    generation_id   INTEGER NOT NULL,
+    file_id         INTEGER NOT NULL REFERENCES paths(id),
+    edge_rows       INTEGER NOT NULL,
+    edge_lo         INTEGER NOT NULL,
+    edge_hi         INTEGER NOT NULL,
+    unresolved_rows INTEGER NOT NULL,
+    unresolved_lo   INTEGER NOT NULL,
+    unresolved_hi   INTEGER NOT NULL,
+    PRIMARY KEY (generation_id, file_id)
+) WITHOUT ROWID;
+"#;
+
+/// The schema this binary writes.
+///
+/// # Why there is no v20 putting the nodes on ranges
+///
+/// v18 ranged the edges and the unresolved ledger and left `generation_nodes`,
+/// `nodes_fts`/`nodes_fts_map`, `generation_file_rows`, `generation_dead_symbols`
+/// and `generation_coverage_gaps` as full per-generation copies. The obvious
+/// next rung is to give the nodes and the full-text map the same treatment,
+/// and it was designed and then declined on a measurement rather than on
+/// taste. Recorded here because the argument for doing it is visible in the
+/// schema and the argument against it is not.
+///
+/// Measured on a `git archive` corpus of this repository — 1,608 files, 18,501
+/// symbols, 106,420 edges — release binary, one-file incremental builds, p50.
+/// `persist:write` is 304 ms, and `save_generation_timed` charges it:
+///
+/// | relation      | ms  | share |
+/// |---------------|-----|-------|
+/// | `unresolved`  | 118 | 39%   |
+/// | `edges`       |  81 | 27%   |
+/// | `fts`         |  34 | 11%   |
+/// | `nodes`       |  20 | 6.6%  |
+/// | everything else | 33 | 11%  |
+///
+/// The prune that follows costs a further 78 ms, of which 39 ms is the three
+/// node relations' `DELETE`s (31 ms of it `nodes_fts`, timed statement by
+/// statement against a byte copy of the store).
+///
+/// So the whole of what ranging the nodes and the full-text map could return
+/// is **54 ms of the write plus 39 ms of the prune — 93 ms of a 1,155 ms
+/// build**, and that is an upper bound: a ranged write still inserts the
+/// changed files' nodes, still closes the replaced ranges, and a ranged
+/// `nodes_fts` still deletes rows as ranges fall out of retention.
+///
+/// Against that: `nodes_fts` is an FTS5 virtual table whose rowid is
+/// `(generation << 32) | ordinal`, and `latest_search_page` joins
+/// `nodes_fts.rowid & 4294967295` back to `generation_nodes.ordinal`. A row
+/// valid across a range of generations cannot carry a generation in its rowid,
+/// so ranging the nodes means re-keying the full-text index and rewriting that
+/// join — on the hottest read in the store. 2b98fef is the precedent for the
+/// risk: one index on exactly this shape of range predicate cost every read
+/// 36%, and it was found only because it was measured.
+///
+/// A rung that returns 8% of a build for a re-keyed full-text index is not
+/// worth its migration, and a half-applied one is worse than the copy it
+/// replaces. `an_incremental_build_still_copies_every_node_and_full_text_row`
+/// pins the state this describes, so the next person to reach for v19 has to
+/// come past this note rather than rediscover it.
+///
+/// **The number that would justify a rung is elsewhere.** The two relations
+/// that dominate the write are the two already ranged, and their cost is not
+/// copying: it is the diff scan reading back 106,420 edge rows and 89,743
+/// ledger rows on every build to decide what is still valid. That is 66% of
+/// `persist:write`, and no further ranging touches it.
+///
+/// v19 is that rung — [`MIGRATION_V18_TO_V19`] — and it went where this
+/// paragraph pointed rather than where the schema's shape suggested.
+pub const CURRENT_SCHEMA_VERSION: i32 = 19;
+
+/// The `user_version` the Python engine's `index.sqlite` carries — a database
+/// this kernel never wrote and cannot read. Named once, here, so the store's
+/// refusal and the CLI's `status` report the same number for the same file
+/// (the CLI spelled its own `2` until 2026-09-07).
+pub const PYTHON_INDEX_SCHEMA_VERSION: i32 = 2;
 
 /// Every DDL batch a fresh store applies, in the order `Store::migrate` applies
 /// them.
 ///
-/// One owner for "what the current schema is". The create path names these five
+/// One owner for "what the current schema is". The create path names these
 /// constants and so does [`declared_index_names`], so the gate cannot come to
 /// assert a schema the creator does not build. `MIGRATION_V6_TO_V7` is here
 /// because a fresh store really does run it — probed, because `ADD COLUMN` is
 /// not idempotent — and leaving it out would make this list a near-copy of the
 /// truth rather than the truth.
+///
+/// `UNRESOLVED_TABLE` left this list in v18. It is still `MIGRATION_V8_TO_V9`
+/// and an old store still walks it, but a *fresh* store no longer applies it:
+/// `generation_unresolved` is a view over `unresolved_rows` now, and a
+/// `CREATE INDEX` naming a view is an error rather than a no-op. Leaving the
+/// constant listed here would have made [`declared_index_names`] demand two
+/// indexes v18 replaces, which `validate_schema` would then refuse every store
+/// for.
 pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     CREATE_SCHEMA_V3,
     BUILD_HISTORY_TABLE,
     MIGRATION_V6_TO_V7,
-    UNRESOLVED_TABLE,
+    VALIDITY_RANGE_TABLES,
     COVERAGE_GAPS_TABLE,
+    MIGRATION_V18_TO_V19,
 ];
 
 /// Strip SQL line comments so a scan of DDL text cannot read prose as code.

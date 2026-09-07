@@ -9,6 +9,11 @@ kernel lacked — the ``devcouncil: allow-unwired`` marker and dynamic-import
 clearing — were ported into ``wiring.rs`` first, under a parity test that
 measures both implementations against the same corpus.
 
+The two thresholds that scan used to decide whether its unreachable set was
+trustworthy went with it: ``liveness_unreachable_unreliable`` is now the
+kernel's call, out of ``dead_clusters.refused_oversized_graph``
+(``devmap-query/src/code_graph.rs:970``, ``manifest.rs:454``).
+
 The tier helpers below stay: three live callers (``map.py`` twice,
 ``graph_cmd.py``), pure arithmetic over ``Confidence``, and nothing in the
 kernel to duplicate.
@@ -16,13 +21,9 @@ kernel to duplicate.
 
 from __future__ import annotations
 
-import logging
-
 from devcouncil.indexing.graph.schema import (
     Confidence,
 )
-
-logger = logging.getLogger(__name__)
 
 _CONFIDENCE_RANK = {
     Confidence.AMBIGUOUS: 0,
@@ -32,13 +33,6 @@ _CONFIDENCE_RANK = {
     "inferred": 1,
     "extracted": 2,
 }
-
-# Default: if unreachable covers ≥25% of liveness code files, static BFS is
-# too blind (dynamic imports / routers / JSX) — omit the flood.
-_DEFAULT_UNREACHABLE_UNRELIABLE_RATIO = 0.25
-# Ratio alone misreads small repos: 1 dead file out of 3 is real signal, not
-# analysis blindness. Only gate when the absolute flood is at least this big.
-_MIN_UNREACHABLE_FOR_RATIO_GATE = 5
 
 
 def confidence_label(conf: object) -> str:

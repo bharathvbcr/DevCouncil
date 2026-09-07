@@ -22,6 +22,14 @@ fn scratch(name: &str) -> PathBuf {
 
 const WRITERS: usize = 8;
 
+/// A real directory for an entry to name: `Workspace::add` refuses a root that
+/// is not one, so the fixture makes it before registering it.
+fn registered_root(dir: &std::path::Path, tag: &str, writer: usize) -> PathBuf {
+    let root = dir.join(format!("{tag}{writer}"));
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
 #[test]
 fn eight_concurrent_registrations_all_survive() {
     let dir = scratch("add");
@@ -32,10 +40,12 @@ fn eight_concurrent_registrations_all_survive() {
             let root = Arc::clone(&root);
             thread::spawn(move || {
                 Workspace::update(root.as_path(), |workspace| {
-                    workspace.add(
-                        format!("repo{writer}"),
-                        PathBuf::from(format!("/tmp/repo{writer}")),
-                    );
+                    workspace
+                        .add(
+                            format!("repo{writer}"),
+                            registered_root(root.as_path(), "repo", writer),
+                        )
+                        .expect("a real directory registers");
                 })
                 .map(|_| ())
             })
@@ -89,10 +99,12 @@ fn concurrent_adds_and_removes_leave_a_consistent_registry() {
     // Seed the registry so the removers have something to remove.
     Workspace::update(&dir, |workspace| {
         for writer in 0..WRITERS {
-            workspace.add(
-                format!("seed{writer}"),
-                PathBuf::from(format!("/tmp/seed{writer}")),
-            );
+            workspace
+                .add(
+                    format!("seed{writer}"),
+                    registered_root(&dir, "seed", writer),
+                )
+                .expect("a real directory registers");
         }
     })
     .expect("seeding must succeed");
@@ -109,10 +121,12 @@ fn concurrent_adds_and_removes_leave_a_consistent_registry() {
                     .map(|_| ())
                 } else {
                     Workspace::update(root.as_path(), |workspace| {
-                        workspace.add(
-                            format!("late{writer}"),
-                            PathBuf::from(format!("/tmp/late{writer}")),
-                        );
+                        workspace
+                            .add(
+                                format!("late{writer}"),
+                                registered_root(root.as_path(), "late", writer),
+                            )
+                            .expect("a real directory registers");
                     })
                     .map(|_| ())
                 }

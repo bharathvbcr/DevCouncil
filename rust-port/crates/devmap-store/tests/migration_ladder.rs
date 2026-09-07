@@ -101,16 +101,19 @@ fn seed_current_store(db_path: &Path) {
         VALUES (1, 0, 1, 'helper', 'a.py::helper', 'Function', 0, 10, 0, 111, 222, 4),
                (1, 1, 3, 'main', 'b.py::main', 'Function', 0, 10, 1, NULL, NULL, NULL);
 
-        INSERT INTO generation_edges
-            (generation_id, ordinal, source_file_id, target_file_id, source_symbol,
-             target_symbol, edge_kind, confidence, resolution, candidate_total)
-        VALUES (1, 0, 3, 1, 'b.py::main', 'a.py::helper', 'Calls', 0.9, 'Exact', NULL);
+        -- `generation_edges` and `generation_unresolved` are views over
+        -- validity ranges since v18 and are not insertable; the rows live in
+        -- `edge_rows` and `unresolved_rows`. `valid_to` NULL means "still
+        -- valid", which for a store with one generation is every row.
+        INSERT INTO edge_rows
+            (source_file_id, target_file_id, source_symbol, target_symbol,
+             edge_kind, confidence, resolution, candidate_total, valid_from, valid_to)
+        VALUES (3, 1, 'b.py::main', 'a.py::helper', 'Calls', 0.9, 'Exact', NULL, 1, NULL);
 
-        INSERT INTO generation_unresolved
-            (generation_id, ordinal, source_file, source_symbol, callee_name,
-             reason, classification, receiver)
-        VALUES (1, 0, 'b.py', 'b.py::main', 'mystery', 'no candidate',
-                'unresolved', 'obj');
+        INSERT INTO unresolved_rows
+            (source_file, source_symbol, callee_name, reason, classification, receiver,
+             valid_from, valid_to)
+        VALUES ('b.py', 'b.py::main', 'mystery', 'no candidate', 'unresolved', 'obj', 1, NULL);
 
         INSERT INTO generation_dead_symbols
             (generation_id, ordinal, file_path, symbol_name, confidence,
@@ -146,6 +149,39 @@ fn seed_current_store(db_path: &Path) {
 /// traceable to a line of `schema.rs`.
 fn reduce_one_rung(conn: &Connection, from_version: i32) {
     let sql: &str = match from_version {
+        // MIGRATION_V18_TO_V19: the per-file row digests. Purely additive, so
+        // the reduction is the table and nothing else — there is no backfill to
+        // undo, which is the property that lets a v18 store migrate by gaining
+        // an empty table and comparing every row on its next build.
+        19 => "DROP TABLE generation_file_digests;",
+        // MIGRATION_V17_TO_V18: the validity ranges. Materialise both views
+        // back into the base tables they replaced, restore the two edge indexes
+        // v5 created on `generation_edges`, and drop the range tables with the
+        // indexes SQLite dropped along with them.
+        //
+        // `generation_edges.ordinal` comes back as the view's `ordinal`, which
+        // is the range row's own id. That is not the resolver's emission order
+        // any more and nothing reads it as one — `edge_read_order` took
+        // `resolution` as its last key in the same change — so the reduced store
+        // is a v17 store in every respect the ladder asserts.
+        18 => {
+            "CREATE TABLE ge_flat AS SELECT * FROM generation_edges;
+             CREATE TABLE gu_flat AS SELECT * FROM generation_unresolved;
+             DROP VIEW generation_edges;
+             DROP VIEW generation_unresolved;
+             DROP TABLE edge_rows;
+             DROP TABLE unresolved_rows;
+             ALTER TABLE ge_flat RENAME TO generation_edges;
+             ALTER TABLE gu_flat RENAME TO generation_unresolved;
+             CREATE INDEX idx_generation_edges_source
+                 ON generation_edges(generation_id, source_file_id);
+             CREATE INDEX idx_generation_edges_target
+                 ON generation_edges(generation_id, target_file_id);
+             CREATE INDEX idx_generation_unresolved_callee
+                 ON generation_unresolved(generation_id, callee_name);
+             CREATE INDEX idx_generation_unresolved_class
+                 ON generation_unresolved(generation_id, classification);"
+        }
         // MIGRATION_V16_TO_V17: the payload split. Materialise the view back
         // into the base table it replaced and restore v13's index, which the
         // migration drops.
@@ -552,17 +588,20 @@ fn a_migrated_store_reopens_without_migrating_again() {
 
 /// A step that fails its own gate must not advance `user_version`.
 ///
-/// The v16→v17 arm stamps 17 and *then* validates, both inside one
-/// transaction, so a failed validation has to take the stamp down with it. That
-/// rests on `PRAGMA user_version` being transactional in SQLite — true, and
-/// load-bearing enough to be worth a test rather than a comment: if it ever
-/// were not, a store that failed validation would reopen claiming to be at 17,
-/// skip the chain entirely, and every later read would run against a shape
-/// nothing had checked.
+/// The last arm of the chain stamps its version and *then* validates, both
+/// inside one transaction, so a failed validation has to take the stamp down
+/// with it. That rests on `PRAGMA user_version` being transactional in SQLite —
+/// true, and load-bearing enough to be worth a test rather than a comment: if
+/// it ever were not, a store that failed validation would reopen claiming to be
+/// at the top, skip the chain entirely, and every later read would run against
+/// a shape nothing had checked.
 ///
-/// Failure is induced the way it actually happens: `already_split` sees a
-/// database whose `generation_files` is already a view, skips the DDL batch,
-/// and the index a previous partial attempt never created stays missing.
+/// Failure is induced the way it actually happens: a step's idempotency probe
+/// sees the work already done, skips its DDL batch, and an object a previous
+/// partial attempt never created stays missing. The rung the fixture starts on
+/// is `CURRENT_SCHEMA_VERSION - 1` and moves with the end of the chain —
+/// validation runs once, at the last step, because `validate_schema` asserts
+/// the *current* schema and no earlier rung's shape satisfies it.
 #[test]
 fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
     let dir = tmp_dir("migration-halfway");
@@ -570,10 +609,11 @@ fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
     seed_current_store(&db_path);
     {
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "DROP INDEX idx_file_payloads_cache_identity;
-             PRAGMA user_version = 16;",
-        )
+             PRAGMA user_version = {};",
+            CURRENT_SCHEMA_VERSION - 1
+        ))
         .unwrap();
     }
 
@@ -592,7 +632,8 @@ fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 16,
+        version,
+        CURRENT_SCHEMA_VERSION - 1,
         "the step failed, so the store is still at the rung it started on; a \
          stamp that survived its own failed validation would make the next \
          open skip the chain and trust an unchecked shape"
@@ -743,4 +784,214 @@ fn objects_the_schema_does_not_declare_do_not_fail_the_gate() {
     );
     drop(conn);
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// A v17 store with **two** generations keeps both of them across v18.
+///
+/// The rest of this file walks the ladder over a store with one generation,
+/// which is exactly the shape that cannot see the v17→v18 backfill's only real
+/// decision: what `valid_to` is for a row whose generation some later
+/// generation also has. Every row of a one-generation store is still valid, so
+/// the whole `MIN(g.id) WHERE g.id > e.generation_id` expression reads NULL and
+/// any wrong answer passes.
+///
+/// The rows are carried as they stand — each generation's set becoming
+/// `[g, next_g)`, so an edge present in both generations becomes two rows and
+/// the store is no smaller the moment it migrates. That is asserted here rather
+/// than merely intended: collapsing them would mean deciding in SQL which of
+/// two generations' rows are "the same edge", which is what the *write* path
+/// computes from a freshly resolved multiset and what a migration has no
+/// business inventing.
+#[test]
+fn a_v17_store_with_two_generations_carries_both_onto_ranges() {
+    let dir = tmp_dir("v18-backfill-two-generations");
+    let db_path = dir.join("v17-two.sqlite");
+    seed_current_store(&db_path);
+
+    let conn = Connection::open(&db_path).unwrap();
+    // Down to 17 however far the top of the ladder has moved: this test is
+    // about the v17→v18 backfill specifically, and every rung above it has to
+    // come off first.
+    let mut version = CURRENT_SCHEMA_VERSION;
+    while version > 17 {
+        reduce_one_rung(&conn, version);
+        version -= 1;
+    }
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 17, "the fixture must be a v17 store");
+
+    // A second generation that shares one edge with the first and adds one, so
+    // the carried row and the closed row are both exercised. The unresolved
+    // ledger keeps its single row across both, which is the case the measured
+    // corpus is made almost entirely of.
+    conn.execute_batch(
+        r#"
+        INSERT INTO generations (id, created_at, head_sha, repo_root, analysis_json)
+        VALUES (2, 2.0, 'cafebabe', '/tmp/probe', '{"total_files":3,"total_symbols":2,
+                "total_edges":2,"dead_symbols":[],"communities":[],"status":"Ok"}');
+
+        INSERT INTO generation_edges
+            (generation_id, ordinal, source_file_id, target_file_id, source_symbol,
+             target_symbol, edge_kind, confidence, resolution, candidate_total)
+        VALUES (2, 0, 3, 1, 'b.py::main', 'a.py::helper', 'Calls', 0.9, 'Exact', NULL),
+               (2, 1, 1, 3, 'a.py::helper', 'b.py::main', 'References', 0.8, 'UniqueGlobal', NULL);
+
+        INSERT INTO generation_unresolved
+            (generation_id, ordinal, source_file, source_symbol, callee_name,
+             reason, classification, receiver)
+        VALUES (2, 0, 'b.py', 'b.py::main', 'mystery', 'no candidate',
+                'unresolved', 'obj');
+        "#,
+    )
+    .expect("seeding a second v17 generation must succeed");
+
+    let before_edges = edges_by_generation(&conn);
+    let before_unresolved = unresolved_by_generation(&conn);
+    assert_eq!(
+        before_edges.len(),
+        2,
+        "the fixture must have two generations"
+    );
+    drop(conn);
+
+    let store = Store::open(&db_path).expect("a two-generation v17 store must migrate");
+    drop(store);
+
+    let conn = Connection::open(&db_path).unwrap();
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    assert_eq!(
+        edges_by_generation(&conn),
+        before_edges,
+        "a generation must read back exactly what it held before the migration"
+    );
+    assert_eq!(
+        unresolved_by_generation(&conn),
+        before_unresolved,
+        "and so must its unresolved ledger"
+    );
+
+    // The ranges themselves: the edge only generation 1 had is closed at 2, the
+    // two generation 2 has are open, and the shared edge is two rows.
+    let mut ranges: Vec<(i64, Option<i64>, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT valid_from, valid_to, source_symbol || '>' || target_symbol
+                   FROM edge_rows",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    ranges.sort();
+    assert_eq!(
+        ranges,
+        vec![
+            (1, Some(2), "b.py::main>a.py::helper".to_string()),
+            (2, None, "a.py::helper>b.py::main".to_string()),
+            (2, None, "b.py::main>a.py::helper".to_string()),
+        ],
+        "the backfill must give each generation's rows the half-open range \
+         [g, next_g), and must not collapse the edge both generations hold"
+    );
+    let ledger: Vec<(i64, Option<i64>)> = {
+        let mut stmt = conn
+            .prepare("SELECT valid_from, valid_to FROM unresolved_rows ORDER BY valid_from")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(ledger, vec![(1, Some(2)), (2, None)]);
+    drop(conn);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Every generation's edges, keyed by generation, in a form that compares
+/// across the migration: `ordinal` is deliberately absent, because v18 replaces
+/// the resolver's emission ordinal with the range row's own id and nothing
+/// reads it as a position.
+fn edges_by_generation(conn: &Connection) -> BTreeMap<i64, Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT generation_id, source_file_id, target_file_id, source_symbol,
+                    target_symbol, edge_kind, printf('%.17g', confidence),
+                    COALESCE(resolution, '<none>'),
+                    COALESCE(CAST(candidate_total AS TEXT), '<none>')
+               FROM generation_edges",
+        )
+        .unwrap();
+    let mut out: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                format!(
+                    "{}|{}|{}|{}|{}|{}|{}|{}",
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ),
+            ))
+        })
+        .unwrap();
+    for row in rows {
+        let (generation, text) = row.unwrap();
+        out.entry(generation).or_default().push(text);
+    }
+    for rows in out.values_mut() {
+        rows.sort();
+    }
+    out
+}
+
+fn unresolved_by_generation(conn: &Connection) -> BTreeMap<i64, Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT generation_id, source_file, source_symbol, callee_name, reason,
+                    classification, COALESCE(receiver, '<none>')
+               FROM generation_unresolved",
+        )
+        .unwrap();
+    let mut out: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                format!(
+                    "{}|{}|{}|{}|{}|{}",
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ),
+            ))
+        })
+        .unwrap();
+    for row in rows {
+        let (generation, text) = row.unwrap();
+        out.entry(generation).or_default().push(text);
+    }
+    for rows in out.values_mut() {
+        rows.sort();
+    }
+    out
 }

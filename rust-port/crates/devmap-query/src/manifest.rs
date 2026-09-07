@@ -55,14 +55,33 @@ pub fn generate_lean_manifest_json(
 /// Consumer-schema map: the keys Python `repo_map.json` readers already look
 /// up (`files`, `dependents`, `dead_symbol_candidates`, `liveness_meta`, …).
 /// Not token-budgeted — agents need the file list, not a 2k-token sketch.
+///
+/// `repo_root` is the tree this generation indexed, and it is what makes
+/// `package_managers` and `test_commands` answerable: both are questions about
+/// files the extraction pass never sees (lock files are not indexable source)
+/// or about manifest *contents* rather than manifest declarations. The same
+/// parameter `build_code_graph_value` already takes, for the same reason.
+///
+/// `None` is a real state, not a default: the store can fail to record a repo
+/// root, and a caller that cannot name the tree gets `*_computed: false` with
+/// the reason attached rather than an empty list that looks derived.
 pub fn generate_manifest_with_edges(
     extractions: &[Extraction],
     analysis: &AnalysisSummary,
     freshness: FreshnessInfo,
     edges: &[ResolvedEdge],
+    repo_root: Option<&Path>,
 ) -> (Manifest, String) {
     let (lean, _) = generate_manifest(extractions, analysis, freshness.clone());
-    let json = consumer_manifest_json(extractions, analysis, &freshness, &lean, edges);
+    let inventory = match repo_root {
+        Some(root) => crate::inventory::scan(root),
+        None => crate::inventory::RepoInventory::unavailable(
+            "no repository root was recorded for this generation, so the \
+             manifests and lock files that name a package manager or a test \
+             command were never read",
+        ),
+    };
+    let json = consumer_manifest_json(extractions, analysis, &freshness, &lean, edges, &inventory);
     (lean, json)
 }
 
@@ -205,6 +224,7 @@ fn consumer_manifest_json(
     freshness: &FreshnessInfo,
     lean: &Manifest,
     edges: &[ResolvedEdge],
+    inventory: &crate::inventory::RepoInventory,
 ) -> String {
     let mut languages: BTreeSet<String> = BTreeSet::new();
     // Frameworks, from the routes that prove them.
@@ -460,24 +480,20 @@ fn consumer_manifest_json(
         // repository declares no routes any matcher recognises, not that
         // nothing looked.
         "frameworks": frameworks.into_iter().collect::<Vec<_>>(),
-        // Still constants, and now marked as such in `meta`. Each is a
-        // question this kernel cannot answer from what it is given:
+        // Computed from the repository inventory, which is the thing this
+        // function was previously not handed. The old note was right about the
+        // *extractions* — a `.lock` file matches no language spec, so
+        // `is_indexable_source` excludes it and it never becomes an
+        // `Extraction`, and a test command needs manifest contents rather than
+        // manifest declarations — and wrong about the kernel: the repository
+        // root is available here now, and `inventory::scan` reads both under a
+        // depth cap, a directory cap and a per-file size cap.
         //
-        // - `package_managers` is a lockfile question — the Python writer read
-        //   `uv.lock`/`package-lock.json`, and `tests/unit/test_cli_commands.py`
-        //   pins that a bare `pyproject.toml` is *not* evidence of uv. Lock
-        //   files are not indexed: `.lock` matches no language spec, so
-        //   `detect_language` returns `generic` and `is_indexable_source`
-        //   excludes them, which means they never reach `extractions`.
-        // - `test_commands` needs the *contents* of `pyproject.toml` /
-        //   `package.json`, not their declarations.
-        //
-        // Both become computable the day this function is handed the repository
-        // inventory rather than only the indexed extractions. Marked false
-        // until then, because a consumer acting on an empty list has to know
-        // which kind of empty it is.
-        "package_managers": [],
-        "test_commands": [],
+        // `tests/unit/test_cli_commands.py:91`'s rule survives the port: a bare
+        // `pyproject.toml` is not evidence of uv, only `uv.lock` is. See
+        // `inventory::package_managers` for the whole ported table.
+        "package_managers": inventory.package_managers,
+        "test_commands": inventory.test_commands,
         "important_files": lean.important_files,
         // A goal-ranked list, and this producer is given no goal. `dev map
         // --goal` fills it in `map_artifacts.py:379` with the ripgrep scorer;
@@ -734,10 +750,31 @@ fn consumer_manifest_json(
                 // directly, but nothing computed it.
                 "frameworks_computed": true,
                 "subsystem_summaries_computed": true,
-                // Lock files are not indexed, so the evidence never arrives.
-                "package_managers_computed": false,
-                // Needs manifest contents, not manifest declarations.
-                "test_commands_computed": false,
+                // Both read from the repository inventory rather than from the
+                // extractions. `true` here means the walk ran and the lists
+                // above are its answer, empty or not; `false` means no
+                // repository root reached this writer and
+                // `inventory_unavailable_reason` says so.
+                "package_managers_computed": inventory.computed,
+                "test_commands_computed": inventory.computed,
+                // What the inventory could not read, never silently dropped: a
+                // manifest past the size cap is named here, and its *contents*
+                // therefore contributed no command even though its existence
+                // still contributed a manager.
+                "inventory_refused_oversize": inventory.refused_oversize,
+                // The other half of the same promise: a manifest that existed
+                // and could not be read at all — permissions, encoding, a file
+                // that stopped being one — with the reason. Its *existence*
+                // still contributed a package manager above, so without this a
+                // reader sees npm and no scripts, which is what a `package.json`
+                // with an empty `scripts` block also produces.
+                "inventory_unreadable": inventory.unreadable,
+                // Whether a walk bound stopped the search before the tree ran
+                // out. `true` makes both lists a lower bound rather than the
+                // repository's full set.
+                "inventory_walk_truncated": inventory.walk_truncated,
+                "inventory_directories_visited": inventory.directories_visited,
+                "inventory_unavailable_reason": inventory.unavailable_reason,
                 // Goal-dependent; `dev map --goal` fills it downstream.
                 "candidate_files_computed": false,
                 // No language server is consulted by this kernel.
@@ -792,7 +829,7 @@ mod wire_format_tests {
             ..Default::default()
         };
         let freshness = FreshnessInfo::new("head".into(), 1, 0);
-        let (_, json) = generate_manifest_with_edges(&extractions, &analysis, freshness, &[]);
+        let (_, json) = generate_manifest_with_edges(&extractions, &analysis, freshness, &[], None);
         json
     }
 
@@ -1655,7 +1692,14 @@ mod tests {
             let analysis = empty_analysis();
             let fresh = freshness();
             let lean = lean_manifest(&extractions, &analysis, fresh.clone());
-            consumer_manifest_json(&extractions, &analysis, &fresh, &lean, &[])
+            consumer_manifest_json(
+                &extractions,
+                &analysis,
+                &fresh,
+                &lean,
+                &[],
+                &crate::inventory::RepoInventory::unavailable("fixture: no tree"),
+            )
         };
         let value: Value = serde_json::from_str(&json).expect("consumer manifest parses");
         let languages: Vec<&str> = value["languages"]
@@ -1687,7 +1731,14 @@ mod tests {
     ) -> Value {
         let fresh = freshness();
         let lean = lean_manifest(extractions, analysis, fresh.clone());
-        let json = consumer_manifest_json(extractions, analysis, &fresh, &lean, edges);
+        let json = consumer_manifest_json(
+            extractions,
+            analysis,
+            &fresh,
+            &lean,
+            edges,
+            &crate::inventory::RepoInventory::unavailable("fixture: no tree"),
+        );
         serde_json::from_str(&json).expect("consumer manifest parses")
     }
 

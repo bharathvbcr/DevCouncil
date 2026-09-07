@@ -130,11 +130,16 @@ def _graph_degraded_fields(root: Path) -> dict[str, Any]:
 def _graph_payload(root: Path, result: dict[str, Any]) -> dict[str, Any]:
     """Build a graph-tool response whose ``ok`` is *derived*, never asserted.
 
-    ``query_symbol``/``trace_path``/``route_map``/``api_impact`` answer with
+    The Python graph surfaces answered a failure with
     ``{"error": "no code graph; run `dev map` first"}``. Prepending a literal
     ``"ok": True`` published that failure as a success, so a caller branching on
     ``ok`` read "the graph has no callers for this symbol" from a response that
     means "there is no graph".
+
+    Those surfaces are retired — the two remaining producers are the kernel
+    route commands (via :func:`_route_tool`) and `diff_impact` — but the rule
+    stays here rather than at each call site: a producer that grows an ``error``
+    key must not have to remember to flip ``ok`` too.
     """
     error = result.get("error")
     payload: dict[str, Any] = {"ok": not error, **result, **_graph_degraded_fields(root)}
@@ -433,11 +438,20 @@ def _scan_ok(
 
 
 def _symbols_for_path(root: Path, path: str) -> SymbolScan:
-    """Per-path symbol listings from the code graph, or an explicit failure.
+    """Per-path symbol listings from the kernel, or an explicit failure.
 
-    Both engines are tried in order. Every reason one of them declined is kept
-    and reported: a missing kernel, a locked store, a mid-build truncation and a
-    file that genuinely defines nothing all used to return the same ``[]``.
+    Every reason the kernel declined is kept and reported: a missing kernel, a
+    locked store, a mid-build truncation and a file that genuinely defines
+    nothing all used to return the same ``[]``.
+
+    There is no second engine. A `load_code_graph` fallback used to sit below
+    this — the retired Python engine's whole-graph read, 855 ms and ~690 MB RSS
+    on this repository, 3.8 s and a 102 MB `index.sqlite` write on the first
+    call — and it published through :func:`_scan_ok` with no producer total and
+    no truncation flag, so a fallback answer reached the agent wearing the shape
+    of a complete, verified one. A check that could not run must not report what
+    a check that ran and passed reports; the kernel being unreachable is
+    reported as that.
     """
     norm = path.replace("\\", "/")
     reasons: list[str] = []
@@ -495,32 +509,7 @@ def _symbols_for_path(root: Path, path: str) -> SymbolScan:
             )
     except Exception as exc:  # noqa: BLE001 - reported, not swallowed
         reasons.append(f"devmap: {exc}")
-    try:
-        from devcouncil.indexing.graph.build import load_code_graph
-
-        graph = load_code_graph(root)
-        if graph is None:
-            reasons.append("no code graph (run `dev map`)")
-            return SymbolScan(False, "", "; ".join(reasons), [], 0, False)
-        out = []
-        for n in graph.nodes:
-            if n.path != norm:
-                continue
-            kind = n.kind.value if hasattr(n.kind, "value") else str(n.kind)
-            if kind == "file":
-                continue
-            out.append(
-                {
-                    "id": n.id,
-                    "kind": kind,
-                    "name": n.name,
-                    "line": n.line,
-                }
-            )
-        return _scan_ok(out, "code_graph")
-    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-        reasons.append(f"code graph: {exc}")
-        return SymbolScan(False, "", "; ".join(reasons), [], 0, False)
+    return SymbolScan(False, "", "; ".join(reasons), [], 0, False)
 
 
 async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
@@ -942,6 +931,15 @@ def _structured_dead_code(
     path_prefix: str | None,
     min_confidence: str = "inferred",
 ) -> DeadCodeScan:
+    """Dead-symbol candidates from the kernel, or an explicit failure.
+
+    The kernel is the only engine here, for the reason
+    :func:`_symbols_for_path` states: the `load_code_graph` fallback that used
+    to sit below published through :func:`_dead_scan_ok` with
+    ``producer_total=None, producer_truncated=False``, so a Python answer
+    reached `devcouncil_liveness` wearing the kernel's "complete and
+    untruncated" shape.
+    """
     data = _load_repo_map(root) or {}
     reasons: list[str] = []
     try:
@@ -1014,31 +1012,7 @@ def _structured_dead_code(
             )
     except Exception as exc:  # noqa: BLE001 - reported, not swallowed
         reasons.append(f"devmap: {exc}")
-    try:
-        from devcouncil.indexing.graph.build import load_code_graph
-        from devcouncil.indexing.graph.liveness import confidence_at_least
-
-        graph = load_code_graph(root)
-        if graph is None:
-            reasons.append("no code graph (run `dev map`)")
-            return DeadCodeScan(False, "", "; ".join(reasons), [], 0, 0, False)
-        matched = []
-        in_scope = 0
-        hidden = 0
-        for d in graph.dead_code:
-            if not _matches_filters(d.path, data, area=area, path_prefix=path_prefix):
-                continue
-            in_scope += 1
-            if not confidence_at_least(d.confidence, min_confidence):
-                hidden += 1
-                continue
-            matched.append(d.model_dump())
-        return _dead_scan_ok(
-            matched, source="code_graph", total=in_scope, hidden_low_confidence=hidden
-        )
-    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-        reasons.append(f"code graph: {exc}")
-        return DeadCodeScan(False, "", "; ".join(reasons), [], 0, 0, False)
+    return DeadCodeScan(False, "", "; ".join(reasons), [], 0, 0, False)
 
 
 async def handle_graph_ingest(root: Path, arguments: dict) -> list[TextContent]:
@@ -1225,7 +1199,7 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
 
 
 async def handle_graph_query(root: Path, arguments: dict) -> list[TextContent]:
-    """Symbol lookup, kernel-first.
+    """Symbol lookup. The kernel is the only engine; no kernel is an error.
 
     This answered entirely from Python: `query_symbol` -> `load_code_graph` ->
     `index.sqlite`, re-materialising 14,057 nodes and 71,195 edges as pydantic
@@ -1233,7 +1207,8 @@ async def handle_graph_query(root: Path, arguments: dict) -> list[TextContent]:
     kernel-backed `devcouncil_code_search` answering the same class of question,
     with ~90% of it in that re-materialisation — and the first call after any
     kernel build additionally cost 6.5-7.5 s and wrote 242 MB of SQLite under a
-    writer lease, from a tool an agent reads as read-only.
+    writer lease, from a tool an agent reads as read-only. `query_symbol` has
+    since been deleted; the kernel-first shape became kernel-only.
     """
 
     def _body() -> list[TextContent]:
@@ -1243,22 +1218,15 @@ async def handle_graph_query(root: Path, arguments: dict) -> list[TextContent]:
                 "Missing name_or_path", code="missing_argument", argument="name_or_path"
             )
         kernel = _devmap_query_payload(root, "query", name_or_path=name)
-        if kernel is not None:
-            # The CLI's payload shape carries `definitions` but not `matches`,
-            # which this tool has always emitted and agents branch on. Switching
-            # engines must not silently drop a field of the tool's contract, so
-            # it is derived here from the definitions the kernel returned rather
-            # than left absent (which a caller reads as zero matches).
-            kernel.setdefault("matches", len(kernel.get("definitions") or []))
-            return json_text(kernel)
-        from devcouncil.indexing.graph import query_symbol
-
-        payload = _graph_payload(root, query_symbol(root, name))
-        # Provenance is not optional here. Two engines can answer this tool and
-        # they do not agree in every case, so a caller that cannot tell which
-        # replied cannot interpret the answer.
-        payload.setdefault("source", "code_graph")
-        return json_text(payload)
+        if kernel is None:
+            return error_text(_NO_KERNEL_TEXT, code="graph_missing")
+        # The CLI's payload shape carries `definitions` but not `matches`,
+        # which this tool has always emitted and agents branch on. Switching
+        # engines must not silently drop a field of the tool's contract, so
+        # it is derived here from the definitions the kernel returned rather
+        # than left absent (which a caller reads as zero matches).
+        kernel.setdefault("matches", len(kernel.get("definitions") or []))
+        return json_text(kernel)
 
     async def _run() -> list[TextContent]:
         return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
@@ -1267,16 +1235,17 @@ async def handle_graph_query(root: Path, arguments: dict) -> list[TextContent]:
 
 
 async def handle_graph_trace(root: Path, arguments: dict) -> list[TextContent]:
-    """Path between two symbols, kernel-first.
+    """Path between two symbols. The kernel is the only engine.
 
     Measured at 1.133 s in Python against 0.202 s for the kernel.
 
-    **The two engines differ, and the kernel is the correct one.** Python's BFS
-    is *undirected* over `imports`/`calls`/`contains`/`defines`/`inherits`; the
-    kernel walks resolved edges directionally. On a real probe Python reported a
-    two-hop path between two functions through a shared test module while the
-    kernel correctly reported no indexed path. Agents will see fewer, truer
-    paths — and, since the kernel pass in this session, a capped walk now says
+    **The two engines differed, and the kernel is the correct one.** Python's
+    BFS was *undirected* over `imports`/`calls`/`contains`/`defines`/`inherits`;
+    the kernel walks resolved edges directionally. On a real probe Python
+    reported a two-hop path between two functions through a shared test module
+    while the kernel correctly reported no indexed path. That is why the Python
+    tracer was deleted rather than kept as a fallback: a fabricated path is
+    worse than an absent answer, because a caller acts on it. A capped walk says
     so rather than being reported as "no path".
     """
 
@@ -1288,13 +1257,9 @@ async def handle_graph_trace(root: Path, arguments: dict) -> list[TextContent]:
         if not end:
             return error_text("Missing to", code="missing_argument", argument="to")
         kernel = _devmap_query_payload(root, "trace", start=start, end=end)
-        if kernel is not None:
-            return json_text(kernel)
-        from devcouncil.indexing.graph import trace_path
-
-        payload = _graph_payload(root, trace_path(root, start, end))
-        payload.setdefault("source", "code_graph")
-        return json_text(payload)
+        if kernel is None:
+            return error_text(_NO_KERNEL_TEXT, code="graph_missing")
+        return json_text(kernel)
 
     async def _run() -> list[TextContent]:
         return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
@@ -1303,7 +1268,20 @@ async def handle_graph_trace(root: Path, arguments: dict) -> list[TextContent]:
 
 
 async def handle_graph_impact(root: Path, arguments: dict) -> list[TextContent]:
-    """Symbol-level blast radius from paths or working-tree diff (code graph)."""
+    """Symbol-level blast radius from paths or working-tree diff.
+
+    The last graph tool here still on `load_code_graph`. It read the whole
+    graph out of the Python `index.sqlite` cache — the retired engine's read
+    path, measured elsewhere in this package at 1.2 s and hundreds of MB per
+    call — and then re-ran the inbound walk in Python, from a tool an agent
+    reads as read-only.
+
+    The kernel now bands its own walk (`impact --layers`), so the answer is one
+    walk over one generation rather than a Python re-implementation of it, and
+    it carries what Python could not: which targets matched nothing, how many
+    nodes a band held beyond the ones listed, the weakest edge that reached each
+    band, and whether the walk itself stopped short.
+    """
 
     def _body() -> list[TextContent]:
         paths, list_error = optional_string_list_argument(arguments, "paths")
@@ -1319,23 +1297,26 @@ async def handle_graph_impact(root: Path, arguments: dict) -> list[TextContent]:
                 code="missing_argument",
                 argument="paths",
             )
+        seeds = [str(path) for path in (paths or [])]
+        if use_diff:
+            # `git diff`, not the graph — the one part of this tool that never
+            # needed an engine.
+            from devcouncil.indexing.graph.intel import working_tree_changed_paths
 
-        from devcouncil.indexing.graph.build import load_code_graph
-        from devcouncil.indexing.graph.intel import diff_impact
+            changed = working_tree_changed_paths(root)
+            if seeds:
+                wanted = {seed.replace("\\", "/") for seed in seeds}
+                changed = [path for path in changed if path in wanted]
+            seeds = changed
 
-        graph = load_code_graph(root)
-        if graph is None:
+        result = _devmap_query_payload(root, "impact", paths=seeds, max_depth=3)
+        if result is None:
+            return error_text(_NO_KERNEL_TEXT, code="graph_missing")
+        if result.get("ok") is False:
             return error_text(
-                "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
-                code="graph_missing",
+                f"devmap: {result.get('error') or 'refused'}", code="graph_unavailable"
             )
-        result = diff_impact(
-            root,
-            graph,
-            paths=paths,
-            use_diff=use_diff,
-            max_depth=3,
-        )
+        result["source_paths"] = "diff" if use_diff else "paths"
         return json_text(_graph_payload(root, result))
 
     async def _run() -> list[TextContent]:
@@ -1344,18 +1325,39 @@ async def handle_graph_impact(root: Path, arguments: dict) -> list[TextContent]:
     return await with_codeintel_freshness(root, _run)
 
 
+#: Said when no kernel can be reached, by every graph tool here. The kernel is
+#: the engine; there is no second one to fall back to.
+_NO_KERNEL_TEXT = (
+    "No devmap store found. Run `dev map` to build the index these tools read."
+)
+
+
+def _route_tool(root: Path, ask) -> list[TextContent]:
+    """Run one kernel route command and wrap it in the graph-tool envelope.
+
+    Shared by the three route tools because they differ only in which command
+    they send: same unavailability rule, same envelope, same failure text. Each
+    used to `load_code_graph(root)` and then run a Python re-implementation of
+    the command — measured on this repository at 2.1-2.7 s against the kernel's
+    0.8-1.0 s, and answering without the kernel's coverage record
+    (`capabilities` on `routes`, `scan` on all three), so a client scan that
+    stopped at its file cap was published as a complete inventory.
+    """
+    from devcouncil.devmap_client import DevMapClientError, try_connect
+
+    client = try_connect(root)
+    if client is None:
+        return error_text(_NO_KERNEL_TEXT, code="graph_missing")
+    try:
+        result = ask(client)
+    except DevMapClientError as exc:
+        return error_text(f"devmap: {exc}", code="graph_unavailable")
+    return json_text(_graph_payload(root, result))
+
+
 async def handle_route_map(root: Path, arguments: dict) -> list[TextContent]:
     def _body() -> list[TextContent]:
-        from devcouncil.indexing.graph.api_routes import route_map
-        from devcouncil.indexing.graph.build import load_code_graph
-
-        graph = load_code_graph(root)
-        if graph is None:
-            return error_text(
-                "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
-                code="graph_missing",
-            )
-        return json_text(_graph_payload(root, route_map(root, graph)))
+        return _route_tool(root, lambda client: client.routes())
 
     async def _run() -> list[TextContent]:
         return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
@@ -1368,16 +1370,7 @@ async def handle_shape_check(root: Path, arguments: dict) -> list[TextContent]:
         route = optional_string_argument(arguments, "route")
         if route == "":
             return error_text("route must be a string", code="invalid_arguments", argument="route")
-        from devcouncil.indexing.graph.api_routes import shape_check
-        from devcouncil.indexing.graph.build import load_code_graph
-
-        graph = load_code_graph(root)
-        if graph is None:
-            return error_text(
-                "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
-                code="graph_missing",
-            )
-        return json_text(_graph_payload(root, shape_check(root, graph, route_filter=route)))
+        return _route_tool(root, lambda client: client.shape_check(route_filter=route))
 
     async def _run() -> list[TextContent]:
         return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
@@ -1394,16 +1387,7 @@ async def handle_api_impact(root: Path, arguments: dict) -> list[TextContent]:
                 code="missing_argument",
                 argument="route_or_path",
             )
-        from devcouncil.indexing.graph.api_routes import api_impact
-        from devcouncil.indexing.graph.build import load_code_graph
-
-        graph = load_code_graph(root)
-        if graph is None:
-            return error_text(
-                "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
-                code="graph_missing",
-            )
-        return json_text(_graph_payload(root, api_impact(root, route_or_path, graph)))
+        return _route_tool(root, lambda client: client.api_impact(route_or_path))
 
     async def _run() -> list[TextContent]:
         return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"

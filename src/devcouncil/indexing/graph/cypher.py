@@ -133,15 +133,24 @@ def run_cypher(project_root: Path, query: str, *, default_limit: int = 50) -> Di
     name_filter, path_prefix = where.name_filter, where.path_prefix
 
     from devcouncil.codeintel.service import get_codeintel_service
+    from devcouncil.indexing.graph.build import read_code_graph
 
-    try:
-        # The service owns the store, the root and the runtime-observation
-        # table; this used to reach through a query engine's private `_graph`
-        # for all three. Same graph, same runtime merge, same failure mode —
-        # asked of the owner instead.
-        graph = get_codeintel_service(project_root).load_with_runtime_observations()
-    except FileNotFoundError:
-        return {"ok": False, "error": "No committed graph generation."}
+    # The kernel's artifact is the graph. This asked the Python `index.sqlite`
+    # store for a "committed generation" that nothing had written since
+    # `write_code_graph` lost its last caller, so every query against a real
+    # repository returned `No committed graph generation.` — the CLI's
+    # `dev map cypher` and the `devcouncil_graph_cypher` MCP tool alike.
+    graph = read_code_graph(project_root)
+    if graph is None:
+        return {
+            "ok": False,
+            "error": (
+                "No code graph at .devcouncil/graph/code_graph.json; run `dev map` first."
+            ),
+        }
+    # Runtime edges witnessed by the opt-in debug tracer are still the service's
+    # to add: it owns the root, the store and the fingerprint they are scoped by.
+    graph = get_codeintel_service(project_root).merge_runtime_observations(graph)
 
     nodes_by_id = {n.id: n for n in graph.nodes}
     rows: List[Dict[str, Any]] = []

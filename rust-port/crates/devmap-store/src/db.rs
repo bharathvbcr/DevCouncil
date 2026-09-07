@@ -1,15 +1,40 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use crate::edge_index::GenerationEdges;
+use crate::edge_index::{EdgeOrder, GenerationEdges, GenerationEdgesBuilder};
 use devmap_analyze::clones::CloneCandidate;
 use devmap_analyze::model::*;
 use devmap_analyze::DeadClusterScan;
 use devmap_extract::model::*;
+use devmap_extract::subprocess::GIT_HEAD_DEADLINE;
 #[cfg(feature = "parse")]
 use devmap_resolve::model::*;
 use rusqlite::{params, Connection, OptionalExtension, Result, TransactionBehavior};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// A refusal this store raises itself — a future schema, a read-only file, a
+/// NUL in a search query, a Python-era database handed to `--db` — carried in
+/// `rusqlite::Error` so every `Result` in this module is one type.
+///
+/// `InvalidParameterName` carried these until 2026-09-07, and its `Display`
+/// put "Invalid parameter name: " in front of every one of them — text about
+/// a store, rendered as a complaint about a parameter. `ToSqlConversionFailure`
+/// displays its boxed error bare (rusqlite 0.31 `error.rs`), so the reason is
+/// the whole message.
+#[derive(Debug)]
+struct StoreRefusal(String);
+
+impl std::fmt::Display for StoreRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StoreRefusal {}
+
+fn refusal(message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
+}
 
 use crate::coverage::{CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryRefusal};
 use crate::edge_index::ResolutionSource;
@@ -17,8 +42,11 @@ use crate::schema::{
     declared_index_names, BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, COVERAGE_GAPS_TABLE,
     CREATE_SCHEMA_V3, CURRENT_SCHEMA_VERSION, MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12,
     MIGRATION_V12_TO_V13, MIGRATION_V14_TO_V15, MIGRATION_V15_TO_V16, MIGRATION_V16_TO_V17,
-    MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
-    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
+    MIGRATION_V17_TO_V18_BACKFILL_EDGES, MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED,
+    MIGRATION_V17_TO_V18_RENAME_EDGES, MIGRATION_V17_TO_V18_RENAME_UNRESOLVED,
+    MIGRATION_V18_TO_V19, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES,
+    MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9,
+    MIGRATION_V9_TO_V10, PYTHON_INDEX_SCHEMA_VERSION, VALIDITY_RANGE_TABLES,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -29,71 +57,41 @@ use crate::schema::{
 /// be able to say what quarantined means without copying the number.
 pub const MAX_PENDING_ATTEMPTS: u32 = 5;
 
-/// Hard ceiling for the git subprocess. `git` can stall on pathological
-/// repositories, network mounts or hook misconfigurations; unbounded, it hung
-/// every drain batch and CLI status behind it. On expiry the child is killed
-/// and the caller gets an error — `current_git_head`'s callers already treat
-/// an unavailable head as "unavailable", so a stalled git degrades honestly
-/// instead of wedging the daemon.
-const GIT_HEAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
-
+/// `git rev-parse HEAD` through the kernel's one bounded runner.
+///
+/// This was the first bounded git call in the kernel — drain threads, kill at
+/// [`GIT_HEAD_DEADLINE`] — written here because a hung git (network mount,
+/// wedged hook) stalled every drain batch and CLI status behind it. Two more
+/// runners grew beside it in `devmap-query`, one of them unbounded, and three
+/// runners is how three disciplines drift; `devmap_extract::subprocess` is
+/// the one now and this is a caller of it. What stays here is the contract:
+/// `current_git_head`'s callers treat an unavailable head as "unavailable",
+/// so a stalled git degrades honestly instead of wedging the daemon, and a
+/// head that is not a hex identity is refused rather than stored.
 fn run_git_head_with_deadline(program: &str, root: &Path) -> anyhow::Result<String> {
-    use std::io::Read;
-    use std::process::Stdio;
+    use devmap_extract::subprocess::{git_with_program, run_bounded, Bounds, Failure};
 
-    let mut child = std::process::Command::new(program)
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "HEAD"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| anyhow::anyhow!("cannot spawn {program}: {error}"))?;
-
-    // Drain both pipes on helper threads: reading them only after exit would
-    // deadlock once a pipe buffer filled. Kill on deadline; the readers then
-    // see EOF when the child dies.
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
-    let stdout_reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stdout_pipe.read_to_string(&mut buf);
-        buf
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stderr_pipe.read_to_string(&mut buf);
-        buf
-    });
-
-    let started = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if started.elapsed() >= GIT_HEAD_DEADLINE {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    anyhow::bail!(
-                        "{program} rev-parse HEAD exceeded \
-                         {GIT_HEAD_DEADLINE:?} and was killed"
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(error) => anyhow::bail!("{program} rev-parse HEAD failed: {error}"),
-        }
+    let mut command = git_with_program(std::ffi::OsStr::new(program), root);
+    command.args(["rev-parse", "HEAD"]);
+    let bounds = Bounds {
+        deadline: GIT_HEAD_DEADLINE,
+        stdout_cap: 4096,
+        stderr_cap: 4096,
     };
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
-    if !status.success() {
+    let captured = run_bounded(&mut command, bounds).map_err(|failure| match failure {
+        Failure::Deadline { .. } => anyhow::anyhow!(
+            "{program} rev-parse HEAD exceeded {GIT_HEAD_DEADLINE:?} and was killed"
+        ),
+        other => anyhow::anyhow!("{other}"),
+    })?;
+    if !captured.status.success() {
         anyhow::bail!(
             "git rev-parse HEAD failed for {:?}: {}",
             root,
-            stderr.trim()
+            captured.stderr_trimmed()
         );
     }
-    let head = stdout.trim().to_string();
+    let head = captured.stdout_lossy().trim().to_string();
     if !(7..=64).contains(&head.len()) || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         anyhow::bail!("git returned an invalid HEAD identity for {:?}", root);
     }
@@ -395,9 +393,7 @@ fn lock_conn(
     mutex
         .lock()
         .map_err(|_: PoisonError<MutexGuard<'_, Connection>>| {
-            rusqlite::Error::InvalidParameterName(
-                "store mutex poisoned — refusing to continue (fail-closed)".into(),
-            )
+            refusal("store mutex poisoned — refusing to continue (fail-closed)")
         })
 }
 
@@ -435,24 +431,23 @@ pub struct Store {
     /// 71,598-edge vector per query and did not give the memory back: RSS went
     /// 531.6 MB after startup -> 625.2 MB after 6 queries -> 801.4 MB after 26,
     /// about 10 MB per query of allocator churn. One retained copy replaces an
-    /// unbounded series of transient ones.
+    /// The latest generation's edges and the adjacency over them, keyed by
+    /// generation id.
+    ///
+    /// The one memo of a generation's edges. It used to sit beside a second
+    /// one holding the `Vec<StoredEdge>` it was built from, so the rows were
+    /// retained for the life of the process on top of the index — ~100 MB of
+    /// `String`s that only `latest_edges` ever read again. The index now holds
+    /// the generation's *interned* text and addresses it by rank, so the rows
+    /// are built on demand and only for the edges an answer contains, and one
+    /// memo is enough.
     ///
     /// Keyed by generation id, so a build that commits a new generation
     /// invalidates it by construction — there is no separate invalidation path
     /// to forget to call. Only the newest generation is held, so the memory is
     /// bounded by one edge set and not by the number of generations retained.
-    /// The cached set is unfiltered; `min_confidence` is applied per request
-    /// against the same rounding rule the SQL used, so the answer is unchanged.
-    edge_cache: Mutex<Option<CachedEdges>>,
-    /// Adjacency over the same rows [`Store::edge_cache`] holds, keyed by the
-    /// same generation id.
-    ///
-    /// It shares that `Arc` rather than copying the edge text, so what this
-    /// adds is four maps of `u32` ids — see
-    /// [`GenerationEdges::adjacency_bytes`]. Without it every graph question
-    /// paid for the whole generation before the walk began: the clone out of
-    /// the cache, the conversion of every row, and an adjacency map over every
-    /// row, for a question whose answer touches a few dozen edges.
+    /// The index is unfiltered; `min_confidence` is applied per request against
+    /// the same rounding rule the SQL used, so the answer is unchanged.
     edge_index: Mutex<Option<(u32, std::sync::Arc<GenerationEdges>)>>,
     /// `(generation, node_count, edge_count)` for the generation last asked
     /// about.
@@ -521,15 +516,6 @@ impl Drop for WriterLock {
 }
 
 /// One generation's edge rows and the evidence tier behind each of them.
-///
-/// One entry rather than two caches: an evidence tier read from a different
-/// generation than the edge it labels is precisely the drift the index already
-/// refuses to allow for its coverage disclosure.
-type CachedEdges = (
-    u32,
-    std::sync::Arc<Vec<StoredEdge>>,
-    std::sync::Arc<Vec<crate::edge_index::EdgeResolution>>,
-);
 
 #[derive(Debug, Clone)]
 pub struct StoreStatus {
@@ -729,7 +715,7 @@ impl PathRanks {
     /// well-formed store cannot reach this.
     fn rank_of(&self, id: i64) -> Result<u32> {
         self.rank_by_id.get(&id).copied().ok_or_else(|| {
-            rusqlite::Error::InvalidParameterName(format!(
+            refusal(format!(
                 "generation edge names path id {id}, which is not in `paths`; \
                  the store is inconsistent and answering over the edges that \
                  remain would be a wrong answer rather than a partial one"
@@ -740,42 +726,282 @@ impl PathRanks {
     fn path_of(&self, rank: u32) -> &str {
         &self.ordered[rank as usize]
     }
+
+    /// How many distinct `paths` rows this generation's store holds.
+    fn len(&self) -> usize {
+        self.ordered.len()
+    }
 }
 
-/// A generation edge before it has been put in read order.
+/// Everything about an edge that a generation stores, as one hashable value.
 ///
-/// Holds the ranks rather than the paths, and the `f64` confidence SQLite
-/// stored rather than the `f32` [`StoredEdge`] narrows it to, because both are
-/// sort keys and both must compare exactly as SQL compared them.
-struct UnorderedEdge {
-    source_rank: u32,
-    target_rank: u32,
-    source_symbol: String,
-    target_symbol: String,
-    edge_kind: String,
-    confidence: f64,
-    resolution: Option<String>,
-    ordinal: u32,
+/// The identity a v18 validity range is keyed on: two rows with this tuple are
+/// the same edge, and a build that re-derives it leaves the existing row alone.
+/// Every column of `edge_rows` except the range itself and the row id is here,
+/// deliberately — a column left out would let a build silently keep a row whose
+/// stored value it no longer agrees with, which is the carry-forward staleness
+/// the edge loop's comment describes and refuses.
+///
+/// `Cow` because the two sides come from different places: the resolved side
+/// borrows out of `ResolutionResult` (no allocation for ~100k edges) and the
+/// stored side owns what SQLite handed back. `Cow`'s `Eq` and `Hash` are the
+/// underlying `str`'s, so borrowed and owned compare as the strings they are.
+///
+/// The confidence is the `f64` SQLite stores, compared by bit pattern: `f64` is
+/// not `Eq`, and any rounding here would merge two rows the read path can tell
+/// apart.
+#[cfg(feature = "parse")]
+#[derive(PartialEq, Eq, Hash)]
+struct EdgeTuple<'a> {
+    source_file_id: u32,
+    target_file_id: u32,
+    source_symbol: std::borrow::Cow<'a, str>,
+    target_symbol: std::borrow::Cow<'a, str>,
+    edge_kind: std::borrow::Cow<'a, str>,
+    confidence: u64,
+    resolution: Option<std::borrow::Cow<'a, str>>,
+    candidate_total: Option<i64>,
 }
 
-/// The order every reader of a generation's edges sees, as one comparator.
+/// The end of a bucket chain. `u32::MAX` rather than `Option<u32>` so the array
+/// is four bytes an entry: it has one slot per resolved edge, and this store
+/// writes 102,083 of them.
+#[cfg(feature = "parse")]
+const NO_MORE_IN_BUCKET: u32 = u32::MAX;
+
+/// A 64-bit digest of a row's identity, for bucketing only.
 ///
-/// `confidence DESC, source path, target path, source symbol, target symbol,
-/// edge kind` — the key `latest_edges_uncached`'s SQL used to hand to SQLite —
-/// and then `ordinal`, which SQL had no equivalent of and which makes the tail
-/// of the order defined instead of arbitrary. This order is the final
-/// tie-break of every answer derived from a walk (R4), so it has exactly one
-/// owner.
-fn edge_read_order(left: &UnorderedEdge, right: &UnorderedEdge) -> std::cmp::Ordering {
-    right
-        .confidence
-        .total_cmp(&left.confidence)
-        .then_with(|| left.source_rank.cmp(&right.source_rank))
-        .then_with(|| left.target_rank.cmp(&right.target_rank))
-        .then_with(|| left.source_symbol.cmp(&right.source_symbol))
-        .then_with(|| left.target_symbol.cmp(&right.target_symbol))
-        .then_with(|| left.edge_kind.cmp(&right.edge_kind))
-        .then_with(|| left.ordinal.cmp(&right.ordinal))
+/// **Never an answer.** Every candidate a bucket offers is compared field by
+/// field against the row before it is treated as the same row, so two identities
+/// that digest alike are still two identities. The digest exists because the
+/// alternative — a `HashMap` keyed by the identity itself — stores the identity
+/// twice, once in `resolution` and once in the map, and that second copy is
+/// 160 bytes an edge. Measured by `verify.sh` gate 6, which bounds the kernel's
+/// memory per unit of ambiguity fan-out: the map put the probe at 116-118 % of
+/// its model against a 115 % cap, over five interleaved runs where the base
+/// binary measured 100-103 %.
+///
+/// `DefaultHasher::new` seeds from fixed keys, not from `RandomState`, so one
+/// binary buckets the same way on every run — the standard library guarantees
+/// only that every `DefaultHasher` built by `new` agrees with every other, and
+/// not that the digest survives a Rust upgrade. Nothing here needs more than
+/// that: the digest is never stored, never compared across processes, and never
+/// leaves this call. A build whose internal structure is the same run to run is
+/// simply easier to reason about than one whose is not.
+#[cfg(feature = "parse")]
+fn identity_digest<T: std::hash::Hash>(identity: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    identity.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A 128-bit digest of a *multiset* of row identities, and its size.
+///
+/// One source file's contribution to a ranged relation, as one comparable
+/// value. Two files' row sets are the same set exactly when their digests
+/// agree — practically, not provably, and the size of that gap is the whole
+/// safety argument, so it is stated rather than assumed:
+///
+/// * **Order-independent, multiplicity-aware.** The combiner is wrapping
+///   addition, which makes the digest a function of the multiset alone. That
+///   matters twice. The resolver's emission order within a file is not a
+///   promise anyone has made, so an order-sensitive digest would report false
+///   differences and quietly give back the saving. And `XOR` — the other
+///   obvious combiner — would make a row cancel its own duplicate, so a file
+///   holding a tuple twice and one holding it four times would digest alike.
+///   475 edge tuples and 12,424 ledger tuples of this repository occur more
+///   than once in a single generation, so that is a live case and not a
+///   theoretical one.
+/// * **128 bits, from two independent hashes.** `lo` and `hi` are
+///   [`identity_digest`] of the identity and of the identity behind a
+///   domain-separating salt — the same PRF on two different messages. A false
+///   "unchanged" needs the changed multiset to preserve `rows`, `lo` and `hi`
+///   at once; for row digests that behave as random 64-bit values that is
+///   ~2^-128 per file per build, against ~1,600 files and one build per edit.
+/// * **The count is carried, not derived.** It is a third field rather than a
+///   convenience: `rows` alone catches every change that adds or removes rows,
+///   which is most of them, without either sum being consulted.
+///
+/// The identity hashed is [`EdgeTuple`] / [`UnresolvedTuple`] itself, never a
+/// hand-picked subset of their columns. That is the point of load in this whole
+/// design: a column added to an identity is a column the digest covers on the
+/// same commit, and there is no second list of "the fields that matter" to fall
+/// out of step with the first. A digest over a subset would let a build keep a
+/// row whose stored value it no longer agrees with — exactly the carry-forward
+/// staleness `EdgeTuple`'s own doc comment refuses.
+#[cfg(feature = "parse")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RowSetDigest {
+    rows: u64,
+    lo: u64,
+    hi: u64,
+}
+
+/// Domain separation for [`RowSetDigest`]'s second hash.
+///
+/// Any value works as long as it is not the empty prefix; this one is
+/// arbitrary. It is written into the hasher ahead of the identity, so `hi` is
+/// the same PRF as `lo` over a different message rather than a transformation
+/// of `lo` — a second 64 bits of entropy, not a second view of the first.
+#[cfg(feature = "parse")]
+const ROW_DIGEST_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
+
+#[cfg(feature = "parse")]
+impl RowSetDigest {
+    /// Fold one row's identity into the digest.
+    fn absorb<T: std::hash::Hash>(&mut self, identity: &T) {
+        self.rows = self.rows.wrapping_add(1);
+        self.lo = self.lo.wrapping_add(identity_digest(identity));
+        self.hi = self
+            .hi
+            .wrapping_add(identity_digest(&(ROW_DIGEST_SALT, identity)));
+    }
+
+    /// The three columns as SQLite stores them.
+    ///
+    /// SQLite has no unsigned integer type, so the same two's-complement
+    /// round trip the extraction cache uses for its content hashes.
+    fn to_columns(self) -> [i64; 3] {
+        [self.rows as i64, self.lo as i64, self.hi as i64]
+    }
+
+    fn from_columns(rows: i64, lo: i64, hi: i64) -> Self {
+        Self {
+            rows: rows as u64,
+            lo: lo as u64,
+            hi: hi as u64,
+        }
+    }
+}
+
+/// Bucket `count` identities by digest, chaining collisions.
+///
+/// Returns `(buckets, chain)`: `buckets[digest]` is the newest index with that
+/// digest and `chain[index]` the next one, or [`NO_MORE_IN_BUCKET`].
+///
+/// It takes the identity rather than a digest so that [`identity_digest`] is
+/// the one function that decides how anything is bucketed. The alternative —
+/// each caller digesting its own way on the way in — is a structure that can be
+/// built under one rule and searched under another, and the symptom of that is
+/// not a crash but a build that silently rewrites every row.
+///
+/// `identity_of` returns `None` for an index that is not part of this
+/// generation. That index is in no bucket at all, so nothing can match it.
+#[cfg(feature = "parse")]
+fn bucket_identities<T: std::hash::Hash>(
+    count: usize,
+    identity_of: impl Fn(usize) -> Option<T>,
+) -> (std::collections::HashMap<u64, u32>, Vec<u32>) {
+    let mut buckets: std::collections::HashMap<u64, u32> =
+        std::collections::HashMap::with_capacity(count);
+    let mut chain: Vec<u32> = vec![NO_MORE_IN_BUCKET; count];
+    for index in 0..count {
+        let Some(identity) = identity_of(index) else {
+            continue;
+        };
+        let digest = identity_digest(&identity);
+        let index = index as u32;
+        chain[index as usize] = buckets.insert(digest, index).unwrap_or(NO_MORE_IN_BUCKET);
+    }
+    (buckets, chain)
+}
+
+/// Consume the one candidate that *is* this row, and say whether there was one.
+///
+/// The bucket narrows the search; this comparison decides it. A digest is a
+/// filter and never an answer, so every candidate a bucket offers is compared
+/// field by field, and a collision merely costs a comparison that fails. The
+/// candidate is then marked, which is what makes the whole structure a multiset
+/// rather than a set: a row that occurs three times is three candidates, and the
+/// three live rows claim them one at a time.
+///
+/// `identity_of` returns `None` for an index that is not part of this
+/// generation. Those are unreachable through the buckets anyway — nothing put
+/// them there — and the check is kept so that the two are one statement apart
+/// and cannot drift into disagreeing.
+#[cfg(feature = "parse")]
+fn claim_matching_candidate<T: std::hash::Hash + PartialEq>(
+    buckets: &std::collections::HashMap<u64, u32>,
+    chain: &[u32],
+    matched: &mut [bool],
+    live: &T,
+    identity_of: impl Fn(usize) -> Option<T>,
+) -> bool {
+    let mut cursor = buckets
+        .get(&identity_digest(live))
+        .copied()
+        .unwrap_or(NO_MORE_IN_BUCKET);
+    while cursor != NO_MORE_IN_BUCKET {
+        let index = cursor as usize;
+        cursor = chain[index];
+        if matched[index] {
+            continue;
+        }
+        let Some(candidate) = identity_of(index) else {
+            continue;
+        };
+        if candidate == *live {
+            matched[index] = true;
+            return true;
+        }
+    }
+    false
+}
+
+/// The identity of one resolved edge, as `edge_rows` stores it.
+///
+/// The one owner: `save_generation_with_metadata` calls this to decide what to
+/// write and again to write it, so those two passes cannot come to disagree
+/// about which rows they mean.
+///
+/// `kind_labels` is the interned `format!("{:?}", kind)` of every kind in the
+/// generation. Formatting per *edge* instead is 102,083 heap allocations held
+/// for the length of the write, for a value that takes one of a dozen values.
+#[cfg(feature = "parse")]
+fn edge_tuple<'a>(
+    edge: &'a ResolvedEdge,
+    kind_labels: &'a std::collections::HashMap<EdgeKind, String>,
+    source_file_id: u32,
+    target_file_id: u32,
+) -> EdgeTuple<'a> {
+    EdgeTuple {
+        source_file_id,
+        target_file_id,
+        source_symbol: std::borrow::Cow::Borrowed(edge.source_symbol.as_str()),
+        target_symbol: std::borrow::Cow::Borrowed(edge.target_symbol.as_str()),
+        edge_kind: std::borrow::Cow::Borrowed(kind_labels[&edge.edge_kind].as_str()),
+        // Compared by bit pattern, which is what SQLite stores and what the read
+        // path compares. `f64` has no `Eq`, and rounding the key would let two
+        // rows the reader can tell apart share one.
+        confidence: edge.confidence.persist_real().to_bits(),
+        // The evidence tier, so the read path does not have to guess it back out
+        // of the row's file layout. NULL only for an edge built without a
+        // resolution at all, which the resolver never produces —
+        // `ResolvedEdge::new` takes one — and which the read path therefore
+        // reports as `ResolutionSource::Reconstructed`.
+        resolution: edge.resolution.as_ref().map(|resolution| {
+            std::borrow::Cow::Borrowed(crate::edge_index::resolution_kind_label(resolution))
+        }),
+        // How many candidates the ambiguous rung actually weighed, which since
+        // `AMBIGUOUS_FANOUT_CAP` is no longer the number of rows this site
+        // produces. NULL for every other rung: a resolution that names one
+        // target has no candidate list, and writing 1 there would make a certain
+        // edge look like a one-candidate ambiguity.
+        candidate_total: crate::edge_index::ambiguous_candidate_total(edge.resolution.as_deref()),
+    }
+}
+
+/// The same identity for one row of the unresolved-call ledger.
+#[cfg(feature = "parse")]
+#[derive(PartialEq, Eq, Hash)]
+struct UnresolvedTuple<'a> {
+    source_file: std::borrow::Cow<'a, str>,
+    source_symbol: std::borrow::Cow<'a, str>,
+    callee_name: std::borrow::Cow<'a, str>,
+    reason: std::borrow::Cow<'a, str>,
+    classification: std::borrow::Cow<'a, str>,
+    receiver: Option<std::borrow::Cow<'a, str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -818,6 +1044,143 @@ pub struct GenerationWriteOpts {
     /// `save_generation_with_metadata` refuses a generation whose two halves
     /// disagree about which of them it is.
     pub discovery_refusals: Option<Vec<DiscoveryRefusal>>,
+    /// Compare every stored row, rather than only the files whose freshly
+    /// resolved rows disagree with the digest the previous generation recorded.
+    ///
+    /// The escape hatch for the v19 scoping, and the switch the equivalence
+    /// test in `digest_scoped_delta.rs` flips to prove the two paths write the
+    /// same store. It is not the same lever as an empty affected set: a full
+    /// rewrite re-*extracts* every file, which is minutes, while this keeps the
+    /// incremental extraction and only re-derives which stored rows are still
+    /// wanted, which is the ~200 ms the scoping saves. `devmap build
+    /// --verify-rows` is the caller that sets it.
+    ///
+    /// A full rewrite implies it — with no previous generation to have written
+    /// digests, and every row of the relation being replaced, there is nothing
+    /// to scope by — so callers of that path need not also set it.
+    pub verify_every_row: bool,
+}
+
+/// What one generation write spent, charged to the relation that spent it.
+///
+/// `persist:write` is one number, and on this repository it is 0.30 s of a
+/// 1.10 s one-file incremental build. The relations under it have nothing in
+/// common as fixes -- v18 put the edges and the unresolved ledger on validity
+/// ranges and left the rest as full per-generation copies -- so a single span
+/// cannot say which of them a build is waiting for, and the decision about the
+/// next schema rung is exactly that question.
+///
+/// **Accumulated, not bracketed.** The node and full-text writes are
+/// interleaved by construction: an FTS rowid is derived from the node ordinal
+/// the same loop just produced, so separating them into two passes would mean
+/// inventing a second ordinal counter and a second walk. Each field is instead
+/// the sum of the spans that relation's statements were actually inside.
+///
+/// The consequence is that the parts **under-account** for the write by the
+/// glue between them -- the transaction, the carry decision, the guards -- and
+/// never over-account for it. A reader may sum them and compare the total to
+/// `persist:write`; the remainder is real and unattributed, not missing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WriteBreakdown {
+    /// `generation_file_rows` and the `file_payloads` behind it, including the
+    /// three JSON serializations a fresh payload needs.
+    pub file_rows: f64,
+    /// `generation_nodes`, carried and fresh.
+    pub nodes: f64,
+    /// `nodes_fts` and `nodes_fts_map`, carried and fresh.
+    pub fts: f64,
+    /// The edge delta: the scan of live rows, the closes and the inserts.
+    pub edges: f64,
+    /// The unresolved-call ledger delta, the same three passes.
+    pub unresolved: f64,
+    /// `generation_file_digests` -- writing the per-file digests the *next*
+    /// build scopes its two deltas by. Only the table write: computing a digest
+    /// is part of the pass over the relation it describes, and is charged to
+    /// `edges` and `unresolved` where the rows are.
+    pub digests: f64,
+    /// `generation_coverage_gaps`, including the carry-forward scan.
+    pub gaps: f64,
+    /// `generation_dead_symbols`.
+    pub dead: f64,
+    /// `build_history` and the aggregate queries it is computed from.
+    pub history: f64,
+    /// `tx.commit()` -- the durability the whole write is waiting for.
+    pub commit: f64,
+}
+
+impl WriteBreakdown {
+    /// The split as labelled spans, in the order the write incurs them.
+    ///
+    /// One owner for the labels: the `--json` timings and any test that names a
+    /// relation read them from here, so a field added to the struct and left
+    /// out of the report is a compile-time omission rather than a silent one.
+    pub fn parts(&self) -> Vec<(&'static str, f64)> {
+        let Self {
+            file_rows,
+            nodes,
+            fts,
+            edges,
+            unresolved,
+            digests,
+            gaps,
+            dead,
+            history,
+            commit,
+        } = *self;
+        vec![
+            ("file_rows", file_rows),
+            ("nodes", nodes),
+            ("fts", fts),
+            ("edges", edges),
+            ("unresolved", unresolved),
+            ("digests", digests),
+            ("gaps", gaps),
+            ("dead", dead),
+            ("history", history),
+            ("commit", commit),
+        ]
+    }
+}
+
+/// Charges the wall time it is alive for to one field of a [`WriteBreakdown`].
+///
+/// A guard rather than a closure taking the work, because the write path is a
+/// sequence of statements interleaved with the bindings they produce: wrapping
+/// a region in a closure would mean either re-indenting several hundred lines
+/// or threading every binding out through a tuple. A guard costs one line at
+/// the top of a block that is already there.
+///
+/// It charges on `Drop`, so a statement that fails is charged for the time it
+/// took before failing. The alternative -- charging only on success -- would
+/// leave the one build worth profiling as the one build with no profile.
+///
+/// Gated on `parse` because its only caller is: `save_generation_timed` is the
+/// write path and needs the grammar-identity stamps. With the feature off this
+/// is dead code, and `cargo clippy -p devmap-query --no-default-features`
+/// refuses it -- the store's own feature-off check cannot, because
+/// `devmap-serve` is a dev-dependency that pulls default features straight back
+/// in. [`WriteBreakdown`] itself stays ungated: it is public, an embedder that
+/// reads a persisted map can name the type, and gating it would gate the
+/// re-export too.
+#[cfg(feature = "parse")]
+struct Charge<'a> {
+    sink: &'a mut f64,
+    started: std::time::Instant,
+}
+
+#[cfg(feature = "parse")]
+impl Drop for Charge<'_> {
+    fn drop(&mut self) {
+        *self.sink += self.started.elapsed().as_secs_f64();
+    }
+}
+
+#[cfg(feature = "parse")]
+fn charge(sink: &mut f64) -> Charge<'_> {
+    Charge {
+        sink,
+        started: std::time::Instant::now(),
+    }
 }
 
 /// One committed build, as recorded by [`Store::build_history`].
@@ -963,7 +1326,7 @@ fn sqlite_limit(limit: usize) -> i64 {
 /// range is worse than a refusal that names the symbol.
 fn checked_span(path: &str, name: &str, start: i64, end: i64) -> Result<(usize, usize)> {
     let corrupt = || {
-        rusqlite::Error::InvalidParameterName(format!(
+        refusal(format!(
             "stored span for symbol {name:?} in {path} is not a byte range: \
              span_start={start}, span_end={end}"
         ))
@@ -987,12 +1350,12 @@ fn decode_stored_outcome(
     engine_json: &str,
 ) -> Result<(ParseOutcome, ExtractionEngine)> {
     let parse_outcome = serde_json::from_str(parse_json).map_err(|error| {
-        rusqlite::Error::InvalidParameterName(format!(
+        refusal(format!(
             "stored parse outcome for {path} is invalid: {error}"
         ))
     })?;
     let engine = serde_json::from_str(engine_json).map_err(|error| {
-        rusqlite::Error::InvalidParameterName(format!(
+        refusal(format!(
             "stored extraction engine for {path} is invalid: {error}"
         ))
     })?;
@@ -1036,7 +1399,7 @@ fn stored_is_parse_failure(outcome: &ParseOutcome, engine: &ExtractionEngine) ->
 /// would have been closed in one.
 fn fts_match_query(query: &str) -> Result<String> {
     if let Some(offset) = query.find('\0') {
-        return Err(rusqlite::Error::InvalidParameterName(format!(
+        return Err(refusal(format!(
             "search query contains a NUL byte at offset {offset}; SQLite's \
              full-text parser reads the query as a C string, so no escaping \
              can carry one through"
@@ -1047,7 +1410,7 @@ fn fts_match_query(query: &str) -> Result<String> {
 
 pub fn checked_min_confidence(value: f32) -> Result<f32> {
     if value.is_nan() {
-        return Err(rusqlite::Error::InvalidParameterName(
+        return Err(refusal(
             "min_confidence must be a number; got NaN, which no confidence \
              comparison can evaluate"
                 .to_string(),
@@ -1080,6 +1443,7 @@ pub fn checked_min_confidence(value: f32) -> Result<f32> {
 /// A struct rather than eight positional parameters: five of the eight are
 /// `&str`, so a transposed pair would compile and store an engine description
 /// in the parse-outcome column. Named fields make that a compile error.
+#[cfg(feature = "parse")]
 struct StoredPayload<'a> {
     file_id: u32,
     content_hash: i64,
@@ -1167,9 +1531,62 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
         "generation_file_rows",
         &["generation_id", "file_id", "payload_id"],
     ),
+    // v18's two base tables, listed for the same reason v17's are: the views
+    // above are validated through `PRAGMA table_info`, which answers for a view
+    // without saying anything about what it is a view *over*. A migration that
+    // built the view over the wrong shape would pass the check above and fail at
+    // the first write.
+    (
+        "edge_rows",
+        &[
+            "edge_id",
+            "source_file_id",
+            "target_file_id",
+            "source_symbol",
+            "target_symbol",
+            "edge_kind",
+            "confidence",
+            "resolution",
+            "candidate_total",
+            "valid_from",
+            "valid_to",
+        ],
+    ),
+    (
+        "unresolved_rows",
+        &[
+            "unresolved_id",
+            "source_file",
+            "source_symbol",
+            "callee_name",
+            "reason",
+            "classification",
+            "receiver",
+            "valid_from",
+            "valid_to",
+        ],
+    ),
     (
         "generation_coverage_gaps",
         &["generation_id", "gap", "path", "reason"],
+    ),
+    // v19's digest cache. Listed for the same reason the two above are: nothing
+    // reads it but the write path, so a migration that created it with the
+    // wrong columns would be caught by nothing until a build tried to record a
+    // digest — and a build that cannot record one silently loses the scoping
+    // rather than failing, which is the worst way for this table to be wrong.
+    (
+        "generation_file_digests",
+        &[
+            "generation_id",
+            "file_id",
+            "edge_rows",
+            "edge_lo",
+            "edge_hi",
+            "unresolved_rows",
+            "unresolved_lo",
+            "unresolved_hi",
+        ],
     ),
     (
         "generation_unresolved",
@@ -1452,9 +1869,7 @@ impl Store {
             match conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
                 Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
                 Ok(mode) => {
-                    last = Some(rusqlite::Error::InvalidParameterName(format!(
-                        "journal_mode is {mode}, not wal"
-                    )));
+                    last = Some(refusal(format!("journal_mode is {mode}, not wal")));
                 }
                 Err(error) => last = Some(error),
             }
@@ -1469,9 +1884,7 @@ impl Store {
             }
             std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
         }
-        Err(last.unwrap_or_else(|| {
-            rusqlite::Error::InvalidParameterName("could not enable WAL mode".to_string())
-        }))
+        Err(last.unwrap_or_else(|| refusal("could not enable WAL mode".to_string())))
     }
 
     fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -1502,6 +1915,7 @@ impl Store {
     /// The probe uses the same expressions the index does. Safe without a
     /// retry loop: every caller holds the generation write transaction, and the
     /// store has one writer.
+    #[cfg(feature = "parse")]
     fn ensure_payload_id(tx: &Connection, payload: StoredPayload<'_>) -> Result<i64> {
         let StoredPayload {
             file_id,
@@ -1559,6 +1973,21 @@ impl Store {
     /// freshly-created one carrying the current shape, so a step that is legal
     /// only against a table has to ask. Absent counts as "not a table": a step
     /// guarded by this must be skipped when its target does not exist either.
+    /// Whether `name` names anything at all — table, view or index.
+    ///
+    /// [`Self::relation_is_table`] cannot answer this: it reads absent and view
+    /// as the same "no", which is right for a step that only works on a table
+    /// and wrong for one that must be skipped when the relation exists *in any
+    /// shape*. `MIGRATION_V8_TO_V9` is the second kind.
+    fn relation_exists(conn: &Connection, name: &str) -> Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     fn relation_is_table(conn: &Connection, name: &str) -> Result<bool> {
         let kind: Option<String> = conn
             .query_row(
@@ -1586,7 +2015,7 @@ impl Store {
             // *relation* exists and carries the columns readers name — which
             // `PRAGMA table_info` answers for a view exactly as for a table.
             if !matches!(object_type.as_deref(), Some("table") | Some("view")) {
-                return Err(rusqlite::Error::InvalidParameterName(format!(
+                return Err(refusal(format!(
                     "required schema object {table:?} is neither a table nor a view"
                 )));
             }
@@ -1597,7 +2026,7 @@ impl Store {
                 .collect::<Result<_>>()?;
             for column in *required_columns {
                 if !columns.contains(*column) {
-                    return Err(rusqlite::Error::InvalidParameterName(format!(
+                    return Err(refusal(format!(
                         "required column {table}.{column} is missing"
                     )));
                 }
@@ -1626,8 +2055,9 @@ impl Store {
         };
         for index in declared_index_names() {
             if !present.contains(&index) {
-                return Err(rusqlite::Error::InvalidParameterName(format!(
-                    "required index {index} is missing; the store would answer correctly                      and scan for every answer — run `devmap build` to rebuild it"
+                return Err(refusal(format!(
+                    "required index {index} is missing; the store would answer correctly \
+                     and scan for every answer — run `devmap build` to rebuild it"
                 )));
             }
         }
@@ -1642,16 +2072,26 @@ impl Store {
     /// disk could not tell which one was refused, and nothing said whether the
     /// fix was to rebuild the kernel or to rebuild the database. Those are
     /// opposite actions and getting them the wrong way round destroys an index.
+    ///
+    /// The first phrase of the "older binary" remedy is what the Python seam
+    /// matches to file the failure under `schema_newer_than_kernel`
+    /// (`devmap_engine._FUTURE_SCHEMA_MARKER`, pinned to this source by a
+    /// parity test); change it there and here together.
     fn unsupported_schema(store: &str, found: i32) -> rusqlite::Error {
         let remedy = if found > CURRENT_SCHEMA_VERSION {
             "this devmap binary is older than the store; rebuild it with \
              `cargo build --release -p devmap-cli` or set DEVMAP_BINARY to a newer build"
+                .to_string()
+        } else if (1..=PYTHON_INDEX_SCHEMA_VERSION).contains(&found) {
+            format!(
+                "this is the Python engine's database (`.devcouncil/codeintel/index.sqlite`, \
+                 schema {PYTHON_INDEX_SCHEMA_VERSION}), not a devmap store, and this kernel \
+                 cannot convert it — point `--db` at `devmap.sqlite`"
+            )
         } else {
-            "run `devmap build` to migrate the store — and check `--db` actually names a \
-             devmap store: `.devcouncil/codeintel/index.sqlite` is the Python engine's \
-             database (schema 2), not this kernel's"
+            "run `devmap build` to migrate the store".to_string()
         };
-        rusqlite::Error::InvalidParameterName(format!(
+        refusal(format!(
             "devmap store {store}: schema version {found} is not supported by this binary \
              (schema {CURRENT_SCHEMA_VERSION}); {remedy}"
         ))
@@ -1741,8 +2181,15 @@ impl Store {
                 // A fresh database stamps CURRENT_SCHEMA_VERSION directly and
                 // never runs the migration chain, so every table added by a
                 // later migration must also be created here.
-                tx.execute_batch(UNRESOLVED_TABLE)?;
+                //
+                // `VALIDITY_RANGE_TABLES` stands where `UNRESOLVED_TABLE` used
+                // to: since v18 the unresolved ledger *is* a view over
+                // `unresolved_rows`, and applying the v9 batch here would try to
+                // index that view. `UNRESOLVED_TABLE` remains the v8→v9 rung for
+                // stores old enough to need it.
+                tx.execute_batch(VALIDITY_RANGE_TABLES)?;
                 tx.execute_batch(COVERAGE_GAPS_TABLE)?;
+                tx.execute_batch(MIGRATION_V18_TO_V19)?;
                 Self::validate_schema(&tx)?;
                 tx.execute(
                     &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION),
@@ -1772,6 +2219,14 @@ impl Store {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(CREATE_SCHEMA_V3)?;
             tx.execute_batch(MIGRATION_V4_TO_V5)?;
+            // v5's two edge indexes name `generation_edges`, which v18 turned
+            // into a view — and `CREATE INDEX` on a view is an error, not a
+            // no-op. Same probe, same reason, as the v12→v13 step below: this
+            // rung meets whatever `CREATE_SCHEMA_V3` above left, and on a store
+            // that already carries the current shape that is a view.
+            if Self::relation_is_table(&tx, "generation_edges")? {
+                tx.execute_batch(MIGRATION_V4_TO_V5_EDGE_INDEXES)?;
+            }
             let has_analysis_json = {
                 let mut stmt = tx.prepare("PRAGMA table_info(generations)")?;
                 let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -1842,8 +2297,14 @@ impl Store {
         if version == 8 {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // `CREATE TABLE IF NOT EXISTS` is idempotent, so this needs no
-            // probe — unlike the ADD COLUMN migrations above.
-            tx.execute_batch(MIGRATION_V8_TO_V9)?;
+            // probe — but the two indexes beside it are not: since v18
+            // `generation_unresolved` may already be a view, and indexing one
+            // is an error. Skipped whole rather than split, because the table
+            // and its indexes are one shape: if the relation is not a table,
+            // none of this batch applies.
+            if !Self::relation_exists(&tx, "generation_unresolved")? {
+                tx.execute_batch(MIGRATION_V8_TO_V9)?;
+            }
             tx.execute("PRAGMA user_version = 9", [])?;
             // No mid-chain validation: `validate_schema` asserts the *current*
             // schema, and a v9 database legitimately lacks the v10
@@ -1856,7 +2317,13 @@ impl Store {
             // Same idempotency probe as v7/v8: `ADD COLUMN` is not repeatable,
             // and a fresh create applies the current `UNRESOLVED_TABLE`, which
             // already carries the column, before this chain runs.
-            if !Self::has_column(&tx, "generation_unresolved", "classification")? {
+            //
+            // The `relation_is_table` half is v18's: the batch both adds a
+            // column and creates an index, and neither is legal against the
+            // view `generation_unresolved` became.
+            if Self::relation_is_table(&tx, "generation_unresolved")?
+                && !Self::has_column(&tx, "generation_unresolved", "classification")?
+            {
                 tx.execute_batch(MIGRATION_V9_TO_V10)?;
             }
             tx.execute("PRAGMA user_version = 10", [])?;
@@ -1867,7 +2334,9 @@ impl Store {
         }
         if version == 10 {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if !Self::has_column(&tx, "generation_unresolved", "receiver")? {
+            if Self::relation_is_table(&tx, "generation_unresolved")?
+                && !Self::has_column(&tx, "generation_unresolved", "receiver")?
+            {
                 tx.execute_batch(MIGRATION_V10_TO_V11)?;
             }
             tx.execute("PRAGMA user_version = 11", [])?;
@@ -1923,7 +2392,11 @@ impl Store {
             // Same idempotency probe as v7/v8/v10/v11: `ADD COLUMN` is not
             // repeatable, and a fresh create applies `CREATE_SCHEMA_V3`, which
             // already carries the column, before this chain runs.
-            if !Self::has_column(&tx, "generation_edges", "resolution")? {
+            // The `relation_is_table` half is v18's: `ALTER TABLE ... ADD
+            // COLUMN` cannot name the view `generation_edges` became.
+            if Self::relation_is_table(&tx, "generation_edges")?
+                && !Self::has_column(&tx, "generation_edges", "resolution")?
+            {
                 tx.execute_batch(MIGRATION_V14_TO_V15)?;
             }
             tx.execute("PRAGMA user_version = 15", [])?;
@@ -1942,7 +2415,9 @@ impl Store {
         if version == 15 {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // Same idempotency probe as v7/v8/v10/v11/v14.
-            if !Self::has_column(&tx, "generation_edges", "candidate_total")? {
+            if Self::relation_is_table(&tx, "generation_edges")?
+                && !Self::has_column(&tx, "generation_edges", "candidate_total")?
+            {
                 tx.execute_batch(MIGRATION_V15_TO_V16)?;
             }
             tx.execute("PRAGMA user_version = 16", [])?;
@@ -1972,9 +2447,65 @@ impl Store {
                 tx.execute_batch(MIGRATION_V16_TO_V17)?;
             }
             tx.execute("PRAGMA user_version = 17", [])?;
-            Self::validate_schema(&tx)?;
+            // No mid-chain validation: `validate_schema` asserts the *current*
+            // schema, and a v17 database legitimately has `generation_edges` as
+            // a table and no `edge_rows` until the step below runs.
             tx.commit()?;
             version = 17;
+        }
+        if version == 17 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Each relation is asked about separately, and "is it still a
+            // base table?" is the whole question: absent means there is
+            // nothing to carry, a view means this rung already ran, and only a
+            // table has rows that need moving onto ranges.
+            //
+            // A single probe over `generation_edges` was the first shape of
+            // this step and it was wrong for a store that has one relation and
+            // not the other — a hand-built v3 fixture picks up
+            // `generation_unresolved` at rung 9 and never acquires a
+            // `generation_edges` at all, and the single probe read that as
+            // "already migrated" and left the store with no edge relation.
+            let carry_edges = Self::relation_is_table(&tx, "generation_edges")?;
+            let carry_unresolved = Self::relation_is_table(&tx, "generation_unresolved")?;
+            if carry_edges {
+                tx.execute_batch(MIGRATION_V17_TO_V18_RENAME_EDGES)?;
+            }
+            if carry_unresolved {
+                tx.execute_batch(MIGRATION_V17_TO_V18_RENAME_UNRESOLVED)?;
+            }
+            // Unconditional, and idempotent by `IF NOT EXISTS`: the v18 shape
+            // must exist at the end of this rung however the store arrived.
+            tx.execute_batch(VALIDITY_RANGE_TABLES)?;
+            if carry_edges {
+                tx.execute_batch(MIGRATION_V17_TO_V18_BACKFILL_EDGES)?;
+            }
+            if carry_unresolved {
+                tx.execute_batch(MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED)?;
+            }
+            tx.execute("PRAGMA user_version = 18", [])?;
+            // No mid-chain validation: `validate_schema` asserts the *current*
+            // schema, and a v18 database legitimately has no
+            // `generation_file_digests` until the step below runs.
+            tx.commit()?;
+            version = 18;
+        }
+        if version == 18 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Purely additive, and idempotent by `IF NOT EXISTS`. There is no
+            // backfill and there deliberately cannot be one: a digest is a
+            // function of the resolver's output for a file, and SQL cannot
+            // re-derive that from the stored rows without deciding, per file,
+            // which of them the *next* build would still want — which is the
+            // question the write path answers and this table only caches. An
+            // absent digest reads as "unknown" and makes the next build compare
+            // that file's rows exactly as v18 did, so the empty table is a
+            // correct starting state rather than a gap to be filled.
+            tx.execute_batch(MIGRATION_V18_TO_V19)?;
+            tx.execute("PRAGMA user_version = 19", [])?;
+            Self::validate_schema(&tx)?;
+            tx.commit()?;
+            version = 19;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
@@ -2031,7 +2562,7 @@ impl Store {
             // neither be migrated nor, with the columns this kernel reads
             // missing, be answered from; say which, rather than letting the
             // first `ALTER TABLE` report a bare SQLite code.
-            return Err(rusqlite::Error::InvalidParameterName(format!(
+            return Err(refusal(format!(
                 "devmap store {store} is read-only and at schema {stamped}, which this kernel \
                  (schema {CURRENT_SCHEMA_VERSION}) would have to migrate before reading; make \
                  it writable and run `devmap build`, or rebuild it elsewhere"
@@ -2045,7 +2576,6 @@ impl Store {
         }
         Ok(Self {
             conn: Mutex::new(conn),
-            edge_cache: Mutex::new(None),
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
@@ -2156,7 +2686,7 @@ impl Store {
             .as_deref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| ":memory:".to_string());
-        Err(rusqlite::Error::InvalidParameterName(format!(
+        Err(refusal(format!(
             "devmap store {store} is read-only: the file or its directory is not writable by \
              this process, so it can be queried but not rebuilt"
         )))
@@ -2372,7 +2902,6 @@ impl Store {
         Self::migrate(&mut conn, ":memory:")?;
         Ok(Self {
             conn: Mutex::new(conn),
-            edge_cache: Mutex::new(None),
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
@@ -2914,17 +3443,43 @@ impl Store {
         opts: GenerationWriteOpts,
         head_sha: &str,
     ) -> Result<u32> {
+        self.save_generation_timed(extractions, resolution, analysis, opts, head_sha)
+            .map(|(gen_id, _)| gen_id)
+    }
+
+    /// [`save_generation_with_metadata`](Self::save_generation_with_metadata),
+    /// and what the write spent on each relation.
+    ///
+    /// The split lives here rather than in a profiler beside the store because
+    /// two of the relations cannot be separated from outside: the node and
+    /// full-text writes are one interleaved loop, an FTS rowid being derived
+    /// from the node ordinal the loop just produced. See [`WriteBreakdown`] for
+    /// what the numbers do and do not account for.
+    ///
+    /// Every existing caller keeps the `u32` it had; the breakdown is a second
+    /// return value on a second entry point, so the sixty-odd call sites of
+    /// `save_generation*` are untouched by a change none of them asked for.
+    #[cfg(feature = "parse")]
+    pub fn save_generation_timed(
+        &self,
+        extractions: &[Extraction],
+        resolution: &ResolutionResult,
+        analysis: &AnalysisSummary,
+        opts: GenerationWriteOpts,
+        head_sha: &str,
+    ) -> Result<(u32, WriteBreakdown)> {
+        let mut spent = WriteBreakdown::default();
         self.refuse_if_read_only()?;
         if head_sha.is_empty() || head_sha.len() > 128 || head_sha.chars().any(char::is_whitespace)
         {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "head_sha must be non-empty, whitespace-free, and at most 128 characters".into(),
+            return Err(refusal(
+                "head_sha must be non-empty, whitespace-free, and at most 128 characters",
             ));
         }
         let mut unique_paths = std::collections::BTreeSet::new();
         for extraction in extractions {
             if !unique_paths.insert(extraction.file_path.as_str()) {
-                return Err(rusqlite::Error::InvalidParameterName(format!(
+                return Err(refusal(format!(
                     "duplicate extraction path in generation input: {}",
                     extraction.file_path
                 )));
@@ -2944,9 +3499,8 @@ impl Store {
         // Keep the summary semantically complete even though dead rows also
         // have a normalized table. An authoritative-looking empty list makes
         // latest_analysis() disagree with latest_dead_symbols().
-        let analysis_json = serde_json::to_string(&durable_analysis).map_err(|error| {
-            rusqlite::Error::InvalidParameterName(format!("analysis serialization failed: {error}"))
-        })?;
+        let analysis_json = serde_json::to_string(&durable_analysis)
+            .map_err(|error| refusal(format!("analysis serialization failed: {error}")))?;
 
         tx.execute(
             "INSERT INTO generations (created_at, head_sha, analysis_json, repo_root)
@@ -3048,7 +3602,7 @@ impl Store {
             .filter(|path| !current_hashes.contains_key(path.as_str()))
             .collect();
         if !unreplaceable.is_empty() {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
+            return Err(refusal(format!(
                 "cannot carry forward {} file(s) whose stored payload was produced by a different \
                  extractor or grammar (for example {}); rebuild this generation from a full \
                  extraction rather than a differential write",
@@ -3080,6 +3634,7 @@ impl Store {
                        JOIN paths p ON p.id = m.file_id
                       WHERE m.generation_id = ?2 AND p.path = ?3",
                 )?;
+                let _charge = charge(&mut spent.file_rows);
                 for path in &carry {
                     stmt.execute(params![gen_id, prev, path])?;
                 }
@@ -3101,13 +3656,13 @@ impl Store {
             // the same two's-complement representation as the extraction cache.
             let content_hash = extraction.content_hash as i64;
             let parse_json = serde_json::to_string(&extraction.parse_outcome).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
+                refusal(format!(
                     "parse outcome serialization failed for {}: {error}",
                     extraction.file_path
                 ))
             })?;
             let engine_json = serde_json::to_string(&extraction.engine).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
+                refusal(format!(
                     "extraction engine serialization failed for {}: {error}",
                     extraction.file_path
                 ))
@@ -3115,7 +3670,7 @@ impl Store {
             let mut durable_extraction = extraction.for_durable_store();
             durable_extraction.source_code = None;
             let extraction_json = serde_json::to_string(&durable_extraction).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
+                refusal(format!(
                     "extraction serialization failed for {}: {error}",
                     extraction.file_path
                 ))
@@ -3139,11 +3694,14 @@ impl Store {
                     extraction_json: &extraction_json,
                 },
             )?;
-            tx.execute(
-                "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
-                 VALUES (?1, ?2, ?3)",
-                params![gen_id, file_id, payload_id],
-            )?;
+            {
+                let _charge = charge(&mut spent.file_rows);
+                tx.execute(
+                    "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![gen_id, file_id, payload_id],
+                )?;
+            }
         }
 
         let mut node_ord: u32 = 0;
@@ -3178,29 +3736,41 @@ impl Store {
                     ))
                 })?;
                 for row in rows {
-                    let (path, name, qn, kind, start, end, exported, b_exact, b_struct, b_nodes) =
-                        row?;
+                    // The decode is charged to `nodes` with the insert it feeds:
+                    // reading the previous generation's 18,501 rows back out is
+                    // the carry-forward's cost as much as writing them is, and
+                    // splitting the two would leave the larger half unnamed.
+                    let (path, name, qn, kind, start, end, exported, b_exact, b_struct, b_nodes) = {
+                        let _charge = charge(&mut spent.nodes);
+                        row?
+                    };
                     if !carry.contains(&path) {
                         continue;
                     }
                     let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &path)?;
-                    tx.prepare_cached(
-                        "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    )?
-                    .execute(params![
-                        gen_id, node_ord, file_id, name, qn, kind, start, end, exported, b_exact,
-                        b_struct, b_nodes
-                    ])?;
+                    {
+                        let _charge = charge(&mut spent.nodes);
+                        tx.prepare_cached(
+                            "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        )?
+                        .execute(params![
+                            gen_id, node_ord, file_id, name, qn, kind, start, end, exported,
+                            b_exact, b_struct, b_nodes
+                        ])?;
+                    }
                     let fts_rowid = Self::fts_rowid(gen_id, node_ord);
-                    tx.prepare_cached(
-                        "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
-                    )?
-                    .execute(params![fts_rowid, name, qn, path])?;
-                    tx.prepare_cached(
-                        "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
-                    )?
-                    .execute(params![fts_rowid, gen_id])?;
+                    {
+                        let _charge = charge(&mut spent.fts);
+                        tx.prepare_cached(
+                            "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
+                        )?
+                        .execute(params![fts_rowid, name, qn, path])?;
+                        tx.prepare_cached(
+                            "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
+                        )?
+                        .execute(params![fts_rowid, gen_id])?;
+                    }
                     node_ord += 1;
                 }
             }
@@ -3216,36 +3786,43 @@ impl Store {
             }
             let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &ext.file_path)?;
             for sym in &ext.symbols {
-                tx.execute(
-                    "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    params![
-                        gen_id,
-                        node_ord,
-                        file_id,
-                        sym.name,
-                        sym.qualified_name,
-                        sym.kind.as_str(),
-                        sym.span.start_byte,
-                        sym.span.end_byte,
-                        sym.is_exported as i32,
-                        // SQLite integers are signed. The cast is bit-preserving
-                        // and reversed on read, so the stored value round-trips
-                        // even though half the hash space reads back negative.
-                        sym.body_signature.map(|s| s.exact as i64),
-                        sym.body_signature.map(|s| s.structural as i64),
-                        sym.body_signature.map(|s| i64::from(s.nodes))
-                    ],
-                )?;
+                {
+                    let _charge = charge(&mut spent.nodes);
+                    tx.execute(
+                        "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        params![
+                            gen_id,
+                            node_ord,
+                            file_id,
+                            sym.name,
+                            sym.qualified_name,
+                            sym.kind.as_str(),
+                            sym.span.start_byte,
+                            sym.span.end_byte,
+                            sym.is_exported as i32,
+                            // SQLite integers are signed. The cast is
+                            // bit-preserving and reversed on read, so the stored
+                            // value round-trips even though half the hash space
+                            // reads back negative.
+                            sym.body_signature.map(|s| s.exact as i64),
+                            sym.body_signature.map(|s| s.structural as i64),
+                            sym.body_signature.map(|s| i64::from(s.nodes))
+                        ],
+                    )?;
+                }
                 let fts_rowid = Self::fts_rowid(gen_id, node_ord);
-                tx.prepare_cached(
-                    "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
-                )?
-                .execute(params![fts_rowid, sym.name, sym.qualified_name, ext.file_path])?;
-                tx.prepare_cached(
-                    "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
-                )?
-                .execute(params![fts_rowid, gen_id])?;
+                {
+                    let _charge = charge(&mut spent.fts);
+                    tx.prepare_cached(
+                        "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
+                    )?
+                    .execute(params![fts_rowid, sym.name, sym.qualified_name, ext.file_path])?;
+                    tx.prepare_cached(
+                        "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
+                    )?
+                    .execute(params![fts_rowid, gen_id])?;
+                }
                 node_ord += 1;
             }
         }
@@ -3272,55 +3849,339 @@ impl Store {
         //
         // Writing every resolved edge makes that equality true by construction
         // rather than by argument. It stays below as a regression check.
-        let mut edge_ord: u32 = 0;
+        // Since v18 the write is the *difference* between the freshly resolved
+        // tuple multiset and the one already valid, not the whole set.
+        //
+        // Measured on this repository: two consecutive builds one appended line
+        // apart held 101,446 and 101,447 distinct edge tuples, one appeared and
+        // none disappeared — and the store wrote all 102,083 rows again anyway,
+        // because the relation was keyed by generation. The comparison below is
+        // ~100k in-memory tuple compares; the write that follows is the delta.
+        //
+        // Nothing above changes: `resolution.edges` is still the whole tree's
+        // resolution, so a carried row is one this build re-derived and found
+        // identical, not one it declined to look at. That is the distinction the
+        // paragraph above is about, and it is why the equality below is still
+        // structural.
+        //
+        // The multiset is built in one pass over `resolution.edges` and the
+        // inserts walk that same slice again, so the rows land in the resolver's
+        // emission order. Iterating the map instead would have been shorter and
+        // was measurably wrong: a `HashMap`'s order is arbitrary and varies per
+        // process, so the inserts landed in no order at all, and the read path's
+        // sort — which is handed the rows in stored order — lost the nearly
+        // sorted input it had been getting for free. A cold `devmap impact` on
+        // this repository went 115 ms to 150 ms for **the same instruction
+        // count** (1.192 G against 1.188 G) and 32% more cycles: pure memory
+        // stalls in a sort with a worse starting order.
+        //
+        // [`edge_tuple`] is the one owner of what an edge's identity is, called
+        // by both passes, so the pass that decides what to write and the pass
+        // that writes it cannot come to disagree about which rows they mean.
+        //
+        // Every field borrows, and the kinds are formatted once each into
+        // `kind_labels` rather than once per edge: `format!("{:?}", kind)` for
+        // 102,083 edges is 102,083 heap allocations held for the length of the
+        // write. It is the same string by construction, because it is the same
+        // expression.
+        //
+        // Since v19 the comparison is itself a difference. An edge belongs to
+        // its source file and so does an unresolved call, so a file whose
+        // freshly resolved rows digest to what the previous generation recorded
+        // holds exactly the rows already stored: nothing of it is read back,
+        // nothing of it is compared, and nothing of it is written. The measured
+        // shape this addresses is a build that stores one row and reads two
+        // hundred thousand -- 107,257 edge rows and 91,703 ledger rows on this
+        // repository, 66% of `persist:write`.
+        //
+        // The digest is over what the *resolver produced*, never over what the
+        // caller said was affected. Those differ in exactly the case the
+        // paragraphs above describe: an edge from an unchanged file into a
+        // target whose identity moved resolves differently today while its
+        // source file never enters the affected set. Its digest moves with it
+        // and its comparison runs. Scoping on the affected set instead would
+        // reintroduce the staleness this loop refuses.
+        let scope_by_digest = !opts.verify_every_row && !full_rewrite && prev_gen.is_some();
+        let mut stored_edge_digests: std::collections::HashMap<u32, RowSetDigest> =
+            std::collections::HashMap::new();
+        let mut stored_unresolved_digests: std::collections::HashMap<String, RowSetDigest> =
+            std::collections::HashMap::new();
+        if let (true, Some(prev)) = (scope_by_digest, prev_gen) {
+            let _charge = charge(&mut spent.digests);
+            // The edge side is keyed by `paths.id` and the ledger side by the
+            // path text, because that is what each relation's own rows carry:
+            // `edge_rows.source_file_id` is an id and `unresolved_rows`'
+            // `source_file` is a path. Joining `paths` here is what lets each
+            // scan compare against its own key without translating per row.
+            let mut stmt = tx.prepare(
+                "SELECT d.file_id, p.path, d.edge_rows, d.edge_lo, d.edge_hi,
+                        d.unresolved_rows, d.unresolved_lo, d.unresolved_hi
+                   FROM generation_file_digests d
+                   JOIN paths p ON p.id = d.file_id
+                  WHERE d.generation_id = ?1",
+            )?;
+            let mut rows = stmt.query(params![prev])?;
+            while let Some(row) = rows.next()? {
+                let file_id: u32 = row.get(0)?;
+                let path: String = row.get(1)?;
+                stored_edge_digests.insert(
+                    file_id,
+                    RowSetDigest::from_columns(row.get(2)?, row.get(3)?, row.get(4)?),
+                );
+                stored_unresolved_digests.insert(
+                    path,
+                    RowSetDigest::from_columns(row.get(5)?, row.get(6)?, row.get(7)?),
+                );
+            }
+        }
 
+        let mut kind_labels: std::collections::HashMap<EdgeKind, String> =
+            std::collections::HashMap::new();
+        let edge_charge = charge(&mut spent.edges);
         for edge in &resolution.edges {
-            // Deleted paths are not extracted, so a resolution over the current
-            // tree has no edge touching one. Kept as an explicit guard for
-            // callers that pass a resolution computed before the deletion.
+            kind_labels
+                .entry(edge.edge_kind)
+                .or_insert_with(|| format!("{:?}", edge.edge_kind));
+        }
+        // Which edges are in this generation at all, and under which path ids.
+        //
+        // `None` is the one owner of "not in this generation": deleted paths are
+        // not extracted, so a resolution over the current tree has no edge
+        // touching one, and the guard stays for callers that pass a resolution
+        // computed before the deletion. Every pass below reads this rather than
+        // re-asking `deleted`, so they cannot come to disagree about which edges
+        // they are talking about.
+        let mut edge_ids: Vec<Option<(u32, u32)>> = Vec::with_capacity(resolution.edges.len());
+        let mut edge_ord: u32 = 0;
+        for edge in &resolution.edges {
             if deleted.contains(&edge.source_file) || deleted.contains(&edge.target_file) {
+                edge_ids.push(None);
                 continue;
             }
             let src_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.source_file)?;
             let tgt_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.target_file)?;
-            // `prepare_cached` so this 8-parameter INSERT is compiled once per
-            // transaction rather than once per edge. It is the single
-            // highest-frequency statement in the writer: one execution for
-            // every resolved edge, 73,000 of them in a DevCouncil generation.
-            tx.prepare_cached(
-                "INSERT INTO generation_edges (generation_id, ordinal, source_file_id, target_file_id, source_symbol, target_symbol, edge_kind, confidence, resolution, candidate_total)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )?
-            .execute(
-                params![
-                    gen_id,
-                    edge_ord,
-                    src_f_id,
-                    tgt_f_id,
-                    edge.source_symbol,
-                    edge.target_symbol,
-                    format!("{:?}", edge.edge_kind),
-                    edge.confidence.persist_real(),
-                    // The evidence tier, so the read path does not have to
-                    // guess it back out of the row's file layout. NULL only for
-                    // an edge built without a resolution at all, which the
-                    // resolver never produces — `ResolvedEdge::new` takes one —
-                    // and which the read path therefore reports as
-                    // `ResolutionSource::Reconstructed`.
-                    edge.resolution
-                        .as_ref()
-                        .map(|resolution| crate::edge_index::resolution_kind_label(resolution)),
-                    // How many candidates the ambiguous rung actually weighed,
-                    // which since `AMBIGUOUS_FANOUT_CAP` is no longer the number
-                    // of rows this site produces. NULL for every other rung: a
-                    // resolution that names one target has no candidate list,
-                    // and writing 1 there would make a certain edge look like a
-                    // one-candidate ambiguity.
-                    crate::edge_index::ambiguous_candidate_total(edge.resolution.as_deref()),
-                ],
-            )?;
+            edge_ids.push(Some((src_f_id, tgt_f_id)));
             edge_ord += 1;
         }
+
+        // What this build resolved, per source file, as one comparable value
+        // each. Computed on every build and not only on scoped ones: it is what
+        // the *next* build compares against, so a build that skipped it would
+        // cost the following one the whole saving.
+        let mut fresh_edge_digests: std::collections::HashMap<u32, RowSetDigest> =
+            std::collections::HashMap::new();
+        for (index, edge) in resolution.edges.iter().enumerate() {
+            let Some((src_f_id, tgt_f_id)) = edge_ids[index] else {
+                continue;
+            };
+            fresh_edge_digests
+                .entry(src_f_id)
+                .or_default()
+                .absorb(&edge_tuple(edge, &kind_labels, src_f_id, tgt_f_id));
+        }
+        // How many rows each of those files *actually* has live, asked of the
+        // rows rather than of the record.
+        //
+        // A digest is a claim a previous build recorded about what it wrote,
+        // and a claim is not the store. `incremental_equivalence.rs` is built
+        // on the case where the two part company: `drop_stored_edges` deletes
+        // live rows behind the write path, standing in for an older kernel that
+        // recorded fewer of them, and the build is required to commit the cold
+        // answer anyway. A delta that trusted the digest alone would read
+        // "unchanged", skip the file, and leave those rows missing for ever —
+        // which is the class
+        // `stored_edges_that_disagree_with_a_fresh_resolution_are_replaced_not_carried`
+        // exists to refuse, and which this loop's own comment refuses in the
+        // paragraph above.
+        //
+        // So a file is skipped only when the rows agree with the record as well
+        // as with this build: one integer column per live row, no allocation
+        // and no comparison, against the four string allocations and the
+        // field-by-field compare the skip avoids.
+        //
+        // **What it covers, stated because the gap is the safety argument.**
+        // Every row added to or removed from a file by anything other than this
+        // write path — a repair, an older kernel, a hand-edited database. Not a
+        // content column overwritten in place with the row count preserved, and
+        // nothing outside a test does that: the only `UPDATE` either ranged
+        // table takes in this crate sets `valid_to`, twice, in this function.
+        // A row's content is written by its `INSERT` and never again.
+        let mut live_edge_rows: std::collections::HashMap<u32, u64> = fresh_edge_digests
+            .keys()
+            .map(|file_id| (*file_id, 0))
+            .collect();
+        if scope_by_digest {
+            let mut stmt =
+                tx.prepare("SELECT source_file_id FROM edge_rows WHERE valid_to IS NULL")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                // A file this build resolved nothing for is not a candidate to
+                // skip, so its live rows need no count — the scan below
+                // compares and closes them either way.
+                if let Some(count) = live_edge_rows.get_mut(&row.get::<_, u32>(0)?) {
+                    *count += 1;
+                }
+            }
+        }
+        // A file is unchanged only when a digest was *found* and matched. The
+        // three ways there can be no entry — a v18 store that migrated with an
+        // empty table, a file this generation resolved for the first time, a
+        // file whose rows the previous build wrote under `verify_every_row` —
+        // all land on "compare it", which is v18's behaviour exactly. Absence
+        // is never equality.
+        let unchanged_edge_files: std::collections::HashSet<u32> = if scope_by_digest {
+            fresh_edge_digests
+                .iter()
+                .filter(|(file_id, fresh)| {
+                    stored_edge_digests.get(file_id) == Some(*fresh)
+                        && live_edge_rows.get(file_id) == Some(&fresh.rows)
+                })
+                .map(|(file_id, _)| *file_id)
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        // A *multiset*, not a set. 475 edge tuples of this repository occur more
+        // than once in one generation (1,111 rows); collapsing them would drop
+        // rows the analysis counted and make the equality below refuse the
+        // build. The multiset is `matched` — one bit per resolved edge — rather
+        // than a count per distinct tuple, so two identical edges are two
+        // entries that are consumed one at a time.
+        //
+        // One closure, named and handed to both the bucketing and the search,
+        // rather than the same body written out twice. `bucket_identities`'
+        // doc says why the two must agree about what an identity *is*; since
+        // v19 they must also agree about which indexes are offered at all, and
+        // a second copy of the `unchanged_edge_files` test is exactly the drift
+        // that doc describes — a structure built under one rule and searched
+        // under another, whose symptom is not a crash but a build that keeps
+        // rows it should have closed.
+        let edge_identity = |index: usize| -> Option<EdgeTuple<'_>> {
+            let (src_f_id, tgt_f_id) = edge_ids[index]?;
+            // Not a candidate for anything: this file's live rows are not read
+            // back, so nothing can claim them, and its fresh rows are already
+            // stored, so nothing may insert them.
+            if unchanged_edge_files.contains(&src_f_id) {
+                return None;
+            }
+            Some(edge_tuple(
+                &resolution.edges[index],
+                &kind_labels,
+                src_f_id,
+                tgt_f_id,
+            ))
+        };
+        let (edge_buckets, edge_chain) = bucket_identities(resolution.edges.len(), edge_identity);
+        // Pre-claimed rather than left false: an unchanged file's rows are
+        // already valid, so the insert loop below must not write them again,
+        // and it skips exactly what is marked here.
+        let mut edge_matched: Vec<bool> = (0..resolution.edges.len())
+            .map(|index| {
+                edge_ids[index]
+                    .is_some_and(|(src_f_id, _)| unchanged_edge_files.contains(&src_f_id))
+            })
+            .collect();
+
+        // The rows already valid, streamed rather than materialised: the probe
+        // key is built per row and dropped, so the peak is this map plus the
+        // ids that need closing, not a second copy of the generation.
+        let mut close_edges: Vec<i64> = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT edge_id, source_file_id, target_file_id, source_symbol,
+                        target_symbol, edge_kind, confidence, resolution, candidate_total
+                 FROM edge_rows WHERE valid_to IS NULL",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                // The partition column first, and on its own. A row belonging
+                // to an unchanged file costs one integer decode here instead of
+                // the four string allocations, the hash and the field-by-field
+                // comparison below — measured at 51 ms of the 68 ms this loop
+                // spent on 107,257 rows.
+                let source_file_id: u32 = row.get(1)?;
+                if unchanged_edge_files.contains(&source_file_id) {
+                    continue;
+                }
+                let edge_id: i64 = row.get(0)?;
+                let live = EdgeTuple {
+                    source_file_id,
+                    target_file_id: row.get(2)?,
+                    source_symbol: std::borrow::Cow::Owned(row.get(3)?),
+                    target_symbol: std::borrow::Cow::Owned(row.get(4)?),
+                    edge_kind: std::borrow::Cow::Owned(row.get(5)?),
+                    confidence: row.get::<_, f64>(6)?.to_bits(),
+                    // The stored label verbatim, never round-tripped through
+                    // `ResolutionKind`: a spelling this binary does not know
+                    // would come back `None` from the enum and then compare
+                    // equal to a row that genuinely has no resolution, which is
+                    // a carried-forward row the reader would label
+                    // `Reconstructed` while the writer thought it matched.
+                    resolution: row
+                        .get::<_, Option<String>>(7)?
+                        .map(std::borrow::Cow::Owned),
+                    candidate_total: row.get(8)?,
+                };
+                let still_valid = claim_matching_candidate(
+                    &edge_buckets,
+                    &edge_chain,
+                    &mut edge_matched,
+                    &live,
+                    edge_identity,
+                );
+                if !still_valid {
+                    close_edges.push(edge_id);
+                }
+            }
+        }
+        {
+            let mut close = tx.prepare_cached(
+                "UPDATE edge_rows SET valid_to = ?2 WHERE edge_id = ?1 AND valid_to IS NULL",
+            )?;
+            for edge_id in &close_edges {
+                close.execute(params![edge_id, gen_id])?;
+            }
+            // `prepare_cached` so this 10-parameter INSERT is compiled once per
+            // transaction rather than once per edge. It is the writer's
+            // highest-frequency statement on a cold build — one execution per
+            // resolved edge, 102,083 of them here — and on an incremental build
+            // it now runs for the delta alone.
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO edge_rows (source_file_id, target_file_id, source_symbol,
+                                        target_symbol, edge_kind, confidence, resolution,
+                                        candidate_total, valid_from, valid_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+            )?;
+            // In emission order, and only the copies the live set did not
+            // already supply: a tuple wanted three times and valid twice is
+            // inserted once, at the position of its first occurrence.
+            for (index, edge) in resolution.edges.iter().enumerate() {
+                let Some((src_f_id, tgt_f_id)) = edge_ids[index] else {
+                    continue;
+                };
+                if edge_matched[index] {
+                    continue;
+                }
+                let tuple = edge_tuple(edge, &kind_labels, src_f_id, tgt_f_id);
+                insert.execute(params![
+                    tuple.source_file_id,
+                    tuple.target_file_id,
+                    tuple.source_symbol.as_ref(),
+                    tuple.target_symbol.as_ref(),
+                    tuple.edge_kind.as_ref(),
+                    f64::from_bits(tuple.confidence),
+                    tuple.resolution.as_deref(),
+                    tuple.candidate_total,
+                    gen_id,
+                ])?;
+            }
+        }
+        // One span from the kind labels to the last insert: the identity index,
+        // the scan of live rows, the closes and the inserts are the edge delta,
+        // and charging them separately would invite a reader to fix the cheapest
+        // of four passes that only exist together.
+        drop(edge_charge);
 
         // The analysis must have been computed over the edge set being stored.
         //
@@ -3351,7 +4212,7 @@ impl Store {
         // held it exactly. Exempting the case would have left the watcher, the
         // most frequent writer of all, unguarded precisely when it deletes.
         if edge_ord as usize != analysis.total_edges {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
+            return Err(refusal(format!(
                 "generation would store {edge_ord} edges but its analysis was computed over {}; \
                  dead-code and community results would describe a different graph than the one stored",
                 analysis.total_edges
@@ -3373,6 +4234,7 @@ impl Store {
         // removing from the generation must not leave a coverage row behind
         // claiming the graph is missing something it no longer contains.
         let mut gap_rows: Vec<(String, String, String)> = Vec::new();
+        let gap_charge = charge(&mut spent.gaps);
         // The extraction gaps carry forward exactly as the file rows above do,
         // and for the same reason: a differential write is handed only the
         // extractions it re-read, so deriving the whole inventory from them
@@ -3422,6 +4284,7 @@ impl Store {
         // is the drain agreeing with `devmap build` about where the repository
         // ends, and dropping the row here would make the refusal invisible on
         // the one path that produces it most.
+        drop(gap_charge);
         let measured_refusals = match &opts.discovery_refusals {
             Some(refusals) => {
                 // Deduplicated by path, because the count below is checked
@@ -3452,7 +4315,7 @@ impl Store {
         // at, and a summary claiming none while rows exist is the over-claim
         // this whole inventory exists to end.
         if measured_refusals != analysis.discovery_refused_files {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
+            return Err(refusal(format!(
                 "generation would store {measured_refusals:?} discovery refusal(s) but its \
                  analysis was computed over {:?}; `discovery_refused_files` is derived from \
                  the inventory and the two must be one measurement",
@@ -3460,6 +4323,7 @@ impl Store {
             )));
         }
         {
+            let _charge = charge(&mut spent.gaps);
             let mut insert = tx.prepare(
                 "INSERT OR REPLACE INTO generation_coverage_gaps
                  (generation_id, gap, path, reason)
@@ -3470,11 +4334,10 @@ impl Store {
             }
         }
 
+        let dead_charge = charge(&mut spent.dead);
         for (ordinal, dead) in analysis.dead_symbols.iter().enumerate() {
             let ordinal = u32::try_from(ordinal).map_err(|_| {
-                rusqlite::Error::InvalidParameterName(
-                    "dead-symbol row count exceeds SQLite generation ordinal capacity".into(),
-                )
+                refusal("dead-symbol row count exceeds SQLite generation ordinal capacity")
             })?;
             tx.execute(
                 "INSERT INTO generation_dead_symbols
@@ -3491,6 +4354,7 @@ impl Store {
                 ],
             )?;
         }
+        drop(dead_charge);
 
         // D17: the unresolved-call ledger. Written inside the same transaction
         // as everything else, so a generation can never be observable while
@@ -3500,28 +4364,236 @@ impl Store {
         // re-preparing the INSERT for each one cost seconds of the build — the
         // self-build gate caught it as a regression the moment this table
         // landed.
+        //
+        // Written as a validity range since v18, exactly as the edges above
+        // are, and for the same measurement: two consecutive builds one appended
+        // line apart held 89,743 rows and **65,567 distinct tuples on both
+        // sides, with nothing appearing and nothing disappearing** — a ledger
+        // that had not changed at all and was rewritten in full every time.
+        // Declared out here because the digest write below reads it, and the
+        // block it is filled in is scoped to the charge it belongs to.
+        let mut fresh_unresolved_digests: std::collections::HashMap<&str, RowSetDigest> =
+            std::collections::HashMap::new();
         {
-            let mut insert = tx.prepare(
-                "INSERT INTO generation_unresolved
-                 (generation_id, ordinal, source_file, source_symbol, callee_name, reason,
-                  classification, receiver)
+            let _charge = charge(&mut spent.unresolved);
+            // 12,424 ledger tuples of this repository occur more than once in
+            // one generation (36,600 rows), so this is a multiset too — and
+            // `matched`, one bit a row, is what makes it one.
+            //
+            // The reason text is formatted on demand rather than kept in a
+            // parallel `Vec<String>`: 89,743 owned strings held for the length
+            // of the write is memory `verify.sh` gate 6 charges against the
+            // kernel's model, and the three passes below need it only while a
+            // comparison is in flight.
+            let unresolved_tuple = |index: usize| -> UnresolvedTuple<'_> {
+                let unresolved = &resolution.unresolved[index];
+                UnresolvedTuple {
+                    source_file: std::borrow::Cow::Borrowed(unresolved.source_file.as_str()),
+                    source_symbol: std::borrow::Cow::Borrowed(unresolved.source_symbol.as_str()),
+                    callee_name: std::borrow::Cow::Borrowed(unresolved.callee_name.as_str()),
+                    reason: std::borrow::Cow::Owned(format!("{:?}", unresolved.resolution)),
+                    classification: std::borrow::Cow::Borrowed(unresolved.class.label()),
+                    receiver: unresolved
+                        .receiver
+                        .as_deref()
+                        .map(std::borrow::Cow::Borrowed),
+                }
+            };
+            // The same per-file digest the edges get, keyed by the path
+            // `unresolved_rows` itself stores rather than by a `paths` id: the
+            // scan below reads that column, and translating 91,703 of them per
+            // build to look each one up would cost more than the lookup saves.
+            for (index, unresolved) in resolution.unresolved.iter().enumerate() {
+                fresh_unresolved_digests
+                    .entry(unresolved.source_file.as_str())
+                    .or_default()
+                    .absorb(&unresolved_tuple(index));
+            }
+            // The ledger's half of the check the edge pass documents: the rows
+            // are asked how many of them there are, so a row deleted behind the
+            // write path is never mistaken for a row still stored.
+            //
+            // The map is seeded from the fresh paths and only ever incremented
+            // through `get_mut`, so a borrowed `&str` off the row answers it and
+            // 91,703 lookups allocate nothing.
+            let mut live_unresolved_rows: std::collections::HashMap<&str, u64> =
+                fresh_unresolved_digests
+                    .keys()
+                    .map(|path| (*path, 0))
+                    .collect();
+            if scope_by_digest {
+                let mut stmt =
+                    tx.prepare("SELECT source_file FROM unresolved_rows WHERE valid_to IS NULL")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    if let Some(count) = live_unresolved_rows.get_mut(row.get_ref(0)?.as_str()?) {
+                        *count += 1;
+                    }
+                }
+            }
+            let unchanged_unresolved_files: std::collections::HashSet<&str> = if scope_by_digest {
+                fresh_unresolved_digests
+                    .iter()
+                    .filter(|(path, fresh)| {
+                        stored_unresolved_digests.get(**path) == Some(*fresh)
+                            && live_unresolved_rows.get(**path) == Some(&fresh.rows)
+                    })
+                    .map(|(path, _)| *path)
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
+
+            // One closure for the bucketing and the search, for the reason the
+            // edge pass names: the two must agree about which indexes are
+            // offered, not only about what an identity is.
+            let ledger_identity = |index: usize| -> Option<UnresolvedTuple<'_>> {
+                if unchanged_unresolved_files
+                    .contains(resolution.unresolved[index].source_file.as_str())
+                {
+                    return None;
+                }
+                Some(unresolved_tuple(index))
+            };
+            let (ledger_buckets, ledger_chain) =
+                bucket_identities(resolution.unresolved.len(), ledger_identity);
+            let mut ledger_matched: Vec<bool> = resolution
+                .unresolved
+                .iter()
+                .map(|unresolved| {
+                    unchanged_unresolved_files.contains(unresolved.source_file.as_str())
+                })
+                .collect();
+
+            let mut close_rows: Vec<i64> = Vec::new();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT unresolved_id, source_file, source_symbol, callee_name, reason,
+                            classification, receiver
+                     FROM unresolved_rows WHERE valid_to IS NULL",
+                )?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    // `get_ref` rather than `get`, and only for the membership
+                    // test: the partition column is consulted for every live
+                    // row and owned for almost none of them, so the borrowed
+                    // `&str` answers the question and the `String` is allocated
+                    // only for a row that is going to be compared. It does not
+                    // outlive the condition — a `ValueRef` borrows the
+                    // statement, not the row, and holding one across
+                    // `rows.next()` is a borrow the loop cannot have.
+                    if unchanged_unresolved_files.contains(row.get_ref(1)?.as_str()?) {
+                        continue;
+                    }
+                    let unresolved_id: i64 = row.get(0)?;
+                    let live = UnresolvedTuple {
+                        source_file: std::borrow::Cow::Owned(row.get(1)?),
+                        source_symbol: std::borrow::Cow::Owned(row.get(2)?),
+                        callee_name: std::borrow::Cow::Owned(row.get(3)?),
+                        reason: std::borrow::Cow::Owned(row.get(4)?),
+                        classification: std::borrow::Cow::Owned(row.get(5)?),
+                        receiver: row
+                            .get::<_, Option<String>>(6)?
+                            .map(std::borrow::Cow::Owned),
+                    };
+                    let still_valid = claim_matching_candidate(
+                        &ledger_buckets,
+                        &ledger_chain,
+                        &mut ledger_matched,
+                        &live,
+                        ledger_identity,
+                    );
+                    if !still_valid {
+                        close_rows.push(unresolved_id);
+                    }
+                }
+            }
+            let mut close = tx.prepare_cached(
+                "UPDATE unresolved_rows SET valid_to = ?2
+                  WHERE unresolved_id = ?1 AND valid_to IS NULL",
+            )?;
+            for unresolved_id in &close_rows {
+                close.execute(params![unresolved_id, gen_id])?;
+            }
+            // One prepared statement for the whole ledger. A repository of this
+            // size produces tens of thousands of unresolved calls per
+            // generation, and re-preparing the INSERT for each one cost seconds
+            // of the build — the self-build gate caught it as a regression the
+            // moment this table landed.
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO unresolved_rows
+                 (source_file, source_symbol, callee_name, reason, classification, receiver,
+                  valid_from, valid_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+            )?;
+            for (index, still_valid) in ledger_matched.iter().enumerate() {
+                if *still_valid {
+                    continue;
+                }
+                let tuple = unresolved_tuple(index);
+                insert.execute(params![
+                    tuple.source_file.as_ref(),
+                    tuple.source_symbol.as_ref(),
+                    tuple.callee_name.as_ref(),
+                    tuple.reason.as_ref(),
+                    tuple.classification.as_ref(),
+                    tuple.receiver.as_deref(),
+                    gen_id,
+                ])?;
+            }
+        }
+
+        // What the *next* build scopes by.
+        //
+        // Written for every file that has at least one row in either relation,
+        // which is exactly the set that can have live rows after this write: a
+        // live row is either one this build re-derived and kept or one it just
+        // inserted, and both come from `resolution`. A file with no fresh rows
+        // therefore needs no digest — it has none of either relation left, and
+        // the next build reads its absence as "compare it" and finds nothing.
+        //
+        // Deleted paths are covered by the same statement rather than exempted
+        // from it. `edge_ids` is `None` for every edge touching one, so a
+        // deleted file contributes to no digest, is absent from this table, and
+        // its stored rows are compared and closed on the next build exactly as
+        // they are on this one.
+        //
+        // Row-per-file, not row-per-relation-per-file: the two digests share a
+        // key and are read together by the one query above, and splitting them
+        // would double a table whose whole purpose is to be cheap to read.
+        {
+            let _charge = charge(&mut spent.digests);
+            let mut digests: std::collections::HashMap<u32, (RowSetDigest, RowSetDigest)> =
+                std::collections::HashMap::with_capacity(fresh_edge_digests.len());
+            for (file_id, digest) in &fresh_edge_digests {
+                digests.entry(*file_id).or_default().0 = *digest;
+            }
+            for (path, digest) in &fresh_unresolved_digests {
+                // Interned here rather than in the per-row loop above: this is
+                // one lookup per *file*, and every one of these paths already
+                // has an id — a file with unresolved calls was extracted, and
+                // extraction is what put it in `paths`.
+                let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, path)?;
+                digests.entry(file_id).or_default().1 = *digest;
+            }
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO generation_file_digests
+                 (generation_id, file_id, edge_rows, edge_lo, edge_hi,
+                  unresolved_rows, unresolved_lo, unresolved_hi)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
-            for (ordinal, unresolved) in resolution.unresolved.iter().enumerate() {
-                let ordinal = u32::try_from(ordinal).map_err(|_| {
-                    rusqlite::Error::InvalidParameterName(
-                        "unresolved row count exceeds SQLite generation ordinal capacity".into(),
-                    )
-                })?;
+            for (file_id, (edges, unresolved)) in &digests {
+                let [edge_rows, edge_lo, edge_hi] = edges.to_columns();
+                let [unresolved_rows, unresolved_lo, unresolved_hi] = unresolved.to_columns();
                 insert.execute(params![
                     gen_id,
-                    ordinal,
-                    unresolved.source_file,
-                    unresolved.source_symbol,
-                    unresolved.callee_name,
-                    format!("{:?}", unresolved.resolution),
-                    unresolved.class.label(),
-                    unresolved.receiver.as_deref(),
+                    file_id,
+                    edge_rows,
+                    edge_lo,
+                    edge_hi,
+                    unresolved_rows,
+                    unresolved_lo,
+                    unresolved_hi,
                 ])?;
             }
         }
@@ -3529,6 +4601,7 @@ impl Store {
         // The history row is written inside the generation's own transaction.
         // A build is therefore never observable without its history entry, and
         // a rolled-back generation leaves no phantom row behind.
+        let history_charge = charge(&mut spent.history);
         let symbols: i64 = tx.query_row(
             "SELECT COUNT(*) FROM generation_nodes WHERE generation_id = ?1",
             params![gen_id],
@@ -3641,9 +4714,13 @@ impl Store {
              (SELECT generation_id FROM build_history ORDER BY built_at DESC, generation_id DESC LIMIT ?1)",
             params![BUILD_HISTORY_RETENTION as i64],
         )?;
+        drop(history_charge);
 
-        tx.commit()?;
-        Ok(gen_id)
+        {
+            let _charge = charge(&mut spent.commit);
+            tx.commit()?;
+        }
+        Ok((gen_id, spent))
     }
 
     /// Most recent builds, newest first. `limit` is clamped to the retention cap.
@@ -3798,7 +4875,7 @@ impl Store {
                 // no parsing frontend cannot rebuild — the caller would loop.
                 // `true` would be worse: a currency claim from a check that did
                 // not run.
-                return Err(rusqlite::Error::InvalidParameterName(format!(
+                return Err(refusal(format!(
                     "whether the stored payload is current cannot be decided by this build: \
                      the answer is the compiled grammar version for {language:?}, and this \
                      binary was built without the parsing frontend. Build with \
@@ -3922,11 +4999,8 @@ impl Store {
         let Some(raw) = raw else {
             return Ok(None);
         };
-        let mut summary: AnalysisSummary = serde_json::from_str(&raw).map_err(|error| {
-            rusqlite::Error::InvalidParameterName(format!(
-                "stored generation analysis is invalid: {error}"
-            ))
-        })?;
+        let mut summary: AnalysisSummary = serde_json::from_str(&raw)
+            .map_err(|error| refusal(format!("stored generation analysis is invalid: {error}")))?;
         if summary.discovery_refused_files.is_some() {
             let refused: usize = snapshot.query_row(
                 "SELECT COUNT(*) FROM generation_coverage_gaps
@@ -4026,7 +5100,7 @@ impl Store {
             return Ok(None);
         };
         let status: AnalysisStatus = serde_json::from_str(&json).map_err(|error| {
-            rusqlite::Error::InvalidParameterName(format!(
+            refusal(format!(
                 "stored generation analysis status is invalid: {error}"
             ))
         })?;
@@ -4549,9 +5623,7 @@ impl Store {
         for row in rows {
             let (json, path) = row?;
             let extraction = serde_json::from_str(&json).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
-                    "stored extraction for {path} is invalid: {error}"
-                ))
+                refusal(format!("stored extraction for {path} is invalid: {error}"))
             })?;
             extractions.push(extraction);
         }
@@ -4587,9 +5659,7 @@ impl Store {
             return Ok(None);
         };
         let extraction = serde_json::from_str(&json).map_err(|error| {
-            rusqlite::Error::InvalidParameterName(format!(
-                "stored extraction for {path} is invalid: {error}"
-            ))
+            refusal(format!("stored extraction for {path} is invalid: {error}"))
         })?;
         Ok(Some(extraction))
     }
@@ -4831,8 +5901,16 @@ impl Store {
 
     /// Every edge in the latest generation at or above `min_confidence`.
     ///
-    /// Served from [`Store::edge_cache`] when the generation has not moved. See
-    /// that field for the measurements that motivate it.
+    /// Materialised from [`Store::generation_edges`], which is the one read of
+    /// a generation's edges: the rows a caller gets here are built from the
+    /// index's interned columns rather than from a second query, so a filtered
+    /// read and an indexed walk cannot describe different generations or
+    /// disagree about the order they are in.
+    ///
+    /// This is the whole-generation shape, and it costs what a whole generation
+    /// costs — six owned `String`s per row. Everything that only needs *some*
+    /// rows should ask the index for those, which is what the query engine now
+    /// does; this stays for the callers that genuinely want every row.
     pub fn latest_edges(&self, min_confidence: f32) -> Result<Vec<StoredEdge>> {
         // The confidence comparison is the SQL's, moved into Rust unchanged, so
         // a cached answer and a freshly-queried one cannot disagree — *given a
@@ -4844,67 +5922,13 @@ impl Store {
         // comparison that never ran. `checked_min_confidence` refuses the input
         // instead, so neither implementation is asked an unanswerable question.
         let min_confidence = checked_min_confidence(min_confidence)?;
-        let Some((_, all, _)) = self.latest_edge_rows()? else {
+        let Some(index) = self.generation_edges()? else {
             return Ok(Vec::new());
         };
-        Ok(all
-            .iter()
-            .filter(|edge| crate::edge_index::admits(edge.confidence, min_confidence))
-            .cloned()
+        Ok((0..index.len() as u32)
+            .filter(|id| index.admits(*id, min_confidence))
+            .map(|id| index.stored_edge(id))
             .collect())
-    }
-
-    /// The latest generation's unfiltered edge rows, and the generation they
-    /// came from.
-    ///
-    /// The one place [`Store::edge_cache`] is consulted and filled, so
-    /// [`Store::latest_edges`] and [`Store::generation_edges`] read the same
-    /// rows for the same generation and share one allocation of them. `None`
-    /// means no generation has been persisted.
-    ///
-    /// Keyed by the generation the rows were *read from*, not by the one
-    /// sampled before the load. This function asks the question twice — once
-    /// to probe the cache, once inside the load's own snapshot — and a writer
-    /// committing between the two made the entry `(N, edges of N+1)`: a key
-    /// that can never be hit again, so the cache silently stopped being one
-    /// until the next load rewrote it. Labelling the entry with the generation
-    /// its rows came from makes the key mean what it says.
-    fn latest_edge_rows(&self) -> Result<Option<CachedEdges>> {
-        let current = {
-            let conn = lock_conn(&self.conn)?;
-            Self::latest_generation_id_locked(&conn)?
-        };
-        let Some(current) = current else {
-            return Ok(None);
-        };
-        if let Ok(cache) = self.edge_cache.lock() {
-            if let Some((generation, edges, resolutions)) = cache.as_ref() {
-                if *generation == current {
-                    return Ok(Some((
-                        current,
-                        std::sync::Arc::clone(edges),
-                        std::sync::Arc::clone(resolutions),
-                    )));
-                }
-            }
-        }
-        let Some((loaded, all, resolutions)) = self.latest_edges_uncached(0.0)? else {
-            return Ok(None);
-        };
-        let all = std::sync::Arc::new(all);
-        // Decoded once per generation, beside the rows they describe rather
-        // than in a cache of their own: an evidence tier read from a different
-        // generation than the edge it labels is the drift `GenerationEdges`
-        // already refuses to allow for its coverage disclosure.
-        let resolutions = std::sync::Arc::new(resolutions);
-        if let Ok(mut cache) = self.edge_cache.lock() {
-            *cache = Some((
-                loaded,
-                std::sync::Arc::clone(&all),
-                std::sync::Arc::clone(&resolutions),
-            ));
-        }
-        Ok(Some((loaded, all, resolutions)))
     }
 
     /// Adjacency over the latest generation's edges, built once per generation.
@@ -4915,11 +5939,24 @@ impl Store {
     /// running, and the next call after that build gets the newer generation
     /// because the memo is keyed by its id.
     ///
-    /// Errors on an unknown stored edge kind, which is where the per-request
-    /// conversion used to fail: a store written by a binary that knows an edge
-    /// kind this one does not is refused rather than half-read.
+    /// Errors on an unknown stored edge kind or resolution label, which is
+    /// where the per-request conversion used to fail: a store written by a
+    /// binary that knows a kind or a tier this one does not is refused rather
+    /// than half-read.
+    ///
+    /// Keyed by the generation the rows were *read from*, not by the one
+    /// sampled before the load. This function asks the question twice — once to
+    /// probe the memo, once inside the load's own snapshot — and a writer
+    /// committing between the two made the entry `(N, edges of N+1)`: a key
+    /// that can never be hit again, so the memo silently stopped being one
+    /// until the next load rewrote it. Labelling the entry with the generation
+    /// its rows came from makes the key mean what it says.
     pub fn generation_edges(&self) -> Result<Option<std::sync::Arc<GenerationEdges>>> {
-        let Some((current, rows, resolutions)) = self.latest_edge_rows()? else {
+        let current = {
+            let conn = lock_conn(&self.conn)?;
+            Self::latest_generation_id_locked(&conn)?
+        };
+        let Some(current) = current else {
             return Ok(None);
         };
         if let Ok(cache) = self.edge_index.lock() {
@@ -4929,133 +5966,118 @@ impl Store {
                 }
             }
         }
-        if rows.len() > u32::MAX as usize {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
-                "generation {current} holds {} edges, more than the {} an edge \
-                 index can address; answering over a prefix of it would be a \
-                 wrong answer rather than a bounded one",
-                rows.len(),
-                u32::MAX
-            )));
-        }
-        // Read for `current` specifically — the generation the rows came from,
-        // which may already be behind the store's latest.
-        let analysis = self.analysis_disclosure_for(current)?;
-        let index = std::sync::Arc::new(
-            GenerationEdges::build_with_resolutions(
-                rows,
-                analysis,
-                Some(resolutions.as_ref().clone()),
-            )
-            .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
-        );
+        let Some((loaded, index)) = self.latest_edge_index_uncached()? else {
+            return Ok(None);
+        };
+        let index = std::sync::Arc::new(index);
         if let Ok(mut cache) = self.edge_index.lock() {
-            *cache = Some((current, std::sync::Arc::clone(&index)));
+            *cache = Some((loaded, std::sync::Arc::clone(&index)));
         }
         Ok(Some(index))
     }
 
-    /// Every edge of the latest generation, and the generation they came from.
+    /// The latest generation's adjacency, read fresh, and the generation it
+    /// came from.
     ///
-    /// The generation travels with the rows because [`Self::latest_edges`]
-    /// caches them under it; returning only the rows left the caller to label
-    /// them with a generation it had resolved separately. `None` when the store
-    /// holds no generation.
-    ///
-    /// # Why the order is not SQL's any more
+    /// # Why this does not materialise the generation
     ///
     /// This read is the whole fixed cost of arriving at [`GenerationEdges`],
-    /// which is what a one-shot `devmap impact` pays and never amortises. Split
-    /// on this repository's 101,503 edges, minima of three runs each:
+    /// which is what a one-shot `devmap impact` pays and never amortises — the
+    /// index memo above is per *process*, and a CLI process asks one question.
+    /// Measured on this repository's 102,239 edges, cold, minima of nine runs:
+    /// arriving at the index cost **63.1 ms** and the walk that followed cost
+    /// **1.5 ms**. The whole of a cold `impact` was arrival.
+    ///
+    /// Two shapes were paying for it, and both were proportional to the
+    /// generation rather than to the answer:
     ///
     /// | part | cost |
     /// |---|---|
-    /// | `ORDER BY confidence DESC, sp.path, tp.path, …` | **~72 ms** |
-    /// | the two `paths` joins | ~9 ms |
-    /// | the row scan and its string materialisation | ~19 ms |
-    /// | building the adjacency in [`GenerationEdges::build_with_resolutions`] | ~23 ms |
+    /// | `ORDER BY confidence DESC, sp.path, tp.path, …` in SQLite | ~72 ms (removed earlier) |
+    /// | the row scan and six owned `String`s per `StoredEdge` | ~41 ms |
+    /// | four `HashMap<Box<str>, Vec<u32>>` over those rows | ~22 ms |
     ///
-    /// The sort is the single biggest term and it is the one SQLite is worst
-    /// at here: the key spans two joined `paths` strings, so no index can
-    /// supply it (`generation_edges` is keyed `(generation_id, ordinal)`, and
-    /// `ordinal` is the *resolver's* emission order, not this one), and the
-    /// plan is `USE TEMP B-TREE FOR ORDER BY` over every row of the
-    /// generation — ~15 MB of records through SQLite's sorter to order a Vec
-    /// that is about to be built in memory anyway.
+    /// A generation's rows are mostly repetition — 102,239 edges naming 17,869
+    /// distinct symbols, 1,602 paths, 8 kinds and 7 resolution labels — and the
+    /// row shape paid for that repetition twice, once copying the text and
+    /// again hashing it. So the rows are never built: the cursor's borrowed
+    /// `&str`s go straight into [`GenerationEdgesBuilder`], which interns each
+    /// distinct string once and keeps six `u32`s per edge, and the adjacency
+    /// becomes a counting sort over those ranks instead of four hash maps over
+    /// the text. What a caller needs a row for it gets one row at a time, for
+    /// the edges its answer actually contains.
     ///
-    /// So the ordering moves to Rust, and with it the joins: the `paths` table
-    /// is 1,567 rows, read once and *ranked* once, which turns the two most
-    /// discriminating string keys of the comparison into `u32` compares.
-    /// Measured end to end, the same rows in the same order: **~100 ms → ~39
-    /// ms**.
+    /// # Why the order is the same
     ///
-    /// # Why the result is the same order
-    ///
-    /// [`edge_read_order`] is the comparator, and it is SQL's key by key:
-    /// SQLite's default collation is BINARY, which is `str`'s byte ordering,
-    /// and the confidence is compared as the `f64` SQLite stored rather than
-    /// the `f32` [`StoredEdge`] narrows it to, so no pair that SQL separated
-    /// can collapse into a tie here. It then adds `ordinal` as a final key,
-    /// which SQL had no equivalent of: SQLite's sorter is not stable, so rows
-    /// equal on all six of its keys came back in an order nothing defined.
-    /// The extra key can only order pairs SQL left unordered, and it makes the
-    /// result reproducible instead of merely unspecified.
-    #[allow(clippy::type_complexity)]
-    fn latest_edges_uncached(
-        &self,
-        min_confidence: f32,
-    ) -> Result<Option<(u32, Vec<StoredEdge>, Vec<crate::edge_index::EdgeResolution>)>> {
+    /// [`EdgeOrder::ReadOrder`] hands the ordering to `edge_read_order`, which
+    /// is SQL's key for key and is the single owner of it — see the comparator.
+    /// `the_rust_edge_order_is_the_sql_order_it_replaced` runs the removed
+    /// statement verbatim against the same store and requires row-for-row
+    /// agreement.
+    fn latest_edge_index_uncached(&self) -> Result<Option<(u32, GenerationEdges)>> {
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
         let paths = PathRanks::read(&snapshot)?;
+        let edge_count: i64 = snapshot.query_row(
+            "SELECT COUNT(*) FROM generation_edges WHERE generation_id = ?1",
+            params![gen],
+            |row| row.get(0),
+        )?;
+        // Ids are `u32`. A generation with more edges than that cannot be
+        // addressed, and answering over a silently truncated prefix would be a
+        // wrong answer rather than a bounded one.
+        if edge_count > u32::MAX as i64 {
+            return Err(refusal(format!(
+                "generation {gen} holds {edge_count} edges, more than the {} an \
+                 edge index can address; answering over a prefix of it would be \
+                 a wrong answer rather than a bounded one",
+                u32::MAX
+            )));
+        }
+        let mut builder = GenerationEdgesBuilder::with_capacity(edge_count.max(0) as usize);
+        // The `paths` table is read and ranked once — 1,602 rows — and every
+        // edge then names its two files by rank. Interning the path *text* per
+        // edge would hash 204,478 strings to learn 1,602 facts.
+        let file_ranks: Vec<u32> = (0..paths.len())
+            .map(|rank| builder.intern_file(paths.path_of(rank as u32)))
+            .collect();
         let mut stmt = snapshot.prepare(
             "SELECT e.source_file_id, e.target_file_id, e.source_symbol,
-                    e.target_symbol, e.edge_kind, e.confidence, e.resolution,
-                    e.ordinal
+                    e.target_symbol, e.edge_kind, e.confidence, e.resolution
              FROM generation_edges e
-             WHERE e.generation_id = ?1 AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?2 * 1000) AS INTEGER)",
+             WHERE e.generation_id = ?1",
         )?;
-        let rows = stmt.query_map(params![gen, min_confidence], |row| {
-            Ok(UnorderedEdge {
-                source_rank: paths.rank_of(row.get(0)?)?,
-                target_rank: paths.rank_of(row.get(1)?)?,
-                source_symbol: row.get(2)?,
-                target_symbol: row.get(3)?,
-                edge_kind: row.get(4)?,
-                confidence: row.get(5)?,
-                resolution: row.get(6)?,
-                ordinal: row.get(7)?,
-            })
-        })?;
-        let mut unordered = rows.collect::<Result<Vec<_>>>()?;
-        unordered.sort_unstable_by(edge_read_order);
-
-        // The evidence tier is decoded in the same pass that materialises the
-        // rows, from the row it describes. Taking it from a second query would
-        // let the two describe different generations, and taking it later would
-        // need this ordering reproduced somewhere else — which is exactly the
-        // alignment a shifted resolution column would break.
-        let mut edges = Vec::with_capacity(unordered.len());
-        let mut resolutions = Vec::with_capacity(unordered.len());
-        for row in unordered {
-            let edge = StoredEdge {
-                source_file: paths.path_of(row.source_rank).to_string(),
-                target_file: paths.path_of(row.target_rank).to_string(),
-                source_symbol: row.source_symbol,
-                target_symbol: row.target_symbol,
-                edge_kind: row.edge_kind,
-                confidence: row.confidence as f32,
-                resolution: row.resolution,
-            };
-            resolutions.push(
-                crate::edge_index::edge_resolution(&edge)
-                    .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
-            );
-            edges.push(edge);
+        let mut rows = stmt.query(params![gen])?;
+        while let Some(row) = rows.next()? {
+            // `rank_of` refuses an edge whose `paths` row is gone rather than
+            // dropping it, which is what the `INNER JOIN` this replaced did:
+            // an edge set with holes in it under a successful status, whose
+            // holes then propagate as positive claims.
+            let source_file = file_ranks[paths.rank_of(row.get(0)?)? as usize];
+            let target_file = file_ranks[paths.rank_of(row.get(1)?)? as usize];
+            builder
+                .push_ranked(
+                    source_file,
+                    target_file,
+                    row.get_ref(2)?.as_str()?,
+                    row.get_ref(3)?.as_str()?,
+                    row.get_ref(4)?.as_str()?,
+                    row.get(5)?,
+                    row.get_ref(6)?.as_str_or_null()?,
+                )
+                .map_err(|error| refusal(error.to_string()))?;
         }
-        Ok(Some((gen, edges, resolutions)))
+        drop(rows);
+        drop(stmt);
+        // Read for `gen` specifically — the generation the rows came from,
+        // which may already be behind the store's latest.
+        let analysis = Self::analysis_disclosure_in(&snapshot, gen)?;
+        let index = builder
+            .finish_with_stored_evidence(analysis, EdgeOrder::ReadOrder)
+            .map_err(|error| refusal(error.to_string()))?;
+        Ok(Some((gen, index)))
     }
 
     /// The callers of `names` and the unfiltered total, against one generation.
@@ -5140,11 +6162,8 @@ impl Store {
         // second copy of the dead-symbol list, so parsing it here would undo
         // the bound above. See `AnalysisDisclosure`.
         raw.map(|json| {
-            serde_json::from_str::<AnalysisDisclosure>(&json).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
-                    "stored generation analysis is invalid: {error}"
-                ))
-            })
+            serde_json::from_str::<AnalysisDisclosure>(&json)
+                .map_err(|error| refusal(format!("stored generation analysis is invalid: {error}")))
         })
         .transpose()
     }
@@ -5176,25 +6195,7 @@ impl Store {
         // `analysis_disclosure_in` refuses to round one to the other.
         serde_json::from_str::<DeadClusterScan>(&raw)
             .map(Some)
-            .map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
-                    "stored dead-cluster scan is invalid: {error}"
-                ))
-            })
-    }
-
-    /// [`Self::analysis_disclosure_in`] for a generation the caller already
-    /// resolved.
-    ///
-    /// Addressed by id rather than by "latest" on purpose: the edge rows this
-    /// qualifies may have come from a cache filled before a newer generation
-    /// landed, and a disclosure describing a snapshot the answer did not come
-    /// from is worse than none. A generation pruned between the two reads has
-    /// no row here, which reads as `None` — "could not be read" — and that is
-    /// the honest answer.
-    fn analysis_disclosure_for(&self, generation: u32) -> Result<Option<AnalysisDisclosure>> {
-        let conn = lock_conn(&self.conn)?;
-        Self::analysis_disclosure_in(&conn, generation)
+            .map_err(|error| refusal(format!("stored dead-cluster scan is invalid: {error}")))
     }
 
     /// The dead-symbol rows and the analysis that qualifies them, against one
@@ -5500,7 +6501,7 @@ impl Store {
         if searchable {
             return Ok(());
         }
-        Err(rusqlite::Error::InvalidParameterName(format!(
+        Err(refusal(format!(
             "generation {gen} has symbol rows but no full-text index rows, so \
              this search could not run and its empty result is not an answer \
              about the repository; rebuild the index with `devmap repair --fts`"
@@ -5533,7 +6534,7 @@ impl Store {
             |row| row.get::<_, i64>(0).map(|found| found != 0),
         )?;
         if !present {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
+            return Err(refusal(format!(
                 "generation {generation_id} is not in this store — it was pruned \
                  or never written — so the files it indexed are unknown, not none; \
                  re-read the latest generation id and ask again"
@@ -5811,11 +6812,8 @@ impl Store {
 
         let conn = lock_conn(&self.conn)?;
         let previous_busy_ms: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
-        let previous_busy_ms = u64::try_from(previous_busy_ms).map_err(|_| {
-            rusqlite::Error::InvalidParameterName(
-                "SQLite returned a negative busy_timeout".to_string(),
-            )
-        })?;
+        let previous_busy_ms = u64::try_from(previous_busy_ms)
+            .map_err(|_| refusal("SQLite returned a negative busy_timeout".to_string()))?;
 
         // TRUNCATE honors busy_timeout and could otherwise monopolize the
         // store mutex for seconds while a reader holds a snapshot. Bound the
@@ -5951,15 +6949,16 @@ impl Store {
                 params![old_gen],
             )?;
             tx.execute(
-                "DELETE FROM generation_edges WHERE generation_id = ?1",
-                params![old_gen],
-            )?;
-            tx.execute(
-                "DELETE FROM generation_unresolved WHERE generation_id = ?1",
-                params![old_gen],
-            )?;
-            tx.execute(
                 "DELETE FROM generation_coverage_gaps WHERE generation_id = ?1",
+                params![old_gen],
+            )?;
+            // The v19 digests go with their generation like every other
+            // per-generation copy. Only the newest generation's are ever read —
+            // it is the one the live rows belong to — and it is the one
+            // retention keeps by construction, so this deletes rows nothing
+            // would consult rather than rows something needs.
+            tx.execute(
+                "DELETE FROM generation_file_digests WHERE generation_id = ?1",
                 params![old_gen],
             )?;
             tx.execute(
@@ -5969,6 +6968,34 @@ impl Store {
             tx.execute("DELETE FROM generations WHERE id = ?1", params![old_gen])?;
             pruned_count += 1;
         }
+
+        // Edges and unresolved calls are not deleted per generation: since v18
+        // one row covers the whole range of generations it was valid for, and
+        // deleting it because *one* of them went away would take it from the
+        // retained ones too.
+        //
+        // What becomes unreachable instead is any row whose validity had already
+        // ended by the oldest generation still retained — `valid_to <= cutoff`
+        // is exactly "no retained generation can see this". Rows still open, and
+        // rows closed later than the cutoff, are untouched. `keep_generations`
+        // is at least 1 and the early return above proved there are more
+        // generations than that, so `gen_ids[keep_generations - 1]` is the
+        // oldest retained id.
+        //
+        // `idx_edge_rows_closed` and `idx_unresolved_rows_closed` make this a
+        // scan of the closed rows rather than of the whole table. They are the
+        // only partial indexes v18 keeps: the matching `valid_to IS NULL` half
+        // made SQLite plan every *read* as a MULTI-INDEX OR over 102,083 rowid
+        // lookups and cost a cold `impact` 40 ms — see `VALIDITY_RANGE_TABLES`.
+        let cutoff = gen_ids[keep_generations - 1];
+        tx.execute(
+            "DELETE FROM edge_rows WHERE valid_to IS NOT NULL AND valid_to <= ?1",
+            params![cutoff],
+        )?;
+        tx.execute(
+            "DELETE FROM unresolved_rows WHERE valid_to IS NOT NULL AND valid_to <= ?1",
+            params![cutoff],
+        )?;
 
         // A payload outlives its generation only for as long as some *other*
         // generation still names it. Deleting the membership rows above frees
@@ -6114,7 +7141,7 @@ impl Store {
         payload
             .map(|(table, json)| {
                 serde_json::from_str(&json).map_err(|error| {
-                    rusqlite::Error::InvalidParameterName(format!(
+                    refusal(format!(
                         "stored extraction payload in {table} for content \
                          {hash:#018x} ({language}, grammar {grammar}, analyzer \
                          {analyzer}) is invalid: {error}",
@@ -6145,9 +7172,8 @@ impl Store {
         // Source text is already identified by the content hash and remains on
         // disk; duplicating it in both cache and generation rows bloats the DB.
         cached.source_code = None;
-        let payload = serde_json::to_string(&cached).map_err(|err| {
-            rusqlite::Error::InvalidParameterName(format!("cache serialize failed: {err}"))
-        })?;
+        let payload = serde_json::to_string(&cached)
+            .map_err(|err| refusal(format!("cache serialize failed: {err}")))?;
         let conn = lock_conn(&self.conn)?;
         conn.execute(
             "INSERT INTO extraction_cache (content_hash, language, grammar_version, analyzer_version, payload_json, accessed_at)
@@ -7123,7 +8149,8 @@ mod bounded_claim_tests {
         assert_eq!(
             sqlite_limit(usize::MAX),
             i64::MAX,
-            "usize::MAX must clamp to the largest cap SQLite can express,              not wrap to -1"
+            "usize::MAX must clamp to the largest cap SQLite can express, \
+             not wrap to -1"
         );
         for limit in [
             usize::MAX,
@@ -7234,5 +8261,137 @@ mod git_head_tests {
                 "an honest fast failure must not be a kill: {error}"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "parse")]
+mod delta_bucket_tests {
+    use super::*;
+
+    /// An identity that digests the same as every other, however different it
+    /// is.
+    ///
+    /// Real SipHash collisions cannot be summoned on demand, and a test that
+    /// injected its own digest would no longer be testing the digest the write
+    /// path uses. This hashes to a constant instead, so `identity_digest` — the
+    /// one function both the bucketing and the search go through — returns the
+    /// same value for every value of it, and the collision the write path meets
+    /// once in a very long while is here every time.
+    #[derive(PartialEq, Eq, Debug)]
+    struct Collides(&'static str);
+
+    impl std::hash::Hash for Collides {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            state.write_u8(0);
+        }
+    }
+
+    /// A collision must cost a comparison, never an answer.
+    ///
+    /// [`claim_matching_candidate`] narrows with a 64-bit digest and decides
+    /// with `PartialEq`. Were it to trust the digest, two different rows that
+    /// happened to digest alike would be treated as one: the live row left
+    /// open, the new row never written, and the generation reading back an edge
+    /// it was never given.
+    #[test]
+    fn a_collision_narrows_the_search_and_never_decides_it() {
+        let names = ["alpha", "beta", "gamma"];
+        let (buckets, chain) = bucket_identities(names.len(), |index| Some(Collides(names[index])));
+        assert_eq!(
+            buckets.len(),
+            1,
+            "the fixture only tests collisions if the identities actually collide"
+        );
+
+        let mut matched = vec![false; names.len()];
+        let claim = |live: &'static str, matched: &mut Vec<bool>| {
+            claim_matching_candidate(&buckets, &chain, matched, &Collides(live), |index| {
+                Some(Collides(names[index]))
+            })
+        };
+
+        assert!(claim("beta", &mut matched), "beta is one of the candidates");
+        assert_eq!(
+            matched,
+            vec![false, true, false],
+            "the candidate claimed is the one that compared equal, not the one \
+             the bucket happened to offer first"
+        );
+        assert!(
+            !claim("delta", &mut matched),
+            "a row nothing equals is not in this generation, however it digests"
+        );
+        assert_eq!(
+            matched,
+            vec![false, true, false],
+            "a search that found nothing claims nothing"
+        );
+        assert!(claim("alpha", &mut matched));
+        assert!(claim("gamma", &mut matched));
+        assert!(
+            !claim("alpha", &mut matched),
+            "each candidate is claimed once, so a fourth live row finds none"
+        );
+    }
+
+    /// A repeated row is repeated candidates, not one candidate with a count.
+    ///
+    /// 475 edge tuples of this repository occur more than once in a single
+    /// generation. If the delta collapsed them, a rebuild would close the
+    /// copies it could not account for and the generation would lose rows the
+    /// analysis counted.
+    #[test]
+    fn a_row_stored_three_times_answers_three_live_rows_and_no_more() {
+        let names = ["duplicate", "duplicate", "duplicate"];
+        let (buckets, chain) = bucket_identities(names.len(), |index| Some(names[index]));
+        let mut matched = vec![false; names.len()];
+        let claim = |matched: &mut Vec<bool>| {
+            claim_matching_candidate(&buckets, &chain, matched, &"duplicate", |index| {
+                Some(names[index])
+            })
+        };
+
+        assert!(claim(&mut matched));
+        assert!(claim(&mut matched));
+        assert!(claim(&mut matched));
+        assert_eq!(matched, vec![true, true, true], "all three were claimed");
+        assert!(
+            !claim(&mut matched),
+            "a fourth live copy has no candidate left, so it is closed"
+        );
+    }
+
+    /// An index outside this generation is a candidate for nothing.
+    ///
+    /// Edges touching a deleted path are not part of the generation, so their
+    /// identity is `None`. Two things keep them out, and this asserts both:
+    /// they enter no bucket and no chain, so nothing can offer them; and the
+    /// search skips them even if something did. Either alone would hold open a
+    /// row this generation does not contain the day the other changed.
+    #[test]
+    fn an_index_outside_the_generation_is_never_claimed() {
+        let names = [Some("kept"), None, Some("kept")];
+        let (buckets, chain) = bucket_identities(names.len(), |index| names[index]);
+        assert!(
+            !buckets
+                .values()
+                .chain(chain.iter())
+                .any(|&index| index == 1),
+            "an index with no identity is in no bucket and on no chain: {buckets:?} {chain:?}"
+        );
+        let mut matched = vec![false; names.len()];
+        let claim = |matched: &mut Vec<bool>| {
+            claim_matching_candidate(&buckets, &chain, matched, &"kept", |index| names[index])
+        };
+
+        assert!(claim(&mut matched));
+        assert!(claim(&mut matched));
+        assert_eq!(
+            matched,
+            vec![true, false, true],
+            "the excluded index is still unmatched, because it was never a candidate"
+        );
+        assert!(!claim(&mut matched), "there is no third candidate");
     }
 }

@@ -31,7 +31,8 @@ The "hybrid" column below is historical. Since the kernel audit's second pass:
   `.devcouncil/logs/traces.jsonl`. Contract in `docs/code-graph.md` → "When a
   map looks wrong".
 - **Binary discovery is one rule** for the seam and the client
-  (`devmap_engine.find_engine_binary`): `DEVMAP_BINARY`, else the newest
+  (`devmap_engine.find_engine_binary`): `DEVMAP_BINARY` (used or refused by
+  name, never replaced), else the newest
   *capable* build in `<repo>/rust-port/target`, `<package>/rust-port/target`,
   `PATH`. **Socket path is one formula** (`devmap_client.default_socket_path`
   mirrors `devmap-serve::ipc_identity_for`; `devmap serve --print-socket-path`

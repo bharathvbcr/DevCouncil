@@ -168,84 +168,87 @@ def test_graph_sync_watch_search_ingest(tmp_path, monkeypatch):
 
 
 def test_graph_routes_shape_api_demo_hooks(tmp_path, monkeypatch):
+    """Rendering for `dev map routes` / `shape-check` / `api-impact` / `demo`.
+
+    The three route commands used to be fed by `indexing/graph/api_routes.py`
+    over `load_code_graph`; they now ask the kernel through `_require_kernel`,
+    so the double is a client rather than a module patch. The assertions — exit
+    codes, the "No routes" and "No shape" empty renderings, and the exit-1 for a
+    route the kernel does not know — are unchanged.
+    """
     from devcouncil.cli.commands.init import initialize_project
     import devcouncil.indexing.graph.build as graph_build
-    import devcouncil.indexing.graph.api_routes as api_routes
     import devcouncil.indexing.viz as viz
 
     initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
     graph = SimpleNamespace(dead_code=[], edges=[])
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: graph)
+    monkeypatch.setattr(graph_build, "read_code_graph", lambda root: graph)
 
-    monkeypatch.setattr(
-        api_routes,
-        "route_map",
-        lambda root, g: {
-            "routes": [
-                {
-                    "verb": "GET",
-                    "path": "/x",
-                    "framework": "fastapi",
-                    "handlers": [{"id": "h"}],
-                    "consumers": [{"id": "c"}],
-                }
-            ]
-        },
-    )
+    class _RouteClient:
+        def __init__(self):
+            self.routes_result = {
+                "routes": [
+                    {
+                        "verb": "GET",
+                        "path": "/x",
+                        "framework": "fastapi",
+                        "handlers": [{"id": "h"}],
+                        "consumers": [{"id": "c"}],
+                    }
+                ]
+            }
+            self.shape_result = {
+                "mismatches": [
+                    {"verb": "GET", "route": "/x", "missing_in_handler": ["id"]}
+                ]
+            }
+            self.impact_result = {
+                "found": True,
+                "verb": "GET",
+                "route": "/x",
+                "risk": "low",
+                "consumers": [1],
+                "middleware": [],
+                "shape_mismatches": [{}],
+            }
+
+        def is_map_stale(self):
+            return False
+
+        def routes(self, route_filter=None):
+            return self.routes_result
+
+        def shape_check(self, route_filter=None):
+            return self.shape_result
+
+        def api_impact(self, route):
+            return self.impact_result
+
+    client = _RouteClient()
+    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: client)
+
     routes = runner.invoke(app, ["map", "routes", "--project-root", str(tmp_path)])
     assert routes.exit_code == 0
     empty = runner.invoke(app, ["map", "routes", "--json", "--project-root", str(tmp_path)])
     assert empty.exit_code == 0
 
-    monkeypatch.setattr(api_routes, "route_map", lambda root, g: {"routes": []})
+    client.routes_result = {"routes": []}
     assert "No routes" in runner.invoke(
         app, ["map", "routes", "--project-root", str(tmp_path)]
     ).output
 
-    monkeypatch.setattr(
-        api_routes,
-        "shape_check",
-        lambda root, g, route_filter=None: {
-            "mismatches": [
-                {
-                    "verb": "GET",
-                    "route": "/x",
-                    "missing_in_handler": ["id"],
-                }
-            ]
-        },
-    )
     shape = runner.invoke(app, ["map", "shape-check", "--project-root", str(tmp_path)])
     assert shape.exit_code == 0
 
-    monkeypatch.setattr(
-        api_routes, "shape_check", lambda root, g, route_filter=None: {"mismatches": []}
-    )
+    client.shape_result = {"mismatches": []}
     assert "No shape" in runner.invoke(
         app, ["map", "shape-check", "--project-root", str(tmp_path)]
     ).output
 
-    monkeypatch.setattr(
-        api_routes,
-        "api_impact",
-        lambda root, route, g: {
-            "found": True,
-            "verb": "GET",
-            "route": "/x",
-            "risk": "low",
-            "consumers": [1],
-            "middleware": [],
-            "shape_mismatches": [{}],
-        },
-    )
     impact = runner.invoke(app, ["map", "api-impact", "/x", "--project-root", str(tmp_path)])
     assert impact.exit_code == 0
 
-    monkeypatch.setattr(
-        api_routes,
-        "api_impact",
-        lambda root, route, g: {"found": False},
-    )
+    client.impact_result = {"found": False}
     assert (
         runner.invoke(
             app, ["map", "api-impact", "/missing", "--project-root", str(tmp_path)]

@@ -3,9 +3,11 @@ the end-to-end map test: db guard, if-stale, wiki refresh, watch loop, graph-con
 
 from __future__ import annotations
 
-import time
-
+import json
+import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -134,6 +136,81 @@ def test_map_engine_unavailable_exits(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "build_map_result", _boom)
     result = runner.invoke(app, ["map"])
     assert result.exit_code == 1
+
+
+# One process per probe: `sys.modules` in the pytest process is polluted by every
+# other test that ever imported the ORM, so the only way to ask "did *this*
+# command import it" is to ask a process that has done nothing else.
+_IMPORT_PROBE = """
+import json, sys
+from pathlib import Path
+from typer.testing import CliRunner
+from devcouncil.cli.commands.map import app
+
+root = Path(sys.argv[1])
+result = CliRunner().invoke(app, ["--project-root", str(root), "--if-stale"])
+print(json.dumps({
+    "exit": result.exit_code,
+    "loaded": sorted(
+        name for name in ("sqlalchemy", "sqlmodel", "devcouncil.storage.db")
+        if name in sys.modules
+    ),
+    "output": result.output[-400:],
+}))
+"""
+
+
+def _probe_map_imports(root: Path) -> dict:
+    proc = subprocess.run(
+        [sys.executable, "-c", _IMPORT_PROBE, str(root)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "DEVMAP_AUTOSPAWN": "0"},
+    )
+    assert proc.returncode == 0, f"probe failed: {proc.stderr[-2000:]}"
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_map_on_an_initialised_project_does_not_pay_for_the_orm(tmp_path):
+    """`dev map` must not import SQLAlchemy to ask whether a directory exists.
+
+    The root callback ran `initialize_project(...)` and then
+    `from devcouncil.storage.db import get_db` for a single existence check, on
+    every `dev map`. Neither needs an ORM on an already-initialised project:
+    `initialize_project`'s whole remaining effect there is `ensure_gitignore`,
+    and the guard's only observable behaviour is "exit 1 if `.devcouncil` is
+    not there". Measured on this machine, the two cost 120 ms of a 445 ms warm
+    `dev map` — a quarter of every turn, spent importing a database layer this
+    command never queries.
+    """
+    _git_repo(tmp_path)
+    # `dev init` writes into the *cwd*, so initialise the fixture directly
+    # rather than depending on a chdir the probe subprocess would not share.
+    from devcouncil.cli.commands.init import initialize_project
+
+    initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
+    assert (tmp_path / ".devcouncil" / "config.yaml").is_file()
+
+    probe = _probe_map_imports(tmp_path)
+    assert probe["exit"] == 0, probe
+    assert probe["loaded"] == [], (
+        "an already-initialised project must not pull the ORM into a `dev map`: "
+        f"{probe['loaded']}"
+    )
+
+
+def test_map_still_initialises_a_fresh_checkout(tmp_path):
+    """The other half of the same change: skipping work on an *initialised*
+    project must not skip it on a fresh one. A first `dev map` still writes
+    `.devcouncil/config.yaml` and `state.sqlite`, which is what
+    `test_cli_map_auto_initializes_when_missing` pins from the other side."""
+    _git_repo(tmp_path)
+    assert not (tmp_path / ".devcouncil" / "config.yaml").exists()
+
+    probe = _probe_map_imports(tmp_path)
+    assert probe["exit"] == 0, probe
+    assert (tmp_path / ".devcouncil" / "config.yaml").is_file(), probe
+    assert (tmp_path / ".devcouncil" / "state.sqlite").is_file(), probe
 
 
 def test_map_if_stale_skips_when_fresh(tmp_path, monkeypatch):

@@ -322,7 +322,124 @@ code-intelligence kernel; `rust/` is the analysis plane ported from MANVI on 202
 share no crates. `rust/STATUS.md` §1 records why the second workspace was not folded into the
 first — read it before proposing a merge.
 
-### Handoff (2026-09-02, evening) — start here
+### Handoff (2026-09-07, morning) — start here
+
+Branch `claude/dev-map-hardening-perf-e9d85c` at `59bb7f4`: 118 commits over main `7ed1558`
+(16 lane merges; 189 files, +21,609/−8,919 — `rust-port/` +16,266/−1,725, `src/devcouncil/`
++1,841/−4,330). Not pushed. Verify before building on it — every number below was taken on
+the tree the section names. On `37d3b82` (whose `rust-port/` is byte-identical to `59bb7f4`'s):
+verify.sh exit 0, ALL GATES GREEN — determinism digest `4307ab37…e235da5` unchanged since round 3,
+self-build 3,126 ms / 150 MiB cold / 1,617 files / peak RSS 711 MiB, memory model OK, growth
+gate OK, incremental equivalence OK (5 cycles), mutation gate skipped by the script's default;
+feature-off clippy `-D warnings` 0 lines for all seven crates; Go gofmt 0, vet clean, 8
+packages ok. Python `tests/unit` on `59bb7f4` with `index.sqlite` absent: 4,603 passed / 1 xfailed / 0 failed in 8:43, nothing created under `.devcouncil/codeintel/`.
+
+```bash
+export DEVMAP_AUTOSPAWN=0
+bash rust-port/verify.sh                                  # nine gate lines, ALL GATES GREEN; tree must be untouched for the run
+cd rust-port && cargo test --workspace                    # 2,191 passed / 0 failed / 3 ignored on 37d3b82; ~17 GB of test binaries — `cargo clean --profile dev` after
+for c in devmap-extract devmap-resolve devmap-analyze devmap-store devmap-query devmap-serve devmap-cli; do
+  cargo clippy -p $c --no-default-features --all-targets -- -D warnings; done   # CI's feature-off job runs `cargo check`, which cannot fail on warnings
+.venv/bin/python -m pytest tests/unit -q -p no:cacheprovider   # with .devcouncil/codeintel/index.sqlite absent and DEVMAP_BINARY *not* exported
+cd backend/go_orchestrator && gofmt -l . && go vet ./... && go test ./... -count=1
+```
+
+**What this pass changed (owners in `git log --merges 7ed1558..HEAD`; one lane per merge):**
+
+1. *Store.* Schema v18: `edge_rows`/`unresolved_rows` carry validity ranges and
+   `generation_edges`/`generation_unresolved` are views over them (Lane V). One-file build
+   1,822→1,286 ms p50, store 228→164 MB, one edge row written per one-file build instead of
+   191,822. v19 (ranged nodes/FTS) was *declined by measurement* (Lane N, note on
+   `CURRENT_SCHEMA_VERSION`): whole-copy relations are 18 % of the 304 ms write; the diff
+   scan of the two ranged relations is 66 %. `persist:write` is split per relation in the
+   build's `--json` `timings`. Schema v19 (Lane D): `generation_file_digests`, a 128-bit
+   multiset digest plus row count per source file per generation, so the delta compares only
+   files whose freshly resolved rows disagree — and only when the live row count agrees with
+   the record (a skip that trusted the record alone lost rows deleted behind the write path;
+   the incremental-equivalence gate caught it). One-file `persist:write` 291→216 ms, total
+   1,107→1,027 ms p50; cold build +2.5 %; three cold reads +0.3–0.5 ms (reported).
+2. *Queries.* Columnar interned edge index (Lane P3): cold `impact` 145→57 ms here,
+   249→154 ms on scholarlm; the SQL `ORDER BY` over two joined path strings was the cost,
+   not the index (Lane P2). `impact --layers` per depth (Lane M3). Cypher subset refuses
+   what it cannot read instead of answering as every node (`8130576`). `trace X X` refused
+   (`2298fed`). `cypher`/`routes`/`shape-check`/`api-impact` answer from the graph's nodes
+   and edges instead of building the whole artifact per call (cypher 666→431 ms, routes
+   805→578 ms p50); one newline table per file takes 81 ms off every export.
+3. *Resolver accuracy.* Net resolution 437→504 ‰ (Lane A), Go `SamePackage` rung and
+   qualified types (Lane A2); `EXTRACTION_SCHEMA_VERSION` 33→37, so every store rebuilds
+   cold once. Wiring parity with the Python tables (Lanes W, K): decorator prefix match,
+   generated suffixes, console-script entries as `WiringKind::ConfigEntryPoint`.
+4. *Daemon and IPC.* Batch ceiling, honest refusals on a full queue, watcher flush on stop
+   (Lane S1); one bounded subprocess runner for every `Command::new` in production code,
+   process-group kill at the deadline (`c57c81d`, Lane S2); first-byte timeout and zero
+   budget/depth refused on the socket as on the CLI (`e307437`).
+5. *Seam.* `dev map` warm 1.16–1.27 s → 377 ms p50 (Lane G2: `package_managers`,
+   `test_commands`, `hotspots` computed in Rust; `initialize_project` without SQLAlchemy).
+   The Python graph store, query engine and writer are gone (Lanes M, M2, M3, M4; src net
+   ≈ −4,200 lines); `devmap_engine.state_dir` is the one Python owner of the state
+   directory and asks `devmap --json paths` (`f28bb32`, 8 ms, opens no store). Refusals are
+   no longer laundered into fallbacks (`DevMapRequestRefused`).
+6. *Honesty.* `status` names a Python `index.sqlite` instead of migrating it (`647f78a`);
+   a named root must be a directory (`b387870` — `manifest <missing>` used to create it);
+   a build root that is a file is refused (`52d44ce`); `DEVMAP_BINARY` in the Go client is
+   used or refused, never replaced (`f5151b7`); workspace registry validates roots and
+   labels (`22bd95d`); read-only stores can be queried (`667eb36`); SIGPIPE restored for
+   one-shot commands (`8708dc2`).
+
+**Per-turn cost on this repository** — two shared clones (main `7ed1558` and this tree), each
+with its own venv, release kernel and store, every case a fresh `dev` process, arms alternated
+sample by sample (n=11; `scratchpad/ab_perturn.py`):
+
+| case                    | main p50 | this tree p50 | main min | this tree min |
+|-------------------------|---------:|--------------:|---------:|--------------:|
+| `dev map` (warm no-op)  |   414 ms |    **294 ms** |      405 |           288 |
+| `dev map status`        |   291 ms |        302 ms |      287 |           298 |
+| `dev map query <name>`  |   268 ms |    **246 ms** |      257 |           239 |
+| `dev hook post-tool-use`|   589 ms |        584 ms |      571 |           576 |
+
+`status` is 11 ms slower: every Python process now asks `devmap --json paths` once for the
+state directory instead of re-deriving the rule (M4's one owner; `paths` costs 8 ms). That is
+the price of one owner and it is stated, not hidden. Main already carries this branch's
+rounds 1–3 (the sibling merged them as `4b11971`), so the session-start figure of 1.16–1.27 s
+for a warm `dev map` is not the baseline here — main's 414 ms is.
+
+**Decisions taken on 2026-09-07 (the user's answers: "choose the best", "merge all to
+main and delete the other branches", "fix it"):**
+
+- *TOML.* The parser. `toml 1.1.5` is a workspace dependency (`parse`, `serde`,
+  `preserve_order`, `std`); `pyproject.toml`, `Cargo.toml` and `package.json` are parsed,
+  not grepped, for both the file-level script claim and the entry-point symbols. The
+  512-declaration cap keeps the file's first 512 (`preserve_order`). 201 dead findings
+  identical to the line reader on this repository's corpus.
+- *Merge.* The sibling's `claude/vibrant-bartik-382014` (`ef5e030`) and this branch are
+  merged into main in that order and the branches deleted; the two worktrees are detached
+  at their merged commits rather than removed, because live sessions sit in them.
+- *`DEVMAP_BINARY`.* Used or refused by name, never replaced, on both sides: the Python
+  seam refused only an override that existed but failed the probe and fell through to the
+  package build for one that did not exist; now it refuses that too. The Go candidate list
+  lost its unreachable override block; help text and both discovery documents say the rule.
+
+**Next structural items (measured, not fixed):**
+
+1. A one-file build still runs resolve (0.31 s) and analyze (0.14 s) in full — inherent to
+   the corpus-wide passes; a per-file resolver output cache is the next big win.
+2. `devmap-store/src/db.rs`: store refusals carried in `rusqlite::Error::InvalidParameterName`
+   print an "Invalid parameter name:" prefix; and the CLI's `PYTHON_INDEX_SCHEMA` constant
+   should be exported by the store, not spelled in `main.rs`.
+3. `devmap html` / `cypher` pay the ~100 ms churn log (G2 leftover); churn stales silently
+   when the 90-day window rolls without a commit.
+4. gortex parity gaps: `STATUS.md` → "Gaps vs. gortex".
+
+**Traps this pass paid for (each is a memory note in the lead's memory directory):**
+verify.sh must run on an untouched tree or its digest is unattributable; A/B interleaved
+only, sequential before/after produced a false regression; exporting `DEVMAP_BINARY` into
+the full pytest run breaks `test_devmap_engine`; unit tests must never build against the
+checkout's own store; agent worktrees fork one merge behind the base — check
+`git merge-base` at launch; `ruff format --check` fails on `wiring.py` and its tests at
+HEAD, so never reformat whole files as a drive-by; a lane's `cargo test --workspace` costs
+~17 GB of test binaries.
+
+### Handoff (2026-09-02, evening) — superseded by the 2026-09-07 handoff above
 
 This is the state a new contributor inherits. Verify it before building on it:
 

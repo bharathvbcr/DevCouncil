@@ -238,6 +238,23 @@ class BudgetedResponse:
     #: reason here, so a consumer that predates this field fails closed on the
     #: absence rather than open on an empty finding.
     dead_clusters_incomplete: Optional[str] = None
+    #: The same walk, banded by distance from the seeds — ``impact(layers=True)``
+    #: only.
+    #:
+    #: ``None`` means no banding was asked for, exactly as ``dead_clusters`` is
+    #: ``None`` on an answer that is not a dead-code answer. It is the kernel's
+    #: own ``BlastRadius`` object (``seeds``, ``unmatched_targets``, ``layers``
+    #: as a budgeted response of bands, ``total_impacted``), passed through
+    #: rather than reshaped here: the one renderer is
+    #: ``mcp.handlers.codeintel._blast_radius_payload``, and a second reshaping
+    #: on the way through the client would be a second thing to keep in step
+    #: with it.
+    #:
+    #: An edge list cannot carry distance — an edge names two endpoints and no
+    #: hop count — so before this field the consumers that needed bands invented
+    #: them. ``dev map impact`` labelled everything a depth-3 walk returned
+    #: ``depth: 1, confidence: "extracted"``.
+    blast_radius: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -344,6 +361,33 @@ def walk_incomplete_reason(response: Any) -> Optional[str]:
         return None
     text = str(reason).strip()
     return text or None
+
+
+#: Edge kinds that represent one symbol invoking another. The devmap store also
+#: emits structural edges (`Contains` for file→symbol, `MemberOf` for
+#: symbol→type, `Imports` for module→module); including those in a caller/callee
+#: list makes a symbol look like it calls itself and inflates blast radius with
+#: edges nobody can act on.
+CALL_EDGE_KINDS = frozenset({"Calls"})
+
+
+def edge_nodes(items: Any, symbol_key: str, file_key: str) -> List[str]:
+    """Call-graph node names from one direction's raw edge list.
+
+    Beside :func:`resolution_unavailable_reason` and
+    :func:`walk_incomplete_reason` for the same reason they are here: it decides
+    which edge kinds count as calls at all, and two copies of that filter would
+    drift silently. `dev map query`'s batched and single-target paths and the
+    task prompt's impact block all read one direction's edges the same way.
+    """
+    edges: List[str] = []
+    for edge in items or []:
+        if str(edge.get("edge_kind") or "") not in CALL_EDGE_KINDS:
+            continue
+        node = str(edge.get(symbol_key) or edge.get(file_key) or "")
+        if node:
+            edges.append(node)
+    return edges
 
 
 def try_connect(
@@ -1014,7 +1058,72 @@ class DevMapClient:
             dead_clusters=dead_clusters,
             dead_clusters_truncated=dead_clusters_truncated,
             dead_clusters_incomplete=dead_clusters_incomplete,
+            blast_radius=self._blast_radius(resp.get("blast_radius"), budget),
         )
+
+    def _blast_radius(
+        self, radius: Any, budget: int
+    ) -> Optional[Dict[str, Any]]:
+        """Validate the banded half of an ``impact(layers=True)`` answer.
+
+        Checked rather than copied, for the reason ``dead_clusters`` is checked:
+        this half is read as "N symbols are this many hops away" and a
+        malformed one arriving as a silently-dropped ``None`` would be
+        indistinguishable from an answer that carried no bands because none were
+        asked for.
+
+        The bands are themselves a budgeted response, so they go back through
+        :meth:`_budgeted` — one implementation of ``shown + hidden == total``,
+        not two. The band counts are checked against ``total_impacted`` only
+        when the list was *not* trimmed: a trimmed list sums to less by design,
+        and asserting otherwise would reject a correctly truncated answer.
+        """
+        if radius is None:
+            return None
+        if not isinstance(radius, dict):
+            raise DevMapClientError("devmap response blast_radius must be an object")
+        for key in ("seeds", "unmatched_targets"):
+            value = radius.get(key, [])
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise DevMapClientError(
+                    f"devmap response blast_radius.{key} must be a list of strings"
+                )
+        layers = radius.get("layers")
+        if not isinstance(layers, dict):
+            raise DevMapClientError(
+                "devmap response blast_radius.layers must be a budgeted response"
+            )
+        bands = self._budgeted(layers, budget)
+        total_impacted = self._strict_nonnegative_int(
+            radius.get("total_impacted", 0), "blast_radius total_impacted"
+        )
+        counted = 0
+        for band in bands.items:
+            counted += self._strict_nonnegative_int(
+                band.get("node_count", 0), "blast_radius band node_count"
+            )
+        if not bands.truncated and counted != total_impacted:
+            raise DevMapClientError(
+                "devmap response blast_radius bands do not partition the walk: "
+                f"bands sum to {counted}, total_impacted={total_impacted}"
+            )
+        return {
+            "seeds": list(radius.get("seeds") or []),
+            "unmatched_targets": list(radius.get("unmatched_targets") or []),
+            # The validated sub-response, put back in the kernel's own shape so
+            # the one renderer downstream reads exactly what the kernel sent.
+            "layers": {
+                "items": bands.items,
+                "shown": bands.shown,
+                "hidden": bands.hidden,
+                "total": bands.total,
+                "truncated": bands.truncated,
+                "tokens_used": bands.tokens_used,
+                "resolution": bands.resolution,
+                "walk_incomplete": bands.walk_incomplete,
+            },
+            "total_impacted": total_impacted,
+        }
 
     def status(self) -> DevMapStatus:
         req = {"cmd": "status"}
@@ -1204,16 +1313,39 @@ class DevMapClient:
         return answers
 
     def impact(
-        self, target: str, depth: int = 3, min_rung: Optional[str] = None
+        self,
+        target: str,
+        depth: int = 3,
+        min_rung: Optional[str] = None,
+        *,
+        layers: bool = False,
     ) -> BudgetedResponse:
         """Callers of ``target``, optionally floored at a resolution rung.
 
         See :meth:`deps` for why the floor is here.
+
+        ``layers=True`` asks the kernel to band the same walk by distance and
+        returns it on :attr:`BudgetedResponse.blast_radius`. It is opt-in
+        because it is a second reading of the walk, and because every caller
+        that predates it must keep getting the object it already parses.
+
+        ``layers`` and ``min_rung`` together are refused here as well as in the
+        kernel. The bands are derived before the rung cut and the edge list is
+        packed after it, so an answer carrying both would describe two different
+        graphs in one object — and a client that let the request through only to
+        have the kernel refuse it would report a transport failure for what is a
+        contradiction in the question.
         """
         self._validate_query(target, "target")
         self._validate_depth(depth)
         budget = 2000
         rung = _validated_min_rung(min_rung)
+        if layers and rung is not None:
+            raise DevMapClientError(
+                "impact cannot take both layers and min_rung: the distance bands "
+                "are walked without a rung floor, so the two halves of the answer "
+                "would describe different graphs"
+            )
         payload: Dict[str, Any] = {
             "cmd": "impact",
             "target": target,
@@ -1224,9 +1356,23 @@ class DevMapClient:
         if rung is not None:
             payload["min_rung"] = rung
             args += ["--min-rung", rung]
+        if layers:
+            payload["layers"] = True
+            args += ["--layers"]
         args += _positional(target)
         resp = self._request(payload, args)
-        return self._budgeted(resp, budget)
+        answer = self._budgeted(resp, budget)
+        if layers and answer.blast_radius is None:
+            # Fail closed and loud. A kernel too old to know the flag answers
+            # the flat query and says nothing; silently returning that would
+            # hand the caller a banded reading of an unbanded answer, which is
+            # the fabrication this field exists to end.
+            raise DevMapClientError(
+                "devmap answered an impact(layers=True) request without a "
+                "blast_radius; the kernel predates the field — rebuild it "
+                "(cargo build --release -p devmap-cli)"
+            )
+        return answer
 
     def trace(
         self,
@@ -1625,7 +1771,9 @@ class DevMapClient:
         )
 
     def manifest(self, write_path: Optional[pathlib.Path] = None) -> Dict[str, Any]:
-        out = write_path or (self.root_dir / ".devcouncil" / "repo_map.json")
+        from devcouncil.devmap_engine import map_path
+
+        out = write_path or map_path(self.root_dir)
         self._run_cli_command(["manifest", str(self.root_dir), "--output", str(out)])
         if not out.is_file():
             raise DevMapClientError(f"devmap manifest was not created at {out}")
@@ -1636,7 +1784,9 @@ class DevMapClient:
         return self._decode_json_object(raw_manifest, "manifest")
 
     def read_repo_map(self) -> Dict[str, Any]:
-        path = self.root_dir / ".devcouncil" / "repo_map.json"
+        from devcouncil.devmap_engine import map_path
+
+        path = map_path(self.root_dir)
         if path.is_file():
             try:
                 raw_map = path.read_text(encoding="utf-8")
@@ -1652,6 +1802,47 @@ class DevMapClient:
             ["snapshots", "--budget", str(budget), *_positional(file_path)]
         )
         return self._budgeted(resp, budget)
+
+    # --- HTTP route surfaces ------------------------------------------------
+    #
+    # These three go over the CLI rather than :meth:`_request`. The daemon's
+    # `IpcCommand` (`devmap-serve/src/protocol.rs`) has no `routes`,
+    # `shape_check` or `api_impact` variant, so a socket attempt would be
+    # rejected as `invalid_request` and retried on the CLI anyway — one wasted
+    # round trip per call, for a command whose own bounded file scan dominates
+    # its cost. The CLI is the same kernel over a different transport, not a
+    # second engine.
+    #
+    # Each answer carries the kernel's own coverage record (`capabilities` on
+    # `routes`, `scan` on `shape-check` and `api-impact`): what the client scan
+    # read, and whether it finished. The Python implementations these replace
+    # carried no such record, so a scan that stopped at its file cap was
+    # published as a complete route inventory.
+
+    def routes(self, route_filter: Optional[str] = None) -> Dict[str, Any]:
+        """HTTP routes, their handlers, and the clients that call them."""
+        args = ["routes"]
+        if route_filter:
+            self._validate_query(route_filter, "route filter")
+            args += ["--filter", route_filter]
+        return self._run_cli_command(args + _positional(str(self.root_dir)))
+
+    def shape_check(self, route_filter: Optional[str] = None) -> Dict[str, Any]:
+        """What each handler returns against what its callers read."""
+        args = ["shape-check"]
+        if route_filter:
+            self._validate_query(route_filter, "route filter")
+            args += ["--filter", route_filter]
+        return self._run_cli_command(args + _positional(str(self.root_dir)))
+
+    def api_impact(self, route: str) -> Dict[str, Any]:
+        """What changing one route reaches: callers, shape, and a risk band."""
+        self._validate_query(route, "route")
+        # `route` is positional and may begin with `/`, which clap reads as a
+        # path and not a flag — but `--` is cheap and the rule here is uniform.
+        return self._run_cli_command(
+            ["api-impact", *_positional(route, str(self.root_dir))]
+        )
 
     def is_map_stale(self) -> bool:
         st = self.status()

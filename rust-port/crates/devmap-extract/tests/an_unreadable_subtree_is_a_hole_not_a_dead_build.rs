@@ -163,6 +163,35 @@ fn a_root_that_cannot_be_opened_is_still_an_error() {
     );
 }
 
+/// A root that exists and is not a directory was never examined either.
+///
+/// `ignore::WalkBuilder` walks a file root by yielding the file itself, so a
+/// build pointed at a regular file "ran": zero candidates, zero sources, and a
+/// generation that reads as a repository with nothing in it. Measured through
+/// the release binary: `devmap build <regular file>` exited 0 with
+/// `files_indexed: 0` and wrote a generation, while `devmap build <missing
+/// path>` exited 1 — two roots the walk could not examine, one a dead build
+/// and one a passing one.
+#[test]
+fn a_root_that_is_not_a_directory_is_refused_not_walked_as_an_empty_tree() {
+    let dir = scratch("fileroot");
+    let file = dir.join("README.md");
+    fs::write(&file, "# not a repository\n").unwrap();
+    let error = collect_sources_with_report(&file)
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| {
+            panic!(
+                "a regular file answered as a root instead of failing, so an empty \
+                 index reads as a repository with nothing in it"
+            )
+        });
+    assert!(
+        error.contains("README.md") && error.contains("not a directory"),
+        "the failure must name the root and say what is wrong with it: {error}"
+    );
+}
+
 /// The same `result?`, in the second walk of the same tree.
 ///
 /// `devmap build` runs `collect_sources_with_report` and then

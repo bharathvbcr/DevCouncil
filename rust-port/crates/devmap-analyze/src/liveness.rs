@@ -1249,6 +1249,24 @@ fn symbol_exemption_index(
     let c_header_exports = c_header_exported_names(extractions);
     let go_build_variants = go_build_variant_identities(extractions);
 
+    // The one annotation kind whose target lives in a *different* file from the
+    // one that carries it: `[project.scripts] cli = "pkg.mod:func"` is written
+    // in `pyproject.toml` and names a symbol in `pkg/mod.py`. Every other
+    // symbol-scoped kind is emitted by the extractor for the file it is
+    // examining, which is why the per-extraction map below cannot see this one.
+    //
+    // Keyed on the whole target string, which the extractor builds as
+    // `<file path>::<attr>` — the same shape as a symbol's `qualified_name`.
+    // The file path is inside the key, so a corpus-wide map cannot exempt a
+    // namesake in some other file; a bare name could, which is exactly why the
+    // per-extraction map stays per-extraction.
+    let config_entry_points: HashMap<&str, &str> = extractions
+        .iter()
+        .flat_map(|ext| ext.wiring.iter())
+        .filter(|w| w.kind == WiringKind::ConfigEntryPoint)
+        .map(|w| (w.target_symbol.as_str(), w.details.as_str()))
+        .collect();
+
     let mut index: HashMap<(String, String), String> = HashMap::new();
     for ext in extractions {
         // A wiring annotation is file-scoped only when it targets the file
@@ -1322,6 +1340,15 @@ fn symbol_exemption_index(
             let reason: Option<String> = wired
                 .get(sym.qualified_name.as_str())
                 .map(|details| (*details).to_string())
+                // An explicit declaration in a manifest, ahead of every
+                // inference below it: `pip` writes the launcher that calls this
+                // function, and the launcher is generated at install time and
+                // is not in any corpus.
+                .or_else(|| {
+                    config_entry_points
+                        .get(sym.qualified_name.as_str())
+                        .map(|details| (*details).to_string())
+                })
                 .or(heritage)
                 .or_else(|| {
                     go_interface_exemptions

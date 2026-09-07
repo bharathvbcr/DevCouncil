@@ -924,6 +924,7 @@ fn test_incremental_store() -> anyhow::Result<()> {
         build_started: None,
         repo_root: None,
         discovery_refusals: None,
+        verify_every_row: false,
     };
 
     let gen2 = store.save_generation_with_opts(&exts2, &resolution2, &analysis2, opts)?;

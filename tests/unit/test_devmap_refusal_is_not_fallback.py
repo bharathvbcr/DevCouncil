@@ -85,7 +85,10 @@ def test_cli_query_refusal_exits_one_without_loading_the_python_graph(monkeypatc
     def _never(*args, **kwargs):
         raise AssertionError("the Python graph engine must not be consulted for a refused request")
 
-    monkeypatch.setattr(graph_query, "load_code_graph", _never)
+    # `query.py` reads the kernel's `code_graph.json` through `read_code_graph`
+    # now, not the retired store through `load_code_graph`; this guards whatever
+    # whole-graph read the module holds, so it follows the name.
+    monkeypatch.setattr(graph_query, "read_code_graph", _never)
     monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(app, ["map", "query", "x" * 5000, "--project-root", str(tmp_path)])
 

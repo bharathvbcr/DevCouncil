@@ -117,7 +117,9 @@ pub fn detect_communities(
         communities: emit(&names, &base, &partition),
         degraded: (!converged).then(|| {
             format!(
-                "community detection stopped at its iteration ceiling                  ({MAX_PASSES} passes / {MAX_LOCAL_ROUNDS} local rounds) before the                  partition settled; communities are best-effort"
+                "community detection stopped at its iteration ceiling \
+                 ({MAX_PASSES} passes / {MAX_LOCAL_ROUNDS} local rounds) before the \
+                 partition settled; communities are best-effort"
             )
         }),
     }

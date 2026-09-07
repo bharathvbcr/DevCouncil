@@ -18,6 +18,7 @@ import json
 import logging
 from dataclasses import dataclass
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -29,9 +30,186 @@ from typing import Any, Dict, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_RELPATH = ".devcouncil/codeintel/devmap.sqlite"
-DEFAULT_MAP_RELPATH = ".devcouncil/repo_map.json"
-DEFAULT_GRAPH_RELPATH = ".devcouncil/graph/code_graph.json"
+#: The state directory DevCouncil creates when a repository has none, and the
+#: one this module's artifact paths are relative to. `.devmap/` is the kernel's
+#: standalone layout; see :func:`state_dir`, which decides between them.
+DEVCOUNCIL_STATE_DIR = ".devcouncil"
+STANDALONE_STATE_DIR = ".devmap"
+
+#: Artifact locations *within* the state directory. These are the kernel's own
+#: constants (`devmap_extract::paths::{STORE,REPO_MAP,CODE_GRAPH}_RELPATH`).
+DB_RELPATH_IN_STATE_DIR = "codeintel/devmap.sqlite"
+MAP_RELPATH_IN_STATE_DIR = "repo_map.json"
+GRAPH_RELPATH_IN_STATE_DIR = "graph/code_graph.json"
+LIVE_BUILD_RELPATH_IN_STATE_DIR = "codeintel/devmap-build.live.json"
+
+DEFAULT_DB_RELPATH = f"{DEVCOUNCIL_STATE_DIR}/{DB_RELPATH_IN_STATE_DIR}"
+DEFAULT_MAP_RELPATH = f"{DEVCOUNCIL_STATE_DIR}/{MAP_RELPATH_IN_STATE_DIR}"
+DEFAULT_GRAPH_RELPATH = f"{DEVCOUNCIL_STATE_DIR}/{GRAPH_RELPATH_IN_STATE_DIR}"
+
+#: Resolved state directories, keyed by the inputs that can change the answer.
+#: See :func:`state_dir` for why the key is shaped this way.
+_STATE_DIR_CACHE: Dict[tuple, Path] = {}
+_STATE_DIR_LOCK = threading.Lock()
+
+#: How long the kernel gets to answer `status`. It is a store-header read; a
+#: kernel that cannot answer it in this time is a kernel this resolver does not
+#: wait on, because every one of its callers is a *reader* looking for a file.
+_STATE_DIR_TIMEOUT = 20.0
+
+
+def _state_dir_cache_key(root: Path) -> tuple:
+    """Everything the kernel's resolution depends on, as a cache key.
+
+    The kernel resolves the state directory from `$DEVMAP_HOME` and from which
+    of the two directories exist on disk (`devmap_extract::paths`). Those are
+    two `stat` calls and an environment read; the *subprocess* is the cost this
+    cache exists to avoid, so the key carries them rather than pinning one
+    answer per root for the life of the process. A test that creates `.devmap/`
+    after a first call gets a fresh answer, and so does a repository being
+    migrated under a long-lived daemon.
+    """
+    return (
+        root,
+        os.environ.get("DEVMAP_HOME", ""),
+        (root / STANDALONE_STATE_DIR).is_dir(),
+        (root / DEVCOUNCIL_STATE_DIR).is_dir(),
+    )
+
+
+def _kernel_state_dir(root: Path) -> Optional[Path]:
+    """The state directory the kernel resolves for ``root``, or None.
+
+    Asked, not re-derived: `devmap --json paths` reports `db_path`, and the
+    directory two levels above it is the state directory. A second Python copy
+    of the rule in `devmap_extract::paths` is exactly the drift this function
+    exists to prevent -- `.devcouncil/` was hard-coded at eleven sites in the
+    kernel before that module, and once already broke `verify.sh` gate 8 on the
+    Python side.
+
+    `paths` opens nothing. This used to ask `status`, which opens the store to
+    count nodes: 29 ms per process against a 168 MB store to answer a question
+    the kernel settles before it opens anything, and no answer at all for a
+    store `status` cannot open. A kernel too old to know `paths` (exit 2,
+    "unrecognized subcommand") is asked `status` instead.
+
+    None when there is no kernel, or it could not answer: a *reader* must not
+    fail because the binary is missing.
+    """
+    try:
+        binary = find_engine_binary(root)
+    except DevMapEngineError:
+        return None
+    completed = None
+    for subcommand in ("paths", "status"):
+        try:
+            completed = subprocess.run(
+                [binary, "--json", subcommand],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=_STATE_DIR_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            logger.debug("state dir probe (%s) failed to run", subcommand, exc_info=True)
+            return None
+        if completed.returncode == 0:
+            break
+        if subcommand == "paths" and "unrecognized subcommand" in completed.stderr:
+            continue
+        logger.debug("state dir probe (%s) exited %s", subcommand, completed.returncode)
+        return None
+    if completed is None or completed.returncode != 0:
+        return None
+    try:
+        db_path = json.loads(completed.stdout).get("db_path")
+    except (ValueError, AttributeError):
+        logger.debug("state dir probe returned unreadable JSON", exc_info=True)
+        return None
+    if not isinstance(db_path, str) or not db_path:
+        return None
+    # `db_path` is `<state dir>/codeintel/devmap.sqlite`, relative to the cwd it
+    # was resolved in, which is `root`.
+    resolved = Path(db_path)
+    if not resolved.is_absolute():
+        resolved = root / resolved
+    return resolved.parent.parent
+
+
+def state_dir(root: Path) -> Path:
+    """Where Dev Map keeps ``root``'s state: ``.devcouncil/`` or ``.devmap/``.
+
+    One owner for a question six Python readers answered with the literal
+    ``.devcouncil`` -- `devmap_health`, `devmap_client` (twice), `knowledge.wiki`,
+    `indexing.semantic_index`, and this module's own `DEFAULT_*_RELPATH`. The
+    kernel resolves it per repository (`$DEVMAP_HOME`, then an existing
+    ``.devmap/``, then an existing ``.devcouncil/``), so any of those literals is
+    wrong for a repository on the standalone layout -- and wrong *silently*: the
+    reader finds no file and reports "no map" for a map that exists.
+
+    Two rules, in order:
+
+    1. **What the kernel says, when that directory exists.** The kernel owns the
+       rule and has already applied it, so this asks rather than re-deriving.
+       The existence check is what makes the answer evidence: a resolved
+       directory that is on disk is where this repository's state actually is.
+    2. **``.devcouncil/`` otherwise.** Nothing has been created yet (or there is
+       no kernel to ask), and ``.devcouncil/`` is what DevCouncil's own writer
+       creates. Deferring to the kernel's *default* here would point the readers
+       at ``.devmap/`` while ``dev map`` wrote ``.devcouncil/``, which is the
+       divergence this function exists to remove.
+
+    Cached per root and per the inputs that can change the answer, because rule 1
+    costs a subprocess. Never raises.
+    """
+    root = Path(root).expanduser().resolve()
+    key = _state_dir_cache_key(root)
+    with _STATE_DIR_LOCK:
+        cached = _STATE_DIR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    resolved: Optional[Path] = None
+    # Nothing on disk and no override: the kernel can only report its default,
+    # and this is the case where following that default would diverge from what
+    # DevCouncil's writer does. Skip the subprocess and answer rule 2 directly.
+    if key[1] or key[2] or key[3]:
+        answer = _kernel_state_dir(root)
+        if answer is not None and answer.is_dir():
+            resolved = answer
+    if resolved is None:
+        resolved = root / DEVCOUNCIL_STATE_DIR
+    with _STATE_DIR_LOCK:
+        _STATE_DIR_CACHE[key] = resolved
+    return resolved
+
+
+def map_path(root: Path) -> Path:
+    """``repo_map.json``, wherever this repository's state directory is."""
+    return state_dir(root) / MAP_RELPATH_IN_STATE_DIR
+
+
+#: Aliases for `build_map`, whose locals are already called `map_path` and
+#: `graph_path` (they are the *chosen* paths, which a caller may override).
+default_map_path = map_path
+
+
+def graph_path(root: Path) -> Path:
+    """``graph/code_graph.json``, wherever this repository's state directory is."""
+    return state_dir(root) / GRAPH_RELPATH_IN_STATE_DIR
+
+
+graph_path_for = graph_path
+
+
+def live_build_path(root: Path) -> Path:
+    """The in-progress build marker, wherever this root's state directory is."""
+    return state_dir(root) / LIVE_BUILD_RELPATH_IN_STATE_DIR
+
+
+def store_path(root: Path) -> Path:
+    """``codeintel/devmap.sqlite``, wherever this repository's state directory is."""
+    return state_dir(root) / DB_RELPATH_IN_STATE_DIR
 
 
 class DevMapEngineError(RuntimeError):
@@ -314,7 +492,8 @@ def find_engine_binary(root: Optional[Path] = None) -> str:
     **Location, other repositories.** `DevMapClient` used to search
     `<root>/rust-port/target` and nothing else, which is right for DevCouncil
     and wrong everywhere else. Both rules now live here: the repository, then
-    the package, then `PATH`, and an explicit `DEVMAP_BINARY` beats all three.
+    the package, then `PATH`, and an explicit `DEVMAP_BINARY` beats all three —
+    used or refused by name, never replaced by a search result.
 
     **Capability, not version.** `~/.cargo/bin/devmap` reports `devmap 0.1.0`,
     exactly what the freshly built binary reports, and does not support
@@ -347,7 +526,15 @@ def find_engine_binary(root: Optional[Path] = None) -> str:
     for candidate in _binary_candidates(root):
         if not (candidate.is_file() and os.access(candidate, os.X_OK)):
             if override and str(candidate) == str(Path(override).expanduser()):
-                rejected.append(f"{candidate} (from {BINARY_ENV_VAR}: not an executable file)")
+                # Refused, not noted: appending this to `rejected` and moving
+                # on let the search fall through to the package build, so a
+                # typo in the override was answered by another kernel — the
+                # substitution the Go client stopped making in `f5151b7`.
+                raise DevMapEngineError(
+                    f"{BINARY_ENV_VAR} points at {candidate}, which is not an executable "
+                    "file. Unset it, or point it at a built kernel (an explicit override "
+                    "is used or refused, never replaced by another kernel)."
+                )
             continue
         # The kernel's own declaration first — it comes out of the `status`
         # probe this selection runs anyway. Only a kernel that declares nothing
@@ -466,12 +653,19 @@ def _manifest_accepts_stamp_flags(binary: str) -> bool:
     )
 
 
-_FUTURE_SCHEMA_MARKER = "unsupported future schema version"
+#: The phrase the store's refusal spells when the store is newer than the
+#: binary (`devmap-store/src/db.rs`, `unsupported_schema`). It was
+#: "unsupported future schema version" until the kernel rewrote the refusal to
+#: name the store, both versions and the remedy — and the seam kept looking
+#: for the old phrase, so a real future-schema failure classified as
+#: `kernel_failed` and the explanation below never fired. Pinned to the
+#: store's source by `test_the_future_schema_marker_is_a_phrase_the_store_actually_emits`.
+_FUTURE_SCHEMA_MARKER = "this devmap binary is older than the store"
 
 #: Written while a kernel build runs, removed when it ends. `dev map status`
 #: reads it from another process to say "building: stage X, pid N, 12 s"; a
 #: marker whose pid is dead is a crashed or killed build and is reported as such.
-LIVE_BUILD_RELPATH = ".devcouncil/codeintel/devmap-build.live.json"
+LIVE_BUILD_RELPATH = f"{DEVCOUNCIL_STATE_DIR}/{LIVE_BUILD_RELPATH_IN_STATE_DIR}"
 #: Trace event type of one kernel run (build / manifest / repair). They go to
 #: the same `.devcouncil/logs/traces.jsonl` every other DevCouncil stage uses,
 #: so `devcouncil_tail_trace` and `dev map runs` read the same record.
@@ -667,7 +861,7 @@ def _run(
     stage = stage or _stage_of(argv)
     run_id = uuid.uuid4().hex[:12]
     root = Path(cwd)
-    live_path = root / LIVE_BUILD_RELPATH if stage == "build" else None
+    live_path = live_build_path(root) if stage == "build" else None
     started_at = time.time()
     started_mono = time.monotonic()
     stderr_lines: List[str] = []
@@ -855,7 +1049,7 @@ def repair_pending(root: Path, *, timeout: float = 300.0) -> str:
     root = Path(root).expanduser().resolve()
     binary = find_engine_binary(root)
     completed = _run(
-        [binary, "--db", str(root / DEFAULT_DB_RELPATH), "--progress", "never", "repair", "--pending"],
+        [binary, "--db", str(store_path(root)), "--progress", "never", "repair", "--pending"],
         cwd=root,
         timeout=timeout,
         stage="repair",
@@ -923,17 +1117,16 @@ def render_map_html(
 def _explain_kernel_failure(argv: List[str], output: str) -> Optional[str]:
     """Turn a kernel refusal the operator cannot act on into one they can.
 
-    The kernel's "unsupported future schema version N" is correct and useless:
-    it names neither the binary that is too old, nor the store that is newer,
-    nor what to run. Measured cost of that gap on this machine: every `dev map`
-    failing for a day while a fresh build sat in `rust-port/target`.
+    The kernel's refusal names the store path, both schema versions and the
+    remedy, but not *which* binary ran or when it was built — and this seam
+    chose the binary, so it is the one that can say. Measured cost of that gap
+    on this machine: every `dev map` failing for a day while a fresh build sat
+    in `rust-port/target`.
     """
     if _FUTURE_SCHEMA_MARKER not in output:
         return None
-    version = ""
-    for token in output.split():
-        if token.isdigit():
-            version = token
+    found = re.search(r"schema version (\d+)", output)
+    version = found.group(1) if found else ""
     binary = argv[0]
     built = "unknown build time"
     try:
@@ -1246,20 +1439,26 @@ def build_map_result(
         raise DevMapEngineError(f"project root does not exist: {root}")
 
     binary = find_engine_binary(root)
-    db_path = root / DEFAULT_DB_RELPATH
+    # `--db` / `--output` / `--graph-output` are passed explicitly, so this
+    # process decides the state directory rather than letting the kernel resolve
+    # it a second time. It therefore has to decide it the *same* way: these
+    # spelled `.devcouncil/...` as literals, and on a repository holding the
+    # standalone layout that put `dev map`'s artifacts in a directory the
+    # kernel's own daemon, hooks and Go clients do not read.
+    db_path = store_path(root)
     # A relative output path is resolved against `root`, never against the
     # process's cwd. `dev map --project-root /other/repo` passes the *default*
-    # `.devcouncil/repo_map.json`, and resolving that against cwd made the
-    # engine read — and nearly rewrite — the map belonging to whichever
-    # repository the shell happened to be sitting in.
-    def _under_root(candidate: Optional[Path], fallback: str) -> Path:
+    # map path, and resolving that against cwd made the engine read — and nearly
+    # rewrite — the map belonging to whichever repository the shell happened to
+    # be sitting in.
+    def _under_root(candidate: Optional[Path], fallback: Path) -> Path:
         if candidate is None:
-            return root / fallback
+            return fallback
         candidate = Path(candidate).expanduser()
         return candidate if candidate.is_absolute() else (root / candidate)
 
-    map_path = _under_root(output, DEFAULT_MAP_RELPATH)
-    graph_path = _under_root(graph_output, DEFAULT_GRAPH_RELPATH)
+    map_path = _under_root(output, default_map_path(root))
+    graph_path = _under_root(graph_output, graph_path_for(root))
     db_path.parent.mkdir(parents=True, exist_ok=True)
     graph_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1319,8 +1518,19 @@ def build_map_result(
         # or git could not run — so it stamped nothing. Python's inventory has a
         # directory-walk fallback for exactly this case, and without it the map
         # carries empty digests and reads permanently stale.
-        stamp_freshness(root, map_path, graph_path)
-        freshness_source = "python"
+        #
+        # The values go back *through the kernel*: `_write_manifest_separately`
+        # hands them to `devmap manifest` as flags, so the kernel writes the
+        # artifacts once more with the digests in place and re-stamps them.
+        # The previous fallback, `stamp_freshness`, rewrote both files from
+        # Python — 26 % larger, pretty-printed, and no longer the bytes the
+        # kernel's `<db>.artifacts.json` described, so every later build
+        # regenerated the manifest and the doctor called the writer unverified.
+        # Measured on a `git archive` corpus copy, 2026-09-06. Only a kernel
+        # too old to take the flags still gets the Python rewrite, inside
+        # `_write_manifest_separately`.
+        _write_manifest_separately(binary, root, db_path, map_path, graph_path, timeout)
+        freshness_source = "caller"
 
     reported_status = manifest.get("status")
     status = reported_status if isinstance(reported_status, dict) else None

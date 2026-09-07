@@ -108,19 +108,23 @@ def test_path_prefixed_dev_map_allowed_without_task(tmp_path: Path):
         assert decision.action == "allow", command
 
 
-def test_map_unlock_allowed_without_task_under_contain(
+def test_map_abort_allowed_without_task_under_contain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """``dev map unlock`` is lease-lifecycle allowlisted (task=None ok under contain).
+    """``dev map abort`` is lease-lifecycle allowlisted (task=None ok under contain).
 
-    Raw ``kill`` stays denied — recovery must go through unlock, not shell kill.
+    Raw ``kill`` stays denied — recovery must go through the command, not a
+    shell kill. The example was ``dev map unlock``, which freed the *Python*
+    store's writer lease; that store and that command are deleted, and the
+    kernel's own lock is released by the OS when the holder dies. ``abort`` is
+    the recovery command that is left, and it is what this must keep allowing.
     """
     policy = _contain_policy(tmp_path, monkeypatch)
     for command in (
-        "dev map unlock",
-        "dev map unlock --force",
-        "uv run dev map unlock --json",
-        ".venv/bin/dev map unlock --force",
+        "dev map abort",
+        "dev map abort --json",
+        "uv run dev map abort --json",
+        ".venv/bin/dev map abort",
     ):
         decision = policy.evaluate(
             {"name": "Shell", "arguments": {"command": command}},
