@@ -74,7 +74,6 @@ fn is_sink(name: &str) -> bool {
     })
 }
 
-#[cfg(feature = "parse")]
 mod parsing {
     use super::*;
     use tree_sitter::{Node, Parser};
@@ -673,10 +672,9 @@ fn push_unique(list: &mut Vec<String>, value: String) {
     list.push(value);
 }
 
-#[cfg(feature = "parse")]
 pub use parsing::python_function_pdgs;
 
-#[cfg(all(test, feature = "parse"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

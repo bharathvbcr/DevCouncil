@@ -6,7 +6,10 @@ pub mod liveness;
 pub mod model;
 pub mod pdg;
 // The producer for `pdg`: source in, `FunctionPdgInput` out. Behind `parse`,
-// because it needs a grammar.
+// because it needs a grammar — the whole module, not only its entry point:
+// the sink table and its helpers have no reader without one, and left outside
+// the gate they were four warnings the embedder shape carried for nobody.
+#[cfg(feature = "parse")]
 pub mod pdgsrc;
 pub mod resolution_rate;
 pub mod traversal;
