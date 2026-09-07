@@ -159,6 +159,27 @@ def test_an_explicit_binary_override_is_honoured_and_still_probed(tmp_path, monk
     assert "DEVMAP_BINARY" in str(caught.value)
 
 
+def test_an_explicit_binary_that_does_not_exist_is_refused_not_replaced(tmp_path, monkeypatch):
+    """`DEVMAP_BINARY` naming a file that is not there is an error by name.
+
+    The capable-but-wrong case above was refused; the missing case was
+    appended to the rejected list and the search fell through to the package
+    build — so a typo in the override was answered by another kernel, which is
+    exactly what the Go client stopped doing in `f5151b7`. One rule, both
+    sides: an explicit override is used or refused, never replaced.
+    """
+    package_root = _isolate_binary_search(monkeypatch, tmp_path)
+    fallback = _fake_kernel(package_root / "rust-port" / "target" / "release" / "devmap")
+    missing = tmp_path / "nowhere" / "devmap"
+    monkeypatch.setenv("DEVMAP_BINARY", str(missing))
+    devmap_engine._clear_probe_caches()
+    with pytest.raises(DevMapEngineError) as caught:
+        chosen = find_engine_binary()
+        pytest.fail(f"a missing DEVMAP_BINARY was replaced by {chosen} (fallback {fallback})")
+    message = str(caught.value)
+    assert str(missing) in message and "DEVMAP_BINARY" in message
+
+
 def test_a_future_schema_refusal_names_the_binary_and_the_fix(tmp_path, monkeypatch):
     """The kernel's refusal is correct and useless: it does not say which binary
     is old, that the store is newer, or what to run. The seam must."""

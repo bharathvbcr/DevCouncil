@@ -492,7 +492,8 @@ def find_engine_binary(root: Optional[Path] = None) -> str:
     **Location, other repositories.** `DevMapClient` used to search
     `<root>/rust-port/target` and nothing else, which is right for DevCouncil
     and wrong everywhere else. Both rules now live here: the repository, then
-    the package, then `PATH`, and an explicit `DEVMAP_BINARY` beats all three.
+    the package, then `PATH`, and an explicit `DEVMAP_BINARY` beats all three —
+    used or refused by name, never replaced by a search result.
 
     **Capability, not version.** `~/.cargo/bin/devmap` reports `devmap 0.1.0`,
     exactly what the freshly built binary reports, and does not support
@@ -525,7 +526,15 @@ def find_engine_binary(root: Optional[Path] = None) -> str:
     for candidate in _binary_candidates(root):
         if not (candidate.is_file() and os.access(candidate, os.X_OK)):
             if override and str(candidate) == str(Path(override).expanduser()):
-                rejected.append(f"{candidate} (from {BINARY_ENV_VAR}: not an executable file)")
+                # Refused, not noted: appending this to `rejected` and moving
+                # on let the search fall through to the package build, so a
+                # typo in the override was answered by another kernel — the
+                # substitution the Go client stopped making in `f5151b7`.
+                raise DevMapEngineError(
+                    f"{BINARY_ENV_VAR} points at {candidate}, which is not an executable "
+                    "file. Unset it, or point it at a built kernel (an explicit override "
+                    "is used or refused, never replaced by another kernel)."
+                )
             continue
         # The kernel's own declaration first — it comes out of the `status`
         # probe this selection runs anyway. Only a kernel that declares nothing

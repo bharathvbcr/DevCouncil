@@ -208,7 +208,7 @@ Python seam is two files: `src/devcouncil/devmap_engine.py` runs `devmap build` 
 newline-framed JSON IPC to a `devmap serve` daemon (one per repository, socket derived from the
 canonical root; spawned on demand, never by a status probe, and never when `DEVMAP_AUTOSPAWN=0`)
 with a CLI fallback for every request. The kernel binary is located by one rule for both:
-`DEVMAP_BINARY` if set, else the newest capable build among `<repo>/rust-port/target/{release,debug}`,
+`DEVMAP_BINARY` if set (used or refused by name, never replaced by another kernel), else the newest capable build among `<repo>/rust-port/target/{release,debug}`,
 `<package>/rust-port/target/{release,debug}` and `PATH` — "capable" being what `manifest --help`
 advertises, because every build reports the same version string.
 

@@ -61,7 +61,9 @@ func discoverBinary(ctx context.Context, root string) (string, error) {
 	return "", ErrNoBinary
 }
 
-// binaryCandidates lists possible kernels, most-preferred first.
+// binaryCandidates lists possible kernels, most-preferred first. The explicit
+// override is not a candidate: discoverBinary uses or refuses it before this
+// list is consulted, so it can never be out-ranked or fallen through from.
 func binaryCandidates(root string) []string {
 	var out []string
 	seen := map[string]bool{}
@@ -74,17 +76,6 @@ func binaryCandidates(root string) []string {
 		}
 		seen[p] = true
 		out = append(out, p)
-	}
-
-	// An explicit override beats everything, including capability: an operator
-	// naming a binary is entitled to have that binary used, and a silent
-	// substitution would make a deliberate test of a specific build a lie.
-	if env := os.Getenv("DEVMAP_BINARY"); env != "" {
-		if abs, err := filepath.Abs(env); err == nil {
-			add(abs)
-		} else {
-			add(env)
-		}
 	}
 
 	for _, built := range localBuilds(root) {
