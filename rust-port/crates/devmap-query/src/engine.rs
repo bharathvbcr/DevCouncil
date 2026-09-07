@@ -616,6 +616,20 @@ impl<'a> StoreQueryEngine<'a> {
                 reason: "scoped trace endpoints must not be empty".to_string(),
             }));
         }
+        // `trace X X` walked the graph from `X` looking for `X`, never counted
+        // the start as reached, and reported the walk's budget — "stopped at
+        // depth 3 after visiting 44 nodes; whether a path exists is unknown" —
+        // for a question the walk cannot answer. Whether a cycle passes through
+        // a symbol is `impact`'s question; a scoped trace needs two endpoints.
+        if from == to {
+            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                reason: format!(
+                    "{from:?} and {to:?} are the same symbol; a scoped trace needs two \
+                     different endpoints (whether a cycle passes through it is an \
+                     `impact` question)"
+                ),
+            }));
+        }
         let edges = self.resolved_edges(req.min_confidence)?;
         let path = match shortest_path(
             &edges,
@@ -656,7 +670,9 @@ impl<'a> StoreQueryEngine<'a> {
                 };
                 return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                     reason: format!(
-                        "search from {from:?} to {to:?} stopped at {limits} after                          visiting {visited} nodes without reaching the target;                          whether a path exists is unknown — retry with a larger                          --depth"
+                        "search from {from:?} to {to:?} stopped at {limits} after visiting \
+                         {visited} nodes without reaching the target; whether a path exists \
+                         is unknown — retry with a larger --depth"
                     ),
                 }));
             }
