@@ -588,13 +588,26 @@ const ENTRY_POINT_SECTIONS: &[&str] = &[
 /// Prefix form of the above: any group under `[project.entry-points.…]`.
 const ENTRY_POINT_SECTION_PREFIX: &str = "project.entry-points.";
 
-/// Most entry points one manifest contributes symbol targets for.
+/// Most entry-point declarations one manifest is read for.
+///
+/// Counted in *declarations*, which is what the manifest writes; each one
+/// contributes [`ENTRY_POINT_CANDIDATES`] annotations, so the annotation
+/// ceiling is the product. Naming it in annotations instead would make the
+/// number mean something different from what a reader of a `pyproject.toml`
+/// can count.
 ///
 /// A bound, not a sample: past it the exemption is simply not claimed, which
 /// is the fail-open direction for this rule — a missing exemption produces an
-/// extra dead-symbol *finding*, never a hidden one. No manifest in any corpus
-/// measured here comes within two orders of magnitude of it.
+/// extra dead-symbol *finding*, never a hidden one, so a truncated read can
+/// only over-report. No manifest in any corpus measured here comes within two
+/// orders of magnitude of it.
 const ENTRY_POINT_CAP: usize = 512;
+
+/// Module paths one `pkg.mod:attr` target is tried against.
+///
+/// Pinned equal to `wiring._add_module_file`'s candidate list by
+/// `tests/unit/test_wiring_parity_with_kernel.py`.
+const ENTRY_POINT_CANDIDATES: usize = 4;
 
 fn entry_point_target_pattern() -> &'static regex::Regex {
     use std::sync::OnceLock;
@@ -652,8 +665,12 @@ pub fn config_entry_point_symbols(path: &str, source: &str) -> Vec<WiringAnnotat
     };
 
     let mut annotations = Vec::new();
+    let mut declarations = 0usize;
     let mut in_entry_section = false;
     for line in source.lines() {
+        if declarations >= ENTRY_POINT_CAP {
+            break;
+        }
         let trimmed = line.trim();
         if let Some(header) = trimmed
             .strip_prefix('[')
@@ -675,17 +692,19 @@ pub fn config_entry_point_symbols(path: &str, source: &str) -> Vec<WiringAnnotat
         if module.is_empty() || attribute.is_empty() {
             continue;
         }
+        declarations += 1;
         let module_path = module.replace('.', "/");
         let details = format!("declared as an entry point by {normalized}: {module}:{attribute}");
-        for candidate in [
+        // Typed to `ENTRY_POINT_CANDIDATES` on purpose: adding a fifth module
+        // path here is a type error until the constant moves with it, and the
+        // constant is what the parity module's count is checked against.
+        let candidates: [String; ENTRY_POINT_CANDIDATES] = [
             format!("{base}{module_path}.py"),
             format!("{base}{module_path}/__init__.py"),
             format!("{base}src/{module_path}.py"),
             format!("{base}src/{module_path}/__init__.py"),
-        ] {
-            if annotations.len() >= ENTRY_POINT_CAP {
-                return annotations;
-            }
+        ];
+        for candidate in candidates {
             annotations.push(WiringAnnotation {
                 kind: WiringKind::ConfigEntryPoint,
                 target_symbol: format!("{candidate}::{attribute}"),
@@ -1450,5 +1469,42 @@ lint = \"not.an:entrypoint\"
                 "{path} must not be read as a Python manifest"
             );
         }
+    }
+
+    /// The entry-point read is bounded, and the bound truncates fail-open.
+    ///
+    /// A cap that quietly changed the *verdict* would be the honesty defect this
+    /// codebase keeps refusing: a check that could not run reporting what a
+    /// check that ran and passed reports. This one cannot. Past
+    /// `ENTRY_POINT_CAP` declarations the exemption is simply not claimed, so a
+    /// truncated read produces extra dead-symbol *findings* and never hides one
+    /// — and the cap is counted in declarations, which is what a reader of a
+    /// `pyproject.toml` can count, not in the annotations each one expands to.
+    #[test]
+    fn the_entry_point_read_is_bounded_and_truncates_fail_open() {
+        let mut manifest = String::from("[project.scripts]\n");
+        for index in 0..(ENTRY_POINT_CAP * 2) {
+            manifest.push_str(&format!("tool{index} = \"pkg.mod{index}:main\"\n"));
+        }
+        let annotations = config_entry_point_symbols("pyproject.toml", &manifest);
+        assert_eq!(
+            annotations.len(),
+            ENTRY_POINT_CAP * ENTRY_POINT_CANDIDATES,
+            "the cap is counted in declarations and each contributes \
+             {ENTRY_POINT_CANDIDATES} module-path candidates"
+        );
+        // Fail-open: the declarations past the cap contribute nothing, so their
+        // functions stay dead-symbol candidates rather than being cleared on a
+        // read that stopped early.
+        assert!(
+            !annotations.iter().any(|a| a
+                .target_symbol
+                .starts_with(&format!("pkg/mod{}.py", ENTRY_POINT_CAP))),
+            "a declaration past the cap must contribute no exemption at all"
+        );
+        // And the first one still does, or the cap has turned the rule off.
+        assert!(annotations
+            .iter()
+            .any(|a| a.target_symbol == "pkg/mod0.py::main"));
     }
 }
