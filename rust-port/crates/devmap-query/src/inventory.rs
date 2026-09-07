@@ -258,7 +258,16 @@ fn walk_markers(root: &Path) -> Markers {
                 }
                 continue;
             }
-            if !kind.is_file() {
+            // A symlink to a regular file counts. `file_type()` does not
+            // follow links, and a monorepo whose `package.json` or lock file is
+            // a link into a shared config directory declares its manager
+            // exactly as much as one that stores the bytes here — the previous
+            // `!kind.is_file()` reported that repository as declaring nothing,
+            // which is the shape of failure this whole module exists to remove.
+            // `Path::is_file` *does* follow, and answers `false` for a dangling
+            // link, a loop, or a link to a directory, so the extra `stat` is
+            // paid only for links and never turns into a traversal.
+            if !kind.is_file() && !(kind.is_symlink() && entry.path().is_file()) {
                 continue;
             }
             if depth == 0 && TOP_LEVEL_MARKERS.contains(&name.as_str()) {
@@ -704,6 +713,53 @@ mod tests {
         // root is real source and must not be dropped.
         assert!(!skip_dir("build", 1));
         assert!(!skip_dir("src", 0));
+    }
+
+    #[test]
+    fn a_symlinked_lock_file_is_still_a_declaration() {
+        // A monorepo whose `uv.lock` is a link into a shared config directory
+        // declares uv exactly as much as one that stores the bytes in place.
+        let root = std::env::temp_dir().join(format!(
+            "devmap-inventory-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("shared")).expect("create fixture");
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"x\"\n")
+            .expect("write pyproject");
+        std::fs::write(root.join("shared/uv.lock"), "version = 1\n").expect("write lock");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("shared/uv.lock"), root.join("uv.lock"))
+            .expect("link the lock file");
+        #[cfg(not(unix))]
+        std::fs::copy(root.join("shared/uv.lock"), root.join("uv.lock")).expect("copy");
+
+        let inventory = scan(&root);
+        assert!(inventory.computed);
+        assert!(
+            inventory.package_managers.iter().any(|name| name == "uv"),
+            "a linked uv.lock is still this repository's lock file: {:?}",
+            inventory.package_managers
+        );
+
+        // A dangling link is not a file and must not be counted, and must not
+        // stop the walk either.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("gone/go.mod"), root.join("go.mod"))
+                .expect("link a missing file");
+            let after = scan(&root);
+            assert!(
+                !after.package_managers.iter().any(|name| name == "go mod"),
+                "a dangling go.mod link declares nothing: {:?}",
+                after.package_managers
+            );
+            assert!(after.package_managers.iter().any(|name| name == "uv"));
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
