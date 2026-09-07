@@ -773,6 +773,49 @@ struct EdgeTuple<'a> {
     candidate_total: Option<i64>,
 }
 
+/// The identity of one resolved edge, as `edge_rows` stores it.
+///
+/// The one owner: `save_generation_with_metadata` calls this to decide what to
+/// write and again to write it, so those two passes cannot come to disagree
+/// about which rows they mean.
+///
+/// `kind_labels` is the interned `format!("{:?}", kind)` of every kind in the
+/// generation. Formatting per *edge* instead is 102,083 heap allocations held
+/// for the length of the write, for a value that takes one of a dozen values.
+#[cfg(feature = "parse")]
+fn edge_tuple<'a>(
+    edge: &'a ResolvedEdge,
+    kind_labels: &'a std::collections::HashMap<EdgeKind, String>,
+    source_file_id: u32,
+    target_file_id: u32,
+) -> EdgeTuple<'a> {
+    EdgeTuple {
+        source_file_id,
+        target_file_id,
+        source_symbol: std::borrow::Cow::Borrowed(edge.source_symbol.as_str()),
+        target_symbol: std::borrow::Cow::Borrowed(edge.target_symbol.as_str()),
+        edge_kind: std::borrow::Cow::Borrowed(kind_labels[&edge.edge_kind].as_str()),
+        // Compared by bit pattern, which is what SQLite stores and what the read
+        // path compares. `f64` has no `Eq`, and rounding the key would let two
+        // rows the reader can tell apart share one.
+        confidence: edge.confidence.persist_real().to_bits(),
+        // The evidence tier, so the read path does not have to guess it back out
+        // of the row's file layout. NULL only for an edge built without a
+        // resolution at all, which the resolver never produces —
+        // `ResolvedEdge::new` takes one — and which the read path therefore
+        // reports as `ResolutionSource::Reconstructed`.
+        resolution: edge.resolution.as_ref().map(|resolution| {
+            std::borrow::Cow::Borrowed(crate::edge_index::resolution_kind_label(resolution))
+        }),
+        // How many candidates the ambiguous rung actually weighed, which since
+        // `AMBIGUOUS_FANOUT_CAP` is no longer the number of rows this site
+        // produces. NULL for every other rung: a resolution that names one
+        // target has no candidate list, and writing 1 there would make a certain
+        // edge look like a one-candidate ambiguity.
+        candidate_total: crate::edge_index::ambiguous_candidate_total(edge.resolution.as_deref()),
+    }
+}
+
 /// The same identity for one row of the unresolved-call ledger.
 #[derive(PartialEq, Eq, Hash)]
 struct UnresolvedTuple<'a> {
@@ -3468,70 +3511,55 @@ impl Store {
         // paragraph above is about, and it is why the equality below is still
         // structural.
         //
-        // The tuples are kept in a `Vec` in the resolver's emission order, and
-        // the multiset is a map *into* it. Iterating the map instead would have
-        // been shorter and was measurably wrong: a `HashMap`'s order is
-        // arbitrary and varies per process, so the inserts landed in no order
-        // at all, and the read path's sort — which is handed the rows in stored
-        // order — lost the nearly-sorted input it had been getting for free. A
-        // cold `devmap impact` on this repository went 115 ms to 150 ms for
-        // **the same instruction count** (1.192 G against 1.188 G) and 32% more
-        // cycles: pure memory stalls in a sort with a worse starting order.
-        let mut ordered: Vec<EdgeTuple> = Vec::with_capacity(resolution.edges.len());
+        // The multiset is built in one pass over `resolution.edges` and the
+        // inserts walk that same slice again, so the rows land in the resolver's
+        // emission order. Iterating the map instead would have been shorter and
+        // was measurably wrong: a `HashMap`'s order is arbitrary and varies per
+        // process, so the inserts landed in no order at all, and the read path's
+        // sort — which is handed the rows in stored order — lost the nearly
+        // sorted input it had been getting for free. A cold `devmap impact` on
+        // this repository went 115 ms to 150 ms for **the same instruction
+        // count** (1.192 G against 1.188 G) and 32% more cycles: pure memory
+        // stalls in a sort with a worse starting order.
+        //
+        // [`edge_tuple`] is the one owner of what an edge's identity is, called
+        // by both passes, so the pass that decides what to write and the pass
+        // that writes it cannot come to disagree about which rows they mean.
+        //
+        // Every field borrows, and the kinds are formatted once each into
+        // `kind_labels` rather than once per edge: `format!("{:?}", kind)` for
+        // 102,083 edges is 102,083 heap allocations held for the length of the
+        // write. It is the same string by construction, because it is the same
+        // expression.
+        let mut kind_labels: std::collections::HashMap<EdgeKind, String> =
+            std::collections::HashMap::new();
         for edge in &resolution.edges {
-            // Deleted paths are not extracted, so a resolution over the current
-            // tree has no edge touching one. Kept as an explicit guard for
-            // callers that pass a resolution computed before the deletion.
+            kind_labels
+                .entry(edge.edge_kind)
+                .or_insert_with(|| format!("{:?}", edge.edge_kind));
+        }
+        // A *multiset*, not a set. 475 edge tuples of this repository occur more
+        // than once in one generation (1,111 rows); collapsing them would drop
+        // rows the analysis counted and make the equality below refuse the
+        // build.
+        //
+        // Deleted paths are not extracted, so a resolution over the current tree
+        // has no edge touching one. The skip stays as an explicit guard for
+        // callers that pass a resolution computed before the deletion, and both
+        // passes apply it.
+        let mut wanted: std::collections::HashMap<EdgeTuple, u32> =
+            std::collections::HashMap::with_capacity(resolution.edges.len());
+        let mut edge_ord: u32 = 0;
+        for edge in &resolution.edges {
             if deleted.contains(&edge.source_file) || deleted.contains(&edge.target_file) {
                 continue;
             }
             let src_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.source_file)?;
             let tgt_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.target_file)?;
-            let tuple = EdgeTuple {
-                source_file_id: src_f_id,
-                target_file_id: tgt_f_id,
-                source_symbol: std::borrow::Cow::Borrowed(edge.source_symbol.as_str()),
-                target_symbol: std::borrow::Cow::Borrowed(edge.target_symbol.as_str()),
-                edge_kind: std::borrow::Cow::Owned(format!("{:?}", edge.edge_kind)),
-                // Compared by bit pattern, which is what SQLite stores and what
-                // the read path compares. `f64` has no `Eq`, and rounding the
-                // key would let two rows the reader can tell apart share one.
-                confidence: edge.confidence.persist_real().to_bits(),
-                // The evidence tier, so the read path does not have to guess it
-                // back out of the row's file layout. NULL only for an edge built
-                // without a resolution at all, which the resolver never produces
-                // — `ResolvedEdge::new` takes one — and which the read path
-                // therefore reports as `ResolutionSource::Reconstructed`.
-                resolution: edge.resolution.as_ref().map(|resolution| {
-                    std::borrow::Cow::Borrowed(crate::edge_index::resolution_kind_label(resolution))
-                }),
-                // How many candidates the ambiguous rung actually weighed, which
-                // since `AMBIGUOUS_FANOUT_CAP` is no longer the number of rows
-                // this site produces. NULL for every other rung: a resolution
-                // that names one target has no candidate list, and writing 1
-                // there would make a certain edge look like a one-candidate
-                // ambiguity.
-                candidate_total: crate::edge_index::ambiguous_candidate_total(
-                    edge.resolution.as_deref(),
-                ),
-            };
-            ordered.push(tuple);
-        }
-        let edge_ord = u32::try_from(ordered.len()).map_err(|_| {
-            rusqlite::Error::InvalidParameterName(
-                "edge row count exceeds SQLite generation ordinal capacity".into(),
-            )
-        })?;
-
-        // A *multiset*, not a set. 475 edge tuples of this repository occur more
-        // than once in one generation (1,111 rows); collapsing them would drop
-        // rows the analysis counted and make the equality below refuse the
-        // build. The map borrows its keys from `ordered`, so this costs no
-        // second copy of the generation.
-        let mut wanted: std::collections::HashMap<&EdgeTuple, u32> =
-            std::collections::HashMap::with_capacity(ordered.len());
-        for tuple in &ordered {
-            *wanted.entry(tuple).or_insert(0) += 1;
+            *wanted
+                .entry(edge_tuple(edge, &kind_labels, src_f_id, tgt_f_id))
+                .or_insert(0) += 1;
+            edge_ord += 1;
         }
 
         // The rows already valid, streamed rather than materialised: the probe
@@ -3592,8 +3620,16 @@ impl Store {
             // In emission order, and only the copies the live set did not
             // already supply: a tuple wanted three times and valid twice is
             // inserted once, at the position of its first occurrence.
-            for tuple in &ordered {
-                let Some(missing) = wanted.get_mut(tuple) else {
+            for edge in &resolution.edges {
+                if deleted.contains(&edge.source_file) || deleted.contains(&edge.target_file) {
+                    continue;
+                }
+                // Already interned by the pass above, which visited exactly the
+                // edges this one does.
+                let src_f_id = path_ids[&edge.source_file];
+                let tgt_f_id = path_ids[&edge.target_file];
+                let tuple = edge_tuple(edge, &kind_labels, src_f_id, tgt_f_id);
+                let Some(missing) = wanted.get_mut(&tuple) else {
                     continue;
                 };
                 if *missing == 0 {

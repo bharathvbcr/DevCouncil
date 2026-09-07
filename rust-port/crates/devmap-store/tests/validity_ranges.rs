@@ -648,6 +648,39 @@ fn pruning_reclaims_rows_no_retained_generation_can_see() {
     let newest = *generations.last().unwrap();
     let newest_edges = edges_at(&conn, newest);
     let before = stored_edge_rows(&conn);
+    let middle = generations[generations.len() - 2];
+    let middle_edges = edges_at(&conn, middle);
+
+    // Retention first, reclaim second. A row closed *inside* the window is
+    // still reachable — the older retained generation sees it — so a prune that
+    // reclaimed by "is this row closed?" rather than by "is its end before the
+    // oldest generation we kept?" would take it and leave that generation short.
+    store.prune_generations_except_latest(2).unwrap();
+    assert_eq!(
+        edges_at(&conn, middle),
+        middle_edges,
+        "pruning to two generations took rows the older retained one still sees"
+    );
+    assert!(
+        !middle_edges.is_empty(),
+        "fixture precondition: the second-newest generation has edges"
+    );
+    assert_ne!(
+        middle_edges, newest_edges,
+        "fixture precondition: the two retained generations must differ, or \
+         nothing is closed inside the window"
+    );
+    let within_window: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edge_rows WHERE valid_to IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        within_window > 0,
+        "fixture precondition: some row ended inside the retained window"
+    );
 
     store.prune_generations_except_latest(1).unwrap();
 
@@ -850,4 +883,112 @@ fn an_unresolved_call_that_goes_away_leaves_the_generation_that_had_it_intact() 
         "the second generation resolved everything and must hold no ledger rows"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// A writer killed between closing rows and inserting their successors leaves
+/// the generation it started from intact.
+///
+/// The delta write has a shape the whole-rewrite one did not: it *ends* rows
+/// before it begins their replacements, so there is a moment when the store
+/// holds neither. If that moment were durable, a killed build would leave a
+/// generation missing every edge that had changed — a graph that is not wrong
+/// about any edge it has and is silently short of the ones it does not.
+///
+/// Driven with a real child process and `SIGKILL`, because an in-process
+/// `panic` unwinds through rusqlite's `Drop` and rolls the transaction back,
+/// which tests Rust's destructors rather than SQLite's recovery. The child
+/// holds an uncommitted `BEGIN IMMEDIATE` with every row closed inside it.
+#[cfg(unix)]
+#[test]
+fn a_writer_killed_between_closing_and_inserting_leaves_every_edge_servable() {
+    let dir = tmp_dir("v18-killed-mid-delta");
+    let db = dir.join("index.sqlite");
+    let store = Store::open(&db).unwrap();
+    let files = tree(0, 6);
+    let generation = commit(&store, &files, &[]);
+    let before = store.latest_edges(0.0).unwrap();
+    assert!(
+        !before.is_empty(),
+        "fixture precondition: the generation has edges"
+    );
+    store.checkpoint_wal().unwrap();
+    drop(store);
+
+    // A child that opens the store, closes every live edge and ledger row
+    // inside an uncommitted transaction — the exact half-state the delta write
+    // passes through — announces itself, and then blocks until it is killed.
+    let script = format!(
+        r#"
+import sqlite3, sys, time
+conn = sqlite3.connect({:?}, isolation_level=None)
+conn.execute("PRAGMA busy_timeout=5000")
+conn.execute("BEGIN IMMEDIATE")
+conn.execute("INSERT INTO generations (created_at, head_sha, analysis_json) VALUES (9.0, 'torn', '{{}}')")
+gen = conn.execute("SELECT max(id) FROM generations").fetchone()[0]
+conn.execute("UPDATE edge_rows SET valid_to = ? WHERE valid_to IS NULL", (gen,))
+conn.execute("UPDATE unresolved_rows SET valid_to = ? WHERE valid_to IS NULL", (gen,))
+sys.stdout.write("closed\n")
+sys.stdout.flush()
+time.sleep(600)
+"#,
+        db.to_string_lossy()
+    );
+    let mut child = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&script)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3 is required to hold an uncommitted transaction");
+
+    use std::io::{BufRead, BufReader};
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while line.trim() != "closed" && std::time::Instant::now() < deadline {
+        line.clear();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+    }
+    assert_eq!(line.trim(), "closed", "child never closed the rows");
+
+    // SIGKILL: no unwinding, no destructors, no rollback by the process itself.
+    unsafe {
+        libc_kill(child.id() as i32, 9);
+    }
+    let _ = child.wait();
+
+    let reopened = Store::open(&db).expect("the store must recover");
+    assert_eq!(
+        reopened.latest_generation_id().unwrap(),
+        Some(generation),
+        "the killed writer's uncommitted generation became visible"
+    );
+    assert_eq!(
+        reopened.latest_edges(0.0).unwrap(),
+        before,
+        "the closes committed without their inserts: the recovered generation \
+         serves fewer edges than the one it was built from"
+    );
+    let conn = Connection::open(&db).unwrap();
+    let open_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM edge_rows WHERE valid_to IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        open_rows,
+        before.len() as i64,
+        "a killed close left rows ended that nothing ended"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
