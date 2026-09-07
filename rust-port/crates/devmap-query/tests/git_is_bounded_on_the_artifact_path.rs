@@ -114,3 +114,71 @@ fn churn_past_the_cap_costs_its_bytes_not_the_deadline() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The *commit* cap is a bound like any other, and a window cut by it makes the
+/// counts a lower bound — so it has to say so.
+///
+/// `--max-count=5000` is the one bound whose effect is invisible in the bytes:
+/// git stops emitting and exits zero, the output is nowhere near
+/// `CHURN_OUTPUT_CAP`, and `stdout_truncated` is `false`. Measured on a real
+/// 5,200-commit repository the whole capped listing is 38 KB against an 8 MB
+/// cap. `hotspots_truncated` in `code_graph.json` is `churn.truncated`
+/// verbatim, so a repository whose quarter holds more than the cap ships
+/// hotspot counts that are a subset of its history under a field that says
+/// nothing was cut.
+///
+/// The fixture emits exactly `CHURN_COMMIT_CAP` commit blocks in git's own
+/// `-z --name-only --pretty=format:` framing: each block is its paths
+/// NUL-terminated, and blocks are joined by one more NUL. Measured against git
+/// 2.50.1 — three commits of two files each produce
+/// `f3\0g3\0\0f2\0g2\0\0f1\0g1\0`; an empty commit contributes an empty block,
+/// and so does a merge, which `--name-only` gives no paths for.
+#[test]
+fn a_window_cut_at_the_commit_cap_says_so() {
+    let commits = inventory::CHURN_COMMIT_CAP;
+    let (dir, git) = fake_git(&format!(
+        "awk 'BEGIN{{for(i=0;i<{commits};i++){{if(i)print \"\";print \"src/f\" i \".py\"}}}}' \
+         | tr '\\n' '\\0'"
+    ));
+    let churn = inventory::churn_with_program(git.as_os_str(), Path::new("/tmp"));
+    assert!(
+        churn.computed,
+        "git answered; a capped answer is still an answer: {}",
+        churn.unavailable_reason
+    );
+    // Every path arrived, so the *byte* cap is not what fired here — the case
+    // would prove nothing if it had.
+    assert_eq!(
+        churn.commits_by_path.len(),
+        commits,
+        "the fixture must deliver the cap's worth of commits whole"
+    );
+    assert!(
+        churn.truncated,
+        "the commit cap cut the window at {commits} commits and the counts are \
+         a lower bound; `truncated` is how a reader learns that, and it said false"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// …and a window no bound touched still says nothing was cut.
+///
+/// The companion to the case above: "always truncated" would pass that one and
+/// tell every reader its counts are a lower bound, which is the same loss of
+/// information in the other direction. It also pins the commit count itself —
+/// three commits' framing, including the empty block a merge contributes.
+#[test]
+fn a_window_under_the_commit_cap_says_nothing_was_cut() {
+    // `a\0b\0` `\0` `` `\0` `c\0` — two commits naming files with a merge's
+    // empty block between them, exactly as git 2.50.1 frames it.
+    let (dir, git) = fake_git("printf 'a.py\\0b.py\\0\\0\\0c.py\\0'");
+    let churn = inventory::churn_with_program(git.as_os_str(), Path::new("/tmp"));
+    assert!(churn.computed, "{}", churn.unavailable_reason);
+    assert_eq!(churn.commits_by_path.len(), 3);
+    assert!(
+        !churn.truncated,
+        "no bound bit: three commits against a cap of {} and 8 MB of room",
+        inventory::CHURN_COMMIT_CAP
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

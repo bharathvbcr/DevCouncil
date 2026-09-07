@@ -601,13 +601,39 @@ pub fn churn_with_program(program: &OsStr, root: &Path) -> FileChurn {
 
     let text = captured.stdout_lossy();
     let mut commits_by_path: BTreeMap<String, u32> = BTreeMap::new();
+    // Commits, counted so the *commit* cap can be seen at all.
+    //
+    // Of this invocation's four bounds it is the only one that leaves no trace
+    // in the bytes: `--max-count` makes git stop emitting and exit zero, and on
+    // a real 5,200-commit repository the whole capped listing is 38 KB against
+    // an 8 MB `CHURN_OUTPUT_CAP`, so `stdout_truncated` is `false` and the
+    // window was still cut.
+    //
+    // `-z --name-only --pretty=format:` frames the output as one block per
+    // commit — each of its paths NUL-terminated — with the blocks joined by one
+    // more NUL. A stream of `f` files across `n` commits therefore carries
+    // `f + n - 1` NULs and splits into `f + n` entries, of which `f` are
+    // non-empty: every commit contributes exactly one empty entry, whether it
+    // named files, named none (an empty commit), or is a merge, which
+    // `--name-only` gives no paths for. Measured against git 2.50.1.
+    let mut commits_seen = 0usize;
     for entry in text.split('\0') {
+        if entry.is_empty() {
+            commits_seen += 1;
+            continue;
+        }
         let path = entry.trim().replace('\\', "/");
         if path.is_empty() {
             continue;
         }
         *commits_by_path.entry(path).or_insert(0) += 1;
     }
+    // At exactly the cap the window may or may not have been cut — git stops
+    // without saying which — so this reports it as cut. Over-reporting a bound
+    // is the safe direction: `truncated` reaching a reader as `false` when
+    // history was dropped is the failure this exists to prevent, and the
+    // opposite costs one repository in `CHURN_COMMIT_CAP` an accurate flag.
+    let commit_cap_reached = commits_seen >= CHURN_COMMIT_CAP;
     if commits_by_path.is_empty() {
         // A repository whose commits in the window touched no file, or none
         // in the window at all: git answered, and the answer was empty.
@@ -619,7 +645,7 @@ pub fn churn_with_program(program: &OsStr, root: &Path) -> FileChurn {
         commits_by_path,
         computed: true,
         unavailable_reason: String::new(),
-        truncated: captured.stdout_truncated,
+        truncated: captured.stdout_truncated || commit_cap_reached,
     }
 }
 
