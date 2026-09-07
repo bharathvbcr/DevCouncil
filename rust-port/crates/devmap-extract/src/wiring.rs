@@ -90,18 +90,38 @@ pub fn is_vendored_path(path: &str) -> bool {
     is_minified_bundle(&norm)
 }
 
+/// Whether `path`'s basename is one a well-known code generator writes.
+///
+/// Each arm names a generator and the exact file it emits, because the
+/// annotation this feeds — `WiringKind::GeneratedFile` — exempts every symbol
+/// in the file from the dead-code answer. A suffix that is merely *suggestive*
+/// of generation clears real findings.
+///
+/// Two arms were wrong in opposite directions, and
+/// `devcouncil.indexing.wiring._GENERATED_PATH_RE` is the spec for both:
+///
+/// * grpcio-tools writes `*_pb2_grpc.pyi` beside `*_pb2_grpc.py` and only the
+///   second was here, so the type stub half of every gRPC service was reported
+///   on as hand-written code.
+/// * `zz_generated` is kubebuilder's convention and kubebuilder writes Go. A
+///   bare `starts_with` claimed `zz_generated.txt` and `zz_generated_notes.md`
+///   as generated too — prose, exempted on a prefix.
+///
+/// 42 of the 651 paths in Lane W's differential diverged from the Python rule
+/// across these two arms.
 pub fn is_generated_path(path: &str) -> bool {
     let norm = path.replace('\\', "/").to_lowercase();
     let filename = norm.rsplit('/').next().unwrap_or(&norm);
     filename.ends_with("_pb2.py")
         || filename.ends_with("_pb2.pyi")
         || filename.ends_with("_pb2_grpc.py")
+        || filename.ends_with("_pb2_grpc.pyi")
         || filename.ends_with(".pb.go")
         || filename.ends_with(".pb.gw.go")
         || filename.ends_with("_pb.js")
         || filename.ends_with("_pb.ts")
         || filename.ends_with("_pb.d.ts")
-        || filename.starts_with("zz_generated")
+        || (filename.starts_with("zz_generated") && filename.ends_with(".go"))
 }
 
 pub fn source_has_generated_header(source: &str) -> bool {
@@ -1171,6 +1191,31 @@ mod tests {
             assert!(
                 is_wiring_decorator(decorator),
                 "{decorator} should be wiring"
+            );
+        }
+    }
+
+    /// The generator suffixes are the ones a generator actually writes.
+    ///
+    /// grpcio-tools emits `*_pb2_grpc.pyi` beside `*_pb2_grpc.py` and the
+    /// kernel knew only the second; `zz_generated` is a kubebuilder convention
+    /// and kubebuilder writes Go, so a bare `starts_with` claimed prose.
+    #[test]
+    fn generated_paths_match_what_the_generator_writes() {
+        assert!(
+            is_generated_path("api/service_pb2_grpc.pyi"),
+            "grpcio-tools writes the grpc type stub too"
+        );
+        assert!(is_generated_path("k8s/zz_generated.deepcopy.go"));
+        for path in [
+            "docs/zz_generated.txt",
+            "docs/zz_generated_notes.md",
+            "web/zz_generated.ts",
+        ] {
+            assert!(
+                !is_generated_path(path),
+                "{path}: `zz_generated` is kubebuilder's Go convention, and \
+                 exempting a non-Go file on that prefix clears a real finding"
             );
         }
     }
