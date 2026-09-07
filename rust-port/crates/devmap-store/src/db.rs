@@ -3624,10 +3624,14 @@ impl Store {
                 if deleted.contains(&edge.source_file) || deleted.contains(&edge.target_file) {
                     continue;
                 }
-                // Already interned by the pass above, which visited exactly the
-                // edges this one does.
-                let src_f_id = path_ids[&edge.source_file];
-                let tgt_f_id = path_ids[&edge.target_file];
+                // Already interned by the pass above, which visited exactly
+                // the edges this one does — so these are memo hits, not
+                // queries. Asked rather than indexed: `path_ids[..]` would be a
+                // panic in the store's writer if the two passes ever came to
+                // disagree about which edges they visit, and a `?` is the same
+                // cost when the memo hits.
+                let src_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.source_file)?;
+                let tgt_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.target_file)?;
                 let tuple = edge_tuple(edge, &kind_labels, src_f_id, tgt_f_id);
                 let Some(missing) = wanted.get_mut(&tuple) else {
                     continue;
