@@ -7,12 +7,24 @@ pub fn is_test_path(path: &str) -> bool {
     let name_lower = name.to_lowercase();
 
     let parts: Vec<&str> = norm_lower.split('/').collect();
-    let in_test_dir = parts.iter().rev().skip(1).any(|p| {
+    let mut in_test_dir = parts.iter().rev().skip(1).any(|p| {
         *p == "tests" || *p == "test" || *p == "__tests__" || *p == "spec" || *p == "androidtest"
     });
 
+    // The Android / JVM layout, which contributes to the *directory* verdict
+    // and does not stand in for it. This used to `return true` outright, ahead
+    // of the `!name.starts_with('.')` guard below, so the rule the kernel
+    // published held for `tests/.eslintrc` and not for `app/src/test/.eslintrc`
+    // — the same file, one directory layout apart. Every dotfile a JVM project
+    // keeps beside its tests was annotated `TestFile`, which exempts the whole
+    // file from liveness.
+    //
+    // Kept as a branch rather than deleted even though the segment table above
+    // already answers `test` and `androidtest`: it mirrors
+    // `devcouncil.indexing.wiring.is_test_path`, which the parity module pins,
+    // and it is what keeps the JVM layout working if that table ever narrows.
     if norm_lower.contains("/src/test/") || norm_lower.contains("/src/androidtest/") {
-        return true;
+        in_test_dir = true;
     }
 
     let looks_like_test = name_lower.starts_with("test_")
@@ -1038,5 +1050,33 @@ mod tests {
                 "{name} must not be a lifecycle hook"
             );
         }
+    }
+
+    /// The dotfile exclusion applies to the JVM shape too.
+    ///
+    /// `/src/test/` and `/src/androidtest/` used to `return true` outright,
+    /// ahead of the `!name.starts_with('.')` guard that
+    /// `test_path_rule_ignores_dotfiles_inside_a_test_directory` documents. So
+    /// the rule the kernel published held for `tests/.eslintrc` and not for
+    /// `app/src/test/.eslintrc` — the same file, one directory layout apart.
+    #[test]
+    fn the_dotfile_exclusion_survives_the_jvm_test_directories() {
+        for path in [
+            "app/src/test/.eslintrc",
+            "app/src/test/.gitkeep",
+            "app/src/androidTest/.env",
+            "app/src/androidTest/.hidden.py",
+        ] {
+            assert!(
+                !is_test_path(path),
+                "{path}: a dotfile lands in the directory bucket, and that bucket \
+                 excludes it — the `/src/test/` early return skipped the exclusion"
+            );
+        }
+        // Everything the directory rule did claim, it still claims.
+        assert!(is_test_path("app/src/test/java/Thing.java"));
+        assert!(is_test_path("app/src/androidTest/Thing.kt"));
+        // And a filename rule still outranks the dotfile exclusion.
+        assert!(is_test_path("app/src/test/.eslintrc.test.js"));
     }
 }

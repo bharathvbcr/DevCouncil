@@ -254,7 +254,17 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// an inner call, a bounded dotted path otherwise. That is a different string
 /// for the same source, so mixing generations would put two spellings of one
 /// receiver in one ledger and split every grouping over it without saying so.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "36";
+///
+/// v37 (K) changes which wiring annotations a file carries, and a v36 row
+/// carries the old answers with nothing about it looking stale — the shape the
+/// v31 note calls the reason a bump is not optional. A wiring annotation is an
+/// *exemption*: reusing a stale one either hides a real finding or publishes a
+/// delete-this verdict about code a framework reaches.
+///
+/// * `is_test_path` no longer returns early on the `/src/test/` and
+///   `/src/androidTest/` layouts, so a dotfile there is no longer annotated
+///   `TestFile` — a v36 row exempts every one of them from liveness.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "37";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
