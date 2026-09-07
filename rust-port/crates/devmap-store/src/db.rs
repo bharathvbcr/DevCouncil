@@ -773,6 +773,112 @@ struct EdgeTuple<'a> {
     candidate_total: Option<i64>,
 }
 
+/// The end of a bucket chain. `u32::MAX` rather than `Option<u32>` so the array
+/// is four bytes an entry: it has one slot per resolved edge, and this store
+/// writes 102,083 of them.
+const NO_MORE_IN_BUCKET: u32 = u32::MAX;
+
+/// A 64-bit digest of a row's identity, for bucketing only.
+///
+/// **Never an answer.** Every candidate a bucket offers is compared field by
+/// field against the row before it is treated as the same row, so two identities
+/// that digest alike are still two identities. The digest exists because the
+/// alternative — a `HashMap` keyed by the identity itself — stores the identity
+/// twice, once in `resolution` and once in the map, and that second copy is
+/// 160 bytes an edge. Measured by `verify.sh` gate 6, which bounds the kernel's
+/// memory per unit of ambiguity fan-out: the map put the probe at 116-118 % of
+/// its model against a 115 % cap, over five interleaved runs where the base
+/// binary measured 100-103 %.
+///
+/// `DefaultHasher::new` seeds from fixed keys, not from `RandomState`, so one
+/// binary buckets the same way on every run — the standard library guarantees
+/// only that every `DefaultHasher` built by `new` agrees with every other, and
+/// not that the digest survives a Rust upgrade. Nothing here needs more than
+/// that: the digest is never stored, never compared across processes, and never
+/// leaves this call. A build whose internal structure is the same run to run is
+/// simply easier to reason about than one whose is not.
+#[cfg(feature = "parse")]
+fn identity_digest<T: std::hash::Hash>(identity: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    identity.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Bucket `count` identities by digest, chaining collisions.
+///
+/// Returns `(buckets, chain)`: `buckets[digest]` is the newest index with that
+/// digest and `chain[index]` the next one, or [`NO_MORE_IN_BUCKET`].
+///
+/// It takes the identity rather than a digest so that [`identity_digest`] is
+/// the one function that decides how anything is bucketed. The alternative —
+/// each caller digesting its own way on the way in — is a structure that can be
+/// built under one rule and searched under another, and the symptom of that is
+/// not a crash but a build that silently rewrites every row.
+///
+/// `identity_of` returns `None` for an index that is not part of this
+/// generation. That index is in no bucket at all, so nothing can match it.
+#[cfg(feature = "parse")]
+fn bucket_identities<T: std::hash::Hash>(
+    count: usize,
+    identity_of: impl Fn(usize) -> Option<T>,
+) -> (std::collections::HashMap<u64, u32>, Vec<u32>) {
+    let mut buckets: std::collections::HashMap<u64, u32> =
+        std::collections::HashMap::with_capacity(count);
+    let mut chain: Vec<u32> = vec![NO_MORE_IN_BUCKET; count];
+    for index in 0..count {
+        let Some(identity) = identity_of(index) else {
+            continue;
+        };
+        let digest = identity_digest(&identity);
+        let index = index as u32;
+        chain[index as usize] = buckets.insert(digest, index).unwrap_or(NO_MORE_IN_BUCKET);
+    }
+    (buckets, chain)
+}
+
+/// Consume the one candidate that *is* this row, and say whether there was one.
+///
+/// The bucket narrows the search; this comparison decides it. A digest is a
+/// filter and never an answer, so every candidate a bucket offers is compared
+/// field by field, and a collision merely costs a comparison that fails. The
+/// candidate is then marked, which is what makes the whole structure a multiset
+/// rather than a set: a row that occurs three times is three candidates, and the
+/// three live rows claim them one at a time.
+///
+/// `identity_of` returns `None` for an index that is not part of this
+/// generation. Those are unreachable through the buckets anyway — nothing put
+/// them there — and the check is kept so that the two are one statement apart
+/// and cannot drift into disagreeing.
+#[cfg(feature = "parse")]
+fn claim_matching_candidate<T: std::hash::Hash + PartialEq>(
+    buckets: &std::collections::HashMap<u64, u32>,
+    chain: &[u32],
+    matched: &mut [bool],
+    live: &T,
+    identity_of: impl Fn(usize) -> Option<T>,
+) -> bool {
+    let mut cursor = buckets
+        .get(&identity_digest(live))
+        .copied()
+        .unwrap_or(NO_MORE_IN_BUCKET);
+    while cursor != NO_MORE_IN_BUCKET {
+        let index = cursor as usize;
+        cursor = chain[index];
+        if matched[index] {
+            continue;
+        }
+        let Some(candidate) = identity_of(index) else {
+            continue;
+        };
+        if candidate == *live {
+            matched[index] = true;
+            return true;
+        }
+    }
+    false
+}
+
 /// The identity of one resolved edge, as `edge_rows` stores it.
 ///
 /// The one owner: `save_generation_with_metadata` calls this to decide what to
@@ -3538,29 +3644,43 @@ impl Store {
                 .entry(edge.edge_kind)
                 .or_insert_with(|| format!("{:?}", edge.edge_kind));
         }
-        // A *multiset*, not a set. 475 edge tuples of this repository occur more
-        // than once in one generation (1,111 rows); collapsing them would drop
-        // rows the analysis counted and make the equality below refuse the
-        // build.
+        // Which edges are in this generation at all, and under which path ids.
         //
-        // Deleted paths are not extracted, so a resolution over the current tree
-        // has no edge touching one. The skip stays as an explicit guard for
-        // callers that pass a resolution computed before the deletion, and both
-        // passes apply it.
-        let mut wanted: std::collections::HashMap<EdgeTuple, u32> =
-            std::collections::HashMap::with_capacity(resolution.edges.len());
+        // `None` is the one owner of "not in this generation": deleted paths are
+        // not extracted, so a resolution over the current tree has no edge
+        // touching one, and the guard stays for callers that pass a resolution
+        // computed before the deletion. Every pass below reads this rather than
+        // re-asking `deleted`, so they cannot come to disagree about which edges
+        // they are talking about.
+        let mut edge_ids: Vec<Option<(u32, u32)>> = Vec::with_capacity(resolution.edges.len());
         let mut edge_ord: u32 = 0;
         for edge in &resolution.edges {
             if deleted.contains(&edge.source_file) || deleted.contains(&edge.target_file) {
+                edge_ids.push(None);
                 continue;
             }
             let src_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.source_file)?;
             let tgt_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.target_file)?;
-            *wanted
-                .entry(edge_tuple(edge, &kind_labels, src_f_id, tgt_f_id))
-                .or_insert(0) += 1;
+            edge_ids.push(Some((src_f_id, tgt_f_id)));
             edge_ord += 1;
         }
+
+        // A *multiset*, not a set. 475 edge tuples of this repository occur more
+        // than once in one generation (1,111 rows); collapsing them would drop
+        // rows the analysis counted and make the equality below refuse the
+        // build. The multiset is `matched` — one bit per resolved edge — rather
+        // than a count per distinct tuple, so two identical edges are two
+        // entries that are consumed one at a time.
+        let (edge_buckets, edge_chain) = bucket_identities(resolution.edges.len(), |index| {
+            let (src_f_id, tgt_f_id) = edge_ids[index]?;
+            Some(edge_tuple(
+                &resolution.edges[index],
+                &kind_labels,
+                src_f_id,
+                tgt_f_id,
+            ))
+        });
+        let mut edge_matched: Vec<bool> = vec![false; resolution.edges.len()];
 
         // The rows already valid, streamed rather than materialised: the probe
         // key is built per row and dropped, so the peak is this map plus the
@@ -3593,9 +3713,23 @@ impl Store {
                         .map(std::borrow::Cow::Owned),
                     candidate_total: row.get(8)?,
                 };
-                match wanted.get_mut(&live) {
-                    Some(remaining) if *remaining > 0 => *remaining -= 1,
-                    _ => close_edges.push(edge_id),
+                let still_valid = claim_matching_candidate(
+                    &edge_buckets,
+                    &edge_chain,
+                    &mut edge_matched,
+                    &live,
+                    |index| {
+                        let (src_f_id, tgt_f_id) = edge_ids[index]?;
+                        Some(edge_tuple(
+                            &resolution.edges[index],
+                            &kind_labels,
+                            src_f_id,
+                            tgt_f_id,
+                        ))
+                    },
+                );
+                if !still_valid {
+                    close_edges.push(edge_id);
                 }
             }
         }
@@ -3620,26 +3754,14 @@ impl Store {
             // In emission order, and only the copies the live set did not
             // already supply: a tuple wanted three times and valid twice is
             // inserted once, at the position of its first occurrence.
-            for edge in &resolution.edges {
-                if deleted.contains(&edge.source_file) || deleted.contains(&edge.target_file) {
-                    continue;
-                }
-                // Already interned by the pass above, which visited exactly
-                // the edges this one does — so these are memo hits, not
-                // queries. Asked rather than indexed: `path_ids[..]` would be a
-                // panic in the store's writer if the two passes ever came to
-                // disagree about which edges they visit, and a `?` is the same
-                // cost when the memo hits.
-                let src_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.source_file)?;
-                let tgt_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.target_file)?;
-                let tuple = edge_tuple(edge, &kind_labels, src_f_id, tgt_f_id);
-                let Some(missing) = wanted.get_mut(&tuple) else {
+            for (index, edge) in resolution.edges.iter().enumerate() {
+                let Some((src_f_id, tgt_f_id)) = edge_ids[index] else {
                     continue;
                 };
-                if *missing == 0 {
+                if edge_matched[index] {
                     continue;
                 }
-                *missing -= 1;
+                let tuple = edge_tuple(edge, &kind_labels, src_f_id, tgt_f_id);
                 insert.execute(params![
                     tuple.source_file_id,
                     tuple.target_file_id,
@@ -3839,33 +3961,34 @@ impl Store {
         // sides, with nothing appearing and nothing disappearing** — a ledger
         // that had not changed at all and was rewritten in full every time.
         {
-            let mut reason_texts: Vec<String> = Vec::with_capacity(resolution.unresolved.len());
-            for unresolved in &resolution.unresolved {
-                reason_texts.push(format!("{:?}", unresolved.resolution));
-            }
-            // Emission order, for the same reason the edges keep theirs.
-            let mut ordered: Vec<UnresolvedTuple> = Vec::with_capacity(resolution.unresolved.len());
-            for (unresolved, reason) in resolution.unresolved.iter().zip(&reason_texts) {
-                let tuple = UnresolvedTuple {
+            // 12,424 ledger tuples of this repository occur more than once in
+            // one generation (36,600 rows), so this is a multiset too — and
+            // `matched`, one bit a row, is what makes it one.
+            //
+            // The reason text is formatted on demand rather than kept in a
+            // parallel `Vec<String>`: 89,743 owned strings held for the length
+            // of the write is memory `verify.sh` gate 6 charges against the
+            // kernel's model, and the three passes below need it only while a
+            // comparison is in flight.
+            let unresolved_tuple = |index: usize| -> UnresolvedTuple<'_> {
+                let unresolved = &resolution.unresolved[index];
+                UnresolvedTuple {
                     source_file: std::borrow::Cow::Borrowed(unresolved.source_file.as_str()),
                     source_symbol: std::borrow::Cow::Borrowed(unresolved.source_symbol.as_str()),
                     callee_name: std::borrow::Cow::Borrowed(unresolved.callee_name.as_str()),
-                    reason: std::borrow::Cow::Borrowed(reason.as_str()),
+                    reason: std::borrow::Cow::Owned(format!("{:?}", unresolved.resolution)),
                     classification: std::borrow::Cow::Borrowed(unresolved.class.label()),
                     receiver: unresolved
                         .receiver
                         .as_deref()
                         .map(std::borrow::Cow::Borrowed),
-                };
-                ordered.push(tuple);
-            }
-            // 12,424 ledger tuples of this repository occur more than once in
-            // one generation (36,600 rows), so this is a multiset too.
-            let mut wanted: std::collections::HashMap<&UnresolvedTuple, u32> =
-                std::collections::HashMap::with_capacity(ordered.len());
-            for tuple in &ordered {
-                *wanted.entry(tuple).or_insert(0) += 1;
-            }
+                }
+            };
+            let (ledger_buckets, ledger_chain) =
+                bucket_identities(resolution.unresolved.len(), |index| {
+                    Some(unresolved_tuple(index))
+                });
+            let mut ledger_matched: Vec<bool> = vec![false; resolution.unresolved.len()];
 
             let mut close_rows: Vec<i64> = Vec::new();
             {
@@ -3887,9 +4010,15 @@ impl Store {
                             .get::<_, Option<String>>(6)?
                             .map(std::borrow::Cow::Owned),
                     };
-                    match wanted.get_mut(&live) {
-                        Some(remaining) if *remaining > 0 => *remaining -= 1,
-                        _ => close_rows.push(unresolved_id),
+                    let still_valid = claim_matching_candidate(
+                        &ledger_buckets,
+                        &ledger_chain,
+                        &mut ledger_matched,
+                        &live,
+                        |index| Some(unresolved_tuple(index)),
+                    );
+                    if !still_valid {
+                        close_rows.push(unresolved_id);
                     }
                 }
             }
@@ -3911,14 +4040,11 @@ impl Store {
                   valid_from, valid_to)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
             )?;
-            for tuple in &ordered {
-                let Some(missing) = wanted.get_mut(tuple) else {
-                    continue;
-                };
-                if *missing == 0 {
+            for (index, still_valid) in ledger_matched.iter().enumerate() {
+                if *still_valid {
                     continue;
                 }
-                *missing -= 1;
+                let tuple = unresolved_tuple(index);
                 insert.execute(params![
                     tuple.source_file.as_ref(),
                     tuple.source_symbol.as_ref(),
@@ -7657,5 +7783,137 @@ mod git_head_tests {
                 "an honest fast failure must not be a kill: {error}"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "parse")]
+mod delta_bucket_tests {
+    use super::*;
+
+    /// An identity that digests the same as every other, however different it
+    /// is.
+    ///
+    /// Real SipHash collisions cannot be summoned on demand, and a test that
+    /// injected its own digest would no longer be testing the digest the write
+    /// path uses. This hashes to a constant instead, so `identity_digest` — the
+    /// one function both the bucketing and the search go through — returns the
+    /// same value for every value of it, and the collision the write path meets
+    /// once in a very long while is here every time.
+    #[derive(PartialEq, Eq, Debug)]
+    struct Collides(&'static str);
+
+    impl std::hash::Hash for Collides {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            state.write_u8(0);
+        }
+    }
+
+    /// A collision must cost a comparison, never an answer.
+    ///
+    /// [`claim_matching_candidate`] narrows with a 64-bit digest and decides
+    /// with `PartialEq`. Were it to trust the digest, two different rows that
+    /// happened to digest alike would be treated as one: the live row left
+    /// open, the new row never written, and the generation reading back an edge
+    /// it was never given.
+    #[test]
+    fn a_collision_narrows_the_search_and_never_decides_it() {
+        let names = ["alpha", "beta", "gamma"];
+        let (buckets, chain) = bucket_identities(names.len(), |index| Some(Collides(names[index])));
+        assert_eq!(
+            buckets.len(),
+            1,
+            "the fixture only tests collisions if the identities actually collide"
+        );
+
+        let mut matched = vec![false; names.len()];
+        let claim = |live: &'static str, matched: &mut Vec<bool>| {
+            claim_matching_candidate(&buckets, &chain, matched, &Collides(live), |index| {
+                Some(Collides(names[index]))
+            })
+        };
+
+        assert!(claim("beta", &mut matched), "beta is one of the candidates");
+        assert_eq!(
+            matched,
+            vec![false, true, false],
+            "the candidate claimed is the one that compared equal, not the one \
+             the bucket happened to offer first"
+        );
+        assert!(
+            !claim("delta", &mut matched),
+            "a row nothing equals is not in this generation, however it digests"
+        );
+        assert_eq!(
+            matched,
+            vec![false, true, false],
+            "a search that found nothing claims nothing"
+        );
+        assert!(claim("alpha", &mut matched));
+        assert!(claim("gamma", &mut matched));
+        assert!(
+            !claim("alpha", &mut matched),
+            "each candidate is claimed once, so a fourth live row finds none"
+        );
+    }
+
+    /// A repeated row is repeated candidates, not one candidate with a count.
+    ///
+    /// 475 edge tuples of this repository occur more than once in a single
+    /// generation. If the delta collapsed them, a rebuild would close the
+    /// copies it could not account for and the generation would lose rows the
+    /// analysis counted.
+    #[test]
+    fn a_row_stored_three_times_answers_three_live_rows_and_no_more() {
+        let names = ["duplicate", "duplicate", "duplicate"];
+        let (buckets, chain) = bucket_identities(names.len(), |index| Some(names[index]));
+        let mut matched = vec![false; names.len()];
+        let claim = |matched: &mut Vec<bool>| {
+            claim_matching_candidate(&buckets, &chain, matched, &"duplicate", |index| {
+                Some(names[index])
+            })
+        };
+
+        assert!(claim(&mut matched));
+        assert!(claim(&mut matched));
+        assert!(claim(&mut matched));
+        assert_eq!(matched, vec![true, true, true], "all three were claimed");
+        assert!(
+            !claim(&mut matched),
+            "a fourth live copy has no candidate left, so it is closed"
+        );
+    }
+
+    /// An index outside this generation is a candidate for nothing.
+    ///
+    /// Edges touching a deleted path are not part of the generation, so their
+    /// identity is `None`. Two things keep them out, and this asserts both:
+    /// they enter no bucket and no chain, so nothing can offer them; and the
+    /// search skips them even if something did. Either alone would hold open a
+    /// row this generation does not contain the day the other changed.
+    #[test]
+    fn an_index_outside_the_generation_is_never_claimed() {
+        let names = [Some("kept"), None, Some("kept")];
+        let (buckets, chain) = bucket_identities(names.len(), |index| names[index]);
+        assert!(
+            !buckets
+                .values()
+                .chain(chain.iter())
+                .any(|&index| index == 1),
+            "an index with no identity is in no bucket and on no chain: {buckets:?} {chain:?}"
+        );
+        let mut matched = vec![false; names.len()];
+        let claim = |matched: &mut Vec<bool>| {
+            claim_matching_candidate(&buckets, &chain, matched, &"kept", |index| names[index])
+        };
+
+        assert!(claim(&mut matched));
+        assert!(claim(&mut matched));
+        assert_eq!(
+            matched,
+            vec![true, false, true],
+            "the excluded index is still unmatched, because it was never a candidate"
+        );
+        assert!(!claim(&mut matched), "there is no third candidate");
     }
 }
