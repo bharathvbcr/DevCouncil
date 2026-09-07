@@ -595,11 +595,20 @@ def _annotate_graph_degraded(root: Path, graph: CodeGraph) -> CodeGraph:
 #: `indexing/graph/query.py`, the per-file shards read by that same module, the
 #: two `stats` reads in the commands that had just written them, and nothing in
 #: `rust-port/` at all.
-PDG_SIDECAR_REL = Path(".devcouncil") / "graph" / "pdg.json"
+PDG_SIDECAR_NAME = "pdg.json"
 
 
 def pdg_sidecar_path(root: Path) -> Path:
-    return root / PDG_SIDECAR_REL
+    """Beside `code_graph.json`, derived from it rather than re-spelled.
+
+    Taking the directory from :func:`graph_path` means :data:`GRAPH_REL` stays
+    the one place the graph state directory is named. A second literal
+    ``.devcouncil/graph`` here would be a copy that drifts the first time the
+    state directory moves — and it does move: the standalone kernel resolves a
+    `.devmap` state dir. :func:`devcouncil.indexing.viz.write_graph_html`
+    already places `graph.html` this way.
+    """
+    return graph_path(root).with_name(PDG_SIDECAR_NAME)
 
 
 def python_paths_for_pdg(root: Path) -> List[str]:
