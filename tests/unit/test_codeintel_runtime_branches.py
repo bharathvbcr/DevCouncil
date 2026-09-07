@@ -112,13 +112,20 @@ class _FakeKernelClient:
             },
         }
 
-    def impact(self, target, depth=3):
-        """Unavailable, so ``_devmap_query_payload`` degrades as it always did.
+    def impact(self, target, depth=3, min_rung=None, *, layers=False):
+        """Unavailable, so the command renders the reason per path.
 
-        ``dev map impact`` is not part of this migration and still falls back to
-        the Python ``diff_impact``. Before ``try_connect`` was stubbed here, no
-        store existed and the fallback was reached by returning ``None``; the
-        stub has to reproduce that rather than accidentally answer.
+        The signature tracks ``DevMapClient.impact`` deliberately. It stopped at
+        ``(target, depth)`` while the real one grew ``min_rung`` and ``layers``,
+        so ``dev map impact`` — which now asks for ``layers=True`` — hit
+        ``TypeError`` here instead of the ``DevMapClientError`` this fixture
+        exists to raise, and the command died on a stub mismatch rather than
+        exercising its unavailable-kernel branch. A stub whose signature drifts
+        from the seam it stands in for tests nothing.
+
+        There is no Python fallback below this any more: an unanswerable path is
+        reported as unanswerable, and one such path no longer decides the engine
+        for the whole command.
         """
         from devcouncil.devmap_client import DevMapClientError
 
@@ -1498,8 +1505,19 @@ def test_graph_cli_remaining_output_branches(
         ],
     ).output
 
-    fake_graph = types.SimpleNamespace(dead_code=[], edges=[])
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda _root: fake_graph)
+    # `meta` too: `CodeGraph` always carries one, and `_require_graph` reads it
+    # for the size-capped-export disclosure.
+    fake_graph = types.SimpleNamespace(dead_code=[], edges=[], meta={})
+    # `_require_graph` reads `code_graph.json` through `read_code_graph`; the
+    # retired store read is patched to raise so a regression onto it is loud.
+    monkeypatch.setattr(graph_build, "read_code_graph", lambda _root: fake_graph)
+    monkeypatch.setattr(
+        graph_build,
+        "load_code_graph",
+        lambda _root: (_ for _ in ()).throw(
+            AssertionError("these commands must not reach the retired Python store")
+        ),
+    )
     monkeypatch.setattr(
         intel,
         "graph_check",
@@ -1517,27 +1535,14 @@ def test_graph_cli_remaining_output_branches(
         app,
         ["map", "process", "--json", "--project-root", str(tmp_path)],
     ).output
-    monkeypatch.setattr(
-        intel,
-        "diff_impact",
-        lambda *_args, **_kwargs: {
-            "paths": [
-                {
-                    "path": "app.py",
-                    "symbols": [],
-                    "blast": {
-                        "layers": [
-                            {
-                                "depth": 1,
-                                "confidence": "inferred",
-                                "nodes": [f"n{i}" for i in range(8)],
-                            }
-                        ]
-                    },
-                }
-            ]
-        },
-    )
+    # `dev map impact` with an unavailable kernel refuses; it does not answer.
+    #
+    # This block used to stub `intel.diff_impact` and assert the command exited
+    # 0 with a truncated (`…`) blast. Both halves are retired: the kernel bands
+    # its own walk and `graph_cmd` no longer calls `diff_impact` at all, so the
+    # stub was dead and the exit code it pinned was the Python fallback's. A
+    # fabricated blast radius is worse than an absent one, because a caller acts
+    # on it.
     impacted = runner.invoke(
         app,
         [
@@ -1550,8 +1555,9 @@ def test_graph_cli_remaining_output_branches(
             str(tmp_path),
         ],
     )
-    assert impacted.exit_code == 0
-    assert "…" in impacted.output
+    assert impacted.exit_code == 1, impacted.output
+    assert "no Python fallback" in impacted.output
+    assert "dev map" in impacted.output
 
     fake_graph.edges = [
         GraphEdge(source="a", target="b", kind="imports"),
