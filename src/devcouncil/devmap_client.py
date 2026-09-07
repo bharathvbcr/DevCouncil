@@ -14,7 +14,7 @@ import socket
 import subprocess
 import threading
 import time
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 
 # The Rust kernel's own store, deliberately NOT the Python index.
@@ -1335,7 +1335,46 @@ class DevMapClient:
         )
         return self._budgeted(resp, budget)
 
-    def _validate_budgeted_sections(self, payload: Dict[str, Any], budget: int) -> None:
+    @staticmethod
+    def _required_section(
+        payload: Dict[str, Any], name: str, where: str = "devmap response"
+    ) -> Dict[str, Any]:
+        """``payload[name]`` as an object, or a refusal.
+
+        The distinction it draws is the whole point. A section that never
+        arrived is not a section that arrived empty, and treating the first as
+        the second is how a check that could not run comes to report what a
+        check that ran and found nothing reports — ``dev map affected`` printed
+        ``No affected tests found.`` and ``shown 0 of 0`` for an answer with no
+        ``tests`` section in it at all.
+        """
+        section = payload.get(name)
+        if not isinstance(section, dict):
+            raise DevMapClientError(
+                f"{where} is missing the {name} section "
+                f"(got {type(section).__name__})"
+            )
+        return section
+
+    def _validate_definitions_section(self, section: Dict[str, Any], budget: int) -> None:
+        for item in self._budgeted(section, budget).items:
+            for side in ("callers", "callees"):
+                self._budgeted(
+                    self._required_section(item, side, "devmap explore definition"),
+                    budget,
+                )
+
+    def _validate_tests_section(self, section: Dict[str, Any], budget: int) -> None:
+        self._budgeted(section, budget)
+
+    def _validate_blast_radius_section(self, section: Dict[str, Any], budget: int) -> None:
+        self._budgeted(
+            self._required_section(section, "layers", "devmap blast radius"), budget
+        )
+
+    def _validate_budgeted_sections(
+        self, payload: Dict[str, Any], budget: int, *, sections: Tuple[str, ...]
+    ) -> None:
         """Run every budgeted section of a composed answer past :meth:`_budgeted`.
 
         A composed response is several responses in a trench coat, and each of
@@ -1343,27 +1382,26 @@ class DevMapClient:
         edge list arrive with ``shown + hidden != total`` — the exact invariant
         the separate ``impact``/``trace`` calls have always been held to — and a
         caller would read a broken count as a measured one.
+
+        ``sections`` names what *this* command's answer must carry, and every
+        one of them is required. The two composed commands carry different sets
+        — the kernel's ``ExploreReport`` has ``definitions`` and
+        ``blast_radius``, its ``AffectedTestsReport`` has ``tests`` and
+        ``blast_radius``, and none of those fields is optional on the wire — so
+        an absent section is always an answer that did not arrive. This was
+        previously an ``isinstance(..., dict)`` guard per section, which made
+        one shape stand for two different facts: "this command does not send
+        that section" and "the section is missing or malformed". Declaring the
+        set per caller separates them, and looking each name up in
+        ``validators`` keeps a declared-but-unchecked section unrepresentable.
         """
-        definitions = payload.get("definitions")
-        if isinstance(definitions, dict):
-            checked = self._budgeted(definitions, budget)
-            for item in checked.items:
-                for side in ("callers", "callees"):
-                    section = item.get(side)
-                    if not isinstance(section, dict):
-                        raise DevMapClientError(
-                            f"devmap explore definition is missing {side}"
-                        )
-                    self._budgeted(section, budget)
-        tests = payload.get("tests")
-        if isinstance(tests, dict):
-            self._budgeted(tests, budget)
-        radius = payload.get("blast_radius")
-        if isinstance(radius, dict):
-            layers = radius.get("layers")
-            if not isinstance(layers, dict):
-                raise DevMapClientError("devmap blast radius is missing layers")
-            self._budgeted(layers, budget)
+        validators: Dict[str, Callable[[Dict[str, Any], int], None]] = {
+            "definitions": self._validate_definitions_section,
+            "tests": self._validate_tests_section,
+            "blast_radius": self._validate_blast_radius_section,
+        }
+        for name in sections:
+            validators[name](self._required_section(payload, name), budget)
 
     def explore(
         self,
@@ -1420,7 +1458,9 @@ class DevMapClient:
                 *_positional(query),
             ],
         )
-        self._validate_budgeted_sections(resp, budget)
+        self._validate_budgeted_sections(
+            resp, budget, sections=("definitions", "blast_radius")
+        )
         return resp
 
     def affected_tests(
@@ -1470,7 +1510,9 @@ class DevMapClient:
                 *_positional(*targets),
             ],
         )
-        self._validate_budgeted_sections(resp, budget)
+        self._validate_budgeted_sections(
+            resp, budget, sections=("tests", "blast_radius")
+        )
         return resp
 
     def preview(

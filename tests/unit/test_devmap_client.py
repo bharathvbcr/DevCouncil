@@ -960,7 +960,7 @@ def test_affected_blast_radius_layers_are_validated(
             "blast_radius": {"seeds": [], "unmatched_targets": [], "total_impacted": 0},
         },
     )
-    with pytest.raises(DevMapClientError, match="blast radius is missing layers"):
+    with pytest.raises(DevMapClientError, match="blast radius is missing the layers section"):
         client.affected_tests(["a"])
 
 

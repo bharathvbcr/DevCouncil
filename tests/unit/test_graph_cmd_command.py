@@ -1117,6 +1117,37 @@ def test_the_fields_the_raw_renderers_derive_from_are_typed_at_load(loc, documen
     assert caught.value.errors()[0]["loc"] == loc
 
 
+def _drive_map_command(tmp_path, monkeypatch, argv, payload):
+    """Run a `dev map` subcommand through the real client, transport replaced.
+
+    Only `_request` is stubbed, so every validation the client actually applies
+    to a kernel answer runs — this is the seam the fix lives at.
+    """
+    import devcouncil.devmap_client as devmap_client
+    from devcouncil.devmap_client import DevMapClient
+
+    client = DevMapClient(root_dir=tmp_path, autospawn=False)
+    monkeypatch.setattr(client, "_request", lambda body, cli_args, timeout=120.0: payload)
+    monkeypatch.setattr(devmap_client, "try_connect", lambda root: client)
+    return runner.invoke(app, argv + ["--project-root", str(tmp_path)])
+
+
+_EMPTY_BUDGETED = {
+    "shown": 0,
+    "hidden": 0,
+    "total": 0,
+    "truncated": False,
+    "tokens_used": 0,
+    "items": [],
+}
+_BLAST_RADIUS = {
+    "seeds": [],
+    "unmatched_targets": [],
+    "layers": _EMPTY_BUDGETED,
+    "total_impacted": 0,
+}
+
+
 @pytest.mark.parametrize("shown", ["abc", [1], 1.0, True])
 def test_a_counter_the_kernel_did_not_type_is_refused_before_it_renders(
     tmp_path, monkeypatch, shown
@@ -1127,9 +1158,6 @@ def test_a_counter_the_kernel_did_not_type_is_refused_before_it_renders(
     `_validate_budgeted_sections` refuses the section, the command reports the
     refusal and exits 3, and no counter line is printed from the bad value.
     """
-    import devcouncil.devmap_client as devmap_client
-    from devcouncil.devmap_client import DevMapClient
-
     payload = {
         "tests": {
             "shown": shown,
@@ -1138,14 +1166,133 @@ def test_a_counter_the_kernel_did_not_type_is_refused_before_it_renders(
             "truncated": False,
             "tokens_used": 1,
             "items": [{"path": "t/x.py", "depth": 1}],
-        }
+        },
+        # Well-formed, so the refusal below is attributable to the counter
+        # rather than to the section guard `_required_section` now applies.
+        "blast_radius": _BLAST_RADIUS,
     }
-    client = DevMapClient(root_dir=tmp_path, autospawn=False)
-    monkeypatch.setattr(client, "_request", lambda body, cli_args, timeout=120.0: payload)
-    monkeypatch.setattr(devmap_client, "try_connect", lambda root: client)
 
-    result = runner.invoke(app, ["map", "affected", "x", "--project-root", str(tmp_path)])
+    result = _drive_map_command(tmp_path, monkeypatch, ["map", "affected", "x"], payload)
 
     assert result.exit_code == 3
     assert "affected is unavailable" in result.output
     assert f"shown {shown} of" not in result.output
+
+
+# --- A composed section that never arrived --------------------------------------
+#
+# `explore` and `affected` are the two composed answers: the kernel's
+# `ExploreReport` carries `definitions` and `blast_radius`, its
+# `AffectedTestsReport` carries `tests` and `blast_radius`, and none of those
+# fields is optional on the wire. The client used to guard each with
+# `isinstance(section, dict)`, which made one shape stand for two facts — "this
+# command does not send that section" and "the section did not arrive" — so a
+# missing `tests` reached the renderer as `{}` and printed
+# `No affected tests found.` / `shown 0 of 0`. That is a check that could not
+# run reporting what a check that ran and found nothing reports.
+
+
+# `None` and the absent key are the two that used to render as a measured zero;
+# the three wrong types raised `AttributeError` out of the renderer as exit 1.
+_MISSING_SHAPES = [
+    pytest.param({"__absent__": True}, id="absent"),
+    pytest.param({"value": None}, id="none"),
+    pytest.param({"value": "abc"}, id="str"),
+    pytest.param({"value": 5}, id="int"),
+    pytest.param({"value": [1]}, id="list"),
+]
+
+
+def _with_section(base, name, shape):
+    payload = dict(base)
+    if shape.get("__absent__"):
+        payload.pop(name, None)
+    else:
+        payload[name] = shape["value"]
+    return payload
+
+
+@pytest.mark.parametrize("shape", _MISSING_SHAPES)
+@pytest.mark.parametrize("section", ["tests", "blast_radius"])
+def test_affected_refuses_a_section_that_never_arrived(
+    tmp_path, monkeypatch, section, shape
+):
+    """`dev map affected` reports the refusal and exits 3, never a measured none.
+
+    Before the fix `absent` and `none` printed `No affected tests found.` with
+    `shown 0 of 0` at exit 0, and the three wrong types raised out of the
+    renderer at exit 1 with a traceback.
+    """
+    payload = _with_section(
+        {"tests": _EMPTY_BUDGETED, "blast_radius": _BLAST_RADIUS}, section, shape
+    )
+
+    result = _drive_map_command(tmp_path, monkeypatch, ["map", "affected", "x"], payload)
+
+    assert result.exit_code == 3, result.output
+    assert f"affected is unavailable: devmap response is missing the {section} section" in (
+        result.output
+    )
+    assert "No affected tests found." not in result.output
+    assert "shown 0 of 0" not in result.output
+
+
+@pytest.mark.parametrize("shape", _MISSING_SHAPES)
+@pytest.mark.parametrize("section", ["definitions", "blast_radius"])
+def test_explore_refuses_a_section_that_never_arrived(
+    tmp_path, monkeypatch, section, shape
+):
+    """The same gap sat above and below the `tests` one, and closes the same way.
+
+    `explore`'s renderer never reads `blast_radius`, so a malformed one used to
+    exit 0 and reach a `--json` consumer unchecked; a missing `definitions`
+    printed `shown 0 of 0`.
+    """
+    payload = _with_section(
+        {"definitions": _EMPTY_BUDGETED, "blast_radius": _BLAST_RADIUS}, section, shape
+    )
+
+    result = _drive_map_command(tmp_path, monkeypatch, ["map", "explore", "x"], payload)
+
+    assert result.exit_code == 3, result.output
+    assert f"explore is unavailable: devmap response is missing the {section} section" in (
+        result.output
+    )
+    assert "shown 0 of 0" not in result.output
+
+
+def test_a_measured_none_is_still_reported_as_one(tmp_path, monkeypatch):
+    """The guard refuses an answer that did not arrive, not one that found nothing.
+
+    A complete `affected` answer whose walk reached no test file must keep
+    printing `No affected tests found.` at exit 0 — the fix separates the two
+    outcomes, so over-tightening would collapse them the other way.
+    """
+    payload = {"tests": _EMPTY_BUDGETED, "blast_radius": _BLAST_RADIUS}
+
+    result = _drive_map_command(tmp_path, monkeypatch, ["map", "affected", "x"], payload)
+
+    assert result.exit_code == 0, result.output
+    assert "No affected tests found." in result.output
+    assert "shown 0 of 0" in result.output
+
+
+def test_a_composed_answer_that_is_whole_still_renders(tmp_path, monkeypatch):
+    """`explore`'s nested edge sections stay required, and a complete one renders."""
+    definition = {
+        "id": "a.py::f",
+        "file_path": "a.py",
+        "span": [3, 4],
+        "callers": _EMPTY_BUDGETED,
+        "callees": _EMPTY_BUDGETED,
+    }
+    payload = {
+        "definitions": {**_EMPTY_BUDGETED, "shown": 1, "total": 1, "items": [definition]},
+        "blast_radius": _BLAST_RADIUS,
+    }
+
+    result = _drive_map_command(tmp_path, monkeypatch, ["map", "explore", "x"], payload)
+
+    assert result.exit_code == 0, result.output
+    assert "a.py::f" in result.output
+    assert "shown 1 of 1" in result.output
