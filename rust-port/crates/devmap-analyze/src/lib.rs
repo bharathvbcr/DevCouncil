@@ -21,7 +21,8 @@ pub use dead_clusters::{
     DEAD_CLUSTER_MEMBER_CAP, DEAD_CLUSTER_QUALIFIED_CONFIDENCE,
 };
 pub use graph_intel::{
-    graph_intel, GodNode, GraphIntel, ImportCycle, GOD_NODE_CAP, IMPORT_CYCLE_CAP,
+    graph_intel, FileChurn, GodNode, GraphIntel, Hotspot, ImportCycle, GOD_NODE_CAP, HOTSPOT_CAP,
+    IMPORT_CYCLE_CAP,
 };
 pub use liveness::{
     analyze_liveness, analyze_liveness_with_coverage, exempt_symbol_names, extraction_coverage,

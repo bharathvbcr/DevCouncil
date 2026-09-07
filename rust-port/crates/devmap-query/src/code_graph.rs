@@ -1033,12 +1033,35 @@ pub fn build_code_graph_value(
         );
     }
 
-    // Graph intelligence: the hubs the repository leans on, and its import
-    // cycles. See `devmap_analyze::graph_intel` for why this moved into the
-    // kernel — `enrich_graph_intel` lost both its callers in `d232dea`, and
-    // `viz.py:520-522` has been rendering `(none)` into the Intel tab of every
-    // graph written since, regardless of what the repository holds.
-    let intel = devmap_analyze::graph_intel(edges);
+    // Graph intelligence: the hubs the repository leans on, its import cycles,
+    // and its churn x coupling hotspots. See `devmap_analyze::graph_intel` for
+    // why this moved into the kernel — `enrich_graph_intel` lost both its
+    // callers in `d232dea`, and `viz.py:520-522` has been rendering `(none)`
+    // into the Intel tab of every graph written since, regardless of what the
+    // repository holds.
+    //
+    // The churn half is a `git log` and is therefore the one part of this
+    // artifact that costs a subprocess. It is paid here rather than skipped
+    // because this is the only place that writes the panel, and it is paid at
+    // most once per artifact regeneration: `write_consumer_artifacts` returns
+    // on its stamp before reaching this function when nothing changed, so an
+    // unchanged `dev map` does not run git at all.
+    let churn = match repo_root {
+        Some(root) => crate::inventory::churn(std::path::Path::new(root)),
+        None => devmap_analyze::FileChurn::unavailable(
+            "no repository root was recorded for this generation, so no history \
+             was read",
+        ),
+    };
+    // The paths this generation actually indexed. Churn names every path git
+    // touched in the window, including files deleted since and files no
+    // extractor can read; a hotspot naming one of those is a row no other list
+    // in this artifact mentions.
+    let known_files: std::collections::BTreeSet<&str> = extractions
+        .iter()
+        .map(|ext| ext.file_path.as_str())
+        .collect();
+    let intel = devmap_analyze::graph_intel(edges, &churn, &known_files);
 
     let payload = json!({
         "schema_version": CODE_GRAPH_SCHEMA_VERSION,
@@ -1100,6 +1123,11 @@ pub fn build_code_graph_value(
             // `hotspots_computed: false` below says the same in the artifact.
             "god_nodes": intel.god_nodes,
             "circular_imports": intel.circular_imports,
+            // The third panel. `viz.py:521` has read this key since before the
+            // cutover and found it absent on every graph the Rust kernel has
+            // written, so the Hotspots tab said "(no churn data)" on a
+            // repository with three months of history.
+            "hotspots": intel.hotspots,
             "devmap_rust": {
                 "engine": CONSUMER_MAP_ENGINE,
                 "generation_id": freshness.generation_id,
@@ -1138,8 +1166,20 @@ pub fn build_code_graph_value(
                 "circular_imports_shown": intel.circular_imports.len(),
                 "circular_imports_total": intel.circular_imports_total,
                 "circular_imports_truncated": intel.circular_imports_truncated(),
-                // Churn needs repository history this producer does not read.
-                "hotspots_computed": false,
+                // Churn is repository history, read by one bounded `git log`
+                // in `inventory::churn`. `false` here means that read did not
+                // happen — no repository root, no git, no commits in the
+                // window — and the reason below says which.
+                "hotspots_computed": intel.hotspots_computed,
+                "hotspots_unavailable_reason": intel.hotspots_unavailable_reason,
+                "hotspots_shown": intel.hotspots.len(),
+                // Scored candidates before the cap, so fifteen rows are never
+                // mistaken for the population they came from.
+                "hotspots_total": intel.hotspots_total,
+                "hotspots_truncated": intel.hotspots_truncated(),
+                // Whether a churn bound cut the history short. `true` makes
+                // every `churn` count a lower bound rather than the window's.
+                "hotspots_churn_truncated": intel.hotspots_churn_truncated,
                 "unavailable": unavailable,
             },
         },

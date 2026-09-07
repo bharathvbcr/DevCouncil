@@ -12,11 +12,16 @@
 //! `d232dea` made: the kernel already holds the edges, and a second producer
 //! of an artifact the kernel owns is exactly what that commit removed.
 //!
-//! **`hotspots` is not here.** It is churn × coupling — `git log
-//! --since=90.days --name-only` scored against fan-in — and the churn half
-//! needs repository history this crate does not read. Fabricating a
-//! coupling-only score under the same name would be a different metric wearing
-//! the old one's label.
+//! `hotspots` is here too, and its shape is the reason it arrived late: it is
+//! churn × coupling — `git log --since=90.days --name-only` scored against
+//! fan-in — and the churn half is repository *history*, which this crate does
+//! not and should not read. So the reading is `devmap-query`'s
+//! (`inventory::churn`, one bounded subprocess) and the scoring is here, which
+//! keeps this crate a pure function of what it is handed and puts one owner on
+//! each half. Handing this function an empty churn map is not the same as
+//! handing it none: the caller carries the reason and emits it, so an empty
+//! `hotspots` from a repository with no history is never the same answer as an
+//! empty one from a repository whose files nothing has touched.
 
 use crate::dead_clusters::strongly_connected_components;
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,6 +36,10 @@ pub const GOD_NODE_CAP: usize = 15;
 /// Most import cycles to emit. `circular_imports` used 50 and `viz.py` slices
 /// to 30, so 30 is what a reader could ever see.
 pub const IMPORT_CYCLE_CAP: usize = 30;
+
+/// Most hotspots to emit. The Python original's `top_n = 20`; `viz.py` slices
+/// to 30, so 20 is the bound that ever bit.
+pub const HOTSPOT_CAP: usize = 20;
 
 /// One heavily-connected node, in the shape `viz.py:967` indexes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -50,6 +59,51 @@ pub struct ImportCycle {
     pub length: usize,
 }
 
+/// One churn × coupling hotspot, in the shape `viz.py:963` indexes.
+///
+/// `score` is a `f64` rounded to two decimals rather than kept at full
+/// precision, matching the Python original's `round(..., 2)`. The rounding is
+/// part of the artifact's contract, not a display choice: the value is written
+/// into JSON that two runs must render identically, and a 17-digit float whose
+/// last digits depend on summation order is how that stops being true.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Hotspot {
+    pub path: String,
+    pub churn: u32,
+    pub fan_in: u32,
+    pub score: f64,
+}
+
+/// How often each file changed inside the churn window, and whether anyone
+/// looked.
+///
+/// Defined here, where the score that consumes it is defined, rather than in
+/// the `devmap-query` module that fills it: `devmap-analyze` cannot depend on
+/// `devmap-query` (the dependency runs the other way), and a bare
+/// `BTreeMap` parameter would have dropped exactly the `computed` bit this
+/// whole change exists to carry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileChurn {
+    /// Repo-relative path → commits touching it, within the window.
+    pub commits_by_path: BTreeMap<String, u32>,
+    /// Whether the history was read at all.
+    pub computed: bool,
+    /// Why it was not, when it was not.
+    pub unavailable_reason: String,
+    /// Whether a bound cut the history short, making the counts a lower bound.
+    pub truncated: bool,
+}
+
+impl FileChurn {
+    /// A reading that did not happen, with the reason attached.
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            unavailable_reason: reason.into(),
+            ..Self::default()
+        }
+    }
+}
+
 /// The whole report, each list with the bounds of its own cap.
 #[derive(Debug, Clone, Default)]
 pub struct GraphIntel {
@@ -59,6 +113,16 @@ pub struct GraphIntel {
     pub god_nodes_total: usize,
     pub circular_imports: Vec<ImportCycle>,
     pub circular_imports_total: usize,
+    pub hotspots: Vec<Hotspot>,
+    /// Scored candidates before the cap.
+    pub hotspots_total: usize,
+    /// Whether the churn half was read. `false` means `hotspots` is empty
+    /// because nothing looked, and [`Self::hotspots_unavailable_reason`] says
+    /// why — the distinction `hotspots_computed` publishes.
+    pub hotspots_computed: bool,
+    pub hotspots_unavailable_reason: String,
+    /// Whether a churn bound cut the history short.
+    pub hotspots_churn_truncated: bool,
 }
 
 impl GraphIntel {
@@ -68,6 +132,10 @@ impl GraphIntel {
 
     pub fn circular_imports_truncated(&self) -> bool {
         self.circular_imports_total > self.circular_imports.len()
+    }
+
+    pub fn hotspots_truncated(&self) -> bool {
+        self.hotspots_total > self.hotspots.len()
     }
 }
 
@@ -116,16 +184,22 @@ fn is_package_init(path: &str) -> bool {
     path.replace('\\', "/").rsplit('/').next() == Some("__init__.py")
 }
 
-/// Rank the graph's hubs and find its import cycles.
-pub fn graph_intel(edges: &[ResolvedEdge]) -> GraphIntel {
-    GraphIntel {
-        god_nodes: Vec::new(),
-        god_nodes_total: 0,
-        circular_imports: Vec::new(),
-        circular_imports_total: 0,
-    }
-    .with_god_nodes(edges)
-    .with_import_cycles(edges)
+/// Rank the graph's hubs, find its import cycles, and score its hotspots.
+///
+/// `known_files` is the set of paths this generation actually indexed. Churn
+/// names files git knows about, which includes every deleted, ignored and
+/// unindexable one; scoring those would put paths in the artifact that no other
+/// list in it mentions, which is the Python original's `if path not in
+/// file_paths` rule and the reason it exists.
+pub fn graph_intel(
+    edges: &[ResolvedEdge],
+    churn: &FileChurn,
+    known_files: &BTreeSet<&str>,
+) -> GraphIntel {
+    GraphIntel::default()
+        .with_god_nodes(edges)
+        .with_import_cycles(edges)
+        .with_hotspots(edges, churn, known_files)
 }
 
 impl GraphIntel {
@@ -244,6 +318,87 @@ impl GraphIntel {
             .collect();
         self
     }
+
+    /// Churn × coupling: how often a file changes, weighted by how much of the
+    /// repository would feel it if it changed again.
+    ///
+    /// `score = commits * (1 + ln(1 + fan_in))`, the Python original's
+    /// `count * (1 + math.log1p(fi))`. The logarithm is what stops the ranking
+    /// being fan-in alone on a repository with one enormous hub: doubling a
+    /// file's importers moves it much less than doubling how often it is
+    /// rewritten, which is the "refactor risk" this metric is for.
+    fn with_hotspots(
+        mut self,
+        edges: &[ResolvedEdge],
+        churn: &FileChurn,
+        known_files: &BTreeSet<&str>,
+    ) -> Self {
+        self.hotspots_computed = churn.computed;
+        self.hotspots_unavailable_reason = churn.unavailable_reason.clone();
+        self.hotspots_churn_truncated = churn.truncated;
+        if !churn.computed {
+            return self;
+        }
+
+        // File-level import fan-in, deduplicated by (importer, imported): a
+        // file that imports five symbols from another is one importer of it,
+        // not five. The Python original reached the same number by counting
+        // only edges whose *both* endpoints were file nodes; this counts the
+        // distinct file pairs behind every import edge, which is the same
+        // question asked of a model that carries the file on every edge.
+        let mut pairs: BTreeSet<(&str, &str)> = BTreeSet::new();
+        for edge in edges {
+            if edge.edge_kind != EdgeKind::Imports {
+                continue;
+            }
+            let (source, target) = (edge.source_file.as_str(), edge.target_file.as_str());
+            if source == target {
+                continue;
+            }
+            pairs.insert((source, target));
+        }
+        let mut fan_in: BTreeMap<&str, u32> = BTreeMap::new();
+        for (_, target) in pairs {
+            *fan_in.entry(target).or_insert(0) += 1;
+        }
+
+        let mut scored: Vec<Hotspot> = churn
+            .commits_by_path
+            .iter()
+            // Only files this generation indexed. Churn names every path git
+            // touched, including ones deleted since and ones no extractor can
+            // read; a hotspot the rest of the artifact has never heard of is
+            // not actionable.
+            .filter(|(path, _)| known_files.contains(path.as_str()))
+            .map(|(path, commits)| {
+                let inbound = fan_in.get(path.as_str()).copied().unwrap_or(0);
+                let raw = f64::from(*commits) * (1.0 + f64::from(inbound).ln_1p());
+                Hotspot {
+                    path: path.clone(),
+                    churn: *commits,
+                    fan_in: inbound,
+                    // Two decimals, as the Python original rounded, so two
+                    // renderings of one generation are the same bytes.
+                    score: (raw * 100.0).round() / 100.0,
+                }
+            })
+            .collect();
+        // By score descending, then by path ascending. The second key is not
+        // cosmetic: the list is cut at HOTSPOT_CAP, and a tie broken by
+        // traversal order changes the artifact's bytes with nothing about the
+        // repository having changed.
+        scored.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        self.hotspots_total = scored.len();
+        scored.truncate(HOTSPOT_CAP);
+        self.hotspots = scored;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -285,6 +440,114 @@ mod tests {
         assert!(is_package_init("a/b/__init__.py"));
         assert!(is_package_init("a\\b\\__init__.py"));
         assert!(!is_package_init("a/b/init.py"));
+    }
+
+    /// A file-level import edge, in the shape the resolver emits.
+    fn import_edge(source: &str, target: &str) -> ResolvedEdge {
+        ResolvedEdge {
+            source_file: source.to_string(),
+            target_file: target.to_string(),
+            source_symbol: source.to_string(),
+            target_symbol: target.to_string(),
+            edge_kind: EdgeKind::Imports,
+            confidence: devmap_extract::model::Confidence::DETERMINISTIC,
+            resolution: None,
+            details: None,
+            evidence: None,
+        }
+    }
+
+    fn churn_of(pairs: &[(&str, u32)]) -> FileChurn {
+        FileChurn {
+            commits_by_path: pairs
+                .iter()
+                .map(|(path, count)| ((*path).to_string(), *count))
+                .collect(),
+            computed: true,
+            unavailable_reason: String::new(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn an_unread_history_produces_no_hotspots_and_keeps_its_reason() {
+        let churn = FileChurn::unavailable("not a git repository");
+        let known: BTreeSet<&str> = ["a.py"].into_iter().collect();
+        let intel = graph_intel(&[], &churn, &known);
+        assert!(!intel.hotspots_computed);
+        assert_eq!(intel.hotspots_unavailable_reason, "not a git repository");
+        assert!(intel.hotspots.is_empty());
+        assert_eq!(intel.hotspots_total, 0);
+    }
+
+    #[test]
+    fn a_read_history_with_nothing_in_it_is_a_computed_empty_answer() {
+        // The distinction the marker exists for: this is *not* the same state
+        // as the test above, and the artifact must not render them alike.
+        let intel = graph_intel(&[], &churn_of(&[]), &BTreeSet::new());
+        assert!(intel.hotspots_computed);
+        assert!(intel.hotspots.is_empty());
+    }
+
+    #[test]
+    fn a_churned_path_the_generation_never_indexed_is_not_a_hotspot() {
+        let churn = churn_of(&[("deleted.py", 40), ("kept.py", 1)]);
+        let known: BTreeSet<&str> = ["kept.py"].into_iter().collect();
+        let intel = graph_intel(&[], &churn, &known);
+        assert_eq!(intel.hotspots_total, 1);
+        assert_eq!(intel.hotspots[0].path, "kept.py");
+    }
+
+    #[test]
+    fn the_score_is_commits_times_one_plus_log1p_of_fan_in() {
+        let churn = churn_of(&[("hub.py", 4)]);
+        let known: BTreeSet<&str> = ["hub.py"].into_iter().collect();
+        // Three distinct importers, one of them importing twice: fan-in is the
+        // number of files, not the number of edges.
+        let edges: Vec<ResolvedEdge> = [
+            ("a.py", "hub.py"),
+            ("b.py", "hub.py"),
+            ("c.py", "hub.py"),
+            ("a.py", "hub.py"),
+        ]
+        .into_iter()
+        .map(|(source, target)| import_edge(source, target))
+        .collect();
+        let intel = graph_intel(&edges, &churn, &known);
+        assert_eq!(intel.hotspots[0].fan_in, 3);
+        let expected = (4.0f64 * (1.0 + 3.0f64.ln_1p()) * 100.0).round() / 100.0;
+        assert_eq!(intel.hotspots[0].score, expected);
+    }
+
+    #[test]
+    fn a_tie_is_broken_by_path_so_two_renderings_agree() {
+        let churn = churn_of(&[("b.py", 3), ("a.py", 3), ("c.py", 3)]);
+        let known: BTreeSet<&str> = ["a.py", "b.py", "c.py"].into_iter().collect();
+        let intel = graph_intel(&[], &churn, &known);
+        let paths: Vec<&str> = intel.hotspots.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.py", "b.py", "c.py"]);
+    }
+
+    #[test]
+    fn a_capped_hotspot_list_still_reports_the_population() {
+        let pairs: Vec<(String, u32)> = (0..HOTSPOT_CAP + 7)
+            .map(|index| (format!("f{index:03}.py"), index as u32 + 1))
+            .collect();
+        let churn = FileChurn {
+            commits_by_path: pairs.iter().cloned().collect(),
+            computed: true,
+            ..Default::default()
+        };
+        let known: BTreeSet<&str> = pairs.iter().map(|(path, _)| path.as_str()).collect();
+        let intel = graph_intel(&[], &churn, &known);
+        assert_eq!(intel.hotspots.len(), HOTSPOT_CAP);
+        assert_eq!(intel.hotspots_total, HOTSPOT_CAP + 7);
+        assert!(intel.hotspots_truncated());
+        // Ranked before cut: the most-churned file survives the cap.
+        assert_eq!(
+            intel.hotspots[0].path,
+            format!("f{:03}.py", HOTSPOT_CAP + 6)
+        );
     }
 
     #[test]
