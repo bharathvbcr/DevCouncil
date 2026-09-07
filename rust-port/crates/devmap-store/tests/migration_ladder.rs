@@ -778,3 +778,206 @@ fn objects_the_schema_does_not_declare_do_not_fail_the_gate() {
     drop(conn);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A v17 store with **two** generations keeps both of them across v18.
+///
+/// The rest of this file walks the ladder over a store with one generation,
+/// which is exactly the shape that cannot see the v17→v18 backfill's only real
+/// decision: what `valid_to` is for a row whose generation some later
+/// generation also has. Every row of a one-generation store is still valid, so
+/// the whole `MIN(g.id) WHERE g.id > e.generation_id` expression reads NULL and
+/// any wrong answer passes.
+///
+/// The rows are carried as they stand — each generation's set becoming
+/// `[g, next_g)`, so an edge present in both generations becomes two rows and
+/// the store is no smaller the moment it migrates. That is asserted here rather
+/// than merely intended: collapsing them would mean deciding in SQL which of
+/// two generations' rows are "the same edge", which is what the *write* path
+/// computes from a freshly resolved multiset and what a migration has no
+/// business inventing.
+#[test]
+fn a_v17_store_with_two_generations_carries_both_onto_ranges() {
+    let dir = tmp_dir("v18-backfill-two-generations");
+    let db_path = dir.join("v17-two.sqlite");
+    seed_current_store(&db_path);
+
+    let conn = Connection::open(&db_path).unwrap();
+    reduce_one_rung(&conn, CURRENT_SCHEMA_VERSION);
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 17, "the fixture must be a v17 store");
+
+    // A second generation that shares one edge with the first and adds one, so
+    // the carried row and the closed row are both exercised. The unresolved
+    // ledger keeps its single row across both, which is the case the measured
+    // corpus is made almost entirely of.
+    conn.execute_batch(
+        r#"
+        INSERT INTO generations (id, created_at, head_sha, repo_root, analysis_json)
+        VALUES (2, 2.0, 'cafebabe', '/tmp/probe', '{"total_files":3,"total_symbols":2,
+                "total_edges":2,"dead_symbols":[],"communities":[],"status":"Ok"}');
+
+        INSERT INTO generation_edges
+            (generation_id, ordinal, source_file_id, target_file_id, source_symbol,
+             target_symbol, edge_kind, confidence, resolution, candidate_total)
+        VALUES (2, 0, 3, 1, 'b.py::main', 'a.py::helper', 'Calls', 0.9, 'Exact', NULL),
+               (2, 1, 1, 3, 'a.py::helper', 'b.py::main', 'References', 0.8, 'UniqueGlobal', NULL);
+
+        INSERT INTO generation_unresolved
+            (generation_id, ordinal, source_file, source_symbol, callee_name,
+             reason, classification, receiver)
+        VALUES (2, 0, 'b.py', 'b.py::main', 'mystery', 'no candidate',
+                'unresolved', 'obj');
+        "#,
+    )
+    .expect("seeding a second v17 generation must succeed");
+
+    let before_edges = edges_by_generation(&conn);
+    let before_unresolved = unresolved_by_generation(&conn);
+    assert_eq!(
+        before_edges.len(),
+        2,
+        "the fixture must have two generations"
+    );
+    drop(conn);
+
+    let store = Store::open(&db_path).expect("a two-generation v17 store must migrate");
+    drop(store);
+
+    let conn = Connection::open(&db_path).unwrap();
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    assert_eq!(
+        edges_by_generation(&conn),
+        before_edges,
+        "a generation must read back exactly what it held before the migration"
+    );
+    assert_eq!(
+        unresolved_by_generation(&conn),
+        before_unresolved,
+        "and so must its unresolved ledger"
+    );
+
+    // The ranges themselves: the edge only generation 1 had is closed at 2, the
+    // two generation 2 has are open, and the shared edge is two rows.
+    let mut ranges: Vec<(i64, Option<i64>, String)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT valid_from, valid_to, source_symbol || '>' || target_symbol
+                   FROM edge_rows",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    ranges.sort();
+    assert_eq!(
+        ranges,
+        vec![
+            (1, Some(2), "b.py::main>a.py::helper".to_string()),
+            (2, None, "a.py::helper>b.py::main".to_string()),
+            (2, None, "b.py::main>a.py::helper".to_string()),
+        ],
+        "the backfill must give each generation's rows the half-open range \
+         [g, next_g), and must not collapse the edge both generations hold"
+    );
+    let ledger: Vec<(i64, Option<i64>)> = {
+        let mut stmt = conn
+            .prepare("SELECT valid_from, valid_to FROM unresolved_rows ORDER BY valid_from")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(ledger, vec![(1, Some(2)), (2, None)]);
+    drop(conn);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Every generation's edges, keyed by generation, in a form that compares
+/// across the migration: `ordinal` is deliberately absent, because v18 replaces
+/// the resolver's emission ordinal with the range row's own id and nothing
+/// reads it as a position.
+fn edges_by_generation(conn: &Connection) -> BTreeMap<i64, Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT generation_id, source_file_id, target_file_id, source_symbol,
+                    target_symbol, edge_kind, printf('%.17g', confidence),
+                    COALESCE(resolution, '<none>'),
+                    COALESCE(CAST(candidate_total AS TEXT), '<none>')
+               FROM generation_edges",
+        )
+        .unwrap();
+    let mut out: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                format!(
+                    "{}|{}|{}|{}|{}|{}|{}|{}",
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ),
+            ))
+        })
+        .unwrap();
+    for row in rows {
+        let (generation, text) = row.unwrap();
+        out.entry(generation).or_default().push(text);
+    }
+    for rows in out.values_mut() {
+        rows.sort();
+    }
+    out
+}
+
+fn unresolved_by_generation(conn: &Connection) -> BTreeMap<i64, Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT generation_id, source_file, source_symbol, callee_name, reason,
+                    classification, COALESCE(receiver, '<none>')
+               FROM generation_unresolved",
+        )
+        .unwrap();
+    let mut out: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                format!(
+                    "{}|{}|{}|{}|{}|{}",
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ),
+            ))
+        })
+        .unwrap();
+    for row in rows {
+        let (generation, text) = row.unwrap();
+        out.entry(generation).or_default().push(text);
+    }
+    for rows in out.values_mut() {
+        rows.sort();
+    }
+    out
+}
