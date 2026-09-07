@@ -1389,52 +1389,6 @@ def entry_roots(
     return roots
 
 
-def entry_point_symbols(root: Path, files: Iterable[str]) -> Set[str]:
-    """Return ``path::attr`` keys for pyproject ``module:attr`` script targets.
-
-    Used by graph dead-code so CLI entry functions (e.g. ``pkg.b:main``) are not
-    flagged merely because nothing in-repo calls them.
-    """
-    out: Set[str] = set()
-    try:
-        file_set = {_norm(f) for f in files}
-        text = _read_text(root, "pyproject.toml")
-        if not text:
-            return out
-        try:
-            import tomllib
-        except ImportError:  # pragma: no cover
-            import tomli as tomllib  # type: ignore
-
-        data = tomllib.loads(text)
-        project = data.get("project") or {}
-        entry_maps: list = []
-        for key in ("scripts", "gui-scripts"):
-            val = project.get(key)
-            if isinstance(val, dict):
-                entry_maps.append(val)
-        eps = project.get("entry-points") or {}
-        if isinstance(eps, dict):
-            for group in eps.values():
-                if isinstance(group, dict):
-                    entry_maps.append(group)
-        for mapping in entry_maps:
-            for target in mapping.values():
-                if not isinstance(target, str) or ":" not in target:
-                    continue
-                mod, _, attr = target.partition(":")
-                mod, attr = mod.strip(), attr.strip()
-                if not mod or not attr:
-                    continue
-                found: Set[str] = set()
-                _add_module_file(mod, file_set, found)
-                for path in found:
-                    out.add(f"{path}::{attr}")
-    except Exception:
-        logger.debug("entry_point_symbols failed", exc_info=True)
-    return out
-
-
 _SHORT_STEM_MAX = 12
 
 
@@ -1493,17 +1447,6 @@ def _module_forms(value: str) -> Set[str]:
             forms.add(base.replace(".", "/"))
             break
     return {f for f in forms if f}
-
-
-def import_spec_matches(spec: str, tokens: Set[str]) -> bool:
-    """True when an import string matches ``tokens`` on a module/path boundary."""
-    if not spec or not tokens:
-        return False
-    spec_forms = _module_forms(spec)
-    for t in tokens:
-        if spec_forms & _module_forms(t):
-            return True
-    return False
 
 
 def has_allow_unwired(project_root: Path, path: str) -> bool:

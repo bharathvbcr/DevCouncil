@@ -225,16 +225,6 @@ def test_entry_roots_includes_main_module(tmp_path):
     assert "pkg/__main__.py" in roots
 
 
-def test_entry_point_symbols(tmp_path):
-    (tmp_path / "pyproject.toml").write_text(
-        '[project]\nname = "x"\nversion = "0"\n'
-        '[project.scripts]\nmycli = "pkg.cli:main"\n',
-        encoding="utf-8",
-    )
-    syms = wiring.entry_point_symbols(tmp_path, ["pkg/cli.py"])
-    assert "pkg/cli.py::main" in syms
-
-
 def test_package_json_entry_targets(tmp_path):
     (tmp_path / "package.json").write_text(
         '{"name": "app", "main": "src/index.js", "bin": {"app": "bin/cli.js"}}\n',
@@ -333,14 +323,6 @@ def test_module_tokens_for():
     tokens = wiring.module_tokens_for("src/pkg/mod.py")
     assert "src/pkg/mod" in tokens
     assert "pkg.mod" in tokens  # src. prefix stripped from dotted form
-
-
-def test_import_spec_matches():
-    tokens = wiring.module_tokens_for("src/pkg/mod.py")
-    assert wiring.import_spec_matches("pkg.mod", tokens)
-    assert wiring.import_spec_matches("pkg/mod", tokens)
-    assert not wiring.import_spec_matches("other.module", tokens)
-    assert not wiring.import_spec_matches("", tokens)
 
 
 # ----------------------------------------------------------------------
@@ -613,7 +595,7 @@ def test_package_json_index_fallback(tmp_path):
 
 
 # ----------------------------------------------------------------------
-# entry_roots / entry_point_symbols exception + edge branches
+# entry_roots exception + edge branches
 # ----------------------------------------------------------------------
 
 
@@ -623,28 +605,6 @@ def test_entry_roots_returns_empty_on_exception(tmp_path):
         yield  # pragma: no cover
 
     assert wiring.entry_roots(tmp_path, bad_files()) == []
-
-
-def test_entry_point_symbols_entry_points_and_skips(tmp_path):
-    (tmp_path / "pkg").mkdir()
-    (tmp_path / "pkg" / "ep.py").write_text("def hook():\n    pass\n", encoding="utf-8")
-    (tmp_path / "pyproject.toml").write_text(
-        '[project]\nname = "x"\nversion = "0"\n'
-        '[project.entry-points."grp"]\nname = "pkg.ep:hook"\n'
-        'nocolon = "pkg.ep"\n',
-        encoding="utf-8",
-    )
-    syms = wiring.entry_point_symbols(tmp_path, ["pkg/ep.py"])
-    assert "pkg/ep.py::hook" in syms
-
-
-def test_entry_point_symbols_bad_toml_returns_empty(tmp_path):
-    (tmp_path / "pyproject.toml").write_text("= = invalid [[[\n", encoding="utf-8")
-    assert wiring.entry_point_symbols(tmp_path, ["pkg/ep.py"]) == set()
-
-
-def test_entry_point_symbols_no_pyproject(tmp_path):
-    assert wiring.entry_point_symbols(tmp_path, ["pkg/ep.py"]) == set()
 
 
 # ----------------------------------------------------------------------
