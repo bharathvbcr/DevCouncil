@@ -357,14 +357,17 @@ fn drop_stored_edges(root: &std::path::Path, keep_source: &str, drop_count: usiz
     let conn = rusqlite::Connection::open(db_path(root)).unwrap();
     let removed = conn
         .execute(
-            // `generation_edges` is WITHOUT ROWID, keyed by (generation_id,
-            // ordinal) — delete by that key, not by a rowid it does not have.
-            "DELETE FROM generation_edges
-             WHERE generation_id = (SELECT max(id) FROM generations)
-               AND ordinal IN (
-                 SELECT e.ordinal FROM generation_edges e
+            // `generation_edges` is a view over the validity ranges since v18
+            // and is not deletable; the rows live in `edge_rows`, keyed by
+            // `edge_id`. Only currently-valid rows are removed — a closed row
+            // is already invisible to the latest generation, so deleting one
+            // would not reproduce anything.
+            "DELETE FROM edge_rows
+             WHERE valid_to IS NULL
+               AND edge_id IN (
+                 SELECT e.edge_id FROM edge_rows e
                  JOIN paths sp ON sp.id = e.source_file_id
-                 WHERE e.generation_id = (SELECT max(id) FROM generations)
+                 WHERE e.valid_to IS NULL
                    AND sp.path <> ?1
                  LIMIT ?2
              )",
@@ -619,13 +622,11 @@ fn an_incremental_build_equals_a_cold_build_under_random_churn() {
                 let index = live[rng.pick(live.len())];
                 let conn = rusqlite::Connection::open(db_path(&root)).unwrap();
                 conn.execute(
-                    "DELETE FROM generation_edges
-                     WHERE generation_id = (SELECT max(id) FROM generations)
-                       AND ordinal IN (
-                         SELECT ordinal FROM generation_edges
-                         WHERE generation_id = (SELECT max(id) FROM generations)
-                         LIMIT 2
-                       )",
+                    "DELETE FROM edge_rows
+                      WHERE valid_to IS NULL
+                        AND edge_id IN (
+                          SELECT edge_id FROM edge_rows WHERE valid_to IS NULL LIMIT 2
+                        )",
                     [],
                 )
                 .unwrap();

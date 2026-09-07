@@ -216,9 +216,16 @@ fn status_counts_stored_edges_whose_confidence_contradicts_their_evidence() {
         let conn = rusqlite::Connection::open(&db).unwrap();
         // Every `Calls` edge with a stored deterministic-or-high kind is moved
         // to the floor; the count of rows touched is what status must report.
+        //
+        // `edge_rows`, not `generation_edges`: since v18 the latter is a view
+        // over the validity ranges and is not updatable. Only the currently
+        // valid rows are tampered with, which for a store with one generation
+        // is all of them — a closed row belongs to a generation status is not
+        // reporting on.
         conn.execute(
-            "UPDATE generation_edges SET confidence = 0.2
-             WHERE edge_kind = 'Calls'
+            "UPDATE edge_rows SET confidence = 0.2
+             WHERE valid_to IS NULL
+               AND edge_kind = 'Calls'
                AND resolution IN ('ImportScoped', 'SameFile', 'UniqueGlobal', 'ReceiverType')",
             [],
         )

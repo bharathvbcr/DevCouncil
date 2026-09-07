@@ -101,16 +101,19 @@ fn seed_current_store(db_path: &Path) {
         VALUES (1, 0, 1, 'helper', 'a.py::helper', 'Function', 0, 10, 0, 111, 222, 4),
                (1, 1, 3, 'main', 'b.py::main', 'Function', 0, 10, 1, NULL, NULL, NULL);
 
-        INSERT INTO generation_edges
-            (generation_id, ordinal, source_file_id, target_file_id, source_symbol,
-             target_symbol, edge_kind, confidence, resolution, candidate_total)
-        VALUES (1, 0, 3, 1, 'b.py::main', 'a.py::helper', 'Calls', 0.9, 'Exact', NULL);
+        -- `generation_edges` and `generation_unresolved` are views over
+        -- validity ranges since v18 and are not insertable; the rows live in
+        -- `edge_rows` and `unresolved_rows`. `valid_to` NULL means "still
+        -- valid", which for a store with one generation is every row.
+        INSERT INTO edge_rows
+            (source_file_id, target_file_id, source_symbol, target_symbol,
+             edge_kind, confidence, resolution, candidate_total, valid_from, valid_to)
+        VALUES (3, 1, 'b.py::main', 'a.py::helper', 'Calls', 0.9, 'Exact', NULL, 1, NULL);
 
-        INSERT INTO generation_unresolved
-            (generation_id, ordinal, source_file, source_symbol, callee_name,
-             reason, classification, receiver)
-        VALUES (1, 0, 'b.py', 'b.py::main', 'mystery', 'no candidate',
-                'unresolved', 'obj');
+        INSERT INTO unresolved_rows
+            (source_file, source_symbol, callee_name, reason, classification, receiver,
+             valid_from, valid_to)
+        VALUES ('b.py', 'b.py::main', 'mystery', 'no candidate', 'unresolved', 'obj', 1, NULL);
 
         INSERT INTO generation_dead_symbols
             (generation_id, ordinal, file_path, symbol_name, confidence,
@@ -146,6 +149,34 @@ fn seed_current_store(db_path: &Path) {
 /// traceable to a line of `schema.rs`.
 fn reduce_one_rung(conn: &Connection, from_version: i32) {
     let sql: &str = match from_version {
+        // MIGRATION_V17_TO_V18: the validity ranges. Materialise both views
+        // back into the base tables they replaced, restore the two edge indexes
+        // v5 created on `generation_edges`, and drop the range tables with the
+        // indexes SQLite dropped along with them.
+        //
+        // `generation_edges.ordinal` comes back as the view's `ordinal`, which
+        // is the range row's own id. That is not the resolver's emission order
+        // any more and nothing reads it as one — `edge_read_order` took
+        // `resolution` as its last key in the same change — so the reduced store
+        // is a v17 store in every respect the ladder asserts.
+        18 => {
+            "CREATE TABLE ge_flat AS SELECT * FROM generation_edges;
+             CREATE TABLE gu_flat AS SELECT * FROM generation_unresolved;
+             DROP VIEW generation_edges;
+             DROP VIEW generation_unresolved;
+             DROP TABLE edge_rows;
+             DROP TABLE unresolved_rows;
+             ALTER TABLE ge_flat RENAME TO generation_edges;
+             ALTER TABLE gu_flat RENAME TO generation_unresolved;
+             CREATE INDEX idx_generation_edges_source
+                 ON generation_edges(generation_id, source_file_id);
+             CREATE INDEX idx_generation_edges_target
+                 ON generation_edges(generation_id, target_file_id);
+             CREATE INDEX idx_generation_unresolved_callee
+                 ON generation_unresolved(generation_id, callee_name);
+             CREATE INDEX idx_generation_unresolved_class
+                 ON generation_unresolved(generation_id, classification);"
+        }
         // MIGRATION_V16_TO_V17: the payload split. Materialise the view back
         // into the base table it replaced and restore v13's index, which the
         // migration drops.
@@ -552,17 +583,20 @@ fn a_migrated_store_reopens_without_migrating_again() {
 
 /// A step that fails its own gate must not advance `user_version`.
 ///
-/// The v16→v17 arm stamps 17 and *then* validates, both inside one
-/// transaction, so a failed validation has to take the stamp down with it. That
-/// rests on `PRAGMA user_version` being transactional in SQLite — true, and
-/// load-bearing enough to be worth a test rather than a comment: if it ever
-/// were not, a store that failed validation would reopen claiming to be at 17,
-/// skip the chain entirely, and every later read would run against a shape
-/// nothing had checked.
+/// The last arm of the chain — v17→v18 — stamps 18 and *then* validates, both
+/// inside one transaction, so a failed validation has to take the stamp down
+/// with it. That rests on `PRAGMA user_version` being transactional in SQLite —
+/// true, and load-bearing enough to be worth a test rather than a comment: if
+/// it ever were not, a store that failed validation would reopen claiming to be
+/// at 18, skip the chain entirely, and every later read would run against a
+/// shape nothing had checked.
 ///
-/// Failure is induced the way it actually happens: `already_split` sees a
-/// database whose `generation_files` is already a view, skips the DDL batch,
-/// and the index a previous partial attempt never created stays missing.
+/// Failure is induced the way it actually happens: `already_ranged` sees a
+/// database whose `generation_edges` is already a view, skips the DDL batch,
+/// and the index a previous partial attempt never created stays missing. The
+/// rung the fixture starts on moves with the end of the chain — validation runs
+/// once, at the last step, because `validate_schema` asserts the *current*
+/// schema and no earlier rung's shape satisfies it.
 #[test]
 fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
     let dir = tmp_dir("migration-halfway");
@@ -572,7 +606,7 @@ fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(
             "DROP INDEX idx_file_payloads_cache_identity;
-             PRAGMA user_version = 16;",
+             PRAGMA user_version = 17;",
         )
         .unwrap();
     }
@@ -592,7 +626,7 @@ fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 16,
+        version, 17,
         "the step failed, so the store is still at the rung it started on; a \
          stamp that survived its own failed validation would make the next \
          open skip the chain and trust an unchecked shape"
