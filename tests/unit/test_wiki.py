@@ -179,3 +179,101 @@ def test_load_repo_map_regenerates_on_corrupt_json(tmp_path: Path, monkeypatch):
     result = wiki_mod._load_repo_map(tmp_path, remap=False)
     assert called.get("ran") is True
     assert result is sentinel
+
+
+# --- "Wired to": one graph read for the whole bundle -------------------------
+#
+# `_wired_to_links` called `load_code_graph(project_root)` once **per
+# subsystem** — a whole-graph read, with no memoisation, inside the loop that
+# renders subsystem pages. Measured on a tmp copy of this repository (12
+# subsystems, 102,646 edges) that is 949.3 ms x 12 = 11.4 s per wiki refresh,
+# to derive a file->file import index that costs 151.2 ms to build once from
+# the kernel's own `code_graph.json` and is identical (3,313 pairs, verified
+# equal to what `load_code_graph` yields).
+#
+# `dev map` runs `--wiki` by default.
+
+
+def _write_import_graph(root: Path, edges):
+    import json
+
+    path = root / ".devcouncil" / "graph" / "code_graph.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({
+            "nodes": [],
+            "edges": [
+                {"source": s, "target": t, "kind": k} for s, t, k in edges
+            ],
+        }),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_wiki_reads_the_graph_once_for_the_whole_bundle(tmp_path: Path, monkeypatch):
+    """Not once per subsystem, and never through the Python store."""
+    from devcouncil.knowledge import wiki as wiki_mod
+
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.load_code_graph",
+        lambda root: (_ for _ in ()).throw(
+            AssertionError("the wiki must not read the Python graph store")
+        ),
+    )
+    _write_import_graph(tmp_path, [
+        ("src/pkg/cli/main.py", "src/pkg/core/engine.py", "imports"),
+        ("src/pkg/core/engine.py", "src/pkg/util/io.py", "imports"),
+    ])
+    reads: list[Path] = []
+    real = wiki_mod._file_import_edges
+
+    def _counting(root):
+        reads.append(root)
+        return real(root)
+
+    monkeypatch.setattr(wiki_mod, "_file_import_edges", _counting)
+
+    generate_wiki(tmp_path, _repo_map(), tmp_path / "wiki", project_name="Demo")
+
+    assert len(reads) == 1, (
+        f"the graph was read {len(reads)} times for a 2-subsystem bundle; "
+        "it must be read once"
+    )
+
+
+def test_wired_to_links_come_from_the_kernels_own_export(tmp_path: Path, monkeypatch):
+    """The rendered "Wired to" section is unchanged; only its producer moved."""
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.load_code_graph",
+        lambda root: (_ for _ in ()).throw(
+            AssertionError("the wiki must not read the Python graph store")
+        ),
+    )
+    _write_import_graph(tmp_path, [
+        # in-area -> out-of-area: a "wired to" target
+        ("src/pkg/cli/main.py", "src/pkg/core/engine.py", "imports"),
+        # in-area -> in-area: not a target
+        ("src/pkg/cli/main.py", "src/pkg/cli/main.py", "imports"),
+        # a call edge, not an import: not a target
+        ("src/pkg/cli/main.py", "src/pkg/other/x.py", "calls"),
+        # symbol-level: not a file-to-file import
+        ("src/pkg/cli/main.py::f", "src/pkg/sym/y.py::g", "imports"),
+    ])
+
+    wiki_dir = tmp_path / "wiki"
+    generate_wiki(tmp_path, _repo_map(), wiki_dir, project_name="Demo")
+    page = (wiki_dir / "subsystems" / "src-pkg-cli.md").read_text(encoding="utf-8")
+
+    assert "Wired to" in page, page
+    assert "src/pkg/core/engine.py" in page
+    assert "src/pkg/other/x.py" not in page
+    assert "src/pkg/sym/y.py" not in page
+
+
+def test_no_graph_export_means_no_wired_to_section(tmp_path: Path):
+    """No export is silence, not a fabricated empty neighbourhood."""
+    wiki_dir = tmp_path / "wiki"
+    generate_wiki(tmp_path, _repo_map(), wiki_dir, project_name="Demo")
+    page = (wiki_dir / "subsystems" / "src-pkg-cli.md").read_text(encoding="utf-8")
+    assert "Wired to" not in page
