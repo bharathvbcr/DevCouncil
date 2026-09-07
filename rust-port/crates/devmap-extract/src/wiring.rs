@@ -573,6 +573,129 @@ fn config_script_entry(path: &str, source: &str) -> bool {
     }
 }
 
+/// TOML section headers whose keys are `name = "module:attr"` entry points.
+///
+/// `project.entry-points.<group>` is matched by prefix — `console_scripts`,
+/// `gui_scripts` and every plugin group a package publishes have the same
+/// shape. Poetry's own table is here because `config_script_entry` above
+/// already reads it as evidence the file declares a script.
+const ENTRY_POINT_SECTIONS: &[&str] = &[
+    "project.scripts",
+    "project.gui-scripts",
+    "tool.poetry.scripts",
+];
+
+/// Prefix form of the above: any group under `[project.entry-points.…]`.
+const ENTRY_POINT_SECTION_PREFIX: &str = "project.entry-points.";
+
+/// Most entry points one manifest contributes symbol targets for.
+///
+/// A bound, not a sample: past it the exemption is simply not claimed, which
+/// is the fail-open direction for this rule — a missing exemption produces an
+/// extra dead-symbol *finding*, never a hidden one. No manifest in any corpus
+/// measured here comes within two orders of magnitude of it.
+const ENTRY_POINT_CAP: usize = 512;
+
+fn entry_point_target_pattern() -> &'static regex::Regex {
+    use std::sync::OnceLock;
+    static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        // `module:qualname`, the PEP 621 object reference. `qualname` is dotted
+        // so `pkg.mod:Class.method` reaches the method's own qualified name,
+        // which is exactly the `file::Type.name` the extractor writes for it.
+        // Quoted because a bare word in a TOML value is not a string, and an
+        // inline table (`{ callable = "pkg.mod:fn" }`) puts the reference in
+        // the same quotes as the plain form does.
+        regex::Regex::new(r#"['"]([A-Za-z_][\w.]*)\s*:\s*([A-Za-z_][\w.]*)['"]"#)
+            .expect("entry-point object reference pattern compiles")
+    })
+}
+
+/// Symbol identities a Python console-script declaration names, with a reason.
+///
+/// `[project.scripts] cli = "pkg.mod:func"` is a call site: `pip` writes a
+/// launcher that imports `pkg.mod` and calls `func`, and that launcher is
+/// generated at install time and lives outside the corpus. Nothing in the
+/// repository need ever reference `func`.
+///
+/// Before this, `config_script_entry` marked the manifest itself a
+/// [`WiringKind::ScriptEntry`], and `ScriptEntry` exempts only symbols whose
+/// `target_symbol` is that same file — a TOML file, which declares none. So the
+/// entry function was a `dead_symbol_candidate` at the `extracted` tier, the
+/// one agents are told to act on. `devcouncil.indexing.wiring.entry_point_symbols`
+/// was the only implementation of the rule and had lost its caller (deleted in
+/// `c9f9202`); this is that rule, in the engine.
+///
+/// **Every** plausible module path is emitted rather than the first that
+/// exists on disk, which is where this parts company with the Python original.
+/// `extract_wiring_annotations` is a pure function of `(path, source)` and the
+/// extraction cache keys on exactly that (`cache::CacheKey`), so a rule that
+/// consulted the tree would make a cached payload depend on evidence the key
+/// does not cover — the same file would mean different things in two trees and
+/// the cache could not tell. The join in `devmap-analyze` is against real
+/// extracted symbols, so a candidate naming a module that does not exist
+/// matches nothing; this is the shape `WiringKind::DynamicImport` already uses,
+/// and `a_dynamic_reference_does_not_resurrect_an_unrelated_cycle` pins that it
+/// stays harmless.
+///
+/// Module paths resolve against the manifest's own directory, so a monorepo's
+/// `packages/foo/pyproject.toml` names symbols under `packages/foo/`.
+pub fn config_entry_point_symbols(path: &str, source: &str) -> Vec<WiringAnnotation> {
+    let normalized = normalize_path(path);
+    let name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if name != "pyproject.toml" {
+        return Vec::new();
+    }
+    let base = match normalized.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/"),
+        None => String::new(),
+    };
+
+    let mut annotations = Vec::new();
+    let mut in_entry_section = false;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(header) = trimmed
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            let header = header.trim().trim_matches('"');
+            in_entry_section = ENTRY_POINT_SECTIONS.contains(&header)
+                || header.starts_with(ENTRY_POINT_SECTION_PREFIX);
+            continue;
+        }
+        if !in_entry_section || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(reference) = entry_point_target_pattern().captures(trimmed) else {
+            continue;
+        };
+        let module = reference.get(1).map_or("", |m| m.as_str());
+        let attribute = reference.get(2).map_or("", |m| m.as_str());
+        if module.is_empty() || attribute.is_empty() {
+            continue;
+        }
+        let module_path = module.replace('.', "/");
+        let details = format!("declared as an entry point by {normalized}: {module}:{attribute}");
+        for candidate in [
+            format!("{base}{module_path}.py"),
+            format!("{base}{module_path}/__init__.py"),
+            format!("{base}src/{module_path}.py"),
+            format!("{base}src/{module_path}/__init__.py"),
+        ] {
+            if annotations.len() >= ENTRY_POINT_CAP {
+                return annotations;
+            }
+            annotations.push(WiringAnnotation {
+                kind: WiringKind::ConfigEntryPoint,
+                target_symbol: format!("{candidate}::{attribute}"),
+                details: details.clone(),
+            });
+        }
+    }
+    annotations
+}
+
 fn is_language_main(path: &str, source: &str) -> bool {
     let p = path.replace('\\', "/");
     let name = p.rsplit('/').next().unwrap_or(path);
@@ -663,6 +786,12 @@ pub fn extract_wiring_annotations(path: &str, source: &str) -> Vec<WiringAnnotat
             details: "Script / binary entry point".to_string(),
         });
     }
+
+    // The symbol half of the same declaration. `ScriptEntry` above is a claim
+    // about the manifest *file*, and a manifest declares no symbols — so on its
+    // own it left the function a console script actually names as a dead-symbol
+    // candidate. These carry the resolved `module:attr` target.
+    annotations.extend(config_entry_point_symbols(path, source));
 
     // A file the toolchain compiles as a root: nothing in the source imports
     // it, nothing should, and its `mod` declarations run outward from it.
@@ -1216,6 +1345,107 @@ mod tests {
                 !is_generated_path(path),
                 "{path}: `zz_generated` is kubebuilder's Go convention, and \
                  exempting a non-Go file on that prefix clears a real finding"
+            );
+        }
+    }
+
+    /// `[project.scripts]` names a *symbol*, and the annotation carries it.
+    ///
+    /// `config_script_entry` marks the manifest a `ScriptEntry`, which is a
+    /// claim about the file; a TOML file declares no symbols, so on its own it
+    /// exempts nothing and the entry function stays a dead-symbol candidate.
+    /// Every plausible module path is emitted rather than the first that
+    /// exists, because this function is pure in `(path, source)` and the
+    /// extraction cache keys on exactly that.
+    #[test]
+    fn a_console_script_declaration_names_the_function_it_calls() {
+        const MANIFEST: &str = "\
+[project]
+name = \"fx\"
+
+[project.scripts]
+fxtool = \"pkg.cli:main_entry\"
+
+[project.gui-scripts]
+fxgui = \"pkg.ui:launch\"
+
+[project.entry-points.some_plugins]
+plug = \"pkg.plug:Registry.build\"
+
+[tool.poetry.scripts]
+poetry_tool = \"pkg.poetry_cli:run\"
+
+[tool.ruff]
+line-length = 100
+lint = \"not.an:entrypoint\"
+";
+        let targets: Vec<String> = extract_wiring_annotations("pyproject.toml", MANIFEST)
+            .into_iter()
+            .filter(|a| a.kind == WiringKind::ConfigEntryPoint)
+            .map(|a| a.target_symbol)
+            .collect();
+
+        for expected in [
+            "pkg/cli.py::main_entry",
+            "pkg/cli/__init__.py::main_entry",
+            "src/pkg/cli.py::main_entry",
+            "src/pkg/cli/__init__.py::main_entry",
+            "pkg/ui.py::launch",
+            "pkg/plug.py::Registry.build",
+            "pkg/poetry_cli.py::run",
+        ] {
+            assert!(
+                targets.iter().any(|t| t == expected),
+                "a console script names {expected} and the kernel never resolved \
+                 the module:attr target, so the entry function stayed a \
+                 dead-symbol candidate: {targets:?}"
+            );
+        }
+        // A key outside an entry-point section is not an entry point, however
+        // much it looks like one.
+        assert!(
+            !targets.iter().any(|t| t.contains("::entrypoint")),
+            "a `module:attr`-shaped value under [tool.ruff] is not a declared \
+             entry point: {targets:?}"
+        );
+        // The manifest keeps its own file-scoped claim.
+        assert!(extract_wiring_annotations("pyproject.toml", MANIFEST)
+            .iter()
+            .any(|a| a.kind == WiringKind::ScriptEntry && a.target_symbol == "pyproject.toml"));
+    }
+
+    /// A nested manifest names symbols under its own directory.
+    ///
+    /// A monorepo's `packages/foo/pyproject.toml` declares `pkg.cli:main` for
+    /// `packages/foo/pkg/cli.py`, not for a `pkg/` at the repository root —
+    /// which would be some other package's code.
+    #[test]
+    fn a_nested_manifest_resolves_against_its_own_directory() {
+        let targets: Vec<String> = config_entry_point_symbols(
+            "packages/foo/pyproject.toml",
+            "[project.scripts]\nfoo = \"pkg.cli:main\"\n",
+        )
+        .into_iter()
+        .map(|a| a.target_symbol)
+        .collect();
+        assert!(
+            targets.contains(&"packages/foo/pkg/cli.py::main".to_string()),
+            "{targets:?}"
+        );
+        assert!(
+            !targets.iter().any(|t| t.starts_with("pkg/")),
+            "a nested manifest must not claim a root-level module of the same \
+             name — that is another package's code: {targets:?}"
+        );
+    }
+
+    /// Nothing but a `pyproject.toml` declares Python entry points here.
+    #[test]
+    fn only_a_pyproject_contributes_entry_point_symbols() {
+        for path in ["Cargo.toml", "package.json", "docs/pyproject.toml.md"] {
+            assert!(
+                config_entry_point_symbols(path, "[project.scripts]\na = \"p.m:f\"\n").is_empty(),
+                "{path} must not be read as a Python manifest"
             );
         }
     }

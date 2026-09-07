@@ -915,6 +915,21 @@ pub enum WiringKind {
     /// plugin, a code-split route and a worker entry point are all reachable
     /// and all invisible to an import-edge walk.
     DynamicImport,
+    /// A config file declares this *symbol* as a program entry point.
+    ///
+    /// `target_symbol` is a resolved symbol identity — `pkg/mod.py::func` for
+    /// `[project.scripts] cli = "pkg.mod:func"` — not the manifest's own path.
+    /// The annotation lives on the manifest that makes the declaration and the
+    /// join that clears the symbol happens in `devmap-analyze`, where the whole
+    /// corpus is in scope; that is the same shape [`WiringKind::DynamicImport`]
+    /// uses, and for the same reason.
+    ///
+    /// Distinct from [`WiringKind::ScriptEntry`], which is a claim about the
+    /// *file* and exempts every symbol in it. A manifest declares no symbols,
+    /// so `ScriptEntry` on a `pyproject.toml` exempted nothing at all and the
+    /// function a console script names stayed a dead-symbol candidate at the
+    /// tier agents are told to act on.
+    ConfigEntryPoint,
 }
 
 /// One `m(...)` entry of a `type X interface { ... }` declaration.
