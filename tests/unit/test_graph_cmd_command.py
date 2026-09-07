@@ -1001,3 +1001,108 @@ def test_a_count_spelled_as_an_integral_float_is_not_thrown_away():
     out = _render([{"members": ["a"], "size": 3.0, "confidence": 0.5}])
 
     assert "0.50  3 symbols: a, +2 more" in out, out
+
+
+# --- The raw pattern that stays raw ---------------------------------------------
+#
+# Five renderers in `graph_cmd` still join or format a bare `.get()`:
+# `graph_trace`'s path, `graph_check_cmd`'s degree and cycle nodes,
+# `graph_process`'s steps, `graph_routes`'s handler ids. Driven with the shapes
+# that broke `_render_dead_clusters`, each misbehaved the same way — an `int` or
+# a `[1]` raised out of the render, a `str` joined into members that do not
+# exist. They stay raw because those shapes cannot arrive: everything they
+# render is derived from fields `CodeGraph` types, and `load_code_graph` refuses
+# the file before a renderer sees it. `graph_affected` reads the kernel, whose
+# counters the client refuses unless they are non-negative ints. These pin that
+# premise at the loader, at the schema and at the client; loosen `GraphNode.id`
+# to `Any` and the schema test fails before a renderer does.
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"nodes": "abc"},
+        {"nodes": [{"id": 5, "kind": "file"}]},
+        {"entry_roots": "abc"},
+    ],
+)
+def test_a_malformed_graph_file_is_refused_at_load_not_rendered(tmp_path, document):
+    """The real loader, the real file, the real command: refused, not rendered.
+
+    The message is the missing-graph one, and that is the right advice — a
+    rebuild replaces a truncated or hand-edited export.
+    """
+    from devcouncil.indexing.graph.build import load_code_graph
+
+    graph_file = tmp_path / ".devcouncil" / "graph" / "code_graph.json"
+    graph_file.parent.mkdir(parents=True)
+    graph_file.write_text(json.dumps({"schema_version": 2, **document}))
+
+    assert load_code_graph(tmp_path) is None
+
+    result = runner.invoke(app, ["map", "check", "--project-root", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "No code graph" in result.output
+    assert "abc" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("loc", "document"),
+    [
+        (("nodes",), {"nodes": "abc"}),
+        (("nodes", 0, "id"), {"nodes": [{"id": 5, "kind": "file"}]}),
+        (("nodes", 0, "id"), {"nodes": [{"id": ["a"], "kind": "file"}]}),
+        (("edges", 0, "source"), {"edges": [{"source": [1], "target": "b", "kind": "calls"}]}),
+        (("edges", 0, "target"), {"edges": [{"source": "a", "target": 7, "kind": "calls"}]}),
+        (("entry_roots",), {"entry_roots": "abc"}),
+        (("entry_roots", 0), {"entry_roots": [1]}),
+    ],
+)
+def test_the_fields_the_raw_renderers_derive_from_are_typed_at_load(loc, document):
+    """`GraphNode.id`, the edge endpoints and `entry_roots` refuse the trap shapes.
+
+    These are the fields the five raw renderers derive from. A `str` where a
+    list goes is the shape that does not crash — it joins — so it is the one
+    that must be refused here rather than tolerated downstream.
+    """
+    from pydantic import ValidationError
+
+    from devcouncil.indexing.graph.schema import CodeGraph
+
+    with pytest.raises(ValidationError) as caught:
+        CodeGraph.model_validate(document)
+    assert caught.value.errors()[0]["loc"] == loc
+
+
+@pytest.mark.parametrize("shown", ["abc", [1], 1.0, True])
+def test_a_counter_the_kernel_did_not_type_is_refused_before_it_renders(
+    tmp_path, monkeypatch, shown
+):
+    """`dev map affected` prints `shown N of M` raw; the client makes that safe.
+
+    Driven through the real `DevMapClient` with only the transport replaced:
+    `_validate_budgeted_sections` refuses the section, the command reports the
+    refusal and exits 3, and no counter line is printed from the bad value.
+    """
+    import devcouncil.devmap_client as devmap_client
+    from devcouncil.devmap_client import DevMapClient
+
+    payload = {
+        "tests": {
+            "shown": shown,
+            "hidden": 0,
+            "total": 1,
+            "truncated": False,
+            "tokens_used": 1,
+            "items": [{"path": "t/x.py", "depth": 1}],
+        }
+    }
+    client = DevMapClient(root_dir=tmp_path, autospawn=False)
+    monkeypatch.setattr(client, "_request", lambda body, cli_args, timeout=120.0: payload)
+    monkeypatch.setattr(devmap_client, "try_connect", lambda root: client)
+
+    result = runner.invoke(app, ["map", "affected", "x", "--project-root", str(tmp_path)])
+
+    assert result.exit_code == 3
+    assert "affected is unavailable" in result.output
+    assert f"shown {shown} of" not in result.output

@@ -1192,6 +1192,10 @@ def graph_affected(
         console.print("No affected tests found.")
     for row in rows:
         console.print(f"{row['path']}  depth {row['depth']}")
+    # Raw on purpose: the kernel is the only producer (no client, no answer —
+    # exit 3 above), and ``DevMapClient._budgeted`` has already refused any
+    # ``shown``/``total`` that is not a non-negative ``int``. See the note
+    # above ``_string_members``.
     console.print(f"shown {tests.get('shown', 0)} of {tests.get('total', 0)}")
 
 
@@ -1320,7 +1324,37 @@ def graph_trace(
     if not result.get("found"):
         console.print(f"No path between {start!r} and {end!r}")
         raise typer.Exit(code=1)
+    # Raw on purpose: both producers build ``path`` as ``list[str]`` — the
+    # kernel branch of ``_devmap_query_payload`` wraps each node in ``str()``,
+    # and ``trace_path`` walks ids ``CodeGraph`` typed at load. See the note
+    # above ``_string_members``.
     console.print(" → ".join(result.get("path") or []))
+
+
+# Where the same raw pattern is left alone, and why.
+#
+# The two helpers below exist because ``dead_clusters`` is the one payload
+# ``CodeGraph`` declares untyped (``List[Dict[str, Any]]``), so a hand-edited
+# ``code_graph.json`` reaches ``_render_dead_clusters`` exactly as written.
+# Five other renderers in this file join or format a bare ``.get()`` the same
+# way — ``graph_affected``, ``graph_trace``, ``graph_check_cmd``,
+# ``graph_process`` and ``graph_routes`` — and, driven with the same shapes,
+# every one of them misbehaved as the cluster renderer did: an ``int`` or a
+# ``[1]`` raised out of the whole render, and a ``str`` joined into members
+# that do not exist. They are not converted, because those shapes cannot
+# arrive. Every graph reaches them through ``load_code_graph``, which refuses
+# the file with ``CodeGraph.model_validate`` before any renderer sees it (the
+# store path validates per row), and what they render is derived from fields
+# the model types — ``GraphNode.id``, ``GraphEdge.source``/``target``,
+# ``entry_roots`` — never from a field it leaves as ``Any``. ``graph_affected``
+# has no graph path at all; its counters pass ``DevMapClient._budgeted``
+# first. Pinned in ``tests/unit/test_graph_cmd_command.py`` by
+# ``test_a_malformed_graph_file_is_refused_at_load_not_rendered`` and the two
+# tests beside it.
+#
+# The rule that keeps this true: a renderer that reads a field the model
+# leaves untyped — ``extras``, ``meta``, ``dead_clusters`` — goes through the
+# helpers; one that reads a typed field may stay raw.
 
 
 def _string_members(value: object) -> list[str]:
@@ -1849,6 +1883,10 @@ def graph_check_cmd(
         typer.echo(json.dumps(report, indent=2))
         return
     console.print(f"[bold]God nodes[/bold] (top {top} by degree)")
+    # Raw on purpose, both loops: ``degree`` is a ``Counter`` count and
+    # ``nodes`` a sorted list of edge endpoints, each derived by ``graph_check``
+    # from fields ``CodeGraph`` typed at load. See the note above
+    # ``_string_members``.
     for g in report.get("god_nodes") or []:
         console.print(
             f"  {g.get('degree'):>4}  {g.get('id')}  ({g.get('kind')})"
@@ -1889,6 +1927,9 @@ def graph_process(
     if not processes:
         console.print("No processes found.")
         return
+    # Raw on purpose: ``steps`` are ids ``CodeGraph`` typed at load, seeded
+    # from ``entry_roots`` (``List[str]``) or the ``entry`` the caller typed.
+    # See the note above ``_string_members``.
     for p in processes:
         console.print(f"[bold]{p.get('name')}[/bold]  (depth {p.get('depth')})")
         console.print("  " + " → ".join(p.get("steps") or []))
@@ -2111,6 +2152,9 @@ def graph_routes(
         )
         handlers = route.get("handlers") or []
         if handlers:
+            # Raw on purpose: ``handlers`` are ``_summarize_handler`` rows keyed
+            # by ids ``CodeGraph`` typed at load. See the note above
+            # ``_string_members``.
             console.print("  handlers: " + ", ".join(h.get("id", "?") for h in handlers[:4]))
         consumers = route.get("consumers") or []
         if consumers:
