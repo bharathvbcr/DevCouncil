@@ -10,6 +10,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const PROTOCOL_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a peer may sit on a fresh connection before sending anything.
+///
+/// A connection holds one of [`MAX_CONCURRENT_CONNECTIONS`] admission permits
+/// from `accept` until its frame is read, so a peer that connects and sends
+/// nothing holds a permit for the whole per-read timeout. Measured with the
+/// release binary: 120 idle connections made a legitimate `status` wait
+/// 5,003 ms — the whole [`IO_TIMEOUT`] — on a socket whose baseline answer is
+/// milliseconds. Every client this daemon has writes the moment it connects,
+/// so the first byte is due sooner than the rest; a slow writer that has
+/// started gets the ordinary timeout for every read after it.
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Upper bound on how long one query may occupy its connection task.
 ///
 /// Queries share the store connection with the drain loop's generation writes,
@@ -614,8 +625,24 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
     if text.len() > MAX_QUERY_BYTES {
         return Err(format!("query exceeds {MAX_QUERY_BYTES} bytes"));
     }
+    // The CLI refuses `--budget 0` for the same reason, and the two
+    // transports must agree: a zero budget returns an empty page that cannot
+    // be told apart from a complete answer.
+    if budget == 0 {
+        return Err(
+            "token budget must be at least 1: a zero budget returns an empty page \
+                    that cannot be told apart from a complete answer"
+                .to_string(),
+        );
+    }
     if budget > MAX_TOKEN_BUDGET {
         return Err(format!("token budget exceeds {MAX_TOKEN_BUDGET}"));
+    }
+    // Same rule as the CLI's `--depth`: a walk of depth 0 visits nothing and
+    // answers with an empty radius that reads as "nothing is affected".
+    // Commands without a traversal carry depth 1 here and never see this.
+    if depth == 0 {
+        return Err("traversal depth must be at least 1: depth 0 walks nothing".to_string());
     }
     if depth > MAX_TRAVERSAL_DEPTH {
         return Err(format!("traversal depth exceeds {MAX_TRAVERSAL_DEPTH}"));
@@ -1029,13 +1056,20 @@ where
         if std::time::Instant::now() >= deadline {
             return Err(FrameReadError::DeadlineExceeded);
         }
-        let read = tokio::time::timeout(io_timeout, stream.read(&mut chunk))
+        // The first byte is due within `FIRST_BYTE_TIMEOUT`; see its doc. The
+        // `min` keeps a caller-supplied shorter timeout meaningful.
+        let (timeout, what) = if payload.is_empty() {
+            (
+                FIRST_BYTE_TIMEOUT.min(io_timeout),
+                "IPC peer sent nothing after connecting",
+            )
+        } else {
+            (io_timeout, "IPC request read timed out")
+        };
+        let read = tokio::time::timeout(timeout, stream.read(&mut chunk))
             .await
             .map_err(|_| {
-                FrameReadError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "IPC request read timed out",
-                ))
+                FrameReadError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, what))
             })??;
         if read == 0 {
             return if payload.is_empty() {
@@ -2505,6 +2539,79 @@ mod tests {
         assert_eq!(value["ok"], true);
         assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(value["result"]["pending_count"], 0);
+    }
+
+    /// `search` with `budget: 0` answered `ok: true, shown: 0, hidden: 26`
+    /// over the socket — read back from the release binary — while the CLI
+    /// refuses the same request: a zero budget returns an empty page that
+    /// cannot be told apart from a complete answer. One rule, both transports.
+    #[tokio::test]
+    async fn protocol_refuses_a_zero_token_budget_like_the_cli_does() {
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let task = tokio::spawn(handle_stream(server, store));
+        client
+            .write_all(b"{\"version\":1,\"cmd\":\"search\",\"query\":\"x\",\"budget\":0}\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        task.await.unwrap().unwrap();
+        let value: Value = serde_json::from_str(response.trim()).unwrap();
+        assert_eq!(value["ok"], false, "{value}");
+        assert_eq!(value["error"]["code"], "invalid_parameters", "{value}");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("budget"),
+            "{value}"
+        );
+    }
+
+    /// A peer that connects and sends nothing holds one of the admission
+    /// permits until the per-read timeout. Measured with the release binary:
+    /// 120 idle connections made a legitimate `status` wait 5,003 ms — the
+    /// whole `IO_TIMEOUT` — on a socket whose baseline answer is milliseconds.
+    /// The first byte of a frame is due sooner than the rest: every client
+    /// this daemon has writes the moment it connects.
+    #[tokio::test]
+    async fn an_idle_peer_is_dropped_before_the_per_read_timeout() {
+        let (_held_open, server) = tokio::io::duplex(64);
+        let started = std::time::Instant::now();
+        let outcome = read_frame(
+            server,
+            IO_TIMEOUT,
+            std::time::Instant::now() + REQUEST_DEADLINE,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(matches!(outcome, Err(FrameReadError::Io(_))), "{outcome:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "an idle peer held its permit for {elapsed:?}; the first byte must be due \
+             well before the {IO_TIMEOUT:?} per-read timeout"
+        );
+
+        // Once the first byte has arrived, the per-read timeout is the ordinary
+        // one: a slow writer that has started is not an idle peer.
+        let (mut client, server) = tokio::io::duplex(64);
+        let reader = tokio::spawn(read_frame(
+            server,
+            IO_TIMEOUT,
+            std::time::Instant::now() + REQUEST_DEADLINE,
+        ));
+        client.write_all(b"{").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        client
+            .write_all(b"\"version\":1,\"cmd\":\"status\"}\n")
+            .await
+            .unwrap();
+        let payload = reader
+            .await
+            .unwrap()
+            .expect("a frame whose first byte arrived in time is read to its newline");
+        assert_eq!(payload, b"{\"version\":1,\"cmd\":\"status\"}");
     }
 
     #[tokio::test]
