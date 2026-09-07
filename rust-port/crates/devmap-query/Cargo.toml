@@ -178,3 +178,7 @@ required-features = ["parse"]
 [[test]]
 name = "graph_intel_is_emitted"
 required-features = ["parse"]
+
+[[test]]
+name = "dead_clusters_reach_a_query"
+required-features = ["parse"]

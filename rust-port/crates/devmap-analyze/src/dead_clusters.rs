@@ -111,13 +111,59 @@ pub struct DeadClusterScan {
     pub refused_oversized_graph: bool,
 }
 
-/// Beyond this many distinct symbols in the call graph, the scan refuses.
+impl DeadClusterScan {
+    /// The clusters to publish, or `None` when the pass refused to walk.
+    ///
+    /// Every surface that carries this scan needs the same conditional, and
+    /// three of them wrote it — or rather, three of them wrote `clusters`
+    /// straight through and rendered "the graph was too large to walk" as *the
+    /// pass ran and found no abandoned subsystems*: the query response, the
+    /// `code_graph.json` artifact, and the consumer manifest. A refusal leaves
+    /// `clusters` empty, so a field-for-field copy is indistinguishable from a
+    /// clean corpus at every one of them.
+    ///
+    /// Answered here rather than at each surface, with [`Self::incomplete_reason`]
+    /// as its other half, so a fourth consumer inherits the distinction instead
+    /// of having to know about it.
+    pub fn reported_clusters(&self) -> Option<&[DeadClusterReport]> {
+        if self.refused_oversized_graph {
+            None
+        } else {
+            Some(&self.clusters)
+        }
+    }
+
+    /// Why [`Self::reported_clusters`] is `None`, when it is `None` because the
+    /// pass ran and refused.
+    ///
+    /// A reader told only that no scan is recorded will rebuild, and the
+    /// rebuild walks the same graph and refuses again — so the ceiling is named
+    /// rather than merely alluded to, which also lets a reader judge how far
+    /// past it their repository is.
+    pub fn incomplete_reason(&self) -> Option<String> {
+        self.refused_oversized_graph.then(|| {
+            format!(
+                "the call graph exceeded {DEAD_CLUSTER_MAX_NODES} distinct symbols, \
+                 so no component scan ran for this generation"
+            )
+        })
+    }
+}
+
+/// The most distinct symbols the scan will hold before refusing.
 ///
 /// Tarjan is linear, so this is not about asymptotics — it is about the memory
 /// three index vectors over every node cost on a graph this kernel has measured
 /// at 944,000 edges. Refusing loudly beats a walk that succeeds by consuming
 /// the machine, and `refused_oversized_graph` says which happened rather than
 /// leaving an empty result to read as "no dead clusters".
+///
+/// **Exactly this many, inclusive.** The guard is `names.len() >= MAX` *before*
+/// a push, so a graph of exactly 400,000 distinct symbols is walked and the
+/// 400,001st refuses the whole scan. The old wording — "beyond this many" —
+/// described the same behaviour ambiguously enough that a reader could take the
+/// boundary either way, and a bound whose edge is a matter of interpretation is
+/// how an off-by-one becomes a load-bearing accident.
 pub const DEAD_CLUSTER_MAX_NODES: usize = 400_000;
 
 /// Whether this edge relates two *symbols* at all.
@@ -294,8 +340,28 @@ pub(crate) fn strongly_connected_components(adjacency: &[Vec<u32>]) -> Vec<Vec<u
 /// point is live for the same reason and by the same rule. Without it, a
 /// perfectly ordinary set of mutually recursive exported functions is a
 /// "cluster nothing reaches".
-fn externally_reachable_symbols(extractions: &[Extraction]) -> BTreeSet<String> {
-    let mut reachable = BTreeSet::new();
+///
+/// **It was only seeded from two of them.** `is_exported` and wiring
+/// annotations were here; every exemption the single-symbol cascade computes —
+/// a C-family header export, a Go interface implementation, a heritage
+/// override, a member of an exported type, a Go build variant — was not,
+/// because the cascade computed them one function later and kept them local.
+///
+/// The failure is not a tier disagreement. `__all__ += ["MyClass"]` with
+/// `MyClass.a()` and `MyClass.b()` calling each other is exempted twice by the
+/// single-symbol pass as declared public API, and was reported here at
+/// `DEAD_CLUSTER_CONFIDENCE` with the reason "reached by nothing outside the
+/// component" — a live proposal to delete public API. Two mutually recursive C
+/// functions declared in a shared header are the same shape, and neither had a
+/// test: `an_exported_member_keeps_the_cluster_alive` exercises `is_exported`
+/// and stops there.
+///
+/// `liveness::exempt_symbol_names` is now the one owner and both passes read it.
+fn externally_reachable_symbols(
+    extractions: &[Extraction],
+    resolution: &ResolutionResult,
+) -> BTreeSet<String> {
+    let mut reachable = crate::liveness::exempt_symbol_names(extractions, resolution);
     for ext in extractions {
         for symbol in &ext.symbols {
             if symbol.is_exported {
@@ -397,7 +463,7 @@ pub fn dead_clusters(extractions: &[Extraction], resolution: &ResolutionResult) 
         }
     }
 
-    let externally_reachable = externally_reachable_symbols(extractions);
+    let externally_reachable = externally_reachable_symbols(extractions, resolution);
     let qualifying = qualifying_symbols(resolution);
 
     let mut clustered_symbols: BTreeSet<String> = BTreeSet::new();

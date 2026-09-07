@@ -30,12 +30,41 @@ use crate::engine::{byte_span_to_line_range, resolve_source_path};
 use crate::manifest::{entry_root_paths, is_entry_root, CONSUMER_MAP_ENGINE};
 use crate::model::FreshnessInfo;
 use devmap_analyze::model::{AnalysisStatus, AnalysisSummary};
-use devmap_extract::languages::{capabilities_for_language, Capability};
+use devmap_extract::languages::Capability;
 use devmap_extract::model::{
     confidence_millis, EdgeKind, ExtractedSymbol, Extraction, ParseOutcome, SymbolKind, WiringKind,
 };
 use devmap_resolve::model::ResolvedEdge;
 use serde_json::{json, Map, Value};
+
+/// Every top-level key `code_graph.json` carries, sorted.
+///
+/// The contract with `schema.py`'s `CodeGraph`, declared once. It was written
+/// out by hand in three places — this module's own test, the CLI artifact test,
+/// and the pydantic model — and adding `dead_clusters_incomplete` to the writer
+/// broke two of them separately, which is the drift this list exists to end.
+///
+/// Additive by convention: pydantic ignores unknown keys, so a consumer that
+/// predates a key reads the artifact unchanged and `CODE_GRAPH_SCHEMA_VERSION`
+/// does not move. What must not happen is a key on one side and not the other,
+/// because *that* is silent — the field simply loads as its default, and for
+/// `dead_clusters` that default said "the component pass never ran".
+pub const CODE_GRAPH_TOP_LEVEL_KEYS: &[&str] = &[
+    "content_fingerprint",
+    "dead_clusters",
+    "dead_clusters_incomplete",
+    "dead_clusters_truncated",
+    "dead_code",
+    "edges",
+    "entry_roots",
+    "generated_head",
+    "indexed_hash",
+    "meta",
+    "nodes",
+    "schema_version",
+    "unreachable_files",
+    "unwired_candidates",
+];
 
 /// `SCHEMA_VERSION` in `src/devcouncil/indexing/graph/schema.py`.
 pub const CODE_GRAPH_SCHEMA_VERSION: u32 = 2;
@@ -196,8 +225,9 @@ fn file_area(path: &str) -> String {
 /// Mirrors `dead_symbol_identity` in `devmap-analyze`, which builds the
 /// `symbol_name` carried on every `DeadSymbolReport`. The two must agree
 /// because `dead_code[].id` is rebuilt as `file_path::symbol_name` and looked
-/// up against the node ids produced here; `dead_code_ids_join_the_node_ids`
-/// fails the moment they diverge.
+/// up against the node ids produced here;
+/// `dead_code_ids_join_the_node_ids_and_a_miss_is_explicit` fails the moment
+/// they diverge.
 fn relative_qualname(symbol: &ExtractedSymbol, file_path: &str) -> String {
     symbol
         .qualified_name
@@ -387,6 +417,37 @@ pub(crate) fn unwired_candidates(
     extractions: &[Extraction],
     edges: &[ResolvedEdge],
 ) -> UnwiredScan {
+    // Files whose *import* of something is not evidence that a human wired it.
+    //
+    // `TestFile` was here alone, and the same sentence is true of the other two
+    // — more strongly, if anything. A test importing a module is a real
+    // dependency that says nothing about production wiring; a **vendored**
+    // bundle importing one is a third party's dependency in a tree this
+    // repository does not author, and a **generated** file's import was written
+    // by a code generator from a spec, not by anyone deciding the module should
+    // exist. Either one silently cleared a genuinely stranded module: one
+    // vendored blob with a broad import surface can mark half a tree wired.
+    //
+    // Pre-existing, and `is_wiring_evidence` widened the surface it applies to,
+    // which is what makes it worth closing now rather than noting.
+    //
+    // Only the *source* side is filtered. A vendored file can still be an
+    // unwired candidate itself — that question is answered by the
+    // `WiringKind::Vendored` exemption further down, on its own grounds.
+    let non_authoring_importers: BTreeSet<&str> = extractions
+        .iter()
+        .filter(|ext| {
+            ext.wiring.iter().any(|w| {
+                matches!(
+                    w.kind,
+                    WiringKind::TestFile | WiringKind::Vendored | WiringKind::GeneratedFile
+                )
+            })
+        })
+        .map(|ext| ext.file_path.as_str())
+        .collect();
+    // Kept under its old name for the two later reads that mean exactly "a
+    // test", so widening this set could not silently widen those.
     let test_files: BTreeSet<&str> = extractions
         .iter()
         .filter(|ext| ext.wiring.iter().any(|w| w.kind == WiringKind::TestFile))
@@ -410,7 +471,7 @@ pub(crate) fn unwired_candidates(
         if !is_wiring_evidence(edge) || edge.source_file == edge.target_file {
             continue;
         }
-        if test_files.contains(edge.source_file.as_str()) {
+        if non_authoring_importers.contains(edge.source_file.as_str()) {
             continue;
         }
         if let Some(package_node) = edge.target_file.strip_prefix("package:") {
@@ -503,7 +564,7 @@ pub(crate) fn unwired_candidates(
             // shares its language, and that language's capability is the whole
             // answer. Checked after the parse-failure branch so a file with
             // both holes is charged once, to the more specific of the two.
-            if !capabilities_for_language(&ext.language).contains(Capability::Imports) {
+            if !ext.capabilities().contains(Capability::Imports) {
                 excluded_import_blind += 1;
                 return false;
             }
@@ -988,8 +1049,19 @@ pub fn build_code_graph_value(
         // than inside it: a 40-symbol dead subsystem is one thing a reader acts
         // on, and forty entries would push real single-symbol findings past the
         // cap. Top level, with the other finding lists.
-        "dead_clusters": analysis.dead_clusters.clusters.clone(),
+        //
+        // `null`, not `[]`, when the pass refused. The scan comes back with an
+        // empty `clusters` beside `refused_oversized_graph`, so writing the
+        // field straight through puts "the graph was too large to walk" into
+        // the artifact as "there are no abandoned subsystems" — and `CodeGraph`
+        // loads it as a computed empty finding with nothing to say otherwise.
+        // The same distinction `dead` makes on the query path.
+        "dead_clusters": analysis.dead_clusters.reported_clusters(),
         "dead_clusters_truncated": analysis.dead_clusters.truncated_clusters,
+        // Why the list above is absent, when it is absent because the pass ran
+        // and refused. A reader told only "not recorded" would rebuild, and the
+        // rebuild walks the same graph and refuses again.
+        "dead_clusters_incomplete": analysis.dead_clusters.incomplete_reason(),
         "entry_roots": entry_root_paths(extractions),
         "unwired_candidates": unwired.paths,
         // Computed by the component pass — files whose every declared symbol
@@ -1580,28 +1652,9 @@ mod tests {
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
-            keys,
-            [
-                "content_fingerprint",
-                // Added by W1.1, additively: the Python models ignore
-                // unknown keys (pydantic's default), so a consumer that
-                // predates the component pass reads the artifact
-                // unchanged. `CODE_GRAPH_SCHEMA_VERSION` therefore does
-                // not move: nothing that was readable stopped being so.
-                "dead_clusters",
-                "dead_clusters_truncated",
-                "dead_code",
-                "edges",
-                "entry_roots",
-                "generated_head",
-                "indexed_hash",
-                "meta",
-                "nodes",
-                "schema_version",
-                "unreachable_files",
-                "unwired_candidates",
-            ],
-            "top-level keys must match schema.py's CodeGraph exactly"
+            keys, CODE_GRAPH_TOP_LEVEL_KEYS,
+            "the writer must emit exactly the keys `CODE_GRAPH_TOP_LEVEL_KEYS` \
+             declares, which is the contract with schema.py's CodeGraph"
         );
         assert_eq!(value["schema_version"], json!(CODE_GRAPH_SCHEMA_VERSION));
     }
@@ -2041,6 +2094,47 @@ mod tests {
                 .is_some_and(|reason| reason.contains("coverage")),
             "the reason the answer cannot be trusted must be stated: {:?}",
             flagged["meta"]["devmap_rust"]["unavailable"]["unreachable_files"]
+        );
+    }
+
+    /// A refused component scan is written as an absence, not as an empty list.
+    ///
+    /// The artifact had the same hole the query surface did, two lines from a
+    /// mechanism built to close it: `unreachable_files` gets an `unavailable`
+    /// marker when the scan refuses, and `dead_clusters` was written straight
+    /// through — so `code_graph.json` recorded "the graph was too large to
+    /// walk" as `[]`, and `CodeGraph` loaded it as a computed empty finding.
+    ///
+    /// Both directions, because writing `null` unconditionally would pass the
+    /// first half and make every ordinary artifact claim it had no scan.
+    #[test]
+    fn a_refused_component_scan_is_written_as_null_with_its_reason() {
+        let files = [extract_file("k.py", "def a(): pass\n")];
+
+        let computed = graph(&files, &empty_analysis(), &[]);
+        assert_eq!(
+            computed["dead_clusters"],
+            json!([]),
+            "a scan that ran and found none is a finding and must stay a list"
+        );
+        assert_eq!(computed["dead_clusters_incomplete"], json!(null));
+
+        let mut refused = empty_analysis();
+        refused.dead_clusters.refused_oversized_graph = true;
+        refused.dead_clusters.clusters.clear();
+        let value = graph(&files, &refused, &[]);
+        assert_eq!(
+            value["dead_clusters"],
+            json!(null),
+            "nothing was walked, so the artifact knows nothing about components;              an empty list would say it walked and found none"
+        );
+        assert!(
+            value["dead_clusters_incomplete"]
+                .as_str()
+                .is_some_and(|reason| reason
+                    .contains(&devmap_analyze::dead_clusters::DEAD_CLUSTER_MAX_NODES.to_string())),
+            "and the reason must name the ceiling: {:?}",
+            value["dead_clusters_incomplete"]
         );
     }
 

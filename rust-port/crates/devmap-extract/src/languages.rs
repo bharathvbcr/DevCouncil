@@ -174,6 +174,30 @@ impl Capabilities {
             .copied()
             .filter(move |cap| self.contains(*cap))
     }
+
+    /// The capabilities this build lacks for the language, in bit order.
+    ///
+    /// The complement of [`Self::iter`], and the projection a *disclosure*
+    /// wants: a reader deciding whether an empty answer is a fact or a hole
+    /// needs the bits that are clear, not the ones that are set.
+    pub fn missing(self) -> impl Iterator<Item = Capability> {
+        Capability::ALL
+            .iter()
+            .copied()
+            .filter(move |cap| !self.contains(*cap))
+    }
+
+    /// Every capability either side observes.
+    ///
+    /// Needed because one language *key* can cover extractions with different
+    /// answers: `notebook` resolves per file through
+    /// [`crate::model::Extraction::capabilities`], so a corpus with a Python
+    /// notebook and an R notebook has one row and two capability sets behind it.
+    /// The union is the honest aggregate — the row means "this build can observe
+    /// X for files reported under this key", and it can, for some of them.
+    pub const fn union(self, other: Capabilities) -> Capabilities {
+        Capabilities(self.0 | other.0)
+    }
 }
 
 /// `Capabilities::new(CALLS | REFERENCES)` — bare `u8` constants so the set
@@ -650,7 +674,13 @@ pub fn detect_language(path: &Path) -> &'static str {
 /// left to the fallback: an explicit row is a decision, an absence is an
 /// oversight, and `every_reachable_grammar_declares_capabilities` cannot tell
 /// them apart otherwise.
-const NON_REGISTRY_CAPABILITIES: &[(&str, Capabilities)] = &[
+/// Capability rows for the grammars `detect_language` reaches through its
+/// fallback table rather than through [`LANGUAGE_SPECS`].
+///
+/// Public so `language_capabilities.rs` can require a probe for each, the way it
+/// already does for the registry. It could not before, and the notebook row was
+/// wrong for as long as nothing looked at it.
+pub const NON_REGISTRY_CAPABILITIES: &[(&str, Capabilities)] = &[
     ("shell", Capabilities::new(CALLS | REFERENCES)),
     ("sql", Capabilities::new(CALLS | REFERENCES)),
     // No linked grammar. Both reach `crate::fallback`, which recovers
@@ -671,6 +701,22 @@ const NON_REGISTRY_CAPABILITIES: &[(&str, Capabilities)] = &[
     ("generic", Capabilities::NONE),
     // A notebook is re-parsed with its kernel's grammar, so its capabilities
     // are that grammar's, resolved per file rather than declared here.
+    //
+    // "Resolved per file" was an intention with no implementation for as long as
+    // this row existed. `capabilities_for_language` takes a `&str` and
+    // `Extraction::language` for an `.ipynb` stays `"notebook"` — the kernel
+    // name goes into `ExtractionEngine::Notebook { kernel_language }` and never
+    // into `language` — so every clean notebook took this `NONE` verbatim: it
+    // was charged both `CallBlind` and `ImportBlind` with the false reason
+    // "`notebook` has no call extractor in this build", dropped from
+    // `files_with_call_extraction`, made `file_is_call_blind` for every symbol
+    // it declares, and counted into `unwired_candidates`' import-blind
+    // exclusions — while `notebook.rs` was filling `extraction.imports` and
+    // `extraction.calls` and `grammar_read_this_file()` returned true.
+    //
+    // [`crate::model::Extraction::capabilities`] is the resolver this comment
+    // always described, and every production charge site asks it. This row is
+    // the fail-closed answer for a caller holding only the string.
     ("notebook", Capabilities::NONE),
 ];
 

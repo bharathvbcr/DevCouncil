@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package probe;
+
+message Widget {
+  string name = 1;
+}
+
+service WidgetService {
+  rpc Draw(Widget) returns (Widget);
+}

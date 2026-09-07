@@ -1,5 +1,5 @@
 use crate::model::*;
-use devmap_extract::languages::{capabilities_for_language, Capability};
+use devmap_extract::languages::Capability;
 use devmap_extract::model::*;
 use devmap_resolve::model::*;
 use std::collections::{HashMap, HashSet};
@@ -345,11 +345,17 @@ impl ExtractionCoverage {
     /// existing two counters are kept apart for exactly this reason ("different
     /// claims"), and a third that means something else again gets the same
     /// treatment.
+    /// Derived from [`Self::blind_files`] rather than re-listing its counters.
+    ///
+    /// They were two hand-written sums over the same fields and they had already
+    /// drifted: `not_parsed_files` was in the numerator of `blind_share` and not
+    /// in this verdict, so 500 vendored bundles alone left the corpus "complete"
+    /// — every finding at 0.9 — and adding one `.proto` made it *50% blind* in
+    /// one step. `degraded_reason` then sized the hole from a third list again,
+    /// so the sentence a reader saw could not match what `cap` had charged.
+    /// One owner ends all three disagreements.
     pub fn is_complete(&self) -> bool {
-        self.parse_failed_files == 0
-            && self.pattern_recovered_files == 0
-            && self.discovery_refused_files == 0
-            && self.call_blind_files == 0
+        self.blind_files() == 0
     }
 
     /// Files that contributed no call edges, of any kind.
@@ -411,8 +417,49 @@ impl ExtractionCoverage {
     /// deliberately absent for the same reason it is absent from
     /// `is_complete()`: it is a hole in a different claim.
     fn blind_files(&self) -> usize {
-        self.files_without_call_extraction()
+        // **Not** `files_without_call_extraction()`, which is a count of *fact*
+        // and includes `not_parsed_files`. This is the count of *hole*, and the
+        // two differ by exactly the files `is_complete()` deliberately forgives:
+        // minified bundles the extractor chose not to parse, already exempt from
+        // liveness through `WiringKind::Vendored`, whose own field doc says
+        // folding them in "would cap every dead-code finding in every repository
+        // that vendors one bundle".
+        //
+        // They were in this sum anyway. A repository with 500 bundles and no
+        // other gap reported *complete* — so every finding kept 0.9 — and the
+        // first `.proto` added to it charged all 501 files at once, taking the
+        // ceiling from ungraded to the floor in a single file. Forgiving a class
+        // in the verdict and charging it in the ratio is not conservatism in
+        // either direction; it is two policies.
+        self.parse_failed_files
+            .saturating_add(self.pattern_recovered_files)
+            .saturating_add(self.call_blind_files)
             .saturating_add(self.discovery_refused_files)
+    }
+
+    /// The blind share this record is *charged* at, which is never smaller than
+    /// [`MIN_CHARGED_BLIND_SHARE`].
+    ///
+    /// `None` carries the same meaning it does in [`Self::blind_share`]:
+    /// nothing was measured, so nothing is known.
+    fn charged_blind_share(&self) -> Option<f32> {
+        Some(self.blind_share()?.max(MIN_CHARGED_BLIND_SHARE))
+    }
+
+    /// The ceiling for a claim whose strength compounds over `extra` extra
+    /// members, or `None` when no corpus was measured.
+    ///
+    /// One implementation for [`Self::cap`] and [`Self::cap_cluster`], which
+    /// were the same five lines with one term different — and therefore two
+    /// places for a future change to the curve, the floor or the minimum charge
+    /// to land in only one of.
+    fn ceiling(&self, extra: i32) -> Option<f32> {
+        let charged = self.charged_blind_share()?;
+        Some(
+            (1.0 - charged)
+                .powi(COVERAGE_CEILING_EXPONENT.saturating_add(extra))
+                .clamp(COVERAGE_LOSS_CONFIDENCE_CAP, HIGHEST_DEGRADED_CONFIDENCE),
+        )
     }
 
     /// The share of the corpus whose calls were never extracted, in `[0, 1]`.
@@ -488,13 +535,34 @@ impl ExtractionCoverage {
         // No measured corpus behind the record: nothing was read, so nothing is
         // known, and the floor is the only honest answer. Reachable — a build
         // whose discovery refused every file it found produces exactly this.
-        let Some(blind_share) = self.blind_share() else {
+        let Some(ceiling) = self.ceiling(0) else {
             return confidence.min(COVERAGE_LOSS_CONFIDENCE_CAP);
         };
-        let ceiling = (1.0 - blind_share)
-            .powi(COVERAGE_CEILING_EXPONENT)
-            .clamp(COVERAGE_LOSS_CONFIDENCE_CAP, HIGHEST_DEGRADED_CONFIDENCE);
         confidence.min(ceiling)
+    }
+
+    /// The ceiling for a finding whose **own file** contributed no call edges.
+    ///
+    /// [`Self::cap`] prices a corpus-wide ratio, and for a file that is itself
+    /// blind that ratio is the wrong denominator by construction. Measured: in
+    /// a 99-Python / 1-Terraform corpus the `.tf` symbols took the corpus
+    /// ceiling — 1% blind — and published at the top of `inferred` carrying
+    /// `CALL_BLIND_REASON`, which is the string "this language has no call
+    /// extractor in this build" priced as a one-percent risk. The local blind
+    /// share for that file is 1.0: no call in it was read, and the files most
+    /// likely to call it are the other files of the same language, every one of
+    /// them equally unread. `(1 - 1.0)^n` is zero, so the floor is what the same
+    /// curve returns for it, and the floor is what it gets.
+    ///
+    /// The worse of the two, not the local one alone, so a call-blind file in an
+    /// *also* badly degraded corpus cannot come back better than its neighbours.
+    ///
+    /// Distinct from the wholesale exemption `is_parse_failed` applies. A
+    /// call-blind file's declarations are real — a grammar read them cleanly —
+    /// so the finding stays visible and non-exempt; only its confidence says
+    /// that the evidence behind it could never have been gathered.
+    pub fn cap_call_blind_file(&self, confidence: f32) -> f32 {
+        self.cap(confidence).min(COVERAGE_LOSS_CONFIDENCE_CAP)
     }
 
     /// The ceiling for a **whole-graph** claim, which falls faster than
@@ -515,17 +583,23 @@ impl ExtractionCoverage {
     /// `size` is clamped rather than trusted: `powi` on a 400,000-member
     /// component would underflow to zero, which the floor would catch anyway,
     /// but the clamp says so rather than relying on it.
+    ///
+    /// The clamp's *lower* bound is 1, so `cap_cluster(x, 0)` prices a
+    /// zero-member component as a one-member one. No such component exists —
+    /// Tarjan emits no empty component and the pass discards single nodes that
+    /// do not self-loop — so this is a total function over an input the
+    /// producer cannot supply, not a rounding of a real case. It is 1 rather
+    /// than 0 because `(1 - s)^8` is the *single-symbol* ceiling, and a claim
+    /// about nothing must not be priced more cheaply than a claim about
+    /// something.
     pub fn cap_cluster(&self, confidence: f32, size: usize) -> f32 {
         if self.is_complete() {
             return confidence;
         }
-        let Some(blind_share) = self.blind_share() else {
+        let members = size.clamp(1, CLUSTER_COMPOUNDING_MEMBER_CAP) as i32;
+        let Some(ceiling) = self.ceiling(members) else {
             return confidence.min(COVERAGE_LOSS_CONFIDENCE_CAP);
         };
-        let members = size.clamp(1, CLUSTER_COMPOUNDING_MEMBER_CAP) as i32;
-        let ceiling = (1.0 - blind_share)
-            .powi(COVERAGE_CEILING_EXPONENT + members)
-            .clamp(COVERAGE_LOSS_CONFIDENCE_CAP, HIGHEST_DEGRADED_CONFIDENCE);
         confidence.min(ceiling)
     }
 }
@@ -575,6 +649,57 @@ const CLUSTER_COMPOUNDING_MEMBER_CAP: usize = 64;
 /// to rely on quietly; it is why those tests still pass unchanged, and it is
 /// checked rather than assumed.
 const COVERAGE_CEILING_EXPONENT: i32 = 8;
+
+/// The smallest blind share a degraded scan may be charged at.
+///
+/// **The denominator measures the wrong thing, and this is what is done about
+/// it.** `blind_share` is a ratio over *file counts*, and file counts are not
+/// what a dead-code claim rests on — call sites are. The two diverge in one
+/// direction and only one:
+///
+/// * Discovery refuses a file precisely for exceeding `MAX_SOURCE_BYTES`
+///   (`db.rs`), so the refused class is *by definition* the largest files in the
+///   tree.
+/// * Parse failures and `Skipped` cluster on the same tail: generated clients,
+///   vendored bundles, machine-written protocol code.
+///
+/// So the files that go blind are systematically the files holding the most
+/// calls, and a ratio over counts prices them as *average*. One 4 MB generated
+/// client in a 1,000-file repository is 0.1% by file count and plausibly fifteen
+/// percent of the corpus's call edges; the formula saw 0.1%.
+///
+/// **Weighting is not available, and pretending otherwise would be worse.** A
+/// discovery-refused file has no `Extraction` at all — no symbols, no bytes,
+/// nothing to weigh — so a symbol-weighted or byte-weighted share would give the
+/// one class we *know* is huge a weight of zero. That is the same error with an
+/// arithmetic alibi.
+///
+/// What is left is to state the uncertainty instead of pricing it at zero. A
+/// corpus with any hole in it is charged at least this much, whatever the file
+/// count says.
+///
+/// **The value, and the shape it is chosen for.** At 5%, `0.95^8 = 0.663`. That
+/// is the middle of `inferred` — the tier whose contract is "unconfirmed" — with
+/// 0.237 of headroom below `EXTRACTED_FLOOR_MILLIS` and 0.263 above
+/// `INFERRED_FLOOR_MILLIS`. The rule it encodes is one sentence: **a check with
+/// a known hole in it reports in the middle of "unconfirmed", never at its
+/// edge.**
+///
+/// Without it the ceiling for a small hole was `HIGHEST_DEGRADED_CONFIDENCE`
+/// itself, 0.89, so the entire distance between "the caller of this symbol was
+/// never read" and "safe to delete" was ten thousandths and a rounding rule.
+/// The audit's Q-1 — `lib.py::helper` whose only caller sits in a file over
+/// `MAX_SOURCE_BYTES` — scored 0.35 before the grading landed and 0.89 after,
+/// which is a claim that is *literally false* published one tier below the
+/// act-on threshold. It now scores 0.663.
+///
+/// **It costs the grading nothing.** What the grading is for is separation: with
+/// every confidence tied at 0.35, `ORDER BY confidence DESC, file_path`
+/// degenerated to alphabetical and an agent read the first 66 filenames instead
+/// of the strongest evidence. Separation needs the three tiers to differ, not to
+/// approach `extracted` — and at 0.663 against 0.4 they differ by more than they
+/// did at 0.89 against 0.4 in every way that a ranked read can use.
+const MIN_CHARGED_BLIND_SHARE: f32 = 0.05;
 
 /// The highest confidence a finding from an incomplete scan may carry.
 ///
@@ -949,7 +1074,7 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
             // Both bits are asked independently: HCL is call-blind *and*
             // import-blind, Java only the second, and collapsing them would
             // make a file with one hole indistinguishable from a file with two.
-            let capabilities = capabilities_for_language(&ext.language);
+            let capabilities = ext.capabilities();
             if !capabilities.contains(Capability::Calls) {
                 gaps.push(ExtractionGapEntry {
                     path: ext.file_path.clone(),
@@ -1003,8 +1128,7 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
     coverage.files_with_call_extraction = extractions
         .iter()
         .filter(|ext| {
-            a_grammar_read_this_file(ext)
-                && capabilities_for_language(&ext.language).contains(Capability::Calls)
+            a_grammar_read_this_file(ext) && ext.capabilities().contains(Capability::Calls)
         })
         .count();
     coverage
@@ -1016,37 +1140,16 @@ pub struct LivenessOutcome {
     pub coverage: ExtractionCoverage,
 }
 
-/// Dead-symbol findings only.
+/// The two symbol sets the whole liveness question turns on: what an edge
+/// names, and what an edge *might* name.
 ///
-/// Thin delegate over [`analyze_liveness_with_coverage`], kept because callers
-/// that only want the findings should not have to name the coverage record.
-/// The confidence cap is applied by the canonical implementation, so both entry
-/// points report the same tiers.
-pub fn analyze_liveness(
-    extractions: &[Extraction],
-    resolution: &ResolutionResult,
-) -> Vec<DeadSymbolReport> {
-    analyze_liveness_with_coverage(extractions, resolution, DiscoveryCoverage::none()).reports
-}
+/// Hoisted out of `analyze_liveness_with_coverage`'s body so the exemption
+/// index below — which both passes read — can be built from the same walk
+/// instead of a second one that would eventually disagree about which
+/// resolutions count as reaching.
+type CallIndex = (HashSet<(String, String)>, HashSet<(String, String)>);
 
-pub fn analyze_liveness_with_coverage(
-    extractions: &[Extraction],
-    resolution: &ResolutionResult,
-    discovery: DiscoveryCoverage,
-) -> LivenessOutcome {
-    let mut coverage = extraction_coverage(extractions);
-    // Folded in before the cap is applied, not after the reports are built: a
-    // file discovery never read may hold the only call to a symbol here, so a
-    // refusal has to reach `coverage.cap()` the same way a parse failure does.
-    coverage.discovery_refused_files = discovery.charged();
-    // Computed once for the whole corpus: the join is name-only, so it has no
-    // per-file component to recompute.
-    let unresolved_names = unresolved_namesake_names(resolution);
-    let supertypes = supertypes_by_type(resolution);
-    let go_interface_specs = go_interface_specs_by_package(extractions);
-    let c_header_exports = c_header_exported_names(extractions);
-    let go_build_variants = go_build_variant_identities(extractions);
-
+fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
     // File-scoped called symbols: (target_file, symbol_name_or_qualified_name)
     let mut called_symbols: HashSet<(String, String)> = HashSet::new();
     let mut ambiguous_symbols: HashSet<(String, String)> = HashSet::new();
@@ -1111,78 +1214,50 @@ pub fn analyze_liveness_with_coverage(
         }
     }
 
-    let mut reports = Vec::new();
+    (called_symbols, ambiguous_symbols)
+}
 
+/// Why the single-symbol pass exempts a symbol, keyed by
+/// `(file path, qualified name)`.
+///
+/// **Hoisted, because two passes were answering this question and only one of
+/// them knew the answers.** `dead_clusters::externally_reachable_symbols` seeded
+/// its live set from `symbol.is_exported` and wiring annotations alone, so every
+/// exemption computed here was invisible to it. The consequence is not a tier
+/// disagreement, it is a proposal to delete public API: `__all__ +=
+/// ["MyClass"]` with `MyClass.a()` and `MyClass.b()` mutually recursive exempts
+/// both symbols in this pass and reports the pair as a cluster "reached by
+/// nothing outside the component" in that one. Two mutually recursive C
+/// functions declared in a shared header are the same shape.
+///
+/// One owner, read twice, rather than one computation copied. The cost is a
+/// second walk of the corpus in [`exempt_symbol_names`]; the alternative —
+/// threading this through `dead_clusters`' public signature — would have moved
+/// the drift from the data to the call sites.
+///
+/// The `.or_else` precedence of the original chain is preserved exactly, because
+/// the reason string is a machine token in three tests: symbol wiring, heritage
+/// override, Go interface, C header, exported owner, Go build variant.
+fn symbol_exemption_index(
+    extractions: &[Extraction],
+    resolution: &ResolutionResult,
+    called: &HashSet<(String, String)>,
+    ambiguous: &HashSet<(String, String)>,
+) -> HashMap<(String, String), String> {
+    let supertypes = supertypes_by_type(resolution);
+    let go_interface_specs = go_interface_specs_by_package(extractions);
+    let c_header_exports = c_header_exported_names(extractions);
+    let go_build_variants = go_build_variant_identities(extractions);
+
+    let mut index: HashMap<(String, String), String> = HashMap::new();
     for ext in extractions {
-        // X6: Parse-failed files must NEVER be reported as confirmed dead code
-        // candidates — and neither must pattern-recovered ones.
-        //
-        // A `Fallback` file had its declarations recovered by line pattern
-        // because no grammar exists for its language, and that tier extracts no
-        // calls at all. So *every* symbol in such a file is uncalled by
-        // construction, and reporting them would hand `devmap dead` one false
-        // candidate per declaration in every `.proto`, `.ps1` and `.vb` in the
-        // tree. "Nothing calls it" is only evidence when calls were looked for.
-        //
-        // `Skipped` joins them under the same sentence. Today its only symbol
-        // is the `File` node, which the loop below exempts anyway, so this
-        // changes no verdict — it is here because the rule is "nothing calls it
-        // is only evidence when calls were looked for", and a file nobody
-        // parsed is the clearest case of calls not being looked for. Leaving it
-        // out would make the guard depend on the `File`-node exemption holding
-        // somewhere else.
-        let is_parse_failed = matches!(
-            ext.parse_outcome,
-            ParseOutcome::Failed { .. }
-                | ParseOutcome::Fallback { .. }
-                | ParseOutcome::Skipped { .. }
-        );
-
-        // The same sentence as `is_parse_failed`, one step further out: a file
-        // whose grammar succeeded but whose language has no call extractor also
-        // extracted no calls, so every symbol in it is uncalled by
-        // construction. `is_parse_failed` could not see this because the parse
-        // did not fail — that is exactly how CFML and Terraform symbols reached
-        // the `extracted` tier.
-        let file_is_call_blind = a_grammar_read_this_file(ext)
-            && !capabilities_for_language(&ext.language).contains(Capability::Calls);
-
         // A wiring annotation is file-scoped only when it targets the file
         // itself. Symbol-scoped annotations must never be read as file-scoped:
-        // one `#[test] fn` would otherwise exempt every symbol in the file,
-        // which is the same over-exemption the file-level decorator rule
-        // already suffers from.
-        let (file_wiring, symbol_wiring): (Vec<_>, Vec<_>) = ext
+        // one `#[test] fn` would otherwise exempt every symbol in the file.
+        let wired: HashMap<&str, &str> = ext
             .wiring
             .iter()
-            .partition(|w| w.target_symbol == ext.file_path);
-
-        let is_file_exempt = is_parse_failed
-            || file_wiring.iter().any(|w| {
-                matches!(
-                    w.kind,
-                    WiringKind::Vendored
-                        | WiringKind::TestFile
-                        | WiringKind::GeneratedFile
-                        | WiringKind::ScriptEntry
-                        | WiringKind::StructuralExempt
-                        | WiringKind::FrameworkDecorator
-                        | WiringKind::Launcher
-                        | WiringKind::ReExportPackage
-                        // An explicit author declaration. The Python side has
-                        // honoured this since it was introduced and the kernel
-                        // did not, so a file whose author had already answered
-                        // the question was reported as dead on every build.
-                        | WiringKind::AllowUnwired
-                )
-            });
-
-        // Per-symbol exemptions: a runtime, framework, or harness reaches the
-        // symbol without an explicit call site, or the language forbids the
-        // symbol from ever being marked public. Keyed by `qualified_name`,
-        // which is what the extractor writes into `target_symbol`.
-        let symbol_exemptions: HashMap<&str, &str> = symbol_wiring
-            .iter()
+            .filter(|w| w.target_symbol != ext.file_path)
             .filter(|w| {
                 matches!(
                     w.kind,
@@ -1232,6 +1307,230 @@ pub fn analyze_liveness_with_coverage(
             HashSet::new()
         };
 
+        for sym in &ext.symbols {
+            if sym.kind == SymbolKind::File || sym.name.starts_with('_') {
+                continue;
+            }
+            let identity = dead_symbol_identity(sym, &ext.file_path);
+            let is_ambiguously_called = ambiguous
+                .contains(&(ext.file_path.clone(), sym.name.clone()))
+                || ambiguous.contains(&(ext.file_path.clone(), sym.qualified_name.clone()));
+
+            let heritage =
+                reached_through_a_supertype(&ext.file_path, &identity, &supertypes, called);
+
+            let reason: Option<String> = wired
+                .get(sym.qualified_name.as_str())
+                .map(|details| (*details).to_string())
+                .or(heritage)
+                .or_else(|| {
+                    go_interface_exemptions
+                        .get(sym.qualified_name.as_str())
+                        .cloned()
+                })
+                // A definition whose name a header publishes is this unit's
+                // public API, and its callers can lie outside the corpus
+                // entirely — a library, a foreign-language binding, hand-written
+                // assembly. Keyed on the bare name because that is what a
+                // prototype declares; the qualified name belongs to the file
+                // that defines it and no header could ever match it.
+                .or_else(|| {
+                    (is_c_family_language(&ext.language)
+                        && !is_c_header_path(&ext.file_path)
+                        && c_header_exports.contains(sym.name.as_str()))
+                    .then(|| "Declared in a C-family header — public interface".to_string())
+                })
+                // A member of an exported type, in a language where the member
+                // could not have said so itself.
+                //
+                // Keyed on `parent_symbol`, which is the owner's exact
+                // `qualified_name`. An earlier attempt split the member's own
+                // qualified name on `.` and matched `A.java::A.used` as owner
+                // `A` — the dot it found belonged to the file extension, and it
+                // exempted every method in every Java class.
+                .or_else(|| {
+                    sym.parent_symbol
+                        .as_deref()
+                        .filter(|parent| exported_owners.contains(parent))
+                        .map(|_| "Member of an exported type — public interface".to_string())
+                })
+                // A spurious ambiguity, not a real one: the candidates the
+                // resolver could not choose between are one identity compiled
+                // for different platforms, so the call reached whichever one
+                // this build selected.
+                //
+                // Gated on `is_ambiguously_called` deliberately. If *nothing*
+                // calls the identity it is dead in every variant, and the
+                // confident branch must keep saying so — a build constraint
+                // explains an ambiguity, never an absence of callers.
+                .or_else(|| {
+                    (is_ambiguously_called
+                        && go_package_key(ext)
+                            .map(|(dir, package)| {
+                                go_build_variants.contains(&(dir, package, identity.clone()))
+                            })
+                            .unwrap_or(false))
+                    .then(|| GO_BUILD_VARIANT_REASON.to_string())
+                });
+
+            if let Some(reason) = reason {
+                index.insert((ext.file_path.clone(), sym.qualified_name.clone()), reason);
+            }
+        }
+    }
+    index
+}
+
+/// The qualified names the single-symbol pass would never call dead.
+///
+/// The seed `dead_clusters` was missing. Public because the cluster pass lives
+/// in another module and must reach the same verdict from the same evidence —
+/// that is the entire content of this fix.
+///
+/// Go build variants are in here too, and harmlessly: the cluster pass already
+/// treats an ambiguously-named symbol as qualifying evidence, so an identity
+/// exempted for being one platform's spelling of another was never going to be
+/// reported confidently anyway.
+pub fn exempt_symbol_names(
+    extractions: &[Extraction],
+    resolution: &ResolutionResult,
+) -> std::collections::BTreeSet<String> {
+    let (called, ambiguous) = called_and_ambiguous_symbols(resolution);
+    symbol_exemption_index(extractions, resolution, &called, &ambiguous)
+        .into_keys()
+        .map(|(_, qualified_name)| qualified_name)
+        .collect()
+}
+
+/// Dead-symbol findings only.
+///
+/// Thin delegate over [`analyze_liveness_with_coverage`], kept because callers
+/// that only want the findings should not have to name the coverage record.
+/// The confidence cap is applied by the canonical implementation, so both entry
+/// points report the same tiers.
+pub fn analyze_liveness(
+    extractions: &[Extraction],
+    resolution: &ResolutionResult,
+) -> Vec<DeadSymbolReport> {
+    analyze_liveness_with_coverage(extractions, resolution, DiscoveryCoverage::none()).reports
+}
+
+pub fn analyze_liveness_with_coverage(
+    extractions: &[Extraction],
+    resolution: &ResolutionResult,
+    discovery: DiscoveryCoverage,
+) -> LivenessOutcome {
+    let mut coverage = extraction_coverage(extractions);
+    // Folded in before the cap is applied, not after the reports are built: a
+    // file discovery never read may hold the only call to a symbol here, so a
+    // refusal has to reach `coverage.cap()` the same way a parse failure does.
+    coverage.discovery_refused_files = discovery.charged();
+    // Computed once for the whole corpus: the join is name-only, so it has no
+    // per-file component to recompute.
+    let unresolved_names = unresolved_namesake_names(resolution);
+
+    let (called_symbols, ambiguous_symbols) = called_and_ambiguous_symbols(resolution);
+    // The exemptions, computed ahead of the cascade rather than inside it, so
+    // `dead_clusters` can read the same set. See `symbol_exemption_index`: the
+    // cluster pass seeded its live set from `is_exported` and wiring alone and
+    // therefore proposed deleting exported Python members, C functions declared
+    // in a shared header, Go interface implementations and heritage overrides —
+    // every one of which this pass had already exempted, one function later.
+    let exemptions =
+        symbol_exemption_index(extractions, resolution, &called_symbols, &ambiguous_symbols);
+
+    let mut reports = Vec::new();
+
+    for ext in extractions {
+        // X6: Parse-failed files must NEVER be reported as confirmed dead code
+        // candidates — and neither must pattern-recovered ones.
+        //
+        // A `Fallback` file had its declarations recovered by line pattern
+        // because no grammar exists for its language, and that tier extracts no
+        // calls at all. So *every* symbol in such a file is uncalled by
+        // construction, and reporting them would hand `devmap dead` one false
+        // candidate per declaration in every `.proto`, `.ps1` and `.vb` in the
+        // tree. "Nothing calls it" is only evidence when calls were looked for.
+        //
+        // `Skipped` joins them under the same sentence. Today its only symbol
+        // is the `File` node, which the loop below exempts anyway, so this
+        // changes no verdict — it is here because the rule is "nothing calls it
+        // is only evidence when calls were looked for", and a file nobody
+        // parsed is the clearest case of calls not being looked for. Leaving it
+        // out would make the guard depend on the `File`-node exemption holding
+        // somewhere else.
+        let is_parse_failed = matches!(
+            ext.parse_outcome,
+            ParseOutcome::Failed { .. }
+                | ParseOutcome::Fallback { .. }
+                | ParseOutcome::Skipped { .. }
+        );
+
+        // The same sentence as `is_parse_failed`, one step further out: a file
+        // whose grammar succeeded but whose language has no call extractor also
+        // extracted no calls, so every symbol in it is uncalled by
+        // construction. `is_parse_failed` could not see this because the parse
+        // did not fail — that is exactly how CFML and Terraform symbols reached
+        // the `extracted` tier.
+        let file_is_call_blind =
+            a_grammar_read_this_file(ext) && !ext.capabilities().contains(Capability::Calls);
+
+        // Every finding about a symbol in this file, priced against the
+        // blindness that actually bears on it.
+        //
+        // `file_is_call_blind` used to select only the *reason string*; the
+        // confidence still came from `coverage.cap`, which is a corpus-wide
+        // ratio. So in a 99-Python / 1-Terraform corpus a `.tf` symbol published
+        // at the top of `inferred` carrying "this language has no call extractor
+        // in this build" — a permanent property of the build, priced as a one
+        // percent transient. The reason and the number now agree.
+        let cap = |confidence: f32| {
+            if file_is_call_blind {
+                coverage.cap_call_blind_file(confidence)
+            } else {
+                coverage.cap(confidence)
+            }
+        };
+
+        // A wiring annotation is file-scoped only when it targets the file
+        // itself. Symbol-scoped annotations must never be read as file-scoped:
+        // one `#[test] fn` would otherwise exempt every symbol in the file,
+        // which is the same over-exemption the file-level decorator rule
+        // already suffers from.
+        // The symbol-scoped half now lives in `symbol_exemption_index`, which
+        // applies the same rule: an annotation is file-scoped only when it
+        // targets the file itself, or one `#[test] fn` would exempt every
+        // symbol in the file.
+        let file_wiring: Vec<_> = ext
+            .wiring
+            .iter()
+            .filter(|w| w.target_symbol == ext.file_path)
+            .collect();
+
+        let is_file_exempt = is_parse_failed
+            || file_wiring.iter().any(|w| {
+                matches!(
+                    w.kind,
+                    WiringKind::Vendored
+                        | WiringKind::TestFile
+                        | WiringKind::GeneratedFile
+                        | WiringKind::ScriptEntry
+                        | WiringKind::StructuralExempt
+                        | WiringKind::FrameworkDecorator
+                        | WiringKind::Launcher
+                        | WiringKind::ReExportPackage
+                        // An explicit author declaration. The Python side has
+                        // honoured this since it was introduced and the kernel
+                        // did not, so a file whose author had already answered
+                        // the question was reported as dead on every build.
+                        | WiringKind::AllowUnwired
+                )
+            });
+
+        // Per-symbol exemptions: a runtime, framework, or harness reaches the
+        // symbol without an explicit call site, or the language forbids the
+        // symbol from ever being marked public. Keyed by `qualified_name`,
+        // which is what the extractor writes into `target_symbol`.
         let file_reason = if matches!(ext.parse_outcome, ParseOutcome::Fallback { .. }) {
             Some(
                 "Declarations recovered by pattern, no call extraction — \
@@ -1276,71 +1575,14 @@ pub fn analyze_liveness_with_coverage(
             };
 
             let is_exported = sym.is_exported;
-            // Computed before the borrowed chain below so the owned string
-            // outlives it.
-            let heritage_exemption = reached_through_a_supertype(
-                &ext.file_path,
-                &dead_symbol_identity(sym, &ext.file_path),
-                &supertypes,
-                &called_symbols,
-            );
-            let symbol_exemption: Option<&str> = symbol_exemptions
-                .get(sym.qualified_name.as_str())
-                .copied()
-                .or(heritage_exemption.as_deref())
-                .or_else(|| {
-                    go_interface_exemptions
-                        .get(sym.qualified_name.as_str())
-                        .map(String::as_str)
-                })
-                // A definition whose name a header publishes is this unit's
-                // public API, and its callers can lie outside the corpus
-                // entirely — a library, a foreign-language binding, hand-written
-                // assembly. Keyed on the bare name because that is what a
-                // prototype declares; the qualified name belongs to the file
-                // that defines it and no header could ever match it.
-                .or_else(|| {
-                    (is_c_family_language(&ext.language)
-                        && !is_c_header_path(&ext.file_path)
-                        && c_header_exports.contains(sym.name.as_str()))
-                    .then_some("Declared in a C-family header — public interface")
-                })
-                // A spurious ambiguity, not a real one: the candidates the
-                // resolver could not choose between are one identity compiled
-                // for different platforms, so the call reached whichever one
-                // this build selected.
-                //
-                // Gated on `is_ambiguously_called` deliberately. If *nothing*
-                // calls the identity it is dead in every variant, and the
-                // confident branch must keep saying so — a build constraint
-                // explains an ambiguity, never an absence of callers.
-                // A member of an exported type, in a language where the member
-                // could not have said so itself.
-                //
-                // Keyed on `parent_symbol`, which is the owner's exact
-                // `qualified_name`. An earlier attempt split the member's own
-                // qualified name on `.` and matched `A.java::A.used` as owner
-                // `A` — the dot it found belonged to the file extension, and it
-                // exempted every method in every Java class.
-                .or_else(|| {
-                    sym.parent_symbol
-                        .as_deref()
-                        .filter(|parent| exported_owners.contains(parent))
-                        .map(|_| "Member of an exported type — public interface")
-                })
-                .or_else(|| {
-                    (is_ambiguously_called
-                        && go_package_key(ext)
-                            .map(|(dir, package)| {
-                                go_build_variants.contains(&(
-                                    dir,
-                                    package,
-                                    dead_symbol_identity(sym, &ext.file_path),
-                                ))
-                            })
-                            .unwrap_or(false))
-                    .then_some(GO_BUILD_VARIANT_REASON)
-                });
+            // One lookup where six `.or_else` arms used to sit. The arms moved
+            // to `symbol_exemption_index` unchanged and in the same order —
+            // symbol wiring, heritage override, Go interface, C header,
+            // exported owner, Go build variant — because the reason string is a
+            // machine token three tests match exactly.
+            let symbol_exemption: Option<&str> = exemptions
+                .get(&(ext.file_path.clone(), sym.qualified_name.clone()))
+                .map(String::as_str);
 
             if !is_called
                 && is_ambiguously_called
@@ -1352,7 +1594,7 @@ pub fn analyze_liveness_with_coverage(
                 reports.push(DeadSymbolReport {
                     symbol_name: dead_symbol_identity(sym, &ext.file_path),
                     file_path: ext.file_path.clone(),
-                    confidence: coverage.cap(0.4),
+                    confidence: cap(0.4),
                     is_exempt: false,
                     exemption_reason: Some("only_ambiguous_callers".to_string()),
                 });
@@ -1376,7 +1618,7 @@ pub fn analyze_liveness_with_coverage(
                 reports.push(DeadSymbolReport {
                     symbol_name: dead_symbol_identity(sym, &ext.file_path),
                     file_path: ext.file_path.clone(),
-                    confidence: coverage.cap(0.4),
+                    confidence: cap(0.4),
                     is_exempt: false,
                     exemption_reason: Some(UNRESOLVED_NAMESAKE_REASON.to_string()),
                 });
@@ -1395,7 +1637,7 @@ pub fn analyze_liveness_with_coverage(
                 reports.push(DeadSymbolReport {
                     symbol_name: dead_symbol_identity(sym, &ext.file_path),
                     file_path: ext.file_path.clone(),
-                    confidence: coverage.cap(0.9),
+                    confidence: cap(0.9),
                     is_exempt: false,
                     // Most specific reason wins, matching the exempt branch
                     // below. A symbol in a call-blind file is not merely

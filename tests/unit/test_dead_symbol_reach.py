@@ -353,3 +353,65 @@ def test_the_outage_marker_never_masks_a_real_finding(tmp_path, monkeypatch):
     """
     gaps = _run(tmp_path, monkeypatch, lambda *_a, **_k: _response())
     assert not any(g.gap_type == "quality_gate_failed" for g in gaps)
+
+
+# --- The transcription this module's docstring says is frozen ---
+#
+# `devmap_client._norm_repo_path` is a hand copy of `indexing.wiring._norm`,
+# deliberately not imported: `devmap_client` sits below `indexing` in the
+# dependency order and has to stay importable without it. Its docstring said the
+# rule was "frozen by ``test_symbol_is_reached.py``, which asserts the two
+# agree" — a file that has never existed in this repository. Nothing anywhere
+# referenced `_norm_repo_path` outside its own module, so the two copies were
+# free to drift, and the drift is silent where it matters most: the caller at
+# `symbol_reach` compares a normalised `target_file` against a normalised
+# `path`, so a disagreement makes every edge miss the equality test and the
+# symbol reports "never referenced" — a positive claim from a comparison that
+# never matched.
+#
+# Behaviour is compared, not source text: a legitimate rewrite of either copy
+# must be free to change its spelling and not its answer.
+
+_NORMALISATION_CASES = [
+    "",
+    "a.py",
+    "./a.py",
+    ".//a.py",
+    "././a.py",
+    "./././",
+    "src/a.py",
+    ".\\a.py",
+    "src\\pkg\\a.py",
+    ".\\.\\src\\a.py",
+    "..\\a.py",
+    "../a.py",
+    "../../elsewhere/secret.py",
+    # The trap the docstring names by hand: `lstrip("./")` would eat the
+    # leading dot of a hidden directory and the whole of a dots-only name.
+    "./.config/a.py",
+    ".config/a.py",
+    "...a.py",
+    ".hidden",
+    "/abs/a.py",
+    "//server/share/a.py",
+    "a b/c.py",
+    "a/./b.py",
+    "tests/./unit/a.py",
+    "\\",
+    "/",
+    ".",
+    "..",
+    "./",
+]
+
+
+@pytest.mark.parametrize("path", _NORMALISATION_CASES)
+def test_the_hand_copied_normaliser_answers_what_wiring_answers(path: str) -> None:
+    from devcouncil.devmap_client import _norm_repo_path
+    from devcouncil.indexing.wiring import _norm
+
+    assert _norm_repo_path(path) == _norm(path), (
+        f"devmap_client._norm_repo_path and wiring._norm disagree on {path!r}; "
+        "symbol_reach compares target_file against path through this rule, so a "
+        "disagreement reports a referenced symbol as never referenced"
+    )

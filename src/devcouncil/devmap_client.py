@@ -166,6 +166,28 @@ class SymbolReach:
         )
 
 
+#: The resolution rungs the kernel names, strongest first.
+#:
+#: Mirrored here rather than imported because the kernel is another process, and
+#: validated *before* the request goes out for the reason the kernel refuses a
+#: typo rather than defaulting: a misspelled floor answered at full breadth is a
+#: filtered answer a caller believes is narrow, which is worse than an error.
+#: `test_the_client_rung_names_match_the_kernels` reads the label arms out of
+#: `rung.rs` and pins the two lists against each other.
+MIN_RUNG_NAMES = ("deterministic", "high", "speculative")
+
+
+def _validated_min_rung(min_rung: Optional[str]) -> Optional[str]:
+    """``None`` for no floor, or a name the kernel will accept."""
+    if min_rung is None:
+        return None
+    if min_rung not in MIN_RUNG_NAMES:
+        raise DevMapClientError(
+            f"devmap min_rung must be one of {', '.join(MIN_RUNG_NAMES)}; got {min_rung!r}"
+        )
+    return min_rung
+
+
 @dataclass
 class BudgetedResponse:
     shown: int
@@ -187,6 +209,35 @@ class BudgetedResponse:
     #: of 1 the reverse walk routinely reports it with `truncated: false` and
     #: `hidden: 0`.
     walk_incomplete: Optional[str] = None
+    #: Abandoned cycles found in the same generation, for a ``dead`` answer.
+    #:
+    #: ``None`` means the kernel sent none — the generation predates the
+    #: component pass, or this is not a dead-code answer. An empty list means
+    #: the pass ran and found none, which is a finding. Keeping the two apart is
+    #: the whole reason this is ``Optional`` and not a defaulted list.
+    #:
+    #: The pass finds what a one-hop inbound-edge join structurally cannot: a
+    #: subsystem whose functions call each other has an inbound edge on every
+    #: symbol, so ``dead_code`` reports none of it. Until this field existed the
+    #: kernel computed the answer and no Python consumer could see it.
+    dead_clusters: Optional[List[Dict[str, Any]]] = None
+    #: Components found and not listed, because the producer's cap cut them.
+    #:
+    #: Beside the list rather than folded into ``hidden``, which counts what the
+    #: token budget trimmed. Different failures, and ``shown + hidden == total``
+    #: is enforced against the second.
+    dead_clusters_truncated: int = 0
+    #: Why ``dead_clusters`` is ``None``, when the kernel ran the pass and
+    #: refused it.
+    #:
+    #: The scan has three outcomes and an ``Optional[list]`` holds two. A call
+    #: graph past the kernel's node ceiling comes back with an empty cluster
+    #: list and a refusal flag; carrying it as ``[]`` would say *the pass ran
+    #: and found no abandoned subsystems*, which is the reading that gets a
+    #: subsystem kept. The kernel therefore sends no list at all and puts the
+    #: reason here, so a consumer that predates this field fails closed on the
+    #: absence rather than open on an empty finding.
+    dead_clusters_incomplete: Optional[str] = None
 
 
 @dataclass
@@ -210,7 +261,9 @@ def _norm_repo_path(path: str) -> str:
     Matches ``devcouncil.indexing.wiring._norm`` exactly. Not imported from
     there because this module sits below ``indexing`` in the dependency order
     and must stay importable without it; the rule is two lines and frozen by
-    ``test_symbol_is_reached.py``, which asserts the two agree.
+    ``tests/unit/test_dead_symbol_reach.py``'s
+    ``test_the_hand_copied_normaliser_answers_what_wiring_answers``, which
+    runs both over the same paths and asserts the answers agree.
     """
     normalized = path.replace("\\", "/")
     while normalized.startswith("./"):
@@ -919,6 +972,36 @@ class DevMapClient:
         walk_incomplete = resp.get("walk_incomplete")
         if walk_incomplete is not None and not isinstance(walk_incomplete, str):
             raise DevMapClientError("devmap response walk_incomplete must be a string")
+        # Validated, not merely copied. A cluster list is read as "delete this
+        # subsystem", and a malformed one arriving as a silently-dropped `None`
+        # would be indistinguishable from a generation that has no clusters —
+        # the one distinction this field exists to carry.
+        dead_clusters = resp.get("dead_clusters")
+        if dead_clusters is not None:
+            if not isinstance(dead_clusters, list) or not all(
+                isinstance(cluster, dict) for cluster in dead_clusters
+            ):
+                raise DevMapClientError(
+                    "devmap response dead_clusters must be a list of objects"
+                )
+            dead_clusters = list(dead_clusters)
+        dead_clusters_truncated = self._strict_nonnegative_int(
+            resp.get("dead_clusters_truncated", 0), "response dead_clusters_truncated"
+        )
+        dead_clusters_incomplete = resp.get("dead_clusters_incomplete")
+        if dead_clusters_incomplete is not None:
+            if not isinstance(dead_clusters_incomplete, str):
+                raise DevMapClientError(
+                    "devmap response dead_clusters_incomplete must be a string"
+                )
+            if dead_clusters is not None:
+                # Both at once is the kernel claiming a scan it also says did
+                # not run. Refusing beats picking one, because either choice
+                # would be a guess presented as the kernel's answer.
+                raise DevMapClientError(
+                    "devmap response carries both dead_clusters and "
+                    "dead_clusters_incomplete; a refused scan has no list"
+                )
         return BudgetedResponse(
             shown=shown,
             hidden=hidden,
@@ -928,6 +1011,9 @@ class DevMapClient:
             items=list(items),
             resolution=resp.get("resolution"),
             walk_incomplete=walk_incomplete,
+            dead_clusters=dead_clusters,
+            dead_clusters_truncated=dead_clusters_truncated,
+            dead_clusters_incomplete=dead_clusters_incomplete,
         )
 
     def status(self) -> DevMapStatus:
@@ -1002,19 +1088,38 @@ class DevMapClient:
         resp = self._request(payload, args)
         return self._budgeted(resp, limit)
 
-    def deps(self, target: str, depth: int = 1) -> BudgetedResponse:
+    def deps(
+        self, target: str, depth: int = 1, min_rung: Optional[str] = None
+    ) -> BudgetedResponse:
+        """Callees of ``target``, optionally floored at a resolution rung.
+
+        ``min_rung`` is W2.3's point and it stopped at the kernel: the CLI and
+        the IPC command have taken a floor since it landed, and no Python or MCP
+        surface exposed one, so an agent asking for deterministic-only edges
+        still could not. The histogram the kernel returns describes the
+        population *before* the floor, so a narrowed answer stays readable as
+        one.
+        """
         self._validate_query(target, "target")
         if depth != 1:
             raise DevMapClientError("devmap deps depth must be 1")
         budget = 2000
-        resp = self._request(
-            {"cmd": "deps", "target": target, "budget": budget},
-            ["deps", "--budget", str(budget), *_positional(target)],
-        )
+        rung = _validated_min_rung(min_rung)
+        payload: Dict[str, Any] = {"cmd": "deps", "target": target, "budget": budget}
+        args = ["deps", "--budget", str(budget)]
+        if rung is not None:
+            payload["min_rung"] = rung
+            args += ["--min-rung", rung]
+        args += _positional(target)
+        resp = self._request(payload, args)
         return self._budgeted(resp, budget)
 
     def neighbors(
-        self, targets: List[str], depth: int = 1, min_confidence: float = 0.0
+        self,
+        targets: List[str],
+        depth: int = 1,
+        min_confidence: float = 0.0,
+        min_rung: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Callers and callees for several targets in one exchange.
 
@@ -1032,31 +1137,41 @@ class DevMapClient:
         Each direction is validated by :meth:`_budgeted` exactly as it would be
         on its own, so a composed answer cannot smuggle past the count and
         truncation invariants the separate calls enforce.
+
+        ``min_rung`` is accepted for the same reason: this is the two queries
+        composed, both of them take a floor, and a composition that drops a
+        filter its parts accept answers a broader question than the caller
+        asked while looking like it answered theirs.
         """
         if not isinstance(targets, list):
             raise DevMapClientError("devmap neighbors targets must be a list")
         for target in targets:
             self._validate_query(target, "target")
+        rung = _validated_min_rung(min_rung)
         budget = 2000
-        resp = self._request(
-            {
-                "cmd": "neighbors",
-                "targets": list(targets),
-                "budget": budget,
-                "depth": depth,
-                "min_confidence": min_confidence,
-            },
-            [
-                "neighbors",
-                "--budget",
-                str(budget),
-                "--depth",
-                str(depth),
-                "--min-confidence",
-                str(min_confidence),
-                *_positional(*targets),
-            ],
-        )
+        payload: Dict[str, Any] = {
+            "cmd": "neighbors",
+            "targets": list(targets),
+            "budget": budget,
+            "depth": depth,
+            "min_confidence": min_confidence,
+        }
+        args = [
+            "neighbors",
+            "--budget",
+            str(budget),
+            "--depth",
+            str(depth),
+            "--min-confidence",
+            str(min_confidence),
+        ]
+        if rung is not None:
+            payload["min_rung"] = rung
+            args += ["--min-rung", rung]
+        # Positional last: `--min-rung` takes a value, and clap would read the
+        # first target as it if the flag trailed the list.
+        args += _positional(*targets)
+        resp = self._request(payload, args)
         entries = resp.get("neighbors")
         if not isinstance(entries, list):
             raise DevMapClientError("devmap neighbors response must carry a list")
@@ -1088,24 +1203,48 @@ class DevMapClient:
             })
         return answers
 
-    def impact(self, target: str, depth: int = 3) -> BudgetedResponse:
+    def impact(
+        self, target: str, depth: int = 3, min_rung: Optional[str] = None
+    ) -> BudgetedResponse:
+        """Callers of ``target``, optionally floored at a resolution rung.
+
+        See :meth:`deps` for why the floor is here.
+        """
         self._validate_query(target, "target")
         self._validate_depth(depth)
         budget = 2000
-        resp = self._request(
-            {"cmd": "impact", "target": target, "budget": budget, "depth": depth},
-            ["impact", "--budget", str(budget), "--depth", str(depth), *_positional(target)],
-        )
+        rung = _validated_min_rung(min_rung)
+        payload: Dict[str, Any] = {
+            "cmd": "impact",
+            "target": target,
+            "budget": budget,
+            "depth": depth,
+        }
+        args = ["impact", "--budget", str(budget), "--depth", str(depth)]
+        if rung is not None:
+            payload["min_rung"] = rung
+            args += ["--min-rung", rung]
+        args += _positional(target)
+        resp = self._request(payload, args)
         return self._budgeted(resp, budget)
 
     def trace(
-        self, from_symbol: str, depth: int = 3, to_symbol: Optional[str] = None
+        self,
+        from_symbol: str,
+        depth: int = 3,
+        to_symbol: Optional[str] = None,
+        min_rung: Optional[str] = None,
     ) -> BudgetedResponse:
+        """A path between two symbols, optionally floored at a resolution rung.
+
+        See :meth:`deps` for why the floor is here.
+        """
         budget = 2000
         self._validate_query(from_symbol, "trace source")
         self._validate_depth(depth)
         if to_symbol is not None:
             self._validate_query(to_symbol, "trace destination")
+        rung = _validated_min_rung(min_rung)
         payload: Dict[str, Any] = {
             "cmd": "trace",
             "from": from_symbol,
@@ -1116,6 +1255,9 @@ class DevMapClient:
         # accepts no option after `--`, and the two endpoints are positional so
         # their order still carries meaning.
         args = ["trace", "--budget", str(budget), "--depth", str(depth)]
+        if rung is not None:
+            payload["min_rung"] = rung
+            args += ["--min-rung", rung]
         if to_symbol is None:
             args += _positional(from_symbol)
         else:

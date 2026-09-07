@@ -115,3 +115,15 @@ required-features = ["parse"]
 [[test]]
 name = "unresolved_namesake_veto"
 required-features = ["parse"]
+
+[[test]]
+name = "coverage_cap_at_repository_scale"
+required-features = ["parse"]
+
+[[test]]
+name = "exemptions_reach_both_passes"
+required-features = ["parse"]
+
+[[test]]
+name = "a_notebook_is_not_call_blind"
+required-features = ["parse"]

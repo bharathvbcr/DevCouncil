@@ -358,3 +358,70 @@ def test_snapshot_empty_roots_not_complete(tmp_path):
 def test_load_missing_baseline_returns_none(tmp_path):
     assert load_liveness_baseline(tmp_path, "NO-SUCH") is None
     assert not (Path(tmp_path) / ".devcouncil" / "liveness_baseline").exists()
+
+
+def test_both_version_guards_exist_and_neither_alone_invalidates_the_other_half():
+    """**M8.** The "bump these two together" instruction was a comment.
+
+    ``LIVENESS_SCHEMA_VERSION``'s doc says to bump it in step with
+    ``wiring.LIVENESS_SCAN_VERSION``, and nothing tested the coupling — so a
+    change to one alone left the other half of the diff comparing a baseline
+    written by an engine that measured something else. Both were in fact moved
+    together at 1→2 / 4→5, which is what makes the instruction plausible and
+    also why nobody would have noticed it going unenforced.
+
+    The instruction is unnecessary if both guards really refuse independently,
+    which is the property tested here rather than the pair of numbers: a stale
+    ``scan_version`` must invalidate the symbol half whatever the schema says,
+    and a stale ``schema_version`` must invalidate the whole diff whatever the
+    scan version says. With both holding, bumping either alone is safe — and if
+    a future edit removes one guard, this fails instead of the comment quietly
+    becoming load-bearing.
+    """
+    from devcouncil.indexing.wiring import LIVENESS_SCAN_VERSION
+    from devcouncil.verification.checks.liveness_ratchet import LIVENESS_SCHEMA_VERSION
+
+    def run(baseline_extra: dict, current_extra: dict):
+        baseline = {
+            "complete": True,
+            "scan_version": LIVENESS_SCAN_VERSION,
+            "schema_version": LIVENESS_SCHEMA_VERSION,
+            "unwired_candidates": [],
+            "unreachable_files": [],
+            "dead_symbol_candidates": [],
+            "symbol_index": ["pkg/mod.py::helper"],
+            **baseline_extra,
+        }
+        current = {
+            "schema_version": LIVENESS_SCHEMA_VERSION,
+            "unwired_candidates": [],
+            "unreachable_files": [],
+            "dead_symbol_candidates": ["pkg/mod.py:3 helper"],
+            **current_extra,
+        }
+        return detect_liveness_regressions(
+            baseline,
+            current,
+            set(),
+            task=_task(),
+            next_gap_id=_gap_id,
+            blocking=False,
+        )
+
+    # Both current: the regression is reported, or every assertion below holds
+    # for want of anything to suppress.
+    assert len(run({}, {})) == 1, "the fixture must produce a finding to suppress"
+
+    # A stale scan version suppresses the symbol half on its own, with the
+    # schema version left current.
+    assert run({"scan_version": LIVENESS_SCAN_VERSION - 1}, {}) == [], (
+        "the symbol diff must refuse a baseline from a different scanner even "
+        "when the schema version matches"
+    )
+
+    # And a stale schema version suppresses the diff on its own, with the scan
+    # version left current.
+    assert run({"schema_version": LIVENESS_SCHEMA_VERSION - 1}, {}) == [], (
+        "the diff must refuse a baseline from a different schema even when the "
+        "scan version matches"
+    )

@@ -565,8 +565,14 @@ fn consumer_manifest_json(
         // list rather than inside it: a 40-symbol dead subsystem is one thing a
         // reader acts on, and forty entries would push real single-symbol
         // findings past the cap.
-        "dead_clusters": analysis.dead_clusters.clusters,
+        //
+        // `null` when the component pass refused an oversized graph. The flag
+        // above says the *reachability* answer is untrustworthy; this key used
+        // to publish the refusal's empty `clusters` as a computed result beside
+        // it, which is the same fact stated two ways with opposite meanings.
+        "dead_clusters": analysis.dead_clusters.reported_clusters(),
         "dead_clusters_truncated": analysis.dead_clusters.truncated_clusters,
+        "dead_clusters_incomplete": analysis.dead_clusters.incomplete_reason(),
         "liveness_meta": {
             "engine": CONSUMER_MAP_ENGINE,
             "dead_symbol": {
@@ -1783,6 +1789,50 @@ mod tests {
                 .is_none(),
             "a computed answer must not also be declared unavailable: {:?}",
             value["liveness_meta"]["unavailable"]
+        );
+    }
+
+    /// The two artifacts must agree about a refused component scan, and neither
+    /// may publish its empty `clusters` as a result.
+    ///
+    /// The manifest already sets `liveness_unreachable_unreliable` on a refusal
+    /// and then published `dead_clusters: []` two lines later — the same fact
+    /// stated twice with opposite meanings, and the reassuring statement is the
+    /// one a reader acts on. Both keys now come from `DeadClusterScan`'s own
+    /// accessors, so this asserts the surface, not a second copy of the rule.
+    #[test]
+    fn a_refused_component_scan_is_absent_from_the_manifest_not_empty_in_it() {
+        let extractions = vec![extract_file("k.py", "def a(): pass\n")];
+
+        let computed = consumer_json(&extractions, &empty_analysis(), &[]);
+        assert_eq!(
+            computed["dead_clusters"],
+            json!([]),
+            "a scan that ran and found none is a finding, and stays a list"
+        );
+        assert_eq!(computed["dead_clusters_incomplete"], json!(null));
+
+        let mut refused = empty_analysis();
+        refused.dead_clusters.refused_oversized_graph = true;
+        refused.dead_clusters.clusters.clear();
+        let value = consumer_json(&extractions, &refused, &[]);
+        assert_eq!(
+            value["liveness_unreachable_unreliable"], true,
+            "precondition: the refusal reaches the flag it always reached"
+        );
+        assert_eq!(
+            value["dead_clusters"],
+            json!(null),
+            "and it must reach the list too; `[]` beside that flag says the \
+             component pass ran and found nothing"
+        );
+        assert!(
+            value["dead_clusters_incomplete"]
+                .as_str()
+                .is_some_and(|reason| reason
+                    .contains(&devmap_analyze::dead_clusters::DEAD_CLUSTER_MAX_NODES.to_string())),
+            "with the ceiling named, so a reader knows a rebuild will not help: {:?}",
+            value["dead_clusters_incomplete"]
         );
     }
 

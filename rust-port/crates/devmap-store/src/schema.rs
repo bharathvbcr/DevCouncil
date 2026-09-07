@@ -654,6 +654,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_file_payloads_identity
     ON file_payloads(file_id, content_hash, language,
                      COALESCE(grammar_version, ''), COALESCE(analyzer_version, ''));
 
+-- The third payload index, and the one this step shipped without.
+--
+-- `DROP INDEX idx_generation_files_cache_identity` below removes v13's index,
+-- whose whole job was the extraction-cache fallback's lookup *by content
+-- identity alone* (`db.rs::payload_for_cache_key`) — no `file_id`, because
+-- `CacheKey` has none. The surviving unique index leads with `file_id` and
+-- cannot serve that query, so a migrated store full-scanned `file_payloads` on
+-- every cache miss: the exact cost v13 was introduced to remove, reintroduced
+-- for existing installations only, and invisible because `validate_schema`
+-- checks columns and never indexes.
+--
+-- Fresh stores were always fine, which is why nothing caught it.
+-- `migration_ladder.rs::a_migrated_store_carries_the_same_schema_as_a_fresh_one`
+-- now compares the two schemas object by object, so the next index added to
+-- `CREATE_SCHEMA_V3` and forgotten here fails rather than degrading quietly.
+CREATE INDEX IF NOT EXISTS idx_file_payloads_cache_identity
+    ON file_payloads(content_hash, language, grammar_version, analyzer_version);
+
 CREATE TABLE IF NOT EXISTS generation_file_rows (
     generation_id INTEGER NOT NULL,
     file_id       INTEGER NOT NULL REFERENCES paths(id),
@@ -684,7 +702,12 @@ SELECT f.generation_id, f.file_id, p.payload_id
 DROP INDEX IF EXISTS idx_generation_files_cache_identity;
 DROP TABLE generation_files;
 
-CREATE VIEW generation_files AS
+-- `IF NOT EXISTS` to match `CREATE_SCHEMA_V3`. The `already_split` probe in
+-- `db.rs` means this batch never runs against a store that has the view, so the
+-- guard changes no behaviour today — it removes the asymmetry that made the
+-- step's safety depend on a probe in a different file rather than on the
+-- statement itself.
+CREATE VIEW IF NOT EXISTS generation_files AS
 SELECT m.generation_id      AS generation_id,
        m.file_id            AS file_id,
        p.language           AS language,
@@ -699,6 +722,78 @@ SELECT m.generation_id      AS generation_id,
 "#;
 
 pub const CURRENT_SCHEMA_VERSION: i32 = 17;
+
+/// Every DDL batch a fresh store applies, in the order `Store::migrate` applies
+/// them.
+///
+/// One owner for "what the current schema is". The create path names these five
+/// constants and so does [`declared_index_names`], so the gate cannot come to
+/// assert a schema the creator does not build. `MIGRATION_V6_TO_V7` is here
+/// because a fresh store really does run it — probed, because `ADD COLUMN` is
+/// not idempotent — and leaving it out would make this list a near-copy of the
+/// truth rather than the truth.
+pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
+    CREATE_SCHEMA_V3,
+    BUILD_HISTORY_TABLE,
+    MIGRATION_V6_TO_V7,
+    UNRESOLVED_TABLE,
+    COVERAGE_GAPS_TABLE,
+];
+
+/// Strip SQL line comments so a scan of DDL text cannot read prose as code.
+fn without_sql_comments(sql: &str) -> String {
+    sql.lines()
+        .map(|line| match line.find("--") {
+            Some(at) => &line[..at],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The indexes the current schema declares, read out of the DDL that creates
+/// them.
+///
+/// **Derived, because the alternative rotted once already.** `REQUIRED_SCHEMA`
+/// is a hand-written second copy of the column list and stayed correct only
+/// because a test compares it to a live store; an index list written the same
+/// way would need the same test and would have had none, which is precisely how
+/// `MIGRATION_V16_TO_V17` came to drop `idx_generation_files_cache_identity`
+/// and create no successor for it. Nothing reported that, because
+/// `validate_schema` checked columns and an index is not a column.
+///
+/// Parsing our own `const` is a real derivation rather than a guess: the text
+/// scanned is the text executed, in this crate, and
+/// `the_index_gate_reads_every_index_the_schema_creates` pins the parse against
+/// a store SQLite actually built.
+pub fn declared_index_names() -> Vec<String> {
+    let mut names = Vec::new();
+    for batch in FRESH_SCHEMA_BATCHES {
+        let sql = without_sql_comments(batch);
+        for chunk in sql.split("CREATE ").skip(1) {
+            let rest = match chunk.strip_prefix("UNIQUE ") {
+                Some(rest) => rest,
+                None => chunk,
+            };
+            let Some(rest) = rest.strip_prefix("INDEX ") else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+            let name: String = rest
+                .trim_start()
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '(' && *c != ';')
+                .collect();
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
 
 #[cfg(test)]
 mod retention_constant_tests {

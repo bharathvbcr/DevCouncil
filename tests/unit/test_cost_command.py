@@ -187,8 +187,9 @@ def test_cost_budget_set_without_config_errors(tmp_path, monkeypatch):
 # the stdout+stderr streams merged, so it parses identically whether or not a banner
 # leaked onto stdout — it cannot detect this bug at all, which is why the pre-existing
 # tests above passed while `dev cost budget --json --set 5.00` emitted unparseable
-# stdout. `tests/e2e/test_json_stdout_contract.py` re-proves the same contract through a
-# real subprocess, where the streams are genuinely separate rather than emulated.
+# stdout. The two `a_real_process_...` tests at the end of this file re-prove the
+# same contract through a real subprocess, where the streams are genuinely separate
+# rather than emulated.
 
 
 def _init(tmp_path, monkeypatch):
@@ -272,3 +273,76 @@ def test_cost_budget_json_missing_config_still_emits_one_object(tmp_path, monkey
     data = json.loads(result.stdout)
     assert data["ok"] is False
     assert "Config not found" in data["error"]
+
+
+# --- The same contract, through a real process ---
+#
+# Everything above runs `app` in-process. `CliRunner(mix_stderr=False)` *models*
+# two streams by handing Click two buffers; it does not prove that the process
+# writes the confirmation to fd 2. A routing bug that Click's own machinery
+# papers over — a `print` straight to `sys.__stdout__`, a library that reopens
+# fd 1, a banner emitted before Click installs its wrappers — is invisible to
+# every assertion above and visible to a shell pipeline immediately, which is
+# where `--json` is actually consumed (`dev cost budget --json | jq`).
+#
+# The comment that used to sit here pointed at a test under a tests/e2e directory
+# that has never existed, and said it re-proved this "through a real subprocess".
+# The stronger half of the contract was documented and not written.
+# `tests/unit/test_a_cited_test_exists.py` now refuses that shape.
+
+
+def _dev(root, *args):
+    """Run the real CLI in a child process, with genuinely separate streams."""
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    # pytest's `pythonpath` setting does not reach a child interpreter.
+    env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+    env.pop("DEVCOUNCIL_LOG_DIR", None)
+    # Colour codes and wrapping would be a second, unrelated reason for the
+    # stdout bytes not to parse.
+    env["NO_COLOR"] = "1"
+    env["TERM"] = "dumb"
+    env["COLUMNS"] = "200"
+    return subprocess.run(
+        [sys.executable, "-m", "devcouncil.cli.main", *args],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+    )
+
+
+def test_a_real_process_puts_exactly_one_json_object_on_stdout(tmp_path, monkeypatch):
+    """Success path, unemulated: stdout parses whole, the confirmation is on stderr."""
+    _init(tmp_path, monkeypatch)
+
+    done = _dev(tmp_path, "cost", "budget", "--json", "--set", "5.00")
+
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout)["budget_usd"] == 5.0
+    assert "cost_budget_usd = 5.00" in done.stderr
+    assert "cost_budget_usd = 5.00" not in done.stdout
+
+
+def test_a_real_process_puts_exactly_one_json_object_on_stdout_when_it_fails(
+    tmp_path, monkeypatch
+):
+    """Error path: a non-zero exit is still a `--json` path, so stdout still parses.
+
+    Zero objects on stdout breaks the contract exactly as two would — a caller
+    piping to `jq` gets a parse error either way, and the diagnostic that would
+    explain it is on the stream they did not read.
+    """
+    _init(tmp_path, monkeypatch)
+
+    done = _dev(tmp_path, "cost", "budget", "--json", "--set", "5.00", "--clear")
+
+    assert done.returncode == 2
+    data = json.loads(done.stdout)
+    assert data["ok"] is False
+    assert "not both" in data["error"]
+    assert "not both" in done.stderr

@@ -443,3 +443,223 @@ fn a_symbol_target_gets_its_own_callees_not_its_file_s() {
         "the file-shaped path regressed while fixing the symbol-shaped one"
     );
 }
+
+// --- the rung floor, which this composition dropped --------------------------
+//
+// `min_rung` was pinned to `None` inside the fan-out while `impact` and `deps`
+// — the two queries `neighbors` *is* — each took a floor. That makes three
+// parameters this function has pinned to a constant, and the other two were
+// both defects: `min_confidence` hardcoded 0.0 on the inbound side, so one
+// answer's two halves disagreed about the caller's filter, and `max_depth`
+// pinned to 1, which the equivalence test above could not see because it
+// compares at depth 1. The pattern is the finding, not the parameter.
+
+/// Two files defining the same name, so a call to it cannot resolve
+/// deterministically, beside a same-file call that can.
+///
+/// Mixed rungs are the precondition for any of this to mean anything: over a
+/// corpus whose every edge sits on one rung, a floor and no floor return the
+/// same list and every assertion below holds for the wrong reason.
+fn mixed_rung_fixture() -> Store {
+    let extractions = vec![
+        extract_file("lib_a.py", "def shared():\n    return 1\n"),
+        extract_file("lib_b.py", "def shared():\n    return 2\n"),
+        extract_file(
+            "app.py",
+            "def helper():\n    return shared()\n\n\ndef main():\n    return helper()\n",
+        ),
+    ];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
+        .unwrap();
+    store
+}
+
+fn rung_targets() -> Vec<String> {
+    vec![
+        "app.py".to_string(),
+        "app.py::helper".to_string(),
+        "lib_a.py::shared".to_string(),
+    ]
+}
+
+/// A floor narrows the composition exactly as it narrows each half alone.
+///
+/// The same equivalence the file already asserts at no floor, asserted at every
+/// rung — which is the only way to catch a floor that is accepted and dropped.
+/// A dropped floor returns *more* edges than asked for, and nothing in the
+/// response says so: the caller reads a broad answer as a narrow one and acts
+/// on evidence they explicitly excluded.
+#[test]
+fn a_floor_narrows_the_composition_exactly_as_it_narrows_its_parts() {
+    let store = mixed_rung_fixture();
+    let engine = StoreQueryEngine::new(&store);
+    let targets = rung_targets();
+
+    for rung in devmap_query::Rung::ALL.iter().copied() {
+        let composed = engine
+            .neighbors_at_rung(&targets, 2000, 0.0, 1, Some(rung))
+            .unwrap_or_else(|error| panic!("neighbors at {}: {error}", rung.label()));
+        assert_eq!(composed.len(), targets.len());
+
+        for (entry, target) in composed.iter().zip(targets.iter()) {
+            let separate_callers = engine
+                .impact_at_rung(
+                    Request {
+                        query: target.clone(),
+                        token_budget: 2000,
+                        min_confidence: 0.0,
+                        max_depth: 1,
+                    },
+                    Some(rung),
+                )
+                .expect("impact must answer");
+            // `trace`, not `dependencies`, for the reason the equivalence test
+            // above records: only the traversal is directed by construction.
+            let separate_callees = engine
+                .trace_at_rung(
+                    Request {
+                        query: target.clone(),
+                        token_budget: 2000,
+                        min_confidence: 0.0,
+                        max_depth: 1,
+                    },
+                    Some(rung),
+                )
+                .expect("trace must answer");
+
+            for (direction, composed_side, separate_side) in [
+                ("callers", &entry.callers, &separate_callers),
+                ("callees", &entry.callees, &separate_callees),
+            ] {
+                let label = rung.label();
+                assert_eq!(
+                    composed_side.shown, separate_side.shown,
+                    "{target} {direction} at {label}: shown differs"
+                );
+                assert_eq!(
+                    composed_side.total, separate_side.total,
+                    "{target} {direction} at {label}: total differs"
+                );
+                assert_eq!(
+                    serde_json::to_value(&composed_side.items).unwrap(),
+                    serde_json::to_value(&separate_side.items).unwrap(),
+                    "{target} {direction} at {label}: edge list differs"
+                );
+                // The histogram counts the population *before* the cut, so a
+                // narrowed answer stays readable as a narrowed one. A
+                // composition that dropped it would leave a short list looking
+                // like a sparse graph.
+                assert_eq!(
+                    serde_json::to_value(&composed_side.rungs).unwrap(),
+                    serde_json::to_value(&separate_side.rungs).unwrap(),
+                    "{target} {direction} at {label}: rung histogram differs"
+                );
+            }
+        }
+    }
+}
+
+/// And the floor really cuts, or the parity above compares two identical lists.
+///
+/// The vacuity guard. `min_confidence` and `max_depth` were both pinned here
+/// for a whole release precisely because the tests around them were satisfied
+/// by a fixture where the pinned value and the requested one agreed.
+#[test]
+fn the_floor_under_test_actually_removes_edges_from_the_composition() {
+    let store = mixed_rung_fixture();
+    let engine = StoreQueryEngine::new(&store);
+    let targets = rung_targets();
+
+    let unfiltered = engine.neighbors(&targets, 2000, 0.0, 1).expect("neighbors");
+    let strict = engine
+        .neighbors_at_rung(
+            &targets,
+            2000,
+            0.0,
+            1,
+            Some(devmap_query::Rung::Deterministic),
+        )
+        .expect("neighbors at deterministic");
+
+    let count = |answers: &[devmap_query::Neighbors]| -> usize {
+        answers
+            .iter()
+            .map(|entry| entry.callers.items.len() + entry.callees.items.len())
+            .sum()
+    };
+    let (before, after) = (count(&unfiltered), count(&strict));
+    assert!(
+        before > after,
+        "the fixture must hold edges below `deterministic`, or the parity test \
+         above compares two identical lists at every rung: {before} edges \
+         unfiltered, {after} at deterministic"
+    );
+    assert!(
+        after > 0,
+        "and some must survive, or 'narrowed correctly' is indistinguishable \
+         from 'answered nothing': {after}"
+    );
+}
+
+/// The OFF direction: no floor is the answer every existing caller already got.
+///
+/// `neighbors` delegates to `neighbors_at_rung(.., None)`, so this pins that the
+/// delegation changed nothing — a composition that started filtering by default
+/// would silently shrink every answer in the repository.
+#[test]
+fn the_unfiltered_composition_is_unchanged_by_the_floor_it_now_accepts() {
+    let store = mixed_rung_fixture();
+    let engine = StoreQueryEngine::new(&store);
+    let targets = rung_targets();
+
+    let plain = engine.neighbors(&targets, 2000, 0.0, 1).expect("neighbors");
+    let explicit_none = engine
+        .neighbors_at_rung(&targets, 2000, 0.0, 1, None)
+        .expect("neighbors at no floor");
+    assert_eq!(
+        serde_json::to_value(&plain).unwrap(),
+        serde_json::to_value(&explicit_none).unwrap(),
+        "an absent floor must be exactly the old behaviour, byte for byte"
+    );
+
+    // And `speculative` — the bottom rung — admits everything, so it must equal
+    // the unfiltered answer too. If it does not, the floor is cutting on
+    // something other than the ladder.
+    let bottom = engine
+        .neighbors_at_rung(
+            &targets,
+            2000,
+            0.0,
+            1,
+            Some(devmap_query::Rung::Speculative),
+        )
+        .expect("neighbors at speculative");
+    assert_eq!(
+        serde_json::to_value(
+            plain
+                .iter()
+                .map(|e| (&e.callers.items, &e.callees.items))
+                .collect::<Vec<_>>()
+        )
+        .unwrap(),
+        serde_json::to_value(
+            bottom
+                .iter()
+                .map(|e| (&e.callers.items, &e.callees.items))
+                .collect::<Vec<_>>()
+        )
+        .unwrap(),
+        "the bottom rung excludes nothing"
+    );
+}
