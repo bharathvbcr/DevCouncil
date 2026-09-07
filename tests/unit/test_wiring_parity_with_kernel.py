@@ -220,17 +220,30 @@ def test_the_two_entry_point_candidate_tables_are_the_same_set() -> None:
     :func:`wiring.entry_roots`, or the two disagree about which file a console
     script names.
     """
-    body = _fn_body(_kernel_source(), "config_entry_point_symbols")
-    kernel_block = re.search(r"for candidate in \[(.*?)\n        \] \{", body, re.DOTALL)
+    source = _kernel_source()
+    body = _fn_body(source, "config_entry_point_symbols")
+    kernel_block = re.search(
+        r"let candidates: \[String; ENTRY_POINT_CANDIDATES\] = \[(.*?)\n        \];",
+        body,
+        re.DOTALL,
+    )
     assert kernel_block, (
         "config_entry_point_symbols no longer holds its module-path candidates "
-        "in a `for candidate in [...]`; this parity check cannot run, and must "
-        "not be read as one that passed"
+        "in a `let candidates: [String; ENTRY_POINT_CANDIDATES] = [...]`; this "
+        "parity check cannot run, and must not be read as one that passed"
     )
     kernel = {
         template.replace("{base}", "").replace("{module_path}", "{parts}")
         for template in re.findall(r'format!\("([^"]*)"\)', kernel_block.group(1))
     }
+
+    declared = re.search(r"const ENTRY_POINT_CANDIDATES: usize = (\d+);", source)
+    assert declared, "ENTRY_POINT_CANDIDATES is no longer a `usize` const in wiring.rs"
+    assert len(kernel) == int(declared.group(1)), (
+        "the kernel's candidate list and the constant the bound is expressed in "
+        f"disagree: {len(kernel)} candidates, ENTRY_POINT_CANDIDATES="
+        f"{declared.group(1)}"
+    )
 
     python_source = inspect.getsource(wiring._add_module_file)
     python_block = re.search(r"candidates = \[(.*?)\n    \]", python_source, re.DOTALL)
