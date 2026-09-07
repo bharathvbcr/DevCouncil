@@ -20,7 +20,9 @@
 //!   read and discarded rather than the pipe being closed under the child, so
 //!   it finishes on its own terms and its exit status still means what it
 //!   says; the caller learns that the answer is incomplete — never a truncated
-//!   answer presented as whole.
+//!   answer presented as whole. A pipe that stops answering before EOF is
+//!   reported the same way, because the caller is holding the same thing: a
+//!   prefix.
 //! * **Both pipes drained concurrently**, because reading them after exit
 //!   deadlocks the moment either buffer fills.
 //! * **No terminal, no stdin.** `stdin` is `/dev/null`; the `git` constructor
@@ -68,7 +70,11 @@ pub struct Bounds {
 pub struct Captured {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
-    /// The child wrote more stdout than the cap; the rest was discarded.
+    /// The bytes here are a *prefix* of what the child had to say: it wrote
+    /// more than the cap, or the pipe stopped answering before EOF. One flag
+    /// for both, because every caller asks the same question of it — "are these
+    /// bytes the whole answer" — and there is no reading of that question where
+    /// a pipe that failed mid-stream counts as yes.
     pub stdout_truncated: bool,
     pub stderr: Vec<u8>,
     pub stderr_truncated: bool,
@@ -223,6 +229,8 @@ pub fn run_bounded(command: &mut Command, bounds: Bounds) -> Result<Captured, Fa
 
 struct Drained {
     bytes: Vec<u8>,
+    /// The bytes kept are a prefix of what the child had to say — because the
+    /// cap cut it, or because the pipe stopped answering before EOF.
     truncated: bool,
 }
 
@@ -233,6 +241,14 @@ struct Drained {
 /// turns "this answer was long" into "this answer took ten seconds", and
 /// charges every caller the full deadline for the privilege of a partial
 /// result.
+///
+/// Only `Ok(0)` is the end. `read` on a pipe may return `Interrupted` before it
+/// has transferred anything, and `std` retries that only inside `read_to_end` /
+/// `read_exact` — never on a bare `read` — so this loop has to. Any other error
+/// leaves a *prefix*, and a prefix is reported the same way the cap's is: the
+/// one property every caller of this module reads is "are the bytes I have the
+/// whole answer", and there is no version of that question where a pipe that
+/// stopped answering counts as yes.
 fn drain(pipe: Option<impl Read>, cap: usize) -> Drained {
     let mut drained = Drained {
         bytes: Vec::new(),
@@ -244,7 +260,12 @@ fn drain(pipe: Option<impl Read>, cap: usize) -> Drained {
     let mut chunk = [0u8; 64 * 1024];
     loop {
         match pipe.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                drained.truncated = true;
+                break;
+            }
             Ok(read) => {
                 let room = cap.saturating_sub(drained.bytes.len());
                 if read > room {
@@ -257,4 +278,89 @@ fn drain(pipe: Option<impl Read>, cap: usize) -> Drained {
         }
     }
     drained
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    /// A reader that returns a scripted sequence, so `drain`'s error handling
+    /// can be exercised without arranging a signal.
+    struct Scripted(std::collections::VecDeque<std::io::Result<&'static [u8]>>);
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                None => Ok(0),
+                Some(Err(error)) => Err(error),
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+            }
+        }
+    }
+
+    fn scripted(steps: Vec<std::io::Result<&'static [u8]>>) -> Option<Scripted> {
+        Some(Scripted(steps.into_iter().collect()))
+    }
+
+    /// `read` is allowed to return `Interrupted` before it has transferred
+    /// anything, and `std` retries that only inside `read_to_end` /
+    /// `read_exact` — never on a bare `read`. Reading it as EOF drops the rest
+    /// of the child's answer.
+    #[test]
+    fn an_interrupted_read_is_resumed_not_read_as_the_end() {
+        let drained = drain(
+            scripted(vec![
+                Ok(b"first "),
+                Err(std::io::Error::from(ErrorKind::Interrupted)),
+                Ok(b"second"),
+            ]),
+            1 << 20,
+        );
+        assert_eq!(drained.bytes, b"first second");
+        assert!(
+            !drained.truncated,
+            "nothing was lost, so nothing may be reported as lost"
+        );
+    }
+
+    /// A pipe that stops answering before EOF leaves a *prefix*. The whole
+    /// point of the cap is that a prefix is never presented as the whole
+    /// answer, and a read error produces exactly the same prefix.
+    #[test]
+    fn a_pipe_that_fails_before_eof_leaves_a_prefix_that_says_so() {
+        let drained = drain(
+            scripted(vec![
+                Ok(b"as far as this"),
+                Err(std::io::Error::from(ErrorKind::BrokenPipe)),
+                Ok(b"never seen"),
+            ]),
+            1 << 20,
+        );
+        assert_eq!(drained.bytes, b"as far as this");
+        assert!(
+            drained.truncated,
+            "the read stopped short of EOF; the caller is holding a prefix and \
+             has just been told it is the whole answer"
+        );
+    }
+
+    /// The cap's own case, unchanged: bytes past it are dropped and reported.
+    #[test]
+    fn the_cap_still_reports_its_own_truncation() {
+        let drained = drain(scripted(vec![Ok(b"0123456789")]), 4);
+        assert_eq!(drained.bytes, b"0123");
+        assert!(drained.truncated);
+    }
+
+    /// …and a clean read to EOF reports nothing.
+    #[test]
+    fn a_clean_read_reports_no_truncation() {
+        let drained = drain(scripted(vec![Ok(b"whole")]), 1 << 20);
+        assert_eq!(drained.bytes, b"whole");
+        assert!(!drained.truncated);
+    }
 }
