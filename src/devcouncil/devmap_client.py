@@ -1638,6 +1638,47 @@ class DevMapClient:
         )
         return self._budgeted(resp, budget)
 
+    # --- HTTP route surfaces ------------------------------------------------
+    #
+    # These three go over the CLI rather than :meth:`_request`. The daemon's
+    # `IpcCommand` (`devmap-serve/src/protocol.rs`) has no `routes`,
+    # `shape_check` or `api_impact` variant, so a socket attempt would be
+    # rejected as `invalid_request` and retried on the CLI anyway — one wasted
+    # round trip per call, for a command whose own bounded file scan dominates
+    # its cost. The CLI is the same kernel over a different transport, not a
+    # second engine.
+    #
+    # Each answer carries the kernel's own coverage record (`capabilities` on
+    # `routes`, `scan` on `shape-check` and `api-impact`): what the client scan
+    # read, and whether it finished. The Python implementations these replace
+    # carried no such record, so a scan that stopped at its file cap was
+    # published as a complete route inventory.
+
+    def routes(self, route_filter: Optional[str] = None) -> Dict[str, Any]:
+        """HTTP routes, their handlers, and the clients that call them."""
+        args = ["routes"]
+        if route_filter:
+            self._validate_query(route_filter, "route filter")
+            args += ["--filter", route_filter]
+        return self._run_cli_command(args + _positional(str(self.root_dir)))
+
+    def shape_check(self, route_filter: Optional[str] = None) -> Dict[str, Any]:
+        """What each handler returns against what its callers read."""
+        args = ["shape-check"]
+        if route_filter:
+            self._validate_query(route_filter, "route filter")
+            args += ["--filter", route_filter]
+        return self._run_cli_command(args + _positional(str(self.root_dir)))
+
+    def api_impact(self, route: str) -> Dict[str, Any]:
+        """What changing one route reaches: callers, shape, and a risk band."""
+        self._validate_query(route, "route")
+        # `route` is positional and may begin with `/`, which clap reads as a
+        # path and not a flag — but `--` is cheap and the rule here is uniform.
+        return self._run_cli_command(
+            ["api-impact", *_positional(route, str(self.root_dir))]
+        )
+
     def is_map_stale(self) -> bool:
         st = self.status()
         return not st.is_fresh or st.pending_count > 0

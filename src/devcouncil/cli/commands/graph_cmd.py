@@ -709,6 +709,24 @@ def _require_graph(root: Path, *, warn_stale: bool = True):
     return graph
 
 
+def _require_kernel(root: Path, *, warn_stale: bool = True):
+    """A live client, or exit naming the kernel — the sibling of `_require_graph`.
+
+    For the commands the kernel answers directly. It reads the store the kernel
+    wrote, rather than materialising the whole graph out of the Python
+    `index.sqlite` cache first.
+    """
+    from devcouncil.devmap_client import try_connect
+
+    client = try_connect(root)
+    if client is None:
+        status.print("[red]No devmap store; run `dev map` first.[/red]")
+        raise typer.Exit(code=1)
+    if warn_stale:
+        _warn_if_stale(root)
+    return client
+
+
 def _kernel_build_payload(refresh) -> dict:  # noqa: ANN001
     """The JSON a kernel-backed build command reports."""
     kernel = getattr(refresh, "kernel_status", None)
@@ -2105,11 +2123,8 @@ def graph_routes(
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Map HTTP routes to handlers and client fetch consumers."""
-    from devcouncil.indexing.graph.api_routes import route_map
-
     root = _root(project_root)
-    graph = _require_graph(root)
-    result = route_map(root, graph)
+    result = _require_kernel(root).routes()
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -2137,11 +2152,8 @@ def graph_shape_check(
     route: Optional[str] = typer.Option(None, "--route", help="Filter to one route path or id."),
 ) -> None:
     """Compare handler response keys vs client accessed keys."""
-    from devcouncil.indexing.graph.api_routes import shape_check
-
     root = _root(project_root)
-    graph = _require_graph(root)
-    result = shape_check(root, graph, route_filter=route)
+    result = _require_kernel(root).shape_check(route_filter=route)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -2163,11 +2175,8 @@ def graph_api_impact(
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """API blast radius: consumers, middleware, shape mismatches, risk tier."""
-    from devcouncil.indexing.graph.api_routes import api_impact
-
     root = _root(project_root)
-    graph = _require_graph(root)
-    result = api_impact(root, route_or_path, graph)
+    result = _require_kernel(root).api_impact(route_or_path)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return

@@ -1313,18 +1313,39 @@ async def handle_graph_impact(root: Path, arguments: dict) -> list[TextContent]:
     return await with_codeintel_freshness(root, _run)
 
 
+#: Said when no kernel can be reached, by every route tool. The kernel is the
+#: engine for these three; there is no Python route scanner to fall back to.
+_NO_KERNEL_TEXT = (
+    "No devmap store found. Run `dev map` to build the index the route tools read."
+)
+
+
+def _route_tool(root: Path, ask) -> list[TextContent]:
+    """Run one kernel route command and wrap it in the graph-tool envelope.
+
+    Shared by the three route tools because they differ only in which command
+    they send: same unavailability rule, same envelope, same failure text. Each
+    used to `load_code_graph(root)` and then run a Python re-implementation of
+    the command — measured on this repository at 2.1-2.7 s against the kernel's
+    0.8-1.0 s, and answering without the kernel's coverage record
+    (`capabilities` on `routes`, `scan` on all three), so a client scan that
+    stopped at its file cap was published as a complete inventory.
+    """
+    from devcouncil.devmap_client import DevMapClientError, try_connect
+
+    client = try_connect(root)
+    if client is None:
+        return error_text(_NO_KERNEL_TEXT, code="graph_missing")
+    try:
+        result = ask(client)
+    except DevMapClientError as exc:
+        return error_text(f"devmap: {exc}", code="graph_unavailable")
+    return json_text(_graph_payload(root, result))
+
+
 async def handle_route_map(root: Path, arguments: dict) -> list[TextContent]:
     def _body() -> list[TextContent]:
-        from devcouncil.indexing.graph.api_routes import route_map
-        from devcouncil.indexing.graph.build import load_code_graph
-
-        graph = load_code_graph(root)
-        if graph is None:
-            return error_text(
-                "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
-                code="graph_missing",
-            )
-        return json_text(_graph_payload(root, route_map(root, graph)))
+        return _route_tool(root, lambda client: client.routes())
 
     async def _run() -> list[TextContent]:
         return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
@@ -1337,16 +1358,7 @@ async def handle_shape_check(root: Path, arguments: dict) -> list[TextContent]:
         route = optional_string_argument(arguments, "route")
         if route == "":
             return error_text("route must be a string", code="invalid_arguments", argument="route")
-        from devcouncil.indexing.graph.api_routes import shape_check
-        from devcouncil.indexing.graph.build import load_code_graph
-
-        graph = load_code_graph(root)
-        if graph is None:
-            return error_text(
-                "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
-                code="graph_missing",
-            )
-        return json_text(_graph_payload(root, shape_check(root, graph, route_filter=route)))
+        return _route_tool(root, lambda client: client.shape_check(route_filter=route))
 
     async def _run() -> list[TextContent]:
         return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"
@@ -1363,16 +1375,7 @@ async def handle_api_impact(root: Path, arguments: dict) -> list[TextContent]:
                 code="missing_argument",
                 argument="route_or_path",
             )
-        from devcouncil.indexing.graph.api_routes import api_impact
-        from devcouncil.indexing.graph.build import load_code_graph
-
-        graph = load_code_graph(root)
-        if graph is None:
-            return error_text(
-                "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
-                code="graph_missing",
-            )
-        return json_text(_graph_payload(root, api_impact(root, route_or_path, graph)))
+        return _route_tool(root, lambda client: client.api_impact(route_or_path))
 
     async def _run() -> list[TextContent]:
         return await asyncio.to_thread(_body)  # see "Why _body runs in a thread"

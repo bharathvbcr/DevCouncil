@@ -14,7 +14,7 @@ from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
 from devcouncil.domain.task import Task
-from devcouncil.indexing.graph.schema import CodeGraph, GraphEdge, GraphNode, NodeKind
+from devcouncil.indexing.graph.schema import CodeGraph
 from devcouncil.verification.claims.models import Assertion, CheckResult, Kind, Status
 
 runner = CliRunner()
@@ -122,87 +122,22 @@ def test_check_repo_map_freshness_ok_path(tmp_path, monkeypatch):
     assert rows[0][1] == "[green]OK[/green]"
 
 
-# --- api_routes.py --------------------------------------------------------------
-
-
-def test_api_routes_normalize_and_match_variants():
-    from devcouncil.indexing.graph import api_routes as ar
-
-    assert ar.normalize_route_path("api/items") == "/api/items"
-    assert ar.normalize_route_path("\\api\\items\\:id") == "/api/items/*"
-    assert ar.paths_match("/a/:id", "/a/{id}") is True
-    assert ar.paths_match("/a/b", "/a/c") is False
-    assert ar.paths_match("/a", "/a/b") is False
-
-
-def test_api_routes_verbs_compatible():
-    from devcouncil.indexing.graph import api_routes as ar
-
-    assert ar._verbs_compatible("ANY", "POST") is True
-    assert ar._verbs_compatible("GET", "GET") is True
-    assert ar._verbs_compatible("HEAD", "GET") is True
-    assert ar._verbs_compatible("POST", "GET") is False
-
-
-def test_api_routes_consumer_keys_and_risk():
-    from devcouncil.indexing.graph import api_routes as ar
-
-    window = [
-        "const resp = await fetch('/x');",
-        "const { id, name } = await resp.json();",
-        "console.log(resp.token);",
-    ]
-    keys = ar._consumer_keys(window, "resp")
-    assert {"id", "name", "token"} <= keys
-
-    assert ar._risk_level(consumers=[], mismatches=[]) == "none"
-    assert ar._risk_level(consumers=[{}], mismatches=[{}]) == "medium"
-    assert ar._risk_level(consumers=[{}, {}], mismatches=[{}]) == "high"
-    assert ar._risk_level(consumers=[{}, {}], mismatches=[]) == "low"
-
-
-def test_api_routes_handler_return_keys_python(tmp_path):
-    from devcouncil.indexing.graph import api_routes as ar
-
-    src = tmp_path / "handlers.py"
-    src.write_text(
-        "def list_items():\n"
-        "    return {'id': 1, 'name': 'x', 'price': 9}\n",
-        encoding="utf-8",
-    )
-    node = GraphNode(
-        id="handlers.py::list_items",
-        kind=NodeKind.FUNCTION,
-        path="handlers.py",
-        name="list_items",
-        line=1,
-    )
-    keys = ar.handler_return_keys(tmp_path, node)
-    assert {"id", "name", "price"} <= keys
-
-
-def test_api_routes_route_matches_filter():
-    from devcouncil.indexing.graph import api_routes as ar
-
-    route = {"path": "/api/items/{id}", "id": "route-1", "normalized_path": "/api/items/*"}
-    assert ar._route_matches_filter(route, "/api/items/{id}") is True
-    assert ar._route_matches_filter(route, "route-1") is True
-    assert ar._route_matches_filter(route, "/api/items/42") is True
-    assert ar._route_matches_filter(route, "/other") is False
-
-
-def test_api_routes_resolve_handlers_fallback(tmp_path):
-    from devcouncil.indexing.graph import api_routes as ar
-
-    route = GraphNode(id="app.py::route_get", kind=NodeKind.ROUTE, path="app.py", name="get_items", line=1)
-    handler = GraphNode(id="app.py::list_items", kind=NodeKind.FUNCTION, path="app.py", name="list_items", line=3)
-    graph = CodeGraph(
-        nodes=[route, handler],
-        edges=[GraphEdge(source=route.id, target=route.id, kind="routes_to")],
-    )
-    nodes = {n.id: n for n in graph.nodes}
-    resolved = ar._resolve_route_handlers(route, [route.id], nodes, graph)
-    assert resolved == [handler.id]
+# --- api_routes.py ----------------------------------------------------------
+#
+# Retired with the module. `indexing/graph/api_routes.py` was a Python
+# re-implementation of `devmap routes` / `shape-check` / `api-impact` over
+# `load_code_graph`; both its production readers (the MCP route tools and
+# `dev map routes` / `shape-check` / `api-impact`) now ask the kernel, so the
+# module and the coverage of its private helpers went with it. The canonical
+# owner is `devmap_query::api_routes`, whose suite carries the same cases —
+# `a_template_literal_parameter_normalises_without_leaving_its_dollar`,
+# `a_flask_converter_normalises_whole_rather_than_from_its_colon`,
+# `paths_match_segment_wise_and_reject_different_depths`,
+# `a_consumer_is_matched_to_its_route_with_the_keys_it_reads`,
+# `a_key_the_handler_never_returns_is_a_mismatch`,
+# `a_route_nothing_calls_is_not_reported_as_no_risk` — plus several the Python
+# copy never had, such as
+# `a_truncated_scan_never_reports_a_route_as_safe_to_change`.
 
 
 # --- stop_gate.py ---------------------------------------------------------------
