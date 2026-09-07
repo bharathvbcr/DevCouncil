@@ -651,18 +651,19 @@ def test_graph_cmd_corpus_and_pdg_text_paths(tmp_path, monkeypatch):
     assert none.exit_code == 0
     assert "No matches" in none.output
 
-    monkeypatch.setattr(gc, "_require_graph", lambda root: SimpleNamespace(meta={"pdg": {"stats": {}}}, nodes=[], edges=[]))
+    # `pdg build` takes its file list from the map's own inventory and writes a
+    # sidecar; it no longer loads a `CodeGraph` or writes one back.
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.python_paths_for_pdg",
+        lambda root: ["a.py"],
+    )
     monkeypatch.setattr(
         "devcouncil.indexing.graph.build.build_pdg_for_paths",
-        lambda *a, **k: SimpleNamespace(files={}),
+        lambda *a, **k: SimpleNamespace(files={}, to_meta=lambda: {"stats": {}}),
     )
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.merge_pdg_into_graph",
-        lambda graph, layer: {},
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.write_code_graph",
-        lambda *a, **k: None,
+        "devcouncil.indexing.graph.build.write_pdg_layer",
+        lambda root, layer: root / ".devcouncil" / "graph" / "pdg.json",
     )
     pdg = runner.invoke(gc.app, ["pdg", "build", "--project-root", str(mapped)])
     assert pdg.exit_code == 0, pdg.output

@@ -1268,7 +1268,20 @@ async def handle_graph_trace(root: Path, arguments: dict) -> list[TextContent]:
 
 
 async def handle_graph_impact(root: Path, arguments: dict) -> list[TextContent]:
-    """Symbol-level blast radius from paths or working-tree diff (code graph)."""
+    """Symbol-level blast radius from paths or working-tree diff.
+
+    The last graph tool here still on `load_code_graph`. It read the whole
+    graph out of the Python `index.sqlite` cache — the retired engine's read
+    path, measured elsewhere in this package at 1.2 s and hundreds of MB per
+    call — and then re-ran the inbound walk in Python, from a tool an agent
+    reads as read-only.
+
+    The kernel now bands its own walk (`impact --layers`), so the answer is one
+    walk over one generation rather than a Python re-implementation of it, and
+    it carries what Python could not: which targets matched nothing, how many
+    nodes a band held beyond the ones listed, the weakest edge that reached each
+    band, and whether the walk itself stopped short.
+    """
 
     def _body() -> list[TextContent]:
         paths, list_error = optional_string_list_argument(arguments, "paths")
@@ -1284,23 +1297,26 @@ async def handle_graph_impact(root: Path, arguments: dict) -> list[TextContent]:
                 code="missing_argument",
                 argument="paths",
             )
+        seeds = [str(path) for path in (paths or [])]
+        if use_diff:
+            # `git diff`, not the graph — the one part of this tool that never
+            # needed an engine.
+            from devcouncil.indexing.graph.intel import working_tree_changed_paths
 
-        from devcouncil.indexing.graph.build import load_code_graph
-        from devcouncil.indexing.graph.intel import diff_impact
+            changed = working_tree_changed_paths(root)
+            if seeds:
+                wanted = {seed.replace("\\", "/") for seed in seeds}
+                changed = [path for path in changed if path in wanted]
+            seeds = changed
 
-        graph = load_code_graph(root)
-        if graph is None:
+        result = _devmap_query_payload(root, "impact", paths=seeds, max_depth=3)
+        if result is None:
+            return error_text(_NO_KERNEL_TEXT, code="graph_missing")
+        if result.get("ok") is False:
             return error_text(
-                "No code graph found. Run `dev map` to generate .devcouncil/graph/code_graph.json.",
-                code="graph_missing",
+                f"devmap: {result.get('error') or 'refused'}", code="graph_unavailable"
             )
-        result = diff_impact(
-            root,
-            graph,
-            paths=paths,
-            use_diff=use_diff,
-            max_depth=3,
-        )
+        result["source_paths"] = "diff" if use_diff else "paths"
         return json_text(_graph_payload(root, result))
 
     async def _run() -> list[TextContent]:

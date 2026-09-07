@@ -69,6 +69,19 @@ def _init_repo_with_commit(root: Path) -> str:
     return _git(root, "rev-parse", "HEAD")
 
 
+def _seed_graph(root: Path, graph: CodeGraph) -> None:
+    """Put a graph where both the freshness probe and the readers look.
+
+    `store.save_graph` alone was enough while `dev map dead` reached its graph
+    through `load_code_graph`, which preferred the Python store. It reads
+    `code_graph.json` now, so a store-only fixture leaves the command with no
+    graph at all and the freshness assertions below never run.
+    """
+    from devcouncil.indexing.graph.build import write_code_graph
+
+    write_code_graph(root, graph)
+
+
 # ---------------------------------------------------------------------------
 # 1. FTS prune must never delete by the UNINDEXED generation_id column.
 # ---------------------------------------------------------------------------
@@ -245,8 +258,11 @@ def test_graph_dead_fails_loud_on_stale_index(tmp_path: Path) -> None:
     from devcouncil.cli.commands.graph_cmd import app
 
     _init_repo_with_commit(tmp_path)
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph("one", head="0000000000000000000000000000000000000000"))
+    # Both artifacts, because they answer different halves of this test.
+    # `index_freshness` reads the store; the dead-code list now comes from
+    # `code_graph.json`, the file the kernel writes and `_require_graph` reads.
+    # `write_code_graph` writes both from one graph, so they cannot disagree.
+    _seed_graph(tmp_path, _graph("one", head="0" * 40))
 
     runner = CliRunner()
     result = runner.invoke(app, ["dead", "--project-root", str(tmp_path)])
@@ -275,8 +291,7 @@ def test_graph_dead_exits_zero_when_index_matches_head(tmp_path: Path) -> None:
     from devcouncil.cli.commands.graph_cmd import app
 
     head = _init_repo_with_commit(tmp_path)
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph("one", head=head))
+    _seed_graph(tmp_path, _graph("one", head=head))
 
     runner = CliRunner()
     result = runner.invoke(app, ["dead", "--project-root", str(tmp_path)])

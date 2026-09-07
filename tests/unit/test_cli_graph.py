@@ -124,15 +124,58 @@ def test_cli_graph_process(tmp_path, monkeypatch):
     assert res_json.exit_code == 0
 
 
-def test_cli_graph_impact(tmp_path, monkeypatch):
+def test_cli_graph_impact_without_a_kernel_store_is_red(tmp_path, monkeypatch):
+    """Rewritten, for the reason the GraphML sibling below states.
+
+    This environment holds a hand-built Python graph and no kernel store, and
+    `dev map impact` used to answer from that graph — running the inbound walk
+    in Python and labelling every symbol a depth-3 walk reached `depth: 1,
+    confidence: "extracted"`. The bands are the kernel's now, so no kernel is an
+    error naming it rather than a second engine's answer.
+    """
     _setup_graph_env(tmp_path, monkeypatch)
-    
+
     res = runner.invoke(app, ["map", "impact", "src/a.py"])
-    assert res.exit_code == 0
-    assert "src/a.py" in res.output
-    
+    assert res.exit_code == 1, res.output
+    assert "devmap" in res.output.lower()
+
     res_json = runner.invoke(app, ["map", "impact", "src/a.py", "--json"])
-    assert res_json.exit_code == 0
+    assert res_json.exit_code == 1
+
+
+def test_cli_graph_impact_from_the_kernel(tmp_path, monkeypatch):
+    """The real producer, end to end: sources → `devmap build` → `dev map impact`."""
+    import subprocess
+
+    from tests.unit.graph_fixtures import kernel_graph
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text(
+        "from pkg.b import func_b\n\ndef func_a():\n    return func_b()\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pkg" / "b.py").write_text("def func_b():\n    return 1\n", encoding="utf-8")
+    for args in (
+        ["init"],
+        ["add", "-A"],
+        ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+    ):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+    kernel_graph(tmp_path)  # builds the store, or skips when no kernel is built
+
+    res = runner.invoke(app, ["map", "impact", "pkg/b.py"])
+    assert res.exit_code == 0, res.output
+    assert "pkg/b.py" in res.output
+    assert "depth 1" in res.output
+
+    res_json = runner.invoke(app, ["map", "impact", "pkg/b.py", "--json"])
+    assert res_json.exit_code == 0, res_json.output
+    payload = json.loads(res_json.stdout)
+    assert payload["source"] == "devmap"
+    entry = payload["paths"][0]
+    assert entry["blast"]["seeds"], entry
+    assert entry["blast"]["total_impacted"] >= 1, entry
 
 
 def test_cli_graph_html(tmp_path, monkeypatch):

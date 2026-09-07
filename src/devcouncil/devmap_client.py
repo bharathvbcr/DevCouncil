@@ -238,6 +238,23 @@ class BudgetedResponse:
     #: reason here, so a consumer that predates this field fails closed on the
     #: absence rather than open on an empty finding.
     dead_clusters_incomplete: Optional[str] = None
+    #: The same walk, banded by distance from the seeds — ``impact(layers=True)``
+    #: only.
+    #:
+    #: ``None`` means no banding was asked for, exactly as ``dead_clusters`` is
+    #: ``None`` on an answer that is not a dead-code answer. It is the kernel's
+    #: own ``BlastRadius`` object (``seeds``, ``unmatched_targets``, ``layers``
+    #: as a budgeted response of bands, ``total_impacted``), passed through
+    #: rather than reshaped here: the one renderer is
+    #: ``mcp.handlers.codeintel._blast_radius_payload``, and a second reshaping
+    #: on the way through the client would be a second thing to keep in step
+    #: with it.
+    #:
+    #: An edge list cannot carry distance — an edge names two endpoints and no
+    #: hop count — so before this field the consumers that needed bands invented
+    #: them. ``dev map impact`` labelled everything a depth-3 walk returned
+    #: ``depth: 1, confidence: "extracted"``.
+    blast_radius: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1041,7 +1058,72 @@ class DevMapClient:
             dead_clusters=dead_clusters,
             dead_clusters_truncated=dead_clusters_truncated,
             dead_clusters_incomplete=dead_clusters_incomplete,
+            blast_radius=self._blast_radius(resp.get("blast_radius"), budget),
         )
+
+    def _blast_radius(
+        self, radius: Any, budget: int
+    ) -> Optional[Dict[str, Any]]:
+        """Validate the banded half of an ``impact(layers=True)`` answer.
+
+        Checked rather than copied, for the reason ``dead_clusters`` is checked:
+        this half is read as "N symbols are this many hops away" and a
+        malformed one arriving as a silently-dropped ``None`` would be
+        indistinguishable from an answer that carried no bands because none were
+        asked for.
+
+        The bands are themselves a budgeted response, so they go back through
+        :meth:`_budgeted` — one implementation of ``shown + hidden == total``,
+        not two. The band counts are checked against ``total_impacted`` only
+        when the list was *not* trimmed: a trimmed list sums to less by design,
+        and asserting otherwise would reject a correctly truncated answer.
+        """
+        if radius is None:
+            return None
+        if not isinstance(radius, dict):
+            raise DevMapClientError("devmap response blast_radius must be an object")
+        for key in ("seeds", "unmatched_targets"):
+            value = radius.get(key, [])
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise DevMapClientError(
+                    f"devmap response blast_radius.{key} must be a list of strings"
+                )
+        layers = radius.get("layers")
+        if not isinstance(layers, dict):
+            raise DevMapClientError(
+                "devmap response blast_radius.layers must be a budgeted response"
+            )
+        bands = self._budgeted(layers, budget)
+        total_impacted = self._strict_nonnegative_int(
+            radius.get("total_impacted", 0), "blast_radius total_impacted"
+        )
+        counted = 0
+        for band in bands.items:
+            counted += self._strict_nonnegative_int(
+                band.get("node_count", 0), "blast_radius band node_count"
+            )
+        if not bands.truncated and counted != total_impacted:
+            raise DevMapClientError(
+                "devmap response blast_radius bands do not partition the walk: "
+                f"bands sum to {counted}, total_impacted={total_impacted}"
+            )
+        return {
+            "seeds": list(radius.get("seeds") or []),
+            "unmatched_targets": list(radius.get("unmatched_targets") or []),
+            # The validated sub-response, put back in the kernel's own shape so
+            # the one renderer downstream reads exactly what the kernel sent.
+            "layers": {
+                "items": bands.items,
+                "shown": bands.shown,
+                "hidden": bands.hidden,
+                "total": bands.total,
+                "truncated": bands.truncated,
+                "tokens_used": bands.tokens_used,
+                "resolution": bands.resolution,
+                "walk_incomplete": bands.walk_incomplete,
+            },
+            "total_impacted": total_impacted,
+        }
 
     def status(self) -> DevMapStatus:
         req = {"cmd": "status"}
@@ -1231,16 +1313,39 @@ class DevMapClient:
         return answers
 
     def impact(
-        self, target: str, depth: int = 3, min_rung: Optional[str] = None
+        self,
+        target: str,
+        depth: int = 3,
+        min_rung: Optional[str] = None,
+        *,
+        layers: bool = False,
     ) -> BudgetedResponse:
         """Callers of ``target``, optionally floored at a resolution rung.
 
         See :meth:`deps` for why the floor is here.
+
+        ``layers=True`` asks the kernel to band the same walk by distance and
+        returns it on :attr:`BudgetedResponse.blast_radius`. It is opt-in
+        because it is a second reading of the walk, and because every caller
+        that predates it must keep getting the object it already parses.
+
+        ``layers`` and ``min_rung`` together are refused here as well as in the
+        kernel. The bands are derived before the rung cut and the edge list is
+        packed after it, so an answer carrying both would describe two different
+        graphs in one object — and a client that let the request through only to
+        have the kernel refuse it would report a transport failure for what is a
+        contradiction in the question.
         """
         self._validate_query(target, "target")
         self._validate_depth(depth)
         budget = 2000
         rung = _validated_min_rung(min_rung)
+        if layers and rung is not None:
+            raise DevMapClientError(
+                "impact cannot take both layers and min_rung: the distance bands "
+                "are walked without a rung floor, so the two halves of the answer "
+                "would describe different graphs"
+            )
         payload: Dict[str, Any] = {
             "cmd": "impact",
             "target": target,
@@ -1251,9 +1356,23 @@ class DevMapClient:
         if rung is not None:
             payload["min_rung"] = rung
             args += ["--min-rung", rung]
+        if layers:
+            payload["layers"] = True
+            args += ["--layers"]
         args += _positional(target)
         resp = self._request(payload, args)
-        return self._budgeted(resp, budget)
+        answer = self._budgeted(resp, budget)
+        if layers and answer.blast_radius is None:
+            # Fail closed and loud. A kernel too old to know the flag answers
+            # the flat query and says nothing; silently returning that would
+            # hand the caller a banded reading of an unbanded answer, which is
+            # the fabrication this field exists to end.
+            raise DevMapClientError(
+                "devmap answered an impact(layers=True) request without a "
+                "blast_radius; the kernel predates the field — rebuild it "
+                "(cargo build --release -p devmap-cli)"
+            )
+        return answer
 
     def trace(
         self,

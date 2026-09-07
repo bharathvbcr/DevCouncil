@@ -468,34 +468,32 @@ def map_repo(
 
 
 def _build_pdg_layer(root: Path) -> None:
-    """Opt-in PDG/CFG/taint layer, computed by the Python analyser over the
-    kernel's graph and merged into the JSON export. Failure is reported, never
-    fatal: the map is already written."""
+    """Opt-in PDG/CFG/taint layer, written to its own artifact.
+
+    Failure is reported, never fatal: the map is already written.
+
+    This used to merge the layer into a `CodeGraph` loaded out of the Python
+    store and call `write_code_graph`, which rewrites `code_graph.json` — the
+    file the kernel had just finished writing, and is the only writer of. The
+    layer now lands in `.devcouncil/graph/pdg.json`, so `dev map --pdg` no
+    longer edits the kernel's output behind it.
+    """
     try:
         from devcouncil.indexing.graph.build import (
             build_pdg_for_paths,
-            load_code_graph,
-            merge_pdg_into_graph,
-            write_code_graph,
+            python_paths_for_pdg,
+            write_pdg_layer,
         )
 
-        graph = load_code_graph(root)
-        if graph is None:
-            status_console.print("[yellow]PDG layer skipped: no code graph to analyse[/yellow]")
+        paths = python_paths_for_pdg(root)
+        if not paths:
+            status_console.print(
+                "[yellow]PDG layer skipped: no Python files in the map's inventory[/yellow]"
+            )
             return
-        layer = build_pdg_for_paths(root, graph)
-        shards = merge_pdg_into_graph(graph, layer)
-        merged: dict = {}
-        try:
-            from devcouncil.codeintel import get_codeintel_service
-
-            merged = dict(get_codeintel_service(root).store.analysis_shards())
-        except Exception:
-            pass
-        for path, payload in shards.items():
-            merged.setdefault(path, {}).update(payload)
-        write_code_graph(root, graph, analysis_shards=merged)
-        stats = (graph.meta.get("pdg") or {}).get("stats") or {}
+        layer = build_pdg_for_paths(root, paths=paths)
+        write_pdg_layer(root, layer)
+        stats = (layer.to_meta() or {}).get("stats") or {}
         status_console.print(
             f"[green]Wrote PDG layer[/green] "
             f"({stats.get('function_count', 0)} functions, "

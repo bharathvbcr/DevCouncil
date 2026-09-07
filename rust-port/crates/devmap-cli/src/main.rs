@@ -580,6 +580,18 @@ enum Commands {
         /// mistaken for a sparse graph.
         #[arg(long)]
         min_rung: Option<String>,
+        /// Also band the reached symbols by distance from the target.
+        ///
+        /// The flat edge list says *what* reaches the target; it cannot say how
+        /// far, because an edge does not carry the hop the walk found it at. A
+        /// consumer that needs "3 call it directly and 39 are reached through
+        /// those 3" gets it from the kernel here rather than inventing it.
+        ///
+        /// Refused together with `--min-rung`: the band walk filters on
+        /// confidence and has no rung, so honouring one would narrow the edges
+        /// and leave the bands wide.
+        #[arg(long)]
+        layers: bool,
     },
     /// Callers and callees for several targets in one invocation.
     ///
@@ -2686,9 +2698,26 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
             budget,
             depth,
             min_rung,
+            layers,
             ..
+        } => {
+            check_rung(min_rung)?;
+            check_budget(*budget)?;
+            // Refused rather than half-applied. The band walk filters on
+            // confidence and knows nothing of rungs, so a request for both
+            // would return edges cut to the floor beside bands that were not —
+            // one answer whose two halves disagree about the question.
+            if *layers && min_rung.is_some() {
+                return Err(
+                    "--layers cannot be combined with --min-rung: the distance bands are \
+                     walked without a rung floor, so the two halves of the answer would \
+                     describe different graphs"
+                        .to_string(),
+                );
+            }
+            check_depth(*depth)
         }
-        | Commands::Trace {
+        Commands::Trace {
             budget,
             depth,
             min_rung,
@@ -3503,24 +3532,39 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             budget,
             depth,
             min_rung,
+            layers,
         } => {
             let store = open_for_read(&cli.db())?;
             let engine = StoreQueryEngine::new(&store);
-            let resp = engine.impact_at_rung(
-                Request {
-                    query: target.clone(),
-                    token_budget: *budget,
-                    min_confidence: 0.0,
-                    max_depth: *depth,
-                },
-                // Already validated above, so `None` here means "none was
-                // asked for", never "one was asked for and did not parse".
-                min_rung.as_deref().and_then(devmap_query::Rung::parse),
-            )?;
-            if cli.json {
-                emit_json(cli, &serde_json::to_value(&resp)?)?;
+            let req = Request {
+                query: target.clone(),
+                token_budget: *budget,
+                min_confidence: 0.0,
+                max_depth: *depth,
+            };
+            if *layers {
+                // `--min-rung` with `--layers` was refused in validation, so
+                // dropping the floor here cannot silently widen an answer a
+                // caller asked to narrow.
+                let resp = engine.impact_layered(req)?;
+                if cli.json {
+                    emit_json(cli, &serde_json::to_value(&resp)?)?;
+                } else {
+                    emit_edges(&resp.edges);
+                    emit_blast_radius(&resp.blast_radius);
+                }
             } else {
-                emit_edges(&resp);
+                let resp = engine.impact_at_rung(
+                    req,
+                    // Already validated above, so `None` here means "none was
+                    // asked for", never "one was asked for and did not parse".
+                    min_rung.as_deref().and_then(devmap_query::Rung::parse),
+                )?;
+                if cli.json {
+                    emit_json(cli, &serde_json::to_value(&resp)?)?;
+                } else {
+                    emit_edges(&resp);
+                }
             }
         }
         Commands::Neighbors {

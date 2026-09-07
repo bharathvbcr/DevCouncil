@@ -386,6 +386,91 @@ def write_code_graph(
     return path
 
 
+#: Stamped on a graph whose on-disk form is a size-capped export.
+#:
+#: The Python store used to hide this: `load_code_graph` preferred SQLite, which
+#: held the uncapped graph, so a consumer reading a `compact` or `stub`
+#: `code_graph.json` still got complete lists. Reading the artifact directly
+#: removes that cover, and a capped export must therefore say it is capped
+#: rather than answer in the shape of a complete one — `compact` truncates
+#: `unwired_candidates` at 200 and `dead_code` at 500, and `stub` empties the
+#: nodes and edges entirely.
+GRAPH_INCOMPLETE_META = "graph_export_incomplete_reason"
+
+#: Export tiers whose lists are the whole graph. `None` is the kernel's own
+#: artifact, which is not tiered at all.
+_COMPLETE_EXPORT_TIERS = (None, "slim")
+
+
+def read_code_graph(root: Path) -> Optional[CodeGraph]:
+    """The kernel's ``code_graph.json``, parsed once and validated.
+
+    This is a read of the kernel's own artifact, not a second engine: the same
+    `devmap manifest` run that writes `repo_map.json` writes this file, and the
+    Python side has not built a graph since the kernel became the only writer.
+
+    It replaces :func:`load_code_graph` for every consumer that wants the whole
+    graph. That function reached the graph through the Python `index.sqlite`
+    cache — importing this same JSON into it on first read, then re-materialising
+    every node and edge as pydantic models out of SQLite on every call after.
+
+    Measured on this repository as a tmp corpus (1,637 files, 36 MB artifact),
+    interleaved A/B, n=11, on a contended machine, both routes returning the
+    same 18,316 nodes / 104,951 edges / 192 dead entries and the same node-id
+    set:
+
+    ==========================  ========  ========  ==========
+    route                       p50       min       peak RSS
+    ==========================  ========  ========  ==========
+    load_code_graph (warm)      1193.9ms  1154.3ms  250 MB
+    read_code_graph             322.5ms   310.4ms   409 MB
+    ==========================  ========  ========  ==========
+
+    The first `load_code_graph` on a fresh checkout costs 4787.0 ms and writes a
+    104.2 MB `index.sqlite` — from a read path, under a writer lease.
+
+    The trade is not free and is stated rather than buried: `json.load` builds
+    the whole object tree at once where the store re-materialised it row by row,
+    so peak RSS goes *up* by ~159 MB on this corpus. It buys 3.7x on the warm
+    read and removes the 104 MB write and the second store it lands in.
+
+    Returns ``None`` when there is no artifact, when it is unreadable, or when
+    it is larger than ``indexing.graph_json_max_bytes`` — the same bound
+    :func:`write_code_graph` enforces on the way out, so a file this refuses is
+    one this process would refuse to write.
+
+    A size-capped export is returned *with* :data:`GRAPH_INCOMPLETE_META` set in
+    ``meta``, never silently. See that constant for why.
+    """
+    root = root.expanduser().resolve()
+    path = graph_path(root)
+    if not path.is_file():
+        return None
+    limit = _graph_json_max_bytes(root)
+    try:
+        size = path.stat().st_size
+        if size > limit:
+            logger.warning(
+                "code graph export is %d bytes, over the %d-byte bound; "
+                "not read (raise indexing.graph_json_max_bytes to read it)",
+                size,
+                limit,
+            )
+            return None
+        graph = CodeGraph.model_validate(read_json(path))
+    except Exception:
+        logger.debug("Failed to read code graph export", exc_info=True)
+        return None
+    tier = (graph.meta or {}).get("compatibility_export_tier")
+    if tier not in _COMPLETE_EXPORT_TIERS:
+        graph.meta[GRAPH_INCOMPLETE_META] = (
+            f"code_graph.json is a size-capped {tier!r} export: its node, edge "
+            "and liveness lists are truncated or empty. Re-run `dev map` after "
+            "raising indexing.graph_json_max_bytes for a complete answer."
+        )
+    return _annotate_graph_degraded(root, graph)
+
+
 def load_code_graph(root: Path) -> Optional[CodeGraph]:
     from devcouncil.codeintel import get_codeintel_service
 
@@ -498,14 +583,138 @@ def _annotate_graph_degraded(root: Path, graph: CodeGraph) -> CodeGraph:
 
 # --- Opt-in PDG layer (CFG / reaching-def / CDG / taint) ---
 
+#: Where the opt-in PDG layer lives. Its own file, beside the kernel's.
+#:
+#: The layer used to be merged into the `CodeGraph` and written back with
+#: :func:`write_code_graph`, which rewrites `code_graph.json` — the artifact the
+#: kernel is the only writer of. That write-back was also the last production
+#: caller of the Python store's persist path, and it survived every `dev map`
+#: run only until the next one, because the kernel rewrites the file from
+#: scratch. Nothing outside the PDG commands ever read it back: `rg -uu pdg`
+#: over the tree finds `graph.meta["pdg"]` read by `load_pdg_layer` and
+#: `indexing/graph/query.py`, the per-file shards read by that same module, the
+#: two `stats` reads in the commands that had just written them, and nothing in
+#: `rust-port/` at all.
+PDG_SIDECAR_NAME = "pdg.json"
+
+
+def pdg_sidecar_path(root: Path) -> Path:
+    """Beside `code_graph.json`, derived from it rather than re-spelled.
+
+    Taking the directory from :func:`graph_path` means :data:`GRAPH_REL` stays
+    the one place the graph state directory is named. A second literal
+    ``.devcouncil/graph`` here would be a copy that drifts the first time the
+    state directory moves — and it does move: the standalone kernel resolves a
+    `.devmap` state dir. :func:`devcouncil.indexing.viz.write_graph_html`
+    already places `graph.html` this way.
+    """
+    return graph_path(root).with_name(PDG_SIDECAR_NAME)
+
+
+def python_paths_for_pdg(root: Path) -> List[str]:
+    """Python files to analyse, from the kernel's own file inventory.
+
+    `repo_map.json` is what the same `dev map` run writes beside
+    `code_graph.json`, and it lists every file the kernel indexed with its
+    language. Taking the list from here rather than from `graph.nodes` means the
+    PDG layer needs no graph at all — it is a per-file analysis, and it was
+    parsing a 34 MB graph to learn which files end in `.py`.
+
+    Returns an empty list when there is no map, which the callers report as
+    "run `dev map` first" rather than as "this repository has no Python".
+    """
+    try:
+        data = read_json(root / ".devcouncil" / "repo_map.json")
+    except (OSError, ValueError):
+        return []
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, list):
+        return []
+    paths: Set[str] = set()
+    for entry in files:
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("path") or "").replace("\\", "/")
+        if path.endswith(".py"):
+            paths.add(path)
+    return sorted(paths)
+
+
+def write_pdg_layer(root: Path, layer) -> Path:
+    """Publish the PDG layer to its own artifact, atomically.
+
+    Complete rather than capped: `PDGLayer.to_meta` trims `taint_findings` to
+    500 because it was going into `graph.meta` beside everything else, and a
+    reader of `dev map explain` was given that truncated list with nothing
+    saying it was one. The per-function findings under `files` are the whole
+    set, and :func:`read_pdg_layer` rebuilds the finding list from them.
+    """
+    payload = {
+        "version": int(getattr(layer, "version", 1)),
+        "stats": (layer.to_meta() or {}).get("stats") or {},
+        "files": {
+            path: file_pdg.to_dict() for path, file_pdg in sorted(layer.files.items())
+        },
+    }
+    path = pdg_sidecar_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n",
+    )
+    return path
+
+
+def read_pdg_layer_file(root: Path):
+    """The PDG sidecar as a ``PDGLayer``, or ``None`` when it has not been built.
+
+    ``None`` means "no PDG layer on disk" — the opt-in analysis has not run —
+    which the query surfaces report as such rather than as "this code has no
+    control flow".
+    """
+    from devcouncil.indexing.graph.pdg.schema import PDGLayer, PDG_VERSION, FilePDG
+
+    path = pdg_sidecar_path(root)
+    if not path.is_file():
+        return None
+    try:
+        raw = read_json(path)
+    except (OSError, ValueError):
+        logger.debug("PDG sidecar unreadable", exc_info=True)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    layer = PDGLayer(version=int(raw.get("version") or PDG_VERSION))
+    files = raw.get("files")
+    if isinstance(files, dict):
+        for path_key, payload in files.items():
+            if not isinstance(payload, dict):
+                continue
+            try:
+                file_pdg = FilePDG.from_dict(payload)
+            except (KeyError, TypeError, ValueError):
+                logger.debug("PDG sidecar entry unreadable: %s", path_key, exc_info=True)
+                continue
+            layer.files[str(path_key)] = file_pdg
+            for function in file_pdg.functions:
+                layer.taint_findings.extend(function.taint)
+    return layer
+
 
 def build_pdg_for_paths(
     root: Path,
-    graph: CodeGraph,
+    graph: Optional[CodeGraph] = None,
     *,
     paths: Optional[Iterable[str]] = None,
 ):
-    """Analyze Python files and return a PDG layer."""
+    """Analyze Python files and return a PDG layer.
+
+    ``graph`` is accepted for callers that already hold one and is used only to
+    enumerate Python files; ``None`` takes that list from the kernel's own
+    inventory instead (:func:`python_paths_for_pdg`). The analysis itself has
+    never looked at the graph — it parses each file with ``ast``.
+    """
     from devcouncil.indexing.graph.pdg.cdg import build_cdg
     from devcouncil.indexing.graph.pdg.cfg import build_cfg_for_function
     from devcouncil.indexing.graph.pdg.reaching_def import compute_reaching_defs
@@ -514,7 +723,11 @@ def build_pdg_for_paths(
 
     root = root.expanduser().resolve()
     if paths is None:
-        paths = sorted({n.path for n in graph.nodes if n.path.endswith(".py")})
+        paths = (
+            sorted({n.path for n in graph.nodes if n.path.endswith(".py")})
+            if graph is not None
+            else python_paths_for_pdg(root)
+        )
 
     def _python_functions(tree: ast.AST) -> List[tuple[str, ast.AST]]:
         out: List[tuple[str, ast.AST]] = []

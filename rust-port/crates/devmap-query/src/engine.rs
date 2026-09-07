@@ -245,6 +245,70 @@ impl<'a> StoreQueryEngine<'a> {
         self.traverse(req, true, min_rung)
     }
 
+    /// [`Self::impact`], with the reached symbols banded by distance.
+    ///
+    /// The flat edge list answers *what*; the bands answer *how far*, and until
+    /// this existed every consumer that needed the second derived it from the
+    /// first. Deriving it is not possible — an edge list does not carry the hop
+    /// at which the walk reached each endpoint — so the derivation was a guess,
+    /// and the guess in this repository asserted `depth: 1` and
+    /// `confidence: extracted` for every symbol a depth-3 walk returned.
+    ///
+    /// One generation, one index, two readings of it. Both halves come from the
+    /// same [`GenerationEdges`] snapshot, so the edge list and the bands cannot
+    /// describe different states of the repository the way a client issuing two
+    /// calls could — the straddle [`Self::neighbors_at_rung`] has to detect and
+    /// retry is not expressible here.
+    ///
+    /// **No rung floor.** [`Self::blast_walk`] filters on `min_confidence` and
+    /// has no rung, so accepting one would narrow the edges and leave the bands
+    /// wide — a composed answer whose two halves disagree about what the caller
+    /// asked for, which is the defect `neighbors_at_rung` documents. A caller
+    /// that wants a floor asks [`Self::impact_at_rung`] and gets an answer whose
+    /// filter is uniform.
+    ///
+    /// The budget is split, not doubled: `token_budget / 2` to the bands and the
+    /// remainder to the edges, as [`Self::affected_tests`] splits its own. A
+    /// caller asking for 2,000 tokens is answered in 2,000.
+    pub fn impact_layered(&self, req: Request<String>) -> anyhow::Result<LayeredImpact> {
+        devmap_store::checked_min_confidence(req.min_confidence)?;
+        let layer_budget = req.token_budget / 2;
+        let edge_budget = req.token_budget.saturating_sub(layer_budget);
+        let Some(index) = self.generation_edges()? else {
+            let reason = "no persisted generation is available".to_string();
+            return Ok(LayeredImpact {
+                edges: unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: reason.clone(),
+                }),
+                blast_radius: BlastRadius {
+                    seeds: Vec::new(),
+                    unmatched_targets: vec![req.query],
+                    layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+                    total_impacted: 0,
+                },
+            });
+        };
+        let direction = index.directed(true, req.min_confidence);
+        let (edges, bands) = self.traverse_walked(
+            &index,
+            &direction,
+            Request {
+                token_budget: edge_budget,
+                ..req
+            },
+            None,
+            Some(layer_budget),
+        )?;
+        Ok(LayeredImpact {
+            edges,
+            // `Some` by construction: `band_budget` was `Some` on the call
+            // above, and every return path of `traverse_walked` maps it.
+            blast_radius: bands.ok_or_else(|| {
+                anyhow::anyhow!("a banded traversal returned no bands; this is a bug in the kernel")
+            })?,
+        })
+    }
+
     /// Answer both call-graph directions for several targets in one pass.
     ///
     /// This is a composition, not new analysis: each target still gets exactly
@@ -682,6 +746,35 @@ impl<'a> StoreQueryEngine<'a> {
         req: Request<String>,
         min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
+        Ok(self
+            .traverse_walked(index, direction, req, min_rung, None)?
+            .0)
+    }
+
+    /// [`Self::traverse_over`], optionally banding the same walk by distance.
+    ///
+    /// One body, so `impact` and `impact --layers` cannot answer from two
+    /// different walks. `band_budget` is `None` for every caller that wants only
+    /// the edge list — which is the walk unchanged, byte for byte — and `Some`
+    /// for [`Self::impact_layered`], which needs the *same* edges partitioned by
+    /// the hop the walk reached them at.
+    ///
+    /// The bands are computed here rather than by a second walk over the store
+    /// for one reason: they must describe *this* answer. [`Self::blast_walk`]
+    /// walks the generation index directly and does not apply the reverse-
+    /// direction exclusions the traversal applies — no upward containment, no
+    /// file-level imports out of a symbol node — so a radius from there names
+    /// nodes this answer's edge list does not contain. That is the right shape
+    /// for `explore` and `affected`, which ask a wider question; it is the wrong
+    /// shape for an answer whose other half is the edge list itself.
+    fn traverse_walked(
+        &self,
+        index: &GenerationEdges,
+        direction: &devmap_store::DirectedEdges<'_>,
+        req: Request<String>,
+        min_rung: Option<crate::rung::Rung>,
+        band_budget: Option<u32>,
+    ) -> anyhow::Result<(Response<ResolvedEdge>, Option<BlastRadius>)> {
         let min_confidence = devmap_store::checked_min_confidence(req.min_confidence)?;
         // The direction is the view's, not a second argument that could
         // disagree with it. A reversed walk over a forward index answers
@@ -701,11 +794,21 @@ impl<'a> StoreQueryEngine<'a> {
                 .map(|(symbol, _)| symbol)
                 .collect();
         if start.is_empty() {
+            let reason = format!("{target} has no indexed traversal start");
             let mut response = unavailable_response(ResolutionAvailability::Unavailable {
-                reason: format!("{target} has no indexed traversal start"),
+                reason: reason.clone(),
             });
             response.walk_incomplete = coverage_gap;
-            return Ok(response);
+            // "Nothing looked" and "nothing was found" must not render alike on
+            // either half: the bands go out `Unavailable` with the target named,
+            // never as a radius of zero.
+            let bands = band_budget.map(|_| BlastRadius {
+                seeds: Vec::new(),
+                unmatched_targets: vec![target.to_string()],
+                layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+                total_impacted: 0,
+            });
+            return Ok((response, bands));
         }
         // `traverse_indexed` is bounded by `max_nodes`/`max_depth` and does not
         // itself consult the flag; checking on either side of it keeps an
@@ -736,6 +839,22 @@ impl<'a> StoreQueryEngine<'a> {
         // would report a distribution of whatever happened to fit, and would
         // spend the budget on edges it was about to discard.
         let (traversed, rungs) = crate::rung::narrow(traversed, min_rung);
+        // Also before the budget, and for the same reason: the bands describe
+        // the population the walk reached, not the slice that fitted. They are
+        // built from `traversed` rather than from `walk.traversed_edges` so that
+        // every banded node is an endpoint of an edge this answer measured —
+        // the two halves partition one set, and a node can appear in one and not
+        // the other only if the budgeter trimmed it, which the budgeter counts.
+        let bands = band_budget.map(|budget| {
+            blast_radius_from_edges(
+                &start,
+                &traversed,
+                reverse,
+                max_depth,
+                budget,
+                walk.stop.reason(max_depth, max_nodes),
+            )
+        });
         let mut response = budget_take(traversed, req.token_budget, |_| EDGE_TOKENS);
         response.rungs = Some(rungs);
         // Two independent qualifications, composed rather than ranked.
@@ -756,7 +875,7 @@ impl<'a> StoreQueryEngine<'a> {
             walk.stop.reason(max_depth, max_nodes),
             analysis_coverage_gap(index.analysis()),
         );
-        Ok(response)
+        Ok((response, bands))
     }
 
     /// Definitions matching `query`, each with its source, both call-graph
@@ -3125,6 +3244,112 @@ impl BlastWalk {
             layers: response,
             total_impacted: self.total_impacted,
         }
+    }
+}
+
+/// Band the endpoints of one traversal's edges by the hop that reached them.
+///
+/// The distance a traversal found a node at is not recoverable from an edge
+/// list — an edge carries two endpoints and no hop count — which is why every
+/// consumer that wanted bands had to guess, and why the guess in
+/// `graph_cmd.py` labelled a three-hop dependent `depth: 1`. This recovers it
+/// the only way it can be recovered honestly: by re-deriving shortest distance
+/// over the edges the walk actually crossed.
+///
+/// **It is a partition of `edges`, not a second walk.** Everything it can name
+/// is an endpoint of an edge already in this answer, so the bands and the edge
+/// list cannot describe different graphs, cannot apply different direction
+/// rules, and cannot come from different generations. That is the property
+/// [`StoreQueryEngine::blast_walk`] cannot offer here: it walks the index
+/// directly, without the traversal's reverse-direction exclusions, so it names
+/// the *file* that contains the seed and everything importing it.
+///
+/// Breadth-first over the crossed edges reproduces the walk's own depths
+/// exactly, because the walk is itself breadth-first and records the edge that
+/// first reached each node — the one exception being a walk that hit the
+/// recorded-edge cap, which is what `walk_incomplete` is carrying when it says
+/// so.
+fn blast_radius_from_edges(
+    seeds: &[String],
+    edges: &[ResolvedEdge],
+    reverse: bool,
+    depth_cap: usize,
+    token_budget: u32,
+    walk_incomplete: Option<String>,
+) -> BlastRadius {
+    // Borrowed keys and a B-tree for the same reasons `AdjacencyIndex` uses
+    // them: the edges outlive this call, and a deterministic iteration order is
+    // what makes the sampled `nodes` list reproducible.
+    let mut adjacency: BTreeMap<&str, Vec<(&str, f32)>> = BTreeMap::new();
+    for edge in edges {
+        let (from, to) = if reverse {
+            (edge.target_symbol.as_str(), edge.source_symbol.as_str())
+        } else {
+            (edge.source_symbol.as_str(), edge.target_symbol.as_str())
+        };
+        adjacency
+            .entry(from)
+            .or_default()
+            .push((to, edge.confidence.0));
+    }
+
+    let seed_set: BTreeSet<&str> = seeds.iter().map(String::as_str).collect();
+    let mut visited: BTreeSet<&str> = seed_set.clone();
+    let mut frontier: Vec<&str> = seed_set.iter().copied().collect();
+    let mut layers: Vec<BlastLayer> = Vec::new();
+    let mut total_impacted: u32 = 0;
+
+    for depth in 1..=depth_cap {
+        let mut members: BTreeSet<&str> = BTreeSet::new();
+        let mut lowest: Option<f32> = None;
+        for node in &frontier {
+            for (next, confidence) in adjacency.get(node).map(Vec::as_slice).unwrap_or_default() {
+                if visited.contains(next) {
+                    continue;
+                }
+                members.insert(next);
+                // The weakest edge that reached anything in this band. A radius
+                // held together by name-only attribution must not read like one
+                // built from resolved calls.
+                lowest = Some(match lowest {
+                    Some(current) => current.min(*confidence),
+                    None => *confidence,
+                });
+            }
+        }
+        if members.is_empty() {
+            break;
+        }
+        let node_count = u32::try_from(members.len()).unwrap_or(u32::MAX);
+        total_impacted = total_impacted.saturating_add(node_count);
+        let nodes: Vec<String> = members
+            .iter()
+            .take(BLAST_LAYER_NODE_SAMPLE)
+            .map(|node| (*node).to_string())
+            .collect();
+        layers.push(BlastLayer {
+            depth,
+            nodes_omitted: node_count
+                .saturating_sub(u32::try_from(nodes.len()).unwrap_or(u32::MAX)),
+            nodes,
+            node_count,
+            lowest_confidence: lowest,
+        });
+        visited.extend(members.iter().copied());
+        frontier = members.into_iter().collect();
+    }
+
+    let mut response = budget_take(layers, token_budget, blast_layer_tokens);
+    response.walk_incomplete = walk_incomplete;
+    BlastRadius {
+        seeds: seed_set.into_iter().map(str::to_string).collect(),
+        // Every seed here came from `indexed_traversal_starts` and therefore
+        // matched. The unmatched case never reaches this function — it returns
+        // an `Unavailable` radius one level up, where the caller's own text is
+        // still in hand to name.
+        unmatched_targets: Vec::new(),
+        layers: response,
+        total_impacted,
     }
 }
 

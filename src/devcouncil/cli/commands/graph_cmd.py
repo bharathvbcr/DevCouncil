@@ -631,34 +631,71 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
                 **_graph_degraded_fields(root),
             }
         if kind == "impact":
-            paths = list(kwargs.get("paths") or [])
-            depth = int(kwargs.get("max_depth", 3))
+            # One renderer for a banded blast radius, shared with
+            # `devcouncil_code_explore` / `_affected`. The alternative is a
+            # second place that decides what `confidence` on a band means, and
+            # the last time there were two, this one meant "distance" and the
+            # other meant "evidence".
+            from devcouncil.integrations.mcp.handlers.codeintel import (
+                _blast_radius_payload,
+            )
+
+            paths = [str(p).replace("\\", "/") for p in (kwargs.get("paths") or [])]
+            depth = max(1, min(3, int(kwargs.get("max_depth", 3))))
             items = []
             for path_s in paths:
-                resp = client.impact(path_s, depth=max(1, min(3, depth)))
-                reason = resolution_unavailable_reason(resp.resolution)
-                if reason:
-                    raise DevMapClientError(f"{path_s}: {reason}")
-                nodes = sorted({
-                    str(edge.get("source_symbol") or edge.get("source_file") or "")
-                    for edge in resp.items
-                    if edge.get("source_symbol") or edge.get("source_file")
-                })
+                # `layers=True`: the bands are the kernel's, computed over the
+                # edges of the walk it just performed. What stood here derived
+                # them from the returned edge list, which cannot carry distance,
+                # and so published every symbol a depth-3 walk reached as
+                # `depth: 1, confidence: "extracted"`.
+                resp = client.impact(path_s, depth=depth, layers=True)
+                blast = _blast_radius_payload(resp.blast_radius or {})
+                # The seeds are what the walk started from: the symbols in this
+                # file that the generation holds an inbound edge for, plus the
+                # file node itself. Not "every symbol defined here" — the key
+                # says which, because an empty list used to read as the latter.
                 items.append({
                     "path": path_s,
-                    "symbols": [],
-                    "blast": {
-                        "layers": [{
-                            "depth": 1,
-                            "nodes": nodes,
-                            "confidence": "extracted",
-                            "count": len(nodes),
-                        }] if nodes else [],
-                        "total_impacted": len(nodes),
-                    },
+                    "symbols": [
+                        {
+                            "id": seed,
+                            "path": seed.split("::", 1)[0],
+                            "name": seed.split("::", 1)[1] if "::" in seed else seed,
+                        }
+                        for seed in blast.get("seeds") or []
+                    ],
+                    "symbols_are_walk_seeds": True,
+                    "blast": blast,
+                    # A target with no indexed inbound edge is an *answer* —
+                    # "nothing reaches this" — and it used to be raised as a
+                    # client error, which sent the whole command to
+                    # `load_code_graph`. A correct answer must not trigger a
+                    # whole-graph read.
+                    "unavailable": blast.get("unavailable")
+                    or resolution_unavailable_reason(resp.resolution),
+                    # The edge half's own counters, so "3 callers listed" can
+                    # never be read as "3 callers exist".
+                    "edges_shown": resp.shown,
+                    "edges_total": resp.total,
+                    "edges_truncated": resp.truncated,
                     "resolution": "devmap",
                 })
-            return {"ok": True, "paths": items, "source": "devmap", **_graph_degraded_fields(root)}
+            # No `aggregate`. The retired Python engine computed one blast over
+            # every path's seeds at once, which is not the union of the per-path
+            # radii — a node two hops from one path can be one hop from another
+            # — and the kernel answers one target per call, so a union published
+            # under that name would be a different number wearing it. Nothing
+            # reads the key: `rg -uu aggregate` finds only the producer, and the
+            # kernel branch that has served this command since the M2 lane never
+            # emitted it.
+            return {
+                "ok": True,
+                "paths": items,
+                "path_count": len(items),
+                "source": "devmap",
+                **_graph_degraded_fields(root),
+            }
     except DevMapRequestRefused as exc:
         # The request, not the kernel, was refused: over the byte cap, not
         # UTF-8, a depth out of range. No engine can serve it, so it is an
@@ -704,12 +741,28 @@ def _warn_if_stale(
 
 
 def _require_graph(root: Path, *, warn_stale: bool = True):
-    from devcouncil.indexing.graph.build import load_code_graph
+    """The kernel's whole graph, read from the artifact the kernel writes.
 
-    graph = load_code_graph(root)
+    This went through `load_code_graph` — the retired engine's read path, which
+    imports `code_graph.json` into the Python `index.sqlite` cache on first read
+    (a ~94 MB write, under a writer lease, from a command that only reads) and
+    re-materialises every node and edge out of SQLite afterwards. The commands
+    below want the whole graph and the whole graph is already on disk.
+    """
+    from devcouncil.indexing.graph.build import GRAPH_INCOMPLETE_META, read_code_graph
+
+    graph = read_code_graph(root)
     if graph is None:
-        status.print("[red]No code graph; run `dev map` first.[/red]")
+        status.print(
+            "[red]No code graph at .devcouncil/graph/code_graph.json; "
+            "run `dev map` first.[/red]"
+        )
         raise typer.Exit(code=1)
+    # Named, never silent. A capped export answers in the shape of a complete
+    # one, and the store that used to hide the cap is no longer in the path.
+    incomplete = (graph.meta or {}).get(GRAPH_INCOMPLETE_META)
+    if incomplete:
+        status.print(f"[yellow]{incomplete}[/yellow]")
     if warn_stale:
         _warn_if_stale(root)
     return graph
@@ -1976,45 +2029,83 @@ def graph_impact(
     json_output: bool = typer.Option(False, "--json"),
     max_depth: int = typer.Option(3, "--max-depth", help="Inbound blast depth (1–3)."),
 ) -> None:
-    """Diff / path blast radius via enclosing symbols and inbound callers."""
+    """Diff / path blast radius: inbound callers, banded by distance.
+
+    `--diff` names the seed set from the working tree; the walk itself is the
+    kernel's, per path, and so are the bands. There is no Python engine below
+    this: what used to sit here loaded the whole graph out of `index.sqlite`
+    and re-ran the walk in Python, and it was reached not only when the kernel
+    was absent but whenever a path had no indexed inbound edge — that is, every
+    time the kernel correctly answered "nothing depends on this".
+    """
     root = _root(project_root)
     if not diff and not paths:
         status.print("[red]Provide paths or --diff.[/red]")
         raise typer.Exit(code=1)
-    result = None
-    if not diff and paths:
-        result = _devmap_query_payload(
-            root, "impact", paths=list(paths), max_depth=max_depth
-        )
-    if result is None:
-        from devcouncil.indexing.graph.intel import diff_impact
+    if diff:
+        from devcouncil.indexing.graph.intel import working_tree_changed_paths
 
-        graph = _require_graph(root)
-        result = diff_impact(
-            root,
-            graph,
-            paths=paths,
-            use_diff=diff,
-            max_depth=max(1, min(3, max_depth)),
-        )
+        # Reads `git diff`, not the graph. When the caller also named paths,
+        # they narrow the diff rather than replace it, as they always did.
+        changed = working_tree_changed_paths(root)
+        if paths:
+            wanted = {str(p).replace("\\", "/") for p in paths}
+            changed = [p for p in changed if p in wanted]
+        seeds = changed
+    else:
+        seeds = [str(p) for p in (paths or [])]
+    result = _devmap_query_payload(root, "impact", paths=seeds, max_depth=max_depth)
+    if result is None:
+        status.print(_NO_KERNEL_MESSAGE)
+        raise typer.Exit(code=1)
+    if result.get("ok") is False:
+        status.print(f"[red]devmap: {result.get('error') or 'refused'}[/red]")
+        raise typer.Exit(code=1)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
     if not result.get("paths"):
-        console.print("No impacted paths.")
+        console.print(
+            "No paths to analyse." if diff else "No impacted paths."
+        )
         return
     for item in result["paths"]:
         console.print(f"[bold]{item['path']}[/bold]")
+        unavailable = item.get("unavailable")
+        if unavailable:
+            # Printed instead of an empty radius: "nothing looked" and "nothing
+            # found" are the two readings this line exists to separate.
+            console.print(f"  [yellow]{unavailable}[/yellow]")
         syms = item.get("symbols") or []
         if syms:
-            console.print("  symbols: " + ", ".join(s["id"] for s in syms[:8]))
-        for layer in (item.get("blast") or {}).get("layers") or []:
+            label = "walk seeds" if item.get("symbols_are_walk_seeds") else "symbols"
+            console.print(f"  {label}: " + ", ".join(s["id"] for s in syms[:8]))
+        blast = item.get("blast") or {}
+        for layer in blast.get("layers") or []:
             nodes = layer.get("nodes") or []
+            # `confidence` is now the weakest edge that reached the band, and
+            # `None` when the band holds no measured edge — printed as "-"
+            # rather than as a tier name nothing measured.
+            #
+            # Round brackets, not square. This line read `[{confidence}]` and
+            # Rich took `[extracted]` for console markup and *dropped it*: the
+            # tier has never actually appeared in the output, for any band, on
+            # either engine.
+            tier = layer.get("confidence") or "-"
+            omitted = layer.get("nodes_omitted") or 0
             console.print(
-                f"  depth {layer['depth']} [{layer['confidence']}]: "
-                f"{len(nodes)} — " + ", ".join(nodes[:6])
+                f"  depth {layer['depth']} ({tier}): "
+                f"{layer.get('count', len(nodes))} — " + ", ".join(nodes[:6])
                 + (" …" if len(nodes) > 6 else "")
+                + (f"  ({omitted} not listed)" if omitted else "")
             )
+        if blast.get("layers_truncated"):
+            console.print(
+                f"  showing {blast.get('layers_shown')} of "
+                f"{blast.get('layers_total')} bands (token budget)"
+            )
+        if blast.get("walk_incomplete"):
+            console.print(f"  [yellow]warning: {blast['walk_incomplete']}[/yellow]")
 
 
 @app.command("html")
@@ -2341,39 +2432,40 @@ def graph_pdg_build(
     project_root: Path = typer.Option(Path("."), "--project-root"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Build or refresh the PDG layer for Python files."""
+    """Build or refresh the PDG layer for Python files.
+
+    The layer lands in `.devcouncil/graph/pdg.json`. It used to be merged into
+    the `CodeGraph` and written back with `write_code_graph`, which rewrites
+    `code_graph.json` — the artifact the kernel is the only writer of — and
+    persists the whole graph into the Python store on the way. Nothing outside
+    these PDG commands ever read it back, and the next `dev map` run overwrote
+    it anyway.
+    """
     from devcouncil.indexing.graph.build import (
-        CompatibilityGraphTooLarge,
         build_pdg_for_paths,
-        merge_pdg_into_graph,
-        write_code_graph,
+        python_paths_for_pdg,
+        write_pdg_layer,
     )
 
     root = _root(project_root)
-    graph = _require_graph(root)
-    layer = build_pdg_for_paths(root, graph, paths=paths or None)
-    shards = merge_pdg_into_graph(graph, layer)
-    merged: dict = {}
-    try:
-        from devcouncil.codeintel import get_codeintel_service
-
-        merged = dict(get_codeintel_service(root).store.analysis_shards())
-    except Exception:
-        pass
-    for path, payload in shards.items():
-        merged.setdefault(path, {}).update(payload)
-    export_warning = ""
-    try:
-        write_code_graph(root, graph, analysis_shards=merged)
-    except CompatibilityGraphTooLarge as exc:
-        # SQLite committed the PDG shards and a stub/pointer JSON is on disk;
-        # only the compatibility export is degraded — not the PDG build.
-        export_warning = str(exc)
-    stats = (graph.meta.get("pdg") or {}).get("stats") or {}
-    payload = {"ok": True, "stats": stats, "files": sorted(layer.files.keys())}
-    if export_warning:
-        payload["compatibility_export"] = "degraded"
-        payload["compatibility_export_reason"] = export_warning
+    wanted = list(paths or [])
+    if not wanted:
+        wanted = python_paths_for_pdg(root)
+        if not wanted:
+            status.print(
+                "[red]No file inventory at .devcouncil/repo_map.json; "
+                "run `dev map` first.[/red]"
+            )
+            raise typer.Exit(code=1)
+    layer = build_pdg_for_paths(root, paths=wanted)
+    out = write_pdg_layer(root, layer)
+    stats = (layer.to_meta() or {}).get("stats") or {}
+    payload = {
+        "ok": True,
+        "stats": stats,
+        "files": sorted(layer.files.keys()),
+        "artifact": str(out.relative_to(root)) if out.is_relative_to(root) else str(out),
+    }
     if json_output:
         typer.echo(json.dumps(payload, indent=2))
         return
@@ -2381,8 +2473,7 @@ def graph_pdg_build(
         f"PDG: {stats.get('function_count', 0)} functions, "
         f"{stats.get('taint_count', 0)} taint findings across {stats.get('file_count', 0)} files"
     )
-    if export_warning:
-        console.print(f"[yellow]compatibility export degraded: {export_warning}[/yellow]")
+    console.print(f"Wrote {payload['artifact']}")
 
 
 @app.command("explain")

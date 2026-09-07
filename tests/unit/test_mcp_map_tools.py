@@ -745,17 +745,36 @@ async def test_graph_impact_no_graph(tmp_path, monkeypatch):
 
 @pytest.mark.anyio
 async def test_graph_impact_ok(tmp_path, monkeypatch):
-    from types import SimpleNamespace
+    """Rewritten: the tool no longer has a Python engine under it.
+
+    It used to load the whole graph and run `diff_impact` in Python. The kernel
+    bands its own walk now, so the double is the kernel payload, and
+    `load_code_graph` is patched to raise — a tool that still reaches it fails
+    here rather than passing on a fixture that had nothing to load.
+    """
+
+    def _never(root):
+        raise AssertionError(
+            "handle_graph_impact reached the retired Python engine's whole-graph read"
+        )
+
+    monkeypatch.setattr("devcouncil.indexing.graph.build.load_code_graph", _never)
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.intel.working_tree_changed_paths",
+        lambda root: ["a.py"],
+    )
+    seen: list[list[str]] = []
+
+    def _kernel(root, kind, **kwargs):
+        seen.append(list(kwargs.get("paths") or []))
+        return {"ok": True, "source": "devmap", "paths": [], "path_count": 0}
 
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph", lambda root: SimpleNamespace()
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.intel.diff_impact",
-        lambda root, graph, paths, use_diff, max_depth: {"paths": paths or [], "diff": use_diff},
+        "devcouncil.cli.commands.graph_cmd._devmap_query_payload", _kernel
     )
     out = _parse(await mapmod.handle_graph_impact(tmp_path, {"diff": True}))
-    assert out["ok"] is True and out["diff"] is True
+    assert out["ok"] is True and out["source_paths"] == "diff"
+    assert seen == [["a.py"]], seen
 
 
 @pytest.mark.anyio

@@ -9,7 +9,6 @@ from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
 from devcouncil.codeintel.sync.lease import WriterLease
-from devcouncil.indexing.graph.build import CompatibilityGraphTooLarge
 
 runner = CliRunner()
 
@@ -221,62 +220,79 @@ def test_graph_explain_pdg_query(tmp_path, monkeypatch):
     )
     assert bad.exit_code == 2
 
-    # pdg build
-    layer = SimpleNamespace(files={"a.py": {}})
+    # pdg build — the layer is its own artifact now: the file list comes from the
+    # map's inventory and the result goes to the sidecar, with no `CodeGraph`
+    # loaded and none written back.
+    layer = SimpleNamespace(
+        files={"a.py": {}},
+        to_meta=lambda: {"stats": {"function_count": 1, "taint_count": 0, "file_count": 1}},
+    )
+    monkeypatch.setattr(graph_build, "python_paths_for_pdg", lambda root: ["a.py"])
     monkeypatch.setattr(
-        graph_build, "build_pdg_for_paths", lambda root, graph, paths=None: layer
+        graph_build, "build_pdg_for_paths", lambda root, graph=None, *, paths=None: layer
     )
     monkeypatch.setattr(
-        graph_build, "merge_pdg_into_graph", lambda graph, layer: {"a.py": {"x": 1}}
+        graph_build,
+        "write_pdg_layer",
+        lambda root, layer: root / ".devcouncil" / "graph" / "pdg.json",
     )
-    monkeypatch.setattr(graph_build, "write_code_graph", lambda *a, **k: None)
-    monkeypatch.setattr(
-        "devcouncil.codeintel.get_codeintel_service",
-        lambda root: SimpleNamespace(store=SimpleNamespace(analysis_shards=lambda: {})),
-    )
-    graph = SimpleNamespace(meta={"pdg": {"stats": {"function_count": 1, "taint_count": 0, "file_count": 1}}})
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: graph)
     pb = runner.invoke(
         app, ["map", "pdg", "build", "--json", "--project-root", str(tmp_path)]
     )
     assert pb.exit_code == 0
 
 
-def test_graph_pdg_build_survives_oversized_compatibility_export(tmp_path, monkeypatch):
-    """Stub-tier export raises after a successful write; `dev graph pdg` must
-    report degraded-export success, not crash (SQLite already committed)."""
+def test_graph_pdg_build_never_writes_the_compatibility_export(tmp_path, monkeypatch):
+    """`dev map pdg build` must not touch `code_graph.json` at all.
+
+    This test used to pin the *recovery* from a defect that no longer exists.
+    `pdg build` merged its layer into a `CodeGraph` and called
+    `write_code_graph`, so an oversized graph raised `CompatibilityGraphTooLarge`
+    after SQLite had committed, and the command had to report
+    `compatibility_export: degraded` rather than crash. The whole write-back is
+    gone — the kernel is the only writer of `code_graph.json`, and the next
+    `dev map` rewrote the merged file from the store anyway — so the failure
+    mode is unreachable and the payload keys it asserted no longer exist.
+
+    What replaces it is the stronger invariant: the export is not written, so it
+    cannot be degraded. `write_code_graph` raises here; a `pdg build` that still
+    reached it would fail loudly instead of quietly reporting success.
+    """
     import json
 
     from devcouncil.indexing.graph import build as graph_build
 
-    layer = SimpleNamespace(files={"a.py": {}})
-    monkeypatch.setattr(
-        graph_build, "build_pdg_for_paths", lambda root, graph, paths=None: layer
+    layer = SimpleNamespace(
+        files={"a.py": {}},
+        to_meta=lambda: {"stats": {"function_count": 1, "taint_count": 0, "file_count": 1}},
     )
+    monkeypatch.setattr(graph_build, "python_paths_for_pdg", lambda root: ["a.py"])
     monkeypatch.setattr(
-        graph_build, "merge_pdg_into_graph", lambda graph, layer: {"a.py": {"x": 1}}
+        graph_build, "build_pdg_for_paths", lambda root, graph=None, *, paths=None: layer
     )
 
-    def _too_large(*_a, **_k):
-        raise CompatibilityGraphTooLarge("exceeded cap; wrote stub JSON")
+    def _must_not_be_called(*_a, **_k):
+        raise AssertionError(
+            "`pdg build` wrote the compatibility export; the kernel is the only "
+            "writer of code_graph.json"
+        )
 
-    monkeypatch.setattr(graph_build, "write_code_graph", _too_large)
+    monkeypatch.setattr(graph_build, "write_code_graph", _must_not_be_called)
+    monkeypatch.setattr(graph_build, "load_code_graph", _must_not_be_called)
     monkeypatch.setattr(
-        "devcouncil.codeintel.get_codeintel_service",
-        lambda root: SimpleNamespace(store=SimpleNamespace(analysis_shards=lambda: {})),
+        graph_build,
+        "write_pdg_layer",
+        lambda root, layer: root / ".devcouncil" / "graph" / "pdg.json",
     )
-    graph = SimpleNamespace(
-        meta={"pdg": {"stats": {"function_count": 1, "taint_count": 0, "file_count": 1}}}
-    )
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: graph)
+
     result = runner.invoke(
         app, ["map", "pdg", "build", "--json", "--project-root", str(tmp_path)]
     )
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
-    assert payload["compatibility_export"] == "degraded"
-    assert "stub" in payload["compatibility_export_reason"]
+    assert payload["artifact"].endswith("pdg.json")
+    assert "compatibility_export" not in payload
 
 
 def test_graph_status_json_and_hooks_refuse(tmp_path, monkeypatch):

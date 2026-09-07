@@ -19,12 +19,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from devcouncil.indexing.graph.build import load_code_graph
+from devcouncil.indexing.graph.build import read_code_graph
 from devcouncil.indexing.graph.schema import CodeGraph, GraphNode
 
 
 def _load(root: Path, graph: Optional[CodeGraph] = None) -> Optional[CodeGraph]:
-    return graph if graph is not None else load_code_graph(root)
+    """The kernel's `code_graph.json`, or the graph a caller already holds.
+
+    This was `load_code_graph`, which reaches the same data through the Python
+    `index.sqlite` cache. The dead-symbol gate below is the reason that matters:
+    it runs as a *fallback for when the kernel cannot be reached*, and its own
+    caller documents it as reading "code_graph.json, the artifact the same
+    kernel writes". It did not — it imported that artifact into a second store
+    first, ~94 MB of writes under a writer lease, from a verification gate.
+    """
+    return graph if graph is not None else read_code_graph(root)
 
 
 def _match_nodes(graph: CodeGraph, name_or_path: str) -> List[GraphNode]:
@@ -80,41 +89,41 @@ def symbol_has_non_test_inbound(
 # --- Opt-in PDG query helpers ---
 
 
-def _load_file_pdg_from_store(root: Path, path: str):
-    from devcouncil.indexing.graph.pdg.schema import FilePDG
-
-    path = path.replace("\\", "/")
-    try:
-        from devcouncil.codeintel import get_codeintel_service
-
-        shards = get_codeintel_service(root).store.analysis_shards()
-        raw = (shards.get(path) or {}).get("pdg")
-        if isinstance(raw, dict):
-            return FilePDG.from_dict(raw)
-    except Exception:
-        pass
-    return None
+#: Said by every PDG surface when the opt-in layer has not been built.
+_NO_PDG = (
+    "no PDG layer at .devcouncil/graph/pdg.json; run `dev map --pdg` or "
+    "`dev map pdg build` first"
+)
 
 
-def _match_pdg_functions(root: Path, graph: CodeGraph, target: str):
+def _match_pdg_functions(layer, target: str):
+    """Functions in the built layer matching ``target``: a path or a name.
+
+    The layer is the only input. This used to resolve a bare name to files by
+    scanning ``graph.nodes`` — a whole-graph read to answer a question the PDG
+    layer's own ``qualname``s answer, since a function with no PDG entry cannot
+    be in the result either way.
+    """
     q = target.replace("\\", "/")
-    paths: set[str] = set()
-    if q.endswith(".py"):
-        paths.add(q)
-    else:
-        for n in graph.nodes:
-            if n.name == q or n.id.endswith(f"::{q}") or q in n.id:
-                if n.path:
-                    paths.add(n.path.replace("\\", "/"))
     hits = []
-    for path in paths:
-        file_pdg = _load_file_pdg_from_store(root, path)
-        if file_pdg is None:
+    for path, file_pdg in layer.files.items():
+        if q.endswith(".py") and path.replace("\\", "/") != q:
             continue
         for fn in file_pdg.functions:
-            if q.endswith(".py") or fn.qualname == q or fn.qualname.endswith(f".{q}") or q in fn.qualname:
+            if (
+                q.endswith(".py")
+                or fn.qualname == q
+                or fn.qualname.endswith(f".{q}")
+                or q in fn.qualname
+            ):
                 hits.append(fn)
     return hits
+
+
+def _pdg_layer(root: Path):
+    from devcouncil.indexing.graph.build import read_pdg_layer_file
+
+    return read_pdg_layer_file(root)
 
 
 def explain_pdg_taint(
@@ -124,18 +133,18 @@ def explain_pdg_taint(
     path: Optional[str] = None,
     category: Optional[str] = None,
 ) -> Dict[str, Any]:
-    from devcouncil.indexing.graph.build import load_pdg_layer
-    from devcouncil.indexing.graph.pdg.schema import TaintFinding
+    """Taint findings from the built PDG layer.
 
-    g = _load(root, graph)
-    if g is None:
-        return {"ok": False, "error": "no code graph; run `dev map --pdg` or `dev map pdg build` first"}
-    layer = load_pdg_layer(g)
-    findings: List[TaintFinding] = list(layer.taint_findings) if layer else []
-    if not findings and isinstance(g.meta.get("pdg"), dict):
-        for item in g.meta["pdg"].get("taint_findings") or []:
-            if isinstance(item, dict):
-                findings.append(TaintFinding.from_dict(item))
+    Complete, not sampled. The findings used to come from ``graph.meta["pdg"]``,
+    where ``PDGLayer.to_meta`` had trimmed them to the first 500 with nothing in
+    the payload saying so — a capped list published as the answer to "what
+    reaches a sink". The sidecar carries every function's findings, and
+    ``count`` counts them.
+    """
+    layer = _pdg_layer(root)
+    if layer is None:
+        return {"ok": False, "error": _NO_PDG}
+    findings = list(layer.taint_findings)
     if path:
         path = path.replace("\\", "/")
         findings = [f for f in findings if f.path == path]
@@ -150,10 +159,10 @@ def query_pdg_controls(
     *,
     graph: Optional[CodeGraph] = None,
 ) -> Dict[str, Any]:
-    g = _load(root, graph)
-    if g is None:
-        return {"ok": False, "error": "no code graph"}
-    functions = _match_pdg_functions(root, g, target)
+    layer = _pdg_layer(root)
+    if layer is None:
+        return {"ok": False, "error": _NO_PDG}
+    functions = _match_pdg_functions(layer, target)
     if not functions:
         return {"ok": False, "error": f"no PDG for target {target!r}; run `dev map pdg build`"}
     return {
@@ -173,10 +182,10 @@ def query_pdg_flows(
     variable: Optional[str] = None,
     graph: Optional[CodeGraph] = None,
 ) -> Dict[str, Any]:
-    g = _load(root, graph)
-    if g is None:
-        return {"ok": False, "error": "no code graph"}
-    functions = _match_pdg_functions(root, g, target)
+    layer = _pdg_layer(root)
+    if layer is None:
+        return {"ok": False, "error": _NO_PDG}
+    functions = _match_pdg_functions(layer, target)
     if not functions:
         return {"ok": False, "error": f"no PDG for target {target!r}; run `dev map pdg build`"}
     out: List[dict[str, Any]] = []
