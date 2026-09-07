@@ -3467,9 +3467,17 @@ impl Store {
         // identical, not one it declined to look at. That is the distinction the
         // paragraph above is about, and it is why the equality below is still
         // structural.
-        let mut wanted: std::collections::HashMap<EdgeTuple, u32> =
-            std::collections::HashMap::with_capacity(resolution.edges.len());
-        let mut edge_ord: u32 = 0;
+        //
+        // The tuples are kept in a `Vec` in the resolver's emission order, and
+        // the multiset is a map *into* it. Iterating the map instead would have
+        // been shorter and was measurably wrong: a `HashMap`'s order is
+        // arbitrary and varies per process, so the inserts landed in no order
+        // at all, and the read path's sort — which is handed the rows in stored
+        // order — lost the nearly-sorted input it had been getting for free. A
+        // cold `devmap impact` on this repository went 115 ms to 150 ms for
+        // **the same instruction count** (1.192 G against 1.188 G) and 32% more
+        // cycles: pure memory stalls in a sort with a worse starting order.
+        let mut ordered: Vec<EdgeTuple> = Vec::with_capacity(resolution.edges.len());
         for edge in &resolution.edges {
             // Deleted paths are not extracted, so a resolution over the current
             // tree has no edge touching one. Kept as an explicit guard for
@@ -3507,12 +3515,23 @@ impl Store {
                     edge.resolution.as_deref(),
                 ),
             };
-            // A *multiset*, not a set. 475 edge tuples of this repository occur
-            // more than once in one generation (1,111 rows); collapsing them
-            // would drop rows the analysis counted and make the equality below
-            // refuse the build.
+            ordered.push(tuple);
+        }
+        let edge_ord = u32::try_from(ordered.len()).map_err(|_| {
+            rusqlite::Error::InvalidParameterName(
+                "edge row count exceeds SQLite generation ordinal capacity".into(),
+            )
+        })?;
+
+        // A *multiset*, not a set. 475 edge tuples of this repository occur more
+        // than once in one generation (1,111 rows); collapsing them would drop
+        // rows the analysis counted and make the equality below refuse the
+        // build. The map borrows its keys from `ordered`, so this costs no
+        // second copy of the generation.
+        let mut wanted: std::collections::HashMap<&EdgeTuple, u32> =
+            std::collections::HashMap::with_capacity(ordered.len());
+        for tuple in &ordered {
             *wanted.entry(tuple).or_insert(0) += 1;
-            edge_ord += 1;
         }
 
         // The rows already valid, streamed rather than materialised: the probe
@@ -3570,20 +3589,28 @@ impl Store {
                                         candidate_total, valid_from, valid_to)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
             )?;
-            for (tuple, missing) in &wanted {
-                for _ in 0..*missing {
-                    insert.execute(params![
-                        tuple.source_file_id,
-                        tuple.target_file_id,
-                        tuple.source_symbol.as_ref(),
-                        tuple.target_symbol.as_ref(),
-                        tuple.edge_kind.as_ref(),
-                        f64::from_bits(tuple.confidence),
-                        tuple.resolution.as_deref(),
-                        tuple.candidate_total,
-                        gen_id,
-                    ])?;
+            // In emission order, and only the copies the live set did not
+            // already supply: a tuple wanted three times and valid twice is
+            // inserted once, at the position of its first occurrence.
+            for tuple in &ordered {
+                let Some(missing) = wanted.get_mut(tuple) else {
+                    continue;
+                };
+                if *missing == 0 {
+                    continue;
                 }
+                *missing -= 1;
+                insert.execute(params![
+                    tuple.source_file_id,
+                    tuple.target_file_id,
+                    tuple.source_symbol.as_ref(),
+                    tuple.target_symbol.as_ref(),
+                    tuple.edge_kind.as_ref(),
+                    f64::from_bits(tuple.confidence),
+                    tuple.resolution.as_deref(),
+                    tuple.candidate_total,
+                    gen_id,
+                ])?;
             }
         }
 
@@ -3772,12 +3799,12 @@ impl Store {
         // sides, with nothing appearing and nothing disappearing** — a ledger
         // that had not changed at all and was rewritten in full every time.
         {
-            let mut wanted: std::collections::HashMap<UnresolvedTuple, u32> =
-                std::collections::HashMap::with_capacity(resolution.unresolved.len());
             let mut reason_texts: Vec<String> = Vec::with_capacity(resolution.unresolved.len());
             for unresolved in &resolution.unresolved {
                 reason_texts.push(format!("{:?}", unresolved.resolution));
             }
+            // Emission order, for the same reason the edges keep theirs.
+            let mut ordered: Vec<UnresolvedTuple> = Vec::with_capacity(resolution.unresolved.len());
             for (unresolved, reason) in resolution.unresolved.iter().zip(&reason_texts) {
                 let tuple = UnresolvedTuple {
                     source_file: std::borrow::Cow::Borrowed(unresolved.source_file.as_str()),
@@ -3790,8 +3817,13 @@ impl Store {
                         .as_deref()
                         .map(std::borrow::Cow::Borrowed),
                 };
-                // 12,424 ledger tuples of this repository occur more than once
-                // in one generation (36,600 rows), so this is a multiset too.
+                ordered.push(tuple);
+            }
+            // 12,424 ledger tuples of this repository occur more than once in
+            // one generation (36,600 rows), so this is a multiset too.
+            let mut wanted: std::collections::HashMap<&UnresolvedTuple, u32> =
+                std::collections::HashMap::with_capacity(ordered.len());
+            for tuple in &ordered {
                 *wanted.entry(tuple).or_insert(0) += 1;
             }
 
@@ -3839,18 +3871,23 @@ impl Store {
                   valid_from, valid_to)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
             )?;
-            for (tuple, missing) in &wanted {
-                for _ in 0..*missing {
-                    insert.execute(params![
-                        tuple.source_file.as_ref(),
-                        tuple.source_symbol.as_ref(),
-                        tuple.callee_name.as_ref(),
-                        tuple.reason.as_ref(),
-                        tuple.classification.as_ref(),
-                        tuple.receiver.as_deref(),
-                        gen_id,
-                    ])?;
+            for tuple in &ordered {
+                let Some(missing) = wanted.get_mut(tuple) else {
+                    continue;
+                };
+                if *missing == 0 {
+                    continue;
                 }
+                *missing -= 1;
+                insert.execute(params![
+                    tuple.source_file.as_ref(),
+                    tuple.source_symbol.as_ref(),
+                    tuple.callee_name.as_ref(),
+                    tuple.reason.as_ref(),
+                    tuple.classification.as_ref(),
+                    tuple.receiver.as_deref(),
+                    gen_id,
+                ])?;
             }
         }
 
@@ -6301,9 +6338,11 @@ impl Store {
         // generations than that, so `gen_ids[keep_generations - 1]` is the
         // oldest retained id.
         //
-        // The two partial indexes on `valid_to IS NOT NULL` make this a scan of
-        // the closed rows rather than of the whole table, which with two
-        // retained generations is one build's churn.
+        // `idx_edge_rows_closed` and `idx_unresolved_rows_closed` make this a
+        // scan of the closed rows rather than of the whole table. They are the
+        // only partial indexes v18 keeps: the matching `valid_to IS NULL` half
+        // made SQLite plan every *read* as a MULTI-INDEX OR over 102,083 rowid
+        // lookups and cost a cold `impact` 40 ms — see `VALIDITY_RANGE_TABLES`.
         let cutoff = gen_ids[keep_generations - 1];
         tx.execute(
             "DELETE FROM edge_rows WHERE valid_to IS NOT NULL AND valid_to <= ?1",

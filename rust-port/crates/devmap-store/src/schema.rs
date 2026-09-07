@@ -798,14 +798,30 @@ CREATE TABLE IF NOT EXISTS unresolved_rows (
 CREATE INDEX IF NOT EXISTS idx_edge_rows_source ON edge_rows(source_file_id);
 CREATE INDEX IF NOT EXISTS idx_edge_rows_target ON edge_rows(target_file_id);
 
--- The write path's own index. Every build scans the currently-valid set once to
--- diff it, and every build closes the rows that went away; both are keyed on
--- `valid_to`, and both are partial so the index carries entries only for the
--- side it serves. `idx_edge_rows_closed` in particular stays tiny — with two
--- retained generations the closed set is one build's churn, so the prune's
--- reclaim is a short index scan instead of a walk of every live row.
-CREATE INDEX IF NOT EXISTS idx_edge_rows_open
-    ON edge_rows(valid_from) WHERE valid_to IS NULL;
+-- The prune's index, and **only** the prune's.
+--
+-- The design this came from called for a partial index on `valid_to IS NULL`
+-- to serve the write path's diff scan. Measured, that index made the *reads*
+-- 36% slower and was withdrawn. With both halves of `valid_to IS NULL OR
+-- valid_to > ?` indexed, SQLite plans the reader's scan as a MULTI-INDEX OR:
+--
+--   |--SEARCH g USING INTEGER PRIMARY KEY (rowid=?)
+--   `--MULTI-INDEX OR
+--      |--SEARCH e USING INDEX idx_edge_rows_open (valid_from<?)
+--      `--SEARCH e USING INDEX idx_edge_rows_closed (valid_to>?)
+--
+-- — 102,083 rowid lookups instead of one sequential pass, and a cold
+-- `devmap impact` on this repository went 111 ms to 151 ms (p50, n=21,
+-- interleaved, half-run min drift 1-2 ms). Leaving only the `IS NOT NULL` half
+-- indexed makes the OR unindexable, the plan `SCAN e`, and the reader whole,
+-- while the prune's `valid_to <= ?` still gets its index.
+--
+-- The diff scan wants every live row, so a sequential pass is the right plan
+-- for it too: an index on `valid_to IS NULL` would have read the same rows in
+-- rowid order through one more level of indirection.
+--
+-- These stay tiny by construction: with two retained generations the closed
+-- set is one build's churn, and the prune empties it.
 CREATE INDEX IF NOT EXISTS idx_edge_rows_closed
     ON edge_rows(valid_to) WHERE valid_to IS NOT NULL;
 
@@ -813,8 +829,6 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_rows_callee
     ON unresolved_rows(callee_name);
 CREATE INDEX IF NOT EXISTS idx_unresolved_rows_class
     ON unresolved_rows(classification);
-CREATE INDEX IF NOT EXISTS idx_unresolved_rows_open
-    ON unresolved_rows(valid_from) WHERE valid_to IS NULL;
 CREATE INDEX IF NOT EXISTS idx_unresolved_rows_closed
     ON unresolved_rows(valid_to) WHERE valid_to IS NOT NULL;
 
