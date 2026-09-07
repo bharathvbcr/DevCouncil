@@ -105,7 +105,16 @@ _WIRING_DECORATOR_HINTS = (
 # instead of being compared against a current side that measured something else.
 LIVENESS_SCAN_VERSION = 5
 
-_VENDOR_DIR_NAMES = frozenset({"vendor", "vendored", "node_modules"})
+# Kept equal to `devmap-extract/src/wiring.rs`'s `is_vendored_path` segment list
+# and `MINIFIED_SUFFIXES`, and pinned there by
+# `tests/unit/test_wiring_parity_with_kernel.py`. `third_party` and the
+# `.min.mjs` / `.min.cjs` bundles were in the kernel's tables and not in these,
+# so the map exempted them from liveness while the verify gates below still
+# reported on them.
+_VENDOR_DIR_NAMES = frozenset({"vendor", "vendored", "node_modules", "third_party"})
+# The compound suffix, not the substring `min`: `src/mining.js` and
+# `src/minify.js` are hand-written.
+_MINIFIED_SUFFIXES = (".min.js", ".min.mjs", ".min.cjs", ".min.css")
 
 
 def _norm(path: str) -> str:
@@ -187,8 +196,9 @@ def is_dunder_symbol(name: str) -> bool:
 def is_vendored_path(path: str) -> bool:
     """True when ``path`` is a vendored/minified bundle, not first-class source.
 
-    Matches ``vendor`` / ``vendored`` / ``node_modules`` path segments and
-    ``.min.js`` / ``.min.css`` basenames — same convention
+    Matches the :data:`_VENDOR_DIR_NAMES` path segments and the
+    :data:`_MINIFIED_SUFFIXES` basenames — the same two tables the kernel's
+    ``is_vendored_path`` holds, and the same convention
     :func:`structural_exemptions` already encodes for file-level liveness.
     """
     try:
@@ -197,9 +207,7 @@ def is_vendored_path(path: str) -> bool:
         parts = norm.lower().split("/")
         if any(p in _VENDOR_DIR_NAMES for p in parts):
             return True
-        if name.endswith(".min.js") or name.endswith(".min.css"):
-            return True
-        return False
+        return name.lower().endswith(_MINIFIED_SUFFIXES)
     except Exception:
         logger.debug("is_vendored_path failed for %s", path, exc_info=True)
         return False
