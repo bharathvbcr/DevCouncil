@@ -2630,6 +2630,30 @@ use devmap_query::{MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH};
 /// Refused, never clamped. Clamping is what makes a capped answer
 /// indistinguishable from a complete one, which is the failure this codebase
 /// treats as worse than an error.
+/// The path a root-taking subcommand names must be a directory that exists.
+///
+/// Measured through the release binary: `manifest <missing path>` created
+/// `<missing path>/.devmap/` and wrote the artifacts of the store's *other*
+/// repository into it; `routes`, `shape-check` and `api-impact` answered from
+/// the store's recorded root and never said the path they were given does not
+/// exist; `build <file>` walked the file as an empty tree. A path the caller
+/// named and this binary could not examine is not a repository root, and
+/// answering — or writing — as if it were is the check that could not run
+/// reporting as one that ran. Only [`Cli::root_hint`]'s subcommands carry a
+/// root, and the default `.` always exists, so only a path the caller actually
+/// spelled can fail here.
+fn validate_root(cli: &Cli) -> Result<(), String> {
+    let root = cli.root_hint();
+    match std::fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(format!(
+            "{}: not a directory; the path a subcommand names must be a repository root",
+            root.display()
+        )),
+        Err(error) => Err(format!("{}: {error}", root.display())),
+    }
+}
+
 fn validate_limits(command: &Commands) -> Result<(), String> {
     let check_budget = |budget: u32| -> Result<(), String> {
         if budget == 0 {
@@ -2866,7 +2890,7 @@ async fn main() -> std::process::ExitCode {
     if !cli.command.serves() {
         restore_default_sigpipe();
     }
-    let outcome = match validate_limits(&cli.command) {
+    let outcome = match validate_limits(&cli.command).and_then(|()| validate_root(&cli)) {
         Ok(()) => run(&cli).await,
         Err(message) => Err(anyhow::anyhow!(message)),
     };
