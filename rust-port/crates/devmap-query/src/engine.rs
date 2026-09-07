@@ -617,12 +617,16 @@ impl<'a> StoreQueryEngine<'a> {
             return Ok(Vec::new());
         };
         let mut edges = Vec::new();
-        for (id, row) in index.edges().iter().enumerate() {
-            self.cancel.check_every(id)?;
-            if !index.admits(id as u32, min_confidence) {
+        for id in 0..index.len() as u32 {
+            self.cancel.check_every(id as usize)?;
+            if !index.admits(id, min_confidence) {
                 continue;
             }
-            edges.push(stored_edge_to_resolved(row.clone())?);
+            // The one whole-generation materialisation left, and the row is
+            // built here rather than held for the life of the index: only
+            // `trace_between` needs every edge as a `ResolvedEdge`, and it is
+            // about to own all of them anyway.
+            edges.push(stored_edge_to_resolved(index.stored_edge(id))?);
         }
         Ok(edges)
     }
@@ -1098,15 +1102,9 @@ impl<'a> StoreQueryEngine<'a> {
         // fail the other. The whole-generation `BTreeMap` this replaced was
         // rebuilt per call, which is the cost the index exists to remove.
         let inbound = |node: &str| {
-            index
-                .into_target_symbol(node)
-                .iter()
-                .copied()
-                .filter(|id| {
-                    index.admits(*id, min_confidence)
-                        && index.edge(*id).confidence >= min_confidence
-                })
-                .map(|id| index.edge(id))
+            index.into_target_symbol(node).iter().copied().filter(|id| {
+                index.admits(*id, min_confidence) && index.confidence(*id) >= min_confidence
+            })
         };
 
         let mut visited: BTreeSet<String> = walk
@@ -1121,10 +1119,9 @@ impl<'a> StoreQueryEngine<'a> {
             let mut seen: BTreeSet<String> = BTreeSet::new();
             let mut lowest: Option<f32> = None;
             for node in &frontier {
-                for edge in inbound(node.as_str()) {
-                    if visited.contains(edge.source_symbol.as_str())
-                        || seen.contains(edge.source_symbol.as_str())
-                    {
+                for id in inbound(node.as_str()) {
+                    let source_symbol = index.source_symbol(id);
+                    if visited.contains(source_symbol) || seen.contains(source_symbol) {
                         continue;
                     }
                     // The cap is a *withholding*, recorded as one. A radius
@@ -1134,16 +1131,17 @@ impl<'a> StoreQueryEngine<'a> {
                         walk.stop.node_capped = true;
                         continue;
                     }
-                    seen.insert(edge.source_symbol.clone());
+                    seen.insert(source_symbol.to_string());
                     // The file comes from the edge that actually reached this
                     // node, not from a global symbol-to-file guess: the same
                     // qualified name can appear in two files, and attributing a
                     // reached symbol to the wrong one puts the wrong test in
                     // the answer.
-                    members.insert((edge.source_symbol.clone(), edge.source_file.clone()));
+                    members.insert((source_symbol.to_string(), index.source_file(id).to_string()));
+                    let confidence = index.confidence(id);
                     lowest = Some(match lowest {
-                        Some(current) => current.min(edge.confidence),
-                        None => edge.confidence,
+                        Some(current) => current.min(confidence),
+                        None => confidence,
                     });
                 }
             }
@@ -1165,8 +1163,7 @@ impl<'a> StoreQueryEngine<'a> {
                 // Something was still expanding when the depth bound stopped
                 // it. Left unsaid, a capped radius reads as a complete one.
                 walk.stop.depth_capped = frontier.iter().any(|node| {
-                    inbound(node.as_str())
-                        .any(|edge| !visited.contains(edge.source_symbol.as_str()))
+                    inbound(node.as_str()).any(|id| !visited.contains(index.source_symbol(id)))
                 });
             }
         }
@@ -2919,14 +2916,13 @@ fn indexed_traversed_edges(
     for (checked, source) in sources.iter().enumerate() {
         cancel.check_every(checked)?;
         for id in index.from_source_symbol(source) {
-            let edge = index.edge(*id);
-            if !index.admits(*id, min_confidence) || edge.confidence < min_confidence {
+            if !index.admits(*id, min_confidence) || index.confidence(*id) < min_confidence {
                 continue;
             }
             if traversed.contains(&(
-                edge.source_symbol.as_str(),
-                edge.target_symbol.as_str(),
-                edge.edge_kind.as_str(),
+                index.source_symbol(*id),
+                index.target_symbol(*id),
+                index.kind_label(*id),
             )) {
                 ids.push(*id);
             }
@@ -2939,7 +2935,7 @@ fn indexed_traversed_edges(
     let mut edges = Vec::with_capacity(ids.len());
     for (checked, id) in ids.into_iter().enumerate() {
         cancel.check_every(checked)?;
-        edges.push(stored_edge_to_resolved(index.edge(id).clone())?);
+        edges.push(stored_edge_to_resolved(index.stored_edge(id))?);
     }
     Ok(edges)
 }
@@ -2973,11 +2969,10 @@ fn indexed_traversal_starts(
                     continue;
                 }
                 for id in group {
-                    let row = index.edge(*id);
                     let path = if reverse {
-                        &row.target_file
+                        index.target_file(*id)
                     } else {
-                        &row.source_file
+                        index.source_file(*id)
                     };
                     if crate::query_match::path_matches(path, file) {
                         ids.push(*id);
@@ -3007,11 +3002,16 @@ fn indexed_traversal_starts(
     Ok(ids
         .into_iter()
         .map(|id| {
-            let row = index.edge(id);
             if reverse {
-                (row.target_symbol.clone(), row.target_file.clone())
+                (
+                    index.target_symbol(id).to_string(),
+                    index.target_file(id).to_string(),
+                )
             } else {
-                (row.source_symbol.clone(), row.source_file.clone())
+                (
+                    index.source_symbol(id).to_string(),
+                    index.source_file(id).to_string(),
+                )
             }
         })
         .collect())
@@ -4692,17 +4692,15 @@ mod indexed_start_equivalence_tests {
     fn an_edge_on_the_rounding_boundary_is_crossed_but_not_reported() {
         let rows = rows();
         let index = GenerationEdges::build(std::sync::Arc::new(rows.clone()), None).expect("index");
-        let boundary = index
-            .edges()
-            .iter()
-            .position(|row| row.confidence == 0.7495)
-            .expect("fixture holds the boundary edge") as u32;
+        let boundary = (0..index.len() as u32)
+            .find(|id| index.confidence(*id) == 0.7495)
+            .expect("fixture holds the boundary edge");
         assert!(
             index.admits(boundary, 0.75),
             "0.7495 rounds to 750 and must be admitted, as the store admits it"
         );
         assert!(
-            index.edge(boundary).confidence < 0.75,
+            index.confidence(boundary) < 0.75,
             "and must still fail the plain compare the answer applies"
         );
     }

@@ -458,10 +458,9 @@ fn a_stored_confidence_that_contradicts_its_stored_kind_is_counted_not_trusted()
         "the SQL count must agree with the index"
     );
     // The row itself is left as evidence: the count reports, it does not repair.
-    let tampered: Vec<&devmap_store::StoredEdge> = index
-        .edges()
-        .iter()
-        .filter(|edge| edge.source_symbol == "caller")
+    let tampered: Vec<devmap_store::StoredEdge> = (0..index.len() as u32)
+        .filter(|id| index.source_symbol(*id) == "caller")
+        .map(|id| index.stored_edge(id))
         .collect();
     assert_eq!(tampered.len(), 1);
     assert!((tampered[0].confidence - 0.2).abs() < 1e-6);
