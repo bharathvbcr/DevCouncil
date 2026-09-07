@@ -4,6 +4,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use crate::edge_index::GenerationEdges;
 use devmap_analyze::clones::CloneCandidate;
 use devmap_analyze::model::*;
+use devmap_analyze::DeadClusterScan;
 use devmap_extract::model::*;
 #[cfg(feature = "parse")]
 use devmap_resolve::model::*;
@@ -13,11 +14,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::coverage::{CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryRefusal};
 use crate::edge_index::ResolutionSource;
 use crate::schema::{
-    BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, COVERAGE_GAPS_TABLE, CREATE_SCHEMA_V3,
-    CURRENT_SCHEMA_VERSION, MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12, MIGRATION_V12_TO_V13,
-    MIGRATION_V14_TO_V15, MIGRATION_V15_TO_V16, MIGRATION_V16_TO_V17, MIGRATION_V3_TO_V4,
-    MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8,
-    MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
+    declared_index_names, BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, COVERAGE_GAPS_TABLE,
+    CREATE_SCHEMA_V3, CURRENT_SCHEMA_VERSION, MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12,
+    MIGRATION_V12_TO_V13, MIGRATION_V14_TO_V15, MIGRATION_V15_TO_V16, MIGRATION_V16_TO_V17,
+    MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
+    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -609,6 +610,20 @@ pub struct CallersPage {
 pub struct DeadPage {
     pub generation: u32,
     pub analysis: Option<AnalysisDisclosure>,
+    /// Abandoned cycles found in the same generation, or `None` when the
+    /// generation predates the pass or its analysis could not be read.
+    ///
+    /// Carried on the page rather than fetched separately for the reason the
+    /// disclosure is: a cluster list from one generation beside single-symbol
+    /// rows from another is the "safe to delete" upgrade
+    /// [`Self::analysis`] exists to prevent, one level out.
+    ///
+    /// Bounded at the source — `DEAD_CLUSTER_CAP` clusters of
+    /// `DEAD_CLUSTER_MEMBER_CAP` members — so this is at most a few tens of
+    /// kilobytes and needs no budget of its own. It is read with its own
+    /// `json_extract` rather than folded into `AnalysisDisclosure`, which is
+    /// parsed on many query paths that have no use for it.
+    pub dead_clusters: Option<DeadClusterScan>,
     /// Non-exempt rows, ranked, at most the requested limit.
     pub rows: Vec<DeadSymbolReport>,
     /// Every non-exempt row in this generation, independent of the limit.
@@ -1128,6 +1143,30 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "candidate_total",
         ],
     ),
+    // The v17 payload split's two base tables. They were validated only
+    // transitively, through the `generation_files` view that joins them — so a
+    // migration that produced the view over the wrong shape, or dropped one of
+    // them, was caught by nothing until the first write. The S-8 drift test
+    // iterates this list and asserts every *actual* column is required, which
+    // by construction can never notice a *table* that is absent from it.
+    (
+        "file_payloads",
+        &[
+            "payload_id",
+            "file_id",
+            "content_hash",
+            "language",
+            "grammar_version",
+            "analyzer_version",
+            "parse_outcome_json",
+            "engine_json",
+            "extraction_json",
+        ],
+    ),
+    (
+        "generation_file_rows",
+        &["generation_id", "file_id", "payload_id"],
+    ),
     (
         "generation_coverage_gaps",
         &["generation_id", "gap", "path", "reason"],
@@ -1564,6 +1603,34 @@ impl Store {
                 }
             }
         }
+
+        // Indexes, which this gate did not look at until an absent one cost
+        // every migrated store a full scan of `file_payloads` per cache miss.
+        //
+        // A missing index is not a correctness fault, which is exactly why it
+        // needs a gate: nothing fails, every answer stays right, and the store
+        // silently costs orders of magnitude more to read. That is the shape of
+        // defect a test suite is worst at noticing.
+        //
+        // The expectation is derived from the DDL that creates them
+        // (`declared_index_names`), never listed here, so this cannot drift the
+        // way `REQUIRED_SCHEMA` would have.
+        let present: std::collections::BTreeSet<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'",
+            )?;
+            let names = stmt
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_>>()?;
+            names
+        };
+        for index in declared_index_names() {
+            if !present.contains(&index) {
+                return Err(rusqlite::Error::InvalidParameterName(format!(
+                    "required index {index} is missing; the store would answer correctly                      and scan for every answer — run `devmap build` to rebuild it"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1860,7 +1927,15 @@ impl Store {
                 tx.execute_batch(MIGRATION_V14_TO_V15)?;
             }
             tx.execute("PRAGMA user_version = 15", [])?;
-            Self::validate_schema(&tx)?;
+            // No mid-chain validation, for the same reason as every step above:
+            // `validate_schema` asserts the *current* schema, and a v15 database
+            // legitimately lacks `generation_edges.candidate_total` until v16
+            // adds it and the `file_payloads` split until v17. The call that
+            // stood here made `Store::open` fail outright — "required column
+            // generation_edges.candidate_total is missing" — for every store
+            // stamped 5 through 14, which is every installation that had not
+            // already been migrated. The end-of-chain check below is the
+            // authoritative gate, and `migration_ladder.rs` walks every rung.
             tx.commit()?;
             version = 15;
         }
@@ -1871,7 +1946,11 @@ impl Store {
                 tx.execute_batch(MIGRATION_V15_TO_V16)?;
             }
             tx.execute("PRAGMA user_version = 16", [])?;
-            Self::validate_schema(&tx)?;
+            // No mid-chain validation: a v16 database legitimately predates the
+            // v17 payload split. It happened to satisfy `validate_schema`
+            // because `REQUIRED_SCHEMA` names no v17-only column — which is an
+            // accident of that list, not a property of the schema, and is
+            // exactly the kind of accident the rule exists to stop relying on.
             tx.commit()?;
             version = 16;
         }
@@ -5070,6 +5149,40 @@ impl Store {
         .transpose()
     }
 
+    /// The abandoned cycles one generation's analysis recorded.
+    ///
+    /// `None` means the column could not be read as a scan: no analysis row, or
+    /// a generation written before `dead_clusters` existed. That is *not* an
+    /// empty scan, and the two must not render alike — an empty list is "the
+    /// pass ran and found nothing", which is a finding.
+    ///
+    /// Read with its own `json_extract` rather than through
+    /// `AnalysisDisclosure`, which is deserialized on search, edge and status
+    /// paths that have no use for a cluster list and would pay for parsing one.
+    fn dead_clusters_in(snapshot: &Connection, generation: u32) -> Result<Option<DeadClusterScan>> {
+        let raw: Option<String> = snapshot
+            .query_row(
+                "SELECT json_extract(analysis_json, '$.dead_clusters')
+                 FROM generations WHERE id = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        // A malformed blob is an error, not an absence, for the same reason
+        // `analysis_disclosure_in` refuses to round one to the other.
+        serde_json::from_str::<DeadClusterScan>(&raw)
+            .map(Some)
+            .map_err(|error| {
+                rusqlite::Error::InvalidParameterName(format!(
+                    "stored dead-cluster scan is invalid: {error}"
+                ))
+            })
+    }
+
     /// [`Self::analysis_disclosure_in`] for a generation the caller already
     /// resolved.
     ///
@@ -5092,9 +5205,11 @@ impl Store {
             return Ok(None);
         };
         let analysis = Self::analysis_disclosure_in(&snapshot, generation)?;
+        let dead_clusters = Self::dead_clusters_in(&snapshot, generation)?;
         Ok(Some(DeadPage {
             generation,
             analysis,
+            dead_clusters,
             rows: Self::dead_symbols_page_in(&snapshot, generation, limit)?,
             total_non_exempt: Self::count_dead_non_exempt_in(&snapshot, generation)?,
         }))
@@ -6555,6 +6670,81 @@ mod connection_tests {
                 );
             }
         }
+    }
+
+    /// S-8, the other direction: the gate must name every relation, not just
+    /// every column of the relations it happens to name.
+    ///
+    /// `the_schema_gate_names_every_column_the_current_schema_creates` iterates
+    /// `REQUIRED_SCHEMA` and checks that every *actual* column of each listed
+    /// table is required — so a table missing from the list is invisible to it
+    /// by construction, and `file_payloads` and `generation_file_rows` were
+    /// both missing from v17 onward. They passed only transitively, through the
+    /// `generation_files` view that joins them.
+    #[test]
+    fn the_schema_gate_names_every_relation_the_current_schema_creates() {
+        let store = Store::open_in_memory().expect("store");
+        let conn = lock_conn(&store.conn).expect("connection");
+        let required: std::collections::BTreeSet<&str> =
+            REQUIRED_SCHEMA.iter().map(|(table, _)| *table).collect();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                  WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
+                  ORDER BY name",
+            )
+            .expect("sqlite_master");
+        let actual: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("relations")
+            .collect::<Result<_>>()
+            .expect("relations");
+        let missing: Vec<&String> = actual
+            .iter()
+            // FTS5 owns four shadow tables beneath `nodes_fts`; their existence
+            // follows from the virtual table and is not this schema's to declare.
+            .filter(|name| !name.starts_with("nodes_fts_") || *name == "nodes_fts_map")
+            .filter(|name| !required.contains(name.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{missing:?} exist in the current schema but the gate does not require them; \
+             a store missing one would open clean and fail at the first write"
+        );
+    }
+
+    /// The index gate's expectation is parsed out of DDL, so the parse itself
+    /// needs pinning against what SQLite actually built.
+    ///
+    /// A scanner that silently found nothing would make
+    /// `validate_schema`'s index check vacuous — the same "passes for the wrong
+    /// reason" failure the whole review turns on.
+    #[test]
+    fn the_index_gate_reads_every_index_the_schema_creates() {
+        let store = Store::open_in_memory().expect("store");
+        let conn = lock_conn(&store.conn).expect("connection");
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                  WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .expect("indexes");
+        let built: std::collections::BTreeSet<String> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("index names")
+            .collect::<Result<_>>()
+            .expect("index names");
+        let declared: std::collections::BTreeSet<String> =
+            declared_index_names().into_iter().collect();
+        assert!(
+            !declared.is_empty(),
+            "the DDL scan found no indexes at all; the gate would pass vacuously"
+        );
+        assert_eq!(
+            declared, built,
+            "the index names parsed out of the schema DDL disagree with the indexes \
+             a fresh store actually has"
+        );
     }
 
     #[test]

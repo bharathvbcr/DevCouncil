@@ -130,9 +130,23 @@ def _liveness_summary(repo_map: RepoMap) -> str | None:
     # me", so the kernel drops it from the population rather than calling it
     # unwired. Excluding it is right; not saying so would make an unexamined
     # file indistinguishable from an examined one that came back clean.
-    excluded = _excluded_coverage_loss(meta)
-    if excluded:
-        notes.append(f"{excluded} files excluded from unwired: extraction coverage loss")
+    coverage_loss, import_blind = _unwired_exclusions(meta)
+    # Both counters, or the printed number is a third of the exclusion on this
+    # repository: 5 against 15. `excluded_import_blind` is what the v33 work
+    # created and it was the one the human-facing line ignored — and the two are
+    # deliberately separate, not summable into one word, because they are
+    # different holes. A file whose parse failed was not read; a file in a
+    # language with no import extractor was read perfectly and asked a question
+    # this build cannot answer. Only the second is permanent.
+    if coverage_loss:
+        notes.append(
+            f"{coverage_loss} files excluded from unwired: extraction coverage loss"
+        )
+    if import_blind:
+        notes.append(
+            f"{import_blind} excluded: no import extractor for their language "
+            "(permanent for this build)"
+        )
     if roots_floor or unwired_floor or dead_floor:
         notes.append("N+ means this map disclosed no total")
     notes.append("map clears on any non-test importer")
@@ -146,17 +160,30 @@ def _liveness_summary(repo_map: RepoMap) -> str | None:
     )
 
 
-def _excluded_coverage_loss(meta: object) -> int:
-    """Files the unwired question could not be asked of, per the map's own count."""
+def _unwired_exclusions(meta: object) -> tuple[int, int]:
+    """``(coverage loss, import blind)`` — both files the question could not be asked of.
+
+    Two numbers because the kernel keeps two, and it keeps two because they are
+    different facts. ``excluded_coverage_loss`` counts files nothing read — a
+    parse failure or a pattern recovery, which a re-index may fix.
+    ``excluded_import_blind`` counts files a grammar read cleanly whose language
+    this build has no import extractor for, which no amount of re-running
+    changes. Summing them into one word would tell a reader to re-index for a
+    hole that is permanent.
+    """
     if not isinstance(meta, Mapping):
-        return 0
+        return (0, 0)
     bucket = meta.get("unwired")
     if not isinstance(bucket, Mapping):
+        return (0, 0)
+
+    def _count(key: str) -> int:
+        value = bucket.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
         return 0
-    excluded = bucket.get("excluded_coverage_loss")
-    if isinstance(excluded, int) and not isinstance(excluded, bool) and excluded > 0:
-        return excluded
-    return 0
+
+    return (_count("excluded_coverage_loss"), _count("excluded_import_blind"))
 
 
 @app.callback(invoke_without_command=True)

@@ -303,7 +303,8 @@ fn h2_traversed_selection(edges: &[ResolvedEdge], symbol_target: &str) {
 /// Candidate: identical set membership, borrowed keys, zero allocation.
 ///
 /// `edge_kind_name` reproduces the `Debug` spelling `traverse_graph` records,
-/// which `tests/traversal_selection_allocates_nothing.rs` pins.
+/// which `engine.rs`'s `edge_kind_name_is_the_spelling_traverse_graph_records`
+/// pins.
 fn traversed_candidate(
     traversal: &TraversalResult,
     edges: &[ResolvedEdge],

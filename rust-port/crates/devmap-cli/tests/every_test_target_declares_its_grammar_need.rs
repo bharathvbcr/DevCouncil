@@ -69,6 +69,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "adversarial_store",
             "coverage_gap_inventory",
             "kernel_defects",
+            "migration_ladder",
             "one_symlink_rule",
             "read_only_store",
             "store_hardening",

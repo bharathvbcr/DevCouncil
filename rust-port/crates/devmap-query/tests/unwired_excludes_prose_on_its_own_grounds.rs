@@ -147,16 +147,60 @@ fn the_import_blind_counter_is_a_subset_of_the_coverage_gap_inventory() {
     );
 }
 
-/// And the population is the source languages, named.
+/// And the population is the source languages, **named** — not merely counted.
+///
+/// **M5.** This asserted a bare `excluded == 2` on a five-file fixture, which
+/// verifies a number and not that the two files are the ones its own message
+/// names. Any two of the five reaching the counter would satisfy it, including
+/// the README and the JSON that the neighbouring test exists to keep *out* of
+/// it: swap the population entirely and the count is unchanged.
+///
+/// So the identities are checked, by re-deriving which files the filter must
+/// have charged from the capability registry rather than by restating the two
+/// paths a second time.
 #[test]
 fn only_source_files_are_charged_as_import_blind() {
+    use devmap_extract::languages::Capability;
+
     let extractions = corpus();
     let excluded = counter(&graph(&extractions), "unwired_excluded_import_blind");
+
+    // Derived: a file is charged exactly when a grammar read it and this build
+    // has no import extractor for its language. Both halves matter — the README
+    // fails the first and the C# file fails the second.
+    let expected: Vec<&str> = extractions
+        .iter()
+        .filter(|ext| {
+            ext.grammar_read_this_file() && !ext.capabilities().contains(Capability::Imports)
+        })
+        .map(|ext| ext.file_path.as_str())
+        .collect();
     assert_eq!(
-        excluded, 2,
+        expected,
+        vec!["src/Helper.cs", "Sources/App/Helper.swift"],
+        "fixture assumption: these are the two import-blind source files, and \
+         the count below is about them and not about any other two"
+    );
+    assert_eq!(
+        excluded,
+        expected.len() as u64,
         "the C# file and the Swift file are import-blind; the README, the JSON \
          and the YAML are not source and were never candidates"
     );
+
+    // The other three are excluded on their own grounds and charged to nothing,
+    // which is the claim the bare count could not make.
+    for path in ["README.md", "data/config.json", "ci/pipeline.yaml"] {
+        let ext = extractions
+            .iter()
+            .find(|ext| ext.file_path == path)
+            .expect("fixture file");
+        assert!(
+            !ext.grammar_read_this_file(),
+            "{path} must be excluded because nothing read it, not because its \
+             language lacks an import extractor"
+        );
+    }
 }
 
 /// The exclusion itself must survive: prose stays out of the list.

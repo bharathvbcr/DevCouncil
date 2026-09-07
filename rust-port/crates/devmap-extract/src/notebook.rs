@@ -385,28 +385,56 @@ pub fn extract_notebook(
     // range in the real file, which is the rule the symbols already follow.
     // Nothing persists a call span today; leaving one that indexes a buffer
     // which no longer exists is a trap for whoever first does.
+    // One relocation, applied to both edge kinds.
+    //
+    // `references` were not carried forward at all, which the capability matrix
+    // could not see until the corpus gained an `.ipynb`: a notebook declaring
+    // `class Widget(BaseWidget)` produced no `ReferenceKind::Heritage`, so W1.2's
+    // `Extends`/`Implements` edges never fired for a notebook and every
+    // `Capability::References` consumer saw an empty vector for a file whose
+    // grammar had read it cleanly. That is the over-claim direction — a bit the
+    // kernel declares and does not deliver — which is the one failure the
+    // capability registry exists to make impossible.
+    let relocate_span = |span: &mut Span| {
+        let line = buffer
+            .get(span.start_byte..span.end_byte)
+            .and_then(|text| text.lines().next())
+            .unwrap_or_default();
+        if let Some(cell) = cells
+            .iter()
+            .find(|cell| !line.is_empty() && cell.code.contains(line))
+        {
+            if let Some(raw_span) = cell.raw_span.clone() {
+                *span = raw_span;
+            }
+        }
+    };
+    let relocate_owner = |owner: &mut String| {
+        if let Some(name) = owner.strip_prefix(synthetic_prefix.as_str()) {
+            *owner = format!("{real_prefix}{name}");
+        }
+    };
+
     extraction.calls = parsed
         .calls
         .into_iter()
         .map(|mut call| {
             if let Some(caller) = call.caller_symbol.as_mut() {
-                if let Some(name) = caller.strip_prefix(synthetic_prefix.as_str()) {
-                    *caller = format!("{real_prefix}{name}");
-                }
+                relocate_owner(caller);
             }
-            let line = buffer
-                .get(call.span.start_byte..call.span.end_byte)
-                .and_then(|text| text.lines().next())
-                .unwrap_or_default();
-            if let Some(cell) = cells
-                .iter()
-                .find(|cell| !line.is_empty() && cell.code.contains(line))
-            {
-                if let Some(raw_span) = cell.raw_span.clone() {
-                    call.span = raw_span;
-                }
-            }
+            relocate_span(&mut call.span);
             call
+        })
+        .collect();
+    extraction.references = parsed
+        .references
+        .into_iter()
+        .map(|mut reference| {
+            if let Some(enclosing) = reference.enclosing_symbol.as_mut() {
+                relocate_owner(enclosing);
+            }
+            relocate_span(&mut reference.span);
+            reference
         })
         .collect();
     extraction

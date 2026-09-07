@@ -284,6 +284,11 @@ pub enum IpcCommand {
         depth: usize,
         #[serde(default)]
         min_confidence: f32,
+        /// The rung floor, which this composition accepts because `impact` and
+        /// `deps` — the two queries it is — each accept one. Absent means no
+        /// floor, which is what every caller predating it already sent.
+        #[serde(default)]
+        min_rung: Option<String>,
     },
     Dead {
         #[serde(default = "default_budget")]
@@ -439,7 +444,8 @@ fn request_min_rung(command: &IpcCommand) -> Option<&str> {
     match command {
         IpcCommand::Deps { min_rung, .. }
         | IpcCommand::Impact { min_rung, .. }
-        | IpcCommand::Trace { min_rung, .. } => min_rung.as_deref(),
+        | IpcCommand::Trace { min_rung, .. }
+        | IpcCommand::Neighbors { min_rung, .. } => min_rung.as_deref(),
         _ => None,
     }
 }
@@ -491,6 +497,7 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
             budget,
             depth,
             min_confidence,
+            ..
         } => {
             // Refused, not trimmed. Silently answering the first sixteen of
             // twenty would hand back a short list that reads exactly like a
@@ -837,8 +844,15 @@ pub(crate) fn dispatch(
             budget,
             depth,
             min_confidence,
+            min_rung,
         } => Ok(json!({
-            "neighbors": engine.neighbors(&targets, budget, min_confidence, depth)?,
+            "neighbors": engine.neighbors_at_rung(
+                &targets,
+                budget,
+                min_confidence,
+                depth,
+                parsed_min_rung(&min_rung),
+            )?,
         })),
         IpcCommand::Dead { budget } => Ok(serde_json::to_value(engine.dead_symbols(budget)?)?),
         IpcCommand::Explore {
@@ -1844,6 +1858,7 @@ mod tests {
                 budget: 2000,
                 depth: 1,
                 min_confidence: 0.0,
+                min_rung: None,
             },
         };
         let value = dispatch(
@@ -1906,6 +1921,7 @@ mod tests {
                 budget: 10,
                 depth: 1,
                 min_confidence: 0.0,
+                min_rung: None,
             },
         };
         let limit = devmap_query::MAX_NEIGHBOR_TARGETS;
@@ -1933,6 +1949,97 @@ mod tests {
 
         // An empty list is a caller asking nothing, which is unambiguous.
         assert!(validate_request(&neighbors(Vec::new())).is_ok());
+    }
+
+    /// Every command that declares `min_rung` refuses a name that is not one.
+    ///
+    /// The validation exists and nothing exercised it — not for any command.
+    /// `request_min_rung`'s own doc says a command that gains the parameter and
+    /// forgets the validation should be one edit rather than two, which is only
+    /// true while something checks that the two lists agree; until now nothing
+    /// did, and `Neighbors` gaining the field was exactly the edit that would
+    /// have gone unnoticed.
+    ///
+    /// The command list is read out of this file's own enum rather than
+    /// restated, so a fifth command declaring the field is covered the day it
+    /// lands. A hand-written list here would be the same defect one layer up.
+    #[test]
+    fn every_command_declaring_a_rung_refuses_a_name_that_is_not_one() {
+        let source = include_str!("protocol.rs");
+        let body = source
+            .split_once("pub enum IpcCommand {")
+            .expect("the command enum must be findable")
+            .1;
+        let body = body.split("\n}\n").next().expect("enum body");
+
+        // Variant headers sit at four spaces; their fields at eight. That makes
+        // the split unambiguous without parsing Rust.
+        let mut declaring: Vec<String> = Vec::new();
+        let mut current: Option<String> = None;
+        for line in body.lines() {
+            if let Some(name) = line.strip_prefix("    ").and_then(|rest| {
+                rest.strip_suffix(" {")
+                    .filter(|n| n.chars().next().is_some_and(char::is_uppercase))
+            }) {
+                current = Some(name.to_string());
+            } else if line.trim_start().starts_with("min_rung:") {
+                if let Some(name) = current.take() {
+                    declaring.push(name);
+                }
+            }
+        }
+        assert!(
+            declaring.len() >= 4,
+            "the scan found {declaring:?}; if the enum's shape changed this \
+             guard would pass over commands it never checked"
+        );
+
+        // A superset of every required field. Unknown keys are ignored (no
+        // `deny_unknown_fields`), so one object deserialises into whichever
+        // variant `cmd` names.
+        let request = |command: &str, rung: &str| -> IpcRequest {
+            let snake = command
+                .chars()
+                .flat_map(|c| {
+                    if c.is_uppercase() {
+                        vec!['_', c.to_ascii_lowercase()]
+                    } else {
+                        vec![c]
+                    }
+                })
+                .collect::<String>()
+                .trim_start_matches('_')
+                .to_string();
+            serde_json::from_value(serde_json::json!({
+                "version": 1,
+                "cmd": snake,
+                "target": "a.py::f",
+                "targets": ["a.py::f"],
+                "from": "a.py::f",
+                "to": "b.py::g",
+                "query": "f",
+                "min_rung": rung,
+            }))
+            .unwrap_or_else(|error| panic!("{command}: request must parse: {error}"))
+        };
+
+        for command in &declaring {
+            let refused = validate_request(&request(command, "certain"));
+            let message = refused.expect_err(&format!(
+                "{command} accepted an unknown rung; a floor silently dropped \
+                 answers at full breadth and reads as the narrow answer asked for"
+            ));
+            assert!(
+                message.contains("deterministic"),
+                "{command}: the refusal must name the values that work: {message}"
+            );
+            // And the OFF direction, or a validator that refused everything
+            // would pass the half above.
+            assert!(
+                validate_request(&request(command, "deterministic")).is_ok(),
+                "{command} rejected a valid rung"
+            );
+        }
     }
 
     /// Every request bound is exclusive, and each is load-bearing.

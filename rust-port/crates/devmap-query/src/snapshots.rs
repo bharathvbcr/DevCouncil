@@ -128,6 +128,11 @@ pub fn semantic_snapshots(
         resolution: resp.resolution,
         walk_incomplete: None,
         rungs: None,
+        // A snapshot re-frames one answer's counters; it does not produce a
+        // dead-code answer, so it carries neither cluster field.
+        dead_clusters: None,
+        dead_clusters_truncated: 0,
+        dead_clusters_incomplete: None,
     }
 }
 

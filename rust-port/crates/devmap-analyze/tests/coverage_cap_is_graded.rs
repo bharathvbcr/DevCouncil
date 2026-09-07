@@ -299,34 +299,142 @@ fn the_ceiling_reaches_the_floor_well_before_the_corpus_is_half_unread() {
     );
 }
 
-/// A cluster is a strictly stronger claim, so it is priced strictly lower.
+/// A cluster is a stronger claim, so it is priced lower — **where the clamp
+/// does not mask the difference.**
 ///
-/// The single-symbol ceiling and the cluster ceiling must never coincide at the
-/// same blind share, or `cap_cluster` is decorative — which is exactly what a
-/// shared `cap()` made it.
+/// The doc that stood here said the two ceilings "must never coincide at the
+/// same blind share, or `cap_cluster` is decorative", and the assertion below it
+/// was `cluster <= single`, which is satisfied by equality. They did coincide,
+/// at the very blind share the test chose: `blindness(1, 199)` is 0.5% blind, so
+/// both `(1-s)^8` and `(1-s)^10` exceed `HIGHEST_DEGRADED_CONFIDENCE` and both
+/// clamp to it. The test passed on `<=` while the property it stated was false.
+///
+/// The true property is narrower and is what is asserted now. Both ceilings are
+/// `clamp(·, FLOOR, HIGHEST)`, so they necessarily agree at both ends:
+///
+/// * **both at `HIGHEST`** while even the compounded exponent stays above it —
+///   a corpus barely blind at all, where the size of the component genuinely is
+///   not the binding constraint;
+/// * **both at `FLOOR`** once even the un-compounded exponent has fallen below
+///   it — a corpus so blind that no claim about it survives.
+///
+/// Between those, they must separate *strictly*, or the compounding is
+/// decorative for real. That band is what is swept here.
 #[test]
 fn a_cluster_ceiling_is_stricter_than_a_single_symbol_ceiling() {
-    let coverage = blindness(1, 199);
+    // Never outranks, at any share and any size. The weak half of the contract,
+    // kept because it is the half a future formula is most likely to break.
+    for (blind, readable) in [
+        (1usize, 199usize),
+        (1, 99),
+        (2, 98),
+        (5, 95),
+        (11, 89),
+        (50, 50),
+    ] {
+        let coverage = blindness(blind, readable);
+        let single = coverage.cap(0.9);
+        for size in [2usize, 5, 20, 60, 100_000] {
+            let cluster = coverage.cap_cluster(0.9, size);
+            assert!(
+                cluster <= single,
+                "a whole-graph claim over {size} members must not outrank a \
+                 one-symbol claim (blind={blind}/{readable}): {cluster} vs {single}"
+            );
+            assert!(
+                cluster.is_finite() && cluster >= COVERAGE_LOSS_CONFIDENCE_CAP,
+                "and it must stay a number inside the band: {cluster}"
+            );
+        }
+    }
 
-    let single = coverage.cap(0.9);
-    for size in [2usize, 5, 20, 60, 100_000] {
-        let cluster = coverage.cap_cluster(0.9, size);
+    // The strong half: inside the band, the compounding really separates them.
+    // At 5% blind the single-symbol ceiling is 0.663 and a five-member component
+    // is 0.513 — a whole tier of difference, not a rounding step.
+    let banded = blindness(5, 95);
+    let single = banded.cap(0.9);
+    assert!(
+        single < HIGHEST_DEGRADED_CONFIDENCE && single > COVERAGE_LOSS_CONFIDENCE_CAP,
+        "fixture assumption: this share must sit inside the clamp, or the \
+         separation below is masked: {single}"
+    );
+    for size in [2usize, 5, 20] {
+        let cluster = banded.cap_cluster(0.9, size);
         assert!(
-            cluster <= single,
-            "a whole-graph claim over {size} members must not outrank a \
-             one-symbol claim: {cluster} vs {single}"
-        );
-        assert!(
-            cluster.is_finite() && cluster >= COVERAGE_LOSS_CONFIDENCE_CAP,
-            "and it must stay a number inside the band: {cluster}"
+            cluster < single - 1e-6,
+            "inside the band the compounding must separate the two strictly, \
+             not merely fail to invert them: {cluster} vs {single} at size {size}"
         );
     }
 
     // Bigger component, weaker claim — monotone in the size, which is the whole
     // reason the size is passed in.
     assert!(
-        coverage.cap_cluster(0.9, 40) <= coverage.cap_cluster(0.9, 2),
+        banded.cap_cluster(0.9, 40) < banded.cap_cluster(0.9, 2),
         "a forty-symbol cluster is a weaker claim than a two-symbol one"
+    );
+}
+
+/// **M2.** The one blind share at which the ladder still flattens, stated.
+///
+/// `cap` is a ceiling and its combinator is `min`, so wherever the ceiling falls
+/// below a finding's own confidence, every finding above it collapses onto the
+/// ceiling. For the two tiers that matter — 0.9 ("no edge names this") and 0.4
+/// ("something names it and we could not say what") — that is the window where
+/// the ceiling sits in `[0.35, 0.4]`: from `1 - 0.4^(1/8) = 10.82%` blind to the
+/// floor crossover at `1 - 0.35^(1/8) = 12.3%`.
+///
+/// It is not removable without abandoning `min` for a multiplicative degrade,
+/// which would lower *every* finding — including a 0.4 one in a barely-degraded
+/// corpus — and cross tier boundaries for findings the coverage hole says
+/// nothing about. So it is bounded and pinned instead: a window 1.5 percentage
+/// points wide, inside which both claims land in `ambiguous`, which is the tier
+/// that means "do not act" for both of them.
+///
+/// `the_cap_is_monotone_at_every_blind_share` checks non-decreasing and cannot
+/// see this; a window that widened to ten points would still pass it.
+#[test]
+fn the_ladder_flattens_only_inside_a_narrow_stated_window() {
+    let separated = |blind: usize, readable: usize| {
+        let coverage = blindness(blind, readable);
+        coverage.cap(0.9) > coverage.cap(0.4) + 1e-6
+    };
+
+    // Below the window: the two tiers are distinct.
+    assert!(separated(10, 90), "10% blind must still rank the two apart");
+    // Inside it: they are not, and that is the stated cost.
+    assert!(
+        !separated(115, 885),
+        "11.5% blind is inside the window this test exists to bound"
+    );
+    // Above it: both are on the floor, which is the pre-grading behaviour the
+    // floor was kept to preserve.
+    assert!(!separated(20, 80), "20% blind is on the floor for both");
+
+    // And the window is narrow. Swept at tenth-of-a-percent resolution so a
+    // future exponent or floor that widened it has to come here and say so.
+    // `blind` counts twentieths of a percent of a 2,000-file corpus, so the
+    // sweep runs from 0.05% to 20% at 0.05% resolution.
+    let flat: Vec<usize> = (1..=400)
+        .filter(|blind| !separated(*blind, 2000 - *blind))
+        .collect();
+    let first = *flat
+        .first()
+        .expect("the window is non-empty by construction");
+    assert!(
+        (205..=225).contains(&first),
+        "the flattening must begin at ~10.8% blind, not earlier: it begins at \
+         {:.2}%",
+        first as f32 / 20.0
+    );
+    // And once it starts it does not stop: everything above the window is on
+    // the floor for both tiers, so there is exactly one flat region, not a
+    // scatter of them.
+    assert_eq!(
+        flat.len(),
+        400 - first + 1,
+        "the flat region must be contiguous from {:.2}% upward, not a scatter",
+        first as f32 / 20.0
     );
 }
 
@@ -350,4 +458,43 @@ fn a_coverage_record_with_no_readable_files_falls_to_the_floor() {
         "nothing was read, so nothing is known: {got}"
     );
     assert!(got.is_finite(), "the ceiling must be a number: {got}");
+}
+
+/// **M9.** The two boundary inputs the cluster ceiling accepts, priced.
+///
+/// Neither is reachable from the producer — Tarjan emits no empty component,
+/// and the node cap refuses long before a component of `usize::MAX` — so both
+/// are clamps over inputs the type allows and the caller cannot supply. Pinned
+/// anyway, because a clamp whose behaviour nobody has stated is a clamp a later
+/// edit will "simplify".
+#[test]
+fn the_cluster_ceiling_is_total_over_the_sizes_its_type_permits() {
+    let coverage = blindness(5, 95);
+
+    // Zero members is priced as one: `(1 - s)^8`, the single-symbol ceiling. A
+    // claim about nothing must not come back stronger than a claim about
+    // something, and `powi(8 + 0)` would be exactly that.
+    assert!(
+        (coverage.cap_cluster(0.9, 0) - coverage.cap_cluster(0.9, 1)).abs() < 1e-6,
+        "a zero-member component is priced as a one-member one: {} vs {}",
+        coverage.cap_cluster(0.9, 0),
+        coverage.cap_cluster(0.9, 1)
+    );
+    assert!(
+        coverage.cap_cluster(0.9, 0) <= coverage.cap(0.9),
+        "and never above the single-symbol ceiling"
+    );
+
+    // And the upper end saturates rather than overflowing `powi`'s exponent.
+    let huge = coverage.cap_cluster(0.9, usize::MAX);
+    assert!(
+        huge.is_finite()
+            && (COVERAGE_LOSS_CONFIDENCE_CAP..=HIGHEST_DEGRADED_CONFIDENCE).contains(&huge),
+        "an absurd membership must stay inside the band: {huge}"
+    );
+    assert!(
+        (huge - coverage.cap_cluster(0.9, 64)).abs() < 1e-6,
+        "past `CLUSTER_COMPOUNDING_MEMBER_CAP` the size stops being informative \
+         and the ceiling stops moving: {huge}"
+    );
 }

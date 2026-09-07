@@ -571,3 +571,59 @@ def test_liveness_summary_reports_files_unwired_could_not_examine():
     )
     summary = map_cmd._liveness_summary(repo_map)
     assert "3 files excluded from unwired" in summary
+
+
+def test_liveness_summary_reports_import_blind_exclusions_too():
+    """**R14.** The readout printed one of the two exclusion counters.
+
+    On this repository `excluded_coverage_loss` is 5 and `excluded_import_blind`
+    is 15, and only the first was printed — so the human-facing line
+    under-reported the exclusion threefold, and the field the v33 work created
+    was the one it ignored.
+
+    The two stay separate rather than summed. A coverage loss may be fixed by a
+    re-index; a language with no import extractor will not be, and one word for
+    both would send a reader to rebuild for a permanent hole.
+    """
+    repo_map = _meta_map(
+        unwired_shown=2,
+        liveness_meta={
+            "unwired": {
+                "shown": 2,
+                "total": 2,
+                "truncated": False,
+                "excluded_coverage_loss": 5,
+                "excluded_import_blind": 15,
+            },
+        },
+    )
+    summary = map_cmd._liveness_summary(repo_map)
+    assert "5 files excluded from unwired" in summary
+    assert "15 excluded" in summary
+    assert "no import extractor" in summary
+    assert "permanent for this build" in summary, (
+        "the two holes must not read alike: one invites a re-index and the "
+        "other cannot be fixed by one"
+    )
+
+
+def test_liveness_summary_reports_no_exclusion_when_there_is_none():
+    """The OFF direction: a clean map must not carry an exclusion note.
+
+    A note that is always present carries exactly as much information as one
+    that is never present.
+    """
+    repo_map = _meta_map(
+        unwired_shown=2,
+        liveness_meta={
+            "unwired": {
+                "shown": 2,
+                "total": 2,
+                "truncated": False,
+                "excluded_coverage_loss": 0,
+                "excluded_import_blind": 0,
+            },
+        },
+    )
+    summary = map_cmd._liveness_summary(repo_map)
+    assert "excluded" not in summary

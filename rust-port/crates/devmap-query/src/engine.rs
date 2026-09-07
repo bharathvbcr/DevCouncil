@@ -268,6 +268,33 @@ impl<'a> StoreQueryEngine<'a> {
         min_confidence: f32,
         max_depth: usize,
     ) -> anyhow::Result<Vec<Neighbors>> {
+        self.neighbors_at_rung(targets, token_budget, min_confidence, max_depth, None)
+    }
+
+    /// [`Self::neighbors`], narrowed to a named rung.
+    ///
+    /// A composition must accept every filter its parts accept. `min_rung` was
+    /// pinned to `None` inside this fan-out while `impact` and `deps` — the two
+    /// queries it *is* — each took a floor, so a caller could ask either half
+    /// for deterministic-only edges and could not ask for both at once.
+    ///
+    /// That is the third parameter to be pinned here and the third to be a
+    /// defect: `min_confidence` was hardcoded 0.0 on the inbound side, so one
+    /// answer's two halves disagreed about the caller's filter; `max_depth` was
+    /// pinned to 1, invisible to a composition test that compared at depth 1.
+    /// Both notes are still in the body below, a few lines from where this
+    /// argument now travels, because the pattern is the point: a fan-out that
+    /// drops a filter answers the *broader* question, plausibly, and nothing in
+    /// the response says so — the caller reads a wide list as the narrow one
+    /// they asked for, which is the direction no reader guards against.
+    pub fn neighbors_at_rung(
+        &self,
+        targets: &[String],
+        token_budget: u32,
+        min_confidence: f32,
+        max_depth: usize,
+        min_rung: Option<crate::rung::Rung>,
+    ) -> anyhow::Result<Vec<Neighbors>> {
         if targets.len() > MAX_NEIGHBOR_TARGETS {
             anyhow::bail!(
                 "neighbors accepts at most {} targets, got {}",
@@ -304,7 +331,7 @@ impl<'a> StoreQueryEngine<'a> {
         for attempt in 0..2 {
             let before = self.store.latest_generation_id()?;
             let mut answers =
-                self.neighbors_once(targets, token_budget, min_confidence, max_depth)?;
+                self.neighbors_once(targets, token_budget, min_confidence, max_depth, min_rung)?;
             let after = self.store.latest_generation_id()?;
             if before == after {
                 return Ok(answers);
@@ -333,6 +360,7 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         min_confidence: f32,
         max_depth: usize,
+        min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Vec<Neighbors>> {
         // Nothing asked, nothing read. Without this the hoisted load below
         // would pull the whole edge table to answer a request with no targets.
@@ -418,7 +446,7 @@ impl<'a> StoreQueryEngine<'a> {
                     min_confidence,
                     max_depth,
                 },
-                None,
+                min_rung,
             )?;
             // Outbound edges come from whichever query can actually answer
             // for this target's shape.
@@ -477,7 +505,7 @@ impl<'a> StoreQueryEngine<'a> {
                     min_confidence,
                     max_depth,
                 },
-                None,
+                min_rung,
             )?;
             answers.push(Neighbors {
                 target: target.clone(),
@@ -1194,6 +1222,26 @@ impl<'a> StoreQueryEngine<'a> {
         response.hidden = response.total.saturating_sub(response.shown);
         response.truncated = response.hidden > 0;
         response.walk_incomplete = analysis_coverage_gap(page.analysis.as_ref());
+        // The other half of the answer, and until now the half nothing could
+        // see. A one-hop inbound-edge join structurally cannot report a
+        // subsystem whose functions call each other, so a `dead` answer without
+        // the component pass is not a shorter list — it is a list missing an
+        // entire class of finding. `DeadClusterScan::clusters` is capped at
+        // `DEAD_CLUSTER_CAP` by the producer, so this needs no budget of its
+        // own; what the cap dropped travels beside it.
+        if let Some(scan) = page.dead_clusters {
+            if scan.refused_oversized_graph {
+                // The one outcome an `Option<Vec<_>>` cannot hold. Leaving the
+                // empty list here would say the walk ran and found nothing.
+                response.dead_clusters_incomplete = Some(format!(
+                    "the call graph exceeded {} distinct symbols, so no                      component scan ran for this generation",
+                    devmap_analyze::dead_clusters::DEAD_CLUSTER_MAX_NODES
+                ));
+            } else {
+                response.dead_clusters_truncated = scan.truncated_clusters;
+                response.dead_clusters = Some(scan.clusters);
+            }
+        }
         Ok(response)
     }
 
@@ -1419,6 +1467,9 @@ impl<'a> StoreQueryEngine<'a> {
             resolution: ResolutionAvailability::Available,
             walk_incomplete: None,
             rungs: None,
+            dead_clusters: None,
+            dead_clusters_truncated: 0,
+            dead_clusters_incomplete: None,
         };
 
         // `Skipped` is here for the same reason `Failed` is, and the reason is
@@ -2508,6 +2559,9 @@ impl<'a> QueryEngine<'a> {
                 resolution: ResolutionAvailability::Available,
                 walk_incomplete: None,
                 rungs: None,
+                dead_clusters: None,
+                dead_clusters_truncated: 0,
+                dead_clusters_incomplete: None,
             };
         }
         let q_lower = req.query.to_lowercase();
@@ -3218,6 +3272,9 @@ fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
         resolution,
         walk_incomplete: None,
         rungs: None,
+        dead_clusters: None,
+        dead_clusters_truncated: 0,
+        dead_clusters_incomplete: None,
     }
 }
 
@@ -3713,6 +3770,9 @@ where
         resolution: ResolutionAvailability::Available,
         walk_incomplete: None,
         rungs: None,
+        dead_clusters: None,
+        dead_clusters_truncated: 0,
+        dead_clusters_incomplete: None,
     }
 }
 
@@ -3735,6 +3795,9 @@ where
             resolution: ResolutionAvailability::Available,
             walk_incomplete: None,
             rungs: None,
+            dead_clusters: None,
+            dead_clusters_truncated: 0,
+            dead_clusters_incomplete: None,
         };
     }
     Response {
@@ -3747,6 +3810,9 @@ where
         resolution: ResolutionAvailability::Available,
         walk_incomplete: None,
         rungs: None,
+        dead_clusters: None,
+        dead_clusters_truncated: 0,
+        dead_clusters_incomplete: None,
     }
 }
 

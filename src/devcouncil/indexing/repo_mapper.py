@@ -70,8 +70,8 @@ class _CacheDirectoryCache:
     """Memoised ancestor lookup for the Cache Directory Tagging Standard.
 
     Transcribed from ``devmap_extract::CacheDirectoryCache``, and it has to stay
-    a transcription: ``tests/freshness_parity.rs`` compares this inventory
-    against the kernel's file for file.
+    a transcription: ``rust-port/crates/devmap-query/tests/freshness_parity.rs``
+    compares this inventory against the kernel's file for file.
 
     **Why the inventory consults it at all.** ``dev map``'s discovery walk prunes
     a tagged directory whole — cargo, pip, uv, ccache, tox, ruff and pytest all
