@@ -329,34 +329,28 @@ async def test_liveness_dead_code_defaults_to_inferred(tmp_path, monkeypatch):
         lambda self, data: False,
     )
 
-    from devcouncil.indexing.graph.schema import CodeGraph, Confidence, DeadCodeEntry
-
-    graph = CodeGraph(
-        schema_version=2,
-        nodes=[],
-        edges=[],
-        dead_code=[
-            DeadCodeEntry(
-                id="a.py::inferred_dead",
-                path="a.py",
-                line=1,
-                kind="function",
-                confidence=Confidence.INFERRED,
-                reason="no inbound call edges (method)",
-            ),
-            DeadCodeEntry(
-                id="b.py::ambiguous_dead",
-                path="b.py",
-                line=2,
-                kind="function",
-                confidence=Confidence.AMBIGUOUS,
-                reason="graph-dead but token-scan cleared (possible name collision)",
-            ),
-        ],
-    )
+    items = [
+        {
+            "id": "a.py::inferred_dead",
+            "file_path": "a.py",
+            "symbol_name": "inferred_dead",
+            "kind": "function",
+            "span": (1, 1),
+            "confidence": "inferred",
+            "reason": "no inbound call edges (method)",
+        },
+        {
+            "id": "b.py::ambiguous_dead",
+            "file_path": "b.py",
+            "symbol_name": "ambiguous_dead",
+            "kind": "function",
+            "span": (2, 2),
+            "confidence": "ambiguous",
+            "reason": "graph-dead but token-scan cleared (possible name collision)",
+        },
+    ]
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: graph,
+        "devcouncil.devmap_client.try_connect", lambda root: _fake_dead_client(items)
     )
 
     defaulted = json.loads((await call_tool("devcouncil_liveness", {}))[0].text)
@@ -444,17 +438,9 @@ async def test_repo_map_symbols_for_path(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
     )
-    from types import SimpleNamespace
-
-    nodes = [
-        SimpleNamespace(id="n1", kind=SimpleNamespace(value="function"), name="charge", line=3, path="src/payments/gateway.py"),
-        SimpleNamespace(id="n2", kind="file", name="gateway", line=1, path="src/payments/gateway.py"),
-        SimpleNamespace(id="n3", kind=SimpleNamespace(value="function"), name="other", line=9, path="src/other.py"),
-    ]
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: SimpleNamespace(nodes=nodes),
-    )
+    # No kernel is reachable under `tmp_path`, so the summary branch's symbol
+    # scan is unavailable and the list is empty. (This used to monkeypatch
+    # `load_code_graph`; that engine is no longer on this path at all.)
     # subsystem given -> detail branch; symbols only surface on the summary branch.
     await mapmod.handle_repo_map(tmp_path, {"path": "src/payments/gateway.py", "subsystem": "src/payments"})
     # path with no declared area -> summary branch with symbols computed.
@@ -471,16 +457,6 @@ async def test_repo_map_summary_symbols_listed(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
     )
-    from types import SimpleNamespace
-
-    nodes = [
-        SimpleNamespace(id="s1", kind=SimpleNamespace(value="function"), name="orphan_fn", line=2, path="src/orphan.py"),
-        SimpleNamespace(id="s2", kind="file", name="orphan", line=1, path="src/orphan.py"),
-    ]
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: SimpleNamespace(nodes=nodes),
-    )
     # 'src/orphan.py' area is 'src' -> resolved but no subsystem match, so it hits the
     # unknown_subsystem branch. Use a path outside any area to reach the summary branch.
     result = await mapmod.handle_repo_map(tmp_path, {"path": "top_level.py"})
@@ -489,38 +465,83 @@ async def test_repo_map_summary_symbols_listed(tmp_path, monkeypatch):
     assert out["symbols"] == []  # top_level.py has no graph nodes
 
 
-def test_symbols_for_path_no_graph_is_unavailable(tmp_path, monkeypatch):
-    monkeypatch.setattr("devcouncil.indexing.graph.build.load_code_graph", lambda root: None)
+def test_symbols_for_path_no_kernel_is_unavailable(tmp_path, monkeypatch):
+    """No kernel is "could not look", and it names the kernel."""
+    import devcouncil.devmap_client as devmap_client
+
+    monkeypatch.setattr(devmap_client, "try_connect", lambda root: None)
     scan = mapmod._symbols_for_path(tmp_path, "a.py")
     assert scan.ok is False
     assert scan.items == []
-    assert "no code graph" in scan.reason
+    assert "devmap" in scan.reason
 
 
-def test_symbols_for_path_lists_symbols(tmp_path, monkeypatch):
+def test_symbols_for_path_never_answers_from_the_python_graph(tmp_path, monkeypatch):
+    """A readable Python graph must not rescue a scan the kernel could not run.
+
+    The kernel is the engine. The Python fallback answered from
+    `load_code_graph` — the retired engine's read path, 855 ms and ~690 MB on
+    this repository — and published the result through `_scan_ok` with no
+    producer total and no truncation flag, so a fallback answer arrived at the
+    agent looking like a complete, verified one.
+    """
     from types import SimpleNamespace
 
+    import devcouncil.devmap_client as devmap_client
+
+    monkeypatch.setattr(devmap_client, "try_connect", lambda root: None)
     nodes = [
-        SimpleNamespace(id="n1", kind=SimpleNamespace(value="function"), name="f", line=3, path="a.py"),
-        SimpleNamespace(id="n2", kind="file", name="a", line=1, path="a.py"),
-        SimpleNamespace(id="n3", kind="class", name="C", line=5, path="a.py"),
+        SimpleNamespace(
+            id="n1", kind=SimpleNamespace(value="function"), name="f", line=3, path="a.py"
+        ),
     ]
     monkeypatch.setattr(
         "devcouncil.indexing.graph.build.load_code_graph",
         lambda root: SimpleNamespace(nodes=nodes),
     )
+
     scan = mapmod._symbols_for_path(tmp_path, "a.py")
-    assert scan.ok is True
+
+    assert scan.ok is False, (
+        f"the Python graph answered for the kernel: {scan.source!r} {scan.items!r}"
+    )
+    assert scan.source != "code_graph"
+    assert scan.items == []
+
+
+def test_symbols_for_path_lists_symbols_from_the_kernel(tmp_path, monkeypatch):
+    import devcouncil.devmap_client as devmap_client
+
+    class _Resp:
+        resolution = "Available"
+        truncated = False
+        walk_incomplete = None
+        total = 2
+        items = [
+            {"file_path": "a.py", "symbol_name": "f", "kind": "function", "span": (3, 4)},
+            {"file_path": "a.py", "symbol_name": "a", "kind": "file", "span": (1, 1)},
+            {"file_path": "a.py", "symbol_name": "C", "kind": "class", "span": (5, 9)},
+        ]
+
+    class _Client:
+        def search(self, query, limit=2000, semantic=False):
+            return _Resp()
+
+    monkeypatch.setattr(devmap_client, "try_connect", lambda root: _Client())
+    scan = mapmod._symbols_for_path(tmp_path, "a.py")
+    assert scan.ok is True and scan.source == "devmap"
     names = {s["name"] for s in scan.items}
     assert names == {"f", "C"}  # 'file' kind excluded
-    assert scan.total == 2 and scan.truncated is False
 
 
 def test_symbols_for_path_reports_the_error_it_used_to_swallow(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: (_ for _ in ()).throw(RuntimeError("boom")),
-    )
+    import devcouncil.devmap_client as devmap_client
+
+    class _Client:
+        def search(self, query, limit=2000, semantic=False):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(devmap_client, "try_connect", lambda root: _Client())
     scan = mapmod._symbols_for_path(tmp_path, "a.py")
     assert scan.ok is False
     assert scan.items == []
@@ -616,27 +637,66 @@ async def test_liveness_non_list_entry_roots(tmp_path, monkeypatch):
 
 # ---- _structured_dead_code ----------------------------------------------------
 
-def test_structured_dead_code_no_graph_is_unavailable_not_clean(tmp_path, monkeypatch):
-    """No graph is "could not look", not "looked and found nothing"."""
-    monkeypatch.setattr("devcouncil.indexing.graph.build.load_code_graph", lambda root: None)
+def test_structured_dead_code_no_kernel_is_unavailable_not_clean(tmp_path, monkeypatch):
+    """No kernel is "could not look", not "looked and found nothing"."""
+    import devcouncil.devmap_client as devmap_client
+
+    monkeypatch.setattr(devmap_client, "try_connect", lambda root: None)
     scan = mapmod._structured_dead_code(tmp_path, area=None, path_prefix=None)
     assert scan.ok is False
     assert scan.items == []
-    assert "no code graph" in scan.reason
+    assert "devmap" in scan.reason
+
+
+def test_structured_dead_code_never_answers_from_the_python_graph(tmp_path, monkeypatch):
+    """A readable Python graph must not stand in for a kernel that could not run.
+
+    The fallback published its listing through `_dead_scan_ok` with
+    `producer_total=None, producer_truncated=False`, so a Python answer reached
+    `devcouncil_liveness` wearing the kernel's "complete and untruncated"
+    shape — the same conflation `_dead_scan_ok`'s own docstring was written to
+    stop, one layer down.
+    """
+    from types import SimpleNamespace
+
+    import devcouncil.devmap_client as devmap_client
+
+    monkeypatch.setattr(devmap_client, "try_connect", lambda root: None)
+    entry = SimpleNamespace(
+        path="a.py",
+        confidence="extracted",
+        model_dump=lambda: {"id": "a.py::f", "path": "a.py", "confidence": "extracted"},
+    )
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.load_code_graph",
+        lambda root: SimpleNamespace(dead_code=[entry]),
+    )
+
+    scan = mapmod._structured_dead_code(tmp_path, area=None, path_prefix=None)
+
+    assert scan.ok is False, (
+        f"the Python graph answered for the kernel: {scan.source!r} {scan.items!r}"
+    )
+    assert scan.source != "code_graph"
+    assert scan.items == []
 
 
 def test_structured_dead_code_reports_the_error_it_used_to_swallow(tmp_path, monkeypatch):
-    """Rewritten: this test used to assert the swallow (``== ([], 0)``).
+    """Rewritten twice: this test used to assert the swallow (``== ([], 0)``).
 
     That encoded the defect as the contract — a crashing dead-code scan was
     indistinguishable from a repository with no dead code, which is exactly the
     Class A failure this module exists to prevent. The honest contract is an
-    unavailable scan carrying the reason.
+    unavailable scan carrying the reason. The raising engine is now the kernel
+    client, because it is the only engine.
     """
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: (_ for _ in ()).throw(RuntimeError("boom")),
-    )
+    import devcouncil.devmap_client as devmap_client
+
+    class _Client:
+        def dead_symbols(self, budget=2000):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(devmap_client, "try_connect", lambda root: _Client())
     scan = mapmod._structured_dead_code(tmp_path, area=None, path_prefix=None)
     assert scan.ok is False
     assert scan.items == []
@@ -649,7 +709,10 @@ def test_structured_dead_code_reports_the_error_it_used_to_swallow(tmp_path, mon
 async def test_graph_query_missing_and_ok(tmp_path, monkeypatch):
     missing = _parse(await mapmod.handle_graph_query(tmp_path, {}))
     assert missing["code"] == "missing_argument"
-    monkeypatch.setattr("devcouncil.indexing.graph.query_symbol", lambda root, name: {"symbol": name})
+    # The engine is the kernel; `query_symbol` no longer exists to stand in.
+    monkeypatch.setattr(
+        mapmod, "_devmap_query_payload", lambda root, kind, **kw: {"ok": True, "symbol": "foo"}
+    )
     ok = _parse(await mapmod.handle_graph_query(tmp_path, {"name_or_path": "foo"}))
     assert ok["ok"] is True and ok["symbol"] == "foo"
 
@@ -659,7 +722,9 @@ async def test_graph_trace_missing_and_ok(tmp_path, monkeypatch):
     assert _parse(await mapmod.handle_graph_trace(tmp_path, {"to": "b"}))["argument"] == "from"
     assert _parse(await mapmod.handle_graph_trace(tmp_path, {"from": "a"}))["argument"] == "to"
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.trace_path", lambda root, a, b: {"path": [a, b]}
+        mapmod,
+        "_devmap_query_payload",
+        lambda root, kind, **kw: {"ok": True, "path": [kw["start"], kw["end"]]},
     )
     ok = _parse(await mapmod.handle_graph_trace(tmp_path, {"from": "a", "to": "b"}))
     assert ok["ok"] is True and ok["path"] == ["a", "b"]
@@ -784,26 +849,67 @@ async def test_graph_ingest_paths_branch_reports_engine_unavailable(tmp_path, mo
 # ---- Class A: unavailable is never a clean bill of health ----------------------
 
 
-def _fake_dead_graph(count, *, confidence=None):
-    from devcouncil.indexing.graph.schema import CodeGraph, Confidence, DeadCodeEntry
+def _dead_item(i, confidence="inferred", path="a.py"):
+    """One row shaped as the kernel's ``dead_symbols`` emits it."""
+    return {
+        "id": f"{path}::dead_{i}",
+        "file_path": path,
+        "symbol_name": f"dead_{i}",
+        "kind": "function",
+        "span": (i + 1, i + 1),
+        "confidence": confidence,
+        "reason": "no inbound call edges",
+    }
 
-    conf = confidence or Confidence.INFERRED
-    return CodeGraph(
-        schema_version=2,
-        nodes=[],
-        edges=[],
-        dead_code=[
-            DeadCodeEntry(
-                id=f"a.py::dead_{i}",
-                path="a.py",
-                line=i + 1,
-                kind="function",
-                confidence=conf,
-                reason="no inbound call edges",
+
+def _fake_dead_client(items, *, total=None, truncated=False, walk_incomplete=None,
+                      resolution="Available", exc=None):
+    """A `DevMapClient` double for the one method `_structured_dead_code` calls.
+
+    These assertions used to reach the engine through
+    `indexing.graph.build.load_code_graph`. That fallback is gone — the kernel is
+    the only engine — but every property they pin (the row cap, the confidence
+    filter, `hidden` summing both, and "unavailable is not a clean bill") is
+    about `_structured_dead_code`, not about which producer fed it, so they are
+    re-pointed rather than dropped.
+    """
+    from devcouncil.devmap_client import BudgetedResponse
+
+    resolved_total = len(items) if total is None else total
+
+    class _Client:
+        def is_map_stale(self):
+            # `with_codeintel_freshness` asks every client this before the
+            # handler runs; a double without it fails inside the wrapper
+            # instead of at the assertion under test.
+            return False
+
+        def dead_symbols(self, budget=2000):
+            if exc is not None:
+                raise exc
+            return BudgetedResponse(
+                shown=len(items),
+                hidden=resolved_total - len(items),
+                total=resolved_total,
+                truncated=truncated,
+                tokens_used=0,
+                items=list(items),
+                resolution=resolution,
+                walk_incomplete=walk_incomplete,
             )
-            for i in range(count)
-        ],
-    )
+
+    return _Client()
+
+
+def test_the_dead_code_fake_matches_the_client_it_stands_in_for():
+    """The double must accept what `DevMapClient.dead_symbols` accepts."""
+    import inspect
+
+    from devcouncil.devmap_client import DevMapClient
+
+    real = set(inspect.signature(DevMapClient.dead_symbols).parameters)
+    fake = set(inspect.signature(type(_fake_dead_client([])).dead_symbols).parameters)
+    assert real <= fake, f"the dead-code double is missing {sorted(real - fake)}"
 
 
 @pytest.mark.anyio
@@ -812,10 +918,9 @@ async def test_liveness_dead_code_unavailable_is_not_a_clean_bill(tmp_path, monk
     monkeypatch.setattr(
         "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
     )
-    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: None)
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: (_ for _ in ()).throw(RuntimeError("store locked")),
+        "devcouncil.devmap_client.try_connect",
+        lambda root: _fake_dead_client([], exc=RuntimeError("store locked")),
     )
 
     out = _parse(await mapmod.handle_liveness(tmp_path, {}))
@@ -834,9 +939,9 @@ async def test_liveness_dead_code_carries_total_beside_the_cap(tmp_path, monkeyp
     monkeypatch.setattr(
         "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
     )
-    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: None)
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph", lambda root: _fake_dead_graph(250)
+        "devcouncil.devmap_client.try_connect",
+        lambda root: _fake_dead_client([_dead_item(i) for i in range(250)]),
     )
 
     out = _parse(await mapmod.handle_liveness(tmp_path, {}))
@@ -854,30 +959,16 @@ async def test_liveness_dead_code_carries_total_beside_the_cap(tmp_path, monkeyp
 
 @pytest.mark.anyio
 async def test_liveness_dead_code_hidden_sums_confidence_and_cap(tmp_path, monkeypatch):
-    from devcouncil.indexing.graph.schema import CodeGraph, Confidence, DeadCodeEntry
-
     _write_repo_map(tmp_path)
     monkeypatch.setattr(
         "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
     )
-    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: None)
-    graph = CodeGraph(
-        schema_version=2,
-        nodes=[],
-        edges=[],
-        dead_code=[
-            DeadCodeEntry(
-                id=f"a.py::dead_{i}",
-                path="a.py",
-                line=i + 1,
-                kind="function",
-                confidence=Confidence.INFERRED if i < 250 else Confidence.AMBIGUOUS,
-                reason="no inbound call edges",
-            )
-            for i in range(255)
-        ],
+    items = [
+        _dead_item(i, "inferred" if i < 250 else "ambiguous") for i in range(255)
+    ]
+    monkeypatch.setattr(
+        "devcouncil.devmap_client.try_connect", lambda root: _fake_dead_client(items)
     )
-    monkeypatch.setattr("devcouncil.indexing.graph.build.load_code_graph", lambda root: graph)
 
     out = _parse(await mapmod.handle_liveness(tmp_path, {}))
 
@@ -905,25 +996,26 @@ def test_graph_degraded_fields_known_with_a_map(tmp_path):
 
 @pytest.mark.anyio
 async def test_graph_query_error_payload_is_not_ok(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.query_symbol",
-        lambda root, name: {"error": "no code graph; run `dev map` first", "query": name},
-    )
+    """An engine that could not answer is `ok: False`, and names the kernel.
+
+    This used to drive the Python fallback's own `{"error": ...}` payload
+    through `_graph_payload`. There is no fallback: an absent kernel is the
+    only way this tool fails to answer, and it says so.
+    """
+    monkeypatch.setattr(mapmod, "_devmap_query_payload", lambda root, kind, **kw: None)
     out = _parse(await mapmod.handle_graph_query(tmp_path, {"name_or_path": "foo"}))
     assert out["ok"] is False
-    assert out["code"] == "graph_unavailable"
-    assert out["error"] == "no code graph; run `dev map` first"
+    assert out["code"] == "graph_missing"
+    assert "devmap" in out["error"].lower()
 
 
 @pytest.mark.anyio
 async def test_graph_trace_error_payload_is_not_ok(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.trace_path",
-        lambda root, a, b: {"error": "no code graph; run `dev map` first", "from": a, "to": b},
-    )
+    monkeypatch.setattr(mapmod, "_devmap_query_payload", lambda root, kind, **kw: None)
     out = _parse(await mapmod.handle_graph_trace(tmp_path, {"from": "a", "to": "b"}))
     assert out["ok"] is False
-    assert out["code"] == "graph_unavailable"
+    assert out["code"] == "graph_missing"
+    assert "devmap" in out["error"].lower()
 
 
 # ---- Class A: impact always says which engine answered ------------------------
@@ -971,15 +1063,18 @@ async def test_repo_map_symbols_unavailable_is_not_an_empty_file(tmp_path, monke
     monkeypatch.setattr(
         "devcouncil.integrations.mcp.handlers.map.RepoMapper.map_is_stale", lambda self, d: False
     )
-    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: None)
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: (_ for _ in ()).throw(RuntimeError("graph unreadable")),
-    )
+    class _Client:
+        def is_map_stale(self):
+            return False
+
+        def search(self, query, limit=2000, semantic=False):
+            raise RuntimeError("store unreadable")
+
+    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: _Client())
     out = _parse(await mapmod.handle_repo_map(tmp_path, {"path": "top_level.py"}))
     assert out["symbols"] == []
     assert out["symbols_available"] is False
-    assert "graph unreadable" in out["symbols_reason"]
+    assert "store unreadable" in out["symbols_reason"]
 
 
 @pytest.mark.anyio

@@ -107,11 +107,13 @@ def _index_freshness_fields(root: Path) -> dict[str, object]:
 
 
 
-#: Edge kinds that represent one symbol invoking another. The devmap store also
-#: emits structural edges (`Contains` for file→symbol, `MemberOf` for
-#: symbol→type); including those in a caller/callee list makes a symbol look like
-#: it calls itself and inflates blast radius with edges nobody can act on.
-_CALL_EDGE_KINDS = frozenset({"Calls"})
+#: Which edge kinds count as calls, and how to read one direction's edge list,
+#: moved to :mod:`devcouncil.devmap_client` — the one seam every kernel consumer
+#: already goes through — when the task prompt's impact block became a second
+#: reader of the same raw edges. Re-bound under the private name this module's
+#: own call sites already use. `CALL_EDGE_KINDS` itself had no reader outside
+#: `edge_nodes` (`rg -uu` over `src/` and `tests/`), so it did not come along.
+from devcouncil.devmap_client import edge_nodes as _edge_nodes  # noqa: E402
 
 
 def _call_edges(
@@ -167,23 +169,6 @@ def _call_edges(
         return None, f"{method} resolution unavailable: {reason}"
 
     return _edge_nodes(resp.items, symbol_key, file_key), None
-
-
-def _edge_nodes(items, symbol_key: str, file_key: str) -> list:
-    """Call-graph node names from one direction's raw edge list.
-
-    Split out of :func:`_call_edges` so the batched and single-target paths
-    share it verbatim. Two copies of this filter would drift, and the drift
-    would be silent: it decides which edge kinds count as calls at all.
-    """
-    edges = []
-    for edge in items:
-        if str(edge.get("edge_kind") or "") not in _CALL_EDGE_KINDS:
-            continue
-        node = str(edge.get(symbol_key) or edge.get(file_key) or "")
-        if node:
-            edges.append(node)
-    return edges
 
 
 def _sends_min_rung(call, what: str, min_rung: Optional[str]) -> bool:
@@ -402,7 +387,13 @@ def _checked_min_rung(min_rung: Optional[str]) -> Optional[str]:
 
 
 def _devmap_query_payload(root: Path, kind: str, **kwargs):
-    """Try DevMapClient for query surfaces; return payload or None for Python fallback."""
+    """The kernel's answer for a query surface, or ``None`` when it cannot answer.
+
+    ``None`` used to mean "fall back to the Python engine". There is no Python
+    engine for `query` or `trace` any more; ``None`` now means the caller
+    refuses, naming the kernel. The signal is unchanged so the surfaces that
+    still branch on it (`status`, and the MCP siblings) read it the same way.
+    """
     from devcouncil.devmap_client import (
         DevMapClientError,
         DevMapRequestRefused,
@@ -722,6 +713,32 @@ def _require_graph(root: Path, *, warn_stale: bool = True):
     if warn_stale:
         _warn_if_stale(root)
     return graph
+
+
+#: Printed when no kernel can answer. Named so `query` and `trace` cannot drift
+#: into saying different things about the same condition.
+_NO_KERNEL_MESSAGE = (
+    "[red]No devmap store; run `dev map` first. "
+    "The kernel is the only graph engine — there is no Python fallback.[/red]"
+)
+
+
+def _require_kernel(root: Path, *, warn_stale: bool = True):
+    """A live client, or exit naming the kernel — the sibling of `_require_graph`.
+
+    For the commands the kernel answers directly. It reads the store the kernel
+    wrote, rather than materialising the whole graph out of the Python
+    `index.sqlite` cache first.
+    """
+    from devcouncil.devmap_client import try_connect
+
+    client = try_connect(root)
+    if client is None:
+        status.print("[red]No devmap store; run `dev map` first.[/red]")
+        raise typer.Exit(code=1)
+    if warn_stale:
+        _warn_if_stale(root)
+    return client
 
 
 def _kernel_build_payload(refresh) -> dict:  # noqa: ANN001
@@ -1259,25 +1276,21 @@ def graph_query(
     """360° view: definition, callers, callees, importers.
 
     --min-rung narrows every edge list here to the resolution rungs it names.
-    The fallback graph has no ladder to filter on, so a floor is refused there
-    rather than silently ignored: an unfiltered answer to a request for
-    deterministic-only edges is the reading that gets acted on.
+
+    The kernel is the only engine. This used to fall back to
+    `indexing.graph.query.query_symbol` over `load_code_graph` — the retired
+    engine's whole-graph read, 855 ms and ~690 MB RSS on this repository — and
+    that fallback carried no resolution ladder, so `--min-rung` had to be
+    refused against it separately. Both refusals are now the same one.
     """
     root = _root(project_root)
     min_rung = _checked_min_rung(min_rung)
     result = _devmap_query_payload(
         root, "query", name_or_path=name_or_path, min_rung=min_rung
     )
-    if result is None and min_rung is not None:
-        status.print(
-            "[red]--min-rung needs the devmap index; the fallback graph carries "
-            "no resolution ladder to filter on (run `dev map` to build one)[/red]"
-        )
-        raise typer.Exit(code=3)
     if result is None:
-        from devcouncil.indexing.graph import query_symbol
-
-        result = {**query_symbol(root, name_or_path), **_graph_degraded_fields(root)}
+        status.print(_NO_KERNEL_MESSAGE)
+        raise typer.Exit(code=3 if min_rung is not None else 1)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -1310,23 +1323,23 @@ def graph_trace(
 
     --min-rung restricts the walk to the named rungs, so a path can be asked
     for on evidence the resolver proved rather than on evidence it guessed.
-    Refused against the fallback graph, which has no ladder.
+
+    The kernel is the only engine, and here that is a correctness rule rather
+    than a performance one: the Python `trace_path` this fell back to ran an
+    *undirected* BFS over `imports`/`calls`/`contains`/`defines`/`inherits`
+    while the kernel walks resolved edges directionally. On a real probe Python
+    reported a two-hop path between two functions through a shared test module
+    where the kernel correctly reported none. A fabricated path is worse than an
+    absent answer, because a caller acts on it.
     """
     root = _root(project_root)
     min_rung = _checked_min_rung(min_rung)
     result = _devmap_query_payload(
         root, "trace", start=start, end=end, min_rung=min_rung
     )
-    if result is None and min_rung is not None:
-        status.print(
-            "[red]--min-rung needs the devmap index; the fallback graph carries "
-            "no resolution ladder to filter on (run `dev map` to build one)[/red]"
-        )
-        raise typer.Exit(code=3)
     if result is None:
-        from devcouncil.indexing.graph import trace_path
-
-        result = {**trace_path(root, start, end), **_graph_degraded_fields(root)}
+        status.print(_NO_KERNEL_MESSAGE)
+        raise typer.Exit(code=3 if min_rung is not None else 1)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -2161,11 +2174,8 @@ def graph_routes(
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Map HTTP routes to handlers and client fetch consumers."""
-    from devcouncil.indexing.graph.api_routes import route_map
-
     root = _root(project_root)
-    graph = _require_graph(root)
-    result = route_map(root, graph)
+    result = _require_kernel(root).routes()
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -2196,11 +2206,8 @@ def graph_shape_check(
     route: Optional[str] = typer.Option(None, "--route", help="Filter to one route path or id."),
 ) -> None:
     """Compare handler response keys vs client accessed keys."""
-    from devcouncil.indexing.graph.api_routes import shape_check
-
     root = _root(project_root)
-    graph = _require_graph(root)
-    result = shape_check(root, graph, route_filter=route)
+    result = _require_kernel(root).shape_check(route_filter=route)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -2222,11 +2229,8 @@ def graph_api_impact(
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """API blast radius: consumers, middleware, shape mismatches, risk tier."""
-    from devcouncil.indexing.graph.api_routes import api_impact
-
     root = _root(project_root)
-    graph = _require_graph(root)
-    result = api_impact(root, route_or_path, graph)
+    result = _require_kernel(root).api_impact(route_or_path)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return

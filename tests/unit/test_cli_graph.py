@@ -50,30 +50,37 @@ def _setup_graph_env(tmp_path: Path, monkeypatch) -> Path:
     return tmp_path
 
 
-def test_cli_graph_query(tmp_path, monkeypatch):
+def test_cli_graph_query_refuses_a_python_only_store(tmp_path, monkeypatch):
+    """`dev map query` has no Python engine to fall back to, and says so.
+
+    Rewritten: this asserted that the command rendered a hand-built graph
+    written into the *Python* store — the compatibility read path
+    `_setup_graph_env` builds. That path is retired: `query_symbol` and
+    `trace_path` are gone and the kernel is the only engine, so a tree with a
+    Python store and no devmap generation gets an error naming the kernel.
+
+    The rendering these used to cover is covered against the kernel seam in
+    `test_graph_cmd_command.py` (`test_graph_query_json`,
+    `test_graph_query_human_with_defs`).
+    """
     _setup_graph_env(tmp_path, monkeypatch)
-    
+
     res = runner.invoke(app, ["map", "query", "src/a.py::func_a"])
-    assert res.exit_code == 0
-    assert "src/a.py::func_a" in res.output
-    
-    res_json = runner.invoke(app, ["map", "query", "src/a.py::func_a", "--json"])
-    assert res_json.exit_code == 0
-    data = json.loads(res_json.stdout)
-    assert len(data["definitions"]) > 0
+    assert res.exit_code != 0
+    assert "dev map" in res.output or "devmap" in res.output, res.output
 
 
-def test_cli_graph_trace(tmp_path, monkeypatch):
+def test_cli_graph_trace_refuses_a_python_only_store(tmp_path, monkeypatch):
+    """Same, and here the deleted engine was wrong rather than merely slow.
+
+    The Python tracer walked the graph *undirected*, so it reported paths the
+    kernel's directional walk finds no evidence for.
+    """
     _setup_graph_env(tmp_path, monkeypatch)
-    
+
     res = runner.invoke(app, ["map", "trace", "src/a.py::func_a", "src/b.py::func_b"])
-    assert res.exit_code == 0
-    assert "src/a.py::func_a → src/b.py::func_b" in res.output
-    
-    res_json = runner.invoke(app, ["map", "trace", "src/a.py::func_a", "src/b.py::func_b", "--json"])
-    assert res_json.exit_code == 0
-    data = json.loads(res_json.stdout)
-    assert data["found"] is True
+    assert res.exit_code != 0
+    assert "dev map" in res.output or "devmap" in res.output, res.output
 
 
 def test_cli_graph_dead(tmp_path, monkeypatch):
@@ -199,9 +206,13 @@ def test_graph_alias_query_and_html(tmp_path, monkeypatch):
     """Compatibility: `dev graph …` remains dual-registered with `dev map …`."""
     _setup_graph_env(tmp_path, monkeypatch)
 
+    # The alias reaches the *same* command, so it reaches the same refusal now
+    # that `dev map query` has no Python engine behind it. What is under test
+    # here is the dual registration, not the answer.
     res = runner.invoke(app, ["graph", "query", "src/a.py::func_a"])
-    assert res.exit_code == 0
-    assert "src/a.py::func_a" in res.output
+    assert res.exit_code != 0
+    assert "No such command" not in res.output, res.output
+    assert "dev map" in res.output or "devmap" in res.output, res.output
 
     res_html = runner.invoke(app, ["graph", "html"])
     assert res_html.exit_code == 0

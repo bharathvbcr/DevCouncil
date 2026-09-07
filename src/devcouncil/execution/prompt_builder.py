@@ -577,43 +577,90 @@ class PromptBuilder:
             + "\n"
         )
 
-    def _graph_impact_lines(self, task: Task) -> List[str]:
-        """Optional symbol-level inbound blast (depth 1) from the code graph."""
-        try:
-            from devcouncil.indexing.graph.build import load_code_graph
-            from devcouncil.indexing.graph.intel import diff_impact
+    #: Said instead of nothing when the kernel cannot answer. `[]` here used to
+    #: be indistinguishable from "the kernel ran and found no callers", and this
+    #: block is read as evidence about what a change breaks.
+    _IMPACT_NO_KERNEL = (
+        "- symbol callers unavailable: the devmap kernel could not be reached "
+        "(run `dev map` to build the index)"
+    )
 
-            graph = load_code_graph(self.project_root)
-            if graph is None:
-                return []
-            paths = [
-                pf.path.replace("\\", "/")
-                for pf in task.planned_files[: self._IMPACT_MAX_FILES]
-                if pf.allowed_change != "create"
-            ]
-            if not paths:
-                return []
-            result = diff_impact(
-                self.project_root, graph, paths=paths, use_diff=False, max_depth=1
-            )
-            out: List[str] = []
-            for item in result.get("paths") or []:
-                layers = (item.get("blast") or {}).get("layers") or []
-                depth1 = next((L for L in layers if L.get("depth") == 1), None)
-                nodes = (depth1 or {}).get("nodes") or []
-                if not nodes:
-                    continue
-                shown = nodes[: self._IMPACT_MAX_DEPS]
-                more = f" (+{len(nodes) - len(shown)})" if len(nodes) > len(shown) else ""
-                out.append(
-                    f"- `{item['path']}` symbol callers (depth 1): "
-                    + ", ".join(f"`{n}`" for n in shown)
-                    + more
-                )
-            return out
-        except Exception:
-            logger.debug("graph impact lines skipped", exc_info=True)
+    def _graph_impact_lines(self, task: Task) -> List[str]:
+        """Symbol-level inbound blast (depth 1) for the planned files, from the kernel.
+
+        One batched ``neighbors`` exchange rather than the retired Python
+        engine's whole-graph read. `load_code_graph` materialised every node and
+        edge as pydantic models out of `index.sqlite` — measured on this
+        repository (18,121 nodes / 102,646 edges) at 3.79 s plus a 102 MB store
+        write on the first call and 855 ms at ~690 MB RSS on each one after — to
+        answer a question the kernel answers for all eight planned files at once
+        in 95 ms. Every task prompt paid it.
+
+        The kernel's honesty signals are rendered, not dropped: a truncated
+        answer carries its remainder, and a walk that stopped early is reported
+        as "I stopped looking" rather than as an empty finding — the same rule
+        :func:`devcouncil.devmap_client.walk_incomplete_reason` states and
+        ``dev map query`` applies.
+        """
+        paths = [
+            pf.path.replace("\\", "/")
+            for pf in task.planned_files[: self._IMPACT_MAX_FILES]
+            if pf.allowed_change != "create"
+        ]
+        if not paths:
             return []
+        try:
+            import devcouncil.devmap_client as devmap_client
+
+            client = devmap_client.try_connect(self.project_root)
+            if client is None:
+                return [self._IMPACT_NO_KERNEL]
+            answers = client.neighbors(paths, depth=1)
+        except Exception:
+            logger.debug("graph impact lines: kernel unavailable", exc_info=True)
+            return [self._IMPACT_NO_KERNEL]
+
+        from devcouncil.devmap_client import (
+            edge_nodes,
+            resolution_unavailable_reason,
+            walk_incomplete_reason,
+        )
+
+        out: List[str] = []
+        for answer in answers:
+            path = str(answer.get("target") or "")
+            callers = answer.get("callers")
+            reason = resolution_unavailable_reason(getattr(callers, "resolution", None))
+            if reason:
+                out.append(f"- `{path}` symbol callers unavailable: {reason}")
+                continue
+            nodes: List[str] = []
+            for node in edge_nodes(getattr(callers, "items", None), "source_symbol", "source_file"):
+                if node not in nodes:
+                    nodes.append(node)
+            incomplete = walk_incomplete_reason(callers)
+            if not nodes:
+                # An empty list from a walk that stopped early reads as
+                # "nothing calls this"; the honest answer is "I stopped
+                # looking". A genuinely empty answer stays silent, as before.
+                if incomplete:
+                    out.append(f"- `{path}` symbol callers: walk incomplete ({incomplete})")
+                continue
+            shown = nodes[: self._IMPACT_MAX_DEPS]
+            # `total` counts the edges the kernel found; `nodes` counts the
+            # distinct callers left after the structural edges are filtered out,
+            # so the remainder is taken from whichever is larger. Reporting only
+            # `len(nodes)` would publish a budget-trimmed sample as a total.
+            found = max(len(nodes), int(getattr(callers, "total", 0) or 0))
+            more = f" (+{found - len(shown)})" if found > len(shown) else ""
+            note = " — walk incomplete, this is a lower bound" if incomplete else ""
+            out.append(
+                f"- `{path}` symbol callers (depth 1): "
+                + ", ".join(f"`{n}`" for n in shown)
+                + more
+                + note
+            )
+        return out
 
     def _liveness_debt_section(self, task: Task, data: dict | None) -> str:
         """Surface map unwired/dead-symbol candidates that overlap the task's subsystems."""

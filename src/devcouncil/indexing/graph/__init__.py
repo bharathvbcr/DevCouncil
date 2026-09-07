@@ -1,8 +1,12 @@
 """Symbol-level code knowledge graph for DevCouncil repo mapping.
 
-Public entry points: :func:`load_code_graph`, :func:`write_code_graph`,
-:func:`query_symbol`, :func:`trace_path`, plus graph intelligence
-(:func:`diff_impact`, :func:`graph_check`, …).
+Public entry points: :func:`load_code_graph`, :func:`write_code_graph`, plus
+graph intelligence (:func:`diff_impact`, :func:`graph_check`, …).
+
+Symbol lookup and path tracing are **not** here any more. `query_symbol` and
+`trace_path` were the fallback engine for `dev map query` / `dev map trace` and
+their MCP siblings; the kernel is the only graph engine now, and those two are
+gone from :mod:`devcouncil.indexing.graph.query`.
 
 Neither building the graph nor refreshing the artifacts is one of them. The Rust
 kernel extracts and resolves the graph and writes both ``.devcouncil/repo_map.json``
@@ -52,10 +56,6 @@ if TYPE_CHECKING:  # pragma: no cover - import-time cost is the whole point
         build_graph_okf_bundle,
         export_graph_okf,
     )
-    from devcouncil.indexing.graph.query import (  # noqa: F401
-        query_symbol,
-        trace_path,
-    )
     from devcouncil.indexing.graph.schema import (  # noqa: F401
         SCHEMA_VERSION,
         CodeGraph,
@@ -81,8 +81,6 @@ _EXPORTS: dict[str, str] = {
     "extract_processes": "intel",
     "god_nodes": "intel",
     "graph_check": "intel",
-    "query_symbol": "query",
-    "trace_path": "query",
     "SCHEMA_VERSION": "schema",
     "CodeGraph": "schema",
     "Confidence": "schema",

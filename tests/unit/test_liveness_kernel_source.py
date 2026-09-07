@@ -177,53 +177,119 @@ def test_a_capped_list_is_not_a_ratchet_input(tmp_path, monkeypatch, cut):
     assert load_liveness_baseline(tmp_path, "TASK-1") is None
 
 
-class _FakeNode:
-    def __init__(self, path, name):
-        self.path = path
-        self.name = name
+# `_graph_liveness` reads `code_graph.json` — the kernel's own export — with a
+# plain bounded `json.load`. It used to go through
+# `indexing.graph.build.load_code_graph`, which imports that same JSON into the
+# Python `index.sqlite` cache and re-materialises every node and edge as
+# pydantic models. Measured on a tmp copy of this repository's tree (17,505
+# symbols, 120 unwired candidates) the two produce byte-identical lists, at
+# p50 815.0 ms / min 784.9 ms against p50 133.8 ms / min 128.0 ms.
+#
+# So the fixtures below are the artifact itself rather than a fake model.
 
 
-class _FakeGraph:
-    def __init__(self, *, head, tier=None, nodes=None):
-        self.generated_head = head
-        self.meta = (
-            {"legacy_dead_symbol_candidates": []}
-            if tier is None
-            else {"compatibility_export_tier": tier, "legacy_dead_symbol_candidates": []}
-        )
-        self.nodes = nodes if nodes is not None else [_FakeNode("pkg/lib.py", "helper")]
-        self.entry_roots: list[str] = []
-        self.unwired_candidates: list[str] = []
-        self.unreachable_files: list[str] = []
-        self.dead_code: list[dict] = []
+def _write_graph(root: Path, *, head, tier=None, nodes=None, **extra):
+    meta: dict = {"legacy_dead_symbol_candidates": []}
+    if tier is not None:
+        meta["compatibility_export_tier"] = tier
+    payload = {
+        "generated_head": head,
+        "meta": meta,
+        "nodes": (
+            [{"path": "pkg/lib.py", "name": "helper"}] if nodes is None else nodes
+        ),
+        "edges": [],
+        "entry_roots": [],
+        "unwired_candidates": [],
+        "unreachable_files": [],
+        "dead_code": [],
+        **extra,
+    }
+    path = root / ".devcouncil" / "graph" / "code_graph.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
-def _index(monkeypatch, graph, head):
+def _index(tmp_path, head, *, graph_head=None, tier=None, nodes=None):
     from devcouncil.verification.checks import liveness_ratchet
 
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph", lambda _root: graph
-    )
-    graph = liveness_ratchet._graph_liveness(Path("/nowhere"), head)
+    _write_graph(tmp_path, head=graph_head if graph_head is not None else head,
+                 tier=tier, nodes=nodes)
+    graph = liveness_ratchet._graph_liveness(tmp_path, head)
     return (graph["symbol_index"] if graph else [], graph is not None)
 
 
-def test_a_graph_from_another_generation_is_not_a_symbol_index(monkeypatch):
+def test_graph_liveness_never_touches_the_python_store(tmp_path, monkeypatch):
+    """The lists come from the kernel's JSON export, not from `index.sqlite`.
+
+    `load_code_graph` is monkeypatched to raise: reaching it at all is the
+    defect, and it is also what wrote a 102 MB `index.sqlite` the first time a
+    ratchet ran on a fresh checkout.
+    """
+    from devcouncil.verification.checks import liveness_ratchet
+
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.load_code_graph",
+        lambda _root: (_ for _ in ()).throw(
+            AssertionError("the ratchet must not read the Python graph store")
+        ),
+    )
+    _write_graph(tmp_path, head="h", unwired_candidates=["pkg/orphan.py"])
+
+    got = liveness_ratchet._graph_liveness(tmp_path, "h")
+
+    assert got is not None, "the kernel's own export must be readable on its own"
+    assert got["symbol_index"] == ["pkg/lib.py::helper"]
+    assert got["unwired_candidates"] == ["pkg/orphan.py"]
+    assert (tmp_path / ".devcouncil" / "codeintel" / "index.sqlite").exists() is False
+
+
+def test_a_missing_graph_export_is_not_an_empty_snapshot(tmp_path):
+    """No export is "could not look" — an empty snapshot clears the ratchet."""
+    from devcouncil.verification.checks import liveness_ratchet
+
+    assert liveness_ratchet._graph_liveness(tmp_path, "h") is None
+
+
+def test_a_graph_export_that_is_not_json_is_not_a_snapshot(tmp_path):
+    from devcouncil.verification.checks import liveness_ratchet
+
+    path = tmp_path / ".devcouncil" / "graph" / "code_graph.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+    assert liveness_ratchet._graph_liveness(tmp_path, "h") is None
+
+
+def test_an_oversized_graph_export_is_refused_rather_than_read(tmp_path, monkeypatch):
+    """The read is bounded, as the import it replaces was.
+
+    An unbounded `json.load` of an artifact this process did not write is how a
+    verification check becomes the thing that exhausts the machine.
+    """
+    from devcouncil.verification.checks import liveness_ratchet
+
+    _write_graph(tmp_path, head="h")
+    monkeypatch.setattr(liveness_ratchet, "_graph_json_max_bytes", lambda root: 8)
+    assert liveness_ratchet._graph_liveness(tmp_path, "h") is None
+
+
+def test_a_graph_from_another_generation_is_not_a_symbol_index(tmp_path):
     """The straddle guard.
 
     Pairing a symbol index from one generation with candidate lists from
     another turns the difference between two generations into a "regression" —
     the exact shape of a false stranding report.
     """
-    index, usable = _index(monkeypatch, _FakeGraph(head="older"), "newer")
+    index, usable = _index(tmp_path, "newer", graph_head="older")
     assert not usable and index == []
 
-    index, usable = _index(monkeypatch, _FakeGraph(head="same"), "same")
+    index, usable = _index(tmp_path, "same")
     assert usable and index == ["pkg/lib.py::helper"]
 
 
 @pytest.mark.parametrize("tier, usable", [("slim", True), ("compact", False), ("stub", False)])
-def test_a_capped_graph_export_is_not_a_symbol_index(monkeypatch, tier, usable):
+def test_a_capped_graph_export_is_not_a_symbol_index(tmp_path, tier, usable):
     """``compact`` strips node extras and ``stub`` drops nodes entirely.
 
     Either one yields an index that is missing symbols for reasons that have
@@ -231,7 +297,7 @@ def test_a_capped_graph_export_is_not_a_symbol_index(monkeypatch, tier, usable):
     exempted from the ratchet — so a capped export silently narrows the check
     rather than failing it.
     """
-    got_index, got_usable = _index(monkeypatch, _FakeGraph(head="h", tier=tier), "h")
+    got_index, got_usable = _index(tmp_path, "h", tier=tier)
     assert got_usable is usable, tier
     assert bool(got_index) is usable
 

@@ -11,9 +11,7 @@ from devcouncil.indexing.graph.query import (
     explain_pdg_taint,
     query_pdg_controls,
     query_pdg_flows,
-    query_symbol,
     symbol_has_non_test_inbound,
-    trace_path,
 )
 from devcouncil.indexing.graph.schema import CodeGraph, GraphEdge, GraphNode, NodeKind
 
@@ -33,26 +31,6 @@ def _graph() -> CodeGraph:
         GraphEdge(source="tests/t.py::test_foo", target="pkg/a.py::foo", kind="calls"),
     ]
     return CodeGraph(nodes=nodes, edges=edges)
-
-
-def test_query_symbol_missing_graph(tmp_path: Path):
-    result = query_symbol(tmp_path, "foo", graph=None)
-    assert "error" in result
-    assert result["query"] == "foo"
-
-
-def test_query_symbol_no_matches(tmp_path: Path):
-    result = query_symbol(tmp_path, "missing", graph=_graph())
-    assert result["matches"] == []
-    assert result["definitions"] == []
-
-
-def test_query_symbol_match_by_suffix_and_edges(tmp_path: Path):
-    result = query_symbol(tmp_path, "foo", graph=_graph())
-    assert result["matches"] >= 1
-    defs = result["definitions"]
-    assert defs
-    assert "pkg/b.py::bar" in defs[0]["callers"]
 
 
 def test_match_nodes_path_and_id_suffix():
@@ -77,27 +55,6 @@ def test_symbol_has_non_test_inbound_ignores_test_only(tmp_path: Path):
         edges=[GraphEdge(source="tests/t.py::test_foo", target="pkg/a.py::foo", kind="calls")],
     )
     assert symbol_has_non_test_inbound(tmp_path, "pkg/a.py", "foo", graph=g) is False
-
-
-def test_trace_path_missing_graph_and_endpoints(tmp_path: Path):
-    assert "error" in trace_path(tmp_path, "a", "b", graph=None)
-    missing = trace_path(tmp_path, "zzz", "yyy", graph=_graph())
-    assert missing["found"] is False
-    assert missing["reason"] == "endpoint not found"
-
-
-def test_trace_path_found_and_not_found(tmp_path: Path):
-    found = trace_path(tmp_path, "pkg/b.py", "pkg/a.py", graph=_graph())
-    assert found["found"] is True
-    assert found["path"]
-    orphan = CodeGraph(
-        nodes=[
-            GraphNode(id="alpha", kind=NodeKind.FILE, path="alpha.py", name="alpha"),
-            GraphNode(id="beta", kind=NodeKind.FILE, path="beta.py", name="beta"),
-        ],
-        edges=[],
-    )
-    assert trace_path(tmp_path, "alpha", "beta", graph=orphan, max_depth=0)["found"] is False
 
 
 def test_explain_pdg_taint_no_graph(tmp_path: Path):
@@ -195,42 +152,3 @@ def test_load_file_pdg_and_match_functions(tmp_path: Path):
         assert hits
         hits2 = _match_pdg_functions(tmp_path, _graph(), "foo")
         assert hits2
-
-
-def _wide_graph(match_count: int = 25, caller_count: int = 60) -> CodeGraph:
-    nodes = [
-        GraphNode(id=f"pkg/a.py::foo_{i}", kind=NodeKind.FUNCTION, path="pkg/a.py", name=f"foo_{i}")
-        for i in range(match_count)
-    ]
-    edges = []
-    for i in range(caller_count):
-        nodes.append(
-            GraphNode(
-                id=f"pkg/c{i}.py::caller_{i}",
-                kind=NodeKind.FUNCTION,
-                path=f"pkg/c{i}.py",
-                name=f"caller_{i}",
-            )
-        )
-        edges.append(
-            GraphEdge(source=f"pkg/c{i}.py::caller_{i}", target="pkg/a.py::foo_0", kind="calls")
-        )
-    return CodeGraph(nodes=nodes, edges=edges)
-
-
-def test_query_symbol_reports_definition_totals_beside_the_cap(tmp_path: Path):
-    result = query_symbol(tmp_path, "foo_", graph=_wide_graph())
-    assert len(result["definitions"]) == 20
-    assert result["definitions_shown"] == 20
-    assert result["definitions_total"] == 25
-    assert result["definitions_truncated"] is True
-
-
-def test_query_symbol_reports_edge_totals_beside_the_cap(tmp_path: Path):
-    result = query_symbol(tmp_path, "foo_", graph=_wide_graph())
-    definition = next(d for d in result["definitions"] if d["id"] == "pkg/a.py::foo_0")
-    assert len(definition["callers"]) == 50
-    assert definition["callers_total"] == 60
-    assert definition["callers_truncated"] is True
-    assert definition["callees_total"] == 0
-    assert definition["callees_truncated"] is False

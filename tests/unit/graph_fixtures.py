@@ -209,3 +209,31 @@ def kernel_graph(root: Path) -> "CodeGraph":
     graph = load_code_graph(root)
     assert graph is not None, "the kernel wrote no graph the Python side could read"
     return graph
+
+
+def kernel_client(root: Path):
+    """A live ``DevMapClient`` over a store the kernel just built under ``root``.
+
+    The sibling of :func:`kernel_graph` for consumers that have moved off the
+    retired Python read path: same producer, same sources, but the answer comes
+    back over the client rather than as a whole materialised ``CodeGraph``.
+    Nothing here touches ``index.sqlite``.
+
+    Skips when no kernel binary is built, and when the build committed a store
+    with nothing in it — ``try_connect`` refuses that case in production too,
+    and a test that accepted it would assert against confident zeroes.
+    """
+    import pytest
+
+    from devcouncil.devmap_client import try_connect
+    from devcouncil.indexing.map_artifacts import refresh_map_artifacts
+
+    if not _have_kernel():
+        pytest.skip("devmap kernel not built (cargo build --release -p devmap-cli)")
+    root = Path(root)
+    (root / ".devcouncil").mkdir(exist_ok=True)
+    refresh_map_artifacts(root, root / ".devcouncil" / "repo_map.json", quiet=True)
+    client = try_connect(root)
+    if client is None:
+        pytest.skip("the kernel built no usable generation over this fixture tree")
+    return client

@@ -14,7 +14,6 @@ from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
 from devcouncil.domain.task import Task
-from devcouncil.indexing.graph.schema import CodeGraph, GraphEdge, GraphNode, NodeKind
 from devcouncil.verification.claims.models import Assertion, CheckResult, Kind, Status
 
 runner = CliRunner()
@@ -72,7 +71,25 @@ def test_check_mapping_stack_legacy_graphify_and_missing_graph(tmp_path):
     assert any("Missing" in row[2] for row in rows if row[0] == "Code graph")
 
 
-def test_check_mapping_stack_loadable_graph(tmp_path, monkeypatch):
+class _StoreProbe:
+    """A `DevMapClient` double for the one question `doctor` asks the store."""
+
+    def __init__(self, *, generation_id=7, node_count=12):
+        self.generation_id = generation_id
+        self.node_count = node_count
+
+    def status(self):
+        return self
+
+
+def test_check_mapping_stack_probes_the_store_not_the_python_graph(tmp_path, monkeypatch):
+    """"Does a graph exist" is a `status` call, not a whole-graph read.
+
+    `doctor` asked it twice per run through `load_code_graph`, which
+    materialises every node and edge out of the Python `index.sqlite` cache:
+    measured on a tmp copy of this repository, p50 2546.8 ms / min 1872.8 ms
+    against `try_connect`'s p50 41.2 ms / min 36.4 ms, for a boolean.
+    """
     from devcouncil.cli.commands import doctor as doctor_cmd
 
     graph_path = tmp_path / ".devcouncil" / "graph" / "code_graph.json"
@@ -81,11 +98,33 @@ def test_check_mapping_stack_loadable_graph(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "devcouncil.indexing.graph.build.load_code_graph",
-        lambda _root: CodeGraph(nodes=[], edges=[]),
+        lambda _root: (_ for _ in ()).throw(
+            AssertionError("doctor must not read the whole graph to check it exists")
+        ),
+    )
+    monkeypatch.setattr(
+        "devcouncil.devmap_client.try_connect", lambda root: _StoreProbe()
     )
     rows = doctor_cmd.check_mapping_stack(tmp_path)
     graph_rows = [row for row in rows if row[0] == "Code graph"]
-    assert graph_rows and "OK" in graph_rows[0][1]
+    assert graph_rows and "OK" in graph_rows[0][1], graph_rows
+
+
+def test_check_mapping_stack_reports_an_export_with_no_store_behind_it(
+    tmp_path, monkeypatch
+):
+    """A readable JSON export whose store is gone is a warning, not an OK."""
+    from devcouncil.cli.commands import doctor as doctor_cmd
+
+    graph_path = tmp_path / ".devcouncil" / "graph" / "code_graph.json"
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    graph_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: None)
+    rows = doctor_cmd.check_mapping_stack(tmp_path)
+    graph_rows = [row for row in rows if row[0] == "Code graph"]
+    assert graph_rows and "OK" not in graph_rows[0][1], graph_rows
+    assert "devmap" in graph_rows[0][2] or "dev map" in graph_rows[0][2], graph_rows
 
 
 def test_check_execution_containment_rows(tmp_path, monkeypatch):
@@ -122,87 +161,22 @@ def test_check_repo_map_freshness_ok_path(tmp_path, monkeypatch):
     assert rows[0][1] == "[green]OK[/green]"
 
 
-# --- api_routes.py --------------------------------------------------------------
-
-
-def test_api_routes_normalize_and_match_variants():
-    from devcouncil.indexing.graph import api_routes as ar
-
-    assert ar.normalize_route_path("api/items") == "/api/items"
-    assert ar.normalize_route_path("\\api\\items\\:id") == "/api/items/*"
-    assert ar.paths_match("/a/:id", "/a/{id}") is True
-    assert ar.paths_match("/a/b", "/a/c") is False
-    assert ar.paths_match("/a", "/a/b") is False
-
-
-def test_api_routes_verbs_compatible():
-    from devcouncil.indexing.graph import api_routes as ar
-
-    assert ar._verbs_compatible("ANY", "POST") is True
-    assert ar._verbs_compatible("GET", "GET") is True
-    assert ar._verbs_compatible("HEAD", "GET") is True
-    assert ar._verbs_compatible("POST", "GET") is False
-
-
-def test_api_routes_consumer_keys_and_risk():
-    from devcouncil.indexing.graph import api_routes as ar
-
-    window = [
-        "const resp = await fetch('/x');",
-        "const { id, name } = await resp.json();",
-        "console.log(resp.token);",
-    ]
-    keys = ar._consumer_keys(window, "resp")
-    assert {"id", "name", "token"} <= keys
-
-    assert ar._risk_level(consumers=[], mismatches=[]) == "none"
-    assert ar._risk_level(consumers=[{}], mismatches=[{}]) == "medium"
-    assert ar._risk_level(consumers=[{}, {}], mismatches=[{}]) == "high"
-    assert ar._risk_level(consumers=[{}, {}], mismatches=[]) == "low"
-
-
-def test_api_routes_handler_return_keys_python(tmp_path):
-    from devcouncil.indexing.graph import api_routes as ar
-
-    src = tmp_path / "handlers.py"
-    src.write_text(
-        "def list_items():\n"
-        "    return {'id': 1, 'name': 'x', 'price': 9}\n",
-        encoding="utf-8",
-    )
-    node = GraphNode(
-        id="handlers.py::list_items",
-        kind=NodeKind.FUNCTION,
-        path="handlers.py",
-        name="list_items",
-        line=1,
-    )
-    keys = ar.handler_return_keys(tmp_path, node)
-    assert {"id", "name", "price"} <= keys
-
-
-def test_api_routes_route_matches_filter():
-    from devcouncil.indexing.graph import api_routes as ar
-
-    route = {"path": "/api/items/{id}", "id": "route-1", "normalized_path": "/api/items/*"}
-    assert ar._route_matches_filter(route, "/api/items/{id}") is True
-    assert ar._route_matches_filter(route, "route-1") is True
-    assert ar._route_matches_filter(route, "/api/items/42") is True
-    assert ar._route_matches_filter(route, "/other") is False
-
-
-def test_api_routes_resolve_handlers_fallback(tmp_path):
-    from devcouncil.indexing.graph import api_routes as ar
-
-    route = GraphNode(id="app.py::route_get", kind=NodeKind.ROUTE, path="app.py", name="get_items", line=1)
-    handler = GraphNode(id="app.py::list_items", kind=NodeKind.FUNCTION, path="app.py", name="list_items", line=3)
-    graph = CodeGraph(
-        nodes=[route, handler],
-        edges=[GraphEdge(source=route.id, target=route.id, kind="routes_to")],
-    )
-    nodes = {n.id: n for n in graph.nodes}
-    resolved = ar._resolve_route_handlers(route, [route.id], nodes, graph)
-    assert resolved == [handler.id]
+# --- api_routes.py ----------------------------------------------------------
+#
+# Retired with the module. `indexing/graph/api_routes.py` was a Python
+# re-implementation of `devmap routes` / `shape-check` / `api-impact` over
+# `load_code_graph`; both its production readers (the MCP route tools and
+# `dev map routes` / `shape-check` / `api-impact`) now ask the kernel, so the
+# module and the coverage of its private helpers went with it. The canonical
+# owner is `devmap_query::api_routes`, whose suite carries the same cases —
+# `a_template_literal_parameter_normalises_without_leaving_its_dollar`,
+# `a_flask_converter_normalises_whole_rather_than_from_its_colon`,
+# `paths_match_segment_wise_and_reject_different_depths`,
+# `a_consumer_is_matched_to_its_route_with_the_keys_it_reads`,
+# `a_key_the_handler_never_returns_is_a_mismatch`,
+# `a_route_nothing_calls_is_not_reported_as_no_risk` — plus several the Python
+# copy never had, such as
+# `a_truncated_scan_never_reports_a_route_as_safe_to_change`.
 
 
 # --- stop_gate.py ---------------------------------------------------------------

@@ -346,6 +346,33 @@ def walk_incomplete_reason(response: Any) -> Optional[str]:
     return text or None
 
 
+#: Edge kinds that represent one symbol invoking another. The devmap store also
+#: emits structural edges (`Contains` for file→symbol, `MemberOf` for
+#: symbol→type, `Imports` for module→module); including those in a caller/callee
+#: list makes a symbol look like it calls itself and inflates blast radius with
+#: edges nobody can act on.
+CALL_EDGE_KINDS = frozenset({"Calls"})
+
+
+def edge_nodes(items: Any, symbol_key: str, file_key: str) -> List[str]:
+    """Call-graph node names from one direction's raw edge list.
+
+    Beside :func:`resolution_unavailable_reason` and
+    :func:`walk_incomplete_reason` for the same reason they are here: it decides
+    which edge kinds count as calls at all, and two copies of that filter would
+    drift silently. `dev map query`'s batched and single-target paths and the
+    task prompt's impact block all read one direction's edges the same way.
+    """
+    edges: List[str] = []
+    for edge in items or []:
+        if str(edge.get("edge_kind") or "") not in CALL_EDGE_KINDS:
+            continue
+        node = str(edge.get(symbol_key) or edge.get(file_key) or "")
+        if node:
+            edges.append(node)
+    return edges
+
+
 def try_connect(
     root_dir: Optional[Union[str, pathlib.Path]] = None,
     *,
@@ -1610,6 +1637,47 @@ class DevMapClient:
             ["snapshots", "--budget", str(budget), *_positional(file_path)]
         )
         return self._budgeted(resp, budget)
+
+    # --- HTTP route surfaces ------------------------------------------------
+    #
+    # These three go over the CLI rather than :meth:`_request`. The daemon's
+    # `IpcCommand` (`devmap-serve/src/protocol.rs`) has no `routes`,
+    # `shape_check` or `api_impact` variant, so a socket attempt would be
+    # rejected as `invalid_request` and retried on the CLI anyway — one wasted
+    # round trip per call, for a command whose own bounded file scan dominates
+    # its cost. The CLI is the same kernel over a different transport, not a
+    # second engine.
+    #
+    # Each answer carries the kernel's own coverage record (`capabilities` on
+    # `routes`, `scan` on `shape-check` and `api-impact`): what the client scan
+    # read, and whether it finished. The Python implementations these replace
+    # carried no such record, so a scan that stopped at its file cap was
+    # published as a complete route inventory.
+
+    def routes(self, route_filter: Optional[str] = None) -> Dict[str, Any]:
+        """HTTP routes, their handlers, and the clients that call them."""
+        args = ["routes"]
+        if route_filter:
+            self._validate_query(route_filter, "route filter")
+            args += ["--filter", route_filter]
+        return self._run_cli_command(args + _positional(str(self.root_dir)))
+
+    def shape_check(self, route_filter: Optional[str] = None) -> Dict[str, Any]:
+        """What each handler returns against what its callers read."""
+        args = ["shape-check"]
+        if route_filter:
+            self._validate_query(route_filter, "route filter")
+            args += ["--filter", route_filter]
+        return self._run_cli_command(args + _positional(str(self.root_dir)))
+
+    def api_impact(self, route: str) -> Dict[str, Any]:
+        """What changing one route reaches: callers, shape, and a risk band."""
+        self._validate_query(route, "route")
+        # `route` is positional and may begin with `/`, which clap reads as a
+        # path and not a flag — but `--` is cheap and the rule here is uniform.
+        return self._run_cli_command(
+            ["api-impact", *_positional(route, str(self.root_dir))]
+        )
 
     def is_map_stale(self) -> bool:
         st = self.status()

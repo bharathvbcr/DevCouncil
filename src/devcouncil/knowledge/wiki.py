@@ -34,7 +34,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Mapping, Optional, Sequence
 
 from pydantic import BaseModel, Field
 
@@ -168,37 +168,85 @@ def _bullets(items: list[str], code: bool = True) -> list[str]:
     return [fmt.format(item) for item in items]
 
 
-def _wired_to_links(project_root: Path | None, subsystem: RepoSubsystem) -> list[str]:
+def _file_import_edges(project_root: Path | None) -> list[tuple[str, str]]:
+    """File-to-file ``imports`` pairs from the kernel's own ``code_graph.json``.
+
+    Read **once per bundle** and handed to every subsystem page.
+    :func:`_wired_to_links` used to call
+    ``indexing.graph.build.load_code_graph`` itself, once per subsystem, with no
+    memoisation: a whole-graph read that imports the 35 MB export into the
+    Python ``index.sqlite`` cache and re-materialises every node and edge as
+    pydantic models. Measured on a tmp copy of this repository — 12 subsystems,
+    102,646 edges — that is 949.3 ms x 12 = 11.4 s per wiki refresh, and
+    ``dev map`` runs ``--wiki`` by default. The index this actually needs
+    (3,313 file-to-file import pairs) costs 151.2 ms to build once from the same
+    artifact, and is identical.
+
+    Returns an empty list when there is no export, when it is unreadable, or
+    when it is over the configured bound — the caller renders no "Wired to"
+    section at all in that case, rather than an empty one that would read as
+    "this subsystem imports nothing".
+    """
+    if project_root is None:
+        return []
+    try:
+        import json
+
+        from devcouncil.indexing.graph.build import _graph_json_max_bytes, graph_path
+
+        path = graph_path(project_root)
+        if not path.is_file() or path.stat().st_size > _graph_json_max_bytes(project_root):
+            return []
+        with path.open("rb") as handle:
+            data = json.load(handle)
+        edges = data.get("edges") if isinstance(data, Mapping) else None
+        pairs: list[tuple[str, str]] = []
+        for edge in edges if isinstance(edges, list) else []:
+            if not isinstance(edge, Mapping) or edge.get("kind") != "imports":
+                continue
+            source = str(edge.get("source") or "")
+            target = str(edge.get("target") or "")
+            # File-level only: a `pkg/a.py::f -> pkg/b.py::g` pair is a symbol
+            # edge and does not name a file this subsystem is wired to.
+            if not source or not target or "::" in source or "::" in target:
+                continue
+            pairs.append((source, target))
+        return pairs
+    except Exception:
+        logger.debug("import-edge index unavailable for the wiki", exc_info=True)
+        return []
+
+
+def _wired_to_links(
+    subsystem: RepoSubsystem, import_edges: Sequence[tuple[str, str]]
+) -> list[str]:
     """Graph-derived import neighbors for wiki 'Wired to' sections (OKF-style links).
 
     Link targets use the same ``files/<path>.md`` layout as
     ``dev graph export --format okf``, via :mod:`export_links`, so wiki pages can
     cross-link into a sibling graph OKF bundle under ``../graph/``.
+
+    Takes the import index rather than fetching it: see
+    :func:`_file_import_edges` for why it is read once per bundle.
     """
-    if project_root is None:
+    if not import_edges:
         return []
     try:
-        from devcouncil.indexing.graph.build import load_code_graph
         from devcouncil.indexing.graph.export_links import subsystem_doc_path, wired_to_bullets
 
-        graph = load_code_graph(project_root)
-        if graph is None:
-            return []
         # Collect files in this area from critical/entry/role lists
         area_files = set(subsystem.entry_points + subsystem.critical_files)
         for paths in (subsystem.role_files or {}).values():
             area_files.update(paths)
-        targets: set[str] = set()
-        for e in graph.edges:
-            if e.kind != "imports":
-                continue
-            if "::" in e.source or "::" in e.target:
-                continue
-            if e.source in area_files and e.target not in area_files:
-                targets.add(e.target)
+        targets = {
+            target
+            for source, target in import_edges
+            if source in area_files and target not in area_files
+        }
         from_rel = subsystem_doc_path(subsystem.area)
         return wired_to_bullets(targets, from_rel=from_rel, link_to_graph=True)
     except Exception:
+        logger.debug("wired-to links unavailable for %s", subsystem.area, exc_info=True)
         return []
 
 
@@ -207,7 +255,7 @@ def _subsystem_body(
     slug_by_area: dict[str, str],
     prose: Optional[WikiProse] = None,
     *,
-    project_root: Path | None = None,
+    import_edges: Sequence[tuple[str, str]] = (),
     handoffs_computed: bool = True,
     roles_computed: bool = True,
 ) -> str:
@@ -268,7 +316,7 @@ def _subsystem_body(
             "absence here is not evidence that nothing crosses._",
         ]
 
-    wired = _wired_to_links(project_root, subsystem)
+    wired = _wired_to_links(subsystem, import_edges)
     if wired:
         lines += ["", "## Wired to", ""] + wired
 
@@ -351,6 +399,8 @@ def _build_skeleton(
     # One question about the artifact, asked once rather than per page.
     handoffs_are_computed = handoffs_computed(repo_map)
     roles_are_computed = role_buckets_computed(repo_map)
+    # Likewise the graph: one read for the bundle, not one per subsystem.
+    import_edges = _file_import_edges(project_root)
     for subsystem in repo_map.subsystems:
         slug = slug_by_area[subsystem.area]
         docs.append(
@@ -365,7 +415,7 @@ def _build_skeleton(
                     subsystem,
                     slug_by_area,
                     prose_by_area.get(subsystem.area),
-                    project_root=project_root,
+                    import_edges=import_edges,
                     handoffs_computed=handoffs_are_computed,
                     roles_computed=roles_are_computed,
                 ),
