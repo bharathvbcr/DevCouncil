@@ -554,39 +554,113 @@ fn is_launcher_file(path: &str) -> bool {
     )
 }
 
+/// One parse of a manifest, shared by the file-level claim
+/// ([`config_script_entry`]) and the symbol-level one
+/// ([`config_entry_point_symbols`]). Until 2026-09-07 both were substring
+/// tests over the text — `[project.scripts]` at the start of any line, `"bin"`
+/// anywhere in a `package.json` — so a header quoted in a description declared
+/// an entry point and a dependency named `bin` declared a script.
+///
+/// A manifest the parser cannot read makes no claim. That is the fail-open
+/// direction for these rules: an exemption not granted is one more finding a
+/// reader sees, never a finding hidden.
+fn parse_toml(source: &str) -> Option<toml::Table> {
+    source.parse::<toml::Table>().ok()
+}
+
+/// Does this manifest declare a script or binary target? A claim about the
+/// file ([`WiringKind::ScriptEntry`]); the symbols it names are
+/// [`config_entry_point_symbols`]'s.
 fn config_script_entry(path: &str, source: &str) -> bool {
     let p = path.replace('\\', "/");
     let name = p.rsplit('/').next().unwrap_or(path);
     match name {
-        "Cargo.toml" => source.contains("[[bin]]") || source.contains("[bin]"),
+        // `[[bin]]` (an array of tables) or a bare `[bin]` table.
+        "Cargo.toml" => parse_toml(source).is_some_and(|manifest| {
+            manifest
+                .get("bin")
+                .is_some_and(|bin| bin.is_array() || bin.is_table())
+        }),
         "pyproject.toml" => {
-            source.contains("[project.scripts]")
-                || source.contains("[tool.poetry.scripts]")
-                || source.contains("console_scripts")
+            parse_toml(source).is_some_and(|manifest| !entry_point_tables(&manifest).is_empty())
         }
-        "package.json" => {
-            source.contains("\"bin\"")
-                || source.contains("\"main\"")
-                || source.contains("\"scripts\"")
-        }
+        // Top-level keys only: a dependency named `bin` is not a script.
+        "package.json" => serde_json::from_str::<serde_json::Value>(source)
+            .ok()
+            .and_then(|manifest| {
+                manifest.as_object().map(|object| {
+                    ["bin", "main", "scripts"]
+                        .iter()
+                        .any(|key| object.contains_key(*key))
+                })
+            })
+            .unwrap_or(false),
         _ => false,
     }
 }
 
-/// TOML section headers whose keys are `name = "module:attr"` entry points.
-///
-/// `project.entry-points.<group>` is matched by prefix — `console_scripts`,
-/// `gui_scripts` and every plugin group a package publishes have the same
-/// shape. Poetry's own table is here because `config_script_entry` above
-/// already reads it as evidence the file declares a script.
-const ENTRY_POINT_SECTIONS: &[&str] = &[
-    "project.scripts",
-    "project.gui-scripts",
-    "tool.poetry.scripts",
-];
+/// The tables whose keys are `name = "module:attr"` entry points, in a fixed
+/// order: `project.scripts`, `project.gui-scripts`, every group under
+/// `project.entry-points` (each group is its own table — `console_scripts`,
+/// `gui_scripts`, and every plugin group a package publishes), then Poetry's
+/// `tool.poetry.scripts`. A declared-but-empty table still counts as a
+/// declaration for the file-level claim.
+fn entry_point_tables(manifest: &toml::Table) -> Vec<&toml::Table> {
+    let mut tables = Vec::new();
+    if let Some(project) = manifest.get("project").and_then(toml::Value::as_table) {
+        for key in ["scripts", "gui-scripts"] {
+            if let Some(table) = project.get(key).and_then(toml::Value::as_table) {
+                tables.push(table);
+            }
+        }
+        if let Some(groups) = project.get("entry-points").and_then(toml::Value::as_table) {
+            tables.extend(groups.iter().filter_map(|(_, group)| group.as_table()));
+        }
+    }
+    if let Some(table) = manifest
+        .get("tool")
+        .and_then(toml::Value::as_table)
+        .and_then(|tool| tool.get("poetry"))
+        .and_then(toml::Value::as_table)
+        .and_then(|poetry| poetry.get("scripts"))
+        .and_then(toml::Value::as_table)
+    {
+        tables.push(table);
+    }
+    tables
+}
 
-/// Prefix form of the above: any group under `[project.entry-points.…]`.
-const ENTRY_POINT_SECTION_PREFIX: &str = "project.entry-points.";
+/// The `module:attr` one declaration names — the PEP 621 object reference —
+/// from a string value or from Poetry's `{ callable = … }` / `{ reference = … }`
+/// table. PEP 621 allows a trailing ` [extra, …]`; the extras are not part of
+/// the reference. `qualname` is dotted so `pkg.mod:Class.method` reaches the
+/// method's own qualified name, which is exactly the `file::Type.name` the
+/// extractor writes for it.
+fn object_reference(value: &toml::Value) -> Option<(&str, &str)> {
+    let text = value.as_str().or_else(|| {
+        let table = value.as_table()?;
+        table
+            .get("callable")
+            .or_else(|| table.get("reference"))
+            .and_then(toml::Value::as_str)
+    })?;
+    let reference = text.split('[').next().unwrap_or(text);
+    let (module, attribute) = reference.split_once(':')?;
+    let (module, attribute) = (module.trim(), attribute.trim());
+    (is_dotted_identifier(module) && is_dotted_identifier(attribute)).then_some((module, attribute))
+}
+
+/// `a`, `a.b`, `_x.y2` — ASCII identifiers joined by dots, nothing else.
+fn is_dotted_identifier(text: &str) -> bool {
+    !text.is_empty()
+        && text.split('.').all(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
 
 /// Most entry-point declarations one manifest is read for.
 ///
@@ -608,21 +682,6 @@ const ENTRY_POINT_CAP: usize = 512;
 /// Pinned equal to `wiring._add_module_file`'s candidate list by
 /// `tests/unit/test_wiring_parity_with_kernel.py`.
 const ENTRY_POINT_CANDIDATES: usize = 4;
-
-fn entry_point_target_pattern() -> &'static regex::Regex {
-    use std::sync::OnceLock;
-    static PATTERN: OnceLock<regex::Regex> = OnceLock::new();
-    PATTERN.get_or_init(|| {
-        // `module:qualname`, the PEP 621 object reference. `qualname` is dotted
-        // so `pkg.mod:Class.method` reaches the method's own qualified name,
-        // which is exactly the `file::Type.name` the extractor writes for it.
-        // Quoted because a bare word in a TOML value is not a string, and an
-        // inline table (`{ callable = "pkg.mod:fn" }`) puts the reference in
-        // the same quotes as the plain form does.
-        regex::Regex::new(r#"['"]([A-Za-z_][\w.]*)\s*:\s*([A-Za-z_][\w.]*)['"]"#)
-            .expect("entry-point object reference pattern compiles")
-    })
-}
 
 /// Symbol identities a Python console-script declaration names, with a reason.
 ///
@@ -664,35 +723,23 @@ pub fn config_entry_point_symbols(path: &str, source: &str) -> Vec<WiringAnnotat
         None => String::new(),
     };
 
+    let Some(manifest) = parse_toml(source) else {
+        return Vec::new();
+    };
+    let mut declarations: Vec<(&str, &str)> = Vec::new();
+    for table in entry_point_tables(&manifest) {
+        for (_, value) in table.iter() {
+            if declarations.len() >= ENTRY_POINT_CAP {
+                break;
+            }
+            if let Some(reference) = object_reference(value) {
+                declarations.push(reference);
+            }
+        }
+    }
+
     let mut annotations = Vec::new();
-    let mut declarations = 0usize;
-    let mut in_entry_section = false;
-    for line in source.lines() {
-        if declarations >= ENTRY_POINT_CAP {
-            break;
-        }
-        let trimmed = line.trim();
-        if let Some(header) = trimmed
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            let header = header.trim().trim_matches('"');
-            in_entry_section = ENTRY_POINT_SECTIONS.contains(&header)
-                || header.starts_with(ENTRY_POINT_SECTION_PREFIX);
-            continue;
-        }
-        if !in_entry_section || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some(reference) = entry_point_target_pattern().captures(trimmed) else {
-            continue;
-        };
-        let module = reference.get(1).map_or("", |m| m.as_str());
-        let attribute = reference.get(2).map_or("", |m| m.as_str());
-        if module.is_empty() || attribute.is_empty() {
-            continue;
-        }
-        declarations += 1;
+    for (module, attribute) in declarations {
         let module_path = module.replace('.', "/");
         let details = format!("declared as an entry point by {normalized}: {module}:{attribute}");
         // Typed to `ENTRY_POINT_CANDIDATES` on purpose: adding a fifth module
@@ -1452,6 +1499,124 @@ lint = \"not.an:entrypoint\"
         assert!(extract_wiring_annotations("pyproject.toml", MANIFEST)
             .iter()
             .any(|a| a.kind == WiringKind::ScriptEntry && a.target_symbol == "pyproject.toml"));
+    }
+
+    /// A TOML table header inside a multi-line string is text, not a table.
+    ///
+    /// The line reader took `[project.scripts]` wherever it stood at the start
+    /// of a line, so a description quoting one declared an entry point — and
+    /// `config_script_entry`'s substring test claimed the file declared a
+    /// script. The manifest is parsed now; a string is a string.
+    #[test]
+    fn a_table_header_inside_a_multi_line_string_declares_nothing() {
+        const MANIFEST: &str = "\
+[project]
+name = \"fx\"
+description = \"\"\"
+[project.scripts]
+fake = \"evil.mod:run\"
+\"\"\"
+";
+        let annotations = extract_wiring_annotations("pyproject.toml", MANIFEST);
+        assert!(
+            !annotations
+                .iter()
+                .any(|a| a.kind == WiringKind::ConfigEntryPoint),
+            "a header inside a string declares no entry point: {annotations:?}"
+        );
+        assert!(
+            !annotations
+                .iter()
+                .any(|a| a.kind == WiringKind::ScriptEntry),
+            "a header inside a string is not a script declaration: {annotations:?}"
+        );
+    }
+
+    /// `[project.entry-points]` with each group as an inline table is valid
+    /// TOML the line reader could not see: the header has no group suffix.
+    #[test]
+    fn an_entry_point_group_written_as_an_inline_table_is_read() {
+        const MANIFEST: &str =
+            "[project.entry-points]\nconsole_scripts = { mytool = \"pkg.cli:main\" }\n";
+        let targets: Vec<String> = config_entry_point_symbols("pyproject.toml", MANIFEST)
+            .into_iter()
+            .map(|a| a.target_symbol)
+            .collect();
+        assert!(
+            targets.iter().any(|t| t == "pkg/cli.py::main"),
+            "an inline-table group declares its scripts: {targets:?}"
+        );
+    }
+
+    /// Poetry's `{ callable = … }` table and PEP 621's `module:attr [extra]`
+    /// suffix both name a symbol; the extras are not part of the reference.
+    #[test]
+    fn poetry_callable_tables_and_extras_suffixes_name_the_symbol() {
+        const MANIFEST: &str = "\
+[tool.poetry.scripts]
+t = { callable = \"pkg.a:go\" }
+
+[project.scripts]
+u = \"pkg.b:run [fast]\"
+";
+        let targets: Vec<String> = config_entry_point_symbols("pyproject.toml", MANIFEST)
+            .into_iter()
+            .map(|a| a.target_symbol)
+            .collect();
+        for expected in ["pkg/a.py::go", "pkg/b.py::run"] {
+            assert!(
+                targets.iter().any(|t| t == expected),
+                "{expected} is declared and must be named: {targets:?}"
+            );
+        }
+        assert!(
+            !targets
+                .iter()
+                .any(|t| t.contains("[fast]") || t.contains("run [")),
+            "the extras suffix is not part of the symbol: {targets:?}"
+        );
+    }
+
+    /// A dependency named `bin` is not a `package.json` script claim; the
+    /// substring test read any `"bin"` anywhere in the file as one.
+    #[test]
+    fn a_dependency_named_bin_is_not_a_package_json_script_claim() {
+        let dependency = extract_wiring_annotations(
+            "package.json",
+            "{\"name\": \"x\", \"dependencies\": {\"bin\": \"1.0.0\"}}",
+        );
+        assert!(
+            !dependency.iter().any(|a| a.kind == WiringKind::ScriptEntry),
+            "a dependency named bin declares no script: {dependency:?}"
+        );
+        let real = extract_wiring_annotations(
+            "package.json",
+            "{\"name\": \"x\", \"bin\": {\"x\": \"cli.js\"}}",
+        );
+        assert!(
+            real.iter().any(|a| a.kind == WiringKind::ScriptEntry),
+            "a top-level bin is a script declaration: {real:?}"
+        );
+    }
+
+    /// `[[bin]]` inside a Cargo.toml string is text.
+    #[test]
+    fn a_bin_header_inside_a_cargo_string_is_not_a_target() {
+        let quoted =
+            "[package]\nname = \"x\"\ndescription = \"\"\"\n[[bin]]\nname = \"fake\"\n\"\"\"\n";
+        assert!(
+            !extract_wiring_annotations("Cargo.toml", quoted)
+                .iter()
+                .any(|a| a.kind == WiringKind::ScriptEntry),
+            "a [[bin]] inside a string declares no target"
+        );
+        let real = "[package]\nname = \"x\"\n\n[[bin]]\nname = \"x\"\npath = \"src/main.rs\"\n";
+        assert!(
+            extract_wiring_annotations("Cargo.toml", real)
+                .iter()
+                .any(|a| a.kind == WiringKind::ScriptEntry),
+            "a real [[bin]] table is a target declaration"
+        );
     }
 
     /// A nested manifest names symbols under its own directory.

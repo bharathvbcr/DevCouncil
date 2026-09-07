@@ -9,6 +9,7 @@ serde.workspace = true
 serde_json.workspace = true
 rayon.workspace = true
 regex.workspace = true
+toml.workspace = true
 anyhow.workspace = true
 tree-sitter = { workspace = true, optional = true }
 tree-sitter-language = { workspace = true, optional = true }

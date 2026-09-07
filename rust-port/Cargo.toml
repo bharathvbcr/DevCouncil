@@ -41,6 +41,7 @@ license = "Apache-2.0"
 # Arc<T> serializes as the inner T, so the wire form is unchanged.
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
+toml = { version = "1.1", default-features = false, features = ["parse", "preserve_order", "serde", "std"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 # Only for `signal(2)` in the CLI: one-shot commands restore the default
 # SIGPIPE disposition so a closed pipe ends them quietly (devmap-cli/main.rs).
