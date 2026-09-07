@@ -1029,17 +1029,29 @@ impl WriteBreakdown {
 /// It charges on `Drop`, so a statement that fails is charged for the time it
 /// took before failing. The alternative -- charging only on success -- would
 /// leave the one build worth profiling as the one build with no profile.
+///
+/// Gated on `parse` because its only caller is: `save_generation_timed` is the
+/// write path and needs the grammar-identity stamps. With the feature off this
+/// is dead code, and `cargo clippy -p devmap-query --no-default-features`
+/// refuses it -- the store's own feature-off check cannot, because
+/// `devmap-serve` is a dev-dependency that pulls default features straight back
+/// in. [`WriteBreakdown`] itself stays ungated: it is public, an embedder that
+/// reads a persisted map can name the type, and gating it would gate the
+/// re-export too.
+#[cfg(feature = "parse")]
 struct Charge<'a> {
     sink: &'a mut f64,
     started: std::time::Instant,
 }
 
+#[cfg(feature = "parse")]
 impl Drop for Charge<'_> {
     fn drop(&mut self) {
         *self.sink += self.started.elapsed().as_secs_f64();
     }
 }
 
+#[cfg(feature = "parse")]
 fn charge(sink: &mut f64) -> Charge<'_> {
     Charge {
         sink,
