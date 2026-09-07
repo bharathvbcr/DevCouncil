@@ -27,11 +27,21 @@ from devcouncil.utils.json_persist import dump_json, read_json
 
 logger = logging.getLogger(__name__)
 
-GRAPH_REL = Path(".devcouncil") / "graph" / "code_graph.json"
-
-
 def graph_path(root: Path) -> Path:
-    return root / GRAPH_REL
+    """The kernel's ``code_graph.json``, wherever this root's state dir is.
+
+    This was ``root / ".devcouncil" / "graph" / "code_graph.json"``, a literal.
+    The kernel resolves the state directory per repository, so on one holding
+    the standalone ``.devmap/`` layout that literal named a file that does not
+    exist -- and every consumer of it reported "no graph" for a graph that does.
+    :func:`devcouncil.devmap_engine.state_dir` is the one owner of the answer.
+
+    Imported inside the function: this module is on the `dev map` import path
+    and the facade above it is deferred for exactly that reason.
+    """
+    from devcouncil.devmap_engine import graph_path as resolved_graph_path
+
+    return resolved_graph_path(root)
 
 
 # Bumped whenever the digest algorithm changes: a fingerprint stamped under an
@@ -252,11 +262,13 @@ def read_code_graph(root: Path) -> Optional[CodeGraph]:
 
 def _annotate_graph_degraded(root: Path, graph: CodeGraph) -> CodeGraph:
     """Surface repo_map lean/degraded handshake on graph payloads for consumers."""
-    map_path = root / ".devcouncil" / "repo_map.json"
-    if not map_path.is_file():
+    from devcouncil.devmap_engine import map_path
+
+    map_file = map_path(root)
+    if not map_file.is_file():
         return graph
     try:
-        data = read_json(map_path)
+        data = read_json(map_file)
         if not isinstance(data, dict) or not data.get("graph_degraded"):
             return graph
         graph.meta["graph_degraded"] = True
@@ -308,8 +320,10 @@ def python_paths_for_pdg(root: Path) -> List[str]:
     Returns an empty list when there is no map, which the callers report as
     "run `dev map` first" rather than as "this repository has no Python".
     """
+    from devcouncil.devmap_engine import map_path
+
     try:
-        data = read_json(root / ".devcouncil" / "repo_map.json")
+        data = read_json(map_path(root))
     except (OSError, ValueError):
         return []
     files = data.get("files") if isinstance(data, dict) else None

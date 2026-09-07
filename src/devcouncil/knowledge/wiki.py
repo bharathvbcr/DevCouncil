@@ -651,17 +651,19 @@ def _project_name(root: Path) -> str:
 
 
 def _load_repo_map(root: Path, *, remap: bool) -> RepoMap:
-    map_path = root / ".devcouncil" / "repo_map.json"
-    if not remap and map_path.is_file():
+    from devcouncil.devmap_engine import map_path as resolved_map_path
+
+    map_file = resolved_map_path(root)
+    if not remap and map_file.is_file():
         try:
-            return RepoMap.model_validate_json(map_path.read_text(encoding="utf-8"))
+            return RepoMap.model_validate_json(map_file.read_text(encoding="utf-8"))
         except Exception:
             # Corrupt/stale-schema map: regenerate instead of crashing — the
             # mapper is deterministic and cheap relative to a failed wiki run.
             logger.warning("repo_map.json unreadable; regenerating for wiki", exc_info=True)
     from devcouncil.indexing.map_artifacts import generate_map_artifacts
 
-    return generate_map_artifacts(root, map_path)
+    return generate_map_artifacts(root, map_file)
 
 
 def _build_router(root: Path):

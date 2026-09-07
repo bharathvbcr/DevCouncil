@@ -109,10 +109,10 @@ def _index_freshness_fields(root: Path) -> dict[str, object]:
 
         fields: dict[str, object] = dict(map_freshness(root))
         try:
-            from devcouncil.devmap_engine import DEFAULT_MAP_RELPATH
+            from devcouncil.devmap_engine import map_path
 
             fields["age_seconds"] = max(
-                0.0, time.time() - (root / DEFAULT_MAP_RELPATH).stat().st_mtime
+                0.0, time.time() - map_path(root).stat().st_mtime
             )
         except OSError:
             fields["age_seconds"] = None
