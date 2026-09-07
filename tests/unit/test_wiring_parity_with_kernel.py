@@ -46,6 +46,15 @@ needed the change. All four are now closed in the kernel and asserted:
   ``config_entry_point_symbols`` now owns the rule, and the four module-path
   candidates it tries are pinned equal to the ones ``wiring._add_module_file``
   still uses for ``entry_roots``.
+
+One went the other way — the kernel was right and the Python copy wrong:
+
+* ``is_test_path`` on a *file* named ``test`` or ``androidTest`` under
+  ``src/``: Python wrapped the whole path in slashes before looking for
+  ``/src/test/``, so ``app/src/test`` (a file) was a test directory to it and
+  exempt from liveness. The kernel reads the directory part only. Its
+  ``a_file_named_like_the_jvm_test_directory_is_not_a_test_path`` fixtures are
+  read below.
 """
 
 from __future__ import annotations

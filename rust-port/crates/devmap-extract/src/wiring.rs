@@ -1298,6 +1298,25 @@ mod tests {
         assert!(is_test_path("app/src/test/.eslintrc.test.js"));
     }
 
+    /// The JVM branch answers for the *directory* the file sits in, so a file
+    /// that happens to be named `test` or `androidTest` under `src/` is not a
+    /// test path. The Python copy wrapped the whole path in slashes before
+    /// looking for `/src/test/`, so `app/src/test` — a file — read as a test
+    /// directory, and a script by that name was exempted from liveness. The
+    /// parity module reads this block, so the Python copy is held to it.
+    #[test]
+    fn a_file_named_like_the_jvm_test_directory_is_not_a_test_path() {
+        for path in ["src/test", "app/src/test", "app/src/androidTest"] {
+            assert!(
+                !is_test_path(path),
+                "{path}: the last segment is the file's name, not a directory it sits in"
+            );
+        }
+        // The directory rule still claims what it claimed.
+        assert!(is_test_path("src/test/Foo.kt"));
+        assert!(is_test_path("app/src/androidTest/Ui.kt"));
+    }
+
     /// A hint is a path prefix or a whole identifier segment, never a substring.
     ///
     /// `lower.contains(h)` made `@multitask` a `task`, `@preregister` a

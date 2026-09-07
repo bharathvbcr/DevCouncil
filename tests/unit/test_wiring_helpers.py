@@ -26,6 +26,19 @@ def test_is_test_path_variants():
     assert not wiring.is_test_path("Contest.kt")
 
 
+def test_a_file_named_like_the_jvm_test_directory_is_not_a_test_path():
+    # The JVM rule (`src/test/`, `src/androidTest/`) is a verdict on the
+    # directory a file sits in. Wrapping the *whole* path in slashes before
+    # looking for `/src/test/` made a file named `test` under `src/` a test
+    # path, and exempted it from liveness. The kernel
+    # (`wiring.rs::a_file_named_like_the_jvm_test_directory_is_not_a_test_path`)
+    # is the spec here; the parity module pins the same fixtures.
+    for path in ("src/test", "app/src/test", "app/src/androidTest"):
+        assert not wiring.is_test_path(path), path
+    assert wiring.is_test_path("src/test/Foo.kt")
+    assert wiring.is_test_path("app/src/androidTest/Ui.kt")
+
+
 def test_is_private_covers_the_dunder_case_too():
     # `is_dunder_symbol` was deleted with the Python symbol scan that used it
     # (its last caller went in d232dea). The kernel reached the same conclusion

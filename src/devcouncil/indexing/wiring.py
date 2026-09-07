@@ -133,8 +133,12 @@ def is_test_path(path: str) -> bool:
     name_l = name.lower()
     parts = norm_l.split("/")
     in_test_dir = any(p in _TEST_DIR_NAMES for p in parts[:-1])
-    # Android / JVM: src/test/, src/androidTest/
-    if "/src/test/" in f"/{norm_l}/" or "/src/androidtest/" in f"/{norm_l}/":
+    # Android / JVM: src/test/, src/androidTest/. A verdict on the directory
+    # the file sits in, so only the directory part is searched: wrapping the
+    # whole path in slashes made a *file* named `test` under `src/` a test
+    # path (and exempt from liveness). The kernel reads the directory part.
+    directory = "/".join(parts[:-1])
+    if "/src/test/" in f"/{directory}/" or "/src/androidtest/" in f"/{directory}/":
         in_test_dir = True
     looks_like_test = (
         name_l.startswith("test_")
