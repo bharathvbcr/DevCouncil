@@ -1,6 +1,5 @@
 import fnmatch
 import subprocess
-from collections import Counter
 import json
 from pathlib import Path
 
