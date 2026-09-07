@@ -521,7 +521,9 @@ fn a_go_import_resolves_to_a_package_node_not_to_files() {
     assert_eq!(
         targets,
         vec!["package:store/store"],
-        "the import must resolve, and must land on the package node — if it          resolved to the files the tests below would hold for a different          reason"
+        "the import must resolve, and must land on the package node — if it \
+         resolved to the files the tests below would hold for a different \
+         reason"
     );
 }
 

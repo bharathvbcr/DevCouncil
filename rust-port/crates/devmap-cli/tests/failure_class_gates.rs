@@ -239,7 +239,8 @@ mod class_d_identity_is_validated {
         assert_eq!(
             store.latest_generation_head_sha().expect("read head sha"),
             None,
-            "an unbuilt store has no HEAD to compare against, and that is not              the same as having been built at an unknown one"
+            "an unbuilt store has no HEAD to compare against, and that is not \
+             the same as having been built at an unknown one"
         );
 
         {
@@ -255,7 +256,8 @@ mod class_d_identity_is_validated {
         assert_eq!(
             store.latest_generation_head_sha().expect("read head sha"),
             Some("deadbeefcafe".to_string()),
-            "the HEAD a generation was built at must be recoverable, or a moved              checkout cannot be detected"
+            "the HEAD a generation was built at must be recoverable, or a moved \
+             checkout cannot be detected"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -380,7 +382,8 @@ mod class_a_status_is_computed_not_asserted {
         assert!(detection.communities.is_empty());
         assert!(
             detection.degraded.is_none(),
-            "an empty corpus settled trivially; reporting it as degraded would              make the signal useless"
+            "an empty corpus settled trivially; reporting it as degraded would \
+             make the signal useless"
         );
     }
 }

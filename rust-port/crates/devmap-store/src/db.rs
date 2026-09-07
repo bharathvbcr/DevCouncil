@@ -1803,7 +1803,8 @@ impl Store {
         for index in declared_index_names() {
             if !present.contains(&index) {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
-                    "required index {index} is missing; the store would answer correctly                      and scan for every answer — run `devmap build` to rebuild it"
+                    "required index {index} is missing; the store would answer correctly \
+                     and scan for every answer — run `devmap build` to rebuild it"
                 )));
             }
         }
@@ -7527,7 +7528,8 @@ mod bounded_claim_tests {
         assert_eq!(
             sqlite_limit(usize::MAX),
             i64::MAX,
-            "usize::MAX must clamp to the largest cap SQLite can express,              not wrap to -1"
+            "usize::MAX must clamp to the largest cap SQLite can express, \
+             not wrap to -1"
         );
         for limit in [
             usize::MAX,

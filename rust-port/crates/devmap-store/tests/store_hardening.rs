@@ -2644,7 +2644,8 @@ fn every_migration_step_is_re_entrant_from_every_version() {
 
         let store = Store::open(&db_path).unwrap_or_else(|error| {
             panic!(
-                "a store stamped at v{stamped} must migrate to                  v{CURRENT_SCHEMA_VERSION}, not fail to open: {error}"
+                "a store stamped at v{stamped} must migrate to \
+                 v{CURRENT_SCHEMA_VERSION}, not fail to open: {error}"
             )
         });
         drop(store);

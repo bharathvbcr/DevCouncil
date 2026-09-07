@@ -1366,7 +1366,8 @@ impl<'a> StoreQueryEngine<'a> {
                 // The one outcome an `Option<Vec<_>>` cannot hold. Leaving the
                 // empty list here would say the walk ran and found nothing.
                 response.dead_clusters_incomplete = Some(format!(
-                    "the call graph exceeded {} distinct symbols, so no                      component scan ran for this generation",
+                    "the call graph exceeded {} distinct symbols, so no \
+                     component scan ran for this generation",
                     devmap_analyze::dead_clusters::DEAD_CLUSTER_MAX_NODES
                 ));
             } else {
@@ -1619,7 +1620,9 @@ impl<'a> StoreQueryEngine<'a> {
                 file_is_indexed: self.store.latest_extraction_for_path(path)?.is_some(),
                 compared_against: "nothing".to_string(),
                 degraded_reason: Some(format!(
-                    "the buffer was not parsed ({reason}); no delta is reported,                      because an unparsed file yields no symbols and would read                      as a deletion of every symbol in it"
+                    "the buffer was not parsed ({reason}); no delta is reported, \
+                     because an unparsed file yields no symbols and would read \
+                     as a deletion of every symbol in it"
                 )),
                 symbols: Vec::new(),
                 bodies_not_compared: 0,

@@ -2166,7 +2166,8 @@ mod tests {
         assert_eq!(
             value["dead_clusters"],
             json!(null),
-            "nothing was walked, so the artifact knows nothing about components;              an empty list would say it walked and found none"
+            "nothing was walked, so the artifact knows nothing about components; \
+             an empty list would say it walked and found none"
         );
         assert!(
             value["dead_clusters_incomplete"]

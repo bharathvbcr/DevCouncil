@@ -285,7 +285,8 @@ fn a_manifest_with_no_tree_behind_it_says_the_inventory_did_not_run() {
         .unwrap_or_default();
     assert!(
         reason.contains("no repository root"),
-        "an uncomputed inventory must name why, or `false` is a flag with no          information behind it: {reason:?}"
+        "an uncomputed inventory must name why, or `false` is a flag with no \
+         information behind it: {reason:?}"
     );
     assert!(
         map["package_managers"]

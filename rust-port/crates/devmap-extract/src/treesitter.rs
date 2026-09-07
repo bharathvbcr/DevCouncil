@@ -358,7 +358,8 @@ pub fn extract_treesitter_with_budget(
                     lang,
                     source,
                     format!(
-                        "grammar {grammar} for {lang} returned no tree and named no reason;                          no symbols are claimed for this file"
+                        "grammar {grammar} for {lang} returned no tree and named no reason; \
+                         no symbols are claimed for this file"
                     ),
                 );
             }
