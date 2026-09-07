@@ -157,3 +157,12 @@ def test_graph_html_reads_the_artifact(kernel_corpus, no_python_store):
     out = write_graph_html(kernel_corpus)
     assert out.is_file()
     assert out.stat().st_size > 0
+
+
+def test_symbol_reach_gate_reads_the_artifact(kernel_corpus, no_python_store):
+    from devcouncil.indexing.graph.query import symbol_has_non_test_inbound
+
+    assert symbol_has_non_test_inbound(kernel_corpus, "pkg/util.py", "run") is True, (
+        "pkg/main.py calls util.run; the gate must see it without the store"
+    )
+    assert symbol_has_non_test_inbound(kernel_corpus, "pkg/util.py", "unused") is False

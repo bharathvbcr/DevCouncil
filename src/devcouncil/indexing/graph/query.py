@@ -19,12 +19,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from devcouncil.indexing.graph.build import load_code_graph
+from devcouncil.indexing.graph.build import read_code_graph
 from devcouncil.indexing.graph.schema import CodeGraph, GraphNode
 
 
 def _load(root: Path, graph: Optional[CodeGraph] = None) -> Optional[CodeGraph]:
-    return graph if graph is not None else load_code_graph(root)
+    """The kernel's `code_graph.json`, or the graph a caller already holds.
+
+    This was `load_code_graph`, which reaches the same data through the Python
+    `index.sqlite` cache. The dead-symbol gate below is the reason that matters:
+    it runs as a *fallback for when the kernel cannot be reached*, and its own
+    caller documents it as reading "code_graph.json, the artifact the same
+    kernel writes". It did not — it imported that artifact into a second store
+    first, ~94 MB of writes under a writer lease, from a verification gate.
+    """
+    return graph if graph is not None else read_code_graph(root)
 
 
 def _match_nodes(graph: CodeGraph, name_or_path: str) -> List[GraphNode]:
