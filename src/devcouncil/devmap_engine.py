@@ -1319,8 +1319,19 @@ def build_map_result(
         # or git could not run — so it stamped nothing. Python's inventory has a
         # directory-walk fallback for exactly this case, and without it the map
         # carries empty digests and reads permanently stale.
-        stamp_freshness(root, map_path, graph_path)
-        freshness_source = "python"
+        #
+        # The values go back *through the kernel*: `_write_manifest_separately`
+        # hands them to `devmap manifest` as flags, so the kernel writes the
+        # artifacts once more with the digests in place and re-stamps them.
+        # The previous fallback, `stamp_freshness`, rewrote both files from
+        # Python — 26 % larger, pretty-printed, and no longer the bytes the
+        # kernel's `<db>.artifacts.json` described, so every later build
+        # regenerated the manifest and the doctor called the writer unverified.
+        # Measured on a `git archive` corpus copy, 2026-09-06. Only a kernel
+        # too old to take the flags still gets the Python rewrite, inside
+        # `_write_manifest_separately`.
+        _write_manifest_separately(binary, root, db_path, map_path, graph_path, timeout)
+        freshness_source = "caller"
 
     reported_status = manifest.get("status")
     status = reported_status if isinstance(reported_status, dict) else None
