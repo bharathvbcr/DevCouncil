@@ -92,6 +92,72 @@ fn a_real_directory_past_the_depth_cap_is_a_truncated_walk() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// The directory cap stops the walk and says so, and it stops at the number it
+/// promises.
+///
+/// The bound exists so a generated fixture corpus or a checked-in dependency
+/// cache the skip list does not name cannot turn an artifact write into a
+/// full-disk traversal, and `inventory_directories_visited` is published so a
+/// reader can size the walk that produced the answer.
+#[test]
+fn the_directory_cap_stops_the_walk_and_reports_both_numbers() {
+    let root = root("dircap");
+    // One past the cap, counting the root itself as the first visit.
+    for index in 0..inventory::WALK_DIR_CAP {
+        std::fs::create_dir(root.join(format!("d{index:06}"))).unwrap();
+    }
+    std::fs::write(root.join("uv.lock"), "").unwrap();
+
+    let scanned = inventory::scan(&root);
+    assert!(scanned.computed);
+    assert_eq!(
+        scanned.directories_visited,
+        inventory::WALK_DIR_CAP,
+        "the walk opened more directories than it promises to"
+    );
+    assert!(
+        scanned.walk_truncated,
+        "the tree was not exhausted; both lists are a lower bound and must say so"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A symlinked directory loop is not descended, so the depth cap is not what
+/// has to save the walk from it.
+///
+/// `entry.file_type()` does not follow links, and a linked tree is reachable
+/// from wherever it really lives — so the walk declines it rather than relying
+/// on `WALK_DEPTH_CAP` to end a cycle it should never have entered.
+#[test]
+fn a_symlinked_directory_loop_is_not_walked() {
+    let root = root("symloop");
+    std::fs::create_dir(root.join("real")).unwrap();
+    std::os::unix::fs::symlink(&root, root.join("real").join("back")).unwrap();
+    std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+    std::fs::write(root.join("uv.lock"), "").unwrap();
+
+    let started = std::time::Instant::now();
+    let scanned = inventory::scan(&root);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the loop was followed: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(scanned.package_managers, vec!["uv".to_string()]);
+    assert!(
+        scanned.directories_visited <= 3,
+        "root and `real` are the only real directories: {}",
+        scanned.directories_visited
+    );
+    assert!(
+        !scanned.walk_truncated,
+        "declining a link is not running out of budget"
+    );
+    // Break the cycle before the sweep.
+    let _ = std::fs::remove_file(root.join("real").join("back"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// A manifest that exists and could not be read is not a manifest that said
 /// nothing.
 ///
