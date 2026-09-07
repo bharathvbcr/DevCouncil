@@ -229,9 +229,10 @@ def test_matching_runtime_observation_becomes_a_graph_edge(tmp_path: Path) -> No
     performed was never reachable outside this test.
 
     What *is* still reachable is the merge itself: ``run_cypher`` reads the
-    graph through ``load_with_runtime_observations``, so an observation still
-    changes an answer an agent can ask for. That is what this now pins, at the
-    owner the loader moved to.
+    kernel's graph and hands it to ``merge_runtime_observations``, so an
+    observation still changes an answer an agent can ask for. That is what this
+    now pins, at the owner the merge kept when the Python store's graph half
+    went.
 
     Retired with the engine, and not replaced in the kernel: the kernel's dead
     list does not consult runtime observations, so a symbol proven live by a
@@ -239,14 +240,14 @@ def test_matching_runtime_observation_becomes_a_graph_edge(tmp_path: Path) -> No
     """
     service = get_codeintel_service(tmp_path)
     fingerprint = source_fingerprint(tmp_path)
-    service.persist(CodeGraph(dead_code=[
+    graph_in = CodeGraph(dead_code=[
         DeadCodeEntry(
             id="app.py::live_at_runtime",
             path="app.py",
             confidence=Confidence.EXTRACTED,
             reason="no static callers",
         )
-    ]))
+    ])
     session = service.store.start_runtime_session(
         provider="fixture",
         source_fingerprint=fingerprint,
@@ -258,7 +259,7 @@ def test_matching_runtime_observation_becomes_a_graph_edge(tmp_path: Path) -> No
         "kind": "observed_calls",
     }])
 
-    graph = service.load_with_runtime_observations()
+    graph = service.merge_runtime_observations(graph_in)
     runtime = [edge for edge in graph.edges if edge.extras.get("provenance") == "runtime"]
     assert [(edge.source, edge.target, edge.kind) for edge in runtime] == [
         ("app.py::entry", "app.py::live_at_runtime", "observed_calls")

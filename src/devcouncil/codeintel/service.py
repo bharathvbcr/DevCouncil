@@ -74,27 +74,24 @@ class CodeIntelService:
     def load(self) -> CodeGraph | None:
         return self.store.load_graph()
 
-    def load_with_runtime_observations(self) -> CodeGraph:
-        """The committed graph, plus fingerprint-matched runtime edges.
+    def merge_runtime_observations(self, graph: CodeGraph) -> CodeGraph:
+        """Add this root's fingerprint-matched runtime edges to ``graph``.
 
-        Moved here from ``CodeIntelQueryEngine._graph`` when that module was
-        retired. It was never a query concern: the store, the root and the
-        runtime-observation table are all owned by this service, and the engine
-        was reaching through it for all three. ``run_cypher`` — the one
-        production caller left — now asks the owner directly.
+        The graph itself is the kernel's — read from ``code_graph.json`` by the
+        caller. This used to load it from the Python ``index.sqlite`` store, and
+        that store has had no writer since ``write_code_graph`` lost its last
+        production caller: every ``run_cypher`` on a real repository answered
+        ``"No committed graph generation."``, on both the CLI and the
+        ``devcouncil_graph_cypher`` MCP tool. The runtime half of the store is
+        still written — by the opt-in debug tracer — so the merge survives the
+        graph half and takes the graph as an argument instead of owning it.
 
         Runtime edges are additive and never overwrite an extracted edge: an
         observation that duplicates a static edge is dropped, so provenance on
         an existing edge cannot be rewritten by a later session. Sampled kinds
         are `INFERRED`, because a stack sample witnesses that a call happened,
         not that the edge is the only one it could have been.
-
-        Raises:
-            FileNotFoundError: when no generation has been committed.
         """
-        graph = self.load()
-        if graph is None:
-            raise FileNotFoundError("no code-intelligence index; run `dev map init`")
         # Fingerprinting shells out to git (diff + untracked hashing) — only pay
         # that per-query cost when runtime evidence actually exists to match.
         if not self.store.has_runtime_observations():

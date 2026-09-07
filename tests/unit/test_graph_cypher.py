@@ -7,19 +7,30 @@ from devcouncil.indexing.graph.schema import CodeGraph, Confidence, GraphEdge, G
 
 
 class _FakeService:
-    """Stands in for ``CodeIntelService``, which owns the graph load.
+    """Stands in for ``CodeIntelService``, which owns the runtime-edge merge.
 
-    ``run_cypher`` used to reach through ``CodeIntelQueryEngine._graph`` — a
-    private method on a query engine — for a graph the service owns. The engine
-    was retired with the rest of the Python query surface; the stub follows the
-    caller to its new owner rather than the deleted one.
+    ``run_cypher`` used to ask this object for the *graph* as well, out of the
+    Python ``index.sqlite`` store. That store lost its last writer, so the graph
+    now comes from the kernel's ``code_graph.json`` and the service is left
+    owning only the runtime observations it merges into it. The stub follows the
+    caller: it is a pass-through merge, and the graph is stubbed at
+    ``read_code_graph`` instead.
     """
 
-    def __init__(self, graph: CodeGraph) -> None:
-        self._graph = graph
+    def merge_runtime_observations(self, graph: CodeGraph) -> CodeGraph:
+        return graph
 
-    def load_with_runtime_observations(self) -> CodeGraph:
-        return self._graph
+
+def _stub_graph(monkeypatch, graph):
+    """Serve ``graph`` as the kernel's artifact, with no runtime observations."""
+    monkeypatch.setattr(
+        "devcouncil.indexing.graph.build.read_code_graph",
+        lambda root: graph,
+    )
+    monkeypatch.setattr(
+        "devcouncil.codeintel.service.get_codeintel_service",
+        lambda root: _FakeService(),
+    )
 
 
 def _graph() -> CodeGraph:
@@ -71,30 +82,23 @@ def test_run_cypher_rejects_unknown_rel(tmp_path):
     assert "Unsupported relationship" in result["error"]
 
 
-def test_run_cypher_no_graph(tmp_path, monkeypatch):
-    def missing(root):
-        class Service:
-            def load_with_runtime_observations(self):
-                raise FileNotFoundError("missing")
+def test_run_cypher_no_graph(tmp_path):
+    """No artifact on disk is the only "no graph" case left.
 
-        return Service()
-
-    monkeypatch.setattr(
-        "devcouncil.codeintel.service.get_codeintel_service",
-        missing,
-    )
+    It used to be "no committed generation" in a Python store; `tmp_path` has
+    no ``code_graph.json``, so the real ``read_code_graph`` returns ``None``
+    without any stubbing.
+    """
     result = run_cypher(tmp_path, "MATCH (a)-[r:CALLS]->(b) RETURN a,b")
     assert result["ok"] is False
-    assert "No committed graph" in result["error"]
+    assert "code_graph.json" in result["error"]
+    assert "dev map" in result["error"]
 
 
 def test_run_cypher_calls_with_filters(tmp_path, monkeypatch):
     graph = _graph()
 
-    monkeypatch.setattr(
-        "devcouncil.codeintel.service.get_codeintel_service",
-        lambda root: _FakeService(graph),
-    )
+    _stub_graph(monkeypatch, graph)
     result = run_cypher(
         tmp_path,
         "MATCH (a)-[r:CALLS]->(b) WHERE contains(a.name, 'foo') "
@@ -108,10 +112,7 @@ def test_run_cypher_calls_with_filters(tmp_path, monkeypatch):
 def test_run_cypher_nodes_only(tmp_path, monkeypatch):
     graph = _graph()
 
-    monkeypatch.setattr(
-        "devcouncil.codeintel.service.get_codeintel_service",
-        lambda root: _FakeService(graph),
-    )
+    _stub_graph(monkeypatch, graph)
     result = run_cypher(
         tmp_path,
         "MATCH (a) WHERE contains(a.name, 'ba') RETURN a LIMIT 5",
@@ -125,10 +126,7 @@ def test_run_cypher_nodes_only(tmp_path, monkeypatch):
 def test_run_cypher_imports_relationship(tmp_path, monkeypatch):
     graph = _graph()
 
-    monkeypatch.setattr(
-        "devcouncil.codeintel.service.get_codeintel_service",
-        lambda root: _FakeService(graph),
-    )
+    _stub_graph(monkeypatch, graph)
     result = run_cypher(tmp_path, "MATCH (a)-[r:IMPORTS]->(b) RETURN a,b")
     assert result["ok"] is True
     assert result["count"] == 1
@@ -142,16 +140,9 @@ def test_run_cypher_rejects_delete(tmp_path):
     assert "Mutating" in result["error"]
 
 
-def _stub_engine(monkeypatch, graph):
-    monkeypatch.setattr(
-        "devcouncil.codeintel.service.get_codeintel_service",
-        lambda root: _FakeService(graph),
-    )
-
-
 def test_run_cypher_bounds_an_unbounded_user_limit(tmp_path, monkeypatch):
     """`LIMIT 999999999` is user text, not a budget the server has to honour."""
-    _stub_engine(monkeypatch, _graph())
+    _stub_graph(monkeypatch, _graph())
     result = run_cypher(tmp_path, "MATCH (a) RETURN a LIMIT 999999999")
     assert result["ok"] is True
     assert result["limit_requested"] == 999999999
@@ -160,7 +151,7 @@ def test_run_cypher_bounds_an_unbounded_user_limit(tmp_path, monkeypatch):
 
 
 def test_run_cypher_keeps_a_limit_inside_the_ceiling(tmp_path, monkeypatch):
-    _stub_engine(monkeypatch, _graph())
+    _stub_graph(monkeypatch, _graph())
     result = run_cypher(tmp_path, "MATCH (a) RETURN a LIMIT 10")
     assert result["limit_requested"] == 10
     assert result["limit_applied"] == 10
@@ -168,7 +159,7 @@ def test_run_cypher_keeps_a_limit_inside_the_ceiling(tmp_path, monkeypatch):
 
 
 def test_run_cypher_zero_limit_is_raised_to_one(tmp_path, monkeypatch):
-    _stub_engine(monkeypatch, _graph())
+    _stub_graph(monkeypatch, _graph())
     result = run_cypher(tmp_path, "MATCH (a) RETURN a LIMIT 0")
     assert result["limit_applied"] == 1
     assert result["limit_capped"] is True
@@ -176,7 +167,7 @@ def test_run_cypher_zero_limit_is_raised_to_one(tmp_path, monkeypatch):
 
 
 def test_run_cypher_node_rows_report_total_beside_the_cap(tmp_path, monkeypatch):
-    _stub_engine(monkeypatch, _graph())
+    _stub_graph(monkeypatch, _graph())
     result = run_cypher(tmp_path, "MATCH (a) RETURN a LIMIT 1")
     assert len(result["rows"]) == 1
     assert result["shown"] == 1
@@ -187,7 +178,7 @@ def test_run_cypher_node_rows_report_total_beside_the_cap(tmp_path, monkeypatch)
 
 
 def test_run_cypher_edge_rows_report_total_beside_the_cap(tmp_path, monkeypatch):
-    _stub_engine(monkeypatch, _graph())
+    _stub_graph(monkeypatch, _graph())
     result = run_cypher(tmp_path, "MATCH (a)-[r:CALLS|IMPORTS]->(b) RETURN a,b LIMIT 1")
     assert result["shown"] == 1
     assert result["total"] == 2
@@ -195,7 +186,7 @@ def test_run_cypher_edge_rows_report_total_beside_the_cap(tmp_path, monkeypatch)
 
 
 def test_run_cypher_untruncated_rows_say_so(tmp_path, monkeypatch):
-    _stub_engine(monkeypatch, _graph())
+    _stub_graph(monkeypatch, _graph())
     result = run_cypher(tmp_path, "MATCH (a) RETURN a LIMIT 50")
     assert result["shown"] == 3
     assert result["total"] == 3

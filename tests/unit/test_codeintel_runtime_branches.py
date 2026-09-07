@@ -529,8 +529,9 @@ def test_runtime_merge_skips_fingerprinting_without_runtime_observations(
     """Fingerprinting shells out to git, so it runs only when it can match.
 
     Retargeted from ``CodeIntelQueryEngine._graph`` to
-    ``CodeIntelService.load_with_runtime_observations``, which is where that
-    loader now lives — ``run_cypher`` is its one production caller. The
+    ``CodeIntelService.merge_runtime_observations``, which is where the merge
+    now lives — ``run_cypher`` is its one production caller, and it supplies the
+    kernel's graph rather than one loaded out of a Python store. The
     dead-candidate suppression the second half of this test used to assert went
     with the engine; see
     ``test_codeintel_debug.test_matching_runtime_observation_becomes_a_graph_edge``
@@ -538,7 +539,6 @@ def test_runtime_merge_skips_fingerprinting_without_runtime_observations(
     """
     (tmp_path / "app.py").write_text("def target():\n    return 1\n", encoding="utf-8")
     service = CodeIntelService(tmp_path)
-    service.persist(_query_graph())
 
     def _boom(root: Path) -> str:
         raise AssertionError("source_fingerprint must not run without runtime evidence")
@@ -546,7 +546,7 @@ def test_runtime_merge_skips_fingerprinting_without_runtime_observations(
     monkeypatch.setattr(
         "devcouncil.codeintel.debug.fingerprint.source_fingerprint", _boom
     )
-    graph = service.load_with_runtime_observations()
+    graph = service.merge_runtime_observations(_query_graph())
     assert not [edge for edge in graph.edges if edge.extras.get("provenance") == "runtime"]
 
     session = service.store.start_runtime_session(
@@ -565,7 +565,7 @@ def test_runtime_merge_skips_fingerprinting_without_runtime_observations(
         "devcouncil.codeintel.debug.fingerprint.source_fingerprint",
         lambda root: "fp",
     )
-    merged = service.load_with_runtime_observations()
+    merged = service.merge_runtime_observations(_query_graph())
     runtime = [edge for edge in merged.edges if edge.extras.get("provenance") == "runtime"]
     assert [(edge.source, edge.target) for edge in runtime] == [
         ("app.py::caller", "app.py::target")
