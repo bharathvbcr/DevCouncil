@@ -5843,7 +5843,8 @@ be materialised at all. This is that.
 
 Measured in process on a `git archive` + `git init` copy of this repository
 (1,626 files, 102,239 edges, 17,869 distinct edge symbols, 1,602 paths, 158.8 MB
-store), release, minima of nine cold runs each:
+schema-17 store — this half predates the v18 merge and is the diagnosis, not the
+result), release, minima of nine cold runs each:
 
 | | min |
 |---|---|
@@ -5893,24 +5894,57 @@ removed SQL verbatim and requires row-for-row agreement, and passes unchanged.
 it, ~100 MB of `String`s retained for the life of the process — is gone. `latest_edges`
 materialises from the index instead, so one memo answers both.
 
-| corpus = this repository, n=41 interleaved A B A B | A p50 | B p50 | A min | B min | drift |
-|---|---|---|---|---|---|
-| `search content_hash` (control) | 12.2 | 12.5 | 10.3 | 9.6 | 1.5 |
-| `dead` (control) | 14.5 | 14.5 | 11.8 | 11.7 | 1.4 |
-| `deps content_hash` (control) | 10.0 | 9.9 | 8.0 | 7.9 | 1.1 |
-| `impact content_hash --depth 1` | 100.9 | **64.4** | 84.1 | 53.4 | 2.2 |
-| `impact content_hash --depth 3` | 101.3 | **64.6** | 84.3 | 53.0 | 2.1 |
-| `impact content_hash --depth 8` | 117.6 | **77.1** | 96.8 | 63.4 | 11.9 |
-| `neighbors content_hash` | 104.7 | **67.0** | 84.8 | 52.9 | 12.3 |
-| `trace content_hash main` | 161.7 | **120.9** | 132.8 | 100.8 | 16.4 |
-| `explore content_hash` | 118.6 | **78.3** | 99.0 | 63.7 | 11.5 |
-| `affected src/devcouncil/cli/main.py` | 100.1 | **64.0** | 81.9 | 52.1 | 9.5 |
+Interleaved A B A B, n = 41 each, release binaries in separate
+`CARGO_TARGET_DIR`s, both corpora `git archive` + `git init` copies with their store
+rebuilt by the **base** binary (schema 18). A is `858afda`, B is that merge with this
+lane on top, so the only difference between the two is this change.
 
-−36 % on every edge-reading command; the three controls are flat inside their own
-drift. Store bytes unchanged — nothing is persisted. Allocations during the *first*
-`impact` a process asks, on a 3,293-edge fixture whose answer is 2 edges:
-**21,046 → 213**, pinned by
+| this repository — 1,592 files, 102,239 edges, 153.0 MB store | A p50 | B p50 | A min | B min | drift |
+|---|---|---|---|---|---|
+| `search content_hash` (control) | 11.3 | 11.2 | 10.1 | 10.1 | 0.2 |
+| `dead` (control) | 13.1 | 12.9 | 11.4 | 11.7 | 0.3 |
+| `deps content_hash` (control) | 8.9 | 9.2 | 7.7 | 8.1 | 0.6 |
+| `impact content_hash --depth 1` | 87.5 | **56.6** | 82.2 | 53.7 | 1.6 |
+| `impact content_hash --depth 3` | 86.5 | **57.0** | 82.2 | 54.1 | 1.2 |
+| `impact content_hash --depth 8` | 99.5 | **66.5** | 95.4 | 64.1 | 0.6 |
+| `neighbors content_hash` | 88.1 | **57.9** | 84.1 | 55.0 | 0.6 |
+| `trace content_hash main` | 135.9 | **105.3** | 132.8 | 101.3 | 0.0 |
+| `explore content_hash` | 100.2 | **67.9** | 95.9 | 64.6 | 0.9 |
+| `affected src/devcouncil/cli/main.py` | 85.2 | **55.2** | 80.9 | 53.4 | 1.6 |
+
+| scholarlm — 4,520 files, 272,171 edges, 500.6 MB store | A p50 | B p50 | A min | B min | drift |
+|---|---|---|---|---|---|
+| `search segment` (control) | 13.7 | 13.8 | 12.1 | 12.5 | 0.4 |
+| `dead` (control) | 16.9 | 17.4 | 14.8 | 15.5 | 0.2 |
+| `deps segment` (control) | 9.8 | 10.0 | 8.1 | 8.2 | 0.5 |
+| `impact segment --depth 1` | 248.9 | **153.9** | 214.0 | 131.5 | 6.3 |
+| `impact segment --depth 3` | 248.4 | **153.2** | 213.8 | 129.8 | 4.1 |
+| `impact segment --depth 8` | 248.3 | **151.4** | 210.5 | 132.5 | 5.4 |
+| `neighbors segment` | 249.5 | **148.9** | 216.6 | 134.3 | 1.0 |
+| `explore segment` | 465.8 | **252.8** | 371.9 | 220.0 | 25.5 |
+
+−33 % to −46 %, and the bigger corpus gains more, which is what a cost proportional to
+the generation rather than to the answer should do. The controls are flat within their
+own drift on this repository; on scholarlm `dead` reads +0.5 p50 against 0.2 ms of
+drift, which is **the opposite sign to the same control here** (−0.2), so it is
+reported as noise rather than as an effect.
+
+The whole-generation consumers are unchanged. `latest_edges` now materialises its rows
+from the index instead of from its own query, which is more work per row and less work
+before the rows; measured end to end (n = 21) `manifest` is 881.8 → 837.9 ms p50 against
+44.8 ms of drift and `export` 753.6 → 743.2 against 25.8 — **no result** either way, in
+either direction.
+
+Store bytes are unchanged: nothing is persisted, this is a read-path and an
+in-memory-shape change. Allocations during the *first* `impact` a process asks, on a
+3,293-edge fixture whose answer is 2 edges: **21,046 → 213**, pinned by
 `devmap-query/tests/a_cold_query_pays_for_its_answer_not_the_generation.rs`.
+
+Byte-identity is the acceptance test, not the reasoning: every symbol with ≥ 5 callers,
+under `impact` at depths 1/3/8, `neighbors`, `deps`, `explore` and `trace`, both
+binaries, raw stdout compared. **3,212 of 3,212 symbols and 22,488 comparisons on this
+repository, 1,000 of 7,768 and 7,004 comparisons on scholarlm, 0 diffs.** The scholarlm
+half is a capped sample and both numbers are carried.
 
 ### The 40 ms target is not reachable without a schema change
 
@@ -5924,9 +5958,11 @@ A depth-3 `impact` from one symbol touches 309 edges and a depth-8 one 27,792 �
 and 27 % of the set. The design that reaches the target, measured but **not landed**
 because it is a schema change and Lane V owns the schema:
 
-* `CREATE INDEX ON generation_edges(generation_id, source_symbol)` and the same for
-  `target_symbol`. Measured on this store: **+15.7 MB on 158.8 MB (+9.9 %)** — 8.4 MB
-  and 7.3 MB by `dbstat` — and **0.34 s** to create both after the fact.
+* A symbol index. Measured on the schema-17 store as
+  `CREATE INDEX ON generation_edges(generation_id, source_symbol)` and the same for
+  `target_symbol`: **+15.7 MB on 158.8 MB (+9.9 %)** — 8.4 MB and 7.3 MB by `dbstat` —
+  and **0.34 s** to create both after the fact. Under v18 that spelling no longer
+  exists; see the note below.
 * With them, `SELECT DISTINCT source_symbol … WHERE generation_id = ?` is **4–5 ms**
   over a covering index (14,678 rows), which is what the traversal-start matcher needs
   in order to run `symbol_matches` per distinct symbol; and each frontier expansion
@@ -5945,7 +5981,7 @@ generation's 17,869 edge symbols are neither a node `qualified_name` nor a path,
 314 edges name a source symbol with no matching node row, so resolving starts from the
 node table would silently lose starts.
 
-Lane V's validity ranges (below) landed first, and they change what that index would
+Lane V's validity ranges (above) landed first, and they change what that index would
 have to be: `generation_edges` is now a **view** over `edge_rows` joined on
 `[valid_from, valid_to)`, so an index on `(generation_id, source_symbol)` cannot exist —
 there is no such column to index. The physical form would be
