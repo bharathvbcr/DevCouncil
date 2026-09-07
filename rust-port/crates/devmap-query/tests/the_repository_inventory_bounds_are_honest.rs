@@ -215,6 +215,46 @@ fn a_manifest_that_could_not_be_read_is_named_not_dropped() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A manifest that is not a regular file never reaches the reader.
+///
+/// `MANIFEST_READ_CAP` is enforced as a `metadata.len()` pre-check, and a FIFO
+/// reports length zero — so if one could reach `read_bounded`, the open alone
+/// would block until a writer appeared and the artifact write would hang with
+/// no deadline anywhere on the path. It cannot: the marker walk records a name
+/// only for a regular file or a symlink that resolves to one, so a FIFO named
+/// `package.json` is not a marker and its contents are never asked for. This
+/// pins that gate, because it is the only thing standing between the cap and an
+/// unbounded read.
+#[test]
+fn a_manifest_that_is_a_fifo_is_not_a_marker_and_is_never_opened() {
+    let root = root("fifo");
+    let fifo = root.join("package.json");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "the fixture needs a real FIFO");
+    std::fs::write(root.join("uv.lock"), "").unwrap();
+
+    let started = std::time::Instant::now();
+    let scanned = inventory::scan(&root);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the scan opened the FIFO and blocked on it: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        scanned.package_managers,
+        vec!["uv".to_string()],
+        "a FIFO named `package.json` is not a declaration of npm: {:?}",
+        scanned.package_managers
+    );
+    assert!(scanned.unreadable.is_empty());
+    assert!(scanned.refused_oversize.is_empty());
+    let _ = std::fs::remove_file(&fifo);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// The size cap keeps its own name, and a manifest read whole names neither.
 #[test]
 fn an_oversize_manifest_stays_oversize_and_a_readable_one_is_named_nowhere() {
