@@ -186,3 +186,7 @@ required-features = ["parse"]
 [[test]]
 name = "dead_clusters_reach_a_query"
 required-features = ["parse"]
+
+[[test]]
+name = "impact_layers_come_from_the_kernel"
+required-features = ["parse"]

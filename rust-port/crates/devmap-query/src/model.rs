@@ -380,6 +380,35 @@ pub struct BlastRadius {
     pub total_impacted: u32,
 }
 
+/// An `impact` answer together with how far each reached symbol actually is.
+///
+/// [`crate::StoreQueryEngine::impact`] answers *what* reaches a target, as a
+/// flat edge list. That is the whole answer to "show me the callers" and it is
+/// not the answer to "how big is this change": a consumer needing distance
+/// bands had to invent them, and the one in this repository invented them
+/// wrongly — it relabelled everything a depth-3 reverse walk reached as
+/// `depth: 1, confidence: extracted`, publishing a three-hop transitive
+/// dependent as a direct, deterministically-resolved caller.
+///
+/// So the bands come from the kernel, and they come from the [`BlastRadius`]
+/// that `explore` and `affected` already return rather than from a second shape
+/// that could drift from it. `edges` is flattened, so the wire form is exactly
+/// the `impact` object every existing consumer reads plus one new key: a client
+/// that predates this reads the response it always read.
+///
+/// Both halves are budgeted out of the *same* allowance — a caller that asked
+/// for 2,000 tokens gets 2,000, not 2,000 per half. See
+/// [`crate::StoreQueryEngine::impact_layered`] for the split and for why this
+/// surface takes no rung floor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayeredImpact {
+    /// Exactly what `impact` returns, under its own share of the budget.
+    #[serde(flatten)]
+    pub edges: Response<ResolvedEdge>,
+    /// The same walk, banded by distance from the seeds.
+    pub blast_radius: BlastRadius,
+}
+
 /// One matched definition, with its source and both call-graph directions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExploreDefinition {

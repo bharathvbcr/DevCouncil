@@ -255,6 +255,14 @@ pub enum IpcCommand {
         /// two that could not be narrowed.
         #[serde(default)]
         min_rung: Option<String>,
+        /// Band the reached symbols by distance as well as listing the edges.
+        ///
+        /// Defaulted false, so a client that predates this sends the request it
+        /// always sent and reads the response it always read. Refused together
+        /// with `min_rung`: the band walk takes a confidence floor and no rung,
+        /// so honouring one would narrow half the answer.
+        #[serde(default)]
+        layers: bool,
     },
     Trace {
         from: String,
@@ -460,6 +468,25 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
                 "min_rung must be one of deterministic, high, speculative; got {name:?}"
             ));
         }
+    }
+
+    // Refused rather than half-applied, exactly as the CLI refuses
+    // `--layers --min-rung`: the band walk takes a confidence floor and knows
+    // nothing of rungs, so serving both would return edges cut to the floor
+    // beside bands that were not — one answer whose halves describe different
+    // graphs, and nothing in it saying so.
+    if let IpcCommand::Impact {
+        layers: true,
+        min_rung: Some(_),
+        ..
+    } = &request.command
+    {
+        return Err(
+            "impact cannot take both layers and min_rung: the distance bands are walked \
+             without a rung floor, so the two halves of the answer would describe \
+             different graphs"
+                .to_string(),
+        );
     }
 
     let (text, budget, depth, min_confidence) = match &request.command {
@@ -798,6 +825,24 @@ pub(crate) fn dispatch(
             budget,
             depth,
             min_rung,
+            layers: true,
+        } => {
+            // `min_rung` alongside `layers` was refused in `validate_request`,
+            // so it is `None` here by construction rather than by being dropped.
+            debug_assert!(min_rung.is_none());
+            Ok(serde_json::to_value(engine.impact_layered(Request {
+                query: target,
+                token_budget: budget,
+                min_confidence: 0.0,
+                max_depth: depth,
+            })?)?)
+        }
+        IpcCommand::Impact {
+            target,
+            budget,
+            depth,
+            min_rung,
+            layers: false,
         } => Ok(serde_json::to_value(engine.impact_at_rung(
             Request {
                 query: target,
@@ -2076,6 +2121,7 @@ mod tests {
                 budget: 10,
                 depth,
                 min_rung: None,
+                layers: false,
             },
         };
         assert!(validate_request(&impact(MAX_TRAVERSAL_DEPTH)).is_ok());
@@ -2098,6 +2144,56 @@ mod tests {
             "an oversized trace destination must be rejected even when the \
              source is small"
         );
+    }
+
+    /// `layers` and `min_rung` together are refused, not half-honoured.
+    ///
+    /// The distance bands are derived from the traversal's own edges before the
+    /// rung cut; the edge list is packed after it. Serving both would return
+    /// edges narrowed to the floor beside bands that were not, in one object,
+    /// with nothing saying which half the filter reached. Refusing is the only
+    /// answer that cannot be misread.
+    #[test]
+    fn impact_refuses_layers_together_with_a_rung_floor() {
+        let request = |layers: bool, min_rung: Option<&str>| IpcRequest {
+            version: 1,
+            command: IpcCommand::Impact {
+                target: "a.py::f".to_string(),
+                budget: 10,
+                depth: 2,
+                min_rung: min_rung.map(str::to_string),
+                layers,
+            },
+        };
+        assert!(validate_request(&request(false, None)).is_ok());
+        assert!(validate_request(&request(true, None)).is_ok());
+        assert!(
+            validate_request(&request(false, Some("deterministic"))).is_ok(),
+            "a rung floor on its own is exactly what impact has always accepted"
+        );
+        let refused = validate_request(&request(true, Some("deterministic")))
+            .expect_err("layers with a rung floor must be refused");
+        assert!(
+            refused.contains("min_rung") && refused.contains("layers"),
+            "the refusal must name both halves so the caller knows what to drop: \
+             {refused:?}"
+        );
+    }
+
+    /// A client that predates `layers` sends no such key and must still parse.
+    #[test]
+    fn an_impact_request_without_layers_defaults_to_the_flat_answer() {
+        let parsed: IpcRequest =
+            serde_json::from_str(r#"{"version":1,"cmd":"impact","target":"a.py::f"}"#)
+                .expect("an impact request may omit every optional field");
+        match parsed.command {
+            IpcCommand::Impact { layers, .. } => assert!(
+                !layers,
+                "an absent `layers` must mean the answer a pre-existing client \
+                 expects, never the composed one"
+            ),
+            other => panic!("expected an impact command, got {other:?}"),
+        }
     }
 
     /// A second binder must be refused while the first holds the endpoint,
