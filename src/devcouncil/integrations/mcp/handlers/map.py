@@ -130,11 +130,16 @@ def _graph_degraded_fields(root: Path) -> dict[str, Any]:
 def _graph_payload(root: Path, result: dict[str, Any]) -> dict[str, Any]:
     """Build a graph-tool response whose ``ok`` is *derived*, never asserted.
 
-    ``query_symbol``/``trace_path``/``route_map``/``api_impact`` answer with
+    The Python graph surfaces answered a failure with
     ``{"error": "no code graph; run `dev map` first"}``. Prepending a literal
     ``"ok": True`` published that failure as a success, so a caller branching on
     ``ok`` read "the graph has no callers for this symbol" from a response that
     means "there is no graph".
+
+    Those surfaces are retired — the two remaining producers are the kernel
+    route commands (via :func:`_route_tool`) and `diff_impact` — but the rule
+    stays here rather than at each call site: a producer that grows an ``error``
+    key must not have to remember to flip ``ok`` too.
     """
     error = result.get("error")
     payload: dict[str, Any] = {"ok": not error, **result, **_graph_degraded_fields(root)}
@@ -1194,7 +1199,7 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
 
 
 async def handle_graph_query(root: Path, arguments: dict) -> list[TextContent]:
-    """Symbol lookup, kernel-first.
+    """Symbol lookup. The kernel is the only engine; no kernel is an error.
 
     This answered entirely from Python: `query_symbol` -> `load_code_graph` ->
     `index.sqlite`, re-materialising 14,057 nodes and 71,195 edges as pydantic
@@ -1202,7 +1207,8 @@ async def handle_graph_query(root: Path, arguments: dict) -> list[TextContent]:
     kernel-backed `devcouncil_code_search` answering the same class of question,
     with ~90% of it in that re-materialisation — and the first call after any
     kernel build additionally cost 6.5-7.5 s and wrote 242 MB of SQLite under a
-    writer lease, from a tool an agent reads as read-only.
+    writer lease, from a tool an agent reads as read-only. `query_symbol` has
+    since been deleted; the kernel-first shape became kernel-only.
     """
 
     def _body() -> list[TextContent]:
@@ -1229,16 +1235,17 @@ async def handle_graph_query(root: Path, arguments: dict) -> list[TextContent]:
 
 
 async def handle_graph_trace(root: Path, arguments: dict) -> list[TextContent]:
-    """Path between two symbols, kernel-first.
+    """Path between two symbols. The kernel is the only engine.
 
     Measured at 1.133 s in Python against 0.202 s for the kernel.
 
-    **The two engines differ, and the kernel is the correct one.** Python's BFS
-    is *undirected* over `imports`/`calls`/`contains`/`defines`/`inherits`; the
-    kernel walks resolved edges directionally. On a real probe Python reported a
-    two-hop path between two functions through a shared test module while the
-    kernel correctly reported no indexed path. Agents will see fewer, truer
-    paths — and, since the kernel pass in this session, a capped walk now says
+    **The two engines differed, and the kernel is the correct one.** Python's
+    BFS was *undirected* over `imports`/`calls`/`contains`/`defines`/`inherits`;
+    the kernel walks resolved edges directionally. On a real probe Python
+    reported a two-hop path between two functions through a shared test module
+    while the kernel correctly reported no indexed path. That is why the Python
+    tracer was deleted rather than kept as a fallback: a fabricated path is
+    worse than an absent answer, because a caller acts on it. A capped walk says
     so rather than being reported as "no path".
     """
 

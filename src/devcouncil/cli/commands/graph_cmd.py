@@ -387,7 +387,13 @@ def _checked_min_rung(min_rung: Optional[str]) -> Optional[str]:
 
 
 def _devmap_query_payload(root: Path, kind: str, **kwargs):
-    """Try DevMapClient for query surfaces; return payload or None for Python fallback."""
+    """The kernel's answer for a query surface, or ``None`` when it cannot answer.
+
+    ``None`` used to mean "fall back to the Python engine". There is no Python
+    engine for `query` or `trace` any more; ``None`` now means the caller
+    refuses, naming the kernel. The signal is unchanged so the surfaces that
+    still branch on it (`status`, and the MCP siblings) read it the same way.
+    """
     from devcouncil.devmap_client import (
         DevMapClientError,
         DevMapRequestRefused,
