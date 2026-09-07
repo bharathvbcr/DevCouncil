@@ -192,13 +192,22 @@ def kernel_graph(root: Path) -> "CodeGraph":
 
     For consumer tests that keep their source fixtures: the graph comes from the
     real producer (``devmap build`` through ``refresh_map_artifacts``) and is read
-    back through ``load_code_graph``, exactly as production does. Skips when no
+    back through ``read_code_graph``, exactly as production does. Skips when no
     kernel binary is built, so the suite stays honest rather than green by
     accident.
+
+    It read back through ``load_code_graph`` until this lane. That imports
+    ``code_graph.json`` into the Python ``index.sqlite`` cache on first read, so
+    every test using this fixture created and populated a store no production
+    consumer reads any more -- and a fixture that keeps the retired path warm is
+    how a consumer that regressed onto it would go on passing. The two routes
+    were measured to return the same graph on this repository as a corpus
+    (1,637 files): identical node, edge and dead-entry counts and identical
+    node-id sets.
     """
     import pytest
 
-    from devcouncil.indexing.graph.build import load_code_graph
+    from devcouncil.indexing.graph.build import read_code_graph
     from devcouncil.indexing.map_artifacts import refresh_map_artifacts
 
     if not _have_kernel():
@@ -206,7 +215,7 @@ def kernel_graph(root: Path) -> "CodeGraph":
     root = Path(root)
     (root / ".devcouncil").mkdir(exist_ok=True)
     refresh_map_artifacts(root, root / ".devcouncil" / "repo_map.json", quiet=True)
-    graph = load_code_graph(root)
+    graph = read_code_graph(root)
     assert graph is not None, "the kernel wrote no graph the Python side could read"
     return graph
 
