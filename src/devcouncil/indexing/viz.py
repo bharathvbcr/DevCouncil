@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
-from devcouncil.indexing.graph.build import graph_path, load_code_graph
+from devcouncil.indexing.graph.build import graph_path, read_code_graph
 from devcouncil.indexing.graph.schema import (
     CodeGraph,
     Confidence,
@@ -1045,10 +1045,17 @@ def write_graph_html(
     open_browser: bool = False,
     symbols: bool = False,
 ) -> Path:
-    """Write ``.devcouncil/graph/graph.html`` from the on-disk code graph."""
-    graph = load_code_graph(root)
+    """Write ``.devcouncil/graph/graph.html`` from the on-disk code graph.
+
+    Reads `code_graph.json`, the artifact the kernel writes, rather than
+    routing that same data through the retired Python engine's `index.sqlite`
+    cache — a renderer is a read, and that path's first read is a ~94 MB write.
+    """
+    graph = read_code_graph(root)
     if graph is None:
-        raise FileNotFoundError("No code graph found; run `dev map` first.")
+        raise FileNotFoundError(
+            "No code graph at .devcouncil/graph/code_graph.json; run `dev map` first."
+        )
     out = graph_path(root).with_name("graph.html")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_graph_html(graph, file_level=not symbols), encoding="utf-8")

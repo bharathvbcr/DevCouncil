@@ -149,3 +149,11 @@ def test_map_export_okf_reads_the_artifact(kernel_corpus, no_python_store):
     )
     assert result.exit_code == 0, result.output
     assert out.is_dir() and any(out.iterdir()), "the bundle must actually be written"
+
+
+def test_graph_html_reads_the_artifact(kernel_corpus, no_python_store):
+    from devcouncil.indexing.viz import write_graph_html
+
+    out = write_graph_html(kernel_corpus)
+    assert out.is_file()
+    assert out.stat().st_size > 0
