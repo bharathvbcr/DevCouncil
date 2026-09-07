@@ -184,6 +184,10 @@ name = "graph_intel_is_emitted"
 required-features = ["parse"]
 
 [[test]]
+name = "the_core_graph_is_the_artifacts_nodes_and_edges"
+required-features = ["parse"]
+
+[[test]]
 name = "dead_clusters_reach_a_query"
 required-features = ["parse"]
 

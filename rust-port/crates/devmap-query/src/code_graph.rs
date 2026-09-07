@@ -26,13 +26,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::artifacts::write_atomic;
-use crate::engine::{byte_span_to_line_range, resolve_source_path};
+use crate::engine::{byte_span_to_line_range_in, resolve_source_path};
 use crate::manifest::{entry_root_paths, is_entry_root, CONSUMER_MAP_ENGINE};
 use crate::model::FreshnessInfo;
 use devmap_analyze::model::{AnalysisStatus, AnalysisSummary};
 use devmap_extract::languages::Capability;
 use devmap_extract::model::{
-    confidence_millis, EdgeKind, ExtractedSymbol, Extraction, ParseOutcome, SymbolKind, WiringKind,
+    confidence_millis, EdgeKind, ExtractedSymbol, Extraction, LineIndex, ParseOutcome, SymbolKind,
+    WiringKind,
 };
 use devmap_resolve::model::ResolvedEdge;
 use serde_json::{json, Map, Value};
@@ -646,17 +647,49 @@ struct GraphProvenance {
 /// than reading `code_graph.json` back off disk. The picture and the artifact
 /// must not be able to describe different generations, and the cheapest way to
 /// guarantee that is for there to be only one of them.
-pub fn build_code_graph_value(
+/// The two arrays every reader of the graph consumes, and the bookkeeping the
+/// artifact hangs its panels on. One owner for the node and edge rows: the
+/// artifact ([`build_code_graph_value`]) and the query surfaces
+/// ([`build_graph_core_value`]) both take theirs from [`graph_core`], so a row
+/// cannot differ between what `export` writes and what `cypher` answers from.
+struct GraphCore {
+    nodes: Vec<Value>,
+    edges: Vec<Value>,
+    /// id -> (line, kind label), so `dead_code` can carry the line and kind its
+    /// schema declares instead of a zero that means nothing.
+    node_index: BTreeMap<String, (u32, &'static str)>,
+    provenance: GraphProvenance,
+}
+
+/// `nodes` and `edges` as the artifact emits them, and nothing else.
+///
+/// What `cypher`, `routes`, `shape-check` and `api-impact` answer from. They
+/// read the two arrays; the rest of the artifact — the churn panel's `git log`,
+/// the intel panels, the dead-code list, the subsystem summary — was built and
+/// discarded on every call: 643 ms for a `cypher` on this repository's store
+/// against 8 ms for a `search`, 122 ms of it the git log. The rows are the
+/// artifact's rows by construction (one [`graph_core`]), and
+/// `tests/the_core_graph_is_the_artifacts_nodes_and_edges.rs` pins it.
+pub fn build_graph_core_value(
     extractions: &[Extraction],
     analysis: &AnalysisSummary,
     edges: &[ResolvedEdge],
-    freshness: &FreshnessInfo,
     repo_root: Option<&str>,
-) -> anyhow::Result<Value> {
-    if freshness.generation_id == 0 {
-        anyhow::bail!("code graph unavailable: no committed generation (build a generation first)");
-    }
+) -> Value {
+    let core = graph_core(extractions, analysis, edges, repo_root);
+    json!({
+        "schema_version": CODE_GRAPH_SCHEMA_VERSION,
+        "nodes": core.nodes,
+        "edges": core.edges,
+    })
+}
 
+fn graph_core(
+    extractions: &[Extraction],
+    analysis: &AnalysisSummary,
+    edges: &[ResolvedEdge],
+    repo_root: Option<&str>,
+) -> GraphCore {
     let mut provenance = GraphProvenance::default();
     // One owner for "which files contributed no call edges", shared with
     // `analyze_liveness`, which caps dead-code confidence from the same two
@@ -673,13 +706,15 @@ pub fn build_code_graph_value(
     ordered.sort_by(|left, right| left.file_path.cmp(&right.file_path));
 
     let mut nodes: Vec<Value> = Vec::new();
-    // id -> (line, kind label), so `dead_code` can carry the line and kind its
-    // schema declares instead of a zero that means nothing.
     let mut node_index: BTreeMap<String, (u32, &'static str)> = BTreeMap::new();
 
     for ext in &ordered {
-        let source = std::fs::read_to_string(resolve_source_path(&root, &ext.file_path)).ok();
-        if source.is_none() {
+        // One pass over the file's bytes for every span in it; the string form
+        // of the conversion scans from the top of the file per call.
+        let lines = std::fs::read_to_string(resolve_source_path(&root, &ext.file_path))
+            .ok()
+            .map(|text| LineIndex::new(&text));
+        if lines.is_none() {
             provenance.files_without_readable_source += 1;
         }
         let area = file_area(&ext.file_path);
@@ -712,8 +747,8 @@ pub fn build_code_graph_value(
             let (line, end_line) = if symbol.kind == SymbolKind::File {
                 (0, 0)
             } else {
-                match &source {
-                    Some(text) => byte_span_to_line_range(text, &symbol.span),
+                match &lines {
+                    Some(lines) => byte_span_to_line_range_in(lines, &symbol.span),
                     None => {
                         // The span is bytes; without the file there is no line.
                         // Say so rather than reporting the top of the file.
@@ -774,8 +809,8 @@ pub fn build_code_graph_value(
             }
 
             let mut extras = Map::new();
-            let (line, end_line) = match &source {
-                Some(text) => byte_span_to_line_range(text, &route.span),
+            let (line, end_line) = match &lines {
+                Some(lines) => byte_span_to_line_range_in(lines, &route.span),
                 None => {
                     extras.insert(
                         "line_resolution".to_string(),
@@ -898,6 +933,34 @@ pub fn build_code_graph_value(
         }));
     }
 
+    provenance.distinct_edge_endpoints_without_node = missing_endpoints.len();
+
+    GraphCore {
+        nodes,
+        edges: edge_values,
+        node_index,
+        provenance,
+    }
+}
+
+pub fn build_code_graph_value(
+    extractions: &[Extraction],
+    analysis: &AnalysisSummary,
+    edges: &[ResolvedEdge],
+    freshness: &FreshnessInfo,
+    repo_root: Option<&str>,
+) -> anyhow::Result<Value> {
+    if freshness.generation_id == 0 {
+        anyhow::bail!("code graph unavailable: no committed generation (build a generation first)");
+    }
+
+    let GraphCore {
+        nodes,
+        edges: edge_values,
+        node_index,
+        mut provenance,
+    } = graph_core(extractions, analysis, edges, repo_root);
+
     let mut dead_rows: Vec<&_> = analysis
         .dead_symbols
         .iter()
@@ -915,8 +978,6 @@ pub fn build_code_graph_value(
             .cmp(&right.file_path)
             .then_with(|| left.symbol_name.cmp(&right.symbol_name))
     });
-
-    provenance.distinct_edge_endpoints_without_node = missing_endpoints.len();
 
     let mut dead_code: Vec<Value> = Vec::new();
     let mut dead_seen: BTreeSet<String> = BTreeSet::new();

@@ -327,18 +327,119 @@ pub struct Span {
 impl Span {
     /// Convert byte offsets to a one-based inclusive line range at the query
     /// boundary. Extraction and storage remain UTF-8-safe byte based.
+    ///
+    /// The single-span form of [`LineIndex::line_range`], which owns the
+    /// arithmetic; a loop over every span in one file builds the index once.
     pub fn line_range(&self, source: &str) -> (u32, u32) {
-        let start = self.start_byte.min(source.len());
-        let end = self.end_byte.min(source.len());
-        let line_number = |offset: usize| -> u32 {
-            source.as_bytes()[..offset]
-                .iter()
-                .filter(|&&byte| byte == b'\n')
-                .count()
-                .saturating_add(1)
-                .min(u32::MAX as usize) as u32
-        };
-        (line_number(start), line_number(end))
+        LineIndex::new(source).line_range(self)
+    }
+}
+
+/// The newline offsets of one source text, built once so every span in the
+/// file converts to lines by binary search instead of a scan from the top.
+///
+/// One owner for the arithmetic: a line is one plus the newlines before the
+/// offset, and an offset past the end is on the last line. [`Span::line_range`]
+/// delegates here for a single span. The artifact's node loop used to pay the
+/// scan from the top of the file twice per symbol — `2k` passes over a file
+/// with `k` symbols, 100 ms of every export on this repository — where one
+/// pass and `2k` binary searches answer the same.
+#[derive(Debug, Clone)]
+pub struct LineIndex {
+    len: usize,
+    newlines: Vec<usize>,
+}
+
+impl LineIndex {
+    pub fn new(source: &str) -> Self {
+        let newlines = source
+            .bytes()
+            .enumerate()
+            .filter(|&(_, byte)| byte == b'\n')
+            .map(|(at, _)| at)
+            .collect();
+        Self {
+            len: source.len(),
+            newlines,
+        }
+    }
+
+    /// Length in bytes of the text the table was built from — the clamp a
+    /// caller applies to a span recorded against a longer version of it.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// One-based line holding `offset`; an offset past the end is the last line.
+    pub fn line_at(&self, offset: usize) -> u32 {
+        let offset = offset.min(self.len);
+        self.newlines
+            .partition_point(|&at| at < offset)
+            .saturating_add(1)
+            .min(u32::MAX as usize) as u32
+    }
+
+    pub fn line_range(&self, span: &Span) -> (u32, u32) {
+        (self.line_at(span.start_byte), self.line_at(span.end_byte))
+    }
+}
+
+#[cfg(test)]
+mod line_index_tests {
+    use super::{LineIndex, Span};
+
+    /// The arithmetic `Span::line_range` has always stated: one plus the
+    /// newlines in the prefix, offsets past the end clamped to the end.
+    fn scanned(source: &str, offset: usize) -> u32 {
+        source.as_bytes()[..offset.min(source.len())]
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count() as u32
+            + 1
+    }
+
+    #[test]
+    fn a_line_index_answers_exactly_what_a_scan_of_the_prefix_does() {
+        let sources = [
+            "",
+            "\n",
+            "a",
+            "a\n",
+            "a\nb",
+            "a\r\nb\r\n",
+            "\n\n\n",
+            "fn a() {}\n// \u{1F980} ferris r\u{e9}\nfn b() {}\n",
+        ];
+        for source in sources {
+            let index = LineIndex::new(source);
+            for start in 0..=source.len() + 3 {
+                assert_eq!(
+                    index.line_at(start),
+                    scanned(source, start),
+                    "{source:?} offset {start}"
+                );
+                for end in 0..=source.len() + 3 {
+                    let span = Span {
+                        start_byte: start,
+                        end_byte: end,
+                    };
+                    assert_eq!(
+                        index.line_range(&span),
+                        span.line_range(source),
+                        "{source:?} span {start}..{end}"
+                    );
+                    assert_eq!(
+                        index.line_range(&span),
+                        (scanned(source, start), scanned(source, end)),
+                        "{source:?} span {start}..{end}"
+                    );
+                }
+            }
+        }
     }
 }
 

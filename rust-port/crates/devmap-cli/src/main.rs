@@ -1387,6 +1387,32 @@ fn graph_value_for_read(store: &Store, db: &std::path::Path) -> anyhow::Result<s
     )
 }
 
+/// The graph the read-only surfaces answer from: the artifact's `nodes` and
+/// `edges` from the latest generation, and none of its panels — no `git log`,
+/// no intel, no dead-code list, no freshness. `build_graph_core_value` says
+/// what building the whole artifact cost these commands.
+fn graph_core_for_read(store: &Store) -> anyhow::Result<serde_json::Value> {
+    store
+        .latest_generation_id()?
+        .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
+    let extractions = store.latest_extractions()?;
+    let analysis = store
+        .latest_analysis()?
+        .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
+    let edges = store
+        .latest_edges(0.0)?
+        .into_iter()
+        .map(resolved_edge_from_stored)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let repo_root = store.latest_repo_root()?;
+    Ok(devmap_query::build_graph_core_value(
+        &extractions,
+        &analysis,
+        &edges,
+        repo_root.as_deref(),
+    ))
+}
+
 fn write_consumer_artifacts(
     store: &Store,
     request: ManifestRequest<'_>,
@@ -4822,7 +4848,7 @@ empty graph, which would read as 'this file has no control flow'.",
         }
         Commands::Cypher { query, limit } => {
             let store = open_for_read(&cli.db())?;
-            let graph = graph_value_for_read(&store, &cli.db())?;
+            let graph = graph_core_for_read(&store)?;
             let result = devmap_query::cypher::run(&graph, query, *limit);
             if cli.json {
                 emit_json(cli, &result)?;
@@ -4959,7 +4985,7 @@ represent them",
             max_file_bytes,
         } => {
             let store = open_for_read(&cli.db())?;
-            let graph = graph_value_for_read(&store, &cli.db())?;
+            let graph = graph_core_for_read(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
             let mut mapped = devmap_query::api_routes::route_map(&root, &graph, &budget);
@@ -4979,7 +5005,7 @@ represent them",
             max_file_bytes,
         } => {
             let store = open_for_read(&cli.db())?;
-            let graph = graph_value_for_read(&store, &cli.db())?;
+            let graph = graph_core_for_read(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
             let checked =
@@ -4997,7 +5023,7 @@ represent them",
             max_file_bytes,
         } => {
             let store = open_for_read(&cli.db())?;
-            let graph = graph_value_for_read(&store, &cli.db())?;
+            let graph = graph_core_for_read(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
             let impact = devmap_query::api_routes::api_impact(&root, &graph, &budget, route);

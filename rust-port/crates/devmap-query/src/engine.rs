@@ -3523,6 +3523,17 @@ fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
 }
 
 pub(crate) fn byte_span_to_line_range(source: &str, span: &Span) -> (u32, u32) {
+    byte_span_to_line_range_in(&devmap_extract::model::LineIndex::new(source), span)
+}
+
+/// [`byte_span_to_line_range`] over a table built once per file, for a loop
+/// that converts every span in the file — the string form scans from the top
+/// of the file on every call, which the artifact's node loop paid twice per
+/// symbol.
+pub(crate) fn byte_span_to_line_range_in(
+    lines: &devmap_extract::model::LineIndex,
+    span: &Span,
+) -> (u32, u32) {
     // Delegates the counting to `Span::line_range`, which is the canonical
     // owner and is already UTF-8-safe.
     //
@@ -3538,17 +3549,15 @@ pub(crate) fn byte_span_to_line_range(source: &str, span: &Span) -> (u32, u32) {
     // Two copies of one computation existed and only one was safe. The wrapper
     // survives for the single thing it adds beyond the canonical version — the
     // `max(start)` below — and no longer restates the arithmetic.
+    let len = lines.len();
     let clamped = Span {
-        start_byte: span.start_byte.min(source.len()),
+        start_byte: span.start_byte.min(len),
         // A stored span whose end precedes its start would otherwise report an
         // end line above its start line. Clamping keeps the range orderable for
         // the consumers that render it as `line..end_line`.
-        end_byte: span
-            .end_byte
-            .min(source.len())
-            .max(span.start_byte.min(source.len())),
+        end_byte: span.end_byte.min(len).max(span.start_byte.min(len)),
     };
-    clamped.line_range(source)
+    lines.line_range(&clamped)
 }
 
 /// Per-hit token overhead in [`StoreQueryEngine::search`]'s cost function.
