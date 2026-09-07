@@ -92,3 +92,7 @@ required-features = ["parse"]
 [[test]]
 name = "rust_self_type"
 required-features = ["parse"]
+
+[[test]]
+name = "implicit_receiver_reference"
+required-features = ["parse"]

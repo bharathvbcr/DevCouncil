@@ -1586,6 +1586,24 @@ impl Resolver {
                                         call.caller_symbol.as_deref(),
                                         &call.callee_name,
                                     ))
+                                // X47. The half of the fabricated-caller defect
+                                // X42 left standing. This rung admits a `self.`
+                                // receiver on the grounds that the receiver
+                                // *is* this scope — true, and it says nothing
+                                // about a **module-level function** that
+                                // happens to share the name. Where the
+                                // enclosing type declares the method, rung 1b
+                                // has already answered at `ReceiverType`; where
+                                // it does not, this rung was binding
+                                // `self.on_done()` to `svc.py::on_done` at
+                                // DETERMINISTIC — a free function handed a
+                                // caller it does not have, and thereby shielded
+                                // from the dead-code pass. Same restriction
+                                // X42 put on the global rung, at the rung that
+                                // outranks it.
+                                && (bare_call
+                                    || self.symbol_kind_in(&ext.file_path, &call.callee_name)
+                                        == Some(SymbolKind::Method))
                             {
                                 resolution = Some(Arc::new(Resolution::SameFile {
                                     target_symbol: call.callee_name.clone(),
@@ -2853,6 +2871,35 @@ impl Resolver {
             }
         }
 
+        // X47. 1b, the reference half of X42: an implicit receiver dispatches
+        // on the type the reference is written inside. `bus.subscribe(
+        // self.on_done)` names `Service.on_done` — the method used as a value —
+        // and the call ladder has known that since X42 while this one did not.
+        //
+        // After the typed-receiver rung above, for X42's reason: a scope that
+        // writes `this = Other()` has said what `this` is. Before the import
+        // rung below, for the opposite one — `self.run` cannot mean an imported
+        // free function in any language here, so the import rung is refused for
+        // an implicit receiver outright.
+        let implicit = Self::receiver_is_self(receiver);
+        if implicit {
+            let (target_file, target_symbol, receiver_type) =
+                reference.enclosing_symbol.as_deref().and_then(|caller| {
+                    self.implicit_receiver_target(&ext.file_path, family, caller, name)
+                })?;
+            return Some(self.reference_edge(
+                ext,
+                &target_file,
+                name,
+                reference,
+                Resolution::ReceiverType {
+                    target_symbol,
+                    target_file: target_file.clone(),
+                    receiver_type,
+                },
+            ));
+        }
+
         let (module_file, _) = self.import_bindings.get(&ext.file_path)?.get(receiver)?;
         let (resolved_file, resolved_symbol) = self.lookup_in_package(module_file, name)?;
         Some(self.reference_edge(
@@ -3023,10 +3070,39 @@ impl Resolver {
             }
         }
 
-        let same_file = self.file_symbols.get(&ext.file_path).and_then(|syms| {
-            let hits: Vec<_> = syms.iter().filter(|symbol| *symbol == name).collect();
-            (hits.len() == 1).then(|| ext.file_path.clone())
-        });
+        // X47. A reference *with a receiver* names something that receiver
+        // owns, and the two rungs that can prove which one are the member
+        // rungs. They ran last, after the bare-name rungs below, so the ones
+        // that cannot see a receiver answered first: `self.on_done` in a file
+        // with a module-level `def on_done` resolved to that free function at
+        // `SameFile` and `DETERMINISTIC`, handing it a caller it does not have
+        // and shielding it from the dead-code pass. That is the same
+        // fabricated-caller defect the call ladder's rung 2c was written to
+        // stop, in the ladder it was never applied to.
+        //
+        // So a receiver is asked first and then **disqualifies** every rung
+        // below that reads the bare name alone. The one that still runs is the
+        // global tier, which is HIGH or SPECULATIVE and states its uncertainty
+        // — and which, for an implicit receiver, admits only members.
+        let receiver = reference.receiver_expr.as_deref();
+        if let Some(receiver) = receiver {
+            if let Some(edge) =
+                self.resolve_member_reference(ext, family, reference, receiver, name)
+            {
+                return Some(edge);
+            }
+        }
+        let implicit_receiver = receiver.is_some_and(Self::receiver_is_self);
+
+        let same_file = receiver
+            .is_none()
+            .then(|| {
+                self.file_symbols.get(&ext.file_path).and_then(|syms| {
+                    let hits: Vec<_> = syms.iter().filter(|symbol| *symbol == name).collect();
+                    (hits.len() == 1).then(|| ext.file_path.clone())
+                })
+            })
+            .flatten();
         if let Some(target_file) = same_file {
             if let Some(kind) = self.symbol_kind_in(&target_file, name) {
                 if !prefer_types || is_type(kind) {
@@ -3044,7 +3120,11 @@ impl Resolver {
             }
         }
 
-        if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
+        if let Some(bindings) = self
+            .import_bindings
+            .get(&ext.file_path)
+            .filter(|_| receiver.is_none())
+        {
             if let Some((target_f, target_sym)) = bindings.get(name) {
                 if let Some((resolved_file, resolved_sym)) =
                     self.lookup_in_package(target_f, target_sym)
@@ -3061,21 +3141,6 @@ impl Resolver {
                         },
                     ));
                 }
-            }
-        }
-
-        // A *member* reference names something another symbol owns, so the
-        // two rungs that can prove which one apply exactly as they do for a
-        // method call: a receiver whose type is known, and a receiver bound by
-        // an import. `cfg.enabled` and `cmd.baseline` resolve here.
-        //
-        // This runs before the bare-name refusal below and never widens it: a
-        // reference with no receiver is still a bare name and still refused.
-        if let Some(receiver) = reference.receiver_expr.as_deref() {
-            if let Some(edge) =
-                self.resolve_member_reference(ext, family, reference, receiver, name)
-            {
-                return Some(edge);
             }
         }
 
@@ -3100,7 +3165,11 @@ impl Resolver {
         // After the `Name` refusal above, deliberately: a bare identifier
         // mention is the one shape this function declines rather than fails,
         // and a package-scope rung must not be the thing that widens it.
-        if family == LangFamily::Go {
+        //
+        // Bare names only, for the X47 reason: `search.Paper` written inside
+        // package `api` names `search`'s type, and asking `api`'s own package
+        // block about the bare `Paper` would answer a question nobody asked.
+        if family == LangFamily::Go && receiver.is_none() {
             if let Some((target_file, target_symbol, package_name)) =
                 self.same_package_target(&ext.file_path, name, |kind| {
                     !prefer_types || is_type(kind)
@@ -3126,6 +3195,11 @@ impl Resolver {
                 .filter(|(path, kind, candidate_family)| {
                     family.admits(*candidate_family)
                         && (!prefer_types || is_type(*kind))
+                        // X47, the same restriction X42 put on the call
+                        // ladder's global rung: `self.on_done` names a member
+                        // of the enclosing type, and a module-level function is
+                        // not one.
+                        && (!implicit_receiver || matches!(kind, SymbolKind::Method))
                         && (*candidate_family != LangFamily::Go
                             || Self::go_symbol_visible_from(&ext.file_path, path, name))
                 })
