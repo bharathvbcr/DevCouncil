@@ -3,6 +3,8 @@ name = "devmap-serve"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "IPC daemon and MCP HTTP transport for the DevCouncil code-intelligence kernel"
 
 [dependencies]
 devmap-extract = { path = "../devmap-extract" }

@@ -3,6 +3,8 @@ name = "devmap-resolve"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Call and import resolution into a defended edge graph"
 
 [dependencies]
 # Already a workspace dependency built for devmap-extract and devmap-store, so

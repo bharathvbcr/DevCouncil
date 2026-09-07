@@ -919,6 +919,15 @@ enum Commands {
         inventory: InventoryFlags,
     },
     Status,
+    /// Binary and store health for hosts that install or verify `devmap`.
+    ///
+    /// Emits the store schema on disk (if any), the schema this binary speaks,
+    /// the code-graph artifact schema, how many tree-sitter grammars are linked
+    /// into this build, and the resolved store path. GitPulse and similar hosts
+    /// call `devmap doctor --json` rather than scraping `devmap --version`
+    /// prose, so a vendored-vs-on-disk grammar or schema mismatch is a structured
+    /// refusal rather than a parse of free text.
+    Doctor,
     /// Where this repository's state lives — the state directory, the store, the
     /// artifacts, the workspace registry — resolved exactly as every other
     /// command resolves them, and reported without opening anything.
@@ -1691,6 +1700,25 @@ fn kernel_capabilities() -> serde_json::Value {
         "manifest_stamp_flags": stamp_flags,
         "build_manifest": accepts("build", "manifest"),
     })
+}
+
+/// The structured answer `devmap doctor` emits.
+///
+/// One owner for the fields a host needs to verify a binary against a store
+/// without scraping `--version` prose: the schema on disk (if any), the schema
+/// this binary speaks, the code-graph artifact schema, how many grammars are
+/// linked into this build, and the resolved store path. Absence of a store is
+/// reported as `schema_version: null`, never invented.
+fn doctor_report(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    let schema_version = Store::stored_schema_version(db)?;
+    Ok(serde_json::json!({
+        "schema_version": schema_version,
+        "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
+        "code_graph_schema_version": CODE_GRAPH_SCHEMA_VERSION,
+        "linked_grammar_count": devmap_extract::linked_grammar_count(),
+        "store_path": db.display().to_string(),
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 fn store_status_fields(
@@ -2957,6 +2985,7 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         // No numeric query arguments reach the engine from these.
         Commands::Build { .. }
         | Commands::Status
+        | Commands::Doctor
         | Commands::Paths { .. }
         | Commands::Manifest { .. }
         | Commands::MapHtml { .. }
@@ -4486,6 +4515,13 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             );
             payload.insert("capabilities".into(), kernel_capabilities());
             emit_json(cli, &serde_json::Value::Object(payload))?;
+        }
+        Commands::Doctor => {
+            // Never creates a store. The probe is what a host runs *before* it
+            // trusts this binary against a tree it may not own; creating one
+            // here would turn "is this binary usable?" into a write.
+            let payload = doctor_report(&cli.db())?;
+            emit_json(cli, &payload)?;
         }
         Commands::History { last } => {
             let store = open_for_read(&cli.db())?;

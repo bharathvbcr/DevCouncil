@@ -34,9 +34,22 @@ report the same result as a check that ran and passed.** An agent acting on
 
 ## Install
 
+No-checkout install (verified: succeeds without a local clone; cold build ~1–2
+minutes depending on the machine, because every tree-sitter grammar compiles):
+
 ```bash
-cargo install --path crates/devmap-cli
+cargo install --git https://github.com/bharathvbcr/DevCouncil --locked devmap-cli
 ```
+
+From a checkout of this tree:
+
+```bash
+cargo install --path crates/devmap-cli --locked --force
+```
+
+That puts `devmap` on `PATH` via `~/.cargo/bin` (what GUI apps such as GitPulse
+search when they lack a shell profile). `--locked` keeps the tree's
+`Cargo.lock`; `--force` refreshes an earlier install. Requires a Rust toolchain.
 
 Or build in place — the binary lands at `target/release/devmap`:
 
@@ -47,6 +60,22 @@ cargo build --release
 Requires a Rust toolchain. Nothing else: the grammars are compiled in, and the
 HTML view embeds its own renderer.
 
+Prebuilt binaries (when a version tag is pushed) land on GitHub Releases for
+`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, and
+`x86_64-pc-windows-msvc`, each with a `.sha256` checksum. A failed Windows build
+fails the release rather than omitting that target.
+
+### Version contract
+
+`devmap --version` prints the crate version and the store / code-graph schema
+numbers the binary reads. Hosts that shell out for build / status / preview
+should treat a missing binary and a schema mismatch as distinct failures — never
+as an empty “all clear”.
+
+Prefer `devmap doctor --json` for machine verification: it emits
+`schema_version`, `expected_schema_version`, `code_graph_schema_version`,
+`linked_grammar_count`, and `store_path` as one JSON object, so a host does not
+need to scrape `--version` prose.
 ## Use
 
 ### Index

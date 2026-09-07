@@ -3,6 +3,8 @@ name = "devmap-query"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Query engine and code-graph artifact writers for the DevCouncil kernel"
 
 [dependencies]
 devmap-extract = { path = "../devmap-extract", default-features = false }

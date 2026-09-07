@@ -49,7 +49,7 @@ pub use paths::{
     state_dir, store_path, workspace_path,
 };
 #[cfg(feature = "parse")]
-pub use treesitter::extract_treesitter;
+pub use treesitter::{extract_treesitter, linked_grammar_count, linked_grammar_keys};
 
 pub struct FileRef<'a> {
     pub path: &'a str,

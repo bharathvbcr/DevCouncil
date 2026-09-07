@@ -3,6 +3,8 @@ name = "devmap-extract"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Tree-sitter extraction frontend for the DevCouncil code-intelligence kernel"
 
 [dependencies]
 serde.workspace = true

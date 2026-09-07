@@ -428,3 +428,67 @@ fn a_store_with_no_generation_is_not_fresh() {
         "a healthy repository must keep reporting clean: {built}"
     );
 }
+
+/// `doctor --json` is the host verify surface: schema numbers, grammar count,
+/// store path — never scraped from `--version` prose.
+#[test]
+fn doctor_json_names_schemas_grammar_count_and_store_path() {
+    let root = fixture("doctor");
+    let output = run(&root, &["--json", "doctor"]);
+    assert!(
+        output.status.success(),
+        "doctor must succeed without a store: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload = one_json_line(&output, "doctor with no store");
+
+    assert_eq!(
+        payload["schema_version"],
+        serde_json::Value::Null,
+        "no store yet: {payload}"
+    );
+    assert_eq!(
+        payload["expected_schema_version"],
+        serde_json::json!(devmap_store::CURRENT_SCHEMA_VERSION),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["code_graph_schema_version"],
+        serde_json::json!(devmap_query::CODE_GRAPH_SCHEMA_VERSION),
+        "{payload}"
+    );
+    let grammar_count = payload["linked_grammar_count"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("linked_grammar_count must be a number: {payload}"));
+    assert_eq!(
+        grammar_count,
+        devmap_extract::linked_grammar_count() as u64,
+        "doctor must report the same count the extractor exports: {payload}"
+    );
+    assert!(
+        grammar_count >= 30,
+        "this binary links dozens of grammars: {payload}"
+    );
+    let store_path = payload["store_path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("store_path must be a string: {payload}"));
+    assert!(
+        store_path.contains("devmap.sqlite"),
+        "store_path must name the sqlite file: {payload}"
+    );
+    assert_eq!(
+        payload["version"],
+        serde_json::json!(env!("CARGO_PKG_VERSION")),
+        "{payload}"
+    );
+
+    // After a build, schema_version is the one on disk.
+    std::fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+    run(&root, &["build", "."]);
+    let after = one_json_line(&run(&root, &["doctor", "--json"]), "doctor after build");
+    assert_eq!(
+        after["schema_version"],
+        serde_json::json!(devmap_store::CURRENT_SCHEMA_VERSION),
+        "{after}"
+    );
+}

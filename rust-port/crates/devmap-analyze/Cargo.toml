@@ -3,6 +3,8 @@ name = "devmap-analyze"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Graph analysis: dead code, clones, PDG, and coverage over a persisted map"
 
 [dependencies]
 devmap-extract = { path = "../devmap-extract", default-features = false }

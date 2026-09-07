@@ -29,11 +29,17 @@ codegen-units = 1
 # profile, so `#[should_panic]` coverage is unaffected.
 panic = "abort"
 
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 authors = ["DevCouncil Team"]
 license = "Apache-2.0"
+repository = "https://github.com/bharathvbcr/DevCouncil"
 
 [workspace.dependencies]
 # "rc" lets Arc<T> derive Serialize/Deserialize. ResolvedEdge shares one

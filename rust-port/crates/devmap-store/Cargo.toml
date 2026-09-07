@@ -3,6 +3,8 @@ name = "devmap-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "SQLite store and schema migrations for the DevCouncil code-intelligence kernel"
 
 [dependencies]
 devmap-extract = { path = "../devmap-extract", default-features = false }

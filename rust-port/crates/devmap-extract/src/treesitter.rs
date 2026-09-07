@@ -154,6 +154,75 @@ pub(crate) fn grammar_for(lang: &str) -> Option<(&'static str, Language)> {
     }
 }
 
+/// Language keys that have a [`grammar_for`] arm.
+///
+/// Kept beside the match so a new arm without an entry here fails
+/// [`linked_grammar_keys_cover_every_grammar_for_arm`]. Hosts compare
+/// [`linked_grammar_count`] against a vendored expectation; the count is
+/// derived from this list rather than asserted, so it cannot silently drift.
+const GRAMMAR_LANGUAGE_KEYS: &[&str] = &[
+    "python",
+    "javascript",
+    "typescript",
+    "tsx",
+    "rust",
+    "go",
+    "hcl",
+    "vue",
+    "liquid",
+    "astro",
+    "kotlin",
+    "svelte",
+    "java",
+    "csharp",
+    "php",
+    "ruby",
+    "c",
+    "cpp",
+    "objc",
+    "cuda",
+    "swift",
+    "scala",
+    "dart",
+    "pascal",
+    "lua",
+    "luau",
+    "r",
+    "cfml",
+    "erlang",
+    "solidity",
+    "nix",
+    "shell",
+    "sql",
+];
+
+/// Distinct tree-sitter grammar keys this binary can load.
+///
+/// Excludes languages refused by [`UNSAFE_GRAMMARS`]: those still have a
+/// generated parser in the tree, but this build will not route to them.
+/// Hosts (GitPulse, the Python seam) compare this number against the count
+/// they expect from the same revision, so a binary built without a grammar
+/// cannot claim the same capability as one that has it.
+pub fn linked_grammar_count() -> usize {
+    linked_grammar_keys().len()
+}
+
+/// The grammar keys behind [`linked_grammar_count`], sorted and deduplicated.
+pub fn linked_grammar_keys() -> Vec<&'static str> {
+    let mut keys: Vec<&'static str> = GRAMMAR_LANGUAGE_KEYS
+        .iter()
+        .filter(|lang| {
+            !UNSAFE_GRAMMARS
+                .iter()
+                .any(|(unsafe_lang, _)| unsafe_lang == *lang)
+        })
+        .filter_map(|lang| grammar_for(lang).map(|(grammar, _)| grammar))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
 pub fn extract_treesitter(path: &str, lang: &str, source: &str) -> Extraction {
     extract_treesitter_with_budget(path, lang, source, DEFAULT_PARSE_BUDGET)
 }
@@ -9318,5 +9387,47 @@ mod tests {
                 "predeclared type {predeclared:?} must not be a callee; got {callees:?}"
             );
         }
+    }
+
+    /// Every `grammar_for` arm is counted, and every counted key has an arm.
+    ///
+    /// `linked_grammar_count` is what hosts compare against a vendored
+    /// expectation. If a new language grows an arm without joining
+    /// `GRAMMAR_LANGUAGE_KEYS`, the count stays stale and the host cannot
+    /// detect the mismatch; if a key is listed without an arm, the count
+    /// under-reports silently the other way.
+    #[test]
+    fn linked_grammar_keys_cover_every_grammar_for_arm() {
+        for lang in GRAMMAR_LANGUAGE_KEYS {
+            assert!(
+                grammar_for(lang).is_some()
+                    || UNSAFE_GRAMMARS
+                        .iter()
+                        .any(|(unsafe_lang, _)| unsafe_lang == lang),
+                "{lang} is listed in GRAMMAR_LANGUAGE_KEYS but has no grammar_for arm \
+                 and is not in UNSAFE_GRAMMARS"
+            );
+        }
+        // Spot-check: a language that is not listed must not suddenly grow an
+        // arm without updating the list. Probe a few ids that are deliberately
+        // absent from the table.
+        for absent in ["vb", "cobol", "fortran", "haskell"] {
+            if GRAMMAR_LANGUAGE_KEYS.contains(&absent) {
+                continue;
+            }
+            assert!(
+                grammar_for(absent).is_none()
+                    || UNSAFE_GRAMMARS
+                        .iter()
+                        .any(|(unsafe_lang, _)| *unsafe_lang == absent),
+                "{absent} has a grammar_for arm but is missing from GRAMMAR_LANGUAGE_KEYS"
+            );
+        }
+        let count = linked_grammar_count();
+        assert!(
+            count >= 30,
+            "linked_grammar_count()={count} is too low for this workspace's grammar set"
+        );
+        assert_eq!(count, linked_grammar_keys().len());
     }
 }
