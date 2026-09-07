@@ -9,6 +9,10 @@ use devmap_extract::model::*;
 use crate::model::*;
 use devmap_extract::GoModule;
 
+/// One package-level declaration, as [`Resolver::go_package_symbols`] holds it:
+/// the file that declares it, its qualified name, and its kind.
+type PackageDecl = (String, String, SymbolKind);
+
 /// Where the name a resolution rung failed on was written.
 ///
 /// The tiers in [`UnresolvedClass`] are stated over evidence, and the evidence
@@ -147,6 +151,17 @@ pub struct Resolver {
     go_modules_fresh: bool,
     /// file_path → Go package identifier (`pkg` in `package pkg`).
     go_package_by_file: BTreeMap<String, String>,
+    /// X45. `(directory, package clause, bare name)` → the **package-level**
+    /// declarations of that name, as `(file, qualified name, kind)`.
+    ///
+    /// The index behind [`Resolver::same_package_target`]. Keyed on the
+    /// directory *and* the package clause because a directory is not a package:
+    /// `search/` holds `package search` and its external test package
+    /// `package search_test`, and the second is outside the first's package
+    /// block. Holds only declarations whose parent is the file — a method is
+    /// declared on its type, not in the package block, so a bare name cannot
+    /// reach it.
+    go_package_symbols: BTreeMap<(String, String, String), Vec<PackageDecl>>,
     /// `(file, scope, name)` for every value a callable binds itself.
     ///
     /// `declared_types` can only answer for a binding that carries a *written
@@ -219,6 +234,7 @@ impl Resolver {
             go_modules: Vec::new(),
             go_modules_fresh: false,
             go_package_by_file: BTreeMap::new(),
+            go_package_symbols: BTreeMap::new(),
             scope_locals: BTreeSet::new(),
             max_indexed_path_depth: 0,
             unique_basename: BTreeMap::new(),
@@ -684,6 +700,7 @@ impl Resolver {
         self.qualified_names.clear();
         self.symbol_parents.clear();
         self.go_package_by_file.clear();
+        self.go_package_symbols.clear();
         self.scope_locals.clear();
         self.max_indexed_path_depth = extractions
             .iter()
@@ -773,6 +790,28 @@ impl Resolver {
             if let Some(pkg) = ext.go_package.as_deref().filter(|pkg| !pkg.is_empty()) {
                 self.go_package_by_file
                     .insert(ext.file_path.clone(), pkg.to_string());
+                // X45. The package block, indexed. `parent_symbol` is the
+                // extractor's own answer for "what declares this", and a
+                // file-level parent is exactly what Go puts in the package
+                // block; a method's parent is its type, and no bare name
+                // reaches one.
+                let dir = Self::parent_dir(&ext.file_path);
+                for sym in &ext.symbols {
+                    if sym.kind == SymbolKind::File {
+                        continue;
+                    }
+                    let file_level = sym
+                        .parent_symbol
+                        .as_deref()
+                        .is_none_or(|parent| parent == ext.file_path);
+                    if !file_level {
+                        continue;
+                    }
+                    self.go_package_symbols
+                        .entry((dir.clone(), pkg.to_string(), sym.name.clone()))
+                        .or_default()
+                        .push((ext.file_path.clone(), sym.qualified_name.clone(), sym.kind));
+                }
             }
         }
 
@@ -1598,6 +1637,33 @@ impl Resolver {
                         }
                     }
 
+                    // 2e. X45. The package block. A bare `Trim(raw)` in
+                    // `search/rank.go` names `search/provider.go`'s `Trim`
+                    // because Go's package-level scope spans the package's
+                    // files — no import says so and none needs to.
+                    //
+                    // Placed last of the pre-global rungs, so it takes only
+                    // what the global tier was answering and no rung above it
+                    // loses a call. A *bare* callee only: `x.Trim()` names
+                    // something `x` owns, and a package-level function is not
+                    // one, which is the same rule rung 2c applies within a file.
+                    if resolution.is_none()
+                        && family == LangFamily::Go
+                        && call.receiver_expr.is_none()
+                    {
+                        if let Some((target_file, target_symbol, package_name)) = self
+                            .same_package_target(&ext.file_path, &call.callee_name, |kind| {
+                                kind != SymbolKind::Method
+                            })
+                        {
+                            resolution = Some(Arc::new(Resolution::SamePackage {
+                                target_symbol,
+                                target_file,
+                                package_name,
+                            }));
+                        }
+                    }
+
                     // 3. Global lookup (UniqueGlobal vs AmbiguousGlobal - G5, G3)
                     if resolution.is_none() {
                         if let Some(hits) = self.symbol_index.get(&call.callee_name) {
@@ -2417,6 +2483,59 @@ impl Resolver {
         None
     }
 
+    /// X45. Where a bare `name` written in `file` goes by Go's package-block
+    /// scope rule, or `None` where the rule cannot answer.
+    ///
+    /// Go's spec puts every package-level identifier in scope, unqualified,
+    /// throughout the package — which spans the files of one directory that
+    /// share a package clause. That is deterministic evidence and the resolver
+    /// had no rung for it: the answer came from the global tier, which counts
+    /// matches across the whole language family and so said `UniqueGlobal`
+    /// where the family held one and fanned out at `AmbiguousGlobal` where it
+    /// held several. Measured on scholarlm: 31,587 and 24,635 same-directory
+    /// cross-file Go edges respectively, plus 1,770 defect-tier rows for type
+    /// references the package itself declares.
+    ///
+    /// The declaring file must not be `file`: the same-file rungs own that, and
+    /// they apply scope tests this one has no way to repeat.
+    ///
+    /// `accept` is the caller's kind filter — a type annotation admits only
+    /// type declarations — applied *before* the uniqueness count, so a rejected
+    /// candidate can neither win nor veto.
+    ///
+    /// **Test files are a build tag, not a name.** A `_test.go` declaration is
+    /// absent from the ordinary build, so a non-test file must not reach one;
+    /// a `_test.go` file reaches both, because that is what its build sees.
+    /// The external test package (`package search_test`) needs no rule here —
+    /// its package clause differs, so it keys elsewhere.
+    ///
+    /// Abstains on a package that declares the name twice. That does not
+    /// compile, but this resolver indexes whatever it is pointed at — a
+    /// generated file beside its source, a half-applied merge — and a
+    /// DETERMINISTIC rung that picked one would be picking by input order.
+    fn same_package_target(
+        &self,
+        file: &str,
+        name: &str,
+        accept: impl Fn(SymbolKind) -> bool,
+    ) -> Option<(String, String, String)> {
+        let package = self.go_package_by_file.get(file)?;
+        let source_is_test = file.ends_with("_test.go");
+        let hits = self.go_package_symbols.get(&(
+            Self::parent_dir(file),
+            package.clone(),
+            name.to_string(),
+        ))?;
+        let mut visible = hits.iter().filter(|(path, _, kind)| {
+            path != file && accept(*kind) && (source_is_test || !path.ends_with("_test.go"))
+        });
+        let (target_file, target_symbol, _) = visible.next()?;
+        visible
+            .next()
+            .is_none()
+            .then(|| (target_file.clone(), target_symbol.clone(), package.clone()))
+    }
+
     fn lookup_in_package(&self, file: &str, name: &str) -> Option<(String, String)> {
         if self
             .file_symbols
@@ -2749,6 +2868,53 @@ impl Resolver {
         ))
     }
 
+    /// The module a written type was qualified by, for a reference in type
+    /// position: `search` for `paper search.Paper`.
+    ///
+    /// The one reader of the `@mod` half of `declared_types`, so the resolution
+    /// ladder and [`Self::classify_unresolved`] cannot key that index two ways.
+    /// Scoped-first for the SC9 reason: a qualifier this scope wrote does not
+    /// speak for a same-named binding in another.
+    ///
+    /// `None` for a bare type, and for a `TypeQualifier` reference itself —
+    /// that row *is* the qualifier, and asking what qualifies it would key on
+    /// its own binding and answer with itself.
+    fn type_qualifier_of(&self, file: &str, reference: &ExtractedReference) -> Option<&str> {
+        if reference.kind != ReferenceKind::Type {
+            return None;
+        }
+        let typed = reference.assigned_to.as_deref()?;
+        reference
+            .enclosing_symbol
+            .as_deref()
+            .and_then(|scope| {
+                self.declared_types
+                    .get(&format!("{file}:{scope}:{typed}@mod"))
+            })
+            .or_else(|| self.declared_types.get(&format!("{file}:{typed}@mod")))
+            .map(String::as_str)
+    }
+
+    /// Whether one of `file`'s own import tables binds `qualifier` — the three
+    /// halves the import walk splits every specifier into: resolved to an
+    /// indexed file, external to the corpus, or repo-relative and unindexed.
+    ///
+    /// The same three maps [`Self::classify_unresolved`] consults, asked here
+    /// as one question: does this file state where that module comes from?
+    fn qualifier_is_bound(&self, file: &str, qualifier: &str) -> bool {
+        self.import_bindings
+            .get(file)
+            .is_some_and(|bindings| bindings.contains_key(qualifier))
+            || self
+                .external_imports
+                .get(file)
+                .is_some_and(|imports| imports.contains_key(qualifier))
+            || self
+                .unindexed_local_imports
+                .get(file)
+                .is_some_and(|imports| imports.contains_key(qualifier))
+    }
+
     fn resolve_name_reference(
         &self,
         ext: &Extraction,
@@ -2773,6 +2939,45 @@ impl Resolver {
                     | SymbolKind::Trait
             )
         };
+
+        // X45. A *qualified* type is resolved by its qualifier, before any
+        // rung that reads the bare name.
+        //
+        // `paper search.Paper` is split by the extractor into a `Type`
+        // reference carrying the bare `Paper` — which is what dispatch needs —
+        // and a `TypeQualifier` sibling carrying `search`, paired by the
+        // binding they annotate (SC25). Until now only `classify_unresolved`
+        // read that sibling, and only to *label* the failure; the ladder itself
+        // reduced the written type to `Paper` and then answered as though the
+        // author had written a bare name. On scholarlm that costs every
+        // `search.Paper` outside the package: `Paper` is declared by two
+        // packages, so the global tier abstains — correctly — and the one piece
+        // of evidence that says which is discarded.
+        //
+        // First, not last, because the failure it prevents is a wrong answer
+        // rather than a missing one: in a file that itself declares a `T`,
+        // `t *testing.T` matched the same-file rung and bound a foreign type to
+        // a local one at DETERMINISTIC. A qualifier the ladder cannot follow
+        // still falls through — an unindexed module is a gap, not a veto.
+        if let Some(qualifier) = self.type_qualifier_of(&ext.file_path, reference) {
+            if let Some(edge) =
+                self.resolve_member_reference(ext, family, reference, qualifier, name)
+            {
+                return Some(edge);
+            }
+            // The qualifier could not be followed. Where the file's own import
+            // tables *bind* it, that is an answer and not an absence: the
+            // module is external to the corpus, or repo-relative and unindexed,
+            // and either way no declaration reachable by the bare name can be
+            // the one written. Falling through would hand the reference to the
+            // rungs that read the name alone — which is how `t *testing.T`
+            // bound to a local `type T struct`. A qualifier no import table
+            // names is a different case (Rust makes a crate addressable by path
+            // with no `use` of its root) and still falls through.
+            if self.qualifier_is_bound(&ext.file_path, qualifier) {
+                return None;
+            }
+        }
 
         let same_file = self.file_symbols.get(&ext.file_path).and_then(|syms| {
             let hits: Vec<_> = syms.iter().filter(|symbol| *symbol == name).collect();
@@ -2836,6 +3041,39 @@ impl Resolver {
         // Same-file and import-scoped remain; Calls still unique-global.
         if matches!(reference.kind, ReferenceKind::Name) {
             return None;
+        }
+
+        // X45. The package block, for the reference half of the ladder.
+        //
+        // `func score(paper Paper)` in `search/rank.go` names the `Paper` its
+        // own package declares in `search/provider.go`. Measured on scholarlm,
+        // 1,770 rows of the defect tier were exactly this — `Paper` 455,
+        // `Hypothesis` 449, `AgentSession` 338 — because two packages of that
+        // corpus declare `Paper` and the global tier below abstains between
+        // them, as it should. The package block is the evidence that says
+        // which, and it is written at the top of both files.
+        //
+        // After the `Name` refusal above, deliberately: a bare identifier
+        // mention is the one shape this function declines rather than fails,
+        // and a package-scope rung must not be the thing that widens it.
+        if family == LangFamily::Go {
+            if let Some((target_file, target_symbol, package_name)) =
+                self.same_package_target(&ext.file_path, name, |kind| {
+                    !prefer_types || is_type(kind)
+                })
+            {
+                return Some(self.reference_edge(
+                    ext,
+                    &target_file,
+                    name,
+                    reference,
+                    Resolution::SamePackage {
+                        target_symbol,
+                        target_file: target_file.clone(),
+                        package_name,
+                    },
+                ));
+            }
         }
 
         if let Some(hits) = self.symbol_index.get(name) {

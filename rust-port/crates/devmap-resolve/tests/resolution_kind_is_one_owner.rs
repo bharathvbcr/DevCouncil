@@ -18,6 +18,11 @@ fn every_variant() -> Vec<Resolution> {
             target_symbol: symbol.clone(),
             target_file: file.clone(),
         },
+        Resolution::SamePackage {
+            target_symbol: symbol.clone(),
+            target_file: file.clone(),
+            package_name: "geo".to_string(),
+        },
         Resolution::ImportScoped {
             target_symbol: symbol.clone(),
             target_file: file.clone(),
@@ -70,6 +75,10 @@ fn a_resolution_scores_exactly_what_its_kind_scores() {
     // confidence in every store, and must be made on purpose.
     assert_eq!(
         ResolutionKind::SameFile.confidence(),
+        Confidence::DETERMINISTIC
+    );
+    assert_eq!(
+        ResolutionKind::SamePackage.confidence(),
         Confidence::DETERMINISTIC
     );
     assert_eq!(

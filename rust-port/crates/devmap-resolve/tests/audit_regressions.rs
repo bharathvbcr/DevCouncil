@@ -46,6 +46,10 @@ fn entitled_confidence(resolution: &Resolution) -> Confidence {
         Resolution::SameFile { .. }
         | Resolution::ImportScoped { .. }
         | Resolution::ReceiverType { .. } => Confidence::DETERMINISTIC,
+        // X45. Go's spec puts a package-level identifier in scope, unqualified,
+        // throughout the package — a scope rule the file's own package clause
+        // states, not a count of matches across the family.
+        Resolution::SamePackage { .. } => Confidence::DETERMINISTIC,
         // Not a resolved reference: a relation the graph asserts about its own
         // shape, from a declaration the file carries outright (a Go package
         // clause). Deterministic for the same reason the three above are.
@@ -169,6 +173,7 @@ fn every_edge_confidence_matches_the_evidence_it_names() {
             .expect("every emitted edge names its evidence");
         let tier = match resolution {
             Resolution::SameFile { .. } => "SameFile",
+            Resolution::SamePackage { .. } => "SamePackage",
             Resolution::ImportScoped { .. } => "ImportScoped",
             Resolution::ReceiverType { .. } => "ReceiverType",
             Resolution::UniqueGlobal { .. } => "UniqueGlobal",
