@@ -2895,6 +2895,35 @@ impl Resolver {
             .map(String::as_str)
     }
 
+    /// X46. The type `Self` names in a Rust type annotation, or `None` where
+    /// the keyword cannot be given a concrete answer.
+    ///
+    /// `fn with_god_nodes(self, …) -> Self` returns the type written at the top
+    /// of its `impl` block, and that type is `symbol_parents`' answer for the
+    /// method — the extractor's own record, reduced the same way
+    /// [`Self::declaring_type_of`] reduces it, never a split of the qualified
+    /// name on `.`. `impl Render for Widget` puts `Widget` there and not
+    /// `Render`, which is what makes this the implementor and not the trait.
+    ///
+    /// Abstains inside a `trait`. There `Self` is whatever type implements it —
+    /// not the trait, and not a type this resolver can name — so answering with
+    /// the trait would emit a DETERMINISTIC edge asserting a return type no
+    /// implementation has. That is the opposite of X42's answer for
+    /// `Self::blank()` in the same position, and deliberately: a *method* named
+    /// there is one the trait really does declare.
+    ///
+    /// Rust only. `Self` is a type keyword in Swift too, but inside a `class`
+    /// it means the dynamic type — a subclass this rung would silently name the
+    /// base of — so Swift keeps the honest abstention until someone measures it.
+    fn rust_self_type(&self, file: &str, scope: Option<&str>) -> Option<&str> {
+        let enclosing = self.declaring_type_of(file, scope?)?;
+        matches!(
+            self.symbol_kind_in(file, enclosing)?,
+            SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Class
+        )
+        .then_some(enclosing)
+    }
+
     /// Whether one of `file`'s own import tables binds `qualifier` — the three
     /// halves the import walk splits every specifier into: resolved to an
     /// indexed file, external to the corpus, or repo-relative and unindexed.
@@ -2925,6 +2954,21 @@ impl Resolver {
         if name.is_empty() {
             return None;
         }
+        // X46. `Self` in type position is read as the name of the type the item
+        // is written inside, and then answered by the ordinary rungs — so this
+        // is a substitution, not a rung. The unresolved ledger keeps `Self`
+        // where the substitution finds no type: what failed is the keyword the
+        // author wrote, and renaming a failure is not reporting it.
+        let name = (family == LangFamily::Rust && reference.kind == ReferenceKind::Type)
+            .then(|| {
+                (name == "Self")
+                    .then(|| {
+                        self.rust_self_type(&ext.file_path, reference.enclosing_symbol.as_deref())
+                    })
+                    .flatten()
+            })
+            .flatten()
+            .unwrap_or(name);
         let prefer_types = matches!(
             reference.kind,
             ReferenceKind::Type | ReferenceKind::Heritage | ReferenceKind::HeritageInterface
@@ -3112,6 +3156,15 @@ impl Resolver {
         None
     }
 
+    /// The kind `file` declares `name` as, when it declares it exactly once.
+    ///
+    /// `then_some` **evaluates its argument**, so `(len == 1).then_some(v[0])`
+    /// indexes the vector before the length test can guard it: a name the
+    /// symbol index holds for *other* files and not for this one panicked with
+    /// "the len is 0 but the index is 0". It stood because every caller had
+    /// already proved the name was in this file — X46 added one that had not,
+    /// and the crash was a build abort rather than a wrong answer. `then` takes
+    /// a closure and is evaluated only on the true branch.
     fn symbol_kind_in(&self, file: &str, name: &str) -> Option<SymbolKind> {
         self.symbol_index.get(name).and_then(|hits| {
             let file_hits: Vec<_> = hits
@@ -3119,7 +3172,7 @@ impl Resolver {
                 .filter(|(path, _, _)| path == file)
                 .map(|(_, kind, _)| *kind)
                 .collect();
-            (file_hits.len() == 1).then_some(file_hits[0])
+            (file_hits.len() == 1).then(|| file_hits[0])
         })
     }
 
