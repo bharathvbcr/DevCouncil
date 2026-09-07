@@ -774,6 +774,24 @@ pub fn scan_tree(root: &Path) -> anyhow::Result<ScannedTree> {
 /// The walk half of [`scan_tree`]: every candidate that survived the ignore
 /// rules, the extension test and the size ceiling, as `(relative, absolute)`.
 fn walk_candidates(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf)>, DiscoveryReport)> {
+    // A root that exists and is not a directory was never examined. `ignore`
+    // walks a file root by yielding the file itself, so a build pointed at a
+    // regular file "ran" with zero candidates and wrote a generation that read
+    // as an empty repository — the check-that-could-not-run reporting as one
+    // that ran, in the exact shape the fatal-root rule below refuses for a root
+    // it cannot open. Measured through the release binary: `devmap build
+    // <file>` exited 0 with `files_indexed: 0`; `devmap build <missing>` exited
+    // 1. A missing root is left to the walker, whose error already names it;
+    // `metadata` follows links, so a link to a directory is a directory.
+    if let Ok(metadata) = fs::metadata(root) {
+        if !metadata.is_dir() {
+            anyhow::bail!(
+                "{}: not a directory; a build root must be a directory",
+                root.display()
+            );
+        }
+    }
+
     let mut out = Vec::new();
     let mut report = DiscoveryReport::default();
 
