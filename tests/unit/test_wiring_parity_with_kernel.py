@@ -17,17 +17,23 @@ Nothing here re-implements the kernel: the rule tables and the fixture lists are
 its shape changes, these tests fail rather than skip: a parity check that could
 not run must not report what a parity check that ran and passed reports.
 
-Two divergences are deliberate and are *not* asserted here, because Python is
-the stricter side and the kernel is the one that needs the change:
+What is pinned is the rule *tables* and the kernel's own fixture set, not
+every input: three divergences outside that set are known, and are *not*
+asserted here, because on all three Python is the more precise side and the
+kernel is what needs the change:
 
 * ``is_test_path`` — ``wiring.rs`` returns early on ``/src/test/`` and
   ``/src/androidTest/``, which skips the dotfile exclusion its own
   ``test_path_rule_ignores_dotfiles_inside_a_test_directory`` documents:
   ``app/src/test/.eslintrc`` is a test path to the kernel and not to Python.
 * ``is_wiring_decorator`` — the kernel matches its hints as bare substrings, so
-  ``@FastAPI_thing`` is wiring to it; ``is_wiring_decorated`` matches dotted
-  hints as prefixes and bare hints as whole segments, on purpose (see its
-  docstring). The *hint table* is pinned below; the matching rule is not.
+  ``@FastAPI_thing``, ``@multitask`` and ``@preregister`` are all wiring to it;
+  ``is_wiring_decorated`` matches dotted hints as prefixes and bare hints as
+  whole segments, on purpose (see its docstring). The *hint table* is pinned
+  below; the matching rule is not.
+* ``is_generated_path`` — the kernel misses ``*_pb2_grpc.pyi`` (grpcio-tools
+  writes it) and accepts any ``zz_generated*`` basename where the Python regex
+  requires the ``.go`` kubebuilder writes.
 """
 
 from __future__ import annotations
