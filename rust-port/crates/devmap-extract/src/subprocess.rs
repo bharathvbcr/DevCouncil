@@ -28,6 +28,36 @@
 //! * **No terminal, no stdin.** `stdin` is `/dev/null`; the `git` constructor
 //!   below also refuses interactive prompts and optional locks.
 //!
+//! The deadline reaches the child's *descendants*, not only the child. On unix
+//! the child leads its own process group and the expiry signals the group, so a
+//! hook, a credential helper, a pager or an `sh -c` fan-out dies with the
+//! process that started it. Killing one pid instead used to leave two problems
+//! behind, and they are the same problem: the descendant ran on past a deadline
+//! the caller had been told was enforced, and — still holding the inherited
+//! write ends — it left both drain threads blocked in `read` on a process the
+//! runner never started. The runner returned `Deadline` without them: two
+//! threads and two descriptors per expiry, freed only when the descendant chose
+//! to exit, in a daemon that runs `git` on a schedule. After the group kill the
+//! threads are given a bounded chance to see EOF and come home, so the common
+//! case hands nothing back. A descendant that called `setsid` has left the group
+//! and can still hold a pipe past that window; that is the residual, and the
+//! runner still returns on time when it happens.
+//!
+//! **The trade-off, stated plainly.** A child in its own process group no longer
+//! receives the terminal's `SIGINT`: interrupting a foreground `devmap` leaves an
+//! in-flight child to finish on its own, or — in the hung case — to linger with
+//! nobody left to enforce the deadline, because the enforcer was the process the
+//! user just interrupted. It is bought deliberately. Every caller today is a
+//! `git` read with no stdin and `GIT_TERMINAL_PROMPT=0`, which finishes in
+//! milliseconds or is the pathological case this bound exists for; `devmap serve`
+//! handles `SIGTERM`/`SIGINT` itself and lets in-flight runs complete. And an
+//! interrupted parent takes the read ends of both pipes with it, so a child that
+//! is still *writing* dies of `SIGPIPE` on its next write — leaving only the
+//! child that has gone quiet, which is the one the deadline could not have
+//! helped either. The alternative — a signal handler — is process-global state,
+//! and a library that installs one takes that decision away from every binary
+//! that links it.
+//!
 //! What it deliberately does not decide is what a failure *means*: the store
 //! treats an unavailable `HEAD` as "unavailable", the digests fall back to the
 //! two fingerprints, churn reports `computed: false` with the reason. Each
@@ -52,6 +82,16 @@ use std::time::{Duration, Instant};
 /// for the store's sentinel and the artifacts' digest, so the two cannot
 /// disagree about how long a head is worth waiting for.
 pub const GIT_HEAD_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long the runner waits, after killing the child's process group, for the
+/// two drain threads to see EOF and finish.
+///
+/// Bounded on purpose and spent only on an expiry — the path that has already
+/// cost a full deadline — so it buys the common case back its threads and its
+/// descriptors without letting a descendant that escaped the group (`setsid`)
+/// hold the runner past its promise. Exceeding it is the old behaviour, not a
+/// new failure: the threads are handed back to nobody, exactly as before.
+const DRAIN_HANDBACK: Duration = Duration::from_millis(500);
 
 /// How much of a child the caller is prepared to wait for and to keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,15 +196,23 @@ pub fn git_with_program(program: &OsStr, root: &Path) -> Command {
 pub fn run_bounded(command: &mut Command, bounds: Bounds) -> Result<Captured, Failure> {
     let program = command.get_program().to_string_lossy().into_owned();
     let started = Instant::now();
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| Failure::Spawn {
-            program: program.clone(),
-            error,
-        })?;
+        .stderr(Stdio::piped());
+    // The child leads a process group of its own, so the expiry below can name
+    // the whole tree it started rather than the one pid `Child` knows about.
+    // `process_group` is `std`'s own `setpgid` in the child, between fork and
+    // exec — no `pre_exec`, nothing unsafe here.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|error| Failure::Spawn {
+        program: program.clone(),
+        error,
+    })?;
 
     // Both pipes are taken before anything waits: a reader that starts after
     // the child has filled its buffer starts too late.
@@ -180,25 +228,28 @@ pub fn run_bounded(command: &mut Command, bounds: Bounds) -> Result<Captured, Fa
     });
 
     let deadline = started + bounds.deadline;
-    let killed = |program: &str, child: &mut std::process::Child| {
-        let _ = child.kill();
-        let _ = child.wait();
-        Failure::Deadline {
-            program: program.to_string(),
-            deadline: bounds.deadline,
-        }
-    };
-
     // EOF on both pipes is the cheap signal that the child is finishing; the
     // reap below is what confirms it. Waiting on the readers first means the
     // common case costs no polling at all.
     let stdout = match stdout_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(drained) => drained,
-        Err(_) => return Err(killed(&program, &mut child)),
+        Err(_) => {
+            kill_and_reap(&mut child, &stdout_rx, &stderr_rx);
+            return Err(Failure::Deadline {
+                program,
+                deadline: bounds.deadline,
+            });
+        }
     };
     let stderr = match stderr_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(drained) => drained,
-        Err(_) => return Err(killed(&program, &mut child)),
+        Err(_) => {
+            kill_and_reap(&mut child, &stdout_rx, &stderr_rx);
+            return Err(Failure::Deadline {
+                program,
+                deadline: bounds.deadline,
+            });
+        }
     };
 
     // A child can close its pipes and then hang — a hook that daemonised, a
@@ -207,11 +258,18 @@ pub fn run_bounded(command: &mut Command, bounds: Bounds) -> Result<Captured, Fa
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => return Err(killed(&program, &mut child)),
+            Ok(None) if Instant::now() >= deadline => {
+                kill_and_reap(&mut child, &stdout_rx, &stderr_rx);
+                return Err(Failure::Deadline {
+                    program,
+                    deadline: bounds.deadline,
+                });
+            }
             Ok(None) => thread::sleep(Duration::from_millis(1)),
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                // The same clean-up: a child we can no longer wait on is a child
+                // still running, and its descendants are still holding the pipes.
+                kill_and_reap(&mut child, &stdout_rx, &stderr_rx);
                 return Err(Failure::Wait { program, error });
             }
         }
@@ -225,6 +283,68 @@ pub fn run_bounded(command: &mut Command, bounds: Bounds) -> Result<Captured, Fa
         stderr_truncated: stderr.truncated,
         elapsed: started.elapsed(),
     })
+}
+
+/// End the child and everything it started, then let the drain threads come
+/// home.
+///
+/// The order is the whole point. The kill goes out **before** the reap, because
+/// an unreaped child keeps its process group alive even when it has already
+/// exited — which is exactly the daemonising-hook shape, the parent gone and
+/// the descendants still holding the pipes. Reaping first would dissolve the
+/// group and leave nothing to signal.
+///
+/// The wait on the readers afterwards is bounded by [`DRAIN_HANDBACK`] and is
+/// not load-bearing: the pipes reach EOF once the last holder is dead, and the
+/// only reason to wait at all is so this function does not return two threads
+/// and two descriptors to nobody. A descendant that escaped the group can still
+/// outlast the window, and then the runner does what it always did — returns on
+/// time and leaves the readers to end when the pipe does.
+fn kill_and_reap(
+    child: &mut std::process::Child,
+    stdout_rx: &mpsc::Receiver<Drained>,
+    stderr_rx: &mpsc::Receiver<Drained>,
+) {
+    kill_descendants(child);
+    let _ = child.wait();
+    // One budget across both, not one each: the bound the caller was promised is
+    // a wall clock, and two waits in series would spend twice what it says.
+    let handback = Instant::now() + DRAIN_HANDBACK;
+    let _ = stdout_rx.recv_timeout(handback.saturating_duration_since(Instant::now()));
+    let _ = stderr_rx.recv_timeout(handback.saturating_duration_since(Instant::now()));
+}
+
+/// `SIGKILL` to the child's process group — the child and every descendant that
+/// stayed in it.
+///
+/// The child was spawned with `process_group(0)`, so it leads the group and its
+/// pid is the group id; a negated pid names the group to `kill(2)`. If the
+/// group cannot be signalled at all the direct child is killed the old way,
+/// because "the group call failed" must never come out as "nothing was killed".
+#[cfg(unix)]
+fn kill_descendants(child: &mut std::process::Child) {
+    let Ok(leader) = i32::try_from(child.id()) else {
+        let _ = child.kill();
+        return;
+    };
+    // SAFETY: `kill` names a process group led by a child we started and
+    // delivers a signal to it; it reads and writes none of our memory.
+    let signalled = unsafe { libc::kill(-leader, libc::SIGKILL) } == 0;
+    if !signalled {
+        let _ = child.kill();
+    }
+}
+
+/// Elsewhere the deadline reaches the direct child only.
+///
+/// Windows would need a Job Object — a different lifetime model, with its own
+/// handle to own and inherit — and this runner does not have one. Naming the
+/// gap here rather than leaving `process_group` silently absent: on these
+/// targets a descendant that inherited the pipes survives the deadline, exactly
+/// as it did everywhere before.
+#[cfg(not(unix))]
+fn kill_descendants(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 struct Drained {

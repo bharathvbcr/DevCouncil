@@ -38,6 +38,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         "devmap-extract",
         &[
             "a_cache_verdict_answers_for_the_root_it_was_asked",
+            "a_deadline_reaches_the_children_the_child_started",
             "a_subprocess_is_bounded_in_time_and_bytes",
             "an_unreadable_subtree_is_a_hole_not_a_dead_build",
             "discovery_stays_inside_the_root",
