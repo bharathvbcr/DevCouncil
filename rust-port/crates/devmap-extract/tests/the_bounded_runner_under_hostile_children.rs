@@ -52,8 +52,11 @@ fn a_deadline_of_zero_gives_up_immediately() {
         matches!(failure, Failure::Deadline { .. }),
         "a bound that expired is a deadline: {failure}"
     );
+    // The child sleeps 30 s. Anything well short of that proves the bound was
+    // the deadline and not the child; a tighter threshold would only be a claim
+    // about how loaded the machine is.
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(10),
         "a zero deadline must not wait on the child: {:?}",
         started.elapsed()
     );
@@ -93,8 +96,11 @@ fn a_grandchild_holding_the_pipes_does_not_outlive_the_deadline() {
         bounds(Duration::from_secs(1), 1 << 20),
     );
     let elapsed = started.elapsed();
+    // The grandchild holds the pipes for 30 s; the deadline is 1 s. Anything
+    // well short of 30 s proves the runner did not wait on a process it never
+    // started, without the threshold becoming a load measurement.
     assert!(
-        elapsed < Duration::from_secs(4),
+        elapsed < Duration::from_secs(15),
         "the runner waited on a process it never started: {elapsed:?}"
     );
     match outcome {
@@ -145,28 +151,29 @@ fn a_program_path_with_a_nul_is_a_spawn_failure() {
 /// Both pipes flooded at once. Draining them one after the other deadlocks the
 /// moment either buffer fills, which is the reason the runner takes both before
 /// it waits.
+///
+/// The property is termination, not speed, and the deadline is deliberately far
+/// past what the work needs: reaching it is the *failure*, so a threshold tight
+/// enough to be a timing assertion would fail on a loaded machine and say
+/// "deadlock" when it meant "busy". An earlier draft asserted 16 MB inside 20 s
+/// and did exactly that under `cargo test --workspace`.
 #[test]
 fn both_pipes_flooded_at_once_still_terminate() {
-    let flood = 8 << 20;
+    let flood = 2 << 20;
+    let cap = 256 << 10;
     let (dir, child) = script(&format!(
         "head -c {flood} /dev/zero | tr '\\0' a &\n\
          head -c {flood} /dev/zero | tr '\\0' b >&2\n\
          wait"
     ));
-    let started = Instant::now();
     let captured = run_bounded(
         &mut Command::new(&child),
-        bounds(Duration::from_secs(20), 1 << 20),
+        bounds(Duration::from_secs(120), cap),
     )
-    .expect("neither pipe may block the other");
+    .expect("neither pipe may block the other, and the deadline is not the exit");
     assert!(captured.stdout_truncated && captured.stderr_truncated);
-    assert_eq!(captured.stdout.len(), 1 << 20);
-    assert_eq!(captured.stderr.len(), 1 << 20);
-    assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "the flood cost the deadline rather than its bytes: {:?}",
-        started.elapsed()
-    );
+    assert_eq!(captured.stdout.len(), cap);
+    assert_eq!(captured.stderr.len(), cap);
     let _ = std::fs::remove_dir_all(dir);
 }
 
