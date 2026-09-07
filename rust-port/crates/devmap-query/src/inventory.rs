@@ -27,11 +27,11 @@
 //!   - `git log` runs once, with a deadline, a commit cap and an output cap.
 
 use devmap_analyze::graph_intel::FileChurn;
+use devmap_extract::subprocess::{run_bounded, Bounds, Failure};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::ffi::OsStr;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Largest manifest this reader will pull into memory.
 ///
@@ -533,92 +533,55 @@ pub fn scan(root: &Path) -> RepoInventory {
 /// `git`, or a `git` that stalls produces `computed: false` with the reason
 /// attached — never an empty map presented as a computed answer.
 pub fn churn(root: &Path) -> FileChurn {
-    let mut child = match Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "log",
-            &format!("--since={CHURN_SINCE}"),
-            &format!("--max-count={CHURN_COMMIT_CAP}"),
-            "--name-only",
-            "--no-renames",
-            "--pretty=format:",
-            // Paths NUL-terminated and unquoted, so a non-ASCII path arrives as
-            // the bytes it is rather than as a C-escaped rendering that would
-            // never match an extraction's `file_path`.
-            "-z",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => return FileChurn::unavailable(format!("could not run git log: {error}")),
-    };
+    churn_with_program(OsStr::new("git"), root)
+}
 
-    // The pipe is drained on a helper thread for the reason `devmap-store`'s
-    // `run_git_head_with_deadline` records: waiting for exit before reading
-    // deadlocks the moment the pipe buffer fills, and this command's output is
-    // megabytes rather than a hash.
-    let Some(mut pipe) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return FileChurn::unavailable("git log produced no readable stdout".to_string());
+/// [`churn`] with the program named, so a test can stand a script in for it.
+#[doc(hidden)]
+pub fn churn_with_program(program: &OsStr, root: &Path) -> FileChurn {
+    let mut command = devmap_extract::subprocess::git_with_program(program, root);
+    command.args([
+        "log",
+        &format!("--since={CHURN_SINCE}"),
+        &format!("--max-count={CHURN_COMMIT_CAP}"),
+        "--name-only",
+        "--no-renames",
+        "--pretty=format:",
+        // Paths NUL-terminated and unquoted, so a non-ASCII path arrives as
+        // the bytes it is rather than as a C-escaped rendering that would
+        // never match an extraction's `file_path`.
+        "-z",
+    ]);
+    let bounds = Bounds {
+        deadline: CHURN_DEADLINE,
+        stdout_cap: CHURN_OUTPUT_CAP,
+        stderr_cap: 4096,
     };
-    let (sender, receiver) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
-    std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 64 * 1024];
-        let mut capped = false;
-        loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(read) => {
-                    let room = CHURN_OUTPUT_CAP.saturating_sub(buffer.len());
-                    if read > room {
-                        buffer.extend_from_slice(&chunk[..room]);
-                        capped = true;
-                        break;
-                    }
-                    buffer.extend_from_slice(&chunk[..read]);
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = sender.send((buffer, capped));
-    });
-
-    let deadline = Instant::now() + CHURN_DEADLINE;
-    let payload = match receiver.recv_timeout(CHURN_DEADLINE) {
-        Ok(payload) => payload,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
+    let captured = match run_bounded(&mut command, bounds) {
+        Ok(captured) => captured,
+        Err(Failure::Deadline { .. }) => {
             return FileChurn::unavailable(format!(
                 "git log exceeded {CHURN_DEADLINE:?} and was killed"
-            ));
+            ))
         }
+        Err(failure) => return FileChurn::unavailable(format!("could not run git log: {failure}")),
     };
-    // The reader saw EOF, so the child is finishing. Reap it, but never wait
-    // past the same deadline for it to do so.
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
+    if !captured.status.success() {
+        // git said why — "not a git repository", "does not have any commits
+        // yet" — and that is the reason, verbatim, rather than a guess at it.
+        let said = captured.stderr_trimmed();
+        return FileChurn::unavailable(format!(
+            "git log exited {}: {}",
+            captured.status.code().unwrap_or(-1),
+            if said.is_empty() {
+                "no commits, or not a git repository"
+            } else {
+                said.as_str()
             }
-            Ok(None) => std::thread::yield_now(),
-            Err(_) => break,
-        }
+        ));
     }
 
-    let (bytes, capped) = payload;
-    let text = String::from_utf8_lossy(&bytes);
+    let text = captured.stdout_lossy();
     let mut commits_by_path: BTreeMap<String, u32> = BTreeMap::new();
     for entry in text.split('\0') {
         let path = entry.trim().replace('\\', "/");
@@ -628,20 +591,17 @@ pub fn churn(root: &Path) -> FileChurn {
         *commits_by_path.entry(path).or_insert(0) += 1;
     }
     if commits_by_path.is_empty() {
-        // A repository with no commits in the window, no commits at all, or no
-        // git. Which one it is cannot be told apart from here without a second
-        // subprocess, so the reason says exactly that rather than guessing.
+        // A repository whose commits in the window touched no file, or none
+        // in the window at all: git answered, and the answer was empty.
         return FileChurn::unavailable(
-            "git log named no files: no commits in the churn window, or not a \
-             git repository"
-                .to_string(),
+            "git log named no files: no commits in the churn window".to_string(),
         );
     }
     FileChurn {
         commits_by_path,
         computed: true,
         unavailable_reason: String::new(),
-        truncated: capped,
+        truncated: captured.stdout_truncated,
     }
 }
 
