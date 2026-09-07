@@ -583,14 +583,129 @@ def _annotate_graph_degraded(root: Path, graph: CodeGraph) -> CodeGraph:
 
 # --- Opt-in PDG layer (CFG / reaching-def / CDG / taint) ---
 
+#: Where the opt-in PDG layer lives. Its own file, beside the kernel's.
+#:
+#: The layer used to be merged into the `CodeGraph` and written back with
+#: :func:`write_code_graph`, which rewrites `code_graph.json` — the artifact the
+#: kernel is the only writer of. That write-back was also the last production
+#: caller of the Python store's persist path, and it survived every `dev map`
+#: run only until the next one, because the kernel rewrites the file from
+#: scratch. Nothing outside the PDG commands ever read it back: `rg -uu pdg`
+#: over the tree finds `graph.meta["pdg"]` read by `load_pdg_layer` and
+#: `indexing/graph/query.py`, the per-file shards read by that same module, the
+#: two `stats` reads in the commands that had just written them, and nothing in
+#: `rust-port/` at all.
+PDG_SIDECAR_REL = Path(".devcouncil") / "graph" / "pdg.json"
+
+
+def pdg_sidecar_path(root: Path) -> Path:
+    return root / PDG_SIDECAR_REL
+
+
+def python_paths_for_pdg(root: Path) -> List[str]:
+    """Python files to analyse, from the kernel's own file inventory.
+
+    `repo_map.json` is what the same `dev map` run writes beside
+    `code_graph.json`, and it lists every file the kernel indexed with its
+    language. Taking the list from here rather than from `graph.nodes` means the
+    PDG layer needs no graph at all — it is a per-file analysis, and it was
+    parsing a 34 MB graph to learn which files end in `.py`.
+
+    Returns an empty list when there is no map, which the callers report as
+    "run `dev map` first" rather than as "this repository has no Python".
+    """
+    try:
+        data = read_json(root / ".devcouncil" / "repo_map.json")
+    except (OSError, ValueError):
+        return []
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, list):
+        return []
+    paths: Set[str] = set()
+    for entry in files:
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("path") or "").replace("\\", "/")
+        if path.endswith(".py"):
+            paths.add(path)
+    return sorted(paths)
+
+
+def write_pdg_layer(root: Path, layer) -> Path:
+    """Publish the PDG layer to its own artifact, atomically.
+
+    Complete rather than capped: `PDGLayer.to_meta` trims `taint_findings` to
+    500 because it was going into `graph.meta` beside everything else, and a
+    reader of `dev map explain` was given that truncated list with nothing
+    saying it was one. The per-function findings under `files` are the whole
+    set, and :func:`read_pdg_layer` rebuilds the finding list from them.
+    """
+    payload = {
+        "version": int(getattr(layer, "version", 1)),
+        "stats": (layer.to_meta() or {}).get("stats") or {},
+        "files": {
+            path: file_pdg.to_dict() for path, file_pdg in sorted(layer.files.items())
+        },
+    }
+    path = pdg_sidecar_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n",
+    )
+    return path
+
+
+def read_pdg_layer_file(root: Path):
+    """The PDG sidecar as a ``PDGLayer``, or ``None`` when it has not been built.
+
+    ``None`` means "no PDG layer on disk" — the opt-in analysis has not run —
+    which the query surfaces report as such rather than as "this code has no
+    control flow".
+    """
+    from devcouncil.indexing.graph.pdg.schema import PDGLayer, PDG_VERSION, FilePDG
+
+    path = pdg_sidecar_path(root)
+    if not path.is_file():
+        return None
+    try:
+        raw = read_json(path)
+    except (OSError, ValueError):
+        logger.debug("PDG sidecar unreadable", exc_info=True)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    layer = PDGLayer(version=int(raw.get("version") or PDG_VERSION))
+    files = raw.get("files")
+    if isinstance(files, dict):
+        for path_key, payload in files.items():
+            if not isinstance(payload, dict):
+                continue
+            try:
+                file_pdg = FilePDG.from_dict(payload)
+            except (KeyError, TypeError, ValueError):
+                logger.debug("PDG sidecar entry unreadable: %s", path_key, exc_info=True)
+                continue
+            layer.files[str(path_key)] = file_pdg
+            for function in file_pdg.functions:
+                layer.taint_findings.extend(function.taint)
+    return layer
+
 
 def build_pdg_for_paths(
     root: Path,
-    graph: CodeGraph,
+    graph: Optional[CodeGraph] = None,
     *,
     paths: Optional[Iterable[str]] = None,
 ):
-    """Analyze Python files and return a PDG layer."""
+    """Analyze Python files and return a PDG layer.
+
+    ``graph`` is accepted for callers that already hold one and is used only to
+    enumerate Python files; ``None`` takes that list from the kernel's own
+    inventory instead (:func:`python_paths_for_pdg`). The analysis itself has
+    never looked at the graph — it parses each file with ``ast``.
+    """
     from devcouncil.indexing.graph.pdg.cdg import build_cdg
     from devcouncil.indexing.graph.pdg.cfg import build_cfg_for_function
     from devcouncil.indexing.graph.pdg.reaching_def import compute_reaching_defs
@@ -599,7 +714,11 @@ def build_pdg_for_paths(
 
     root = root.expanduser().resolve()
     if paths is None:
-        paths = sorted({n.path for n in graph.nodes if n.path.endswith(".py")})
+        paths = (
+            sorted({n.path for n in graph.nodes if n.path.endswith(".py")})
+            if graph is not None
+            else python_paths_for_pdg(root)
+        )
 
     def _python_functions(tree: ast.AST) -> List[tuple[str, ast.AST]]:
         out: List[tuple[str, ast.AST]] = []

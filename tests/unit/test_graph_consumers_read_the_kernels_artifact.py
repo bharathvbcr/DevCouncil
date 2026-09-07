@@ -166,3 +166,48 @@ def test_symbol_reach_gate_reads_the_artifact(kernel_corpus, no_python_store):
         "pkg/main.py calls util.run; the gate must see it without the store"
     )
     assert symbol_has_non_test_inbound(kernel_corpus, "pkg/util.py", "unused") is False
+
+
+def test_pdg_layer_reads_the_artifact_and_leaves_the_kernels_alone(
+    kernel_corpus, no_python_store
+):
+    """The PDG layer is Python analysis; it must not rewrite the kernel's file.
+
+    `dev map pdg build` merged its results into the `CodeGraph` and called
+    `write_code_graph`, which rewrites `code_graph.json` — the artifact the
+    kernel is the only writer of. The layer now lands in its own sidecar.
+    """
+    before = graph_build.graph_path(kernel_corpus).read_bytes()
+    result = runner.invoke(
+        graph_app,
+        ["pdg", "build", "--project-root", str(kernel_corpus), "--json"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert graph_build.graph_path(kernel_corpus).read_bytes() == before, (
+        "the PDG layer rewrote the kernel's code_graph.json"
+    )
+    sidecar = kernel_corpus / ".devcouncil" / "graph" / "pdg.json"
+    assert sidecar.is_file(), "the PDG layer must write its own artifact"
+
+
+def test_pdg_queries_read_the_sidecar(kernel_corpus, no_python_store):
+    from devcouncil.indexing.graph.query import (
+        explain_pdg_taint,
+        query_pdg_controls,
+        query_pdg_flows,
+    )
+
+    result = runner.invoke(
+        graph_app, ["pdg", "build", "--project-root", str(kernel_corpus), "--json"]
+    )
+    assert result.exit_code == 0, result.output
+
+    taint = explain_pdg_taint(kernel_corpus)
+    assert taint["ok"] is True, taint
+    controls = query_pdg_controls(kernel_corpus, "run")
+    assert controls["ok"] is True, controls
+    assert controls["functions"], controls
+    flows = query_pdg_flows(kernel_corpus, "run")
+    assert flows["ok"] is True, flows

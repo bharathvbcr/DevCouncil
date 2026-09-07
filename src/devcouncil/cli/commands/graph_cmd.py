@@ -2432,39 +2432,40 @@ def graph_pdg_build(
     project_root: Path = typer.Option(Path("."), "--project-root"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Build or refresh the PDG layer for Python files."""
+    """Build or refresh the PDG layer for Python files.
+
+    The layer lands in `.devcouncil/graph/pdg.json`. It used to be merged into
+    the `CodeGraph` and written back with `write_code_graph`, which rewrites
+    `code_graph.json` — the artifact the kernel is the only writer of — and
+    persists the whole graph into the Python store on the way. Nothing outside
+    these PDG commands ever read it back, and the next `dev map` run overwrote
+    it anyway.
+    """
     from devcouncil.indexing.graph.build import (
-        CompatibilityGraphTooLarge,
         build_pdg_for_paths,
-        merge_pdg_into_graph,
-        write_code_graph,
+        python_paths_for_pdg,
+        write_pdg_layer,
     )
 
     root = _root(project_root)
-    graph = _require_graph(root)
-    layer = build_pdg_for_paths(root, graph, paths=paths or None)
-    shards = merge_pdg_into_graph(graph, layer)
-    merged: dict = {}
-    try:
-        from devcouncil.codeintel import get_codeintel_service
-
-        merged = dict(get_codeintel_service(root).store.analysis_shards())
-    except Exception:
-        pass
-    for path, payload in shards.items():
-        merged.setdefault(path, {}).update(payload)
-    export_warning = ""
-    try:
-        write_code_graph(root, graph, analysis_shards=merged)
-    except CompatibilityGraphTooLarge as exc:
-        # SQLite committed the PDG shards and a stub/pointer JSON is on disk;
-        # only the compatibility export is degraded — not the PDG build.
-        export_warning = str(exc)
-    stats = (graph.meta.get("pdg") or {}).get("stats") or {}
-    payload = {"ok": True, "stats": stats, "files": sorted(layer.files.keys())}
-    if export_warning:
-        payload["compatibility_export"] = "degraded"
-        payload["compatibility_export_reason"] = export_warning
+    wanted = list(paths or [])
+    if not wanted:
+        wanted = python_paths_for_pdg(root)
+        if not wanted:
+            status.print(
+                "[red]No file inventory at .devcouncil/repo_map.json; "
+                "run `dev map` first.[/red]"
+            )
+            raise typer.Exit(code=1)
+    layer = build_pdg_for_paths(root, paths=wanted)
+    out = write_pdg_layer(root, layer)
+    stats = (layer.to_meta() or {}).get("stats") or {}
+    payload = {
+        "ok": True,
+        "stats": stats,
+        "files": sorted(layer.files.keys()),
+        "artifact": str(out.relative_to(root)) if out.is_relative_to(root) else str(out),
+    }
     if json_output:
         typer.echo(json.dumps(payload, indent=2))
         return
@@ -2472,8 +2473,7 @@ def graph_pdg_build(
         f"PDG: {stats.get('function_count', 0)} functions, "
         f"{stats.get('taint_count', 0)} taint findings across {stats.get('file_count', 0)} files"
     )
-    if export_warning:
-        console.print(f"[yellow]compatibility export degraded: {export_warning}[/yellow]")
+    console.print(f"Wrote {payload['artifact']}")
 
 
 @app.command("explain")
