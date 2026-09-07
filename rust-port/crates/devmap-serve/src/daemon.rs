@@ -1294,9 +1294,10 @@ impl Daemon {
         #[cfg(windows)]
         let mut ipc_task = AbortTaskOnDrop({
             let store = Arc::clone(&self.store);
+            let state = Arc::clone(&state);
             let name = self.ipc_path.to_string_lossy().into_owned();
             tokio::spawn(async move {
-                crate::protocol::run_named_pipe(store, &name, Arc::clone(&state)).await
+                crate::protocol::run_named_pipe(store, &name, state).await
             })
         });
 
@@ -1753,13 +1754,17 @@ fn endpoint_artifacts(ipc_path: &std::path::Path) -> Vec<std::path::PathBuf> {
             .unwrap_or_else(|_| parent.to_path_buf());
         Some(parent.join(name))
     };
-    [
-        normalise(ipc_path),
-        normalise(&crate::protocol::ipc_lock_path(ipc_path)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+    let mut out = Vec::new();
+    if let Some(path) = normalise(ipc_path) {
+        out.push(path);
+    }
+    // Advisory lock files are a Unix-socket companion; Windows named pipes do
+    // not create a sibling `.lock` beside the endpoint path.
+    #[cfg(unix)]
+    if let Some(path) = normalise(&crate::protocol::ipc_lock_path(ipc_path)) {
+        out.push(path);
+    }
+    out
 }
 
 /// Whether a daemon that dropped edits should try the sweep that repairs it.
