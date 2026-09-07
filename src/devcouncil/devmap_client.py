@@ -346,6 +346,33 @@ def walk_incomplete_reason(response: Any) -> Optional[str]:
     return text or None
 
 
+#: Edge kinds that represent one symbol invoking another. The devmap store also
+#: emits structural edges (`Contains` for file→symbol, `MemberOf` for
+#: symbol→type, `Imports` for module→module); including those in a caller/callee
+#: list makes a symbol look like it calls itself and inflates blast radius with
+#: edges nobody can act on.
+CALL_EDGE_KINDS = frozenset({"Calls"})
+
+
+def edge_nodes(items: Any, symbol_key: str, file_key: str) -> List[str]:
+    """Call-graph node names from one direction's raw edge list.
+
+    Beside :func:`resolution_unavailable_reason` and
+    :func:`walk_incomplete_reason` for the same reason they are here: it decides
+    which edge kinds count as calls at all, and two copies of that filter would
+    drift silently. `dev map query`'s batched and single-target paths and the
+    task prompt's impact block all read one direction's edges the same way.
+    """
+    edges: List[str] = []
+    for edge in items or []:
+        if str(edge.get("edge_kind") or "") not in CALL_EDGE_KINDS:
+            continue
+        node = str(edge.get(symbol_key) or edge.get(file_key) or "")
+        if node:
+            edges.append(node)
+    return edges
+
+
 def try_connect(
     root_dir: Optional[Union[str, pathlib.Path]] = None,
     *,

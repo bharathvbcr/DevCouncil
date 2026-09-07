@@ -107,11 +107,13 @@ def _index_freshness_fields(root: Path) -> dict[str, object]:
 
 
 
-#: Edge kinds that represent one symbol invoking another. The devmap store also
-#: emits structural edges (`Contains` for file→symbol, `MemberOf` for
-#: symbol→type); including those in a caller/callee list makes a symbol look like
-#: it calls itself and inflates blast radius with edges nobody can act on.
-_CALL_EDGE_KINDS = frozenset({"Calls"})
+#: Which edge kinds count as calls, and how to read one direction's edge list,
+#: moved to :mod:`devcouncil.devmap_client` — the one seam every kernel consumer
+#: already goes through — when the task prompt's impact block became a second
+#: reader of the same raw edges. Re-bound under the private name this module's
+#: own call sites already use. `CALL_EDGE_KINDS` itself had no reader outside
+#: `edge_nodes` (`rg -uu` over `src/` and `tests/`), so it did not come along.
+from devcouncil.devmap_client import edge_nodes as _edge_nodes  # noqa: E402
 
 
 def _call_edges(
@@ -167,23 +169,6 @@ def _call_edges(
         return None, f"{method} resolution unavailable: {reason}"
 
     return _edge_nodes(resp.items, symbol_key, file_key), None
-
-
-def _edge_nodes(items, symbol_key: str, file_key: str) -> list:
-    """Call-graph node names from one direction's raw edge list.
-
-    Split out of :func:`_call_edges` so the batched and single-target paths
-    share it verbatim. Two copies of this filter would drift, and the drift
-    would be silent: it decides which edge kinds count as calls at all.
-    """
-    edges = []
-    for edge in items:
-        if str(edge.get("edge_kind") or "") not in _CALL_EDGE_KINDS:
-            continue
-        node = str(edge.get(symbol_key) or edge.get(file_key) or "")
-        if node:
-            edges.append(node)
-    return edges
 
 
 def _sends_min_rung(call, what: str, min_rung: Optional[str]) -> bool:
