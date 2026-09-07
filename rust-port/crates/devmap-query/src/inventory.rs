@@ -401,9 +401,24 @@ fn declares_test_target(document: &str) -> bool {
         if line.starts_with([' ', '\t']) {
             return false;
         }
-        let Some((head, _)) = line.split_once(':') else {
+        // A comment that *mentions* a target does not declare one, and it is
+        // the shape most likely to be there: `# test: dropped, use pytest`
+        // starts in column 0 and carries a colon, which was the whole of the
+        // rule. `make test` published from that line is an instruction to an
+        // agent to run a target the repository does not have.
+        if line.starts_with('#') {
+            return false;
+        }
+        let Some((head, rest)) = line.split_once(':') else {
             return false;
         };
+        // `test := pytest -q`, and GNU's `test ::= pytest`, are variable
+        // assignments; the name to the left of the colon is not a target. Only
+        // an `=` after the colon run disqualifies — `test::` is a double-colon
+        // *rule* and does declare one.
+        if rest.trim_start_matches(':').starts_with('=') {
+            return false;
+        }
         head.split_whitespace().any(|word| word == "test")
     })
 }
@@ -765,6 +780,41 @@ mod tests {
         // A recipe line mentioning `test:` is not a target.
         assert!(!declares_test_target("all:\n\techo test: nope\n"));
         assert!(!declares_test_target("lint:\n\truff check .\n"));
+    }
+
+    /// A line that only *mentions* a `test` target does not declare one, and
+    /// `test_commands` is an artifact of what the repository declares.
+    ///
+    /// Both of these sit in column 0 and both carry a colon, which was the
+    /// whole of the rule. A repository whose Makefile says `# test: removed,
+    /// use pytest` was published as declaring `make test`, under
+    /// `test_commands_computed: true` — an instruction to an agent to run a
+    /// target that does not exist.
+    #[test]
+    fn a_mention_of_test_is_not_a_declaration_of_it() {
+        assert!(
+            !declares_test_target("# test: dropped in 2024, use pytest\nall:\n\techo hi\n"),
+            "a comment is not a target"
+        );
+        assert!(
+            !declares_test_target("  # test: indented comment\nall:\n"),
+            "nor is an indented one"
+        );
+        assert!(
+            !declares_test_target("test := pytest -q\nall:\n\t$(test)\n"),
+            "`:=` is an assignment; the name to its left is a variable"
+        );
+        assert!(
+            !declares_test_target("test ::= pytest\n"),
+            "and so is GNU's `::=`"
+        );
+        // Still targets, and the reason the rule cannot simply demand a bare
+        // `name:` — `::` is a double-colon rule and `test:` may carry
+        // prerequisites.
+        assert!(declares_test_target("test:: \n\tpytest\n"));
+        assert!(declares_test_target("test: build lint\n\tpytest\n"));
+        // A recipe that is a comment is still a recipe, not a target.
+        assert!(!declares_test_target("all:\n\t# test: nope\n"));
     }
 
     #[test]

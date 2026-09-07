@@ -167,3 +167,50 @@ fn an_oversize_manifest_stays_oversize_and_a_readable_one_is_named_nowhere() {
     assert_eq!(scanned.test_commands, vec!["npm test".to_string()]);
     let _ = std::fs::remove_dir_all(Path::new(&root));
 }
+
+/// A Makefile that only *mentions* a `test` target does not declare one.
+///
+/// `declares_test_target` asked whether a line starts in column 0 and has the
+/// word `test` before its first colon. A comment starts in column 0 and a
+/// comment about a removed target has both — so a repository whose Makefile
+/// says `# test: dropped, use pytest` was published as declaring `make test`,
+/// under `test_commands_computed: true`. The whole contract of this artifact is
+/// that a value is evidence, and an agent reading it runs the command.
+#[test]
+fn a_makefile_comment_about_test_does_not_declare_make_test() {
+    let root = root("makefile-comment");
+    std::fs::write(
+        root.join("Makefile"),
+        "# test: dropped in 2024, use pytest directly\n\
+         VERBOSE := 1\n\
+         all:\n\t@echo building\n",
+    )
+    .unwrap();
+
+    let scanned = inventory::scan(&root);
+    assert!(scanned.computed);
+    assert!(
+        !scanned.test_commands.iter().any(|c| c == "make test"),
+        "the Makefile declares no `test` target; publishing one tells an agent \
+         to run a command that does not exist: {:?}",
+        scanned.test_commands
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// …and one that really declares it still does.
+#[test]
+fn a_makefile_that_declares_test_still_names_make_test() {
+    let root = root("makefile-real");
+    std::fs::write(
+        root.join("Makefile"),
+        "# the test target lives below\n\
+         all:\n\t@echo building\n\
+         test: all\n\tpytest -q\n",
+    )
+    .unwrap();
+
+    let scanned = inventory::scan(&root);
+    assert_eq!(scanned.test_commands, vec!["make test".to_string()]);
+    let _ = std::fs::remove_dir_all(root);
+}
