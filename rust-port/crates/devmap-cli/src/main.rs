@@ -2690,6 +2690,13 @@ use devmap_query::{MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH};
 /// Refused, never clamped. Clamping is what makes a capped answer
 /// indistinguishable from a complete one, which is the failure this codebase
 /// treats as worse than an error.
+/// The `user_version` the Python engine's `index.sqlite` carries.
+///
+/// The store refuses to open it by name (`devmap-store/src/db.rs`, the schema
+/// check); this is the same number for the `status` arm, which reports rather
+/// than opens.
+const PYTHON_INDEX_SCHEMA: i32 = 2;
+
 /// The path a root-taking subcommand names must be a directory that exists.
 ///
 /// Measured through the release binary: `manifest <missing path>` created
@@ -4297,11 +4304,26 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "edge_count": 0,
                     "is_fresh": false,
                     "db_path": cli.db().display().to_string(),
-                    "degraded_reason": format!(
-                        "store schema is {version}, this binary speaks {}; \
-                         run `devmap build` to migrate it",
-                        devmap_store::CURRENT_SCHEMA_VERSION
-                    ),
+                    // `user_version = 2` is the Python engine's `index.sqlite`, a
+                    // schema this kernel has no migration for. `devmap build`
+                    // against it already refuses by name (the store's own
+                    // message); telling `status` readers to run it is advice
+                    // that cannot work, for a file the other command names.
+                    "degraded_reason": if version == PYTHON_INDEX_SCHEMA {
+                        format!(
+                            "store schema is {version}: this is the Python engine's database \
+                             (`.devcouncil/codeintel/index.sqlite`), not a devmap store, and \
+                             this kernel cannot convert it — point `--db` at `devmap.sqlite` \
+                             (this binary speaks {})",
+                            devmap_store::CURRENT_SCHEMA_VERSION
+                        )
+                    } else {
+                        format!(
+                            "store schema is {version}, this binary speaks {}; \
+                             run `devmap build` to migrate it",
+                            devmap_store::CURRENT_SCHEMA_VERSION
+                        )
+                    },
                     "quarantined_count": 0,
                     "quarantined_paths": Vec::<String>::new(),
                     // Same reason as the no-store case: this binary refused to
