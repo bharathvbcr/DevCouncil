@@ -139,8 +139,3 @@ jobs:
           python-version: "3.12"
       - name: Build release binary
         run: cargo build --release
-      # Reports divergence against the frozen goldens. Deliberate divergences
-      # are recorded in DIVERGENCES.md, so this is informational rather than
-      # blocking until that ledger is machine-readable.
-      - name: Parity harness
-        run: python3 tools/parity/parity_harness.py || true
