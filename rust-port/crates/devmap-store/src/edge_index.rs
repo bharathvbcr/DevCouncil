@@ -303,10 +303,6 @@ impl Adjacency {
     fn ranks(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }
-
-    fn bytes(&self) -> usize {
-        (self.offsets.capacity() + self.ids.capacity()) * std::mem::size_of::<u32>()
-    }
 }
 
 /// The order every reader of a generation's edges sees, as one comparator.
@@ -1119,18 +1115,6 @@ impl GenerationEdges {
             reverse,
             min_confidence,
         }
-    }
-
-    /// Bytes of adjacency this index holds, excluding the interned text.
-    ///
-    /// Reported rather than assumed: the index is retained for the life of a
-    /// generation in a long-lived daemon, so "how much does it cost to keep"
-    /// has to be answerable without a profiler.
-    pub fn adjacency_bytes(&self) -> usize {
-        self.by_source_symbol.bytes()
-            + self.by_target_symbol.bytes()
-            + self.by_source_file.bytes()
-            + self.by_target_file.bytes()
     }
 }
 /// One direction of a [`GenerationEdges`], under one confidence floor.
