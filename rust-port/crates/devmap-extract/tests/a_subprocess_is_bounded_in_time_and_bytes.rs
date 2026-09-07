@@ -152,6 +152,60 @@ fn a_missing_program_names_itself() {
     );
 }
 
+/// Structural: no crate's production code spawns a child on its own. The
+/// three runners this module replaced each began as one reasonable
+/// `Command::new`, and the way a fourth arrives is the same — so a new one
+/// is a failure until it is either routed through `run_bounded` or listed
+/// here with its reason.
+#[test]
+fn every_child_process_in_the_kernel_goes_through_the_runner() {
+    // `CARGO_MANIFEST_DIR` is `<workspace>/crates/devmap-extract`.
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the crate lives under crates/")
+        .to_path_buf();
+    let mut offenders = Vec::new();
+    let mut scanned = 0usize;
+    let mut stack = vec![crates];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read crates tree") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                // Only production sources: tests spawn the binary and git
+                // for their fixtures, legitimately and unbounded.
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name == "tests" || name == "target" || name == "examples" || name == "benches" {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs")
+                || path.file_name().is_some_and(|name| name == "subprocess.rs")
+            {
+                continue;
+            }
+            scanned += 1;
+            let text = std::fs::read_to_string(&path).expect("read source");
+            for (index, line) in text.lines().enumerate() {
+                if line.contains("Command::new(") {
+                    offenders.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        scanned > 50,
+        "the scan must have found the kernel's sources: {scanned} files"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a child process spawned outside `devmap_extract::subprocess` has no deadline and no \
+         output cap; route it through `run_bounded`:\n{}",
+        offenders.join("\n")
+    );
+}
+
 #[test]
 fn the_git_constructor_refuses_prompts_and_optional_locks() {
     let command = devmap_extract::subprocess::git(std::path::Path::new("/tmp"));

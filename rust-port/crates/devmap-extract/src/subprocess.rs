@@ -40,6 +40,17 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Wall clock allowed for `git rev-parse HEAD`, wherever the kernel asks it.
+///
+/// `git` can stall on pathological repositories, network mounts or hook
+/// misconfigurations; unbounded, it hung every drain batch and CLI status
+/// behind it. On expiry the child is killed and the caller gets an error —
+/// every asker already treats an unavailable head as "unavailable", so a
+/// stalled git degrades honestly instead of wedging the daemon. One constant
+/// for the store's sentinel and the artifacts' digest, so the two cannot
+/// disagree about how long a head is worth waiting for.
+pub const GIT_HEAD_DEADLINE: Duration = Duration::from_secs(5);
+
 /// How much of a child the caller is prepared to wait for and to keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bounds {

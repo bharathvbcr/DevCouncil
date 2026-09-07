@@ -178,11 +178,9 @@ pub fn git_head(root: &Path) -> String {
     git_head_with_program(OsStr::new("git"), root)
 }
 
-/// Wall clock allowed for `git rev-parse HEAD`. The same bound the store
-/// applies to its own `HEAD` sentinel, for the same reason: a git that stalls
-/// on a network mount or a misconfigured hook must degrade to "unavailable",
-/// not wedge every artifact write behind it.
-pub const GIT_HEAD_DEADLINE: Duration = Duration::from_secs(5);
+/// Wall clock allowed for `git rev-parse HEAD`: the same constant the store
+/// applies to its own `HEAD` sentinel, re-exported so the two cannot drift.
+pub use devmap_extract::subprocess::GIT_HEAD_DEADLINE;
 
 /// Wall clock allowed for one `git ls-files` pass. Generous: the listing is
 /// the whole tracked tree, and a monorepo's is seconds, not milliseconds.

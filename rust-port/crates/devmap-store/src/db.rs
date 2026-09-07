@@ -6,6 +6,7 @@ use devmap_analyze::clones::CloneCandidate;
 use devmap_analyze::model::*;
 use devmap_analyze::DeadClusterScan;
 use devmap_extract::model::*;
+use devmap_extract::subprocess::GIT_HEAD_DEADLINE;
 #[cfg(feature = "parse")]
 use devmap_resolve::model::*;
 use rusqlite::{params, Connection, OptionalExtension, Result, TransactionBehavior};
@@ -31,71 +32,41 @@ use crate::schema::{
 /// be able to say what quarantined means without copying the number.
 pub const MAX_PENDING_ATTEMPTS: u32 = 5;
 
-/// Hard ceiling for the git subprocess. `git` can stall on pathological
-/// repositories, network mounts or hook misconfigurations; unbounded, it hung
-/// every drain batch and CLI status behind it. On expiry the child is killed
-/// and the caller gets an error — `current_git_head`'s callers already treat
-/// an unavailable head as "unavailable", so a stalled git degrades honestly
-/// instead of wedging the daemon.
-const GIT_HEAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
-
+/// `git rev-parse HEAD` through the kernel's one bounded runner.
+///
+/// This was the first bounded git call in the kernel — drain threads, kill at
+/// [`GIT_HEAD_DEADLINE`] — written here because a hung git (network mount,
+/// wedged hook) stalled every drain batch and CLI status behind it. Two more
+/// runners grew beside it in `devmap-query`, one of them unbounded, and three
+/// runners is how three disciplines drift; `devmap_extract::subprocess` is
+/// the one now and this is a caller of it. What stays here is the contract:
+/// `current_git_head`'s callers treat an unavailable head as "unavailable",
+/// so a stalled git degrades honestly instead of wedging the daemon, and a
+/// head that is not a hex identity is refused rather than stored.
 fn run_git_head_with_deadline(program: &str, root: &Path) -> anyhow::Result<String> {
-    use std::io::Read;
-    use std::process::Stdio;
+    use devmap_extract::subprocess::{git_with_program, run_bounded, Bounds, Failure};
 
-    let mut child = std::process::Command::new(program)
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "HEAD"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| anyhow::anyhow!("cannot spawn {program}: {error}"))?;
-
-    // Drain both pipes on helper threads: reading them only after exit would
-    // deadlock once a pipe buffer filled. Kill on deadline; the readers then
-    // see EOF when the child dies.
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
-    let stdout_reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stdout_pipe.read_to_string(&mut buf);
-        buf
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stderr_pipe.read_to_string(&mut buf);
-        buf
-    });
-
-    let started = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if started.elapsed() >= GIT_HEAD_DEADLINE {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    anyhow::bail!(
-                        "{program} rev-parse HEAD exceeded \
-                         {GIT_HEAD_DEADLINE:?} and was killed"
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(error) => anyhow::bail!("{program} rev-parse HEAD failed: {error}"),
-        }
+    let mut command = git_with_program(std::ffi::OsStr::new(program), root);
+    command.args(["rev-parse", "HEAD"]);
+    let bounds = Bounds {
+        deadline: GIT_HEAD_DEADLINE,
+        stdout_cap: 4096,
+        stderr_cap: 4096,
     };
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
-    if !status.success() {
+    let captured = run_bounded(&mut command, bounds).map_err(|failure| match failure {
+        Failure::Deadline { .. } => anyhow::anyhow!(
+            "{program} rev-parse HEAD exceeded {GIT_HEAD_DEADLINE:?} and was killed"
+        ),
+        other => anyhow::anyhow!("{other}"),
+    })?;
+    if !captured.status.success() {
         anyhow::bail!(
             "git rev-parse HEAD failed for {:?}: {}",
             root,
-            stderr.trim()
+            captured.stderr_trimmed()
         );
     }
-    let head = stdout.trim().to_string();
+    let head = captured.stdout_lossy().trim().to_string();
     if !(7..=64).contains(&head.len()) || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         anyhow::bail!("git returned an invalid HEAD identity for {:?}", root);
     }
