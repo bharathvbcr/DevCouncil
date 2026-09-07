@@ -386,6 +386,91 @@ def write_code_graph(
     return path
 
 
+#: Stamped on a graph whose on-disk form is a size-capped export.
+#:
+#: The Python store used to hide this: `load_code_graph` preferred SQLite, which
+#: held the uncapped graph, so a consumer reading a `compact` or `stub`
+#: `code_graph.json` still got complete lists. Reading the artifact directly
+#: removes that cover, and a capped export must therefore say it is capped
+#: rather than answer in the shape of a complete one — `compact` truncates
+#: `unwired_candidates` at 200 and `dead_code` at 500, and `stub` empties the
+#: nodes and edges entirely.
+GRAPH_INCOMPLETE_META = "graph_export_incomplete_reason"
+
+#: Export tiers whose lists are the whole graph. `None` is the kernel's own
+#: artifact, which is not tiered at all.
+_COMPLETE_EXPORT_TIERS = (None, "slim")
+
+
+def read_code_graph(root: Path) -> Optional[CodeGraph]:
+    """The kernel's ``code_graph.json``, parsed once and validated.
+
+    This is a read of the kernel's own artifact, not a second engine: the same
+    `devmap manifest` run that writes `repo_map.json` writes this file, and the
+    Python side has not built a graph since the kernel became the only writer.
+
+    It replaces :func:`load_code_graph` for every consumer that wants the whole
+    graph. That function reached the graph through the Python `index.sqlite`
+    cache — importing this same JSON into it on first read, then re-materialising
+    every node and edge as pydantic models out of SQLite on every call after.
+
+    Measured on this repository as a tmp corpus (1,637 files, 36 MB artifact),
+    interleaved A/B, n=11, on a contended machine, both routes returning the
+    same 18,316 nodes / 104,951 edges / 192 dead entries and the same node-id
+    set:
+
+    ==========================  ========  ========  ==========
+    route                       p50       min       peak RSS
+    ==========================  ========  ========  ==========
+    load_code_graph (warm)      1193.9ms  1154.3ms  250 MB
+    read_code_graph             322.5ms   310.4ms   409 MB
+    ==========================  ========  ========  ==========
+
+    The first `load_code_graph` on a fresh checkout costs 4787.0 ms and writes a
+    104.2 MB `index.sqlite` — from a read path, under a writer lease.
+
+    The trade is not free and is stated rather than buried: `json.load` builds
+    the whole object tree at once where the store re-materialised it row by row,
+    so peak RSS goes *up* by ~159 MB on this corpus. It buys 3.7x on the warm
+    read and removes the 104 MB write and the second store it lands in.
+
+    Returns ``None`` when there is no artifact, when it is unreadable, or when
+    it is larger than ``indexing.graph_json_max_bytes`` — the same bound
+    :func:`write_code_graph` enforces on the way out, so a file this refuses is
+    one this process would refuse to write.
+
+    A size-capped export is returned *with* :data:`GRAPH_INCOMPLETE_META` set in
+    ``meta``, never silently. See that constant for why.
+    """
+    root = root.expanduser().resolve()
+    path = graph_path(root)
+    if not path.is_file():
+        return None
+    limit = _graph_json_max_bytes(root)
+    try:
+        size = path.stat().st_size
+        if size > limit:
+            logger.warning(
+                "code graph export is %d bytes, over the %d-byte bound; "
+                "not read (raise indexing.graph_json_max_bytes to read it)",
+                size,
+                limit,
+            )
+            return None
+        graph = CodeGraph.model_validate(read_json(path))
+    except Exception:
+        logger.debug("Failed to read code graph export", exc_info=True)
+        return None
+    tier = (graph.meta or {}).get("compatibility_export_tier")
+    if tier not in _COMPLETE_EXPORT_TIERS:
+        graph.meta[GRAPH_INCOMPLETE_META] = (
+            f"code_graph.json is a size-capped {tier!r} export: its node, edge "
+            "and liveness lists are truncated or empty. Re-run `dev map` after "
+            "raising indexing.graph_json_max_bytes for a complete answer."
+        )
+    return _annotate_graph_degraded(root, graph)
+
+
 def load_code_graph(root: Path) -> Optional[CodeGraph]:
     from devcouncil.codeintel import get_codeintel_service
 

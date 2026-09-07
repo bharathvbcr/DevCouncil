@@ -185,32 +185,32 @@ def test_graph_trace_without_a_kernel_refuses_rather_than_answering(tmp_path, mo
 
 
 def test_graph_dead_requires_graph(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: None)
+    _kernel_artifact(monkeypatch, None)
     result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
     assert "No code graph" in result.output
 
 
 def test_graph_check_requires_graph(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: None)
+    _kernel_artifact(monkeypatch, None)
     result = runner.invoke(app, ["map", "check", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
 
 
 def test_graph_process_requires_graph(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: None)
+    _kernel_artifact(monkeypatch, None)
     result = runner.invoke(app, ["map", "process", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
 
 
 def test_graph_impact_requires_graph(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: None)
+    _kernel_artifact(monkeypatch, None)
     result = runner.invoke(app, ["map", "impact", "--diff", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
 
 
 def test_graph_export_requires_graph(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: None)
+    _kernel_artifact(monkeypatch, None)
     result = runner.invoke(app, ["map", "export", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
 
@@ -257,6 +257,25 @@ def _never_load_the_python_graph(root):
         "this command reached the retired Python engine's whole-graph read; "
         "the kernel is the only graph engine"
     )
+
+
+def _kernel_artifact(monkeypatch, graph):
+    """Feed the graph-backed commands the kernel's own artifact.
+
+    These are renderer tests: they assert what ``dev map check`` / ``process`` /
+    ``dead`` / ``export`` *print* for a given graph, and the double is how the
+    graph arrives. The seam moved. ``_require_graph`` used to call
+    ``load_code_graph`` — the retired engine's read through the Python
+    ``index.sqlite`` cache — and now calls ``read_code_graph``, a bounded
+    ``json.load`` of ``code_graph.json``, the artifact the kernel writes.
+
+    Patching the new seam keeps the assertions; patching ``load_code_graph`` to
+    raise alongside it adds one they did not have, because a command that
+    regresses onto the retired path now fails loudly instead of passing on a
+    warm store.
+    """
+    monkeypatch.setattr(graph_build, "read_code_graph", lambda root: graph)
+    monkeypatch.setattr(graph_build, "load_code_graph", _never_load_the_python_graph)
 
 
 class _DeadEntry:
@@ -307,7 +326,7 @@ def test_graph_dead_human_with_entries(tmp_path, monkeypatch):
         _DeadEntry("a.py", 3, "a.f", "function", "no callers"),
         _DeadEntry("b.py", 5, "b.g", "function", "no callers"),
     ]
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph(dead=entries))
+    _kernel_artifact(monkeypatch, _fake_graph(dead=entries))
     result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "a.f" in result.output
@@ -319,7 +338,7 @@ def test_graph_dead_json_and_confidence_filter(tmp_path, monkeypatch):
         _DeadEntry("a.py", 3, "a.f", "function", "no callers", confidence="extracted"),
         _DeadEntry("b.py", 5, "b.g", "function", "no callers", confidence="ambiguous"),
     ]
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph(dead=entries))
+    _kernel_artifact(monkeypatch, _fake_graph(dead=entries))
     result = runner.invoke(
         app,
         ["map", "dead", "--json", "--confidence", "extracted", "--project-root", str(tmp_path)],
@@ -333,7 +352,7 @@ def test_graph_dead_json_and_confidence_filter(tmp_path, monkeypatch):
 
 def test_graph_dead_empty_with_hidden(tmp_path, monkeypatch):
     entries = [_DeadEntry("b.py", 5, "b.g", "function", "no callers", confidence="ambiguous")]
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph(dead=entries))
+    _kernel_artifact(monkeypatch, _fake_graph(dead=entries))
     # default min-confidence "inferred" hides the ambiguous entry.
     result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
@@ -361,9 +380,7 @@ def test_graph_dead_distinguishes_all_three_cluster_outcomes(tmp_path, monkeypat
         ({"clusters": []}, ["none."], ["not computed", "not recorded"]),
     ]
     for kwargs, expected, forbidden in cases:
-        monkeypatch.setattr(
-            graph_build, "load_code_graph", lambda root, k=kwargs: _fake_graph(**k)
-        )
+        _kernel_artifact(monkeypatch, _fake_graph(**kwargs))
         result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
         assert result.exit_code == 0, result.output
         for text in expected:
@@ -375,10 +392,8 @@ def test_graph_dead_distinguishes_all_three_cluster_outcomes(tmp_path, monkeypat
 
     # A refusal that also carries a list is the kernel contradicting itself; the
     # readout must not silently pick the reassuring half.
-    monkeypatch.setattr(
-        graph_build,
-        "load_code_graph",
-        lambda root: _fake_graph(clusters=[], clusters_incomplete="graph too large"),
+    _kernel_artifact(
+        monkeypatch, _fake_graph(clusters=[], clusters_incomplete="graph too large")
     )
     result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
     assert result.exit_code == 0, result.output
@@ -387,11 +402,7 @@ def test_graph_dead_distinguishes_all_three_cluster_outcomes(tmp_path, monkeypat
 
 def test_graph_dead_json_carries_the_refusal(tmp_path, monkeypatch):
     """And the machine-readable path, which is what agents read."""
-    monkeypatch.setattr(
-        graph_build,
-        "load_code_graph",
-        lambda root: _fake_graph(clusters_incomplete="graph too large"),
-    )
+    _kernel_artifact(monkeypatch, _fake_graph(clusters_incomplete="graph too large"))
     result = runner.invoke(
         app, ["map", "dead", "--json", "--project-root", str(tmp_path)]
     )
@@ -407,7 +418,7 @@ def test_graph_dead_json_carries_the_refusal(tmp_path, monkeypatch):
 
 
 def test_graph_check_human(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     monkeypatch.setattr(
         intel_mod, "graph_check",
         lambda graph, top_n=15: {
@@ -425,7 +436,7 @@ def test_graph_check_human(tmp_path, monkeypatch):
 
 
 def test_graph_check_json_no_cycles(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     monkeypatch.setattr(
         intel_mod, "graph_check",
         lambda graph, top_n=15: {"god_nodes": [], "circular_imports": []},
@@ -439,7 +450,7 @@ def test_graph_check_json_no_cycles(tmp_path, monkeypatch):
 
 
 def test_graph_process_human(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     monkeypatch.setattr(
         intel_mod, "extract_processes",
         lambda graph, entry=None, max_depth=6: [{"name": "flow", "depth": 2, "steps": ["a", "b"]}],
@@ -450,7 +461,7 @@ def test_graph_process_human(tmp_path, monkeypatch):
 
 
 def test_graph_process_empty(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     monkeypatch.setattr(intel_mod, "extract_processes", lambda graph, entry=None, max_depth=6: [])
     result = runner.invoke(app, ["map", "process", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
@@ -461,7 +472,7 @@ def test_graph_process_empty(tmp_path, monkeypatch):
 
 
 def test_graph_impact_requires_paths_or_diff(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     result = runner.invoke(app, ["map", "impact", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
     assert "Provide paths or --diff" in result.output
@@ -592,14 +603,14 @@ def test_graph_export_graphml_kernel_failure_is_red(tmp_path, monkeypatch):
 
 
 def test_graph_export_okf_requires_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     result = runner.invoke(app, ["map", "export", "--format", "okf", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
     assert "requires -o" in result.output
 
 
 def test_graph_export_okf_writes_bundle(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     out_dir = tmp_path / "okf"
     monkeypatch.setattr(
         export_mod, "write_code_graph_okf",
@@ -613,7 +624,7 @@ def test_graph_export_okf_writes_bundle(tmp_path, monkeypatch):
 
 
 def test_graph_export_okf_missing_graph_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
 
     def boom(root, target, graph=None):
         raise FileNotFoundError("no okf source")
@@ -631,7 +642,7 @@ def test_graph_export_okf_links(tmp_path, monkeypatch):
         SimpleNamespace(kind="calls", source="b", target="c"),
         SimpleNamespace(kind="inherits", source="c", target="d"),
     ]
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph(edges=edges))
+    _kernel_artifact(monkeypatch, _fake_graph(edges=edges))
     result = runner.invoke(app, ["map", "export", "--format", "okf-links", "--project-root", str(tmp_path)])
     assert result.exit_code == 0
     assert "a --imports--> b" in result.output
@@ -639,7 +650,7 @@ def test_graph_export_okf_links(tmp_path, monkeypatch):
 
 
 def test_graph_export_unknown_format(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: _fake_graph())
+    _kernel_artifact(monkeypatch, _fake_graph())
     result = runner.invoke(app, ["map", "export", "--format", "bogus", "--project-root", str(tmp_path)])
     assert result.exit_code == 1
     assert "Unknown format" in result.output

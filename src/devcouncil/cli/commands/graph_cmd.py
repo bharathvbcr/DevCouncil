@@ -741,12 +741,28 @@ def _warn_if_stale(
 
 
 def _require_graph(root: Path, *, warn_stale: bool = True):
-    from devcouncil.indexing.graph.build import load_code_graph
+    """The kernel's whole graph, read from the artifact the kernel writes.
 
-    graph = load_code_graph(root)
+    This went through `load_code_graph` — the retired engine's read path, which
+    imports `code_graph.json` into the Python `index.sqlite` cache on first read
+    (a ~94 MB write, under a writer lease, from a command that only reads) and
+    re-materialises every node and edge out of SQLite afterwards. The commands
+    below want the whole graph and the whole graph is already on disk.
+    """
+    from devcouncil.indexing.graph.build import GRAPH_INCOMPLETE_META, read_code_graph
+
+    graph = read_code_graph(root)
     if graph is None:
-        status.print("[red]No code graph; run `dev map` first.[/red]")
+        status.print(
+            "[red]No code graph at .devcouncil/graph/code_graph.json; "
+            "run `dev map` first.[/red]"
+        )
         raise typer.Exit(code=1)
+    # Named, never silent. A capped export answers in the shape of a complete
+    # one, and the store that used to hide the cap is no longer in the path.
+    incomplete = (graph.meta or {}).get(GRAPH_INCOMPLETE_META)
+    if incomplete:
+        status.print(f"[yellow]{incomplete}[/yellow]")
     if warn_stale:
         _warn_if_stale(root)
     return graph
