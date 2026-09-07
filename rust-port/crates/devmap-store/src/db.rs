@@ -12,6 +12,30 @@ use devmap_resolve::model::*;
 use rusqlite::{params, Connection, OptionalExtension, Result, TransactionBehavior};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// A refusal this store raises itself — a future schema, a read-only file, a
+/// NUL in a search query, a Python-era database handed to `--db` — carried in
+/// `rusqlite::Error` so every `Result` in this module is one type.
+///
+/// `InvalidParameterName` carried these until 2026-09-07, and its `Display`
+/// put "Invalid parameter name: " in front of every one of them — text about
+/// a store, rendered as a complaint about a parameter. `ToSqlConversionFailure`
+/// displays its boxed error bare (rusqlite 0.31 `error.rs`), so the reason is
+/// the whole message.
+#[derive(Debug)]
+struct StoreRefusal(String);
+
+impl std::fmt::Display for StoreRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StoreRefusal {}
+
+fn refusal(message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
+}
+
 use crate::coverage::{CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryRefusal};
 use crate::edge_index::ResolutionSource;
 use crate::schema::{
@@ -22,7 +46,7 @@ use crate::schema::{
     MIGRATION_V17_TO_V18_RENAME_EDGES, MIGRATION_V17_TO_V18_RENAME_UNRESOLVED,
     MIGRATION_V18_TO_V19, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES,
     MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9,
-    MIGRATION_V9_TO_V10, VALIDITY_RANGE_TABLES,
+    MIGRATION_V9_TO_V10, PYTHON_INDEX_SCHEMA_VERSION, VALIDITY_RANGE_TABLES,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -369,9 +393,7 @@ fn lock_conn(
     mutex
         .lock()
         .map_err(|_: PoisonError<MutexGuard<'_, Connection>>| {
-            rusqlite::Error::InvalidParameterName(
-                "store mutex poisoned — refusing to continue (fail-closed)".into(),
-            )
+            refusal("store mutex poisoned — refusing to continue (fail-closed)")
         })
 }
 
@@ -693,7 +715,7 @@ impl PathRanks {
     /// well-formed store cannot reach this.
     fn rank_of(&self, id: i64) -> Result<u32> {
         self.rank_by_id.get(&id).copied().ok_or_else(|| {
-            rusqlite::Error::InvalidParameterName(format!(
+            refusal(format!(
                 "generation edge names path id {id}, which is not in `paths`; \
                  the store is inconsistent and answering over the edges that \
                  remain would be a wrong answer rather than a partial one"
@@ -1304,7 +1326,7 @@ fn sqlite_limit(limit: usize) -> i64 {
 /// range is worse than a refusal that names the symbol.
 fn checked_span(path: &str, name: &str, start: i64, end: i64) -> Result<(usize, usize)> {
     let corrupt = || {
-        rusqlite::Error::InvalidParameterName(format!(
+        refusal(format!(
             "stored span for symbol {name:?} in {path} is not a byte range: \
              span_start={start}, span_end={end}"
         ))
@@ -1328,12 +1350,12 @@ fn decode_stored_outcome(
     engine_json: &str,
 ) -> Result<(ParseOutcome, ExtractionEngine)> {
     let parse_outcome = serde_json::from_str(parse_json).map_err(|error| {
-        rusqlite::Error::InvalidParameterName(format!(
+        refusal(format!(
             "stored parse outcome for {path} is invalid: {error}"
         ))
     })?;
     let engine = serde_json::from_str(engine_json).map_err(|error| {
-        rusqlite::Error::InvalidParameterName(format!(
+        refusal(format!(
             "stored extraction engine for {path} is invalid: {error}"
         ))
     })?;
@@ -1377,7 +1399,7 @@ fn stored_is_parse_failure(outcome: &ParseOutcome, engine: &ExtractionEngine) ->
 /// would have been closed in one.
 fn fts_match_query(query: &str) -> Result<String> {
     if let Some(offset) = query.find('\0') {
-        return Err(rusqlite::Error::InvalidParameterName(format!(
+        return Err(refusal(format!(
             "search query contains a NUL byte at offset {offset}; SQLite's \
              full-text parser reads the query as a C string, so no escaping \
              can carry one through"
@@ -1388,7 +1410,7 @@ fn fts_match_query(query: &str) -> Result<String> {
 
 pub fn checked_min_confidence(value: f32) -> Result<f32> {
     if value.is_nan() {
-        return Err(rusqlite::Error::InvalidParameterName(
+        return Err(refusal(
             "min_confidence must be a number; got NaN, which no confidence \
              comparison can evaluate"
                 .to_string(),
@@ -1847,9 +1869,7 @@ impl Store {
             match conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
                 Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
                 Ok(mode) => {
-                    last = Some(rusqlite::Error::InvalidParameterName(format!(
-                        "journal_mode is {mode}, not wal"
-                    )));
+                    last = Some(refusal(format!("journal_mode is {mode}, not wal")));
                 }
                 Err(error) => last = Some(error),
             }
@@ -1864,9 +1884,7 @@ impl Store {
             }
             std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
         }
-        Err(last.unwrap_or_else(|| {
-            rusqlite::Error::InvalidParameterName("could not enable WAL mode".to_string())
-        }))
+        Err(last.unwrap_or_else(|| refusal("could not enable WAL mode".to_string())))
     }
 
     fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -1997,7 +2015,7 @@ impl Store {
             // *relation* exists and carries the columns readers name — which
             // `PRAGMA table_info` answers for a view exactly as for a table.
             if !matches!(object_type.as_deref(), Some("table") | Some("view")) {
-                return Err(rusqlite::Error::InvalidParameterName(format!(
+                return Err(refusal(format!(
                     "required schema object {table:?} is neither a table nor a view"
                 )));
             }
@@ -2008,7 +2026,7 @@ impl Store {
                 .collect::<Result<_>>()?;
             for column in *required_columns {
                 if !columns.contains(*column) {
-                    return Err(rusqlite::Error::InvalidParameterName(format!(
+                    return Err(refusal(format!(
                         "required column {table}.{column} is missing"
                     )));
                 }
@@ -2037,7 +2055,7 @@ impl Store {
         };
         for index in declared_index_names() {
             if !present.contains(&index) {
-                return Err(rusqlite::Error::InvalidParameterName(format!(
+                return Err(refusal(format!(
                     "required index {index} is missing; the store would answer correctly \
                      and scan for every answer — run `devmap build` to rebuild it"
                 )));
@@ -2054,16 +2072,26 @@ impl Store {
     /// disk could not tell which one was refused, and nothing said whether the
     /// fix was to rebuild the kernel or to rebuild the database. Those are
     /// opposite actions and getting them the wrong way round destroys an index.
+    ///
+    /// The first phrase of the "older binary" remedy is what the Python seam
+    /// matches to file the failure under `schema_newer_than_kernel`
+    /// (`devmap_engine._FUTURE_SCHEMA_MARKER`, pinned to this source by a
+    /// parity test); change it there and here together.
     fn unsupported_schema(store: &str, found: i32) -> rusqlite::Error {
         let remedy = if found > CURRENT_SCHEMA_VERSION {
             "this devmap binary is older than the store; rebuild it with \
              `cargo build --release -p devmap-cli` or set DEVMAP_BINARY to a newer build"
+                .to_string()
+        } else if (1..=PYTHON_INDEX_SCHEMA_VERSION).contains(&found) {
+            format!(
+                "this is the Python engine's database (`.devcouncil/codeintel/index.sqlite`, \
+                 schema {PYTHON_INDEX_SCHEMA_VERSION}), not a devmap store, and this kernel \
+                 cannot convert it — point `--db` at `devmap.sqlite`"
+            )
         } else {
-            "run `devmap build` to migrate the store — and check `--db` actually names a \
-             devmap store: `.devcouncil/codeintel/index.sqlite` is the Python engine's \
-             database (schema 2), not this kernel's"
+            "run `devmap build` to migrate the store".to_string()
         };
-        rusqlite::Error::InvalidParameterName(format!(
+        refusal(format!(
             "devmap store {store}: schema version {found} is not supported by this binary \
              (schema {CURRENT_SCHEMA_VERSION}); {remedy}"
         ))
@@ -2534,7 +2562,7 @@ impl Store {
             // neither be migrated nor, with the columns this kernel reads
             // missing, be answered from; say which, rather than letting the
             // first `ALTER TABLE` report a bare SQLite code.
-            return Err(rusqlite::Error::InvalidParameterName(format!(
+            return Err(refusal(format!(
                 "devmap store {store} is read-only and at schema {stamped}, which this kernel \
                  (schema {CURRENT_SCHEMA_VERSION}) would have to migrate before reading; make \
                  it writable and run `devmap build`, or rebuild it elsewhere"
@@ -2658,7 +2686,7 @@ impl Store {
             .as_deref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| ":memory:".to_string());
-        Err(rusqlite::Error::InvalidParameterName(format!(
+        Err(refusal(format!(
             "devmap store {store} is read-only: the file or its directory is not writable by \
              this process, so it can be queried but not rebuilt"
         )))
@@ -3444,14 +3472,14 @@ impl Store {
         self.refuse_if_read_only()?;
         if head_sha.is_empty() || head_sha.len() > 128 || head_sha.chars().any(char::is_whitespace)
         {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "head_sha must be non-empty, whitespace-free, and at most 128 characters".into(),
+            return Err(refusal(
+                "head_sha must be non-empty, whitespace-free, and at most 128 characters",
             ));
         }
         let mut unique_paths = std::collections::BTreeSet::new();
         for extraction in extractions {
             if !unique_paths.insert(extraction.file_path.as_str()) {
-                return Err(rusqlite::Error::InvalidParameterName(format!(
+                return Err(refusal(format!(
                     "duplicate extraction path in generation input: {}",
                     extraction.file_path
                 )));
@@ -3471,9 +3499,8 @@ impl Store {
         // Keep the summary semantically complete even though dead rows also
         // have a normalized table. An authoritative-looking empty list makes
         // latest_analysis() disagree with latest_dead_symbols().
-        let analysis_json = serde_json::to_string(&durable_analysis).map_err(|error| {
-            rusqlite::Error::InvalidParameterName(format!("analysis serialization failed: {error}"))
-        })?;
+        let analysis_json = serde_json::to_string(&durable_analysis)
+            .map_err(|error| refusal(format!("analysis serialization failed: {error}")))?;
 
         tx.execute(
             "INSERT INTO generations (created_at, head_sha, analysis_json, repo_root)
@@ -3575,7 +3602,7 @@ impl Store {
             .filter(|path| !current_hashes.contains_key(path.as_str()))
             .collect();
         if !unreplaceable.is_empty() {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
+            return Err(refusal(format!(
                 "cannot carry forward {} file(s) whose stored payload was produced by a different \
                  extractor or grammar (for example {}); rebuild this generation from a full \
                  extraction rather than a differential write",
@@ -3629,13 +3656,13 @@ impl Store {
             // the same two's-complement representation as the extraction cache.
             let content_hash = extraction.content_hash as i64;
             let parse_json = serde_json::to_string(&extraction.parse_outcome).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
+                refusal(format!(
                     "parse outcome serialization failed for {}: {error}",
                     extraction.file_path
                 ))
             })?;
             let engine_json = serde_json::to_string(&extraction.engine).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
+                refusal(format!(
                     "extraction engine serialization failed for {}: {error}",
                     extraction.file_path
                 ))
@@ -3643,7 +3670,7 @@ impl Store {
             let mut durable_extraction = extraction.for_durable_store();
             durable_extraction.source_code = None;
             let extraction_json = serde_json::to_string(&durable_extraction).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
+                refusal(format!(
                     "extraction serialization failed for {}: {error}",
                     extraction.file_path
                 ))
@@ -4185,7 +4212,7 @@ impl Store {
         // held it exactly. Exempting the case would have left the watcher, the
         // most frequent writer of all, unguarded precisely when it deletes.
         if edge_ord as usize != analysis.total_edges {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
+            return Err(refusal(format!(
                 "generation would store {edge_ord} edges but its analysis was computed over {}; \
                  dead-code and community results would describe a different graph than the one stored",
                 analysis.total_edges
@@ -4288,7 +4315,7 @@ impl Store {
         // at, and a summary claiming none while rows exist is the over-claim
         // this whole inventory exists to end.
         if measured_refusals != analysis.discovery_refused_files {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
+            return Err(refusal(format!(
                 "generation would store {measured_refusals:?} discovery refusal(s) but its \
                  analysis was computed over {:?}; `discovery_refused_files` is derived from \
                  the inventory and the two must be one measurement",
@@ -4310,9 +4337,7 @@ impl Store {
         let dead_charge = charge(&mut spent.dead);
         for (ordinal, dead) in analysis.dead_symbols.iter().enumerate() {
             let ordinal = u32::try_from(ordinal).map_err(|_| {
-                rusqlite::Error::InvalidParameterName(
-                    "dead-symbol row count exceeds SQLite generation ordinal capacity".into(),
-                )
+                refusal("dead-symbol row count exceeds SQLite generation ordinal capacity")
             })?;
             tx.execute(
                 "INSERT INTO generation_dead_symbols
@@ -4850,7 +4875,7 @@ impl Store {
                 // no parsing frontend cannot rebuild — the caller would loop.
                 // `true` would be worse: a currency claim from a check that did
                 // not run.
-                return Err(rusqlite::Error::InvalidParameterName(format!(
+                return Err(refusal(format!(
                     "whether the stored payload is current cannot be decided by this build: \
                      the answer is the compiled grammar version for {language:?}, and this \
                      binary was built without the parsing frontend. Build with \
@@ -4974,11 +4999,8 @@ impl Store {
         let Some(raw) = raw else {
             return Ok(None);
         };
-        let mut summary: AnalysisSummary = serde_json::from_str(&raw).map_err(|error| {
-            rusqlite::Error::InvalidParameterName(format!(
-                "stored generation analysis is invalid: {error}"
-            ))
-        })?;
+        let mut summary: AnalysisSummary = serde_json::from_str(&raw)
+            .map_err(|error| refusal(format!("stored generation analysis is invalid: {error}")))?;
         if summary.discovery_refused_files.is_some() {
             let refused: usize = snapshot.query_row(
                 "SELECT COUNT(*) FROM generation_coverage_gaps
@@ -5078,7 +5100,7 @@ impl Store {
             return Ok(None);
         };
         let status: AnalysisStatus = serde_json::from_str(&json).map_err(|error| {
-            rusqlite::Error::InvalidParameterName(format!(
+            refusal(format!(
                 "stored generation analysis status is invalid: {error}"
             ))
         })?;
@@ -5601,9 +5623,7 @@ impl Store {
         for row in rows {
             let (json, path) = row?;
             let extraction = serde_json::from_str(&json).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
-                    "stored extraction for {path} is invalid: {error}"
-                ))
+                refusal(format!("stored extraction for {path} is invalid: {error}"))
             })?;
             extractions.push(extraction);
         }
@@ -5639,9 +5659,7 @@ impl Store {
             return Ok(None);
         };
         let extraction = serde_json::from_str(&json).map_err(|error| {
-            rusqlite::Error::InvalidParameterName(format!(
-                "stored extraction for {path} is invalid: {error}"
-            ))
+            refusal(format!("stored extraction for {path} is invalid: {error}"))
         })?;
         Ok(Some(extraction))
     }
@@ -6011,7 +6029,7 @@ impl Store {
         // addressed, and answering over a silently truncated prefix would be a
         // wrong answer rather than a bounded one.
         if edge_count > u32::MAX as i64 {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
+            return Err(refusal(format!(
                 "generation {gen} holds {edge_count} edges, more than the {} an \
                  edge index can address; answering over a prefix of it would be \
                  a wrong answer rather than a bounded one",
@@ -6049,7 +6067,7 @@ impl Store {
                     row.get(5)?,
                     row.get_ref(6)?.as_str_or_null()?,
                 )
-                .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?;
+                .map_err(|error| refusal(error.to_string()))?;
         }
         drop(rows);
         drop(stmt);
@@ -6058,7 +6076,7 @@ impl Store {
         let analysis = Self::analysis_disclosure_in(&snapshot, gen)?;
         let index = builder
             .finish_with_stored_evidence(analysis, EdgeOrder::ReadOrder)
-            .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?;
+            .map_err(|error| refusal(error.to_string()))?;
         Ok(Some((gen, index)))
     }
 
@@ -6144,11 +6162,8 @@ impl Store {
         // second copy of the dead-symbol list, so parsing it here would undo
         // the bound above. See `AnalysisDisclosure`.
         raw.map(|json| {
-            serde_json::from_str::<AnalysisDisclosure>(&json).map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
-                    "stored generation analysis is invalid: {error}"
-                ))
-            })
+            serde_json::from_str::<AnalysisDisclosure>(&json)
+                .map_err(|error| refusal(format!("stored generation analysis is invalid: {error}")))
         })
         .transpose()
     }
@@ -6180,11 +6195,7 @@ impl Store {
         // `analysis_disclosure_in` refuses to round one to the other.
         serde_json::from_str::<DeadClusterScan>(&raw)
             .map(Some)
-            .map_err(|error| {
-                rusqlite::Error::InvalidParameterName(format!(
-                    "stored dead-cluster scan is invalid: {error}"
-                ))
-            })
+            .map_err(|error| refusal(format!("stored dead-cluster scan is invalid: {error}")))
     }
 
     /// The dead-symbol rows and the analysis that qualifies them, against one
@@ -6490,7 +6501,7 @@ impl Store {
         if searchable {
             return Ok(());
         }
-        Err(rusqlite::Error::InvalidParameterName(format!(
+        Err(refusal(format!(
             "generation {gen} has symbol rows but no full-text index rows, so \
              this search could not run and its empty result is not an answer \
              about the repository; rebuild the index with `devmap repair --fts`"
@@ -6523,7 +6534,7 @@ impl Store {
             |row| row.get::<_, i64>(0).map(|found| found != 0),
         )?;
         if !present {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
+            return Err(refusal(format!(
                 "generation {generation_id} is not in this store — it was pruned \
                  or never written — so the files it indexed are unknown, not none; \
                  re-read the latest generation id and ask again"
@@ -6801,11 +6812,8 @@ impl Store {
 
         let conn = lock_conn(&self.conn)?;
         let previous_busy_ms: i64 = conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
-        let previous_busy_ms = u64::try_from(previous_busy_ms).map_err(|_| {
-            rusqlite::Error::InvalidParameterName(
-                "SQLite returned a negative busy_timeout".to_string(),
-            )
-        })?;
+        let previous_busy_ms = u64::try_from(previous_busy_ms)
+            .map_err(|_| refusal("SQLite returned a negative busy_timeout".to_string()))?;
 
         // TRUNCATE honors busy_timeout and could otherwise monopolize the
         // store mutex for seconds while a reader holds a snapshot. Bound the
@@ -7133,7 +7141,7 @@ impl Store {
         payload
             .map(|(table, json)| {
                 serde_json::from_str(&json).map_err(|error| {
-                    rusqlite::Error::InvalidParameterName(format!(
+                    refusal(format!(
                         "stored extraction payload in {table} for content \
                          {hash:#018x} ({language}, grammar {grammar}, analyzer \
                          {analyzer}) is invalid: {error}",
@@ -7164,9 +7172,8 @@ impl Store {
         // Source text is already identified by the content hash and remains on
         // disk; duplicating it in both cache and generation rows bloats the DB.
         cached.source_code = None;
-        let payload = serde_json::to_string(&cached).map_err(|err| {
-            rusqlite::Error::InvalidParameterName(format!("cache serialize failed: {err}"))
-        })?;
+        let payload = serde_json::to_string(&cached)
+            .map_err(|err| refusal(format!("cache serialize failed: {err}")))?;
         let conn = lock_conn(&self.conn)?;
         conn.execute(
             "INSERT INTO extraction_cache (content_hash, language, grammar_version, analyzer_version, payload_json, accessed_at)

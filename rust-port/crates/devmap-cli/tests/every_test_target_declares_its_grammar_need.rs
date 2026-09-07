@@ -71,6 +71,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         "devmap-store",
         &[
             "a_corrupt_analysis_is_not_an_absent_one",
+            "a_refusal_names_its_reason_not_a_parameter",
             "adversarial_store",
             "coverage_gap_inventory",
             "digest_scoped_delta",

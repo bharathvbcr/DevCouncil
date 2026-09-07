@@ -1045,6 +1045,12 @@ CREATE TABLE IF NOT EXISTS generation_file_digests (
 /// paragraph pointed rather than where the schema's shape suggested.
 pub const CURRENT_SCHEMA_VERSION: i32 = 19;
 
+/// The `user_version` the Python engine's `index.sqlite` carries — a database
+/// this kernel never wrote and cannot read. Named once, here, so the store's
+/// refusal and the CLI's `status` report the same number for the same file
+/// (the CLI spelled its own `2` until 2026-09-07).
+pub const PYTHON_INDEX_SCHEMA_VERSION: i32 = 2;
+
 /// Every DDL batch a fresh store applies, in the order `Store::migrate` applies
 /// them.
 ///

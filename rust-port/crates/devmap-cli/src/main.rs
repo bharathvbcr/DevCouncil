@@ -2732,28 +2732,6 @@ fn affected_closure(
 // holds over the socket also holds over argv without a second spelling.
 use devmap_query::{MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH};
 
-/// Reject a numeric argument the engine cannot honour, before it reaches the
-/// engine.
-///
-/// S-1 follow-up. `validate_request` bounds every one of these over the IPC
-/// transport — finite confidence inside `[0, 1]`, a budget and a depth under
-/// the ceilings — while argv reached `StoreQueryEngine` unchecked. The
-/// asymmetry is not cosmetic: `--min-confidence nan` makes every `>=` comparison
-/// in the edge filter false, so the answer is an empty edge list that reads
-/// exactly like "this symbol has no callers"; `--budget 0` returns an empty
-/// result with `truncated` unset for the same reason; and a depth past the
-/// engine's clamp is silently rewritten.
-///
-/// Refused, never clamped. Clamping is what makes a capped answer
-/// indistinguishable from a complete one, which is the failure this codebase
-/// treats as worse than an error.
-/// The `user_version` the Python engine's `index.sqlite` carries.
-///
-/// The store refuses to open it by name (`devmap-store/src/db.rs`, the schema
-/// check); this is the same number for the `status` arm, which reports rather
-/// than opens.
-const PYTHON_INDEX_SCHEMA: i32 = 2;
-
 /// The path a root-taking subcommand names must be a directory that exists.
 ///
 /// Measured through the release binary: `manifest <missing path>` created
@@ -2778,6 +2756,21 @@ fn validate_root(cli: &Cli) -> Result<(), String> {
     }
 }
 
+/// Reject a numeric argument the engine cannot honour, before it reaches the
+/// engine.
+///
+/// S-1 follow-up. `validate_request` bounds every one of these over the IPC
+/// transport — finite confidence inside `[0, 1]`, a budget and a depth under
+/// the ceilings — while argv reached `StoreQueryEngine` unchecked. The
+/// asymmetry is not cosmetic: `--min-confidence nan` makes every `>=` comparison
+/// in the edge filter false, so the answer is an empty edge list that reads
+/// exactly like "this symbol has no callers"; `--budget 0` returns an empty
+/// result with `truncated` unset for the same reason; and a depth past the
+/// engine's clamp is silently rewritten.
+///
+/// Refused, never clamped. Clamping is what makes a capped answer
+/// indistinguishable from a complete one, which is the failure this codebase
+/// treats as worse than an error.
 fn validate_limits(command: &Commands) -> Result<(), String> {
     let check_budget = |budget: u32| -> Result<(), String> {
         if budget == 0 {
@@ -4423,7 +4416,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     // against it already refuses by name (the store's own
                     // message); telling `status` readers to run it is advice
                     // that cannot work, for a file the other command names.
-                    "degraded_reason": if version == PYTHON_INDEX_SCHEMA {
+                    "degraded_reason": if version == devmap_store::PYTHON_INDEX_SCHEMA_VERSION {
                         format!(
                             "store schema is {version}: this is the Python engine's database \
                              (`.devcouncil/codeintel/index.sqlite`), not a devmap store, and \
