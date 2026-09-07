@@ -87,12 +87,14 @@ def _clear_module_caches():
 
 
 #: The developer's own index, which no unit test may touch. `devmap.sqlite` is
-#: the Rust kernel's store; `index.sqlite` is the Python query cache that
-#: `load_code_graph` populates from `code_graph.json` on first read.
+#: the Rust kernel's store, and every file here is one the kernel writes.
+#:
+#: `index.sqlite` (the Python query cache) and `writer.lock` (its build lease)
+#: were watched here too, until the Python store was deleted: nothing creates
+#: either any more, so watching them could only ever report "unchanged" — the
+#: shape of a check that cannot run reporting as one that ran and passed.
 _REPO_STATE_FILES = (
     ".devcouncil/codeintel/devmap.sqlite",
-    ".devcouncil/codeintel/index.sqlite",
-    ".devcouncil/codeintel/writer.lock",
     ".devcouncil/repo_map.json",
     ".devcouncil/graph/code_graph.json",
 )
@@ -127,6 +129,8 @@ def _repo_map_state_is_not_collateral(request: pytest.FixtureRequest):
     `load_code_graph(<repo root>)` and imported this repository's 34 MB
     `code_graph.json` into a 94 MB `.devcouncil/codeintel/index.sqlite` — 66 s
     of the file's runtime, inside an `except Exception` that made it silent.
+    (That function and that store are both deleted now; the escape it describes
+    is not, which is why this fixture stays.)
     Its sibling `test_prompt_builder_injects_applicable_skills` did the same
     thing and was only found because this check ran per test: the
     session-scoped version of it said *that* something escaped and left the
@@ -142,16 +146,17 @@ def _repo_map_state_is_not_collateral(request: pytest.FixtureRequest):
     test. This is a tripwire, not a sandbox; a test that legitimately needs a
     store builds one under `tmp_path`.
 
-    **Its blind spot, measured rather than guessed.** `index.sqlite` is written
-    by `load_code_graph` only when it is *absent*
-    (`indexing/graph/build.py:429`, `if not service.store.exists()`), so once a
-    contaminated run has created it, every later run merely reads it and this
-    comparison sees nothing move. Observed directly: one full run created it at
-    15:47:31 and tripped; the identical run immediately afterwards passed clean
-    while the 94 MB file sat there the whole time. So a green run is only
-    evidence of cleanliness when the cache was absent at session start — delete
-    `.devcouncil/codeintel/index.sqlite` before trusting one. The same caveat
-    applies to any create-if-absent artifact added to the watched set.
+    **Its blind spot, measured rather than guessed.** The create-if-absent
+    artifact this warned about was `index.sqlite`: `load_code_graph` wrote it
+    only when it was missing, so once a contaminated run had created it every
+    later run merely read it and this comparison saw nothing move. Observed
+    directly: one full run created it at 15:47:31 and tripped; the identical run
+    immediately afterwards passed clean while the 94 MB file sat there the whole
+    time. That file is no longer written by anything and is no longer watched,
+    so the specific blind spot is closed — but the *shape* of it is not. Every
+    file above is rewritten unconditionally by the kernel, so a green run is
+    real evidence for those three; the caveat returns the moment a
+    create-if-absent artifact is added to the watched set.
     """
     before = _repo_state_fingerprint()
     yield

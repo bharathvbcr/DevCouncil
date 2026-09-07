@@ -182,7 +182,7 @@ def test_graph_routes_shape_api_demo_hooks(tmp_path, monkeypatch):
 
     initialize_project(tmp_path, quiet=True, with_map=False, with_skills=False)
     graph = SimpleNamespace(dead_code=[], edges=[])
-    monkeypatch.setattr(graph_build, "load_code_graph", lambda root: graph)
+    monkeypatch.setattr(graph_build, "read_code_graph", lambda root: graph)
 
     class _RouteClient:
         def __init__(self):

@@ -215,12 +215,6 @@ def test_wiki_reads_the_graph_once_for_the_whole_bundle(tmp_path: Path, monkeypa
     """Not once per subsystem, and never through the Python store."""
     from devcouncil.knowledge import wiki as wiki_mod
 
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: (_ for _ in ()).throw(
-            AssertionError("the wiki must not read the Python graph store")
-        ),
-    )
     _write_import_graph(tmp_path, [
         ("src/pkg/cli/main.py", "src/pkg/core/engine.py", "imports"),
         ("src/pkg/core/engine.py", "src/pkg/util/io.py", "imports"),
@@ -244,12 +238,6 @@ def test_wiki_reads_the_graph_once_for_the_whole_bundle(tmp_path: Path, monkeypa
 
 def test_wired_to_links_come_from_the_kernels_own_export(tmp_path: Path, monkeypatch):
     """The rendered "Wired to" section is unchanged; only its producer moved."""
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: (_ for _ in ()).throw(
-            AssertionError("the wiki must not read the Python graph store")
-        ),
-    )
     _write_import_graph(tmp_path, [
         # in-area -> out-of-area: a "wired to" target
         ("src/pkg/cli/main.py", "src/pkg/core/engine.py", "imports"),

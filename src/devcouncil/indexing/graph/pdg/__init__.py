@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-from devcouncil.indexing.graph.pdg.build import (
-    build_pdg_for_paths,
-    load_pdg_layer,
-    merge_pdg_into_graph,
-)
+from devcouncil.indexing.graph.pdg.build import build_pdg_for_paths
 from devcouncil.indexing.graph.pdg.cdg import build_cdg
 from devcouncil.indexing.graph.pdg.cfg import CFGResult, block_for_line, build_cfg_for_function
 from devcouncil.indexing.graph.pdg.reaching_def import (
@@ -58,8 +54,6 @@ __all__ = [
     "compute_reaching_defs",
     "explain_pdg_taint",
     "explain_taint",
-    "load_pdg_layer",
-    "merge_pdg_into_graph",
     "query_controls",
     "query_flows",
     "query_pdg_controls",

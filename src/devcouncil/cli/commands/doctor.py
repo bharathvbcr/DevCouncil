@@ -545,10 +545,11 @@ def check_mapping_stack(project_root: Path) -> list[tuple[str, str, str]]:
     rows.extend(check_unknown_indexing_keys(project_root))
     graph_path = project_root / ".devcouncil" / "graph" / "code_graph.json"
     # "Does a graph exist" is a `status` call, not a whole-graph read. This
-    # asked `load_code_graph` — which materialises every node and edge out of
+    # asked `load_code_graph` — which materialised every node and edge out of
     # the Python `index.sqlite` cache — twice per `dev doctor` run to answer a
     # boolean: measured on a tmp copy of this repository, p50 2546.8 ms / min
-    # 1872.8 ms against `try_connect`'s p50 41.2 ms / min 36.4 ms.
+    # 1872.8 ms against `try_connect`'s p50 41.2 ms / min 36.4 ms. Both that
+    # function and the store it read are now deleted.
     #
     # `try_connect` is the right probe and not merely the cheap one: it is
     # `generation_id` non-zero *and* `node_count > 0`, so an empty store that

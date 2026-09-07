@@ -1,91 +1,26 @@
+"""What is left of the Python code-intelligence store: a root, and runtime evidence.
+
+This file held 24 tests of ``CodeIntelStore``: committed generations, atomic
+pruning, content-addressed payload reuse, FTS search, an extraction cache,
+rename aliases, unresolved-reference recording, the compatibility-export
+handshake, corruption quarantine and the v1→v2 migration. Every one of them
+exercised code with no production caller: the Rust kernel became the only writer
+of the graph, ``write_code_graph`` and ``load_code_graph`` were the store's last
+two callers, and both had lost theirs by Lane M3. A test of a function nothing
+calls is not coverage, so they went with the store.
+
+The two that were testing something still reachable are here, retargeted:
+``canonical_project_root`` (whose caller is
+``integrations/mcp/handlers/codeintel.py``) and the runtime-observation gate
+(whose writer is the opt-in debug tracer and whose reader is ``run_cypher``).
+"""
+
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
 from devcouncil.codeintel.service import canonical_project_root, get_codeintel_service
-from devcouncil.codeintel.store import CodeIntelStore
-from devcouncil.indexing.graph.build import graph_path, load_code_graph, write_code_graph
-from devcouncil.indexing.graph.schema import CodeGraph, GraphEdge, GraphNode, NodeKind
-from devcouncil.utils.json_persist import write_model_json
-
-
-def _graph(path: str = "src/app.py", name: str = "main") -> CodeGraph:
-    return CodeGraph(
-        nodes=[
-            GraphNode(id=path, kind=NodeKind.FILE, path=path, name=Path(path).name, language="python"),
-            GraphNode(
-                id=f"{path}::{name}",
-                kind=NodeKind.FUNCTION,
-                path=path,
-                name=name,
-                line=1,
-                end_line=2,
-                language="python",
-            ),
-        ],
-        edges=[GraphEdge(source=path, target=f"{path}::{name}", kind="contains")],
-        entry_roots=[path],
-        generated_head="abc",
-        indexed_hash="files",
-        content_fingerprint="content",
-        meta={"fixture": True},
-    )
-
-
-def test_store_round_trip_uses_wal_and_committed_generation(tmp_path: Path) -> None:
-    source = tmp_path / "src" / "app.py"
-    source.parent.mkdir()
-    source.write_text("def main():\n    return 1\n", encoding="utf-8")
-    store = CodeIntelStore(tmp_path)
-
-    generation = store.save_graph(_graph())
-    loaded = store.load_graph()
-
-    assert generation == 1
-    assert loaded is not None
-    assert loaded.model_dump(exclude={"meta"}) == _graph().model_dump(exclude={"meta"})
-    assert loaded.meta["fixture"] is True
-    assert loaded.meta["codeintel_generation"] == generation
-    assert store.content_for_path("src/app.py") == source.read_bytes()
-    assert store.status().node_count == 2
-    with sqlite3.connect(store.path) as conn:
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-
-
-def test_new_generation_is_atomic_and_prunes_old_rows(tmp_path: Path) -> None:
-    store = CodeIntelStore(tmp_path)
-    first = store.save_graph(_graph(name="first"))
-    second = store.save_graph(_graph(name="second"))
-    third = store.save_graph(_graph(name="third"))
-
-    assert (first, second, third) == (1, 2, 3)
-    assert store.current_generation() == third
-    assert store.load_graph().nodes[-1].name == "third"  # type: ignore[union-attr]
-    assert store.load_graph(first) is None
-    assert store.load_graph(second).nodes[-1].name == "second"  # type: ignore[union-attr]
-
-
-def test_store_fts_and_extraction_cache(tmp_path: Path) -> None:
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph(name="request_handler"))
-
-    hits = store.search("request_handler")
-    assert hits[0]["name"] == "request_handler"
-
-    store.put_extraction(
-        content_hash="hash",
-        language="python",
-        grammar_version="1",
-        config_hash="cfg",
-        payload=b"payload",
-    )
-    assert store.get_extraction(
-        content_hash="hash",
-        language="python",
-        grammar_version="1",
-        config_hash="cfg",
-    ) == b"payload"
+from devcouncil.codeintel.store import RuntimeEvidenceStore
 
 
 def test_service_canonicalizes_nested_project_paths(tmp_path: Path) -> None:
@@ -97,431 +32,53 @@ def test_service_canonicalizes_nested_project_paths(tmp_path: Path) -> None:
     assert get_codeintel_service(nested) is get_codeintel_service(tmp_path)
 
 
-def test_store_records_unresolved_dynamic_references_and_rename_aliases(tmp_path: Path) -> None:
-    old = tmp_path / "old.py"
-    old.write_text("value = eval(name)\n", encoding="utf-8")
-    store = CodeIntelStore(tmp_path)
-    first = CodeGraph(nodes=[
-        GraphNode(id="old.py", kind=NodeKind.FILE, path="old.py", name="old.py", language="python"),
-        GraphNode(
-            id="old.py::dynamic:eval:1",
-            kind=NodeKind.DYNAMIC,
-            path="old.py",
-            name="eval",
-            line=1,
-            end_line=1,
-            language="python",
-            extras={"resolved": False, "sink": "eval"},
-        ),
-    ], edges=[
-        GraphEdge(source="old.py", target="old.py::dynamic:eval:1", kind="dynamic_reference")
-    ])
-    store.save_graph(first)
-
-    new = tmp_path / "new.py"
-    old.rename(new)
-    second = first.model_copy(deep=True)
-    for node in second.nodes:
-        node.id = node.id.replace("old.py", "new.py")
-        node.path = "new.py"
-        if node.kind == NodeKind.FILE:
-            node.name = "new.py"
-    second.edges[0].source = "new.py"
-    second.edges[0].target = "new.py::dynamic:eval:1"
-    store.save_graph(second)
-
-    assert store.unresolved_references() == [{
-        "generation_id": 2,
-        "source_id": "new.py",
-        "name": "eval",
-        "kind": "eval",
-        "path": "new.py",
-        "line": 1,
-        "evidence": {"extras": {"resolved": False, "sink": "eval"}, "node_id": "new.py::dynamic:eval:1"},
-    }]
-    assert store.diagnostics()[0]["message"] == "Unresolved dynamic reference: eval"
-    aliases = store.aliases()
-    assert {row["old_id"]: row["new_id"] for row in aliases} == {
-        "old.py": "new.py",
-        "old.py::dynamic:eval:1": "new.py::dynamic:eval:1",
-    }
-
-
-def _file_node(path: str) -> GraphNode:
-    return GraphNode(id=path, kind=NodeKind.FILE, path=path, name=Path(path).name, language="python")
-
-
-def test_identical_content_surviving_files_do_not_alias(tmp_path: Path) -> None:
-    """Two identical files present in both generations are not renames."""
-    for rel in ("pkg_a/__init__.py", "pkg_b/__init__.py"):
-        target = tmp_path / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("", encoding="utf-8")
-    store = CodeIntelStore(tmp_path)
-    graph = CodeGraph(nodes=[_file_node("pkg_a/__init__.py"), _file_node("pkg_b/__init__.py")])
-    store.save_graph(graph)
-    store.save_graph(graph.model_copy(deep=True))
-
-    assert store.aliases() == []
-
-
-def test_has_indexed_path_and_runtime_observation_gates(tmp_path: Path) -> None:
-    store = CodeIntelStore(tmp_path)
-    assert store.has_indexed_path("src/app.py") is False
+def test_runtime_observation_gate_is_false_until_something_is_observed(
+    tmp_path: Path,
+) -> None:
+    """``has_runtime_observations`` gates a git-shelling fingerprint, so it must
+    answer False without creating the store, and True only once a session has
+    actually recorded an edge."""
+    store = RuntimeEvidenceStore(tmp_path)
     assert store.has_runtime_observations() is False
+    assert store.exists() is False, "a read created the store"
 
-    source = tmp_path / "src" / "app.py"
-    source.parent.mkdir()
-    source.write_text("def main():\n    return 1\n", encoding="utf-8")
-    store.save_graph(_graph())
-    assert store.has_indexed_path("src/app.py") is True
-    assert store.has_indexed_path("src\\app.py") is True
-    assert store.has_indexed_path("src/other.py") is False
+    session = store.start_runtime_session(
+        provider="pytest", source_fingerprint="fp", build_fingerprint="bp"
+    )
+    assert store.has_runtime_observations() is False, "an empty session is not evidence"
 
-    assert store.has_runtime_observations() is False
+    store.add_runtime_observations(session, [{"source": "a", "target": "b"}])
+    assert store.has_runtime_observations() is True
+
+
+def test_runtime_store_reuses_an_existing_index_sqlite(tmp_path: Path) -> None:
+    """A checkout upgraded from an older DevCouncil still has an ``index.sqlite``
+    holding the retired graph tables at ``user_version = 2``. Opening it must
+    neither refuse it for its version nor rewrite it: the two runtime tables are
+    created ``IF NOT EXISTS`` and everything else is left alone."""
+    import sqlite3
+
+    path = tmp_path / ".devcouncil" / "codeintel" / "index.sqlite"
+    path.parent.mkdir(parents=True)
+    legacy = sqlite3.connect(path)
+    legacy.executescript(
+        "CREATE TABLE generations (id INTEGER PRIMARY KEY);"
+        "INSERT INTO generations VALUES (7);"
+        "PRAGMA user_version=2;"
+    )
+    legacy.commit()
+    legacy.close()
+
+    store = RuntimeEvidenceStore(tmp_path)
     session = store.start_runtime_session(
         provider="pytest", source_fingerprint="fp", build_fingerprint="bp"
     )
     store.add_runtime_observations(session, [{"source": "a", "target": "b"}])
     assert store.has_runtime_observations() is True
 
-
-def test_ambiguous_same_content_rename_is_not_aliased(tmp_path: Path) -> None:
-    """One removed path matching two added identical files is not a provable rename."""
-    old = tmp_path / "old.py"
-    old.write_text("x = 1\n", encoding="utf-8")
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(CodeGraph(nodes=[_file_node("old.py")]))
-
-    old.unlink()
-    for rel in ("first.py", "second.py"):
-        (tmp_path / rel).write_text("x = 1\n", encoding="utf-8")
-    store.save_graph(CodeGraph(nodes=[_file_node("first.py"), _file_node("second.py")]))
-
-    assert store.aliases() == []
-
-
-def test_store_disambiguates_duplicate_legacy_symbol_ids(tmp_path: Path) -> None:
-    source = tmp_path / "app.py"
-    source.write_text("def run(): pass\ndef run(): pass\n", encoding="utf-8")
-    graph = CodeGraph(
-        nodes=[
-            GraphNode(id="app.py", kind=NodeKind.FILE, path="app.py", name="app.py"),
-            GraphNode(id="app.py::run", kind=NodeKind.FUNCTION, path="app.py", name="run", line=1),
-            GraphNode(id="app.py::run", kind=NodeKind.FUNCTION, path="app.py", name="run", line=2),
-        ],
-        edges=[
-            GraphEdge(source="app.py", target="app.py::run", kind="contains", reason="ast definition"),
-            GraphEdge(source="app.py", target="app.py::run", kind="contains", reason="ast definition"),
-        ],
-    )
-    store = CodeIntelStore(tmp_path)
-
-    store.save_graph(graph)
-    loaded = store.load_graph()
-
-    assert loaded is not None
-    assert [node.id for node in loaded.nodes] == [
-        "app.py",
-        "app.py::run",
-        "app.py::run#L2:function",
-    ]
-    assert loaded.meta["duplicate_symbol_aliases"] == [
-        {
-            "new_id": "app.py::run#L2:function",
-            "old_id": "app.py::run",
-            "reason": "duplicate legacy symbol identity",
-        }
-    ]
-    assert any(
-        edge.kind == "aliases"
-        and edge.source == "app.py::run#L2:function"
-        and edge.target == "app.py::run"
-        for edge in loaded.edges
-    )
-
-
-def test_compatibility_export_is_not_reimported_but_external_replacement_is(tmp_path: Path) -> None:
-    source = tmp_path / "src" / "app.py"
-    source.parent.mkdir()
-    source.write_text("def main(): return 1\n", encoding="utf-8")
-    initial = _graph()
-
-    write_code_graph(tmp_path, initial)
-    service = get_codeintel_service(tmp_path)
-    assert service.store.current_generation() == 1
-    assert load_code_graph(tmp_path) is not None
-    assert load_code_graph(tmp_path) is not None
-    assert service.store.current_generation() == 1
-
-    # External JSON rewrite must not clobber the canonical store.
-    replacement = _graph(name="replacement")
-    write_model_json(graph_path(tmp_path), replacement)
-    loaded = load_code_graph(tmp_path)
-
-    assert loaded is not None
-    assert loaded.nodes[-1].name == "main"
-    assert service.store.current_generation() == 1
-
-
-def test_compatibility_json_imports_only_when_store_missing(tmp_path: Path) -> None:
-    source = tmp_path / "src" / "app.py"
-    source.parent.mkdir()
-    source.write_text("def main(): return 1\n", encoding="utf-8")
-    (tmp_path / ".devcouncil" / "graph").mkdir(parents=True)
-    write_model_json(graph_path(tmp_path), _graph(name="from_json"))
-
-    loaded = load_code_graph(tmp_path)
-    service = get_codeintel_service(tmp_path)
-    assert loaded is not None
-    assert loaded.nodes[-1].name == "from_json"
-    assert service.store.current_generation() == 1
-
-
-def test_incremental_generation_reuses_content_addressed_payloads(tmp_path: Path) -> None:
-    source = tmp_path / "src" / "app.py"
-    source.parent.mkdir()
-    source.write_text("def main():\n    return 1\n", encoding="utf-8")
-    store = CodeIntelStore(tmp_path)
-    graph = _graph()
-    store.save_graph(graph)
-
-    source.write_text("def main():\n    return 2\n", encoding="utf-8")
-    changed = graph.model_copy(deep=True)
-    changed.nodes[-1].end_line = 3
-    store.save_graph(changed, changed_paths={"src/app.py"})
-
-    assert store.last_write_stats == {
-        "node_payloads_written": 1,
-        "edge_payloads_written": 0,
-        "dead_payloads_written": 0,
-        "node_memberships": 2,
-        "edge_memberships": 1,
-    }
-    with sqlite3.connect(store.path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM node_payloads").fetchone()[0] == 3
-        assert conn.execute("SELECT COUNT(*) FROM edge_payloads").fetchone()[0] == 1
-        # File blobs are opt-in (indexing.store_file_contents); the generation
-        # still records path/hash/size/mtime for every file.
-        assert conn.execute("SELECT COUNT(*) FROM file_contents").fetchone()[0] == 0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM generation_files WHERE content_hash != ''"
-        ).fetchone()[0] == 2
-        assert conn.execute("SELECT COUNT(*) FROM diagnostics").fetchone()[0] == 0
-
-
-def test_file_contents_are_stored_when_opted_in(tmp_path: Path, monkeypatch) -> None:
-    source = tmp_path / "src" / "app.py"
-    source.parent.mkdir()
-    source.write_text("def main():\n    return 1\n", encoding="utf-8")
-    store = CodeIntelStore(tmp_path)
-    monkeypatch.setattr(CodeIntelStore, "_store_file_contents", lambda self: True)
-    store.save_graph(_graph())
-
-    with sqlite3.connect(store.path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM file_contents").fetchone()[0] == 1
-    assert store.content_for_path("src/app.py") == source.read_bytes()
-
-
-def test_content_for_path_falls_back_to_working_tree(tmp_path: Path) -> None:
-    source = tmp_path / "src" / "app.py"
-    source.parent.mkdir()
-    source.write_text("def main():\n    return 1\n", encoding="utf-8")
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph())
-
-    # Blobs were not persisted, so the read comes from disk instead.
-    assert store.content_for_path("src/app.py") == source.read_bytes()
-    assert store.content_for_path("src/missing.py") is None
-
-
-def test_pruning_reclaims_unreferenced_payload_rows(tmp_path: Path) -> None:
-    store = CodeIntelStore(tmp_path)
-    for name in ("first", "second", "third"):
-        store.save_graph(_graph(name=name))
-
-    with sqlite3.connect(store.path) as conn:
-        retained = conn.execute(
-            "SELECT COUNT(*) FROM generations WHERE state='committed'"
-        ).fetchone()[0]
-        node_payloads = conn.execute("SELECT COUNT(*) FROM node_payloads").fetchone()[0]
-        referenced = conn.execute(
-            "SELECT COUNT(DISTINCT payload_hash) FROM generation_nodes"
-        ).fetchone()[0]
-    assert retained == 2
-    assert node_payloads == referenced
-
-
-def test_v1_store_migrates_without_rebuilding_graph(tmp_path: Path) -> None:
-    store = CodeIntelStore(tmp_path)
-    store.initialize()
-    with sqlite3.connect(store.path) as conn:
-        for table in (
-            "generation_analysis", "analysis_payloads", "generation_dead",
-            "dead_payloads", "generation_edges", "edge_payloads",
-            "generation_nodes", "node_payloads", "generation_files",
-            "file_contents",
-        ):
-            conn.execute(f"DROP TABLE {table}")
-        conn.execute("PRAGMA user_version=1")
-        conn.execute(
-            """INSERT INTO generations(
-                id, state, created_at, analyzer_version, schema_version,
-                graph_meta, node_count, edge_count
-            ) VALUES(1, 'committed', 1.0, 'codeintel-1', 2, '{}', 1, 0)"""
-        )
-        conn.execute(
-            "INSERT INTO metadata(key, value) VALUES('current_generation', '1')"
-        )
-        conn.execute(
-            """INSERT INTO nodes(
-                generation_id, id, kind, path, name, extras
-            ) VALUES(1, 'legacy.py', 'file', 'legacy.py', 'legacy.py', '{}')"""
-        )
-        conn.commit()
-
-    store.initialize()
-    loaded = store.load_graph()
-
-    assert loaded is not None
-    assert [node.id for node in loaded.nodes] == ["legacy.py"]
-    assert store.status().schema_version == 2
-
-
-def test_failed_compact_generation_keeps_previous_generation(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    store = CodeIntelStore(tmp_path)
-    first = store.save_graph(_graph(name="first"))
-
-    def fail(_node):
-        raise RuntimeError("injected write failure")
-
-    monkeypatch.setattr(store, "_node_payload", fail)
+    conn = sqlite3.connect(path)
     try:
-        store.save_graph(_graph(name="second"))
-    except RuntimeError as exc:
-        assert str(exc) == "injected write failure"
-    else:
-        raise AssertionError("save unexpectedly succeeded")
-
-    assert store.current_generation() == first
-    assert store.load_graph().nodes[-1].name == "first"  # type: ignore[union-attr]
-
-
-def test_empty_changed_paths_must_not_drop_memberships(tmp_path: Path) -> None:
-    """changed_paths=set() must full-persist, not commit an empty incremental gen."""
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph(name="first"))
-    fuller = _graph(name="second")
-    fuller.nodes.append(
-        GraphNode(
-            id="src/other.py",
-            kind=NodeKind.FILE,
-            path="src/other.py",
-            name="other.py",
-            language="python",
-        )
-    )
-    store.save_graph(fuller, changed_paths=set())
-    loaded = store.load_graph()
-    assert loaded is not None
-    assert len(loaded.nodes) == 3
-    assert {node.id for node in loaded.nodes} >= {"src/app.py", "src/app.py::second", "src/other.py"}
-    assert store.last_write_stats["node_memberships"] == 3
-
-
-def _corrupt_file(path: Path) -> None:
-    # Destroy the sqlite header page: unlike mid-file damage (which WAL-mode
-    # reads can dodge), a broken header fails every subsequent connect.
-    with path.open("r+b") as fh:
-        fh.write(b"\xde\xad\xbe\xef" * 1024)
-
-
-def test_status_reports_corrupt_store_instead_of_raising(tmp_path: Path) -> None:
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph())
-    _corrupt_file(store.path)
-    assert store.status().state == "corrupt"
-
-
-def test_quarantine_if_corrupt_ignores_lock_errors(tmp_path: Path) -> None:
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph())
-    locked = sqlite3.OperationalError("database is locked")
-    assert store.quarantine_if_corrupt(locked) is False
-    assert store.path.is_file()
-    schema_err = sqlite3.DatabaseError("no such table: nodes")
-    assert store.quarantine_if_corrupt(schema_err) is False
-    assert store.path.is_file()
-
-
-def test_persist_quarantines_corrupt_store_and_rebuilds(tmp_path: Path) -> None:
-    from devcouncil.codeintel.service import CodeIntelService
-
-    service = CodeIntelService(tmp_path)
-    service.persist(_graph())
-    _corrupt_file(service.store.path)
-    # WAL/SHM from the first save would replay stale pages; drop them so the
-    # corruption is what sqlite actually sees.
-    for suffix in ("-wal", "-shm"):
-        sibling = Path(str(service.store.path) + suffix)
-        if sibling.exists():
-            sibling.unlink()
-    generation = service.persist(_graph(name="rebuilt"))
-    assert generation >= 1
-    quarantined = service.store.path.with_name(service.store.path.name + ".corrupt")
-    assert quarantined.is_file()
-    assert service.store.status().state == "committed"
-
-
-def test_save_graph_reports_persist_progress(tmp_path: Path) -> None:
-    """Persist must heartbeat per phase, not go silent for its whole duration.
-
-    Regression for a supervisor killing a worker that was 100% inside
-    sqlite3_step / walFindFrame with no phase counter moving.
-    """
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
-    store = CodeIntelStore(tmp_path)
-
-    seen: list[tuple[str, int, int]] = []
-    store.save_graph(_graph(), progress=lambda p, c, t: seen.append((p, c, t)))
-
-    phases = {phase for phase, _c, _t in seen}
-    assert {"persist:files", "persist:nodes", "persist:edges", "persist:commit"} <= phases
-    # The commit phase must both open and close so a watcher sees it finish.
-    assert ("persist:commit", 0, 1) in seen
-    assert ("persist:commit", 1, 1) in seen
-
-
-def test_save_graph_survives_a_failing_progress_callback(tmp_path: Path) -> None:
-    """Progress is observability; a broken callback must never fail a build."""
-    store = CodeIntelStore(tmp_path)
-
-    def boom(*_a: object) -> None:
-        raise RuntimeError("callback exploded")
-
-    assert store.save_graph(_graph(), progress=boom) == 1
-
-
-def test_incremental_copy_handles_a_large_changed_set(tmp_path: Path) -> None:
-    """A repo-scale change set must not inline one bind parameter per path.
-
-    Regression for ``path NOT IN (?,?,…)`` blowing past
-    SQLITE_MAX_VARIABLE_NUMBER on the incremental membership copy.
-    """
-    store = CodeIntelStore(tmp_path)
-    store.save_graph(_graph())
-
-    # Well past both the temp-table threshold and SQLite's default 999/32766
-    # bind-parameter ceiling.
-    changed = {f"src/generated_{index}.py" for index in range(40_000)}
-    changed.add("src/app.py")
-    generation = store.save_graph(_graph(), changed_paths=changed)
-
-    assert generation == 2
-    assert store.current_generation() == 2
-    loaded = store.load_graph()
-    assert loaded is not None
+        assert conn.execute("SELECT id FROM generations").fetchall() == [(7,)]
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 2
+    finally:
+        conn.close()

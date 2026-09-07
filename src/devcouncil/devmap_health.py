@@ -488,28 +488,6 @@ def map_freshness(root: Path) -> Dict[str, Any]:
     return result
 
 
-def python_query_cache_info(root: Path) -> Dict[str, Any]:
-    """The Python `index.sqlite`, now a read cache for the graph JSON.
-
-    It is not the engine and never written by `dev map`; `load_code_graph`
-    imports the kernel's `code_graph.json` into it on first use after a build so
-    the Python-only query commands answer from the current generation.
-    """
-    path = root / ".devcouncil" / "codeintel" / "index.sqlite"
-    info: Dict[str, Any] = {"path": str(path), "exists": path.is_file(), "generation": None}
-    if not path.is_file():
-        return info
-    try:
-        from devcouncil.codeintel import get_codeintel_service
-
-        state = get_codeintel_service(root).status()
-        info["generation"] = state.get("generation")
-        info["state"] = state.get("state")
-    except Exception as exc:  # noqa: BLE001 - informational only
-        info["error"] = f"{type(exc).__name__}: {exc}"
-    return info
-
-
 def collect_map_status(root: Path) -> Dict[str, Any]:
     """Everything `dev map status` prints, as one JSON-able dict.
 
@@ -524,7 +502,6 @@ def collect_map_status(root: Path) -> Dict[str, Any]:
     daemon = daemon_info(root)
     artifacts = artifacts_info(root)
     freshness = map_freshness(root)
-    cache = python_query_cache_info(root)
     build = build_activity(root)
     runs = last_build(root)
 
@@ -550,7 +527,6 @@ def collect_map_status(root: Path) -> Dict[str, Any]:
         "kernel": kernel,
         "daemon": daemon,
         "artifacts": artifacts,
-        "python_query_cache": cache,
         "build": build,
         "last_build": runs,
         "sync": {
@@ -623,12 +599,6 @@ def render_status(result: Dict[str, Any]) -> List[str]:
             )
         else:
             lines.append(f"{name}: missing ({artifact['path']})")
-    cache = result["python_query_cache"]
-    if cache["exists"]:
-        lines.append(
-            f"python query cache: generation {cache.get('generation') or '(none)'} "
-            "(imported from code_graph.json on first read; not the engine)"
-        )
     lines.extend(render_build_lines(result))
     return lines
 

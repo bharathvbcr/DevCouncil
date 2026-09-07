@@ -9,12 +9,11 @@ import pytest
 from typer.testing import CliRunner
 
 from devcouncil.cli.commands.graph_cmd import app as graph_app
-from devcouncil.indexing.graph.build import write_code_graph
+from tests.unit.graph_fixtures import write_graph_artifact
 from tests.unit.graph_fixtures import kernel_graph
 from devcouncil.indexing.graph.intel import (
     circular_imports,
     compute_communities,
-    diff_impact,
     extract_processes,
     god_nodes,
     graph_check,
@@ -73,7 +72,7 @@ def call_chain(tmp_path):
     )
     _commit(tmp_path)
     graph = kernel_graph(tmp_path)
-    write_code_graph(tmp_path, graph)
+    write_graph_artifact(tmp_path, graph)
     return tmp_path, graph
 
 
@@ -197,21 +196,12 @@ def test_extract_processes(call_chain):
     assert "main" in steps_joined or "pkg/main.py" in steps_joined
 
 
-def test_diff_impact_paths(call_chain):
-    root, graph = call_chain
-    result = diff_impact(root, graph, paths=["pkg/util.py"], use_diff=False, max_depth=3)
-    assert result["path_count"] == 1
-    item = result["paths"][0]
-    assert item["path"] == "pkg/util.py"
-    assert item["symbols"]  # util.run
-    layers = item["blast"]["layers"]
-    assert layers[0]["depth"] == 1
-    assert layers[0]["confidence"] == "extracted"
-    # mid.step and/or main should appear in inbound callers at some depth
-    all_nodes = {n for L in layers for n in L["nodes"]}
-    assert any("mid" in n or "main" in n or "step" in n or "run" in n for n in all_nodes) or (
-        item["blast"]["total_impacted"] >= 0
-    )
+# `diff_impact` -- a Python per-path blast walk over a whole `CodeGraph` -- had
+# its test here and nowhere else: `graph_cmd` stopped calling it, the MCP impact
+# tool stopped calling it, and by Lane M3 the kernel banded its own walk
+# (`impact --layers`). The function and its re-export are deleted; the banding
+# it produced is asserted against the kernel in
+# `test_impact_layers_are_the_kernels.py`.
 
 
 def test_cli_graph_check_process_impact(call_chain):
@@ -293,8 +283,6 @@ def test_pdg_package_imports():
         build_pdg_for_paths,
         compute_reaching_defs,
         explain_pdg_taint,
-        load_pdg_layer,
-        merge_pdg_into_graph,
         query_pdg_controls,
     )
 
@@ -302,8 +290,6 @@ def test_pdg_package_imports():
     assert PDG_VERSION >= 1
     assert callable(build_cfg_for_function)
     assert callable(build_pdg_for_paths)
-    assert callable(merge_pdg_into_graph)
-    assert callable(load_pdg_layer)
     assert callable(explain_pdg_taint)
     assert callable(query_pdg_controls)
     assert callable(analyze_taint)
@@ -350,8 +336,21 @@ def test_pdg_taint_command_injection():
     assert any(f.category == "command-injection" for f in findings)
 
 
-def test_pdg_build_merge_meta(tmp_path):
-    from devcouncil.indexing.graph.build import build_pdg_for_paths, merge_pdg_into_graph, write_code_graph
+def test_pdg_build_writes_its_own_sidecar(tmp_path):
+    """The layer is an artifact of its own, not an annotation on the kernel's.
+
+    This built the layer, merged it into `graph.meta["pdg"]` with
+    `merge_pdg_into_graph` and wrote the whole graph back with
+    `write_code_graph`. Lane M3 moved the layer to `.devcouncil/graph/pdg.json`
+    because the kernel is the only writer of `code_graph.json`; the merge and
+    the writer then had no production caller and are deleted. What the layer
+    contains is the same, asserted where it now lives.
+    """
+    from devcouncil.indexing.graph.build import (
+        build_pdg_for_paths,
+        read_pdg_layer_file,
+        write_pdg_layer,
+    )
 
     _write(
         tmp_path,
@@ -363,11 +362,17 @@ def test_pdg_build_merge_meta(tmp_path):
     )
     _commit(tmp_path)
     graph = kernel_graph(tmp_path)
+    graph_bytes = (tmp_path / ".devcouncil" / "graph" / "code_graph.json").read_bytes()
+
     layer = build_pdg_for_paths(tmp_path, graph, paths=["pkg/run.py"])
-    shards = merge_pdg_into_graph(graph, layer)
-    write_code_graph(tmp_path, graph, analysis_shards=shards)
-    assert graph.meta.get("pdg")
-    assert graph.meta["pdg"]["stats"]["taint_count"] >= 0
+    sidecar = write_pdg_layer(tmp_path, layer)
+
+    assert sidecar.is_file()
+    assert (layer.to_meta() or {})["stats"]["taint_count"] >= 0
+    assert read_pdg_layer_file(tmp_path) is not None
+    assert (tmp_path / ".devcouncil" / "graph" / "code_graph.json").read_bytes() == graph_bytes, (
+        "building the PDG layer rewrote the kernel's artifact"
+    )
 
 
 def test_pagerank_pure_python_fallback_matches_networkx(call_chain):

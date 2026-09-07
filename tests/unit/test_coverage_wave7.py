@@ -1,22 +1,18 @@
-"""Wave-7: build_control and map_artifacts stable coverage."""
+"""Wave-7: map_artifacts and doctor stable coverage.
+
+The build_control half went with ``codeintel/build_control.py`` -- the Python
+graph build's status file, stall watchdog and writer lease -- which had no
+production caller left once the Python store was deleted.
+"""
 
 from __future__ import annotations
 
 import json
 import subprocess
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
-from devcouncil.codeintel.build_control import (
-    BuildStatus,
-    GraphBuildBusy,
-    _write_status,
-    graph_build_session,
-    read_build_status,
-    status_path,
-)
 from devcouncil.indexing.map_artifacts import (
     AGENT_GUIDE_MARKER,
     _important_surfaces,
@@ -26,36 +22,6 @@ from devcouncil.indexing.map_artifacts import (
     write_agent_guides,
 )
 from devcouncil.indexing.repo_mapper import RepoMap, RepoSubsystem
-
-
-# --- build_control ------------------------------------------------------------
-
-
-def test_read_write_build_status(tmp_path):
-    assert read_build_status(tmp_path).state == "idle"
-    status = BuildStatus(build_id="b1", state="building", phase="x", completed=1, total=2)
-    _write_status(tmp_path, status)
-    assert status_path(tmp_path).is_file()
-    loaded = read_build_status(tmp_path)
-    assert loaded.build_id == "b1"
-    assert loaded.completed == 1
-
-    status_path(tmp_path).write_text("not-json", encoding="utf-8")
-    assert read_build_status(tmp_path).state == "idle"
-
-
-def test_graph_build_session_nested_and_busy(tmp_path):
-    with graph_build_session(tmp_path):
-        with graph_build_session(tmp_path):
-            pass
-
-    lease = MagicMock()
-    # graph_build_session waits via acquire_with_retry (not a single acquire probe).
-    lease.acquire_with_retry.return_value = False
-    with pytest.raises(GraphBuildBusy):
-        with graph_build_session(tmp_path, lease=lease):
-            pass
-    lease.acquire_with_retry.assert_called()
 
 
 # --- build_worker -------------------------------------------------------------
@@ -131,7 +97,6 @@ def test_refresh_map_artifacts_fails_closed_without_a_kernel(tmp_path, monkeypat
     did not check the degraded flag. With the kernel as the only engine, a
     build that cannot run raises and leaves whatever was on disk untouched.
     """
-    import pytest
 
     from devcouncil.cli.commands.init import initialize_project
     from devcouncil.devmap_engine import DevMapEngineError
@@ -367,7 +332,7 @@ def test_map_pdg_and_html_flags(tmp_path, monkeypatch):
     graph_out.parent.mkdir(parents=True, exist_ok=True)
     graph_out.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
+        "devcouncil.indexing.graph.build.read_code_graph",
         lambda _r: CodeGraph(nodes=[], edges=[]),
     )
     monkeypatch.setattr(
@@ -375,12 +340,8 @@ def test_map_pdg_and_html_flags(tmp_path, monkeypatch):
         lambda *a, **k: {},
     )
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.merge_pdg_into_graph",
-        lambda g, layer: {},
-    )
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.write_code_graph",
-        lambda *a, **k: None,
+        "devcouncil.indexing.graph.build.write_pdg_layer",
+        lambda root, layer: root / ".devcouncil" / "graph" / "pdg.json",
     )
     monkeypatch.setattr(
         "devcouncil.app.config.load_config",

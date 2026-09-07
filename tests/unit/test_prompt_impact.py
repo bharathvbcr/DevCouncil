@@ -330,12 +330,6 @@ def test_graph_impact_lines_ask_the_kernel_not_the_python_graph(tmp_path, monkey
     `load_code_graph` is monkeypatched to raise, so a run that still reaches it
     lands in the handler's `except` and produces no caller lines at all.
     """
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: (_ for _ in ()).throw(
-            AssertionError("load_code_graph must not be on the task-prompt path")
-        ),
-    )
     client = _FakeKernel({
         "src/a.py": _FakeCallers([
             _edge("src/api/checkout.py::charge"),
@@ -492,12 +486,6 @@ def test_graph_impact_lines_end_to_end_against_the_real_kernel(tmp_path, monkeyp
     })
     git_init_commit(tmp_path)
     client = kernel_client(tmp_path)
-    monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda root: (_ for _ in ()).throw(
-            AssertionError("the kernel path must not fall back to load_code_graph")
-        ),
-    )
     _with_kernel(monkeypatch, client)
 
     pb = PromptBuilder(tmp_path)

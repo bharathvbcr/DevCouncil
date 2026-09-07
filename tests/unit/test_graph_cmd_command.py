@@ -121,13 +121,6 @@ def test_graph_query_without_a_kernel_refuses_rather_than_answering(tmp_path, mo
     answer this — and the sibling `trace` fallback did not merely cost more, it
     returned *different* paths (its BFS was undirected).
     """
-    monkeypatch.setattr(
-        graph_build,
-        "load_code_graph",
-        lambda root: (_ for _ in ()).throw(
-            AssertionError("`dev map query` must not read the Python graph")
-        ),
-    )
     _kernel_says(monkeypatch, None)
     result = runner.invoke(app, ["map", "query", "f", "--project-root", str(tmp_path)])
     assert result.exit_code != 0, result.output
@@ -167,13 +160,6 @@ def test_graph_trace_error(tmp_path, monkeypatch):
 
 def test_graph_trace_without_a_kernel_refuses_rather_than_answering(tmp_path, monkeypatch):
     """A fabricated path is worse than an absent answer: a caller acts on it."""
-    monkeypatch.setattr(
-        graph_build,
-        "load_code_graph",
-        lambda root: (_ for _ in ()).throw(
-            AssertionError("`dev map trace` must not read the Python graph")
-        ),
-    )
     _kernel_says(monkeypatch, None)
     result = runner.invoke(app, ["map", "trace", "a", "z", "--project-root", str(tmp_path)])
     assert result.exit_code != 0, result.output
@@ -259,7 +245,7 @@ def _never_load_the_python_graph(root):
     )
 
 
-def _kernel_artifact(monkeypatch, graph):
+def _kernel_artifact(monkeypatch, graph, root=None):
     """Feed the graph-backed commands the kernel's own artifact.
 
     These are renderer tests: they assert what ``dev map check`` / ``process`` /
@@ -269,13 +255,18 @@ def _kernel_artifact(monkeypatch, graph):
     ``index.sqlite`` cache — and now calls ``read_code_graph``, a bounded
     ``json.load`` of ``code_graph.json``, the artifact the kernel writes.
 
-    Patching the new seam keeps the assertions; patching ``load_code_graph`` to
-    raise alongside it adds one they did not have, because a command that
-    regresses onto the retired path now fails loudly instead of passing on a
-    warm store.
+    ``root`` writes an unstamped ``repo_map.json`` beside it. The staleness
+    banner used to read the Python store's generation, found none, and printed
+    nothing; it reads the map artifact now, so a root with a graph and no map is
+    "freshness unknown" and says so. The kernel writes both files in one run, so
+    the fixture writes both. Unstamped is deliberate: a map with no
+    ``generated_head`` has nothing to compare and is not stale.
     """
-    monkeypatch.setattr(graph_build, "read_code_graph", lambda root: graph)
-    monkeypatch.setattr(graph_build, "load_code_graph", _never_load_the_python_graph)
+    monkeypatch.setattr(graph_build, "read_code_graph", lambda _root: graph)
+    if root is not None:
+        map_path = root / ".devcouncil" / "repo_map.json"
+        map_path.parent.mkdir(parents=True, exist_ok=True)
+        map_path.write_text('{"files": []}', encoding="utf-8")
 
 
 class _DeadEntry:
@@ -380,7 +371,7 @@ def test_graph_dead_distinguishes_all_three_cluster_outcomes(tmp_path, monkeypat
         ({"clusters": []}, ["none."], ["not computed", "not recorded"]),
     ]
     for kwargs, expected, forbidden in cases:
-        _kernel_artifact(monkeypatch, _fake_graph(**kwargs))
+        _kernel_artifact(monkeypatch, _fake_graph(**kwargs), root=tmp_path)
         result = runner.invoke(app, ["map", "dead", "--project-root", str(tmp_path)])
         assert result.exit_code == 0, result.output
         for text in expected:
@@ -487,7 +478,6 @@ def test_graph_impact_human_with_results(tmp_path, monkeypatch):
     band's measured confidence, its unlisted remainder, and the walk's own "I
     stopped early".
     """
-    monkeypatch.setattr(graph_build, "load_code_graph", _never_load_the_python_graph)
     monkeypatch.setattr(
         graph_cmd_mod,
         "_devmap_query_payload",
@@ -526,7 +516,6 @@ def test_graph_impact_human_with_results(tmp_path, monkeypatch):
 
 
 def test_graph_impact_no_paths(tmp_path, monkeypatch):
-    monkeypatch.setattr(graph_build, "load_code_graph", _never_load_the_python_graph)
     monkeypatch.setattr(
         graph_cmd_mod,
         "_devmap_query_payload",
@@ -546,7 +535,6 @@ def _no_python_graph(monkeypatch):
     def _never(root):
         raise AssertionError("graphml export must not load the Python code graph")
 
-    monkeypatch.setattr(graph_build, "load_code_graph", _never)
 
 
 def test_graph_export_graphml_stdout(tmp_path, monkeypatch):
@@ -1173,13 +1161,13 @@ def test_a_malformed_graph_file_is_refused_at_load_not_rendered(tmp_path, docume
     The message is the missing-graph one, and that is the right advice — a
     rebuild replaces a truncated or hand-edited export.
     """
-    from devcouncil.indexing.graph.build import load_code_graph
+    from devcouncil.indexing.graph.build import read_code_graph
 
     graph_file = tmp_path / ".devcouncil" / "graph" / "code_graph.json"
     graph_file.parent.mkdir(parents=True)
     graph_file.write_text(json.dumps({"schema_version": 2, **document}))
 
-    assert load_code_graph(tmp_path) is None
+    assert read_code_graph(tmp_path) is None
 
     result = runner.invoke(app, ["map", "check", "--project-root", str(tmp_path)])
     assert result.exit_code == 1

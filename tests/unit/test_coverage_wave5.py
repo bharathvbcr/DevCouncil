@@ -97,12 +97,6 @@ def test_check_mapping_stack_probes_the_store_not_the_python_graph(tmp_path, mon
     graph_path.write_text("{}", encoding="utf-8")
 
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
-        lambda _root: (_ for _ in ()).throw(
-            AssertionError("doctor must not read the whole graph to check it exists")
-        ),
-    )
-    monkeypatch.setattr(
         "devcouncil.devmap_client.try_connect", lambda root: _StoreProbe()
     )
     rows = doctor_cmd.check_mapping_stack(tmp_path)
@@ -374,21 +368,25 @@ def test_emit_decision_gemini_warn(capsys):
 # --- build.py -------------------------------------------------------------------
 
 
-def test_build_graph_json_indent_honors_config(tmp_path, monkeypatch):
+def test_build_graph_json_max_bytes_honors_config(tmp_path, monkeypatch):
+    """The read bound is configurable, and an unreadable config is not "no bound".
+
+    Its sibling `_graph_json_indent` chose the indent of the *Python* writer of
+    `code_graph.json`; that writer is deleted (the kernel is the only one), so
+    the setting it read has no effect and the helper went with it. The byte
+    bound survives, on the reader.
+    """
     from devcouncil.indexing.graph import build as graph_build
 
-    cfg = SimpleNamespace(indexing=SimpleNamespace(compact_graph_json=True))
+    cfg = SimpleNamespace(indexing=SimpleNamespace(graph_json_max_bytes=4096))
     monkeypatch.setattr("devcouncil.app.config.load_config", lambda _r: cfg)
-    assert graph_build._graph_json_indent(tmp_path) is None
-
-    cfg.indexing.compact_graph_json = False
-    assert graph_build._graph_json_indent(tmp_path) == 2
+    assert graph_build._graph_json_max_bytes(tmp_path) == 4096
 
     monkeypatch.setattr(
         "devcouncil.app.config.load_config",
         lambda _r: (_ for _ in ()).throw(RuntimeError("no cfg")),
     )
-    assert graph_build._graph_json_indent(tmp_path) is None
+    assert graph_build._graph_json_max_bytes(tmp_path) == 128 * 1024 * 1024
 
 
 # --- liveness_ratchet.py --------------------------------------------------------

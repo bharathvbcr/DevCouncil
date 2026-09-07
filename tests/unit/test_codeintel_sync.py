@@ -1,14 +1,18 @@
-"""The writer lease, and the kernel seam that is the only map/graph writer.
+"""The kernel seam that is the only map/graph writer.
 
 The watcher (``SyncCoordinator``), the watch scope (``IndexScope``) and the
 Python incremental engine (``sync_affected_paths``) were retired with the
 Python graph engine, and every test that exercised them went with them: they
 asserted the behaviour of a second writer of ``repo_map.json`` /
-``code_graph.json`` that no longer exists.
+``code_graph.json`` that no longer exists. ``WriterLease`` -- the cross-process
+lock that serialised those writers -- outlived them by one lane and is gone
+too, with the three tests that pinned its exclusion and backoff; the kernel
+takes its own advisory ``flock`` on ``devmap.sqlite``.
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 import subprocess
 import time
@@ -16,55 +20,6 @@ from pathlib import Path
 
 import pytest
 
-from devcouncil.codeintel import sync as sync_package
-from devcouncil.codeintel.sync.lease import WriterLease
-
-
-def test_writer_lease_is_exclusive(tmp_path: Path) -> None:
-    path = tmp_path / "writer.lock"
-    first = WriterLease(path)
-    second = WriterLease(path)
-    assert first.acquire()
-    assert not second.acquire()
-    first.release()
-    assert second.acquire()
-    second.release()
-
-
-def test_writer_lease_acquire_with_retry_backoff(tmp_path: Path, monkeypatch) -> None:
-    path = tmp_path / "writer.lock"
-    holder = WriterLease(path)
-    assert holder.acquire()
-    contender = WriterLease(path)
-    sleeps: list[float] = []
-
-    def fake_sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-        if len(sleeps) == 2:
-            holder.release()
-
-    assert contender.acquire_with_retry(
-        timeout=1.0, initial_delay=0.05, max_delay=0.2, sleep=fake_sleep
-    )
-    assert sleeps  # backed off at least once before the holder released
-    assert sleeps[0] <= sleeps[-1] or len(sleeps) == 1
-    contender.release()
-
-
-def test_writer_lease_acquire_with_retry_times_out(tmp_path: Path, monkeypatch) -> None:
-    path = tmp_path / "writer.lock"
-    holder = WriterLease(path)
-    assert holder.acquire()
-    contender = WriterLease(path)
-    monkeypatch.setattr("devcouncil.codeintel.sync.lease.time.sleep", lambda _s: None)
-    # Force deadline to expire immediately after the first failed probe.
-    monotonic = iter([100.0, 100.0, 101.0])
-    monkeypatch.setattr(
-        "devcouncil.codeintel.sync.lease.time.monotonic",
-        lambda: next(monotonic, 101.0),
-    )
-    assert contender.acquire_with_retry(timeout=0.5, initial_delay=0.05) is False
-    holder.release()
 
 
 def _have_kernel() -> bool:
@@ -240,8 +195,9 @@ def test_mcp_lifespan_warms_the_kernel_daemon_and_starts_no_python_watcher(
 
     assert warmed == [tmp_path.resolve()], "the lifespan must warm the kernel daemon"
     assert context == {"codeintel": None}
-    assert not hasattr(sync_package, "get_sync_coordinator")
-    assert not hasattr(sync_package, "SyncCoordinator")
+    # The Python watcher package is gone entirely, not merely emptied.
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("devcouncil.codeintel.sync")
 
 
 def test_mcp_sync_without_a_kernel_reports_engine_unavailable(

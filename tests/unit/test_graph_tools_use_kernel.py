@@ -202,10 +202,18 @@ def test_the_route_double_matches_the_client_it_stands_in_for():
 
 
 def _no_python_graph(monkeypatch):
+    """The route tools may not reach a whole-graph read.
+
+    This patched `indexing.graph.build.load_code_graph` to raise. That function
+    is deleted -- `tests/unit/test_python_store_is_gone.py` asserts the name is
+    gone for the whole tree -- so the tripwire moves to the read that is left:
+    `read_code_graph` is the only remaining whole-graph read, and a route tool
+    reaching it is the same defect the patch was written for.
+    """
     monkeypatch.setattr(
-        "devcouncil.indexing.graph.build.load_code_graph",
+        "devcouncil.indexing.graph.build.read_code_graph",
         lambda root: (_ for _ in ()).throw(
-            AssertionError("the route tools must not load the Python graph")
+            AssertionError("the route tools must not read the whole graph")
         ),
     )
 

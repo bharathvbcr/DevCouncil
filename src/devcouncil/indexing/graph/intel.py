@@ -544,59 +544,5 @@ def working_tree_changed_paths(root: Path) -> List[str]:
         return []
 
 
-def diff_impact(
-    root: Path,
-    graph: CodeGraph,
-    *,
-    paths: Optional[Sequence[str]] = None,
-    use_diff: bool = False,
-    max_depth: int = 3,
-) -> Dict[str, Any]:
-    """Map paths (or working-tree diff) → enclosing symbols → inbound blast radius."""
-    if use_diff or not paths:
-        changed = working_tree_changed_paths(root)
-        if paths:
-            want = {p.replace("\\", "/") for p in paths}
-            changed = [p for p in changed if p in want]
-        target_paths = changed
-    else:
-        target_paths = [p.replace("\\", "/") for p in paths]
-
-    items: List[Dict[str, Any]] = []
-    all_seeds: List[str] = []
-    for path in target_paths:
-        symbols = _enclosing_symbols(graph, path)
-        seed_ids = [s.id for s in symbols] or [path]
-        all_seeds.extend(seed_ids)
-        radius = blast_radius(graph, seed_ids, max_depth=max_depth)
-        items.append(
-            {
-                "path": path,
-                "symbols": [
-                    {
-                        "id": s.id,
-                        "name": s.name,
-                        "line": s.line,
-                        "kind": s.kind.value if hasattr(s.kind, "value") else str(s.kind),
-                    }
-                    for s in symbols[:40]
-                ],
-                "blast": radius,
-            }
-        )
-
-    aggregate = (
-        blast_radius(graph, all_seeds, max_depth=max_depth)
-        if all_seeds
-        else {"seeds": [], "layers": [], "total_impacted": 0}
-    )
-    return {
-        "paths": items,
-        "aggregate": aggregate,
-        "path_count": len(items),
-        "source": "diff" if (use_diff or not paths) else "paths",
-    }
-
-
 # Re-export leaf helper for callers that still import from intel.
 from devcouncil.indexing.graph.communities import community_label_for_area  # noqa: E402,F401

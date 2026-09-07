@@ -30,7 +30,7 @@ All map and graph operations live under **`dev map`**. `dev graph …` is a comp
 | `.devcouncil/repo_map.json` | File inventory, subsystems, entry roots, unwired/unreachable/dead-symbol candidate lists, reverse-import dependents |
 | `.devcouncil/graph/code_graph.json` | Compact export of symbol nodes + edges (imports, named imports, calls, inherits, contains) and tiered `dead_code`, written by the kernel from the same generation as the map. **The kernel store is canonical**; prefer `dev map query` / `trace` / `dead` when the JSON is missing. |
 | `.devcouncil/codeintel/devmap.sqlite` | **Canonical.** The Rust kernel's WAL-mode store: generations, nodes, edges, unresolved references, FTS5, the pending-path queue, build history. Written only by `devmap build` (every `dev map`, `init`, `ingest`, `sync`, verify/checkout refresh and MCP `devcouncil_graph_ingest` go through it). |
-| `.devcouncil/codeintel/index.sqlite` | The Python query cache. Not an engine: `load_code_graph` imports the kernel's `code_graph.json` into it on first read after a build, and the Python-only commands (`check`, `process`, `routes`, `cypher`, `pdg`, …) answer from that cache. Safe to delete; it is rebuilt from the JSON. |
+| `.devcouncil/codeintel/index.sqlite` | Runtime evidence only: debugger sessions and the call edges they witnessed, written by the opt-in tracer (`dev debug`, the `devcouncil_debug_*` MCP tools) and merged into the graph by `dev map cypher`. It held the Python query cache until that store was deleted; nothing creates the file unless a debug session runs. Safe to delete — it is evidence, not an index, and losing it loses only past sessions. |
 | `.devcouncil/graph/graph.html` | Self-contained interactive visualizer (`dev map graph-html` / `dev map html --symbols` / alias `dev graph html`; **not** written by default on bare `dev map`) |
 | `.devcouncil/map.html` | Self-contained subsystem map visualizer (`dev map html`, rendered by the kernel's `devmap map-html`). Nodes are coloured by dominant language in GitHub Linguist's own palette; the header carries a repo-wide language bar and states how many indexed files the subsystems actually cover. Slim payload — the `files[]` inventory is aggregated into per-subsystem language histograms and not embedded, and `dependents{}` is dropped. |
 | `.devcouncil/graph/demo.html` | Sample self-contained interactive UI from `dev map demo` (no map required; primary demo artifact) |
@@ -215,10 +215,11 @@ advertises, because every build reports the same version string.
 Query surfaces that still run on the Python side (`check`, `process`, `routes`, `shape-check`,
 `api-impact`, `cypher`, `pdg`, the HTML visualizers, and the MCP tools `devcouncil_graph_impact`,
 `devcouncil_route_map`, `devcouncil_shape_check`, `devcouncil_api_impact`, `devcouncil_pdg_query`,
-`devcouncil_explain`) read the Python query cache, which `load_code_graph` fills from the kernel's
-`code_graph.json` after each build. `explore` and `affected` left that list on 2026-09-05; every
-`devcouncil_code_*` MCP tool is now kernel-only and reports `Unavailable` rather than substituting
-a second engine's answer.
+`devcouncil_explain`) parse the kernel's own `code_graph.json`. They read it through a Python
+`index.sqlite` cache until 2026-09-07, when that store was deleted: its writer had already lost
+every caller, so `cypher` in particular answered "No committed graph generation." on every
+repository. `explore` and `affected` left this list on 2026-09-05; every `devcouncil_code_*` MCP
+tool is kernel-only and reports `Unavailable` rather than substituting a second engine's answer.
 
 ```bash
 cd rust-port && ./verify.sh

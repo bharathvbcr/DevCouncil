@@ -13,8 +13,11 @@ gate's `symbol_has_non_test_inbound`, and the opt-in PDG layer. Each of them
 wants the whole graph, and the whole graph is on disk in the artifact the kernel
 itself writes.
 
-Every test here patches `load_code_graph` to raise, so a consumer that regresses
-onto it fails loudly rather than passing because the store happened to be warm.
+Every test here ran with `load_code_graph` patched to raise, so a consumer that
+regressed onto it failed loudly rather than passing because the store happened
+to be warm. That function is deleted now, and with it the only thing that
+created `index.sqlite` from a read; the tripwire is therefore the file itself —
+`no_python_store` fails any test that leaves one behind.
 """
 
 from __future__ import annotations
@@ -60,17 +63,23 @@ def kernel_corpus(tmp_path):
 
 
 @pytest.fixture
-def no_python_store(monkeypatch):
-    """`load_code_graph` is a failure, not a fallback."""
+def no_python_store(tmp_path, monkeypatch):
+    """No consumer may create the Python store, and the module may not offer one.
 
-    def _refuse(root):
-        raise AssertionError(
-            "this consumer reached `load_code_graph` — the retired engine's "
-            "whole-graph read through the Python index.sqlite cache"
-        )
-
-    monkeypatch.setattr(graph_build, "load_code_graph", _refuse)
-    return monkeypatch
+    Two assertions in one, because they fail differently. The `getattr` is a
+    structural check that the retired read path has not come back under its old
+    name -- a consumer cannot regress onto a function that does not exist, and
+    this fails the moment someone re-adds it. The file check is behavioural: it
+    catches any *other* route into `index.sqlite`, which is what the monkeypatch
+    this replaced could never see.
+    """
+    assert not hasattr(graph_build, "load_code_graph"), (
+        "`load_code_graph` is back; it is the retired engine's whole-graph read "
+        "through the Python index.sqlite cache"
+    )
+    yield monkeypatch
+    store = tmp_path / ".devcouncil" / "codeintel" / "index.sqlite"
+    assert not store.exists(), f"this consumer created the retired Python store at {store}"
 
 
 def test_read_code_graph_returns_what_the_kernel_wrote(kernel_corpus):
@@ -108,7 +117,19 @@ def test_read_code_graph_marks_a_size_capped_export(kernel_corpus, monkeypatch):
 
 
 def test_read_code_graph_declines_an_oversized_artifact(kernel_corpus, monkeypatch):
+    """Declined *before* the read, not after.
+
+    A bound enforced after parsing has already paid the memory it exists to
+    cap. `test_graph_export_size` pinned this on `load_code_graph`; that
+    function and the tiered writer it shared the bound with are deleted, so the
+    assertion moves to the reader that is left.
+    """
     monkeypatch.setattr(graph_build, "_graph_json_max_bytes", lambda root: 16)
+    monkeypatch.setattr(
+        graph_build,
+        "read_json",
+        lambda _path: (_ for _ in ()).throw(AssertionError("oversized JSON was read")),
+    )
     assert graph_build.read_code_graph(kernel_corpus) is None, (
         "an artifact over the configured bound must be declined, not read"
     )
