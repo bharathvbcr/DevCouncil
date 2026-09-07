@@ -26,6 +26,7 @@
 //!     read" and "read and found nothing" must never be the same answer;
 //!   - `git log` runs once, with a deadline, a commit cap and an output cap.
 
+use devmap_analyze::graph_intel::FileChurn;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
@@ -512,29 +513,6 @@ pub fn scan(root: &Path) -> RepoInventory {
     }
 }
 
-/// How often each file changed inside the churn window.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Churn {
-    /// Repo-relative path → commits touching it, within the window.
-    pub commits_by_path: BTreeMap<String, u32>,
-    /// Whether the history was read at all.
-    pub computed: bool,
-    /// Why it was not, when it was not.
-    pub unavailable_reason: String,
-    /// Whether a bound cut the history short, so a reader knows the counts are
-    /// a lower bound rather than the window's total.
-    pub truncated: bool,
-}
-
-impl Churn {
-    pub fn unavailable(reason: impl Into<String>) -> Self {
-        Self {
-            unavailable_reason: reason.into(),
-            ..Self::default()
-        }
-    }
-}
-
 /// One bounded `git log`, and the per-file commit counts it yields.
 ///
 /// The kernel already shells out to `git` for `HEAD` (`freshness::git_head`,
@@ -545,7 +523,7 @@ impl Churn {
 /// output cap and a wall-clock deadline. A repository with no commits, no
 /// `git`, or a `git` that stalls produces `computed: false` with the reason
 /// attached — never an empty map presented as a computed answer.
-pub fn churn(root: &Path) -> Churn {
+pub fn churn(root: &Path) -> FileChurn {
     let mut child = match Command::new("git")
         .arg("-C")
         .arg(root)
@@ -569,7 +547,7 @@ pub fn churn(root: &Path) -> Churn {
         .spawn()
     {
         Ok(child) => child,
-        Err(error) => return Churn::unavailable(format!("could not run git log: {error}")),
+        Err(error) => return FileChurn::unavailable(format!("could not run git log: {error}")),
     };
 
     // The pipe is drained on a helper thread for the reason `devmap-store`'s
@@ -579,7 +557,7 @@ pub fn churn(root: &Path) -> Churn {
     let Some(mut pipe) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return Churn::unavailable("git log produced no readable stdout".to_string());
+        return FileChurn::unavailable("git log produced no readable stdout".to_string());
     };
     let (sender, receiver) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
     std::thread::spawn(move || {
@@ -610,7 +588,7 @@ pub fn churn(root: &Path) -> Churn {
         Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Churn::unavailable(format!(
+            return FileChurn::unavailable(format!(
                 "git log exceeded {CHURN_DEADLINE:?} and was killed"
             ));
         }
@@ -644,13 +622,13 @@ pub fn churn(root: &Path) -> Churn {
         // A repository with no commits in the window, no commits at all, or no
         // git. Which one it is cannot be told apart from here without a second
         // subprocess, so the reason says exactly that rather than guessing.
-        return Churn::unavailable(
+        return FileChurn::unavailable(
             "git log named no files: no commits in the churn window, or not a \
              git repository"
                 .to_string(),
         );
     }
-    Churn {
+    FileChurn {
         commits_by_path,
         computed: true,
         unavailable_reason: String::new(),

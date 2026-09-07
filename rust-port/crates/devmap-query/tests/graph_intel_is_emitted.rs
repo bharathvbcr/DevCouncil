@@ -20,12 +20,11 @@
 //! edges both computations need, and a second producer of an artifact the
 //! kernel owns is what `d232dea` existed to remove.
 //!
-//! `hotspots` is deliberately **not** ported. It is churn × coupling —
-//! `git log --since=90.days --name-only` scored against fan-in — and the
-//! churn half needs repository history this producer does not read. `viz.py`
-//! already renders that panel as "(no churn data — needs git history)", which
-//! is the honest state; a `hotspots_computed: false` marker says the same
-//! thing in the artifact.
+//! `hotspots` is ported too, and its churn half is `inventory::churn` — one
+//! bounded `git log`, run only where the artifact is written. These fixtures
+//! pass no repository root, so there is no history to read and the marker
+//! correctly says so; `devmap-cli/tests/hotspots_are_churn_times_coupling.rs`
+//! covers the computed case against a fixture with real commits.
 
 #![cfg(feature = "parse")]
 
@@ -167,13 +166,19 @@ fn the_intel_says_what_it_computed_and_what_it_did_not() {
         provenance["circular_imports_computed"],
         serde_json::json!(true)
     );
-    // Churn needs git history this producer does not read. Saying so is the
-    // whole point: the panel has been empty since the cutover and nothing in
-    // the artifact explained which kind of empty it was.
+    // No repository root reaches this fixture, so no history was read. Saying
+    // so is the whole point: the panel has been empty since the cutover and
+    // nothing in the artifact explained which kind of empty it was.
     assert_eq!(
         provenance["hotspots_computed"],
         serde_json::json!(false),
-        "hotspots is churn x coupling and the churn half is unavailable here"
+        "no repository root here, so the churn read cannot have happened"
+    );
+    assert!(
+        provenance["hotspots_unavailable_reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "an uncomputed hotspot list must name why: {provenance}"
     );
     // Every capped list carries its own bounds, so a reader never mistakes the
     // sample for the population.
@@ -182,6 +187,8 @@ fn the_intel_says_what_it_computed_and_what_it_did_not() {
         "god_nodes_total",
         "circular_imports_shown",
         "circular_imports_total",
+        "hotspots_shown",
+        "hotspots_total",
     ] {
         assert!(
             provenance[key].is_number(),
