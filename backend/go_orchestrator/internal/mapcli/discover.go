@@ -2,6 +2,7 @@ package mapcli
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +27,32 @@ import (
 // and the first that answers correctly wins, so a fresh but incapable build
 // falls through to an older capable one rather than failing the invocation.
 func discoverBinary(ctx context.Context, root string) (string, error) {
+	// An explicit override is used or refused, never replaced. The candidate
+	// list puts it first, but "first candidate that answers the probe" fell
+	// through to a local build or PATH when the named binary did not — and
+	// `status` then reported another kernel's name for a deliberate test of
+	// this one. Measured with the built client: DEVMAP_BINARY naming a script
+	// that printed garbage, hung, or exited 3 was answered by ~/.cargo/bin/devmap.
+	if env := os.Getenv("DEVMAP_BINARY"); env != "" {
+		binary := env
+		if abs, err := filepath.Abs(env); err == nil {
+			binary = abs
+		}
+		info, err := os.Stat(binary)
+		if err != nil {
+			return "", fmt.Errorf("DEVMAP_BINARY names %s: %w", binary, err)
+		}
+		if info.IsDir() {
+			return "", fmt.Errorf("DEVMAP_BINARY names %s, which is a directory", binary)
+		}
+		if err := devmap.New(binary, root).Probe(ctx); err != nil {
+			return "", fmt.Errorf(
+				"DEVMAP_BINARY names %s, which did not answer the capability probe: %w "+
+					"(an explicit override is used or refused, never replaced by another kernel)",
+				binary, err)
+		}
+		return binary, nil
+	}
 	for _, candidate := range binaryCandidates(root) {
 		if capable(ctx, candidate, root) {
 			return candidate, nil

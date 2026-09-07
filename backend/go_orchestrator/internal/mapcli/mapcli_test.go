@@ -343,3 +343,44 @@ esac
 	}
 	return path
 }
+
+// An operator naming a binary is entitled to have that binary used — or told
+// why it cannot be. Measured with the built dcmap: DEVMAP_BINARY pointing at a
+// script that printed garbage, hung, or exited 3 was silently replaced by
+// ~/.cargo/bin/devmap, and `status` answered with that binary's name — the
+// exact substitution binaryCandidates' own comment says must never happen.
+func TestAnExplicitBinaryThatFailsTheProbeIsRefusedNotSubstituted(t *testing.T) {
+	broken := filepath.Join(t.TempDir(), "devmap-broken")
+	if err := os.WriteFile(broken, []byte("#!/bin/sh\necho kernel exploded >&2\nexit 3\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	capable := fakeKernel(t, kernelStatusOK)
+	t.Setenv("DEVMAP_BINARY", broken)
+	t.Setenv("PATH", filepath.Dir(capable))
+
+	got, err := discoverBinary(context.Background(), t.TempDir())
+	if err == nil {
+		t.Fatalf("DEVMAP_BINARY=%s failed the probe and was silently replaced by %s", broken, got)
+	}
+	if !strings.Contains(err.Error(), broken) {
+		t.Errorf("the refusal must name the override: %v", err)
+	}
+	if errors.Is(err, ErrNoBinary) {
+		t.Errorf("an override that failed is not %q: %v", ErrNoBinary, err)
+	}
+}
+
+func TestAnExplicitBinaryThatDoesNotExistIsRefusedByName(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-such-devmap")
+	capable := fakeKernel(t, kernelStatusOK)
+	t.Setenv("DEVMAP_BINARY", missing)
+	t.Setenv("PATH", filepath.Dir(capable))
+
+	got, err := discoverBinary(context.Background(), t.TempDir())
+	if err == nil {
+		t.Fatalf("DEVMAP_BINARY=%s does not exist and was silently replaced by %s", missing, got)
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("the refusal must name the override: %v", err)
+	}
+}
