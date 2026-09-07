@@ -79,12 +79,18 @@ def _state_dir_cache_key(root: Path) -> tuple:
 def _kernel_state_dir(root: Path) -> Optional[Path]:
     """The state directory the kernel resolves for ``root``, or None.
 
-    Asked, not re-derived: `devmap --json status` reports `db_path`, and the
+    Asked, not re-derived: `devmap --json paths` reports `db_path`, and the
     directory two levels above it is the state directory. A second Python copy
     of the rule in `devmap_extract::paths` is exactly the drift this function
     exists to prevent -- `.devcouncil/` was hard-coded at eleven sites in the
     kernel before that module, and once already broke `verify.sh` gate 8 on the
     Python side.
+
+    `paths` opens nothing. This used to ask `status`, which opens the store to
+    count nodes: 29 ms per process against a 168 MB store to answer a question
+    the kernel settles before it opens anything, and no answer at all for a
+    store `status` cannot open. A kernel too old to know `paths` (exit 2,
+    "unrecognized subcommand") is asked `status` instead.
 
     None when there is no kernel, or it could not answer: a *reader* must not
     fail because the binary is missing.
@@ -93,20 +99,27 @@ def _kernel_state_dir(root: Path) -> Optional[Path]:
         binary = find_engine_binary(root)
     except DevMapEngineError:
         return None
-    try:
-        completed = subprocess.run(
-            [binary, "--json", "status"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=_STATE_DIR_TIMEOUT,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        logger.debug("state dir probe failed to run", exc_info=True)
+    completed = None
+    for subcommand in ("paths", "status"):
+        try:
+            completed = subprocess.run(
+                [binary, "--json", subcommand],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=_STATE_DIR_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            logger.debug("state dir probe (%s) failed to run", subcommand, exc_info=True)
+            return None
+        if completed.returncode == 0:
+            break
+        if subcommand == "paths" and "unrecognized subcommand" in completed.stderr:
+            continue
+        logger.debug("state dir probe (%s) exited %s", subcommand, completed.returncode)
         return None
-    if completed.returncode != 0:
-        logger.debug("state dir probe exited %s", completed.returncode)
+    if completed is None or completed.returncode != 0:
         return None
     try:
         db_path = json.loads(completed.stdout).get("db_path")

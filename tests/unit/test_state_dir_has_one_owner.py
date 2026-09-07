@@ -185,3 +185,36 @@ def test_devmap_health_reports_the_resolved_artifacts(standalone_root: Path) -> 
     # fingerprint -- that is the map's own business, not the resolver's.)
     assert status["index_freshness"]["map_head"] == head, status["index_freshness"]
     assert status["index_freshness"]["current_head"] == head, status["index_freshness"]
+
+
+def test_the_resolver_asks_paths_and_does_not_need_a_readable_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The resolver asks `devmap --json paths`, which opens nothing.
+
+    It used to ask `status`, which opens the store to count nodes: 29 ms per
+    process against this repository's 168 MB store to answer a question the
+    kernel settles before it opens anything -- and no answer at all for a store
+    `status` cannot open. A kernel whose `status` fails (the store is not a
+    database) still knows where the state directory is.
+    """
+    root = tmp_path / "repo"
+    (root / ".devmap" / "codeintel").mkdir(parents=True)
+    stub = tmp_path / "devmap"
+    stub.write_text(
+        "#!/bin/sh\n"
+        # `find_engine_binary` asks `manifest --help` for `--graph-output` and
+        # `--db <no store> status` for the schema; both are answered.
+        'case " $* " in\n'
+        '  *" --help "*) echo "--graph-output"; exit 0 ;;\n'
+        '  *" --db "*) echo \'{"expected_schema_version": 18}\'; exit 0 ;;\n'
+        '  *" paths "*) echo \'{"db_path": ".devmap/codeintel/devmap.sqlite"}\'; exit 0 ;;\n'
+        '  *" status "*) echo "Error: file is not a database" >&2; exit 1 ;;\n'
+        "esac\n"
+        "exit 2\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setenv("DEVMAP_BINARY", str(stub))
+    devmap_engine._STATE_DIR_CACHE.clear()
+
+    assert devmap_engine.state_dir(root) == (root / ".devmap").resolve()

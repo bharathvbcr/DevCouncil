@@ -167,7 +167,8 @@ impl Cli {
             | Commands::Export { path, .. }
             | Commands::Routes { path, .. }
             | Commands::ShapeCheck { path, .. }
-            | Commands::ApiImpact { path, .. } => path,
+            | Commands::ApiImpact { path, .. }
+            | Commands::Paths { path } => path,
             _ => Path::new("."),
         }
     }
@@ -902,6 +903,20 @@ enum Commands {
         inventory: InventoryFlags,
     },
     Status,
+    /// Where this repository's state lives — the state directory, the store, the
+    /// artifacts, the workspace registry — resolved exactly as every other
+    /// command resolves them, and reported without opening anything.
+    ///
+    /// The Python seam's state-directory resolver asked `status` for `db_path`
+    /// once per process; `status` opens the store to count nodes, so that cost
+    /// 29 ms against a 168 MB store to answer a question the kernel settles
+    /// before it opens anything, and could not be answered at all for a store
+    /// `status` cannot open. Existence is reported, never inferred: a resolved
+    /// directory that is on disk is where the state actually is.
+    Paths {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Longitudinal view: how the map has moved across recent builds.
     History {
         #[arg(short, long, default_value_t = 10)]
@@ -2882,6 +2897,7 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         // No numeric query arguments reach the engine from these.
         Commands::Build { .. }
         | Commands::Status
+        | Commands::Paths { .. }
         | Commands::Manifest { .. }
         | Commands::MapHtml { .. }
         | Commands::Freshness { .. }
@@ -4264,6 +4280,44 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     },
                 }),
             )?;
+        }
+        Commands::Paths { path } => {
+            // Absolute, so a caller in another directory can use every field
+            // as given; `validate_root` has already checked the directory exists.
+            let root = path.canonicalize()?;
+            let state_dir = devmap_extract::paths::state_dir(&root);
+            let db_path = cli.db();
+            let db_path = if db_path.is_absolute() {
+                db_path
+            } else {
+                root.join(db_path)
+            };
+            let payload = serde_json::json!({
+                "root": root,
+                "state_dir": state_dir,
+                "state_dir_exists": state_dir.is_dir(),
+                "db_path": db_path,
+                "store_exists": db_path.is_file(),
+                "repo_map": devmap_extract::paths::repo_map_path(&root),
+                "code_graph": devmap_extract::paths::code_graph_path(&root),
+                "workspace": devmap_extract::paths::workspace_path(&root),
+                "plugin_dir": devmap_extract::paths::plugin_dir(&root),
+            });
+            if cli.json {
+                emit_json(cli, &payload)?;
+            } else {
+                for key in [
+                    "root",
+                    "state_dir",
+                    "db_path",
+                    "repo_map",
+                    "code_graph",
+                    "workspace",
+                    "plugin_dir",
+                ] {
+                    println!("{key:<12} {}", payload[key].as_str().unwrap_or(""));
+                }
+            }
         }
         Commands::Status => {
             // Answers even with no store, but never creates one. The client
