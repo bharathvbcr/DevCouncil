@@ -273,9 +273,13 @@ an unambiguous `routes_to` (kernel `EdgeKind::HandlesRoute`) or `subscribes`
 Exemptions: `WiringKind` marks a symbol the runtime invokes with no observable call site
 at all — `FrameworkDecorator`, `RuntimeEntryPoint` (`func init`, `#[test]`,
 `componentDidMount`, `pytest_*`), `ScriptEntry`, `Launcher`, `ReExportPackage`,
-`StructuralExempt` (a Rust trait-impl method cannot carry `pub`, so `is_exported` says
-nothing about it) — and an exempt symbol reports the reason it was exempted, per symbol
-or per file. Ambiguous name matches stay unresolved and never suppress a dead-code
+`ConfigEntryPoint` (a `[project.scripts] cli = "pkg.mod:func"` declaration, resolved to
+`pkg/mod.py::func` — the launcher that calls it is generated at install time and is not
+in the corpus), `StructuralExempt` (a Rust trait-impl method cannot carry `pub`, so
+`is_exported` says nothing about it) — and an exempt symbol reports the reason it was
+exempted, per symbol or per file. `ScriptEntry` and `ConfigEntryPoint` come from the same
+declaration and answer different questions: the first is a claim about the manifest
+*file*, the second about the symbol it names. Ambiguous name matches stay unresolved and never suppress a dead-code
 candidate.
 
 The Python framework manifest that used to do this — `codeintel/resolution/frameworks/`,

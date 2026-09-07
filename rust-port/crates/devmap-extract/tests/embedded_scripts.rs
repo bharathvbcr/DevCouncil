@@ -651,8 +651,13 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // `receiver_expr` becomes the receiver's identity instead of a copy of its
     // source text, so a v35 row and a v36 row spell the same receiver two ways
     // and every grouping over the column splits silently across the boundary.
+    // v37 is the exemption kind: the wiring annotations a file carries change,
+    // and a wiring annotation is what removes a file or a symbol from the
+    // dead-code answer. A stale one is worse than a stale fact — it either
+    // hides a real finding or publishes a delete-this verdict about code a
+    // framework reaches, and nothing about the row looks old.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "36",
+        EXTRACTION_SCHEMA_VERSION, "37",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

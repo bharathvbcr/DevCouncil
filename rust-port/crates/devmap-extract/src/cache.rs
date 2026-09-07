@@ -254,7 +254,34 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// an inner call, a bounded dotted path otherwise. That is a different string
 /// for the same source, so mixing generations would put two spellings of one
 /// receiver in one ledger and split every grouping over it without saying so.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "36";
+///
+/// v37 (K) changes which wiring annotations a file carries, and a v36 row
+/// carries the old answers with nothing about it looking stale — the shape the
+/// v31 note calls the reason a bump is not optional. A wiring annotation is an
+/// *exemption*: reusing a stale one either hides a real finding or publishes a
+/// delete-this verdict about code a framework reaches.
+///
+/// * `is_test_path` no longer returns early on the `/src/test/` and
+///   `/src/androidTest/` layouts, so a dotfile there is no longer annotated
+///   `TestFile` — a v36 row exempts every one of them from liveness.
+/// * `is_wiring_decorator` matches a dotted hint as a prefix and a bare hint as
+///   a whole segment instead of as a substring, so a v36 row can carry a
+///   `FrameworkDecorator` for `@multitask` or `@preregister` — and that
+///   annotation exempts every symbol in its file.
+/// * `is_generated_path` gains `*_pb2_grpc.pyi` and requires `.go` after
+///   `zz_generated`, so a v36 row is wrong in both directions: missing a
+///   `GeneratedFile` on a gRPC type stub, and carrying one on a `.txt`.
+/// * `WiringKind::ConfigEntryPoint` is new. A v36 `pyproject.toml` row carries
+///   only the file-scoped `ScriptEntry`, so every console-script entry
+///   function stays a dead-symbol candidate at the `extracted` tier —
+///   a confident proposal to delete a program's entry point.
+///
+/// Each on its own already answers "no" to "may a stored row be reused?", by
+/// the rule the v31 note records. All four are the sharpest shape of stale:
+/// they change an *exemption*, so a reused row either hides a real finding or
+/// publishes a delete-this verdict about code a framework reaches, and nothing
+/// about the row looks old.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "37";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

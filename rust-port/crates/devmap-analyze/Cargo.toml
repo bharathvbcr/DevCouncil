@@ -127,3 +127,7 @@ required-features = ["parse"]
 [[test]]
 name = "a_notebook_is_not_call_blind"
 required-features = ["parse"]
+
+[[test]]
+name = "a_console_script_entry_reaches_its_function"
+required-features = ["parse"]
