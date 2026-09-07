@@ -305,13 +305,20 @@ def write_code_graph_okf(
 
     Returns ``(out_dir, written_paths)``.
     """
-    from devcouncil.indexing.graph.build import load_code_graph
+    from devcouncil.indexing.graph.build import read_code_graph
 
     root = root.expanduser().resolve()
     if graph is None:
-        graph = load_code_graph(root)
+        # The kernel's artifact, read once. This went through
+        # `load_code_graph`, which imports the same JSON into the Python
+        # `index.sqlite` cache and hands it back as re-materialised pydantic
+        # models — a round trip through a second store to bundle the file it
+        # started from.
+        graph = read_code_graph(root)
     if graph is None:
-        raise FileNotFoundError("No code graph found; run `dev map` first.")
+        raise FileNotFoundError(
+            "No code graph at .devcouncil/graph/code_graph.json; run `dev map` first."
+        )
     name = project_name or root.name
     bundle = build_code_graph_okf(graph, project_name=name)
     out = out_dir if out_dir.is_absolute() else root / out_dir

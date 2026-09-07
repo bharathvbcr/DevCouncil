@@ -131,3 +131,21 @@ def test_map_process_reads_the_artifact(kernel_corpus, no_python_store):
     )
     assert result.exit_code == 0, result.output
     assert isinstance(json.loads(result.stdout), list)
+
+
+def test_map_export_okf_reads_the_artifact(kernel_corpus, no_python_store):
+    out = kernel_corpus / "okf"
+    result = runner.invoke(
+        graph_app,
+        [
+            "export",
+            "--format",
+            "okf",
+            "-o",
+            str(out),
+            "--project-root",
+            str(kernel_corpus),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert out.is_dir() and any(out.iterdir()), "the bundle must actually be written"
