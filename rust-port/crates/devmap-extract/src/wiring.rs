@@ -132,6 +132,26 @@ pub fn source_has_generated_header(source: &str) -> bool {
     false
 }
 
+/// Whether a decorator line is framework registration rather than ordinary
+/// Python plumbing.
+///
+/// A dotted hint (`app.`, `pytest.`, …) matches as a **prefix** of the
+/// decorator's dotted base; a bare hint (`route`, `task`, `register`, …)
+/// matches a **whole identifier segment**. Neither matches a bare substring.
+///
+/// It used to be `lower.contains(h)` over the raw line, which made
+/// `@multitask` a `task`, `@preregister` a `register` and `@FastAPI_thing` a
+/// `fastapi`. That is not a cosmetic over-match: the annotation this feeds is
+/// `WiringKind::FrameworkDecorator` targeting the *file*
+/// (`extract_wiring_annotations`), and `is_file_exempt`
+/// (`devmap-analyze/src/liveness.rs`) exempts every symbol in a file carrying
+/// one — so a single such line hid a whole file from the dead-code scan.
+///
+/// `devcouncil.indexing.wiring.is_wiring_decorated` is the spec, and this is
+/// its rule transcribed: split off everything from the first `(`, strip the
+/// leading `@`, trim, lowercase, then split on `.` and whitespace for the
+/// segment set. The hint table itself is unchanged and is pinned equal to the
+/// Python one by `tests/unit/test_wiring_parity_with_kernel.py`.
 pub fn is_wiring_decorator(decorator: &str) -> bool {
     let hints = [
         "app.",
@@ -158,8 +178,27 @@ pub fn is_wiring_decorator(decorator: &str) -> bool {
         "dramatiq.",
         "huey.",
     ];
-    let lower = decorator.to_lowercase();
-    hints.iter().any(|h| lower.contains(h))
+    let base = decorator
+        .split('(')
+        .next()
+        .unwrap_or(decorator)
+        .trim_start_matches('@')
+        .trim()
+        .to_lowercase();
+    if base.is_empty() {
+        return false;
+    }
+    let segments: Vec<&str> = base
+        .split(|c: char| c == '.' || c.is_whitespace())
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    hints.iter().any(|hint| {
+        if hint.ends_with('.') {
+            base.starts_with(hint)
+        } else {
+            segments.contains(hint)
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -918,6 +957,16 @@ mod tests {
         assert!(!source_has_generated_header("def handler(): pass\n"));
     }
 
+    /// Case folding, on decorators that are wiring in any casing.
+    ///
+    /// `@FastAPI_thing` used to stand here as the case-folding fixture and has
+    /// been replaced by `@FastAPI` and `@App.Route('/')`. It was never a
+    /// case-insensitivity case: it matched only because `fastapi` was compared
+    /// as a bare *substring* of `fastapi_thing`, which is the defect
+    /// `wiring_decorator_hints_are_prefixes_and_segments_not_substrings`
+    /// refuses. The two replacements exercise exactly what this test is named
+    /// for — a mixed-case segment and a mixed-case dotted prefix — without
+    /// re-encoding the over-match.
     #[test]
     fn wiring_decorator_hints_are_case_insensitive() {
         for decorator in [
@@ -926,7 +975,8 @@ mod tests {
             "@click.command()",
             "@pytest.fixture",
             "@celery.task",
-            "@FastAPI_thing",
+            "@FastAPI",
+            "@App.Route('/')",
             "@receiver(post_save)",
         ] {
             assert!(
@@ -1078,5 +1128,50 @@ mod tests {
         assert!(is_test_path("app/src/androidTest/Thing.kt"));
         // And a filename rule still outranks the dotfile exclusion.
         assert!(is_test_path("app/src/test/.eslintrc.test.js"));
+    }
+
+    /// A hint is a path prefix or a whole identifier segment, never a substring.
+    ///
+    /// `lower.contains(h)` made `@multitask` a `task`, `@preregister` a
+    /// `register` and `@FastAPI_thing` a `fastapi`. Because the annotation this
+    /// feeds targets the *file* and `is_file_exempt` exempts every symbol in
+    /// the file, one such line hides a whole file from the dead-code scan.
+    /// `devcouncil.indexing.wiring.is_wiring_decorated` is the spec: dotted
+    /// hints match as prefixes, bare hints as whole segments.
+    #[test]
+    fn wiring_decorator_hints_are_prefixes_and_segments_not_substrings() {
+        for decorator in [
+            "@multitask",
+            "@preregister",
+            "@FastAPI_thing",
+            "@my_action_helper",
+            "@reroute",
+            "@taskless",
+            "@commander",
+        ] {
+            assert!(
+                !is_wiring_decorator(decorator),
+                "{decorator} is not framework registration; a substring match \
+                 hides every symbol in its file from the dead-code scan"
+            );
+        }
+        // The hint table is unchanged, and everything it was written for still
+        // matches.
+        for decorator in [
+            "@app.route('/')",
+            "@router.get('/x')",
+            "@click.command()",
+            "@pytest.fixture",
+            "@celery.task",
+            "@receiver(post_save)",
+            "@api_view(['GET'])",
+            "@task",
+            "@register",
+        ] {
+            assert!(
+                is_wiring_decorator(decorator),
+                "{decorator} should be wiring"
+            );
+        }
     }
 }
