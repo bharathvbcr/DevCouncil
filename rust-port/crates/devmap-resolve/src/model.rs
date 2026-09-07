@@ -142,6 +142,7 @@ impl LangFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ResolutionKind {
     SameFile,
+    SamePackage,
     ImportScoped,
     ReceiverType,
     UniqueGlobal,
@@ -153,8 +154,9 @@ pub enum ResolutionKind {
 impl ResolutionKind {
     /// Every kind, in declaration order. What [`Self::from_label`] searches and
     /// what a table generated from the enum (the store's SQL check) iterates.
-    pub const ALL: [ResolutionKind; 7] = [
+    pub const ALL: [ResolutionKind; 8] = [
         ResolutionKind::SameFile,
+        ResolutionKind::SamePackage,
         ResolutionKind::ImportScoped,
         ResolutionKind::ReceiverType,
         ResolutionKind::UniqueGlobal,
@@ -165,9 +167,9 @@ impl ResolutionKind {
 
     /// The confidence a rung entitles an edge to.
     ///
-    /// - `SameFile`, `ImportScoped`, `ReceiverType` — deterministic: the
-    ///   declaration is in this file, or the import or the receiver's type
-    ///   names it outright.
+    /// - `SameFile`, `SamePackage`, `ImportScoped`, `ReceiverType` —
+    ///   deterministic: the declaration is in this file, or in this file's
+    ///   package block, or the import or the receiver's type names it outright.
     /// - `UniqueGlobal` — exactly one declaration of that name in the family.
     /// - `AmbiguousGlobal` — several matches and no way to choose (G5).
     /// - `Unresolved` — no edge is ever built from this variant. It scores at
@@ -179,6 +181,7 @@ impl ResolutionKind {
     pub fn confidence(self) -> Confidence {
         match self {
             ResolutionKind::SameFile
+            | ResolutionKind::SamePackage
             | ResolutionKind::ImportScoped
             | ResolutionKind::ReceiverType
             | ResolutionKind::Structural => Confidence::DETERMINISTIC,
@@ -192,6 +195,7 @@ impl ResolutionKind {
     pub fn label(self) -> &'static str {
         match self {
             ResolutionKind::SameFile => "SameFile",
+            ResolutionKind::SamePackage => "SamePackage",
             ResolutionKind::ImportScoped => "ImportScoped",
             ResolutionKind::ReceiverType => "ReceiverType",
             ResolutionKind::UniqueGlobal => "UniqueGlobal",
@@ -259,6 +263,24 @@ pub enum Resolution {
         target_symbol: String,
         target_file: String,
     },
+    /// X45. The declaration is in another file of **this file's package**.
+    ///
+    /// Go puts every package-level identifier in the package block, so a bare
+    /// name written in `search/rank.go` reaches `search/provider.go` with no
+    /// import and no ambiguity — the language resolves it, not a name count.
+    /// None of the other rungs can say that: the declaration is not in this
+    /// file, no import names it, no receiver was typed, and the two global
+    /// tiers are defined by how many matches the *family* holds, which is a
+    /// different question with a different answer.
+    ///
+    /// `package_name` is carried because a directory is not a package: a
+    /// directory holds `package foo` and its external test package `foo_test`,
+    /// and the two do not share a scope.
+    SamePackage {
+        target_symbol: String,
+        target_file: String,
+        package_name: String,
+    },
     ImportScoped {
         target_symbol: String,
         target_file: String,
@@ -307,6 +329,7 @@ impl Resolution {
     pub fn kind(&self) -> ResolutionKind {
         match self {
             Resolution::SameFile { .. } => ResolutionKind::SameFile,
+            Resolution::SamePackage { .. } => ResolutionKind::SamePackage,
             Resolution::ImportScoped { .. } => ResolutionKind::ImportScoped,
             Resolution::ReceiverType { .. } => ResolutionKind::ReceiverType,
             Resolution::UniqueGlobal { .. } => ResolutionKind::UniqueGlobal,
@@ -336,6 +359,11 @@ impl Resolution {
             Resolution::SameFile {
                 target_symbol,
                 target_file,
+            }
+            | Resolution::SamePackage {
+                target_symbol,
+                target_file,
+                ..
             }
             | Resolution::ImportScoped {
                 target_symbol,

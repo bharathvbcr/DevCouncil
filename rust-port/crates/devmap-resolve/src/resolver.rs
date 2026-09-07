@@ -9,6 +9,10 @@ use devmap_extract::model::*;
 use crate::model::*;
 use devmap_extract::GoModule;
 
+/// One package-level declaration, as [`Resolver::go_package_symbols`] holds it:
+/// the file that declares it, its qualified name, and its kind.
+type PackageDecl = (String, String, SymbolKind);
+
 /// Where the name a resolution rung failed on was written.
 ///
 /// The tiers in [`UnresolvedClass`] are stated over evidence, and the evidence
@@ -147,6 +151,17 @@ pub struct Resolver {
     go_modules_fresh: bool,
     /// file_path → Go package identifier (`pkg` in `package pkg`).
     go_package_by_file: BTreeMap<String, String>,
+    /// X45. `(directory, package clause, bare name)` → the **package-level**
+    /// declarations of that name, as `(file, qualified name, kind)`.
+    ///
+    /// The index behind [`Resolver::same_package_target`]. Keyed on the
+    /// directory *and* the package clause because a directory is not a package:
+    /// `search/` holds `package search` and its external test package
+    /// `package search_test`, and the second is outside the first's package
+    /// block. Holds only declarations whose parent is the file — a method is
+    /// declared on its type, not in the package block, so a bare name cannot
+    /// reach it.
+    go_package_symbols: BTreeMap<(String, String, String), Vec<PackageDecl>>,
     /// `(file, scope, name)` for every value a callable binds itself.
     ///
     /// `declared_types` can only answer for a binding that carries a *written
@@ -219,6 +234,7 @@ impl Resolver {
             go_modules: Vec::new(),
             go_modules_fresh: false,
             go_package_by_file: BTreeMap::new(),
+            go_package_symbols: BTreeMap::new(),
             scope_locals: BTreeSet::new(),
             max_indexed_path_depth: 0,
             unique_basename: BTreeMap::new(),
@@ -607,10 +623,69 @@ impl Resolver {
             }
         }
 
+        // X48. The receiver is rooted at a **host global object**.
+        //
+        // `console.log(...)`, `JSON.stringify(x)`, `process.env`,
+        // `Math.floor(n)`. These reached `UninferredReceiver`, the tier that
+        // means "the receiver is a value whose type we could not infer" — and
+        // `console` is not a receiver whose type could not be inferred, it is
+        // one whose type the runtime states. Same argument X43 made for
+        // `std::fs`, in the language whose globals are objects rather than
+        // modules. Measured: 126 of the 316 JS `uninferred_receiver` rows on
+        // this repository, 7,408 of 58,904 across scholarlm's JS/TS.
+        //
+        // Three guards, and the table alone is never enough.
+        //
+        // The receiver must **be** the root and nothing else — the same shape
+        // X43's `bare_module_handle` requires, and here it is load-bearing in a
+        // way the `::` version is not. X44 reduces a receiver *structurally*,
+        // so `JSON.stringify(rows)` as the receiver of `.padStart(…)` is
+        // recorded as `JSON.stringify` with the parentheses gone: after that
+        // reduction a call result and a property read are the same string, and
+        // no test on the text can separate them. `process.env.PWD` is therefore
+        // **not** claimed, and that is an abstention rather than an oversight —
+        // it costs rows and invents nothing. Separating them needs the
+        // extractor to keep "this was a call" in the reduced receiver, which is
+        // `ExtractedCall::receiver_expr`'s shape and a change of its own.
+        //
+        // The enclosing scope must not bind the root, which
+        // `root_is_a_value_here` already answers. And the corpus gets the last
+        // word: a repository that declares its own `Date` keeps `Date.parse` in
+        // the defect tier, which is the veto `is_prelude_type` opens with. The
+        // file's own imports needed no test here — an import of the root
+        // returned `External` several rungs above.
+        if !root_is_a_value_here && receiver == root && Self::receiver_is_property_path(receiver) {
+            if let Some(environment) = crate::builtins::host_global_object(family, root) {
+                if !self.family_declares(family, root) {
+                    return UnresolvedClass::HostGlobal {
+                        environment: environment.to_string(),
+                    };
+                }
+            }
+        }
+
         // A receiver we could not type. Not a defect — naming its owner needs
         // real type inference — but distinct from a bare-name failure, and by
         // far the larger group.
         UnresolvedClass::UninferredReceiver
+    }
+
+    /// Whether a receiver expression is a dotted run of plain identifiers.
+    ///
+    /// The `.` twin of [`Self::receiver_is_module_path`], and it exists for the
+    /// same reason: `process` and `process.env` are the objects themselves,
+    /// while `JSON.stringify(x)` as the receiver of `.length` is an
+    /// *expression* that merely starts at one. A segment carrying parentheses,
+    /// brackets, quotes or whitespace disqualifies the whole receiver, so the
+    /// chained case keeps the tier it belongs in.
+    fn receiver_is_property_path(receiver: &str) -> bool {
+        !receiver.is_empty()
+            && receiver.split('.').all(|segment| {
+                !segment.is_empty()
+                    && segment
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            })
     }
 
     /// Whether a receiver expression is a module **path** rather than a value.
@@ -684,6 +759,7 @@ impl Resolver {
         self.qualified_names.clear();
         self.symbol_parents.clear();
         self.go_package_by_file.clear();
+        self.go_package_symbols.clear();
         self.scope_locals.clear();
         self.max_indexed_path_depth = extractions
             .iter()
@@ -773,6 +849,28 @@ impl Resolver {
             if let Some(pkg) = ext.go_package.as_deref().filter(|pkg| !pkg.is_empty()) {
                 self.go_package_by_file
                     .insert(ext.file_path.clone(), pkg.to_string());
+                // X45. The package block, indexed. `parent_symbol` is the
+                // extractor's own answer for "what declares this", and a
+                // file-level parent is exactly what Go puts in the package
+                // block; a method's parent is its type, and no bare name
+                // reaches one.
+                let dir = Self::parent_dir(&ext.file_path);
+                for sym in &ext.symbols {
+                    if sym.kind == SymbolKind::File {
+                        continue;
+                    }
+                    let file_level = sym
+                        .parent_symbol
+                        .as_deref()
+                        .is_none_or(|parent| parent == ext.file_path);
+                    if !file_level {
+                        continue;
+                    }
+                    self.go_package_symbols
+                        .entry((dir.clone(), pkg.to_string(), sym.name.clone()))
+                        .or_default()
+                        .push((ext.file_path.clone(), sym.qualified_name.clone(), sym.kind));
+                }
             }
         }
 
@@ -1547,6 +1645,24 @@ impl Resolver {
                                         call.caller_symbol.as_deref(),
                                         &call.callee_name,
                                     ))
+                                // X47. The half of the fabricated-caller defect
+                                // X42 left standing. This rung admits a `self.`
+                                // receiver on the grounds that the receiver
+                                // *is* this scope — true, and it says nothing
+                                // about a **module-level function** that
+                                // happens to share the name. Where the
+                                // enclosing type declares the method, rung 1b
+                                // has already answered at `ReceiverType`; where
+                                // it does not, this rung was binding
+                                // `self.on_done()` to `svc.py::on_done` at
+                                // DETERMINISTIC — a free function handed a
+                                // caller it does not have, and thereby shielded
+                                // from the dead-code pass. Same restriction
+                                // X42 put on the global rung, at the rung that
+                                // outranks it.
+                                && (bare_call
+                                    || self.symbol_kind_in(&ext.file_path, &call.callee_name)
+                                        == Some(SymbolKind::Method))
                             {
                                 resolution = Some(Arc::new(Resolution::SameFile {
                                     target_symbol: call.callee_name.clone(),
@@ -1595,6 +1711,33 @@ impl Resolver {
                                     }));
                                 }
                             }
+                        }
+                    }
+
+                    // 2e. X45. The package block. A bare `Trim(raw)` in
+                    // `search/rank.go` names `search/provider.go`'s `Trim`
+                    // because Go's package-level scope spans the package's
+                    // files — no import says so and none needs to.
+                    //
+                    // Placed last of the pre-global rungs, so it takes only
+                    // what the global tier was answering and no rung above it
+                    // loses a call. A *bare* callee only: `x.Trim()` names
+                    // something `x` owns, and a package-level function is not
+                    // one, which is the same rule rung 2c applies within a file.
+                    if resolution.is_none()
+                        && family == LangFamily::Go
+                        && call.receiver_expr.is_none()
+                    {
+                        if let Some((target_file, target_symbol, package_name)) = self
+                            .same_package_target(&ext.file_path, &call.callee_name, |kind| {
+                                kind != SymbolKind::Method
+                            })
+                        {
+                            resolution = Some(Arc::new(Resolution::SamePackage {
+                                target_symbol,
+                                target_file,
+                                package_name,
+                            }));
                         }
                     }
 
@@ -2417,6 +2560,59 @@ impl Resolver {
         None
     }
 
+    /// X45. Where a bare `name` written in `file` goes by Go's package-block
+    /// scope rule, or `None` where the rule cannot answer.
+    ///
+    /// Go's spec puts every package-level identifier in scope, unqualified,
+    /// throughout the package — which spans the files of one directory that
+    /// share a package clause. That is deterministic evidence and the resolver
+    /// had no rung for it: the answer came from the global tier, which counts
+    /// matches across the whole language family and so said `UniqueGlobal`
+    /// where the family held one and fanned out at `AmbiguousGlobal` where it
+    /// held several. Measured on scholarlm: 31,587 and 24,635 same-directory
+    /// cross-file Go edges respectively, plus 1,770 defect-tier rows for type
+    /// references the package itself declares.
+    ///
+    /// The declaring file must not be `file`: the same-file rungs own that, and
+    /// they apply scope tests this one has no way to repeat.
+    ///
+    /// `accept` is the caller's kind filter — a type annotation admits only
+    /// type declarations — applied *before* the uniqueness count, so a rejected
+    /// candidate can neither win nor veto.
+    ///
+    /// **Test files are a build tag, not a name.** A `_test.go` declaration is
+    /// absent from the ordinary build, so a non-test file must not reach one;
+    /// a `_test.go` file reaches both, because that is what its build sees.
+    /// The external test package (`package search_test`) needs no rule here —
+    /// its package clause differs, so it keys elsewhere.
+    ///
+    /// Abstains on a package that declares the name twice. That does not
+    /// compile, but this resolver indexes whatever it is pointed at — a
+    /// generated file beside its source, a half-applied merge — and a
+    /// DETERMINISTIC rung that picked one would be picking by input order.
+    fn same_package_target(
+        &self,
+        file: &str,
+        name: &str,
+        accept: impl Fn(SymbolKind) -> bool,
+    ) -> Option<(String, String, String)> {
+        let package = self.go_package_by_file.get(file)?;
+        let source_is_test = file.ends_with("_test.go");
+        let hits = self.go_package_symbols.get(&(
+            Self::parent_dir(file),
+            package.clone(),
+            name.to_string(),
+        ))?;
+        let mut visible = hits.iter().filter(|(path, _, kind)| {
+            path != file && accept(*kind) && (source_is_test || !path.ends_with("_test.go"))
+        });
+        let (target_file, target_symbol, _) = visible.next()?;
+        visible
+            .next()
+            .is_none()
+            .then(|| (target_file.clone(), target_symbol.clone(), package.clone()))
+    }
+
     fn lookup_in_package(&self, file: &str, name: &str) -> Option<(String, String)> {
         if self
             .file_symbols
@@ -2734,6 +2930,35 @@ impl Resolver {
             }
         }
 
+        // X47. 1b, the reference half of X42: an implicit receiver dispatches
+        // on the type the reference is written inside. `bus.subscribe(
+        // self.on_done)` names `Service.on_done` — the method used as a value —
+        // and the call ladder has known that since X42 while this one did not.
+        //
+        // After the typed-receiver rung above, for X42's reason: a scope that
+        // writes `this = Other()` has said what `this` is. Before the import
+        // rung below, for the opposite one — `self.run` cannot mean an imported
+        // free function in any language here, so the import rung is refused for
+        // an implicit receiver outright.
+        let implicit = Self::receiver_is_self(receiver);
+        if implicit {
+            let (target_file, target_symbol, receiver_type) =
+                reference.enclosing_symbol.as_deref().and_then(|caller| {
+                    self.implicit_receiver_target(&ext.file_path, family, caller, name)
+                })?;
+            return Some(self.reference_edge(
+                ext,
+                &target_file,
+                name,
+                reference,
+                Resolution::ReceiverType {
+                    target_symbol,
+                    target_file: target_file.clone(),
+                    receiver_type,
+                },
+            ));
+        }
+
         let (module_file, _) = self.import_bindings.get(&ext.file_path)?.get(receiver)?;
         let (resolved_file, resolved_symbol) = self.lookup_in_package(module_file, name)?;
         Some(self.reference_edge(
@@ -2749,6 +2974,82 @@ impl Resolver {
         ))
     }
 
+    /// The module a written type was qualified by, for a reference in type
+    /// position: `search` for `paper search.Paper`.
+    ///
+    /// The one reader of the `@mod` half of `declared_types`, so the resolution
+    /// ladder and [`Self::classify_unresolved`] cannot key that index two ways.
+    /// Scoped-first for the SC9 reason: a qualifier this scope wrote does not
+    /// speak for a same-named binding in another.
+    ///
+    /// `None` for a bare type, and for a `TypeQualifier` reference itself —
+    /// that row *is* the qualifier, and asking what qualifies it would key on
+    /// its own binding and answer with itself.
+    fn type_qualifier_of(&self, file: &str, reference: &ExtractedReference) -> Option<&str> {
+        if reference.kind != ReferenceKind::Type {
+            return None;
+        }
+        let typed = reference.assigned_to.as_deref()?;
+        reference
+            .enclosing_symbol
+            .as_deref()
+            .and_then(|scope| {
+                self.declared_types
+                    .get(&format!("{file}:{scope}:{typed}@mod"))
+            })
+            .or_else(|| self.declared_types.get(&format!("{file}:{typed}@mod")))
+            .map(String::as_str)
+    }
+
+    /// X46. The type `Self` names in a Rust type annotation, or `None` where
+    /// the keyword cannot be given a concrete answer.
+    ///
+    /// `fn with_god_nodes(self, …) -> Self` returns the type written at the top
+    /// of its `impl` block, and that type is `symbol_parents`' answer for the
+    /// method — the extractor's own record, reduced the same way
+    /// [`Self::declaring_type_of`] reduces it, never a split of the qualified
+    /// name on `.`. `impl Render for Widget` puts `Widget` there and not
+    /// `Render`, which is what makes this the implementor and not the trait.
+    ///
+    /// Abstains inside a `trait`. There `Self` is whatever type implements it —
+    /// not the trait, and not a type this resolver can name — so answering with
+    /// the trait would emit a DETERMINISTIC edge asserting a return type no
+    /// implementation has. That is the opposite of X42's answer for
+    /// `Self::blank()` in the same position, and deliberately: a *method* named
+    /// there is one the trait really does declare.
+    ///
+    /// Rust only. `Self` is a type keyword in Swift too, but inside a `class`
+    /// it means the dynamic type — a subclass this rung would silently name the
+    /// base of — so Swift keeps the honest abstention until someone measures it.
+    fn rust_self_type(&self, file: &str, scope: Option<&str>) -> Option<&str> {
+        let enclosing = self.declaring_type_of(file, scope?)?;
+        matches!(
+            self.symbol_kind_in(file, enclosing)?,
+            SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Class
+        )
+        .then_some(enclosing)
+    }
+
+    /// Whether one of `file`'s own import tables binds `qualifier` — the three
+    /// halves the import walk splits every specifier into: resolved to an
+    /// indexed file, external to the corpus, or repo-relative and unindexed.
+    ///
+    /// The same three maps [`Self::classify_unresolved`] consults, asked here
+    /// as one question: does this file state where that module comes from?
+    fn qualifier_is_bound(&self, file: &str, qualifier: &str) -> bool {
+        self.import_bindings
+            .get(file)
+            .is_some_and(|bindings| bindings.contains_key(qualifier))
+            || self
+                .external_imports
+                .get(file)
+                .is_some_and(|imports| imports.contains_key(qualifier))
+            || self
+                .unindexed_local_imports
+                .get(file)
+                .is_some_and(|imports| imports.contains_key(qualifier))
+    }
+
     fn resolve_name_reference(
         &self,
         ext: &Extraction,
@@ -2759,6 +3060,21 @@ impl Resolver {
         if name.is_empty() {
             return None;
         }
+        // X46. `Self` in type position is read as the name of the type the item
+        // is written inside, and then answered by the ordinary rungs — so this
+        // is a substitution, not a rung. The unresolved ledger keeps `Self`
+        // where the substitution finds no type: what failed is the keyword the
+        // author wrote, and renaming a failure is not reporting it.
+        let name = (family == LangFamily::Rust && reference.kind == ReferenceKind::Type)
+            .then(|| {
+                (name == "Self")
+                    .then(|| {
+                        self.rust_self_type(&ext.file_path, reference.enclosing_symbol.as_deref())
+                    })
+                    .flatten()
+            })
+            .flatten()
+            .unwrap_or(name);
         let prefer_types = matches!(
             reference.kind,
             ReferenceKind::Type | ReferenceKind::Heritage | ReferenceKind::HeritageInterface
@@ -2774,10 +3090,78 @@ impl Resolver {
             )
         };
 
-        let same_file = self.file_symbols.get(&ext.file_path).and_then(|syms| {
-            let hits: Vec<_> = syms.iter().filter(|symbol| *symbol == name).collect();
-            (hits.len() == 1).then(|| ext.file_path.clone())
-        });
+        // X45. A *qualified* type is resolved by its qualifier, before any
+        // rung that reads the bare name.
+        //
+        // `paper search.Paper` is split by the extractor into a `Type`
+        // reference carrying the bare `Paper` — which is what dispatch needs —
+        // and a `TypeQualifier` sibling carrying `search`, paired by the
+        // binding they annotate (SC25). Until now only `classify_unresolved`
+        // read that sibling, and only to *label* the failure; the ladder itself
+        // reduced the written type to `Paper` and then answered as though the
+        // author had written a bare name. On scholarlm that costs every
+        // `search.Paper` outside the package: `Paper` is declared by two
+        // packages, so the global tier abstains — correctly — and the one piece
+        // of evidence that says which is discarded.
+        //
+        // First, not last, because the failure it prevents is a wrong answer
+        // rather than a missing one: in a file that itself declares a `T`,
+        // `t *testing.T` matched the same-file rung and bound a foreign type to
+        // a local one at DETERMINISTIC. A qualifier the ladder cannot follow
+        // still falls through — an unindexed module is a gap, not a veto.
+        if let Some(qualifier) = self.type_qualifier_of(&ext.file_path, reference) {
+            if let Some(edge) =
+                self.resolve_member_reference(ext, family, reference, qualifier, name)
+            {
+                return Some(edge);
+            }
+            // The qualifier could not be followed. Where the file's own import
+            // tables *bind* it, that is an answer and not an absence: the
+            // module is external to the corpus, or repo-relative and unindexed,
+            // and either way no declaration reachable by the bare name can be
+            // the one written. Falling through would hand the reference to the
+            // rungs that read the name alone — which is how `t *testing.T`
+            // bound to a local `type T struct`. A qualifier no import table
+            // names is a different case (Rust makes a crate addressable by path
+            // with no `use` of its root) and still falls through.
+            if self.qualifier_is_bound(&ext.file_path, qualifier) {
+                return None;
+            }
+        }
+
+        // X47. A reference *with a receiver* names something that receiver
+        // owns, and the two rungs that can prove which one are the member
+        // rungs. They ran last, after the bare-name rungs below, so the ones
+        // that cannot see a receiver answered first: `self.on_done` in a file
+        // with a module-level `def on_done` resolved to that free function at
+        // `SameFile` and `DETERMINISTIC`, handing it a caller it does not have
+        // and shielding it from the dead-code pass. That is the same
+        // fabricated-caller defect the call ladder's rung 2c was written to
+        // stop, in the ladder it was never applied to.
+        //
+        // So a receiver is asked first and then **disqualifies** every rung
+        // below that reads the bare name alone. The one that still runs is the
+        // global tier, which is HIGH or SPECULATIVE and states its uncertainty
+        // — and which, for an implicit receiver, admits only members.
+        let receiver = reference.receiver_expr.as_deref();
+        if let Some(receiver) = receiver {
+            if let Some(edge) =
+                self.resolve_member_reference(ext, family, reference, receiver, name)
+            {
+                return Some(edge);
+            }
+        }
+        let implicit_receiver = receiver.is_some_and(Self::receiver_is_self);
+
+        let same_file = receiver
+            .is_none()
+            .then(|| {
+                self.file_symbols.get(&ext.file_path).and_then(|syms| {
+                    let hits: Vec<_> = syms.iter().filter(|symbol| *symbol == name).collect();
+                    (hits.len() == 1).then(|| ext.file_path.clone())
+                })
+            })
+            .flatten();
         if let Some(target_file) = same_file {
             if let Some(kind) = self.symbol_kind_in(&target_file, name) {
                 if !prefer_types || is_type(kind) {
@@ -2795,7 +3179,11 @@ impl Resolver {
             }
         }
 
-        if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
+        if let Some(bindings) = self
+            .import_bindings
+            .get(&ext.file_path)
+            .filter(|_| receiver.is_none())
+        {
             if let Some((target_f, target_sym)) = bindings.get(name) {
                 if let Some((resolved_file, resolved_sym)) =
                     self.lookup_in_package(target_f, target_sym)
@@ -2815,21 +3203,6 @@ impl Resolver {
             }
         }
 
-        // A *member* reference names something another symbol owns, so the
-        // two rungs that can prove which one apply exactly as they do for a
-        // method call: a receiver whose type is known, and a receiver bound by
-        // an import. `cfg.enabled` and `cmd.baseline` resolve here.
-        //
-        // This runs before the bare-name refusal below and never widens it: a
-        // reference with no receiver is still a bare name and still refused.
-        if let Some(receiver) = reference.receiver_expr.as_deref() {
-            if let Some(edge) =
-                self.resolve_member_reference(ext, family, reference, receiver, name)
-            {
-                return Some(edge);
-            }
-        }
-
         // Name identifiers unique-global to a unique function in another file.
         // That binds `except Exception as e` / `print(e)` / `for _, segment`
         // to a unique `def e` / `func segment` across the language family.
@@ -2838,12 +3211,54 @@ impl Resolver {
             return None;
         }
 
+        // X45. The package block, for the reference half of the ladder.
+        //
+        // `func score(paper Paper)` in `search/rank.go` names the `Paper` its
+        // own package declares in `search/provider.go`. Measured on scholarlm,
+        // 1,770 rows of the defect tier were exactly this — `Paper` 455,
+        // `Hypothesis` 449, `AgentSession` 338 — because two packages of that
+        // corpus declare `Paper` and the global tier below abstains between
+        // them, as it should. The package block is the evidence that says
+        // which, and it is written at the top of both files.
+        //
+        // After the `Name` refusal above, deliberately: a bare identifier
+        // mention is the one shape this function declines rather than fails,
+        // and a package-scope rung must not be the thing that widens it.
+        //
+        // Bare names only, for the X47 reason: `search.Paper` written inside
+        // package `api` names `search`'s type, and asking `api`'s own package
+        // block about the bare `Paper` would answer a question nobody asked.
+        if family == LangFamily::Go && receiver.is_none() {
+            if let Some((target_file, target_symbol, package_name)) =
+                self.same_package_target(&ext.file_path, name, |kind| {
+                    !prefer_types || is_type(kind)
+                })
+            {
+                return Some(self.reference_edge(
+                    ext,
+                    &target_file,
+                    name,
+                    reference,
+                    Resolution::SamePackage {
+                        target_symbol,
+                        target_file: target_file.clone(),
+                        package_name,
+                    },
+                ));
+            }
+        }
+
         if let Some(hits) = self.symbol_index.get(name) {
             let family_hits: Vec<_> = hits
                 .iter()
                 .filter(|(path, kind, candidate_family)| {
                     family.admits(*candidate_family)
                         && (!prefer_types || is_type(*kind))
+                        // X47, the same restriction X42 put on the call
+                        // ladder's global rung: `self.on_done` names a member
+                        // of the enclosing type, and a module-level function is
+                        // not one.
+                        && (!implicit_receiver || matches!(kind, SymbolKind::Method))
                         && (*candidate_family != LangFamily::Go
                             || Self::go_symbol_visible_from(&ext.file_path, path, name))
                 })
@@ -2874,6 +3289,15 @@ impl Resolver {
         None
     }
 
+    /// The kind `file` declares `name` as, when it declares it exactly once.
+    ///
+    /// `then_some` **evaluates its argument**, so `(len == 1).then_some(v[0])`
+    /// indexes the vector before the length test can guard it: a name the
+    /// symbol index holds for *other* files and not for this one panicked with
+    /// "the len is 0 but the index is 0". It stood because every caller had
+    /// already proved the name was in this file — X46 added one that had not,
+    /// and the crash was a build abort rather than a wrong answer. `then` takes
+    /// a closure and is evaluated only on the true branch.
     fn symbol_kind_in(&self, file: &str, name: &str) -> Option<SymbolKind> {
         self.symbol_index.get(name).and_then(|hits| {
             let file_hits: Vec<_> = hits
@@ -2881,7 +3305,7 @@ impl Resolver {
                 .filter(|(path, _, _)| path == file)
                 .map(|(_, kind, _)| *kind)
                 .collect();
-            (file_hits.len() == 1).then_some(file_hits[0])
+            (file_hits.len() == 1).then(|| file_hits[0])
         })
     }
 

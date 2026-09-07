@@ -459,6 +459,89 @@ const HOST_GLOBALS: &[(&str, &str)] = &[
     ("structuredClone", "web+node"),
 ];
 
+/// X48. The JavaScript-family global **objects**, as opposed to the global
+/// *functions* in [`HOST_GLOBALS`].
+///
+/// A separate table because it answers a different question, and answering it
+/// from the other one would break that one's first admission rule. `HOST_GLOBALS`
+/// is "callable only" on purpose: a call whose *callee* is `console` cannot be a
+/// real call, so it must stay in the tier that means "possible defect". What
+/// this table is for is the *receiver*: `console.log(...)`, `JSON.stringify(x)`,
+/// `process.env`, `Math.floor(n)`. There the name is not being called — it is
+/// the object the runtime injected, and the member is platform API.
+///
+/// Those rows reached `UninferredReceiver`, the tier documented as "the receiver
+/// is a value whose type we could not infer". `console` is not a receiver whose
+/// type could not be inferred; it is one whose type the runtime states. That is
+/// the same argument X43 made for `std::fs`, in the language whose globals are
+/// objects rather than modules. Measured before this table existed: **126 of the
+/// 316** JS `uninferred_receiver` rows on this repository were rooted at one of
+/// these, and 7,408 of 58,904 across scholarlm's JS/TS.
+///
+/// Two admission rules:
+///
+/// 1. **Named by a specification as a property of the global object** — ECMA-262
+///    §19-28 for the standard objects, WHATWG HTML "Web application APIs" for
+///    the browser ones, and the Node.js "Global objects" page for `process`.
+/// 2. **Never sufficient on its own.** Every use of this table is guarded by the
+///    corpus: the enclosing scope must not bind the name, the file's imports
+///    must not, and no indexed file of the family may declare it. A repository
+///    with its own `class Date` keeps its `Date.parse` in the defect tier, which
+///    is the same veto `is_prelude_type` opens with and for the same reason.
+///
+/// Sorted by name: `host_global_object` uses `binary_search_by_key`.
+const HOST_GLOBAL_OBJECTS: &[(&str, &str)] = &[
+    ("Array", "ecma"),
+    ("Atomics", "ecma"),
+    ("BigInt", "ecma"),
+    ("Boolean", "ecma"),
+    ("Date", "ecma"),
+    ("Intl", "ecma"),
+    ("JSON", "ecma"),
+    ("Map", "ecma"),
+    ("Math", "ecma"),
+    ("Number", "ecma"),
+    ("Object", "ecma"),
+    ("Promise", "ecma"),
+    ("Proxy", "ecma"),
+    ("Reflect", "ecma"),
+    ("RegExp", "ecma"),
+    ("Set", "ecma"),
+    ("String", "ecma"),
+    ("Symbol", "ecma"),
+    ("WeakMap", "ecma"),
+    ("WeakSet", "ecma"),
+    ("console", "web+node"),
+    ("crypto", "web+node"),
+    ("document", "web"),
+    ("globalThis", "web+node"),
+    ("history", "web"),
+    ("localStorage", "web"),
+    ("location", "web"),
+    ("navigator", "web+node"),
+    ("performance", "web+node"),
+    ("process", "node"),
+    ("sessionStorage", "web"),
+    ("window", "web"),
+];
+
+/// The environment that injects `name` as a global **object**, or `None`.
+///
+/// Only ever consulted for the *root of a receiver* in a JavaScript-family
+/// file, and only behind the three corpus guards [`HOST_GLOBAL_OBJECTS`]
+/// documents. A bare callee is not asked here: `console()` is not a call the
+/// runtime can answer, and letting this table say otherwise would hide the
+/// extraction defect that produced it.
+pub fn host_global_object(family: LangFamily, name: &str) -> Option<&'static str> {
+    if family != LangFamily::JsTs {
+        return None;
+    }
+    HOST_GLOBAL_OBJECTS
+        .binary_search_by_key(&name, |(global, _)| *global)
+        .ok()
+        .map(|index| HOST_GLOBAL_OBJECTS[index].1)
+}
+
 /// Whether `name` is declared by the language itself for this family.
 ///
 /// Only ever consulted for a *bare* callee. A call with a receiver is library
@@ -954,6 +1037,39 @@ mod tests {
                 matches!(*environment, "web" | "node" | "web+node"),
                 "{name:?} names an environment {environment:?} that is not one \
                  of the three this crate can cite"
+            );
+        }
+    }
+
+    /// X48. The object table, held to the same two properties, plus the one
+    /// that keeps the two tables from answering each other's question: a
+    /// *function* the runtime injects and an *object* it injects are asked
+    /// about in different positions — callee and receiver root — and a name in
+    /// both would make the answer depend on which position it was written in.
+    #[test]
+    fn the_host_global_object_table_is_sorted_unique_and_disjoint() {
+        let names: Vec<&str> = HOST_GLOBAL_OBJECTS.iter().map(|(name, _)| *name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted, names,
+            "the host-global-object table must be sorted and duplicate-free for \
+             binary_search_by_key to find its entries"
+        );
+        for (name, environment) in HOST_GLOBAL_OBJECTS {
+            assert!(
+                matches!(*environment, "web" | "node" | "web+node" | "ecma"),
+                "{name:?} names an environment {environment:?} that is not one \
+                 of the four this crate can cite"
+            );
+            assert!(
+                HOST_GLOBALS
+                    .binary_search_by_key(name, |(global, _)| *global)
+                    .is_err(),
+                "{name:?} is claimed as both a host global function and a host \
+                 global object; the tier would then depend on the position the \
+                 name was written in rather than on evidence"
             );
         }
     }

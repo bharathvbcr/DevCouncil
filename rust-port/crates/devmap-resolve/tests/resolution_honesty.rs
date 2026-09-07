@@ -48,6 +48,9 @@ fn resolve(files: &[(&str, &str)]) -> (Vec<Extraction>, ResolutionResult) {
 fn entitled(resolution: &Resolution) -> Confidence {
     match resolution {
         Resolution::SameFile { .. }
+        // X45. Go's package block spans the package's files, so a
+        // package-level name is as certainly named as one in this very file.
+        | Resolution::SamePackage { .. }
         | Resolution::ImportScoped { .. }
         | Resolution::ReceiverType { .. }
         | Resolution::Structural { .. } => Confidence::DETERMINISTIC,
@@ -224,6 +227,12 @@ fn no_deterministic_edge_exists_without_deterministic_evidence() {
             matches!(
                 resolution,
                 Resolution::SameFile { .. }
+                    // X45. Admitted deliberately, and this list is where that
+                    // decision is recorded: Go's spec puts a package-level
+                    // identifier in scope, unqualified, throughout the package,
+                    // so the package clause at the top of both files names the
+                    // target as certainly as a declaration in this one does.
+                    | Resolution::SamePackage { .. }
                     | Resolution::ImportScoped { .. }
                     | Resolution::ReceiverType { .. }
                     | Resolution::Structural { .. }
@@ -249,6 +258,20 @@ fn a_deterministic_edge_names_the_target_its_evidence_names() {
                 (target_file, target_file),
                 "a SameFile edge that leaves its file: {edge:?}"
             ),
+            // X45. The package block reaches *other* files of the package, so
+            // unlike `SameFile` this one must leave its file — and land on the
+            // file its evidence names.
+            Some(Resolution::SamePackage { target_file, .. }) => {
+                assert_eq!(
+                    &edge.target_file, target_file,
+                    "a SamePackage edge pointing away from the declaring file: {edge:?}"
+                );
+                assert_ne!(
+                    &edge.target_file, &edge.source_file,
+                    "a SamePackage edge inside one file: the same-file rung owns \
+                     that, and it applies scope tests this one does not: {edge:?}"
+                );
+            }
             Some(Resolution::ImportScoped { target_file, .. }) => assert_eq!(
                 &edge.target_file, target_file,
                 "an ImportScoped edge pointing away from the import's target: {edge:?}"

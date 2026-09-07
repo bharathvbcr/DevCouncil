@@ -84,3 +84,19 @@ required-features = ["parse"]
 [[test]]
 name = "every_site_is_counted_once"
 required-features = ["parse"]
+
+[[test]]
+name = "go_package_scope"
+required-features = ["parse"]
+
+[[test]]
+name = "rust_self_type"
+required-features = ["parse"]
+
+[[test]]
+name = "implicit_receiver_reference"
+required-features = ["parse"]
+
+[[test]]
+name = "host_global_objects"
+required-features = ["parse"]
