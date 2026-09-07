@@ -253,6 +253,14 @@ fn an_incremental_build_still_copies_every_node_and_full_text_row() {
     let nodes_before = count("SELECT COUNT(*) FROM generation_nodes");
     let fts_before = count("SELECT COUNT(*) FROM nodes_fts_map");
     let edges_before = count("SELECT COUNT(*) FROM edge_rows");
+    // `0 == 0 * 2` holds. Every equality below is vacuous against a fixture
+    // that stored nothing, and a fixture can come to store nothing by a change
+    // to the extractor rather than to anything this file is about.
+    assert!(
+        nodes_before > 400 && fts_before > 400 && edges_before > 100,
+        "the fixture must hold enough of each relation for the doubling below to \
+         mean something: nodes={nodes_before} fts={fts_before} edges={edges_before}"
+    );
 
     let second = tree(1, 150);
     let (extractions, resolution, analysis) = pipeline(&as_refs(&second));
