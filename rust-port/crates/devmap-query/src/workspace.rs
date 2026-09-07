@@ -189,14 +189,45 @@ impl Workspace {
     /// later workspace query opens a `.devmap/` store that was never built and
     /// reports the repository as having no symbols — a confident zero, which is
     /// the one answer this codebase refuses to give.
-    pub fn add(&mut self, name: String, root: PathBuf) {
-        let db = store_relpath_for(&root);
-        let entry = WorkspaceRepo { name, root, db };
-        match self.repos.iter_mut().find(|repo| repo.name == entry.name) {
-            Some(existing) => *existing = entry,
-            None => self.repos.push(entry),
+    ///
+    /// Refused, never recorded: a name that is not a label (empty, or carrying
+    /// a control character) and a root that is not a directory. Read back from
+    /// the release binary, a regular file, `""` and `"a\nb"` were all
+    /// registered, and every later workspace query reported them as "no store
+    /// at …" — entries that can only ever answer unavailable. Returns whether an
+    /// entry of that name was replaced, so the caller can say which it did.
+    pub fn add(&mut self, name: String, root: PathBuf) -> anyhow::Result<bool> {
+        let label = name.trim();
+        if label.is_empty() {
+            anyhow::bail!("a repository name must not be empty");
         }
+        if label.chars().any(char::is_control) {
+            anyhow::bail!("a repository name must not carry control characters: {name:?}");
+        }
+        if !root.is_dir() {
+            anyhow::bail!(
+                "{}: not a directory; a registered repository is a directory",
+                root.display()
+            );
+        }
+        let db = store_relpath_for(&root);
+        let entry = WorkspaceRepo {
+            name: label.to_string(),
+            root,
+            db,
+        };
+        let replaced = match self.repos.iter_mut().find(|repo| repo.name == entry.name) {
+            Some(existing) => {
+                *existing = entry;
+                true
+            }
+            None => {
+                self.repos.push(entry);
+                false
+            }
+        };
         self.repos.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(replaced)
     }
 
     /// Remove a repository by name. Returns whether one was removed, so a
@@ -377,14 +408,21 @@ mod tests {
     #[test]
     fn add_is_idempotent_by_name_and_round_trips() {
         let dir = scratch("roundtrip");
+        let (beta, alpha, moved) = (dir.join("beta"), dir.join("alpha"), dir.join("alpha-moved"));
+        for repo in [&beta, &alpha, &moved] {
+            std::fs::create_dir_all(repo).unwrap();
+        }
         let mut workspace = Workspace::load(&dir).unwrap();
-        workspace.add("beta".into(), PathBuf::from("/tmp/beta"));
-        workspace.add("alpha".into(), PathBuf::from("/tmp/alpha"));
-        workspace.add("alpha".into(), PathBuf::from("/tmp/alpha-moved"));
+        assert!(!workspace.add("beta".into(), beta.clone()).unwrap());
+        assert!(!workspace.add("alpha".into(), alpha.clone()).unwrap());
+        assert!(
+            workspace.add("alpha".into(), moved.clone()).unwrap(),
+            "re-registering a name must say it replaced the entry"
+        );
         assert_eq!(workspace.repos.len(), 2, "re-adding a name duplicated it");
         // Sorted, so the file does not churn on unrelated edits.
         assert_eq!(workspace.repos[0].name, "alpha");
-        assert_eq!(workspace.repos[0].root, PathBuf::from("/tmp/alpha-moved"));
+        assert_eq!(workspace.repos[0].root, moved);
 
         workspace.save(&dir).unwrap();
         let reloaded = Workspace::load(&dir).unwrap();
@@ -392,10 +430,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Read back from the release binary: `workspace add` registered a regular
+    /// file, an empty name and a name carrying a newline, and every later
+    /// `workspace search` reported those entries as "no store at …" — a
+    /// registry that can only ever answer "unavailable" for them.
+    #[test]
+    fn a_registered_repository_is_a_directory_and_its_name_is_a_label() {
+        let dir = scratch("labels");
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "not a repository\n").unwrap();
+        let mut workspace = Workspace::load(&dir).unwrap();
+
+        let error = workspace
+            .add("filey".into(), file.clone())
+            .expect_err("a regular file is not a repository");
+        assert!(
+            error.to_string().contains("not a directory"),
+            "the refusal must say why: {error}"
+        );
+        for name in ["", "   ", "a\nb", "tab\there", "bell\u{7}"] {
+            let error = workspace
+                .add(name.into(), repo.clone())
+                .expect_err(&format!("{name:?} is not a label and must be refused"));
+            assert!(error.to_string().contains("name"), "{name:?}: {error}");
+        }
+        assert!(
+            workspace.repos.is_empty(),
+            "nothing may be registered by a refused call: {:?}",
+            workspace.repos
+        );
+        assert!(!workspace.add("  repo  ".into(), repo.clone()).unwrap());
+        assert_eq!(workspace.repos[0].name, "repo", "a label is trimmed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn remove_distinguishes_removed_from_never_registered() {
+        let dir = scratch("remove");
         let mut workspace = Workspace::default();
-        workspace.add("one".into(), PathBuf::from("/tmp/one"));
+        let one = dir.join("one");
+        std::fs::create_dir_all(&one).unwrap();
+        workspace.add("one".into(), one).unwrap();
         assert!(workspace.remove("one"));
         assert!(
             !workspace.remove("one"),

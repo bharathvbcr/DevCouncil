@@ -3788,10 +3788,23 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             }
         }
         Commands::Workspace { action } => {
-            // Rooted at the store's repository, so `devmap --db X workspace` and
-            // `dev map workspace` agree on where the registry lives.
-            let root = devmap_extract::paths::repo_root_from_store(cli.db())
-                .unwrap_or_else(|| PathBuf::from("."));
+            // Rooted at the store's repository when `--db` names a store in its
+            // standard place, so `devmap --db X workspace` and `dev map workspace`
+            // agree on where the registry lives. A store anywhere else — a
+            // `$DEVMAP_HOME` layout, a scratch path — names no repository, and
+            // the registry belongs to the repository this command ran in. The
+            // inverse used to answer the grandparent of *any* path, and an
+            // off-layout `--db` put the registry two directories above the
+            // store, in a directory that was nobody's repository.
+            let root = match &cli.db {
+                Some(explicit) => devmap_extract::paths::repo_root_from_store(explicit)
+                    .unwrap_or_else(|| cli.root_hint().to_path_buf()),
+                None => cli.root_hint().to_path_buf(),
+            };
+            // Absolute in the answer: the registry records absolute roots, and
+            // a `registry` of `./.devmap/workspace.json` tells a caller in
+            // another directory nothing.
+            let root = root.canonicalize().unwrap_or(root);
             // Mutating actions go through `Workspace::update`, which holds an
             // advisory lock across the read and the write. Loading here and
             // saving later — which is what this did — let two concurrent
@@ -3805,10 +3818,11 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     let label = name
                         .clone()
                         .unwrap_or_else(|| devmap_query::workspace::name_for(&canonical));
-                    let (_, written) =
+                    let (added, written) =
                         devmap_query::workspace::Workspace::update(&root, |workspace| {
-                            workspace.add(label.clone(), canonical.clone());
+                            workspace.add(label.clone(), canonical.clone())
                         })?;
+                    let replaced = added?;
                     if cli.json {
                         emit_json(
                             cli,
@@ -3816,11 +3830,13 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                                 "added": label,
                                 "root": canonical,
                                 "registry": written,
+                                "replaced": replaced,
                             }),
                         )?;
                     } else {
                         println!(
-                            "added {label} -> {} ({})",
+                            "{} {label} -> {} ({})",
+                            if replaced { "replaced" } else { "added" },
                             canonical.display(),
                             written.display()
                         );
