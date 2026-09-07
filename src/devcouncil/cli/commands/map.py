@@ -312,13 +312,26 @@ def map_repo(
     from devcouncil.cli.commands.init import initialize_project
 
     initialize_project(root, quiet=True, with_map=False)
-    # Imported at the point of use. Commands are built lazily
-    # (`cli/main.py`), so a module-scope import here is paid by every
-    # `dev map` — and `storage.db` pulls SQLAlchemy and SQLModel, ~85 ms
-    # measured, for one existence check.
-    from devcouncil.storage.db import get_db
-
-    if not get_db(root):
+    # The existence check, without the ORM behind it.
+    #
+    # This was `from devcouncil.storage.db import get_db; if not get_db(root)`,
+    # and the lazy import it already carried was not the cost: importing
+    # SQLAlchemy and SQLModel is 95 ms measured *marginal* in this process, on
+    # every `dev map`, for a function whose only `None` is "`.devcouncil/` is
+    # not there" — which the line above has just guaranteed it is. `get_db`
+    # also opens an engine and runs `ensure_schema_version()`; migrating a
+    # state database this command never queries is not `dev map`'s job, and it
+    # is done by every command that does query it.
+    #
+    # Kept as a check rather than deleted: `initialize_project` can fail to
+    # create the directory (a read-only parent, a full disk) and returns
+    # nothing that says so, and a map command that maps nothing must not exit
+    # 0. Fail-closed, at the cost of one `stat`.
+    if not (root / ".devcouncil").is_dir():
+        status_console.print(
+            f"[red]Project state directory is missing after initialization: "
+            f"{root / '.devcouncil'}[/red]"
+        )
         raise typer.Exit(code=1)
 
     output = output if output.is_absolute() else root / output

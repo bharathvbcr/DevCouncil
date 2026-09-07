@@ -5,8 +5,16 @@ import typer
 import yaml
 from rich.console import Console
 from pathlib import Path
-from devcouncil.storage.db import Database
-from devcouncil.llm.provider import build_role_model_config, validate_model_provider
+# `Database` (SQLAlchemy + SQLModel, 172 ms) and `llm.provider` (172 ms) are
+# imported at the point of use, not here.
+#
+# `initialize_project` is the one function every command calls to make sure the
+# project exists, and on an already-initialised project its whole remaining
+# effect is `ensure_gitignore` — one file read. Importing this module still cost
+# 110 ms of ORM and provider tables to get there, and `dev map` paid it on every
+# invocation. Both names below are used only inside the "not yet initialised"
+# branch and inside the `init` command, so nothing that merely *checks* has to
+# load them.
 from devcouncil.repo.gitignore import ensure_gitignore
 
 from devcouncil.telemetry.stages import log_stage, log_step
@@ -58,7 +66,13 @@ DEFAULT_CONFIG = {
     },
     "models": {
         "provider": "openrouter",
-        "roles": build_role_model_config("openrouter"),
+        # Empty, not a computed default. `initialize_project` is this dict's
+        # only reader (one call site, `copy.deepcopy` at the fresh-init branch)
+        # and it overwrites both keys from the caller's provider before the
+        # config is written, so the value built here was never observable —
+        # it only forced `llm.provider` to be imported by everything that
+        # touched this module.
+        "roles": {},
     },
     "commands": {
         "test": [],
@@ -277,6 +291,11 @@ def initialize_project(
             config["project"]["name"] = project_name
         else:
             config["project"]["name"] = project_root.name
+        from devcouncil.llm.provider import (
+            build_role_model_config,
+            validate_model_provider,
+        )
+
         provider = validate_model_provider(model_provider)
         config["models"]["provider"] = provider
         config["models"]["roles"] = build_role_model_config(
@@ -287,6 +306,8 @@ def initialize_project(
 
         with open(config_path, "w") as f:
             yaml.dump(config, f, default_flow_style=False)
+
+        from devcouncil.storage.db import Database
 
         db = Database(dev_dir / "state.sqlite")
         db.create_db_and_tables()
@@ -332,6 +353,8 @@ def init(
 
     try:
         role_models = parse_role_model_overrides(role_model)
+        from devcouncil.llm.provider import validate_model_provider
+
         model_provider = validate_model_provider(provider)
     except ValueError as e:
         status_console.print(f"[red]{e}[/red]")
