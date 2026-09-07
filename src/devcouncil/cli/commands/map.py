@@ -767,13 +767,13 @@ def _mount_graph_commands(target: typer.Typer) -> None:
     # A partially-initialised graph_cmd (import cycle, or a stale editable
     # install being rewritten under a running process) used to raise
     # ``AttributeError: module 'graph_cmd' has no attribute 'app'`` at import
-    # time and take the whole CLI down — including `dev map unlock`, the command
-    # you need precisely when a build has just been killed. Degrade instead.
+    # time and take the whole CLI down — including `dev map abort`, the command
+    # you need precisely when a build has wedged. Degrade instead.
     source_app = getattr(graph_cmd, "app", None)
     if source_app is None:
         logger.warning(
             "graph command group unavailable; `dev map <graph subcommand>` is not "
-            "mounted this run — use `dev graph ...` (e.g. `dev graph unlock`)"
+            "mounted this run — use `dev graph ...` (e.g. `dev graph abort`)"
         )
         return
 

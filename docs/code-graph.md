@@ -58,7 +58,7 @@ dev map sync                # Same build
 dev map status              # Engine binary, store (schema, size, free pages, WAL), kernel freshness, daemon, artifacts
 dev map doctor              # Verdicts with fixes: kernel present/capable, store no newer than kernel, artifacts kernel-written, reclaim/WAL pressure
 dev map repair --pending    # Drop pending-queue entries the kernel can never index
-dev map unlock              # Free a stuck *legacy* Python query-cache lease (the kernel's lock is released on process death)
+dev map abort               # Stop the kernel build running for this repository (SIGTERM, then SIGKILL)
 ```
 
 `--no-liveness` and `--lsp-refs` are gone: the kernel always computes liveness, and the LSP adjunct was cut with the Python engine. A flag that is accepted and ignored is worse than one that is rejected, so both are rejected.
