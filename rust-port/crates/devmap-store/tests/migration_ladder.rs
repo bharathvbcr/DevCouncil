@@ -412,6 +412,81 @@ fn every_rung_from_five_up_migrates_to_the_current_schema() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A store an older build of the *same* version left without an index the
+/// fresh schema declares heals at open, whatever rung it starts on.
+///
+/// Measured on this repository's own store on 2026-09-07: created at v17 by a
+/// build whose v17 shape had no `idx_file_payloads_cache_identity`, it walked
+/// 17→18→19 under the merged kernel and was then refused by the index gate —
+/// and the refusal's remedy was `devmap build`, the command that had just
+/// refused. The ladder only runs the rungs above the stamp; an index added to
+/// the fresh schema *within* a version number is never on any of them. So the
+/// open path recreates every declared index (all `IF NOT EXISTS`) before the
+/// gate asks for them, and the gate is left to catch what could not be created.
+#[test]
+fn a_store_missing_a_declared_index_two_rungs_down_heals_at_open() {
+    let dir = tmp_dir("heal-index-ladder");
+    let db_path = dir.join("older-build.sqlite");
+    seed_current_store(&db_path);
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        reduce_one_rung(&conn, CURRENT_SCHEMA_VERSION);
+        reduce_one_rung(&conn, CURRENT_SCHEMA_VERSION - 1);
+        conn.execute_batch("DROP INDEX idx_file_payloads_cache_identity;")
+            .unwrap();
+    }
+    let store = Store::open(&db_path).expect("a missing declared index is recreated, not refused");
+    drop(store);
+    let conn = Connection::open(&db_path).unwrap();
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        version, CURRENT_SCHEMA_VERSION,
+        "the ladder still ran to the top"
+    );
+    let present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+             AND name = 'idx_file_payloads_cache_identity'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        present, 1,
+        "the index the older build never made exists after open"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The same for a store already stamped at the current version — the shape a
+/// future same-version build leaves when it adds an index to the fresh schema.
+#[test]
+fn a_current_store_missing_a_declared_index_heals_at_open() {
+    let dir = tmp_dir("heal-index-current");
+    let db_path = dir.join("same-version.sqlite");
+    seed_current_store(&db_path);
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("DROP INDEX idx_file_payloads_cache_identity;")
+            .unwrap();
+    }
+    let store = Store::open(&db_path).expect("a current store missing a declared index heals");
+    drop(store);
+    let conn = Connection::open(&db_path).unwrap();
+    let present: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+             AND name = 'idx_file_payloads_cache_identity'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(present, 1);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// **R2, R15.** A migrated store and a fresh store are the same schema.
 ///
 /// The contract that makes the class unrepeatable. `validate_schema` compares
@@ -596,12 +671,14 @@ fn a_migrated_store_reopens_without_migrating_again() {
 /// at the top, skip the chain entirely, and every later read would run against
 /// a shape nothing had checked.
 ///
-/// Failure is induced the way it actually happens: a step's idempotency probe
-/// sees the work already done, skips its DDL batch, and an object a previous
-/// partial attempt never created stays missing. The rung the fixture starts on
-/// is `CURRENT_SCHEMA_VERSION - 1` and moves with the end of the chain —
-/// validation runs once, at the last step, because `validate_schema` asserts
-/// the *current* schema and no earlier rung's shape satisfies it.
+/// Failure is induced with damage the open path cannot mend: a required
+/// *column* is gone. (A missing declared index used to be the fixture here;
+/// since the open path recreates those, it no longer fails the gate — see
+/// `a_store_missing_a_declared_index_two_rungs_down_heals_at_open`.) The rung
+/// the fixture starts on is `CURRENT_SCHEMA_VERSION - 1` and moves with the
+/// end of the chain — validation runs once, at the last step, because
+/// `validate_schema` asserts the *current* schema and no earlier rung's shape
+/// satisfies it.
 #[test]
 fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
     let dir = tmp_dir("migration-halfway");
@@ -610,7 +687,7 @@ fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
     {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(&format!(
-            "DROP INDEX idx_file_payloads_cache_identity;
+            "ALTER TABLE generations DROP COLUMN repo_root;
              PRAGMA user_version = {};",
             CURRENT_SCHEMA_VERSION - 1
         ))
@@ -619,10 +696,10 @@ fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
 
     let error = Store::open(&db_path)
         .err()
-        .expect("a store missing a declared index must not open");
+        .expect("a store missing a required column must not open");
     let text = error.to_string();
     assert!(
-        text.contains("idx_file_payloads_cache_identity"),
+        text.contains("generations.repo_root"),
         "the refusal must name what is missing, or an operator cannot act on \
          it: {text}"
     );
@@ -651,12 +728,9 @@ fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
     assert_eq!(is_view, 1, "the rollback must not have unmade the view");
 
     // The same store opens once the missing object is restored, which proves
-    // the refusal was about the index and not about some other damage.
-    conn.execute_batch(
-        "CREATE INDEX idx_file_payloads_cache_identity
-             ON file_payloads(content_hash, language, grammar_version, analyzer_version);",
-    )
-    .unwrap();
+    // the refusal was about the column and not about some other damage.
+    conn.execute_batch(devmap_store::MIGRATION_V6_TO_V7)
+        .unwrap();
     drop(conn);
     let store = Store::open(&db_path).expect("with the index back, the step completes");
     drop(store);

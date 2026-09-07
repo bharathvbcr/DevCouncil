@@ -2732,6 +2732,31 @@ fn affected_closure(
 // holds over the socket also holds over argv without a second spelling.
 use devmap_query::{MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH};
 
+/// One rendering of an error chain for the human line and the JSON line.
+///
+/// `{:#}` prints every link joined by `: `. The store carries its refusals in
+/// a rusqlite variant that displays its boxed error *and* returns it as
+/// `source()`, so the chain says the same sentence twice and every store
+/// refusal read as two (measured: the index-gate refusal against this
+/// repository's store, 2026-09-07). A link whose text equals the one before it
+/// adds nothing and is dropped; every other link is kept in order.
+fn render_error(error: &anyhow::Error) -> String {
+    let mut rendered = String::new();
+    let mut previous: Option<String> = None;
+    for cause in error.chain() {
+        let text = cause.to_string();
+        if previous.as_deref() == Some(text.as_str()) {
+            continue;
+        }
+        if !rendered.is_empty() {
+            rendered.push_str(": ");
+        }
+        rendered.push_str(&text);
+        previous = Some(text);
+    }
+    rendered
+}
+
 /// The path a root-taking subcommand names must be a directory that exists.
 ///
 /// Measured through the release binary: `manifest <missing path>` created
@@ -3024,9 +3049,9 @@ async fn main() -> std::process::ExitCode {
             // parsing it saw an empty string and could not tell a failure from
             // a command that answered nothing. Two channels, one message —
             // stdout stays exactly one JSON line either way.
-            eprintln!("Error: {error:#}");
+            eprintln!("Error: {}", render_error(&error));
             if cli.json {
-                println!("{}", serde_json::json!({ "error": format!("{error:#}") }));
+                println!("{}", serde_json::json!({ "error": render_error(&error) }));
             }
             std::process::ExitCode::FAILURE
         }
@@ -4759,7 +4784,7 @@ empty graph, which would read as 'this file has no control flow'.",
                     // the failure this whole analysis is careful about.
                     Err(error) => refused.push(serde_json::json!({
                         "function": input.function_name,
-                        "reason": format!("{error:#}"),
+                        "reason": render_error(&error),
                     })),
                 }
             }

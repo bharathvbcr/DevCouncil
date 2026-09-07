@@ -1103,6 +1103,37 @@ fn without_sql_comments(sql: &str) -> String {
 /// scanned is the text executed, in this crate, and
 /// `the_index_gate_reads_every_index_the_schema_creates` pins the parse against
 /// a store SQLite actually built.
+/// Every `CREATE [UNIQUE] INDEX IF NOT EXISTS …;` statement the fresh schema
+/// runs, as text, so an open can *recreate* what [`declared_index_names`] lets
+/// the gate *demand*.
+///
+/// The ladder runs only the rungs above a store's stamp. An index added to
+/// the fresh schema within a version number — `idx_file_payloads_cache_identity`
+/// joined v17 after some v17 stores already existed — is on none of them, so
+/// such a store walked every later rung and was then refused by the index
+/// gate, with `devmap build` as the remedy: the command that had just
+/// refused. Measured on this repository's own store, 2026-09-07. Every
+/// statement here is `IF NOT EXISTS`, so replaying them on a store that has
+/// the index is a no-op; `every_declared_index_statement_is_idempotent` pins
+/// that.
+pub fn declared_index_statements() -> Vec<String> {
+    let mut statements = Vec::new();
+    for batch in FRESH_SCHEMA_BATCHES {
+        let sql = without_sql_comments(batch);
+        for chunk in sql.split("CREATE ").skip(1) {
+            let body = chunk.strip_prefix("UNIQUE ").unwrap_or(chunk);
+            if !body.starts_with("INDEX ") {
+                continue;
+            }
+            let Some(end) = chunk.find(';') else {
+                continue;
+            };
+            statements.push(format!("CREATE {};", chunk[..end].trim()));
+        }
+    }
+    statements
+}
+
 pub fn declared_index_names() -> Vec<String> {
     let mut names = Vec::new();
     for batch in FRESH_SCHEMA_BATCHES {

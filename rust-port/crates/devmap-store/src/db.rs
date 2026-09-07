@@ -39,14 +39,15 @@ fn refusal(message: impl Into<String>) -> rusqlite::Error {
 use crate::coverage::{CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryRefusal};
 use crate::edge_index::ResolutionSource;
 use crate::schema::{
-    declared_index_names, BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, COVERAGE_GAPS_TABLE,
-    CREATE_SCHEMA_V3, CURRENT_SCHEMA_VERSION, MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12,
-    MIGRATION_V12_TO_V13, MIGRATION_V14_TO_V15, MIGRATION_V15_TO_V16, MIGRATION_V16_TO_V17,
-    MIGRATION_V17_TO_V18_BACKFILL_EDGES, MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED,
-    MIGRATION_V17_TO_V18_RENAME_EDGES, MIGRATION_V17_TO_V18_RENAME_UNRESOLVED,
-    MIGRATION_V18_TO_V19, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES,
-    MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9,
-    MIGRATION_V9_TO_V10, PYTHON_INDEX_SCHEMA_VERSION, VALIDITY_RANGE_TABLES,
+    declared_index_names, declared_index_statements, BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE,
+    COVERAGE_GAPS_TABLE, CREATE_SCHEMA_V3, CURRENT_SCHEMA_VERSION, MIGRATION_V10_TO_V11,
+    MIGRATION_V11_TO_V12, MIGRATION_V12_TO_V13, MIGRATION_V14_TO_V15, MIGRATION_V15_TO_V16,
+    MIGRATION_V16_TO_V17, MIGRATION_V17_TO_V18_BACKFILL_EDGES,
+    MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED, MIGRATION_V17_TO_V18_RENAME_EDGES,
+    MIGRATION_V17_TO_V18_RENAME_UNRESOLVED, MIGRATION_V18_TO_V19, MIGRATION_V3_TO_V4,
+    MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
+    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, PYTHON_INDEX_SCHEMA_VERSION,
+    VALIDITY_RANGE_TABLES,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -1999,6 +2000,23 @@ impl Store {
         Ok(kind.as_deref() == Some("table"))
     }
 
+    /// Recreate every index the fresh schema declares, before the gate below
+    /// demands them.
+    ///
+    /// The ladder runs only the rungs above a store's stamp, and an index
+    /// added to the fresh schema *within* a version number is on none of them.
+    /// This repository's own store — v17 from a build whose v17 had no
+    /// `idx_file_payloads_cache_identity` — walked 17→18→19 and was refused by
+    /// the gate, whose remedy was `devmap build`: the command that had just
+    /// refused. Every statement is `IF NOT EXISTS`, so on a complete store
+    /// this is a handful of catalogue lookups.
+    fn heal_declared_indexes(conn: &Connection) -> Result<()> {
+        for statement in declared_index_statements() {
+            conn.execute_batch(&statement)?;
+        }
+        Ok(())
+    }
+
     fn validate_schema(conn: &Connection) -> Result<()> {
         for (table, required_columns) in REQUIRED_SCHEMA {
             let object_type: Option<String> = conn
@@ -2056,8 +2074,9 @@ impl Store {
         for index in declared_index_names() {
             if !present.contains(&index) {
                 return Err(refusal(format!(
-                    "required index {index} is missing; the store would answer correctly \
-                     and scan for every answer — run `devmap build` to rebuild it"
+                    "required index {index} is missing and was not recreated; the store \
+                     would answer correctly and scan for every answer — `dev map doctor \
+                     --fix` quarantines the store and rebuilds it"
                 )));
             }
         }
@@ -2503,6 +2522,7 @@ impl Store {
             // correct starting state rather than a gap to be filled.
             tx.execute_batch(MIGRATION_V18_TO_V19)?;
             tx.execute("PRAGMA user_version = 19", [])?;
+            Self::heal_declared_indexes(&tx)?;
             Self::validate_schema(&tx)?;
             tx.commit()?;
             version = 19;
@@ -2510,6 +2530,9 @@ impl Store {
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
         }
+        // A store already at the current version can still be missing an
+        // index a later build of the same version added to the fresh schema.
+        Self::heal_declared_indexes(conn)?;
         Self::validate_schema(conn)?;
         Ok(())
     }
@@ -7742,6 +7765,37 @@ mod connection_tests {
     /// The index gate's expectation is parsed out of DDL, so the parse itself
     /// needs pinning against what SQLite actually built.
     ///
+    /// The statements replayed at open name exactly the indexes the gate
+    /// demands, and every one is `IF NOT EXISTS` — a replay on a complete
+    /// store must be a no-op, or healing would break what it meant to mend.
+    #[test]
+    fn every_declared_index_statement_is_idempotent_and_names_a_gated_index() {
+        let statements = declared_index_statements();
+        let mut gated = declared_index_names();
+        gated.sort();
+        let mut named: Vec<String> = statements
+            .iter()
+            .map(|statement| {
+                assert!(
+                    statement.contains("IF NOT EXISTS"),
+                    "a replayed statement must be idempotent: {statement}"
+                );
+                assert!(statement.ends_with(';'), "{statement}");
+                statement
+                    .split("IF NOT EXISTS ")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        named.sort();
+        assert_eq!(
+            named, gated,
+            "the statements replayed at open and the names the gate demands must be one set"
+        );
+    }
+
     /// A scanner that silently found nothing would make
     /// `validate_schema`'s index check vacuous — the same "passes for the wrong
     /// reason" failure the whole review turns on.
