@@ -5829,3 +5829,170 @@ hold becomes two rows. Collapsing them would mean deciding in SQL which of two
 generations' rows are the same edge, which is exactly what the write path computes from a
 freshly resolved multiset and what a migration has no business inventing. The next build
 closes and the next prune reclaims.
+
+## The cold query, without materialising the edge set (2026-09-06, lane P3)
+
+Continues §3 of the per-turn cost pass above and the read-order change that followed
+it. Wave 1 attributed a cold `impact`'s ~133 ms to *building* the index and proposed
+persisting it or routing through the daemon; P2 measured the index build at 23 ms of
+that and the SQLite `ORDER BY` at 72, moved the ordering into Rust, and left the
+arrival at ~89 ms with the note that the 40 ms target needs the full edge set not to
+be materialised at all. This is that.
+
+### Where a cold `impact` actually spends its time
+
+Measured in process on a `git archive` + `git init` copy of this repository
+(1,626 files, 102,239 edges, 17,869 distinct edge symbols, 1,602 paths, 158.8 MB
+schema-17 store — this half predates the v18 merge and is the diagnosis, not the
+result), release, minima of nine cold runs each:
+
+| | min |
+|---|---|
+| `Store::generation_edges` from a cold store | **63.1 ms** |
+| `impact --depth 3` from a cold store | 63.6 ms |
+| `impact --depth 3` with the index already built | **1.5 ms** |
+
+**The walk is 1.5 ms. Everything else is arrival.** `/usr/bin/time -l` agrees from
+outside: `devmap search`, which reads no edges, retires 114 M instructions and peaks at
+17 MB; `devmap impact --depth 3` retires **1.25 billion** and peaks at 110 MB, for an
+answer that touches 309 of the 102,239 edges.
+
+Split of the 63.1 ms, from the SQLite side (`rusqlite`, same store, minima of nine):
+
+| | min |
+|---|---|
+| scan `generation_edges`, ids + confidence + ordinal only | 9.9 ms |
+| …plus both symbol columns as owned `String` | 17.6 ms |
+| …plus both symbol columns interned in place instead | 19.6 ms |
+| …plus edge kind and resolution, every column owned | 23.9 ms |
+| the Rust sort in read order | 10.8 ms |
+| two of the four `HashMap<Box<str>, Vec<u32>>` adjacency maps | 12.7 ms |
+
+Note the third row: **interning the symbols during the scan is 2 ms *dearer* than
+allocating them**, because a hash of a 71-byte string costs more than a `String`
+allocation. Interning only pays once it removes work downstream — which it does, four
+times over, in the adjacency.
+
+### What was landed: interned columns and a counting-sort adjacency
+
+`GenerationEdges` no longer holds `Arc<Vec<StoredEdge>>` plus four string-keyed hash
+maps. It holds an `EdgeText` — every distinct symbol, path, kind spelling and
+resolution label, stored once behind an `Arc<str>`, ranked in ascending byte order —
+and six `u32` columns per edge over it. The adjacency is a counting sort into two
+integer vectors per direction. The store pushes rows straight off the SQLite cursor as
+borrowed `&str`, so no `StoredEdge` is built; `stored_edge(id)` builds one on demand,
+for the edges an answer contains.
+
+Ranking the interned tables by byte order before the rows is what keeps the read order
+(R4) exact: `edge_read_order` compares ranks, and a rank comparison *is* the byte
+comparison SQLite's BINARY collation made, because the ranks were assigned in that
+order. `paths.path` is `UNIQUE`; symbols and kinds are interned by text; so a rank tie
+is a text tie. `the_rust_edge_order_is_the_sql_order_it_replaced` still runs the
+removed SQL verbatim and requires row-for-row agreement, and passes unchanged.
+
+`Store::edge_cache` — the `Vec<StoredEdge>` memo that sat *beside* the index built from
+it, ~100 MB of `String`s retained for the life of the process — is gone. `latest_edges`
+materialises from the index instead, so one memo answers both.
+
+Interleaved A B A B, n = 41 each, release binaries in separate
+`CARGO_TARGET_DIR`s, both corpora `git archive` + `git init` copies with their store
+rebuilt by the **base** binary (schema 18). A is `858afda`, B is that merge with this
+lane on top, so the only difference between the two is this change.
+
+| this repository — 1,592 files, 102,239 edges, 153.0 MB store | A p50 | B p50 | A min | B min | drift |
+|---|---|---|---|---|---|
+| `search content_hash` (control) | 11.3 | 11.2 | 10.1 | 10.1 | 0.2 |
+| `dead` (control) | 13.1 | 12.9 | 11.4 | 11.7 | 0.3 |
+| `deps content_hash` (control) | 8.9 | 9.2 | 7.7 | 8.1 | 0.6 |
+| `impact content_hash --depth 1` | 87.5 | **56.6** | 82.2 | 53.7 | 1.6 |
+| `impact content_hash --depth 3` | 86.5 | **57.0** | 82.2 | 54.1 | 1.2 |
+| `impact content_hash --depth 8` | 99.5 | **66.5** | 95.4 | 64.1 | 0.6 |
+| `neighbors content_hash` | 88.1 | **57.9** | 84.1 | 55.0 | 0.6 |
+| `trace content_hash main` | 135.9 | **105.3** | 132.8 | 101.3 | 0.0 |
+| `explore content_hash` | 100.2 | **67.9** | 95.9 | 64.6 | 0.9 |
+| `affected src/devcouncil/cli/main.py` | 85.2 | **55.2** | 80.9 | 53.4 | 1.6 |
+
+| scholarlm — 4,520 files, 272,171 edges, 500.6 MB store | A p50 | B p50 | A min | B min | drift |
+|---|---|---|---|---|---|
+| `search segment` (control) | 13.7 | 13.8 | 12.1 | 12.5 | 0.4 |
+| `dead` (control) | 16.9 | 17.4 | 14.8 | 15.5 | 0.2 |
+| `deps segment` (control) | 9.8 | 10.0 | 8.1 | 8.2 | 0.5 |
+| `impact segment --depth 1` | 248.9 | **153.9** | 214.0 | 131.5 | 6.3 |
+| `impact segment --depth 3` | 248.4 | **153.2** | 213.8 | 129.8 | 4.1 |
+| `impact segment --depth 8` | 248.3 | **151.4** | 210.5 | 132.5 | 5.4 |
+| `neighbors segment` | 249.5 | **148.9** | 216.6 | 134.3 | 1.0 |
+| `explore segment` | 465.8 | **252.8** | 371.9 | 220.0 | 25.5 |
+
+−33 % to −46 %, and the bigger corpus gains more, which is what a cost proportional to
+the generation rather than to the answer should do. The controls are flat within their
+own drift on this repository; on scholarlm `dead` reads +0.5 p50 against 0.2 ms of
+drift, which is **the opposite sign to the same control here** (−0.2), so it is
+reported as noise rather than as an effect.
+
+The whole-generation consumers are unchanged. `latest_edges` now materialises its rows
+from the index instead of from its own query, which is more work per row and less work
+before the rows; measured end to end (n = 21) `manifest` is 881.8 → 837.9 ms p50 against
+44.8 ms of drift and `export` 753.6 → 743.2 against 25.8 — **no result** either way, in
+either direction.
+
+Store bytes are unchanged: nothing is persisted, this is a read-path and an
+in-memory-shape change. Allocations during the *first* `impact` a process asks, on a
+3,293-edge fixture whose answer is 2 edges: **21,046 → 213**, pinned by
+`devmap-query/tests/a_cold_query_pays_for_its_answer_not_the_generation.rs`.
+
+Byte-identity is the acceptance test, not the reasoning: every symbol with ≥ 5 callers,
+under `impact` at depths 1/3/8, `neighbors`, `deps`, `explore` and `trace`, both
+binaries, raw stdout compared. **3,212 of 3,212 symbols and 22,488 comparisons on this
+repository, 1,000 of 7,768 and 7,004 comparisons on scholarlm, 0 diffs.** The scholarlm
+half is a capped sample and both numbers are carried.
+
+### The 40 ms target is not reachable without a schema change
+
+After this, a cold `impact --depth 3` is ~11 ms of process floor and ~50 ms of arrival,
+and 39 ms of that arrival is SQLite handing over 102,239 rows of eight columns. The
+sort is now 5.6 ms, the byte-ranking 1.7 ms, the four adjacency vectors 1.4 ms, the
+`paths` read and the row count 1.8 ms. **There is no remaining Rust-side term worth
+attacking**; the cost is the scan.
+
+A depth-3 `impact` from one symbol touches 309 edges and a depth-8 one 27,792 — 0.3 %
+and 27 % of the set. The design that reaches the target, measured but **not landed**
+because it is a schema change and Lane V owns the schema:
+
+* A symbol index. Measured on the schema-17 store as
+  `CREATE INDEX ON generation_edges(generation_id, source_symbol)` and the same for
+  `target_symbol`: **+15.7 MB on 158.8 MB (+9.9 %)** — 8.4 MB and 7.3 MB by `dbstat` —
+  and **0.34 s** to create both after the fact. Under v18 that spelling no longer
+  exists; see the note below.
+* With them, `SELECT DISTINCT source_symbol … WHERE generation_id = ?` is **4–5 ms**
+  over a covering index (14,678 rows), which is what the traversal-start matcher needs
+  in order to run `symbol_matches` per distinct symbol; and each frontier expansion
+  becomes a covering-index point lookup rather than a scan.
+* A Rust prototype of the whole frontier-driven arrival — borrowed symbol scan,
+  interned CSR, bounded BFS, then point-fetching the crossed rows by
+  `(generation_id, ordinal)` — measured **17.8–29.0 ms** across `content_hash`,
+  `build` and `main` at depths 1 and 8, against 63.1 ms for the eager arrival. Its
+  floor is the 17.6 ms symbol scan, which the index above is what removes.
+
+Two things that must be true of any such change, and are why it is not a mechanical
+addition: `symbol_matches` is a *suffix* predicate (`s == q`, `s` ends with `::q`, or
+`s` ends with `.q`), so no b-tree index answers it directly and the distinct-symbol
+scan stays; and `generation_nodes` is **not** a usable symbol universe — 161 of this
+generation's 17,869 edge symbols are neither a node `qualified_name` nor a path, and
+314 edges name a source symbol with no matching node row, so resolving starts from the
+node table would silently lose starts.
+
+Lane V's validity ranges (above) landed first, and they change what that index would
+have to be: `generation_edges` is now a **view** over `edge_rows` joined on
+`[valid_from, valid_to)`, so an index on `(generation_id, source_symbol)` cannot exist —
+there is no such column to index. The physical form would be
+`edge_rows(source_symbol, valid_from, valid_to)`, and whether SQLite will use it under
+the view's join is unmeasured. That is the next question, not a rebase of this one.
+
+What v18 did change here, and had to: the read order's last tie-break. It was the
+emission `ordinal`, which v18 cannot supply — a row carried across generations keeps the
+`edge_id` of the generation that first inserted it, so an incremental generation and a
+cold one would order the same edges differently. V replaced it with `resolution`, and
+the columnar comparator carries the same key: the resolution table is ranked in byte
+order like every other, and SQL NULL sorts where `Option::None` sorts, before every
+`Some`.
+

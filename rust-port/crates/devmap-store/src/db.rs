@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use crate::edge_index::GenerationEdges;
+use crate::edge_index::{EdgeOrder, GenerationEdges, GenerationEdgesBuilder};
 use devmap_analyze::clones::CloneCandidate;
 use devmap_analyze::model::*;
 use devmap_analyze::DeadClusterScan;
@@ -408,24 +408,23 @@ pub struct Store {
     /// 71,598-edge vector per query and did not give the memory back: RSS went
     /// 531.6 MB after startup -> 625.2 MB after 6 queries -> 801.4 MB after 26,
     /// about 10 MB per query of allocator churn. One retained copy replaces an
-    /// unbounded series of transient ones.
+    /// The latest generation's edges and the adjacency over them, keyed by
+    /// generation id.
+    ///
+    /// The one memo of a generation's edges. It used to sit beside a second
+    /// one holding the `Vec<StoredEdge>` it was built from, so the rows were
+    /// retained for the life of the process on top of the index — ~100 MB of
+    /// `String`s that only `latest_edges` ever read again. The index now holds
+    /// the generation's *interned* text and addresses it by rank, so the rows
+    /// are built on demand and only for the edges an answer contains, and one
+    /// memo is enough.
     ///
     /// Keyed by generation id, so a build that commits a new generation
     /// invalidates it by construction — there is no separate invalidation path
     /// to forget to call. Only the newest generation is held, so the memory is
     /// bounded by one edge set and not by the number of generations retained.
-    /// The cached set is unfiltered; `min_confidence` is applied per request
-    /// against the same rounding rule the SQL used, so the answer is unchanged.
-    edge_cache: Mutex<Option<CachedEdges>>,
-    /// Adjacency over the same rows [`Store::edge_cache`] holds, keyed by the
-    /// same generation id.
-    ///
-    /// It shares that `Arc` rather than copying the edge text, so what this
-    /// adds is four maps of `u32` ids — see
-    /// [`GenerationEdges::adjacency_bytes`]. Without it every graph question
-    /// paid for the whole generation before the walk began: the clone out of
-    /// the cache, the conversion of every row, and an adjacency map over every
-    /// row, for a question whose answer touches a few dozen edges.
+    /// The index is unfiltered; `min_confidence` is applied per request against
+    /// the same rounding rule the SQL used, so the answer is unchanged.
     edge_index: Mutex<Option<(u32, std::sync::Arc<GenerationEdges>)>>,
     /// `(generation, node_count, edge_count)` for the generation last asked
     /// about.
@@ -494,15 +493,6 @@ impl Drop for WriterLock {
 }
 
 /// One generation's edge rows and the evidence tier behind each of them.
-///
-/// One entry rather than two caches: an evidence tier read from a different
-/// generation than the edge it labels is precisely the drift the index already
-/// refuses to allow for its coverage disclosure.
-type CachedEdges = (
-    u32,
-    std::sync::Arc<Vec<StoredEdge>>,
-    std::sync::Arc<Vec<crate::edge_index::EdgeResolution>>,
-);
 
 #[derive(Debug, Clone)]
 pub struct StoreStatus {
@@ -713,6 +703,11 @@ impl PathRanks {
     fn path_of(&self, rank: u32) -> &str {
         &self.ordered[rank as usize]
     }
+
+    /// How many distinct `paths` rows this generation's store holds.
+    fn len(&self) -> usize {
+        self.ordered.len()
+    }
 }
 
 /// Everything about an edge that a generation stores, as one hashable value.
@@ -905,60 +900,6 @@ struct UnresolvedTuple<'a> {
     reason: std::borrow::Cow<'a, str>,
     classification: std::borrow::Cow<'a, str>,
     receiver: Option<std::borrow::Cow<'a, str>>,
-}
-
-/// A generation edge before it has been put in read order.
-///
-/// Holds the ranks rather than the paths, and the `f64` confidence SQLite
-/// stored rather than the `f32` [`StoredEdge`] narrows it to, because both are
-/// sort keys and both must compare exactly as SQL compared them.
-struct UnorderedEdge {
-    source_rank: u32,
-    target_rank: u32,
-    source_symbol: String,
-    target_symbol: String,
-    edge_kind: String,
-    confidence: f64,
-    resolution: Option<String>,
-}
-
-/// The order every reader of a generation's edges sees, as one comparator.
-///
-/// `confidence DESC, source path, target path, source symbol, target symbol,
-/// edge kind` — the key `latest_edges_uncached`'s SQL used to hand to SQLite —
-/// and then `resolution`. This order is the final tie-break of every answer
-/// derived from a walk (R4), so it has exactly one owner.
-///
-/// # Why the last key is `resolution` and not the emission ordinal
-///
-/// It was `ordinal`, the position the resolver emitted the edge at, which SQL
-/// had no equivalent of and which made the tail of the order defined instead of
-/// arbitrary. v18 cannot supply that: a row's ordinal belongs to the generation
-/// that first inserted it, and a row carried across generations keeps it, so an
-/// incremental generation and a cold one would order the same edges differently.
-///
-/// `resolution` is a strictly better key, not a substitute. It is the last
-/// column `StoredEdge` carries, so any pair it still leaves tied is a pair whose
-/// every read column agrees — two rows a caller cannot tell apart, in either
-/// order. And it makes the read order a pure function of the stored tuples
-/// rather than of the order they happened to arrive in, which is what lets a
-/// generation assembled from carried rows be byte-identical to a cold one.
-///
-/// It is not hypothetical that the old key was load-bearing: six rows of this
-/// repository tie on all six keys above and differ only here — pairs like
-/// `tests/unit/test_local_llm_calibration.py -> src/devcouncil/app/config.py`
-/// at confidence 1, emitted once as `ImportScoped` and once as `ReceiverType`.
-/// Under `ordinal` their order was whichever the resolver reached first.
-fn edge_read_order(left: &UnorderedEdge, right: &UnorderedEdge) -> std::cmp::Ordering {
-    right
-        .confidence
-        .total_cmp(&left.confidence)
-        .then_with(|| left.source_rank.cmp(&right.source_rank))
-        .then_with(|| left.target_rank.cmp(&right.target_rank))
-        .then_with(|| left.source_symbol.cmp(&right.source_symbol))
-        .then_with(|| left.target_symbol.cmp(&right.target_symbol))
-        .then_with(|| left.edge_kind.cmp(&right.edge_kind))
-        .then_with(|| left.resolution.cmp(&right.resolution))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2351,7 +2292,6 @@ impl Store {
         }
         Ok(Self {
             conn: Mutex::new(conn),
-            edge_cache: Mutex::new(None),
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
@@ -2678,7 +2618,6 @@ impl Store {
         Self::migrate(&mut conn, ":memory:")?;
         Ok(Self {
             conn: Mutex::new(conn),
-            edge_cache: Mutex::new(None),
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
@@ -5338,8 +5277,16 @@ impl Store {
 
     /// Every edge in the latest generation at or above `min_confidence`.
     ///
-    /// Served from [`Store::edge_cache`] when the generation has not moved. See
-    /// that field for the measurements that motivate it.
+    /// Materialised from [`Store::generation_edges`], which is the one read of
+    /// a generation's edges: the rows a caller gets here are built from the
+    /// index's interned columns rather than from a second query, so a filtered
+    /// read and an indexed walk cannot describe different generations or
+    /// disagree about the order they are in.
+    ///
+    /// This is the whole-generation shape, and it costs what a whole generation
+    /// costs — six owned `String`s per row. Everything that only needs *some*
+    /// rows should ask the index for those, which is what the query engine now
+    /// does; this stays for the callers that genuinely want every row.
     pub fn latest_edges(&self, min_confidence: f32) -> Result<Vec<StoredEdge>> {
         // The confidence comparison is the SQL's, moved into Rust unchanged, so
         // a cached answer and a freshly-queried one cannot disagree — *given a
@@ -5351,67 +5298,13 @@ impl Store {
         // comparison that never ran. `checked_min_confidence` refuses the input
         // instead, so neither implementation is asked an unanswerable question.
         let min_confidence = checked_min_confidence(min_confidence)?;
-        let Some((_, all, _)) = self.latest_edge_rows()? else {
+        let Some(index) = self.generation_edges()? else {
             return Ok(Vec::new());
         };
-        Ok(all
-            .iter()
-            .filter(|edge| crate::edge_index::admits(edge.confidence, min_confidence))
-            .cloned()
+        Ok((0..index.len() as u32)
+            .filter(|id| index.admits(*id, min_confidence))
+            .map(|id| index.stored_edge(id))
             .collect())
-    }
-
-    /// The latest generation's unfiltered edge rows, and the generation they
-    /// came from.
-    ///
-    /// The one place [`Store::edge_cache`] is consulted and filled, so
-    /// [`Store::latest_edges`] and [`Store::generation_edges`] read the same
-    /// rows for the same generation and share one allocation of them. `None`
-    /// means no generation has been persisted.
-    ///
-    /// Keyed by the generation the rows were *read from*, not by the one
-    /// sampled before the load. This function asks the question twice — once
-    /// to probe the cache, once inside the load's own snapshot — and a writer
-    /// committing between the two made the entry `(N, edges of N+1)`: a key
-    /// that can never be hit again, so the cache silently stopped being one
-    /// until the next load rewrote it. Labelling the entry with the generation
-    /// its rows came from makes the key mean what it says.
-    fn latest_edge_rows(&self) -> Result<Option<CachedEdges>> {
-        let current = {
-            let conn = lock_conn(&self.conn)?;
-            Self::latest_generation_id_locked(&conn)?
-        };
-        let Some(current) = current else {
-            return Ok(None);
-        };
-        if let Ok(cache) = self.edge_cache.lock() {
-            if let Some((generation, edges, resolutions)) = cache.as_ref() {
-                if *generation == current {
-                    return Ok(Some((
-                        current,
-                        std::sync::Arc::clone(edges),
-                        std::sync::Arc::clone(resolutions),
-                    )));
-                }
-            }
-        }
-        let Some((loaded, all, resolutions)) = self.latest_edges_uncached(0.0)? else {
-            return Ok(None);
-        };
-        let all = std::sync::Arc::new(all);
-        // Decoded once per generation, beside the rows they describe rather
-        // than in a cache of their own: an evidence tier read from a different
-        // generation than the edge it labels is the drift `GenerationEdges`
-        // already refuses to allow for its coverage disclosure.
-        let resolutions = std::sync::Arc::new(resolutions);
-        if let Ok(mut cache) = self.edge_cache.lock() {
-            *cache = Some((
-                loaded,
-                std::sync::Arc::clone(&all),
-                std::sync::Arc::clone(&resolutions),
-            ));
-        }
-        Ok(Some((loaded, all, resolutions)))
     }
 
     /// Adjacency over the latest generation's edges, built once per generation.
@@ -5422,11 +5315,24 @@ impl Store {
     /// running, and the next call after that build gets the newer generation
     /// because the memo is keyed by its id.
     ///
-    /// Errors on an unknown stored edge kind, which is where the per-request
-    /// conversion used to fail: a store written by a binary that knows an edge
-    /// kind this one does not is refused rather than half-read.
+    /// Errors on an unknown stored edge kind or resolution label, which is
+    /// where the per-request conversion used to fail: a store written by a
+    /// binary that knows a kind or a tier this one does not is refused rather
+    /// than half-read.
+    ///
+    /// Keyed by the generation the rows were *read from*, not by the one
+    /// sampled before the load. This function asks the question twice — once to
+    /// probe the memo, once inside the load's own snapshot — and a writer
+    /// committing between the two made the entry `(N, edges of N+1)`: a key
+    /// that can never be hit again, so the memo silently stopped being one
+    /// until the next load rewrote it. Labelling the entry with the generation
+    /// its rows came from makes the key mean what it says.
     pub fn generation_edges(&self) -> Result<Option<std::sync::Arc<GenerationEdges>>> {
-        let Some((current, rows, resolutions)) = self.latest_edge_rows()? else {
+        let current = {
+            let conn = lock_conn(&self.conn)?;
+            Self::latest_generation_id_locked(&conn)?
+        };
+        let Some(current) = current else {
             return Ok(None);
         };
         if let Ok(cache) = self.edge_index.lock() {
@@ -5436,131 +5342,118 @@ impl Store {
                 }
             }
         }
-        if rows.len() > u32::MAX as usize {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
-                "generation {current} holds {} edges, more than the {} an edge \
-                 index can address; answering over a prefix of it would be a \
-                 wrong answer rather than a bounded one",
-                rows.len(),
-                u32::MAX
-            )));
-        }
-        // Read for `current` specifically — the generation the rows came from,
-        // which may already be behind the store's latest.
-        let analysis = self.analysis_disclosure_for(current)?;
-        let index = std::sync::Arc::new(
-            GenerationEdges::build_with_resolutions(
-                rows,
-                analysis,
-                Some(resolutions.as_ref().clone()),
-            )
-            .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
-        );
+        let Some((loaded, index)) = self.latest_edge_index_uncached()? else {
+            return Ok(None);
+        };
+        let index = std::sync::Arc::new(index);
         if let Ok(mut cache) = self.edge_index.lock() {
-            *cache = Some((current, std::sync::Arc::clone(&index)));
+            *cache = Some((loaded, std::sync::Arc::clone(&index)));
         }
         Ok(Some(index))
     }
 
-    /// Every edge of the latest generation, and the generation they came from.
+    /// The latest generation's adjacency, read fresh, and the generation it
+    /// came from.
     ///
-    /// The generation travels with the rows because [`Self::latest_edges`]
-    /// caches them under it; returning only the rows left the caller to label
-    /// them with a generation it had resolved separately. `None` when the store
-    /// holds no generation.
-    ///
-    /// # Why the order is not SQL's any more
+    /// # Why this does not materialise the generation
     ///
     /// This read is the whole fixed cost of arriving at [`GenerationEdges`],
-    /// which is what a one-shot `devmap impact` pays and never amortises. Split
-    /// on this repository's 101,503 edges, minima of three runs each:
+    /// which is what a one-shot `devmap impact` pays and never amortises — the
+    /// index memo above is per *process*, and a CLI process asks one question.
+    /// Measured on this repository's 102,239 edges, cold, minima of nine runs:
+    /// arriving at the index cost **63.1 ms** and the walk that followed cost
+    /// **1.5 ms**. The whole of a cold `impact` was arrival.
+    ///
+    /// Two shapes were paying for it, and both were proportional to the
+    /// generation rather than to the answer:
     ///
     /// | part | cost |
     /// |---|---|
-    /// | `ORDER BY confidence DESC, sp.path, tp.path, …` | **~72 ms** |
-    /// | the two `paths` joins | ~9 ms |
-    /// | the row scan and its string materialisation | ~19 ms |
-    /// | building the adjacency in [`GenerationEdges::build_with_resolutions`] | ~23 ms |
+    /// | `ORDER BY confidence DESC, sp.path, tp.path, …` in SQLite | ~72 ms (removed earlier) |
+    /// | the row scan and six owned `String`s per `StoredEdge` | ~41 ms |
+    /// | four `HashMap<Box<str>, Vec<u32>>` over those rows | ~22 ms |
     ///
-    /// The sort is the single biggest term and it is the one SQLite is worst
-    /// at here: the key spans two joined `paths` strings, so no index can
-    /// supply it (`generation_edges` is keyed `(generation_id, ordinal)`, and
-    /// `ordinal` is the *resolver's* emission order, not this one), and the
-    /// plan is `USE TEMP B-TREE FOR ORDER BY` over every row of the
-    /// generation — ~15 MB of records through SQLite's sorter to order a Vec
-    /// that is about to be built in memory anyway.
+    /// A generation's rows are mostly repetition — 102,239 edges naming 17,869
+    /// distinct symbols, 1,602 paths, 8 kinds and 7 resolution labels — and the
+    /// row shape paid for that repetition twice, once copying the text and
+    /// again hashing it. So the rows are never built: the cursor's borrowed
+    /// `&str`s go straight into [`GenerationEdgesBuilder`], which interns each
+    /// distinct string once and keeps six `u32`s per edge, and the adjacency
+    /// becomes a counting sort over those ranks instead of four hash maps over
+    /// the text. What a caller needs a row for it gets one row at a time, for
+    /// the edges its answer actually contains.
     ///
-    /// So the ordering moves to Rust, and with it the joins: the `paths` table
-    /// is 1,567 rows, read once and *ranked* once, which turns the two most
-    /// discriminating string keys of the comparison into `u32` compares.
-    /// Measured end to end, the same rows in the same order: **~100 ms → ~39
-    /// ms**.
+    /// # Why the order is the same
     ///
-    /// # Why the result is the same order
-    ///
-    /// [`edge_read_order`] is the comparator, and it is SQL's key by key:
-    /// SQLite's default collation is BINARY, which is `str`'s byte ordering,
-    /// and the confidence is compared as the `f64` SQLite stored rather than
-    /// the `f32` [`StoredEdge`] narrows it to, so no pair that SQL separated
-    /// can collapse into a tie here. It then adds `ordinal` as a final key,
-    /// which SQL had no equivalent of: SQLite's sorter is not stable, so rows
-    /// equal on all six of its keys came back in an order nothing defined.
-    /// The extra key can only order pairs SQL left unordered, and it makes the
-    /// result reproducible instead of merely unspecified.
-    #[allow(clippy::type_complexity)]
-    fn latest_edges_uncached(
-        &self,
-        min_confidence: f32,
-    ) -> Result<Option<(u32, Vec<StoredEdge>, Vec<crate::edge_index::EdgeResolution>)>> {
+    /// [`EdgeOrder::ReadOrder`] hands the ordering to `edge_read_order`, which
+    /// is SQL's key for key and is the single owner of it — see the comparator.
+    /// `the_rust_edge_order_is_the_sql_order_it_replaced` runs the removed
+    /// statement verbatim against the same store and requires row-for-row
+    /// agreement.
+    fn latest_edge_index_uncached(&self) -> Result<Option<(u32, GenerationEdges)>> {
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
         let paths = PathRanks::read(&snapshot)?;
+        let edge_count: i64 = snapshot.query_row(
+            "SELECT COUNT(*) FROM generation_edges WHERE generation_id = ?1",
+            params![gen],
+            |row| row.get(0),
+        )?;
+        // Ids are `u32`. A generation with more edges than that cannot be
+        // addressed, and answering over a silently truncated prefix would be a
+        // wrong answer rather than a bounded one.
+        if edge_count > u32::MAX as i64 {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "generation {gen} holds {edge_count} edges, more than the {} an \
+                 edge index can address; answering over a prefix of it would be \
+                 a wrong answer rather than a bounded one",
+                u32::MAX
+            )));
+        }
+        let mut builder = GenerationEdgesBuilder::with_capacity(edge_count.max(0) as usize);
+        // The `paths` table is read and ranked once — 1,602 rows — and every
+        // edge then names its two files by rank. Interning the path *text* per
+        // edge would hash 204,478 strings to learn 1,602 facts.
+        let file_ranks: Vec<u32> = (0..paths.len())
+            .map(|rank| builder.intern_file(paths.path_of(rank as u32)))
+            .collect();
         let mut stmt = snapshot.prepare(
             "SELECT e.source_file_id, e.target_file_id, e.source_symbol,
                     e.target_symbol, e.edge_kind, e.confidence, e.resolution
              FROM generation_edges e
-             WHERE e.generation_id = ?1 AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?2 * 1000) AS INTEGER)",
+             WHERE e.generation_id = ?1",
         )?;
-        let rows = stmt.query_map(params![gen, min_confidence], |row| {
-            Ok(UnorderedEdge {
-                source_rank: paths.rank_of(row.get(0)?)?,
-                target_rank: paths.rank_of(row.get(1)?)?,
-                source_symbol: row.get(2)?,
-                target_symbol: row.get(3)?,
-                edge_kind: row.get(4)?,
-                confidence: row.get(5)?,
-                resolution: row.get(6)?,
-            })
-        })?;
-        let mut unordered = rows.collect::<Result<Vec<_>>>()?;
-        unordered.sort_unstable_by(edge_read_order);
-
-        // The evidence tier is decoded in the same pass that materialises the
-        // rows, from the row it describes. Taking it from a second query would
-        // let the two describe different generations, and taking it later would
-        // need this ordering reproduced somewhere else — which is exactly the
-        // alignment a shifted resolution column would break.
-        let mut edges = Vec::with_capacity(unordered.len());
-        let mut resolutions = Vec::with_capacity(unordered.len());
-        for row in unordered {
-            let edge = StoredEdge {
-                source_file: paths.path_of(row.source_rank).to_string(),
-                target_file: paths.path_of(row.target_rank).to_string(),
-                source_symbol: row.source_symbol,
-                target_symbol: row.target_symbol,
-                edge_kind: row.edge_kind,
-                confidence: row.confidence as f32,
-                resolution: row.resolution,
-            };
-            resolutions.push(
-                crate::edge_index::edge_resolution(&edge)
-                    .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
-            );
-            edges.push(edge);
+        let mut rows = stmt.query(params![gen])?;
+        while let Some(row) = rows.next()? {
+            // `rank_of` refuses an edge whose `paths` row is gone rather than
+            // dropping it, which is what the `INNER JOIN` this replaced did:
+            // an edge set with holes in it under a successful status, whose
+            // holes then propagate as positive claims.
+            let source_file = file_ranks[paths.rank_of(row.get(0)?)? as usize];
+            let target_file = file_ranks[paths.rank_of(row.get(1)?)? as usize];
+            builder
+                .push_ranked(
+                    source_file,
+                    target_file,
+                    row.get_ref(2)?.as_str()?,
+                    row.get_ref(3)?.as_str()?,
+                    row.get_ref(4)?.as_str()?,
+                    row.get(5)?,
+                    row.get_ref(6)?.as_str_or_null()?,
+                )
+                .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?;
         }
-        Ok(Some((gen, edges, resolutions)))
+        drop(rows);
+        drop(stmt);
+        // Read for `gen` specifically — the generation the rows came from,
+        // which may already be behind the store's latest.
+        let analysis = Self::analysis_disclosure_in(&snapshot, gen)?;
+        let index = builder
+            .finish_with_stored_evidence(analysis, EdgeOrder::ReadOrder)
+            .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?;
+        Ok(Some((gen, index)))
     }
 
     /// The callers of `names` and the unfiltered total, against one generation.
@@ -5686,20 +5579,6 @@ impl Store {
                     "stored dead-cluster scan is invalid: {error}"
                 ))
             })
-    }
-
-    /// [`Self::analysis_disclosure_in`] for a generation the caller already
-    /// resolved.
-    ///
-    /// Addressed by id rather than by "latest" on purpose: the edge rows this
-    /// qualifies may have come from a cache filled before a newer generation
-    /// landed, and a disclosure describing a snapshot the answer did not come
-    /// from is worse than none. A generation pruned between the two reads has
-    /// no row here, which reads as `None` — "could not be read" — and that is
-    /// the honest answer.
-    fn analysis_disclosure_for(&self, generation: u32) -> Result<Option<AnalysisDisclosure>> {
-        let conn = lock_conn(&self.conn)?;
-        Self::analysis_disclosure_in(&conn, generation)
     }
 
     /// The dead-symbol rows and the analysis that qualifies them, against one
