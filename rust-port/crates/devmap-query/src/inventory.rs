@@ -76,6 +76,24 @@ pub const CHURN_OUTPUT_CAP: usize = 8 * 1024 * 1024;
 /// The churn window. The Python original's `--since=90.days`, kept.
 pub const CHURN_SINCE: &str = "90.days";
 
+/// The day the churn window is anchored to, as days since the Unix epoch.
+///
+/// `--since=90.days` is relative to *now*, so the set of commits churn counts
+/// changes with the calendar even when the repository does not: a quarter with
+/// no new commit still rolls its oldest ones out of the window, and the hotspot
+/// counts shrink. Nothing else the artifact stamp records moves with the clock
+/// — `built_head` and the fingerprints are properties of the tree — so an
+/// artifact written yesterday matched every input today and was kept, silently
+/// stale on the one field that depends on the date. This is that input, at day
+/// granularity: one regeneration per calendar day at most, and only on a run
+/// that would otherwise have skipped.
+pub fn churn_window_day() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() / 86_400)
+        .unwrap_or(0)
+}
+
 /// Directories the marker walk never descends into, at any depth.
 ///
 /// `target` and `node_modules` are build and dependency output whose size is

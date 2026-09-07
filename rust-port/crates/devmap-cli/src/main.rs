@@ -1393,6 +1393,16 @@ fn write_consumer_artifacts(
         stamped.content_fingerprint.clone().into(),
     );
     inputs.insert("code_graph_schema".into(), CODE_GRAPH_SCHEMA_VERSION.into());
+    // The one input that moves with the clock rather than the tree: churn is
+    // `git log --since=90.days`, relative to now, so the same repository on a
+    // later day is a different window. Without this the artifacts of a quiet
+    // repository matched every input for months while their hotspot counts
+    // silently shrank. Day granularity: one regeneration per calendar day at
+    // most, and only on a run that would otherwise have skipped.
+    inputs.insert(
+        "churn_window_day".into(),
+        devmap_query::inventory::churn_window_day().into(),
+    );
     inputs.insert(
         "compact".into(),
         match &compact_dest {
