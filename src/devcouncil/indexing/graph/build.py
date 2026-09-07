@@ -154,7 +154,6 @@ def content_fingerprint(root: Path, files: List[str], *, persist_cache: bool = T
     return f"{_CONTENT_SCHEME}:{body}"
 
 
-
 def _slim_graph_export(graph: CodeGraph) -> CodeGraph:
     """Copy for JSON export: drop bulky meta already recoverable elsewhere.
 
@@ -385,35 +384,6 @@ def write_code_graph(
     if progress is not None:
         progress("export:json", 1, 1)
     return path
-
-
-def export_code_graph_json(root: Path) -> Optional[Path]:
-    """Rewrite the compatibility ``code_graph.json`` from the canonical store.
-
-    Self-heal for a deleted or failed JSON export: loads from SQLite only (no
-    re-persist) and rewrites the artifact + export handshake. Returns the path,
-    or None when the store has no graph or the write fails.
-    """
-    from devcouncil.codeintel import get_codeintel_service
-
-    root = root.expanduser().resolve()
-    try:
-        service = get_codeintel_service(root)
-        graph = service.load()
-        if graph is None:
-            return None
-        path = graph_path(root)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            _write_compatibility_export_tiers(root, path, graph)
-        except CompatibilityGraphTooLarge:
-            # Stub may still be on disk — treat as healed when the file exists.
-            if not path.is_file():
-                raise
-        return path
-    except Exception:
-        logger.warning("code graph JSON re-export failed", exc_info=True)
-        return None
 
 
 def load_code_graph(root: Path) -> Optional[CodeGraph]:

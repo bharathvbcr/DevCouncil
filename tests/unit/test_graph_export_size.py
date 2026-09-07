@@ -214,35 +214,3 @@ def test_oversized_compatibility_import_is_rejected_before_read(tmp_path: Path, 
     )
 
     assert build.load_code_graph(tmp_path) is None
-
-
-def test_export_code_graph_json_self_heals_deleted_artifact(tmp_path: Path):
-    """A deleted JSON export is restored from the canonical SQLite store."""
-    from devcouncil.indexing.graph.build import export_code_graph_json, load_code_graph
-
-    _write(
-        tmp_path,
-        {
-            "pkg/__init__.py": "",
-            "pkg/main.py": "def main():\n    return 1\n",
-        },
-    )
-    _commit(tmp_path)
-    graph = kernel_graph(tmp_path)
-    path = write_code_graph(tmp_path, graph)
-    assert path.is_file()
-    path.unlink()
-
-    healed = export_code_graph_json(tmp_path)
-    assert healed is not None and healed.is_file()
-    restored = load_code_graph(tmp_path)
-    assert restored is not None
-    assert {n.id for n in restored.nodes} >= {n.id for n in graph.nodes if "::" in n.id}
-
-
-def test_export_code_graph_json_returns_none_without_store(tmp_path: Path):
-    from devcouncil.indexing.graph.build import export_code_graph_json
-
-    _write(tmp_path, {"pkg/__init__.py": ""})
-    _commit(tmp_path)
-    assert export_code_graph_json(tmp_path) is None
