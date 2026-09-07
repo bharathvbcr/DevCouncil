@@ -5701,15 +5701,21 @@ six builds (`SELECT valid_from, COUNT(*) FROM edge_rows GROUP BY valid_from`):
 191,822 rows → 1. `edge_rows` holds 102,083 rows in total, none of them closed, against
 `generation_edges`' 204,165 before.
 
-Interleaved A/B, n = 21, half-run minimum drift in brackets:
+Interleaved A/B against the final binary, n = 21 (n = 11 for peak RSS), half-run
+minimum drift in brackets:
 
 | measurement | A (schema 17) p50 | B (schema 18) p50 | A min | B min | verdict |
 |---|---|---|---|---|---|
-| one-file incremental build | 1,737 ms | **1,299 ms** | 1,592 ms [53] | **1,148 ms** [11] | −25 % / −28 %, far outside drift |
+| one-file incremental build | 1,822 ms | **1,286 ms** | 1,553 ms [92] | **1,148 ms** [14] | −29 % p50, −26 % min, far outside drift |
 | steady-state store | 228.2 MB | **164.2 MB** | — | — | −28 % |
-| cold build | 3,212 ms | 3,145 ms | 2,857 ms [231] | 2,753 ms [78] | inside drift — no regression |
-| cold `impact --depth 3` | 157 ms | 156 ms | 125 ms [20] | 118 ms [29] | inside drift — no regression |
-| cold `search` | 51 ms | 51 ms | 40 ms [9] | 40 ms [9] | unchanged |
+| cold build | 3,256 ms | 3,131 ms | 2,693 ms [59] | 2,579 ms [103] | −125 ms, the size of B's own drift — no regression, and no gain claimed |
+| cold `impact --depth 3` | 127 ms | 125 ms | 115 ms [9] | 116 ms [5] | inside drift — no result |
+| cold `search` | 39 ms | 38 ms | 31 ms [6] | 34 ms [2] | inside drift — no result |
+| peak RSS, cold build | 720.9 MB | 727.2 MB | 707.5 MB [8.5] | 715.1 MB [3.5] | +6.3 MB, inside A's own drift — no result |
+
+The one number here that is a *result* rather than an absence of one is the first: a
+one-file touch build costs a quarter less than it did, because it stops rewriting
+191,822 rows it already had.
 
 ### The read that paid for it, twice
 
@@ -5756,7 +5762,61 @@ been getting the resolver's emission order — grouped by file, hence nearly sor
 comparator's two most significant keys — for free. The tuples now live in a `Vec` in
 emission order with the multiset as a map into it, and the insert pass walks the `Vec`.
 
+### The write that paid for it: gate 6
+
+The two regressions above were reads. The third was the write, and no timing found it —
+`verify.sh` gate 6 did, on the first full run of the finished change:
+
+```
+probe: 122038 milli-bytes/candidate (cap 150000), 105108 at 200 candidates => 86% (max 125%)
+probe: model predicts 93 MiB from 694 B x 80000 edges + 86 B x 500000 candidates; measured is 118%
+PROBE FAIL: measured fan-out cost is 118% of the model's prediction (max 115%)
+GATE FAIL: memory-model probe
+```
+
+The delta asked "is this stored row still wanted?" by building a
+`HashMap<EdgeTuple, u32>` — and an `EdgeTuple` *is* the identity: five `Cow<str>` and
+two options of one, about 160 bytes. So the build held two copies of every edge it had
+just resolved, the resolver's and the map's, plus a `Vec<String>` of 89,743 formatted
+ledger reasons. Roughly 22 MB, 22 MB and 6 MB on this repository — invisible next to a
+700 MB peak, which is exactly why the absolute ceiling of gate 5 said nothing and the
+per-candidate coefficient of gate 6 did.
+
+Interleaved, five runs each, to establish that the gate was reporting the change rather
+than its own spread:
+
+| | % of model's prediction | milli-B/candidate | verdict |
+|---|---|---|---|
+| A (schema 17) | 100, 101, 101, 102, 103 | 87,403–92,056 | 5 × `MEMORY MODEL OK` |
+| B (before the fix) | 116, 117, 117, 117, 118 | 118,467–123,021 | 5 × `PROBE FAIL` |
+
+Three points of spread; fifteen points of gap.
+
+The fix is to stop copying what is already in memory. The multiset becomes an index over
+`resolution.edges`: a `HashMap<u64, u32>` from a 64-bit digest to an index, a `Vec<u32>`
+chaining collisions, and a `Vec<bool>` marking claimed candidates — twelve bytes an edge
+against the map's copy of every string. The ledger's reasons are formatted where they
+are compared instead of held in a parallel vector.
+
+Two properties are worth stating because the cheap version of this idea loses them:
+
+* **The digest is a filter and never an answer.** Every candidate a bucket offers is
+  compared field by field, so two identities that digest alike stay two identities and a
+  collision costs one failed comparison. `identity_digest` is the one function both the
+  bucketing and the search go through, so the structure cannot be built under one rule
+  and searched under another. `db::delta_bucket_tests` hashes a test identity to a
+  constant — every value collides, through the real digest path — and a search that
+  trusted the bucket claims `gamma` when asked for `beta`.
+* **It is still a multiset.** The `Vec<bool>` is what makes it one: a tuple that occurs
+  three times is three candidates, claimed one at a time, not one entry with a count.
+
+
 ### What this does not do
+
+Peak RSS is 6 MB above schema 17's at the median — inside the drift of the A side's own
+minimum across the same run, so it is reported as no result rather than as a cost. Before
+the index replaced the tuple-keyed map it was 30 MB, comfortably outside that drift, and
+that one *was* a cost.
 
 The store is 164 MB steady-state, not 158 MB. The remaining two-generation growth is
 `generation_nodes`, `generation_file_rows` and `generation_dead_symbols`, which are
