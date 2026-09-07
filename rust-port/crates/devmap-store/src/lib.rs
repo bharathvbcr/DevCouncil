@@ -15,8 +15,8 @@ pub use db::{
     checked_min_confidence, current_git_head, BuildHistoryRow, CallersPage, DeadPage,
     GenerationWriteOpts, PageSizeConversion, PendingClaim, PendingEnqueueReport, PendingReconcile,
     PendingSupersede, SearchPage, Store, StoreStatus, StoredEdge, StoredFile, StoredSymbol,
-    VacuumAction, VacuumOutcome, WalCheckpointMode, WalCheckpointResult, WriterLock,
-    MAX_PENDING_ATTEMPTS,
+    VacuumAction, VacuumOutcome, WalCheckpointMode, WalCheckpointResult, WriteBreakdown,
+    WriterLock, MAX_PENDING_ATTEMPTS,
 };
 pub use edge_index::{
     edge_kind_from_stored, edge_resolution, resolution_kind_from_stored, resolution_kind_label,

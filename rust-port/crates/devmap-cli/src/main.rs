@@ -195,14 +195,22 @@ enum ProgressMode {
     Never,
 }
 
-/// One completed stage and the sub-phases that ran inside it.
+/// One completed span and the spans that ran inside it.
+///
+/// Recursive, because the breakdown is. A stage contains sub-phases, and a
+/// sub-phase contains the split its own implementation measured — the
+/// generation write reports what each relation cost, and only the store can,
+/// since the node and full-text inserts are one interleaved loop. Two levels
+/// were enough while `persist:write` was one number; a third would have needed
+/// a second, near-identical struct, and the rule below is the same at every
+/// depth.
 struct StageTiming {
     label: String,
     seconds: f64,
-    /// Sub-phases closed while this stage was open. Their durations are
-    /// *included* in `seconds`; they break the stage down, they do not add to
-    /// it. Summing both levels would double-count the build.
-    sub: Vec<(String, f64)>,
+    /// Spans closed while this one was open. Their durations are *included* in
+    /// `seconds`; they break it down, they do not add to it. Summing two levels
+    /// would double-count the build.
+    sub: Vec<StageTiming>,
 }
 
 /// The stage in flight: its label, when it began, and the sub-phases closed
@@ -211,7 +219,7 @@ struct StageTiming {
 /// Named rather than written inline because the tuple appears in a field, a
 /// borrow and two closures, and a reader meeting `(String, Instant, Vec<(String,
 /// f64)>)` in any of them has to reconstruct which position means what.
-type OpenStage = (String, Instant, Vec<(String, f64)>);
+type OpenStage = (String, Instant, Vec<StageTiming>);
 
 struct ProgressReporter {
     enabled: bool,
@@ -304,17 +312,69 @@ impl ProgressReporter {
         if self.enabled {
             eprintln!("      {label} (+{:.0}ms)", elapsed * 1000.0);
         }
-        match self.open.borrow_mut().as_mut() {
-            Some((_, _, sub)) => sub.push((label.to_string(), elapsed)),
-            // A sub-phase outside any stage would otherwise be dropped
-            // silently. Record it as a stage of its own rather than lose it.
-            None => self.timings.borrow_mut().push(StageTiming {
-                label: label.to_string(),
-                seconds: elapsed,
-                sub: Vec::new(),
-            }),
-        }
+        self.record(StageTiming {
+            label: label.to_string(),
+            seconds: elapsed,
+            sub: Vec::new(),
+        });
         outcome
+    }
+
+    /// Time one sub-phase whose implementation reports its own split.
+    ///
+    /// Some phases can only be broken down from the inside. `persist:write` is
+    /// the case that forced this: it is 0.30 s of a 1.10 s one-file incremental
+    /// build on this repository, the relations under it have nothing in common
+    /// as fixes, and the node and full-text writes are one interleaved loop
+    /// that nothing outside the store can separate. The store measures them and
+    /// hands the labelled spans back here.
+    ///
+    /// The parts nest inside the sub-phase and are already counted in its
+    /// `seconds`, exactly as sub-phases are counted in their stage's.
+    fn timed_split<T, E>(
+        &self,
+        label: &str,
+        work: impl FnOnce() -> std::result::Result<(T, Vec<(String, f64)>), E>,
+    ) -> std::result::Result<T, E> {
+        let started = Instant::now();
+        let outcome = work();
+        let elapsed = started.elapsed().as_secs_f64();
+        if self.enabled {
+            eprintln!("      {label} (+{:.0}ms)", elapsed * 1000.0);
+        }
+        // An error path reports the phase with no split rather than no phase:
+        // a write that failed halfway still took the time, and the parts it
+        // managed to charge are not a breakdown of what it did.
+        let parts = match &outcome {
+            Ok((_, parts)) => parts.clone(),
+            Err(_) => Vec::new(),
+        };
+        self.record(StageTiming {
+            label: label.to_string(),
+            seconds: elapsed,
+            sub: parts
+                .into_iter()
+                .map(|(label, seconds)| StageTiming {
+                    label,
+                    seconds,
+                    sub: Vec::new(),
+                })
+                .collect(),
+        });
+        outcome.map(|(value, _)| value)
+    }
+
+    /// File a closed span under the stage that was open when it ran.
+    ///
+    /// One owner for that decision, so `timed` and `timed_split` cannot come to
+    /// disagree about where a sub-phase lands. A span closed outside any stage
+    /// becomes a stage of its own rather than being dropped: silence there is
+    /// how a phase goes unattributed and its time is charged to nothing.
+    fn record(&self, timing: StageTiming) {
+        match self.open.borrow_mut().as_mut() {
+            Some((_, _, sub)) => sub.push(timing),
+            None => self.timings.borrow_mut().push(timing),
+        }
     }
 
     /// An untimed detail line under the current stage. Does not disturb the
@@ -352,19 +412,19 @@ impl ProgressReporter {
     /// time so far and `"open": true`, because omitting it would make the
     /// stages silently fail to account for the total.
     fn timings_json(&self) -> serde_json::Value {
-        let render = |label: &str, secs: f64, sub: &[(String, f64)], open: bool| {
+        fn render(label: &str, secs: f64, sub: &[StageTiming], open: bool) -> serde_json::Value {
             let mut entry = serde_json::json!({"stage": label, "seconds": secs});
             if !sub.is_empty() {
                 entry["sub"] = sub
                     .iter()
-                    .map(|(l, s)| serde_json::json!({"stage": l, "seconds": s}))
+                    .map(|t| render(&t.label, t.seconds, &t.sub, false))
                     .collect();
             }
             if open {
                 entry["open"] = serde_json::Value::Bool(true);
             }
             entry
-        };
+        }
         let mut stages: Vec<serde_json::Value> = self
             .timings
             .borrow()
@@ -3323,14 +3383,24 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // An earlier version of this comment called persistence "the
             // largest phase of a build" — that was read off the shifted
             // attribution and was never true.
-            let gen_id = progress.timed("persist:write", || {
-                store.save_generation_with_metadata(
-                    &extractions,
-                    &resolution,
-                    &analysis,
-                    opts,
-                    &head_sha,
-                )
+            // Split by relation, because the phase as one number cannot be
+            // acted on: v18 put the edges and the unresolved ledger on validity
+            // ranges and left the nodes, the full-text map, the file rows, the
+            // dead symbols and the coverage gaps as full per-generation copies,
+            // and those have nothing in common as fixes. The store measures the
+            // split — the node and full-text inserts are one interleaved loop,
+            // so nothing out here can separate them.
+            let gen_id = progress.timed_split("persist:write", || {
+                store
+                    .save_generation_timed(&extractions, &resolution, &analysis, opts, &head_sha)
+                    .map(|(gen_id, spent)| {
+                        let parts = spent
+                            .parts()
+                            .into_iter()
+                            .map(|(label, seconds)| (label.to_string(), seconds))
+                            .collect();
+                        (gen_id, parts)
+                    })
             })?;
 
             // Every generation carries a full carry-forward copy of the
