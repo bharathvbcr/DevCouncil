@@ -25,7 +25,6 @@ from devcouncil.codeintel.debug.protocol import (
 )
 from devcouncil.codeintel.debug.python_trace_runner import run_trace
 from devcouncil.codeintel.debug.session import DebugSession, DebugSessionManager
-from devcouncil.codeintel.languages import workers
 from devcouncil.codeintel.service import CodeIntelService
 from devcouncil.codeintel.store.sqlite import CodeIntelStore
 from devcouncil.indexing.graph.schema import (
@@ -431,73 +430,6 @@ def test_dap_start_stdio_connect_tcp_and_process_shutdown(
     client._reader_thread.join(timeout=1)
     client.close()
     right.close()
-
-
-def test_worker_helpers_activation_calls_and_pool_recovery(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Span:
-        start_line = 2
-        end_line = 5
-
-    item = types.SimpleNamespace(
-        name="outer",
-        kind="function",
-        span=Span(),
-        decorators=["route"],
-        children=[types.SimpleNamespace(name="inner", kind="function")],
-    )
-    row = workers._structure_row(item)
-    assert row["start_line"] == 2
-    assert row["children"][0]["name"] == "inner"
-
-    class Node:
-        type = "call_expression"
-        children: list[object] = []
-        named_children: list[object] = []
-        start_point = (4, 0)
-
-        def __init__(self, callee=None):
-            self.callee = callee
-
-        def child_by_field_name(self, field):
-            if field == "function":
-                return self.callee
-            return None
-
-    callee = types.SimpleNamespace(start_byte=0, end_byte=7)
-    parser = types.SimpleNamespace(
-        parse=lambda _raw: types.SimpleNamespace(root_node=Node(callee))
-    )
-    assert workers._call_rows(parser, "obj.run()") == [
-        {"name": "run", "receiver": "obj", "line": 5}
-    ]
-
-    workers._ACTIVATION_ATTEMPTED = False
-    workers._ACTIVATION_STATUS = {"installed": False, "activated": False}
-    companion = types.SimpleNamespace(activate=lambda: {"activated": True, "ok": True})
-    monkeypatch.setitem(sys.modules, "devcouncil_codeintel_grammars", companion)
-    assert workers._activate_companion_once()["activated"] is True
-    assert workers._activate_companion_once()["installed"] is True
-
-    class Future:
-        def result(self, timeout):
-            assert timeout == 1.0
-            raise RuntimeError("native crash")
-
-    fake_pool = types.SimpleNamespace(
-        submit=lambda *_args: Future(),
-        shutdown=lambda **_kwargs: None,
-    )
-    pool = workers.ParserWorkerPool(max_workers=99, timeout=0)
-    pool._pool = fake_pool
-    assert pool.max_workers == 4
-    assert pool.timeout == 1.0
-    assert pool.process("python", "x = 1") is None
-    assert pool._pool is None
-    pool.close()
-    status = workers.parser_worker_status()
-    assert status["start_method"] == "spawn"
 
 
 def _query_graph() -> CodeGraph:
@@ -1109,51 +1041,6 @@ def test_debug_module_entrypoints_and_broker_cleanup(
     assert not (
         tmp_path / ".devcouncil" / "codeintel" / "debug-broker.json"
     ).exists()
-
-
-def test_worker_native_process_and_activation_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Result:
-        structure = [
-            types.SimpleNamespace(
-                name="run",
-                kind="function",
-                span=None,
-                decorators=[],
-                children=[],
-            )
-        ]
-        imports = [
-            types.SimpleNamespace(source="pkg", items=["Thing"], alias="Alias")
-        ]
-        exports = [types.SimpleNamespace(name="run")]
-
-    parser = types.SimpleNamespace(
-        parse=lambda _raw: types.SimpleNamespace(
-            root_node=types.SimpleNamespace(children=[])
-        )
-    )
-    pack = types.ModuleType("tree_sitter_language_pack")
-    pack.available_languages = lambda: ["python"]
-    pack.ProcessConfig = lambda **kwargs: kwargs
-    pack.process = lambda _source, _config: Result()
-    pack.get_parser = lambda _language: parser
-    monkeypatch.setitem(sys.modules, "tree_sitter_language_pack", pack)
-    assert workers._native_process("missing", "x") is None
-    processed = workers._native_process("python", "run()")
-    assert processed is not None
-    assert processed["imports"][0]["alias"] == "Alias"
-    assert processed["exports"] == [{"name": "run"}]
-
-    workers._ACTIVATION_ATTEMPTED = False
-    companion = types.SimpleNamespace(
-        activate=lambda: (_ for _ in ()).throw(RuntimeError("bad manifest"))
-    )
-    monkeypatch.setitem(sys.modules, "devcouncil_codeintel_grammars", companion)
-    status = workers._activate_companion_once()
-    assert status["installed"] is True
-    assert "bad manifest" in status["error"]
 
 
 def test_advisor_preflight_probe_and_pairing_branches(

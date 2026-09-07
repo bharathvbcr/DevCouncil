@@ -972,6 +972,13 @@ pub fn build_code_graph_value(
         );
     }
 
+    // Graph intelligence: the hubs the repository leans on, and its import
+    // cycles. See `devmap_analyze::graph_intel` for why this moved into the
+    // kernel — `enrich_graph_intel` lost both its callers in `d232dea`, and
+    // `viz.py:520-522` has been rendering `(none)` into the Intel tab of every
+    // graph written since, regardless of what the repository holds.
+    let intel = devmap_analyze::graph_intel(edges);
+
     let payload = json!({
         "schema_version": CODE_GRAPH_SCHEMA_VERSION,
         "nodes": nodes,
@@ -1010,6 +1017,17 @@ pub fn build_code_graph_value(
             // suppress the key permanently and leave it a third state.
             "liveness_unreachable_unreliable": unreachable_unreliable,
             "legacy_dead_symbol_candidates": legacy_dead,
+            // The two keys `viz.py:520-522` reads for the Intel tab's God
+            // Nodes and Cycles panels. At the top of `meta`, where the Python
+            // producer put them, so the reader needs no change.
+            //
+            // The third panel, `hotspots`, is not filled: it is churn x
+            // coupling and the churn half is `git log --since=90.days`, which
+            // this producer does not read. `viz.py` already renders that panel
+            // as "(no churn data - needs git history)", and
+            // `hotspots_computed: false` below says the same in the artifact.
+            "god_nodes": intel.god_nodes,
+            "circular_imports": intel.circular_imports,
             "devmap_rust": {
                 "engine": CONSUMER_MAP_ENGINE,
                 "generation_id": freshness.generation_id,
@@ -1034,6 +1052,22 @@ pub fn build_code_graph_value(
                 // Reported beside it rather than summed into it: a re-index can
                 // fix the first number and can never fix this one.
                 "unwired_excluded_import_blind": provenance.unwired_excluded_import_blind,
+                // Provenance for the intel panels above. `god_nodes: []` from
+                // a pass that ran and `god_nodes: []` from a pass that never
+                // happened were the same bytes for the whole life of the
+                // post-cutover graph; these are what tell them apart.
+                "god_nodes_computed": true,
+                "god_nodes_shown": intel.god_nodes.len(),
+                // Ranked candidates before the cap, so a reader never mistakes
+                // the fifteen shown for the population they came from.
+                "god_nodes_total": intel.god_nodes_total,
+                "god_nodes_truncated": intel.god_nodes_truncated(),
+                "circular_imports_computed": true,
+                "circular_imports_shown": intel.circular_imports.len(),
+                "circular_imports_total": intel.circular_imports_total,
+                "circular_imports_truncated": intel.circular_imports_truncated(),
+                // Churn needs repository history this producer does not read.
+                "hotspots_computed": false,
                 "unavailable": unavailable,
             },
         },

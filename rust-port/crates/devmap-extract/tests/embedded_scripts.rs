@@ -624,18 +624,35 @@ fn the_cache_identity_covers_the_embedded_grammars() {
 
     // An exact pin, deliberately: it is the tripwire that makes somebody read
     // `EXTRACTION_SCHEMA_VERSION`'s doc comment and write a rationale paragraph
-    // before changing what a cached payload contains. It has fired three times
+    // before changing what a cached payload contains. It has fired four times
     // — 30 -> 31 for reading `<script>` blocks, 31 -> 32 for W1.2's heritage
     // references and W3.3's wiring annotations, 32 -> 33 for W0.3 move 2's import
     // extraction across nineteen grammar keys, and for declining to parse
-    // minified bundles. The first three are additive, which is exactly why each
-    // needed the bump: an additive change leaves a stale row looking perfectly
-    // complete. The last is the one case where the stale rows are *subtractive*
-    // — a v32 row for a bundle can hold several hundred `Clean` symbols this
-    // build no longer claims, and `Clean` is cache-admitted, so without the bump
-    // they would be served indefinitely.
+    // minified bundles, and 33 -> 34 for X40. The additive ones are exactly why
+    // each needed the bump: an additive change leaves a stale row looking
+    // perfectly complete. The subtractive ones are the sharper case — a v32 row
+    // for a bundle can hold several hundred `Clean` symbols this build no
+    // longer claims, and `Clean` is cache-admitted, so without the bump they
+    // would be served indefinitely.
+    //
+    // v34 is both at once: `scope_locals` gains a callable's type parameters,
+    // so a v33 row *asserts* that a generic function binds no `T`, and
+    // `references` loses the inferred-type placeholder `_`, so a v33 row still
+    // holds one per turbofish argument. Both feed the unresolved classifier,
+    // and a stale row makes it answer with the old tier while looking fresh.
+    //
+    // v35 is the subtractive kind again: a v34 row for a `.rs` file carries
+    // one import per `use` whose module specifier is the statement's own
+    // source text, which matches no file and binds no name. Served warm, it
+    // reports zero `Imports` edges and zero `External` classifications for
+    // every Rust file, and both look like findings rather than stale rows.
+    //
+    // v36 changes the *meaning* of a field rather than its presence:
+    // `receiver_expr` becomes the receiver's identity instead of a copy of its
+    // source text, so a v35 row and a v36 row spell the same receiver two ways
+    // and every grouping over the column splits silently across the boundary.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "33",
+        EXTRACTION_SCHEMA_VERSION, "36",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

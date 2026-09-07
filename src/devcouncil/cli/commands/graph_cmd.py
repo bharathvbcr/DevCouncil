@@ -311,6 +311,7 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
     """Try DevMapClient for query surfaces; return payload or None for Python fallback."""
     from devcouncil.devmap_client import (
         DevMapClientError,
+        DevMapRequestRefused,
         resolution_unavailable_reason,
         try_connect,
     )
@@ -561,6 +562,12 @@ def _devmap_query_payload(root: Path, kind: str, **kwargs):
                     "resolution": "devmap",
                 })
             return {"ok": True, "paths": items, "source": "devmap", **_graph_degraded_fields(root)}
+    except DevMapRequestRefused as exc:
+        # The request, not the kernel, was refused: over the byte cap, not
+        # UTF-8, a depth out of range. No engine can serve it, so it is an
+        # error to the caller — never `None`, which would re-run it on the
+        # Python graph engine and answer from a whole-graph load.
+        return {"ok": False, "error": str(exc), "source": "devmap"}
     except DevMapClientError as exc:
         logger.warning(
                 "devmap (Rust) %s failed and this call fell back to the Python path: %s. "
@@ -933,6 +940,15 @@ def graph_search(
             err=True,
         )
         raise typer.Exit(3)
+    if result.get("error"):
+        # A refused request (over the byte cap, not UTF-8). Rendering it as an
+        # empty match list would report "nothing found" for a search that
+        # never ran.
+        if json_output:
+            typer.echo(json.dumps(result, indent=2))
+        else:
+            typer.secho(str(result["error"]), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
     if json_output:
         typer.echo(json.dumps(result, indent=2))
         return
@@ -1775,21 +1791,33 @@ def graph_export(
     project_root: Path = typer.Option(Path("."), "--project-root"),
 ) -> None:
     """Export the code graph as attributed GraphML or an OKF v0.1 bundle."""
-    from devcouncil.indexing.graph.export import export_graphml, write_code_graph_okf
+    from devcouncil.indexing.graph.export import write_code_graph_okf
 
     root = _root(project_root)
-    graph = _require_graph(root)
     fmt = format.lower().strip()
     if fmt == "graphml":
-        text = export_graphml(graph)
-        if str(output) == "-":
-            typer.echo(text)
-        else:
-            out = output if output.is_absolute() else root / output
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(text, encoding="utf-8")
-            status.print(f"[green]Wrote {out}[/green]")
+        # The kernel is the only GraphML exporter (see
+        # `devmap_engine.export_graphml`); no Python graph is loaded for it.
+        from devcouncil.devmap_engine import DevMapEngineError, export_graphml
+
+        try:
+            if str(output) == "-":
+                typer.echo(export_graphml(root)["text"], nl=False)
+            else:
+                out = output if output.is_absolute() else root / output
+                out.parent.mkdir(parents=True, exist_ok=True)
+                report = export_graphml(root, output=out)
+                status.print(
+                    f"[green]Wrote {out}[/green]  {report.get('nodes')} nodes, "
+                    f"{report.get('edges')} edges; {report.get('edges_dangling')} "
+                    f"edge(s) omitted (endpoint not a declared node), "
+                    f"{report.get('characters_replaced')} character(s) replaced"
+                )
+        except DevMapEngineError as exc:
+            status.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
         return
+    graph = _require_graph(root)
     if fmt == "okf":
         if str(output) == "-":
             status.print("[red]OKF export requires -o <directory>[/red]")

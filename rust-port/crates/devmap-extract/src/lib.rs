@@ -32,10 +32,12 @@ pub mod notebook;
 pub mod treesitter;
 pub mod wiring;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "parse")]
+// Ungated: discovery reads the tree in parallel whether or not the parsing
+// frontend is compiled in, so `scan_tree` needs rayon in both shapes.
 use rayon::prelude::*;
 
 pub use gomod::{collect_go_modules, git_worktree_root, parse_go_mod, GoModule};
@@ -665,11 +667,112 @@ fn kind_of(metadata: &fs::Metadata) -> CandidateKind {
     }
 }
 
+/// A discovered tree: every source discovery admitted, and what it refused.
+///
+/// Discovery and extraction used to be a single step, so the only way to learn
+/// what a tree *contains* was to extract it — and the unchanged check, which
+/// needs nothing but `(path, content_hash)`, paid a full extraction round-trip
+/// per file to get it. Measured on this repository (1,311 files): 213–254 ms of
+/// a ~300 ms no-op scan went into cache lookups and JSON deserialization whose
+/// entire result was then discarded. Splitting discovery from extraction lets a
+/// caller reach the same verdict from hashes alone.
+#[derive(Debug, Default)]
+pub struct ScannedTree {
+    /// `(repo-relative path, source)` for every admitted file, sorted by path.
+    pub sources: Vec<(String, String)>,
+    /// Every candidate discovery admitted or refused.
+    pub report: DiscoveryReport,
+}
+
+impl ScannedTree {
+    /// `(path, content_hash)` for every admitted file.
+    ///
+    /// This is exactly the identity an `Extraction` carries. Every construction
+    /// site sets `content_hash: content_hash(source)` over the same bytes
+    /// discovery read (`treesitter.rs` — the parsed, refused and unavailable
+    /// arms alike; `notebook.rs` builds on the same base), and `file_path` is
+    /// the discovery path. A cached payload is only ever returned for a key
+    /// built from those same bytes, and only when its `file_path` matches. So a
+    /// caller comparing these pairs against a stored generation reaches the
+    /// verdict extraction would have produced, without extracting.
+    pub fn file_hashes(&self) -> Vec<(&str, u64)> {
+        self.sources
+            .par_iter()
+            .map(|(path, source)| (path.as_str(), content_hash(source)))
+            .collect()
+    }
+
+    /// Whether this tree is, file for file, the one `previous` describes.
+    ///
+    /// Fails closed on any disagreement in either direction: a differing file
+    /// count, a path only one side holds, or a single differing hash. The
+    /// comparison is per path rather than over a multiset of hashes because a
+    /// rename with byte-identical content leaves the count and every hash
+    /// intact while changing the graph.
+    pub fn matches_file_hashes(&self, previous: &BTreeMap<String, u64>) -> bool {
+        previous.len() == self.sources.len()
+            && self
+                .file_hashes()
+                .iter()
+                .all(|(path, hash)| previous.get(*path).is_some_and(|stored| stored == hash))
+    }
+}
+
 /// Collect source files and report each admitted or rejected candidate.
 /// Gitignored paths are rejected by the walker before they become candidates.
 pub fn collect_sources_with_report(
     root: &Path,
 ) -> anyhow::Result<(Vec<(String, String)>, DiscoveryReport)> {
+    let scanned = scan_tree(root)?;
+    Ok((scanned.sources, scanned.report))
+}
+
+/// Walk `root` and read every admitted source.
+///
+/// The walk is sequential — it is one `readdir` chain, and the gitignore
+/// matcher it drives is stateful — but the reads are not, and doing them inline
+/// in the walk loop made discovery single-threaded over the whole corpus.
+/// Splitting the two costs one `PathBuf` per candidate and buys the read
+/// parallelism. Ordering is not at stake: both outputs are sorted by path
+/// before this returns, exactly as they were when the reads were inline.
+pub fn scan_tree(root: &Path) -> anyhow::Result<ScannedTree> {
+    let (candidates, mut report) = walk_candidates(root)?;
+
+    let read: Vec<Result<(String, String), (String, DiscoverySkipReason)>> = candidates
+        .into_par_iter()
+        .map(|(relative, absolute)| match fs::read_to_string(&absolute) {
+            Ok(source) => Ok((relative, source)),
+            Err(error) => Err((
+                relative,
+                DiscoverySkipReason::Unreadable {
+                    reason: error.to_string(),
+                },
+            )),
+        })
+        .collect();
+
+    let mut sources = Vec::with_capacity(read.len());
+    for outcome in read {
+        match outcome {
+            Ok((relative, source)) => {
+                report.yielded_paths.push(relative.clone());
+                sources.push((relative, source));
+            }
+            Err(skip) => report.skipped_paths.push(skip),
+        }
+    }
+
+    sources.sort_by(|left, right| left.0.cmp(&right.0));
+    report.yielded_paths.sort();
+    report
+        .skipped_paths
+        .sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(ScannedTree { sources, report })
+}
+
+/// The walk half of [`scan_tree`]: every candidate that survived the ignore
+/// rules, the extension test and the size ceiling, as `(relative, absolute)`.
+fn walk_candidates(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf)>, DiscoveryReport)> {
     let mut out = Vec::new();
     let mut report = DiscoveryReport::default();
 
@@ -834,18 +937,7 @@ pub fn collect_sources_with_report(
             ));
             continue;
         }
-        match fs::read_to_string(p) {
-            Ok(src) => {
-                report.yielded_paths.push(rel_str.clone());
-                out.push((rel_str, src));
-            }
-            Err(error) => report.skipped_paths.push((
-                rel_str,
-                DiscoverySkipReason::Unreadable {
-                    reason: error.to_string(),
-                },
-            )),
-        }
+        out.push((rel_str, p.to_path_buf()));
     }
     // Record each pruned cache directory once, as `NonSource`: a build cache is
     // the ordinary case, like a README beside the code, not a gap in coverage.
@@ -857,11 +949,8 @@ pub fn collect_sources_with_report(
             .push((directory.clone(), DiscoverySkipReason::NonSource));
     }
 
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    report.yielded_paths.sort();
-    report
-        .skipped_paths
-        .sort_by(|left, right| left.0.cmp(&right.0));
+    // Not sorted here: `scan_tree` sorts both outputs once the reads are in,
+    // and the candidate order does not reach a caller.
     Ok((out, report))
 }
 

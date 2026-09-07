@@ -210,6 +210,21 @@ impl DebounceBuffer {
         self.last_event = Some(now);
     }
 
+    /// Everything held, regardless of how long it has been held.
+    ///
+    /// The timers exist to coalesce churn into fewer batches; on the way out
+    /// there is no later batch to coalesce into, so waiting for one is waiting
+    /// for something that will not happen. Used only by the stop paths.
+    fn flush(&mut self) -> Option<Vec<String>> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        self.last_event = None;
+        self.oldest_pending = None;
+        self.collapsed = false;
+        Some(std::mem::take(&mut self.pending).into_iter().collect())
+    }
+
     fn take_ready(&mut self, now: Instant) -> Option<Vec<String>> {
         let last_event = self.last_event?;
         if self.pending.is_empty() {
@@ -497,6 +512,22 @@ fn run_watch_loop<F: Fn(Vec<String>)>(
 
     loop {
         if stop_rx.try_recv().is_ok() {
+            // Hand over what is buffered before the thread goes away.
+            //
+            // The debounce holds an observed edit in memory for `DEBOUNCE`, and
+            // the store's pending queue is the only place that edit is ever
+            // written down. Breaking straight out took the buffer with it — and
+            // the daemon's own exit line says the opposite: "pending work stays
+            // queued in the store". Measured with the release binary, a file
+            // edited and `SIGTERM` 500 ms later left `gen=1 pending=0
+            // is_fresh=true` and the new symbol absent from the index. The next
+            // daemon's connect-time sweep re-finds it by content hash, so this
+            // is a window and not a permanent loss; it is a window in which
+            // every reader is told the index is current, and nothing has to
+            // start a daemon to be told that.
+            if let Some(paths) = buffer.flush() {
+                callback(paths);
+            }
             break;
         }
         // Deliver matured batches on the event path too: a tree under
@@ -532,7 +563,15 @@ fn run_watch_loop<F: Fn(Vec<String>)>(
                     callback(paths);
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The producer is gone, so nothing more will arrive — but what
+                // already arrived is still owed to the queue, for the reason the
+                // stop path above gives.
+                if let Some(paths) = buffer.flush() {
+                    callback(paths);
+                }
+                break;
+            }
         }
     }
 }
@@ -903,6 +942,142 @@ mod tests {
         let _ = stop_tx.send(());
         drop(tx);
         thread.join().expect("the watch loop must stop cleanly");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A batch still inside the debounce window is delivered on the way out.
+    ///
+    /// The debounce holds an observed edit in memory for `DEBOUNCE` (2 s), and
+    /// the store's pending queue is the only place that edit is ever written
+    /// down. The loop's stop path broke straight out of the loop, so everything
+    /// the buffer was holding went with the thread — and the daemon says the
+    /// opposite as it goes:
+    ///
+    /// ```text
+    /// INFO SIGTERM received; releasing the IPC endpoint and exiting
+    ///      (pending work stays queued in the store)
+    /// ```
+    ///
+    /// Measured against the pre-fix release binary: a file edited, `SIGTERM`
+    /// 500 ms later, and then, with no daemon left running,
+    ///
+    /// ```text
+    /// gen=1 nodes=60 fresh=True pending=0 degraded=None
+    /// ADDED_DURING_DEBOUNCE present in the index: False
+    /// ```
+    ///
+    /// The next daemon's connect-time sweep does eventually re-find it by
+    /// content hash, so this is a window rather than a permanent loss — but it
+    /// is a window in which every reader is told the index is current, and
+    /// nothing has to start a daemon to be told that. An editor that saves and a
+    /// tool that restarts the daemon are the ordinary way to land in it.
+    ///
+    /// `Duration::from_secs(30)` as the debounce, so the flush under test can
+    /// only be the shutdown one: nothing else could have matured in the
+    /// milliseconds this test runs for.
+    #[test]
+    fn a_debounced_batch_is_delivered_when_the_watcher_is_told_to_stop() {
+        let root = scratch_root("shutdown-flush");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.py"), "def a():\n    return 1\n").unwrap();
+
+        let (tx, rx) = sync_channel(WATCH_QUEUE_CAPACITY);
+        let overflowed = Arc::new(AtomicBool::new(false));
+        offer_watch_event(
+            &tx,
+            &overflowed,
+            Ok(
+                notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(root.join("src/a.py")),
+            ),
+        );
+
+        let (stop_tx, stop_rx) = channel();
+        let (batches_tx, batches_rx) = channel();
+        let loop_root = root.clone();
+        let loop_flag = Arc::clone(&overflowed);
+        let thread = std::thread::spawn(move || {
+            run_watch_loop(
+                &loop_root,
+                rx,
+                stop_rx,
+                &loop_flag,
+                // Far longer than this test lives, so a delivery here is the
+                // shutdown flush and cannot be the debounce maturing.
+                Duration::from_secs(30),
+                move |paths| {
+                    let _ = batches_tx.send(paths);
+                },
+            );
+        });
+
+        // Let the loop take the event off the queue and into the buffer. The
+        // receive poll is 250 ms; this is comfortably past it, and the assertion
+        // below distinguishes "not yet buffered" from "dropped" by failing with
+        // a timeout either way — which is the honest outcome for both.
+        std::thread::sleep(Duration::from_millis(900));
+        assert!(
+            batches_rx.try_recv().is_err(),
+            "fixture precondition: with a 30 s debounce nothing may have been \
+             delivered yet, or this test is measuring the ordinary flush"
+        );
+
+        let _ = stop_tx.send(());
+        let delivered = batches_rx.recv_timeout(Duration::from_secs(10)).expect(
+            "a watcher told to stop must hand over what it is holding. The daemon \
+             logs `pending work stays queued in the store` as it exits, and the \
+             store's queue is the only place a debounced edit is ever written \
+             down — dropped here, the edit is absent from the index while \
+             `status` reports `is_fresh: true` to every reader until some later \
+             daemon's connect-time sweep happens to re-find it",
+        );
+        assert_eq!(
+            delivered,
+            vec![root.join("src/a.py").to_string_lossy().into_owned()],
+            "and it must hand over the paths themselves, not a rescan"
+        );
+
+        drop(tx);
+        thread.join().expect("the watch loop must stop cleanly");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The OFF direction: stopping an empty watcher delivers nothing.
+    ///
+    /// Without this, a shutdown flush that unconditionally called the callback
+    /// would pass the test above while enqueueing an empty batch on every clean
+    /// exit — and `run_loop`'s callback treats a non-empty batch as a reason to
+    /// touch the activity clock, so an empty one is not merely wasteful.
+    #[test]
+    fn stopping_a_watcher_that_is_holding_nothing_delivers_nothing() {
+        let root = scratch_root("shutdown-flush-empty");
+        let (tx, rx) = sync_channel(WATCH_QUEUE_CAPACITY);
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let (stop_tx, stop_rx) = channel();
+        let (batches_tx, batches_rx) = channel();
+        let loop_root = root.clone();
+        let loop_flag = Arc::clone(&overflowed);
+        let thread = std::thread::spawn(move || {
+            run_watch_loop(
+                &loop_root,
+                rx,
+                stop_rx,
+                &loop_flag,
+                Duration::from_secs(30),
+                move |paths| {
+                    let _ = batches_tx.send(paths);
+                },
+            );
+        });
+
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = stop_tx.send(());
+        drop(tx);
+        thread.join().expect("the watch loop must stop cleanly");
+        assert!(
+            batches_rx.try_recv().is_err(),
+            "a watcher holding nothing must deliver nothing on the way out"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

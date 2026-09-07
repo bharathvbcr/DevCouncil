@@ -5411,3 +5411,185 @@ partial index on `valid_to IS NULL` and reads of an older generation fall back
 to a scan. That is a behaviour change in about ten query sites and needs its own
 latency measurement, which is why it stays a decision rather than being taken
 here.
+
+## Per-turn cost pass (2026-09-06)
+
+The four costs an agent pays on every turn, measured on schema 17 and A/B'd with
+release binaries built into separate `CARGO_TARGET_DIR`s, interleaved A B A B, on a
+machine with sibling lanes compiling. Baseline `A` is `de44fbb` built from a
+`git archive` of that commit, so the only difference between the binaries is this
+branch. Corpora are `git archive` exports (tracked files only) with `git init` run in
+the copy: without a `.git`, `ignore::WalkBuilder`'s `require_git` default stops
+applying `.gitignore`, and an `rsync` copy of scholarlm went from 4,278 indexable
+files to 129,658 candidates. A corpus copy that drops `.git` is a different corpus.
+
+| corpus | files indexed | edges | store after cold |
+|---|---|---|---|
+| this repository | 1,554 | 100,367 | 155 MB |
+| scholarlm | 4,278 | — | — |
+
+### 1. No-op build — landed, 3.4x / 5.0x
+
+The unchanged check reads only `(file_path, content_hash)` off each `Extraction`, and
+both are pure functions of the bytes discovery already read. It was getting them by
+extracting the whole corpus and discarding the result. The round-trip is also not
+parallel despite the `par_iter` around it: `try_get_cached_extraction` goes through
+`Store`'s single `Mutex<Connection>`, so every rayon thread serialises on it, and each
+hit deserializes a full extraction payload from JSON.
+
+The kernel's own stage timing is the cleanest evidence. On an unchanged tree of 1,554
+files, `"scanning and extracting"` reports **237.2 ms before and 38.8 ms after**.
+
+| corpus | n | A p50 | B p50 | A min | B min | half-run drift |
+|---|---|---|---|---|---|---|
+| this repository | 21 | 251.2 ms | 72.9 ms | 235.0 ms | 67.0 ms | ≤ 9.1 ms |
+| scholarlm | 21 | 670.1 ms | 134.9 ms | 622.3 ms | 122.9 ms | ≤ 30.5 ms |
+
+**No `(size, mtime_ns, ctime_ns, inode)` stamp was needed.** The hash is still taken
+over the bytes, so mtime granularity, `touch -r` and in-place rewrites with a restored
+timestamp never arise, and the equivalence is by construction. Equivalence is pinned by
+`scan_hashes_agree_with_extraction_hashes_over_every_outcome` over a clean parse, a
+`Failed` parse, two byte-identical files at different paths and an empty file, cold and
+warm.
+
+Against the ≤ 30 ms target: the *kernel* wall on this corpus is now **38.9 ms**
+(`total_seconds` in the unchanged JSON), against 237.5 ms before. The 72.9 ms figure
+above is process wall and includes spawn. The remaining ~39 ms is the walk, the read
+and the FNV pass; closing the last 9 ms needs the stat-stamp design, whose safety
+argument is materially harder than the one above.
+
+Reading the tree in parallel is separately measured against its own twin, n=31:
+p50 85.0 → 66.4 ms, min 77.1 → 61.0 ms, drift 3.4 ms. A result, not noise. (On a
+209-commit-older base the same change was *not* separable from the drift; the effect
+is the same size, the baseline was noisier.)
+
+### 2. One-file touch build — measured, not landed; validity ranges remain the answer
+
+Six consecutive one-file edits on this repository, after §1:
+
+| build | store bytes | gens | `generation_edges` | `generation_unresolved` | persist:write | persist:vacuum | total |
+|---|---|---|---|---|---|---|---|
+| cold | 155,451,392 | 1 | 100,367 | 87,837 | — | — | — |
+| 1 | 224,542,720 | 2 | 200,734 | 175,674 | 564 ms | 2 ms | 1.30 s |
+| 2–6 | ~224,480,000 | 2 | 200,734 | 175,674 | 533–573 ms | 78–138 ms | 1.68–1.77 s |
+
+**One changed file rewrites 188,201 rows** — 100,367 edges and 87,837 unresolved — and
+takes the store from 155 MB to 224 MB. Growth is bounded (two retained generations; the
+file stops moving after build 2), so there is no unbounded-growth defect, but every edit
+writes a whole generation of edges.
+
+Two things worth recording as *already done*, so nobody re-derives them: the write path
+is a **single transaction** (`save_generation_with_metadata` opens one
+`GENERATION_TX_BEHAVIOR` transaction) and the hot 8-parameter edge INSERT already uses
+`prepare_cached`. `synchronous` is `NORMAL` globally, which in WAL is the cheap setting.
+Batching and statement reuse are not available as wins.
+
+v17 solved this shape for *files* — `generation_files` is now a view over
+`file_payloads` and `generation_file_rows`, so an unchanged file's payload is stored
+once and the membership row is thin. Edges did not get that treatment and cannot get
+the same one: they are **deliberately never carried forward** (`db.rs`, "Edges come
+from this build's resolution, always"), because the build resolves the whole tree so
+the analysis means the same thing on both paths, and copying prior rows preserved stale
+answers across extractor upgrades and moved-identity targets. So `affected_paths`
+narrows nodes, not edges. **Validity ranges (`[valid_from, valid_to)` with a partial
+index on `valid_to IS NULL`) are the design that keeps that property while writing only
+the rows whose tuple changed**: the comparison is ~100k in-memory tuple compares, the
+write becomes the delta, and the prune and the reclaim collapse with it. Not attempted
+here — it touches `save_generation`, every prune, and every reader keyed on
+`(generation_id, …)`, several of which another session is editing.
+
+#### The reclaim threshold: re-measured on this base, recommendation withdrawn
+
+On a 209-commit-older base this looked like a clear win: reclaim fired on every
+incremental build at 336–605 ms, and raising `VACUUM_FREELIST_RATIO` from 0.05 to 0.60
+took builds from 2.14–2.89 s to 1.60–1.76 s for +109 MB. **That is no longer the trade.**
+K5 reworked the reclaim path, and on this base the same six-build probe gives:
+
+| | steady-state store | persist:vacuum | total build |
+|---|---|---|---|
+| `VACUUM_FREELIST_RATIO = 0.05` (current) | 224.5 MB | 78–138 ms | 1.68–1.77 s |
+| `VACUUM_FREELIST_RATIO = 0.50` (probe) | 292.7 MB | 1–2 ms | 1.56–1.65 s |
+
+~110 ms off a ~1.7 s build — 6 % — for a **30 % larger store**. The recommendation is
+withdrawn; 0.05 is the right constant now. Recorded because the earlier reading was
+wrong for a reason worth keeping: a policy constant measured against a stale base gave
+advice that inverted once the path around it was fixed.
+
+### 3. Cold-process `impact` — the index is a daemon win, not a CLI one
+
+`edge_index.rs` moves adjacency construction to once per *generation* instead of once
+per *question*, cached on the `Store` and keyed by generation id. That works — but the
+cache is per **process**, and `generation_edges()` builds it from
+`latest_edge_rows()`, a full materialisation of every edge row. A one-shot CLI
+invocation pays the whole build and asks one question.
+
+Measured cold, this repository, 100,367 edges, minima of 5 runs:
+
+| command | min | reads the edge set? |
+|---|---|---|
+| `search content_hash` | 35.1 ms | no |
+| `dead` | 35.6 ms | no |
+| `impact content_hash --depth 1` | 168.4 ms | yes |
+| `impact content_hash --depth 3` | 169.8 ms | yes |
+| `impact content_hash --depth 8` | 183.1 ms | yes |
+| `neighbors` (1 target) | 158.5 ms | yes |
+| `neighbors` (5 targets) | 181.3 ms | yes |
+
+Depth 1 → 8 costs **+14.7 ms**; one target → five costs **+22.8 ms**, about 5.7 ms per
+extra question. So the fixed cost of *arriving* at the index is ~133 ms above the
+35 ms process floor, and the marginal cost of a question is ~6 ms. The index does
+exactly what its doc claims within a process; the CLI just never gets a second question
+to amortise it against.
+
+Cold `impact` is 0.26 s / 119 MiB against `search` at 0.01 s / 16 MiB. The ≤ 30 ms
+target is therefore not a traversal problem and not fixable by trimming the walk. The
+two shapes that would fix it: **persist the index (or its CSR arrays) per generation**
+so a cold process maps rather than builds it, or **route CLI queries through the daemon
+that already holds it**. Neither attempted — both are `devmap-query`/`devmap-serve`
+work.
+
+### 4. Peak RSS — measured; the split's cost found and closed
+
+| workload | peak RSS |
+|---|---|
+| scholarlm cold build (4,278 files) | ~1,684 MiB |
+| `impact` from a cold process | 119 MiB |
+| `search` / `dead` from a cold process | 16–17 MiB |
+
+**The no-op build's peak fell by 72 % as a side effect of §1**, which is the largest
+memory result in this pass and was not the thing being aimed at. `benchmarks/map_bench.py
+--repeat 7` on this repository, minima and peak RSS per stage, `de44fbb` against this
+branch:
+
+| stage | A min | B min | A peak RSS | B peak RSS |
+|---|---|---|---|---|
+| `cold` | 2.72 s | 2.74 s | 664 MiB | 670 MiB |
+| `warm` | 199 ms | **41 ms** | 183 MiB | **51 MiB** |
+| `touch` | 1.32 s | 1.25 s | 537 MiB | 534 MiB |
+| `manifest` | 65 ms | 63 ms | not measured | not measured |
+
+An unchanged build never materialises the extractions, so it never pays for them: 4.9x
+on wall and 183 → 51 MiB on peak. `cold`, `touch` and `manifest` are unchanged within
+their spread — and `touch` and `manifest` carry spreads of 101 % and 1003 % in the A run,
+so those two minima describe the machine as much as the code and no claim is made from
+them.
+
+Scanning before extracting binds the corpus text in the build's scope, where it would
+survive resolve, analyze and persist — the stages that set the peak. Measured against
+its own twin (the same binary with the drop replaced by a keep-alive binding), n=5 cold
+builds of scholarlm: **1,714 MiB without the drop against 1,684 MiB with it, 30 MiB**,
+wall unchanged in both directions (p50 10.39 s vs 10.56 s, minima 9.94 s vs 10.00 s).
+
+Comparing the whole branch against `de44fbb` instead gives 1,682 vs 1,692 MiB p50 with
+overlapping ranges — **no result**. Only the isolated twin attributes the effect, and
+the branch-level comparison is reported here as the null it is rather than as the win
+the twin shows.
+
+The discovery *report* must outlive the source text (`discovery_refusals` turns it into
+the analysis disclosure), so the code destructures `ScannedTree` and drops only
+`sources`. Dropping the pair does not compile.
+
+No further clearly-free reduction was found and none was invented. The `extractions`
+vector is live from extraction through persist by construction — resolve, analyze and
+the writer all read it — so "drop extractions once persisted" needs a streaming persist,
+which is the same structural change as §2.

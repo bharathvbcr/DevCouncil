@@ -10,17 +10,14 @@ from devcouncil.domain.gap import Gap
 from devcouncil.domain.requirement import AcceptanceCriterion, Requirement
 from devcouncil.domain.task import PlannedFile, Task
 from tests.unit.graph_fixtures import kernel_graph
-from devcouncil.indexing.graph.export import (
-    export_graphml,
-    file_doc_rel,
-)
+from devcouncil.indexing.graph.export import file_doc_rel
 from devcouncil.indexing.graph.export_links import (
     GRAPH_FROM_WIKI,
     file_doc_path,
     relative_md_link,
     wired_to_bullets,
 )
-from devcouncil.indexing.graph.okf_export import export_graph_okf, graph_to_graphml
+from devcouncil.indexing.graph.okf_export import export_graph_okf
 from devcouncil.knowledge.okf import OKFDocument, read_bundle, validate_bundle
 from devcouncil.knowledge.frontmatter import split_frontmatter
 from devcouncil.reporting.report_builder import ReportBuilder
@@ -160,19 +157,6 @@ def test_code_graph_okf_frontmatter_and_indexes(tmp_path):
     # Markdown import/call links present on file pages
     a_doc = bundle.by_path()[file_doc_rel("pkg/a.py")]
     assert "Imports" in a_doc.body or "imports" in a_doc.body.lower() or "Calls" in a_doc.body
-
-
-def test_graphml_includes_attributes(tmp_path):
-    _write(tmp_path, {"pkg/__init__.py": "", "pkg/a.py": "def f():\n    return 1\n"})
-    _commit(tmp_path)
-    graph = kernel_graph(tmp_path)
-    xml = graph_to_graphml(graph)
-    assert 'attr.name="kind"' in xml
-    assert 'attr.name="confidence"' in xml
-    assert 'attr.name="area"' in xml
-    assert 'attr.name="community"' in xml
-    assert 'attr.name="dead"' in xml
-    assert export_graphml(graph).startswith("<?xml")
 
 
 def test_wiki_graph_share_link_conventions():

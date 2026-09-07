@@ -225,7 +225,7 @@ fn component_is_qualified(members: &[String], qualifying: &BTreeSet<&str>) -> bo
 ///
 /// Returns components in reverse topological order, as Tarjan does; callers
 /// here do not depend on that, but changing it silently would be a trap.
-fn strongly_connected_components(adjacency: &[Vec<u32>]) -> Vec<Vec<u32>> {
+pub(crate) fn strongly_connected_components(adjacency: &[Vec<u32>]) -> Vec<Vec<u32>> {
     let n = adjacency.len();
     const UNVISITED: u32 = u32::MAX;
 

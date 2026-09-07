@@ -311,7 +311,87 @@ def last_build(root: Path) -> Dict[str, Any]:
     }
 
 
-def _artifact(path: Path, *, engine_key: str) -> Dict[str, Any]:
+#: The sidecar layout this reader understands. The kernel refuses to read a
+#: stamp of any other version, and so does this: an older sidecar describes its
+#: outputs by path only and names no engine, so there is nothing here to read.
+_ARTIFACT_STAMP_VERSION = 3
+
+
+def read_artifact_stamp(root: Path) -> Optional[Dict[str, Any]]:
+    """The sidecar the kernel writes beside the store, or ``None``.
+
+    ``<db>.artifacts.json`` records, for each artifact the kernel wrote, the
+    engine that wrote it and what the file looked like at that moment. Reading it
+    is how a consumer answers "did the kernel write this" without parsing the
+    artifact — 34.5 MB of ``code_graph.json``, ~150 ms, for one string.
+
+    Every failure is ``None``: absent, unreadable, not JSON, a version this does
+    not understand. ``None`` means *no evidence*, which is the fail-closed
+    direction — the caller then falls back to reading the artifact itself, which
+    is what it did before the sidecar existed.
+    """
+    path = root / (DEFAULT_DB_RELPATH + ".artifacts.json")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("version") != _ARTIFACT_STAMP_VERSION:
+        return None
+    return payload
+
+
+def _stamp_record(stamp: Optional[Dict[str, Any]], role: str) -> Optional[Dict[str, Any]]:
+    """The stamp's record for one role, looked up by role and never by path.
+
+    The stamp stores each path *as the writer resolved it* — a default run
+    records ``/repo/./.devcouncil/repo_map.json``, with the ``./`` the CLI's
+    default argument leaves in — so a consumer joining the root with the relative
+    path builds a string that names the same file and does not compare equal.
+    """
+    if not isinstance(stamp, dict):
+        return None
+    outputs = stamp.get("outputs")
+    if not isinstance(outputs, list):
+        return None
+    for record in outputs:
+        if isinstance(record, dict) and record.get("role") == role:
+            return record
+    return None
+
+
+def _record_describes(record: Dict[str, Any], path: Path) -> bool:
+    """Whether ``record`` is still a description of the file at ``path``.
+
+    The same four facts the kernel compares, in the same fail-closed direction:
+    a stat that will not answer, or a field the record does not carry, is *not* a
+    match. ``len``+``mtime_ns``+``ino`` are all restorable by ``cp -p`` and
+    friends; ``ctime`` is the one userspace cannot back-date, which is why it is
+    in the tuple.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    try:
+        return (
+            record["len"] == stat.st_size
+            and record["mtime_ns"] == stat.st_mtime_ns
+            and record["ino"] == stat.st_ino
+            and record["ctime_ns"] == stat.st_ctime_ns
+        )
+    except (KeyError, TypeError):
+        return False
+
+
+def _artifact(
+    path: Path,
+    *,
+    engine_key: str,
+    role: str,
+    stamp: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "path": str(path),
         "exists": path.is_file(),
@@ -319,6 +399,11 @@ def _artifact(path: Path, *, engine_key: str) -> Dict[str, Any]:
         "written_at": None,
         "map_engine": None,
         "generated_head": None,
+        # Whether `map_engine` was *verified* against the kernel's own record of
+        # writing this exact file, rather than read out of the file's own claim.
+        # A claim is what any writer can put there; the sidecar is what the
+        # kernel put beside the store.
+        "writer_verified": False,
     }
     if not path.is_file():
         return info
@@ -328,6 +413,16 @@ def _artifact(path: Path, *, engine_key: str) -> Dict[str, Any]:
         info["written_at"] = _iso(stat.st_mtime)
     except OSError:
         pass
+
+    record = _stamp_record(stamp, role)
+    if record is not None and _record_describes(record, path):
+        # The kernel wrote this file and these are still its bytes, so the
+        # engine it recorded is the engine — and the artifact is not opened.
+        info["map_engine"] = stamp.get("map_engine") if isinstance(stamp, dict) else None
+        info["generated_head"] = stamp.get("generated_head") if isinstance(stamp, dict) else None
+        info["writer_verified"] = True
+        return info
+
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -345,9 +440,14 @@ def _artifact(path: Path, *, engine_key: str) -> Dict[str, Any]:
 
 
 def artifacts_info(root: Path) -> Dict[str, Any]:
+    stamp = read_artifact_stamp(root)
     return {
-        "repo_map": _artifact(root / DEFAULT_MAP_RELPATH, engine_key="top"),
-        "code_graph": _artifact(root / DEFAULT_GRAPH_RELPATH, engine_key="meta"),
+        "repo_map": _artifact(
+            root / DEFAULT_MAP_RELPATH, engine_key="top", role="repo_map", stamp=stamp
+        ),
+        "code_graph": _artifact(
+            root / DEFAULT_GRAPH_RELPATH, engine_key="meta", role="code_graph", stamp=stamp
+        ),
     }
 
 
@@ -911,6 +1011,10 @@ def run_doctor(root: Path) -> Dict[str, Any]:
                 fix_command="dev map" if ok_edges is False else "",
             )
 
+    # The engine name has one owner on this side; imported late because
+    # `map_artifacts` pulls the whole indexing stack and the doctor should not.
+    from devcouncil.indexing.map_artifacts import MAP_ENGINE as CONSUMER_MAP_ENGINE
+
     for name, artifact in status["artifacts"].items():
         if not artifact["exists"]:
             check(
@@ -924,17 +1028,50 @@ def run_doctor(root: Path) -> Dict[str, Any]:
             )
         elif artifact.get("error"):
             check(name, False, artifact["error"], fix="dev map", code="artifact_unreadable", fix_command="dev map")
-        elif artifact.get("map_engine") != "devmap-rust":
+        elif artifact.get("map_engine") == CONSUMER_MAP_ENGINE:
+            # Verified means the kernel's own sidecar still describes these
+            # bytes. Claimed means the file says so about itself, which is all
+            # that could be established before the sidecar carried the engine.
+            evidence = (
+                "verified against the kernel's stamp"
+                if artifact.get("writer_verified")
+                else "self-declared (no stamp describes this file)"
+            )
+            check(
+                name,
+                True,
+                f"{_mb(artifact.get('bytes'))} by {CONSUMER_MAP_ENGINE}, {evidence}",
+                critical=False,
+            )
+        elif artifact.get("map_engine"):
+            # A positive claim by some other writer. This is the finding the
+            # check exists for, and it stays critical.
             check(
                 name,
                 False,
-                f"written by {artifact.get('map_engine') or 'an unknown writer'}, not the kernel",
+                f"written by {artifact['map_engine']}, not the kernel",
                 fix="dev map (the kernel overwrites foreign artifacts)",
                 code="foreign_writer",
                 fix_command="dev map",
             )
         else:
-            check(name, True, f"{_mb(artifact.get('bytes'))} by devmap-rust", critical=False)
+            # No engine anywhere: none in the file, and no stamp that still
+            # describes it. That is the absence of evidence, not evidence of a
+            # foreign writer, and it must not be reported as the latter — a
+            # check that could not run may not return what a check that ran and
+            # failed returns. Non-critical, and `None` rather than `False`, so a
+            # map with an unlabelled artifact is not called broken on no
+            # evidence.
+            check(
+                name,
+                None,
+                "names no engine, and no stamp describes this file; "
+                "cannot tell who wrote it",
+                critical=False,
+                fix="dev map (a build rewrites the artifact and stamps it)",
+                code="artifact_writer_unverified",
+                fix_command="dev map",
+            )
 
     freshness = status["index_freshness"]
     if freshness.get("fresh") is False:

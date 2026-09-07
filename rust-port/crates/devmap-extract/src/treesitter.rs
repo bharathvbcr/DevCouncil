@@ -1692,7 +1692,10 @@ fn member_access_receiver(node: Node, source: &str) -> Option<String> {
         return None;
     }
     let object = parent.child_by_field_name(object_field)?;
-    let text = get_node_text(object, source);
+    // X44. The object's *identity*, not its source text: `runner.invoke(app,
+    // ["init"]).output` names the call it reads from, and a receiver that is a
+    // block copied into a column groups with nothing.
+    let text = receiver_identity(object, source, 0);
     (!text.is_empty()).then_some(text)
 }
 
@@ -3053,21 +3056,7 @@ fn extract_node(
             // Emitting them here as well produced the same method twice.
             "impl_item" => {}
             "use_declaration" => {
-                let text = get_node_text(node, source);
-                let spec = text
-                    .trim_start_matches("pub ")
-                    .trim_start_matches("use ")
-                    .trim_end_matches(';')
-                    .trim()
-                    .to_string();
-                imports.push(ExtractedImport {
-                    raw_import: text,
-                    module_specifier: spec,
-                    imported_names: vec![],
-                    local_names: vec![],
-                    alias: None,
-                    span,
-                });
+                rust_use_imports(node, source, span, imports);
             }
             "call_expression" => {
                 if let Some(f) = node.child_by_field_name("function") {
@@ -4336,6 +4325,142 @@ pub(crate) fn is_anonymous_callable(kind: &str) -> bool {
     )
 }
 
+/// The longest a receiver expression may be recorded as.
+///
+/// X44. `receiver_expr` is documented as existing "so the classification can be
+/// audited rather than trusted", which means being grouped and read. A receiver
+/// that is a unique 38,644-character string — the measured maximum on this
+/// repository, the whole body of one function, stored as the "receiver" of a
+/// method called on the end of it — groups with nothing and answers no
+/// question, while costing the store a megabyte of duplicated source.
+///
+/// 64 characters holds every receiver that is genuinely a path of names, which
+/// is what this field is for. Past it the value is cut and **marked** cut, so a
+/// truncated string can never be read as a whole expression.
+const MAX_RECEIVER_CHARS: usize = 64;
+
+/// A receiver expression reduced to something a reader can group by.
+///
+/// One line, bounded, and marked when it was cut. Collapsing whitespace is part
+/// of the identity and not cosmetic: 4,973 receivers on this repository contain
+/// a newline, and every one of them is a block that was copied into a column
+/// whose job is to name a value.
+fn bound_receiver_text(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX_RECEIVER_CHARS {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(MAX_RECEIVER_CHARS).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Grammar keys for a call, across the languages this crate splits receivers
+/// for. A call's identity is the callee it names, never its argument list.
+fn is_call_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "call"
+            | "call_expression"
+            | "function_call_expression"
+            | "invocation_expression"
+            | "macro_invocation"
+            | "member_call_expression"
+            | "method_call"
+            | "method_invocation"
+            | "new_expression"
+            | "object_creation_expression"
+            | "scoped_call_expression"
+    )
+}
+
+/// Grammar keys for member access — the same three spellings
+/// `member_access_receiver` already reconciles, plus Rust's and C's.
+fn member_access_fields(kind: &str) -> Option<(&'static str, &'static str)> {
+    match kind {
+        "attribute" => Some(("object", "attribute")),
+        "member_expression" => Some(("object", "property")),
+        "selector_expression" => Some(("operand", "field")),
+        "field_expression" => Some(("value", "field")),
+        _ => None,
+    }
+}
+
+/// What a receiver expression *is*, rather than what it says.
+///
+/// X44. The receiver used to be `get_node_text` of the receiver node, whole, so
+/// `runner.invoke(app, ["init"]).output.strip()` recorded its entire left-hand
+/// side. The classifier reads only the receiver's leftmost segment, and a
+/// reader auditing the ledger needs rows that group — neither is served by a
+/// copy of the source.
+///
+/// The reduction is structural, not textual: a receiver that is a **call** is
+/// named by that call's callee, and a member access is `<object identity>.
+/// <property>`. Anything this walk does not recognise keeps its text, bounded.
+pub(crate) fn receiver_identity(node: Node, source: &str, depth: usize) -> String {
+    if depth > 16 {
+        return bound_receiver_text(&get_node_text(node, source));
+    }
+    let fallback = || bound_receiver_text(&get_node_text(node, source));
+    let kind = node.kind();
+    if matches!(
+        kind,
+        "await_expression" | "parenthesized_expression" | "non_null_expression"
+    ) {
+        return match node.named_child(0) {
+            Some(inner) => receiver_identity(inner, source, depth + 1),
+            None => fallback(),
+        };
+    }
+    if is_call_node(kind) {
+        return node
+            .child_by_field_name("function")
+            .or_else(|| node.child_by_field_name("constructor"))
+            .map(|target| {
+                // The inner call's callee **with its own receiver**, not the
+                // callee alone. Measured: reducing `runner.invoke(app, [...])`
+                // to `invoke` cost 1,235 `External` classifications on this
+                // repository, because the classifier roots its answer at the
+                // receiver's leftmost segment and `runner` is where the
+                // declared type `CliRunner` — and the import that proves it
+                // external — is recorded. `runner.invoke` keeps that root and
+                // still drops the argument list, which is the part that made
+                // the string unique.
+                let (name, receiver) = split_call_target_inner(target, source, depth + 1);
+                match receiver.filter(|receiver| !receiver.is_empty()) {
+                    Some(receiver) if !name.is_empty() => format!("{receiver}.{name}"),
+                    _ => name,
+                }
+            })
+            .map(|identity| bound_receiver_text(&identity))
+            .filter(|identity| !identity.is_empty())
+            .unwrap_or_else(fallback);
+    }
+    if let Some((object_field, member_field)) = member_access_fields(kind) {
+        let member = node
+            .child_by_field_name(member_field)
+            .map(|child| get_node_text(child, source))
+            .filter(|text| !text.is_empty());
+        let object = node
+            .child_by_field_name(object_field)
+            .or_else(|| node.child_by_field_name("argument"))
+            .map(|child| receiver_identity(child, source, depth + 1))
+            .filter(|text| !text.is_empty());
+        return match (object, member) {
+            (Some(object), Some(member)) => bound_receiver_text(&format!("{object}.{member}")),
+            _ => fallback(),
+        };
+    }
+    fallback()
+}
+
+/// The receiver named by `field` on `node`, as an identity.
+fn receiver_from_field(node: Node, field: &str, source: &str, depth: usize) -> Option<String> {
+    node.child_by_field_name(field)
+        .map(|child| receiver_identity(child, source, depth + 1))
+        .filter(|text| !text.is_empty())
+}
+
 fn split_call_target_inner(
     function_node: Node,
     source: &str,
@@ -4384,11 +4509,11 @@ fn split_call_target_inner(
         }
         "attribute" => (
             get_child_text(function_node, "attribute", source).unwrap_or_default(),
-            get_child_text(function_node, "object", source),
+            receiver_from_field(function_node, "object", source, depth),
         ),
         "member_expression" => (
             get_child_text(function_node, "property", source).unwrap_or_default(),
-            get_child_text(function_node, "object", source),
+            receiver_from_field(function_node, "object", source, depth),
         ),
         // C++ scope resolution: `ns::fn()`, `S::sm()`, `a::b::c()`.
         //
@@ -4431,8 +4556,8 @@ fn split_call_target_inner(
         // field here, so the fallback cannot change a Rust split.
         "field_expression" => {
             let field = get_child_text(function_node, "field", source);
-            let value = get_child_text(function_node, "value", source)
-                .or_else(|| get_child_text(function_node, "argument", source));
+            let value = receiver_from_field(function_node, "value", source, depth)
+                .or_else(|| receiver_from_field(function_node, "argument", source, depth));
             match (field, value) {
                 (Some(field), value) if !field.is_empty() => (field, value),
                 _ => (get_node_text(function_node, source), None),
@@ -4441,7 +4566,7 @@ fn split_call_target_inner(
         "selector_expression" => {
             let field = get_child_text(function_node, "field", source)
                 .or_else(|| get_child_text(function_node, "selector", source));
-            let operand = get_child_text(function_node, "operand", source);
+            let operand = receiver_from_field(function_node, "operand", source, depth);
             match (field, operand) {
                 (Some(field), Some(operand)) if !field.is_empty() => (field, Some(operand)),
                 _ => (get_node_text(function_node, source), None),
@@ -4667,6 +4792,279 @@ fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// One leaf of a `use` tree: the module it comes from and the name it binds.
+struct RustUseLeaf {
+    /// The path segments before the imported name — `["std", "collections"]`
+    /// for `std::collections::BTreeMap`.
+    module: Vec<String>,
+    /// The name imported from that module, or `None` for a glob.
+    name: Option<String>,
+    /// The local binding, when `as` renamed it.
+    alias: Option<String>,
+}
+
+/// How deeply a `use` tree may nest before recovery stops.
+///
+/// A `use` group is a tree and this walk recurses per level, so an adversarially
+/// nested statement is a stack-overflow shape — the same reason
+/// [`rust_type_name`] is bounded. There is deliberately **no cap on the number
+/// of leaves**: leaves cost source bytes, which `MAX_SOURCE_BYTES` already
+/// bounds, and a leaf cap would silently truncate an import list — presenting a
+/// capped sample as the file's complete set of imports, which is exactly the
+/// shape that makes "nothing imports this" mean two different things.
+const RUST_USE_MAX_DEPTH: usize = 32;
+
+/// The path segments of a `use` path node, appended to `out`.
+///
+/// Returns `false` for a node shape this does not recognise, and the caller
+/// abandons the leaf rather than recording a partial path — half a module path
+/// resolves to a *different* module, which is worse than not resolving.
+fn rust_path_segments(node: Node, source: &str, depth: usize, out: &mut Vec<String>) -> bool {
+    if depth > RUST_USE_MAX_DEPTH {
+        return false;
+    }
+    match node.kind() {
+        "scoped_identifier" | "scoped_type_identifier" => {
+            if let Some(path) = node.child_by_field_name("path") {
+                if !rust_path_segments(path, source, depth + 1, out) {
+                    return false;
+                }
+            }
+            match node.child_by_field_name("name") {
+                Some(name) => rust_path_segments(name, source, depth + 1, out),
+                None => false,
+            }
+        }
+        "identifier" | "type_identifier" | "primitive_type" | "super" | "crate" | "self"
+        | "metavariable" => {
+            let text = get_node_text(node, source);
+            if text.is_empty() {
+                return false;
+            }
+            out.push(text);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Flatten a `use` tree into one leaf per name it binds.
+fn collect_rust_use_leaves(
+    node: Node,
+    source: &str,
+    prefix: &[String],
+    depth: usize,
+    out: &mut Vec<RustUseLeaf>,
+) {
+    if depth > RUST_USE_MAX_DEPTH {
+        return;
+    }
+    match node.kind() {
+        "use_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_rust_use_leaves(child, source, prefix, depth + 1, out);
+            }
+        }
+        "scoped_use_list" => {
+            let mut nested = prefix.to_vec();
+            if let Some(path) = node.child_by_field_name("path") {
+                if !rust_path_segments(path, source, 0, &mut nested) {
+                    return;
+                }
+            }
+            if let Some(list) = node.child_by_field_name("list") {
+                collect_rust_use_leaves(list, source, &nested, depth + 1, out);
+            }
+        }
+        "use_as_clause" => {
+            let mut segments = prefix.to_vec();
+            let Some(path) = node.child_by_field_name("path") else {
+                return;
+            };
+            if !rust_path_segments(path, source, 0, &mut segments) {
+                return;
+            }
+            let alias = node
+                .child_by_field_name("alias")
+                .map(|child| get_node_text(child, source))
+                .filter(|alias| !alias.is_empty());
+            if let Some(name) = segments.pop() {
+                out.push(RustUseLeaf {
+                    module: segments,
+                    name: Some(name),
+                    alias,
+                });
+            }
+        }
+        "use_wildcard" => {
+            let mut segments = prefix.to_vec();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if !rust_path_segments(child, source, 0, &mut segments) {
+                    return;
+                }
+            }
+            out.push(RustUseLeaf {
+                module: segments,
+                name: None,
+                alias: None,
+            });
+        }
+        _ => {
+            let mut segments = prefix.to_vec();
+            if !rust_path_segments(node, source, 0, &mut segments) {
+                return;
+            }
+            if let Some(name) = segments.pop() {
+                out.push(RustUseLeaf {
+                    module: segments,
+                    name: Some(name),
+                    alias: None,
+                });
+            }
+        }
+    }
+}
+
+/// How many **inline** `mod { … }` blocks enclose this node.
+///
+/// Rust's `super` is relative to the module, not to the file, and an inline
+/// module is one module deeper without being one file deeper. `mod tests { use
+/// super::*; }` therefore names the *file it is written in*; the same statement
+/// at file level names the parent directory's module. This repository contains
+/// 87 of the first spelling and none of the resolver's rungs could tell them
+/// apart.
+fn rust_inline_module_depth(node: Node) -> usize {
+    let mut depth = 0usize;
+    let mut current = bounded_parent(node);
+    while let Some(parent) = current {
+        if parent.kind() == "mod_item" && parent.child_by_field_name("body").is_some() {
+            depth += 1;
+        }
+        current = bounded_parent(parent);
+    }
+    depth
+}
+
+/// The module specifier a leaf's path denotes, with `super` resolved against
+/// the inline-module nesting it was written inside.
+///
+/// `super` spent against an inline module does not leave the file, so once the
+/// nesting is used up the target is this file — spelled `self`, which the
+/// resolver reads as "the file this import is written in".
+///
+/// Known limit, stated rather than papered over: where the nesting absorbs every
+/// `super` and segments remain (`mod tests { use super::helpers::thing; }`),
+/// the remainder is emitted as `self::helpers`, which resolves to a sibling
+/// *file* module. That is right when `helpers` is `mod helpers;` and wrong when
+/// it is `mod helpers { … }` in this same file — and telling those apart needs
+/// the file's own inline-module table, which this function does not have. The
+/// wrong case resolves to nothing, which is where it already sat.
+fn rust_use_specifier(module: &[String], inline_depth: usize) -> String {
+    let leading_super = module
+        .iter()
+        .take_while(|segment| *segment == "super")
+        .count();
+    let spent = leading_super.min(inline_depth);
+    let remaining = leading_super - spent;
+    let mut segments: Vec<&str> = Vec::with_capacity(module.len());
+    if leading_super > 0 && remaining == 0 {
+        segments.push("self");
+    } else {
+        segments.extend(std::iter::repeat_n("super", remaining));
+    }
+    segments.extend(module[leading_super..].iter().map(String::as_str));
+    segments.join("::")
+}
+
+/// Read a `use_declaration` into one [`ExtractedImport`] per module it names.
+///
+/// The arm this replaces stored the statement's own text as the module
+/// specifier: `use tree_sitter::{Language, Node, Parser};` became one import
+/// whose module was the literal string `"tree_sitter::{Language, Node,
+/// Parser}"`, with an empty `imported_names`. Both fields are what every
+/// consumer of an import reads, so nothing downstream worked at all — measured
+/// on this repository, no `.rs` file produced a single `Imports` edge and
+/// `UnresolvedClass::External` never fired once for Rust, while the same ladder
+/// produced 8,734 External rows for Python from the same evidence shape.
+///
+/// A glob is emitted as the `.` alias rather than as a name. That spelling
+/// already exists for Go's dot-import and means exactly this — bind everything
+/// this module exports — so the resolver needs no second rung for it.
+fn rust_use_imports(
+    node: Node,
+    source: &str,
+    span: Span,
+    imports: &mut Vec<ExtractedImport>,
+) -> Option<()> {
+    let raw = get_node_text(node, source);
+    let argument = node.child_by_field_name("argument")?;
+    let inline_depth = rust_inline_module_depth(node);
+    let mut leaves: Vec<RustUseLeaf> = Vec::new();
+    collect_rust_use_leaves(argument, source, &[], 0, &mut leaves);
+
+    // Grouped by module so `use std::{fmt, io}` is one import of `std` naming
+    // two symbols, the shape every other language's extractor produces. Ordered
+    // by module for determinism (R4); names keep source order within a module.
+    let mut named: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
+    let mut whole_module: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for leaf in leaves {
+        // `use serde;` and `use super::{self, thing};` import the module
+        // itself, not a name out of it.
+        let names_the_module = leaf.module.is_empty() || leaf.name.as_deref() == Some("self");
+        if names_the_module {
+            let mut module = leaf.module.clone();
+            if leaf.name.as_deref() != Some("self") {
+                if let Some(name) = leaf.name.clone() {
+                    module.push(name);
+                }
+            }
+            if module.is_empty() {
+                continue;
+            }
+            whole_module.insert(rust_use_specifier(&module, inline_depth), leaf.alias);
+            continue;
+        }
+        let specifier = rust_use_specifier(&leaf.module, inline_depth);
+        match leaf.name {
+            // A glob binds the module's whole surface, which is what the
+            // resolver's `.` alias means.
+            None => {
+                whole_module.insert(specifier, Some(".".to_string()));
+            }
+            Some(name) => {
+                let local = leaf.alias.unwrap_or_else(|| name.clone());
+                let entry = named.entry(specifier).or_default();
+                entry.0.push(name);
+                entry.1.push(local);
+            }
+        }
+    }
+
+    for (specifier, (imported_names, local_names)) in named {
+        imports.push(ExtractedImport {
+            raw_import: raw.clone(),
+            module_specifier: specifier,
+            imported_names,
+            local_names,
+            alias: None,
+            span: span.clone(),
+        });
+    }
+    for (specifier, alias) in whole_module {
+        imports.push(ExtractedImport {
+            raw_import: raw.clone(),
+            module_specifier: specifier,
+            imported_names: vec![],
+            local_names: vec![],
+            alias,
+            span: span.clone(),
+        });
+    }
+    Some(())
 }
 
 /// Parameter name → declared type, for languages whose parameters carry one.
@@ -4987,6 +5385,20 @@ fn maybe_push_name_reference(
     }
     let name = get_node_text(node, source);
     if !is_user_ident(&name) {
+        return;
+    }
+    // X40. `_` in **type position** is the inferred-type placeholder — Rust's
+    // `row.get::<_, f64>(1)`, Go's blank identifier — and it references
+    // nothing, so there is no attribution to attempt and no honest tier to file
+    // the failure under. Measured on this repository: 275 of the 9,790 rows in
+    // the tier documented as "the only tier that indicates a defect" were this
+    // placeholder, every one of them a turbofish.
+    //
+    // Restricted to type position on purpose. `_` is a perfectly ordinary
+    // value-position identifier in JavaScript (lodash) and Python (gettext), so
+    // refusing it everywhere would drop real references; no language names a
+    // *type* `_`.
+    if ref_kind == ReferenceKind::Type && name.chars().all(|character| character == '_') {
         return;
     }
     if ref_kind == ReferenceKind::Name && name_is_shadowed_by_local(node, source, &name) {
@@ -5662,6 +6074,63 @@ fn collect_parameter_names(callable: Node, source: &str, out: &mut BTreeSet<Stri
         }
     }
 }
+/// The **type parameters** the callable declares on itself: `T` and `E` in
+/// `fn read<T, E>(…)`, `T` in `func Map[T any](…)`, `K` in
+/// `function pick<K extends string>(…)`.
+///
+/// X40. A type parameter is a name the enclosing item binds in its own
+/// signature, which is precisely what `UnresolvedClass::LocalBinding` is
+/// defined as — "a bare call to a name the enclosing symbol itself declares".
+/// Before this, a use of `T` in the body or the parameter list matched no
+/// indexed symbol and landed in the tier documented as the one that indicates a
+/// defect, which is not what a generic parameter is.
+///
+/// Read through the grammar's `type_parameters` node rather than from a naming
+/// convention: `T`-shaped single letters are the *style*, not the rule, and a
+/// parameter called `Item` is no less bound by the signature that declares it.
+/// Every grammar this crate links spells the list `type_parameters`; a language
+/// whose grammar does not simply contributes nothing here, which leaves its
+/// generics exactly where they are today rather than guessing.
+fn collect_type_parameter_names(callable: Node, source: &str, out: &mut BTreeSet<String>) {
+    let mut cursor = callable.walk();
+    let Some(params) = callable
+        .children(&mut cursor)
+        .find(|child| child.kind() == "type_parameters")
+    else {
+        return;
+    };
+    let mut worklist = vec![params];
+    while let Some(node) = worklist.pop() {
+        // The declared name is the *first* identifier of each entry; a bound
+        // (`T: Display`, `T any`) is a use of another type and must not be
+        // recorded as though this signature declared it.
+        if matches!(node.kind(), "type_parameter" | "constrained_type_parameter") {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .or_else(|| node.named_child(0))
+                .map(|child| get_node_text(child, source))
+                .filter(|name| is_user_ident(name))
+            {
+                out.insert(name);
+            }
+            continue;
+        }
+        if matches!(node.kind(), "type_identifier" | "identifier")
+            && bounded_parent(node).is_some_and(|parent| parent.kind() == "type_parameters")
+        {
+            let name = get_node_text(node, source);
+            if is_user_ident(&name) {
+                out.insert(name);
+            }
+            continue;
+        }
+        let mut children = node.walk();
+        for child in node.named_children(&mut children) {
+            worklist.push(child);
+        }
+    }
+}
+
 fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec<(String, String)> {
     let mut by_scope: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut worklist = vec![root];
@@ -5683,6 +6152,10 @@ fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec
                 // which is why `next_gap_id: Callable[…]` and `cls` were the two
                 // largest remaining unattributed callees on this repository.
                 collect_parameter_names(node, source, entry);
+                // X40. A type parameter is bound by this signature exactly as a
+                // value parameter is, and the resolver reads both from the same
+                // per-scope set.
+                collect_type_parameter_names(node, source, entry);
             }
         }
         push_children(node, &mut worklist);
@@ -6832,11 +7305,17 @@ mod tests {
                 "rust",
                 "use std::collections::BTreeMap;\nuse crate::thing::{One, Two as Three};\n                 pub use inner::Exported;\n",
                 vec![
-                    ("std::collections::BTreeMap", vec![], vec![], None),
-                    // Grouped `use` is recorded as its raw specifier rather than
-                    // split into names; pinned as current behavior, not intent.
-                    ("crate::thing::{One, Two as Three}", vec![], vec![], None),
-                    ("inner::Exported", vec![], vec![], None),
+                    // X41. Each `use` names a module and the names it takes out
+                    // of it, the shape every other grammar here produces. This
+                    // expectation used to read
+                    // `("crate::thing::{One, Two as Three}", [], [], None)` and
+                    // said so in a comment — "pinned as current behavior, not
+                    // intent". The intent is this: a module specifier that is
+                    // the statement's own source text matches no file and binds
+                    // no name, so nothing downstream could use it.
+                    ("std::collections", vec!["BTreeMap"], vec!["BTreeMap"], None),
+                    ("crate::thing", vec!["One", "Two"], vec!["One", "Three"], None),
+                    ("inner", vec!["Exported"], vec!["Exported"], None),
                 ],
                 vec!["f.rs"],
             ),

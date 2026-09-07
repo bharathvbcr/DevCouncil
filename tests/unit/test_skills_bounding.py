@@ -61,7 +61,15 @@ def test_repo_basename_scan_is_cached_and_invalidates(tmp_path, monkeypatch):
     R.clear_skill_caches()
 
 
-def test_prompt_builder_defers_skills_beyond_cap():
+def test_prompt_builder_defers_skills_beyond_cap(tmp_path, monkeypatch):
+    # The over-cap selection must come from this test's own root, not from
+    # whatever manifests the checkout running the suite happens to carry (a
+    # default-root `PromptBuilder()` read the repository and, as a side effect,
+    # indexed it — see `_repo_map_state_is_not_collateral` in tests/conftest.py).
+    for marker in ("build.gradle", "package.json", "pyproject.toml", "go.mod", "Dockerfile"):
+        (tmp_path / marker).write_text("x", encoding="utf-8")
+    R.clear_skill_caches()
+    monkeypatch.chdir(tmp_path)
     task = Task(
         id="T",
         title="api server with android client, web dashboard, ios app, docker, kafka",
@@ -70,7 +78,7 @@ def test_prompt_builder_defers_skills_beyond_cap():
         expected_tests=[],
         allowed_commands=[],
     )
-    prompt = PromptBuilder().build_task_prompt(task, [])
+    prompt = PromptBuilder(tmp_path).build_task_prompt(task, [])
     assert "## Engineering skills" in prompt
     # When more than the cap apply, the overflow is pointed at the scaffolded files.
     assert "Also applicable" in prompt

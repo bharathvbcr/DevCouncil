@@ -13,7 +13,6 @@ from typing import List
 
 from devcouncil.indexing.graph.export import (
     build_code_graph_okf,
-    export_graphml,
     file_doc_rel,
     write_code_graph_okf,
 )
@@ -31,7 +30,6 @@ from devcouncil.indexing.graph.schema import CodeGraph
 
 # Public aliases matching the Phase-7 plan names
 build_graph_okf_bundle = build_code_graph_okf
-graph_to_graphml = export_graphml
 
 
 def export_graph_okf(
@@ -57,7 +55,6 @@ __all__ = [
     "export_graph_okf",
     "file_doc_path",
     "file_doc_rel",
-    "graph_to_graphml",
     "relative_md_link",
     "slugify_area",
     "subsystem_doc_path",

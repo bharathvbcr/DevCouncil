@@ -138,16 +138,58 @@ def test_cli_graph_html(tmp_path, monkeypatch):
     assert (tmp_path / ".devcouncil" / "graph" / "graph.html").exists()
 
 
-def test_cli_graph_export(tmp_path, monkeypatch):
+def test_cli_graph_export_okf_from_the_compatibility_graph(tmp_path, monkeypatch):
     _setup_graph_env(tmp_path, monkeypatch)
-    
-    res = runner.invoke(app, ["map", "export", "--format", "graphml"])
-    assert res.exit_code == 0
-    assert "graph" in res.output
-    
+
     res_okf = runner.invoke(app, ["map", "export", "--format", "okf", "-o", "okf-out"])
     assert res_okf.exit_code == 0
     assert "Wrote OKF bundle" in res_okf.output
+
+
+def test_cli_graph_export_graphml_without_a_kernel_store_is_red(tmp_path, monkeypatch):
+    """GraphML comes from the kernel and only from the kernel.
+
+    This environment holds a hand-built Python graph and no kernel store. The
+    Python exporter that used to answer here was a duplicate of the kernel's
+    (deleted 2026-09-06, see `devmap_engine.export_graphml`); answering from it
+    now would be the silent second engine the map's own comment calls "a
+    defect, not a mode". So: exit 1, the kernel named, no GraphML on stdout.
+    """
+    _setup_graph_env(tmp_path, monkeypatch)
+
+    res = runner.invoke(app, ["map", "export", "--format", "graphml"])
+    assert res.exit_code == 1, res.output
+    assert "<graphml" not in res.output
+    assert "devmap" in res.output.lower()
+
+
+def test_cli_graph_export_graphml_from_the_kernel(tmp_path, monkeypatch):
+    """The real producer, end to end: sources → `devmap build` → `dev map export`."""
+    import subprocess
+
+    from tests.unit.graph_fixtures import kernel_graph
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text("from pkg.b import func_b\n\ndef func_a():\n    return func_b()\n", encoding="utf-8")
+    (tmp_path / "pkg" / "b.py").write_text("def func_b():\n    return 1\n", encoding="utf-8")
+    for args in (["init"], ["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+    kernel_graph(tmp_path)  # builds the store, or skips when no kernel is built
+
+    out = tmp_path / "out" / "g.graphml"
+    res = runner.invoke(app, ["map", "export", "--format", "graphml", "-o", str(out)])
+    assert res.exit_code == 0, res.output
+    text = out.read_text(encoding="utf-8")
+    assert text.startswith("<?xml")
+    assert 'attr.name="dead"' in text and 'attr.name="community"' in text
+    assert "pkg/a.py::func_a" in text and "pkg/b.py::func_b" in text
+    # The kernel's counts reach the operator; Rich wraps at 80 columns.
+    assert "nodes" in " ".join(res.output.split())
+
+    res_stdout = runner.invoke(app, ["map", "export", "--format", "graphml"])
+    assert res_stdout.exit_code == 0, res_stdout.output
+    assert res_stdout.output.startswith("<?xml")
 
 
 # --- thin `dev graph` alias suite (dual-registered map app) ---------------------

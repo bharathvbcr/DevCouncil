@@ -18,10 +18,7 @@ use devmap_query::{
 };
 use devmap_resolve::{Resolver, UnresolvedClass};
 use devmap_serve::{default_ipc_path_for, Daemon};
-use devmap_store::{
-    current_git_head, extract_tree_cached_with_report, GenerationWriteOpts, Store,
-    GENERATION_RETENTION,
-};
+use devmap_store::{current_git_head, GenerationWriteOpts, Store, GENERATION_RETENTION};
 
 /// One line describing what a reclaim decided, did, and whether it landed.
 ///
@@ -1365,33 +1362,50 @@ fn write_consumer_artifacts(
         .compact_graph_output
         .map(|destination| resolve_manifest_output(repo_root.as_deref(), destination));
 
-    // Every input the artifacts' bytes derive from. `{:?}` on the options so a
-    // digest that could not be computed (`None`) can never compare equal to one
-    // that came out empty (`Some("")`).
-    let mut inputs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    inputs.insert("generation_id".into(), gen_id.to_string());
-    inputs.insert("pending_count".into(), status.pending_count.to_string());
-    inputs.insert("built_head".into(), built_head.clone());
-    inputs.insert("repo_root".into(), format!("{repo_root:?}"));
+    // Every input the artifacts' bytes derive from, as real JSON. These values
+    // are compared for equality to decide a skip, and they are also the only
+    // record of *why* a given set of artifacts exists, so a consumer has to be
+    // able to read them. `serde_json::Value` keeps the property the previous
+    // `{:?}` renderings were reaching for — `null` and `""` are different
+    // values, so a digest that could not be computed can never compare equal to
+    // one that came out empty — without the file being JSON in syntax only.
+    let mut inputs: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    inputs.insert("generation_id".into(), gen_id.into());
+    inputs.insert("pending_count".into(), status.pending_count.into());
+    inputs.insert("built_head".into(), built_head.clone().into());
+    inputs.insert("repo_root".into(), repo_root.clone().into());
     inputs.insert(
         "generated_head".into(),
-        format!("{:?}", stamped.generated_head),
+        stamped.generated_head.clone().into(),
     );
-    inputs.insert("indexed_hash".into(), format!("{:?}", stamped.indexed_hash));
+    inputs.insert("indexed_hash".into(), stamped.indexed_hash.clone().into());
     inputs.insert(
         "content_fingerprint".into(),
-        format!("{:?}", stamped.content_fingerprint),
+        stamped.content_fingerprint.clone().into(),
     );
+    inputs.insert("code_graph_schema".into(), CODE_GRAPH_SCHEMA_VERSION.into());
     inputs.insert(
-        "code_graph_schema".into(),
-        CODE_GRAPH_SCHEMA_VERSION.to_string(),
+        "compact".into(),
+        match &compact_dest {
+            Some(path) => path.to_string_lossy().into_owned().into(),
+            None => serde_json::Value::Null,
+        },
     );
-    inputs.insert("compact".into(), format!("{compact_dest:?}"));
+
+    // Taken before `stamped` is consumed below; the stamp is written at the end
+    // of the run, long after it has been moved into the manifest.
+    let stamp_generated_head = stamped.generated_head.clone();
 
     let stamp_path = artifact_stamp_path(request.db);
-    let mut outputs: Vec<&std::path::Path> = vec![dest.as_path(), graph_dest.as_path()];
+    // Role, not position: the sidecar is read by consumers that cannot rebuild
+    // the writer's spelling of these paths, so each output is named.
+    let mut outputs: Vec<(&str, &std::path::Path)> = vec![
+        ("repo_map", dest.as_path()),
+        ("code_graph", graph_dest.as_path()),
+    ];
     if let Some(compact) = &compact_dest {
-        outputs.push(compact.as_path());
+        outputs.push(("compact_graph", compact.as_path()));
     }
     if ArtifactStamp::read(&stamp_path).is_some_and(|stamp| stamp.still_current(&inputs, &outputs))
     {
@@ -1452,7 +1466,7 @@ fn write_consumer_artifacts(
     // artifacts that were never written is a skip that skips nothing real.
     // A stamp that cannot be written is not fatal — it costs the next run a
     // regeneration, which is the behaviour that existed before the stamp.
-    match ArtifactStamp::of(inputs, &outputs) {
+    match ArtifactStamp::of(inputs, stamp_generated_head, &outputs) {
         Ok(stamp) => {
             if let Err(error) = stamp.write(&stamp_path) {
                 eprintln!(
@@ -1487,6 +1501,46 @@ fn write_consumer_artifacts(
 /// to spawn a third process to learn what the store it just wrote looks like.
 /// The schema keys are *not* here — they come from a probe `status` runs before
 /// it opens the store at all, and a build has already opened it.
+///
+/// What this kernel can be asked to do, read out of its own parser.
+///
+/// The seam used to learn this by running `devmap manifest --help` and
+/// `devmap build --help` and grepping the output — two extra process launches
+/// (~140 ms each, measured) per `dev map`, on top of the `status` probe it
+/// already runs to rank candidate binaries. `status` is the probe that has to
+/// happen anyway, so it is the one that should answer.
+///
+/// Derived from clap's command tree rather than asserted, because a hand-written
+/// `true` is a claim that drifts the moment a flag is renamed: this cannot
+/// declare a flag the binary does not actually accept. A kernel too old to carry
+/// this key declares nothing, and the seam falls back to the `--help` probe —
+/// "no evidence" must not read as "does not support it".
+fn kernel_capabilities() -> serde_json::Value {
+    use clap::CommandFactory;
+    let command = Cli::command();
+    let accepts = |subcommand: &str, flag: &str| -> bool {
+        command
+            .get_subcommands()
+            .find(|candidate| candidate.get_name() == subcommand)
+            .is_some_and(|candidate| {
+                candidate
+                    .get_arguments()
+                    .any(|argument| argument.get_long() == Some(flag))
+            })
+    };
+    // All three or none: a kernel accepting only some of the digests would need
+    // the read-modify-write path for the rest, and running both is strictly
+    // worse than running one.
+    let stamp_flags = ["generated-head", "indexed-hash", "content-fingerprint"]
+        .iter()
+        .all(|flag| accepts("manifest", flag));
+    serde_json::json!({
+        "manifest_graph_output": accepts("manifest", "graph-output"),
+        "manifest_stamp_flags": stamp_flags,
+        "build_manifest": accepts("build", "manifest"),
+    })
+}
+
 fn store_status_fields(
     store: &Store,
     db: &std::path::Path,
@@ -2614,6 +2668,55 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
     }
 }
 
+impl Commands {
+    /// Whether this command stays up to answer other processes.
+    ///
+    /// The daemon and the MCP servers write to sockets and pipes whose peers
+    /// come and go; for them a closed peer is an `EPIPE` to handle, not a
+    /// reason to exit, and the ignored-`SIGPIPE` disposition Rust's runtime
+    /// installs is the right one. Everything else is a one-shot command.
+    fn serves(&self) -> bool {
+        matches!(self, Commands::Serve { .. } | Commands::Mcp { .. })
+    }
+}
+
+/// Let a one-shot command end the way every other CLI does when its reader
+/// goes away.
+///
+/// Rust's runtime ignores `SIGPIPE` at startup so that a write to a closed
+/// pipe surfaces as `EPIPE` — and `println!` answers `EPIPE` with a panic.
+/// `devmap export -o - | head` therefore printed `failed printing to stdout:
+/// Broken pipe` and a backtrace hint, where `git`, `sqlite3` and `rg` end
+/// silently. Restoring the default disposition for one-shot commands makes
+/// the kernel behave like them: the process is terminated by the signal the
+/// moment the reader is gone, with nothing written after it and nothing left
+/// half-done that a later run cannot recover (a build killed at any point
+/// leaves the store consistent — `test_process_recovery` and the crash gate
+/// are the evidence). Only one-shot commands: see [`Commands::serves`].
+///
+/// Declared here rather than through the `libc` crate because that crate is
+/// not a direct dependency of this workspace; `signal(2)` has had this
+/// signature on every Unix this kernel builds for, and `SIGPIPE` is 13 on all
+/// of them. Swap for `libc::signal(libc::SIGPIPE, libc::SIG_DFL)` if `libc`
+/// is ever added.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    const SIGPIPE: std::ffi::c_int = 13;
+    const SIG_DFL: usize = 0;
+    extern "C" {
+        fn signal(signum: std::ffi::c_int, handler: usize) -> usize;
+    }
+    // SAFETY: `signal(2)` with `SIG_DFL` installs the default action for a
+    // signal this process is not otherwise handling; it is called once, on
+    // the main thread, before any other thread exists.
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     // stderr, not the builder's default stdout. Every command that emits a
@@ -2628,6 +2731,9 @@ async fn main() -> std::process::ExitCode {
     tracing::subscriber::set_global_default(subscriber).ok();
 
     let cli = Cli::parse();
+    if !cli.command.serves() {
+        restore_default_sigpipe();
+    }
     let outcome = match validate_limits(&cli.command) {
         Ok(()) => run(&cli).await,
         Err(message) => Err(anyhow::anyhow!(message)),
@@ -2686,6 +2792,17 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // pid that holds the store.
             let _writer = Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)?;
             let store = Store::open(cli.db())?;
+            // A store this process can only read opens fine — queries need it
+            // to — and would otherwise fail at the first write with a bare
+            // SQLite code, after paying for the whole scan. Refuse before the
+            // scan, in the store's own words.
+            if store.is_read_only() {
+                anyhow::bail!(
+                    "devmap store {} is read-only: the file or its directory is not writable \
+                     by this process, so it can be queried but not rebuilt",
+                    cli.db().display()
+                );
+            }
             // K1(e2): stamped before discovery, on the queue's own wall clock.
             //
             // A build that walks the whole tree answers every request queued at
@@ -2754,16 +2871,16 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 );
             }
 
-            // K4: `--full` re-parses rather than consulting the extraction
-            // cache. Reading the cache would defeat the point — a cache hit
-            // returns the payload this build is trying to reproduce from
-            // source, so a "full" rebuild that used it would recommit exactly
-            // the rows the operator is asking to replace.
-            let (extractions, discovery) = if *full {
-                devmap_extract::extract_tree_with_report(path)?
-            } else {
-                extract_tree_cached_with_report(&store, path)?
-            };
+            // Discovery, once, before anything decides whether to extract.
+            //
+            // The unchanged check below needs only `(path, content_hash)`, and
+            // that is a pure function of the bytes discovery already read — so
+            // scanning first lets a no-change build answer without paying for
+            // an extraction round-trip per file (measured on this repository:
+            // 213–254 ms of a ~300 ms no-op scan, every byte of it discarded).
+            // `--full` reuses the same scan rather than walking and reading the
+            // corpus a second time.
+            let scanned = devmap_extract::scan_tree(path)?;
             // Report what discovery refused. A file dropped for being oversized
             // or unreadable used to vanish with no record: `repo_map.json` would
             // say five files while two more existed, and nothing distinguished
@@ -2772,7 +2889,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // and nowhere else — the daemon reads the same report and must reach
             // the same verdict, and it cannot do that against a copy of the rule.
             let refused: Vec<&(String, devmap_extract::model::DiscoverySkipReason)> =
-                discovery.refusals().collect();
+                scanned.report.refusals().collect();
             if !refused.is_empty() {
                 // Both numbers in the header. A bare list of twenty under a
                 // count of two hundred is a capped sample presented as the set,
@@ -2810,19 +2927,25 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // on DevCouncil: the first `dev map` after two schema bumps printed
             // "No source changes; generation #412 still current (1,152 files)"
             // while every row in it came from `extract-v23`.
+            //
+            // The comparison itself is made against the scan rather than
+            // against extractions. `ScannedTree::matches_file_hashes` compares
+            // the same `(path, content_hash)` pairs the extractions carry —
+            // every `Extraction` is built with `content_hash(source)` over the
+            // bytes discovery read, and a cached payload is only ever served
+            // for a key built from those same bytes and a matching `file_path`
+            // — so the verdict is the one extraction would have produced, for
+            // the cost of an FNV pass instead of 1,311 store round-trips.
             let previous = store.latest_file_hashes()?;
             if !*full
                 && !previous.is_empty()
-                && previous.len() == extractions.len()
+                && previous.len() == scanned.sources.len()
                 && store.latest_generation_payload_is_current()?
             {
-                let unchanged = extractions.iter().all(|extraction| {
-                    previous
-                        .get(&extraction.file_path)
-                        .is_some_and(|hash| *hash == extraction.content_hash)
-                });
+                let unchanged = scanned.matches_file_hashes(&previous);
                 if unchanged {
-                    progress.stage(2, format_args!("{} files unchanged", extractions.len()));
+                    let file_count = scanned.sources.len();
+                    progress.stage(2, format_args!("{file_count} files unchanged"));
                     let generation = store.latest_generation_id()?.unwrap_or(0);
                     // K2: reclaim runs on the warm path too.
                     //
@@ -2890,7 +3013,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                             cli,
                             &serde_json::json!({
                                 "unchanged": true,
-                                "files": extractions.len(),
+                                "files": file_count,
                                 // Recomputed by this scan, not carried over: a
                                 // build that proves nothing changed has just
                                 // re-asked discovery the same question, and the
@@ -2907,15 +3030,51 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                         )?;
                     } else {
                         println!(
-                            "No source changes; generation #{} still current ({} files).",
-                            generation,
-                            extractions.len()
+                            "No source changes; generation #{generation} still current \
+                             ({file_count} files)."
                         );
                         println!("  Reclaim: {}", reclaim_note(&vacuum));
                     }
                     return Ok(());
                 }
             }
+
+            // Only now, with the tree known to have moved, is extraction worth
+            // its cost.
+            //
+            // K4: `--full` re-parses rather than consulting the extraction
+            // cache. Reading the cache would defeat the point — a cache hit
+            // returns the payload this build is trying to reproduce from
+            // source, so a "full" rebuild that used it would recommit exactly
+            // the rows the operator is asking to replace.
+            let extractions = if *full {
+                let refs: Vec<devmap_extract::FileRef<'_>> = scanned
+                    .sources
+                    .iter()
+                    .map(|(file, source)| devmap_extract::FileRef {
+                        path: file.as_str(),
+                        source: source.as_str(),
+                    })
+                    .collect();
+                devmap_extract::extract_all(&refs)
+            } else {
+                devmap_store::extract_scanned_cached(&store, &scanned)?
+            };
+            // The corpus text is dead the moment extraction has consumed it,
+            // but it is bound in this scope and would otherwise stay resident
+            // through resolve, analyze and persist — the stages that set the
+            // peak. It is the one cost the scan-before-extract split would
+            // otherwise have added, and it is not hypothetical: measured A/B on
+            // scholarlm (4,278 files), holding it cost 23 MiB of peak RSS.
+            //
+            // The *report* has to outlive it — `discovery_refusals` below turns
+            // it into the analysis disclosure — so this destructures rather
+            // than dropping the pair, and only the source text goes.
+            let devmap_extract::ScannedTree {
+                sources,
+                report: discovery,
+            } = scanned;
+            drop(sources);
 
             // B3/SC2: `affected` narrows what this generation *writes*. It no
             // longer narrows what is *resolved*.
@@ -3864,6 +4023,10 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "schema_outdated": false,
                     "schema_version": serde_json::Value::Null,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
+                    // A property of the binary, not of the store — so it is
+                    // answered even here, where there is no store. This is the
+                    // exit the seam's own probe takes.
+                    "capabilities": kernel_capabilities(),
                 });
                 // Through `emit_json` like every other exit from this command.
                 // Printed pretty regardless of `--json`, this was the one
@@ -3898,6 +4061,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "schema_outdated": true,
                     "schema_version": version,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
+                    "capabilities": kernel_capabilities(),
                 });
                 emit_json(cli, &payload)?;
                 return Ok(());
@@ -3915,6 +4079,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 "expected_schema_version".into(),
                 serde_json::json!(devmap_store::CURRENT_SCHEMA_VERSION),
             );
+            payload.insert("capabilities".into(), kernel_capabilities());
             emit_json(cli, &serde_json::Value::Object(payload))?;
         }
         Commands::History { last } => {

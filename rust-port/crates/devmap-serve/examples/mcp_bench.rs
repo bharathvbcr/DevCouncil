@@ -255,8 +255,8 @@ fn main() -> anyhow::Result<()> {
             let _guard = runtime.enter();
             devmap_serve::protocol::UnixIpcServer::bind(&socket)?
         };
-        let activity = Arc::new(devmap_serve::protocol::Activity::default());
-        let served = runtime.spawn(server.run(Arc::clone(&store), activity));
+        let state = Arc::new(devmap_serve::protocol::ServeState::default());
+        let served = runtime.spawn(server.run(Arc::clone(&store), state));
 
         for (name, frame) in [
             ("status", r#"{"version":1,"cmd":"status"}"#),

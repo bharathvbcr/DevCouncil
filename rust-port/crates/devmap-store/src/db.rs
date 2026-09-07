@@ -408,6 +408,18 @@ pub struct Store {
     /// `.writer.lock`. `None` for an in-memory store, which no other process
     /// can reach and therefore has nothing to serialise against.
     db_path: Option<std::path::PathBuf>,
+    /// Whether this process can write the store at all.
+    ///
+    /// A store on a read-only mount, in a CI cache restored without write
+    /// bits, or `chmod 444`'d by an operator is an ordinary store that can be
+    /// *read*. SQLite opens such a file read-only without complaint and only
+    /// fails at the first write — which, before this flag existed, was a
+    /// header rewrite in [`Store::configure_connection`], so every query
+    /// refused with "attempt to write a readonly database" and a readable map
+    /// looked like no map at all. Recorded once at open so a write can be
+    /// refused by name ([`Store::refuse_if_read_only`]) instead of by SQLite
+    /// error code.
+    read_only: bool,
     /// The latest generation's full edge set, kept for the life of that
     /// generation.
     ///
@@ -653,6 +665,102 @@ pub struct StoredEdge {
     /// column existed. Decoded by `edge_resolution`, which labels the `None`
     /// case as a reconstruction rather than a reading.
     pub resolution: Option<String>,
+}
+
+/// One generation's `paths` rows, ordered once so a path comparison is a `u32`
+/// comparison.
+///
+/// The edge read orders ~100k rows on two path strings. Interning them here
+/// costs one scan of a 1,567-row table and turns both keys into ranks whose
+/// integer order *is* the byte order of the paths they stand for — see
+/// [`edge_read_order`].
+struct PathRanks {
+    /// Paths in ascending byte order. A rank indexes this.
+    ordered: Vec<String>,
+    /// `paths.id` to its rank in [`Self::ordered`].
+    rank_by_id: std::collections::HashMap<i64, u32>,
+}
+
+impl PathRanks {
+    fn read(conn: &Connection) -> Result<Self> {
+        let mut stmt = conn.prepare("SELECT id, path FROM paths")?;
+        let mut rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        // Byte order, which is what SQLite's default BINARY collation compares
+        // and therefore what the `ORDER BY sp.path, tp.path` this replaces was.
+        rows.sort_unstable_by(|left, right| left.1.cmp(&right.1));
+        let rank_by_id = rows
+            .iter()
+            .enumerate()
+            .map(|(rank, (id, _))| (*id, rank as u32))
+            .collect();
+        Ok(Self {
+            ordered: rows.into_iter().map(|(_, path)| path).collect(),
+            rank_by_id,
+        })
+    }
+
+    /// The rank of a `paths.id`, or an error.
+    ///
+    /// An edge naming a path row that is not there is a **refusal**, not a
+    /// dropped edge. The `INNER JOIN` this replaces answered the same question
+    /// by omitting the row, so a store whose `paths` table had lost an entry
+    /// answered "nothing depends on this" from a graph it had only partly
+    /// read — the same failure `edge_kind_from_stored` refuses for an unknown
+    /// kind. `generation_edges.source_file_id` is `REFERENCES paths(id)`, so a
+    /// well-formed store cannot reach this.
+    fn rank_of(&self, id: i64) -> Result<u32> {
+        self.rank_by_id.get(&id).copied().ok_or_else(|| {
+            rusqlite::Error::InvalidParameterName(format!(
+                "generation edge names path id {id}, which is not in `paths`; \
+                 the store is inconsistent and answering over the edges that \
+                 remain would be a wrong answer rather than a partial one"
+            ))
+        })
+    }
+
+    fn path_of(&self, rank: u32) -> &str {
+        &self.ordered[rank as usize]
+    }
+}
+
+/// A generation edge before it has been put in read order.
+///
+/// Holds the ranks rather than the paths, and the `f64` confidence SQLite
+/// stored rather than the `f32` [`StoredEdge`] narrows it to, because both are
+/// sort keys and both must compare exactly as SQL compared them.
+struct UnorderedEdge {
+    source_rank: u32,
+    target_rank: u32,
+    source_symbol: String,
+    target_symbol: String,
+    edge_kind: String,
+    confidence: f64,
+    resolution: Option<String>,
+    ordinal: u32,
+}
+
+/// The order every reader of a generation's edges sees, as one comparator.
+///
+/// `confidence DESC, source path, target path, source symbol, target symbol,
+/// edge kind` — the key `latest_edges_uncached`'s SQL used to hand to SQLite —
+/// and then `ordinal`, which SQL had no equivalent of and which makes the tail
+/// of the order defined instead of arbitrary. This order is the final
+/// tie-break of every answer derived from a walk (R4), so it has exactly one
+/// owner.
+fn edge_read_order(left: &UnorderedEdge, right: &UnorderedEdge) -> std::cmp::Ordering {
+    right
+        .confidence
+        .total_cmp(&left.confidence)
+        .then_with(|| left.source_rank.cmp(&right.source_rank))
+        .then_with(|| left.target_rank.cmp(&right.target_rank))
+        .then_with(|| left.source_symbol.cmp(&right.source_symbol))
+        .then_with(|| left.target_symbol.cmp(&right.target_symbol))
+        .then_with(|| left.edge_kind.cmp(&right.edge_kind))
+        .then_with(|| left.ordinal.cmp(&right.ordinal))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1259,7 +1367,19 @@ impl Store {
         // it sits in `configure_connection` — called before `migrate` creates
         // the schema. On an existing mode-NONE store the statement is accepted
         // and ignored; that store is converted on its next full vacuum instead.
-        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        // Read before set. Setting `auto_vacuum` rewrites the database header
+        // even when the mode is already the one being set — measured with the
+        // sqlite3 shell on a `chmod 444` store: every other pragma here is
+        // silent, this one fails with "attempt to write a readonly database
+        // (8)". A store this process can only read must not be refused by its
+        // own open, so the write happens only when the mode actually differs;
+        // and a read-only store whose mode differs keeps its mode, because
+        // reclaim is the only thing that mode serves and reclaim is a write.
+        const INCREMENTAL: i64 = 2;
+        let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+        if auto_vacuum != INCREMENTAL && !conn.is_readonly(rusqlite::DatabaseName::Main)? {
+            conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        }
         Ok(())
     }
 
@@ -1280,6 +1400,14 @@ impl Store {
     /// attribute to this.
     fn enable_wal(conn: &Connection) -> Result<()> {
         const ATTEMPTS: usize = 10;
+        // Switching the journal mode is a write. A read-only store is read in
+        // whatever mode it was left in — WAL if the writer finished cleanly,
+        // rollback-journal otherwise — and both serve reads; retrying the
+        // switch would spend the whole back-off below to report a mode this
+        // process could never change.
+        if conn.is_readonly(rusqlite::DatabaseName::Main)? {
+            return Ok(());
+        }
         let mut last: Option<rusqlite::Error> = None;
         for attempt in 0..ATTEMPTS {
             match conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
@@ -1487,7 +1615,18 @@ impl Store {
         // moment — a vacuum, a competing opener — must make `status` and
         // `doctor` wait, not report a failure.
         conn.busy_timeout(Self::BUSY_TIMEOUT)?;
-        let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version: i32 = match conn.query_row("PRAGMA user_version", [], |row| row.get(0)) {
+            Ok(version) => version,
+            // A WAL store in a directory this process cannot write: the same
+            // shape `Store::open` handles, reached here first because `status`
+            // and `doctor` probe the schema before opening.
+            Err(error) if Self::directory_refused_the_wal(&error) => {
+                let conn = Self::open_immutable(path)?;
+                conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+                conn.query_row("PRAGMA user_version", [], |row| row.get(0))?
+            }
+            Err(error) => return Err(error),
+        };
         Ok(Some(version))
     }
 
@@ -1767,6 +1906,11 @@ impl Store {
 
     pub fn open<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let path = db_path.as_ref();
+        // Before the connection exists: SQLite maps the `-shm` sidecar as it
+        // opens a WAL database, with whatever mode the sidecar has, so a
+        // repair after `Connection::open` is a repair the connection never
+        // sees. See `repair_sidecar_modes`.
+        Self::repair_sidecar_modes(path);
         let mut conn = Connection::open(path)?;
         let store = path.display().to_string();
 
@@ -1782,14 +1926,44 @@ impl Store {
         // This can only refuse, never admit: `migrate` re-reads the version
         // itself, under the write lock, so a store migrated by another process
         // between these two reads is still handled there.
-        let stamped: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let stamped: i32 = match conn.query_row("PRAGMA user_version", [], |row| row.get(0)) {
+            Ok(stamped) => stamped,
+            // A WAL-mode store in a directory this process cannot write has no
+            // `-shm` and no way to create one, so even the first read fails
+            // with `SQLITE_READONLY_DIRECTORY`. SQLite's documented answer for
+            // that shape is an *immutable* read-only open: nothing can be
+            // writing a file in a directory nobody can write to, so the shared
+            // memory the WAL index needs can live in this process alone. Only
+            // taken for a file that exists — a missing store in a read-only
+            // directory is a missing store, and creating one is impossible
+            // rather than immutable.
+            Err(error) if path.is_file() && Self::directory_refused_the_wal(&error) => {
+                conn = Self::open_immutable(path)?;
+                conn.query_row("PRAGMA user_version", [], |row| row.get(0))?
+            }
+            Err(error) => return Err(error),
+        };
         if !Self::schema_is_migratable(stamped) {
             return Err(Self::unsupported_schema(&store, stamped));
+        }
+        let read_only = conn.is_readonly(rusqlite::DatabaseName::Main)?;
+        if read_only && stamped != CURRENT_SCHEMA_VERSION {
+            // Migration is a write. A read-only store at an older schema can
+            // neither be migrated nor, with the columns this kernel reads
+            // missing, be answered from; say which, rather than letting the
+            // first `ALTER TABLE` report a bare SQLite code.
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "devmap store {store} is read-only and at schema {stamped}, which this kernel \
+                 (schema {CURRENT_SCHEMA_VERSION}) would have to migrate before reading; make \
+                 it writable and run `devmap build`, or rebuild it elsewhere"
+            )));
         }
 
         Self::configure_connection(&conn)?;
         Self::enable_wal(&conn)?;
-        Self::migrate(&mut conn, &store)?;
+        if !read_only {
+            Self::migrate(&mut conn, &store)?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             edge_cache: Mutex::new(None),
@@ -1797,7 +1971,116 @@ impl Store {
             generation_counts: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
+            read_only,
         })
+    }
+
+    /// `SQLITE_READONLY_DIRECTORY`: the database is read-only because the
+    /// directory holding it is, so the `-shm` a WAL read needs cannot be made.
+    /// Spelled out because `libsqlite3-sys` exposes the extended codes as bare
+    /// integers, and this is the one [`Store::open`] must tell apart from every
+    /// other read-only failure.
+    const SQLITE_READONLY_DIRECTORY: i32 = 1544;
+
+    fn directory_refused_the_wal(error: &rusqlite::Error) -> bool {
+        matches!(
+            error,
+            rusqlite::Error::SqliteFailure(failure, _)
+                if failure.extended_code == Self::SQLITE_READONLY_DIRECTORY
+        )
+    }
+
+    /// Open `path` read-only and immutable, for a store in a directory this
+    /// process cannot write. See the fallback in [`Store::open`].
+    fn open_immutable(path: &Path) -> Result<Connection> {
+        // A URI filename: `%`, `?` and `#` in the path would be read as URI
+        // syntax, so they are percent-encoded — the only three characters the
+        // SQLite URI grammar reserves inside the path component.
+        let mut encoded = String::with_capacity(path.as_os_str().len() + 8);
+        for byte in path.to_string_lossy().bytes() {
+            match byte {
+                b'%' => encoded.push_str("%25"),
+                b'?' => encoded.push_str("%3F"),
+                b'#' => encoded.push_str("%23"),
+                other => encoded.push(other as char),
+            }
+        }
+        Connection::open_with_flags(
+            format!("file:{encoded}?immutable=1"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+    }
+
+    /// Whether this store can only be read. See the `read_only` field.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Give a writable store's WAL sidecars the write bit the store has.
+    ///
+    /// SQLite creates `-wal` and `-shm` with the *database file's* mode. A
+    /// read of a `chmod 444` store therefore leaves 444 sidecars behind, and
+    /// when the operator later restores the store's write bit the sidecars
+    /// keep theirs off — so the next build fails with "attempt to write a
+    /// readonly database" against a file that is, by every check the
+    /// operator would make, writable. Measured on 2026-09-06: a 444 store
+    /// read once, `chmod 644`, then `devmap build` — code 8, `user_version`
+    /// unchanged. The sidecars are this kernel's, so their mode is this
+    /// kernel's to keep consistent. Best-effort and owner-only: a sidecar
+    /// another user owns is left for that user, and the write that follows
+    /// reports it.
+    #[cfg(unix)]
+    fn repair_sidecar_modes(db_path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        const OWNER_WRITE: u32 = 0o200;
+        let Ok(own) = std::fs::metadata(db_path) else {
+            return;
+        };
+        // Runs before the connection exists, so "writable" is the store's own
+        // owner-write bit: a store without it is read-only and its sidecars
+        // are left exactly as SQLite made them.
+        if own.permissions().mode() & OWNER_WRITE == 0 {
+            return;
+        }
+        let target = own.permissions().mode() | OWNER_WRITE;
+        let name = db_path.as_os_str().to_os_string();
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = name.clone();
+            sidecar.push(suffix);
+            let sidecar = std::path::PathBuf::from(sidecar);
+            let Ok(meta) = std::fs::metadata(&sidecar) else {
+                continue;
+            };
+            let mode = meta.permissions().mode();
+            if mode & OWNER_WRITE == 0 {
+                let mut permissions = meta.permissions();
+                permissions.set_mode(target & 0o7777 | (mode & 0o7777));
+                let _ = std::fs::set_permissions(&sidecar, permissions);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn repair_sidecar_modes(_db_path: &Path) {}
+
+    /// The one place a write against a read-only store is refused, so the
+    /// refusal is the same sentence from every writer and names the store
+    /// rather than an SQLite error code.
+    fn refuse_if_read_only(&self) -> Result<()> {
+        if !self.read_only {
+            return Ok(());
+        }
+        let store = self
+            .db_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| ":memory:".to_string());
+        Err(rusqlite::Error::InvalidParameterName(format!(
+            "devmap store {store} is read-only: the file or its directory is not writable by \
+             this process, so it can be queried but not rebuilt"
+        )))
     }
 
     /// The file this store was opened from, or `None` for an in-memory store.
@@ -1880,7 +2163,14 @@ impl Store {
             .read(true)
             .write(true)
             .truncate(false)
-            .open(&lock_path)?;
+            .open(&lock_path)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot create the writer lock {}: {error}; a build needs the store's \
+                     directory to be writable, though the store can still be queried",
+                    lock_path.display()
+                )
+            })?;
 
         Self::poll_writer_lock(|| file.try_lock(), wait, Self::WRITER_LOCK_POLL, &lock_path)?;
 
@@ -2008,6 +2298,7 @@ impl Store {
             generation_counts: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
             db_path: None,
+            read_only: false,
         })
     }
 
@@ -2088,6 +2379,7 @@ impl Store {
     /// normalisation and no containment check, which is exactly what made the
     /// queue rot: see K1 on `enqueue_pending_paths_under_root`.
     pub fn enqueue_pending_paths(&self, paths: &[String]) -> Result<()> {
+        self.refuse_if_read_only()?;
         let now = Self::now_secs();
         let conn = lock_conn(&self.conn)?;
         let tx = conn.unchecked_transaction()?;
@@ -2543,6 +2835,7 @@ impl Store {
         opts: GenerationWriteOpts,
         head_sha: &str,
     ) -> Result<u32> {
+        self.refuse_if_read_only()?;
         if head_sha.is_empty() || head_sha.len() > 128 || head_sha.chars().any(char::is_whitespace)
         {
             return Err(rusqlite::Error::InvalidParameterName(
@@ -4589,6 +4882,45 @@ impl Store {
     /// caches them under it; returning only the rows left the caller to label
     /// them with a generation it had resolved separately. `None` when the store
     /// holds no generation.
+    ///
+    /// # Why the order is not SQL's any more
+    ///
+    /// This read is the whole fixed cost of arriving at [`GenerationEdges`],
+    /// which is what a one-shot `devmap impact` pays and never amortises. Split
+    /// on this repository's 101,503 edges, minima of three runs each:
+    ///
+    /// | part | cost |
+    /// |---|---|
+    /// | `ORDER BY confidence DESC, sp.path, tp.path, …` | **~72 ms** |
+    /// | the two `paths` joins | ~9 ms |
+    /// | the row scan and its string materialisation | ~19 ms |
+    /// | building the adjacency in [`GenerationEdges::build_with_resolutions`] | ~23 ms |
+    ///
+    /// The sort is the single biggest term and it is the one SQLite is worst
+    /// at here: the key spans two joined `paths` strings, so no index can
+    /// supply it (`generation_edges` is keyed `(generation_id, ordinal)`, and
+    /// `ordinal` is the *resolver's* emission order, not this one), and the
+    /// plan is `USE TEMP B-TREE FOR ORDER BY` over every row of the
+    /// generation — ~15 MB of records through SQLite's sorter to order a Vec
+    /// that is about to be built in memory anyway.
+    ///
+    /// So the ordering moves to Rust, and with it the joins: the `paths` table
+    /// is 1,567 rows, read once and *ranked* once, which turns the two most
+    /// discriminating string keys of the comparison into `u32` compares.
+    /// Measured end to end, the same rows in the same order: **~100 ms → ~39
+    /// ms**.
+    ///
+    /// # Why the result is the same order
+    ///
+    /// [`edge_read_order`] is the comparator, and it is SQL's key by key:
+    /// SQLite's default collation is BINARY, which is `str`'s byte ordering,
+    /// and the confidence is compared as the `f64` SQLite stored rather than
+    /// the `f32` [`StoredEdge`] narrows it to, so no pair that SQL separated
+    /// can collapse into a tie here. It then adds `ordinal` as a final key,
+    /// which SQL had no equivalent of: SQLite's sorter is not stable, so rows
+    /// equal on all six of its keys came back in an order nothing defined.
+    /// The extra key can only order pairs SQL left unordered, and it makes the
+    /// result reproducible instead of merely unspecified.
     #[allow(clippy::type_complexity)]
     fn latest_edges_uncached(
         &self,
@@ -4598,41 +4930,51 @@ impl Store {
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
+        let paths = PathRanks::read(&snapshot)?;
         let mut stmt = snapshot.prepare(
-            "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
-                    e.edge_kind, e.confidence, e.resolution
+            "SELECT e.source_file_id, e.target_file_id, e.source_symbol,
+                    e.target_symbol, e.edge_kind, e.confidence, e.resolution,
+                    e.ordinal
              FROM generation_edges e
-             JOIN paths sp ON sp.id = e.source_file_id
-             JOIN paths tp ON tp.id = e.target_file_id
-             WHERE e.generation_id = ?1 AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?2 * 1000) AS INTEGER)
-             ORDER BY e.confidence DESC, sp.path, tp.path,
-                      e.source_symbol, e.target_symbol, e.edge_kind",
+             WHERE e.generation_id = ?1 AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?2 * 1000) AS INTEGER)",
         )?;
-        // The evidence tier is read in the same statement and decoded in the
-        // same pass. Taking it from a second query would let the two describe
-        // different generations, and taking it later would need the ordering
-        // above reproduced somewhere else — which is exactly the alignment a
-        // shifted resolution column would break.
         let rows = stmt.query_map(params![gen, min_confidence], |row| {
-            let edge = StoredEdge {
-                source_file: row.get(0)?,
-                target_file: row.get(1)?,
+            Ok(UnorderedEdge {
+                source_rank: paths.rank_of(row.get(0)?)?,
+                target_rank: paths.rank_of(row.get(1)?)?,
                 source_symbol: row.get(2)?,
                 target_symbol: row.get(3)?,
                 edge_kind: row.get(4)?,
                 confidence: row.get(5)?,
                 resolution: row.get(6)?,
-            };
-            let resolution = crate::edge_index::edge_resolution(&edge)
-                .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?;
-            Ok((edge, resolution))
+                ordinal: row.get(7)?,
+            })
         })?;
-        let mut edges = Vec::new();
-        let mut resolutions = Vec::new();
-        for row in rows {
-            let (edge, resolution) = row?;
+        let mut unordered = rows.collect::<Result<Vec<_>>>()?;
+        unordered.sort_unstable_by(edge_read_order);
+
+        // The evidence tier is decoded in the same pass that materialises the
+        // rows, from the row it describes. Taking it from a second query would
+        // let the two describe different generations, and taking it later would
+        // need this ordering reproduced somewhere else — which is exactly the
+        // alignment a shifted resolution column would break.
+        let mut edges = Vec::with_capacity(unordered.len());
+        let mut resolutions = Vec::with_capacity(unordered.len());
+        for row in unordered {
+            let edge = StoredEdge {
+                source_file: paths.path_of(row.source_rank).to_string(),
+                target_file: paths.path_of(row.target_rank).to_string(),
+                source_symbol: row.source_symbol,
+                target_symbol: row.target_symbol,
+                edge_kind: row.edge_kind,
+                confidence: row.confidence as f32,
+                resolution: row.resolution,
+            };
+            resolutions.push(
+                crate::edge_index::edge_resolution(&edge)
+                    .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?,
+            );
             edges.push(edge);
-            resolutions.push(resolution);
         }
         Ok(Some((gen, edges, resolutions)))
     }
