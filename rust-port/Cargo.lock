@@ -234,6 +234,7 @@ dependencies = [
  "devmap-resolve",
  "devmap-serve",
  "devmap-store",
+ "libc",
  "rusqlite",
  "serde_json",
  "tokio",

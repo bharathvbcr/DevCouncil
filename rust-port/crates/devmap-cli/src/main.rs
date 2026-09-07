@@ -2792,23 +2792,13 @@ impl Commands {
 /// leaves the store consistent — `test_process_recovery` and the crash gate
 /// are the evidence). Only one-shot commands: see [`Commands::serves`].
 ///
-/// Declared here rather than through the `libc` crate because that crate is
-/// not a direct dependency of this workspace; `signal(2)` has had this
-/// signature on every Unix this kernel builds for, and `SIGPIPE` is 13 on all
-/// of them. Swap for `libc::signal(libc::SIGPIPE, libc::SIG_DFL)` if `libc`
-/// is ever added.
 #[cfg(unix)]
 fn restore_default_sigpipe() {
-    const SIGPIPE: std::ffi::c_int = 13;
-    const SIG_DFL: usize = 0;
-    extern "C" {
-        fn signal(signum: std::ffi::c_int, handler: usize) -> usize;
-    }
     // SAFETY: `signal(2)` with `SIG_DFL` installs the default action for a
     // signal this process is not otherwise handling; it is called once, on
     // the main thread, before any other thread exists.
     unsafe {
-        signal(SIGPIPE, SIG_DFL);
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 
