@@ -761,6 +761,7 @@ impl PathRanks {
 /// The confidence is the `f64` SQLite stores, compared by bit pattern: `f64` is
 /// not `Eq`, and any rounding here would merge two rows the read path can tell
 /// apart.
+#[cfg(feature = "parse")]
 #[derive(PartialEq, Eq, Hash)]
 struct EdgeTuple<'a> {
     source_file_id: u32,
@@ -776,6 +777,7 @@ struct EdgeTuple<'a> {
 /// The end of a bucket chain. `u32::MAX` rather than `Option<u32>` so the array
 /// is four bytes an entry: it has one slot per resolved edge, and this store
 /// writes 102,083 of them.
+#[cfg(feature = "parse")]
 const NO_MORE_IN_BUCKET: u32 = u32::MAX;
 
 /// A 64-bit digest of a row's identity, for bucketing only.
@@ -923,6 +925,7 @@ fn edge_tuple<'a>(
 }
 
 /// The same identity for one row of the unresolved-call ledger.
+#[cfg(feature = "parse")]
 #[derive(PartialEq, Eq, Hash)]
 struct UnresolvedTuple<'a> {
     source_file: std::borrow::Cow<'a, str>,
@@ -1289,6 +1292,7 @@ pub fn checked_min_confidence(value: f32) -> Result<f32> {
 /// A struct rather than eight positional parameters: five of the eight are
 /// `&str`, so a transposed pair would compile and store an engine description
 /// in the parse-outcome column. Named fields make that a compile error.
+#[cfg(feature = "parse")]
 struct StoredPayload<'a> {
     file_id: u32,
     content_hash: i64,
@@ -1746,6 +1750,7 @@ impl Store {
     /// The probe uses the same expressions the index does. Safe without a
     /// retry loop: every caller holds the generation write transaction, and the
     /// store has one writer.
+    #[cfg(feature = "parse")]
     fn ensure_payload_id(tx: &Connection, payload: StoredPayload<'_>) -> Result<i64> {
         let StoredPayload {
             file_id,
