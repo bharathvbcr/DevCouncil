@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from tests.unit.graph_fixtures import git_init_commit, kernel_graph
+from tests.unit.retired_modules import assert_module_is_gone
 
 
 @pytest.fixture()
@@ -75,10 +76,7 @@ _RETIRED_METHODS = (
 
 @pytest.mark.parametrize("name", _RETIRED_MODULES)
 def test_retired_store_module_is_gone(name: str) -> None:
-    import importlib
-
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module(name)
+    assert_module_is_gone(name)
 
 
 @pytest.mark.parametrize(("module", "attribute"), _RETIRED_ATTRIBUTES)

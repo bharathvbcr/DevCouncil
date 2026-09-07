@@ -12,13 +12,14 @@ takes its own advisory ``flock`` on ``devmap.sqlite``.
 
 from __future__ import annotations
 
-import importlib
 import json
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
+
+from tests.unit.retired_modules import assert_module_is_gone
 
 
 
@@ -196,8 +197,7 @@ def test_mcp_lifespan_warms_the_kernel_daemon_and_starts_no_python_watcher(
     assert warmed == [tmp_path.resolve()], "the lifespan must warm the kernel daemon"
     assert context == {"codeintel": None}
     # The Python watcher package is gone entirely, not merely emptied.
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("devcouncil.codeintel.sync")
+    assert_module_is_gone("devcouncil.codeintel.sync")
 
 
 def test_mcp_sync_without_a_kernel_reports_engine_unavailable(
