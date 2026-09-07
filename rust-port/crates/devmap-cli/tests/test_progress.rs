@@ -61,6 +61,100 @@ fn build_progress_is_bounded_complete_and_keeps_json_stdout_clean() {
     fs::remove_dir_all(root).expect("remove fixture tree");
 }
 
+/// `persist:write` carries the split of what it wrote, by relation.
+///
+/// One number cannot be acted on. On this repository `persist:write` is 0.30 s
+/// of a 1.10 s one-file incremental build, and the relations beneath it have
+/// nothing in common as fixes: v18 put the edges and the unresolved ledger on
+/// validity ranges and left the nodes, the full-text map, the file rows, the
+/// dead symbols and the coverage gaps as full per-generation copies. Which of
+/// those the 0.30 s is decides whether the next schema rung is worth its
+/// migration, and no profiler outside the store can answer it — the node and
+/// full-text inserts are one interleaved loop.
+///
+/// The split is asserted here, on the CLI's own `--json` output, because that
+/// is where a reader meets it. Two properties, both about honesty:
+/// every relation is named even when it wrote nothing, and the parts never
+/// outlast the phase that contains them.
+#[test]
+fn the_persist_write_phase_reports_what_each_relation_cost() {
+    let root = temp_root();
+    let db = root.join("index.sqlite");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .args(["--json", "--progress", "never", "--db"])
+        .arg(&db)
+        .arg("build")
+        .arg(&root)
+        .output()
+        .expect("run build");
+    assert!(
+        output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout is one JSON value");
+
+    /// The sub-phase named `wanted`, at any nesting depth.
+    fn find<'a>(stages: &'a [serde_json::Value], wanted: &str) -> Option<&'a serde_json::Value> {
+        for stage in stages {
+            if stage["stage"] == wanted {
+                return Some(stage);
+            }
+            if let Some(nested) = stage["sub"].as_array() {
+                if let Some(hit) = find(nested, wanted) {
+                    return Some(hit);
+                }
+            }
+        }
+        None
+    }
+
+    let stages = payload["timings"]["stages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a build carries timings: {payload}"));
+    let write = find(stages, "persist:write")
+        .unwrap_or_else(|| panic!("the write is a timed phase: {payload}"));
+    let parts = write["sub"]
+        .as_array()
+        .unwrap_or_else(|| panic!("persist:write reports no per-relation split: {write}"));
+
+    let named: Vec<&str> = parts
+        .iter()
+        .map(|part| part["stage"].as_str().unwrap_or("<unnamed>"))
+        .collect();
+    // Every relation, always — a relation that wrote nothing this build reports
+    // zero rather than vanishing, because a missing name and a name worth
+    // nothing are the same silence to a reader deciding what to fix.
+    assert_eq!(
+        named,
+        vec![
+            "file_rows",
+            "nodes",
+            "fts",
+            "edges",
+            "unresolved",
+            "gaps",
+            "dead",
+            "history",
+            "commit",
+        ],
+        "the split names every relation the write touches: {write}"
+    );
+
+    let whole = write["seconds"].as_f64().expect("the write has a duration");
+    let charged: f64 = parts
+        .iter()
+        .map(|part| part["seconds"].as_f64().expect("a part has a duration"))
+        .sum();
+    assert!(
+        charged <= whole + 1e-6,
+        "the parts of a phase cannot outlast it: {charged}s charged of {whole}s: {write}"
+    );
+
+    fs::remove_dir_all(root).expect("remove fixture tree");
+}
+
 /// Fixture roots must never be shared between concurrently running tests.
 /// Against a purely timestamp-keyed root this fails: `SystemTime` advances in
 /// 1 us steps here, so threads entering together receive one identical path and

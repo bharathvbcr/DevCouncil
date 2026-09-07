@@ -944,6 +944,121 @@ pub struct GenerationWriteOpts {
     pub discovery_refusals: Option<Vec<DiscoveryRefusal>>,
 }
 
+/// What one generation write spent, charged to the relation that spent it.
+///
+/// `persist:write` is one number, and on this repository it is 0.30 s of a
+/// 1.10 s one-file incremental build. The relations under it have nothing in
+/// common as fixes -- v18 put the edges and the unresolved ledger on validity
+/// ranges and left the rest as full per-generation copies -- so a single span
+/// cannot say which of them a build is waiting for, and the decision about the
+/// next schema rung is exactly that question.
+///
+/// **Accumulated, not bracketed.** The node and full-text writes are
+/// interleaved by construction: an FTS rowid is derived from the node ordinal
+/// the same loop just produced, so separating them into two passes would mean
+/// inventing a second ordinal counter and a second walk. Each field is instead
+/// the sum of the spans that relation's statements were actually inside.
+///
+/// The consequence is that the parts **under-account** for the write by the
+/// glue between them -- the transaction, the carry decision, the guards -- and
+/// never over-account for it. A reader may sum them and compare the total to
+/// `persist:write`; the remainder is real and unattributed, not missing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WriteBreakdown {
+    /// `generation_file_rows` and the `file_payloads` behind it, including the
+    /// three JSON serializations a fresh payload needs.
+    pub file_rows: f64,
+    /// `generation_nodes`, carried and fresh.
+    pub nodes: f64,
+    /// `nodes_fts` and `nodes_fts_map`, carried and fresh.
+    pub fts: f64,
+    /// The edge delta: the scan of live rows, the closes and the inserts.
+    pub edges: f64,
+    /// The unresolved-call ledger delta, the same three passes.
+    pub unresolved: f64,
+    /// `generation_coverage_gaps`, including the carry-forward scan.
+    pub gaps: f64,
+    /// `generation_dead_symbols`.
+    pub dead: f64,
+    /// `build_history` and the aggregate queries it is computed from.
+    pub history: f64,
+    /// `tx.commit()` -- the durability the whole write is waiting for.
+    pub commit: f64,
+}
+
+impl WriteBreakdown {
+    /// The split as labelled spans, in the order the write incurs them.
+    ///
+    /// One owner for the labels: the `--json` timings and any test that names a
+    /// relation read them from here, so a field added to the struct and left
+    /// out of the report is a compile-time omission rather than a silent one.
+    pub fn parts(&self) -> Vec<(&'static str, f64)> {
+        let Self {
+            file_rows,
+            nodes,
+            fts,
+            edges,
+            unresolved,
+            gaps,
+            dead,
+            history,
+            commit,
+        } = *self;
+        vec![
+            ("file_rows", file_rows),
+            ("nodes", nodes),
+            ("fts", fts),
+            ("edges", edges),
+            ("unresolved", unresolved),
+            ("gaps", gaps),
+            ("dead", dead),
+            ("history", history),
+            ("commit", commit),
+        ]
+    }
+}
+
+/// Charges the wall time it is alive for to one field of a [`WriteBreakdown`].
+///
+/// A guard rather than a closure taking the work, because the write path is a
+/// sequence of statements interleaved with the bindings they produce: wrapping
+/// a region in a closure would mean either re-indenting several hundred lines
+/// or threading every binding out through a tuple. A guard costs one line at
+/// the top of a block that is already there.
+///
+/// It charges on `Drop`, so a statement that fails is charged for the time it
+/// took before failing. The alternative -- charging only on success -- would
+/// leave the one build worth profiling as the one build with no profile.
+///
+/// Gated on `parse` because its only caller is: `save_generation_timed` is the
+/// write path and needs the grammar-identity stamps. With the feature off this
+/// is dead code, and `cargo clippy -p devmap-query --no-default-features`
+/// refuses it -- the store's own feature-off check cannot, because
+/// `devmap-serve` is a dev-dependency that pulls default features straight back
+/// in. [`WriteBreakdown`] itself stays ungated: it is public, an embedder that
+/// reads a persisted map can name the type, and gating it would gate the
+/// re-export too.
+#[cfg(feature = "parse")]
+struct Charge<'a> {
+    sink: &'a mut f64,
+    started: std::time::Instant,
+}
+
+#[cfg(feature = "parse")]
+impl Drop for Charge<'_> {
+    fn drop(&mut self) {
+        *self.sink += self.started.elapsed().as_secs_f64();
+    }
+}
+
+#[cfg(feature = "parse")]
+fn charge(sink: &mut f64) -> Charge<'_> {
+    Charge {
+        sink,
+        started: std::time::Instant::now(),
+    }
+}
+
 /// One committed build, as recorded by [`Store::build_history`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildHistoryRow {
@@ -3160,6 +3275,32 @@ impl Store {
         opts: GenerationWriteOpts,
         head_sha: &str,
     ) -> Result<u32> {
+        self.save_generation_timed(extractions, resolution, analysis, opts, head_sha)
+            .map(|(gen_id, _)| gen_id)
+    }
+
+    /// [`save_generation_with_metadata`](Self::save_generation_with_metadata),
+    /// and what the write spent on each relation.
+    ///
+    /// The split lives here rather than in a profiler beside the store because
+    /// two of the relations cannot be separated from outside: the node and
+    /// full-text writes are one interleaved loop, an FTS rowid being derived
+    /// from the node ordinal the loop just produced. See [`WriteBreakdown`] for
+    /// what the numbers do and do not account for.
+    ///
+    /// Every existing caller keeps the `u32` it had; the breakdown is a second
+    /// return value on a second entry point, so the sixty-odd call sites of
+    /// `save_generation*` are untouched by a change none of them asked for.
+    #[cfg(feature = "parse")]
+    pub fn save_generation_timed(
+        &self,
+        extractions: &[Extraction],
+        resolution: &ResolutionResult,
+        analysis: &AnalysisSummary,
+        opts: GenerationWriteOpts,
+        head_sha: &str,
+    ) -> Result<(u32, WriteBreakdown)> {
+        let mut spent = WriteBreakdown::default();
         self.refuse_if_read_only()?;
         if head_sha.is_empty() || head_sha.len() > 128 || head_sha.chars().any(char::is_whitespace)
         {
@@ -3326,6 +3467,7 @@ impl Store {
                        JOIN paths p ON p.id = m.file_id
                       WHERE m.generation_id = ?2 AND p.path = ?3",
                 )?;
+                let _charge = charge(&mut spent.file_rows);
                 for path in &carry {
                     stmt.execute(params![gen_id, prev, path])?;
                 }
@@ -3385,11 +3527,14 @@ impl Store {
                     extraction_json: &extraction_json,
                 },
             )?;
-            tx.execute(
-                "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
-                 VALUES (?1, ?2, ?3)",
-                params![gen_id, file_id, payload_id],
-            )?;
+            {
+                let _charge = charge(&mut spent.file_rows);
+                tx.execute(
+                    "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![gen_id, file_id, payload_id],
+                )?;
+            }
         }
 
         let mut node_ord: u32 = 0;
@@ -3424,29 +3569,41 @@ impl Store {
                     ))
                 })?;
                 for row in rows {
-                    let (path, name, qn, kind, start, end, exported, b_exact, b_struct, b_nodes) =
-                        row?;
+                    // The decode is charged to `nodes` with the insert it feeds:
+                    // reading the previous generation's 18,501 rows back out is
+                    // the carry-forward's cost as much as writing them is, and
+                    // splitting the two would leave the larger half unnamed.
+                    let (path, name, qn, kind, start, end, exported, b_exact, b_struct, b_nodes) = {
+                        let _charge = charge(&mut spent.nodes);
+                        row?
+                    };
                     if !carry.contains(&path) {
                         continue;
                     }
                     let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &path)?;
-                    tx.prepare_cached(
-                        "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    )?
-                    .execute(params![
-                        gen_id, node_ord, file_id, name, qn, kind, start, end, exported, b_exact,
-                        b_struct, b_nodes
-                    ])?;
+                    {
+                        let _charge = charge(&mut spent.nodes);
+                        tx.prepare_cached(
+                            "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        )?
+                        .execute(params![
+                            gen_id, node_ord, file_id, name, qn, kind, start, end, exported,
+                            b_exact, b_struct, b_nodes
+                        ])?;
+                    }
                     let fts_rowid = Self::fts_rowid(gen_id, node_ord);
-                    tx.prepare_cached(
-                        "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
-                    )?
-                    .execute(params![fts_rowid, name, qn, path])?;
-                    tx.prepare_cached(
-                        "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
-                    )?
-                    .execute(params![fts_rowid, gen_id])?;
+                    {
+                        let _charge = charge(&mut spent.fts);
+                        tx.prepare_cached(
+                            "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
+                        )?
+                        .execute(params![fts_rowid, name, qn, path])?;
+                        tx.prepare_cached(
+                            "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
+                        )?
+                        .execute(params![fts_rowid, gen_id])?;
+                    }
                     node_ord += 1;
                 }
             }
@@ -3462,36 +3619,43 @@ impl Store {
             }
             let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &ext.file_path)?;
             for sym in &ext.symbols {
-                tx.execute(
-                    "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    params![
-                        gen_id,
-                        node_ord,
-                        file_id,
-                        sym.name,
-                        sym.qualified_name,
-                        sym.kind.as_str(),
-                        sym.span.start_byte,
-                        sym.span.end_byte,
-                        sym.is_exported as i32,
-                        // SQLite integers are signed. The cast is bit-preserving
-                        // and reversed on read, so the stored value round-trips
-                        // even though half the hash space reads back negative.
-                        sym.body_signature.map(|s| s.exact as i64),
-                        sym.body_signature.map(|s| s.structural as i64),
-                        sym.body_signature.map(|s| i64::from(s.nodes))
-                    ],
-                )?;
+                {
+                    let _charge = charge(&mut spent.nodes);
+                    tx.execute(
+                        "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        params![
+                            gen_id,
+                            node_ord,
+                            file_id,
+                            sym.name,
+                            sym.qualified_name,
+                            sym.kind.as_str(),
+                            sym.span.start_byte,
+                            sym.span.end_byte,
+                            sym.is_exported as i32,
+                            // SQLite integers are signed. The cast is
+                            // bit-preserving and reversed on read, so the stored
+                            // value round-trips even though half the hash space
+                            // reads back negative.
+                            sym.body_signature.map(|s| s.exact as i64),
+                            sym.body_signature.map(|s| s.structural as i64),
+                            sym.body_signature.map(|s| i64::from(s.nodes))
+                        ],
+                    )?;
+                }
                 let fts_rowid = Self::fts_rowid(gen_id, node_ord);
-                tx.prepare_cached(
-                    "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
-                )?
-                .execute(params![fts_rowid, sym.name, sym.qualified_name, ext.file_path])?;
-                tx.prepare_cached(
-                    "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
-                )?
-                .execute(params![fts_rowid, gen_id])?;
+                {
+                    let _charge = charge(&mut spent.fts);
+                    tx.prepare_cached(
+                        "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
+                    )?
+                    .execute(params![fts_rowid, sym.name, sym.qualified_name, ext.file_path])?;
+                    tx.prepare_cached(
+                        "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
+                    )?
+                    .execute(params![fts_rowid, gen_id])?;
+                }
                 node_ord += 1;
             }
         }
@@ -3555,6 +3719,7 @@ impl Store {
         // expression.
         let mut kind_labels: std::collections::HashMap<EdgeKind, String> =
             std::collections::HashMap::new();
+        let edge_charge = charge(&mut spent.edges);
         for edge in &resolution.edges {
             kind_labels
                 .entry(edge.edge_kind)
@@ -3691,6 +3856,11 @@ impl Store {
                 ])?;
             }
         }
+        // One span from the kind labels to the last insert: the identity index,
+        // the scan of live rows, the closes and the inserts are the edge delta,
+        // and charging them separately would invite a reader to fix the cheapest
+        // of four passes that only exist together.
+        drop(edge_charge);
 
         // The analysis must have been computed over the edge set being stored.
         //
@@ -3743,6 +3913,7 @@ impl Store {
         // removing from the generation must not leave a coverage row behind
         // claiming the graph is missing something it no longer contains.
         let mut gap_rows: Vec<(String, String, String)> = Vec::new();
+        let gap_charge = charge(&mut spent.gaps);
         // The extraction gaps carry forward exactly as the file rows above do,
         // and for the same reason: a differential write is handed only the
         // extractions it re-read, so deriving the whole inventory from them
@@ -3792,6 +3963,7 @@ impl Store {
         // is the drain agreeing with `devmap build` about where the repository
         // ends, and dropping the row here would make the refusal invisible on
         // the one path that produces it most.
+        drop(gap_charge);
         let measured_refusals = match &opts.discovery_refusals {
             Some(refusals) => {
                 // Deduplicated by path, because the count below is checked
@@ -3830,6 +4002,7 @@ impl Store {
             )));
         }
         {
+            let _charge = charge(&mut spent.gaps);
             let mut insert = tx.prepare(
                 "INSERT OR REPLACE INTO generation_coverage_gaps
                  (generation_id, gap, path, reason)
@@ -3840,6 +4013,7 @@ impl Store {
             }
         }
 
+        let dead_charge = charge(&mut spent.dead);
         for (ordinal, dead) in analysis.dead_symbols.iter().enumerate() {
             let ordinal = u32::try_from(ordinal).map_err(|_| {
                 rusqlite::Error::InvalidParameterName(
@@ -3861,6 +4035,7 @@ impl Store {
                 ],
             )?;
         }
+        drop(dead_charge);
 
         // D17: the unresolved-call ledger. Written inside the same transaction
         // as everything else, so a generation can never be observable while
@@ -3877,6 +4052,7 @@ impl Store {
         // sides, with nothing appearing and nothing disappearing** — a ledger
         // that had not changed at all and was rewritten in full every time.
         {
+            let _charge = charge(&mut spent.unresolved);
             // 12,424 ledger tuples of this repository occur more than once in
             // one generation (36,600 rows), so this is a multiset too — and
             // `matched`, one bit a row, is what makes it one.
@@ -3976,6 +4152,7 @@ impl Store {
         // The history row is written inside the generation's own transaction.
         // A build is therefore never observable without its history entry, and
         // a rolled-back generation leaves no phantom row behind.
+        let history_charge = charge(&mut spent.history);
         let symbols: i64 = tx.query_row(
             "SELECT COUNT(*) FROM generation_nodes WHERE generation_id = ?1",
             params![gen_id],
@@ -4088,9 +4265,13 @@ impl Store {
              (SELECT generation_id FROM build_history ORDER BY built_at DESC, generation_id DESC LIMIT ?1)",
             params![BUILD_HISTORY_RETENTION as i64],
         )?;
+        drop(history_charge);
 
-        tx.commit()?;
-        Ok(gen_id)
+        {
+            let _charge = charge(&mut spent.commit);
+            tx.commit()?;
+        }
+        Ok((gen_id, spent))
     }
 
     /// Most recent builds, newest first. `limit` is clamped to the retention cap.

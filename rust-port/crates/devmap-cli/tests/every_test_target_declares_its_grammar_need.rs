@@ -80,6 +80,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "store_hardening",
             "test_fault_injection",
             "validity_ranges",
+            "write_breakdown",
         ],
     ),
 ];
