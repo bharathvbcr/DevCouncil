@@ -409,25 +409,27 @@ def test_mcp_graph_ingest_reports_a_not_fresh_kernel_store(tmp_path: Path, monke
 
 
 @requires_kernel
-def test_pdg_merge_preserves_the_kernel_stamp_and_freshness(tmp_path: Path) -> None:
+def test_pdg_layer_leaves_the_kernels_artifact_untouched(tmp_path: Path) -> None:
     """`dev map --pdg` must not turn the graph into a foreign artifact.
 
-    ``_build_pdg_layer`` re-writes ``code_graph.json`` through the Python
-    ``write_code_graph``. If that dropped ``meta.map_engine`` or restamped
-    freshness from today's tree, ``dev map doctor`` would report a foreign
-    writer (CRITICAL) immediately after a successful build. It does not: the
-    slim export copies ``meta`` and the fingerprints ride on the graph object,
-    and this test is what keeps it that way.
+    It used to merge the layer into a `CodeGraph` and call `write_code_graph`,
+    which rewrites `code_graph.json`. The risk then was that the rewrite dropped
+    `meta.map_engine` or restamped freshness from today's tree, so `dev map
+    doctor` would report a foreign writer (CRITICAL) immediately after a
+    successful build, and this test pinned the stamps that survived it.
+
+    The rewrite is gone: the layer lands in `.devcouncil/graph/pdg.json` and the
+    kernel is the only writer of `code_graph.json`. The invariant is now the
+    stronger one -- not "the rewrite preserves the stamps" but "there is no
+    rewrite" -- and it is asserted on the bytes, through `_build_pdg_layer`, the
+    function `dev map --pdg` actually calls. The old test drove
+    `load_code_graph` + `merge_pdg_into_graph` + `write_code_graph` by hand, so
+    it kept passing while its docstring described a path production had left.
     """
     import subprocess
 
     from devcouncil import devmap_health
-    from devcouncil.indexing.graph.build import (
-        build_pdg_for_paths,
-        load_code_graph,
-        merge_pdg_into_graph,
-        write_code_graph,
-    )
+    from devcouncil.cli.commands.map import _build_pdg_layer
 
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     (tmp_path / ".devcouncil").mkdir()
@@ -440,19 +442,20 @@ def test_pdg_merge_preserves_the_kernel_stamp_and_freshness(tmp_path: Path) -> N
     generate_map_artifacts(tmp_path, map_path, quiet=True)
 
     graph_path = tmp_path / ".devcouncil" / "graph" / "code_graph.json"
-    before = json.loads(graph_path.read_text(encoding="utf-8"))
+    before_bytes = graph_path.read_bytes()
+    before = json.loads(before_bytes.decode("utf-8"))
     assert before["meta"]["map_engine"] == "devmap-rust"
 
-    graph = load_code_graph(tmp_path)
-    assert graph is not None
-    merge_pdg_into_graph(graph, build_pdg_for_paths(tmp_path, graph))
-    write_code_graph(tmp_path, graph)
+    _build_pdg_layer(tmp_path)
 
-    after = json.loads(graph_path.read_text(encoding="utf-8"))
-    assert after["meta"]["map_engine"] == "devmap-rust", "PDG export orphaned the graph"
-    assert "pdg" in after["meta"], "the PDG layer must actually be on disk"
-    for stamp in ("generated_head", "indexed_hash", "content_fingerprint"):
-        assert after[stamp] == before[stamp], f"PDG export restamped {stamp}"
+    assert graph_path.read_bytes() == before_bytes, (
+        "the PDG layer rewrote code_graph.json; the kernel is its only writer"
+    )
+    sidecar = tmp_path / ".devcouncil" / "graph" / "pdg.json"
+    assert sidecar.is_file(), "the PDG layer must write its own artifact"
+    layer = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert layer["files"], "an empty layer would mean the analysis did not run"
+
     doctor = devmap_health.run_doctor(tmp_path)
     failed = [check["name"] for check in doctor["checks"] if check["ok"] is False]
     assert doctor["ok"], f"doctor failed after --pdg: {failed}"
