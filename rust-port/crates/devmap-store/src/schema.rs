@@ -932,6 +932,60 @@ SELECT u.source_file, u.source_symbol, u.callee_name, u.reason,
 DROP TABLE generation_unresolved_v17;
 "#;
 
+/// The schema this binary writes.
+///
+/// # Why there is no v19 putting the nodes on ranges
+///
+/// v18 ranged the edges and the unresolved ledger and left `generation_nodes`,
+/// `nodes_fts`/`nodes_fts_map`, `generation_file_rows`, `generation_dead_symbols`
+/// and `generation_coverage_gaps` as full per-generation copies. The obvious
+/// next rung is to give the nodes and the full-text map the same treatment,
+/// and it was designed and then declined on a measurement rather than on
+/// taste. Recorded here because the argument for doing it is visible in the
+/// schema and the argument against it is not.
+///
+/// Measured on a `git archive` corpus of this repository — 1,608 files, 18,501
+/// symbols, 106,420 edges — release binary, one-file incremental builds, p50.
+/// `persist:write` is 304 ms, and `save_generation_timed` charges it:
+///
+/// | relation      | ms  | share |
+/// |---------------|-----|-------|
+/// | `unresolved`  | 118 | 39%   |
+/// | `edges`       |  81 | 27%   |
+/// | `fts`         |  34 | 11%   |
+/// | `nodes`       |  20 | 6.6%  |
+/// | everything else | 33 | 11%  |
+///
+/// The prune that follows costs a further 78 ms, of which 39 ms is the three
+/// node relations' `DELETE`s (31 ms of it `nodes_fts`, timed statement by
+/// statement against a byte copy of the store).
+///
+/// So the whole of what ranging the nodes and the full-text map could return
+/// is **54 ms of the write plus 39 ms of the prune — 93 ms of a 1,155 ms
+/// build**, and that is an upper bound: a ranged write still inserts the
+/// changed files' nodes, still closes the replaced ranges, and a ranged
+/// `nodes_fts` still deletes rows as ranges fall out of retention.
+///
+/// Against that: `nodes_fts` is an FTS5 virtual table whose rowid is
+/// `(generation << 32) | ordinal`, and `latest_search_page` joins
+/// `nodes_fts.rowid & 4294967295` back to `generation_nodes.ordinal`. A row
+/// valid across a range of generations cannot carry a generation in its rowid,
+/// so ranging the nodes means re-keying the full-text index and rewriting that
+/// join — on the hottest read in the store. 2b98fef is the precedent for the
+/// risk: one index on exactly this shape of range predicate cost every read
+/// 36%, and it was found only because it was measured.
+///
+/// A rung that returns 8% of a build for a re-keyed full-text index is not
+/// worth its migration, and a half-applied one is worse than the copy it
+/// replaces. `an_incremental_build_still_copies_every_node_and_full_text_row`
+/// pins the state this describes, so the next person to reach for v19 has to
+/// come past this note rather than rediscover it.
+///
+/// **The number that would justify a rung is elsewhere.** The two relations
+/// that dominate the write are the two already ranged, and their cost is not
+/// copying: it is the diff scan reading back 106,420 edge rows and 89,743
+/// ledger rows on every build to decide what is still valid. That is 66% of
+/// `persist:write`, and no further ranging touches it.
 pub const CURRENT_SCHEMA_VERSION: i32 = 18;
 
 /// Every DDL batch a fresh store applies, in the order `Store::migrate` applies

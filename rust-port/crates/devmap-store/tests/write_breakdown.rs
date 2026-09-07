@@ -193,3 +193,96 @@ fn the_split_accounts_for_the_write_without_exceeding_it() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The state the measurement describes, pinned so it cannot drift unremarked.
+///
+/// A one-file incremental build copies every node and every full-text row of
+/// the previous generation, and writes a delta of the edges. That asymmetry is
+/// what a v19 would remove, and [`devmap_store::CURRENT_SCHEMA_VERSION`] carries
+/// the measurement that said it is not worth its migration — 93 ms of a
+/// 1,155 ms build, against re-keying the FTS5 index the hottest read joins to.
+///
+/// This is a characterization test, not a guard: if it fails because the nodes
+/// have been put on ranges, that is the rung landing and the expectation here
+/// is what changes. Read the note on `CURRENT_SCHEMA_VERSION` first — it says
+/// what the rung has to be worth.
+#[test]
+fn an_incremental_build_still_copies_every_node_and_full_text_row() {
+    let dir = tmp_dir("write-breakdown-shape");
+    let db = dir.join("devmap.sqlite");
+    let store = Store::open(&db).unwrap();
+
+    let first = tree(0, 150);
+    let (extractions, resolution, analysis) = pipeline(&as_refs(&first));
+    store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
+        .unwrap();
+
+    let count = |sql: &str| -> i64 {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    };
+
+    // Asserted first, because without it the rest of this test is vacuous the
+    // moment the rung it describes lands. `generation_edges` is a view over
+    // `edge_rows` since v18, and `SELECT COUNT(*)` through such a view counts
+    // (row x generation) pairs — so a ranged `generation_nodes` would report
+    // exactly the doubling below while storing nothing twice. What is being
+    // characterized is physical rows, and that is only what these counts mean
+    // while the relations are base tables.
+    for relation in ["generation_nodes", "nodes_fts_map"] {
+        let is_view = count(&format!(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = '{relation}' AND type = 'view'"
+        ));
+        assert_eq!(
+            is_view, 0,
+            "`{relation}` is a view, so the row counts below no longer mean physical rows. \
+             If the nodes have been put on validity ranges, read the note on \
+             CURRENT_SCHEMA_VERSION and rewrite this test against the base relation, as \
+             validity_ranges.rs does with `base_relation`"
+        );
+    }
+
+    let nodes_before = count("SELECT COUNT(*) FROM generation_nodes");
+    let fts_before = count("SELECT COUNT(*) FROM nodes_fts_map");
+    let edges_before = count("SELECT COUNT(*) FROM edge_rows");
+
+    let second = tree(1, 150);
+    let (extractions, resolution, analysis) = pipeline(&as_refs(&second));
+    let opts = GenerationWriteOpts {
+        affected_paths: vec!["hub.py".to_string()],
+        ..Default::default()
+    };
+    store
+        .save_generation_with_opts(&extractions, &resolution, &analysis, opts)
+        .unwrap();
+
+    let nodes_after = count("SELECT COUNT(*) FROM generation_nodes");
+    let fts_after = count("SELECT COUNT(*) FROM nodes_fts_map");
+    let edges_after = count("SELECT COUNT(*) FROM edge_rows");
+
+    assert_eq!(
+        nodes_after,
+        nodes_before * 2,
+        "one edited file copies every node of the generation: {nodes_before} -> {nodes_after}"
+    );
+    assert_eq!(
+        fts_after,
+        fts_before * 2,
+        "and every full-text row with them: {fts_before} -> {fts_after}"
+    );
+    // The contrast, and the reason the asymmetry is worth writing down: the
+    // same build writes the edges it actually gained.
+    assert!(
+        edges_after - edges_before <= edges_before / 10,
+        "the ranged relation writes a delta: {edges_before} -> {edges_after}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
