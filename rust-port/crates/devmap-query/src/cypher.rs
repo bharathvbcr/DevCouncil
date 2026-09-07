@@ -4,14 +4,27 @@
 //! exactly one pattern:
 //!
 //! ```text
-//! MATCH (a[:Label])[-[r:REL|REL]->(b[:Label])] [WHERE …] RETURN … [LIMIT n]
+//! MATCH (a)[-[r:REL|REL]->(b)] [WHERE …] RETURN a[, r][, b] [LIMIT n]
 //! ```
 //!
 //! # Everything here refuses rather than widens
 //!
-//! Three separate places could turn "I did not understand your question" into
-//! "here is an answer", and all three are closed:
+//! Five separate places could turn "I did not understand your question" into
+//! "here is an answer", and all five are closed:
 //!
+//! * **The pattern is read, not skipped over.** The parser used to take
+//!   whatever lay between `MATCH ` and ` RETURN ` and look only for `-[`, so
+//!   `MATCH (((( RETURN ))))` — read back from the release binary on a real
+//!   store — answered `ok: true` with fifty rows and `total: 18404`. Now the
+//!   pattern is `(a)` or `(a)-[r:…]->(b)` exactly. The variables are fixed
+//!   because the `WHERE` grammar and the row keys name them; a node label is
+//!   refused rather than ignored, because this engine filters on nothing a
+//!   label names and `(a:Function)` answering with every kind is the same
+//!   silent over-answer.
+//! * **`RETURN` names what the pattern bound.** The projection was never read,
+//!   so `RETURN ))))` and `RETURN c` both answered with the pattern's rows. The
+//!   row is the same whatever is projected — this engine projects nothing — so
+//!   an item it cannot honour is refused instead of quietly not honoured.
 //! * **An unreadable `WHERE` term is a refusal.** Dropping the term it could not
 //!   parse and running the rest returns *every* row under `ok: true` — a
 //!   strictly wrong answer to the question asked. `OR` is the sharpest case: an
@@ -104,8 +117,14 @@ pub fn parse_where(clause: &str) -> WhereClause {
 /// A naive split would cut `contains(a.name, 'AND')` in half and then fail to
 /// parse both halves — reporting a perfectly good filter as unreadable.
 fn split_on_keyword<'a>(text: &'a str, keyword: &str) -> Vec<&'a str> {
-    let upper = text.to_uppercase();
-    let keyword = keyword.to_uppercase();
+    // ASCII folding only: offsets found in the folded copy slice `text`, and
+    // Unicode case mapping changes byte lengths (`ﬁ` → `FI`, `ŉ` → `ʼN`). With
+    // `to_uppercase()` every offset past such a character in a filter value
+    // was off by one — `'ŉx') AND …` split as `'ŉx') A` — and a value that
+    // grew enough would slice inside a character and panic. The keywords are
+    // ASCII, so ASCII folding finds exactly the same ones.
+    let upper = text.to_ascii_uppercase();
+    let keyword = keyword.to_ascii_uppercase();
     let bytes = upper.as_bytes();
     let mut parts = Vec::new();
     let mut start = 0usize;
@@ -164,7 +183,9 @@ fn call_argument(term: &str, name: &str, field: &str) -> Option<String> {
     // The head is matched case-insensitively and with flexible spacing, because
     // `starts with (b.path, …)` is written every way a person writes it.
     let squashed: String = term.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lower = squashed.to_lowercase();
+    // ASCII folding, for the same reason as `split_on_keyword`: `head.len()`
+    // is used as an offset into `squashed`.
+    let lower = squashed.to_ascii_lowercase();
     let head = format!("{name}(");
     let head_alt = format!("{name} (");
     let open_at = if lower.starts_with(&head) {
@@ -238,7 +259,8 @@ struct Pattern {
 /// Parse the one supported pattern, or say why it is not supported.
 fn parse_query(query: &str, default_limit: usize) -> Result<Pattern, Value> {
     let normalized = query.split_whitespace().collect::<Vec<_>>().join(" ");
-    let upper = normalized.to_uppercase();
+    // ASCII folding: see `split_on_keyword`. These offsets slice `normalized`.
+    let upper = normalized.to_ascii_uppercase();
 
     for clause in ["CREATE", "DELETE", "MERGE", "SET", "REMOVE", "DETACH"] {
         if upper
@@ -266,17 +288,20 @@ fn parse_query(query: &str, default_limit: usize) -> Result<Pattern, Value> {
     let pattern_and_where = &normalized[match_at + "MATCH ".len()..return_at];
     let tail = &normalized[return_at + " RETURN ".len()..];
 
-    // LIMIT, if present, closes the query.
-    let tail_upper = tail.to_uppercase();
-    let limit_requested = match tail_upper.rfind(" LIMIT ") {
-        Some(at) => tail[at + " LIMIT ".len()..]
-            .trim()
-            .parse::<usize>()
-            .map_err(|_| unsupported(&normalized))?,
-        None => default_limit,
+    // LIMIT, if present, closes the query; what precedes it is the projection.
+    let tail_upper = tail.to_ascii_uppercase();
+    let (projection, limit_requested) = match tail_upper.rfind(" LIMIT ") {
+        Some(at) => (
+            &tail[..at],
+            tail[at + " LIMIT ".len()..]
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| unsupported(&normalized))?,
+        ),
+        None => (tail, default_limit),
     };
 
-    let upper_pw = pattern_and_where.to_uppercase();
+    let upper_pw = pattern_and_where.to_ascii_uppercase();
     let (pattern, where_text) = match upper_pw.find(" WHERE ") {
         Some(at) => (
             &pattern_and_where[..at],
@@ -285,22 +310,11 @@ fn parse_query(query: &str, default_limit: usize) -> Result<Pattern, Value> {
         None => (pattern_and_where, ""),
     };
 
-    let relationships = match pattern.find("-[") {
-        None => Vec::new(),
-        Some(at) => {
-            let rest = &pattern[at + 2..];
-            let Some(close) = rest.find(']') else {
-                return Err(unsupported(&normalized));
-            };
-            let spec = &rest[..close];
-            let names = spec.strip_prefix("r:").unwrap_or(spec);
-            names
-                .split('|')
-                .map(|name| name.trim().to_lowercase())
-                .filter(|name| !name.is_empty())
-                .collect()
-        }
-    };
+    let bound = parse_pattern(pattern).ok_or_else(|| unsupported(&normalized))?;
+    if let Err(item) = validate_return(projection, &bound.variables) {
+        return Err(unsupported_return(&normalized, &item, &bound.variables));
+    }
+    let relationships = bound.relationships;
 
     let mut resolved = Vec::with_capacity(relationships.len());
     for name in &relationships {
@@ -329,6 +343,115 @@ fn parse_query(query: &str, default_limit: usize) -> Result<Pattern, Value> {
         relationships: resolved,
         where_clause: parse_where(where_text),
         limit_requested,
+    })
+}
+
+/// What a pattern binds: its variables, and the relationship names between them.
+struct BoundPattern {
+    variables: Vec<&'static str>,
+    relationships: Vec<String>,
+}
+
+/// Read `(a)` or `(a)-[r:k1|k2]->(b)`, and nothing else.
+///
+/// The variables are fixed as `a` and `b` because the `WHERE` grammar names
+/// them (`contains(a.name, …)`, `starts with(b.path, …)`) and the rows are
+/// keyed `a_*`/`b_*`: a pattern binding `x` would run with filters that can
+/// never apply. `r` is bound only when the relationship is written `r:…`.
+/// A label is refused rather than ignored — see the module docs.
+fn parse_pattern(pattern: &str) -> Option<BoundPattern> {
+    let rest = pattern.trim().strip_prefix('(')?;
+    let close = rest.find(')')?;
+    if rest[..close].trim() != "a" {
+        return None;
+    }
+    let rest = rest[close + 1..].trim();
+    if rest.is_empty() {
+        return Some(BoundPattern {
+            variables: vec!["a"],
+            relationships: Vec::new(),
+        });
+    }
+    let rest = rest.strip_prefix("-[")?;
+    let close = rest.find(']')?;
+    let spec = rest[..close].trim();
+    let rest = rest[close + 1..]
+        .trim()
+        .strip_prefix("->")?
+        .trim()
+        .strip_prefix('(')?;
+    let close = rest.find(')')?;
+    if rest[..close].trim() != "b" || !rest[close + 1..].trim().is_empty() {
+        return None;
+    }
+    let (binds_r, names) = match spec.strip_prefix("r:") {
+        Some(names) => (true, names),
+        None => (false, spec.strip_prefix(':').unwrap_or(spec)),
+    };
+    let relationships: Vec<String> = names
+        .split('|')
+        .map(|name| name.trim().to_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if relationships.is_empty() {
+        return None;
+    }
+    let variables = if binds_r {
+        vec!["a", "r", "b"]
+    } else {
+        vec!["a", "b"]
+    };
+    Some(BoundPattern {
+        variables,
+        relationships,
+    })
+}
+
+/// The fields a row carries for a node variable, and so the only projections
+/// this engine can honour.
+const ROW_FIELDS: &[&str] = &["id", "name", "path", "kind"];
+
+/// Every projected item names a variable the pattern bound, bare or with one
+/// of [`ROW_FIELDS`]. Returns the first item it cannot honour.
+fn validate_return(projection: &str, bound: &[&str]) -> Result<(), String> {
+    let projection = projection.trim();
+    if projection.is_empty() {
+        return Err(String::new());
+    }
+    for item in projection.split(',') {
+        let item = item.trim();
+        let (variable, field) = match item.split_once('.') {
+            Some((variable, field)) => (variable.trim(), Some(field.trim())),
+            None => (item, None),
+        };
+        if !bound.contains(&variable) {
+            return Err(item.to_string());
+        }
+        if let Some(field) = field {
+            if variable == "r" || !ROW_FIELDS.contains(&field) {
+                return Err(item.to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unsupported_return(query: &str, item: &str, bound: &[&str]) -> Value {
+    let fields = ROW_FIELDS
+        .iter()
+        .map(|field| format!("a.{field}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    json!({
+        "ok": false,
+        "code": "unsupported_return",
+        "error": format!(
+            "Unsupported RETURN item {item:?}. This engine returns the bound variables' rows \
+             whole: RETURN {}, or a field of a node ({fields}). Refusing rather than answering \
+             with rows the caller did not ask for.",
+            bound.join(", ")
+        ),
+        "query": query,
     })
 }
 
@@ -641,5 +764,92 @@ starts with(b.path, 'nowhere/') RETURN a, b",
         assert_eq!(result["ok"], json!(false));
         assert_eq!(result["code"], json!("unsupported_query"));
         assert!(result["error"].as_str().unwrap().contains("MATCH"));
+    }
+
+    /// The parser found `MATCH ` and ` RETURN ` and took whatever lay between
+    /// as the pattern, so `MATCH (((( RETURN ))))` — read back from the
+    /// release binary on a real store — answered `ok: true` with fifty rows
+    /// and `total: 18404`: a query this engine could not read, reported as
+    /// every node in the graph. The same hole let `(x)` bind a variable the
+    /// WHERE grammar cannot name, and a label the engine never filters on.
+    #[test]
+    fn a_pattern_this_subset_cannot_read_is_refused_not_answered_as_every_node() {
+        for query in [
+            "MATCH (((( RETURN ))))",
+            "MATCH garbage RETURN a",
+            "MATCH (a RETURN a",
+            "MATCH (x) RETURN x",
+            "MATCH (a:Function) RETURN a",
+            "MATCH (a)-[r:calls]->(b RETURN a, b",
+            "MATCH (a)-[r:calls]->(b) extra RETURN a, b",
+            "MATCH (a)-[r:calls]->(x) RETURN a",
+            "MATCH (a) RETURN",
+        ] {
+            let result = run(&graph(), query, 50);
+            assert_eq!(result["ok"], json!(false), "{query}: {result}");
+            assert_eq!(
+                result["code"],
+                json!("unsupported_query"),
+                "{query}: {result}"
+            );
+        }
+    }
+
+    /// Keyword positions were found in a `to_uppercase()` copy and used to
+    /// slice the original. `ﬁ` uppercases to `FI` (three bytes to two) and
+    /// `ŉ` to `ʼN` (two to three), so every offset past such a character was
+    /// off by one: read back from the release binary, the filter value `'ﬁle'`
+    /// was refused as `contains(a.name, 'ﬁle'` — its own closing paren cut off
+    /// — and `'ŉx') AND …` came back as `'ŉx') A`. A value that grows enough
+    /// lands the slice inside a character and panics. Case-folding for the
+    /// keyword search has to preserve byte offsets, which only ASCII folding
+    /// does.
+    #[test]
+    fn a_non_ascii_filter_value_does_not_shift_the_keywords() {
+        for query in [
+            "MATCH (a)-[r:calls]->(b) WHERE contains(a.name, 'ﬁle') AND \
+             starts with(b.path, 'src/') RETURN a, b",
+            "MATCH (a)-[r:calls]->(b) WHERE contains(a.name, 'ŉx') AND \
+             starts with(b.path, 'src/') RETURN a, b LIMIT 3",
+            "MATCH (a) WHERE contains(a.name, 'ŉŉŉŉ') RETURN a",
+        ] {
+            let result = run(&graph(), query, 50);
+            assert_eq!(result["ok"], json!(true), "{query}: {result}");
+        }
+    }
+
+    /// The RETURN clause was never read: `RETURN ))))` and `RETURN c` both
+    /// answered with the pattern's rows. What comes back is always the bound
+    /// variables' fields, so anything else in the projection is a request
+    /// this engine silently did not honour.
+    #[test]
+    fn a_return_naming_nothing_the_pattern_bound_is_refused() {
+        for query in [
+            "MATCH (a) RETURN c",
+            "MATCH (a) RETURN a, b",
+            "MATCH (a) RETURN ))))",
+            "MATCH (a)-[r:calls]->(b) RETURN a, b, z",
+            "MATCH (a) RETURN a.colour",
+        ] {
+            let result = run(&graph(), query, 50);
+            assert_eq!(result["ok"], json!(false), "{query}: {result}");
+            assert_eq!(
+                result["code"],
+                json!("unsupported_return"),
+                "{query}: {result}"
+            );
+        }
+        // Every projection the documentation shows still runs.
+        for query in [
+            "MATCH (a) RETURN a",
+            "MATCH (a) RETURN a.name, a.path LIMIT 2",
+            "MATCH (a)-[r:calls]->(b) RETURN a, b",
+            "MATCH (a)-[r:calls]->(b) RETURN a.id, b.id LIMIT 20",
+            "MATCH (a)-[r:CALLS]->(b) RETURN a, r, b",
+            "MATCH (a)-[:calls]->(b) RETURN a, b",
+        ] {
+            let result = run(&graph(), query, 50);
+            assert_eq!(result["ok"], json!(true), "{query}: {result}");
+        }
     }
 }
