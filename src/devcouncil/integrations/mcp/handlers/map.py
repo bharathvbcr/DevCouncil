@@ -433,11 +433,20 @@ def _scan_ok(
 
 
 def _symbols_for_path(root: Path, path: str) -> SymbolScan:
-    """Per-path symbol listings from the code graph, or an explicit failure.
+    """Per-path symbol listings from the kernel, or an explicit failure.
 
-    Both engines are tried in order. Every reason one of them declined is kept
-    and reported: a missing kernel, a locked store, a mid-build truncation and a
-    file that genuinely defines nothing all used to return the same ``[]``.
+    Every reason the kernel declined is kept and reported: a missing kernel, a
+    locked store, a mid-build truncation and a file that genuinely defines
+    nothing all used to return the same ``[]``.
+
+    There is no second engine. A `load_code_graph` fallback used to sit below
+    this — the retired Python engine's whole-graph read, 855 ms and ~690 MB RSS
+    on this repository, 3.8 s and a 102 MB `index.sqlite` write on the first
+    call — and it published through :func:`_scan_ok` with no producer total and
+    no truncation flag, so a fallback answer reached the agent wearing the shape
+    of a complete, verified one. A check that could not run must not report what
+    a check that ran and passed reports; the kernel being unreachable is
+    reported as that.
     """
     norm = path.replace("\\", "/")
     reasons: list[str] = []
@@ -495,32 +504,7 @@ def _symbols_for_path(root: Path, path: str) -> SymbolScan:
             )
     except Exception as exc:  # noqa: BLE001 - reported, not swallowed
         reasons.append(f"devmap: {exc}")
-    try:
-        from devcouncil.indexing.graph.build import load_code_graph
-
-        graph = load_code_graph(root)
-        if graph is None:
-            reasons.append("no code graph (run `dev map`)")
-            return SymbolScan(False, "", "; ".join(reasons), [], 0, False)
-        out = []
-        for n in graph.nodes:
-            if n.path != norm:
-                continue
-            kind = n.kind.value if hasattr(n.kind, "value") else str(n.kind)
-            if kind == "file":
-                continue
-            out.append(
-                {
-                    "id": n.id,
-                    "kind": kind,
-                    "name": n.name,
-                    "line": n.line,
-                }
-            )
-        return _scan_ok(out, "code_graph")
-    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-        reasons.append(f"code graph: {exc}")
-        return SymbolScan(False, "", "; ".join(reasons), [], 0, False)
+    return SymbolScan(False, "", "; ".join(reasons), [], 0, False)
 
 
 async def handle_impact(root: Path, arguments: dict) -> list[TextContent]:
@@ -942,6 +926,15 @@ def _structured_dead_code(
     path_prefix: str | None,
     min_confidence: str = "inferred",
 ) -> DeadCodeScan:
+    """Dead-symbol candidates from the kernel, or an explicit failure.
+
+    The kernel is the only engine here, for the reason
+    :func:`_symbols_for_path` states: the `load_code_graph` fallback that used
+    to sit below published through :func:`_dead_scan_ok` with
+    ``producer_total=None, producer_truncated=False``, so a Python answer
+    reached `devcouncil_liveness` wearing the kernel's "complete and
+    untruncated" shape.
+    """
     data = _load_repo_map(root) or {}
     reasons: list[str] = []
     try:
@@ -1014,31 +1007,7 @@ def _structured_dead_code(
             )
     except Exception as exc:  # noqa: BLE001 - reported, not swallowed
         reasons.append(f"devmap: {exc}")
-    try:
-        from devcouncil.indexing.graph.build import load_code_graph
-        from devcouncil.indexing.graph.liveness import confidence_at_least
-
-        graph = load_code_graph(root)
-        if graph is None:
-            reasons.append("no code graph (run `dev map`)")
-            return DeadCodeScan(False, "", "; ".join(reasons), [], 0, 0, False)
-        matched = []
-        in_scope = 0
-        hidden = 0
-        for d in graph.dead_code:
-            if not _matches_filters(d.path, data, area=area, path_prefix=path_prefix):
-                continue
-            in_scope += 1
-            if not confidence_at_least(d.confidence, min_confidence):
-                hidden += 1
-                continue
-            matched.append(d.model_dump())
-        return _dead_scan_ok(
-            matched, source="code_graph", total=in_scope, hidden_low_confidence=hidden
-        )
-    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-        reasons.append(f"code graph: {exc}")
-        return DeadCodeScan(False, "", "; ".join(reasons), [], 0, 0, False)
+    return DeadCodeScan(False, "", "; ".join(reasons), [], 0, 0, False)
 
 
 async def handle_graph_ingest(root: Path, arguments: dict) -> list[TextContent]:
