@@ -19,9 +19,10 @@ use crate::schema::{
     CREATE_SCHEMA_V3, CURRENT_SCHEMA_VERSION, MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12,
     MIGRATION_V12_TO_V13, MIGRATION_V14_TO_V15, MIGRATION_V15_TO_V16, MIGRATION_V16_TO_V17,
     MIGRATION_V17_TO_V18_BACKFILL_EDGES, MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED,
-    MIGRATION_V17_TO_V18_RENAME_EDGES, MIGRATION_V17_TO_V18_RENAME_UNRESOLVED, MIGRATION_V3_TO_V4,
-    MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
-    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, VALIDITY_RANGE_TABLES,
+    MIGRATION_V17_TO_V18_RENAME_EDGES, MIGRATION_V17_TO_V18_RENAME_UNRESOLVED,
+    MIGRATION_V18_TO_V19, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES,
+    MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9,
+    MIGRATION_V9_TO_V10, VALIDITY_RANGE_TABLES,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -773,6 +774,85 @@ fn identity_digest<T: std::hash::Hash>(identity: &T) -> u64 {
     hasher.finish()
 }
 
+/// A 128-bit digest of a *multiset* of row identities, and its size.
+///
+/// One source file's contribution to a ranged relation, as one comparable
+/// value. Two files' row sets are the same set exactly when their digests
+/// agree — practically, not provably, and the size of that gap is the whole
+/// safety argument, so it is stated rather than assumed:
+///
+/// * **Order-independent, multiplicity-aware.** The combiner is wrapping
+///   addition, which makes the digest a function of the multiset alone. That
+///   matters twice. The resolver's emission order within a file is not a
+///   promise anyone has made, so an order-sensitive digest would report false
+///   differences and quietly give back the saving. And `XOR` — the other
+///   obvious combiner — would make a row cancel its own duplicate, so a file
+///   holding a tuple twice and one holding it four times would digest alike.
+///   475 edge tuples and 12,424 ledger tuples of this repository occur more
+///   than once in a single generation, so that is a live case and not a
+///   theoretical one.
+/// * **128 bits, from two independent hashes.** `lo` and `hi` are
+///   [`identity_digest`] of the identity and of the identity behind a
+///   domain-separating salt — the same PRF on two different messages. A false
+///   "unchanged" needs the changed multiset to preserve `rows`, `lo` and `hi`
+///   at once; for row digests that behave as random 64-bit values that is
+///   ~2^-128 per file per build, against ~1,600 files and one build per edit.
+/// * **The count is carried, not derived.** It is a third field rather than a
+///   convenience: `rows` alone catches every change that adds or removes rows,
+///   which is most of them, without either sum being consulted.
+///
+/// The identity hashed is [`EdgeTuple`] / [`UnresolvedTuple`] itself, never a
+/// hand-picked subset of their columns. That is the point of load in this whole
+/// design: a column added to an identity is a column the digest covers on the
+/// same commit, and there is no second list of "the fields that matter" to fall
+/// out of step with the first. A digest over a subset would let a build keep a
+/// row whose stored value it no longer agrees with — exactly the carry-forward
+/// staleness `EdgeTuple`'s own doc comment refuses.
+#[cfg(feature = "parse")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RowSetDigest {
+    rows: u64,
+    lo: u64,
+    hi: u64,
+}
+
+/// Domain separation for [`RowSetDigest`]'s second hash.
+///
+/// Any value works as long as it is not the empty prefix; this one is
+/// arbitrary. It is written into the hasher ahead of the identity, so `hi` is
+/// the same PRF as `lo` over a different message rather than a transformation
+/// of `lo` — a second 64 bits of entropy, not a second view of the first.
+#[cfg(feature = "parse")]
+const ROW_DIGEST_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
+
+#[cfg(feature = "parse")]
+impl RowSetDigest {
+    /// Fold one row's identity into the digest.
+    fn absorb<T: std::hash::Hash>(&mut self, identity: &T) {
+        self.rows = self.rows.wrapping_add(1);
+        self.lo = self.lo.wrapping_add(identity_digest(identity));
+        self.hi = self
+            .hi
+            .wrapping_add(identity_digest(&(ROW_DIGEST_SALT, identity)));
+    }
+
+    /// The three columns as SQLite stores them.
+    ///
+    /// SQLite has no unsigned integer type, so the same two's-complement
+    /// round trip the extraction cache uses for its content hashes.
+    fn to_columns(self) -> [i64; 3] {
+        [self.rows as i64, self.lo as i64, self.hi as i64]
+    }
+
+    fn from_columns(rows: i64, lo: i64, hi: i64) -> Self {
+        Self {
+            rows: rows as u64,
+            lo: lo as u64,
+            hi: hi as u64,
+        }
+    }
+}
+
 /// Bucket `count` identities by digest, chaining collisions.
 ///
 /// Returns `(buckets, chain)`: `buckets[digest]` is the newest index with that
@@ -942,6 +1022,21 @@ pub struct GenerationWriteOpts {
     /// `save_generation_with_metadata` refuses a generation whose two halves
     /// disagree about which of them it is.
     pub discovery_refusals: Option<Vec<DiscoveryRefusal>>,
+    /// Compare every stored row, rather than only the files whose freshly
+    /// resolved rows disagree with the digest the previous generation recorded.
+    ///
+    /// The escape hatch for the v19 scoping, and the switch the equivalence
+    /// test in `digest_scoped_delta.rs` flips to prove the two paths write the
+    /// same store. It is not the same lever as an empty affected set: a full
+    /// rewrite re-*extracts* every file, which is minutes, while this keeps the
+    /// incremental extraction and only re-derives which stored rows are still
+    /// wanted, which is the ~200 ms the scoping saves. `devmap build
+    /// --verify-rows` is the caller that sets it.
+    ///
+    /// A full rewrite implies it — with no previous generation to have written
+    /// digests, and every row of the relation being replaced, there is nothing
+    /// to scope by — so callers of that path need not also set it.
+    pub verify_every_row: bool,
 }
 
 /// What one generation write spent, charged to the relation that spent it.
@@ -976,6 +1071,11 @@ pub struct WriteBreakdown {
     pub edges: f64,
     /// The unresolved-call ledger delta, the same three passes.
     pub unresolved: f64,
+    /// `generation_file_digests` -- writing the per-file digests the *next*
+    /// build scopes its two deltas by. Only the table write: computing a digest
+    /// is part of the pass over the relation it describes, and is charged to
+    /// `edges` and `unresolved` where the rows are.
+    pub digests: f64,
     /// `generation_coverage_gaps`, including the carry-forward scan.
     pub gaps: f64,
     /// `generation_dead_symbols`.
@@ -999,6 +1099,7 @@ impl WriteBreakdown {
             fts,
             edges,
             unresolved,
+            digests,
             gaps,
             dead,
             history,
@@ -1010,6 +1111,7 @@ impl WriteBreakdown {
             ("fts", fts),
             ("edges", edges),
             ("unresolved", unresolved),
+            ("digests", digests),
             ("gaps", gaps),
             ("dead", dead),
             ("history", history),
@@ -1445,6 +1547,24 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
     (
         "generation_coverage_gaps",
         &["generation_id", "gap", "path", "reason"],
+    ),
+    // v19's digest cache. Listed for the same reason the two above are: nothing
+    // reads it but the write path, so a migration that created it with the
+    // wrong columns would be caught by nothing until a build tried to record a
+    // digest — and a build that cannot record one silently loses the scoping
+    // rather than failing, which is the worst way for this table to be wrong.
+    (
+        "generation_file_digests",
+        &[
+            "generation_id",
+            "file_id",
+            "edge_rows",
+            "edge_lo",
+            "edge_hi",
+            "unresolved_rows",
+            "unresolved_lo",
+            "unresolved_hi",
+        ],
     ),
     (
         "generation_unresolved",
@@ -2041,6 +2161,7 @@ impl Store {
                 // stores old enough to need it.
                 tx.execute_batch(VALIDITY_RANGE_TABLES)?;
                 tx.execute_batch(COVERAGE_GAPS_TABLE)?;
+                tx.execute_batch(MIGRATION_V18_TO_V19)?;
                 Self::validate_schema(&tx)?;
                 tx.execute(
                     &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION),
@@ -2335,9 +2456,28 @@ impl Store {
                 tx.execute_batch(MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED)?;
             }
             tx.execute("PRAGMA user_version = 18", [])?;
-            Self::validate_schema(&tx)?;
+            // No mid-chain validation: `validate_schema` asserts the *current*
+            // schema, and a v18 database legitimately has no
+            // `generation_file_digests` until the step below runs.
             tx.commit()?;
             version = 18;
+        }
+        if version == 18 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Purely additive, and idempotent by `IF NOT EXISTS`. There is no
+            // backfill and there deliberately cannot be one: a digest is a
+            // function of the resolver's output for a file, and SQL cannot
+            // re-derive that from the stored rows without deciding, per file,
+            // which of them the *next* build would still want — which is the
+            // question the write path answers and this table only caches. An
+            // absent digest reads as "unknown" and makes the next build compare
+            // that file's rows exactly as v18 did, so the empty table is a
+            // correct starting state rather than a gap to be filled.
+            tx.execute_batch(MIGRATION_V18_TO_V19)?;
+            tx.execute("PRAGMA user_version = 19", [])?;
+            Self::validate_schema(&tx)?;
+            tx.commit()?;
+            version = 19;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
@@ -3717,6 +3857,57 @@ impl Store {
         // 102,083 edges is 102,083 heap allocations held for the length of the
         // write. It is the same string by construction, because it is the same
         // expression.
+        //
+        // Since v19 the comparison is itself a difference. An edge belongs to
+        // its source file and so does an unresolved call, so a file whose
+        // freshly resolved rows digest to what the previous generation recorded
+        // holds exactly the rows already stored: nothing of it is read back,
+        // nothing of it is compared, and nothing of it is written. The measured
+        // shape this addresses is a build that stores one row and reads two
+        // hundred thousand -- 107,257 edge rows and 91,703 ledger rows on this
+        // repository, 66% of `persist:write`.
+        //
+        // The digest is over what the *resolver produced*, never over what the
+        // caller said was affected. Those differ in exactly the case the
+        // paragraphs above describe: an edge from an unchanged file into a
+        // target whose identity moved resolves differently today while its
+        // source file never enters the affected set. Its digest moves with it
+        // and its comparison runs. Scoping on the affected set instead would
+        // reintroduce the staleness this loop refuses.
+        let scope_by_digest = !opts.verify_every_row && !full_rewrite && prev_gen.is_some();
+        let mut stored_edge_digests: std::collections::HashMap<u32, RowSetDigest> =
+            std::collections::HashMap::new();
+        let mut stored_unresolved_digests: std::collections::HashMap<String, RowSetDigest> =
+            std::collections::HashMap::new();
+        if let (true, Some(prev)) = (scope_by_digest, prev_gen) {
+            let _charge = charge(&mut spent.digests);
+            // The edge side is keyed by `paths.id` and the ledger side by the
+            // path text, because that is what each relation's own rows carry:
+            // `edge_rows.source_file_id` is an id and `unresolved_rows`'
+            // `source_file` is a path. Joining `paths` here is what lets each
+            // scan compare against its own key without translating per row.
+            let mut stmt = tx.prepare(
+                "SELECT d.file_id, p.path, d.edge_rows, d.edge_lo, d.edge_hi,
+                        d.unresolved_rows, d.unresolved_lo, d.unresolved_hi
+                   FROM generation_file_digests d
+                   JOIN paths p ON p.id = d.file_id
+                  WHERE d.generation_id = ?1",
+            )?;
+            let mut rows = stmt.query(params![prev])?;
+            while let Some(row) = rows.next()? {
+                let file_id: u32 = row.get(0)?;
+                let path: String = row.get(1)?;
+                stored_edge_digests.insert(
+                    file_id,
+                    RowSetDigest::from_columns(row.get(2)?, row.get(3)?, row.get(4)?),
+                );
+                stored_unresolved_digests.insert(
+                    path,
+                    RowSetDigest::from_columns(row.get(5)?, row.get(6)?, row.get(7)?),
+                );
+            }
+        }
+
         let mut kind_labels: std::collections::HashMap<EdgeKind, String> =
             std::collections::HashMap::new();
         let edge_charge = charge(&mut spent.edges);
@@ -3746,22 +3937,124 @@ impl Store {
             edge_ord += 1;
         }
 
+        // What this build resolved, per source file, as one comparable value
+        // each. Computed on every build and not only on scoped ones: it is what
+        // the *next* build compares against, so a build that skipped it would
+        // cost the following one the whole saving.
+        let mut fresh_edge_digests: std::collections::HashMap<u32, RowSetDigest> =
+            std::collections::HashMap::new();
+        for (index, edge) in resolution.edges.iter().enumerate() {
+            let Some((src_f_id, tgt_f_id)) = edge_ids[index] else {
+                continue;
+            };
+            fresh_edge_digests
+                .entry(src_f_id)
+                .or_default()
+                .absorb(&edge_tuple(edge, &kind_labels, src_f_id, tgt_f_id));
+        }
+        // How many rows each of those files *actually* has live, asked of the
+        // rows rather than of the record.
+        //
+        // A digest is a claim a previous build recorded about what it wrote,
+        // and a claim is not the store. `incremental_equivalence.rs` is built
+        // on the case where the two part company: `drop_stored_edges` deletes
+        // live rows behind the write path, standing in for an older kernel that
+        // recorded fewer of them, and the build is required to commit the cold
+        // answer anyway. A delta that trusted the digest alone would read
+        // "unchanged", skip the file, and leave those rows missing for ever —
+        // which is the class
+        // `stored_edges_that_disagree_with_a_fresh_resolution_are_replaced_not_carried`
+        // exists to refuse, and which this loop's own comment refuses in the
+        // paragraph above.
+        //
+        // So a file is skipped only when the rows agree with the record as well
+        // as with this build: one integer column per live row, no allocation
+        // and no comparison, against the four string allocations and the
+        // field-by-field compare the skip avoids.
+        //
+        // **What it covers, stated because the gap is the safety argument.**
+        // Every row added to or removed from a file by anything other than this
+        // write path — a repair, an older kernel, a hand-edited database. Not a
+        // content column overwritten in place with the row count preserved, and
+        // nothing outside a test does that: the only `UPDATE` either ranged
+        // table takes in this crate sets `valid_to`, twice, in this function.
+        // A row's content is written by its `INSERT` and never again.
+        let mut live_edge_rows: std::collections::HashMap<u32, u64> = fresh_edge_digests
+            .keys()
+            .map(|file_id| (*file_id, 0))
+            .collect();
+        if scope_by_digest {
+            let mut stmt =
+                tx.prepare("SELECT source_file_id FROM edge_rows WHERE valid_to IS NULL")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                // A file this build resolved nothing for is not a candidate to
+                // skip, so its live rows need no count — the scan below
+                // compares and closes them either way.
+                if let Some(count) = live_edge_rows.get_mut(&row.get::<_, u32>(0)?) {
+                    *count += 1;
+                }
+            }
+        }
+        // A file is unchanged only when a digest was *found* and matched. The
+        // three ways there can be no entry — a v18 store that migrated with an
+        // empty table, a file this generation resolved for the first time, a
+        // file whose rows the previous build wrote under `verify_every_row` —
+        // all land on "compare it", which is v18's behaviour exactly. Absence
+        // is never equality.
+        let unchanged_edge_files: std::collections::HashSet<u32> = if scope_by_digest {
+            fresh_edge_digests
+                .iter()
+                .filter(|(file_id, fresh)| {
+                    stored_edge_digests.get(file_id) == Some(*fresh)
+                        && live_edge_rows.get(file_id) == Some(&fresh.rows)
+                })
+                .map(|(file_id, _)| *file_id)
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         // A *multiset*, not a set. 475 edge tuples of this repository occur more
         // than once in one generation (1,111 rows); collapsing them would drop
         // rows the analysis counted and make the equality below refuse the
         // build. The multiset is `matched` — one bit per resolved edge — rather
         // than a count per distinct tuple, so two identical edges are two
         // entries that are consumed one at a time.
-        let (edge_buckets, edge_chain) = bucket_identities(resolution.edges.len(), |index| {
+        //
+        // One closure, named and handed to both the bucketing and the search,
+        // rather than the same body written out twice. `bucket_identities`'
+        // doc says why the two must agree about what an identity *is*; since
+        // v19 they must also agree about which indexes are offered at all, and
+        // a second copy of the `unchanged_edge_files` test is exactly the drift
+        // that doc describes — a structure built under one rule and searched
+        // under another, whose symptom is not a crash but a build that keeps
+        // rows it should have closed.
+        let edge_identity = |index: usize| -> Option<EdgeTuple<'_>> {
             let (src_f_id, tgt_f_id) = edge_ids[index]?;
+            // Not a candidate for anything: this file's live rows are not read
+            // back, so nothing can claim them, and its fresh rows are already
+            // stored, so nothing may insert them.
+            if unchanged_edge_files.contains(&src_f_id) {
+                return None;
+            }
             Some(edge_tuple(
                 &resolution.edges[index],
                 &kind_labels,
                 src_f_id,
                 tgt_f_id,
             ))
-        });
-        let mut edge_matched: Vec<bool> = vec![false; resolution.edges.len()];
+        };
+        let (edge_buckets, edge_chain) = bucket_identities(resolution.edges.len(), edge_identity);
+        // Pre-claimed rather than left false: an unchanged file's rows are
+        // already valid, so the insert loop below must not write them again,
+        // and it skips exactly what is marked here.
+        let mut edge_matched: Vec<bool> = (0..resolution.edges.len())
+            .map(|index| {
+                edge_ids[index]
+                    .is_some_and(|(src_f_id, _)| unchanged_edge_files.contains(&src_f_id))
+            })
+            .collect();
 
         // The rows already valid, streamed rather than materialised: the probe
         // key is built per row and dropped, so the peak is this map plus the
@@ -3775,9 +4068,18 @@ impl Store {
             )?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
+                // The partition column first, and on its own. A row belonging
+                // to an unchanged file costs one integer decode here instead of
+                // the four string allocations, the hash and the field-by-field
+                // comparison below — measured at 51 ms of the 68 ms this loop
+                // spent on 107,257 rows.
+                let source_file_id: u32 = row.get(1)?;
+                if unchanged_edge_files.contains(&source_file_id) {
+                    continue;
+                }
                 let edge_id: i64 = row.get(0)?;
                 let live = EdgeTuple {
-                    source_file_id: row.get(1)?,
+                    source_file_id,
                     target_file_id: row.get(2)?,
                     source_symbol: std::borrow::Cow::Owned(row.get(3)?),
                     target_symbol: std::borrow::Cow::Owned(row.get(4)?),
@@ -3799,15 +4101,7 @@ impl Store {
                     &edge_chain,
                     &mut edge_matched,
                     &live,
-                    |index| {
-                        let (src_f_id, tgt_f_id) = edge_ids[index]?;
-                        Some(edge_tuple(
-                            &resolution.edges[index],
-                            &kind_labels,
-                            src_f_id,
-                            tgt_f_id,
-                        ))
-                    },
+                    edge_identity,
                 );
                 if !still_valid {
                     close_edges.push(edge_id);
@@ -4051,6 +4345,10 @@ impl Store {
         // line apart held 89,743 rows and **65,567 distinct tuples on both
         // sides, with nothing appearing and nothing disappearing** — a ledger
         // that had not changed at all and was rewritten in full every time.
+        // Declared out here because the digest write below reads it, and the
+        // block it is filled in is scoped to the charge it belongs to.
+        let mut fresh_unresolved_digests: std::collections::HashMap<&str, RowSetDigest> =
+            std::collections::HashMap::new();
         {
             let _charge = charge(&mut spent.unresolved);
             // 12,424 ledger tuples of this repository occur more than once in
@@ -4076,11 +4374,71 @@ impl Store {
                         .map(std::borrow::Cow::Borrowed),
                 }
             };
+            // The same per-file digest the edges get, keyed by the path
+            // `unresolved_rows` itself stores rather than by a `paths` id: the
+            // scan below reads that column, and translating 91,703 of them per
+            // build to look each one up would cost more than the lookup saves.
+            for (index, unresolved) in resolution.unresolved.iter().enumerate() {
+                fresh_unresolved_digests
+                    .entry(unresolved.source_file.as_str())
+                    .or_default()
+                    .absorb(&unresolved_tuple(index));
+            }
+            // The ledger's half of the check the edge pass documents: the rows
+            // are asked how many of them there are, so a row deleted behind the
+            // write path is never mistaken for a row still stored.
+            //
+            // The map is seeded from the fresh paths and only ever incremented
+            // through `get_mut`, so a borrowed `&str` off the row answers it and
+            // 91,703 lookups allocate nothing.
+            let mut live_unresolved_rows: std::collections::HashMap<&str, u64> =
+                fresh_unresolved_digests
+                    .keys()
+                    .map(|path| (*path, 0))
+                    .collect();
+            if scope_by_digest {
+                let mut stmt =
+                    tx.prepare("SELECT source_file FROM unresolved_rows WHERE valid_to IS NULL")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    if let Some(count) = live_unresolved_rows.get_mut(row.get_ref(0)?.as_str()?) {
+                        *count += 1;
+                    }
+                }
+            }
+            let unchanged_unresolved_files: std::collections::HashSet<&str> = if scope_by_digest {
+                fresh_unresolved_digests
+                    .iter()
+                    .filter(|(path, fresh)| {
+                        stored_unresolved_digests.get(**path) == Some(*fresh)
+                            && live_unresolved_rows.get(**path) == Some(&fresh.rows)
+                    })
+                    .map(|(path, _)| *path)
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
+
+            // One closure for the bucketing and the search, for the reason the
+            // edge pass names: the two must agree about which indexes are
+            // offered, not only about what an identity is.
+            let ledger_identity = |index: usize| -> Option<UnresolvedTuple<'_>> {
+                if unchanged_unresolved_files
+                    .contains(resolution.unresolved[index].source_file.as_str())
+                {
+                    return None;
+                }
+                Some(unresolved_tuple(index))
+            };
             let (ledger_buckets, ledger_chain) =
-                bucket_identities(resolution.unresolved.len(), |index| {
-                    Some(unresolved_tuple(index))
-                });
-            let mut ledger_matched: Vec<bool> = vec![false; resolution.unresolved.len()];
+                bucket_identities(resolution.unresolved.len(), ledger_identity);
+            let mut ledger_matched: Vec<bool> = resolution
+                .unresolved
+                .iter()
+                .map(|unresolved| {
+                    unchanged_unresolved_files.contains(unresolved.source_file.as_str())
+                })
+                .collect();
 
             let mut close_rows: Vec<i64> = Vec::new();
             {
@@ -4091,6 +4449,17 @@ impl Store {
                 )?;
                 let mut rows = stmt.query([])?;
                 while let Some(row) = rows.next()? {
+                    // `get_ref` rather than `get`, and only for the membership
+                    // test: the partition column is consulted for every live
+                    // row and owned for almost none of them, so the borrowed
+                    // `&str` answers the question and the `String` is allocated
+                    // only for a row that is going to be compared. It does not
+                    // outlive the condition — a `ValueRef` borrows the
+                    // statement, not the row, and holding one across
+                    // `rows.next()` is a borrow the loop cannot have.
+                    if unchanged_unresolved_files.contains(row.get_ref(1)?.as_str()?) {
+                        continue;
+                    }
                     let unresolved_id: i64 = row.get(0)?;
                     let live = UnresolvedTuple {
                         source_file: std::borrow::Cow::Owned(row.get(1)?),
@@ -4107,7 +4476,7 @@ impl Store {
                         &ledger_chain,
                         &mut ledger_matched,
                         &live,
-                        |index| Some(unresolved_tuple(index)),
+                        ledger_identity,
                     );
                     if !still_valid {
                         close_rows.push(unresolved_id);
@@ -4145,6 +4514,61 @@ impl Store {
                     tuple.classification.as_ref(),
                     tuple.receiver.as_deref(),
                     gen_id,
+                ])?;
+            }
+        }
+
+        // What the *next* build scopes by.
+        //
+        // Written for every file that has at least one row in either relation,
+        // which is exactly the set that can have live rows after this write: a
+        // live row is either one this build re-derived and kept or one it just
+        // inserted, and both come from `resolution`. A file with no fresh rows
+        // therefore needs no digest — it has none of either relation left, and
+        // the next build reads its absence as "compare it" and finds nothing.
+        //
+        // Deleted paths are covered by the same statement rather than exempted
+        // from it. `edge_ids` is `None` for every edge touching one, so a
+        // deleted file contributes to no digest, is absent from this table, and
+        // its stored rows are compared and closed on the next build exactly as
+        // they are on this one.
+        //
+        // Row-per-file, not row-per-relation-per-file: the two digests share a
+        // key and are read together by the one query above, and splitting them
+        // would double a table whose whole purpose is to be cheap to read.
+        {
+            let _charge = charge(&mut spent.digests);
+            let mut digests: std::collections::HashMap<u32, (RowSetDigest, RowSetDigest)> =
+                std::collections::HashMap::with_capacity(fresh_edge_digests.len());
+            for (file_id, digest) in &fresh_edge_digests {
+                digests.entry(*file_id).or_default().0 = *digest;
+            }
+            for (path, digest) in &fresh_unresolved_digests {
+                // Interned here rather than in the per-row loop above: this is
+                // one lookup per *file*, and every one of these paths already
+                // has an id — a file with unresolved calls was extracted, and
+                // extraction is what put it in `paths`.
+                let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, path)?;
+                digests.entry(file_id).or_default().1 = *digest;
+            }
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO generation_file_digests
+                 (generation_id, file_id, edge_rows, edge_lo, edge_hi,
+                  unresolved_rows, unresolved_lo, unresolved_hi)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for (file_id, (edges, unresolved)) in &digests {
+                let [edge_rows, edge_lo, edge_hi] = edges.to_columns();
+                let [unresolved_rows, unresolved_lo, unresolved_hi] = unresolved.to_columns();
+                insert.execute(params![
+                    gen_id,
+                    file_id,
+                    edge_rows,
+                    edge_lo,
+                    edge_hi,
+                    unresolved_rows,
+                    unresolved_lo,
+                    unresolved_hi,
                 ])?;
             }
         }
@@ -6518,6 +6942,15 @@ impl Store {
             )?;
             tx.execute(
                 "DELETE FROM generation_coverage_gaps WHERE generation_id = ?1",
+                params![old_gen],
+            )?;
+            // The v19 digests go with their generation like every other
+            // per-generation copy. Only the newest generation's are ever read —
+            // it is the one the live rows belong to — and it is the one
+            // retention keeps by construction, so this deletes rows nothing
+            // would consult rather than rows something needs.
+            tx.execute(
+                "DELETE FROM generation_file_digests WHERE generation_id = ?1",
                 params![old_gen],
             )?;
             tx.execute(

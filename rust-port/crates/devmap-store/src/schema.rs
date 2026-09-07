@@ -932,9 +932,63 @@ SELECT u.source_file, u.source_symbol, u.callee_name, u.reason,
 DROP TABLE generation_unresolved_v17;
 "#;
 
+/// v19: each generation records, per source file, a digest of the rows it holds
+/// in the two ranged relations.
+///
+/// v18 made the *write* the difference between the freshly resolved multiset
+/// and the one already valid. It did not make the *comparison* a difference:
+/// deciding which stored rows are still wanted read back every live row of
+/// `edge_rows` and `unresolved_rows` and compared it field by field against the
+/// resolver's output. On this repository that is 107,257 edge rows and 91,703
+/// ledger rows re-read on a build that stores one, and `save_generation_timed`
+/// charges it at 66% of `persist:write` — the number the v19-for-nodes note
+/// below points at.
+///
+/// An edge belongs to its source file, and so does an unresolved call. A file
+/// whose freshly resolved rows digest to what the previous generation recorded
+/// holds exactly the rows already stored, so there is nothing in it to compare
+/// and nothing to write. The digest is over the resolver's *output*, not over
+/// the file's bytes, which is why it may be trusted where the affected set may
+/// not: an edge from an unchanged file into a target whose identity moved
+/// resolves differently today, its source file's digest moves with it, and the
+/// comparison for that file runs. That case is the carry-forward staleness the
+/// edge loop in `db.rs` refuses by construction, and it is why this rung keys
+/// on what was resolved rather than on what was edited.
+///
+/// # Why a table of its own rather than columns on `generation_file_rows`
+///
+/// That row is already per file per generation and would have held the columns.
+/// It is also the base table under the `generation_files` view, which every
+/// payload read joins, and it is `WITHOUT ROWID` — so six more columns widen
+/// the b-tree that a read walks. 2b98fef is the precedent for what a change of
+/// that shape costs when it is not measured: one index on this store's hottest
+/// read path cost every read 36%. A separate table is read by the write path
+/// and by nothing else, so no reader's plan can change.
+///
+/// # What a missing row means
+///
+/// Absent, never assumed. There is no backfill: a v18 store migrates with an
+/// empty digest table, every file reads as "unknown", and the first build after
+/// the migration compares every row exactly as v18 did — then records the
+/// digests it computed on the way. Absence is the safe direction at every
+/// point, which is what lets this rung be additive.
+pub const MIGRATION_V18_TO_V19: &str = r#"
+CREATE TABLE IF NOT EXISTS generation_file_digests (
+    generation_id   INTEGER NOT NULL,
+    file_id         INTEGER NOT NULL REFERENCES paths(id),
+    edge_rows       INTEGER NOT NULL,
+    edge_lo         INTEGER NOT NULL,
+    edge_hi         INTEGER NOT NULL,
+    unresolved_rows INTEGER NOT NULL,
+    unresolved_lo   INTEGER NOT NULL,
+    unresolved_hi   INTEGER NOT NULL,
+    PRIMARY KEY (generation_id, file_id)
+) WITHOUT ROWID;
+"#;
+
 /// The schema this binary writes.
 ///
-/// # Why there is no v19 putting the nodes on ranges
+/// # Why there is no v20 putting the nodes on ranges
 ///
 /// v18 ranged the edges and the unresolved ledger and left `generation_nodes`,
 /// `nodes_fts`/`nodes_fts_map`, `generation_file_rows`, `generation_dead_symbols`
@@ -986,7 +1040,10 @@ DROP TABLE generation_unresolved_v17;
 /// copying: it is the diff scan reading back 106,420 edge rows and 89,743
 /// ledger rows on every build to decide what is still valid. That is 66% of
 /// `persist:write`, and no further ranging touches it.
-pub const CURRENT_SCHEMA_VERSION: i32 = 18;
+///
+/// v19 is that rung — [`MIGRATION_V18_TO_V19`] — and it went where this
+/// paragraph pointed rather than where the schema's shape suggested.
+pub const CURRENT_SCHEMA_VERSION: i32 = 19;
 
 /// Every DDL batch a fresh store applies, in the order `Store::migrate` applies
 /// them.
@@ -1011,6 +1068,7 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     MIGRATION_V6_TO_V7,
     VALIDITY_RANGE_TABLES,
     COVERAGE_GAPS_TABLE,
+    MIGRATION_V18_TO_V19,
 ];
 
 /// Strip SQL line comments so a scan of DDL text cannot read prose as code.

@@ -109,6 +109,7 @@ const RELATIONS: &[&str] = &[
     "fts",
     "edges",
     "unresolved",
+    "digests",
     "gaps",
     "dead",
     "history",

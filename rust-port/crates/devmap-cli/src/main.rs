@@ -565,6 +565,22 @@ enum Commands {
         /// stand in: it narrows the write, it does not widen the read.
         #[arg(long)]
         full: bool,
+        /// Re-derive the validity of every stored edge and unresolved call,
+        /// instead of comparing only the files whose freshly resolved rows
+        /// disagree with the digest schema 19 recorded beside the previous
+        /// generation.
+        ///
+        /// The cheap half of `--full`. `--full` re-parses every source, which
+        /// on a large repository is minutes; this keeps the incremental
+        /// extraction and widens only the comparison the *write* makes, which
+        /// is the ~200 ms the scoping saves. It is the recovery for a store
+        /// whose digests an operator distrusts, and it is what
+        /// `digest_scoped_delta.rs` compares the scoped path against.
+        ///
+        /// `--full` implies it: an empty affected set is the full-rewrite
+        /// signal, and a full rewrite never scopes.
+        #[arg(long)]
+        verify_rows: bool,
         /// Also write `repo_map.json` and `code_graph.json` from the generation
         /// this build leaves current, in this same process.
         ///
@@ -3031,6 +3047,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             affected: affected_flag,
             deleted,
             full,
+            verify_rows,
             manifest: write_manifest,
             output,
             graph_output,
@@ -3432,6 +3449,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     .map(|root| root.to_string_lossy().into_owned()),
                 build_started: Some(build_started),
                 discovery_refusals: Some(refusal_inventory),
+                verify_every_row: *verify_rows,
             };
             let head_sha = current_git_head(path).unwrap_or_else(|_| "unavailable".to_string());
             progress.stage(
