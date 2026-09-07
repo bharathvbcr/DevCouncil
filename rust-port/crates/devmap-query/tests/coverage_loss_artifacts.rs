@@ -80,7 +80,7 @@ fn artifacts(extractions: &[Extraction]) -> (Value, Value) {
     )
     .expect("graph renders");
     let (_, map) =
-        generate_manifest_with_edges(extractions, &analysis, freshness(), &resolution.edges);
+        generate_manifest_with_edges(extractions, &analysis, freshness(), &resolution.edges, None);
     (
         serde_json::from_str(&graph).unwrap(),
         serde_json::from_str(&map).unwrap(),
@@ -296,7 +296,7 @@ fn dead_symbol_candidates_rank_by_confidence_before_truncating() {
         extract_file("a_low.py", "def x(): pass\n"),
         extract_file("z_high.py", "def y(): pass\n"),
     ];
-    let (_, map) = generate_manifest_with_edges(&extractions, &analysis, freshness(), &[]);
+    let (_, map) = generate_manifest_with_edges(&extractions, &analysis, freshness(), &[], None);
     let map: Value = serde_json::from_str(&map).unwrap();
 
     let candidates = strings(&map["dead_symbol_candidates"]);
@@ -326,7 +326,7 @@ fn dead_symbol_candidates_rank_by_confidence_before_truncating() {
     assert_eq!(meta["by_confidence"]["shown"]["inferred"], 195);
 
     // Determinism: the same analysis renders the same list twice.
-    let (_, again) = generate_manifest_with_edges(&extractions, &analysis, freshness(), &[]);
+    let (_, again) = generate_manifest_with_edges(&extractions, &analysis, freshness(), &[], None);
     let again: Value = serde_json::from_str(&again).unwrap();
     assert_eq!(
         map["dead_symbol_candidates"],

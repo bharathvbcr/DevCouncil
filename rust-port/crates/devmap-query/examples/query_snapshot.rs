@@ -187,11 +187,16 @@ fn main() -> anyhow::Result<()> {
         pending_count: 0,
         stamped: devmap_query::StampedFreshness::default(),
     };
+    // The tree this generation indexed, as `write_consumer_artifacts` reads it,
+    // so the snapshot's `package_managers` / `test_commands` are the same
+    // answer `dev map manifest` would write.
+    let repo_root = store.latest_repo_root()?.map(std::path::PathBuf::from);
     let (_lean, manifest_json) = devmap_query::generate_manifest_with_edges(
         &extractions,
         &analysis,
         freshness.clone(),
         &resolved,
+        repo_root.as_deref(),
     );
     std::fs::write(out.join("repo_map.json"), &manifest_json)?;
     let (graph_json, _) = devmap_query::generate_code_graph_encodings(

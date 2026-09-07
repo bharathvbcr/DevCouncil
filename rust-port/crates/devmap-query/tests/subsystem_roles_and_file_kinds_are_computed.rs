@@ -66,6 +66,8 @@ fn manifest_for(extractions: Vec<devmap_extract::model::Extraction>) -> serde_js
         &analysis,
         FreshnessInfo::new("head".into(), 1, 0),
         &resolution.edges,
+        // No tree on disk behind these synthesised extractions.
+        None,
     );
     serde_json::from_str(&json).expect("the manifest is JSON")
 }

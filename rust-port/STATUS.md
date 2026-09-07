@@ -5594,6 +5594,242 @@ vector is live from extraction through persist by construction — resolve, anal
 the writer all read it — so "drop extractions once persisted" needs a streaming persist,
 which is the same structural change as §2.
 
+## Validity ranges: schema v18 (2026-09-06)
+
+§2 of the per-turn pass above measured the one-file touch build and named validity
+ranges as the answer without attempting them. This is that change, landed. Everything
+below is measured on this repository as a `git archive` corpus (1,591 files indexed,
+102,078 edges) with release binaries built into the same target directory from the two
+commits, run **interleaved** A B A B, n = 21, on a machine with sibling lanes compiling.
+
+### What the old shape actually cost, and why
+
+The six-build probe from §2, re-run on this base (`schema 17`, binary A):
+
+| build | store bytes | gens | `generation_edges` | `generation_unresolved` | persist:write | persist:vacuum | persist:prune | total |
+|---|---|---|---|---|---|---|---|---|
+| cold | 158,416,896 | 1 | 102,078 | 89,743 | 661 ms | 126 ms | — | 2.67 s |
+| 1 | 228,196,352 | 2 | 204,157 | 179,486 | 453 ms | 1 ms | — | 1.16 s |
+| 2 | 228,229,120 | 2 | 204,159 | 179,486 | 461 ms | 72 ms | 267 ms | 1.52 s |
+| 3–5 | ~228,200,000 | 2 | 204,16x | 179,486 | 454–472 ms | 67–90 ms | 260–276 ms | 1.50–1.54 s |
+
+The number §2 did not have is what actually *changed* between two of those generations.
+Compared NULL-safe over the whole stored tuple — the first attempt at this compared with
+`USING(candidate_total)`, which never matches a NULL and reported all 61,845
+NULL-bearing rows as changed:
+
+| relation | rows | distinct tuples | appeared | disappeared | duplicated tuples (rows) |
+|---|---|---|---|---|---|
+| `generation_edges` | 102,083 | 101,446 → 101,447 | **1** | 0 | 475 (1,111) |
+| `generation_unresolved` | 89,743 | 65,567 → 65,567 | **0** | 0 | 12,424 (36,600) |
+
+**One edge.** The rows were not re-derived because they had changed; they were
+re-derived because the relation was keyed by generation and nothing could express "still
+true".
+
+### The shape
+
+`edge_rows` and `unresolved_rows` hold the tuples with `[valid_from, valid_to)`;
+`generation_edges` and `generation_unresolved` keep their names and exact column sets as
+views over
+
+```sql
+JOIN generations g ON g.id >= e.valid_from AND (e.valid_to IS NULL OR g.id < e.valid_to)
+```
+
+which is the one owner of the range predicate. Every reader keyed on
+`generation_id = ?` is unchanged, and so are `tools/fanout.sql`, `tools/soak.sh`,
+`verify.sh`'s determinism digest, `benchmarks/map_bench.py` and the parity harness. The
+same trick v17 used for `generation_files`, for the same reason.
+
+A build compares the freshly resolved tuple multiset against the currently-valid one in
+memory, closes what disappeared, inserts what appeared. `save_generation_with_metadata`
+is still one `BEGIN IMMEDIATE` transaction, so a killed writer leaves either the old
+generation or the new one.
+
+Three things the measurement forced, each of which the obvious implementation gets
+wrong:
+
+* **A multiset, not a set.** 475 edge tuples and 12,424 ledger tuples occur more than
+  once in a single generation. A set-valued delta drops them, and the write path's
+  `edge_ord == analysis.total_edges` equality then refuses the *next* build — the store
+  would be unwritable, not merely wrong.
+* **`edge_read_order`'s last key can no longer be the emission ordinal.** A range row's
+  ordinal belongs to the generation that inserted it, so an incremental generation and a
+  cold one would order the same edges differently. It is `resolution` now — the last
+  column `StoredEdge` carries, so any pair still tied is a pair a caller cannot tell
+  apart. This was load-bearing, not theoretical: six rows of this repository tie on all
+  six earlier keys and differ only there, pairs like
+  `tests/unit/test_local_llm_calibration.py -> src/devcouncil/app/config.py` at
+  confidence 1, emitted once as `ImportScoped` and once as `ReceiverType`.
+* **The inserts must follow the resolver's emission order.** Writing the delta by
+  iterating the multiset is shorter and was measurably wrong; see "the read that paid
+  for it" below.
+
+An inverted range is refused by a `CHECK` on the table rather than by a scan at open.
+Read through the predicate, a row whose `valid_to <= valid_from` matches nothing at all —
+it does not error and it cannot double an edge, it *disappears*, and a graph missing an
+edge looks exactly like a graph that never had one. Scanning 102,083 rows on every
+`devmap search` to notice is a cost the schema can make free.
+
+### The result
+
+Six-build probe again, binary B:
+
+| build | store bytes | gens | persist:write | persist:vacuum | persist:prune | total |
+|---|---|---|---|---|---|---|
+| cold | 152,649,728 | 1 | — | — | — | — |
+| 1 | 164,855,808 | 2 | 485 ms | 15 ms | — | — |
+| 2–5 | ~164,180,000 | 2 | 296–352 ms | 13–16 ms | 75–91 ms | — |
+
+(Total build time from this probe is omitted on purpose: it ran while the interleaved
+A/B below was not, and single sequential runs on a contended machine are not a time
+measurement. The A/B is.)
+
+**Rows physically written per one-file build**, read straight out of the store after the
+six builds (`SELECT valid_from, COUNT(*) FROM edge_rows GROUP BY valid_from`):
+
+| generation | edge rows inserted | ledger rows inserted |
+|---|---|---|
+| 1 (cold) | 102,078 | 89,743 |
+| 2 | **1** | **0** |
+| 3 | **1** | **0** |
+| 4 | **1** | **0** |
+| 5 | **1** | **0** |
+| 6 | **1** | **0** |
+
+191,822 rows → 1. `edge_rows` holds 102,083 rows in total, none of them closed, against
+`generation_edges`' 204,165 before.
+
+Interleaved A/B against the final binary, n = 21 (n = 11 for peak RSS), half-run
+minimum drift in brackets:
+
+| measurement | A (schema 17) p50 | B (schema 18) p50 | A min | B min | verdict |
+|---|---|---|---|---|---|
+| one-file incremental build | 1,822 ms | **1,286 ms** | 1,553 ms [92] | **1,148 ms** [14] | −29 % p50, −26 % min, far outside drift |
+| steady-state store | 228.2 MB | **164.2 MB** | — | — | −28 % |
+| cold build | 3,256 ms | 3,131 ms | 2,693 ms [59] | 2,579 ms [103] | −125 ms, the size of B's own drift — no regression, and no gain claimed |
+| cold `impact --depth 3` | 127 ms | 125 ms | 115 ms [9] | 116 ms [5] | inside drift — no result |
+| cold `search` | 39 ms | 38 ms | 31 ms [6] | 34 ms [2] | inside drift — no result |
+| peak RSS, cold build | 720.9 MB | 727.2 MB | 707.5 MB [8.5] | 715.1 MB [3.5] | +6.3 MB, inside A's own drift — no result |
+
+The one number here that is a *result* rather than an absence of one is the first: a
+one-file touch build costs a quarter less than it did, because it stops rewriting
+191,822 rows it already had.
+
+### The read that paid for it, twice
+
+Both of these were found by measuring the reads the change was not supposed to touch,
+and neither would have been visible from the write-side numbers above.
+
+**A partial index on `valid_to IS NULL` cost every read 36 %.** The design called for one
+to serve the diff scan. With *both* halves of `valid_to IS NULL OR valid_to > ?`
+indexed, SQLite plans the reader's scan as a MULTI-INDEX OR:
+
+```
+|--SEARCH g USING INTEGER PRIMARY KEY (rowid=?)
+`--MULTI-INDEX OR
+   |--SEARCH e USING INDEX idx_edge_rows_open (valid_from<?)
+   `--SEARCH e USING INDEX idx_edge_rows_closed (valid_to>?)
+```
+
+— 102,083 rowid lookups instead of one sequential pass. Cold `impact --depth 3` went
+111 → 151 ms p50, 106 → 138 min, with half-run min drift of 1–2 ms. Only the
+`IS NOT NULL` half is kept: the OR becomes unindexable, the plan is `SCAN e`, and the
+prune's `valid_to <= ?` still has its index. The diff scan wants every live row, so a
+sequential pass was always the right plan for it — the index would have read the same
+rows in the same order through one more level of indirection.
+
+*The first attempt to confirm this was itself wrong and is worth recording.* Dropping the
+indexes by hand from a copy of the store made `impact` appear to run in 31 ms, three
+times faster than schema 17. It was not running at all: `validate_schema` refuses a store
+missing a declared index, so every one of those 15 samples timed an error message. A
+check that could not run reported a better number than one that ran and passed.
+
+**Inserting in `HashMap` order cost the read path's sort 32 % more cycles.** After the
+index fix `impact` was still 150 ms. `/usr/bin/time -l`, same corpus, same query:
+
+| | instructions retired | cycles elapsed |
+|---|---|---|
+| A (schema 17) | 1,191,779,234 | 369,551,858 |
+| B (schema 18, before the fix) | 1,187,911,883 | 488,388,348 |
+
+Identical work, 32 % more cycles — memory stalls, not instructions. The delta write was
+iterating the multiset to decide what to insert, and a `HashMap`'s order is arbitrary and
+varies per process, so the rows landed in no order at all.
+`latest_edges_uncached` is handed its rows in stored order and sorts them, and it had
+been getting the resolver's emission order — grouped by file, hence nearly sorted on the
+comparator's two most significant keys — for free. The tuples now live in a `Vec` in
+emission order with the multiset as a map into it, and the insert pass walks the `Vec`.
+
+### The write that paid for it: gate 6
+
+The two regressions above were reads. The third was the write, and no timing found it —
+`verify.sh` gate 6 did, on the first full run of the finished change:
+
+```
+probe: 122038 milli-bytes/candidate (cap 150000), 105108 at 200 candidates => 86% (max 125%)
+probe: model predicts 93 MiB from 694 B x 80000 edges + 86 B x 500000 candidates; measured is 118%
+PROBE FAIL: measured fan-out cost is 118% of the model's prediction (max 115%)
+GATE FAIL: memory-model probe
+```
+
+The delta asked "is this stored row still wanted?" by building a
+`HashMap<EdgeTuple, u32>` — and an `EdgeTuple` *is* the identity: five `Cow<str>` and
+two options of one, about 160 bytes. So the build held two copies of every edge it had
+just resolved, the resolver's and the map's, plus a `Vec<String>` of 89,743 formatted
+ledger reasons. Roughly 22 MB, 22 MB and 6 MB on this repository — invisible next to a
+700 MB peak, which is exactly why the absolute ceiling of gate 5 said nothing and the
+per-candidate coefficient of gate 6 did.
+
+Interleaved, five runs each, to establish that the gate was reporting the change rather
+than its own spread:
+
+| | % of model's prediction | milli-B/candidate | verdict |
+|---|---|---|---|
+| A (schema 17) | 100, 101, 101, 102, 103 | 87,403–92,056 | 5 × `MEMORY MODEL OK` |
+| B (before the fix) | 116, 117, 117, 117, 118 | 118,467–123,021 | 5 × `PROBE FAIL` |
+
+Three points of spread; fifteen points of gap.
+
+The fix is to stop copying what is already in memory. The multiset becomes an index over
+`resolution.edges`: a `HashMap<u64, u32>` from a 64-bit digest to an index, a `Vec<u32>`
+chaining collisions, and a `Vec<bool>` marking claimed candidates — twelve bytes an edge
+against the map's copy of every string. The ledger's reasons are formatted where they
+are compared instead of held in a parallel vector.
+
+Two properties are worth stating because the cheap version of this idea loses them:
+
+* **The digest is a filter and never an answer.** Every candidate a bucket offers is
+  compared field by field, so two identities that digest alike stay two identities and a
+  collision costs one failed comparison. `identity_digest` is the one function both the
+  bucketing and the search go through, so the structure cannot be built under one rule
+  and searched under another. `db::delta_bucket_tests` hashes a test identity to a
+  constant — every value collides, through the real digest path — and a search that
+  trusted the bucket claims `gamma` when asked for `beta`.
+* **It is still a multiset.** The `Vec<bool>` is what makes it one: a tuple that occurs
+  three times is three candidates, claimed one at a time, not one entry with a count.
+
+
+### What this does not do
+
+Peak RSS is 6 MB above schema 17's at the median — inside the drift of the A side's own
+minimum across the same run, so it is reported as no result rather than as a cost. Before
+the index replaced the tuple-keyed map it was 30 MB, comfortably outside that drift, and
+that one *was* a cost.
+
+The store is 164 MB steady-state, not 158 MB. The remaining two-generation growth is
+`generation_nodes`, `generation_file_rows` and `generation_dead_symbols`, which are
+still keyed by generation. Nodes are the largest of the three and are the same shape of
+problem with the same answer; they were out of this lane's scope.
+
+The migration carries a v17 store's rows as they stand, each generation's set becoming
+`[g, next_g)`, so a store is no smaller the instant it migrates — an edge two generations
+hold becomes two rows. Collapsing them would mean deciding in SQL which of two
+generations' rows are the same edge, which is exactly what the write path computes from a
+freshly resolved multiset and what a migration has no business inventing. The next build
+closes and the next prune reclaims.
+
 ## The cold query, without materialising the edge set (2026-09-06, lane P3)
 
 Continues §3 of the per-turn cost pass above and the read-order change that followed
@@ -5709,5 +5945,18 @@ generation's 17,869 edge symbols are neither a node `qualified_name` nor a path,
 314 edges name a source symbol with no matching node row, so resolving starts from the
 node table would silently lose starts.
 
-If Lane V's validity ranges land first, the index has to be keyed on the validity
-columns rather than on `generation_id`, which is a different index, not a rebase.
+Lane V's validity ranges (below) landed first, and they change what that index would
+have to be: `generation_edges` is now a **view** over `edge_rows` joined on
+`[valid_from, valid_to)`, so an index on `(generation_id, source_symbol)` cannot exist —
+there is no such column to index. The physical form would be
+`edge_rows(source_symbol, valid_from, valid_to)`, and whether SQLite will use it under
+the view's join is unmeasured. That is the next question, not a rebase of this one.
+
+What v18 did change here, and had to: the read order's last tie-break. It was the
+emission `ordinal`, which v18 cannot supply — a row carried across generations keeps the
+`edge_id` of the generation that first inserted it, so an incremental generation and a
+cold one would order the same edges differently. V replaced it with `resolution`, and
+the columnar comparator carries the same key: the resolution table is ranked in byte
+order like every other, and SQL NULL sorts where `Option::None` sorts, before every
+`Some`.
+

@@ -1,4 +1,6 @@
-use crate::model::{Extraction, ParseOutcome};
+#[cfg(feature = "parse")]
+use crate::model::Extraction;
+use crate::model::ParseOutcome;
 
 /// Analyzer version baked into cache keys (S14 / X7 admission contract).
 pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");

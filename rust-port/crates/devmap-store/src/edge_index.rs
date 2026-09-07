@@ -241,11 +241,12 @@ struct EdgeText {
     /// [`EdgeKind`] each parses to, in the same order.
     kind_labels: Vec<Arc<str>>,
     kind_values: Vec<EdgeKind>,
-    /// Distinct stored resolution labels, in first-seen order — the only
-    /// interned table whose rank is never a sort key, so nothing is gained by
-    /// ranking it. `None` is not a label: it is [`NO_RESOLUTION`] in the
-    /// column, so a row written before the column existed stays
-    /// distinguishable from one that stored a tier.
+    /// Distinct stored resolution labels in ascending byte order — a sort key
+    /// like the others since v18, where the read order's last tie-break is the
+    /// resolution rather than the emission ordinal. `None` is not a label: it
+    /// is [`NO_RESOLUTION`] in the column, so a row written before the column
+    /// existed stays distinguishable from one that stored a tier, and it sorts
+    /// where `Option::None` sorts.
     resolution_labels: Vec<Arc<str>>,
 }
 
@@ -312,10 +313,29 @@ impl Adjacency {
 ///
 /// `confidence DESC, source path, target path, source symbol, target symbol,
 /// edge kind` — the key `latest_edges_uncached`'s SQL used to hand to SQLite —
-/// and then `ordinal`, which SQL had no equivalent of and which makes the tail
-/// of the order defined instead of arbitrary. This order is the final
-/// tie-break of every answer derived from a walk (R4), so it has exactly one
-/// owner.
+/// and then `resolution`. This order is the final tie-break of every answer
+/// derived from a walk (R4), so it has exactly one owner.
+///
+/// # Why the last key is `resolution` and not the emission ordinal
+///
+/// It was `ordinal`, the position the resolver emitted the edge at, which SQL
+/// had no equivalent of and which made the tail of the order defined instead of
+/// arbitrary. v18 cannot supply that: a row's ordinal belongs to the generation
+/// that first inserted it, and a row carried across generations keeps it, so an
+/// incremental generation and a cold one would order the same edges differently.
+///
+/// `resolution` is a strictly better key, not a substitute. It is the last
+/// column `StoredEdge` carries, so any pair it still leaves tied is a pair whose
+/// every read column agrees — two rows a caller cannot tell apart, in either
+/// order. And it makes the read order a pure function of the stored tuples
+/// rather than of the order they happened to arrive in, which is what lets a
+/// generation assembled from carried rows be byte-identical to a cold one.
+///
+/// It is not hypothetical that the old key was load-bearing: six rows of this
+/// repository tie on all six keys above and differ only here — pairs like
+/// `tests/unit/test_local_llm_calibration.py -> src/devcouncil/app/config.py`
+/// at confidence 1, emitted once as `ImportScoped` and once as `ReceiverType`.
+/// Under `ordinal` their order was whichever the resolver reached first.
 ///
 /// Every key but the confidence is an [`EdgeText`] rank, and a rank comparison
 /// *is* the byte comparison SQL made: the ranks were assigned in ascending byte
@@ -336,11 +356,17 @@ fn edge_read_order(left: &EdgeSortKey, right: &EdgeSortKey) -> std::cmp::Orderin
         .then_with(|| left.source_symbol.cmp(&right.source_symbol))
         .then_with(|| left.target_symbol.cmp(&right.target_symbol))
         .then_with(|| left.kind.cmp(&right.kind))
-        .then_with(|| left.ordinal.cmp(&right.ordinal))
+        .then_with(|| left.resolution.cmp(&right.resolution))
 }
 
 /// One row's keys under [`edge_read_order`], gathered so the sort moves 40
 /// bytes per row instead of the whole column set.
+///
+/// Every key is a rank, and every rank table is in ascending byte order, so
+/// each `u32` comparison is the string comparison it stands for. `resolution`
+/// is the one that needs saying: it is `NO_RESOLUTION_ORDER` for SQL NULL and
+/// `rank + 1` otherwise, which is exactly how `Option<String>` orders — `None`
+/// before every `Some`, and `Some`s among themselves by their text.
 #[derive(Clone, Copy)]
 struct EdgeSortKey {
     confidence: f64,
@@ -349,10 +375,14 @@ struct EdgeSortKey {
     source_symbol: u32,
     target_symbol: u32,
     kind: u32,
-    ordinal: u32,
+    resolution: u32,
     /// Where the row currently sits in the builder's columns.
     row: u32,
 }
+
+/// Where a row with no stored resolution sorts: before every row that has one,
+/// because that is where `None` sorts among `Option<String>`s.
+const NO_RESOLUTION_ORDER: u32 = 0;
 
 /// Which ids a [`GenerationEdgesBuilder`] hands out.
 ///
@@ -396,7 +426,6 @@ pub struct GenerationEdgesBuilder {
     kind: Vec<u32>,
     resolution: Vec<u32>,
     confidence: Vec<f64>,
-    ordinal: Vec<u32>,
 }
 
 impl GenerationEdgesBuilder {
@@ -413,7 +442,6 @@ impl GenerationEdgesBuilder {
             kind: Vec::with_capacity(edges),
             resolution: Vec::with_capacity(edges),
             confidence: Vec::with_capacity(edges),
-            ordinal: Vec::with_capacity(edges),
         }
     }
 
@@ -446,10 +474,6 @@ impl GenerationEdgesBuilder {
     }
 
     /// Push one row, with its file paths already interned.
-    ///
-    /// `ordinal` is `generation_edges.ordinal` — the resolver's emission order.
-    /// It is the final key of [`edge_read_order`] and nothing else reads it, so
-    /// it is dropped once the ids are assigned.
     #[allow(clippy::too_many_arguments)]
     pub fn push_ranked(
         &mut self,
@@ -460,7 +484,6 @@ impl GenerationEdgesBuilder {
         edge_kind: &str,
         confidence: f64,
         resolution: Option<&str>,
-        ordinal: u32,
     ) -> Result<(), UnknownEdgeKind> {
         let kind = self.intern_kind(edge_kind)?;
         let source_symbol = intern(
@@ -488,7 +511,6 @@ impl GenerationEdgesBuilder {
         self.kind.push(kind);
         self.resolution.push(resolution);
         self.confidence.push(confidence);
-        self.ordinal.push(ordinal);
         Ok(())
     }
 
@@ -537,6 +559,28 @@ impl GenerationEdgesBuilder {
             &mut self.text.symbols,
             [&mut self.source_symbol, &mut self.target_symbol],
         );
+        // The `NO_RESOLUTION` sentinel is not a rank and must not be remapped
+        // as one, so the resolution column is reordered through a guard rather
+        // than through `reorder`'s straight lookup.
+        {
+            let names = &mut self.text.resolution_labels;
+            let mut order: Vec<u32> = (0..names.len() as u32).collect();
+            order
+                .sort_unstable_by(|left, right| names[*left as usize].cmp(&names[*right as usize]));
+            let mut new_rank = vec![0u32; names.len()];
+            for (rank, old) in order.iter().enumerate() {
+                new_rank[*old as usize] = rank as u32;
+            }
+            *names = order
+                .iter()
+                .map(|old| Arc::clone(&names[*old as usize]))
+                .collect();
+            for slot in self.resolution.iter_mut() {
+                if *slot != NO_RESOLUTION {
+                    *slot = new_rank[*slot as usize];
+                }
+            }
+        }
         // The kind label table carries a parallel `EdgeKind` column, so it is
         // permuted with its own names rather than through `reorder`.
         let mut order: Vec<u32> = (0..self.text.kind_labels.len() as u32).collect();
@@ -641,7 +685,10 @@ impl GenerationEdgesBuilder {
                     source_symbol: self.source_symbol[row],
                     target_symbol: self.target_symbol[row],
                     kind: self.kind[row],
-                    ordinal: self.ordinal[row],
+                    resolution: match self.resolution[row] {
+                        NO_RESOLUTION => NO_RESOLUTION_ORDER,
+                        rank => rank + 1,
+                    },
                     row: row as u32,
                 })
                 .collect();
@@ -866,7 +913,7 @@ impl GenerationEdges {
             );
         }
         let mut builder = GenerationEdgesBuilder::with_capacity(edges.len());
-        for (ordinal, edge) in edges.iter().enumerate() {
+        for edge in edges.iter() {
             let source_file = builder.intern_file(&edge.source_file);
             let target_file = builder.intern_file(&edge.target_file);
             builder.push_ranked(
@@ -877,7 +924,6 @@ impl GenerationEdges {
                 &edge.edge_kind,
                 edge.confidence as f64,
                 edge.resolution.as_deref(),
-                ordinal as u32,
             )?;
         }
         let mut index = builder.finish(analysis, EdgeOrder::AsPushed);

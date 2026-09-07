@@ -21,13 +21,21 @@
 //! comments name the rule: a degraded flag that is always on carries no
 //! information, and an empty list nothing computed is exactly that.
 //!
-//! Two are now computed from evidence the kernel already holds. The remaining
-//! six are marked `false`, each because the kernel cannot see what it would
-//! need: `package_managers` is a lockfile question and lockfiles are not
-//! indexed (`.lock` has no language spec, so `is_indexable_source` excludes
-//! them), `test_commands` needs manifest *contents*, `candidate_files` is
-//! goal-dependent, `dependency_risks` needs an SCA run, and `lsp`/`processes`
-//! have no producer in this kernel at all. Marked, not guessed. No third state.
+//! Four are computed from evidence the kernel holds. `frameworks` and the
+//! subsystem summaries come from the extractions; `package_managers` and
+//! `test_commands` come from `inventory::scan` over the repository root, which
+//! is the evidence the extractions genuinely do not carry (`.lock` has no
+//! language spec, so `is_indexable_source` excludes it) but the *kernel* is
+//! handed. The fixtures here synthesise their extractions and have no tree on
+//! disk, so those two report `false` for a reason this file states rather than
+//! assumes — see `a_manifest_with_no_tree_behind_it_says_the_inventory_did_not
+//! _run`, and `devmap-cli/tests/the_map_reads_the_repository_inventory.rs` for
+//! the computed case.
+//!
+//! The remaining four are marked `false` because the kernel cannot see what
+//! they would need: `candidate_files` is goal-dependent, `dependency_risks`
+//! needs an SCA run, and `lsp`/`processes` have no producer in this kernel at
+//! all. Marked, not guessed. No third state.
 
 #![cfg(feature = "parse")]
 
@@ -77,6 +85,7 @@ fn manifest() -> serde_json::Value {
         &analysis,
         FreshnessInfo::new("head".into(), 1, 0),
         &resolution.edges,
+        None,
     );
     serde_json::from_str(&json).expect("the manifest is JSON")
 }
@@ -172,6 +181,7 @@ fn a_repository_with_no_routes_still_reports_frameworks_as_computed() {
         &analysis,
         FreshnessInfo::new("head".into(), 1, 0),
         &resolution.edges,
+        None,
     );
     let map: serde_json::Value = serde_json::from_str(&json).expect("the manifest is JSON");
     assert_eq!(
@@ -234,15 +244,13 @@ fn subsystem_summaries_describe_composition_instead_of_being_blank() {
     );
 }
 
-/// The six that are marked `false` must be marked `false` — not quietly
+/// The four that are marked `false` must be marked `false` — not quietly
 /// flipped to `true` by someone filling the marker without filling the field.
 #[test]
 fn the_fields_this_kernel_cannot_see_admit_it() {
     let map = manifest();
     let meta = &map["meta"]["devmap_rust"];
     for marker in [
-        "package_managers_computed",
-        "test_commands_computed",
         "candidate_files_computed",
         "lsp_computed",
         "dependency_risks_computed",
@@ -254,6 +262,38 @@ fn the_fields_this_kernel_cannot_see_admit_it() {
             "{marker} claims the kernel computed a field it emits as a constant: {meta}"
         );
     }
+}
+
+/// `package_managers` and `test_commands` are computed *from the repository
+/// root*, and this fixture has none. A `false` marker here is therefore a
+/// statement about this call, not about the kernel — and it has to carry the
+/// reason, or the two kinds of `false` (no tree was named, versus a tree was
+/// walked and had nothing to say) become the same answer again.
+#[test]
+fn a_manifest_with_no_tree_behind_it_says_the_inventory_did_not_run() {
+    let map = manifest();
+    let meta = &map["meta"]["devmap_rust"];
+    for marker in ["package_managers_computed", "test_commands_computed"] {
+        assert_eq!(
+            meta[marker],
+            serde_json::json!(false),
+            "no repository root was passed, so nothing can have been read: {meta}"
+        );
+    }
+    let reason = meta["inventory_unavailable_reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        reason.contains("no repository root"),
+        "an uncomputed inventory must name why, or `false` is a flag with no          information behind it: {reason:?}"
+    );
+    assert!(
+        map["package_managers"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "and the value has to match the marker"
+    );
+    assert!(map["test_commands"].as_array().is_some_and(Vec::is_empty));
 }
 
 /// Determinism (R4): the same generation renders the same bytes.

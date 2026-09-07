@@ -17,8 +17,10 @@ use crate::schema::{
     declared_index_names, BUILD_HISTORY_RETENTION, BUILD_HISTORY_TABLE, COVERAGE_GAPS_TABLE,
     CREATE_SCHEMA_V3, CURRENT_SCHEMA_VERSION, MIGRATION_V10_TO_V11, MIGRATION_V11_TO_V12,
     MIGRATION_V12_TO_V13, MIGRATION_V14_TO_V15, MIGRATION_V15_TO_V16, MIGRATION_V16_TO_V17,
-    MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
-    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, UNRESOLVED_TABLE,
+    MIGRATION_V17_TO_V18_BACKFILL_EDGES, MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED,
+    MIGRATION_V17_TO_V18_RENAME_EDGES, MIGRATION_V17_TO_V18_RENAME_UNRESOLVED, MIGRATION_V3_TO_V4,
+    MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
+    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, VALIDITY_RANGE_TABLES,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -737,6 +739,198 @@ impl PathRanks {
     }
 }
 
+/// Everything about an edge that a generation stores, as one hashable value.
+///
+/// The identity a v18 validity range is keyed on: two rows with this tuple are
+/// the same edge, and a build that re-derives it leaves the existing row alone.
+/// Every column of `edge_rows` except the range itself and the row id is here,
+/// deliberately — a column left out would let a build silently keep a row whose
+/// stored value it no longer agrees with, which is the carry-forward staleness
+/// the edge loop's comment describes and refuses.
+///
+/// `Cow` because the two sides come from different places: the resolved side
+/// borrows out of `ResolutionResult` (no allocation for ~100k edges) and the
+/// stored side owns what SQLite handed back. `Cow`'s `Eq` and `Hash` are the
+/// underlying `str`'s, so borrowed and owned compare as the strings they are.
+///
+/// The confidence is the `f64` SQLite stores, compared by bit pattern: `f64` is
+/// not `Eq`, and any rounding here would merge two rows the read path can tell
+/// apart.
+#[cfg(feature = "parse")]
+#[derive(PartialEq, Eq, Hash)]
+struct EdgeTuple<'a> {
+    source_file_id: u32,
+    target_file_id: u32,
+    source_symbol: std::borrow::Cow<'a, str>,
+    target_symbol: std::borrow::Cow<'a, str>,
+    edge_kind: std::borrow::Cow<'a, str>,
+    confidence: u64,
+    resolution: Option<std::borrow::Cow<'a, str>>,
+    candidate_total: Option<i64>,
+}
+
+/// The end of a bucket chain. `u32::MAX` rather than `Option<u32>` so the array
+/// is four bytes an entry: it has one slot per resolved edge, and this store
+/// writes 102,083 of them.
+#[cfg(feature = "parse")]
+const NO_MORE_IN_BUCKET: u32 = u32::MAX;
+
+/// A 64-bit digest of a row's identity, for bucketing only.
+///
+/// **Never an answer.** Every candidate a bucket offers is compared field by
+/// field against the row before it is treated as the same row, so two identities
+/// that digest alike are still two identities. The digest exists because the
+/// alternative — a `HashMap` keyed by the identity itself — stores the identity
+/// twice, once in `resolution` and once in the map, and that second copy is
+/// 160 bytes an edge. Measured by `verify.sh` gate 6, which bounds the kernel's
+/// memory per unit of ambiguity fan-out: the map put the probe at 116-118 % of
+/// its model against a 115 % cap, over five interleaved runs where the base
+/// binary measured 100-103 %.
+///
+/// `DefaultHasher::new` seeds from fixed keys, not from `RandomState`, so one
+/// binary buckets the same way on every run — the standard library guarantees
+/// only that every `DefaultHasher` built by `new` agrees with every other, and
+/// not that the digest survives a Rust upgrade. Nothing here needs more than
+/// that: the digest is never stored, never compared across processes, and never
+/// leaves this call. A build whose internal structure is the same run to run is
+/// simply easier to reason about than one whose is not.
+#[cfg(feature = "parse")]
+fn identity_digest<T: std::hash::Hash>(identity: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    identity.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Bucket `count` identities by digest, chaining collisions.
+///
+/// Returns `(buckets, chain)`: `buckets[digest]` is the newest index with that
+/// digest and `chain[index]` the next one, or [`NO_MORE_IN_BUCKET`].
+///
+/// It takes the identity rather than a digest so that [`identity_digest`] is
+/// the one function that decides how anything is bucketed. The alternative —
+/// each caller digesting its own way on the way in — is a structure that can be
+/// built under one rule and searched under another, and the symptom of that is
+/// not a crash but a build that silently rewrites every row.
+///
+/// `identity_of` returns `None` for an index that is not part of this
+/// generation. That index is in no bucket at all, so nothing can match it.
+#[cfg(feature = "parse")]
+fn bucket_identities<T: std::hash::Hash>(
+    count: usize,
+    identity_of: impl Fn(usize) -> Option<T>,
+) -> (std::collections::HashMap<u64, u32>, Vec<u32>) {
+    let mut buckets: std::collections::HashMap<u64, u32> =
+        std::collections::HashMap::with_capacity(count);
+    let mut chain: Vec<u32> = vec![NO_MORE_IN_BUCKET; count];
+    for index in 0..count {
+        let Some(identity) = identity_of(index) else {
+            continue;
+        };
+        let digest = identity_digest(&identity);
+        let index = index as u32;
+        chain[index as usize] = buckets.insert(digest, index).unwrap_or(NO_MORE_IN_BUCKET);
+    }
+    (buckets, chain)
+}
+
+/// Consume the one candidate that *is* this row, and say whether there was one.
+///
+/// The bucket narrows the search; this comparison decides it. A digest is a
+/// filter and never an answer, so every candidate a bucket offers is compared
+/// field by field, and a collision merely costs a comparison that fails. The
+/// candidate is then marked, which is what makes the whole structure a multiset
+/// rather than a set: a row that occurs three times is three candidates, and the
+/// three live rows claim them one at a time.
+///
+/// `identity_of` returns `None` for an index that is not part of this
+/// generation. Those are unreachable through the buckets anyway — nothing put
+/// them there — and the check is kept so that the two are one statement apart
+/// and cannot drift into disagreeing.
+#[cfg(feature = "parse")]
+fn claim_matching_candidate<T: std::hash::Hash + PartialEq>(
+    buckets: &std::collections::HashMap<u64, u32>,
+    chain: &[u32],
+    matched: &mut [bool],
+    live: &T,
+    identity_of: impl Fn(usize) -> Option<T>,
+) -> bool {
+    let mut cursor = buckets
+        .get(&identity_digest(live))
+        .copied()
+        .unwrap_or(NO_MORE_IN_BUCKET);
+    while cursor != NO_MORE_IN_BUCKET {
+        let index = cursor as usize;
+        cursor = chain[index];
+        if matched[index] {
+            continue;
+        }
+        let Some(candidate) = identity_of(index) else {
+            continue;
+        };
+        if candidate == *live {
+            matched[index] = true;
+            return true;
+        }
+    }
+    false
+}
+
+/// The identity of one resolved edge, as `edge_rows` stores it.
+///
+/// The one owner: `save_generation_with_metadata` calls this to decide what to
+/// write and again to write it, so those two passes cannot come to disagree
+/// about which rows they mean.
+///
+/// `kind_labels` is the interned `format!("{:?}", kind)` of every kind in the
+/// generation. Formatting per *edge* instead is 102,083 heap allocations held
+/// for the length of the write, for a value that takes one of a dozen values.
+#[cfg(feature = "parse")]
+fn edge_tuple<'a>(
+    edge: &'a ResolvedEdge,
+    kind_labels: &'a std::collections::HashMap<EdgeKind, String>,
+    source_file_id: u32,
+    target_file_id: u32,
+) -> EdgeTuple<'a> {
+    EdgeTuple {
+        source_file_id,
+        target_file_id,
+        source_symbol: std::borrow::Cow::Borrowed(edge.source_symbol.as_str()),
+        target_symbol: std::borrow::Cow::Borrowed(edge.target_symbol.as_str()),
+        edge_kind: std::borrow::Cow::Borrowed(kind_labels[&edge.edge_kind].as_str()),
+        // Compared by bit pattern, which is what SQLite stores and what the read
+        // path compares. `f64` has no `Eq`, and rounding the key would let two
+        // rows the reader can tell apart share one.
+        confidence: edge.confidence.persist_real().to_bits(),
+        // The evidence tier, so the read path does not have to guess it back out
+        // of the row's file layout. NULL only for an edge built without a
+        // resolution at all, which the resolver never produces —
+        // `ResolvedEdge::new` takes one — and which the read path therefore
+        // reports as `ResolutionSource::Reconstructed`.
+        resolution: edge.resolution.as_ref().map(|resolution| {
+            std::borrow::Cow::Borrowed(crate::edge_index::resolution_kind_label(resolution))
+        }),
+        // How many candidates the ambiguous rung actually weighed, which since
+        // `AMBIGUOUS_FANOUT_CAP` is no longer the number of rows this site
+        // produces. NULL for every other rung: a resolution that names one
+        // target has no candidate list, and writing 1 there would make a certain
+        // edge look like a one-candidate ambiguity.
+        candidate_total: crate::edge_index::ambiguous_candidate_total(edge.resolution.as_deref()),
+    }
+}
+
+/// The same identity for one row of the unresolved-call ledger.
+#[cfg(feature = "parse")]
+#[derive(PartialEq, Eq, Hash)]
+struct UnresolvedTuple<'a> {
+    source_file: std::borrow::Cow<'a, str>,
+    source_symbol: std::borrow::Cow<'a, str>,
+    callee_name: std::borrow::Cow<'a, str>,
+    reason: std::borrow::Cow<'a, str>,
+    classification: std::borrow::Cow<'a, str>,
+    receiver: Option<std::borrow::Cow<'a, str>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredFile {
     pub path: String,
@@ -1039,6 +1233,7 @@ pub fn checked_min_confidence(value: f32) -> Result<f32> {
 /// A struct rather than eight positional parameters: five of the eight are
 /// `&str`, so a transposed pair would compile and store an engine description
 /// in the parse-outcome column. Named fields make that a compile error.
+#[cfg(feature = "parse")]
 struct StoredPayload<'a> {
     file_id: u32,
     content_hash: i64,
@@ -1125,6 +1320,41 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
     (
         "generation_file_rows",
         &["generation_id", "file_id", "payload_id"],
+    ),
+    // v18's two base tables, listed for the same reason v17's are: the views
+    // above are validated through `PRAGMA table_info`, which answers for a view
+    // without saying anything about what it is a view *over*. A migration that
+    // built the view over the wrong shape would pass the check above and fail at
+    // the first write.
+    (
+        "edge_rows",
+        &[
+            "edge_id",
+            "source_file_id",
+            "target_file_id",
+            "source_symbol",
+            "target_symbol",
+            "edge_kind",
+            "confidence",
+            "resolution",
+            "candidate_total",
+            "valid_from",
+            "valid_to",
+        ],
+    ),
+    (
+        "unresolved_rows",
+        &[
+            "unresolved_id",
+            "source_file",
+            "source_symbol",
+            "callee_name",
+            "reason",
+            "classification",
+            "receiver",
+            "valid_from",
+            "valid_to",
+        ],
     ),
     (
         "generation_coverage_gaps",
@@ -1461,6 +1691,7 @@ impl Store {
     /// The probe uses the same expressions the index does. Safe without a
     /// retry loop: every caller holds the generation write transaction, and the
     /// store has one writer.
+    #[cfg(feature = "parse")]
     fn ensure_payload_id(tx: &Connection, payload: StoredPayload<'_>) -> Result<i64> {
         let StoredPayload {
             file_id,
@@ -1518,6 +1749,21 @@ impl Store {
     /// freshly-created one carrying the current shape, so a step that is legal
     /// only against a table has to ask. Absent counts as "not a table": a step
     /// guarded by this must be skipped when its target does not exist either.
+    /// Whether `name` names anything at all — table, view or index.
+    ///
+    /// [`Self::relation_is_table`] cannot answer this: it reads absent and view
+    /// as the same "no", which is right for a step that only works on a table
+    /// and wrong for one that must be skipped when the relation exists *in any
+    /// shape*. `MIGRATION_V8_TO_V9` is the second kind.
+    fn relation_exists(conn: &Connection, name: &str) -> Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     fn relation_is_table(conn: &Connection, name: &str) -> Result<bool> {
         let kind: Option<String> = conn
             .query_row(
@@ -1700,7 +1946,13 @@ impl Store {
                 // A fresh database stamps CURRENT_SCHEMA_VERSION directly and
                 // never runs the migration chain, so every table added by a
                 // later migration must also be created here.
-                tx.execute_batch(UNRESOLVED_TABLE)?;
+                //
+                // `VALIDITY_RANGE_TABLES` stands where `UNRESOLVED_TABLE` used
+                // to: since v18 the unresolved ledger *is* a view over
+                // `unresolved_rows`, and applying the v9 batch here would try to
+                // index that view. `UNRESOLVED_TABLE` remains the v8→v9 rung for
+                // stores old enough to need it.
+                tx.execute_batch(VALIDITY_RANGE_TABLES)?;
                 tx.execute_batch(COVERAGE_GAPS_TABLE)?;
                 Self::validate_schema(&tx)?;
                 tx.execute(
@@ -1731,6 +1983,14 @@ impl Store {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(CREATE_SCHEMA_V3)?;
             tx.execute_batch(MIGRATION_V4_TO_V5)?;
+            // v5's two edge indexes name `generation_edges`, which v18 turned
+            // into a view — and `CREATE INDEX` on a view is an error, not a
+            // no-op. Same probe, same reason, as the v12→v13 step below: this
+            // rung meets whatever `CREATE_SCHEMA_V3` above left, and on a store
+            // that already carries the current shape that is a view.
+            if Self::relation_is_table(&tx, "generation_edges")? {
+                tx.execute_batch(MIGRATION_V4_TO_V5_EDGE_INDEXES)?;
+            }
             let has_analysis_json = {
                 let mut stmt = tx.prepare("PRAGMA table_info(generations)")?;
                 let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -1801,8 +2061,14 @@ impl Store {
         if version == 8 {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // `CREATE TABLE IF NOT EXISTS` is idempotent, so this needs no
-            // probe — unlike the ADD COLUMN migrations above.
-            tx.execute_batch(MIGRATION_V8_TO_V9)?;
+            // probe — but the two indexes beside it are not: since v18
+            // `generation_unresolved` may already be a view, and indexing one
+            // is an error. Skipped whole rather than split, because the table
+            // and its indexes are one shape: if the relation is not a table,
+            // none of this batch applies.
+            if !Self::relation_exists(&tx, "generation_unresolved")? {
+                tx.execute_batch(MIGRATION_V8_TO_V9)?;
+            }
             tx.execute("PRAGMA user_version = 9", [])?;
             // No mid-chain validation: `validate_schema` asserts the *current*
             // schema, and a v9 database legitimately lacks the v10
@@ -1815,7 +2081,13 @@ impl Store {
             // Same idempotency probe as v7/v8: `ADD COLUMN` is not repeatable,
             // and a fresh create applies the current `UNRESOLVED_TABLE`, which
             // already carries the column, before this chain runs.
-            if !Self::has_column(&tx, "generation_unresolved", "classification")? {
+            //
+            // The `relation_is_table` half is v18's: the batch both adds a
+            // column and creates an index, and neither is legal against the
+            // view `generation_unresolved` became.
+            if Self::relation_is_table(&tx, "generation_unresolved")?
+                && !Self::has_column(&tx, "generation_unresolved", "classification")?
+            {
                 tx.execute_batch(MIGRATION_V9_TO_V10)?;
             }
             tx.execute("PRAGMA user_version = 10", [])?;
@@ -1826,7 +2098,9 @@ impl Store {
         }
         if version == 10 {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if !Self::has_column(&tx, "generation_unresolved", "receiver")? {
+            if Self::relation_is_table(&tx, "generation_unresolved")?
+                && !Self::has_column(&tx, "generation_unresolved", "receiver")?
+            {
                 tx.execute_batch(MIGRATION_V10_TO_V11)?;
             }
             tx.execute("PRAGMA user_version = 11", [])?;
@@ -1882,7 +2156,11 @@ impl Store {
             // Same idempotency probe as v7/v8/v10/v11: `ADD COLUMN` is not
             // repeatable, and a fresh create applies `CREATE_SCHEMA_V3`, which
             // already carries the column, before this chain runs.
-            if !Self::has_column(&tx, "generation_edges", "resolution")? {
+            // The `relation_is_table` half is v18's: `ALTER TABLE ... ADD
+            // COLUMN` cannot name the view `generation_edges` became.
+            if Self::relation_is_table(&tx, "generation_edges")?
+                && !Self::has_column(&tx, "generation_edges", "resolution")?
+            {
                 tx.execute_batch(MIGRATION_V14_TO_V15)?;
             }
             tx.execute("PRAGMA user_version = 15", [])?;
@@ -1901,7 +2179,9 @@ impl Store {
         if version == 15 {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // Same idempotency probe as v7/v8/v10/v11/v14.
-            if !Self::has_column(&tx, "generation_edges", "candidate_total")? {
+            if Self::relation_is_table(&tx, "generation_edges")?
+                && !Self::has_column(&tx, "generation_edges", "candidate_total")?
+            {
                 tx.execute_batch(MIGRATION_V15_TO_V16)?;
             }
             tx.execute("PRAGMA user_version = 16", [])?;
@@ -1931,9 +2211,46 @@ impl Store {
                 tx.execute_batch(MIGRATION_V16_TO_V17)?;
             }
             tx.execute("PRAGMA user_version = 17", [])?;
-            Self::validate_schema(&tx)?;
+            // No mid-chain validation: `validate_schema` asserts the *current*
+            // schema, and a v17 database legitimately has `generation_edges` as
+            // a table and no `edge_rows` until the step below runs.
             tx.commit()?;
             version = 17;
+        }
+        if version == 17 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Each relation is asked about separately, and "is it still a
+            // base table?" is the whole question: absent means there is
+            // nothing to carry, a view means this rung already ran, and only a
+            // table has rows that need moving onto ranges.
+            //
+            // A single probe over `generation_edges` was the first shape of
+            // this step and it was wrong for a store that has one relation and
+            // not the other — a hand-built v3 fixture picks up
+            // `generation_unresolved` at rung 9 and never acquires a
+            // `generation_edges` at all, and the single probe read that as
+            // "already migrated" and left the store with no edge relation.
+            let carry_edges = Self::relation_is_table(&tx, "generation_edges")?;
+            let carry_unresolved = Self::relation_is_table(&tx, "generation_unresolved")?;
+            if carry_edges {
+                tx.execute_batch(MIGRATION_V17_TO_V18_RENAME_EDGES)?;
+            }
+            if carry_unresolved {
+                tx.execute_batch(MIGRATION_V17_TO_V18_RENAME_UNRESOLVED)?;
+            }
+            // Unconditional, and idempotent by `IF NOT EXISTS`: the v18 shape
+            // must exist at the end of this rung however the store arrived.
+            tx.execute_batch(VALIDITY_RANGE_TABLES)?;
+            if carry_edges {
+                tx.execute_batch(MIGRATION_V17_TO_V18_BACKFILL_EDGES)?;
+            }
+            if carry_unresolved {
+                tx.execute_batch(MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED)?;
+            }
+            tx.execute("PRAGMA user_version = 18", [])?;
+            Self::validate_schema(&tx)?;
+            tx.commit()?;
+            version = 18;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
@@ -3229,54 +3546,178 @@ impl Store {
         //
         // Writing every resolved edge makes that equality true by construction
         // rather than by argument. It stays below as a regression check.
-        let mut edge_ord: u32 = 0;
-
+        // Since v18 the write is the *difference* between the freshly resolved
+        // tuple multiset and the one already valid, not the whole set.
+        //
+        // Measured on this repository: two consecutive builds one appended line
+        // apart held 101,446 and 101,447 distinct edge tuples, one appeared and
+        // none disappeared — and the store wrote all 102,083 rows again anyway,
+        // because the relation was keyed by generation. The comparison below is
+        // ~100k in-memory tuple compares; the write that follows is the delta.
+        //
+        // Nothing above changes: `resolution.edges` is still the whole tree's
+        // resolution, so a carried row is one this build re-derived and found
+        // identical, not one it declined to look at. That is the distinction the
+        // paragraph above is about, and it is why the equality below is still
+        // structural.
+        //
+        // The multiset is built in one pass over `resolution.edges` and the
+        // inserts walk that same slice again, so the rows land in the resolver's
+        // emission order. Iterating the map instead would have been shorter and
+        // was measurably wrong: a `HashMap`'s order is arbitrary and varies per
+        // process, so the inserts landed in no order at all, and the read path's
+        // sort — which is handed the rows in stored order — lost the nearly
+        // sorted input it had been getting for free. A cold `devmap impact` on
+        // this repository went 115 ms to 150 ms for **the same instruction
+        // count** (1.192 G against 1.188 G) and 32% more cycles: pure memory
+        // stalls in a sort with a worse starting order.
+        //
+        // [`edge_tuple`] is the one owner of what an edge's identity is, called
+        // by both passes, so the pass that decides what to write and the pass
+        // that writes it cannot come to disagree about which rows they mean.
+        //
+        // Every field borrows, and the kinds are formatted once each into
+        // `kind_labels` rather than once per edge: `format!("{:?}", kind)` for
+        // 102,083 edges is 102,083 heap allocations held for the length of the
+        // write. It is the same string by construction, because it is the same
+        // expression.
+        let mut kind_labels: std::collections::HashMap<EdgeKind, String> =
+            std::collections::HashMap::new();
         for edge in &resolution.edges {
-            // Deleted paths are not extracted, so a resolution over the current
-            // tree has no edge touching one. Kept as an explicit guard for
-            // callers that pass a resolution computed before the deletion.
+            kind_labels
+                .entry(edge.edge_kind)
+                .or_insert_with(|| format!("{:?}", edge.edge_kind));
+        }
+        // Which edges are in this generation at all, and under which path ids.
+        //
+        // `None` is the one owner of "not in this generation": deleted paths are
+        // not extracted, so a resolution over the current tree has no edge
+        // touching one, and the guard stays for callers that pass a resolution
+        // computed before the deletion. Every pass below reads this rather than
+        // re-asking `deleted`, so they cannot come to disagree about which edges
+        // they are talking about.
+        let mut edge_ids: Vec<Option<(u32, u32)>> = Vec::with_capacity(resolution.edges.len());
+        let mut edge_ord: u32 = 0;
+        for edge in &resolution.edges {
             if deleted.contains(&edge.source_file) || deleted.contains(&edge.target_file) {
+                edge_ids.push(None);
                 continue;
             }
             let src_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.source_file)?;
             let tgt_f_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &edge.target_file)?;
-            // `prepare_cached` so this 8-parameter INSERT is compiled once per
-            // transaction rather than once per edge. It is the single
-            // highest-frequency statement in the writer: one execution for
-            // every resolved edge, 73,000 of them in a DevCouncil generation.
-            tx.prepare_cached(
-                "INSERT INTO generation_edges (generation_id, ordinal, source_file_id, target_file_id, source_symbol, target_symbol, edge_kind, confidence, resolution, candidate_total)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )?
-            .execute(
-                params![
-                    gen_id,
-                    edge_ord,
-                    src_f_id,
-                    tgt_f_id,
-                    edge.source_symbol,
-                    edge.target_symbol,
-                    format!("{:?}", edge.edge_kind),
-                    edge.confidence.persist_real(),
-                    // The evidence tier, so the read path does not have to
-                    // guess it back out of the row's file layout. NULL only for
-                    // an edge built without a resolution at all, which the
-                    // resolver never produces — `ResolvedEdge::new` takes one —
-                    // and which the read path therefore reports as
-                    // `ResolutionSource::Reconstructed`.
-                    edge.resolution
-                        .as_ref()
-                        .map(|resolution| crate::edge_index::resolution_kind_label(resolution)),
-                    // How many candidates the ambiguous rung actually weighed,
-                    // which since `AMBIGUOUS_FANOUT_CAP` is no longer the number
-                    // of rows this site produces. NULL for every other rung: a
-                    // resolution that names one target has no candidate list,
-                    // and writing 1 there would make a certain edge look like a
-                    // one-candidate ambiguity.
-                    crate::edge_index::ambiguous_candidate_total(edge.resolution.as_deref()),
-                ],
-            )?;
+            edge_ids.push(Some((src_f_id, tgt_f_id)));
             edge_ord += 1;
+        }
+
+        // A *multiset*, not a set. 475 edge tuples of this repository occur more
+        // than once in one generation (1,111 rows); collapsing them would drop
+        // rows the analysis counted and make the equality below refuse the
+        // build. The multiset is `matched` — one bit per resolved edge — rather
+        // than a count per distinct tuple, so two identical edges are two
+        // entries that are consumed one at a time.
+        let (edge_buckets, edge_chain) = bucket_identities(resolution.edges.len(), |index| {
+            let (src_f_id, tgt_f_id) = edge_ids[index]?;
+            Some(edge_tuple(
+                &resolution.edges[index],
+                &kind_labels,
+                src_f_id,
+                tgt_f_id,
+            ))
+        });
+        let mut edge_matched: Vec<bool> = vec![false; resolution.edges.len()];
+
+        // The rows already valid, streamed rather than materialised: the probe
+        // key is built per row and dropped, so the peak is this map plus the
+        // ids that need closing, not a second copy of the generation.
+        let mut close_edges: Vec<i64> = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT edge_id, source_file_id, target_file_id, source_symbol,
+                        target_symbol, edge_kind, confidence, resolution, candidate_total
+                 FROM edge_rows WHERE valid_to IS NULL",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let edge_id: i64 = row.get(0)?;
+                let live = EdgeTuple {
+                    source_file_id: row.get(1)?,
+                    target_file_id: row.get(2)?,
+                    source_symbol: std::borrow::Cow::Owned(row.get(3)?),
+                    target_symbol: std::borrow::Cow::Owned(row.get(4)?),
+                    edge_kind: std::borrow::Cow::Owned(row.get(5)?),
+                    confidence: row.get::<_, f64>(6)?.to_bits(),
+                    // The stored label verbatim, never round-tripped through
+                    // `ResolutionKind`: a spelling this binary does not know
+                    // would come back `None` from the enum and then compare
+                    // equal to a row that genuinely has no resolution, which is
+                    // a carried-forward row the reader would label
+                    // `Reconstructed` while the writer thought it matched.
+                    resolution: row
+                        .get::<_, Option<String>>(7)?
+                        .map(std::borrow::Cow::Owned),
+                    candidate_total: row.get(8)?,
+                };
+                let still_valid = claim_matching_candidate(
+                    &edge_buckets,
+                    &edge_chain,
+                    &mut edge_matched,
+                    &live,
+                    |index| {
+                        let (src_f_id, tgt_f_id) = edge_ids[index]?;
+                        Some(edge_tuple(
+                            &resolution.edges[index],
+                            &kind_labels,
+                            src_f_id,
+                            tgt_f_id,
+                        ))
+                    },
+                );
+                if !still_valid {
+                    close_edges.push(edge_id);
+                }
+            }
+        }
+        {
+            let mut close = tx.prepare_cached(
+                "UPDATE edge_rows SET valid_to = ?2 WHERE edge_id = ?1 AND valid_to IS NULL",
+            )?;
+            for edge_id in &close_edges {
+                close.execute(params![edge_id, gen_id])?;
+            }
+            // `prepare_cached` so this 10-parameter INSERT is compiled once per
+            // transaction rather than once per edge. It is the writer's
+            // highest-frequency statement on a cold build — one execution per
+            // resolved edge, 102,083 of them here — and on an incremental build
+            // it now runs for the delta alone.
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO edge_rows (source_file_id, target_file_id, source_symbol,
+                                        target_symbol, edge_kind, confidence, resolution,
+                                        candidate_total, valid_from, valid_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+            )?;
+            // In emission order, and only the copies the live set did not
+            // already supply: a tuple wanted three times and valid twice is
+            // inserted once, at the position of its first occurrence.
+            for (index, edge) in resolution.edges.iter().enumerate() {
+                let Some((src_f_id, tgt_f_id)) = edge_ids[index] else {
+                    continue;
+                };
+                if edge_matched[index] {
+                    continue;
+                }
+                let tuple = edge_tuple(edge, &kind_labels, src_f_id, tgt_f_id);
+                insert.execute(params![
+                    tuple.source_file_id,
+                    tuple.target_file_id,
+                    tuple.source_symbol.as_ref(),
+                    tuple.target_symbol.as_ref(),
+                    tuple.edge_kind.as_ref(),
+                    f64::from_bits(tuple.confidence),
+                    tuple.resolution.as_deref(),
+                    tuple.candidate_total,
+                    gen_id,
+                ])?;
+            }
         }
 
         // The analysis must have been computed over the edge set being stored.
@@ -3457,28 +3898,105 @@ impl Store {
         // re-preparing the INSERT for each one cost seconds of the build — the
         // self-build gate caught it as a regression the moment this table
         // landed.
+        //
+        // Written as a validity range since v18, exactly as the edges above
+        // are, and for the same measurement: two consecutive builds one appended
+        // line apart held 89,743 rows and **65,567 distinct tuples on both
+        // sides, with nothing appearing and nothing disappearing** — a ledger
+        // that had not changed at all and was rewritten in full every time.
         {
-            let mut insert = tx.prepare(
-                "INSERT INTO generation_unresolved
-                 (generation_id, ordinal, source_file, source_symbol, callee_name, reason,
-                  classification, receiver)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            // 12,424 ledger tuples of this repository occur more than once in
+            // one generation (36,600 rows), so this is a multiset too — and
+            // `matched`, one bit a row, is what makes it one.
+            //
+            // The reason text is formatted on demand rather than kept in a
+            // parallel `Vec<String>`: 89,743 owned strings held for the length
+            // of the write is memory `verify.sh` gate 6 charges against the
+            // kernel's model, and the three passes below need it only while a
+            // comparison is in flight.
+            let unresolved_tuple = |index: usize| -> UnresolvedTuple<'_> {
+                let unresolved = &resolution.unresolved[index];
+                UnresolvedTuple {
+                    source_file: std::borrow::Cow::Borrowed(unresolved.source_file.as_str()),
+                    source_symbol: std::borrow::Cow::Borrowed(unresolved.source_symbol.as_str()),
+                    callee_name: std::borrow::Cow::Borrowed(unresolved.callee_name.as_str()),
+                    reason: std::borrow::Cow::Owned(format!("{:?}", unresolved.resolution)),
+                    classification: std::borrow::Cow::Borrowed(unresolved.class.label()),
+                    receiver: unresolved
+                        .receiver
+                        .as_deref()
+                        .map(std::borrow::Cow::Borrowed),
+                }
+            };
+            let (ledger_buckets, ledger_chain) =
+                bucket_identities(resolution.unresolved.len(), |index| {
+                    Some(unresolved_tuple(index))
+                });
+            let mut ledger_matched: Vec<bool> = vec![false; resolution.unresolved.len()];
+
+            let mut close_rows: Vec<i64> = Vec::new();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT unresolved_id, source_file, source_symbol, callee_name, reason,
+                            classification, receiver
+                     FROM unresolved_rows WHERE valid_to IS NULL",
+                )?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let unresolved_id: i64 = row.get(0)?;
+                    let live = UnresolvedTuple {
+                        source_file: std::borrow::Cow::Owned(row.get(1)?),
+                        source_symbol: std::borrow::Cow::Owned(row.get(2)?),
+                        callee_name: std::borrow::Cow::Owned(row.get(3)?),
+                        reason: std::borrow::Cow::Owned(row.get(4)?),
+                        classification: std::borrow::Cow::Owned(row.get(5)?),
+                        receiver: row
+                            .get::<_, Option<String>>(6)?
+                            .map(std::borrow::Cow::Owned),
+                    };
+                    let still_valid = claim_matching_candidate(
+                        &ledger_buckets,
+                        &ledger_chain,
+                        &mut ledger_matched,
+                        &live,
+                        |index| Some(unresolved_tuple(index)),
+                    );
+                    if !still_valid {
+                        close_rows.push(unresolved_id);
+                    }
+                }
+            }
+            let mut close = tx.prepare_cached(
+                "UPDATE unresolved_rows SET valid_to = ?2
+                  WHERE unresolved_id = ?1 AND valid_to IS NULL",
             )?;
-            for (ordinal, unresolved) in resolution.unresolved.iter().enumerate() {
-                let ordinal = u32::try_from(ordinal).map_err(|_| {
-                    rusqlite::Error::InvalidParameterName(
-                        "unresolved row count exceeds SQLite generation ordinal capacity".into(),
-                    )
-                })?;
+            for unresolved_id in &close_rows {
+                close.execute(params![unresolved_id, gen_id])?;
+            }
+            // One prepared statement for the whole ledger. A repository of this
+            // size produces tens of thousands of unresolved calls per
+            // generation, and re-preparing the INSERT for each one cost seconds
+            // of the build — the self-build gate caught it as a regression the
+            // moment this table landed.
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO unresolved_rows
+                 (source_file, source_symbol, callee_name, reason, classification, receiver,
+                  valid_from, valid_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+            )?;
+            for (index, still_valid) in ledger_matched.iter().enumerate() {
+                if *still_valid {
+                    continue;
+                }
+                let tuple = unresolved_tuple(index);
                 insert.execute(params![
+                    tuple.source_file.as_ref(),
+                    tuple.source_symbol.as_ref(),
+                    tuple.callee_name.as_ref(),
+                    tuple.reason.as_ref(),
+                    tuple.classification.as_ref(),
+                    tuple.receiver.as_deref(),
                     gen_id,
-                    ordinal,
-                    unresolved.source_file,
-                    unresolved.source_symbol,
-                    unresolved.callee_name,
-                    format!("{:?}", unresolved.resolution),
-                    unresolved.class.label(),
-                    unresolved.receiver.as_deref(),
                 ])?;
             }
         }
@@ -4932,8 +5450,7 @@ impl Store {
             .collect();
         let mut stmt = snapshot.prepare(
             "SELECT e.source_file_id, e.target_file_id, e.source_symbol,
-                    e.target_symbol, e.edge_kind, e.confidence, e.resolution,
-                    e.ordinal
+                    e.target_symbol, e.edge_kind, e.confidence, e.resolution
              FROM generation_edges e
              WHERE e.generation_id = ?1",
         )?;
@@ -4954,7 +5471,6 @@ impl Store {
                     row.get_ref(4)?.as_str()?,
                     row.get(5)?,
                     row.get_ref(6)?.as_str_or_null()?,
-                    row.get(7)?,
                 )
                 .map_err(|error| rusqlite::Error::InvalidParameterName(error.to_string()))?;
         }
@@ -5848,14 +6364,6 @@ impl Store {
                 params![old_gen],
             )?;
             tx.execute(
-                "DELETE FROM generation_edges WHERE generation_id = ?1",
-                params![old_gen],
-            )?;
-            tx.execute(
-                "DELETE FROM generation_unresolved WHERE generation_id = ?1",
-                params![old_gen],
-            )?;
-            tx.execute(
                 "DELETE FROM generation_coverage_gaps WHERE generation_id = ?1",
                 params![old_gen],
             )?;
@@ -5866,6 +6374,34 @@ impl Store {
             tx.execute("DELETE FROM generations WHERE id = ?1", params![old_gen])?;
             pruned_count += 1;
         }
+
+        // Edges and unresolved calls are not deleted per generation: since v18
+        // one row covers the whole range of generations it was valid for, and
+        // deleting it because *one* of them went away would take it from the
+        // retained ones too.
+        //
+        // What becomes unreachable instead is any row whose validity had already
+        // ended by the oldest generation still retained — `valid_to <= cutoff`
+        // is exactly "no retained generation can see this". Rows still open, and
+        // rows closed later than the cutoff, are untouched. `keep_generations`
+        // is at least 1 and the early return above proved there are more
+        // generations than that, so `gen_ids[keep_generations - 1]` is the
+        // oldest retained id.
+        //
+        // `idx_edge_rows_closed` and `idx_unresolved_rows_closed` make this a
+        // scan of the closed rows rather than of the whole table. They are the
+        // only partial indexes v18 keeps: the matching `valid_to IS NULL` half
+        // made SQLite plan every *read* as a MULTI-INDEX OR over 102,083 rowid
+        // lookups and cost a cold `impact` 40 ms — see `VALIDITY_RANGE_TABLES`.
+        let cutoff = gen_ids[keep_generations - 1];
+        tx.execute(
+            "DELETE FROM edge_rows WHERE valid_to IS NOT NULL AND valid_to <= ?1",
+            params![cutoff],
+        )?;
+        tx.execute(
+            "DELETE FROM unresolved_rows WHERE valid_to IS NOT NULL AND valid_to <= ?1",
+            params![cutoff],
+        )?;
 
         // A payload outlives its generation only for as long as some *other*
         // generation still names it. Deleting the membership rows above frees
@@ -7131,5 +7667,137 @@ mod git_head_tests {
                 "an honest fast failure must not be a kill: {error}"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "parse")]
+mod delta_bucket_tests {
+    use super::*;
+
+    /// An identity that digests the same as every other, however different it
+    /// is.
+    ///
+    /// Real SipHash collisions cannot be summoned on demand, and a test that
+    /// injected its own digest would no longer be testing the digest the write
+    /// path uses. This hashes to a constant instead, so `identity_digest` — the
+    /// one function both the bucketing and the search go through — returns the
+    /// same value for every value of it, and the collision the write path meets
+    /// once in a very long while is here every time.
+    #[derive(PartialEq, Eq, Debug)]
+    struct Collides(&'static str);
+
+    impl std::hash::Hash for Collides {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            state.write_u8(0);
+        }
+    }
+
+    /// A collision must cost a comparison, never an answer.
+    ///
+    /// [`claim_matching_candidate`] narrows with a 64-bit digest and decides
+    /// with `PartialEq`. Were it to trust the digest, two different rows that
+    /// happened to digest alike would be treated as one: the live row left
+    /// open, the new row never written, and the generation reading back an edge
+    /// it was never given.
+    #[test]
+    fn a_collision_narrows_the_search_and_never_decides_it() {
+        let names = ["alpha", "beta", "gamma"];
+        let (buckets, chain) = bucket_identities(names.len(), |index| Some(Collides(names[index])));
+        assert_eq!(
+            buckets.len(),
+            1,
+            "the fixture only tests collisions if the identities actually collide"
+        );
+
+        let mut matched = vec![false; names.len()];
+        let claim = |live: &'static str, matched: &mut Vec<bool>| {
+            claim_matching_candidate(&buckets, &chain, matched, &Collides(live), |index| {
+                Some(Collides(names[index]))
+            })
+        };
+
+        assert!(claim("beta", &mut matched), "beta is one of the candidates");
+        assert_eq!(
+            matched,
+            vec![false, true, false],
+            "the candidate claimed is the one that compared equal, not the one \
+             the bucket happened to offer first"
+        );
+        assert!(
+            !claim("delta", &mut matched),
+            "a row nothing equals is not in this generation, however it digests"
+        );
+        assert_eq!(
+            matched,
+            vec![false, true, false],
+            "a search that found nothing claims nothing"
+        );
+        assert!(claim("alpha", &mut matched));
+        assert!(claim("gamma", &mut matched));
+        assert!(
+            !claim("alpha", &mut matched),
+            "each candidate is claimed once, so a fourth live row finds none"
+        );
+    }
+
+    /// A repeated row is repeated candidates, not one candidate with a count.
+    ///
+    /// 475 edge tuples of this repository occur more than once in a single
+    /// generation. If the delta collapsed them, a rebuild would close the
+    /// copies it could not account for and the generation would lose rows the
+    /// analysis counted.
+    #[test]
+    fn a_row_stored_three_times_answers_three_live_rows_and_no_more() {
+        let names = ["duplicate", "duplicate", "duplicate"];
+        let (buckets, chain) = bucket_identities(names.len(), |index| Some(names[index]));
+        let mut matched = vec![false; names.len()];
+        let claim = |matched: &mut Vec<bool>| {
+            claim_matching_candidate(&buckets, &chain, matched, &"duplicate", |index| {
+                Some(names[index])
+            })
+        };
+
+        assert!(claim(&mut matched));
+        assert!(claim(&mut matched));
+        assert!(claim(&mut matched));
+        assert_eq!(matched, vec![true, true, true], "all three were claimed");
+        assert!(
+            !claim(&mut matched),
+            "a fourth live copy has no candidate left, so it is closed"
+        );
+    }
+
+    /// An index outside this generation is a candidate for nothing.
+    ///
+    /// Edges touching a deleted path are not part of the generation, so their
+    /// identity is `None`. Two things keep them out, and this asserts both:
+    /// they enter no bucket and no chain, so nothing can offer them; and the
+    /// search skips them even if something did. Either alone would hold open a
+    /// row this generation does not contain the day the other changed.
+    #[test]
+    fn an_index_outside_the_generation_is_never_claimed() {
+        let names = [Some("kept"), None, Some("kept")];
+        let (buckets, chain) = bucket_identities(names.len(), |index| names[index]);
+        assert!(
+            !buckets
+                .values()
+                .chain(chain.iter())
+                .any(|&index| index == 1),
+            "an index with no identity is in no bucket and on no chain: {buckets:?} {chain:?}"
+        );
+        let mut matched = vec![false; names.len()];
+        let claim = |matched: &mut Vec<bool>| {
+            claim_matching_candidate(&buckets, &chain, matched, &"kept", |index| names[index])
+        };
+
+        assert!(claim(&mut matched));
+        assert!(claim(&mut matched));
+        assert_eq!(
+            matched,
+            vec![true, false, true],
+            "the excluded index is still unmatched, because it was never a candidate"
+        );
+        assert!(!claim(&mut matched), "there is no third candidate");
     }
 }

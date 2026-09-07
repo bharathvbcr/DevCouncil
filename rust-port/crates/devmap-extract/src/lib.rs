@@ -24,6 +24,7 @@ pub mod model;
 // Where state lives. Below the `parse` gate on purpose: a query-only consumer
 // needs to find the store and the artifacts without linking a single grammar.
 pub mod paths;
+pub mod subprocess;
 // Needs the grammars: a notebook's cells are reconstructed and then handed to
 // the real extractor, so this module is only meaningful with `parse` on.
 #[cfg(feature = "parse")]

@@ -38,6 +38,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         "devmap-extract",
         &[
             "a_cache_verdict_answers_for_the_root_it_was_asked",
+            "a_subprocess_is_bounded_in_time_and_bytes",
             "an_unreadable_subtree_is_a_hole_not_a_dead_build",
             "discovery_stays_inside_the_root",
             "ignore_rule_tolerance",
@@ -53,6 +54,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         &[
             "artifacts_sidecar_adversarial",
             "freshness_parity",
+            "git_is_bounded_on_the_artifact_path",
             "subsystem_handoff_paths_are_computed",
             "subsystem_roles_and_file_kinds_are_computed",
             "the_freshness_inventory_counts_only_what_discovery_can_index",
@@ -74,6 +76,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "read_only_store",
             "store_hardening",
             "test_fault_injection",
+            "validity_ranges",
         ],
     ),
 ];

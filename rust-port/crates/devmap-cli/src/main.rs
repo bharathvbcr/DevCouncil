@@ -1236,7 +1236,7 @@ fn write_guides_if_requested(
         stamped: StampedFreshness::default(),
     };
     let (_manifest, json_str) =
-        generate_manifest_with_edges(&extractions, &analysis, placeholder, &edges);
+        generate_manifest_with_edges(&extractions, &analysis, placeholder, &edges, Some(tree));
     let map: serde_json::Value = serde_json::from_str(&json_str)?;
 
     let relative = |absolute: &std::path::Path| -> String {
@@ -1393,6 +1393,16 @@ fn write_consumer_artifacts(
         stamped.content_fingerprint.clone().into(),
     );
     inputs.insert("code_graph_schema".into(), CODE_GRAPH_SCHEMA_VERSION.into());
+    // The one input that moves with the clock rather than the tree: churn is
+    // `git log --since=90.days`, relative to now, so the same repository on a
+    // later day is a different window. Without this the artifacts of a quiet
+    // repository matched every input for months while their hotspot counts
+    // silently shrank. Day granularity: one regeneration per calendar day at
+    // most, and only on a run that would otherwise have skipped.
+    inputs.insert(
+        "churn_window_day".into(),
+        devmap_query::inventory::churn_window_day().into(),
+    );
     inputs.insert(
         "compact".into(),
         match &compact_dest {
@@ -1446,8 +1456,13 @@ fn write_consumer_artifacts(
         pending_count: status.pending_count,
         stamped,
     };
-    let (_manifest, json_str) =
-        generate_manifest_with_edges(&extractions, &analysis, freshness.clone(), &edges);
+    let (_manifest, json_str) = generate_manifest_with_edges(
+        &extractions,
+        &analysis,
+        freshness.clone(),
+        &edges,
+        Some(tree.as_path()),
+    );
     let (graph_json, compact_graph_json) = generate_code_graph_encodings(
         &extractions,
         &analysis,

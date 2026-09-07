@@ -385,6 +385,7 @@ fn artifacts(corpus: &Corpus) -> anyhow::Result<()> {
         &analysis,
         freshness.clone(),
         &edges,
+        None,
     );
     let manifest = started.elapsed();
 

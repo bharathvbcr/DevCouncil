@@ -76,6 +76,9 @@ fn manifest() -> serde_json::Value {
         &analysis,
         FreshnessInfo::new("head".into(), 1, 0),
         &resolution.edges,
+        // Synthesised extractions, no tree on disk: the inventory has nothing
+        // to walk and reports itself uncomputed rather than empty.
+        None,
     );
     serde_json::from_str(&json).expect("the manifest is JSON")
 }
@@ -217,6 +220,9 @@ fn no_neighbour_is_a_synthetic_node_the_consumer_can_never_match() {
         &analysis,
         FreshnessInfo::new("head".into(), 1, 0),
         &resolution.edges,
+        // Synthesised extractions, no tree on disk: the inventory has nothing
+        // to walk and reports itself uncomputed rather than empty.
+        None,
     );
     let map: serde_json::Value = serde_json::from_str(&json).expect("the manifest is JSON");
 

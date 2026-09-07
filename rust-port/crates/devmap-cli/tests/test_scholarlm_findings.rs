@@ -603,6 +603,10 @@ fn manifest_emits_consumer_keys_agents_are_told_to_read() {
             stamped: Default::default(),
         },
         &result.edges,
+        // No repository root: this fixture's extractions are synthesised, not
+        // read off a tree, so the inventory has nothing to walk and says so
+        // rather than reporting an empty answer as a computed one.
+        None,
     );
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     for key in [
