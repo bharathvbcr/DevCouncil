@@ -403,16 +403,21 @@ the price of one owner and it is stated, not hidden. Main already carries this b
 rounds 1–3 (the sibling merged them as `4b11971`), so the session-start figure of 1.16–1.27 s
 for a warm `dev map` is not the baseline here — main's 414 ms is.
 
-**Decisions the user still owns:**
+**Decisions taken on 2026-09-07 (the user's answers: "choose the best", "merge all to
+main and delete the other branches", "fix it"):**
 
-- *TOML.* The console-script entry read in `wiring.rs` is line-based; a `[project.scripts]`
-  header inside a multi-line string would be misread. No TOML crate is in `Cargo.lock`;
-  adding one is a dependency decision.
-- *Merge order.* Merge `claude/vibrant-bartik-382014` (`ef5e030`, the sibling's composed-
-  section fix; clean dry run) into main first, then this branch. Both dry-run clean against
-  each other.
-- *`DEVMAP_BINARY`.* An explicit override that fails the probe is now an error in the Go
-  client, not a silent fallback. Scripts that relied on the fallback will fail by name.
+- *TOML.* The parser. `toml 1.1.5` is a workspace dependency (`parse`, `serde`,
+  `preserve_order`, `std`); `pyproject.toml`, `Cargo.toml` and `package.json` are parsed,
+  not grepped, for both the file-level script claim and the entry-point symbols. The
+  512-declaration cap keeps the file's first 512 (`preserve_order`). 201 dead findings
+  identical to the line reader on this repository's corpus.
+- *Merge.* The sibling's `claude/vibrant-bartik-382014` (`ef5e030`) and this branch are
+  merged into main in that order and the branches deleted; the two worktrees are detached
+  at their merged commits rather than removed, because live sessions sit in them.
+- *`DEVMAP_BINARY`.* Used or refused by name, never replaced, on both sides: the Python
+  seam refused only an override that existed but failed the probe and fell through to the
+  package build for one that did not exist; now it refuses that too. The Go candidate list
+  lost its unreachable override block; help text and both discovery documents say the rule.
 
 **Next structural items (measured, not fixed):**
 
