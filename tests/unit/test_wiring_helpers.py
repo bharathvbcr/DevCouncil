@@ -26,13 +26,16 @@ def test_is_test_path_variants():
     assert not wiring.is_test_path("Contest.kt")
 
 
-def test_is_private_and_dunder():
+def test_is_private_covers_the_dunder_case_too():
+    # `is_dunder_symbol` was deleted with the Python symbol scan that used it
+    # (its last caller went in d232dea). The kernel reached the same conclusion
+    # in `devmap-analyze/src/liveness.rs`: "`starts_with("__")` was also tested
+    # here and is subsumed by the single-underscore check".
     assert wiring.is_private_symbol("_x")
     assert not wiring.is_private_symbol("x")
     assert not wiring.is_private_symbol("")
-    assert wiring.is_dunder_symbol("__init__")
-    assert not wiring.is_dunder_symbol("_x")
-    assert not wiring.is_dunder_symbol("__x")
+    assert wiring.is_private_symbol("__init__")
+    assert not hasattr(wiring, "is_dunder_symbol")
 
 
 def test_is_vendored_path():

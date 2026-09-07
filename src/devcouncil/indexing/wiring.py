@@ -188,11 +188,6 @@ def is_private_symbol(name: str) -> bool:
     return bool(name) and name.startswith("_")
 
 
-def is_dunder_symbol(name: str) -> bool:
-    """True for ``__dunder__`` names (methods exempt from dead-code reports)."""
-    return bool(name) and len(name) >= 4 and name.startswith("__") and name.endswith("__")
-
-
 def is_vendored_path(path: str) -> bool:
     """True when ``path`` is a vendored/minified bundle, not first-class source.
 
