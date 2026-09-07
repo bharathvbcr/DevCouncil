@@ -44,6 +44,7 @@ fn build_repo(root: &Path, files: &[(&str, &str)]) {
                 build_started: None,
                 repo_root: Some(root.to_string_lossy().into_owned()),
                 discovery_refusals: None,
+                verify_every_row: false,
             },
         )
         .unwrap();

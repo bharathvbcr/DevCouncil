@@ -73,6 +73,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "a_corrupt_analysis_is_not_an_absent_one",
             "adversarial_store",
             "coverage_gap_inventory",
+            "digest_scoped_delta",
             "kernel_defects",
             "migration_ladder",
             "one_symlink_rule",

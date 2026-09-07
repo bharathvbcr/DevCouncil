@@ -134,6 +134,7 @@ fn the_persist_write_phase_reports_what_each_relation_cost() {
             "fts",
             "edges",
             "unresolved",
+            "digests",
             "gaps",
             "dead",
             "history",

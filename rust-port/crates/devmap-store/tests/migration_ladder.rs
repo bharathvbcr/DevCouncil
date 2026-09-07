@@ -149,6 +149,11 @@ fn seed_current_store(db_path: &Path) {
 /// traceable to a line of `schema.rs`.
 fn reduce_one_rung(conn: &Connection, from_version: i32) {
     let sql: &str = match from_version {
+        // MIGRATION_V18_TO_V19: the per-file row digests. Purely additive, so
+        // the reduction is the table and nothing else — there is no backfill to
+        // undo, which is the property that lets a v18 store migrate by gaining
+        // an empty table and comparing every row on its next build.
+        19 => "DROP TABLE generation_file_digests;",
         // MIGRATION_V17_TO_V18: the validity ranges. Materialise both views
         // back into the base tables they replaced, restore the two edge indexes
         // v5 created on `generation_edges`, and drop the range tables with the
@@ -583,20 +588,20 @@ fn a_migrated_store_reopens_without_migrating_again() {
 
 /// A step that fails its own gate must not advance `user_version`.
 ///
-/// The last arm of the chain — v17→v18 — stamps 18 and *then* validates, both
+/// The last arm of the chain stamps its version and *then* validates, both
 /// inside one transaction, so a failed validation has to take the stamp down
 /// with it. That rests on `PRAGMA user_version` being transactional in SQLite —
 /// true, and load-bearing enough to be worth a test rather than a comment: if
 /// it ever were not, a store that failed validation would reopen claiming to be
-/// at 18, skip the chain entirely, and every later read would run against a
-/// shape nothing had checked.
+/// at the top, skip the chain entirely, and every later read would run against
+/// a shape nothing had checked.
 ///
-/// Failure is induced the way it actually happens: `already_ranged` sees a
-/// database whose `generation_edges` is already a view, skips the DDL batch,
-/// and the index a previous partial attempt never created stays missing. The
-/// rung the fixture starts on moves with the end of the chain — validation runs
-/// once, at the last step, because `validate_schema` asserts the *current*
-/// schema and no earlier rung's shape satisfies it.
+/// Failure is induced the way it actually happens: a step's idempotency probe
+/// sees the work already done, skips its DDL batch, and an object a previous
+/// partial attempt never created stays missing. The rung the fixture starts on
+/// is `CURRENT_SCHEMA_VERSION - 1` and moves with the end of the chain —
+/// validation runs once, at the last step, because `validate_schema` asserts
+/// the *current* schema and no earlier rung's shape satisfies it.
 #[test]
 fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
     let dir = tmp_dir("migration-halfway");
@@ -604,10 +609,11 @@ fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
     seed_current_store(&db_path);
     {
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "DROP INDEX idx_file_payloads_cache_identity;
-             PRAGMA user_version = 17;",
-        )
+             PRAGMA user_version = {};",
+            CURRENT_SCHEMA_VERSION - 1
+        ))
         .unwrap();
     }
 
@@ -626,7 +632,8 @@ fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 17,
+        version,
+        CURRENT_SCHEMA_VERSION - 1,
         "the step failed, so the store is still at the rung it started on; a \
          stamp that survived its own failed validation would make the next \
          open skip the chain and trust an unchecked shape"
@@ -802,7 +809,14 @@ fn a_v17_store_with_two_generations_carries_both_onto_ranges() {
     seed_current_store(&db_path);
 
     let conn = Connection::open(&db_path).unwrap();
-    reduce_one_rung(&conn, CURRENT_SCHEMA_VERSION);
+    // Down to 17 however far the top of the ladder has moved: this test is
+    // about the v17→v18 backfill specifically, and every rung above it has to
+    // come off first.
+    let mut version = CURRENT_SCHEMA_VERSION;
+    while version > 17 {
+        reduce_one_rung(&conn, version);
+        version -= 1;
+    }
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();

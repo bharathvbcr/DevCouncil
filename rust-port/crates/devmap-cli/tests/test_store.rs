@@ -79,6 +79,7 @@ fn test_deletion_reconciliation_and_incremental_write() -> anyhow::Result<()> {
             build_started: None,
             repo_root: None,
             discovery_refusals: None,
+            verify_every_row: false,
         },
     )?;
     assert_eq!(gen2, 2);
