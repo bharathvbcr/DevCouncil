@@ -44,6 +44,13 @@ tree-sitter-svelte-ng = { workspace = true, optional = true }
 tree-sitter-astro-next = { workspace = true, optional = true }
 ignore.workspace = true
 
+# `kill(2)` against a process *group*, which `std` has no way to express: the
+# deadline in `subprocess.rs` has to reach everything the child started, not
+# just the child. Unix-only, because a process group is; the other targets keep
+# `Child::kill` and say so in that module's doc.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [build-dependencies]
 cc = "1"
 
