@@ -623,10 +623,69 @@ impl Resolver {
             }
         }
 
+        // X48. The receiver is rooted at a **host global object**.
+        //
+        // `console.log(...)`, `JSON.stringify(x)`, `process.env`,
+        // `Math.floor(n)`. These reached `UninferredReceiver`, the tier that
+        // means "the receiver is a value whose type we could not infer" — and
+        // `console` is not a receiver whose type could not be inferred, it is
+        // one whose type the runtime states. Same argument X43 made for
+        // `std::fs`, in the language whose globals are objects rather than
+        // modules. Measured: 126 of the 316 JS `uninferred_receiver` rows on
+        // this repository, 7,408 of 58,904 across scholarlm's JS/TS.
+        //
+        // Three guards, and the table alone is never enough.
+        //
+        // The receiver must **be** the root and nothing else — the same shape
+        // X43's `bare_module_handle` requires, and here it is load-bearing in a
+        // way the `::` version is not. X44 reduces a receiver *structurally*,
+        // so `JSON.stringify(rows)` as the receiver of `.padStart(…)` is
+        // recorded as `JSON.stringify` with the parentheses gone: after that
+        // reduction a call result and a property read are the same string, and
+        // no test on the text can separate them. `process.env.PWD` is therefore
+        // **not** claimed, and that is an abstention rather than an oversight —
+        // it costs rows and invents nothing. Separating them needs the
+        // extractor to keep "this was a call" in the reduced receiver, which is
+        // `ExtractedCall::receiver_expr`'s shape and a change of its own.
+        //
+        // The enclosing scope must not bind the root, which
+        // `root_is_a_value_here` already answers. And the corpus gets the last
+        // word: a repository that declares its own `Date` keeps `Date.parse` in
+        // the defect tier, which is the veto `is_prelude_type` opens with. The
+        // file's own imports needed no test here — an import of the root
+        // returned `External` several rungs above.
+        if !root_is_a_value_here && receiver == root && Self::receiver_is_property_path(receiver) {
+            if let Some(environment) = crate::builtins::host_global_object(family, root) {
+                if !self.family_declares(family, root) {
+                    return UnresolvedClass::HostGlobal {
+                        environment: environment.to_string(),
+                    };
+                }
+            }
+        }
+
         // A receiver we could not type. Not a defect — naming its owner needs
         // real type inference — but distinct from a bare-name failure, and by
         // far the larger group.
         UnresolvedClass::UninferredReceiver
+    }
+
+    /// Whether a receiver expression is a dotted run of plain identifiers.
+    ///
+    /// The `.` twin of [`Self::receiver_is_module_path`], and it exists for the
+    /// same reason: `process` and `process.env` are the objects themselves,
+    /// while `JSON.stringify(x)` as the receiver of `.length` is an
+    /// *expression* that merely starts at one. A segment carrying parentheses,
+    /// brackets, quotes or whitespace disqualifies the whole receiver, so the
+    /// chained case keeps the tier it belongs in.
+    fn receiver_is_property_path(receiver: &str) -> bool {
+        !receiver.is_empty()
+            && receiver.split('.').all(|segment| {
+                !segment.is_empty()
+                    && segment
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            })
     }
 
     /// Whether a receiver expression is a module **path** rather than a value.

@@ -96,3 +96,7 @@ required-features = ["parse"]
 [[test]]
 name = "implicit_receiver_reference"
 required-features = ["parse"]
+
+[[test]]
+name = "host_global_objects"
+required-features = ["parse"]
