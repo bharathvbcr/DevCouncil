@@ -762,6 +762,13 @@ fn consumer_manifest_json(
                 // therefore contributed no command even though its existence
                 // still contributed a manager.
                 "inventory_refused_oversize": inventory.refused_oversize,
+                // The other half of the same promise: a manifest that existed
+                // and could not be read at all — permissions, encoding, a file
+                // that stopped being one — with the reason. Its *existence*
+                // still contributed a package manager above, so without this a
+                // reader sees npm and no scripts, which is what a `package.json`
+                // with an empty `scripts` block also produces.
+                "inventory_unreadable": inventory.unreadable,
                 // Whether a walk bound stopped the search before the tree ran
                 // out. `true` makes both lists a lower bound rather than the
                 // repository's full set.

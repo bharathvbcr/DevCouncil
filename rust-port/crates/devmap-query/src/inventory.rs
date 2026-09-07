@@ -20,9 +20,11 @@
 //!
 //!   - the marker walk descends at most [`WALK_DEPTH_CAP`] levels and visits at
 //!     most [`WALK_DIR_CAP`] directories, reporting `walk_truncated` when it
-//!     stops early;
+//!     stops early — and only when a directory it would have *entered* was cut,
+//!     never for one [`skip_dir`] refuses at every depth;
 //!   - a manifest larger than [`MANIFEST_READ_CAP`] is *named* in
-//!     `refused_oversize` rather than silently skipped, because "could not
+//!     `refused_oversize` rather than silently skipped, and one that could not
+//!     be read for any other reason is named in `unreadable`, because "could not
 //!     read" and "read and found nothing" must never be the same answer;
 //!   - `git log` runs once, with a deadline, a commit cap and an output cap.
 
@@ -172,6 +174,18 @@ pub struct RepoInventory {
     pub unavailable_reason: String,
     /// Manifests past [`MANIFEST_READ_CAP`], named rather than dropped.
     pub refused_oversize: Vec<String>,
+    /// Manifests that were there and could not be read, each with the reason.
+    ///
+    /// The size cap has [`Self::refused_oversize`]; every *other* way a read
+    /// fails — a permission denial, a document that is not UTF-8, a file that
+    /// changed type between the walk and the read — used to come back as a bare
+    /// `None` that the caller could not tell from "the file is absent". The
+    /// scan then reported `test_commands` computed, with the manifest's
+    /// contents contributing nothing and nothing saying so, while the file's
+    /// *existence* still contributed its package manager: an artifact naming
+    /// npm and no scripts, which is exactly what a repository with an empty
+    /// `scripts` block produces.
+    pub unreadable: Vec<String>,
     /// Whether a walk bound stopped the search before the tree was exhausted.
     pub walk_truncated: bool,
     /// Directories opened, so a reader can size the walk that produced this.
@@ -267,13 +281,22 @@ fn walk_markers(root: &Path) -> Markers {
                 continue;
             };
             if kind.is_dir() {
+                // `skip_dir` first, and the order is the whole point:
+                // `truncated` says the two published lists are a lower bound
+                // rather than the repository's set, so it must only be set by a
+                // directory the walk would otherwise have entered. A
+                // `node_modules` or a `.git` sitting one level past the cap is
+                // refused at every depth anyway — nothing that could hold a
+                // marker was cut, and reporting it as cut spends the signal on
+                // a directory whose contents are not evidence.
+                if skip_dir(&name, depth) {
+                    continue;
+                }
                 if depth + 1 > WALK_DEPTH_CAP {
                     found.truncated = true;
                     continue;
                 }
-                if !skip_dir(&name, depth) {
-                    stack.push((entry.path(), depth + 1));
-                }
+                stack.push((entry.path(), depth + 1));
                 continue;
             }
             // A symlink to a regular file counts. `file_type()` does not
@@ -312,19 +335,47 @@ fn walk_markers(root: &Path) -> Markers {
     found
 }
 
-/// Read a manifest, or record that it was too large to read.
+/// Read a manifest, or record why it could not be read.
 ///
-/// `None` covers both "absent" and "refused"; the caller distinguishes them by
-/// whether the path landed in `refused`, which is the whole point of carrying
-/// the list.
-fn read_bounded(root: &Path, relative: &str, refused: &mut Vec<String>) -> Option<String> {
+/// `None` covers "absent" and every kind of refusal; the caller distinguishes
+/// them by whether the path landed in one of the two lists, which is the whole
+/// point of carrying them.
+///
+/// Both lists, not just the size one. The size cap was named and every other
+/// failure returned a bare `None`: a manifest whose bytes this process may not
+/// read, or that is not UTF-8, or that stopped being a regular file between the
+/// walk and the read, reached the artifact as "the repository declares no
+/// scripts". Only the marker walk decides whether the file *exists*, so its
+/// package manager was still published — an answer that names npm and no
+/// scripts, indistinguishable from a `package.json` with an empty `scripts`
+/// block.
+fn read_bounded(
+    root: &Path,
+    relative: &str,
+    refused: &mut Vec<String>,
+    unreadable: &mut Vec<String>,
+) -> Option<String> {
     let path = root.join(relative);
-    let metadata = std::fs::metadata(&path).ok()?;
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        // The walk saw this name a moment ago, so "absent" here is itself a
+        // failure to read rather than an absence.
+        Err(error) => {
+            unreadable.push(format!("{relative}: {error}"));
+            return None;
+        }
+    };
     if metadata.len() > MANIFEST_READ_CAP {
         refused.push(relative.to_string());
         return None;
     }
-    std::fs::read_to_string(&path).ok()
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            unreadable.push(format!("{relative}: {error}"));
+            None
+        }
+    }
 }
 
 /// Whether a TOML document opens the given table.
@@ -350,9 +401,24 @@ fn declares_test_target(document: &str) -> bool {
         if line.starts_with([' ', '\t']) {
             return false;
         }
-        let Some((head, _)) = line.split_once(':') else {
+        // A comment that *mentions* a target does not declare one, and it is
+        // the shape most likely to be there: `# test: dropped, use pytest`
+        // starts in column 0 and carries a colon, which was the whole of the
+        // rule. `make test` published from that line is an instruction to an
+        // agent to run a target the repository does not have.
+        if line.starts_with('#') {
+            return false;
+        }
+        let Some((head, rest)) = line.split_once(':') else {
             return false;
         };
+        // `test := pytest -q`, and GNU's `test ::= pytest`, are variable
+        // assignments; the name to the left of the colon is not a target. Only
+        // an `=` after the colon run disqualifies — `test::` is a double-colon
+        // *rule* and does declare one.
+        if rest.trim_start_matches(':').starts_with('=') {
+            return false;
+        }
         head.split_whitespace().any(|word| word == "test")
     })
 }
@@ -414,7 +480,12 @@ fn package_managers(markers: &Markers) -> Vec<String> {
 }
 
 /// The commands the manifests name, in the ported rule order.
-fn test_commands(root: &Path, markers: &Markers, refused: &mut Vec<String>) -> Vec<String> {
+fn test_commands(
+    root: &Path,
+    markers: &Markers,
+    refused: &mut Vec<String>,
+    unreadable: &mut Vec<String>,
+) -> Vec<String> {
     let mut commands: Vec<String> = Vec::new();
     let push = |command: String, commands: &mut Vec<String>| {
         if !commands.contains(&command) {
@@ -425,7 +496,7 @@ fn test_commands(root: &Path, markers: &Markers, refused: &mut Vec<String>) -> V
     // Node: the scripts the repository actually declares, run through the
     // manager its lock file names.
     if markers.top("package.json") {
-        if let Some(text) = read_bounded(root, "package.json", refused) {
+        if let Some(text) = read_bounded(root, "package.json", refused, unreadable) {
             if let Ok(document) = serde_json::from_str::<serde_json::Value>(&text) {
                 let manager = if markers.top("pnpm-lock.yaml") {
                     "pnpm"
@@ -458,7 +529,7 @@ fn test_commands(root: &Path, markers: &Markers, refused: &mut Vec<String>) -> V
     // gains `[tool.pytest]`, which is a declaration in its own right.
     if markers.top("pyproject.toml") || markers.top("setup.py") {
         let pyproject = if markers.top("pyproject.toml") {
-            read_bounded(root, "pyproject.toml", refused).unwrap_or_default()
+            read_bounded(root, "pyproject.toml", refused, unreadable).unwrap_or_default()
         } else {
             String::new()
         };
@@ -499,14 +570,14 @@ fn test_commands(root: &Path, markers: &Markers, refused: &mut Vec<String>) -> V
     // Task runners, which the Python writer did not read at all: a repository
     // whose real entry point is `make test` was reported as having none.
     if markers.top("Makefile") {
-        if let Some(text) = read_bounded(root, "Makefile", refused) {
+        if let Some(text) = read_bounded(root, "Makefile", refused, unreadable) {
             if declares_test_target(&text) {
                 push("make test".to_string(), &mut commands);
             }
         }
     }
     if markers.top("justfile") {
-        if let Some(text) = read_bounded(root, "justfile", refused) {
+        if let Some(text) = read_bounded(root, "justfile", refused, unreadable) {
             if declares_test_target(&text) {
                 push("just test".to_string(), &mut commands);
             }
@@ -525,16 +596,20 @@ pub fn scan(root: &Path) -> RepoInventory {
     }
     let markers = walk_markers(root);
     let mut refused: Vec<String> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
     let package_managers = package_managers(&markers);
-    let test_commands = test_commands(root, &markers, &mut refused);
+    let test_commands = test_commands(root, &markers, &mut refused, &mut unreadable);
     refused.sort();
     refused.dedup();
+    unreadable.sort();
+    unreadable.dedup();
     RepoInventory {
         package_managers,
         test_commands,
         computed: true,
         unavailable_reason: String::new(),
         refused_oversize: refused,
+        unreadable,
         walk_truncated: markers.truncated,
         directories_visited: markers.directories_visited,
     }
@@ -601,13 +676,39 @@ pub fn churn_with_program(program: &OsStr, root: &Path) -> FileChurn {
 
     let text = captured.stdout_lossy();
     let mut commits_by_path: BTreeMap<String, u32> = BTreeMap::new();
+    // Commits, counted so the *commit* cap can be seen at all.
+    //
+    // Of this invocation's four bounds it is the only one that leaves no trace
+    // in the bytes: `--max-count` makes git stop emitting and exit zero, and on
+    // a real 5,200-commit repository the whole capped listing is 38 KB against
+    // an 8 MB `CHURN_OUTPUT_CAP`, so `stdout_truncated` is `false` and the
+    // window was still cut.
+    //
+    // `-z --name-only --pretty=format:` frames the output as one block per
+    // commit — each of its paths NUL-terminated — with the blocks joined by one
+    // more NUL. A stream of `f` files across `n` commits therefore carries
+    // `f + n - 1` NULs and splits into `f + n` entries, of which `f` are
+    // non-empty: every commit contributes exactly one empty entry, whether it
+    // named files, named none (an empty commit), or is a merge, which
+    // `--name-only` gives no paths for. Measured against git 2.50.1.
+    let mut commits_seen = 0usize;
     for entry in text.split('\0') {
+        if entry.is_empty() {
+            commits_seen += 1;
+            continue;
+        }
         let path = entry.trim().replace('\\', "/");
         if path.is_empty() {
             continue;
         }
         *commits_by_path.entry(path).or_insert(0) += 1;
     }
+    // At exactly the cap the window may or may not have been cut — git stops
+    // without saying which — so this reports it as cut. Over-reporting a bound
+    // is the safe direction: `truncated` reaching a reader as `false` when
+    // history was dropped is the failure this exists to prevent, and the
+    // opposite costs one repository in `CHURN_COMMIT_CAP` an accurate flag.
+    let commit_cap_reached = commits_seen >= CHURN_COMMIT_CAP;
     if commits_by_path.is_empty() {
         // A repository whose commits in the window touched no file, or none
         // in the window at all: git answered, and the answer was empty.
@@ -619,7 +720,7 @@ pub fn churn_with_program(program: &OsStr, root: &Path) -> FileChurn {
         commits_by_path,
         computed: true,
         unavailable_reason: String::new(),
-        truncated: captured.stdout_truncated,
+        truncated: captured.stdout_truncated || commit_cap_reached,
     }
 }
 
@@ -679,6 +780,41 @@ mod tests {
         // A recipe line mentioning `test:` is not a target.
         assert!(!declares_test_target("all:\n\techo test: nope\n"));
         assert!(!declares_test_target("lint:\n\truff check .\n"));
+    }
+
+    /// A line that only *mentions* a `test` target does not declare one, and
+    /// `test_commands` is an artifact of what the repository declares.
+    ///
+    /// Both of these sit in column 0 and both carry a colon, which was the
+    /// whole of the rule. A repository whose Makefile says `# test: removed,
+    /// use pytest` was published as declaring `make test`, under
+    /// `test_commands_computed: true` — an instruction to an agent to run a
+    /// target that does not exist.
+    #[test]
+    fn a_mention_of_test_is_not_a_declaration_of_it() {
+        assert!(
+            !declares_test_target("# test: dropped in 2024, use pytest\nall:\n\techo hi\n"),
+            "a comment is not a target"
+        );
+        assert!(
+            !declares_test_target("  # test: indented comment\nall:\n"),
+            "nor is an indented one"
+        );
+        assert!(
+            !declares_test_target("test := pytest -q\nall:\n\t$(test)\n"),
+            "`:=` is an assignment; the name to its left is a variable"
+        );
+        assert!(
+            !declares_test_target("test ::= pytest\n"),
+            "and so is GNU's `::=`"
+        );
+        // Still targets, and the reason the rule cannot simply demand a bare
+        // `name:` — `::` is a double-colon rule and `test:` may carry
+        // prerequisites.
+        assert!(declares_test_target("test:: \n\tpytest\n"));
+        assert!(declares_test_target("test: build lint\n\tpytest\n"));
+        // A recipe that is a comment is still a recipe, not a target.
+        assert!(!declares_test_target("all:\n\t# test: nope\n"));
     }
 
     #[test]
