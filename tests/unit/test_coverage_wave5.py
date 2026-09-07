@@ -14,7 +14,6 @@ from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
 from devcouncil.domain.task import Task
-from devcouncil.indexing.graph.schema import CodeGraph
 from devcouncil.verification.claims.models import Assertion, CheckResult, Kind, Status
 
 runner = CliRunner()
@@ -72,7 +71,25 @@ def test_check_mapping_stack_legacy_graphify_and_missing_graph(tmp_path):
     assert any("Missing" in row[2] for row in rows if row[0] == "Code graph")
 
 
-def test_check_mapping_stack_loadable_graph(tmp_path, monkeypatch):
+class _StoreProbe:
+    """A `DevMapClient` double for the one question `doctor` asks the store."""
+
+    def __init__(self, *, generation_id=7, node_count=12):
+        self.generation_id = generation_id
+        self.node_count = node_count
+
+    def status(self):
+        return self
+
+
+def test_check_mapping_stack_probes_the_store_not_the_python_graph(tmp_path, monkeypatch):
+    """"Does a graph exist" is a `status` call, not a whole-graph read.
+
+    `doctor` asked it twice per run through `load_code_graph`, which
+    materialises every node and edge out of the Python `index.sqlite` cache:
+    measured on a tmp copy of this repository, p50 2546.8 ms / min 1872.8 ms
+    against `try_connect`'s p50 41.2 ms / min 36.4 ms, for a boolean.
+    """
     from devcouncil.cli.commands import doctor as doctor_cmd
 
     graph_path = tmp_path / ".devcouncil" / "graph" / "code_graph.json"
@@ -81,11 +98,33 @@ def test_check_mapping_stack_loadable_graph(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "devcouncil.indexing.graph.build.load_code_graph",
-        lambda _root: CodeGraph(nodes=[], edges=[]),
+        lambda _root: (_ for _ in ()).throw(
+            AssertionError("doctor must not read the whole graph to check it exists")
+        ),
+    )
+    monkeypatch.setattr(
+        "devcouncil.devmap_client.try_connect", lambda root: _StoreProbe()
     )
     rows = doctor_cmd.check_mapping_stack(tmp_path)
     graph_rows = [row for row in rows if row[0] == "Code graph"]
-    assert graph_rows and "OK" in graph_rows[0][1]
+    assert graph_rows and "OK" in graph_rows[0][1], graph_rows
+
+
+def test_check_mapping_stack_reports_an_export_with_no_store_behind_it(
+    tmp_path, monkeypatch
+):
+    """A readable JSON export whose store is gone is a warning, not an OK."""
+    from devcouncil.cli.commands import doctor as doctor_cmd
+
+    graph_path = tmp_path / ".devcouncil" / "graph" / "code_graph.json"
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    graph_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr("devcouncil.devmap_client.try_connect", lambda root: None)
+    rows = doctor_cmd.check_mapping_stack(tmp_path)
+    graph_rows = [row for row in rows if row[0] == "Code graph"]
+    assert graph_rows and "OK" not in graph_rows[0][1], graph_rows
+    assert "devmap" in graph_rows[0][2] or "dev map" in graph_rows[0][2], graph_rows
 
 
 def test_check_execution_containment_rows(tmp_path, monkeypatch):

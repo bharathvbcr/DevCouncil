@@ -110,6 +110,21 @@ def _is_plain_int(value: Any) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _graph_json_max_bytes(root: Path) -> int:
+    """The configured ceiling on a `code_graph.json` this process did not write.
+
+    Same knob the writer bounds itself with (`indexing.graph_json_max_bytes`),
+    read here so the read side cannot be the unbounded one. A verification check
+    that exhausts the machine on a hostile artifact has failed at its own job.
+    """
+    try:
+        from devcouncil.app.config import load_config
+
+        return int(load_config(root).indexing.graph_json_max_bytes)
+    except Exception:
+        return 128 * 1024 * 1024
+
+
 def _graph_liveness(project_root: Path, head: str) -> Optional[dict]:
     """The kernel's own uncapped liveness lists, from `code_graph.json`.
 
@@ -124,31 +139,58 @@ def _graph_liveness(project_root: Path, head: str) -> Optional[dict]:
     writes, and `resolution_rate` — which only the manifest carries — is joined
     to them on `generated_head`.
 
+    **The artifact is read directly.** This went through
+    `indexing.graph.build.load_code_graph`, which imports that same JSON into
+    the Python `index.sqlite` cache and re-materialises every node and edge as
+    pydantic models — 102 MB of writes on the first ratchet run in a fresh
+    checkout, and on this repository's tree p50 815.0 ms / min 784.9 ms against
+    a plain bounded `json.load`'s p50 133.8 ms / min 128.0 ms, for
+    byte-identical lists (17,505 symbols, 120 unwired candidates). The kernel
+    writes this file; nothing is gained by round-tripping it through a second
+    store to read six top-level lists back out.
+
     Returns `None` when the graph cannot be used as a complete inventory:
 
+    * there is none, or it is unreadable, or it is larger than the configured
+      bound;
     * it is a size-capped export (`compatibility_export_tier` `compact` caps the
       lists and `stub` empties them), or
     * it was generated from a different commit than the manifest beside it —
       pairing lists from one generation with a rate from another turns the
       difference between two generations into a "regression".
     """
+    import json
+
+    from devcouncil.indexing.graph.build import graph_path
+
+    path = graph_path(project_root)
     try:
-        from devcouncil.indexing.graph.build import load_code_graph
-    except ImportError:
-        return None
-    try:
-        graph = load_code_graph(project_root)
+        if not path.is_file():
+            return None
+        size = path.stat().st_size
+        limit = _graph_json_max_bytes(project_root)
+        if size > limit:
+            logger.warning(
+                "code graph export is %d bytes, over the %d-byte bound, so the "
+                "liveness snapshot declines to read it",
+                size,
+                limit,
+            )
+            return None
+        with path.open("rb") as handle:
+            data = json.load(handle)
     except Exception:
         logger.warning("code graph unreadable for the liveness snapshot", exc_info=True)
         return None
-    if graph is None:
+    if not isinstance(data, Mapping):
         return None
 
-    meta = getattr(graph, "meta", None) or {}
+    meta = data.get("meta")
+    meta = meta if isinstance(meta, Mapping) else {}
     tier = meta.get("compatibility_export_tier")
     if tier is not None and tier != "slim":
         return None
-    graph_head = str(getattr(graph, "generated_head", "") or "")
+    graph_head = str(data.get("generated_head") or "")
     if head and graph_head and graph_head != head:
         return None
 
@@ -156,11 +198,12 @@ def _graph_liveness(project_root: Path, head: str) -> Optional[dict]:
     # tell a symbol that went dead from one this task just wrote; without it the
     # symbol half refuses to flag anything, which is the "branch that cannot
     # execute" shape this work order removes.
+    nodes = data.get("nodes")
     symbol_index = sorted(
         {
-            f"{_norm(str(node.path))}::{node.name}"
-            for node in (getattr(graph, "nodes", None) or [])
-            if getattr(node, "path", "") and getattr(node, "name", "")
+            f"{_norm(str(node.get('path')))}::{node.get('name')}"
+            for node in (nodes if isinstance(nodes, list) else [])
+            if isinstance(node, Mapping) and node.get("path") and node.get("name")
         }
     )
     if not symbol_index:
@@ -170,16 +213,17 @@ def _graph_liveness(project_root: Path, head: str) -> Optional[dict]:
     # the shape `_symbol_key` parses.
     dead_symbols = _as_list(meta.get("legacy_dead_symbol_candidates"))
     if not dead_symbols:
+        dead_code = data.get("dead_code")
         dead_symbols = [
             str(entry.get("id"))
-            for entry in (getattr(graph, "dead_code", None) or [])
+            for entry in (dead_code if isinstance(dead_code, list) else [])
             if isinstance(entry, Mapping) and entry.get("id")
         ]
 
     return {
-        "entry_roots": _as_list(getattr(graph, "entry_roots", None)),
-        "unwired_candidates": _as_list(getattr(graph, "unwired_candidates", None)),
-        "unreachable_files": _as_list(getattr(graph, "unreachable_files", None)),
+        "entry_roots": _as_list(data.get("entry_roots")),
+        "unwired_candidates": _as_list(data.get("unwired_candidates")),
+        "unreachable_files": _as_list(data.get("unreachable_files")),
         "dead_symbol_candidates": dead_symbols,
         "symbol_index": symbol_index,
         "liveness_unreachable_unreliable": bool(
