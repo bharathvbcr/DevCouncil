@@ -563,10 +563,7 @@ impl GenerationEdgesBuilder {
     /// [`GenerationEdges::analysis`]. A hand-built index in a test passes
     /// `None`, which is the truth for one.
     pub fn finish(self, analysis: Option<AnalysisDisclosure>, order: EdgeOrder) -> GenerationEdges {
-        // Infallible by construction: nothing here reads a resolution label,
-        // so no label can be unknown.
         self.finish_with(analysis, order, None)
-            .expect("reconstructing evidence cannot read a stored label")
     }
 
     /// [`Self::finish`], decoding `generation_edges.resolution` instead of
@@ -583,11 +580,13 @@ impl GenerationEdgesBuilder {
         analysis: Option<AnalysisDisclosure>,
         order: EdgeOrder,
     ) -> Result<GenerationEdges, UnknownResolutionKind> {
+        // The whole refusal happens here, before anything is built: a label
+        // this binary cannot read is not a partially-decoded index.
         let mut kinds = Vec::with_capacity(self.text.resolution_labels.len());
         for label in &self.text.resolution_labels {
             kinds.push(resolution_kind_from_stored(label)?);
         }
-        self.finish_with(analysis, order, Some(kinds))
+        Ok(self.finish_with(analysis, order, Some(kinds)))
     }
 
     /// `stored_kinds` is `Some` when the caller wants the row's own label read
@@ -600,7 +599,7 @@ impl GenerationEdgesBuilder {
         analysis: Option<AnalysisDisclosure>,
         order: EdgeOrder,
         stored_kinds: Option<Vec<StoredResolutionKind>>,
-    ) -> Result<GenerationEdges, UnknownResolutionKind> {
+    ) -> GenerationEdges {
         // Ids are `u32`. A generation with more edges than that cannot be
         // addressed, and answering over a silently truncated prefix would be a
         // wrong answer rather than a bounded one, so it is refused by the
@@ -692,7 +691,7 @@ impl GenerationEdgesBuilder {
 
         let symbol_ranks = self.text.symbols.len();
         let file_ranks = self.text.files.len();
-        Ok(GenerationEdges {
+        GenerationEdges {
             by_source_symbol: Adjacency::build(&self.source_symbol, symbol_ranks),
             by_target_symbol: Adjacency::build(&self.target_symbol, symbol_ranks),
             by_source_file: Adjacency::build(&self.source_file, file_ranks),
@@ -709,7 +708,7 @@ impl GenerationEdgesBuilder {
             text: self.text,
             analysis,
             empty: Vec::new(),
-        })
+        }
     }
 }
 
