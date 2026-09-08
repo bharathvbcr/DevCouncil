@@ -61,6 +61,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "subsystem_roles_and_file_kinds_are_computed",
             "the_repository_inventory_bounds_are_honest",
             "the_freshness_inventory_counts_only_what_discovery_can_index",
+            "viz_projection",
             "workspace_registry_concurrency",
         ],
     ),

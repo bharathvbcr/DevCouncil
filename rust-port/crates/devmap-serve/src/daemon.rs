@@ -1296,9 +1296,7 @@ impl Daemon {
             let store = Arc::clone(&self.store);
             let state = Arc::clone(&state);
             let name = self.ipc_path.to_string_lossy().into_owned();
-            tokio::spawn(async move {
-                crate::protocol::run_named_pipe(store, &name, state).await
-            })
+            tokio::spawn(async move { crate::protocol::run_named_pipe(store, &name, state).await })
         });
 
         // Reconcile after the endpoint is live: a failure here is logged and

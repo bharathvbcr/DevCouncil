@@ -1,5 +1,8 @@
 # Dev Map
 
+Host applications can link the query crate or use the versioned JSON and HTML
+process contract in [HOST_INTEGRATION.md](HOST_INTEGRATION.md).
+
 Symbol-level code intelligence for coding agents and the people who supervise
 them. One binary, one SQLite store, no daemon required and no network.
 
@@ -88,6 +91,48 @@ devmap status               # generation, node/edge counts, freshness
 ```
 
 State lives in `.devmap/` by default. See **Where state lives** below.
+
+Interactive builds show an animated stage bar, the active operation (including
+writer-lock waits), and elapsed stage time. Animation appears after 150 ms and
+refreshes at most every 80 ms, so fast unchanged builds stay quiet. Reading and
+extraction show measured file counts and a phase percentage once their total is
+known. Wider terminals also show throughput and an approximate phase ETA after
+at least ten files and one second of measured work. The stage bar is not an
+overall percentage: resolving and writing have different costs.
+
+The final summary shows generation, elapsed time, file/symbol/edge counts,
+added/changed/removed sources and actual cache hits. Unchanged builds report the
+current generation once. `--verbose` retains phase, reclaim and resolution
+details; coverage refusals and reclaim failures remain visible by default.
+Requested consumer artifacts must finish before completion is announced.
+
+```bash
+devmap build . --progress auto     # animated on interactive stderr (default)
+devmap build . --progress always   # also show plain progress in redirected logs
+devmap build . --progress never    # suppress progress; diagnostics still appear
+devmap build . --verbose           # include phase and resolution details
+devmap build . --json              # JSON only on stdout, including stage timings
+```
+
+`--json --progress always` keeps JSON on stdout and progress on stderr. Live
+rows adapt to terminal width; `TERM=dumb` uses plain lines and Windows uses
+ASCII plain lines. `NO_COLOR=1` disables color. Non-UTF-8 locales use ASCII progress. Redirected
+output never contains progress animation escapes. Paths and diagnostics escape
+terminal control characters.
+
+Progress output has a bounded queue and shutdown. A paused, full or disconnected
+stderr cannot hold the indexing result on a separate stdout pipe. Primary result
+output still follows ordinary stdout backpressure, after releasing the build's
+writer lock. `progress_output` in JSON
+reports failed writes, dropped updates, and retained/omitted diagnostics; a
+successful write means the stream accepted the bytes, not that a person saw
+them. Human summaries disclose incomplete progress output too.
+
+JSON `file_progress` carries scan and extraction counters plus source deltas.
+An extraction value of `null` means it was skipped; zero cache hits means it ran
+without a hit. Removed sources are absent from the readable scan compared with
+the previous generation; discovery refusals are counted separately. See
+[PROGRESS_AUDIT.md](PROGRESS_AUDIT.md) for verification evidence and platform limits.
 
 ### Ask
 

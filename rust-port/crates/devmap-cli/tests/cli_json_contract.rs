@@ -492,3 +492,57 @@ fn doctor_json_names_schemas_grammar_count_and_store_path() {
         "{after}"
     );
 }
+
+/// Host integrations must decide compatibility from fields, without parsing a
+/// diagnostic sentence or optimistically opening a store from a newer kernel.
+#[test]
+fn status_exposes_a_versioned_reader_contract_and_distinguishes_schema_directions() {
+    let root = fixture("host-reader-contract");
+
+    let missing = one_json_line(&run(&root, &["--json", "status"]), "missing status");
+    assert_eq!(missing["host_contract_version"], 1, "{missing}");
+    assert_eq!(missing["schema_relation"], "missing", "{missing}");
+    assert_eq!(missing["reader_ready"], false, "{missing}");
+    assert_eq!(missing["query_ready"], false, "{missing}");
+    assert!(missing["binary_version"].as_str().is_some(), "{missing}");
+    for capability in [
+        "status", "search", "explore", "impact", "trace", "affected", "html",
+    ] {
+        assert_eq!(
+            missing["capabilities"][capability], true,
+            "{capability}: {missing}"
+        );
+    }
+
+    let future = root.join("future.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&future).unwrap();
+        conn.pragma_update(
+            None,
+            "user_version",
+            devmap_store::CURRENT_SCHEMA_VERSION + 1,
+        )
+        .unwrap();
+    }
+    let future_status = one_json_line(
+        &run(&root, &["--db", "future.sqlite", "--json", "status"]),
+        "future status",
+    );
+    assert_eq!(future_status["schema_relation"], "newer", "{future_status}");
+    assert_eq!(future_status["reader_ready"], false, "{future_status}");
+    assert_eq!(future_status["query_ready"], false, "{future_status}");
+    assert!(
+        !future_status["degraded_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("run `devmap build` to migrate"),
+        "an older binary cannot migrate a newer store: {future_status}"
+    );
+
+    std::fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+    run(&root, &["build", "."]);
+    let ready = one_json_line(&run(&root, &["--json", "status"]), "ready status");
+    assert_eq!(ready["schema_relation"], "current", "{ready}");
+    assert_eq!(ready["reader_ready"], true, "{ready}");
+    assert_eq!(ready["query_ready"], true, "{ready}");
+}

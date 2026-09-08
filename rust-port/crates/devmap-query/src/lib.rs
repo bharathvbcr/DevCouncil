@@ -30,6 +30,11 @@ pub mod semantic;
 pub mod viz;
 pub mod workspace;
 
+// Embedder facade: a host that depends on `devmap-query` should not need a
+// second path dependency merely to name the Store accepted by
+// `StoreQueryEngine`. This re-exports the exact crate instance used here.
+pub use devmap_store;
+
 pub use artifacts::{
     should_regenerate, write_atomic, writer_identity, ArtifactFingerprint, ArtifactRecord,
     ArtifactStamp,

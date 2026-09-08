@@ -1,4 +1,3 @@
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -7,6 +6,7 @@ use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
 mod claude;
+mod progress;
 
 use devmap_extract::collect_go_modules;
 use devmap_query::freshness::{self, FreshnessDigests, InventoryLimits, InventorySource};
@@ -141,10 +141,14 @@ struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     json: bool,
 
-    /// Build progress policy. Auto writes progress to stderr only for an
-    /// interactive terminal. Global; see `--db`.
+    /// Build progress policy. Auto animates stages on interactive stderr;
+    /// always also emits plain progress in logs. JSON stdout stays clean.
     #[arg(long, value_enum, global = true, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
+
+    /// Include build phase timings, reclaim details and resolution breakdowns.
+    #[arg(long, short, global = true)]
+    verbose: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -223,8 +227,9 @@ struct StageTiming {
 type OpenStage = (String, Instant, Vec<StageTiming>);
 
 struct ProgressReporter {
-    enabled: bool,
+    display: progress::Display,
     started_at: Instant,
+    json: bool,
     /// The stage currently running: its label, when it began, and the
     /// sub-phases closed inside it so far.
     ///
@@ -249,31 +254,25 @@ struct ProgressReporter {
 }
 
 impl ProgressReporter {
-    const TOTAL_STAGES: usize = 5;
+    const TOTAL_STAGES: usize = progress::TOTAL_STAGES;
 
-    fn new(mode: ProgressMode, json: bool) -> Self {
-        let enabled = match mode {
-            ProgressMode::Auto => !json && std::io::stderr().is_terminal(),
-            ProgressMode::Always => true,
-            ProgressMode::Never => false,
-        };
+    fn new(mode: ProgressMode, json: bool, verbose: bool) -> Self {
         Self {
-            enabled,
+            display: progress::Display::new(mode, json, verbose),
             started_at: Instant::now(),
+            json,
             open: std::cell::RefCell::new(None),
             timings: std::cell::RefCell::new(Vec::new()),
         }
     }
 
     /// Close the running stage, recording its cost against its own label.
-    fn close_open_stage(&self) {
+    fn close_open_stage(&self, succeeded: bool) {
         let Some((label, started, sub)) = self.open.borrow_mut().take() else {
             return;
         };
         let seconds = started.elapsed().as_secs_f64();
-        if self.enabled {
-            eprintln!("      {label} took {:.0}ms", seconds * 1000.0);
-        }
+        self.display.closed(&label, seconds, succeeded);
         self.timings.borrow_mut().push(StageTiming {
             label,
             seconds,
@@ -287,11 +286,9 @@ impl ProgressReporter {
     /// never` is about keeping stderr clean, not about declining to measure,
     /// and the `--json` breakdown must not depend on the human output being on.
     fn stage(&self, current: usize, message: impl std::fmt::Display) {
-        self.close_open_stage();
+        self.close_open_stage(true);
         let rendered = message.to_string();
-        if self.enabled {
-            eprintln!("[{current}/{}] {rendered}", Self::TOTAL_STAGES);
-        }
+        self.display.stage(current, &rendered);
         *self.open.borrow_mut() = Some((rendered, Instant::now(), Vec::new()));
     }
 
@@ -307,12 +304,12 @@ impl ProgressReporter {
         label: &str,
         work: impl FnOnce() -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
+        self.display.detail(label);
         let started = Instant::now();
         let outcome = work();
         let elapsed = started.elapsed().as_secs_f64();
-        if self.enabled {
-            eprintln!("      {label} (+{:.0}ms)", elapsed * 1000.0);
-        }
+        self.display.phase(label, elapsed);
+        self.display.detail("");
         self.record(StageTiming {
             label: label.to_string(),
             seconds: elapsed,
@@ -337,12 +334,12 @@ impl ProgressReporter {
         label: &str,
         work: impl FnOnce() -> std::result::Result<(T, Vec<(String, f64)>), E>,
     ) -> std::result::Result<T, E> {
+        self.display.detail(label);
         let started = Instant::now();
         let outcome = work();
         let elapsed = started.elapsed().as_secs_f64();
-        if self.enabled {
-            eprintln!("      {label} (+{:.0}ms)", elapsed * 1000.0);
-        }
+        self.display.phase(label, elapsed);
+        self.display.detail("");
         // An error path reports the phase with no split rather than no phase:
         // a write that failed halfway still took the time, and the parts it
         // managed to charge are not a breakdown of what it did.
@@ -381,9 +378,7 @@ impl ProgressReporter {
     /// An untimed detail line under the current stage. Does not disturb the
     /// stage clock, so a note between two phases cannot be mistaken for one.
     fn note(&self, message: impl std::fmt::Display) {
-        if self.enabled {
-            eprintln!("      {message}");
-        }
+        self.display.note(message);
     }
 
     /// Close the last stage and print the total.
@@ -392,15 +387,30 @@ impl ProgressReporter {
     /// and opening a fifth stage here would leave it running forever and put a
     /// zero-length entry in the breakdown.
     fn complete(&self, generation_id: u32) {
-        self.close_open_stage();
-        if self.enabled {
-            eprintln!(
-                "[{}/{}] complete: generation #{generation_id} in {:.2}s",
-                Self::TOTAL_STAGES,
-                Self::TOTAL_STAGES,
-                self.started_at.elapsed().as_secs_f64()
-            );
+        self.close_open_stage(true);
+        if !self.json {
+            self.display.finish("");
+            return;
         }
+        self.display.finish(format_args!(
+            "[{}/{}] complete: generation #{generation_id} in {}",
+            Self::TOTAL_STAGES,
+            Self::TOTAL_STAGES,
+            progress::duration(self.started_at.elapsed().as_secs_f64())
+        ));
+    }
+
+    fn up_to_date(&self, generation: u32, files: usize) {
+        self.close_open_stage(true);
+        if !self.json {
+            self.display.finish("");
+            return;
+        }
+        self.display.finish(format_args!(
+            "up to date: generation #{generation} · {} checked in {} · resolve/analyze/write skipped",
+            progress::count(files, "file"),
+            progress::duration(self.started_at.elapsed().as_secs_f64())
+        ));
     }
 
     /// The recorded breakdown as `{stage_label: seconds}` plus the total, for
@@ -1260,6 +1270,7 @@ enum ClaudeAction {
 /// Everything one `manifest` write needs, whether it was asked for on its own
 /// or fused onto the end of a build.
 struct ManifestRequest<'a> {
+    progress: Option<&'a progress::Display>,
     /// The tree the caller named. Used only when the store cannot say where its
     /// repository root is.
     path: &'a std::path::Path,
@@ -1627,20 +1638,27 @@ fn write_consumer_artifacts(
     // artifacts that were never written is a skip that skips nothing real.
     // A stamp that cannot be written is not fatal — it costs the next run a
     // regeneration, which is the behaviour that existed before the stamp.
+    let note = |message: String| {
+        if let Some(progress) = request.progress {
+            progress.diagnostic(message);
+        } else {
+            eprintln!("{message}");
+        }
+    };
     match ArtifactStamp::of(inputs, stamp_generated_head, &outputs) {
         Ok(stamp) => {
             if let Err(error) = stamp.write(&stamp_path) {
-                eprintln!(
+                note(format!(
                     "  note: could not record the artifact stamp at {} ({error}); \
                      the next manifest will regenerate rather than skip",
                     stamp_path.display()
-                );
+                ));
             }
         }
-        Err(error) => eprintln!(
+        Err(error) => note(format!(
             "  note: could not stat the artifacts just written ({error}); \
              the next manifest will regenerate rather than skip"
-        ),
+        )),
     }
 
     Ok(ManifestOutcome {
@@ -1689,6 +1707,11 @@ fn kernel_capabilities() -> serde_json::Value {
                     .any(|argument| argument.get_long() == Some(flag))
             })
     };
+    let has_command = |subcommand: &str| -> bool {
+        command
+            .get_subcommands()
+            .any(|candidate| candidate.get_name() == subcommand)
+    };
     // All three or none: a kernel accepting only some of the digests would need
     // the read-modify-write path for the rest, and running both is strictly
     // worse than running one.
@@ -1696,10 +1719,61 @@ fn kernel_capabilities() -> serde_json::Value {
         .iter()
         .all(|flag| accepts("manifest", flag));
     serde_json::json!({
+        "status": has_command("status"),
+        "search": has_command("search"),
+        "explore": has_command("explore"),
+        "impact": has_command("impact"),
+        "trace": has_command("trace"),
+        "affected": has_command("affected"),
+        "html": has_command("html"),
         "manifest_graph_output": accepts("manifest", "graph-output"),
         "manifest_stamp_flags": stamp_flags,
         "build_manifest": accepts("build", "manifest"),
     })
+}
+
+/// Stable compatibility fields for process hosts such as Manvi and GitPulse.
+///
+/// `status` intentionally exits successfully for incompatible stores so a host
+/// can inspect this contract before deciding whether to invoke a query. These
+/// fields therefore carry readiness explicitly rather than making exit status
+/// stand in for schema negotiation.
+fn host_contract_fields(
+    stored_schema: Option<i32>,
+    generation_id: Option<i64>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let relation = match stored_schema {
+        None => "missing",
+        Some(version) if version == devmap_store::CURRENT_SCHEMA_VERSION => "current",
+        Some(version) if version == devmap_store::PYTHON_INDEX_SCHEMA_VERSION => "foreign",
+        Some(version) if version > devmap_store::CURRENT_SCHEMA_VERSION => "newer",
+        Some(version) if Store::schema_is_migratable(version) => "upgradeable",
+        Some(_) => "unsupported",
+    };
+    let reader_ready = relation == "current";
+    serde_json::Map::from_iter([
+        ("host_contract_version".into(), serde_json::json!(1)),
+        (
+            "binary_version".into(),
+            serde_json::json!(env!("CARGO_PKG_VERSION")),
+        ),
+        ("schema_relation".into(), serde_json::json!(relation)),
+        ("reader_ready".into(), serde_json::json!(reader_ready)),
+        (
+            "query_ready".into(),
+            serde_json::json!(reader_ready && generation_id.is_some()),
+        ),
+    ])
+}
+
+fn extend_host_contract(
+    value: &mut serde_json::Value,
+    stored_schema: Option<i32>,
+    generation_id: Option<i64>,
+) {
+    if let Some(fields) = value.as_object_mut() {
+        fields.extend(host_contract_fields(stored_schema, generation_id));
+    }
 }
 
 /// The structured answer `devmap doctor` emits.
@@ -2095,9 +2169,15 @@ fn report_scan(payload: &serde_json::Value) {
 /// whole point of the flag: the seam used to run `build`, then `manifest`, then
 /// `status` — three processes, three store opens — to answer one question about
 /// one generation.
+struct BuildManifestPayload {
+    json: serde_json::Value,
+    outcome: ManifestOutcome,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_manifest_payload(
     cli: &Cli,
+    progress: &progress::Display,
     store: &Store,
     enabled: bool,
     path: &std::path::Path,
@@ -2107,13 +2187,14 @@ fn build_manifest_payload(
     force: bool,
     stamps: &StampFlags,
     inventory: InventoryFlags,
-) -> anyhow::Result<Option<serde_json::Value>> {
+) -> anyhow::Result<Option<BuildManifestPayload>> {
     if !enabled {
         return Ok(None);
     }
     let outcome = write_consumer_artifacts(
         store,
         ManifestRequest {
+            progress: Some(progress),
             path,
             db: &cli.db(),
             output,
@@ -2130,10 +2211,10 @@ fn build_manifest_payload(
     // whether the generation it just built is fresh, degraded or backed up
     // behind a pending queue.
     payload["status"] = serde_json::Value::Object(store_status_fields(store, &cli.db())?);
-    if !cli.json {
-        report_manifest(cli, &outcome)?;
-    }
-    Ok(Some(payload))
+    Ok(Some(BuildManifestPayload {
+        json: payload,
+        outcome,
+    }))
 }
 
 fn open_for_read(db: &std::path::Path) -> anyhow::Result<Store> {
@@ -3062,8 +3143,10 @@ async fn main() -> std::process::ExitCode {
     if !cli.command.serves() {
         restore_default_sigpipe();
     }
+    let progress = matches!(cli.command, Commands::Build { .. })
+        .then(|| ProgressReporter::new(cli.progress, cli.json, cli.verbose));
     let outcome = match validate_limits(&cli.command).and_then(|()| validate_root(&cli)) {
-        Ok(()) => run(&cli).await,
+        Ok(()) => run(&cli, progress.as_ref()).await,
         Err(message) => Err(anyhow::anyhow!(message)),
     };
     match outcome {
@@ -3078,16 +3161,31 @@ async fn main() -> std::process::ExitCode {
             // parsing it saw an empty string and could not tell a failure from
             // a command that answered nothing. Two channels, one message —
             // stdout stays exactly one JSON line either way.
-            eprintln!("Error: {}", render_error(&error));
-            if cli.json {
-                println!("{}", serde_json::json!({ "error": render_error(&error) }));
+            if let Some(progress) = progress.as_ref() {
+                progress.close_open_stage(false);
+                progress
+                    .display
+                    .diagnostic(format_args!("Error: {}", render_error(&error)));
+                progress.display.finish("build stopped before completion");
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "error": render_error(&error),
+                        "timings": progress.timings_json(), "progress_output": progress.display.output_json() })
+                    );
+                }
+            } else {
+                eprintln!("Error: {}", render_error(&error));
+                if cli.json {
+                    println!("{}", serde_json::json!({ "error": render_error(&error) }));
+                }
             }
             std::process::ExitCode::FAILURE
         }
     }
 }
 
-async fn run(cli: &Cli) -> anyhow::Result<()> {
+async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Build {
             path,
@@ -3103,7 +3201,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             stamps,
             inventory,
         } => {
-            let progress = ProgressReporter::new(cli.progress, cli.json);
+            let progress = progress.expect("main supplies a build reporter");
             let build_started = std::time::Instant::now();
             progress.stage(
                 1,
@@ -3119,7 +3217,9 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // Taking it first means the loser waits for the winner and then
             // does useful work, or fails immediately with a message naming the
             // pid that holds the store.
+            progress.display.detail("waiting for writer lock");
             let _writer = Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)?;
+            progress.display.detail("opening index");
             let store = Store::open(cli.db())?;
             // A store this process can only read opens fine — queries need it
             // to — and would otherwise fail at the first write with a bare
@@ -3182,22 +3282,27 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // sources have not moved is exactly where a stale queue hides.
             let reconciled = store.reconcile_pending_paths(path)?;
             if !reconciled.dropped.is_empty() {
-                eprintln!(
+                progress.display.diagnostic(format_args!(
                     "  pending queue: dropped {} unprocessable row(s):",
                     reconciled.dropped.len()
-                );
+                ));
                 for (dropped, reason) in reconciled.dropped.iter().take(20) {
-                    eprintln!("    {dropped}: {reason}");
+                    progress
+                        .display
+                        .diagnostic(format_args!("    {dropped}: {reason}"));
                 }
                 if reconciled.dropped.len() > 20 {
-                    eprintln!("    … and {} more", reconciled.dropped.len() - 20);
+                    progress.display.diagnostic(format_args!(
+                        "    … and {} more",
+                        reconciled.dropped.len() - 20
+                    ));
                 }
             }
             if !reconciled.rewritten.is_empty() {
-                eprintln!(
+                progress.display.diagnostic(format_args!(
                     "  pending queue: normalized {} row(s) to repo-relative paths",
                     reconciled.rewritten.len()
-                );
+                ));
             }
 
             // Discovery, once, before anything decides whether to extract.
@@ -3209,7 +3314,15 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // 213–254 ms of a ~300 ms no-op scan, every byte of it discarded).
             // `--full` reuses the same scan rather than walking and reading the
             // corpus a second time.
-            let scanned = devmap_extract::scan_tree(path)?;
+            progress.display.detail("discovering source files");
+            let scan_progress =
+                std::sync::Arc::new(devmap_extract::progress::FileProgress::default());
+            progress
+                .display
+                .files("reading", std::sync::Arc::clone(&scan_progress));
+            let scanned = devmap_extract::scan_tree_with_progress(path, Some(&scan_progress))?;
+            let scan_snapshot = scan_progress.snapshot();
+            progress.display.detail("checking content hashes");
             // Report what discovery refused. A file dropped for being oversized
             // or unreadable used to vanish with no record: `repo_map.json` would
             // say five files while two more existed, and nothing distinguished
@@ -3224,17 +3337,22 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 // count of two hundred is a capped sample presented as the set,
                 // which is the one thing this codebase never lets a report do.
                 let shown = refused.len().min(REFUSAL_SAMPLE);
-                eprintln!(
+                progress.display.diagnostic(format_args!(
                     "  discovery refused {} file(s) — these are absent from the graph \
                      (showing {shown} of {}):",
                     refused.len(),
                     refused.len()
-                );
+                ));
                 for (path, reason) in refused.iter().take(REFUSAL_SAMPLE) {
-                    eprintln!("    {path}: {reason:?}");
+                    progress
+                        .display
+                        .diagnostic(format_args!("    {path}: {reason:?}"));
                 }
                 if refused.len() > REFUSAL_SAMPLE {
-                    eprintln!("    … and {} more", refused.len() - REFUSAL_SAMPLE);
+                    progress.display.diagnostic(format_args!(
+                        "    … and {} more",
+                        refused.len() - REFUSAL_SAMPLE
+                    ));
                 }
             }
             let refused_count = refused.len();
@@ -3266,15 +3384,19 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // — so the verdict is the one extraction would have produced, for
             // the cost of an FNV pass instead of 1,311 store round-trips.
             let previous = store.latest_file_hashes()?;
+            let file_delta = scanned.file_delta(&previous);
             if !*full
                 && !previous.is_empty()
                 && previous.len() == scanned.sources.len()
                 && store.latest_generation_payload_is_current()?
             {
-                let unchanged = scanned.matches_file_hashes(&previous);
+                let unchanged = file_delta.is_unchanged();
                 if unchanged {
                     let file_count = scanned.sources.len();
-                    progress.stage(2, format_args!("{file_count} files unchanged"));
+                    progress.stage(
+                        2,
+                        format_args!("{} unchanged", progress::count(file_count, "file")),
+                    );
                     let generation = store.latest_generation_id()?.unwrap_or(0);
                     // K2: reclaim runs on the warm path too.
                     //
@@ -3289,7 +3411,16 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     // and pruning on a read-shaped path would delete history a
                     // caller did not ask to lose.
                     let vacuum = progress.timed("persist:vacuum", || store.vacuum_if_needed())?;
-                    progress.note(format_args!("reclaim: {}", reclaim_note(&vacuum)));
+                    if vacuum
+                        .checkpoint
+                        .is_none_or(|checkpoint| checkpoint.busy != 0)
+                    {
+                        progress
+                            .display
+                            .diagnostic(format_args!("reclaim: {}", reclaim_note(&vacuum)));
+                    } else {
+                        progress.note(format_args!("reclaim: {}", reclaim_note(&vacuum)));
+                    }
                     // K1(e2): the unchanged check compared *every* file in the
                     // tree against the stored generation and found them equal.
                     // That is the same proof a fresh whole-tree build gives —
@@ -3314,8 +3445,12 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     // written — which is the entire saving: `manifest` used to
                     // re-serialize a 22 MB code graph here to produce bytes
                     // identical to the ones already on disk.
+                    if *write_manifest {
+                        progress.display.detail("checking consumer artifacts");
+                    }
                     let manifest = build_manifest_payload(
                         cli,
+                        &progress.display,
                         &store,
                         *write_manifest,
                         path,
@@ -3326,6 +3461,8 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                         stamps,
                         *inventory,
                     )?;
+                    drop(_writer);
+                    progress.up_to_date(generation, file_count);
                     if cli.json {
                         // Built through `serde_json` and carrying `timings`,
                         // like every other build result.
@@ -3342,6 +3479,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                             cli,
                             &serde_json::json!({
                                 "unchanged": true,
+                                "file_progress": { "scan": scan_snapshot, "extraction": null, "delta": file_delta },
                                 "files": file_count,
                                 // Recomputed by this scan, not carried over: a
                                 // build that proves nothing changed has just
@@ -3351,18 +3489,29 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                                 "generation": generation,
                                 "reclaim": reclaim_note(&vacuum),
                                 "timings": progress.timings_json(),
+                                "progress_output": progress.display.output_json(),
                                 // `null` when `--manifest` was not asked for,
                                 // never an empty object: a caller must be able
                                 // to tell "not requested" from "wrote nothing".
-                                "manifest": manifest,
+                                "manifest": manifest.as_ref().map(|manifest| &manifest.json),
                             }),
                         )?;
                     } else {
                         println!(
                             "No source changes; generation #{generation} still current \
-                             ({file_count} files)."
+                             ({}) in {}.",
+                            progress::count(file_count, "file"),
+                            progress::duration(progress.started_at.elapsed().as_secs_f64())
                         );
-                        println!("  Reclaim: {}", reclaim_note(&vacuum));
+                        progress.display.report_loss();
+                        if cli.verbose {
+                            if let Some(manifest) = &manifest {
+                                report_manifest(cli, &manifest.outcome)?;
+                            }
+                        }
+                        if cli.verbose && !progress.display.enabled() {
+                            println!("  Reclaim: {}", reclaim_note(&vacuum));
+                        }
                     }
                     return Ok(());
                 }
@@ -3376,6 +3525,15 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // returns the payload this build is trying to reproduce from
             // source, so a "full" rebuild that used it would recommit exactly
             // the rows the operator is asking to replace.
+            progress.display.detail(&format!(
+                "extracting {}",
+                progress::count(scanned.sources.len(), "file")
+            ));
+            let extraction_progress =
+                std::sync::Arc::new(devmap_extract::progress::FileProgress::default());
+            progress
+                .display
+                .files("extracting", std::sync::Arc::clone(&extraction_progress));
             let extractions = if *full {
                 let refs: Vec<devmap_extract::FileRef<'_>> = scanned
                     .sources
@@ -3385,10 +3543,15 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                         source: source.as_str(),
                     })
                     .collect();
-                devmap_extract::extract_all(&refs)
+                devmap_extract::extract_all_with_progress(&refs, Some(&extraction_progress))
             } else {
-                devmap_store::extract_scanned_cached(&store, &scanned)?
+                devmap_store::extract_scanned_cached_with_progress(
+                    &store,
+                    &scanned,
+                    Some(&extraction_progress),
+                )?
             };
+            let extraction_snapshot = extraction_progress.snapshot();
             // The corpus text is dead the moment extraction has consumed it,
             // but it is bound in this scope and would otherwise stay resident
             // through resolve, analyze and persist — the stages that set the
@@ -3450,11 +3613,17 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             let mut resolver = Resolver::new();
             resolver.index_go_modules(&collect_go_modules(path)?);
             resolver.index_extractions(&extractions);
-            progress.stage(2, format_args!("resolving {} files", extractions.len()));
+            progress.stage(
+                2,
+                format_args!("resolving {}", progress::count(extractions.len(), "file")),
+            );
             let resolution = resolver.resolve_all(&extractions);
             progress.stage(
                 3,
-                format_args!("analyzing {} resolved edges", resolution.edges.len()),
+                format_args!(
+                    "analyzing {}",
+                    progress::count(resolution.edges.len(), "resolved edge")
+                ),
             );
             // The refusal count reaches the analysis, not just stderr. A file
             // discovery turned away has no `Extraction`, so nothing computed
@@ -3585,9 +3754,16 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // decline and a reclaim-that-reclaimed-nothing both take ~0 ms and
             // leave the same file behind, so the duration alone cannot tell a
             // healthy store from one growing without bound.
-            progress.note(format_args!("reclaim: {}", reclaim_note(&vacuum)));
-
-            progress.complete(gen_id);
+            if vacuum
+                .checkpoint
+                .is_none_or(|checkpoint| checkpoint.busy != 0)
+            {
+                progress
+                    .display
+                    .diagnostic(format_args!("reclaim: {}", reclaim_note(&vacuum)));
+            } else {
+                progress.note(format_args!("reclaim: {}", reclaim_note(&vacuum)));
+            }
 
             // SC18: report the tiers separately. One undifferentiated count
             // made 380k structurally-unresolvable calls — language builtins,
@@ -3612,8 +3788,12 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 }
             }
 
+            if *write_manifest {
+                progress.stage(5, "writing consumer artifacts");
+            }
             let manifest = build_manifest_payload(
                 cli,
+                &progress.display,
                 &store,
                 *write_manifest,
                 path,
@@ -3624,11 +3804,14 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 stamps,
                 *inventory,
             )?;
+            drop(_writer);
+            progress.complete(gen_id);
             if cli.json {
                 emit_json(
                     cli,
                     &serde_json::json!({
                         "generation_id": gen_id,
+                        "file_progress": { "scan": scan_snapshot, "extraction": extraction_snapshot, "delta": file_delta },
                         "files_indexed": analysis.total_files,
                         // Its own number, never folded into the parse-failure
                         // count: a refused file is fixed by making it smaller or
@@ -3657,12 +3840,30 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                         // build reads it from the result rather than scraping
                         // the human progress lines off stderr.
                         "timings": progress.timings_json(),
-                        "manifest": manifest,
+                                "progress_output": progress.display.output_json(),
+                        "manifest": manifest.as_ref().map(|manifest| &manifest.json),
                     }),
                 )?;
             } else {
-                println!("Successfully built generation #{gen_id}");
-                println!("  Files indexed: {}", analysis.total_files);
+                println!(
+                    "Built generation #{gen_id} · {} · {} · {} · {}",
+                    progress::count(analysis.total_files, "file"),
+                    progress::count(analysis.total_symbols, "symbol"),
+                    progress::count(analysis.total_edges, "edge"),
+                    progress::duration(progress.started_at.elapsed().as_secs_f64())
+                );
+                println!(
+                    "  Changes: +{} ~{} -{} · {} unchanged · {} cached",
+                    file_delta.added,
+                    file_delta.changed,
+                    file_delta.removed,
+                    file_delta.unchanged,
+                    extraction_snapshot.cache_hits
+                );
+                progress.display.report_loss();
+                if cli.verbose {
+                    println!("  Files indexed: {}", analysis.total_files);
+                }
                 if refused_count > 0 {
                     // Said here as well as on stderr: the count belongs beside
                     // the file total it is part of, or a reader takes the total
@@ -3672,17 +3873,25 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                          (recorded as lost coverage, not parsed)"
                     );
                 }
-                println!("  Symbols extracted: {}", analysis.total_symbols);
-                println!("  Edges resolved: {}", analysis.total_edges);
-                // R5: a call we could not attribute is reported, not dropped.
-                println!("  Unresolved calls: {}", analysis.unresolved_calls);
-                print_resolution_rate(&analysis.resolution_rate);
-                println!("    language builtins:  {builtin_calls}");
-                println!("    host globals:       {host_global_calls}");
-                println!("    local bindings:     {local_binding_calls}");
-                println!("    external imports:   {external_calls}");
-                println!("    uninferred receiver:{uninferred_receiver_calls}");
-                println!("    unattributed:       {unattributed_calls}");
+                if !cli.verbose && (unattributed_calls > 0 || uninferred_receiver_calls > 0) {
+                    println!("  Unresolved: {unattributed_calls} unattributed, {uninferred_receiver_calls} uninferred receivers (details: --verbose)");
+                }
+                if cli.verbose {
+                    println!("  Symbols extracted: {}", analysis.total_symbols);
+                    println!("  Edges resolved: {}", analysis.total_edges);
+                    // R5: a call we could not attribute is reported, not dropped.
+                    println!("  Unresolved calls: {}", analysis.unresolved_calls);
+                    print_resolution_rate(&analysis.resolution_rate);
+                    println!("    language builtins:  {builtin_calls}");
+                    println!("    host globals:       {host_global_calls}");
+                    println!("    local bindings:     {local_binding_calls}");
+                    println!("    external imports:   {external_calls}");
+                    println!("    uninferred receiver:{uninferred_receiver_calls}");
+                    println!("    unattributed:       {unattributed_calls}");
+                    if let Some(manifest) = &manifest {
+                        report_manifest(cli, &manifest.outcome)?;
+                    }
+                }
             }
         }
         Commands::Search {
@@ -4159,6 +4368,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             let outcome = write_consumer_artifacts(
                 &store,
                 ManifestRequest {
+                    progress: None,
                     path,
                     db: &cli.db(),
                     output: &resolve_map_output(output, path),
@@ -4423,7 +4633,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             // Migrating is `build`'s job, where the caller asked for a write.
             let stored_schema = Store::stored_schema_version(cli.db())?;
             let Some(stored_schema) = stored_schema else {
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "generation_id": serde_json::Value::Null,
                     "pending_count": 0,
                     "node_count": 0,
@@ -4447,6 +4657,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     // exit the seam's own probe takes.
                     "capabilities": kernel_capabilities(),
                 });
+                extend_host_contract(&mut payload, None, None);
                 // Through `emit_json` like every other exit from this command.
                 // Printed pretty regardless of `--json`, this was the one
                 // `--json` path in the binary that emitted a multi-line
@@ -4458,7 +4669,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
             };
             if stored_schema != devmap_store::CURRENT_SCHEMA_VERSION {
                 let version = stored_schema;
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "generation_id": serde_json::Value::Null,
                     "pending_count": 0,
                     "node_count": 0,
@@ -4478,10 +4689,21 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                              (this binary speaks {})",
                             devmap_store::CURRENT_SCHEMA_VERSION
                         )
-                    } else {
+                    } else if version > devmap_store::CURRENT_SCHEMA_VERSION {
+                        format!(
+                            "store schema is {version}, newer than the {} this binary speaks; \
+                             install a matching or newer devmap binary",
+                            devmap_store::CURRENT_SCHEMA_VERSION
+                        )
+                    } else if Store::schema_is_migratable(version) {
                         format!(
                             "store schema is {version}, this binary speaks {}; \
                              run `devmap build` to migrate it",
+                            devmap_store::CURRENT_SCHEMA_VERSION
+                        )
+                    } else {
+                        format!(
+                            "store schema is {version}, unsupported by this binary (which speaks {})",
                             devmap_store::CURRENT_SCHEMA_VERSION
                         )
                     },
@@ -4497,6 +4719,7 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
                     "capabilities": kernel_capabilities(),
                 });
+                extend_host_contract(&mut payload, Some(version), None);
                 emit_json(cli, &payload)?;
                 return Ok(());
             }
@@ -4514,6 +4737,12 @@ async fn run(cli: &Cli) -> anyhow::Result<()> {
                 serde_json::json!(devmap_store::CURRENT_SCHEMA_VERSION),
             );
             payload.insert("capabilities".into(), kernel_capabilities());
+            payload.extend(host_contract_fields(
+                Some(stored_schema),
+                payload
+                    .get("generation_id")
+                    .and_then(serde_json::Value::as_i64),
+            ));
             emit_json(cli, &serde_json::Value::Object(payload))?;
         }
         Commands::Doctor => {
@@ -5430,7 +5659,7 @@ mod tests {
     /// the breakdown, and none of them held before the fix.
     #[test]
     fn stage_timings_are_attributed_to_the_stage_that_incurred_them() {
-        let reporter = ProgressReporter::new(ProgressMode::Never, true);
+        let reporter = ProgressReporter::new(ProgressMode::Never, true, false);
 
         reporter.stage(1, "alpha");
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -5483,7 +5712,7 @@ mod tests {
     /// total and a reader would attribute the missing time to nothing at all.
     #[test]
     fn an_unfinished_stage_is_reported_rather_than_dropped() {
-        let reporter = ProgressReporter::new(ProgressMode::Never, true);
+        let reporter = ProgressReporter::new(ProgressMode::Never, true, false);
         reporter.stage(1, "still running");
 
         let json = reporter.timings_json();
