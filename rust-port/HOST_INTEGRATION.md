@@ -19,9 +19,7 @@ use devmap_query::devmap_store::Store;
 
 let repository_root = std::path::Path::new("/path/to/repository");
 let store_path = paths::store_path(repository_root);
-let store = Store::open_existing(store_path)?.ok_or_else(|| {
-    std::io::Error::new(std::io::ErrorKind::NotFound, "map not built")
-})?;
+let store = Store::open_read_only(store_path)?;
 let queries = StoreQueryEngine::new(&store);
 ```
 
@@ -32,6 +30,37 @@ rewriting paths into DevCouncil's Python package. Always use
 `paths::store_path(repository_root)` instead of appending `.devmap` or
 `.devcouncil`: the resolver honors `DEVMAP_HOME`, an existing standalone
 layout, and the legacy DevCouncil layout in their documented precedence.
+
+`open_read_only` requires an existing current-schema store and never creates,
+migrates, or heals it. Writer processes continue to own schema migration.
+
+Hosts that read the JSON artifacts directly should use the checked provider
+rather than open-coding a file read:
+
+```rust
+use devmap_query::host::{ArtifactProvider, FilesystemArtifactProvider};
+use devmap_query::viz::VizOptions;
+
+let artifacts = FilesystemArtifactProvider::for_repo(repository_root);
+let graph = artifacts.read_code_graph()?; // validated Value for a native canvas
+let html = artifacts.code_graph_html(&VizOptions::default())?;
+```
+
+The same provider exposes `read_repo_map`, `repo_map_payload`, and
+`repo_map_html`. It resolves `.devmap` versus `.devcouncil` through
+`devmap_query::paths`, rejects missing, non-regular, malformed, oversized, or
+incomplete artifacts, and accepts the older versionless graph shape. The
+128 MiB ceiling can be lowered with `with_max_bytes`; zero or a value above the
+ceiling is an explicit configuration error. `ArtifactProvider` is the narrow
+replacement seam for a cache or IPC-backed module: implement `load_artifact`,
+and its checked default helpers apply schema and shape validation. A custom
+override of those helpers must preserve the same contract.
+
+The filesystem provider rejects a stable symlink, directory, or FIFO before it
+opens the path and rechecks the opened handle and byte count. Standard Rust has
+no portable atomic no-follow plus nonblocking open, so this does not claim to
+close a hostile path-swap race when another process can rewrite the state
+directory concurrently.
 
 ## Process module
 
@@ -58,6 +87,8 @@ name itself.
 | `schema_relation` | `missing`, `current`, `foreign`, `newer`, `upgradeable`, or `unsupported`. |
 | `reader_ready` | The executable can safely open the store for reads. |
 | `query_ready` | `reader_ready` and a committed generation exists. |
+| `generation_id` | Latest committed generation, or `null`; a query host requires a positive integer. |
+| `db_path` | Resolved store path; a query host requires a nonblank value. |
 | `is_fresh` | No known pending update remains. Independent of schema readiness. |
 | `degraded_reason` | Coverage, freshness, or compatibility problem; `null` only when none is known. |
 | `capabilities` | Operations and flags derived from the executable's command parser. |
@@ -65,6 +96,9 @@ name itself.
 Proceed only when `host_contract_version == 1`, `reader_ready == true`, the
 required capability is `true`, and `query_ready == true` for a query. Treat an
 unknown contract version, missing field, `null`, and `false` as unavailable.
+When `query_ready` is true, also require a positive integer `generation_id` and
+a nonblank `db_path`; this keeps a malformed status response from reaching the
+query path merely because its readiness bit was set.
 `schema_relation == "upgradeable"` means an explicit `devmap build` can migrate
 the store. `foreign`, `newer`, and `unsupported` must not be opened or rewritten
 by that executable.
@@ -79,9 +113,9 @@ devmap --json --db <db> trace <from> [to] --budget <tokens> --depth <n>
 devmap --json --db <db> affected <target>... --budget <tokens> --depth <n> --min-confidence <0..1>
 ```
 
-The host must preserve `shown`, `total`, `hidden`, `truncated`, `resolution`,
-and `walk_incomplete` instead of reducing a response to its item list. Their
-absence is not proof of complete coverage.
+The host must preserve `shown`, `total`, `hidden`, `truncated`, `tokens_used`,
+`resolution`, and `walk_incomplete` instead of reducing a response to its item
+list. Their absence is not proof of complete coverage.
 
 `--json` writes exactly one JSON line to stdout. An operational failure exits
 nonzero and writes `{"error":"..."}` on stdout plus a diagnostic on stderr.

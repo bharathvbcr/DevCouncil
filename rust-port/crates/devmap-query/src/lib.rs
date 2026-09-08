@@ -17,6 +17,7 @@ pub mod escape;
 pub mod export;
 pub mod freshness;
 pub mod guides;
+pub mod host;
 pub mod inventory;
 pub mod linguist;
 pub mod manifest;
@@ -36,6 +37,10 @@ pub mod workspace;
 // the exact crate instances used here.
 pub use devmap_extract::paths;
 pub use devmap_store;
+
+// A host should not need another direct dependency merely to resolve the exact
+// state and artifact paths this crate reads. Re-export the canonical owner.
+pub use devmap_extract::paths;
 
 pub use artifacts::{
     should_regenerate, write_atomic, writer_identity, ArtifactFingerprint, ArtifactRecord,
