@@ -47,10 +47,64 @@ Command surfaces, as the binaries themselves report them:
 ```
 dcstore    acquire, diagnose, release, renew, active, list, task, ready, scope-append, health
 dcverify   check, health
-dcgrep     search, files, health
+dcgrep     search, files, index, health
 ```
 
 `dcstore` additionally requires `--db`.
+
+### Indexed repository search
+
+`dcgrep` links Microsoft's Rust
+[`tgrep-core`](https://github.com/microsoft/tgrep/tree/241128bd1976189f4851e4b7e572cf8bcea57fd8/tgrep-core)
+for trigram extraction, query planning and the disk index. Ripgrep's libraries
+still decide whether each candidate line actually matches. No `tgrep` executable
+or background server is needed.
+
+Build or refresh an index explicitly, then use the existing search command:
+
+```bash
+printf '%s\n' '{"root":"/path/to/repo"}' | dcgrep index
+printf '%s\n' '{"root":"/path/to/repo","pattern":"SomeSymbol"}' | dcgrep search
+```
+
+Search always walks the live tree and applies the current ignore rules. It
+skips matching only when an indexed file's opened descriptor still has the
+same precise metadata as the file read during indexing. New files, changed
+files, newly unignored files and anything absent from a partial index are
+searched normally. Deleted files are absent from the live walk. Rebuild after
+large changes to restore filtering efficiency; freshness does not depend on
+remembering to rebuild.
+
+The additive `index` object reports `status` (`used` or `scan`), the scan fallback
+`reason`, snapshot `files_indexed`, `files_filtered`, and `files_stale`.
+`files_searched` continues to count files passed through the final matcher.
+Schema version 1 and existing request/result fields are unchanged; older Go
+clients can ignore the additional diagnostics.
+
+The cache lives in `.devcouncil/dcgrep/`, which the existing walker always
+excludes. Nonblocking file locks protect two recyclable snapshot slots. A build
+publishes its pointer only after writing and verifying the snapshot. Searches
+fall back to live scanning during a build, on cache corruption, or when locking
+is unavailable. A failed build preserves the previously published snapshot.
+
+Bounds and coverage are explicit:
+
+- A build indexes at most 50,000 files and 2,000,000 trigram postings, reads up
+  to 128 MiB plus at most one bounded file read, and checks a 30-second work
+  budget between files. Individual files retain the searcher's 2 MiB ceiling.
+- `max_files` optionally lowers the file budget; larger values are refused.
+  `files_seen`, `files_indexed`, `files_unindexed`, `walk_errors`,
+  `traversal_complete`, and `limit_reason` distinguish indexed coverage from a
+  capped walk. `files_seen` is not a repository-wide total when the walk stops.
+- Only stable, plain UTF-8 without NULs or a BOM contributes negative evidence.
+  Other encodings and binaries retain live-search behavior and skip reporting.
+- Index filtering currently requires Unix file identity and ctime evidence.
+  Other platforms use the existing live search. Case-insensitive requests,
+  patterns containing inline group syntax (`(?`), and regexes with no necessary
+  trigrams also scan, avoiding disagreements in byte and Unicode semantics.
+- This saves content matching, not directory traversal. Index load and metadata
+  checks can outweigh the savings on repositories containing many small files.
+  Build timing and query timing must be measured separately.
 
 ### Fail-closed, concretely
 
@@ -108,8 +162,8 @@ the new build is broken.
 
 ### Requirements
 
-- **Rust, stable.** `Cargo.toml` declares edition 2024 with resolver 3, so 1.85
-  or newer.
+- **Rust, stable.** `dc-grep` requires 1.89 or newer for standard-library file
+  locking. The other component manifests retain their existing requirements.
 - **A C compiler.** `dc-store` takes `rusqlite` with `bundled` and compiles
   SQLite from source rather than linking whatever `libsqlite3` the host ships.
 - **`sqlite3`** for the Go client tests, which plant a task row with it.

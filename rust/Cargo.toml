@@ -15,7 +15,9 @@ license = "Apache-2.0"
 # so the store does not depend on the host's libsqlite3), and dc-grep takes
 # ripgrep's engine (grep-regex, grep-searcher, ignore) because reimplementing
 # ignore-rule resolution and a line-oriented searcher is exactly the second
-# engine this workspace exists to avoid keeping in step with the first.
+# engine this workspace exists to avoid keeping in step with the first. Its
+# optional index uses Microsoft's pinned tgrep-core for trigram extraction,
+# query planning and disk format, retaining the same final matcher.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

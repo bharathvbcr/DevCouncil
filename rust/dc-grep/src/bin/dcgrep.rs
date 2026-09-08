@@ -13,7 +13,7 @@
 use std::io::Read;
 use std::process::ExitCode;
 
-use dc_grep::{IDENTITY, ListRequest, Request, SCHEMA_VERSION};
+use dc_grep::{IDENTITY, IndexRequest, ListRequest, Request, SCHEMA_VERSION};
 
 fn main() -> ExitCode {
     match run() {
@@ -38,11 +38,14 @@ fn run() -> Result<String, String> {
     let args = collect_args()?;
     match args.first().map(String::as_str) {
         Some("health") => Ok(format!(
-            "{{\"ok\":true,\"searcher\":\"{IDENTITY}\",\"schema_version\":{SCHEMA_VERSION}}}"
+            "{{\"ok\":true,\"searcher\":\"{IDENTITY}\",\"schema_version\":{SCHEMA_VERSION},\"engine\":\"ripgrep\",\"index_engine\":\"tgrep-core\"}}"
         )),
         Some("search") | None => search(),
         Some("files") => list(),
-        Some(other) => Err(format!("unknown command {other:?} (search, files, health)")),
+        Some("index") => index(),
+        Some(other) => Err(format!(
+            "unknown command {other:?} (search, files, index, health)"
+        )),
     }
 }
 
@@ -94,6 +97,15 @@ fn list() -> Result<String, String> {
     let request: ListRequest = serde_json::from_str(&raw)
         .map_err(|err| format!("request is not valid JSON for this schema: {err}"))?;
     let response = dc_grep::list_files(&request)?;
+    serde_json::to_string(&response)
+        .map_err(|err| format!("result could not be rendered as JSON: {err}"))
+}
+
+fn index() -> Result<String, String> {
+    let raw = read_request()?;
+    let request: IndexRequest = serde_json::from_str(&raw)
+        .map_err(|err| format!("request is not valid JSON for this schema: {err}"))?;
+    let response = dc_grep::build_index(&request)?;
     serde_json::to_string(&response)
         .map_err(|err| format!("result could not be rendered as JSON: {err}"))
 }

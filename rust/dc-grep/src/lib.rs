@@ -1,9 +1,12 @@
-//! Repository search, built on ripgrep's engine.
+//! Repository search, with ripgrep matching and optional tgrep indexing.
 //!
 //! This crate owns one question — *where in this repository does this pattern
 //! appear* — and it answers it with the same three libraries ripgrep itself is
 //! assembled from: `ignore` walks the tree and applies ignore rules,
 //! `grep-regex` compiles the pattern, `grep-searcher` runs it over file bytes.
+//! `tgrep-core` supplies candidate planning and postings for explicit snapshots.
+//! Only files with unchanged descriptor metadata can be ruled out by a snapshot;
+//! the live walker and matcher remain authoritative for every other file.
 //!
 //! What the crate adds on top of them is the part a search service must not get
 //! wrong, which is knowing the difference between *nothing matched* and *the
@@ -41,6 +44,9 @@ use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch}
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use serde::{Deserialize, Serialize};
+
+mod index;
+pub use index::{IndexRequest, IndexResponse, SearchIndex, build_index};
 
 /// The wire schema this crate speaks. The Go client refuses a binary that
 /// answers with a different one rather than decoding through the wrong shape.
@@ -223,6 +229,8 @@ pub struct Response {
     pub limit: Option<usize>,
     /// Files actually opened and searched.
     pub files_searched: u64,
+    /// Candidate-index use, including exact filtering and stale-file counts.
+    pub index: SearchIndex,
     pub skipped: Skipped,
     /// Whether ignore rules were applied, echoed back so a caller reporting
     /// the result can say which repository it searched.
@@ -288,6 +296,9 @@ pub fn search(request: &Request) -> Result<Response, String> {
 
     let apply_ignore_rules = !request.include_ignored;
     let walker = build_walker(&target, apply_ignore_rules)?;
+
+    let (candidate_index, mut index) =
+        index::Candidates::load(&root, &request.pattern, request.case_insensitive);
 
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
@@ -367,6 +378,11 @@ pub fn search(request: &Request) -> Result<Response, String> {
             skipped.unrepresentable_name += 1;
             continue;
         };
+        if let Some(candidates) = &candidate_index
+            && candidates.excludes(&rel, &meta, &mut index)
+        {
+            continue;
+        }
         let before = matches.len();
         let mut binary = false;
 
@@ -411,6 +427,7 @@ pub fn search(request: &Request) -> Result<Response, String> {
         truncated,
         limit: truncated.then_some(limit),
         files_searched,
+        index,
         skipped,
         ignore_rules_applied: apply_ignore_rules,
     })

@@ -3,7 +3,8 @@ name = "dc-grep"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Repository search over ripgrep's engine: ignore-aware walking, line-oriented matching"
+description = "Repository search with ripgrep matching and verified tgrep candidate indexing"
+rust-version = "1.89"
 
 # These are ripgrep's own libraries — the same crates BurntSushi/ripgrep builds
 # its binary from — rather than a shell-out to an `rg` on PATH.
@@ -23,6 +24,11 @@ description = "Repository search over ripgrep's engine: ignore-aware walking, li
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 ignore = "0.4.33"
+
+# Pin the reviewed upstream implementation, including precise file-version
+# evidence. The CLI/server is not required; candidate planning and postings
+# stay in-process, and ripgrep remains the final matcher.
+tgrep-core = { git = "https://github.com/microsoft/tgrep", rev = "241128bd1976189f4851e4b7e572cf8bcea57fd8" }
 
 # serde is here and hand-rolled JSON is not, unlike dcstore and dcverify.
 # Those two emit values they generate themselves — gate names, severities,
