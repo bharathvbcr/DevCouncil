@@ -16,25 +16,11 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
+from devcouncil.devmap_engine import DEFAULT_DB_RELPATH
 
-# The Rust kernel's own store, deliberately NOT the Python index.
-#
-# This previously pointed at `.devcouncil/codeintel/index.sqlite`, which is the
-# *Python* schema (`user_version = 2`, tables `node_payloads` / `aliases` /
-# `unresolved_references`). The Rust store is at `user_version = 10` with a
-# different table shape and fails closed on it — `devmap status` against that
-# file returns "unsupported schema version 2".
-#
-# The effect was that every hybrid consumer's Rust path raised
-# `DevMapClientError` and fell through to the Python fallback, on every call, in
-# this repository. The hybrid migration was real code that had never once
-# executed its primary path. Pointing at a distinct file lets the two stores
-# coexist during the cutover instead of contending for one incompatible path.
-#
-# Fail-safe when absent: `_spawn_daemon` requires the file to exist and be
-# non-empty, so a repository that has not run `devmap build` degrades to the
-# Python fallback exactly as before.
-DEFAULT_DB_PATH = ".devcouncil/codeintel/devmap.sqlite"
+# DEFAULT_DB_PATH remains a compatibility export. The engine owns its value;
+# clients resolve each repository through store_path rather than this default.
+DEFAULT_DB_PATH = DEFAULT_DB_RELPATH
 PROTOCOL_VERSION = 1
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_QUERY_BYTES = 4 * 1024

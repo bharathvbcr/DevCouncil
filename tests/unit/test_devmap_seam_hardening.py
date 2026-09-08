@@ -445,6 +445,9 @@ def test_a_status_probe_never_spawns_a_daemon(tmp_path, monkeypatch):
     from devcouncil import devmap_client
     from devcouncil.indexing.map_artifacts import _kernel_status
 
+    # Path discovery is a short CLI query, separately covered by the real
+    # store-layout tests. Keep this tripwire focused on daemon spawning.
+    monkeypatch.setattr(devmap_engine, "_kernel_state_dir", lambda root: root / ".devcouncil")
     spawned: list = []
     monkeypatch.setattr(
         devmap_client.subprocess,
