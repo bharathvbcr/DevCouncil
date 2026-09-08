@@ -67,9 +67,14 @@ TOLERANCE_PCT="${SOAK_TOLERANCE_PCT:-10}"
 cd "$ROOT" || exit 1
 
 digest() {
-  sqlite3 "$STORE" \
+  local records
+  records=$(sqlite3 "$STORE" \
     "SELECT source_symbol||'>'||target_symbol||':'||edge_kind FROM generation_edges
-     WHERE generation_id=(SELECT max(id) FROM generations) ORDER BY 1;" 2>/dev/null | shasum | cut -d' ' -f1
+     WHERE generation_id=(SELECT max(id) FROM generations) ORDER BY 1;") || return 1
+  # Hashing empty stdout always produces a nonempty digest, including when
+  # SQLite failed. Require a successfully read, nonempty comparison corpus.
+  [ -n "$records" ] || { echo "SOAK FAIL: no graph edges were measured" >&2; return 1; }
+  printf '%s\n' "$records" | shasum | cut -d' ' -f1
 }
 file_bytes() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
 # Main database plus its write-ahead log: both are the store's bytes on disk,
@@ -89,7 +94,7 @@ TARGET=$(find . -name '*.py' -not -path './.*' | head -1)
 [ -n "$TARGET" ] || { echo "SOAK FAIL: no target file"; exit 1; }
 ORIG="$ROOT/.soak_orig.$$"
 cp "$TARGET" "$ORIG"
-restore() { cp "$ORIG" "$TARGET"; }
+restore() { cmp -s "$ORIG" "$TARGET" || cp "$ORIG" "$TARGET"; }
 trap 'restore; rm -f "$ORIG"' EXIT
 
 # Ask the kernel where it put its store. Fails closed: a path this cannot read,
@@ -111,7 +116,7 @@ STORE=$(resolve_store) || {
 [ -f "$STORE" ] || {
   echo "SOAK FAIL: the kernel reports its store at $STORE, which does not exist after the initial build"
   exit 1; }
-BASE_DIGEST=$(digest)
+BASE_DIGEST=$(digest) || { echo "SOAK FAIL: baseline graph could not be measured"; exit 1; }
 [ -n "$BASE_DIGEST" ] || { echo "SOAK FAIL: the baseline digest is empty — the store has no edges to compare"; exit 1; }
 BASE_DB=$(db_bytes)
 echo "soak baseline: mode=$MODE digest=${BASE_DIGEST:0:12} db=${BASE_DB} tolerance=${TOLERANCE_PCT}%"
@@ -176,19 +181,34 @@ if [ "$MODE" = "--daemon" ]; then
   done
   [ -n "$SERVE_PID" ] || { echo "SOAK FAIL: cannot identify the daemon process"; exit 1; }
   ask() {
-    python3 - "$ENDPOINT" "$1" <<'PY'
-import json, socket, sys
+    python3 - "$ENDPOINT" "$1" "${2:-validate}" <<'PY'
+import json, socket, sys, time
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.settimeout(30)
 sock.connect(sys.argv[1])
 sock.sendall(sys.argv[2].encode() + b"\n")
 buf = b""
+deadline = time.monotonic() + 30
 while not buf.endswith(b"\n"):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("soak query exceeded its total deadline")
+    sock.settimeout(remaining)
     chunk = sock.recv(65536)
     if not chunk:
         break
     buf += chunk
-json.loads(buf.decode())
+    if len(buf) > 8 * 1024 * 1024:
+        raise ValueError("soak query exceeded the probe's 8 MiB response bound")
+response = json.loads(buf.decode())
+if not isinstance(response, dict) or response.get("ok") is not True:
+    raise ValueError(f"soak query failed: {response!r}")
+if len(sys.argv) > 3 and sys.argv[3] == "fresh":
+    snapshot = response.get("result")
+    if not isinstance(snapshot, dict):
+        raise ValueError("status returned no snapshot")
+    if snapshot.get("is_fresh") is not True:
+        sys.exit(2)
 PY
   }
   for i in $(seq 1 "$CYCLES"); do
@@ -206,9 +226,42 @@ PY
     echo "$i,$(( RSS * 1024 )),$(db_bytes)" >> "$CSV"
     if [ $((i % 10)) -eq 0 ]; then echo "  cycle $i ok rss=$(( RSS * 1024 )) db=$(db_bytes)"; fi
   done
+  if [ "$FAILS" -eq 0 ]; then
+    # The last restore is another edit. Keep the daemon alive until that edit
+    # is committed, then compare the graph we actually measured with baseline.
+    restored=0
+    stable_since=0
+    deadline=$(( SECONDS + 90 ))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      ask '{"version":1,"cmd":"status"}' fresh >/dev/null
+      result=$?
+      case "$result" in
+        0)
+          [ "$stable_since" -ne 0 ] || stable_since=$SECONDS
+          # Watcher shutdown flushes its in-memory debounce buffer. Require
+          # stable freshness beyond its 2 s quiet window before stopping it.
+          if [ $(( SECONDS - stable_since )) -ge 3 ]; then restored=1; break; fi
+          sleep 0.2 ;;
+        2) stable_since=0; sleep 0.2 ;;
+        *) echo "SOAK FAIL: final status query"; FAILS=1; break ;;
+      esac
+    done
+    [ "$restored" -eq 1 ] || { echo "SOAK FAIL: final restore did not become current"; FAILS=1; }
+  fi
+  if [ "$FAILS" -eq 0 ]; then
+    D=$(digest) || { echo "SOAK FAIL: final graph could not be measured"; FAILS=1; }
+    [ "$D" = "$BASE_DIGEST" ] || { echo "SOAK FAIL: final daemon graph differs from baseline"; FAILS=1; }
+  fi
   kill "$SERVE_PID" 2>/dev/null
   wait "$TIME_PID" 2>/dev/null
   rm -f "$ENDPOINT"
+  if [ "$FAILS" -eq 0 ]; then
+    # Verify the stopped state too: shutdown can flush a late watcher batch.
+    stopped=$("$DEVMAP" --json status) && \
+      printf '%s' "$stopped" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("is_fresh") is True else 1)' || {
+        echo "SOAK FAIL: stopped daemon left pending or stale work"; FAILS=1;
+      }
+  fi
   PEAK=$(awk '/maximum resident set size/ {print $1; exit}' "$TIMEOUT_LOG")
   [ -n "$PEAK" ] || PEAK=$(awk -F': ' '/Maximum resident set size/ {print $2*1024; exit}' "$TIMEOUT_LOG")
   echo "daemon peak rss: ${PEAK:-unavailable} bytes over $CYCLES cycles"
@@ -218,11 +271,16 @@ else
     printf '\n# soak cycle %s\ndef _soak_%s():\n    return %s\n' "$i" "$i" "$i" >> "$TARGET"
     "$DEVMAP" build . >/dev/null 2>&1 || { echo "SOAK FAIL: build (dirty) cycle $i"; FAILS=1; break; }
     for q in search dead status; do
-      "$DEVMAP" "$q" >/dev/null 2>&1 || "$DEVMAP" "$q" soak >/dev/null 2>&1 || true
+      args=("$q")
+      [ "$q" != search ] || args+=(soak)
+      "$DEVMAP" "${args[@]}" >/dev/null 2>&1 || {
+        echo "SOAK FAIL: $q query cycle $i"; FAILS=1; break;
+      }
     done
+    [ "$FAILS" -eq 0 ] || break
     restore
     RSS=$(peak_rss_bytes "$TIMEOUT_LOG" "$DEVMAP" build .) || { echo "SOAK FAIL: build (restored) cycle $i"; FAILS=1; break; }
-    D=$(digest)
+    D=$(digest) || { echo "SOAK FAIL: graph read cycle $i"; FAILS=1; break; }
     if [ "$D" != "$BASE_DIGEST" ]; then
       echo "SOAK FAIL: digest drift at cycle $i (${D:0:12} != ${BASE_DIGEST:0:12})"; FAILS=1; break
     fi

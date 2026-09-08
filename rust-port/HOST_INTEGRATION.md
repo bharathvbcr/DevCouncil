@@ -34,6 +34,20 @@ layout, and the legacy DevCouncil layout in their documented precedence.
 `open_read_only` requires an existing current-schema store and never creates,
 migrates, or heals it. Writer processes continue to own schema migration.
 
+
+Query `Response<T>` envelopes carry `source_freshness: null` when whole-tree
+freshness was not checked. Snapshot completeness (`walk_incomplete`, counts,
+and truncation) does not prove that the working tree still matches the map.
+Use executable status to verify it; a parser-free library cannot certify a
+parser's current grammar identity and reports that verification as unavailable.
+
+Search reads verify each returned file against the content hash in the symbol's
+own generation. Changed or unreadable bytes leave the stored hit present with
+an empty `source_span` and an explicit `source_unavailable_reason`. Preserve
+that reason in host adapters. Reads are bounded to 1 MiB per source file;
+preview source files, candidate strings/stdin, and PDG input use the same
+ceiling. Preview content paths must be regular files.
+
 Hosts that read the JSON artifacts directly should use the checked provider
 rather than open-coding a file read:
 
@@ -89,7 +103,7 @@ name itself.
 | `query_ready` | `reader_ready` and a committed generation exists. |
 | `generation_id` | Latest committed generation, or `null`; a query host requires a positive integer. |
 | `db_path` | Resolved store path; a query host requires a nonblank value. |
-| `is_fresh` | No known pending update remains. Independent of schema readiness. |
+| `is_fresh` | A committed generation has no pending work and current source inventory, content hashes, and analyzer payload identity were verified. Independent of schema readiness and extraction completeness. |
 | `degraded_reason` | Coverage, freshness, or compatibility problem; `null` only when none is known. |
 | `capabilities` | Operations and flags derived from the executable's command parser. |
 

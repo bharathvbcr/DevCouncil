@@ -657,7 +657,7 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // hides a real finding or publishes a delete-this verdict about code a
     // framework reaches, and nothing about the row looks old.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "37",
+        EXTRACTION_SCHEMA_VERSION, "38",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

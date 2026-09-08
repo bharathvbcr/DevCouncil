@@ -251,3 +251,67 @@ fn a_generation_written_at_an_unmoved_head_still_carries_forward() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn ra3_a_quiet_queue_does_not_prove_the_working_tree_is_unchanged() {
+    let (root, _daemon, reader) = repo_with_one_generation("freshness-without-watcher");
+    assert!(devmap_serve::index_is_fresh(
+        &reader.status("test").unwrap()
+    ));
+    for (path, content) in [
+        ("src/a.py", "def renamed(): return 1\n"),
+        ("src/new.py", "def new(): return 2\n"),
+    ] {
+        std::fs::write(root.join(path), content).unwrap();
+        let status = reader.status("test").unwrap();
+        assert_eq!(status.pending_count, 0, "no watcher was started");
+        assert!(
+            !devmap_serve::index_is_fresh(&status),
+            "changed source was called fresh: {status:?}"
+        );
+        assert!(devmap_serve::freshness_degraded_reason(&status).is_some());
+        if path == "src/a.py" {
+            std::fs::write(root.join(path), "def a():\n    return 1\n").unwrap();
+        } else {
+            std::fs::remove_file(root.join(path)).unwrap();
+        }
+        assert!(
+            devmap_serve::index_is_fresh(&reader.status("test").unwrap()),
+            "restored bytes must match the snapshot again"
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ra3_deleted_sources_are_stale_even_without_a_watcher() {
+    let (root, _daemon, reader) = repo_with_one_generation("deleted-without-watcher");
+    std::fs::remove_file(root.join("src/a.py")).unwrap();
+    let status = reader.status("test").unwrap();
+    assert!(!devmap_serve::index_is_fresh(&status), "{status:?}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ra3_unverifiable_roots_cannot_be_called_fresh() {
+    let (root, _daemon, reader) = repo_with_one_generation("missing-root");
+    std::fs::remove_dir_all(&root).unwrap();
+    let status = reader.status("test").unwrap();
+    assert!(!devmap_serve::index_is_fresh(&status));
+    assert!(devmap_serve::freshness_degraded_reason(&status).is_some());
+}
+
+#[test]
+fn ra3_old_analyzer_payloads_are_stale_even_when_source_matches() {
+    let (root, _daemon, reader) = repo_with_one_generation("old-analyzer");
+    let db = rusqlite::Connection::open(root.join("index.sqlite")).unwrap();
+    db.execute(
+        "UPDATE file_payloads SET analyzer_version = 'obsolete-audit-fixture'",
+        [],
+    )
+    .unwrap();
+    let status = reader.status("test").unwrap();
+    assert!(!devmap_serve::index_is_fresh(&status), "{status:?}");
+    assert!(devmap_serve::freshness_degraded_reason(&status).is_some());
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -43,6 +43,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "an_unreadable_subtree_is_a_hole_not_a_dead_build",
             "discovery_stays_inside_the_root",
             "ignore_rule_tolerance",
+            "reliability_source_reads",
             "the_bounded_runner_under_hostile_children",
         ],
     ),

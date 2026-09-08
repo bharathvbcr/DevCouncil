@@ -128,7 +128,7 @@ fn read_is_stable(
 }
 
 fn read_stable_source(path: &std::path::Path, relative: &str) -> anyhow::Result<String> {
-    read_stable_source_with(path, relative, || std::fs::read_to_string(path))
+    read_stable_source_with(path, relative, || devmap_extract::read_source(path))
 }
 
 /// Whether a filesystem error means the path is **not there**, as opposed to

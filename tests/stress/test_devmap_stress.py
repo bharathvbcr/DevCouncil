@@ -365,3 +365,19 @@ def test_a_query_that_exceeds_the_budget_contract_is_rejected_not_trusted(tmp_pa
                 pytest.fail(f"budget {budget}: {exc}")
             assert response.tokens_used <= budget
             assert response.shown + response.hidden == response.total
+
+
+def test_soak_success_requires_the_restored_generation_to_be_current(tmp_path):
+    """A daemon soak must drain its final restore before claiming digest stability."""
+    root = _repo(tmp_path / "repo", files=40)
+    script = Path(__file__).resolve().parents[2] / "rust-port/tools/soak.sh"
+    result = subprocess.run(
+        ["bash", str(script), str(root), "35", "--daemon"],
+        env={**os.environ, "DEVMAP_BIN": str(find_engine_binary(root))},
+        capture_output=True, text=True, timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    status = _status(root)
+    assert status.is_fresh and status.pending_count == 0, (
+        "the soak reported success while its restored sources were still stale", status, result.stdout
+    )

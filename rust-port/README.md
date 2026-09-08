@@ -35,6 +35,12 @@ report the same result as a check that ran and passed.** An agent acting on
 "no callers found" needs to know whether that means "nothing calls this" or
 "we stopped looking."
 
+`status` verifies current source bytes and analyzer identity before reporting
+freshness. Query envelopes use `source_freshness: null` when that whole-tree
+check was not performed; changed source snippets are withheld with a reason.
+See the [reliability audit](RELIABILITY_AUDIT_2026-09-08.md) for measured stress
+results and the remaining language/platform limits.
+
 ## Install
 
 No-checkout install (verified: succeeds without a local clone; cold build ~1–2

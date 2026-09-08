@@ -4322,11 +4322,18 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             min_confidence,
         } => {
             let source = if content == "-" {
-                let mut buffer = String::new();
-                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)?;
-                buffer
+                use std::io::Read;
+                let mut buffer = Vec::new();
+                std::io::stdin()
+                    .lock()
+                    .take(devmap_extract::MAX_SOURCE_BYTES + 1)
+                    .read_to_end(&mut buffer)?;
+                if buffer.len() as u64 > devmap_extract::MAX_SOURCE_BYTES {
+                    anyhow::bail!("preview source exceeds the 1 MiB source ceiling");
+                }
+                String::from_utf8(buffer)?
             } else {
-                std::fs::read_to_string(content)
+                devmap_extract::read_source(std::path::Path::new(content))
                     .map_err(|e| anyhow::anyhow!("cannot read {content}: {e}"))?
             };
             let store = open_for_read(&cli.db())?;
@@ -5034,7 +5041,7 @@ empty graph, which would read as 'this file has no control flow'.",
                     file.display()
                 );
             }
-            let source = std::fs::read_to_string(file)
+            let source = devmap_extract::read_source(file)
                 .map_err(|error| anyhow::anyhow!("cannot read {}: {error}", file.display()))?;
             let qualifier = file.to_string_lossy().replace('\\', "/");
             let inputs = devmap_analyze::pdgsrc::python_function_pdgs(&source, &qualifier, 0, 0);
@@ -5821,6 +5828,7 @@ mod tests {
             incomplete: Option<&str>,
         ) -> devmap_query::Response<devmap_analyze::DeadSymbolReport> {
             devmap_query::Response {
+                source_freshness: None,
                 items: Vec::new(),
                 shown: 0,
                 hidden: 0,

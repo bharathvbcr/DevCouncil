@@ -665,10 +665,13 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
 /// `not is_fresh or pending_count > 0`, so the whole stack reported the map as
 /// current while nothing at all had been indexed.
 ///
-/// One owner because the rule was duplicated verbatim across two crates, and a
-/// copy that drifts puts the defect back in whichever one is not updated.
+/// RA3 also requires the store to verify current source bytes and analyzer
+/// payload identity. Missing evidence is a degraded reason, never freshness.
+/// One owner keeps CLI and daemon status on the same contract.
 pub fn index_is_fresh(status: &StoreStatus) -> bool {
-    status.latest_generation.is_some() && status.pending_count == 0
+    status.latest_generation.is_some()
+        && status.pending_count == 0
+        && status.degraded_reason.is_none()
 }
 
 /// Why the index is not current, when it is not.
@@ -729,6 +732,12 @@ pub fn freshness_degraded_reason(status: &StoreStatus) -> Option<String> {
             "this store holds no generation: nothing has been indexed yet — run `devmap build`"
                 .to_string(),
         );
+    }
+    if status.pending_count > 0 {
+        return Some(format!(
+            "{} source change(s) are pending",
+            status.pending_count
+        ));
     }
     None
 }
@@ -1779,7 +1788,7 @@ mod tests {
     /// responses, type-checks here and fails at the seam.
     #[test]
     fn the_explore_dispatch_returns_budgeted_responses_for_every_section() {
-        let store = corpus_store(8);
+        let store = corpus_store(8, None);
         let request = IpcRequest {
             version: 1,
             command: IpcCommand::Explore {
@@ -1836,7 +1845,7 @@ mod tests {
     /// The `affected` dispatch arm carries its list and its radius separately.
     #[test]
     fn the_affected_dispatch_returns_a_budgeted_test_list_and_its_radius() {
-        let store = corpus_store(8);
+        let store = corpus_store(8, None);
         let request = IpcRequest {
             version: 1,
             command: IpcCommand::Affected {
@@ -1926,7 +1935,7 @@ mod tests {
     /// each carrying both directions as full responses.
     #[test]
     fn the_neighbors_dispatch_returns_one_full_response_per_direction() {
-        let store = corpus_store(8);
+        let store = corpus_store(8, None);
         let request = IpcRequest {
             version: 1,
             command: IpcCommand::Neighbors {
@@ -2280,10 +2289,13 @@ mod tests {
     /// the very handle the abandoned task was given.
     /// A store holding enough symbols that any real query over it takes
     /// meaningfully longer than the one-millisecond deadline below.
-    fn corpus_store(symbols: usize) -> Store {
+    fn corpus_store(symbols: usize, root: Option<&std::path::Path>) -> Store {
         let mut source = String::new();
         for index in 0..symbols {
             source.push_str(&format!("def widget_{index:05}():\n    return {index}\n"));
+        }
+        if let Some(root) = root {
+            std::fs::write(root.join("things.py"), &source).expect("fixture source");
         }
         let extraction = devmap_extract::extract_file("things.py", &source);
         let mut resolver = devmap_resolve::Resolver::new();
@@ -2292,7 +2304,15 @@ mod tests {
         let analysis = devmap_analyze::analyze(std::slice::from_ref(&extraction), &resolution);
         let store = Store::open_in_memory().expect("in-memory store");
         store
-            .save_generation(std::slice::from_ref(&extraction), &resolution, &analysis)
+            .save_generation_with_opts(
+                std::slice::from_ref(&extraction),
+                &resolution,
+                &analysis,
+                devmap_store::GenerationWriteOpts {
+                    repo_root: root.map(|path| path.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )
             .expect("generation");
         store
     }
@@ -2302,7 +2322,7 @@ mod tests {
         // Semantic search vectorises the whole corpus, so this is real work —
         // orders of magnitude more than the deadline allows, which is what
         // makes the timeout deterministic rather than a race.
-        let store = Arc::new(corpus_store(4_000));
+        let store = Arc::new(corpus_store(4_000, None));
         let request = IpcRequest {
             version: PROTOCOL_VERSION,
             command: IpcCommand::Search {
@@ -2801,12 +2821,15 @@ mod tests {
         );
     }
 
-    /// The OFF direction. A store with a generation and an empty queue is
-    /// genuinely fresh, and must still say so — otherwise the fix has simply
-    /// moved the lie to the other side.
+    /// The OFF direction: matching source bytes and an empty queue remain
+    /// fresh. The fixture must record its root so that comparison can run.
     #[test]
     fn a_store_with_a_generation_and_no_backlog_is_still_fresh() {
-        let store = corpus_store(4);
+        let root =
+            std::env::temp_dir().join(format!("devmap-protocol-fresh-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let store = corpus_store(4, Some(&root));
         let value = dispatch(
             &store,
             IpcRequest {
@@ -2817,6 +2840,7 @@ mod tests {
             &UnappliedEdits::default(),
         )
         .expect("status must answer");
+        std::fs::remove_dir_all(root).unwrap();
 
         assert!(
             !value["generation_id"].is_null(),

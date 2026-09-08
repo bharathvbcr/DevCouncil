@@ -261,6 +261,8 @@ fn the_cli_refuses_to_preview_a_path_outside_the_repository() {
     use std::process::Command;
 
     let dir = scratch("cli_refuses_escape");
+    let content = dir.join("candidate.py");
+    std::fs::write(&content, "").unwrap();
     let repo = dir.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("lib.py"), LIB).unwrap();
@@ -291,7 +293,7 @@ fn the_cli_refuses_to_preview_a_path_outside_the_repository() {
         .arg("--file")
         .arg("../secrets.py")
         .arg("--content")
-        .arg("/dev/null")
+        .arg(&content)
         .output()
         .expect("devmap preview must run");
     assert!(
@@ -318,7 +320,7 @@ fn the_cli_refuses_to_preview_a_path_outside_the_repository() {
         .arg("--file")
         .arg("lib.py")
         .arg("--content")
-        .arg("/dev/null")
+        .arg(&content)
         .output()
         .expect("devmap preview must run");
     assert!(
@@ -328,4 +330,48 @@ fn the_cli_refuses_to_preview_a_path_outside_the_repository() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ra4_preview_refuses_an_oversized_saved_source() {
+    let dir = scratch("ra4_saved_size");
+    let store = fixture(&dir);
+    let path = dir.join("lib.py");
+    std::fs::write(
+        &path,
+        format!("{LIB}\n#{}", "x".repeat(MAX_SOURCE_BYTES as usize)),
+    )
+    .unwrap();
+    let report = StoreQueryEngine::new(&store)
+        .preview(
+            &path.to_string_lossy(),
+            LIB,
+            2000,
+            PREVIEW_CALLER_MIN_CONFIDENCE,
+        )
+        .unwrap();
+    assert!(
+        !report.delta_available,
+        "an unreadable baseline cannot support a delta: {report:?}"
+    );
+    assert!(report.degraded_reason.is_some());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn ra4_preview_refuses_an_oversized_candidate_before_parsing() {
+    let dir = scratch("ra4_candidate_size");
+    let store = fixture(&dir);
+    let source = format!("{LIB}\n#{}", "x".repeat(MAX_SOURCE_BYTES as usize));
+    let report = StoreQueryEngine::new(&store).preview(
+        &dir.join("lib.py").to_string_lossy(),
+        &source,
+        2000,
+        PREVIEW_CALLER_MIN_CONFIDENCE,
+    );
+    assert!(
+        report.is_err(),
+        "an oversized candidate must be rejected at the input boundary"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }

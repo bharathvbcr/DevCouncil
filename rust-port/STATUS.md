@@ -1,5 +1,7 @@
 # devmap (Rust) Status Ledger
 
+**Reliability audit, 2026-09-08:** RA1 lexical binding isolation, RA2 qualified candidate identity, RA3 source/snapshot coherence, RA4 bounded source ingestion, and RA5 honest soak verification are repaired. Current contracts, failure reproductions, test counts, stress measurements, and remaining limits are recorded in [RELIABILITY_AUDIT_2026-09-08.md](RELIABILITY_AUDIT_2026-09-08.md). That entry supersedes older queue-only freshness and unchecked prefix-read claims below; historical measurements remain historical.
+
 **Active work:** Phase 6 consumer hybrid migration (2026-08-12); kernel performance and gap pass (2026-09-02)
 **Verified scope:** local Rust kernel, persisted queries, differential daemon batching, IPC, and one hybrid Python consumer
 **Closed 2026-08-15 (external-corpus remediation):** generation retention (SC1), peak memory (SC3), build time (SC3b), missing memory/growth gates (SC3c/SC5), dead-code entry-point false positives (SC6), Go cross-file interface exemptions (SC6a), extraction-cache growth (SC7), doubled payload storage (SC8), receiver-name collision producing confidently wrong edges and an unjoinable Go call graph (SC9), orphaned JS/TS call scopes (SC10), Rust trait identity collisions and missing trait signatures (SC11/SC6b), unresolvable Rust method calls (SC12), calls hidden in Rust macro bodies (SC13), most nested-symbol identity collisions (SC14)

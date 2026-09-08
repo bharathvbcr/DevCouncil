@@ -251,9 +251,18 @@ def test_devmap_client_constants_are_defined_once():
                     seen[target.id] = seen.get(target.id, 0) + 1
     duplicated = sorted(name for name, count in seen.items() if count > 1)
     assert duplicated == [], f"defined more than once: {duplicated}"
-    # A constant nothing reads is a constant whose value nobody checks.
+    # Count real reads, including API constants imported by client consumers.
+    # Counting text inside this one module both missed public uses and accepted
+    # a repeated name in a comment as evidence of use.
+    reads = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    for consumer in Path(__file__).parent.glob("test_devmap*.py"):
+        consumer_tree = ast.parse(consumer.read_text(encoding="utf-8"))
+        used = {node.id for node in ast.walk(consumer_tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+        for node in ast.walk(consumer_tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "devcouncil.devmap_client":
+                reads.update(alias.name for alias in node.names if (alias.asname or alias.name) in used)
     for name in seen:
-        assert source.count(name) > 1, f"{name} is defined but never read"
+        assert name in reads, f"{name} is defined but never read"
 
 
 # --- 4. the Rust map is a valid RepoMap --------------------------------------------
@@ -445,9 +454,6 @@ def test_a_status_probe_never_spawns_a_daemon(tmp_path, monkeypatch):
     from devcouncil import devmap_client
     from devcouncil.indexing.map_artifacts import _kernel_status
 
-    # Path discovery is a short CLI query, separately covered by the real
-    # store-layout tests. Keep this tripwire focused on daemon spawning.
-    monkeypatch.setattr(devmap_engine, "_kernel_state_dir", lambda root: root / ".devcouncil")
     spawned: list = []
     monkeypatch.setattr(
         devmap_client.subprocess,
@@ -469,6 +475,10 @@ def test_a_status_probe_never_spawns_a_daemon(tmp_path, monkeypatch):
     store = tmp_path / ".devcouncil" / "codeintel" / "devmap.sqlite"
     store.parent.mkdir(parents=True)
     store.write_bytes(b"not empty")
+    # Path ownership is tested separately. This test must get past the read-only
+    # path probe to exercise the daemon boundary, even without a built kernel.
+    monkeypatch.setattr(devmap_engine, "store_path", lambda root: store)
+    monkeypatch.setenv("DEVMAP_AUTOSPAWN", "1")
 
     status = _kernel_status(tmp_path)
     assert status is not None and status.generation_id == 1
