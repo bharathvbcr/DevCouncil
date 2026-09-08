@@ -540,7 +540,9 @@ class DevMapClient:
         after the CLI build, so "one build, one generation" no longer held."""
         self.root_dir = pathlib.Path(root_dir or os.getcwd()).resolve()
         self.socket_path = socket_path or self._default_socket_path()
-        self.db_path = db_path or DEFAULT_DB_PATH
+        from devcouncil.devmap_engine import store_path
+
+        self.db_path = db_path or str(store_path(self.root_dir))
         # `DEVMAP_AUTOSPAWN=0` disables spawning process-wide. Test suites set
         # it: measured, one unit-test run left 20 daemons behind, one per
         # temporary repository, each holding a store for its 30-minute idle

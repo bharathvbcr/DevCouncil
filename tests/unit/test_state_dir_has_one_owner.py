@@ -91,6 +91,22 @@ def test_the_resolver_agrees_with_the_kernel(standalone_root: Path) -> None:
     assert devmap_engine.state_dir(standalone_root) == kernel_dir
 
 
+def test_client_queries_and_manifest_use_the_kernels_store(standalone_root: Path) -> None:
+    from devcouncil.devmap_client import DevMapClient
+
+    _build(standalone_root)
+    client = DevMapClient(standalone_root, autospawn=False)
+    assert client.status().node_count > 0
+    assert client.manifest().get("files")
+    assert not (standalone_root / devmap_engine.DEFAULT_DB_RELPATH).exists()
+
+
+def test_client_preserves_an_explicit_store_override(tmp_path: Path) -> None:
+    from devcouncil.devmap_client import DevMapClient
+
+    assert DevMapClient(tmp_path, db_path="custom.sqlite").db_path == "custom.sqlite"
+
+
 def test_a_root_with_no_state_dir_keeps_devcouncils_layout(tmp_path: Path) -> None:
     """Rule 2: nothing on disk means what DevCouncil's own writer will create.
 
