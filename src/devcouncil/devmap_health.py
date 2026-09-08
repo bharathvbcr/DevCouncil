@@ -375,7 +375,7 @@ def _record_describes(record: Dict[str, Any], path: Path) -> bool:
     except OSError:
         return False
     try:
-        return (
+        return bool(
             record["len"] == stat.st_size
             and record["mtime_ns"] == stat.st_mtime_ns
             and record["ino"] == stat.st_ino

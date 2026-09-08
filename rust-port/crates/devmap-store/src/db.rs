@@ -1834,7 +1834,7 @@ impl Store {
         // reclaim is the only thing that mode serves and reclaim is a write.
         const INCREMENTAL: i64 = 2;
         let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
-        if auto_vacuum != INCREMENTAL && !conn.is_readonly(rusqlite::DatabaseName::Main)? {
+        if auto_vacuum != INCREMENTAL && !conn.is_readonly(rusqlite::MAIN_DB)? {
             conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         }
         Ok(())
@@ -1862,7 +1862,7 @@ impl Store {
         // rollback-journal otherwise — and both serve reads; retrying the
         // switch would spend the whole back-off below to report a mode this
         // process could never change.
-        if conn.is_readonly(rusqlite::DatabaseName::Main)? {
+        if conn.is_readonly(rusqlite::MAIN_DB)? {
             return Ok(());
         }
         let mut last: Option<rusqlite::Error> = None;
@@ -2631,7 +2631,7 @@ impl Store {
         if !Self::schema_is_migratable(stamped) {
             return Err(Self::unsupported_schema(&store, stamped));
         }
-        let read_only = conn.is_readonly(rusqlite::DatabaseName::Main)?;
+        let read_only = conn.is_readonly(rusqlite::MAIN_DB)?;
         if read_only && stamped != CURRENT_SCHEMA_VERSION {
             // Migration is a write. A read-only store at an older schema can
             // neither be migrated nor, with the columns this kernel reads
@@ -3874,8 +3874,12 @@ impl Store {
                             sym.name,
                             sym.qualified_name,
                             sym.kind.as_str(),
-                            sym.span.start_byte,
-                            sym.span.end_byte,
+                            i64::try_from(sym.span.start_byte).map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })?,
+                            i64::try_from(sym.span.end_byte).map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })?,
                             sym.is_exported as i32,
                             // SQLite integers are signed. The cast is
                             // bit-preserving and reversed on read, so the stored

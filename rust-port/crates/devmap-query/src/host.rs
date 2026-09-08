@@ -557,7 +557,10 @@ fn validate_complete_graph_export(kind: ArtifactKind, value: &Value) -> Result<(
             "`meta` must be an object",
         ));
     };
-    if let Some(tier) = meta.get("compatibility_export_tier") {
+    if let Some(tier) = meta
+        .get("compatibility_export_tier")
+        .filter(|tier| !tier.is_null())
+    {
         match tier.as_str() {
             Some("slim") => {}
             Some(tier) => {

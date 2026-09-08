@@ -6,6 +6,17 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[test]
+fn null_export_tier_preserves_legacy_compatibility_without_hiding_incompleteness() {
+    let mut value = graph();
+    value["meta"] = json!({"compatibility_export_tier": null});
+    devmap_query::host::validate_artifact(ArtifactKind::CodeGraph, &value).unwrap();
+    value["meta"]["graph_export_incomplete_reason"] = json!("edges were capped");
+    let error = devmap_query::host::validate_artifact(ArtifactKind::CodeGraph, &value)
+        .expect_err("an absent tier cannot conceal an incomplete graph");
+    assert!(error.to_string().contains("edges were capped"));
+}
+
 fn scratch(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
