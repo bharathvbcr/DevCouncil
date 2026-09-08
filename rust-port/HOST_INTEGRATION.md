@@ -14,9 +14,11 @@ devmap-query = { path = "../DevCouncil/rust-port/crates/devmap-query", default-f
 ```
 
 ```rust
-use devmap_query::StoreQueryEngine;
+use devmap_query::{paths, StoreQueryEngine};
 use devmap_query::devmap_store::Store;
 
+let repository_root = std::path::Path::new("/path/to/repository");
+let store_path = paths::store_path(repository_root);
 let store = Store::open_existing(store_path)?.ok_or_else(|| {
     std::io::Error::new(std::io::ErrorKind::NotFound, "map not built")
 })?;
@@ -26,7 +28,10 @@ let queries = StoreQueryEngine::new(&store);
 `default-features = false` removes the parser and grammar frontend. A host that
 also builds maps enables the default `parse` feature. `devmap-query` owns its
 HTML renderer asset, so vendoring the crate does not require copying or
-rewriting paths into DevCouncil's Python package.
+rewriting paths into DevCouncil's Python package. Always use
+`paths::store_path(repository_root)` instead of appending `.devmap` or
+`.devcouncil`: the resolver honors `DEVMAP_HOME`, an existing standalone
+layout, and the legacy DevCouncil layout in their documented precedence.
 
 ## Process module
 
@@ -34,8 +39,14 @@ The host supplies three values: binary path, repository root, and per-command
 budget. Probe the binary and store before every new process lifetime:
 
 ```text
-devmap --json --db <root>/.devcouncil/codeintel/devmap.sqlite status
+(cd <root> && devmap --json status)
 ```
+
+Running with the repository root as the working directory and omitting `--db`
+uses the same canonical resolver as the Rust module. A host that supplies an
+explicit database path must obtain it from `paths::store_path(root)` through
+its Rust adapter or configuration; it must not reconstruct the state directory
+name itself.
 
 `host_contract_version` is `1`. A v1 status has these compatibility fields:
 
