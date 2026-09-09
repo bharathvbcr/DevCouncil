@@ -286,8 +286,10 @@ fn a_pathological_source_finishes_or_is_refused_within_its_budget() {
 
     // Parent indexing can finish this input within the budget. A completed
     // result is valid only when it contains the whole (declaration-free) file.
+    // The caller may be descheduled after publication; its wall clock cannot
+    // certify the exact publication instant. Deterministic finalization tests
+    // expire the internal deadline and latch a late incomplete walk instead.
     if matches!(extraction.parse_outcome, ParseOutcome::Clean) {
-        assert!(elapsed < budget, "Clean must finish before its deadline");
         assert_eq!(extraction.symbols.len(), 1);
         assert!(extraction.calls.is_empty());
     } else {
@@ -416,7 +418,8 @@ fn a_deeply_nested_source_finishes_or_is_refused_within_its_budget() {
     );
 
     if matches!(extraction.parse_outcome, ParseOutcome::Clean) {
-        assert!(elapsed < budget, "Clean must finish before its deadline");
+        // Exact deadline admission is pinned by the finalization unit tests;
+        // the outer elapsed bound above includes scheduler and return latency.
         let names: Vec<_> = extraction
             .symbols
             .iter()
