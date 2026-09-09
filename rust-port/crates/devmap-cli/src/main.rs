@@ -1699,40 +1699,42 @@ fn write_consumer_artifacts(
 /// this key declares nothing, and the seam falls back to the `--help` probe —
 /// "no evidence" must not read as "does not support it".
 fn kernel_capabilities() -> serde_json::Value {
-    use clap::CommandFactory;
-    let command = Cli::command();
-    let accepts = |subcommand: &str, flag: &str| -> bool {
-        command
-            .get_subcommands()
-            .find(|candidate| candidate.get_name() == subcommand)
-            .is_some_and(|candidate| {
-                candidate
-                    .get_arguments()
-                    .any(|argument| argument.get_long() == Some(flag))
-            })
-    };
-    let has_command = |subcommand: &str| -> bool {
-        command
-            .get_subcommands()
-            .any(|candidate| candidate.get_name() == subcommand)
-    };
-    // All three or none: a kernel accepting only some of the digests would need
-    // the read-modify-write path for the rest, and running both is strictly
-    // worse than running one.
-    let stamp_flags = ["generated-head", "indexed-hash", "content-fingerprint"]
-        .iter()
-        .all(|flag| accepts("manifest", flag));
-    serde_json::json!({
-        "status": has_command("status"),
-        "search": has_command("search"),
-        "explore": has_command("explore"),
-        "impact": has_command("impact"),
-        "trace": has_command("trace"),
-        "affected": has_command("affected"),
-        "html": has_command("html"),
-        "manifest_graph_output": accepts("manifest", "graph-output"),
-        "manifest_stamp_flags": stamp_flags,
-        "build_manifest": accepts("build", "manifest"),
+    on_command_stack(|| {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let accepts = |subcommand: &str, flag: &str| -> bool {
+            command
+                .get_subcommands()
+                .find(|candidate| candidate.get_name() == subcommand)
+                .is_some_and(|candidate| {
+                    candidate
+                        .get_arguments()
+                        .any(|argument| argument.get_long() == Some(flag))
+                })
+        };
+        let has_command = |subcommand: &str| -> bool {
+            command
+                .get_subcommands()
+                .any(|candidate| candidate.get_name() == subcommand)
+        };
+        // All three or none: a kernel accepting only some of the digests would need
+        // the read-modify-write path for the rest, and running both is strictly
+        // worse than running one.
+        let stamp_flags = ["generated-head", "indexed-hash", "content-fingerprint"]
+            .iter()
+            .all(|flag| accepts("manifest", flag));
+        serde_json::json!({
+            "status": has_command("status"),
+            "search": has_command("search"),
+            "explore": has_command("explore"),
+            "impact": has_command("impact"),
+            "trace": has_command("trace"),
+            "affected": has_command("affected"),
+            "html": has_command("html"),
+            "manifest_graph_output": accepts("manifest", "graph-output"),
+            "manifest_stamp_flags": stamp_flags,
+            "build_manifest": accepts("build", "manifest"),
+        })
     })
 }
 
@@ -3126,8 +3128,8 @@ impl Commands {
 #[cfg(unix)]
 fn restore_default_sigpipe() {
     // SAFETY: `signal(2)` with `SIG_DFL` installs the default action for a
-    // signal this process is not otherwise handling; it is called once, on
-    // the main thread, before any other thread exists.
+    // signal this process is not otherwise handling; it is called once on
+    // the entry thread before a one-shot command writes its result.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
@@ -3136,34 +3138,32 @@ fn restore_default_sigpipe() {
 #[cfg(not(unix))]
 fn restore_default_sigpipe() {}
 
-fn main() -> std::process::ExitCode {
-    // The Windows executable entry stack is 1 MiB. Debug command dispatch
-    // exhausts it before even a status request can answer. Reserve the same
-    // bounded stack on every platform; reservation does not commit 8 MiB of RSS.
-    match std::thread::Builder::new()
-        .name("devmap-cli".into())
+/// Clap's generated command builder reserves nearly 1 MiB in debug builds.
+/// Both argument parsing and capability introspection use it, so both need a
+/// bounded larger stack than Windows' executable entry stack. Keep command I/O
+/// on the entry thread to preserve Unix's synchronous SIGPIPE behavior.
+fn on_command_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let thread = std::thread::Builder::new()
+        .name("devmap-arguments".into())
         .stack_size(8 * 1024 * 1024)
-        .spawn(cli_main)
-    {
-        Ok(thread) => match thread.join() {
-            Ok(status) => status,
-            Err(_) => {
-                eprintln!("DevMap command thread panicked");
-                std::process::ExitCode::FAILURE
-            }
-        },
-        Err(error) => {
-            eprintln!("DevMap could not start command thread: {error}");
-            std::process::ExitCode::FAILURE
-        }
-    }
+        .spawn(work)
+        .unwrap_or_else(|error| {
+            eprintln!("DevMap could not start command introspection: {error}");
+            std::process::exit(1);
+        });
+    thread
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 #[tokio::main]
-async fn cli_main() -> std::process::ExitCode {
+async fn main() -> std::process::ExitCode {
     let started = Instant::now();
-    let matches = Cli::command().get_matches();
-    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    let (cli, matches) = on_command_stack(|| {
+        let matches = Cli::command().get_matches();
+        let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+        (cli, matches)
+    });
     // stderr, not the builder's default stdout. Every command that emits a
     // payload emits it on stdout — `emit_json` prints there, and `devmap mcp`
     // speaks JSON-RPC there — so a log line on stdout is not noise beside the
@@ -3677,7 +3677,9 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             };
 
             let mut resolver = Resolver::new();
-            resolver.index_go_modules(&collect_go_modules(path)?);
+            let go_modules =
+                progress.timed("discovering Go modules", || collect_go_modules(path))?;
+            resolver.index_go_modules(&go_modules);
             resolver.index_extractions(&extractions);
             progress.stage(
                 2,
