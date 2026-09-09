@@ -230,5 +230,7 @@ fn two_files_with_identical_content_keep_their_own_paths() {
         "byte-identical files still need their own payload; the path is inside it"
     );
 
+    drop(stmt);
+    drop(conn);
     std::fs::remove_dir_all(&root).unwrap();
 }

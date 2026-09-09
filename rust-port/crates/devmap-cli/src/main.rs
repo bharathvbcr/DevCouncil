@@ -1,9 +1,32 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
+
+// All one-shot stdout uses this path, including JSON and large exports.
+// Windows has no SIGPIPE; a consumer closing its pipe must not panic the CLI.
+fn write_stdout(message: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    if let Err(error) = std::io::stdout().lock().write_fmt(message) {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        // A diagnostic sink may itself be gone; the failure exit still survives.
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "DevMap could not write stdout: {error}"
+        );
+        std::process::exit(1);
+    }
+}
+
+macro_rules! outln {
+    ($($argument:tt)*) => {
+        write_stdout(format_args!("{}\n", format_args!($($argument)*)))
+    };
+}
 
 mod claude;
 mod progress;
@@ -161,7 +184,7 @@ impl Cli {
     /// one. `claude validate <path>` is deliberately absent: its argument is a
     /// *file* to check, and treating it as a root would resolve the store
     /// relative to a hooks manifest.
-    fn root_hint(&self) -> &Path {
+    fn root_hint(&self) -> PathBuf {
         match &self.command {
             Commands::Build { path, .. }
             | Commands::Manifest { path, .. }
@@ -172,8 +195,12 @@ impl Cli {
             | Commands::Routes { path, .. }
             | Commands::ShapeCheck { path, .. }
             | Commands::ApiImpact { path, .. }
-            | Commands::Paths { path } => path,
-            _ => Path::new("."),
+            | Commands::Paths { path } => path.clone(),
+            // Hook templates retain project-relative paths for the host that
+            // will execute them; they are not a query against this checkout.
+            Commands::Claude { .. } => PathBuf::from("."),
+            _ => devmap_extract::git_worktree_root(Path::new("."))
+                .unwrap_or_else(|| PathBuf::from(".")),
         }
     }
 
@@ -958,6 +985,9 @@ enum Commands {
         last: usize,
     },
     Repair {
+        /// Explicitly upgrade the store schema after coordinating all readers and writers.
+        #[arg(long, conflicts_with_all = ["fts", "pending", "page_size"])]
+        schema: bool,
         #[arg(long)]
         fts: bool,
         /// Drop pending-queue rows that no drain can ever process: quarantined
@@ -1695,40 +1725,42 @@ fn write_consumer_artifacts(
 /// this key declares nothing, and the seam falls back to the `--help` probe —
 /// "no evidence" must not read as "does not support it".
 fn kernel_capabilities() -> serde_json::Value {
-    use clap::CommandFactory;
-    let command = Cli::command();
-    let accepts = |subcommand: &str, flag: &str| -> bool {
-        command
-            .get_subcommands()
-            .find(|candidate| candidate.get_name() == subcommand)
-            .is_some_and(|candidate| {
-                candidate
-                    .get_arguments()
-                    .any(|argument| argument.get_long() == Some(flag))
-            })
-    };
-    let has_command = |subcommand: &str| -> bool {
-        command
-            .get_subcommands()
-            .any(|candidate| candidate.get_name() == subcommand)
-    };
-    // All three or none: a kernel accepting only some of the digests would need
-    // the read-modify-write path for the rest, and running both is strictly
-    // worse than running one.
-    let stamp_flags = ["generated-head", "indexed-hash", "content-fingerprint"]
-        .iter()
-        .all(|flag| accepts("manifest", flag));
-    serde_json::json!({
-        "status": has_command("status"),
-        "search": has_command("search"),
-        "explore": has_command("explore"),
-        "impact": has_command("impact"),
-        "trace": has_command("trace"),
-        "affected": has_command("affected"),
-        "html": has_command("html"),
-        "manifest_graph_output": accepts("manifest", "graph-output"),
-        "manifest_stamp_flags": stamp_flags,
-        "build_manifest": accepts("build", "manifest"),
+    on_command_stack(|| {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let accepts = |subcommand: &str, flag: &str| -> bool {
+            command
+                .get_subcommands()
+                .find(|candidate| candidate.get_name() == subcommand)
+                .is_some_and(|candidate| {
+                    candidate
+                        .get_arguments()
+                        .any(|argument| argument.get_long() == Some(flag))
+                })
+        };
+        let has_command = |subcommand: &str| -> bool {
+            command
+                .get_subcommands()
+                .any(|candidate| candidate.get_name() == subcommand)
+        };
+        // All three or none: a kernel accepting only some of the digests would need
+        // the read-modify-write path for the rest, and running both is strictly
+        // worse than running one.
+        let stamp_flags = ["generated-head", "indexed-hash", "content-fingerprint"]
+            .iter()
+            .all(|flag| accepts("manifest", flag));
+        serde_json::json!({
+            "status": has_command("status"),
+            "search": has_command("search"),
+            "explore": has_command("explore"),
+            "impact": has_command("impact"),
+            "trace": has_command("trace"),
+            "affected": has_command("affected"),
+            "html": has_command("html"),
+            "manifest_graph_output": accepts("manifest", "graph-output"),
+            "manifest_stamp_flags": stamp_flags,
+            "build_manifest": accepts("build", "manifest"),
+        })
     })
 }
 
@@ -1876,15 +1908,17 @@ fn report_manifest(cli: &Cli, outcome: &ManifestOutcome) -> anyhow::Result<()> {
         return emit_json(cli, &manifest_json(outcome));
     }
     if outcome.artifacts_unchanged {
-        println!(
+        outln!(
             "Artifacts already current for generation #{} ({:?}, {:?}).",
-            outcome.generation_id, outcome.output, outcome.graph_output
+            outcome.generation_id,
+            outcome.output,
+            outcome.graph_output
         );
     } else {
-        println!("Manifest written to {:?}", outcome.output);
-        println!("Code graph written to {:?}", outcome.graph_output);
+        outln!("Manifest written to {:?}", outcome.output);
+        outln!("Code graph written to {:?}", outcome.graph_output);
         if let Some(destination) = &outcome.compact_graph_output {
-            println!("Interned code graph written to {:?}", destination);
+            outln!("Interned code graph written to {:?}", destination);
         }
     }
     for guide in &outcome.guides {
@@ -1896,10 +1930,10 @@ fn report_manifest(cli: &Cli, outcome: &ManifestOutcome) -> anyhow::Result<()> {
                 "left alone (no `Managed by devmap` marker)"
             }
         };
-        println!("  guide {}: {note}", guide.path.display());
+        outln!("  guide {}: {note}", guide.path.display());
     }
     if !outcome.freshness_unavailable_reason.is_empty() {
-        println!(
+        outln!(
             "  freshness stamps unavailable: {}",
             outcome.freshness_unavailable_reason
         );
@@ -1962,7 +1996,7 @@ fn resolve_graph_output(explicit: &Option<PathBuf>, root: &Path) -> PathBuf {
 /// One line per symbol, then the counts — never a page length alone.
 fn report_ast(answer: &serde_json::Value) {
     for hit in answer["matches"].as_array().into_iter().flatten() {
-        println!(
+        outln!(
             "{:<10} {:<12} {}  {}",
             hit["kind"].as_str().unwrap_or(""),
             hit["language"].as_str().unwrap_or(""),
@@ -1973,14 +2007,14 @@ fn report_ast(answer: &serde_json::Value) {
     let shown = answer["shown"].as_u64().unwrap_or(0);
     let total = answer["total"].as_u64().unwrap_or(0);
     if answer["truncated"].as_bool().unwrap_or(false) {
-        println!("{shown} of {total} match(es); raise --limit to see the rest");
+        outln!("{shown} of {total} match(es); raise --limit to see the rest");
     } else {
-        println!("{total} match(es)");
+        outln!("{total} match(es)");
     }
     // An empty answer because the filter names something the index does not
     // hold is a different problem from an empty answer because nothing matched.
     for unmatched in answer["unmatched_filters"].as_array().into_iter().flatten() {
-        println!(
+        outln!(
             "  --{} {:?}: {}",
             unmatched["filter"].as_str().unwrap_or(""),
             unmatched["value"].as_str().unwrap_or(""),
@@ -2040,7 +2074,7 @@ fn retain_matching_routes(mapped: &mut serde_json::Value, filter: &str) {
 fn report_routes(mapped: &serde_json::Value) {
     let routes = mapped["routes"].as_array().cloned().unwrap_or_default();
     if routes.is_empty() {
-        println!("No routes in this generation.");
+        outln!("No routes in this generation.");
     }
     for route in &routes {
         let handlers: Vec<String> = route["handlers"]
@@ -2057,7 +2091,7 @@ fn report_routes(mapped: &serde_json::Value) {
                 _ => h["id"].as_str().unwrap_or("?").to_string(),
             })
             .collect();
-        println!(
+        outln!(
             "{:<7} {}  -> {}",
             route["verb"].as_str().unwrap_or("ANY"),
             route["path"].as_str().unwrap_or(""),
@@ -2069,7 +2103,7 @@ fn report_routes(mapped: &serde_json::Value) {
         );
         let consumers = route["consumers"].as_array().map(Vec::len).unwrap_or(0);
         if consumers > 0 {
-            println!("        {consumers} client call site(s)");
+            outln!("        {consumers} client call site(s)");
         }
     }
     report_scan(mapped);
@@ -2079,7 +2113,7 @@ fn report_shape_check(checked: &serde_json::Value) {
     let checks = checked["checks"].as_array().cloned().unwrap_or_default();
     for check in &checks {
         let verdict = check["verdict"].as_str().unwrap_or("");
-        println!(
+        outln!(
             "{:<7} {}  {}",
             check["verb"].as_str().unwrap_or("ANY"),
             check["route"].as_str().unwrap_or(""),
@@ -2092,13 +2126,13 @@ fn report_shape_check(checked: &serde_json::Value) {
                 .flatten()
                 .filter_map(|k| k.as_str())
                 .collect();
-            println!(
+            outln!(
                 "        consumers read, handler never returns: {}",
                 missing.join(", ")
             );
         }
     }
-    println!(
+    outln!(
         "{} of {} route(s) mismatch",
         checked["mismatch_count"].as_u64().unwrap_or(0),
         checks.len()
@@ -2108,25 +2142,25 @@ fn report_shape_check(checked: &serde_json::Value) {
 
 fn report_api_impact(impact: &serde_json::Value) {
     if impact["found"] != serde_json::json!(true) {
-        println!(
+        outln!(
             "No route matched {:?}.",
             impact["route"].as_str().unwrap_or("")
         );
         report_scan(impact);
         return;
     }
-    println!(
+    outln!(
         "{} {}",
         impact["verb"].as_str().unwrap_or("ANY"),
         impact["route"].as_str().unwrap_or("")
     );
-    println!(
+    outln!(
         "  risk: {} — {}",
         impact["risk"].as_str().unwrap_or("unknown"),
         impact["risk_reason"].as_str().unwrap_or("")
     );
     for consumer in impact["consumers"].as_array().into_iter().flatten() {
-        println!(
+        outln!(
             "  called from {}:{}",
             consumer["path"].as_str().unwrap_or(""),
             consumer["line"].as_u64().unwrap_or(0)
@@ -2139,7 +2173,7 @@ fn report_api_impact(impact: &serde_json::Value) {
             .flatten()
             .filter_map(|k| k.as_str())
             .collect();
-        println!("  shape: consumers read {}", missing.join(", "));
+        outln!("  shape: consumers read {}", missing.join(", "));
     }
     report_scan(impact);
 }
@@ -2151,7 +2185,7 @@ fn report_scan(payload: &serde_json::Value) {
     if scan["complete"].as_bool().unwrap_or(true) {
         return;
     }
-    println!(
+    outln!(
         "  scan incomplete: read {} of {} file(s); {} skipped for budget, \
 {} over size, {} unreadable. Counts above are lower bounds.",
         scan["files_read"].as_u64().unwrap_or(0),
@@ -2217,14 +2251,20 @@ fn build_manifest_payload(
     }))
 }
 
-fn open_for_read(db: &std::path::Path) -> anyhow::Result<Store> {
-    match Store::open_existing(db)? {
-        Some(store) => Ok(store),
-        None => Err(anyhow::anyhow!(
+fn open_for_read(cli: &Cli) -> anyhow::Result<Store> {
+    let db = cli.db();
+    if !db.is_file() {
+        anyhow::bail!(
             "no devmap store at {} — run `devmap build` first",
             db.display()
-        )),
+        );
     }
+    // Navigation must never perform a compatibility upgrade under live clients.
+    let store = Store::open_read_only(&db)?;
+    if cli.db.is_none() {
+        store.validate_repo_root(&cli.root_hint())?;
+    }
+    Ok(store)
 }
 
 fn split_csv(raw: &Option<String>) -> Vec<String> {
@@ -2247,15 +2287,15 @@ fn ensure_parent(path: &std::path::Path) -> anyhow::Result<()> {
 
 fn emit_json(cli: &Cli, payload: &serde_json::Value) -> anyhow::Result<()> {
     if cli.json {
-        println!("{}", serde_json::to_string(payload)?);
+        outln!("{}", serde_json::to_string(payload)?);
     } else {
-        println!("{}", serde_json::to_string_pretty(payload)?);
+        outln!("{}", serde_json::to_string_pretty(payload)?);
     }
     Ok(())
 }
 
 fn emit_unavailable(reason: &str) {
-    println!("unavailable: {reason}");
+    outln!("unavailable: {reason}");
 }
 
 /// The line a truncated result must carry, if any.
@@ -2272,7 +2312,7 @@ fn truncation_line(shown: u32, hidden: u32, total: u32, truncated: bool) -> Opti
 
 fn emit_truncation(shown: u32, hidden: u32, total: u32, truncated: bool) {
     if let Some(line) = truncation_line(shown, hidden, total, truncated) {
-        println!("{line}");
+        outln!("{line}");
     }
 }
 
@@ -2282,9 +2322,13 @@ fn emit_search(resp: &devmap_query::Response<devmap_query::SymbolHit>) {
         return;
     }
     for hit in &resp.items {
-        println!(
+        outln!(
             "{}:{}-{}  {}  {}",
-            hit.file_path, hit.span.0, hit.span.1, hit.kind, hit.symbol_name
+            hit.file_path,
+            hit.span.0,
+            hit.span.1,
+            hit.kind,
+            hit.symbol_name
         );
     }
     emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
@@ -2296,7 +2340,7 @@ fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedEdge>) {
         return;
     }
     for edge in &resp.items {
-        println!(
+        outln!(
             "{}::{}  --{:?}-->  {}::{}",
             edge.source_file,
             edge.source_symbol,
@@ -2314,7 +2358,7 @@ fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedEdge>) {
     // exactly as it did before the flag existed.
     if let Some(rungs) = &resp.rungs {
         if rungs.filtered_out > 0 {
-            println!(
+            outln!(
                 "note: --min-rung hid {} of {} edges (deterministic {}, high {}, speculative {})",
                 rungs.filtered_out,
                 rungs.total(),
@@ -2328,13 +2372,13 @@ fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedEdge>) {
     // one says the walk that produced `items` stopped before the graph ran out,
     // so `total` is the size of a partial answer.
     if let Some(reason) = &resp.walk_incomplete {
-        println!("warning: {reason}");
+        outln!("warning: {reason}");
     }
 }
 
 fn emit_blast_radius(radius: &devmap_query::BlastRadius) {
     if !radius.unmatched_targets.is_empty() {
-        println!(
+        outln!(
             "warning: no indexed traversal start for: {}",
             radius.unmatched_targets.join(", ")
         );
@@ -2343,13 +2387,13 @@ fn emit_blast_radius(radius: &devmap_query::BlastRadius) {
         emit_unavailable(reason);
         return;
     }
-    println!("blast radius: {} impacted", radius.total_impacted);
+    outln!("blast radius: {} impacted", radius.total_impacted);
     for layer in &radius.layers.items {
         let confidence = layer
             .lowest_confidence
             .map(|value| format!("{value:.2}"))
             .unwrap_or_else(|| "-".to_string());
-        println!(
+        outln!(
             "  depth {}: {} nodes (lowest confidence {confidence}){}",
             layer.depth,
             layer.node_count,
@@ -2360,7 +2404,7 @@ fn emit_blast_radius(radius: &devmap_query::BlastRadius) {
             }
         );
         for node in &layer.nodes {
-            println!("    {node}");
+            outln!("    {node}");
         }
     }
     emit_truncation(
@@ -2370,7 +2414,7 @@ fn emit_blast_radius(radius: &devmap_query::BlastRadius) {
         radius.layers.truncated,
     );
     if let Some(reason) = &radius.layers.walk_incomplete {
-        println!("warning: {reason}");
+        outln!("warning: {reason}");
     }
 }
 
@@ -2380,7 +2424,7 @@ fn emit_explore(report: &devmap_query::ExploreReport) {
         return;
     }
     for definition in &report.definitions.items {
-        println!(
+        outln!(
             "{}:{}-{}  {}  {}",
             definition.file_path,
             definition.span.0,
@@ -2391,17 +2435,17 @@ fn emit_explore(report: &devmap_query::ExploreReport) {
         // Class A: an unreadable file is reported as unread, never as a symbol
         // whose body happens to be empty.
         match &definition.source_unavailable_reason {
-            Some(reason) => println!("  source unavailable: {reason}"),
+            Some(reason) => outln!("  source unavailable: {reason}"),
             None => {
                 for line in definition.source.lines() {
-                    println!("  {line}");
+                    outln!("  {line}");
                 }
                 if let Some(omitted) = definition.source_omitted_bytes {
-                    println!("  ... {omitted} bytes omitted to fit the budget");
+                    outln!("  ... {omitted} bytes omitted to fit the budget");
                 }
             }
         }
-        println!(
+        outln!(
             "  callers: {} of {}{}   callees: {} of {}{}",
             definition.callers.shown,
             definition.callers.total,
@@ -2425,7 +2469,7 @@ fn emit_explore(report: &devmap_query::ExploreReport) {
         report.definitions.total,
         report.definitions.truncated,
     );
-    println!(
+    outln!(
         "budget: {} total = {} definitions + {} per edge direction + {} blast radius",
         report.budget.total,
         report.budget.definitions,
@@ -2441,9 +2485,11 @@ fn emit_affected(report: &devmap_query::AffectedTestsReport) {
         return;
     }
     for test in &report.tests.items {
-        println!(
+        outln!(
             "{}  depth {}  {} reached symbol(s)",
-            test.path, test.depth, test.reached_symbols
+            test.path,
+            test.depth,
+            test.reached_symbols
         );
     }
     emit_truncation(
@@ -2453,7 +2499,7 @@ fn emit_affected(report: &devmap_query::AffectedTestsReport) {
         report.tests.truncated,
     );
     if let Some(reason) = &report.tests.walk_incomplete {
-        println!("warning: {reason}");
+        outln!("warning: {reason}");
     }
     emit_blast_radius(&report.blast_radius);
 }
@@ -2464,9 +2510,11 @@ fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
         return;
     }
     for row in &resp.items {
-        println!(
+        outln!(
             "{:.2}  {}::{}",
-            row.confidence, row.file_path, row.symbol_name
+            row.confidence,
+            row.file_path,
+            row.symbol_name
         );
     }
     emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
@@ -2486,7 +2534,7 @@ fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
 /// reader deciding whether to rebuild needs to know which they are looking at.
 fn emit_dead_clusters(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
     for line in dead_cluster_lines(resp) {
-        println!("{line}");
+        outln!("{line}");
     }
 }
 
@@ -2562,8 +2610,8 @@ const DEAD_CLUSTER_SAMPLE: usize = 4;
 
 fn emit_savings(report: &devmap_query::SavingsReport) {
     let tokens = |bytes: u64| bytes / u64::from(devmap_query::BYTES_PER_TOKEN);
-    println!("basis: {}", report.basis);
-    println!(
+    outln!("basis: {}", report.basis);
+    outln!(
         "corpus:   {} files, {} bytes  (~{} tokens to read in full)",
         report.indexed_files,
         report.corpus_bytes,
@@ -2572,38 +2620,40 @@ fn emit_savings(report: &devmap_query::SavingsReport) {
     if report.corpus_files_unreadable > 0 {
         // Named, not folded into the total as zero: an unread file makes the
         // corpus look smaller, which makes the map look better.
-        println!(
+        outln!(
             "          {} indexed file(s) could not be read and are excluded from that total",
             report.corpus_files_unreadable
         );
     }
     match report.repo_map_bytes {
-        Some(bytes) => println!("repo_map: {} bytes  (~{} tokens)", bytes, tokens(bytes)),
-        None => println!("repo_map: not written yet"),
+        Some(bytes) => outln!("repo_map: {} bytes  (~{} tokens)", bytes, tokens(bytes)),
+        None => outln!("repo_map: not written yet"),
     }
     let Some(query) = &report.query else {
-        println!("(pass --query to account for one search)");
+        outln!("(pass --query to account for one search)");
         return;
     };
-    println!(
+    outln!(
         "query {:?}: {} hit(s) across {} file(s)",
-        query.query, query.hits, query.files_named
+        query.query,
+        query.hits,
+        query.files_named
     );
-    println!("  map answer cost:        {} tokens", query.answer_tokens);
-    println!(
+    outln!("  map answer cost:        {} tokens", query.answer_tokens);
+    outln!(
         "  reading those files:    ~{} tokens ({} bytes)",
         tokens(query.files_bytes),
         query.files_bytes
     );
     if query.files_unreadable > 0 {
-        println!(
+        outln!(
             "  {} named file(s) could not be read and are excluded",
             query.files_unreadable
         );
     }
     let alternative = tokens(query.files_bytes);
     if alternative > u64::from(query.answer_tokens) {
-        println!(
+        outln!(
             "  floor on the saving:    ~{} tokens, and only for a reader who already \
              knew which files to open",
             alternative - u64::from(query.answer_tokens)
@@ -2612,20 +2662,20 @@ fn emit_savings(report: &devmap_query::SavingsReport) {
         // Said plainly rather than suppressed. On a tiny corpus, or a query
         // whose hits live in small files, the map is not cheaper — and a
         // savings report that can only ever report a saving is advertising.
-        println!("  no saving on this query: the files are smaller than the answer");
+        outln!("  no saving on this query: the files are smaller than the answer");
     }
 }
 
 fn emit_preview(report: &devmap_query::PreviewReport) {
-    println!("{}  parse={}", report.file_path, report.parse_status);
+    outln!("{}  parse={}", report.file_path, report.parse_status);
     if report.compared_against == "nothing" {
-        println!("note: no file at this path; every symbol reads as added");
+        outln!("note: no file at this path; every symbol reads as added");
     }
     if !report.file_is_indexed {
-        println!("note: this file is not in the index; no caller graph is available for it");
+        outln!("note: this file is not in the index; no caller graph is available for it");
     }
     if let Some(reason) = &report.degraded_reason {
-        println!("note: {reason}");
+        outln!("note: {reason}");
     }
     if !report.delta_available {
         // The reason above already says why. Printing an empty symbol list
@@ -2640,13 +2690,13 @@ fn emit_preview(report: &devmap_query::PreviewReport) {
             devmap_query::PreviewChange::BodyChanged => "body",
             devmap_query::PreviewChange::Changed => "changed",
         };
-        println!("{change:<11} {} ({})", symbol.qualified_name, symbol.kind);
+        outln!("{change:<11} {} ({})", symbol.qualified_name, symbol.kind);
     }
     if report.symbols.is_empty() {
-        println!("no symbol-level change");
+        outln!("no symbol-level change");
     }
     if report.bodies_not_compared > 0 {
-        println!(
+        outln!(
             "{} symbol(s) declared identically but not body-compared \
              (below the signature size floor, or no grammar)",
             report.bodies_not_compared
@@ -2655,16 +2705,18 @@ fn emit_preview(report: &devmap_query::PreviewReport) {
     for caller in &report.broken_callers.items {
         // `caller_symbol` and `target_symbol` are already `path::Name`, so the
         // file is not printed again beside them.
-        println!(
+        outln!(
             "  affects  {}  ->  {}  ({:.2})",
-            caller.caller_symbol, caller.target_symbol, caller.confidence
+            caller.caller_symbol,
+            caller.target_symbol,
+            caller.confidence
         );
     }
     if report.broken_callers.total == 0 {
-        println!("no calls from other files are affected");
+        outln!("no calls from other files are affected");
     }
     if report.ambiguous_callers > 0 {
-        println!(
+        outln!(
             "{} further call edge(s) fell below the confidence floor and are not \
              listed (usually a bare method name matching many definitions); \
              pass --min-confidence 0 to see them",
@@ -2689,27 +2741,30 @@ fn emit_clones(report: &devmap_query::CloneReport) {
             devmap_analyze::CloneKind::Exact => "exact",
             devmap_analyze::CloneKind::Structural => "structural",
         };
-        println!(
+        outln!(
             "{kind}  {} members  {} nodes  #{:016x}",
             group.members.len(),
             group.min_nodes,
             group.signature
         );
         for member in &group.members {
-            println!(
+            outln!(
                 "    {}:{}  {}",
-                member.file_path, member.span_start, member.symbol_name
+                member.file_path,
+                member.span_start,
+                member.symbol_name
             );
         }
         if group.members_omitted > 0 {
-            println!("    ... {} more members not listed", group.members_omitted);
+            outln!("    ... {} more members not listed", group.members_omitted);
         }
     }
     // Always printed, including when nothing was found: "no duplicates" and
     // "nothing was examined" are different answers and must not print the same.
-    println!(
+    outln!(
         "coverage: {} symbols signed, {} unsigned",
-        report.signed_symbols, report.unsigned_symbols
+        report.signed_symbols,
+        report.unsigned_symbols
     );
     emit_truncation(
         report.groups.shown,
@@ -2880,7 +2935,7 @@ fn render_error(error: &anyhow::Error) -> String {
 /// spelled can fail here.
 fn validate_root(cli: &Cli) -> Result<(), String> {
     let root = cli.root_hint();
-    match std::fs::metadata(root) {
+    match std::fs::metadata(&root) {
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(format!(
             "{}: not a directory; the path a subcommand names must be a repository root",
@@ -3116,8 +3171,8 @@ impl Commands {
 #[cfg(unix)]
 fn restore_default_sigpipe() {
     // SAFETY: `signal(2)` with `SIG_DFL` installs the default action for a
-    // signal this process is not otherwise handling; it is called once, on
-    // the main thread, before any other thread exists.
+    // signal this process is not otherwise handling; it is called once on
+    // the entry thread before a one-shot command writes its result.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
@@ -3126,20 +3181,50 @@ fn restore_default_sigpipe() {
 #[cfg(not(unix))]
 fn restore_default_sigpipe() {}
 
+/// Clap's generated command builder reserves nearly 1 MiB in debug builds.
+/// Both argument parsing and capability introspection use it, so both need a
+/// bounded larger stack than Windows' executable entry stack. Keep command I/O
+/// on the entry thread to preserve Unix's synchronous SIGPIPE behavior.
+fn on_command_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let thread = std::thread::Builder::new()
+        .name("devmap-arguments".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(work)
+        .unwrap_or_else(|error| {
+            eprintln!("DevMap could not start command introspection: {error}");
+            std::process::exit(1);
+        });
+    thread
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    let started = Instant::now();
+    let (cli, matches) = on_command_stack(|| {
+        let matches = Cli::command().get_matches();
+        let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+        (cli, matches)
+    });
     // stderr, not the builder's default stdout. Every command that emits a
     // payload emits it on stdout — `emit_json` prints there, and `devmap mcp`
     // speaks JSON-RPC there — so a log line on stdout is not noise beside the
     // answer, it is a line *inside* the answer. `devmap search --json | jq`
     // fails on it, and an MCP client's next parse fails on it.
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+        .with_max_level(if cli.verbose {
+            Level::DEBUG
+        } else {
+            Level::INFO
+        })
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr)
         .finish();
-    tracing::subscriber::set_global_default(subscriber).ok();
+    if let Err(error) = tracing::subscriber::set_global_default(subscriber) {
+        eprintln!("DevMap logging unavailable: {error}");
+    }
 
-    let cli = Cli::parse();
     if !cli.command.serves() {
         restore_default_sigpipe();
     }
@@ -3152,7 +3237,25 @@ async fn main() -> std::process::ExitCode {
     match outcome {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            // The human line always, on stderr where every other diagnostic
+            // Capture the open stage before closing it as failed. Do not log
+            // query arguments, preview buffers, or environment variables.
+            let root = std::path::absolute(cli.root_hint())
+                .unwrap_or_else(|_| cli.root_hint().to_path_buf());
+            let db = std::path::absolute(cli.db()).unwrap_or_else(|_| cli.db());
+            let context = serde_json::json!({
+                "command": matches.subcommand_name(),
+                "binary_version": version_line(),
+                "binary_path": std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned()),
+                "pid": std::process::id(),
+                "unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis()),
+                "root": root.to_string_lossy(),
+                "root_path_lossy": root.to_str().is_none(),
+                "db_path": db.to_string_lossy(),
+                "db_path_lossy": db.to_str().is_none(),
+                "elapsed_ms": started.elapsed().as_millis(),
+                "stage": progress.as_ref().and_then(|p| p.open.borrow().as_ref().map(|(label, _, _)| label.clone())),
+            });
+            // Attempt the human line on stderr, where every other diagnostic
             // this binary writes goes. Under `--json`, the same failure *also*
             // goes out as one line of JSON on stdout, because that is what
             // `--json` promises on every exit and the failing paths are the
@@ -3163,21 +3266,40 @@ async fn main() -> std::process::ExitCode {
             // stdout stays exactly one JSON line either way.
             if let Some(progress) = progress.as_ref() {
                 progress.close_open_stage(false);
-                progress
-                    .display
-                    .diagnostic(format_args!("Error: {}", render_error(&error)));
-                progress.display.finish("build stopped before completion");
+                progress.display.diagnostic(format_args!(
+                    "Error: {} — build stopped before completion; DevMap context: {context}",
+                    render_error(&error)
+                ));
+                progress.display.finish("");
                 if cli.json {
-                    println!(
+                    outln!(
                         "{}",
-                        serde_json::json!({ "error": render_error(&error),
+                        serde_json::json!({ "error": render_error(&error), "diagnostic_context": context,
                         "timings": progress.timings_json(), "progress_output": progress.display.output_json() })
                     );
+                } else {
+                    // stderr may be blocked or gone. Preserve the retained
+                    // diagnostic on the plain primary output without waiting
+                    // longer on the optional renderer.
+                    let receipt = progress.display.output_json();
+                    for line in receipt["diagnostics"]["unrendered"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(line) = line.as_str() {
+                            outln!("{line}");
+                        }
+                    }
                 }
             } else {
                 eprintln!("Error: {}", render_error(&error));
+                eprintln!("DevMap context: {context}");
                 if cli.json {
-                    println!("{}", serde_json::json!({ "error": render_error(&error) }));
+                    outln!(
+                        "{}",
+                        serde_json::json!({ "error": render_error(&error), "diagnostic_context": context })
+                    );
                 }
             }
             std::process::ExitCode::FAILURE
@@ -3221,6 +3343,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             let _writer = Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)?;
             progress.display.detail("opening index");
             let store = Store::open(cli.db())?;
+            store.bind_repo_root(path)?;
             // A store this process can only read opens fine — queries need it
             // to — and would otherwise fail at the first write with a bare
             // SQLite code, after paying for the whole scan. Refuse before the
@@ -3232,7 +3355,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     cli.db().display()
                 );
             }
-            // K1(e2): stamped before discovery, on the queue's own wall clock.
+            // Capture the durable queue boundary before discovery.
             //
             // A build that walks the whole tree answers every request queued at
             // or before this instant, whatever that request named — which is
@@ -3240,7 +3363,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             // before the walk, never after: an event that arrives while this
             // build is extracting may describe an edit it did not see, and that
             // row has to survive.
-            let build_start = Store::queue_clock_now();
+            let build_start = store.pending_watermark()?;
 
             // K7: refuse an `--affected` path inside a tagged build cache.
             //
@@ -3430,7 +3553,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     // repository that is already current keeps a stale queue,
                     // and `status` reports NOT FRESH indefinitely.
                     let retired = store.clear_pending_superseded(
-                        devmap_store::PendingSupersede::WholeTreeBuiltAt(build_start),
+                        devmap_store::PendingSupersede::WholeTreeThrough(&build_start),
                     )?;
                     if !retired.is_empty() {
                         progress.note(format_args!(
@@ -3497,7 +3620,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                             }),
                         )?;
                     } else {
-                        println!(
+                        outln!(
                             "No source changes; generation #{generation} still current \
                              ({}) in {}.",
                             progress::count(file_count, "file"),
@@ -3510,7 +3633,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                             }
                         }
                         if cli.verbose && !progress.display.enabled() {
-                            println!("  Reclaim: {}", reclaim_note(&vacuum));
+                            outln!("  Reclaim: {}", reclaim_note(&vacuum));
                         }
                     }
                     return Ok(());
@@ -3545,7 +3668,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     .collect();
                 devmap_extract::extract_all_with_progress(&refs, Some(&extraction_progress))
             } else {
-                devmap_store::extract_scanned_cached_with_progress(
+                devmap_store::extract_scanned_for_generation(
                     &store,
                     &scanned,
                     Some(&extraction_progress),
@@ -3611,7 +3734,9 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             };
 
             let mut resolver = Resolver::new();
-            resolver.index_go_modules(&collect_go_modules(path)?);
+            let go_modules =
+                progress.timed("discovering Go modules", || collect_go_modules(path))?;
+            resolver.index_go_modules(&go_modules);
             resolver.index_extractions(&extractions);
             progress.stage(
                 2,
@@ -3739,9 +3864,9 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 .collect();
             let narrowed = !*full && !split_csv(affected_flag).is_empty();
             let retired = store.clear_pending_superseded(if narrowed {
-                devmap_store::PendingSupersede::IndexedPaths(&indexed)
+                devmap_store::PendingSupersede::IndexedPathsThrough(&indexed, &build_start)
             } else {
-                devmap_store::PendingSupersede::WholeTreeBuiltAt(build_start)
+                devmap_store::PendingSupersede::WholeTreeThrough(&build_start)
             })?;
             if !retired.is_empty() {
                 progress.note(format_args!(
@@ -3845,14 +3970,14 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     }),
                 )?;
             } else {
-                println!(
+                outln!(
                     "Built generation #{gen_id} · {} · {} · {} · {}",
                     progress::count(analysis.total_files, "file"),
                     progress::count(analysis.total_symbols, "symbol"),
                     progress::count(analysis.total_edges, "edge"),
                     progress::duration(progress.started_at.elapsed().as_secs_f64())
                 );
-                println!(
+                outln!(
                     "  Changes: +{} ~{} -{} · {} unchanged · {} cached",
                     file_delta.added,
                     file_delta.changed,
@@ -3862,32 +3987,32 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 );
                 progress.display.report_loss();
                 if cli.verbose {
-                    println!("  Files indexed: {}", analysis.total_files);
+                    outln!("  Files indexed: {}", analysis.total_files);
                 }
                 if refused_count > 0 {
                     // Said here as well as on stderr: the count belongs beside
                     // the file total it is part of, or a reader takes the total
                     // for a count of files that were read.
-                    println!(
+                    outln!(
                         "    of which refused by discovery: {refused_count} \
                          (recorded as lost coverage, not parsed)"
                     );
                 }
                 if !cli.verbose && (unattributed_calls > 0 || uninferred_receiver_calls > 0) {
-                    println!("  Unresolved: {unattributed_calls} unattributed, {uninferred_receiver_calls} uninferred receivers (details: --verbose)");
+                    outln!("  Unresolved: {unattributed_calls} unattributed, {uninferred_receiver_calls} uninferred receivers (details: --verbose)");
                 }
                 if cli.verbose {
-                    println!("  Symbols extracted: {}", analysis.total_symbols);
-                    println!("  Edges resolved: {}", analysis.total_edges);
+                    outln!("  Symbols extracted: {}", analysis.total_symbols);
+                    outln!("  Edges resolved: {}", analysis.total_edges);
                     // R5: a call we could not attribute is reported, not dropped.
-                    println!("  Unresolved calls: {}", analysis.unresolved_calls);
+                    outln!("  Unresolved calls: {}", analysis.unresolved_calls);
                     print_resolution_rate(&analysis.resolution_rate);
-                    println!("    language builtins:  {builtin_calls}");
-                    println!("    host globals:       {host_global_calls}");
-                    println!("    local bindings:     {local_binding_calls}");
-                    println!("    external imports:   {external_calls}");
-                    println!("    uninferred receiver:{uninferred_receiver_calls}");
-                    println!("    unattributed:       {unattributed_calls}");
+                    outln!("    language builtins:  {builtin_calls}");
+                    outln!("    host globals:       {host_global_calls}");
+                    outln!("    local bindings:     {local_binding_calls}");
+                    outln!("    external imports:   {external_calls}");
+                    outln!("    uninferred receiver:{uninferred_receiver_calls}");
+                    outln!("    unattributed:       {unattributed_calls}");
                     if let Some(manifest) = &manifest {
                         report_manifest(cli, &manifest.outcome)?;
                     }
@@ -3899,7 +4024,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             budget,
             semantic,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
             let resp = if *semantic {
                 engine.search_semantic(query, *budget)?
@@ -3923,7 +4048,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             min_confidence,
             min_rung,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
             // Both floors apply, at different places: `min_confidence` goes to
             // the store, which drops rows before the engine sees them, and the
@@ -3951,7 +4076,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             min_rung,
             layers,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
             let req = Request {
                 query: target.clone(),
@@ -3991,7 +4116,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             min_confidence,
             min_rung,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
             // `check_rung` above has already refused an unparseable name, so a
             // `None` here means no floor was asked for and never that one was
@@ -4007,10 +4132,10 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 emit_json(cli, &serde_json::json!({ "neighbors": answers }))?;
             } else {
                 for entry in &answers {
-                    println!("{}", entry.target);
-                    println!("  callers:");
+                    outln!("{}", entry.target);
+                    outln!("  callers:");
                     emit_edges(&entry.callers);
-                    println!("  callees:");
+                    outln!("  callees:");
                     emit_edges(&entry.callees);
                 }
             }
@@ -4022,7 +4147,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             depth,
             min_rung,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
             let rung = min_rung.as_deref().and_then(devmap_query::Rung::parse);
             let resp = if let Some(destination) = to {
@@ -4055,7 +4180,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             }
         }
         Commands::Dead { budget } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let payload = StoreQueryEngine::new(&store).dead_symbols(*budget)?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&payload)?)?;
@@ -4070,7 +4195,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             depth,
             min_confidence,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let report = StoreQueryEngine::new(&store).explore(
                 query,
                 *limit,
@@ -4090,7 +4215,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             depth,
             min_confidence,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let report = StoreQueryEngine::new(&store).affected_tests(
                 targets,
                 *budget,
@@ -4150,7 +4275,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                             }),
                         )?;
                     } else {
-                        println!(
+                        outln!(
                             "{} {label} -> {} ({})",
                             if replaced { "replaced" } else { "added" },
                             canonical.display(),
@@ -4174,9 +4299,9 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     if cli.json {
                         emit_json(cli, &serde_json::json!({"removed": removed, "name": name}))?;
                     } else if removed {
-                        println!("removed {name}");
+                        outln!("removed {name}");
                     } else {
-                        println!("{name} is not registered");
+                        outln!("{name} is not registered");
                     }
                 }
                 WorkspaceAction::List => {
@@ -4212,7 +4337,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         return Ok(());
                     }
                     if workspace.repos.is_empty() {
-                        println!("no repositories registered ({})", root.display());
+                        outln!("no repositories registered ({})", root.display());
                     }
                     for repo in &workspace.repos {
                         // The store *file* existing says nothing about whether
@@ -4236,7 +4361,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                                 },
                             },
                         };
-                        println!("{:<16} {:<34} {}", repo.name, state, repo.root.display());
+                        outln!("{:<16} {:<34} {}", repo.name, state, repo.root.display());
                     }
                 }
                 WorkspaceAction::Search {
@@ -4251,7 +4376,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         emit_json(cli, &serde_json::to_value(&result)?)?;
                     } else {
                         for entry in &result.items {
-                            println!(
+                            outln!(
                                 "[{}] {}:{}  {}",
                                 entry.repo,
                                 entry.hit.file_path,
@@ -4259,14 +4384,16 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                                 entry.hit.symbol_name
                             );
                         }
-                        println!(
+                        outln!(
                             "{} repo(s) queried, {} shown of {}",
-                            result.repos_queried, result.shown, result.total
+                            result.repos_queried,
+                            result.shown,
+                            result.total
                         );
                         // Never silent. A workspace answer assembled from a
                         // subset is not a workspace answer.
                         for missing in &result.unavailable {
-                            println!("  unavailable: {} — {}", missing.repo, missing.reason);
+                            outln!("  unavailable: {} — {}", missing.repo, missing.reason);
                         }
                     }
                 }
@@ -4292,7 +4419,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         )?;
                     } else {
                         for link in &links {
-                            println!(
+                            outln!(
                                 "{} {} -> {}  ({}; {})",
                                 link.from_repo,
                                 link.module_specifier,
@@ -4301,13 +4428,13 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                                 link.evidence
                             );
                         }
-                        println!("{} candidate link(s)", links.len());
+                        outln!("{} candidate link(s)", links.len());
                     }
                 }
             }
         }
         Commands::Savings { query, budget } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let report = StoreQueryEngine::new(&store).savings(query.as_deref(), *budget)?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&report)?)?;
@@ -4336,7 +4463,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 devmap_extract::read_source(std::path::Path::new(content))
                     .map_err(|e| anyhow::anyhow!("cannot read {content}: {e}"))?
             };
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let report =
                 StoreQueryEngine::new(&store).preview(file, &source, *budget, *min_confidence)?;
             if cli.json {
@@ -4350,7 +4477,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             kind,
             min_nodes,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             // `value_parser` has already rejected anything but the two names,
             // so a `None` here can only be "no filter requested".
             let wanted = kind.as_deref().and_then(devmap_query::parse_clone_kind);
@@ -4371,7 +4498,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             stamps,
             inventory,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let outcome = write_consumer_artifacts(
                 &store,
                 ManifestRequest {
@@ -4425,7 +4552,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 *force || !stamped || devmap_query::should_regenerate(&out_path, &fingerprint);
             if !regenerate {
                 if cli.json {
-                    println!(
+                    outln!(
                         "{}",
                         serde_json::json!({
                             "output": out_path.display().to_string(),
@@ -4435,7 +4562,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         })
                     );
                 } else {
-                    println!("{} is current", out_path.display());
+                    outln!("{} is current", out_path.display());
                 }
                 return Ok(());
             }
@@ -4443,7 +4570,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             let html = devmap_query::render_map_preview_html(&repo_map, &fingerprint);
             devmap_query::write_atomic(&out_path, html.as_bytes())?;
             if cli.json {
-                println!(
+                outln!(
                     "{}",
                     serde_json::json!({
                         "output": out_path.display().to_string(),
@@ -4453,7 +4580,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     })
                 );
             } else {
-                println!("Wrote {} ({} bytes)", out_path.display(), html.len());
+                outln!("Wrote {} ({} bytes)", out_path.display(), html.len());
             }
         }
         Commands::Freshness {
@@ -4623,7 +4750,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     "workspace",
                     "plugin_dir",
                 ] {
-                    println!("{key:<12} {}", payload[key].as_str().unwrap_or(""));
+                    outln!("{key:<12} {}", payload[key].as_str().unwrap_or(""));
                 }
             }
         }
@@ -4736,6 +4863,9 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     cli.db().display()
                 );
             };
+            if cli.db.is_none() {
+                store.validate_repo_root(&cli.root_hint())?;
+            }
             let mut payload = store_status_fields(&store, &cli.db())?;
             payload.insert("schema_outdated".into(), serde_json::json!(false));
             payload.insert("schema_version".into(), serde_json::json!(stored_schema));
@@ -4760,7 +4890,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             emit_json(cli, &payload)?;
         }
         Commands::History { last } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let rows = store.build_history(*last)?;
 
             if cli.json {
@@ -4801,11 +4931,18 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     &serde_json::json!({ "shown": rows.len(), "history": entries }),
                 )?;
             } else if rows.is_empty() {
-                println!("No build history yet — run `devmap build` first.");
+                outln!("No build history yet — run `devmap build` first.");
             } else {
-                println!(
+                outln!(
                     "{:>5}  {:<12} {:>7} {:>8} {:>8} {:>6} {:>9} {:>8}",
-                    "gen", "head", "files", "symbols", "edges", "dead", "build_ms", "db_MiB"
+                    "gen",
+                    "head",
+                    "files",
+                    "symbols",
+                    "edges",
+                    "dead",
+                    "build_ms",
+                    "db_MiB"
                 );
                 for (index, row) in rows.iter().enumerate() {
                     let head: String = row.head_sha.chars().take(12).collect();
@@ -4820,7 +4957,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                             )
                         })
                         .unwrap_or_default();
-                    println!(
+                    outln!(
                         "{:>5}  {:<12} {:>7} {:>8} {:>8} {:>6} {:>9} {:>8.2}{}",
                         row.generation_id,
                         head,
@@ -4837,15 +4974,37 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             }
         }
         Commands::Repair {
+            schema,
             fts,
             pending,
             page_size,
         } => {
-            // `cli.db()` rather than `cli.db`: the store path is resolved per
-            // repository now, and `--db` is an `Option`.
-            let store = open_for_read(&cli.db())?;
-            if !*fts && !*pending && !*page_size {
-                anyhow::bail!("specify a repair target, e.g. --fts, --pending or --page-size");
+            if !*schema && !*fts && !*pending && !*page_size {
+                anyhow::bail!("specify a repair target: --schema, --fts, --pending or --page-size");
+            }
+            let db = cli.db();
+            if !db.is_file() {
+                anyhow::bail!(
+                    "no devmap store at {} — run `devmap build` first",
+                    db.display()
+                );
+            }
+            let _writer = Store::lock_writer_at(&db, Store::WRITER_LOCK_WAIT)?;
+            let before = Store::stored_schema_version(&db)?;
+            let store = Store::open(&db)?;
+            drop(_writer); // Page-size conversion acquires its own writer guard.
+            if cli.db.is_none() {
+                store.validate_repo_root(&cli.root_hint())?;
+            }
+            if *schema {
+                emit_json(
+                    cli,
+                    &serde_json::json!({
+                        "schema_before": before,
+                        "schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
+                        "upgraded": before != Some(devmap_store::CURRENT_SCHEMA_VERSION),
+                    }),
+                )?;
             }
             if *page_size {
                 let outcome = store.convert_page_size()?;
@@ -4859,18 +5018,19 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         }),
                     )?;
                 } else if outcome.converted {
-                    println!(
+                    outln!(
                         "Store rewritten at {} byte pages (was {}).",
-                        outcome.after, outcome.before
+                        outcome.after,
+                        outcome.before
                     );
                 } else {
-                    println!("Store already uses {} byte pages.", outcome.after);
+                    outln!("Store already uses {} byte pages.", outcome.after);
                 }
             }
             if *fts {
                 store.repair_fts()?;
                 if !cli.json {
-                    println!("FTS search index repaired.");
+                    outln!("FTS search index repaired.");
                 }
             }
             if *pending {
@@ -4912,24 +5072,24 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     )?;
                 } else {
                     if root.is_none() {
-                        println!(
+                        outln!(
                             "No generation yet, so no repository root to check paths against; \
                              dropping quarantined rows only."
                         );
                     }
                     for (dropped, reason) in &structural.dropped {
-                        println!("dropped {dropped}: {reason}");
+                        outln!("dropped {dropped}: {reason}");
                     }
                     for (from, to) in &structural.rewritten {
-                        println!("normalized {from} -> {to}");
+                        outln!("normalized {from} -> {to}");
                     }
                     for dropped in &quarantined {
-                        println!(
+                        outln!(
                             "dropped {dropped}: exceeded {} retry attempts",
                             devmap_store::MAX_PENDING_ATTEMPTS
                         );
                     }
-                    println!(
+                    outln!(
                         "Pending queue repaired: {} unprocessable, {} quarantined, \
                          {} normalized.",
                         structural.dropped.len(),
@@ -4940,7 +5100,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             }
         }
         Commands::Snapshots { file, budget } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let extractions = store.latest_extractions()?;
             let resp = semantic_snapshots(
                 &extractions,
@@ -5017,7 +5177,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 if cli.json {
                     emit_json(cli, &serde_json::json!({"socket": ipc_path}))?;
                 } else {
-                    println!("{}", ipc_path.display());
+                    outln!("{}", ipc_path.display());
                 }
                 return Ok(());
             }
@@ -5132,7 +5292,7 @@ empty graph, which would read as 'this file has no control flow'.",
                 )?;
             } else {
                 for row in &rows {
-                    println!(
+                    outln!(
                         "{}  lines {}-{}  {} node(s), {} edge(s)",
                         row["function"].as_str().unwrap_or(""),
                         row["start_line"],
@@ -5141,12 +5301,12 @@ empty graph, which would read as 'this file has no control flow'.",
                         row["edges"]
                     );
                     for sink in row["taint_sinks"].as_array().into_iter().flatten() {
-                        println!("    sink {}", sink.as_str().unwrap_or(""));
+                        outln!("    sink {}", sink.as_str().unwrap_or(""));
                     }
                 }
-                println!("  {} of {} function(s)", rows.len(), graphs.len());
+                outln!("  {} of {} function(s)", rows.len(), graphs.len());
                 for entry in &refused {
-                    println!(
+                    outln!(
                         "  refused {}: {}",
                         entry["function"].as_str().unwrap_or(""),
                         entry["reason"].as_str().unwrap_or("")
@@ -5155,7 +5315,7 @@ empty graph, which would read as 'this file has no control flow'.",
             }
         }
         Commands::Cypher { query, limit } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let graph = graph_core_for_read(&store)?;
             let result = devmap_query::cypher::run(&graph, query, *limit);
             if cli.json {
@@ -5163,17 +5323,17 @@ empty graph, which would read as 'this file has no control flow'.",
             } else if result["ok"].as_bool() == Some(true) {
                 for row in result["rows"].as_array().into_iter().flatten() {
                     match row.get("rel").and_then(serde_json::Value::as_str) {
-                        Some(rel) => println!(
+                        Some(rel) => outln!(
                             "{}  -[{rel}]->  {}",
                             row["a_id"].as_str().unwrap_or(""),
                             row["b_id"].as_str().unwrap_or("")
                         ),
-                        None => println!("{}", row["a_id"].as_str().unwrap_or("")),
+                        None => outln!("{}", row["a_id"].as_str().unwrap_or("")),
                     }
                 }
                 // Both numbers, always: a page reported as a count reads as a
                 // total, and this surface exists to answer "how many".
-                println!(
+                outln!(
                     "  {} of {} row(s){}",
                     result["shown"].as_u64().unwrap_or(0),
                     result["total"].as_u64().unwrap_or(0),
@@ -5201,19 +5361,19 @@ empty graph, which would read as 'this file has no control flow'.",
             limit,
             facets,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             if *facets {
                 let facets = devmap_query::ast::ast_facets(&store)?;
                 if cli.json {
                     emit_json(cli, &facets)?;
                 } else {
-                    println!("kinds:");
+                    outln!("kinds:");
                     for (name, count) in facets["kinds"].as_object().into_iter().flatten() {
-                        println!("  {name:<16} {count}");
+                        outln!("  {name:<16} {count}");
                     }
-                    println!("languages:");
+                    outln!("languages:");
                     for (name, count) in facets["languages"].as_object().into_iter().flatten() {
-                        println!("  {name:<16} {count}");
+                        outln!("  {name:<16} {count}");
                     }
                 }
                 return Ok(());
@@ -5232,7 +5392,7 @@ empty graph, which would read as 'this file has no control flow'.",
             }
         }
         Commands::Export { path, out } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let graph = graph_value_for_read(&store, &cli.db())?;
             let gen_id = store.latest_generation_id()?.unwrap_or(0);
             let (xml, report) = devmap_query::export::export_graphml(&graph);
@@ -5243,7 +5403,7 @@ empty graph, which would read as 'this file has no control flow'.",
                 .filter(|_| !to_stdout)
                 .unwrap_or_else(|| devmap_extract::paths::state_dir(path).join("graph.graphml"));
             if to_stdout {
-                print!("{xml}");
+                write_stdout(format_args!("{xml}"));
             } else {
                 ensure_parent(&destination)?;
                 std::fs::write(&destination, &xml)?;
@@ -5268,17 +5428,17 @@ empty graph, which would read as 'this file has no control flow'.",
                     }),
                 )?;
             } else if !to_stdout {
-                println!("Wrote {}", destination.display());
-                println!("  {} nodes, {} edges", report.nodes, report.edges);
+                outln!("Wrote {}", destination.display());
+                outln!("  {} nodes, {} edges", report.nodes, report.edges);
                 if report.edges_dangling > 0 {
-                    println!(
+                    outln!(
                         "  {} edge(s) omitted: an endpoint is not a declared node \
 (GraphML cannot express one)",
                         report.edges_dangling
                     );
                 }
                 if report.characters_replaced > 0 {
-                    println!(
+                    outln!(
                         "  {} character(s) replaced with U+FFFD: XML 1.0 cannot \
 represent them",
                         report.characters_replaced
@@ -5292,7 +5452,7 @@ represent them",
             max_files,
             max_file_bytes,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let graph = graph_core_for_read(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
@@ -5312,7 +5472,7 @@ represent them",
             max_files,
             max_file_bytes,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let graph = graph_core_for_read(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
@@ -5330,7 +5490,7 @@ represent them",
             max_files,
             max_file_bytes,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let graph = graph_core_for_read(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
@@ -5347,7 +5507,7 @@ represent them",
             level,
             max_nodes,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let gen_id = store.latest_generation_id()?.unwrap_or(0);
             let repo_root = store.latest_repo_root()?;
 
@@ -5388,16 +5548,16 @@ represent them",
                     }),
                 )?;
             } else {
-                println!("Wrote {}", destination.display());
+                outln!("Wrote {}", destination.display());
                 let shown = counts["nodes_shown"].as_u64().unwrap_or(0);
                 let total = counts["nodes_total"].as_u64().unwrap_or(0);
                 if counts["nodes_truncated"].as_bool().unwrap_or(false) {
-                    println!(
+                    outln!(
                         "  {shown} of {total} nodes drawn (most connected first); \
 raise --max-nodes to widen"
                     );
                 } else {
-                    println!("  {total} nodes drawn");
+                    outln!("  {total} nodes drawn");
                 }
             }
         }
@@ -5455,15 +5615,17 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
             } else {
                 for (event, hook, reason) in &coverage {
                     match hook {
-                        Some(hook) => println!(
+                        Some(hook) => outln!(
                             "{event:<20} handled   devmap {} (matcher {:?})\n{:22}{reason}",
-                            hook.subcommand, hook.matcher, ""
+                            hook.subcommand,
+                            hook.matcher,
+                            ""
                         ),
-                        None => println!("{event:<20} -\n{:22}{reason}", ""),
+                        None => outln!("{event:<20} -\n{:22}{reason}", ""),
                     }
                 }
                 let handled = coverage.iter().filter(|(_, h, _)| h.is_some()).count();
-                println!("\n{handled} of {} events handled", coverage.len());
+                outln!("\n{handled} of {} events handled", coverage.len());
                 Ok(())
             }
         }
@@ -5521,13 +5683,13 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
                 )
             } else {
                 for file in &written {
-                    println!(
+                    outln!(
                         "{} {}",
                         if file.changed { "wrote  " } else { "current" },
                         file.path.display()
                     );
                 }
-                println!(
+                outln!(
                     "\n{changed} of {} file(s) changed. Install with:\n  \
                      claude plugin marketplace add {}\n  claude plugin install {}@{}",
                     written.len(),
@@ -5544,9 +5706,9 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
                 emit_json(cli, &report.to_json())?;
             } else {
                 for diagnostic in &report.diagnostics {
-                    println!("{diagnostic}");
+                    outln!("{diagnostic}");
                 }
-                println!(
+                outln!(
                     "{}: {} error(s), {} warning(s){}",
                     if report.ok() { "ok" } else { "FAILED" },
                     report.errors().count(),
@@ -5580,10 +5742,10 @@ fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
     let Some(net) = rate.net_permille else {
         // No site was attempted. Saying "0.0%" here would report a failure that
         // never happened; the `Option` exists precisely to keep the two apart.
-        println!("  Resolution rate: not measured (no attribution sites)");
+        outln!("  Resolution rate: not measured (no attribution sites)");
         return;
     };
-    println!(
+    outln!(
         "  Resolution rate: {}.{}% net, {}.{}% gross ({} resolved / {} unresolved, {} explained)",
         net / 10,
         net % 10,
@@ -5601,7 +5763,7 @@ fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
     rows.sort_by_key(|(language, row)| (row.net_permille.unwrap_or(u32::MAX), (*language).clone()));
     for (language, row) in rows.iter().take(RESOLUTION_RATE_LANGUAGES_SHOWN) {
         match row.net_permille {
-            Some(net) => println!(
+            Some(net) => outln!(
                 "    {language:<12} {}.{}%  ({} resolved / {} unresolved)",
                 net / 10,
                 net % 10,
@@ -5609,9 +5771,9 @@ fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
                 row.unresolved_sites
             ),
             None if !row.extracts_calls => {
-                println!("    {language:<12} no call extractor in this build (0 attribution sites)")
+                outln!("    {language:<12} no call extractor in this build (0 attribution sites)")
             }
-            None => println!("    {language:<12} not measured (no attribution sites)"),
+            None => outln!("    {language:<12} not measured (no attribution sites)"),
         }
         // Printed beside a *measured* row too, and that is the point: a language
         // can attribute calls perfectly and still have no heritage extractor, so
@@ -5625,7 +5787,7 @@ fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
             .filter(|name| *name != "calls")
             .collect();
         if !blind.is_empty() {
-            println!(
+            outln!(
                 "    {:<12} …and this build extracts no {} for it, so an empty \
                  answer there is a hole and not a finding",
                 "",
@@ -5634,7 +5796,7 @@ fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
         }
     }
     if rows.len() > RESOLUTION_RATE_LANGUAGES_SHOWN {
-        println!(
+        outln!(
             "    … {} more language(s); the full breakdown is in `--json`",
             rows.len() - RESOLUTION_RATE_LANGUAGES_SHOWN
         );

@@ -169,3 +169,103 @@ fn queries_succeed_while_a_build_is_committing() {
         "reads must not fail while a build commits: {failures:?}"
     );
 }
+
+#[test]
+fn an_absolute_home_cannot_alias_two_worktrees() {
+    use devmap_extract::subprocess::{run_bounded, Bounds};
+    use std::time::Duration;
+    let scratch = temp_root("root-alias");
+    let a = scratch.join("a");
+    let b = scratch.join("b");
+    let home = scratch.join("shared-state");
+    for (root, symbol) in [(&a, "owner_a"), (&b, "owner_b")] {
+        fs::create_dir(root).unwrap();
+        fs::write(
+            root.join("source.py"),
+            format!("def {symbol}():\n    return 1\n"),
+        )
+        .unwrap();
+    }
+    let invoke = |root: &std::path::Path, args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_devmap"));
+        command
+            .current_dir(root)
+            .env("DEVMAP_HOME", &home)
+            .env("DEVMAP_AUTOSPAWN", "0")
+            .args(args);
+        let output = run_bounded(
+            &mut command,
+            Bounds {
+                deadline: Duration::from_secs(60),
+                stdout_cap: 1024 * 1024,
+                stderr_cap: 64 * 1024,
+            },
+        )
+        .unwrap();
+        assert!(!output.stdout_truncated && !output.stderr_truncated);
+        output
+    };
+    assert!(invoke(&a, &["build", ".", "--json"]).status.success());
+    let second = invoke(&b, &["build", ".", "--json"]);
+    assert!(!second.status.success());
+    assert!(
+        second.stderr_trimmed().contains("belongs to worktree"),
+        "{}",
+        second.stderr_trimmed()
+    );
+    for command in ["search", "status"] {
+        let args = if command == "search" {
+            vec![command, "owner_a", "--json"]
+        } else {
+            vec![command, "--json"]
+        };
+        assert!(
+            !invoke(&b, &args).status.success(),
+            "implicit {command} returned another worktree's map"
+        );
+    }
+    let own = invoke(&a, &["search", "owner_a", "--json"]);
+    assert!(own.status.success(), "{}", own.stderr_trimmed());
+    let payload: serde_json::Value = serde_json::from_slice(&own.stdout).unwrap();
+    assert_eq!(payload["total"], 1);
+    fs::remove_dir_all(scratch).unwrap();
+}
+
+#[test]
+fn navigation_from_a_nested_directory_uses_its_worktree_map() {
+    use devmap_extract::subprocess::{run_bounded, Bounds};
+    let root = temp_root("nested-navigation");
+    let bounded = |command: &mut Command| {
+        let out = run_bounded(
+            command,
+            Bounds {
+                deadline: std::time::Duration::from_secs(60),
+                stdout_cap: 1024 * 1024,
+                stderr_cap: 64 * 1024,
+            },
+        )
+        .unwrap();
+        assert!(out.status.success(), "{}", out.stderr_trimmed());
+        assert!(!out.stdout_truncated && !out.stderr_truncated);
+        out
+    };
+    bounded(Command::new("git").args(["init", "-q"]).arg(&root));
+    write_fixture(&root, 0);
+    bounded(
+        Command::new(env!("CARGO_BIN_EXE_devmap"))
+            .env_remove("DEVMAP_HOME")
+            .arg("build")
+            .arg(&root)
+            .arg("--json"),
+    );
+    let out = bounded(
+        Command::new(env!("CARGO_BIN_EXE_devmap"))
+            .env_remove("DEVMAP_HOME")
+            .current_dir(root.join("src"))
+            .args(["search", "helper0", "--json"]),
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["total"], 1);
+    assert!(!root.join("src/.devmap").exists());
+    fs::remove_dir_all(root).unwrap();
+}

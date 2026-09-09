@@ -1,5 +1,9 @@
 # devmap (Rust) Status Ledger
 
+**Schema-20 follow-up, 2026-09-09:** the unchanged self-build gate passed at 8,599 ms on hosted Linux and 3.269 seconds with the frozen local release. The final CLI passed 128-worktree / 256-editor and eight-larger-graph workloads, and all 16 schema-17/18/19 migration copies passed integrity, payload-preservation, idempotence and rollback checks. GitPulse passed macOS/Linux/Windows CI and exact-artifact MCP readback. See [SCHEMA20_QUALIFICATION_2026-09-09.md](SCHEMA20_QUALIFICATION_2026-09-09.md) for final native capacity status, exact identities, retained failures and limits. Live stores remain at their original schemas; coordinated installed-client cutover is pending.
+
+**Staleness/navigation audit, 2026-09-08:** stale generations remain navigable; current-source snippets are checked separately. CLI, daemon, and GitPulse now share the `StoreStatus` freshness verdict. The workspace passed 2,289 tests and the 40-cycle daemon storm passed; the 10-second self-build performance gate was red in that audit and is superseded by the follow-up above. See [STALENESS_AUDIT_2026-09-08.md](STALENESS_AUDIT_2026-09-08.md) for measured results, interrupted runs, and parser-free reader limits.
+
 **Reliability audit, 2026-09-08:** RA1 lexical binding isolation, RA2 qualified candidate identity, RA3 source/snapshot coherence, RA4 bounded source ingestion, and RA5 honest soak verification are repaired. Current contracts, failure reproductions, test counts, stress measurements, and remaining limits are recorded in [RELIABILITY_AUDIT_2026-09-08.md](RELIABILITY_AUDIT_2026-09-08.md). That entry supersedes older queue-only freshness and unchecked prefix-read claims below; historical measurements remain historical.
 
 **Active work:** Phase 6 consumer hybrid migration (2026-08-12); kernel performance and gap pass (2026-09-02)
@@ -5997,4 +6001,3 @@ cold one would order the same edges differently. V replaced it with `resolution`
 the columnar comparator carries the same key: the resolution table is ranked in byte
 order like every other, and SQL NULL sorts where `Option::None` sorts, before every
 `Some`.
-

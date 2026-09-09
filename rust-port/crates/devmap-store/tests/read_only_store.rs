@@ -13,6 +13,8 @@
 //! answer from it; and a write against it fails with a reason that names the
 //! store as read-only rather than a raw SQLite code.
 
+#![cfg(unix)]
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

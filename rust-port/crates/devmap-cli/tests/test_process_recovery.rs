@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::fs;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +24,15 @@ fn temp_root() -> std::path::PathBuf {
 
 fn wait_for_path(path: &std::path::Path) {
     for _ in 0..200 {
-        if path.exists() {
+        #[cfg(unix)]
+        let ready = std::os::unix::net::UnixStream::connect(path).is_ok();
+        #[cfg(windows)]
+        let ready = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .is_ok();
+        if ready {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -35,17 +41,10 @@ fn wait_for_path(path: &std::path::Path) {
 }
 
 #[test]
-fn kill9_restart_replays_durable_pending_work_and_replaces_stale_socket() {
+fn process_death_restart_replays_durable_pending_work_and_reclaims_the_endpoint() {
     let root = temp_root();
     let db = root.join(".devcouncil/codeintel/index.sqlite");
-    let socket = std::path::PathBuf::from(format!(
-        "/tmp/devmap-pr-{}-{}.sock",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let socket = devmap_serve::default_ipc_path_for(&root);
     let pending = "recover.py".to_string();
     fs::write(root.join(&pending), vec![b'x'; 1024 * 1024 + 1])
         .expect("create temporarily oversized source");
@@ -70,9 +69,19 @@ fn kill9_restart_replays_durable_pending_work_and_replaces_stale_socket() {
     std::thread::sleep(Duration::from_millis(250));
     first.kill().expect("kill first daemon");
     first.wait().expect("reap first daemon");
+    #[cfg(unix)]
     assert!(
         socket.exists(),
         "SIGKILL should leave a stale socket fixture"
+    );
+    #[cfg(windows)]
+    assert!(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&socket)
+            .is_err(),
+        "process death must release the named pipe"
     );
     assert_eq!(
         Store::open(&db)
@@ -126,6 +135,7 @@ fn kill9_restart_replays_durable_pending_work_and_replaces_stale_socket() {
                 .any(|symbol| symbol.name == "recovered_symbol")
     }));
 
+    drop(observer);
     let _ = fs::remove_file(socket);
     fs::remove_dir_all(root).expect("remove fixture tree");
 }

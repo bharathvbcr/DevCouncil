@@ -27,6 +27,15 @@
 //! halves of one tool disagreeing about the boundary of the repository, with
 //! the permissive half being the one that reads the bytes.
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink as symlink_file;
+#[cfg(unix)]
+use std::os::unix::fs::symlink as symlink_dir;
+#[cfg(windows)]
+use std::os::windows::fs::symlink_dir;
+#[cfg(windows)]
+use std::os::windows::fs::symlink_file;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -75,7 +84,7 @@ fn a_symlink_pointing_out_of_the_repository_is_not_read() {
         "SECRET = \"AKIAIOSFODNN7EXAMPLE\"\n\n\ndef leak():\n    return SECRET\n",
     )
     .unwrap();
-    std::os::unix::fs::symlink(outside.join("credentials.py"), root.join("src/creds.py")).unwrap();
+    symlink_file(outside.join("credentials.py"), root.join("src/creds.py")).unwrap();
 
     let (sources, report) = collect_sources_with_report(&root).expect("discovery runs");
 
@@ -111,7 +120,7 @@ fn a_symlink_pointing_inside_the_repository_is_still_read() {
     fs::create_dir_all(root.join("src")).unwrap();
     fs::create_dir_all(root.join("shared")).unwrap();
     fs::write(root.join("shared/util.py"), "def util():\n    return 2\n").unwrap();
-    std::os::unix::fs::symlink(root.join("shared/util.py"), root.join("src/util.py")).unwrap();
+    symlink_file(root.join("shared/util.py"), root.join("src/util.py")).unwrap();
 
     let (sources, _) = collect_sources_with_report(&root).expect("discovery runs");
     let paths: Vec<&str> = sources.iter().map(|(path, _)| path.as_str()).collect();
@@ -132,7 +141,7 @@ fn a_relative_symlink_that_climbs_out_of_the_repository_is_not_read() {
     fs::create_dir_all(&outside).unwrap();
     fs::write(outside.join("secret.py"), "TOKEN = \"hunter2\"\n").unwrap();
     fs::write(root.join("src/a.py"), "def a():\n    return 1\n").unwrap();
-    std::os::unix::fs::symlink(
+    symlink_file(
         Path::new("../../elsewhere/secret.py"),
         root.join("src/secret.py"),
     )
@@ -168,7 +177,7 @@ fn a_dangling_symlink_is_recorded_as_a_refusal_rather_than_passed_over_in_silenc
     let root = scratch("dangling");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/a.py"), "def a():\n    return 1\n").unwrap();
-    std::os::unix::fs::symlink(root.join("nowhere.py"), root.join("src/gone.py")).unwrap();
+    symlink_file(root.join("nowhere.py"), root.join("src/gone.py")).unwrap();
 
     let (sources, report) = collect_sources_with_report(&root).expect("discovery runs");
     assert!(
@@ -189,7 +198,7 @@ fn a_symlink_loop_is_recorded_as_a_refusal() {
     let root = scratch("loop");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/a.py"), "def a():\n    return 1\n").unwrap();
-    std::os::unix::fs::symlink("loop.py", root.join("src/loop.py")).unwrap();
+    symlink_file("loop.py", root.join("src/loop.py")).unwrap();
 
     let (sources, report) = collect_sources_with_report(&root).expect("discovery runs");
     assert!(
@@ -221,7 +230,7 @@ fn a_file_over_the_ceiling_reached_through_an_in_root_symlink_is_still_refused_b
         fs::metadata(&big).unwrap().len() > devmap_extract::MAX_SOURCE_BYTES,
         "the fixture must be over the ceiling"
     );
-    std::os::unix::fs::symlink(&big, root.join("src/big.py")).unwrap();
+    symlink_file(&big, root.join("src/big.py")).unwrap();
 
     let (sources, report) = collect_sources_with_report(&root).expect("discovery runs");
     assert!(
@@ -247,7 +256,7 @@ fn a_symlink_to_a_directory_inside_the_repository_is_not_descended() {
     let root = scratch("dirlink");
     fs::create_dir_all(root.join("shared/pkg")).unwrap();
     fs::write(root.join("shared/pkg/mod.py"), "def m():\n    return 1\n").unwrap();
-    std::os::unix::fs::symlink(root.join("shared/pkg"), root.join("pkg")).unwrap();
+    symlink_dir(root.join("shared/pkg"), root.join("pkg")).unwrap();
 
     let (sources, _) = collect_sources_with_report(&root).expect("discovery runs");
     let paths: Vec<&str> = sources.iter().map(|(path, _)| path.as_str()).collect();

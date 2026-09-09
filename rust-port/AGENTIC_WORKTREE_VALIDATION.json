@@ -1,0 +1,37 @@
+{
+  "worktrees": 128,
+  "simultaneous_daemons": 128,
+  "simultaneous_editors": 256,
+  "build_workers": 16,
+  "tokio_workers_per_process": 2,
+  "rayon_workers_per_process": 2,
+  "binary_sha256": "8170efd7d02fa345ae5d3c7f6057a5034dfeed50e7617d66860ba973fc677027",
+  "rounds": 12,
+  "edit_operations": 36864,
+  "ipc_queries": 3072,
+  "metadata_checks": 512,
+  "cold_comparisons": 128,
+  "kills": 384,
+  "daemon_rss_kib_samples": [
+    3788384,
+    3784656,
+    3786272,
+    3777488,
+    3774704,
+    3772528,
+    3767056,
+    3771072,
+    3776288,
+    3780272,
+    3784912,
+    3784960
+  ],
+  "passed": true,
+  "elapsed_seconds": 129.01,
+  "query_latency_ms": {
+    "samples": 3072,
+    "p50": 38.374,
+    "p95": 204.218,
+    "max": 521.545
+  }
+}

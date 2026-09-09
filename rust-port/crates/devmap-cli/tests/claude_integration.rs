@@ -342,6 +342,7 @@ fn concurrent_emission_leaves_one_valid_bundle() {
 }
 
 #[test]
+#[cfg(unix)] // POSIX directory write bits; Windows directory read-only is not a write barrier.
 fn an_unwritable_output_directory_fails_loudly_and_names_the_path() {
     let dir = scratch("readonly");
     let out = dir.join("locked");
@@ -351,10 +352,6 @@ fn an_unwritable_output_directory_fails_loudly_and_names_the_path() {
     {
         use std::os::unix::fs::PermissionsExt;
         perms.set_mode(0o500); // r-x, no write
-    }
-    #[cfg(not(unix))]
-    {
-        perms.set_readonly(true);
     }
     std::fs::set_permissions(&out, perms).unwrap();
 
@@ -374,6 +371,28 @@ fn an_unwritable_output_directory_fails_loudly_and_names_the_path() {
         std::fs::set_permissions(&out, perms).unwrap();
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(windows)]
+fn a_read_only_output_file_is_refused_without_replacing_its_bytes() {
+    let dir = scratch("readonly-file");
+    let target = dir.join(".claude-plugin/marketplace.json");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "preserve this file").unwrap();
+    let original = std::fs::metadata(&target).unwrap().permissions();
+    let mut perms = original.clone();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&target, perms).unwrap();
+    let run = devmap(&["claude", "plugin", "--out", dir.to_str().unwrap()]);
+    assert_ne!(run.status, Some(0), "{}", run.stdout);
+    assert!(run.stderr.contains("marketplace.json"), "{}", run.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "preserve this file"
+    );
+    std::fs::set_permissions(&target, original).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// A non-UTF-8 store path is refused rather than written through

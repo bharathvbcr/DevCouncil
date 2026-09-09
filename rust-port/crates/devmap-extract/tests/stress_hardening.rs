@@ -251,7 +251,7 @@ fn a_truncated_fallback_scan_survives_the_durable_store() {
 }
 
 /// A pathological source must not stall the build, and must not be described as
-/// anything other than refused.
+/// complete output when finished, or an explicit refusal when its budget expires.
 ///
 /// Measured before this bound existed (release build, tree-sitter-cpp 0.23): a
 /// 4,000-byte C++ file of 2,000 nested braces took **130,994 ms** — over two
@@ -266,7 +266,7 @@ fn a_truncated_fallback_scan_survives_the_durable_store() {
 /// explicit instead, and it must never claim the grammar is missing — that
 /// sentence is reserved for a language with no grammar at all.
 #[test]
-fn a_pathological_source_is_refused_within_its_budget() {
+fn a_pathological_source_finishes_or_is_refused_within_its_budget() {
     use std::time::{Duration, Instant};
 
     let hostile = format!("{}{}", "{".repeat(2_000), "}".repeat(2_000));
@@ -284,6 +284,30 @@ fn a_pathological_source_is_refused_within_its_budget() {
         budget
     );
 
+    // Parent indexing can finish this input within the budget. A completed
+    // result is valid only when it contains the whole (declaration-free) file.
+    // The caller may be descheduled after publication; its wall clock cannot
+    // certify the exact publication instant. Deterministic finalization tests
+    // expire the internal deadline and latch a late incomplete walk instead.
+    if matches!(extraction.parse_outcome, ParseOutcome::Clean) {
+        assert_eq!(extraction.symbols.len(), 1);
+        assert!(extraction.calls.is_empty());
+    } else {
+        assert!(matches!(
+            &extraction.parse_outcome,
+            ParseOutcome::Failed { reason } if reason.contains("budget")
+        ));
+        assert_eq!(extraction.symbols.len(), 1);
+        assert!(extraction.calls.is_empty());
+    }
+    // Force cancellation independently of machine speed. All original refusal
+    // assertions below remain mandatory, even when the hostile input is fast.
+    let extraction = devmap_extract::treesitter::extract_treesitter_with_budget(
+        "h.cpp",
+        "cpp",
+        &hostile,
+        Duration::ZERO,
+    );
     let reason = match &extraction.parse_outcome {
         devmap_extract::model::ParseOutcome::Failed { reason } => reason.clone(),
         other => panic!("an abandoned parse must be Failed, not {other:?}"),
@@ -329,7 +353,7 @@ fn a_pathological_source_is_refused_within_its_budget() {
 
 /// Deep *nesting* must be bounded by the budget, exactly as deep braces are.
 ///
-/// The sibling case `a_pathological_source_is_refused_within_its_budget` pins a
+/// The sibling case `a_pathological_source_finishes_or_is_refused_within_its_budget` pins a
 /// C++ file whose cost is in the parse and the walk. This one attacks a
 /// different axis and a different code path, and it is the one that got past
 /// the bound: measured 2026-09-05 against the unfixed extractor, a **10 KB** Go
@@ -349,14 +373,12 @@ fn a_pathological_source_is_refused_within_its_budget() {
 ///
 /// A stride bounds the number of steps between clock reads, not the work inside
 /// one step, so the bound has to live where the unbounded step is —
-/// `bounded_parent`. The quadratic itself is *not* fixed here; it is bounded.
-///
-/// Asserted the way the sibling test asserts: an elapsed bound, and a refusal
-/// that names the budget. `Clean` is the failure this exists to catch —
-/// publishing a file the extractor did not finish reading is the same defect as
-/// presenting a capped sample as complete coverage.
+/// `bounded_parent`. Parent indexing now removes that repeated root walk for
+/// bounded trees; larger trees still need the deadline-checked native fallback.
+/// A completed extraction is allowed within budget and must include its tail.
+/// A forced deadline separately pins refusal without publishing a partial graph.
 #[test]
-fn a_deeply_nested_source_is_refused_within_its_budget() {
+fn a_deeply_nested_source_finishes_or_is_refused_within_its_budget() {
     use std::time::{Duration, Instant};
 
     // The depth the 2026-09-05 measurement used: 13.15 s against the 5 s
@@ -395,6 +417,34 @@ fn a_deeply_nested_source_is_refused_within_its_budget() {
         elapsed.as_secs_f64() / budget.as_secs_f64()
     );
 
+    if matches!(extraction.parse_outcome, ParseOutcome::Clean) {
+        // Exact deadline admission is pinned by the finalization unit tests;
+        // the outer elapsed bound above includes scheduler and return latency.
+        let names: Vec<_> = extraction
+            .symbols
+            .iter()
+            .filter(|s| s.kind != devmap_extract::model::SymbolKind::File)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["T", "M"],
+            "the complete declaration set must survive"
+        );
+    } else {
+        assert!(matches!(
+            &extraction.parse_outcome,
+            ParseOutcome::Failed { reason } if reason.contains("budget")
+        ));
+        assert_eq!(extraction.symbols.len(), 1);
+        assert!(extraction.calls.is_empty());
+    }
+    let extraction = devmap_extract::treesitter::extract_treesitter_with_budget(
+        "svc/deep.go",
+        "go",
+        &hostile,
+        Duration::ZERO,
+    );
     let reason = match &extraction.parse_outcome {
         ParseOutcome::Failed { reason } => reason.clone(),
         other => panic!(
@@ -578,7 +628,7 @@ fn cobol_is_refused_promptly_rather_than_parsed_by_a_nonterminating_grammar() {
 /// 6,000 spends its full 5 s in `bounded_parent` and is — correctly — refused,
 /// which would make this test assert the time limit instead of the thing it is
 /// named for. One test, one property: the budget is pinned by
-/// `a_pathological_source_is_refused_within_its_budget` and
+/// `a_pathological_source_finishes_or_is_refused_within_its_budget` and
 /// `tests/budget_is_a_real_bound.rs`, and this one asks only whether a
 /// thousand-deep type expression can still end the process.
 ///

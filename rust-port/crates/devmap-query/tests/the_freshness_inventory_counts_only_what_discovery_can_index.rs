@@ -224,7 +224,10 @@ fn a_symlink_out_of_the_repository_is_absent_from_the_inventory_too() {
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::write(outside.join("s.py"), "SECRET_V1 = 1\n").unwrap();
     std::fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink(outside.join("s.py"), root.join("esc.py")).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(outside.join("s.py"), root.join("esc.py")).unwrap();
     for args in [
         vec!["init", "-q"],
         vec!["add", "-A"],

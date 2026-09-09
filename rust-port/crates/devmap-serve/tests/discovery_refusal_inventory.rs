@@ -183,7 +183,10 @@ fn a_new_refusal_is_recorded_by_path_and_an_unrelated_batch_leaves_it_alone() {
     let outside = scratch("new-refusal-outside").join("secret.py");
     std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
     std::fs::write(&outside, "def secret():\n    return 0\n").unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&outside, root.join("escape.py")).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&outside, root.join("escape.py")).unwrap();
 
     let daemon = Daemon::new(Store::open(&db_path).unwrap(), root.clone());
     enqueue_and_drain(&store, &daemon, &root, &["escape.py"]);
@@ -222,7 +225,10 @@ fn a_new_refusal_is_recorded_by_path_and_an_unrelated_batch_leaves_it_alone() {
 fn a_repaired_symlink_clears_the_refusal_and_lands_in_the_graph() {
     let root = scratch("repaired-symlink");
     std::fs::write(root.join("lib.py"), LIB).unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink(root.join("nowhere.py"), root.join("app.py")).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(root.join("nowhere.py"), root.join("app.py")).unwrap();
     let db_path = root.join("index.sqlite");
 
     let store = cold_build(&root, &db_path);

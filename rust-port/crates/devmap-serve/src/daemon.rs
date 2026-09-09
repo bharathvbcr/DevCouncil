@@ -59,6 +59,8 @@ struct ShutdownSignals {
     #[cfg(windows)]
     ctrl_c: tokio::signal::windows::CtrlC,
     #[cfg(windows)]
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+    #[cfg(windows)]
     ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
 }
 
@@ -76,6 +78,7 @@ impl ShutdownSignals {
     fn install() -> anyhow::Result<Self> {
         Ok(Self {
             ctrl_c: tokio::signal::windows::ctrl_c()?,
+            ctrl_break: tokio::signal::windows::ctrl_break()?,
             ctrl_shutdown: tokio::signal::windows::ctrl_shutdown()?,
         })
     }
@@ -93,6 +96,7 @@ impl ShutdownSignals {
     async fn recv(&mut self) -> &'static str {
         tokio::select! {
             _ = self.ctrl_c.recv() => "CTRL_C",
+            _ = self.ctrl_break.recv() => "CTRL_BREAK",
             _ = self.ctrl_shutdown.recv() => "CTRL_SHUTDOWN",
         }
     }
@@ -240,6 +244,8 @@ pub struct Daemon {
     /// say — and the store half of [`Daemon::vanished_reason`] is then skipped
     /// rather than guessed at. A guess here retires a working daemon.
     store_path: Option<std::path::PathBuf>,
+    #[cfg(test)]
+    connect_time_probe: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// What one drain established about git HEAD, from one reading of it.
@@ -348,6 +354,8 @@ impl Daemon {
             max_idle: None,
             shutdown: Arc::new(tokio::sync::Notify::new()),
             store_path: None,
+            #[cfg(test)]
+            connect_time_probe: None,
         }
     }
 
@@ -469,6 +477,10 @@ impl Daemon {
     /// must hash the current source set and enqueue changed, new, and deleted
     /// paths before it can truthfully report a fresh index.
     pub fn reconcile_connect_time(&self) -> anyhow::Result<usize> {
+        #[cfg(test)]
+        if let Some(probe) = &self.connect_time_probe {
+            probe();
+        }
         let (sources, discovery) = collect_sources_with_report(&self.root)?;
 
         let previous: std::collections::BTreeMap<_, _> = self
@@ -891,6 +903,11 @@ impl Daemon {
         &self,
         read_head: &dyn Fn(&std::path::Path) -> anyhow::Result<String>,
     ) -> anyhow::Result<usize> {
+        // Serialize the complete read/compute/publish cycle. Taking this only
+        // at persistence lets a competing build replace the base generation
+        // after this drain has read it, invalidating its carry-forward.
+        let _writer = self.store.lock_writer(Store::WRITER_LOCK_WAIT)?;
+        self.store.bind_repo_root(&self.root)?;
         let claims = self.store.claim_pending_batch(self.batch_limit)?;
         if claims.is_empty() {
             return Ok(0);
@@ -1002,7 +1019,9 @@ impl Daemon {
         // Charge the attempt now, to the paths that earned it, before any
         // batch-wide step can fail and take the whole batch down with it.
         if !failed.is_empty() {
-            self.store.bump_pending_attempts(&failed)?;
+            self.store.bump_pending_attempts(
+                &failed.iter().map(|path| claim_of(path)).collect::<Vec<_>>(),
+            )?;
         }
 
         if succeeded.is_empty() {
@@ -1095,8 +1114,10 @@ impl Daemon {
             // measure it. This report was discarded as `_report`, which is what
             // made a full re-extraction the *most* confident thing the daemon
             // did and the least entitled to be.
-            let (whole_tree, report) =
-                devmap_store::extract_tree_cached_with_report(&self.store, &self.root)?;
+            let scanned = devmap_extract::scan_tree(&self.root)?;
+            let whole_tree =
+                devmap_store::extract_scanned_for_generation(&self.store, &scanned, None)?;
+            let report = scanned.report;
             // A full walk replaces the inventory outright rather than merging
             // into it: it re-decided every path in the tree, so a carried row
             // could only describe a path this walk has just answered for.
@@ -1129,15 +1150,7 @@ impl Daemon {
         // the next drain still sees a difference and rebuilds. See
         // `head_for_drain`.
         let head_sha = head.sha;
-        // K13: hold the cross-process writer lock across persist + prune. A
-        // `devmap build` running beside the daemon otherwise races it on
-        // SQLite's busy timeout alone, and the loser surfaces `database is
-        // locked` after paying for a full resolve. Taken *here* rather than at
-        // the top of the drain because everything above is reads and
-        // extraction, which two writers may safely do at once.
-        let _writer = self
-            .store
-            .lock_writer(devmap_store::Store::WRITER_LOCK_WAIT)?;
+        // Writer ownership has been held since before the base snapshot was read.
         self.store.save_generation_with_metadata(
             if full_rebuild { &extractions } else { &fresh },
             &resolution,
@@ -1194,6 +1207,16 @@ impl Daemon {
         Ok(succeeded.len())
     }
 
+    /// Discovery, hashing and SQLite work must not occupy the IPC executor.
+    /// Startup and later repair sweeps share this path, including runtimes
+    /// with a single worker. The durable queue remains the commit boundary.
+    async fn reconcile_in_background(&self) -> anyhow::Result<usize> {
+        let worker = self.clone();
+        tokio::task::spawn_blocking(move || worker.reconcile_connect_time())
+            .await
+            .map_err(|error| anyhow::anyhow!("reconcile worker failed: {error}"))?
+    }
+
     /// Long-lived loop: file watcher enqueues durable pending paths; idle poll drains them.
     /// Does not return until cancelled / fatal error / idle retirement.
     ///
@@ -1205,6 +1228,7 @@ impl Daemon {
     /// gave up and killed the daemon it had just spawned after three seconds,
     /// then fell back to re-doing the work through the CLI, on every call.
     pub async fn run_loop(&self) -> anyhow::Result<()> {
+        self.store.bind_repo_root(&self.root)?;
         // Captured *first*, before the IPC endpoint binds, because the window
         // between binding and here is not empty: `reconcile_connect_time`
         // sweeps the tree in it, which on a large repository is seconds during
@@ -1238,6 +1262,7 @@ impl Daemon {
         }
 
         let state = Arc::new(crate::protocol::ServeState::default());
+        state.unapplied.begin_initial_sweep();
         let max_idle = self.resolved_max_idle();
 
         // Installed before the endpoint is bound, so a signal arriving at any
@@ -1305,7 +1330,8 @@ impl Daemon {
         // enqueued before the failure; a daemon that refused to serve until
         // its startup sweep succeeded turned one unreadable path into a full
         // map outage.
-        match self.reconcile_connect_time() {
+        let sweep_watermark = state.unapplied.sweep_watermark();
+        match self.reconcile_in_background().await {
             Ok(reconciled) => {
                 if reconciled > 0 {
                     info!("connect-time sweep enqueued {reconciled} changed path(s)");
@@ -1317,7 +1343,7 @@ impl Daemon {
                 // named is now either indexed or queued by name. Nothing else
                 // clears it — a later ordinary enqueue that happens to succeed
                 // says nothing about the paths an earlier one dropped.
-                state.unapplied.cleared_by_sweep();
+                state.unapplied.cleared_by_sweep(sweep_watermark);
             }
             // The sweep is itself an enqueue, so a store that refuses writes
             // refuses this too — and then the startup pass that would have
@@ -1487,14 +1513,15 @@ impl Daemon {
                     if should_resweep(&state.unapplied, last_resweep, std::time::Instant::now())
                     {
                         last_resweep = std::time::Instant::now();
-                        match self.reconcile_connect_time() {
+                        let sweep_watermark = state.unapplied.sweep_watermark();
+                        match self.reconcile_in_background().await {
                             Ok(reconciled) => {
                                 info!(
                                     "re-swept the tree after edits this daemon could not \
-                                     record; {reconciled} changed path(s) queued and the \
-                                     staleness is retired"
+                                     record; {reconciled} changed path(s) queued; \
+                                     refusals arriving during the sweep remain recorded"
                                 );
-                                state.unapplied.cleared_by_sweep();
+                                state.unapplied.cleared_by_sweep(sweep_watermark);
                             }
                             // Still refused. The record stands, which is the
                             // point: a repair that could not run must not
@@ -1822,6 +1849,44 @@ mod tests {
     // form is the correct one for them: no discovery step ran over what they
     // assembled. The drain itself must never use it.
     use devmap_analyze::analyze;
+
+    #[test]
+    fn agentic_drain_takes_the_writer_lock_before_reading_its_base() {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-agentic-writer-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("main.py"), "def main(): return 1\n").unwrap();
+        let db = root.join("index.sqlite");
+        let store = Store::open(&db).unwrap();
+        store.enqueue_pending_paths(&["main.py".into()]).unwrap();
+        let held = store.lock_writer(Duration::from_secs(1)).unwrap();
+        let daemon = Daemon::new(store, root.clone());
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            daemon.drain_pending_batch_with_head(&|_| {
+                sent.send(()).unwrap();
+                Ok("unavailable".into())
+            })
+        });
+        let read_while_locked = received.recv_timeout(Duration::from_millis(500));
+        drop(held);
+        let outcome = worker.join().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            matches!(
+                read_while_locked,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "drain read its base before obtaining writer ownership"
+        );
+    }
 
     /// The HEAD identity a drain reads in a scratch tree that is not a git
     /// repository: `current_git_head` fails there, and the drain stamps
@@ -2955,102 +3020,79 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn status_answers_while_the_connect_time_sweep_is_still_running() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // Regression for the bind-after-reconcile ordering. The sweep hashed
-        // the whole tree before the IPC listener bound, so a client's three-
-        // second readiness deadline expired on any real repository: the
-        // daemon was killed mid-startup, then every call repeated the spawn,
-        // wait and kill before falling back to the CLI. Bound first, so
-        // `status` answers from the last committed generation while the
-        // sweep is still grinding.
+        // A barrier proves that the sweep is still running when IPC answers.
+        // Timing a large fixture can pass after a synchronous sweep has blocked
+        // the executor and finished, or fail merely because hashing got faster.
         let root = short_unix_fixture_dir("bindfirst");
-        // Enough *work* that hashing the tree takes comfortably longer than
-        // the probe budget below; the precondition asserts this so the test
-        // cannot pass vacuously on a fast machine.
-        //
-        // The margin is in bytes per file rather than in file count. At two
-        // lines per file this fixture drifted down to 115 ms against its own
-        // 120 ms floor and failed on the precondition — correctly, since the
-        // ordering assertion would have been meaningless — as the kernel got
-        // faster. Reaching the same margin by multiplying the file count would
-        // mean tens of thousands of inodes and a setup slower than the test;
-        // hashing cost scales with content, so bigger files buy the same
-        // headroom for 6,000 `fs::write` calls instead of 25,000.
-        const FILE_COUNT: usize = 6_000;
-        const BODIES_PER_FILE: usize = 24;
-        for index in 0..FILE_COUNT {
-            let mut body = String::with_capacity(BODIES_PER_FILE * 48);
-            for leaf in 0..BODIES_PER_FILE {
-                body.push_str(&format!(
-                    "def leaf_{index}_{leaf}():\n    return {index} + {leaf}\n"
-                ));
-            }
-            fs::write(root.join(format!("mod_{index}.py")), body).unwrap();
-        }
-
-        let sweep_started = std::time::Instant::now();
-        let (sources, _report) = devmap_extract::collect_sources_with_report(&root).unwrap();
-        let _hashes: Vec<u64> = sources
-            .iter()
-            .map(|(_, source)| devmap_extract::content_hash(source))
-            .collect();
-        let sweep_elapsed = sweep_started.elapsed();
-        assert!(
-            sweep_elapsed >= Duration::from_millis(120),
-            "fixture precondition failed: a {FILE_COUNT}-file sweep took only \
-             {sweep_elapsed:?}; the ordering assertion below would be vacuous"
-        );
-
-        let store = Store::open_in_memory().unwrap();
+        fs::write(root.join("main.py"), "def main(): pass\n").unwrap();
         let socket = root.join("b.sock");
-        let probe_budget = sweep_elapsed / 4;
-        let daemon = Daemon::new(store, root.clone())
+        let mut daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone())
             .with_ipc_path(socket.clone())
             .with_idle_poll(Duration::from_millis(10))
             .with_max_idle(Some(Duration::from_secs(30)));
-        let task = tokio::spawn(async move { daemon.run_loop().await });
-
-        let bind_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while !socket.exists() && tokio::time::Instant::now() < bind_deadline {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(socket.exists(), "daemon IPC socket did not start");
-
-        // The whole round trip must land inside a fraction of one sweep —
-        // under the old ordering it could not start until a full sweep
-        // finished.
-        let answer = tokio::time::timeout(probe_budget, async {
-            loop {
-                match tokio::net::UnixStream::connect(&socket).await {
-                    Err(_) => tokio::time::sleep(Duration::from_millis(2)).await,
-                    Ok(mut stream) => {
-                        stream
-                            .write_all(b"{\"version\":1,\"cmd\":\"status\"}\n")
-                            .await
-                            .unwrap();
-                        let mut response = String::new();
-                        stream.read_to_string(&mut response).await.unwrap();
-                        break serde_json::from_str::<serde_json::Value>(response.trim()).unwrap();
-                    }
-                }
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = std::sync::Mutex::new(Some(started_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let completed = Arc::new(AtomicBool::new(false));
+        let probe_completed = completed.clone();
+        daemon.connect_time_probe = Some(Arc::new(move || {
+            if let Some(started) = started_tx.lock().unwrap().take() {
+                started.send(()).unwrap();
+                // Bounded even on the broken synchronous path, which blocks
+                // this test's single executor thread from sending the release.
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+                probe_completed.store(true, Ordering::SeqCst);
             }
+        }));
+        let running = daemon.clone();
+        let task = tokio::spawn(async move { running.run_loop().await });
+        tokio::time::timeout(Duration::from_secs(10), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let answer = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            stream
+                .write_all(b"{\"version\":1,\"cmd\":\"status\"}\n")
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            serde_json::from_str::<serde_json::Value>(response.trim()).unwrap()
         })
         .await;
-        let payload = answer.expect("status must answer within a fraction of one sweep");
-        assert_eq!(payload["ok"], true);
-        // The store here has never committed a generation, and the wire form
-        // for that is JSON null — the same shape the Python client maps to 0
-        // (`try_connect` treats it as unusable, which is correct: nothing has
-        // been indexed). Pinning null keeps the envelope contract honest; a
-        // fabricated 0 would claim a generation exists.
-        assert!(payload["result"]["generation_id"].is_null());
+        let answered_during_sweep = !completed.load(Ordering::SeqCst);
+        let _ = release_tx.send(());
+        daemon.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("shutdown must finish")
+            .unwrap()
+            .unwrap();
+        fs::remove_dir_all(&root).unwrap();
 
-        task.abort();
-        let _ = task.await;
-        let _ = fs::remove_dir_all(&root);
+        assert!(
+            answered_during_sweep,
+            "sweep blocked the IPC executor until it finished"
+        );
+        let payload = answer.expect("status must answer while the sweep is blocked");
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["result"]["is_fresh"], false);
+        assert!(payload["result"]["degraded_reason"]
+            .as_str()
+            .unwrap()
+            .contains("unverified"));
+        assert!(payload["result"]["generation_id"].is_null());
     }
 
     #[cfg(unix)]
@@ -3760,6 +3802,7 @@ mod tests {
     /// A row naming a socket is one no drain can act on and one more reason for
     /// `status` to answer "not fresh", so it is filtered at the one place that
     /// knows which endpoint is this process's own.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_daemon_does_not_queue_its_own_endpoint_as_repository_work() {
         let dir = short_unix_fixture_dir("own-endpoint");
@@ -3817,6 +3860,7 @@ mod tests {
     /// rather than the whole path, because at the moment this matters the socket
     /// has just been unlinked and canonicalizing it fails — a `Vec` that came
     /// back empty there would filter nothing while looking like it worked.
+    #[cfg(unix)]
     #[test]
     fn the_endpoint_filter_covers_the_socket_and_its_lock_after_they_are_gone() {
         let dir = short_unix_fixture_dir("endpoint-artifacts");
@@ -3880,7 +3924,7 @@ mod tests {
         );
 
         // And once a sweep has succeeded there is nothing left to fire for.
-        degraded.cleared_by_sweep();
+        degraded.cleared_by_sweep(degraded.sweep_watermark());
         assert!(!should_resweep(&degraded, long_ago, now));
     }
 
@@ -4012,7 +4056,7 @@ mod tests {
 
         // Only a completed connect-time sweep — the one pass that re-reads every
         // source's content hash — can.
-        unapplied.cleared_by_sweep();
+        unapplied.cleared_by_sweep(unapplied.sweep_watermark());
         assert!(
             daemon_index_is_fresh(&status, &unapplied),
             "a completed sweep has re-examined the whole tree, so the claim retires"

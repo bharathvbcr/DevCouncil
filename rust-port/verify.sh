@@ -81,10 +81,16 @@ step "5/9 self-build gates — DevCouncil repo, release"
 START=$(now_ns)
 [ -x "$DEVMAP_BIN" ] || {
   echo "GATE FAIL: no release binary at $DEVMAP_BIN — step 4 builds it with \`cargo run --release\`, so this means cargo wrote it somewhere else (check CARGO_TARGET_DIR)"; exit 1; }
-RSS=$(peak_rss_bytes "$TMP1/self.rss" "$DEVMAP_BIN" --db "$TMP1/self.sqlite" --progress never build ..) || {
+RSS=$(PEAK_RSS_STDOUT_FILE="$TMP1/self.json" peak_rss_bytes "$TMP1/self.rss" "$DEVMAP_BIN" --db "$TMP1/self.sqlite" --json --progress never build ..) || {
   echo "GATE FAIL: could not measure peak RSS — refusing to report an unmeasured build as passing"; exit 1; }
 END=$(now_ns)
 MS=$(( (END - START) / 1000000 ))
+python3 - "$TMP1/self.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as source:
+    report = json.load(source)
+print("measured build stages:", json.dumps(report["timings"], separators=(",", ":")))
+PY
 # This measures a COLD build, and is compared against the per-generation budget.
 # The steady state — what a running repository actually sits at — is gated in
 # the growth step instead (SC27).

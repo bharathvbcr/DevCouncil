@@ -572,7 +572,25 @@ fn a_store_replaced_under_an_open_handle_never_answers_silently_empty() {
     for sidecar in ["index.sqlite-wal", "index.sqlite-shm"] {
         let _ = fs::remove_file(dir.join(sidecar));
     }
-    fs::rename(&other, &db_path).unwrap();
+    let replaced = fs::rename(&other, &db_path);
+    #[cfg(windows)]
+    if let Err(error) = &replaced {
+        // Windows prevents replacing SQLite's open/mapped database. That is
+        // stronger exclusion; still verify the original reader answers alpha.
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let names: Vec<_> = store
+            .all_symbols()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        assert!(names.iter().any(|name| name == "alpha"));
+        assert!(!names.iter().any(|name| name == "zulu"));
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
+    replaced.unwrap();
 
     match store.all_symbols() {
         Ok(rows) => {

@@ -247,3 +247,37 @@ fn the_unusable_rule_line_is_reported_alongside_the_verdict() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&clean);
 }
+
+#[test]
+fn relative_gitfile_pointers_and_submodule_excludes_share_the_same_owner() {
+    let root = scratch_repo("relative-gitfile");
+    let metadata = root.join("private-metadata");
+    std::fs::rename(root.join(".git"), &metadata).unwrap();
+    std::fs::create_dir(metadata.join("info")).unwrap();
+    std::fs::write(metadata.join("info/exclude"), "hidden.py\n").unwrap();
+    std::fs::write(root.join(".git"), "gitdir: private-metadata\n").unwrap();
+    std::fs::write(root.join("hidden.py"), "pass\n").unwrap();
+    let resolved = devmap_extract::git_metadata(&root).unwrap().unwrap();
+    assert_eq!(resolved.git_dir, metadata.canonicalize().unwrap());
+    assert_eq!(resolved.common_dir, resolved.git_dir);
+    assert!(is_gitignored(&root, &root.join("hidden.py"), false).unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn malformed_or_oversized_git_pointers_are_errors_not_non_git_trees() {
+    let root = scratch_repo("bad-gitfile");
+    std::fs::remove_dir(root.join(".git")).unwrap();
+    for text in [
+        "".to_string(),
+        "gitdir: \n".to_string(),
+        "garbage\n".to_string(),
+        "x".repeat(65_537),
+    ] {
+        std::fs::write(root.join(".git"), text).unwrap();
+        assert!(devmap_extract::git_metadata(&root).is_err());
+    }
+    std::fs::remove_file(root.join(".git")).unwrap();
+    assert!(devmap_extract::git_metadata(&root).unwrap().is_none());
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -1250,10 +1250,12 @@ fn hook_db_arg(db: &Path) -> anyhow::Result<String> {
 /// renamed subcommand turns every hook that names it into a process that exits
 /// non-zero on every fire, and nothing else would notice.
 pub fn known_subcommands<C: clap::CommandFactory>() -> Vec<String> {
-    C::command()
-        .get_subcommands()
-        .map(|c| c.get_name().to_string())
-        .collect()
+    crate::on_command_stack(|| {
+        C::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect()
+    })
 }
 
 /// The command string to write into an emitted hook or MCP entry.

@@ -12,8 +12,6 @@
 //! `#[ignore]`d, because a stress test nobody runs is a stress test that does
 //! not exist.
 
-#![cfg(unix)]
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -525,8 +523,11 @@ impl tokio::io::AsyncWrite for SharedSink {
 /// `std::env::temp_dir()` on macOS is a per-user path under `/var/folders`,
 /// which alone is most of the portable 100-byte `sockaddr_un` budget.
 fn scratch_repo(tag: &str) -> std::path::PathBuf {
-    let dir =
-        std::path::PathBuf::from("/tmp").join(format!("devmap-st-{}-{tag}", std::process::id()));
+    #[cfg(unix)]
+    let parent = std::path::PathBuf::from("/tmp");
+    #[cfg(windows)]
+    let parent = std::env::temp_dir();
+    let dir = parent.join(format!("devmap-st-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch repo");
     std::fs::write(
@@ -544,7 +545,10 @@ fn scratch_repo(tag: &str) -> std::path::PathBuf {
 
 /// One framed request over the daemon's Unix socket, answered on one line.
 async fn ipc_exchange(socket: &std::path::Path, frame: &str) -> std::io::Result<Value> {
+    #[cfg(unix)]
     let mut stream = tokio::net::UnixStream::connect(socket).await?;
+    #[cfg(windows)]
+    let mut stream = tokio::net::windows::named_pipe::ClientOptions::new().open(socket)?;
     stream.write_all(frame.as_bytes()).await?;
     stream.write_all(b"\n").await?;
     stream.flush().await?;
@@ -561,7 +565,10 @@ async fn ipc_exchange(socket: &std::path::Path, frame: &str) -> std::io::Result<
 
 async fn wait_for_socket(socket: &std::path::Path) {
     for _ in 0..500 {
-        if socket.exists() {
+        if ipc_exchange(socket, r#"{"version":1,"cmd":"status"}"#)
+            .await
+            .is_ok()
+        {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -582,7 +589,7 @@ async fn wait_for_socket(socket: &std::path::Path) {
 async fn the_ipc_daemon_answers_every_client_while_its_queue_drains() {
     let root = scratch_repo("ipcload");
     let db = root.join("index.sqlite");
-    let socket = root.join("d.sock");
+    let socket = devmap_serve::default_ipc_path_for(&root);
 
     {
         let store = Store::open(&db).expect("store");
@@ -685,7 +692,7 @@ async fn the_ipc_daemon_answers_every_client_while_its_queue_drains() {
 async fn fifty_spawn_retire_cycles_and_a_kill_mid_drain_leave_the_store_usable() {
     let root = scratch_repo("lifecycle");
     let db = root.join("index.sqlite");
-    let socket = root.join("d.sock");
+    let socket = devmap_serve::default_ipc_path_for(&root);
 
     let started = Instant::now();
     for cycle in 0..50u32 {
@@ -700,9 +707,10 @@ async fn fifty_spawn_retire_cycles_and_a_kill_mid_drain_leave_the_store_usable()
             .unwrap_or_else(|_| panic!("cycle {cycle} never retired"));
         assert!(outcome.is_ok(), "cycle {cycle} reported: {outcome:?}");
         assert!(
-            !socket.exists(),
-            "cycle {cycle} returned with its socket still on disk; the next \
-             client would be told the endpoint is already active"
+            ipc_exchange(&socket, r#"{"version":1,"cmd":"status"}"#)
+                .await
+                .is_err(),
+            "cycle {cycle} returned with its endpoint still answering"
         );
     }
     assert!(
@@ -766,16 +774,14 @@ async fn fifty_spawn_retire_cycles_and_a_kill_mid_drain_leave_the_store_usable()
     );
 
     let daemon = devmap_serve::Daemon::new(store, root.clone()).with_store_path(db.clone());
-    let drained = tokio::task::spawn_blocking(move || daemon.drain_pending_batch())
+    let _drained = tokio::task::spawn_blocking(move || daemon.drain_pending_batch())
         .await
         .expect("drain task")
         .expect("the next drain must complete the interrupted work");
-    if still_queued {
-        assert!(
-            drained >= 1,
-            "work left queued by the kill must be claimable, not stranded"
-        );
-    }
+    // Aborting a Tokio task does not terminate its spawn_blocking drain. That
+    // worker may finish after `still_queued` was read and before this drain
+    // obtains writer ownership. The final state below proves recovery whichever
+    // worker completed it; the real SIGKILL case lives in test_process_recovery.
 
     let store = Store::open(&db).expect("store");
     assert!(
@@ -791,6 +797,7 @@ async fn fifty_spawn_retire_cycles_and_a_kill_mid_drain_leave_the_store_usable()
         "and it must not still be queued: work completed once is not work to redo"
     );
 
+    drop(store);
     let _ = std::fs::remove_dir_all(&root);
 }
 
