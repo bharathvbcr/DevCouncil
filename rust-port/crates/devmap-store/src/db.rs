@@ -493,6 +493,7 @@ mod agentic_queue_regressions {
     #[test]
     fn pending_admission_restores_the_query_timeout_and_rolls_back_errors() {
         let store = Store::open_in_memory().unwrap();
+        let before = store.pending_watermark().unwrap();
         let error: Result<()> =
             store.with_pending_transaction(std::time::Duration::from_millis(25), |tx| {
                 Store::upsert_pending(tx, std::iter::once("refused.py"), 1.0)?;
@@ -503,8 +504,8 @@ mod agentic_queue_regressions {
             .to_string()
             .contains("injected write failure"));
         assert!(store.get_pending_paths().unwrap().is_empty());
-        assert_eq!(store.pending_watermark().unwrap().revision, 0);
-        let timeout: u64 = lock_conn(&store.conn)
+        assert_eq!(store.pending_watermark().unwrap(), before);
+        let timeout: i64 = lock_conn(&store.conn)
             .unwrap()
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
@@ -512,7 +513,7 @@ mod agentic_queue_regressions {
         store
             .enqueue_pending_paths(&["accepted.py".into()])
             .unwrap();
-        let timeout: u64 = lock_conn(&store.conn)
+        let timeout: i64 = lock_conn(&store.conn)
             .unwrap()
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
