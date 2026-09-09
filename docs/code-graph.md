@@ -23,6 +23,8 @@ All map and graph operations live under **`dev map`**. `dev graph …` is a comp
 
 **HTML split:** `dev map html` writes the subsystem map (`.devcouncil/map.html`). Symbol-level graph HTML is `dev map graph-html`, `dev map html --symbols`, or alias `dev graph html` (`.devcouncil/graph/graph.html`).
 
+Rust-generated agent guides also include the portable [repository hygiene policy](repository-hygiene.md). The policy is reusable by embedding hosts; scheduling and deletion remain host responsibilities.
+
 ## Artifacts
 
 | Path | Role |

@@ -414,3 +414,10 @@ every deliberate divergence from the Python implementation this replaced.
 
 Apache-2.0, per the `LICENSE` at the repository root. `Cargo.toml`, the plugin
 manifest and that file all say so, and a test fails if they stop agreeing.
+
+## Repository hygiene policy
+
+`devmap-query::hygiene` supplies portable output eligibility, preservation rules,
+retention validation and agent guidance, including in no-parser builds. See the
+[host contract](../docs/repository-hygiene.md). Hosts own authorization, activity
+checks, scheduling and execution; the policy module never deletes files.
