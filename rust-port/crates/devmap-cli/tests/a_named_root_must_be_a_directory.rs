@@ -64,11 +64,27 @@ fn run(cwd: &Path, db: &Path, args: &[&str], root: &Path) -> (Option<i32>, Strin
         .current_dir(cwd)
         .output()
         .expect("devmap runs");
-    (
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    )
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut diagnostic = String::from_utf8_lossy(&out.stderr).into_owned();
+    if diagnostic.is_empty() {
+        // Progress is bounded: a stalled renderer reports its retained error
+        // in JSON instead of holding the command open indefinitely.
+        let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(payload["progress_output"]["incomplete"], true);
+        let retained = payload["progress_output"]["diagnostics"]["unrendered"]
+            .as_array()
+            .unwrap();
+        assert!(
+            !retained.is_empty(),
+            "a failed renderer must preserve the refusal"
+        );
+        diagnostic = retained
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    (out.status.code(), stdout, diagnostic)
 }
 
 #[test]

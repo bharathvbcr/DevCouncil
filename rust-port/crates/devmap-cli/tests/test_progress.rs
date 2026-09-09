@@ -187,60 +187,74 @@ fn terminal_fixture_handles_cannot_leak_into_concurrent_child_builds() {
 fn an_error_still_returns_json_when_the_progress_pipe_is_full() {
     use std::os::fd::AsRawFd;
     use std::time::{Duration, Instant};
-    let root = temp_root();
-    let (_reader, writer) = std::io::pipe().unwrap();
-    let fd = writer.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    assert_eq!(
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
-        0
-    );
-    let bytes = [b'x'; 4096];
-    let mut full = false;
-    for _ in 0..1024 {
-        if unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) } < 0 {
-            assert_eq!(
-                std::io::Error::last_os_error().kind(),
-                std::io::ErrorKind::WouldBlock
-            );
-            full = true;
-            break;
+    for json in [true, false] {
+        let root = temp_root();
+        let (_reader, writer) = std::io::pipe().unwrap();
+        let fd = writer.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let bytes = [b'x'; 4096];
+        let mut full = false;
+        for _ in 0..1024 {
+            if unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) } < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                full = true;
+                break;
+            }
         }
+        assert!(full);
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_devmap"));
+        if json {
+            command.arg("--json");
+        }
+        let mut child = command
+            .args(["build", "--progress", "always", "--db"])
+            .arg(root.join("src/main.py/impossible.sqlite"))
+            .arg(&root)
+            .stderr(writer)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let blocked = child.try_wait().unwrap().is_none();
+        if blocked {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(!blocked, "a diagnostic blocked the error result");
+        assert!(!output.status.success());
+        if !json {
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                text.contains("Error:") && text.contains("impossible.sqlite"),
+                "plain failure disappeared: {text}"
+            );
+            continue;
+        }
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(payload["error"].is_string());
+        assert_eq!(payload["progress_output"]["incomplete"], true);
+        assert_eq!(
+            payload["progress_output"]["diagnostics"]["unrendered_total"],
+            1
+        );
+        assert!(payload["timings"]["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|stage| stage.get("open").is_none()));
     }
-    assert!(full);
-    assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_devmap"))
-        .args(["build", "--json", "--progress", "always", "--db"])
-        .arg(root.join("src/main.py/impossible.sqlite"))
-        .arg(&root)
-        .stderr(writer)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let blocked = child.try_wait().unwrap().is_none();
-    if blocked {
-        child.kill().unwrap();
-    }
-    let output = child.wait_with_output().unwrap();
-    fs::remove_dir_all(root).unwrap();
-    assert!(!blocked, "a diagnostic blocked the error result");
-    assert!(!output.status.success());
-    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(payload["error"].is_string());
-    assert_eq!(payload["progress_output"]["incomplete"], true);
-    assert_eq!(
-        payload["progress_output"]["diagnostics"]["unrendered_total"],
-        1
-    );
-    assert!(payload["timings"]["stages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|stage| stage.get("open").is_none()));
 }
 
 #[cfg(unix)]

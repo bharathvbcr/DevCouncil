@@ -158,7 +158,7 @@ impl Display {
     pub(super) fn report_loss(&self) {
         let receipt = self.output_json();
         if receipt["incomplete"] == true {
-            println!("  Progress output incomplete ({} dropped updates, {} failed writes; details: --json)", receipt["dropped_updates"], receipt["failed_writes"]);
+            super::write_stdout(format_args!("  Progress output incomplete ({} dropped updates, {} failed writes; details: --json)\n", receipt["dropped_updates"], receipt["failed_writes"]));
         }
     }
 

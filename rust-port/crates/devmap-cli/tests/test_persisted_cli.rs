@@ -286,3 +286,52 @@ fn query_commands_do_not_rebuild_or_require_sources() {
 
     fs::remove_dir_all(&root).expect("remove fixture tree");
 }
+
+#[test]
+fn navigation_never_migrates_a_live_older_store() {
+    let root = temp_root();
+    fs::write(
+        root.join("src/target.py"),
+        "def upgrade_probe():\n    return 1\n",
+    )
+    .unwrap();
+    staleness_query(&root, &["build", "."]);
+    let db = root.join("index.sqlite");
+    let before = staleness_query(&root, &["status"])["generation_id"].clone();
+    {
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection.execute_batch("ALTER TABLE pending_paths DROP COLUMN revision; DROP TABLE pending_state; PRAGMA user_version=19;").unwrap();
+    }
+    for args in [
+        vec!["search", "upgrade_probe"],
+        vec!["impact", "upgrade_probe"],
+        vec!["repair"],
+        vec!["repair", "--schema", "--pending"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_devmap"))
+            .args(["--db"])
+            .arg(&db)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{args:?} implicitly accepted an older schema"
+        );
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                .unwrap(),
+            19,
+            "{args:?} must not upgrade a live store as a side effect"
+        );
+    }
+    staleness_query(&root, &["repair", "--schema"]);
+    assert_eq!(staleness_query(&root, &["status"])["generation_id"], before);
+    assert_eq!(
+        staleness_query(&root, &["search", "upgrade_probe"])["total"],
+        1
+    );
+    fs::remove_dir_all(root).unwrap();
+}

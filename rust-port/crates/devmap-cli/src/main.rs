@@ -985,6 +985,9 @@ enum Commands {
         last: usize,
     },
     Repair {
+        /// Explicitly upgrade the store schema after coordinating all readers and writers.
+        #[arg(long, conflicts_with_all = ["fts", "pending", "page_size"])]
+        schema: bool,
         #[arg(long)]
         fts: bool,
         /// Drop pending-queue rows that no drain can ever process: quarantined
@@ -2250,18 +2253,18 @@ fn build_manifest_payload(
 
 fn open_for_read(cli: &Cli) -> anyhow::Result<Store> {
     let db = cli.db();
-    match Store::open_existing(&db)? {
-        Some(store) => {
-            if cli.db.is_none() {
-                store.validate_repo_root(&cli.root_hint())?;
-            }
-            Ok(store)
-        }
-        None => Err(anyhow::anyhow!(
+    if !db.is_file() {
+        anyhow::bail!(
             "no devmap store at {} — run `devmap build` first",
             db.display()
-        )),
+        );
     }
+    // Navigation must never perform a compatibility upgrade under live clients.
+    let store = Store::open_read_only(&db)?;
+    if cli.db.is_none() {
+        store.validate_repo_root(&cli.root_hint())?;
+    }
+    Ok(store)
 }
 
 fn split_csv(raw: &Option<String>) -> Vec<String> {
@@ -3252,7 +3255,7 @@ async fn main() -> std::process::ExitCode {
                 "elapsed_ms": started.elapsed().as_millis(),
                 "stage": progress.as_ref().and_then(|p| p.open.borrow().as_ref().map(|(label, _, _)| label.clone())),
             });
-            // The human line always, on stderr where every other diagnostic
+            // Attempt the human line on stderr, where every other diagnostic
             // this binary writes goes. Under `--json`, the same failure *also*
             // goes out as one line of JSON on stdout, because that is what
             // `--json` promises on every exit and the failing paths are the
@@ -3274,6 +3277,20 @@ async fn main() -> std::process::ExitCode {
                         serde_json::json!({ "error": render_error(&error), "diagnostic_context": context,
                         "timings": progress.timings_json(), "progress_output": progress.display.output_json() })
                     );
+                } else {
+                    // stderr may be blocked or gone. Preserve the retained
+                    // diagnostic on the plain primary output without waiting
+                    // longer on the optional renderer.
+                    let receipt = progress.display.output_json();
+                    for line in receipt["diagnostics"]["unrendered"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(line) = line.as_str() {
+                            outln!("{line}");
+                        }
+                    }
                 }
             } else {
                 eprintln!("Error: {}", render_error(&error));
@@ -4957,15 +4974,37 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             }
         }
         Commands::Repair {
+            schema,
             fts,
             pending,
             page_size,
         } => {
-            // `cli.db()` rather than `cli.db`: the store path is resolved per
-            // repository now, and `--db` is an `Option`.
-            let store = open_for_read(cli)?;
-            if !*fts && !*pending && !*page_size {
-                anyhow::bail!("specify a repair target, e.g. --fts, --pending or --page-size");
+            if !*schema && !*fts && !*pending && !*page_size {
+                anyhow::bail!("specify a repair target: --schema, --fts, --pending or --page-size");
+            }
+            let db = cli.db();
+            if !db.is_file() {
+                anyhow::bail!(
+                    "no devmap store at {} — run `devmap build` first",
+                    db.display()
+                );
+            }
+            let _writer = Store::lock_writer_at(&db, Store::WRITER_LOCK_WAIT)?;
+            let before = Store::stored_schema_version(&db)?;
+            let store = Store::open(&db)?;
+            drop(_writer); // Page-size conversion acquires its own writer guard.
+            if cli.db.is_none() {
+                store.validate_repo_root(&cli.root_hint())?;
+            }
+            if *schema {
+                emit_json(
+                    cli,
+                    &serde_json::json!({
+                        "schema_before": before,
+                        "schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
+                        "upgraded": before != Some(devmap_store::CURRENT_SCHEMA_VERSION),
+                    }),
+                )?;
             }
             if *page_size {
                 let outcome = store.convert_page_size()?;

@@ -980,8 +980,9 @@ pub async fn serve_http_on_with_admission(
                 use tokio::io::AsyncWriteExt;
                 let mut stream = stream;
                 let _ = tokio::time::timeout(SHED_WRITE_TIMEOUT, async {
-                    let _ = stream.write_all(&shed_response()).await;
-                    let _ = stream.shutdown().await;
+                    if stream.write_all(&shed_response()).await.is_ok() {
+                        close_http_stream(stream).await;
+                    }
                 })
                 .await;
             });
@@ -1002,29 +1003,28 @@ pub async fn serve_http_on_with_admission(
                 .header_read_timeout(IDLE_TIMEOUT)
                 .serve_connection(io, service);
             match connection.without_shutdown().await {
-                Ok(parts) => {
-                    // An early 413 leaves unread request bytes. Dropping that
-                    // socket immediately sends a TCP reset on Windows, which
-                    // can erase the refusal before the client receives it.
-                    // Flush/half-close first, then discard a bounded tail. The
-                    // admission permit remains held through this bounded close.
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut stream = parts.io.into_inner();
-                    let closed = tokio::time::timeout(Duration::from_secs(1), async {
-                        stream.shutdown().await?;
-                        tokio::io::copy(
-                            &mut stream.take(MAX_BODY_BYTES + 64 * 1024),
-                            &mut tokio::io::sink(),
-                        )
-                        .await
-                    })
-                    .await;
-                    if let Ok(Err(error)) = closed {
-                        tracing::debug!("MCP HTTP close ended: {error}");
-                    }
-                }
+                Ok(parts) => close_http_stream(parts.io.into_inner()).await,
                 Err(err) => tracing::debug!("MCP HTTP connection ended: {err}"),
             }
         });
+    }
+}
+
+/// Preserve early refusals when unread request bytes would otherwise trigger a
+/// reset (especially on Windows). Both admitted and shed connections use this
+/// bounded half-close. An admitted connection retains its permit until done.
+async fn close_http_stream(mut stream: tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let closed = tokio::time::timeout(Duration::from_secs(1), async {
+        stream.shutdown().await?;
+        tokio::io::copy(
+            &mut stream.take(MAX_BODY_BYTES + 64 * 1024),
+            &mut tokio::io::sink(),
+        )
+        .await
+    })
+    .await;
+    if let Ok(Err(error)) = closed {
+        tracing::debug!("MCP HTTP close ended: {error}");
     }
 }
