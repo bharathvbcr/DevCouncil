@@ -231,7 +231,6 @@ fn symlinked_database_names_cannot_bypass_writer_ownership() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn hardlinked_databases_are_refused_before_diverging_wal_or_lock_files() {
     let temp = Scratch::new();
