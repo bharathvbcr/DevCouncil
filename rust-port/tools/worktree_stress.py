@@ -43,6 +43,36 @@ def retry_file_operation(operation, *, platform_name=os.name, deadline_seconds=5
             time.sleep(min(.01, remaining))
 
 
+class ProbeAdmission:
+    """Bound measurement processes independently of editor/daemon concurrency."""
+
+    def __init__(self, workers, timeout=30):
+        if not isinstance(workers, int) or isinstance(workers, bool) or not 1 <= workers <= 32:
+            raise ValueError("probe workers must be 1..32")
+        if not 0 <= timeout <= 30:
+            raise ValueError("probe admission timeout must be 0..30 seconds")
+        self._slots = threading.BoundedSemaphore(workers)
+        self._lock = threading.Lock()
+        self._timeout = timeout
+        self._active = 0
+        self.peak = 0
+
+    def run(self, operation):
+        if not self._slots.acquire(timeout=self._timeout):
+            raise TimeoutError("IPC probe admission exceeded its deadline")
+        try:
+            with self._lock:
+                self._active += 1
+                self.peak = max(self.peak, self._active)
+            try:
+                return operation()
+            finally:
+                with self._lock:
+                    self._active -= 1
+        finally:
+            self._slots.release()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -50,6 +80,8 @@ def main():
     parser.add_argument("--worktrees", type=int, default=128)
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--build-workers", type=int, default=16)
+    parser.add_argument("--probe-workers", type=int, default=8,
+                        help="maximum native IPC measurement processes (1..32); editors remain independent")
     parser.add_argument("--fixture-files", type=int, default=0,
                         help="additional indexed modules per worktree (0..8192)")
     parser.add_argument("--functions-per-file", type=int, default=8,
@@ -60,11 +92,14 @@ def main():
         parser.error("worktrees must be 1..256, rounds 1..100, build-workers 1..32")
     if not (0 <= args.fixture_files <= 8192 and 2 <= args.functions_per_file <= 64):
         parser.error("fixture-files must be 0..8192, functions-per-file 2..64")
+    if not 1 <= args.probe_workers <= 32:
+        parser.error("probe-workers must be 1..32")
     if os.name not in ("posix", "nt"):
         parser.error("supported process control platforms: POSIX and Windows")
     if os.name == "nt" and args.ipc_probe is None:
         parser.error("Windows requires --ipc-probe (cargo build -p devmap-cli --example ipc_probe)")
     probe = str(args.ipc_probe.resolve(strict=True)) if args.ipc_probe else None
+    probe_admission = ProbeAdmission(args.probe_workers)
     process_options = (dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
                        if os.name == "nt" else dict(start_new_session=True))
     binary = str(args.binary.resolve(strict=True))
@@ -85,6 +120,9 @@ def main():
                   ipc_transport="named_pipe" if os.name == "nt" else "unix_socket",
                   ipc_probe_process=probe is not None,
                   latency_includes_probe_startup=probe is not None,
+                  latency_includes_probe_admission=probe is not None,
+                  ipc_probe_workers=args.probe_workers if probe else 0,
+                  ipc_probe_admission_timeout_seconds=30 if probe else 0,
                   initial_source_files_per_worktree=1 + args.fixture_files,
                   initial_symbols_per_worktree=3 + args.fixture_files * (1 + args.functions_per_file),
                   initial_functions_per_worktree=2 + args.fixture_files * args.functions_per_file,
@@ -125,7 +163,8 @@ def main():
     def ipc(endpoint, **command):
         if probe:
             try:
-                data = run([probe, str(endpoint), json.dumps(dict(version=1, **command))])
+                data = probe_admission.run(
+                    lambda: run([probe, str(endpoint), json.dumps(dict(version=1, **command))]))
             except subprocess.CalledProcessError as error:
                 if error.returncode == 2:
                     raise ConnectionRefusedError(str(endpoint)) from error
@@ -395,6 +434,7 @@ def main():
             report["cleanup_errors"] = cleanup_errors
             report["passed"] = False
         report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        report["ipc_probe_peak_active"] = probe_admission.peak
         if query_ms:
             measured = sorted(query_ms)
             report["query_latency_ms"] = {"samples": len(measured), "p50": round(measured[len(measured)//2], 3), "p95": round(measured[min(len(measured)-1, int(len(measured)*.95))], 3), "max": round(measured[-1], 3)}
