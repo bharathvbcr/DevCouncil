@@ -3668,7 +3668,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     .collect();
                 devmap_extract::extract_all_with_progress(&refs, Some(&extraction_progress))
             } else {
-                devmap_store::extract_scanned_cached_with_progress(
+                devmap_store::extract_scanned_for_generation(
                     &store,
                     &scanned,
                     Some(&extraction_progress),

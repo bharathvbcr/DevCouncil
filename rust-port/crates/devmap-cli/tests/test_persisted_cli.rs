@@ -335,3 +335,26 @@ fn navigation_never_migrates_a_live_older_store() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn generation_build_does_not_write_a_disposable_copy_of_every_extraction() {
+    let root = temp_root();
+    fs::write(root.join("src/one.py"), "def first(): return 1\n").unwrap();
+    let db = root.join("index.sqlite");
+    drop(devmap_store::Store::open(&db).unwrap());
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TRIGGER refuse_disposable_extractions BEFORE INSERT ON extraction_cache BEGIN SELECT RAISE(ABORT, 'generation builds must persist extraction payloads once'); END;").unwrap();
+    }
+    staleness_query(&root, &["build", "."]);
+    fs::write(root.join("src/two.py"), "def second(): return 2\n").unwrap();
+    let next = staleness_query(&root, &["build", "."]);
+    assert_eq!(next["files_indexed"], 2);
+    assert_eq!(
+        next["file_progress"]["extraction"]["cache_hits"], 1,
+        "the committed generation still serves unchanged extraction payloads"
+    );
+    assert_eq!(staleness_query(&root, &["search", "first"])["total"], 1);
+    assert_eq!(staleness_query(&root, &["search", "second"])["total"], 1);
+    fs::remove_dir_all(root).unwrap();
+}

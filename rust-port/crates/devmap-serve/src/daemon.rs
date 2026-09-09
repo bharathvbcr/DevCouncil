@@ -1110,8 +1110,10 @@ impl Daemon {
             // measure it. This report was discarded as `_report`, which is what
             // made a full re-extraction the *most* confident thing the daemon
             // did and the least entitled to be.
-            let (whole_tree, report) =
-                devmap_store::extract_tree_cached_with_report(&self.store, &self.root)?;
+            let scanned = devmap_extract::scan_tree(&self.root)?;
+            let whole_tree =
+                devmap_store::extract_scanned_for_generation(&self.store, &scanned, None)?;
+            let report = scanned.report;
             // A full walk replaces the inventory outright rather than merging
             // into it: it re-decided every path in the tree, so a carried row
             // could only describe a path this walk has just answered for.
