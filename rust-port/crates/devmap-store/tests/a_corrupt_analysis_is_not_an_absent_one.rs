@@ -83,7 +83,8 @@ fn a_malformed_analysis_blob_is_refused_rather_than_read_as_no_analysis() {
         .expect("a well-formed summary must survive the strip");
     assert_eq!(analysis.total_files, 3);
     assert_eq!(
-        analysis.unresolved_calls, 4,
+        analysis.unresolved_calls,
+        Some(4),
         "the disclosure fields must survive json_remove, or the strip took too much"
     );
 
@@ -97,4 +98,26 @@ fn a_malformed_analysis_blob_is_refused_rather_than_read_as_no_analysis() {
          answer. Got: {:?}",
         outcome.map(|page| page.map(|p| (p.generation, p.analysis.is_some())))
     );
+}
+
+#[test]
+fn symbol_snapshots_reject_corrupt_or_partial_attribution_metadata() {
+    for breakdown in [
+        "{}",
+        "[]",
+        "1",
+        r#"{"unresolved_sites":1}"#,
+        r#"{"unresolved_sites":1,"explained_sites":-1}"#,
+        r#"{"unresolved_sites":"1","explained_sites":0}"#,
+    ] {
+        let summary = format!(
+            r#"{{"total_files":0,"total_symbols":0,"total_edges":0,"status":"Ok","unresolved_calls":1,"resolution_rate":{breakdown}}}"#
+        );
+        let (store, path) = store_with_analysis("invalid-attribution", &summary);
+        assert!(store.all_symbols_page().is_err(), "{summary}");
+        assert!(store.search_page("missing", 10).is_err(), "{summary}");
+        assert!(store.dead_page(10).is_err(), "{summary}");
+        drop(store);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 }

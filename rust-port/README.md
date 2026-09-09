@@ -40,8 +40,26 @@ report the same result as a check that ran and passed.** An agent acting on
 `status` verifies current source bytes and analyzer identity before reporting
 freshness. Query envelopes use `source_freshness: null` when that whole-tree
 check was not performed; changed source snippets are withheld with a reason.
-See the [reliability audit](RELIABILITY_AUDIT_2026-09-08.md) for measured stress
-results and the remaining language/platform limits.
+See the [coverage and robustness audit](RELIABILITY_AUDIT_2026-09-09.md) for
+current fixes, measured stress results, and remaining language/platform limits.
+The [earlier reliability audit](RELIABILITY_AUDIT_2026-09-08.md) records the
+previous binding and source-read repairs.
+
+An incomplete query can have several independent causes:
+
+- `truncated` means the output budget withheld known results. Increase
+  `--budget` to display more; `total` still describes only what the walk reached.
+- A depth limit in `walk_incomplete` means traversal stopped before exhausting
+  the indexed graph. Increase `--depth` to explore further.
+- Attribution warnings describe repository-wide unresolved sites, not a count
+  of missing edges for the selected symbol. Known built-ins, runtime globals,
+  and external imports are excluded using the recorded resolution breakdown.
+  Callbacks, unknown receivers, and other unbound targets still qualify the
+  answer. Older or inconsistent breakdowns report unknown coverage.
+
+Impact, trace, affected tests, and the layers in composed answers retain these
+coverage qualifications. Rebuilding refreshes stale source data; it does not
+remove language limitations or make unresolved dynamic calls deterministic.
 
 ## Install
 

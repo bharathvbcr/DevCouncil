@@ -21,10 +21,492 @@
 //!   exact shape of one with none.
 
 use devmap_extract::extract_file;
-use devmap_extract::model::{Extraction, ExtractionEngine, ParseOutcome, SymbolKind};
+use devmap_extract::model::{Confidence, Extraction, ExtractionEngine, ParseOutcome, SymbolKind};
 use devmap_query::{QueryEngine, Request, StoreQueryEngine};
 use devmap_resolve::Resolver;
 use devmap_store::{GenerationWriteOpts, Store};
+
+#[test]
+fn dependencies_disclose_unbound_calls_but_not_known_builtins() {
+    for (source, has_gap) in [
+        ("def entry(callback):\n    callback()\n", true),
+        ("def entry():\n    print(1)\n", false),
+    ] {
+        let files = [("app.py", source)];
+        let store = store_of(&files, &[]);
+        let extractions = vec![extract_file("app.py", source)];
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions);
+        let req = || Request {
+            query: "app.py".into(),
+            token_budget: 2000,
+            min_confidence: 0.0,
+            max_depth: 3,
+        };
+        assert_eq!(
+            StoreQueryEngine::new(&store)
+                .dependencies(req())
+                .unwrap()
+                .walk_incomplete
+                .is_some(),
+            has_gap,
+            "stored: {source}"
+        );
+        assert_eq!(
+            QueryEngine::new(&extractions, &resolution)
+                .dependencies(req())
+                .walk_incomplete
+                .is_some(),
+            has_gap,
+            "memory: {source}"
+        );
+    }
+}
+
+#[test]
+fn semantic_search_and_explore_keep_parse_loss_on_hits_and_misses() {
+    let store = store_of(
+        &[
+            ("read.py", "def present():\n    return 1\n"),
+            ("lost.py", "def missing():\n    return 2\n"),
+        ],
+        &["lost.py"],
+    );
+    let engine = StoreQueryEngine::new(&store);
+    for query in ["present", "missing"] {
+        let semantic = engine.search_semantic(query, 20_000).unwrap();
+        assert!(
+            semantic.walk_incomplete.is_some(),
+            "semantic {query}: {semantic:?}"
+        );
+        let explore = engine.explore(query, 5, 20_000, 0.0, 64).unwrap();
+        assert!(
+            explore.definitions.walk_incomplete.is_some(),
+            "explore {query}: {explore:?}"
+        );
+    }
+}
+
+#[test]
+fn scoped_traces_keep_attribution_loss_on_found_and_missing_paths() {
+    let store = store_of(&[("app.py", "def destination():\n    return 1\ndef source(callback):\n    callback()\n    return destination()\n")], &[]);
+    let engine = StoreQueryEngine::new(&store);
+    for target in ["destination", "absent"] {
+        let answer = engine
+            .trace_between(Request {
+                query: ("source".into(), target.into()),
+                token_budget: 2000,
+                min_confidence: 0.0,
+                max_depth: 64,
+            })
+            .unwrap();
+        assert!(answer.walk_incomplete.is_some(), "{target}: {answer:?}");
+    }
+}
+
+#[test]
+fn explore_preserves_qualified_definition_identity() {
+    let store = store_of(&[("app.py", "class A:\n    def ping(self):\n        return 1\nclass B:\n    def ping(self):\n        return 2\ndef first():\n    return A().ping()\ndef second():\n    return B().ping()\n")], &[]);
+    let engine = StoreQueryEngine::new(&store);
+    let report = engine.explore("ping", 10, 20_000, 0.0, 64).unwrap();
+    assert_eq!(report.definitions.shown, 2, "{report:?}");
+    let ids: std::collections::BTreeSet<_> = report
+        .definitions
+        .items
+        .iter()
+        .map(|d| d.id.as_str())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        2,
+        "different methods must have different traversal identities: {report:?}"
+    );
+    for definition in &report.definitions.items {
+        assert_eq!(definition.id, definition.qualified_name);
+        assert!(
+            definition
+                .callers
+                .items
+                .iter()
+                .all(|edge| edge.target_symbol == definition.id),
+            "{definition:?}"
+        );
+        assert!(
+            !definition.callers.items.is_empty(),
+            "fixture needs real callers: {definition:?}"
+        );
+    }
+}
+
+#[test]
+fn explore_radius_discloses_definitions_omitted_by_limit_or_budget() {
+    let store = store_of(&[("app.py", "def helper_a():\n    return 1\ndef helper_b():\n    return 2\ndef entry():\n    helper_a()\n    helper_b()\n")], &[]);
+    let engine = StoreQueryEngine::new(&store);
+    for (limit, budget) in [(1, 20_000), (10, 0)] {
+        let report = engine.explore("helper", limit, budget, 0.0, 64).unwrap();
+        assert!(report.definitions.hidden > 0, "{report:?}");
+        assert!(
+            report
+                .blast_radius
+                .layers
+                .walk_incomplete
+                .as_deref()
+                .is_some_and(|r| r.contains("definition")),
+            "omitted seeds cannot imply a complete radius: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn absent_indexes_do_not_publish_available_empty_radii() {
+    let store = Store::open_in_memory().unwrap();
+    let engine = StoreQueryEngine::new(&store);
+    let explore = engine.explore("helper", 5, 2000, 0.0, 3).unwrap();
+    let affected = engine
+        .affected_tests(&["helper".into()], 2000, 0.0, 3)
+        .unwrap();
+    for radius in [explore.blast_radius, affected.blast_radius] {
+        assert!(
+            matches!(
+                radius.layers.resolution,
+                devmap_query::ResolutionAvailability::Unavailable { .. }
+            ),
+            "{radius:?}"
+        );
+    }
+}
+
+#[test]
+fn memory_queries_refuse_nan_like_the_store_queries() {
+    let extractions = vec![extract_file(
+        "app.py",
+        "def helper():\n    return 1\ndef entry():\n    return helper()\n",
+    )];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let engine = QueryEngine::new(&extractions, &resolution);
+    let req = |query: &str| Request {
+        query: query.into(),
+        token_budget: 2000,
+        min_confidence: f32::NAN,
+        max_depth: 3,
+    };
+    for answer in [
+        engine.dependencies(req("app.py")),
+        engine.impact(req("helper")),
+        engine.trace(req("entry")),
+    ] {
+        assert!(
+            matches!(answer.resolution, devmap_query::ResolutionAvailability::Unavailable { ref reason } if reason.contains("NaN")),
+            "{answer:?}"
+        );
+    }
+}
+
+#[test]
+fn memory_traversal_enforces_the_same_depth_ceiling_as_storage() {
+    let mut source = "def node_80():\n    return 1\n".to_string();
+    for i in 0..80 {
+        source.push_str(&format!("def node_{i}():\n    return node_{}()\n", i + 1));
+    }
+    let extractions = vec![extract_file("app.py", &source)];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let memory = QueryEngine::new(&extractions, &resolution);
+    let store = store_of(&[("app.py", &source)], &[]);
+    let req = || Request {
+        query: "node_0".into(),
+        token_budget: 20_000,
+        min_confidence: 0.0,
+        max_depth: usize::MAX,
+    };
+    let stored = StoreQueryEngine::new(&store).trace(req()).unwrap();
+    assert!(
+        stored
+            .walk_incomplete
+            .as_deref()
+            .is_some_and(|s| s.contains("depth 64")),
+        "{stored:?}"
+    );
+    assert_eq!(memory.trace(req()).walk_incomplete, stored.walk_incomplete);
+}
+
+#[test]
+fn confidence_filtering_cannot_walk_through_an_excluded_bridge() {
+    let extractions = vec![extract_file("app.py", "def target():\n    return 1\ndef bridge():\n    return target()\ndef entry():\n    return bridge()\n")];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let mut resolution = resolver.resolve_all(&extractions);
+    let bridge = resolution
+        .edges
+        .iter_mut()
+        .find(|edge| {
+            edge.source_symbol == "app.py::entry" && edge.target_symbol == "app.py::bridge"
+        })
+        .expect("fixture bridge");
+    bridge.confidence = Confidence(0.4);
+    let memory = QueryEngine::new(&extractions, &resolution);
+    let req = |target: &str, floor| Request {
+        query: target.into(),
+        token_budget: 20_000,
+        min_confidence: floor,
+        max_depth: 64,
+    };
+    assert!(memory
+        .trace(req("entry", 0.0))
+        .items
+        .iter()
+        .any(|e| e.target_symbol == "app.py::target"));
+    let forward = memory.trace(req("entry", 0.8));
+    assert!(
+        !forward
+            .items
+            .iter()
+            .any(|e| e.target_symbol == "app.py::target"),
+        "a disconnected edge leaked across a filtered bridge: {forward:?}"
+    );
+
+    // Reverse the floor placement: a low edge into the target must hide the
+    // high edge further upstream, in the same way as forward traversal.
+    for edge in &mut resolution.edges {
+        if edge.source_symbol == "app.py::entry" && edge.target_symbol == "app.py::bridge" {
+            edge.confidence = Confidence(1.0);
+        }
+        if edge.source_symbol == "app.py::bridge" && edge.target_symbol == "app.py::target" {
+            edge.confidence = Confidence(0.4);
+        }
+    }
+    let memory = QueryEngine::new(&extractions, &resolution);
+    let reverse = memory.impact(req("target", 0.8));
+    assert!(
+        !reverse
+            .items
+            .iter()
+            .any(|e| e.source_symbol == "app.py::entry"),
+        "{reverse:?}"
+    );
+}
+
+#[test]
+fn layered_impact_spends_one_budget_across_both_parts() {
+    let mut source = "def leaf():\n    return 1\n".to_string();
+    for i in 0..50 {
+        let target = if i == 0 {
+            "leaf".to_string()
+        } else {
+            format!("node_{}", i - 1)
+        };
+        source.push_str(&format!("def node_{i}():\n    return {target}()\n"));
+    }
+    let store = store_of(&[("app.py", &source)], &[]);
+    let report = StoreQueryEngine::new(&store)
+        .impact_layered(Request {
+            query: "leaf".into(),
+            token_budget: 1000,
+            min_confidence: 0.0,
+            max_depth: 64,
+        })
+        .unwrap();
+    let edge_tokens = report.edges.tokens_used;
+    let layer_tokens = report.blast_radius.layers.tokens_used;
+    assert!(
+        edge_tokens > 0 && layer_tokens > 0,
+        "both sides must spend tokens: {report:?}"
+    );
+    assert!(
+        edge_tokens <= 500 && layer_tokens <= 500,
+        "the caller supplied one shared budget: {report:?}"
+    );
+    assert!(edge_tokens + layer_tokens <= 1000);
+}
+
+#[test]
+fn explained_calls_do_not_make_the_index_incomplete() {
+    for (path, source) in [
+        ("builtin.py", "def entry():\n    print(1)\n"),
+        ("host.ts", "export function entry() { return setTimeout(() => 1, 10); }"),
+        ("external.ts", "import { readFileSync } from 'node:fs'; export function entry() { return readFileSync('fixture'); }"),
+    ] {
+        let store = store_of(&[(path, source)], &[]);
+        let analysis = store.latest_analysis().unwrap().unwrap();
+        assert!(analysis.unresolved_calls > 0, "fixture must exercise unresolved sites: {path}");
+        assert_eq!(analysis.resolution_rate.unresolved_sites, analysis.resolution_rate.explained_sites, "fixture must contain only explained sites: {analysis:?}");
+        let engine = StoreQueryEngine::new(&store);
+        let dead = engine.dead_symbols(10_000).unwrap();
+        assert_eq!(dead.walk_incomplete, None, "known external targets must not claim missing internal edges: {path}");
+        let impact = engine.impact(Request {query: "entry".into(), token_budget: 10_000, min_confidence: 0.0, max_depth: 64}).unwrap();
+        assert_eq!(impact.walk_incomplete, None, "{path}: {impact:?}");
+    }
+}
+
+#[test]
+fn mixed_attribution_counts_exclude_explained_sites_and_name_their_scope() {
+    let store = store_of(&[("app.py", "def entry(callback, receiver):\n    print(1)\n    callback()\n    receiver.method()\n    missing()\n")], &[]);
+    let analysis = store.latest_analysis().unwrap().unwrap();
+    let rate = &analysis.resolution_rate;
+    assert!(rate.explained_sites > 0 && rate.unresolved_sites > rate.explained_sites);
+    let dead = StoreQueryEngine::new(&store).dead_symbols(10_000).unwrap();
+    let reason = dead.walk_incomplete.unwrap();
+    let remaining = rate.unresolved_sites - rate.explained_sites;
+    assert!(
+        reason.contains(&format!("{remaining} of {}", rate.unresolved_sites)),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("repository-wide") && reason.contains("not specific to this target"),
+        "{reason}"
+    );
+    assert!(
+        !reason.contains("missing that many edges"),
+        "unresolved sites are not an exact edge count: {reason}"
+    );
+}
+
+#[test]
+fn affected_tests_and_explore_keep_repository_coverage_warnings() {
+    let store = store_of(
+        &[
+            ("lib.py", "def helper():\n    return 1\n"),
+            (
+                "test_app.py",
+                "from lib import helper\ndef test_helper():\n    return helper()\n",
+            ),
+            ("unknown.py", "def entry(callback):\n    callback()\n"),
+        ],
+        &[],
+    );
+    let engine = StoreQueryEngine::new(&store);
+    let affected = engine
+        .affected_tests(&["helper".into()], 10_000, 0.0, 64)
+        .unwrap();
+    assert!(affected
+        .tests
+        .items
+        .iter()
+        .any(|test| test.path == "test_app.py"));
+    assert!(
+        affected.tests.walk_incomplete.is_some(),
+        "a completed walk must not erase unresolved callbacks: {affected:?}"
+    );
+    assert_eq!(
+        affected.tests.walk_incomplete,
+        affected.blast_radius.layers.walk_incomplete
+    );
+    let explored = engine.explore("helper", 5, 10_000, 0.0, 64).unwrap();
+    assert!(
+        explored.blast_radius.layers.walk_incomplete.is_some(),
+        "{explored:?}"
+    );
+}
+
+#[test]
+fn layered_impact_keeps_the_same_coverage_warning_on_both_halves() {
+    let store = store_of(
+        &[
+            ("lib.py", "def helper():\n    return 1\n"),
+            (
+                "app.py",
+                "from lib import helper\ndef entry(callback):\n    helper()\n    callback()\n",
+            ),
+        ],
+        &[],
+    );
+    let report = StoreQueryEngine::new(&store)
+        .impact_layered(Request {
+            query: "helper".into(),
+            token_budget: 10_000,
+            min_confidence: 0.0,
+            max_depth: 64,
+        })
+        .unwrap();
+    assert!(report.edges.walk_incomplete.is_some());
+    assert_eq!(
+        report.edges.walk_incomplete,
+        report.blast_radius.layers.walk_incomplete
+    );
+}
+
+#[test]
+fn in_memory_traversals_keep_the_same_attribution_warning_as_storage() {
+    let files = [
+        ("lib.py", "def helper():\n    return 1\n"),
+        (
+            "app.py",
+            "from lib import helper\ndef entry(callback):\n    helper()\n    callback()\n",
+        ),
+    ];
+    let extractions: Vec<_> = files
+        .iter()
+        .map(|(path, source)| extract_file(path, source))
+        .collect();
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let memory = QueryEngine::new(&extractions, &resolution);
+    let store = store_of(&files, &[]);
+    let stored = StoreQueryEngine::new(&store);
+    let req = |target: &str| Request {
+        query: target.into(),
+        token_budget: 10_000,
+        min_confidence: 0.0,
+        max_depth: 64,
+    };
+    let expected = stored.impact(req("helper")).unwrap().walk_incomplete;
+    assert!(expected.is_some());
+    assert_eq!(memory.impact(req("helper")).walk_incomplete, expected);
+    assert_eq!(
+        memory.trace(req("entry")).walk_incomplete,
+        stored.trace(req("entry")).unwrap().walk_incomplete
+    );
+    assert_eq!(
+        memory.impact(req("missing_target")).walk_incomplete,
+        stored
+            .impact(req("missing_target"))
+            .unwrap()
+            .walk_incomplete
+    );
+    assert_eq!(
+        memory.trace(req("missing_target")).walk_incomplete,
+        stored.trace(req("missing_target")).unwrap().walk_incomplete
+    );
+}
+
+#[test]
+fn output_budget_depth_and_attribution_gaps_survive_together() {
+    let store = store_of(
+        &[
+            ("d.py", "def d():\n    return 1\n"),
+            ("c.py", "from d import d\ndef c():\n    return d()\n"),
+            ("b.py", "from c import c\ndef b():\n    return c()\n"),
+            (
+                "a.py",
+                "from b import b\ndef a(callback):\n    b()\n    callback()\n",
+            ),
+        ],
+        &[],
+    );
+    let report = StoreQueryEngine::new(&store)
+        .impact_layered(Request {
+            query: "d".into(),
+            token_budget: 0,
+            min_confidence: 0.0,
+            max_depth: 1,
+        })
+        .unwrap();
+    assert!(report.edges.truncated && report.edges.total > report.edges.shown);
+    let reason = report.edges.walk_incomplete.as_ref().unwrap();
+    assert!(
+        reason.contains("depth") && reason.contains("unresolved attribution"),
+        "{reason}"
+    );
+    assert_eq!(
+        report.edges.walk_incomplete,
+        report.blast_radius.layers.walk_incomplete
+    );
+}
 
 /// A chain `a -> b -> c -> d`, four hops, so a depth-2 walk must stop short.
 fn chain() -> Vec<devmap_extract::model::Extraction> {
@@ -679,7 +1161,7 @@ fn search_over_a_complete_corpus_claims_nothing() {
         dead.walk_incomplete
             .as_deref()
             .unwrap_or_default()
-            .contains("unattributed"),
+            .contains("unresolved attribution"),
         "the fixture must actually hold unattributed calls, or the assertions \
          below are vacuous: {dead:?}"
     );

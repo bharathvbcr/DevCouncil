@@ -68,6 +68,98 @@ const LIB: &str = "def helper():\n    return 1\n\n\ndef orphan():\n    return 2\
 const APP: &str = "from lib import helper\n\n\ndef main():\n    return helper()\n";
 
 #[test]
+fn semantic_and_dependency_pages_pair_rows_with_their_own_analysis_under_writes() {
+    use std::sync::{Arc, Barrier};
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    commit(&store, &[("app.py", "def initial():\n    return 1\n")], &[]);
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_store = Arc::clone(&store);
+    let writer_barrier = Arc::clone(&barrier);
+    let writer = std::thread::spawn(move || {
+        writer_barrier.wait();
+        for round in 0..100 {
+            let mut source = "def root():\n    return 1\n".to_string();
+            for i in 0..if round % 2 == 0 { 40 } else { 1 } {
+                source.push_str(&format!("def member_{i}():\n    return root()\n"));
+            }
+            commit(&writer_store, &[("app.py", &source)], &[]);
+            writer_store.prune_generations_except_latest(1).unwrap();
+        }
+    });
+    barrier.wait();
+    for _ in 0..300 {
+        let symbols = store.all_symbols_page().unwrap().unwrap();
+        assert_eq!(symbols.rows.len(), symbols.analysis.unwrap().total_symbols);
+        assert_eq!(symbols.total as usize, symbols.rows.len());
+        let file = store.file_edges("app.py", 0.0).unwrap().unwrap();
+        assert_eq!(file.edges.len(), file.analysis.unwrap().total_edges);
+        assert_eq!(file.file.path, "app.py");
+    }
+    writer.join().unwrap();
+    assert_eq!(store.latest_generation_id().unwrap(), Some(101));
+}
+
+#[test]
+fn explore_under_rebuilds_is_consistent_or_qualifies_every_part() {
+    use std::sync::{Arc, Barrier};
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let generation = |store: &Store, label: &str| {
+        let source = format!("class {label}:\n    def ping(self):\n        return 1\ndef enter_{label}():\n    return {label}().ping()\n");
+        commit(store, &[("app.py", &source)], &[]);
+    };
+    generation(&store, "Even");
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_store = Arc::clone(&store);
+    let writer_barrier = Arc::clone(&barrier);
+    let writer = std::thread::spawn(move || {
+        writer_barrier.wait();
+        for round in 0..100 {
+            generation(&writer_store, if round % 2 == 0 { "Odd" } else { "Even" });
+            writer_store.prune_generations_except_latest(1).unwrap();
+        }
+    });
+    barrier.wait();
+    let engine = StoreQueryEngine::new(&store);
+    for _ in 0..300 {
+        let report = engine.explore("ping", 5, 20_000, 0.0, 64).unwrap();
+        assert_eq!(report.definitions.shown, 1, "{report:?}");
+        let definition = &report.definitions.items[0];
+        if report
+            .definitions
+            .walk_incomplete
+            .as_deref()
+            .is_some_and(|s| s.contains("index moved"))
+        {
+            for reason in [
+                &report.blast_radius.layers.walk_incomplete,
+                &definition.callers.walk_incomplete,
+                &definition.callees.walk_incomplete,
+            ] {
+                assert!(
+                    reason.as_deref().is_some_and(|s| s.contains("index moved")),
+                    "{report:?}"
+                );
+            }
+        } else {
+            assert!(
+                !definition.callers.items.is_empty(),
+                "a stable answer must include its caller: {report:?}"
+            );
+            assert!(
+                definition
+                    .callers
+                    .items
+                    .iter()
+                    .all(|e| e.target_symbol == definition.id),
+                "{report:?}"
+            );
+        }
+    }
+    writer.join().unwrap();
+    assert_eq!(store.latest_generation_id().unwrap(), Some(101));
+}
+
+#[test]
 fn a_dead_page_reports_the_analysis_of_the_generation_it_listed() {
     let store = Store::open_in_memory().unwrap();
     // Generation 1: degraded, because `app.py` would not parse.

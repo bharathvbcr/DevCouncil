@@ -167,3 +167,28 @@ fn a_ranking_pool_smaller_than_the_match_set_says_the_ranking_is_partial() {
         "the reason must name what was incomplete, got {reason:?}"
     );
 }
+
+#[test]
+fn explore_uses_the_same_ranking_contract_as_search() {
+    let store = corpus(200);
+    let engine = StoreQueryEngine::new(&store);
+    let answer = engine.explore("alpha", 5, 2_000, 0.0, 3).unwrap();
+    assert_eq!(
+        answer
+            .definitions
+            .items
+            .first()
+            .map(|d| d.symbol_name.as_str()),
+        Some("alpha"),
+        "{answer:?}"
+    );
+    let sample = engine.explore("alpha", 5, 40, 0.0, 3).unwrap();
+    assert!(
+        sample
+            .definitions
+            .walk_incomplete
+            .as_deref()
+            .is_some_and(|s| s.contains("rank")),
+        "{sample:?}"
+    );
+}
