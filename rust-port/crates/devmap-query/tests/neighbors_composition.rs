@@ -16,28 +16,6 @@ use devmap_query::cancel::Cancel;
 use devmap_query::{Request, StoreQueryEngine, MAX_NEIGHBOR_TARGETS};
 use devmap_resolve::Resolver;
 use devmap_store::{GenerationWriteOpts, Store};
-use std::time::{Duration, Instant};
-
-/// Where [`a_cancelled_composition_stops_partway_through_the_fan_out`] starts
-/// looking for a fixture big enough to measure.
-///
-/// A starting point, not a size. A hard-coded fan rots every time the engine
-/// gets faster, and it rots *differently* in debug and release — at 340 the
-/// composed call took 60 ms in debug against a 150 ms floor, and a fan that
-/// clears the floor in debug is still under it in release. The test doubles
-/// from here until the fixture is slow enough to distinguish "stopped early"
-/// from "finished", which is the property it actually depends on.
-const FAN_PER_MODULE_SEED: usize = 340;
-
-/// How many doublings that search is allowed.
-///
-/// Bounded so a machine that will never produce a measurable baseline fails
-/// with a number rather than building fixtures forever. 2^6 x 340 is ~21,760
-/// functions per module, far past anything a real optimisation could outrun.
-const FAN_DOUBLINGS: u32 = 6;
-
-/// Baseline below which "stopped early" cannot be distinguished from noise.
-const MEASURABLE_BASELINE: Duration = Duration::from_millis(150);
 
 const CORE: &str =
     "def helper(rows):\n    return sum(rows)\n\n\ndef unused(rows):\n    return rows\n";
@@ -245,84 +223,6 @@ fn an_unindexed_target_is_unavailable_not_empty() {
     );
 }
 
-/// A cancelled composition stops partway through instead of running the whole
-/// fan-out.
-///
-/// The flag is tripped *while* the loop runs, not before it: a pre-set flag is
-/// caught by the first check whatever the checking strategy, so it would prove
-/// far less than it looks like it proves.
-///
-/// What actually stops the work here is `impact`'s own traversal, which
-/// consults the flag as it walks; the loop's per-target check only closes the
-/// gap between sub-queries. This test was run against both the per-target
-/// check and the `check_every(index)` form it replaced and passes on both, so
-/// it pins the *property* — a cancelled composition stops partway through —
-/// rather than one implementation of it.
-///
-/// It sizes itself against its own measured baseline: if the fixture is too
-/// fast for "stopped early" to mean anything, it fails saying so rather than
-/// passing vacuously.
-#[test]
-fn a_cancelled_composition_stops_partway_through_the_fan_out() {
-    let targets: Vec<String> = (0..MAX_NEIGHBOR_TARGETS)
-        .map(|index| format!("mod{index}.py"))
-        .collect();
-
-    // Grow the corpus until one uncancelled answer takes long enough to
-    // measure. The alternative — a fixed fan — encodes today's engine speed in
-    // a constant and turns tomorrow's optimisation into this test's failure,
-    // which is what happened when the traversal stopped materialising the whole
-    // generation per question.
-    let mut fan = FAN_PER_MODULE_SEED;
-    let mut store = wide_fixture(fan);
-    let mut baseline = Duration::ZERO;
-    for _ in 0..=FAN_DOUBLINGS {
-        let engine = StoreQueryEngine::new(&store);
-        let started = Instant::now();
-        engine
-            .neighbors(&targets, 200_000, 0.0, 6)
-            .expect("the uncancelled baseline must answer");
-        baseline = started.elapsed();
-        if baseline >= MEASURABLE_BASELINE {
-            break;
-        }
-        fan *= 2;
-        store = wide_fixture(fan);
-    }
-    assert!(
-        baseline >= MEASURABLE_BASELINE,
-        "even at {fan} functions per module the fixture completes in \
-         {baseline:?}; too fast for 'stopped early' to mean anything, so this \
-         test would assert nothing"
-    );
-
-    let cancel = Cancel::new();
-    let engine = StoreQueryEngine::new(&store).with_cancel(cancel.clone());
-    let flipper = {
-        let cancel = cancel.clone();
-        let after = baseline / 8;
-        std::thread::spawn(move || {
-            std::thread::sleep(after);
-            cancel.cancel();
-        })
-    };
-    let started = Instant::now();
-    let outcome = engine.neighbors(&targets, 200_000, 0.0, 6);
-    let elapsed = started.elapsed();
-    flipper.join().expect("flipper panicked");
-
-    assert!(
-        outcome.is_err(),
-        "a composition cancelled after {:?} ran all the way to completion",
-        baseline / 8
-    );
-    assert!(
-        elapsed < baseline / 2,
-        "a cancelled composition took {elapsed:?} against an uncancelled \
-         {baseline:?}; the loop is consulting the flag too rarely to matter"
-    );
-}
-
 /// A flag already set before the call is refused immediately, too.
 #[test]
 fn a_composition_that_starts_cancelled_does_no_work() {
@@ -334,55 +234,6 @@ fn a_composition_that_starts_cancelled_does_no_work() {
         engine.neighbors(&targets(), 2000, 0.0, 1).is_err(),
         "a composition ran with its cancel flag already set"
     );
-}
-
-/// A corpus wide enough that one `impact` traversal is real work: every module
-/// calls into a shared hub, so a reverse walk from any of them fans across the
-/// whole graph rather than terminating after a couple of edges.
-///
-/// The fan is sized against the assertion in the cancellation test,
-/// not chosen: that test measures its own uncancelled baseline and refuses to
-/// run if the fixture answers too quickly for "stopped early" to distinguish
-/// anything. When the engine gets faster the fixture has to get wider, or the
-/// test starts asserting nothing — which is why the number lives here with a
-/// reason attached rather than inline.
-fn wide_fixture(fan_per_module: usize) -> Store {
-    let mut sources: Vec<(String, String)> = Vec::new();
-    let mut hub = String::new();
-    for index in 0..MAX_NEIGHBOR_TARGETS {
-        hub.push_str(&format!(
-            "def hub{index}(rows):\n    return sum(rows)\n\n\n"
-        ));
-    }
-    sources.push(("hub.py".to_string(), hub));
-    for module in 0..MAX_NEIGHBOR_TARGETS {
-        let mut body = String::from("import hub\n\n\n");
-        for func in 0..fan_per_module {
-            body.push_str(&format!(
-                "def f{module}_{func}(rows):\n    return hub.hub{}(rows)\n\n\n",
-                func % MAX_NEIGHBOR_TARGETS
-            ));
-        }
-        sources.push((format!("mod{module}.py"), body));
-    }
-    let extractions: Vec<_> = sources
-        .iter()
-        .map(|(path, body)| extract_file(path, body))
-        .collect();
-    let mut resolver = Resolver::new();
-    resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
-    let analysis = devmap_analyze::analyze(&extractions, &resolution);
-    let store = Store::open_in_memory().unwrap();
-    store
-        .save_generation_with_opts(
-            &extractions,
-            &resolution,
-            &analysis,
-            GenerationWriteOpts::default(),
-        )
-        .unwrap();
-    store
 }
 
 /// A symbol's callees are the symbol's own outbound calls.

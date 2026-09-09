@@ -29,7 +29,7 @@ peak_rss_bytes() {
     echo "no /usr/bin/time supporting -l (BSD) or -v (GNU) is available" >&2
     return 1
   }
-  /usr/bin/time "$PEAK_RSS_TIME_FLAG" "$@" 2>"$out" >/dev/null || return 1
+  /usr/bin/time "$PEAK_RSS_TIME_FLAG" "$@" 2>"$out" >"${PEAK_RSS_STDOUT_FILE:-/dev/null}" || return 1
   local v
   v=$(awk '/maximum resident set size/ {print $1; exit}' "$out")                  # macOS: bytes
   if [ -z "$v" ]; then

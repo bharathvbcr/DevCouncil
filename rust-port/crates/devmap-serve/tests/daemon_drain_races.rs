@@ -85,6 +85,34 @@ fn generation_paths(store: &Store) -> Vec<String> {
     paths
 }
 
+#[test]
+#[cfg(windows)]
+fn windows_protects_live_sidecars_and_refuses_offline_corruption() {
+    use std::io::Write;
+    let (root, daemon, reader) = repo_with_one_generation("corrupt-store-windows");
+    let shm = root.join("index.sqlite-shm");
+    let bytes = vec![0x5a; std::fs::metadata(&shm).unwrap().len() as usize];
+    let error = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&shm)
+        .unwrap()
+        .write_all(&bytes)
+        .expect_err("Windows must protect SQLite's locked shared memory");
+    assert_eq!(error.raw_os_error(), Some(33));
+    assert!(devmap_serve::index_is_fresh(
+        &reader.status("test").unwrap()
+    ));
+    drop(reader);
+    drop(daemon);
+    let db = root.join("index.sqlite");
+    std::fs::write(&db, b"not a database").unwrap();
+    assert!(
+        Store::open(&db).is_err(),
+        "offline corruption must be refused"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// A generation written after HEAD moved must describe the tree at that HEAD,
 /// not a carry-forward of the previous checkout.
 ///
@@ -164,6 +192,7 @@ fn a_generation_written_after_head_moved_re_reads_the_tree() {
 /// SQLite's choice, not this kernel's — a page still in cache, a `-wal` that
 /// survived — and every one of them has to refuse.
 #[test]
+#[cfg(unix)]
 fn a_corrupted_store_refuses_rather_than_answering_empty_and_fresh() {
     let (root, daemon, reader) = repo_with_one_generation("corrupt-store");
     let db_path = root.join("index.sqlite");

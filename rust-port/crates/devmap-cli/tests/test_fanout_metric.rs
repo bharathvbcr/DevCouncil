@@ -247,6 +247,7 @@ fn the_fanout_metric_matches_a_hand_counted_corpus() {
         "every speculative edge must be accounted for by the fan-out grouping"
     );
 
+    drop(conn);
     std::fs::remove_dir_all(&root).unwrap();
 }
 

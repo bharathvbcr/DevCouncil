@@ -32,6 +32,13 @@ defaults:
   run:
     working-directory: rust-port
 
+# Bound nested executor fan-out on hosted runners. Individual stress tests still
+# create their explicit 256 concurrent sessions; every test remains collected.
+env:
+  RUST_TEST_THREADS: "2"
+  RAYON_NUM_THREADS: "2"
+  TOKIO_WORKER_THREADS: "2"
+
 jobs:
   test:
     name: test (${{ matrix.os }})

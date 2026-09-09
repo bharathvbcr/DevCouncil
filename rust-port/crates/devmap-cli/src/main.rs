@@ -5,6 +5,29 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
+// All one-shot stdout uses this path, including JSON and large exports.
+// Windows has no SIGPIPE; a consumer closing its pipe must not panic the CLI.
+fn write_stdout(message: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    if let Err(error) = std::io::stdout().lock().write_fmt(message) {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        // A diagnostic sink may itself be gone; the failure exit still survives.
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "DevMap could not write stdout: {error}"
+        );
+        std::process::exit(1);
+    }
+}
+
+macro_rules! outln {
+    ($($argument:tt)*) => {
+        write_stdout(format_args!("{}\n", format_args!($($argument)*)))
+    };
+}
+
 mod claude;
 mod progress;
 
@@ -1882,15 +1905,17 @@ fn report_manifest(cli: &Cli, outcome: &ManifestOutcome) -> anyhow::Result<()> {
         return emit_json(cli, &manifest_json(outcome));
     }
     if outcome.artifacts_unchanged {
-        println!(
+        outln!(
             "Artifacts already current for generation #{} ({:?}, {:?}).",
-            outcome.generation_id, outcome.output, outcome.graph_output
+            outcome.generation_id,
+            outcome.output,
+            outcome.graph_output
         );
     } else {
-        println!("Manifest written to {:?}", outcome.output);
-        println!("Code graph written to {:?}", outcome.graph_output);
+        outln!("Manifest written to {:?}", outcome.output);
+        outln!("Code graph written to {:?}", outcome.graph_output);
         if let Some(destination) = &outcome.compact_graph_output {
-            println!("Interned code graph written to {:?}", destination);
+            outln!("Interned code graph written to {:?}", destination);
         }
     }
     for guide in &outcome.guides {
@@ -1902,10 +1927,10 @@ fn report_manifest(cli: &Cli, outcome: &ManifestOutcome) -> anyhow::Result<()> {
                 "left alone (no `Managed by devmap` marker)"
             }
         };
-        println!("  guide {}: {note}", guide.path.display());
+        outln!("  guide {}: {note}", guide.path.display());
     }
     if !outcome.freshness_unavailable_reason.is_empty() {
-        println!(
+        outln!(
             "  freshness stamps unavailable: {}",
             outcome.freshness_unavailable_reason
         );
@@ -1968,7 +1993,7 @@ fn resolve_graph_output(explicit: &Option<PathBuf>, root: &Path) -> PathBuf {
 /// One line per symbol, then the counts — never a page length alone.
 fn report_ast(answer: &serde_json::Value) {
     for hit in answer["matches"].as_array().into_iter().flatten() {
-        println!(
+        outln!(
             "{:<10} {:<12} {}  {}",
             hit["kind"].as_str().unwrap_or(""),
             hit["language"].as_str().unwrap_or(""),
@@ -1979,14 +2004,14 @@ fn report_ast(answer: &serde_json::Value) {
     let shown = answer["shown"].as_u64().unwrap_or(0);
     let total = answer["total"].as_u64().unwrap_or(0);
     if answer["truncated"].as_bool().unwrap_or(false) {
-        println!("{shown} of {total} match(es); raise --limit to see the rest");
+        outln!("{shown} of {total} match(es); raise --limit to see the rest");
     } else {
-        println!("{total} match(es)");
+        outln!("{total} match(es)");
     }
     // An empty answer because the filter names something the index does not
     // hold is a different problem from an empty answer because nothing matched.
     for unmatched in answer["unmatched_filters"].as_array().into_iter().flatten() {
-        println!(
+        outln!(
             "  --{} {:?}: {}",
             unmatched["filter"].as_str().unwrap_or(""),
             unmatched["value"].as_str().unwrap_or(""),
@@ -2046,7 +2071,7 @@ fn retain_matching_routes(mapped: &mut serde_json::Value, filter: &str) {
 fn report_routes(mapped: &serde_json::Value) {
     let routes = mapped["routes"].as_array().cloned().unwrap_or_default();
     if routes.is_empty() {
-        println!("No routes in this generation.");
+        outln!("No routes in this generation.");
     }
     for route in &routes {
         let handlers: Vec<String> = route["handlers"]
@@ -2063,7 +2088,7 @@ fn report_routes(mapped: &serde_json::Value) {
                 _ => h["id"].as_str().unwrap_or("?").to_string(),
             })
             .collect();
-        println!(
+        outln!(
             "{:<7} {}  -> {}",
             route["verb"].as_str().unwrap_or("ANY"),
             route["path"].as_str().unwrap_or(""),
@@ -2075,7 +2100,7 @@ fn report_routes(mapped: &serde_json::Value) {
         );
         let consumers = route["consumers"].as_array().map(Vec::len).unwrap_or(0);
         if consumers > 0 {
-            println!("        {consumers} client call site(s)");
+            outln!("        {consumers} client call site(s)");
         }
     }
     report_scan(mapped);
@@ -2085,7 +2110,7 @@ fn report_shape_check(checked: &serde_json::Value) {
     let checks = checked["checks"].as_array().cloned().unwrap_or_default();
     for check in &checks {
         let verdict = check["verdict"].as_str().unwrap_or("");
-        println!(
+        outln!(
             "{:<7} {}  {}",
             check["verb"].as_str().unwrap_or("ANY"),
             check["route"].as_str().unwrap_or(""),
@@ -2098,13 +2123,13 @@ fn report_shape_check(checked: &serde_json::Value) {
                 .flatten()
                 .filter_map(|k| k.as_str())
                 .collect();
-            println!(
+            outln!(
                 "        consumers read, handler never returns: {}",
                 missing.join(", ")
             );
         }
     }
-    println!(
+    outln!(
         "{} of {} route(s) mismatch",
         checked["mismatch_count"].as_u64().unwrap_or(0),
         checks.len()
@@ -2114,25 +2139,25 @@ fn report_shape_check(checked: &serde_json::Value) {
 
 fn report_api_impact(impact: &serde_json::Value) {
     if impact["found"] != serde_json::json!(true) {
-        println!(
+        outln!(
             "No route matched {:?}.",
             impact["route"].as_str().unwrap_or("")
         );
         report_scan(impact);
         return;
     }
-    println!(
+    outln!(
         "{} {}",
         impact["verb"].as_str().unwrap_or("ANY"),
         impact["route"].as_str().unwrap_or("")
     );
-    println!(
+    outln!(
         "  risk: {} — {}",
         impact["risk"].as_str().unwrap_or("unknown"),
         impact["risk_reason"].as_str().unwrap_or("")
     );
     for consumer in impact["consumers"].as_array().into_iter().flatten() {
-        println!(
+        outln!(
             "  called from {}:{}",
             consumer["path"].as_str().unwrap_or(""),
             consumer["line"].as_u64().unwrap_or(0)
@@ -2145,7 +2170,7 @@ fn report_api_impact(impact: &serde_json::Value) {
             .flatten()
             .filter_map(|k| k.as_str())
             .collect();
-        println!("  shape: consumers read {}", missing.join(", "));
+        outln!("  shape: consumers read {}", missing.join(", "));
     }
     report_scan(impact);
 }
@@ -2157,7 +2182,7 @@ fn report_scan(payload: &serde_json::Value) {
     if scan["complete"].as_bool().unwrap_or(true) {
         return;
     }
-    println!(
+    outln!(
         "  scan incomplete: read {} of {} file(s); {} skipped for budget, \
 {} over size, {} unreadable. Counts above are lower bounds.",
         scan["files_read"].as_u64().unwrap_or(0),
@@ -2259,15 +2284,15 @@ fn ensure_parent(path: &std::path::Path) -> anyhow::Result<()> {
 
 fn emit_json(cli: &Cli, payload: &serde_json::Value) -> anyhow::Result<()> {
     if cli.json {
-        println!("{}", serde_json::to_string(payload)?);
+        outln!("{}", serde_json::to_string(payload)?);
     } else {
-        println!("{}", serde_json::to_string_pretty(payload)?);
+        outln!("{}", serde_json::to_string_pretty(payload)?);
     }
     Ok(())
 }
 
 fn emit_unavailable(reason: &str) {
-    println!("unavailable: {reason}");
+    outln!("unavailable: {reason}");
 }
 
 /// The line a truncated result must carry, if any.
@@ -2284,7 +2309,7 @@ fn truncation_line(shown: u32, hidden: u32, total: u32, truncated: bool) -> Opti
 
 fn emit_truncation(shown: u32, hidden: u32, total: u32, truncated: bool) {
     if let Some(line) = truncation_line(shown, hidden, total, truncated) {
-        println!("{line}");
+        outln!("{line}");
     }
 }
 
@@ -2294,9 +2319,13 @@ fn emit_search(resp: &devmap_query::Response<devmap_query::SymbolHit>) {
         return;
     }
     for hit in &resp.items {
-        println!(
+        outln!(
             "{}:{}-{}  {}  {}",
-            hit.file_path, hit.span.0, hit.span.1, hit.kind, hit.symbol_name
+            hit.file_path,
+            hit.span.0,
+            hit.span.1,
+            hit.kind,
+            hit.symbol_name
         );
     }
     emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
@@ -2308,7 +2337,7 @@ fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedEdge>) {
         return;
     }
     for edge in &resp.items {
-        println!(
+        outln!(
             "{}::{}  --{:?}-->  {}::{}",
             edge.source_file,
             edge.source_symbol,
@@ -2326,7 +2355,7 @@ fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedEdge>) {
     // exactly as it did before the flag existed.
     if let Some(rungs) = &resp.rungs {
         if rungs.filtered_out > 0 {
-            println!(
+            outln!(
                 "note: --min-rung hid {} of {} edges (deterministic {}, high {}, speculative {})",
                 rungs.filtered_out,
                 rungs.total(),
@@ -2340,13 +2369,13 @@ fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedEdge>) {
     // one says the walk that produced `items` stopped before the graph ran out,
     // so `total` is the size of a partial answer.
     if let Some(reason) = &resp.walk_incomplete {
-        println!("warning: {reason}");
+        outln!("warning: {reason}");
     }
 }
 
 fn emit_blast_radius(radius: &devmap_query::BlastRadius) {
     if !radius.unmatched_targets.is_empty() {
-        println!(
+        outln!(
             "warning: no indexed traversal start for: {}",
             radius.unmatched_targets.join(", ")
         );
@@ -2355,13 +2384,13 @@ fn emit_blast_radius(radius: &devmap_query::BlastRadius) {
         emit_unavailable(reason);
         return;
     }
-    println!("blast radius: {} impacted", radius.total_impacted);
+    outln!("blast radius: {} impacted", radius.total_impacted);
     for layer in &radius.layers.items {
         let confidence = layer
             .lowest_confidence
             .map(|value| format!("{value:.2}"))
             .unwrap_or_else(|| "-".to_string());
-        println!(
+        outln!(
             "  depth {}: {} nodes (lowest confidence {confidence}){}",
             layer.depth,
             layer.node_count,
@@ -2372,7 +2401,7 @@ fn emit_blast_radius(radius: &devmap_query::BlastRadius) {
             }
         );
         for node in &layer.nodes {
-            println!("    {node}");
+            outln!("    {node}");
         }
     }
     emit_truncation(
@@ -2382,7 +2411,7 @@ fn emit_blast_radius(radius: &devmap_query::BlastRadius) {
         radius.layers.truncated,
     );
     if let Some(reason) = &radius.layers.walk_incomplete {
-        println!("warning: {reason}");
+        outln!("warning: {reason}");
     }
 }
 
@@ -2392,7 +2421,7 @@ fn emit_explore(report: &devmap_query::ExploreReport) {
         return;
     }
     for definition in &report.definitions.items {
-        println!(
+        outln!(
             "{}:{}-{}  {}  {}",
             definition.file_path,
             definition.span.0,
@@ -2403,17 +2432,17 @@ fn emit_explore(report: &devmap_query::ExploreReport) {
         // Class A: an unreadable file is reported as unread, never as a symbol
         // whose body happens to be empty.
         match &definition.source_unavailable_reason {
-            Some(reason) => println!("  source unavailable: {reason}"),
+            Some(reason) => outln!("  source unavailable: {reason}"),
             None => {
                 for line in definition.source.lines() {
-                    println!("  {line}");
+                    outln!("  {line}");
                 }
                 if let Some(omitted) = definition.source_omitted_bytes {
-                    println!("  ... {omitted} bytes omitted to fit the budget");
+                    outln!("  ... {omitted} bytes omitted to fit the budget");
                 }
             }
         }
-        println!(
+        outln!(
             "  callers: {} of {}{}   callees: {} of {}{}",
             definition.callers.shown,
             definition.callers.total,
@@ -2437,7 +2466,7 @@ fn emit_explore(report: &devmap_query::ExploreReport) {
         report.definitions.total,
         report.definitions.truncated,
     );
-    println!(
+    outln!(
         "budget: {} total = {} definitions + {} per edge direction + {} blast radius",
         report.budget.total,
         report.budget.definitions,
@@ -2453,9 +2482,11 @@ fn emit_affected(report: &devmap_query::AffectedTestsReport) {
         return;
     }
     for test in &report.tests.items {
-        println!(
+        outln!(
             "{}  depth {}  {} reached symbol(s)",
-            test.path, test.depth, test.reached_symbols
+            test.path,
+            test.depth,
+            test.reached_symbols
         );
     }
     emit_truncation(
@@ -2465,7 +2496,7 @@ fn emit_affected(report: &devmap_query::AffectedTestsReport) {
         report.tests.truncated,
     );
     if let Some(reason) = &report.tests.walk_incomplete {
-        println!("warning: {reason}");
+        outln!("warning: {reason}");
     }
     emit_blast_radius(&report.blast_radius);
 }
@@ -2476,9 +2507,11 @@ fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
         return;
     }
     for row in &resp.items {
-        println!(
+        outln!(
             "{:.2}  {}::{}",
-            row.confidence, row.file_path, row.symbol_name
+            row.confidence,
+            row.file_path,
+            row.symbol_name
         );
     }
     emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
@@ -2498,7 +2531,7 @@ fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
 /// reader deciding whether to rebuild needs to know which they are looking at.
 fn emit_dead_clusters(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
     for line in dead_cluster_lines(resp) {
-        println!("{line}");
+        outln!("{line}");
     }
 }
 
@@ -2574,8 +2607,8 @@ const DEAD_CLUSTER_SAMPLE: usize = 4;
 
 fn emit_savings(report: &devmap_query::SavingsReport) {
     let tokens = |bytes: u64| bytes / u64::from(devmap_query::BYTES_PER_TOKEN);
-    println!("basis: {}", report.basis);
-    println!(
+    outln!("basis: {}", report.basis);
+    outln!(
         "corpus:   {} files, {} bytes  (~{} tokens to read in full)",
         report.indexed_files,
         report.corpus_bytes,
@@ -2584,38 +2617,40 @@ fn emit_savings(report: &devmap_query::SavingsReport) {
     if report.corpus_files_unreadable > 0 {
         // Named, not folded into the total as zero: an unread file makes the
         // corpus look smaller, which makes the map look better.
-        println!(
+        outln!(
             "          {} indexed file(s) could not be read and are excluded from that total",
             report.corpus_files_unreadable
         );
     }
     match report.repo_map_bytes {
-        Some(bytes) => println!("repo_map: {} bytes  (~{} tokens)", bytes, tokens(bytes)),
-        None => println!("repo_map: not written yet"),
+        Some(bytes) => outln!("repo_map: {} bytes  (~{} tokens)", bytes, tokens(bytes)),
+        None => outln!("repo_map: not written yet"),
     }
     let Some(query) = &report.query else {
-        println!("(pass --query to account for one search)");
+        outln!("(pass --query to account for one search)");
         return;
     };
-    println!(
+    outln!(
         "query {:?}: {} hit(s) across {} file(s)",
-        query.query, query.hits, query.files_named
+        query.query,
+        query.hits,
+        query.files_named
     );
-    println!("  map answer cost:        {} tokens", query.answer_tokens);
-    println!(
+    outln!("  map answer cost:        {} tokens", query.answer_tokens);
+    outln!(
         "  reading those files:    ~{} tokens ({} bytes)",
         tokens(query.files_bytes),
         query.files_bytes
     );
     if query.files_unreadable > 0 {
-        println!(
+        outln!(
             "  {} named file(s) could not be read and are excluded",
             query.files_unreadable
         );
     }
     let alternative = tokens(query.files_bytes);
     if alternative > u64::from(query.answer_tokens) {
-        println!(
+        outln!(
             "  floor on the saving:    ~{} tokens, and only for a reader who already \
              knew which files to open",
             alternative - u64::from(query.answer_tokens)
@@ -2624,20 +2659,20 @@ fn emit_savings(report: &devmap_query::SavingsReport) {
         // Said plainly rather than suppressed. On a tiny corpus, or a query
         // whose hits live in small files, the map is not cheaper — and a
         // savings report that can only ever report a saving is advertising.
-        println!("  no saving on this query: the files are smaller than the answer");
+        outln!("  no saving on this query: the files are smaller than the answer");
     }
 }
 
 fn emit_preview(report: &devmap_query::PreviewReport) {
-    println!("{}  parse={}", report.file_path, report.parse_status);
+    outln!("{}  parse={}", report.file_path, report.parse_status);
     if report.compared_against == "nothing" {
-        println!("note: no file at this path; every symbol reads as added");
+        outln!("note: no file at this path; every symbol reads as added");
     }
     if !report.file_is_indexed {
-        println!("note: this file is not in the index; no caller graph is available for it");
+        outln!("note: this file is not in the index; no caller graph is available for it");
     }
     if let Some(reason) = &report.degraded_reason {
-        println!("note: {reason}");
+        outln!("note: {reason}");
     }
     if !report.delta_available {
         // The reason above already says why. Printing an empty symbol list
@@ -2652,13 +2687,13 @@ fn emit_preview(report: &devmap_query::PreviewReport) {
             devmap_query::PreviewChange::BodyChanged => "body",
             devmap_query::PreviewChange::Changed => "changed",
         };
-        println!("{change:<11} {} ({})", symbol.qualified_name, symbol.kind);
+        outln!("{change:<11} {} ({})", symbol.qualified_name, symbol.kind);
     }
     if report.symbols.is_empty() {
-        println!("no symbol-level change");
+        outln!("no symbol-level change");
     }
     if report.bodies_not_compared > 0 {
-        println!(
+        outln!(
             "{} symbol(s) declared identically but not body-compared \
              (below the signature size floor, or no grammar)",
             report.bodies_not_compared
@@ -2667,16 +2702,18 @@ fn emit_preview(report: &devmap_query::PreviewReport) {
     for caller in &report.broken_callers.items {
         // `caller_symbol` and `target_symbol` are already `path::Name`, so the
         // file is not printed again beside them.
-        println!(
+        outln!(
             "  affects  {}  ->  {}  ({:.2})",
-            caller.caller_symbol, caller.target_symbol, caller.confidence
+            caller.caller_symbol,
+            caller.target_symbol,
+            caller.confidence
         );
     }
     if report.broken_callers.total == 0 {
-        println!("no calls from other files are affected");
+        outln!("no calls from other files are affected");
     }
     if report.ambiguous_callers > 0 {
-        println!(
+        outln!(
             "{} further call edge(s) fell below the confidence floor and are not \
              listed (usually a bare method name matching many definitions); \
              pass --min-confidence 0 to see them",
@@ -2701,27 +2738,30 @@ fn emit_clones(report: &devmap_query::CloneReport) {
             devmap_analyze::CloneKind::Exact => "exact",
             devmap_analyze::CloneKind::Structural => "structural",
         };
-        println!(
+        outln!(
             "{kind}  {} members  {} nodes  #{:016x}",
             group.members.len(),
             group.min_nodes,
             group.signature
         );
         for member in &group.members {
-            println!(
+            outln!(
                 "    {}:{}  {}",
-                member.file_path, member.span_start, member.symbol_name
+                member.file_path,
+                member.span_start,
+                member.symbol_name
             );
         }
         if group.members_omitted > 0 {
-            println!("    ... {} more members not listed", group.members_omitted);
+            outln!("    ... {} more members not listed", group.members_omitted);
         }
     }
     // Always printed, including when nothing was found: "no duplicates" and
     // "nothing was examined" are different answers and must not print the same.
-    println!(
+    outln!(
         "coverage: {} symbols signed, {} unsigned",
-        report.signed_symbols, report.unsigned_symbols
+        report.signed_symbols,
+        report.unsigned_symbols
     );
     emit_truncation(
         report.groups.shown,
@@ -3229,7 +3269,7 @@ async fn main() -> std::process::ExitCode {
                 ));
                 progress.display.finish("");
                 if cli.json {
-                    println!(
+                    outln!(
                         "{}",
                         serde_json::json!({ "error": render_error(&error), "diagnostic_context": context,
                         "timings": progress.timings_json(), "progress_output": progress.display.output_json() })
@@ -3239,7 +3279,7 @@ async fn main() -> std::process::ExitCode {
                 eprintln!("Error: {}", render_error(&error));
                 eprintln!("DevMap context: {context}");
                 if cli.json {
-                    println!(
+                    outln!(
                         "{}",
                         serde_json::json!({ "error": render_error(&error), "diagnostic_context": context })
                     );
@@ -3563,7 +3603,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                             }),
                         )?;
                     } else {
-                        println!(
+                        outln!(
                             "No source changes; generation #{generation} still current \
                              ({}) in {}.",
                             progress::count(file_count, "file"),
@@ -3576,7 +3616,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                             }
                         }
                         if cli.verbose && !progress.display.enabled() {
-                            println!("  Reclaim: {}", reclaim_note(&vacuum));
+                            outln!("  Reclaim: {}", reclaim_note(&vacuum));
                         }
                     }
                     return Ok(());
@@ -3913,14 +3953,14 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     }),
                 )?;
             } else {
-                println!(
+                outln!(
                     "Built generation #{gen_id} · {} · {} · {} · {}",
                     progress::count(analysis.total_files, "file"),
                     progress::count(analysis.total_symbols, "symbol"),
                     progress::count(analysis.total_edges, "edge"),
                     progress::duration(progress.started_at.elapsed().as_secs_f64())
                 );
-                println!(
+                outln!(
                     "  Changes: +{} ~{} -{} · {} unchanged · {} cached",
                     file_delta.added,
                     file_delta.changed,
@@ -3930,32 +3970,32 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 );
                 progress.display.report_loss();
                 if cli.verbose {
-                    println!("  Files indexed: {}", analysis.total_files);
+                    outln!("  Files indexed: {}", analysis.total_files);
                 }
                 if refused_count > 0 {
                     // Said here as well as on stderr: the count belongs beside
                     // the file total it is part of, or a reader takes the total
                     // for a count of files that were read.
-                    println!(
+                    outln!(
                         "    of which refused by discovery: {refused_count} \
                          (recorded as lost coverage, not parsed)"
                     );
                 }
                 if !cli.verbose && (unattributed_calls > 0 || uninferred_receiver_calls > 0) {
-                    println!("  Unresolved: {unattributed_calls} unattributed, {uninferred_receiver_calls} uninferred receivers (details: --verbose)");
+                    outln!("  Unresolved: {unattributed_calls} unattributed, {uninferred_receiver_calls} uninferred receivers (details: --verbose)");
                 }
                 if cli.verbose {
-                    println!("  Symbols extracted: {}", analysis.total_symbols);
-                    println!("  Edges resolved: {}", analysis.total_edges);
+                    outln!("  Symbols extracted: {}", analysis.total_symbols);
+                    outln!("  Edges resolved: {}", analysis.total_edges);
                     // R5: a call we could not attribute is reported, not dropped.
-                    println!("  Unresolved calls: {}", analysis.unresolved_calls);
+                    outln!("  Unresolved calls: {}", analysis.unresolved_calls);
                     print_resolution_rate(&analysis.resolution_rate);
-                    println!("    language builtins:  {builtin_calls}");
-                    println!("    host globals:       {host_global_calls}");
-                    println!("    local bindings:     {local_binding_calls}");
-                    println!("    external imports:   {external_calls}");
-                    println!("    uninferred receiver:{uninferred_receiver_calls}");
-                    println!("    unattributed:       {unattributed_calls}");
+                    outln!("    language builtins:  {builtin_calls}");
+                    outln!("    host globals:       {host_global_calls}");
+                    outln!("    local bindings:     {local_binding_calls}");
+                    outln!("    external imports:   {external_calls}");
+                    outln!("    uninferred receiver:{uninferred_receiver_calls}");
+                    outln!("    unattributed:       {unattributed_calls}");
                     if let Some(manifest) = &manifest {
                         report_manifest(cli, &manifest.outcome)?;
                     }
@@ -4075,10 +4115,10 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 emit_json(cli, &serde_json::json!({ "neighbors": answers }))?;
             } else {
                 for entry in &answers {
-                    println!("{}", entry.target);
-                    println!("  callers:");
+                    outln!("{}", entry.target);
+                    outln!("  callers:");
                     emit_edges(&entry.callers);
-                    println!("  callees:");
+                    outln!("  callees:");
                     emit_edges(&entry.callees);
                 }
             }
@@ -4218,7 +4258,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                             }),
                         )?;
                     } else {
-                        println!(
+                        outln!(
                             "{} {label} -> {} ({})",
                             if replaced { "replaced" } else { "added" },
                             canonical.display(),
@@ -4242,9 +4282,9 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     if cli.json {
                         emit_json(cli, &serde_json::json!({"removed": removed, "name": name}))?;
                     } else if removed {
-                        println!("removed {name}");
+                        outln!("removed {name}");
                     } else {
-                        println!("{name} is not registered");
+                        outln!("{name} is not registered");
                     }
                 }
                 WorkspaceAction::List => {
@@ -4280,7 +4320,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         return Ok(());
                     }
                     if workspace.repos.is_empty() {
-                        println!("no repositories registered ({})", root.display());
+                        outln!("no repositories registered ({})", root.display());
                     }
                     for repo in &workspace.repos {
                         // The store *file* existing says nothing about whether
@@ -4304,7 +4344,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                                 },
                             },
                         };
-                        println!("{:<16} {:<34} {}", repo.name, state, repo.root.display());
+                        outln!("{:<16} {:<34} {}", repo.name, state, repo.root.display());
                     }
                 }
                 WorkspaceAction::Search {
@@ -4319,7 +4359,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         emit_json(cli, &serde_json::to_value(&result)?)?;
                     } else {
                         for entry in &result.items {
-                            println!(
+                            outln!(
                                 "[{}] {}:{}  {}",
                                 entry.repo,
                                 entry.hit.file_path,
@@ -4327,14 +4367,16 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                                 entry.hit.symbol_name
                             );
                         }
-                        println!(
+                        outln!(
                             "{} repo(s) queried, {} shown of {}",
-                            result.repos_queried, result.shown, result.total
+                            result.repos_queried,
+                            result.shown,
+                            result.total
                         );
                         // Never silent. A workspace answer assembled from a
                         // subset is not a workspace answer.
                         for missing in &result.unavailable {
-                            println!("  unavailable: {} — {}", missing.repo, missing.reason);
+                            outln!("  unavailable: {} — {}", missing.repo, missing.reason);
                         }
                     }
                 }
@@ -4360,7 +4402,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         )?;
                     } else {
                         for link in &links {
-                            println!(
+                            outln!(
                                 "{} {} -> {}  ({}; {})",
                                 link.from_repo,
                                 link.module_specifier,
@@ -4369,7 +4411,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                                 link.evidence
                             );
                         }
-                        println!("{} candidate link(s)", links.len());
+                        outln!("{} candidate link(s)", links.len());
                     }
                 }
             }
@@ -4493,7 +4535,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 *force || !stamped || devmap_query::should_regenerate(&out_path, &fingerprint);
             if !regenerate {
                 if cli.json {
-                    println!(
+                    outln!(
                         "{}",
                         serde_json::json!({
                             "output": out_path.display().to_string(),
@@ -4503,7 +4545,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         })
                     );
                 } else {
-                    println!("{} is current", out_path.display());
+                    outln!("{} is current", out_path.display());
                 }
                 return Ok(());
             }
@@ -4511,7 +4553,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             let html = devmap_query::render_map_preview_html(&repo_map, &fingerprint);
             devmap_query::write_atomic(&out_path, html.as_bytes())?;
             if cli.json {
-                println!(
+                outln!(
                     "{}",
                     serde_json::json!({
                         "output": out_path.display().to_string(),
@@ -4521,7 +4563,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     })
                 );
             } else {
-                println!("Wrote {} ({} bytes)", out_path.display(), html.len());
+                outln!("Wrote {} ({} bytes)", out_path.display(), html.len());
             }
         }
         Commands::Freshness {
@@ -4691,7 +4733,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     "workspace",
                     "plugin_dir",
                 ] {
-                    println!("{key:<12} {}", payload[key].as_str().unwrap_or(""));
+                    outln!("{key:<12} {}", payload[key].as_str().unwrap_or(""));
                 }
             }
         }
@@ -4872,11 +4914,18 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     &serde_json::json!({ "shown": rows.len(), "history": entries }),
                 )?;
             } else if rows.is_empty() {
-                println!("No build history yet — run `devmap build` first.");
+                outln!("No build history yet — run `devmap build` first.");
             } else {
-                println!(
+                outln!(
                     "{:>5}  {:<12} {:>7} {:>8} {:>8} {:>6} {:>9} {:>8}",
-                    "gen", "head", "files", "symbols", "edges", "dead", "build_ms", "db_MiB"
+                    "gen",
+                    "head",
+                    "files",
+                    "symbols",
+                    "edges",
+                    "dead",
+                    "build_ms",
+                    "db_MiB"
                 );
                 for (index, row) in rows.iter().enumerate() {
                     let head: String = row.head_sha.chars().take(12).collect();
@@ -4891,7 +4940,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                             )
                         })
                         .unwrap_or_default();
-                    println!(
+                    outln!(
                         "{:>5}  {:<12} {:>7} {:>8} {:>8} {:>6} {:>9} {:>8.2}{}",
                         row.generation_id,
                         head,
@@ -4930,18 +4979,19 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         }),
                     )?;
                 } else if outcome.converted {
-                    println!(
+                    outln!(
                         "Store rewritten at {} byte pages (was {}).",
-                        outcome.after, outcome.before
+                        outcome.after,
+                        outcome.before
                     );
                 } else {
-                    println!("Store already uses {} byte pages.", outcome.after);
+                    outln!("Store already uses {} byte pages.", outcome.after);
                 }
             }
             if *fts {
                 store.repair_fts()?;
                 if !cli.json {
-                    println!("FTS search index repaired.");
+                    outln!("FTS search index repaired.");
                 }
             }
             if *pending {
@@ -4983,24 +5033,24 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     )?;
                 } else {
                     if root.is_none() {
-                        println!(
+                        outln!(
                             "No generation yet, so no repository root to check paths against; \
                              dropping quarantined rows only."
                         );
                     }
                     for (dropped, reason) in &structural.dropped {
-                        println!("dropped {dropped}: {reason}");
+                        outln!("dropped {dropped}: {reason}");
                     }
                     for (from, to) in &structural.rewritten {
-                        println!("normalized {from} -> {to}");
+                        outln!("normalized {from} -> {to}");
                     }
                     for dropped in &quarantined {
-                        println!(
+                        outln!(
                             "dropped {dropped}: exceeded {} retry attempts",
                             devmap_store::MAX_PENDING_ATTEMPTS
                         );
                     }
-                    println!(
+                    outln!(
                         "Pending queue repaired: {} unprocessable, {} quarantined, \
                          {} normalized.",
                         structural.dropped.len(),
@@ -5088,7 +5138,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 if cli.json {
                     emit_json(cli, &serde_json::json!({"socket": ipc_path}))?;
                 } else {
-                    println!("{}", ipc_path.display());
+                    outln!("{}", ipc_path.display());
                 }
                 return Ok(());
             }
@@ -5203,7 +5253,7 @@ empty graph, which would read as 'this file has no control flow'.",
                 )?;
             } else {
                 for row in &rows {
-                    println!(
+                    outln!(
                         "{}  lines {}-{}  {} node(s), {} edge(s)",
                         row["function"].as_str().unwrap_or(""),
                         row["start_line"],
@@ -5212,12 +5262,12 @@ empty graph, which would read as 'this file has no control flow'.",
                         row["edges"]
                     );
                     for sink in row["taint_sinks"].as_array().into_iter().flatten() {
-                        println!("    sink {}", sink.as_str().unwrap_or(""));
+                        outln!("    sink {}", sink.as_str().unwrap_or(""));
                     }
                 }
-                println!("  {} of {} function(s)", rows.len(), graphs.len());
+                outln!("  {} of {} function(s)", rows.len(), graphs.len());
                 for entry in &refused {
-                    println!(
+                    outln!(
                         "  refused {}: {}",
                         entry["function"].as_str().unwrap_or(""),
                         entry["reason"].as_str().unwrap_or("")
@@ -5234,17 +5284,17 @@ empty graph, which would read as 'this file has no control flow'.",
             } else if result["ok"].as_bool() == Some(true) {
                 for row in result["rows"].as_array().into_iter().flatten() {
                     match row.get("rel").and_then(serde_json::Value::as_str) {
-                        Some(rel) => println!(
+                        Some(rel) => outln!(
                             "{}  -[{rel}]->  {}",
                             row["a_id"].as_str().unwrap_or(""),
                             row["b_id"].as_str().unwrap_or("")
                         ),
-                        None => println!("{}", row["a_id"].as_str().unwrap_or("")),
+                        None => outln!("{}", row["a_id"].as_str().unwrap_or("")),
                     }
                 }
                 // Both numbers, always: a page reported as a count reads as a
                 // total, and this surface exists to answer "how many".
-                println!(
+                outln!(
                     "  {} of {} row(s){}",
                     result["shown"].as_u64().unwrap_or(0),
                     result["total"].as_u64().unwrap_or(0),
@@ -5278,13 +5328,13 @@ empty graph, which would read as 'this file has no control flow'.",
                 if cli.json {
                     emit_json(cli, &facets)?;
                 } else {
-                    println!("kinds:");
+                    outln!("kinds:");
                     for (name, count) in facets["kinds"].as_object().into_iter().flatten() {
-                        println!("  {name:<16} {count}");
+                        outln!("  {name:<16} {count}");
                     }
-                    println!("languages:");
+                    outln!("languages:");
                     for (name, count) in facets["languages"].as_object().into_iter().flatten() {
-                        println!("  {name:<16} {count}");
+                        outln!("  {name:<16} {count}");
                     }
                 }
                 return Ok(());
@@ -5314,7 +5364,7 @@ empty graph, which would read as 'this file has no control flow'.",
                 .filter(|_| !to_stdout)
                 .unwrap_or_else(|| devmap_extract::paths::state_dir(path).join("graph.graphml"));
             if to_stdout {
-                print!("{xml}");
+                write_stdout(format_args!("{xml}"));
             } else {
                 ensure_parent(&destination)?;
                 std::fs::write(&destination, &xml)?;
@@ -5339,17 +5389,17 @@ empty graph, which would read as 'this file has no control flow'.",
                     }),
                 )?;
             } else if !to_stdout {
-                println!("Wrote {}", destination.display());
-                println!("  {} nodes, {} edges", report.nodes, report.edges);
+                outln!("Wrote {}", destination.display());
+                outln!("  {} nodes, {} edges", report.nodes, report.edges);
                 if report.edges_dangling > 0 {
-                    println!(
+                    outln!(
                         "  {} edge(s) omitted: an endpoint is not a declared node \
 (GraphML cannot express one)",
                         report.edges_dangling
                     );
                 }
                 if report.characters_replaced > 0 {
-                    println!(
+                    outln!(
                         "  {} character(s) replaced with U+FFFD: XML 1.0 cannot \
 represent them",
                         report.characters_replaced
@@ -5459,16 +5509,16 @@ represent them",
                     }),
                 )?;
             } else {
-                println!("Wrote {}", destination.display());
+                outln!("Wrote {}", destination.display());
                 let shown = counts["nodes_shown"].as_u64().unwrap_or(0);
                 let total = counts["nodes_total"].as_u64().unwrap_or(0);
                 if counts["nodes_truncated"].as_bool().unwrap_or(false) {
-                    println!(
+                    outln!(
                         "  {shown} of {total} nodes drawn (most connected first); \
 raise --max-nodes to widen"
                     );
                 } else {
-                    println!("  {total} nodes drawn");
+                    outln!("  {total} nodes drawn");
                 }
             }
         }
@@ -5526,15 +5576,17 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
             } else {
                 for (event, hook, reason) in &coverage {
                     match hook {
-                        Some(hook) => println!(
+                        Some(hook) => outln!(
                             "{event:<20} handled   devmap {} (matcher {:?})\n{:22}{reason}",
-                            hook.subcommand, hook.matcher, ""
+                            hook.subcommand,
+                            hook.matcher,
+                            ""
                         ),
-                        None => println!("{event:<20} -\n{:22}{reason}", ""),
+                        None => outln!("{event:<20} -\n{:22}{reason}", ""),
                     }
                 }
                 let handled = coverage.iter().filter(|(_, h, _)| h.is_some()).count();
-                println!("\n{handled} of {} events handled", coverage.len());
+                outln!("\n{handled} of {} events handled", coverage.len());
                 Ok(())
             }
         }
@@ -5592,13 +5644,13 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
                 )
             } else {
                 for file in &written {
-                    println!(
+                    outln!(
                         "{} {}",
                         if file.changed { "wrote  " } else { "current" },
                         file.path.display()
                     );
                 }
-                println!(
+                outln!(
                     "\n{changed} of {} file(s) changed. Install with:\n  \
                      claude plugin marketplace add {}\n  claude plugin install {}@{}",
                     written.len(),
@@ -5615,9 +5667,9 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
                 emit_json(cli, &report.to_json())?;
             } else {
                 for diagnostic in &report.diagnostics {
-                    println!("{diagnostic}");
+                    outln!("{diagnostic}");
                 }
-                println!(
+                outln!(
                     "{}: {} error(s), {} warning(s){}",
                     if report.ok() { "ok" } else { "FAILED" },
                     report.errors().count(),
@@ -5651,10 +5703,10 @@ fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
     let Some(net) = rate.net_permille else {
         // No site was attempted. Saying "0.0%" here would report a failure that
         // never happened; the `Option` exists precisely to keep the two apart.
-        println!("  Resolution rate: not measured (no attribution sites)");
+        outln!("  Resolution rate: not measured (no attribution sites)");
         return;
     };
-    println!(
+    outln!(
         "  Resolution rate: {}.{}% net, {}.{}% gross ({} resolved / {} unresolved, {} explained)",
         net / 10,
         net % 10,
@@ -5672,7 +5724,7 @@ fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
     rows.sort_by_key(|(language, row)| (row.net_permille.unwrap_or(u32::MAX), (*language).clone()));
     for (language, row) in rows.iter().take(RESOLUTION_RATE_LANGUAGES_SHOWN) {
         match row.net_permille {
-            Some(net) => println!(
+            Some(net) => outln!(
                 "    {language:<12} {}.{}%  ({} resolved / {} unresolved)",
                 net / 10,
                 net % 10,
@@ -5680,9 +5732,9 @@ fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
                 row.unresolved_sites
             ),
             None if !row.extracts_calls => {
-                println!("    {language:<12} no call extractor in this build (0 attribution sites)")
+                outln!("    {language:<12} no call extractor in this build (0 attribution sites)")
             }
-            None => println!("    {language:<12} not measured (no attribution sites)"),
+            None => outln!("    {language:<12} not measured (no attribution sites)"),
         }
         // Printed beside a *measured* row too, and that is the point: a language
         // can attribute calls perfectly and still have no heritage extractor, so
@@ -5696,7 +5748,7 @@ fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
             .filter(|name| *name != "calls")
             .collect();
         if !blind.is_empty() {
-            println!(
+            outln!(
                 "    {:<12} …and this build extracts no {} for it, so an empty \
                  answer there is a hole and not a finding",
                 "",
@@ -5705,7 +5757,7 @@ fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
         }
     }
     if rows.len() > RESOLUTION_RATE_LANGUAGES_SHOWN {
-        println!(
+        outln!(
             "    … {} more language(s); the full breakdown is in `--json`",
             rows.len() - RESOLUTION_RATE_LANGUAGES_SHOWN
         );

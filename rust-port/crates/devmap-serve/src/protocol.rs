@@ -1297,6 +1297,14 @@ pub(crate) fn ipc_lock_path(path: &std::path::Path) -> std::path::PathBuf {
 /// endpoint.
 #[cfg(unix)]
 fn lock_ipc_endpoint(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    lock_ipc_endpoint_with(path, || {})
+}
+
+#[cfg(unix)]
+fn lock_ipc_endpoint_with(
+    path: &std::path::Path,
+    mut on_contention: impl FnMut(),
+) -> anyhow::Result<std::fs::File> {
     use std::io::Write;
 
     let lock_path = ipc_lock_path(path);
@@ -1335,6 +1343,7 @@ fn lock_ipc_endpoint(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
                 return Ok(file);
             }
             Err(std::fs::TryLockError::WouldBlock) => {
+                on_contention();
                 if std::time::Instant::now() >= deadline {
                     anyhow::bail!(
                         "devmap IPC endpoint {path:?} is owned by another live daemon \
@@ -2932,9 +2941,9 @@ mod hardening_limit_tests {
     /// routinely far shorter than that conclusion: measured on this workspace,
     /// a losing bind acquired the lock 5-20 ms later in every observed case,
     /// while the daemon it belonged to had already refused to start. This test
-    /// reproduces that window deterministically — the holder releases well
-    /// inside `LOCK_CONTENTION_WINDOW` — and fails against the pre-retry code,
-    /// which refuses immediately.
+    /// releases the holder after an observed failed acquisition. Sleeping in
+    /// another thread did not guarantee release before the wall-clock deadline
+    /// on loaded native runners. The real kernel lock is still exercised.
     #[cfg(unix)]
     #[test]
     fn a_briefly_held_endpoint_lock_is_waited_out_not_refused() {
@@ -2955,24 +2964,20 @@ mod hardening_limit_tests {
             .unwrap();
         holder.lock().expect("the test holds the lock first");
 
-        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = std::sync::Arc::clone(&released);
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            drop(holder);
+        let mut holder = Some(holder);
+        let mut contentions = 0;
+        let acquired = lock_ipc_endpoint_with(&path, || {
+            contentions += 1;
+            drop(holder.take());
         });
-
-        let acquired = lock_ipc_endpoint(&path);
-        releaser.join().unwrap();
 
         assert!(
             acquired.is_ok(),
-            "a lock released after 20ms must be waited out, got {:?}",
+            "a lock released after contention must be retried, got {:?}",
             acquired.err()
         );
         assert!(
-            released.load(std::sync::atomic::Ordering::SeqCst),
+            contentions == 1,
             "the bind must have waited for the holder rather than racing it"
         );
 

@@ -105,7 +105,7 @@ fn one_manifest_invocation_publishes_both_consumer_artifacts() {
     assert!(
         payload["graph_output"]
             .as_str()
-            .is_some_and(|p| p.ends_with(".devmap/graph/code_graph.json")),
+            .is_some_and(|p| Path::new(p).ends_with(".devmap/graph/code_graph.json")),
         "the JSON result must name the graph it wrote: {payload}"
     );
 
