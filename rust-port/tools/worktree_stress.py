@@ -318,11 +318,13 @@ def main():
         exclude.write_text("excluded.py\n")
         parallel(lambda i: wait_metadata(i, present=False), range(len(roots)))
         def move_head(root):
-            run(["git", "-c", "user.name=DevMap test", "-c", "user.email=devmap-test@invalid", "-c", f"core.hooksPath={hooks}", "commit", "--allow-empty", "-qm", "metadata-only edit"], root)
+            run(["git", "-c", "user.name=DevMap test", "-c", "user.email=devmap-test@invalid", "-c", f"core.hooksPath={hooks}", "commit", "--allow-empty", "-qm", f"metadata-only edit for {root.name}"], root)
             return run(["git", "rev-parse", "HEAD"], root).decode().strip()
         heads = parallel(move_head, roots)
+        assert len(set(heads)) == len(roots), "private HEAD edits must be distinct in every worktree"
         parallel(lambda i: wait_metadata(i, head=heads[i]), range(len(roots)))
         report["metadata_checks"] = 4 * len(roots)
+        report["distinct_private_heads"] = len(set(heads))
         print("shared exclude changes and private HEAD-only commits converged", flush=True)
 
 
