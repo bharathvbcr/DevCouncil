@@ -1,7 +1,7 @@
 # DevCouncil analysis components
 
-Four Rust crates that answer *may this change proceed*. Three build to
-standalone binaries; the fourth is a library linked into one of them.
+Five Rust crates that answer *may this change proceed*. Three build to
+standalone component binaries; the others are libraries linked into them.
 
 DevCouncil owns these as **components**. A harness — [MANVI](https://github.com/bharathvbcr/Manvi)
 is the one they were built for — resolves each as a binary from `PATH` and
@@ -19,6 +19,7 @@ it in here would make every `dc-verify` test compile them.
 | `dc-verify` | `dcverify` | What a diff changed, whether it stayed in scope, whether it is honest, whether tests reached it |
 | `dc-grep` | `dcgrep` | What is in this repository, honouring its ignore rules |
 | `dc-glob` | *(library)* | Whether a path matches a pattern, with CPython `fnmatch` semantics |
+| `dc-evidence` | *(library, via `dcverify evidence-check`)* | Whether an independently admitted acceptance contract is satisfied by a bound execution-evidence bundle |
 
 ---
 
@@ -46,11 +47,17 @@ Command surfaces, as the binaries themselves report them:
 
 ```
 dcstore    acquire, diagnose, release, renew, active, list, task, ready, scope-append, health
-dcverify   check, health
+dcverify   check, evidence-check, health
 dcgrep     search, files, index, health
 ```
 
 `dcstore` additionally requires `--db`.
+
+The [acceptance evidence protocol](dc-evidence/PROTOCOL.md) extends `dcverify`
+without changing the existing diff contract. It validates exact input/artifact
+hashes, run/session bindings, ordered post-action observations and typed criteria.
+`ok` means evaluation ran; `verdict` distinguishes passed, failed and incomplete.
+Manvi owns execution and observation provenance; DevMap remains code intelligence.
 
 ### Indexed repository search
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["dc-glob", "dc-grep", "dc-store", "dc-verify"]
+members = ["dc-glob", "dc-grep", "dc-store", "dc-verify", "dc-evidence"]
 
 [workspace.package]
 version = "0.1.1"

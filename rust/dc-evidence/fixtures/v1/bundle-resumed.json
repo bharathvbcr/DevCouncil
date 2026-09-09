@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "run_id": "run-1",
+  "session_id": "desktop-1",
+  "epoch": 1,
+  "contract_sha256": "bdf5f2cf064b49e340ba043d78511e8e10bdf6ee4276daa0b03fc5fc8922e816",
+  "capability_sha256": "1a4bf7dac3b78318718a5047937473da4898acfb53cbbc9afdbe0c7fa9f3eec2",
+  "journal_complete": true,
+  "degraded": [
+
+  ],
+  "actions": [
+    {
+      "id": "action-1",
+      "sequence": 1,
+      "disposition": "succeeded"
+    }
+  ],
+  "observations": [
+    {
+      "sequence": 2,
+      "run_id": "run-1",
+      "session_id": "desktop-1",
+      "epoch": 1,
+      "after_action_id": "action-1",
+      "facts": {
+        "document.text": "Hello Jarvis"
+      },
+      "artifact_ids": [
+        "note"
+      ]
+    },
+    {
+      "sequence": 5,
+      "run_id": "run-1",
+      "session_id": "desktop-1",
+      "epoch": 3,
+      "after_action_id": "action-1",
+      "facts": {
+        "document.text": "Hello Jarvis"
+      },
+      "artifact_ids": [
+        "note"
+      ]
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "note",
+      "path": "note.txt",
+      "sha256": "6c0bbef0b972b783dc25154dc72d49a0167473dd147678f820d7923d9605b3b9",
+      "size_bytes": 12
+    }
+  ],
+  "epoch_transitions": [
+    {
+      "sequence": 3,
+      "from_epoch": 1,
+      "to_epoch": 2,
+      "reason": "pause"
+    },
+    {
+      "sequence": 4,
+      "from_epoch": 2,
+      "to_epoch": 3,
+      "reason": "resume"
+    }
+  ]
+}

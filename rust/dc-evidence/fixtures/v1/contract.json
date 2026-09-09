@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "save-note",
+  "criteria": [
+    {
+      "id": "note-content",
+      "fact": "document.text",
+      "required": true,
+      "predicate": {
+        "op": "equals",
+        "value": "Hello Jarvis"
+      }
+    }
+  ]
+}
