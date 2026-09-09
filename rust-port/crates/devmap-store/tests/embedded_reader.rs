@@ -237,12 +237,31 @@ fn hardlinked_databases_are_refused_before_diverging_wal_or_lock_files() {
     drop(Store::open(temp.db()).unwrap());
     let alias = temp.0.join("alias.sqlite");
     fs::hard_link(temp.db(), &alias).unwrap();
-    assert!(Store::open(&alias).is_err(), "hardlink writer was accepted");
-    assert!(
-        Store::open_read_only(&alias).is_err(),
-        "hardlink reader could miss another name's WAL"
-    );
-    assert!(Store::lock_writer_at(&alias, std::time::Duration::ZERO).is_err());
+    let before = fs::read(temp.db()).unwrap();
+    for path in [temp.db(), alias.clone()] {
+        let writer = Store::open(&path)
+            .err()
+            .expect("hardlink writer was accepted");
+        assert!(
+            writer.to_string().contains("multiple hard links"),
+            "{writer}"
+        );
+        let reader = Store::open_read_only(&path)
+            .err()
+            .expect("hardlink reader could miss another name's WAL");
+        assert!(
+            reader.to_string().contains("multiple hard links"),
+            "{reader}"
+        );
+        let lock = Store::lock_writer_at(&path, std::time::Duration::ZERO)
+            .expect_err("hardlink acquired independent writer ownership");
+        assert!(lock.to_string().contains("multiple hard links"), "{lock}");
+        assert!(!Store::writer_lock_path(&path).exists());
+    }
+    assert_eq!(fs::read(temp.db()).unwrap(), before);
+    fs::remove_file(alias).unwrap();
+    drop(Store::open_read_only(temp.db()).unwrap());
+    drop(Store::lock_writer_at(&temp.db(), std::time::Duration::ZERO).unwrap());
 }
 
 #[cfg(unix)]

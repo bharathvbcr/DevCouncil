@@ -7,6 +7,7 @@ A deadline, subprocess failure, missing result or truncated response fails the r
 """
 import argparse
 import concurrent.futures as futures
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -126,7 +127,7 @@ def main():
             return result["result"]
 
     def snapshot(db):
-        with sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=10) as conn:
+        with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=10)) as conn:
             assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
             assert not conn.execute("PRAGMA foreign_key_check").fetchall()
             generation = conn.execute("SELECT max(id) FROM generations").fetchone()[0]
@@ -235,7 +236,7 @@ def main():
             while time.monotonic() < deadline:
                 nodes, _, pending = snapshot(dbs[i])
                 found = any(row[1].endswith(f"::excluded_w{i}") for row in nodes)
-                with sqlite3.connect(dbs[i].as_uri() + "?mode=ro", uri=True, timeout=10) as conn:
+                with closing(sqlite3.connect(dbs[i].as_uri() + "?mode=ro", uri=True, timeout=10)) as conn:
                     stored_head = conn.execute("SELECT head_sha FROM generations ORDER BY id DESC LIMIT 1").fetchone()[0]
                 if pending == 0 and (present is None or found == present) and (head is None or stored_head == head):
                     return

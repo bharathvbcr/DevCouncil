@@ -59,6 +59,8 @@ struct ShutdownSignals {
     #[cfg(windows)]
     ctrl_c: tokio::signal::windows::CtrlC,
     #[cfg(windows)]
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+    #[cfg(windows)]
     ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
 }
 
@@ -76,6 +78,7 @@ impl ShutdownSignals {
     fn install() -> anyhow::Result<Self> {
         Ok(Self {
             ctrl_c: tokio::signal::windows::ctrl_c()?,
+            ctrl_break: tokio::signal::windows::ctrl_break()?,
             ctrl_shutdown: tokio::signal::windows::ctrl_shutdown()?,
         })
     }
@@ -93,6 +96,7 @@ impl ShutdownSignals {
     async fn recv(&mut self) -> &'static str {
         tokio::select! {
             _ = self.ctrl_c.recv() => "CTRL_C",
+            _ = self.ctrl_break.recv() => "CTRL_BREAK",
             _ = self.ctrl_shutdown.recv() => "CTRL_SHUTDOWN",
         }
     }
