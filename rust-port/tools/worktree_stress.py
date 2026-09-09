@@ -26,10 +26,16 @@ def main():
     parser.add_argument("--worktrees", type=int, default=128)
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--build-workers", type=int, default=16)
+    parser.add_argument("--fixture-files", type=int, default=0,
+                        help="additional indexed modules per worktree (0..8192)")
+    parser.add_argument("--functions-per-file", type=int, default=8,
+                        help="functions per additional module (2..64)")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not (1 <= args.worktrees <= 256 and 1 <= args.rounds <= 100 and 1 <= args.build_workers <= 32):
         parser.error("worktrees must be 1..256, rounds 1..100, build-workers 1..32")
+    if not (0 <= args.fixture_files <= 8192 and 2 <= args.functions_per_file <= 64):
+        parser.error("fixture-files must be 0..8192, functions-per-file 2..64")
     if os.name != "posix":
         parser.error("this process-death harness requires POSIX signals and Unix sockets")
     binary = str(args.binary.resolve(strict=True))
@@ -46,6 +52,11 @@ def main():
                   simultaneous_editors=2 * args.worktrees, build_workers=args.build_workers,
                   tokio_workers_per_process=2, rayon_workers_per_process=2,
                   binary_sha256=binary_hash,
+                  initial_source_files_per_worktree=1 + args.fixture_files,
+                  initial_symbols_per_worktree=3 + args.fixture_files * (1 + args.functions_per_file),
+                  initial_functions_per_worktree=2 + args.fixture_files * args.functions_per_file,
+                  initial_call_edges_per_worktree=1 + args.fixture_files * (args.functions_per_file - 1),
+                  fixture_functions_per_file=args.functions_per_file,
                   rounds=args.rounds, edit_operations=0, ipc_queries=0, metadata_checks=0,
                   cold_comparisons=0, kills=0, daemon_rss_kib_samples=[], passed=False)
 
@@ -125,6 +136,14 @@ def main():
         run(["git", "init", "-q", str(main_tree)])
         (main_tree / ".gitignore").write_text(".devmap/\n.devcouncil/\nAGENTS.md\n")
         (main_tree / "common.py").write_text("def stable_helper():\n    return 1\ndef stable_caller():\n    return stable_helper()\n")
+        # Unique names prevent accidental cross-file ambiguity from turning a
+        # size test into an uncontrolled quadratic-resolution fixture.
+        for module in range(args.fixture_files):
+            body = []
+            for leaf in range(args.functions_per_file):
+                expression = str(module) if leaf == 0 else f"fixture_{module}_{leaf - 1}()"
+                body.append(f"def fixture_{module}_{leaf}():\n    return {expression}\n")
+            (main_tree / f"fixture_{module}.py").write_text("".join(body))
         run(["git", "add", "."], main_tree)
         run(["git", "-c", "user.name=DevMap test", "-c", "user.email=devmap-test@invalid", "-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture"], main_tree)
         roots = [scratch / f"w{i}" for i in range(args.worktrees)]
@@ -137,6 +156,16 @@ def main():
         print(f"created {len(roots)} real linked worktrees", flush=True)
         parallel(lambda root: run([binary, "build", str(root), "--json"]), roots)
         dbs = [root / ".devmap/codeintel/devmap.sqlite" for root in roots]
+        for db in dbs:
+            nodes, edges, pending = snapshot(db)
+            assert len(nodes) == report["initial_symbols_per_worktree"], f"fixture symbol coverage mismatch: {len(nodes)}, sample={nodes[:6]}"
+            assert sum(row[2] == "File" for row in nodes) == report["initial_source_files_per_worktree"]
+            assert sum(row[2] == "Function" for row in nodes) == report["initial_functions_per_worktree"]
+            assert sum(row[2] == "Calls" for row in edges) == report["initial_call_edges_per_worktree"], "fixture edge coverage mismatch"
+            if "initial_edges_per_worktree" in report:
+                assert len(edges) == report["initial_edges_per_worktree"]
+            report["initial_edges_per_worktree"] = len(edges)
+            assert pending == 0
         endpoints = [scratch / f"s{i}" for i in range(args.worktrees)]
 
         def start_daemon(i):

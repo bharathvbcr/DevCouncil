@@ -398,7 +398,7 @@ mod agentic_queue_regressions {
     fn enqueue_at(store: &Store, path: &str, time: f64) {
         let conn = lock_conn(&store.conn).unwrap();
         let tx = conn.unchecked_transaction().unwrap();
-        Store::upsert_pending(&tx, path, time).unwrap();
+        Store::upsert_pending(&tx, std::iter::once(path), time).unwrap();
         tx.commit().unwrap();
     }
 
@@ -3306,9 +3306,7 @@ impl Store {
         let now = Self::now_secs();
         let conn = lock_conn(&self.conn)?;
         let tx = conn.unchecked_transaction()?;
-        for path in paths {
-            Self::upsert_pending(&tx, path, now)?;
-        }
+        Self::upsert_pending(&tx, paths.iter().map(String::as_str), now)?;
         tx.commit()
     }
 
@@ -3319,35 +3317,49 @@ impl Store {
             .as_secs_f64()
     }
 
-    fn upsert_pending(tx: &rusqlite::Transaction<'_>, path: &str, now: f64) -> Result<()> {
-        let revision = Self::next_pending_revision(tx)?;
-        tx.prepare_cached(
+    fn upsert_pending<'a>(
+        tx: &rusqlite::Transaction<'_>,
+        paths: impl ExactSizeIterator<Item = &'a str>,
+        now: f64,
+    ) -> Result<()> {
+        if paths.len() == 0 {
+            return Ok(());
+        }
+        // Allocate once per batch while holding the same transaction as its
+        // inserts. Every edit still gets a distinct revision, including repeated
+        // paths. A refused insert rolls back the reservation and every row.
+        let mut revision = Self::reserve_pending_revisions(tx, paths.len())?;
+        let mut insert = tx.prepare_cached(
             "INSERT INTO pending_paths (path, queued_at, attempts, revision) VALUES (?1, ?2, 0, ?3)
              ON CONFLICT(path) DO UPDATE SET
                queued_at=excluded.queued_at,
                revision=excluded.revision,
                attempts=0",
-        )?
-        .execute(params![path, now, revision])?;
+        )?;
+        for path in paths {
+            revision += 1; // the reservation proved the entire range fits i64
+            insert.execute(params![path, now, revision])?;
+        }
         Ok(())
     }
 
-    fn next_pending_revision(conn: &Connection) -> Result<i64> {
-        let changed = conn.execute(
-            "UPDATE pending_state SET revision = revision + 1
-             WHERE singleton = 1 AND revision < 9223372036854775807",
-            [],
-        )?;
-        if changed != 1 {
-            return Err(refusal(
-                "pending queue revision exhausted or its state is missing",
-            ));
+    /// Reserve `count` revisions and return the position before the range.
+    /// One cached UPDATE avoids preparing two statements for every path while
+    /// hundreds of sessions contend for SQLite's single writer.
+    fn reserve_pending_revisions(conn: &Connection, count: usize) -> Result<i64> {
+        let count =
+            i64::try_from(count).map_err(|_| refusal("pending revision batch is too large"))?;
+        if count <= 0 {
+            return Err(refusal("pending revision batch must be nonempty"));
         }
-        conn.query_row(
-            "SELECT revision FROM pending_state WHERE singleton = 1",
-            [],
-            |r| r.get(0),
-        )
+        conn.prepare_cached(
+            "UPDATE pending_state SET revision = revision + ?1
+             WHERE singleton = 1 AND revision <= 9223372036854775807 - ?1
+             RETURNING revision - ?1",
+        )?
+        .query_row([count], |row| row.get(0))
+        .optional()?
+        .ok_or_else(|| refusal("pending queue revision exhausted or its state is missing"))
     }
 
     fn pending_watermark_in(conn: &Connection) -> Result<PendingWatermark> {
@@ -3514,9 +3526,7 @@ impl Store {
         {
             let conn = lock_conn(&self.conn)?;
             let tx = conn.unchecked_transaction()?;
-            for entry in &canonical {
-                Self::upsert_pending(&tx, entry, now)?;
-            }
+            Self::upsert_pending(&tx, canonical.iter().map(String::as_str), now)?;
             tx.commit()?;
         }
         report.enqueued = canonical.into_iter().collect();
@@ -3648,7 +3658,7 @@ impl Store {
                 }
                 // A merge is a new event. Claims taken before either spelling
                 // was repaired cannot acknowledge the merged work.
-                let revision = Self::next_pending_revision(&tx)?;
+                let revision = Self::reserve_pending_revisions(&tx, 1)? + 1;
                 tx.prepare_cached(
                     "INSERT INTO pending_paths (path, queued_at, attempts, revision) VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(path) DO UPDATE SET

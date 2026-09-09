@@ -8,6 +8,8 @@
 //! canonical root, `<temp>/devmap-<16 hex>/ipc.sock`) and printable without
 //! starting anything, so a second implementation can be checked against it.
 
+#![cfg(unix)]
+
 use devmap_serve::{default_ipc_path_for, Daemon};
 use devmap_store::Store;
 use std::path::PathBuf;
@@ -27,7 +29,6 @@ fn scratch(name: &str) -> PathBuf {
 /// The printed path is the path a daemon binds, and printing it creates
 /// nothing.
 #[tokio::test]
-#[cfg(unix)]
 async fn the_printed_socket_path_is_the_one_the_daemon_binds() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -120,7 +121,6 @@ async fn the_printed_socket_path_is_the_one_the_daemon_binds() {
 
 /// The same repository, named three ways, is one endpoint.
 #[test]
-#[cfg(unix)]
 fn every_spelling_of_one_root_prints_one_endpoint() {
     let base = scratch("spellings");
     let real = base.join("repo");
