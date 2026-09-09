@@ -188,6 +188,7 @@ impl Cli {
         match &self.command {
             Commands::Build { path, .. }
             | Commands::Manifest { path, .. }
+            | Commands::MapHtml { path, .. }
             | Commands::Freshness { path, .. }
             | Commands::Serve { path, .. }
             | Commands::Html { path, .. }
@@ -199,8 +200,7 @@ impl Cli {
             // Hook templates retain project-relative paths for the host that
             // will execute them; they are not a query against this checkout.
             Commands::Claude { .. } => PathBuf::from("."),
-            _ => devmap_extract::git_worktree_root(Path::new("."))
-                .unwrap_or_else(|| PathBuf::from(".")),
+            _ => default_root_hint(),
         }
     }
 
@@ -218,6 +218,12 @@ impl Cli {
             None => devmap_extract::paths::store_path(self.root_hint()),
         }
     }
+}
+
+/// Omitted roots agree with rootless queries. An explicit `.` still scopes a
+/// build to the current directory; no other worktree's store is inherited.
+fn default_root_hint() -> PathBuf {
+    devmap_extract::git_worktree_root(Path::new(".")).unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -585,7 +591,7 @@ impl From<InventoryFlags> for InventoryLimits {
 enum Commands {
     /// Cold or incremental build of the code-intelligence graph
     Build {
-        #[arg(default_value = ".")]
+        #[arg(default_value_os_t = default_root_hint())]
         path: PathBuf,
         #[arg(long)]
         affected: Option<String>,
@@ -857,7 +863,7 @@ enum Commands {
     /// and a second subcommand would let a repository sit with a fresh map
     /// beside a stale graph built from a different generation.
     Manifest {
-        #[arg(default_value = ".")]
+        #[arg(default_value_os_t = default_root_hint())]
         path: PathBuf,
         /// Unset, resolved against `path`'s state directory. See
         /// `devmap_extract::paths`.
@@ -910,14 +916,14 @@ enum Commands {
     /// inventory before it could say anything about language or coverage.
     MapHtml {
         /// Repository root; `--input` and `--output` resolve against it.
-        #[arg(default_value = ".")]
+        #[arg(default_value_os_t = default_root_hint())]
         path: PathBuf,
-        /// The repo map to render.
-        #[arg(long, default_value = ".devcouncil/repo_map.json")]
-        input: PathBuf,
-        /// Where to write the page.
-        #[arg(short, long, default_value = ".devcouncil/map.html")]
-        output: PathBuf,
+        /// The repo map to render. Defaults to the resolved state directory.
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Where to write the page. Defaults to `<state dir>/map.html`.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
         /// Rewrite even when the existing page already carries this map's
         /// fingerprint.
         #[arg(long, default_value_t = false)]
@@ -936,7 +942,7 @@ enum Commands {
     /// The comparison is reported field by field: a caller is told *which* of
     /// head, inventory and content moved, not merely that something did.
     Freshness {
-        #[arg(default_value = ".")]
+        #[arg(default_value_os_t = default_root_hint())]
         path: PathBuf,
         /// The `generated_head` a map carries. Compared, never written.
         #[arg(long)]
@@ -976,7 +982,7 @@ enum Commands {
     /// `status` cannot open. Existence is reported, never inferred: a resolved
     /// directory that is on disk is where the state actually is.
     Paths {
-        #[arg(default_value = ".")]
+        #[arg(default_value_os_t = default_root_hint())]
         path: PathBuf,
     },
     /// Longitudinal view: how the map has moved across recent builds.
@@ -1024,7 +1030,7 @@ enum Commands {
     /// the current kernel. Set DEVMAP_MAX_IDLE_SECS (seconds) to change the
     /// bound, or to 0 to keep serving forever.
     Serve {
-        #[arg(default_value = ".")]
+        #[arg(default_value_os_t = default_root_hint())]
         path: PathBuf,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -1149,7 +1155,7 @@ enum Commands {
     /// Attributed: every node carries its kind, path, area, community and its
     /// dead/unwired/unreachable flags; every edge its kind and confidence.
     Export {
-        #[arg(default_value = ".")]
+        #[arg(default_value_os_t = default_root_hint())]
         path: PathBuf,
         /// Where to write. Defaults to `<state dir>/graph.graphml`; `-` is stdout.
         #[arg(short, long)]
@@ -1163,7 +1169,7 @@ enum Commands {
     /// walk of the files the graph names — so every answer carries what the
     /// scan read and whether it finished.
     Routes {
-        #[arg(default_value = ".")]
+        #[arg(default_value_os_t = default_root_hint())]
         path: PathBuf,
         /// Only routes matching this path or id.
         #[arg(long)]
@@ -1179,7 +1185,7 @@ enum Commands {
     /// Compare what a handler returns against what its callers read.
     #[command(name = "shape-check")]
     ShapeCheck {
-        #[arg(default_value = ".")]
+        #[arg(default_value_os_t = default_root_hint())]
         path: PathBuf,
         /// Only routes matching this path or id.
         #[arg(long)]
@@ -1195,7 +1201,7 @@ enum Commands {
     ApiImpact {
         /// The route path or `"VERB /path"` id.
         route: String,
-        #[arg(default_value = ".")]
+        #[arg(default_value_os_t = default_root_hint())]
         path: PathBuf,
         #[arg(long, default_value_t = 5_000)]
         max_files: usize,
@@ -1209,7 +1215,7 @@ enum Commands {
     /// opens from a `file://` URL on a machine that has never seen a package
     /// manager. Capped by node count and honest about it — see `--max-nodes`.
     Html {
-        #[arg(default_value = ".")]
+        #[arg(default_value_os_t = default_root_hint())]
         path: PathBuf,
         /// Where to write. Defaults to `<state dir>/graph.html`.
         #[arg(short, long)]
@@ -4529,17 +4535,21 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     path.join(p)
                 }
             };
-            let map_path = resolve(input);
-            let out_path = resolve(output);
+            let map_path = input
+                .as_ref()
+                .map(&resolve)
+                .unwrap_or_else(|| devmap_extract::paths::repo_map_path(path));
+            let out_path = output
+                .as_ref()
+                .map(resolve)
+                .unwrap_or_else(|| devmap_extract::paths::state_dir(path).join("map.html"));
 
-            let text = std::fs::read_to_string(&map_path).map_err(|err| {
-                anyhow::anyhow!(
-                    "cannot read repo map at {}: {err} (run `devmap manifest` first)",
-                    map_path.display()
-                )
-            })?;
-            let repo_map: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
-                anyhow::anyhow!("{} is not valid JSON: {err}", map_path.display())
+            let repo_map = devmap_query::host::read_repo_map(
+                &map_path,
+                devmap_query::host::DEFAULT_ARTIFACT_BYTES,
+            )
+            .map_err(|err| {
+                anyhow::anyhow!("cannot load repo map at {}: {err}", map_path.display())
             })?;
             let fingerprint = devmap_query::fingerprint_for(&repo_map);
 
@@ -4721,12 +4731,9 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             // as given; `validate_root` has already checked the directory exists.
             let root = path.canonicalize()?;
             let state_dir = devmap_extract::paths::state_dir(&root);
-            let db_path = cli.db();
-            let db_path = if db_path.is_absolute() {
-                db_path
-            } else {
-                root.join(db_path)
-            };
+            // Both explicit --db and relative roots are invocation-relative.
+            // Joining this to root again duplicates the repository directory.
+            let db_path = std::path::absolute(cli.db())?;
             let payload = serde_json::json!({
                 "root": root,
                 "state_dir": state_dir,

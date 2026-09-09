@@ -1,0 +1,182 @@
+{
+  "date": "2026-09-09",
+  "source_base": "e93e5d4d939f6a3e64c32aaf23eff79aa23e88ca",
+  "state_at_qualification": "local_uncommitted_candidate_not_installed",
+  "workspace_tests": {
+    "command": "cargo test --locked --workspace",
+    "exit_code": 0,
+    "test_summaries": 220,
+    "passed": 2377,
+    "failed": 0,
+    "ignored": 3,
+    "ignored_entries": [
+      "test the_emitted_bundle_passes_claude_plugin_validate_strict ... ignored, requires the `claude` CLI on PATH; run with --ignored",
+      "test a_storm_kill_restart_cycle_converges_on_the_cold_build ... ignored, minutes-long soak; run explicitly and report the numbers",
+      "test concurrent_prune_writer_child ... ignored"
+    ]
+  },
+  "focused_contracts": {
+    "cli_tests": 13,
+    "guide_tests": 1,
+    "all_passed": true
+  },
+  "clippy": {
+    "command": "cargo clippy --locked --workspace --all-targets -- -D warnings",
+    "exit_code": 0
+  },
+  "format": {
+    "command": "cargo fmt --all -- --check",
+    "exit_code": 0
+  },
+  "stress": {
+    "worktrees": 16,
+    "simultaneous_daemons": 16,
+    "simultaneous_editors": 32,
+    "build_workers": 4,
+    "tokio_workers_per_process": 2,
+    "rayon_workers_per_process": 2,
+    "binary_sha256": "eff4e4c30a0c881a7862ad0208d794e732861b25261c704991f41d9139ad0d9c",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "ipc_transport": "unix_socket",
+    "ipc_probe_process": false,
+    "latency_includes_probe_startup": false,
+    "latency_includes_probe_admission": false,
+    "ipc_probe_workers": 0,
+    "ipc_probe_admission_timeout_seconds": 0,
+    "initial_source_files_per_worktree": 33,
+    "initial_symbols_per_worktree": 291,
+    "initial_functions_per_worktree": 258,
+    "initial_call_edges_per_worktree": 225,
+    "fixture_functions_per_file": 8,
+    "rounds": 12,
+    "edit_operations": 4608,
+    "ipc_queries": 384,
+    "metadata_checks": 64,
+    "cold_comparisons": 16,
+    "kills": 48,
+    "daemon_rss_kib_samples": [
+      525008,
+      521584,
+      519024,
+      516448,
+      515040,
+      516160,
+      516320,
+      515936,
+      517536,
+      518448,
+      517872,
+      518304
+    ],
+    "passed": true,
+    "filesystem_retry_attempts": 0,
+    "filesystem_retry_deadline_seconds": 5,
+    "initial_edges_per_worktree": 483,
+    "distinct_private_heads": 16,
+    "elapsed_seconds": 74.051,
+    "ipc_probe_peak_active": 0,
+    "query_latency_ms": {
+      "samples": 384,
+      "p50": 7.349,
+      "p95": 34.9,
+      "max": 132.269
+    }
+  },
+  "missing_named_root_comparison": [
+    {
+      "binary": "installed",
+      "returncode": 0,
+      "created_missing_root": true,
+      "result": {
+        "bytes": 216367,
+        "fingerprint": "map-preview:::",
+        "output": "/var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/devmap-explicit-root-proof-po4vgulr/installed/missing/.devcouncil/map.html",
+        "written": true
+      }
+    },
+    {
+      "binary": "candidate",
+      "returncode": 1,
+      "created_missing_root": false,
+      "result": {
+        "diagnostic_context": {
+          "binary_path": "/tmp/devmap-state-audit-candidate",
+          "binary_version": "0.1.1 (store schema 20, code graph schema 2)",
+          "command": "map-html",
+          "db_path": "/var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/devmap-explicit-root-proof-po4vgulr/candidate/missing/.devmap/codeintel/devmap.sqlite",
+          "db_path_lossy": false,
+          "elapsed_ms": 31,
+          "pid": 27909,
+          "root": "/var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/devmap-explicit-root-proof-po4vgulr/candidate/missing",
+          "root_path_lossy": false,
+          "stage": null,
+          "unix_ms": 1788989343222
+        },
+        "error": "/var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/devmap-explicit-root-proof-po4vgulr/candidate/missing: No such file or directory (os error 2)"
+      }
+    }
+  ],
+  "real_gitpulse_bootstrap": {
+    "invocation": "from GitPulse/src: devmap build --manifest --json; devmap status --json; devmap paths --json; devmap map-html --json",
+    "source_head": "d2d8713da93e9fe7106306b9c8faac1d34b06a4d",
+    "before": {
+      "code_graph": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse/.devmap/graph/code_graph.json",
+      "db_path": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse/.devmap/codeintel/devmap.sqlite",
+      "plugin_dir": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse/.devmap/devmap-plugin",
+      "repo_map": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse/.devmap/repo_map.json",
+      "root": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse",
+      "state_dir": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse/.devmap",
+      "state_dir_exists": false,
+      "store_exists": false,
+      "workspace": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse/.devmap/workspace.json"
+    },
+    "after": {
+      "code_graph": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse/.devmap/graph/code_graph.json",
+      "db_path": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse/.devmap/codeintel/devmap.sqlite",
+      "plugin_dir": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse/.devmap/devmap-plugin",
+      "repo_map": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse/.devmap/repo_map.json",
+      "root": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse",
+      "state_dir": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse/.devmap",
+      "state_dir_exists": true,
+      "store_exists": true,
+      "workspace": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse/.devmap/workspace.json"
+    },
+    "query_ready": true,
+    "is_fresh": true,
+    "files_indexed": 1820,
+    "node_count": 25345,
+    "edge_count": 299676,
+    "coverage_gap_totals": {
+      "call_blind": 0,
+      "discovery_refused": 0,
+      "import_blind": 18,
+      "not_parsed": 0,
+      "parse_failed": 0,
+      "pattern_recovered": 0
+    },
+    "render": {
+      "bytes": 259009,
+      "fingerprint": "map-preview:d2d8713da93e9fe7106306b9c8faac1d34b06a4d:325318cb9d3a25de25cd2514418a858e44403675:c2:6f8ce69b5c4e9d3845820bb7e0456f9bece754be",
+      "output": "/Users/bharath/.codex/worktrees/devmap-bootstrap-guidance/GitPulse/.devmap/map.html",
+      "written": true
+    }
+  },
+  "limits": [
+    "macOS arm64 only for this candidate",
+    "Debug binary stress, not release performance qualification",
+    "Installed CLI and app not replaced",
+    "No Windows or Linux execution",
+    "No claim of complete language attribution",
+    "Ignored single-worktree soak not run; separate 16-worktree crash/restart stress passed",
+    "External Claude CLI validation not run; emitter unchanged",
+    "concurrent_prune_writer_child is invoked by its passing parent test"
+  ],
+  "logs": {
+    "workspace": "/tmp/devmap-state-workspace-final.log",
+    "clippy": "/tmp/devmap-state-clippy.log",
+    "path_red": "/tmp/devmap-state-red.log",
+    "guide_red": "/tmp/devmap-guide-red.log",
+    "artifact_red": "/tmp/devmap-artifact-red.log",
+    "final_stress": "/tmp/devmap-state-stress-final.log"
+  }
+}

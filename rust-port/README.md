@@ -14,7 +14,7 @@ who calls this, what breaks if I change it, which tests cover it, what is dead,
 what did that edit just do.
 
 ```bash
-devmap build .          # index the tree
+devmap build --manifest # index this worktree and export its repository map
 devmap explore handler  # the whole neighbourhood of a symbol, in one call
 devmap affected src/api.py   # the tests a change here reaches
 devmap dead                  # dead-symbol candidates, each with its confidence
@@ -117,6 +117,21 @@ devmap status               # generation, node/edge counts, freshness
 ```
 
 State lives in `.devmap/` by default. See **Where state lives** below.
+
+For a fresh checkout or linked worktree, run `devmap paths --json` to find
+the resolved database and `repo_map` paths, then `devmap status --json` to
+inspect readiness. Generated state is local to a worktree and is not copied
+by Git. A missing store is an uninitialized checkout, not an empty graph.
+Run `devmap build --manifest` to create both the database and exported maps;
+use the same command to restore a missing map beside an existing database.
+Read-only discovery never creates or copies state from another worktree.
+See the [state-discovery audit](STATE_DISCOVERY_AUDIT_2026-09-09.md) for
+reproduced failures, regression evidence, and qualification limits.
+
+When a repository argument is omitted, builds, rendering, and queries agree
+on the nearest Git worktree root, including from a subdirectory. Explicit
+paths retain their scope: `devmap build .` deliberately indexes the current
+directory. Outside Git, omitted roots use the current directory.
 
 Interactive builds show an animated stage bar, the active operation (including
 writer-lock waits), and elapsed stage time. Animation appears after 150 ms and
@@ -283,6 +298,14 @@ devmap map-html .                      # subsystems, coloured by language
 Linguist's own palette and carrying the coverage the map does *not* have —
 subsystems are a selected set, not a partition.
 
+`map-html` reads the resolved state directory's `repo_map.json` and writes
+`map.html` beside it, honoring `.devmap/`, legacy `.devcouncil/`, and
+`DEVMAP_HOME` consistently with the builder. Explicit `--input` and `--output`
+paths remain relative to the selected repository root unless absolute.
+Input uses the host artifact reader: it must be a regular, non-symlink file,
+valid repository-map JSON, and at most 128 MiB. Refused input never creates
+or replaces the preview.
+
 Both HTML views offer **Hide notes & Markdown**. The code graph hides note and
 document nodes (including symbols owned by Markdown files) and their edges.
 The subsystem map hides an area only when all its attributed files are
@@ -403,10 +426,12 @@ Resolved per repository, in this order:
    both tools keep agreeing about one file.
 4. `<repo>/.devmap/` otherwise.
 
-`--db` overrides the store path directly. The state directory holds
+`--db` overrides the store path directly; a relative value is resolved against
+the invoking directory. A relative `DEVMAP_HOME` is resolved against the
+repository root. The state directory holds
 `codeintel/devmap.sqlite` (canonical), `repo_map.json`, `graph/code_graph.json`
-and `workspace.json`. `devmap paths` prints the resolved layout — and whether
-each part exists — without opening the store, so a wrapper can ask instead of
+and `workspace.json`. `devmap paths` prints the resolved layout and whether
+the state directory and database exist, without opening the store, so a wrapper can ask instead of
 re-deriving the rule.
 
 ## Across repositories
