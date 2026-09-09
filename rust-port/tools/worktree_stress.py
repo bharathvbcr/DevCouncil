@@ -22,6 +22,27 @@ import threading
 import time
 
 
+def retry_file_operation(operation, *, platform_name=os.name, deadline_seconds=5, on_retry=None):
+    """Model bounded editor retries for Windows rename/delete sharing races.
+
+    Access-denied can also be permanent. Exhaustion propagates the actual error;
+    no edit or graph assertion is skipped. Other OS/errors are never retried.
+    """
+    if not 0 <= deadline_seconds <= 5:
+        raise ValueError("filesystem retry budget must be 0..5 seconds")
+    deadline = time.monotonic() + deadline_seconds
+    while True:
+        try:
+            return operation()
+        except OSError as error:
+            remaining = deadline - time.monotonic()
+            if platform_name != "nt" or getattr(error, "winerror", None) not in (5, 32, 33) or remaining <= 0:
+                raise
+            if on_retry is not None:
+                on_retry()
+            time.sleep(min(.01, remaining))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -55,6 +76,7 @@ def main():
     children = []
     query_ms = []
     logs = []
+    retry_count_lock = threading.Lock()
     started = time.monotonic()
     report = dict(worktrees=args.worktrees, simultaneous_daemons=args.worktrees,
                   simultaneous_editors=2 * args.worktrees, build_workers=args.build_workers,
@@ -69,7 +91,15 @@ def main():
                   initial_call_edges_per_worktree=1 + args.fixture_files * (args.functions_per_file - 1),
                   fixture_functions_per_file=args.functions_per_file,
                   rounds=args.rounds, edit_operations=0, ipc_queries=0, metadata_checks=0,
-                  cold_comparisons=0, kills=0, daemon_rss_kib_samples=[], passed=False)
+                  cold_comparisons=0, kills=0, daemon_rss_kib_samples=[], passed=False,
+                  filesystem_retry_attempts=0, filesystem_retry_deadline_seconds=5)
+
+    def record_retry():
+        with retry_count_lock:
+            report["filesystem_retry_attempts"] += 1
+
+    def mutate(operation):
+        return retry_file_operation(operation, on_retry=record_retry)
 
     def run(argv, cwd=None):
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
@@ -266,14 +296,14 @@ def main():
                 barrier.wait(timeout=30)
                 for revision in range(8):
                     stage = root / f"agent{agent}.tmp"
-                    stage.write_text(f"def owner_w{i}_a{agent}_r{cycle}():\n    return {revision}\n")
-                    stage.replace(path)
+                    mutate(lambda: stage.write_text(f"def owner_w{i}_a{agent}_r{cycle}():\n    return {revision}\n"))
+                    mutate(lambda: stage.replace(path))
                 renamed = root / f"renamed{agent}.py"
-                path.rename(renamed)
-                renamed.rename(path)
+                mutate(lambda: path.rename(renamed))
+                mutate(lambda: renamed.rename(path))
                 transient = root / f"deleted{agent}.py"
-                transient.write_text("def must_disappear():\n    return 1\n")
-                transient.unlink()
+                mutate(lambda: transient.write_text("def must_disappear():\n    return 1\n"))
+                mutate(transient.unlink)
                 # Query while other editors and drains are active.
                 query_start = time.monotonic()
                 result = ipc(endpoints[i], cmd="search", query="stable_helper")
