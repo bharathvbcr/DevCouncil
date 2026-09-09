@@ -269,3 +269,31 @@ fn a_filesystem_read_only_open_still_validates_queue_identity() {
         "read-only fallback skipped validation"
     );
 }
+
+#[test]
+fn a_queue_burst_can_wait_out_a_long_writer_without_losing_the_edit() {
+    let temp = Scratch::new();
+    let store = Store::open(temp.db()).unwrap();
+    let blocker = rusqlite::Connection::open(temp.db()).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let task = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        store.enqueue_pending_paths(&["after-long-writer.py".into()])
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    // Longer than the ordinary connection's five-second busy timeout. Queue
+    // producers need their own bounded admission budget for concurrent bursts.
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    blocker.execute_batch("ROLLBACK").unwrap();
+    task.join()
+        .unwrap()
+        .expect("the enqueue must survive temporary writer contention");
+    let store = Store::open(temp.db()).unwrap();
+    assert_eq!(
+        store.get_pending_paths().unwrap(),
+        vec!["after-long-writer.py"]
+    );
+}

@@ -34,6 +34,8 @@
 //! has not been examined at all, and answering "zero sources, complete" for one
 //! is precisely the check-that-could-not-run reporting as a check that passed.
 
+#![cfg(unix)]
+
 use std::fs;
 use std::path::PathBuf;
 

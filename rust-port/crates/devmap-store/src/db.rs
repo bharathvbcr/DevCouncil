@@ -491,6 +491,35 @@ mod agentic_queue_regressions {
     }
 
     #[test]
+    fn pending_admission_restores_the_query_timeout_and_rolls_back_errors() {
+        let store = Store::open_in_memory().unwrap();
+        let error: Result<()> =
+            store.with_pending_transaction(std::time::Duration::from_millis(25), |tx| {
+                Store::upsert_pending(tx, std::iter::once("refused.py"), 1.0)?;
+                Err(refusal("injected write failure"))
+            });
+        assert!(error
+            .unwrap_err()
+            .to_string()
+            .contains("injected write failure"));
+        assert!(store.get_pending_paths().unwrap().is_empty());
+        assert_eq!(store.pending_watermark().unwrap().revision, 0);
+        let timeout: u64 = lock_conn(&store.conn)
+            .unwrap()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5_000);
+        store
+            .enqueue_pending_paths(&["accepted.py".into()])
+            .unwrap();
+        let timeout: u64 = lock_conn(&store.conn)
+            .unwrap()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5_000);
+    }
+
+    #[test]
     fn revision_exhaustion_rolls_back_the_entire_enqueue() {
         let store = Store::open_in_memory().unwrap();
         lock_conn(&store.conn)
@@ -1910,6 +1939,10 @@ impl Store {
     /// different wait from every other, and nothing would fail. Stated once
     /// and applied at both openers instead.
     const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Bursts from hundreds of sessions must be admitted behind a temporary
+    /// writer. This bounds only pending-event admission; reader timeouts stay
+    /// at five seconds. Refusal remains an error the daemon must reconcile.
+    const PENDING_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// How many quarantined paths [`Store::status`] names in its degraded
     /// reason. Bounded because the reason is a one-line diagnostic, not a
@@ -3302,12 +3335,31 @@ impl Store {
     /// normalisation and no containment check, which is exactly what made the
     /// queue rot: see K1 on `enqueue_pending_paths_under_root`.
     pub fn enqueue_pending_paths(&self, paths: &[String]) -> Result<()> {
-        self.refuse_if_read_only()?;
         let now = Self::now_secs();
-        let conn = lock_conn(&self.conn)?;
-        let tx = conn.unchecked_transaction()?;
-        Self::upsert_pending(&tx, paths.iter().map(String::as_str), now)?;
-        tx.commit()
+        self.with_pending_transaction(Self::PENDING_ADMISSION_TIMEOUT, |tx| {
+            Self::upsert_pending(tx, paths.iter().map(String::as_str), now)
+        })
+    }
+
+    /// Acquire the writer before reading queue identity, and restore the
+    /// ordinary busy policy on success and failure. One immediate transaction
+    /// gives the whole batch one admission wait rather than a timeout per path.
+    fn with_pending_transaction<T>(
+        &self,
+        wait: std::time::Duration,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.refuse_if_read_only()?;
+        let mut conn = lock_conn(&self.conn)?;
+        conn.busy_timeout(wait)?;
+        let result = (|| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let value = write(&tx)?;
+            tx.commit()?;
+            Ok(value)
+        })();
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+        result
     }
 
     fn now_secs() -> f64 {
@@ -3521,14 +3573,12 @@ impl Store {
         if canonical.is_empty() {
             return Ok(report);
         }
-        self.bind_repo_root(root)?;
+        let owner = Self::normalized_repo_root(root)?;
         let now = Self::now_secs();
-        {
-            let conn = lock_conn(&self.conn)?;
-            let tx = conn.unchecked_transaction()?;
-            Self::upsert_pending(&tx, canonical.iter().map(String::as_str), now)?;
-            tx.commit()?;
-        }
+        self.with_pending_transaction(Self::PENDING_ADMISSION_TIMEOUT, |tx| {
+            Self::bind_repo_root_in(tx, &owner)?;
+            Self::upsert_pending(tx, canonical.iter().map(String::as_str), now)
+        })?;
         report.enqueued = canonical.into_iter().collect();
         Ok(report)
     }
@@ -8787,6 +8837,7 @@ mod git_head_tests {
     /// drain batch behind it. The bounded runner kills at
     /// [`GIT_HEAD_DEADLINE`]; this test proves the error arrives near the
     /// deadline rather than after the sleeper's own 30s exit.
+    #[cfg(unix)]
     #[test]
     fn a_stalled_git_is_killed_at_the_deadline() {
         let stamp = std::time::SystemTime::now()
@@ -8819,7 +8870,6 @@ mod git_head_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_real_git_head_still_validates_normally() {
         // Positive control: the deadline path must not have broken honest git.
