@@ -162,8 +162,8 @@ fn missing_invalid_oversized_and_wrong_shape_are_distinct_refusals() {
     assert!(err.to_string().contains("schema 999"));
     assert!(err.to_string().contains("schema 2"));
 
-    for invalid_schema in [Value::Null, json!("2")] {
-        let path = root.join(format!("invalid-schema-{invalid_schema}.json"));
+    for (index, invalid_schema) in [Value::Null, json!("2")].into_iter().enumerate() {
+        let path = root.join(format!("invalid-schema-{index}.json"));
         write_json(
             &path,
             &json!({"schema_version": invalid_schema, "nodes": [], "edges": []}),

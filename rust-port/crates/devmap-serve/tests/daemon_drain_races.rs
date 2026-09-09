@@ -180,12 +180,24 @@ fn a_corrupted_store_refuses_rather_than_answering_empty_and_fresh() {
     // keeping the length so the page cache cannot hide the damage behind a
     // short-file check.
     let length = std::fs::metadata(&db_path).unwrap().len() as usize;
-    std::fs::write(&db_path, vec![0x5a; length]).unwrap();
+    // Overwrite without truncation: Windows forbids truncating mapped files.
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&db_path)
+        .unwrap()
+        .write_all(&vec![0x5a; length])
+        .unwrap();
     for suffix in ["-wal", "-shm"] {
         let side = db_path.with_extension(format!("sqlite{suffix}"));
         if side.exists() {
             let side_length = std::fs::metadata(&side).unwrap().len() as usize;
-            std::fs::write(&side, vec![0x5a; side_length]).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&side)
+                .unwrap()
+                .write_all(&vec![0x5a; side_length])
+                .unwrap();
         }
     }
 
@@ -280,6 +292,8 @@ fn ra3_a_quiet_queue_does_not_prove_the_working_tree_is_unchanged() {
             "restored bytes must match the snapshot again"
         );
     }
+    drop(reader);
+    drop(_daemon);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -289,16 +303,27 @@ fn ra3_deleted_sources_are_stale_even_without_a_watcher() {
     std::fs::remove_file(root.join("src/a.py")).unwrap();
     let status = reader.status("test").unwrap();
     assert!(!devmap_serve::index_is_fresh(&status), "{status:?}");
+    drop(reader);
+    drop(_daemon);
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn ra3_unverifiable_roots_cannot_be_called_fresh() {
     let (root, _daemon, reader) = repo_with_one_generation("missing-root");
+    // Keep the store outside the source tree so Windows can delete the tree
+    // while the reader remains open. The persisted ownership still names root.
+    drop(reader);
+    drop(_daemon);
+    let external = root.with_extension("sqlite");
+    std::fs::rename(root.join("index.sqlite"), &external).unwrap();
+    let reader = Store::open(&external).unwrap();
     std::fs::remove_dir_all(&root).unwrap();
     let status = reader.status("test").unwrap();
     assert!(!devmap_serve::index_is_fresh(&status));
     assert!(devmap_serve::freshness_degraded_reason(&status).is_some());
+    drop(reader);
+    std::fs::remove_file(external).unwrap();
 }
 
 #[test]
@@ -313,5 +338,8 @@ fn ra3_old_analyzer_payloads_are_stale_even_when_source_matches() {
     let status = reader.status("test").unwrap();
     assert!(!devmap_serve::index_is_fresh(&status), "{status:?}");
     assert!(devmap_serve::freshness_degraded_reason(&status).is_some());
+    drop(db);
+    drop(reader);
+    drop(_daemon);
     std::fs::remove_dir_all(root).unwrap();
 }

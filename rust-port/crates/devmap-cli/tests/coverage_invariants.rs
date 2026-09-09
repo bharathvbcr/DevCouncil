@@ -71,7 +71,13 @@ fn indexable_files_on_disk(root: &Path) -> BTreeSet<String> {
     found
         .into_iter()
         .filter_map(|path| {
-            let rel = path.strip_prefix(root).ok()?.to_str()?.to_string();
+            let rel = path
+                .strip_prefix(root)
+                .ok()?
+                .components()
+                .map(|part| part.as_os_str().to_str())
+                .collect::<Option<Vec<_>>>()?
+                .join("/");
             devmap_extract::is_indexable_source(&rel).then_some(rel)
         })
         .collect()

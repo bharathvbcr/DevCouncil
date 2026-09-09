@@ -837,8 +837,10 @@ mod tests {
             .split("const DATA = ")
             .nth(1)
             .unwrap()
-            .split(";\n")
+            .lines()
             .next()
+            .unwrap()
+            .strip_suffix(';')
             .unwrap();
         let parsed: Value = serde_json::from_str(blob).unwrap();
         assert_eq!(
@@ -873,8 +875,10 @@ mod tests {
             .split("const DATA = ")
             .nth(1)
             .unwrap()
-            .split(";\n")
+            .lines()
             .next()
+            .unwrap()
+            .strip_suffix(';')
             .unwrap();
         let parsed: Value = serde_json::from_str(blob).unwrap();
         assert_eq!(parsed["subsystems"][0]["area"], hostile);

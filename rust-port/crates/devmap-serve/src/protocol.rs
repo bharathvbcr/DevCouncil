@@ -2074,13 +2074,13 @@ mod tests {
             .split_once("pub enum IpcCommand {")
             .expect("the command enum must be findable")
             .1;
-        let body = body.split("\n}\n").next().expect("enum body");
+        let body = body.lines().take_while(|line| *line != "}");
 
         // Variant headers sit at four spaces; their fields at eight. That makes
         // the split unambiguous without parsing Rust.
         let mut declaring: Vec<String> = Vec::new();
         let mut current: Option<String> = None;
-        for line in body.lines() {
+        for line in body {
             if let Some(name) = line.strip_prefix("    ").and_then(|rest| {
                 rest.strip_suffix(" {")
                     .filter(|n| n.chars().next().is_some_and(char::is_uppercase))

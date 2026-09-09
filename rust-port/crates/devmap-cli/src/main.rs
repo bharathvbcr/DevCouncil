@@ -3136,8 +3136,31 @@ fn restore_default_sigpipe() {
 #[cfg(not(unix))]
 fn restore_default_sigpipe() {}
 
+fn main() -> std::process::ExitCode {
+    // The Windows executable entry stack is 1 MiB. Debug command dispatch
+    // exhausts it before even a status request can answer. Reserve the same
+    // bounded stack on every platform; reservation does not commit 8 MiB of RSS.
+    match std::thread::Builder::new()
+        .name("devmap-cli".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(cli_main)
+    {
+        Ok(thread) => match thread.join() {
+            Ok(status) => status,
+            Err(_) => {
+                eprintln!("DevMap command thread panicked");
+                std::process::ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("DevMap could not start command thread: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 #[tokio::main]
-async fn main() -> std::process::ExitCode {
+async fn cli_main() -> std::process::ExitCode {
     let started = Instant::now();
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());

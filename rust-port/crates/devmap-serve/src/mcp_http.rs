@@ -1001,8 +1001,29 @@ pub async fn serve_http_on_with_admission(
                 .timer(TokioTimer::new())
                 .header_read_timeout(IDLE_TIMEOUT)
                 .serve_connection(io, service);
-            if let Err(err) = connection.await {
-                tracing::debug!("MCP HTTP connection ended: {err}");
+            match connection.without_shutdown().await {
+                Ok(parts) => {
+                    // An early 413 leaves unread request bytes. Dropping that
+                    // socket immediately sends a TCP reset on Windows, which
+                    // can erase the refusal before the client receives it.
+                    // Flush/half-close first, then discard a bounded tail. The
+                    // admission permit remains held through this bounded close.
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut stream = parts.io.into_inner();
+                    let closed = tokio::time::timeout(Duration::from_secs(1), async {
+                        stream.shutdown().await?;
+                        tokio::io::copy(
+                            &mut stream.take(MAX_BODY_BYTES + 64 * 1024),
+                            &mut tokio::io::sink(),
+                        )
+                        .await
+                    })
+                    .await;
+                    if let Ok(Err(error)) = closed {
+                        tracing::debug!("MCP HTTP close ended: {error}");
+                    }
+                }
+                Err(err) => tracing::debug!("MCP HTTP connection ended: {err}"),
             }
         });
     }

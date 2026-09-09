@@ -208,7 +208,10 @@ fn test_s18_busy_truncate_checkpoint_falls_back_to_passive() {
     let started = Instant::now();
     let checkpoint = store.checkpoint_wal().unwrap();
     assert!(
-        started.elapsed() < std::time::Duration::from_millis(500),
+        // busy_timeout bounds SQLite's requested sleeps, not OS scheduling or
+        // checkpoint I/O. Hosted macOS/Windows exceeded 500 ms with the correct
+        // 250 ms policy. Four seconds still detects the original 5 s wait.
+        started.elapsed() < std::time::Duration::from_secs(4),
         "checkpoint fallback must not hold the store lock for SQLite's busy timeout: {:?}",
         started.elapsed()
     );
