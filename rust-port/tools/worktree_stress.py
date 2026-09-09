@@ -10,6 +10,7 @@ import concurrent.futures as futures
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import signal
 import socket
@@ -23,6 +24,7 @@ import time
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--ipc-probe", type=Path, help="native ipc_probe example; required on Windows")
     parser.add_argument("--worktrees", type=int, default=128)
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--build-workers", type=int, default=16)
@@ -36,12 +38,17 @@ def main():
         parser.error("worktrees must be 1..256, rounds 1..100, build-workers 1..32")
     if not (0 <= args.fixture_files <= 8192 and 2 <= args.functions_per_file <= 64):
         parser.error("fixture-files must be 0..8192, functions-per-file 2..64")
-    if os.name != "posix":
-        parser.error("this process-death harness requires POSIX signals and Unix sockets")
+    if os.name not in ("posix", "nt"):
+        parser.error("supported process control platforms: POSIX and Windows")
+    if os.name == "nt" and args.ipc_probe is None:
+        parser.error("Windows requires --ipc-probe (cargo build -p devmap-cli --example ipc_probe)")
+    probe = str(args.ipc_probe.resolve(strict=True)) if args.ipc_probe else None
+    process_options = (dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                       if os.name == "nt" else dict(start_new_session=True))
     binary = str(args.binary.resolve(strict=True))
     with open(binary, "rb") as binary_file:
         binary_hash = hashlib.file_digest(binary_file, "sha256").hexdigest()
-    env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", DEVMAP_AUTOSPAWN="0", DEVMAP_MAX_IDLE_SECS="0",
+    env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, DEVMAP_AUTOSPAWN="0", DEVMAP_MAX_IDLE_SECS="0",
                TOKIO_WORKER_THREADS="2", RAYON_NUM_THREADS="2")
     env.pop("DEVMAP_HOME", None)
     children = []
@@ -51,7 +58,10 @@ def main():
     report = dict(worktrees=args.worktrees, simultaneous_daemons=args.worktrees,
                   simultaneous_editors=2 * args.worktrees, build_workers=args.build_workers,
                   tokio_workers_per_process=2, rayon_workers_per_process=2,
-                  binary_sha256=binary_hash,
+                  binary_sha256=binary_hash, platform=platform.platform(),
+                  ipc_transport="named_pipe" if os.name == "nt" else "unix_socket",
+                  ipc_probe_process=probe is not None,
+                  latency_includes_probe_startup=probe is not None,
                   initial_source_files_per_worktree=1 + args.fixture_files,
                   initial_symbols_per_worktree=3 + args.fixture_files * (1 + args.functions_per_file),
                   initial_functions_per_worktree=2 + args.fixture_files * args.functions_per_file,
@@ -63,19 +73,18 @@ def main():
     def run(argv, cwd=None):
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                     stdout=stdout, stderr=stderr, start_new_session=True)
+                                     stdout=stdout, stderr=stderr, **process_options)
             try:
                 code = child.wait(timeout=90)
             finally:
                 if child.poll() is None:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    child.wait(timeout=10)
+                    stop(child, crash=True)
             for stream in (stdout, stderr):
                 if stream.tell() > 2_000_000:
                     raise RuntimeError("subprocess output exceeded harness bound")
                 stream.seek(0)
             if code:
-                raise RuntimeError(f"{argv!r}: exit {code}: {stderr.read(8192)!r}")
+                raise subprocess.CalledProcessError(code, argv, stderr=stderr.read(8192))
             return stdout.read(2_000_000)
 
     def parallel(fn, items):
@@ -83,6 +92,17 @@ def main():
             return list(pool.map(fn, items))
 
     def ipc(endpoint, **command):
+        if probe:
+            try:
+                data = run([probe, str(endpoint), json.dumps(dict(version=1, **command))])
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 2:
+                    raise ConnectionRefusedError(str(endpoint)) from error
+                raise
+            result = json.loads(data)
+            if result.get("ok") is not True:
+                raise RuntimeError(f"IPC error: {result}")
+            return result["result"]
         with socket.socket(socket.AF_UNIX) as client:
             deadline = time.monotonic() + 30
             client.settimeout(30)
@@ -106,7 +126,7 @@ def main():
             return result["result"]
 
     def snapshot(db):
-        with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10) as conn:
+        with sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=10) as conn:
             assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
             assert not conn.execute("PRAGMA foreign_key_check").fetchall()
             generation = conn.execute("SELECT max(id) FROM generations").fetchone()[0]
@@ -119,21 +139,35 @@ def main():
 
     def stop(child, crash=False):
         if child.poll() is None:
-            os.killpg(child.pid, signal.SIGKILL if crash else signal.SIGTERM)
+            if os.name == "nt":
+                if crash:
+                    child.kill()
+                else:
+                    child.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                os.killpg(child.pid, signal.SIGKILL if crash else signal.SIGTERM)
             try:
                 child.wait(timeout=15)
             except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
+                if os.name == "nt":
+                    child.kill()
+                else:
+                    os.killpg(child.pid, signal.SIGKILL)
                 child.wait(timeout=10)
                 if not crash:
                     raise RuntimeError("daemon did not shut down within 15 seconds")
+        if not crash and child.returncode != 0:
+            raise RuntimeError(f"daemon graceful shutdown failed: exit {child.returncode}")
 
-    scratch_scope = tempfile.TemporaryDirectory(prefix="dm-wt-", dir="/tmp")
+    scratch_scope = tempfile.TemporaryDirectory(prefix="dm-wt-", dir="/tmp" if os.name == "posix" else None)
     try:
         scratch = Path(scratch_scope.name)
         main_tree = scratch / "main"
         main_tree.mkdir()
+        hooks = scratch / "empty-hooks"
+        hooks.mkdir()
         run(["git", "init", "-q", str(main_tree)])
+        run(["git", "config", "core.autocrlf", "false"], main_tree)
         (main_tree / ".gitignore").write_text(".devmap/\n.devcouncil/\nAGENTS.md\n")
         (main_tree / "common.py").write_text("def stable_helper():\n    return 1\ndef stable_caller():\n    return stable_helper()\n")
         # Unique names prevent accidental cross-file ambiguity from turning a
@@ -145,7 +179,7 @@ def main():
                 body.append(f"def fixture_{module}_{leaf}():\n    return {expression}\n")
             (main_tree / f"fixture_{module}.py").write_text("".join(body))
         run(["git", "add", "."], main_tree)
-        run(["git", "-c", "user.name=DevMap test", "-c", "user.email=devmap-test@invalid", "-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture"], main_tree)
+        run(["git", "-c", "user.name=DevMap test", "-c", "user.email=devmap-test@invalid", "-c", f"core.hooksPath={hooks}", "commit", "-qm", "fixture"], main_tree)
         roots = [scratch / f"w{i}" for i in range(args.worktrees)]
         for root in roots:
             run(["git", "worktree", "add", "-q", "--detach", str(root), "HEAD"], main_tree)
@@ -166,14 +200,15 @@ def main():
                 assert len(edges) == report["initial_edges_per_worktree"]
             report["initial_edges_per_worktree"] = len(edges)
             assert pending == 0
-        endpoints = [scratch / f"s{i}" for i in range(args.worktrees)]
+        endpoints = ([Path(r"\\.\pipe" + f"\\devmap-capacity-{os.getpid()}-{i}") for i in range(args.worktrees)]
+                     if os.name == "nt" else [scratch / f"s{i}" for i in range(args.worktrees)])
 
         def start_daemon(i):
             log = tempfile.TemporaryFile()
             logs.append(log)
             child = subprocess.Popen([binary, "serve", str(roots[i]), "--socket", str(endpoints[i])],
                                      env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                     start_new_session=True)
+                                     **process_options)
             children.append(child)
             return child
 
@@ -183,7 +218,7 @@ def main():
             while time.monotonic() < deadline:
                 if active[i].poll() is not None:
                     raise RuntimeError(f"daemon {i} exited during startup")
-                if endpoints[i].exists():
+                if os.name == "nt" or endpoints[i].exists():
                     try:
                         return ipc(endpoints[i], cmd="status")
                     except (ConnectionRefusedError, FileNotFoundError):
@@ -200,7 +235,7 @@ def main():
             while time.monotonic() < deadline:
                 nodes, _, pending = snapshot(dbs[i])
                 found = any(row[1].endswith(f"::excluded_w{i}") for row in nodes)
-                with sqlite3.connect(f"file:{dbs[i]}?mode=ro", uri=True, timeout=10) as conn:
+                with sqlite3.connect(dbs[i].as_uri() + "?mode=ro", uri=True, timeout=10) as conn:
                     stored_head = conn.execute("SELECT head_sha FROM generations ORDER BY id DESC LIMIT 1").fetchone()[0]
                 if pending == 0 and (present is None or found == present) and (head is None or stored_head == head):
                     return
@@ -213,7 +248,7 @@ def main():
         exclude.write_text("excluded.py\n")
         parallel(lambda i: wait_metadata(i, present=False), range(len(roots)))
         def move_head(root):
-            run(["git", "-c", "user.name=DevMap test", "-c", "user.email=devmap-test@invalid", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-qm", "metadata-only edit"], root)
+            run(["git", "-c", "user.name=DevMap test", "-c", "user.email=devmap-test@invalid", "-c", f"core.hooksPath={hooks}", "commit", "--allow-empty", "-qm", "metadata-only edit"], root)
             return run(["git", "rev-parse", "HEAD"], root).decode().strip()
         heads = parallel(move_head, roots)
         parallel(lambda i: wait_metadata(i, head=heads[i]), range(len(roots)))
@@ -271,7 +306,12 @@ def main():
                     time.sleep(.1)
                 raise RuntimeError(f"worktree {i} did not converge after round {cycle}")
             parallel(converged, range(len(roots)))
-            rss = run(["ps", "-o", "rss=", "-p", ",".join(str(child.pid) for child in active)]).split()
+            pids = ",".join(str(child.pid) for child in active)
+            if os.name == "nt":
+                rss = run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                           f"$ErrorActionPreference='Stop'; Get-Process -Id {pids} | ForEach-Object {{ [math]::Ceiling($_.WorkingSet64 / 1024) }}"]).split()
+            else:
+                rss = run(["ps", "-o", "rss=", "-p", pids]).split()
             assert len(rss) == len(active), "RSS sample missed a daemon"
             report["daemon_rss_kib_samples"].append(sum(int(value) for value in rss))
             print(f"round {cycle + 1}: {2 * len(roots)} editors converged; {len(victims)} crash/restarts", flush=True)
@@ -284,16 +324,30 @@ def main():
             incremental = snapshot(dbs[i])
             expected = snapshot(cold)
             assert incremental == expected, f"incremental/cold mismatch in worktree {i}"
-            assert not endpoints[i].exists(), f"stale endpoint after shutdown: {i}"
+            if os.name == "nt":
+                try:
+                    ipc(endpoints[i], cmd="status")
+                except ConnectionRefusedError:
+                    pass
+                else:
+                    raise RuntimeError(f"endpoint still serves after shutdown: {i}")
+            else:
+                assert not endpoints[i].exists(), f"stale endpoint after shutdown: {i}"
         parallel(compare, range(len(roots)))
         report["cold_comparisons"] = len(roots)
         report["passed"] = True
     except BaseException as error:
         report["error"] = str(error)
+        if isinstance(error, subprocess.CalledProcessError):
+            report["subprocess_stderr"] = (error.stderr or b"").decode(errors="replace")
         raise
     finally:
+        cleanup_errors = []
         for child in children:
-            stop(child, crash=True)
+            try:
+                stop(child, crash=True)
+            except Exception as error:
+                cleanup_errors.append(f"child {child.pid}: {error}")
         if not report["passed"]:
             report["daemon_log_samples"] = []
             for log in logs[:4]:
@@ -302,13 +356,21 @@ def main():
                 report["daemon_log_samples"].append(log.read().decode(errors="replace"))
         for log in logs:
             log.close()
-        scratch_scope.cleanup()
+        try:
+            scratch_scope.cleanup()
+        except Exception as error:
+            cleanup_errors.append(f"scratch cleanup: {error}")
+        if cleanup_errors:
+            report["cleanup_errors"] = cleanup_errors
+            report["passed"] = False
         report["elapsed_seconds"] = round(time.monotonic() - started, 3)
         if query_ms:
             measured = sorted(query_ms)
             report["query_latency_ms"] = {"samples": len(measured), "p50": round(measured[len(measured)//2], 3), "p95": round(measured[min(len(measured)-1, int(len(measured)*.95))], 3), "max": round(measured[-1], 3)}
         args.output.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report), flush=True)
+        if cleanup_errors:
+            raise RuntimeError(f"harness cleanup failed: {cleanup_errors}")
 
 
 if __name__ == "__main__":

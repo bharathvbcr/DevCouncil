@@ -78,6 +78,27 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --workspace --no-fail-fast
 
+      - uses: actions/setup-python@v5
+        if: ${{ !cancelled() }}
+        with:
+          python-version: "3.12"
+      - name: Native worktree capacity and process recovery
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          python tools/worktree_stress.py --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 2 --fixture-files 4 --rounds 1 --build-workers 2 --output capacity-smoke.json
+          python tools/worktree_stress.py --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 128 --fixture-files 64 --rounds 4 --build-workers 8 --output capacity-native.json
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: capacity-${{ matrix.os }}
+          path: rust-port/capacity-*.json
+          if-no-files-found: error
+
   # The shape an embedder links: this workspace's five parsing crates each
   # build without tree-sitter, answering questions about a persisted map
   # instead of building one. Nothing in CI had ever compiled that shape.
