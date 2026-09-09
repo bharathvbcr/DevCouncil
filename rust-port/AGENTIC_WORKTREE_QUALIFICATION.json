@@ -1,0 +1,727 @@
+{
+  "qualification_date": "2026-09-09",
+  "status": "qualified_measured_envelopes_live_cutover_pending",
+  "live_cutover_completed": false,
+  "runtime_commit": "da7d2d106201073e14d7ab43cc2f78981f6755ed",
+  "harness_commit": "da7d2d106201073e14d7ab43cc2f78981f6755ed",
+  "gitpulse_candidate_commit": "7b96c278098e583a9477f33db7871f1a8811265c",
+  "staged_artifacts": {
+    "devcouncil_commit": "da7d2d106201073e14d7ab43cc2f78981f6755ed",
+    "gitpulse_commit": "7b96c278098e583a9477f33db7871f1a8811265c",
+    "store_schema": 20,
+    "signature": "ad hoc; strict deep verification passed; not Developer ID or notarized",
+    "installed": false,
+    "isolated_build_targets": true,
+    "files": [
+      {
+        "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/devmap",
+        "bytes": 60416304,
+        "sha256": "05df9a854a20b10dfc0bf082bd4cb05aa0af237208b768c99b758ee0d79ca423"
+      },
+      {
+        "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/GitPulse.app/Contents/MacOS/gitpulse",
+        "bytes": 37818160,
+        "sha256": "6e68710452b875d3721e033148f3ab0ad82cd4aff9a8ce61a749fa96a2ae061e"
+      },
+      {
+        "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/GitPulse.app/Contents/MacOS/gitpulse-hook",
+        "bytes": 6018384,
+        "sha256": "46f22829046c17878fc1b3650ae0ae04a5897c000e0de4f1e527450e3629eba2"
+      },
+      {
+        "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/GitPulse.app/Contents/MacOS/gitpulse-mcp",
+        "bytes": 8174880,
+        "sha256": "8a0674cf85d038464b00f76b4abc716f5032a82f3bd1bb8d5ca81cb02708c2a0"
+      },
+      {
+        "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/GitPulse.app/Contents/MacOS/gitpulsed",
+        "bytes": 5824672,
+        "sha256": "0abdefe3980d8810255efaa689d15fe312295245a790df164fbaecc3126c2f2b"
+      }
+    ]
+  },
+  "staged_hashes_reverified": true,
+  "local_capacity": [
+    {
+      "worktrees": 128,
+      "simultaneous_daemons": 128,
+      "simultaneous_editors": 256,
+      "build_workers": 16,
+      "tokio_workers_per_process": 2,
+      "rayon_workers_per_process": 2,
+      "binary_sha256": "05df9a854a20b10dfc0bf082bd4cb05aa0af237208b768c99b758ee0d79ca423",
+      "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+      "ipc_transport": "unix_socket",
+      "ipc_probe_process": false,
+      "latency_includes_probe_startup": false,
+      "latency_includes_probe_admission": false,
+      "ipc_probe_workers": 0,
+      "ipc_probe_admission_timeout_seconds": 0,
+      "initial_source_files_per_worktree": 257,
+      "initial_symbols_per_worktree": 2307,
+      "initial_functions_per_worktree": 2050,
+      "initial_call_edges_per_worktree": 1793,
+      "fixture_functions_per_file": 8,
+      "rounds": 8,
+      "edit_operations": 24576,
+      "ipc_queries": 2048,
+      "metadata_checks": 512,
+      "cold_comparisons": 128,
+      "kills": 256,
+      "daemon_rss_kib_samples": [
+        4943504,
+        4795936,
+        4658560,
+        4497168,
+        4505536,
+        4500016,
+        4499680,
+        4508256
+      ],
+      "passed": true,
+      "filesystem_retry_attempts": 0,
+      "filesystem_retry_deadline_seconds": 5,
+      "initial_edges_per_worktree": 3843,
+      "distinct_private_heads": 128,
+      "elapsed_seconds": 116.181,
+      "ipc_probe_peak_active": 0,
+      "query_latency_ms": {
+        "samples": 2048,
+        "p50": 33.437,
+        "p95": 155.5,
+        "max": 575.974
+      }
+    },
+    {
+      "worktrees": 8,
+      "simultaneous_daemons": 8,
+      "simultaneous_editors": 16,
+      "build_workers": 8,
+      "tokio_workers_per_process": 2,
+      "rayon_workers_per_process": 2,
+      "binary_sha256": "05df9a854a20b10dfc0bf082bd4cb05aa0af237208b768c99b758ee0d79ca423",
+      "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+      "ipc_transport": "unix_socket",
+      "ipc_probe_process": false,
+      "latency_includes_probe_startup": false,
+      "latency_includes_probe_admission": false,
+      "ipc_probe_workers": 0,
+      "ipc_probe_admission_timeout_seconds": 0,
+      "initial_source_files_per_worktree": 4097,
+      "initial_symbols_per_worktree": 69635,
+      "initial_functions_per_worktree": 65538,
+      "initial_call_edges_per_worktree": 61441,
+      "fixture_functions_per_file": 16,
+      "rounds": 6,
+      "edit_operations": 1152,
+      "ipc_queries": 96,
+      "metadata_checks": 32,
+      "cold_comparisons": 8,
+      "kills": 12,
+      "daemon_rss_kib_samples": [
+        3832480,
+        3514704,
+        3194544,
+        2937856,
+        2942608,
+        2940464
+      ],
+      "passed": true,
+      "filesystem_retry_attempts": 0,
+      "filesystem_retry_deadline_seconds": 5,
+      "initial_edges_per_worktree": 126979,
+      "distinct_private_heads": 8,
+      "elapsed_seconds": 96.785,
+      "ipc_probe_peak_active": 0,
+      "query_latency_ms": {
+        "samples": 96,
+        "p50": 8.998,
+        "p95": 19.746,
+        "max": 32.983
+      }
+    }
+  ],
+  "native_capacity_final": {
+    "status": "passed",
+    "ci_url": "https://github.com/bharathvbcr/DevCouncil/actions/runs/34344358354",
+    "platforms": {
+      "linux": {
+        "worktrees": 128,
+        "simultaneous_daemons": 128,
+        "simultaneous_editors": 256,
+        "build_workers": 8,
+        "tokio_workers_per_process": 2,
+        "rayon_workers_per_process": 2,
+        "binary_sha256": "32b5c3a5d588a0c0f9ed58597e928281b8e70f668755274c279c3156293a0355",
+        "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+        "ipc_transport": "unix_socket",
+        "ipc_probe_process": true,
+        "latency_includes_probe_startup": true,
+        "latency_includes_probe_admission": true,
+        "ipc_probe_workers": 8,
+        "ipc_probe_admission_timeout_seconds": 30,
+        "initial_source_files_per_worktree": 65,
+        "initial_symbols_per_worktree": 579,
+        "initial_functions_per_worktree": 514,
+        "initial_call_edges_per_worktree": 449,
+        "fixture_functions_per_file": 8,
+        "rounds": 4,
+        "edit_operations": 12288,
+        "ipc_queries": 1024,
+        "metadata_checks": 512,
+        "cold_comparisons": 128,
+        "kills": 128,
+        "daemon_rss_kib_samples": [
+          4623548,
+          4575156,
+          4546580,
+          4473140
+        ],
+        "passed": true,
+        "filesystem_retry_attempts": 0,
+        "filesystem_retry_deadline_seconds": 5,
+        "initial_edges_per_worktree": 963,
+        "distinct_private_heads": 128,
+        "elapsed_seconds": 125.342,
+        "ipc_probe_peak_active": 8,
+        "query_latency_ms": {
+          "samples": 1024,
+          "p50": 337.676,
+          "p95": 814.012,
+          "max": 1114.656
+        }
+      },
+      "macos": {
+        "worktrees": 128,
+        "simultaneous_daemons": 128,
+        "simultaneous_editors": 256,
+        "build_workers": 8,
+        "tokio_workers_per_process": 2,
+        "rayon_workers_per_process": 2,
+        "binary_sha256": "020a18b9ce50d8d589bf91d506b0a6e75ec2291988fa77bac7ec02281cc75c65",
+        "platform": "macOS-15.7.9-arm64-arm-64bit",
+        "ipc_transport": "unix_socket",
+        "ipc_probe_process": true,
+        "latency_includes_probe_startup": true,
+        "latency_includes_probe_admission": true,
+        "ipc_probe_workers": 8,
+        "ipc_probe_admission_timeout_seconds": 30,
+        "initial_source_files_per_worktree": 65,
+        "initial_symbols_per_worktree": 579,
+        "initial_functions_per_worktree": 514,
+        "initial_call_edges_per_worktree": 449,
+        "fixture_functions_per_file": 8,
+        "rounds": 4,
+        "edit_operations": 12288,
+        "ipc_queries": 1024,
+        "metadata_checks": 512,
+        "cold_comparisons": 128,
+        "kills": 128,
+        "daemon_rss_kib_samples": [
+          3739392,
+          3754224,
+          3777280,
+          3799472
+        ],
+        "passed": true,
+        "filesystem_retry_attempts": 0,
+        "filesystem_retry_deadline_seconds": 5,
+        "initial_edges_per_worktree": 963,
+        "distinct_private_heads": 128,
+        "elapsed_seconds": 118.195,
+        "ipc_probe_peak_active": 8,
+        "query_latency_ms": {
+          "samples": 1024,
+          "p50": 805.352,
+          "p95": 1115.873,
+          "max": 1584.029
+        }
+      },
+      "windows": {
+        "worktrees": 128,
+        "simultaneous_daemons": 128,
+        "simultaneous_editors": 256,
+        "build_workers": 8,
+        "tokio_workers_per_process": 2,
+        "rayon_workers_per_process": 2,
+        "binary_sha256": "475a3e58a220bb722379e8e1e74bf954f93d1636557135c6aee33af0e945ee72",
+        "platform": "Windows-2025Server-10.0.26100-SP0",
+        "ipc_transport": "named_pipe",
+        "ipc_probe_process": true,
+        "latency_includes_probe_startup": true,
+        "latency_includes_probe_admission": true,
+        "ipc_probe_workers": 8,
+        "ipc_probe_admission_timeout_seconds": 30,
+        "initial_source_files_per_worktree": 65,
+        "initial_symbols_per_worktree": 579,
+        "initial_functions_per_worktree": 514,
+        "initial_call_edges_per_worktree": 449,
+        "fixture_functions_per_file": 8,
+        "rounds": 4,
+        "edit_operations": 12288,
+        "ipc_queries": 1024,
+        "metadata_checks": 512,
+        "cold_comparisons": 128,
+        "kills": 128,
+        "daemon_rss_kib_samples": [
+          3276388,
+          3205384,
+          3202024,
+          3238976
+        ],
+        "passed": true,
+        "filesystem_retry_attempts": 1110,
+        "filesystem_retry_deadline_seconds": 5,
+        "initial_edges_per_worktree": 963,
+        "distinct_private_heads": 128,
+        "elapsed_seconds": 262.39,
+        "ipc_probe_peak_active": 8,
+        "query_latency_ms": {
+          "samples": 1024,
+          "p50": 7218.0,
+          "p95": 12313.0,
+          "max": 13266.0
+        }
+      }
+    }
+  },
+  "migration": {
+    "passed": true,
+    "binary_sha256": "05df9a854a20b10dfc0bf082bd4cb05aa0af237208b768c99b758ee0d79ca423",
+    "stores_tested": 16,
+    "schemas_before": [
+      17,
+      18,
+      19
+    ],
+    "receipt": {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final-migration-rehearsal.json",
+      "bytes": 59115,
+      "sha256": "78bcfc4ea7ae58a33a72bbd33b57da2bd7587debf84c2a0528e696f57a88d277"
+    }
+  },
+  "self_build": {
+    "elapsed_seconds": 3.2687794999801554,
+    "peak_rss_bytes": 776617984,
+    "binary_sha256": "05df9a854a20b10dfc0bf082bd4cb05aa0af237208b768c99b758ee0d79ca423",
+    "passed": true,
+    "files": 1649
+  },
+  "final_hosted_self_build": {
+    "run": 34344358354,
+    "job": 102442320617,
+    "required_gates_passed": true,
+    "build_ms": 8599,
+    "files": 1647,
+    "database_mib": 170,
+    "database_budget_mib": 257,
+    "peak_rss_mib": 681,
+    "rss_budget_mib": 894,
+    "optional_mutants_ran": false,
+    "rust_result_totals": {
+      "blocks": 219,
+      "passed": 2335,
+      "failed": 0,
+      "ignored": 3
+    }
+  },
+  "retained_loaded_host_failure": {
+    "build_ms": 17386,
+    "threshold_ms": 10000,
+    "passed": false,
+    "log": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/previous-final-1c2-da9/logs/devmap-rollout-final-verify.log"
+  },
+  "live_store_inventory": [
+    {
+      "source": "/Users/bharath/Code/devtools/DevPrism/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        4,
+        "/Users/bharath/Code/devtools/DevPrism"
+      ]
+    },
+    {
+      "source": "/Users/bharath/Code/devtools/Strait/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        1,
+        "/Users/bharath/Code/devtools/Strait"
+      ]
+    },
+    {
+      "source": "/Users/bharath/Code/devtools/Manvi/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        29,
+        "/Users/bharath/Code/devtools/Manvi"
+      ]
+    },
+    {
+      "source": "/Users/bharath/Code/web/Portfolio/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        2,
+        "/Users/bharath/Code/web/Portfolio"
+      ]
+    },
+    {
+      "source": "/Users/bharath/Code/apps/DevType/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        2,
+        "/Users/bharath/Code/apps/DevType"
+      ]
+    },
+    {
+      "source": "/Users/bharath/Code/devtools/MarkDev/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        5,
+        "/Users/bharath/Code/devtools/MarkDev"
+      ]
+    },
+    {
+      "source": "/Users/bharath/Code/scholarlm/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        46,
+        "/Users/bharath/Code/scholarlm"
+      ]
+    },
+    {
+      "source": "/Users/bharath/.codex/worktrees/agentic-workspaces/Manvi/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        14,
+        "/Users/bharath/.codex/worktrees/agentic-workspaces/Manvi"
+      ]
+    },
+    {
+      "source": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        1276,
+        "/Users/bharath/Code/devtools/DevCouncil"
+      ]
+    },
+    {
+      "source": "/Users/bharath/.codex/worktrees/agentic-workspaces/GitPulse/.devmap/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        13,
+        "/Users/bharath/.codex/worktrees/agentic-workspaces/GitPulse"
+      ]
+    },
+    {
+      "source": "/Users/bharath/Code/research/BINN/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        47,
+        "/Users/bharath/Code/research/BINN"
+      ]
+    },
+    {
+      "source": "/Users/bharath/Code/devtools/GitPulse/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        243,
+        "/Users/bharath/Code/devtools/GitPulse"
+      ]
+    },
+    {
+      "source": "/Users/bharath/Code/devtools/DevCouncil/.claude/worktrees/dev-map-hardening-perf-e9d85c/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 18,
+      "original_schema": 18,
+      "latest": [
+        36,
+        "/Users/bharath/Code/devtools/DevCouncil/.claude/worktrees/dev-map-hardening-perf-e9d85c"
+      ]
+    },
+    {
+      "source": "/Users/bharath/Code/devtools/DevCouncil/.claude/worktrees/dev-map-hardening-perf-e9d85c/rust-port/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 17,
+      "original_schema": 17,
+      "latest": [
+        41,
+        "/Users/bharath/Code/devtools/DevCouncil/.claude/worktrees/dev-map-hardening-perf-e9d85c/rust-port"
+      ]
+    },
+    {
+      "source": "/Users/bharath/Code/research/MLSystemsLab/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        3,
+        "/Users/bharath/Code/research/MLSystemsLab"
+      ]
+    },
+    {
+      "source": "/Users/bharath/Code/research/MLSystemsLab/.claude/worktrees/experiment-comparison-arxiv-9f396c/.devcouncil/codeintel/devmap.sqlite",
+      "schema": 19,
+      "original_schema": 19,
+      "latest": [
+        21,
+        "/Users/bharath/Code/research/MLSystemsLab/.claude/worktrees/experiment-comparison-arxiv-9f396c"
+      ]
+    }
+  ],
+  "installed_binaries": [
+    {
+      "path": "/Users/bharath/.cargo/bin/devmap",
+      "sha256": "6ffd350e70643af346f66dff9908342d0fc9f2e5c39c48919b10f7ed7ec45802",
+      "matches_original": true
+    },
+    {
+      "path": "/Users/bharath/.cargo/bin/gitpulse-mcp",
+      "sha256": "87d5b71d48bb6755455ba73e81a0ab245380711ad698d062a58e24ab0033ef75",
+      "matches_original": true
+    },
+    {
+      "path": "/Applications/GitPulse.app/Contents/MacOS/gitpulse",
+      "sha256": "c8538fbc6e64c422b28b2a209a602b670ff05b601a3f1ef47e4db7fc15e922f3",
+      "matches_original": true
+    }
+  ],
+  "mcp_readback": {
+    "binary_sha256": "8a0674cf85d038464b00f76b4abc716f5032a82f3bd1bb8d5ca81cb02708c2a0",
+    "passed": true,
+    "navigation_schemas_checked": 5,
+    "navigation_responses_checked": 6,
+    "server": {
+      "name": "gitpulse-mcp",
+      "version": "0.0.9"
+    },
+    "store_schema": 20,
+    "search_shown": 28,
+    "search_total": 28,
+    "stale_snippets_withheld": 28,
+    "impact_shown": 80,
+    "impact_total": 4999,
+    "impact_truncated": true,
+    "walk_incomplete": "the walk did not complete: 28203 traversed edges unrecorded; the result is a lower bound, not the full blast radius; the analysis is partial: call extraction did not cover the whole corpus: 3 file(s) failed to parse, 4 recovered by pattern (no calls extracted), 1 refused by discovery and never read at all \u2014 dead-code and unwired findings are a lower bound and are capped below the confident tier; 4 file(s) in a language with no call extractor at all (permanent for this build, not a transient failure); 95210 call(s) in this generation are unattributed: the graph behind this answer is missing that many edges, so it is a lower bound",
+    "foreign_root_refused": "DevMap store belongs to worktree \"/Users/bharath/Code/devtools/DevCouncil\", not \"/Users/bharath/Code/devtools/GitPulse\"; use a separate --db or DEVMAP_HOME for each worktree"
+  },
+  "mcp_doctor": {
+    "binPath": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/GitPulse.app/Contents/MacOS/gitpulse-mcp",
+    "version": "0.0.9",
+    "storeSchema": 20,
+    "expected": "0.0.9",
+    "expectedSchema": 20,
+    "status": "ok",
+    "violations": [],
+    "ok": true
+  },
+  "gitpulse_ci": {
+    "url": "https://github.com/bharathvbcr/GitPulse/actions/runs/34344431921",
+    "status": "completed",
+    "conclusion": "success",
+    "rust_result_totals": {
+      "linux": {
+        "blocks": 61,
+        "passed": 2070,
+        "failed": 0,
+        "ignored": 10
+      },
+      "macos": {
+        "blocks": 61,
+        "passed": 2071,
+        "failed": 0,
+        "ignored": 10
+      },
+      "windows": {
+        "blocks": 61,
+        "passed": 1916,
+        "failed": 0,
+        "ignored": 10
+      }
+    }
+  },
+  "devcouncil_ci": {
+    "url": "https://github.com/bharathvbcr/DevCouncil/actions/runs/34344358354",
+    "status": "completed",
+    "conclusion": "success",
+    "rust_result_totals": {
+      "linux": {
+        "blocks": 219,
+        "passed": 2335,
+        "failed": 0,
+        "ignored": 3
+      },
+      "macos": {
+        "blocks": 219,
+        "passed": 2335,
+        "failed": 0,
+        "ignored": 3
+      },
+      "windows": {
+        "blocks": 219,
+        "passed": 2234,
+        "failed": 0,
+        "ignored": 3
+      }
+    }
+  },
+  "finalization_regressions": {
+    "pre_fix": "both failed: late finalization published Clean",
+    "post_fix": "both passed; full extraction crate 590 passed, zero failed or ignored; strict Clippy passed",
+    "publication_contract": "check clock and incomplete-walk latch after final scopes and parser/tree/index cleanup",
+    "caller_clock_limit": "an exact external elapsed assertion includes post-publication descheduling; deterministic boundary injection replaces that oracle without weakening outer wall-time or complete-graph assertions"
+  },
+  "source_consistency": {
+    "devcouncil_files_compared": 358,
+    "devcouncil_mismatches": [],
+    "gitpulse_files_compared": 149,
+    "gitpulse_payload_mismatches": [],
+    "gitpulse_manifest_difference": "devmap-query upstream commit only; canonical b5d95033 vs qualification d9678f33; all nine crate payloads match official vendor check"
+  },
+  "historical_evidence": {
+    "directory": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/previous-final-1c2-da9",
+    "superseded_aggregate": {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/previous-final-1c2-da9/superseded-qualification-draft.json",
+      "bytes": 52078,
+      "sha256": "2c3d2ea3dae3d0592a48dc0eab3ee85f62db59c08935f5da5629c2bf07c41301"
+    },
+    "path_relocation": "old receipts retain their original final/ paths; archived files now reside under previous-final-1c2-da9/. They describe superseded candidates and must not be read as final runtime qualification."
+  },
+  "unverified": [
+    "coordinated installed client cutover and reconnect",
+    "every operating system, architecture and filesystem",
+    "network filesystem lock correctness",
+    "power-loss recovery",
+    "multi-week production soak",
+    "hundreds of large monorepos on one host",
+    "complete dynamic-language and framework analysis",
+    "workspace-wide mutation coverage",
+    "trusted platform publication",
+    "default thread-pool sizing at 128-daemon concurrency"
+  ],
+  "evidence": [
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/candidates.json",
+      "bytes": 1596,
+      "sha256": "53d7e956461a13d73cd615e4d25e002b0c23f1cec38a719e7a521913836b7faa"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/signature.txt",
+      "bytes": 2042,
+      "sha256": "8e8db4dca7b32da74d118105049565b58655ca7a0fc237cebca453e412185625"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/capacity-128.json",
+      "bytes": 1344,
+      "sha256": "e169631bf6092788855ab35a3602900a177811a7172db909ed95d8b313b83844"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/capacity-large.json",
+      "bytes": 1306,
+      "sha256": "8bfcaf90e0b7ac4019758da66cd3bc77ca7701a47ab56e3953eb2a5d9741dcc5"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/self-build-measurement.json",
+      "bytes": 12955,
+      "sha256": "5f5fb2af7fdbc3a6d895bbc9fe49efadbc5a9797d9c2ab5519873a529a02f262"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/mcp-navigation.json",
+      "bytes": 1296,
+      "sha256": "7fa9b155e59a7914daaaa3fb654707fa3c8929bb259e2daf87c2f493aa01e372"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/mcp-doctor.json",
+      "bytes": 287,
+      "sha256": "a3cdc8a65de871d350f07fc8073924559da34a1f8c95910dcf4deee66f45794f"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/live-store-inventory.json",
+      "bytes": 3938,
+      "sha256": "8e3ed624e401f5898a692fbba8129ab89dca0f43a15eed17fb4c5d441f417bcb"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/installed-binary-inventory.json",
+      "bytes": 531,
+      "sha256": "ac861fa0cb17c1e6b84367d0733bc3ae021c015c8fbd5764e9a94bf88015b5a4"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/logs/manifest.json",
+      "bytes": 5577,
+      "sha256": "07d5819a27d1a5d30af1cc16dbcf11ce5d4fa140b5de1aede590bfe40b1513ac"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/backup-manifest.json",
+      "bytes": 6987,
+      "sha256": "779c35c59eb549fad26e8ae8c95b9938d0ec0848904447af4f59f7daa851032a"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final-migration-rehearsal.py",
+      "bytes": 6153,
+      "sha256": "44cb44ee400f921d8df7af8c4a4565845f2da5a3268264b2f779b9c330d08954"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final-mcp-navigation.py",
+      "bytes": 5878,
+      "sha256": "8b2cb1bc35c24a05c358e2b1ab8b8dc8199be89a19398c8452593f32461314f0"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/devcouncil-restoration-comparison.json",
+      "bytes": 5757,
+      "sha256": "518d27eee96575f56ecd6e4aabf0f85af16cb5b72123954f40c02129d399c594"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/devcouncil-restoration-result.json",
+      "bytes": 309,
+      "sha256": "69bce915f551ca1d6e869ec9936af78a01d1b2cc4d1ee83ef219dad0dc0ab6e5"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/devcouncil-ci.json",
+      "bytes": 13399,
+      "sha256": "605479b6bb0301fd32cee51ebcde281f74ca6bd6c157703052abb9c0e5a2d984"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/native-da7/linux/capacity-native.json",
+      "bytes": 1300,
+      "sha256": "bae70396dd8563276b06f196ea5a93b26e6e34a54cde79b480121ed13181f57f"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/native-da7/linux/capacity-smoke.json",
+      "bytes": 1224,
+      "sha256": "76a3d1db006a8796c304aa98aaf988ecff1d8e5d8cb48345f89b0bf8fcd3c29e"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/native-da7/macos/capacity-native.json",
+      "bytes": 1284,
+      "sha256": "ae3ff47e8850d6820cb9d7e6c055d41bf16a8754e0e7cc2909bd08afdeafdbe4"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/native-da7/macos/capacity-smoke.json",
+      "bytes": 1208,
+      "sha256": "99a70d88e8f610a544f704b8b3d3293f82d6f96a81b399d5b5a37a2e520021a6"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/native-da7/windows/capacity-native.json",
+      "bytes": 1333,
+      "sha256": "b4dc5e54271e0901acf1a946ca4c107059ab3bf3f440037e59de9b50cd00bf95"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/native-da7/windows/capacity-smoke.json",
+      "bytes": 1250,
+      "sha256": "9da187425e91e6d491a68cbb75dd3829ca1248a7b405ee89eea734bda98dda01"
+    },
+    {
+      "path": "/Users/bharath/Library/Application Support/DevMap/rollouts/2026-09-09-schema20/final/gitpulse-ci.json",
+      "bytes": 12546,
+      "sha256": "96aba69c7c594dd62431b20be74d9e77a03d31d8097126f8243eb77c80054b11"
+    }
+  ]
+}

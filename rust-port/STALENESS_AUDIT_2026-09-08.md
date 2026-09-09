@@ -1,5 +1,7 @@
 # DevMap staleness and navigation audit — 8 September 2026
 
+**Follow-up:** [Schema-20 qualification](SCHEMA20_QUALIFICATION_2026-09-09.md) records native CI, larger graph and 128-worktree stress, read-only migration safety, and the now-passing unchanged self-build gate. The measurements and failures below belong to the earlier candidate. Coordinated live consumer cutover remains pending.
+
 ## Verified behavior and repair
 
 Staleness does not disable persisted navigation. A quiet watcher queue is not proof of current source. Real CLI tests reproduce `is_fresh: false`, `pending_count: 0`, and `query_ready: true` after a same-size edit. Stored identities remain searchable, changed-source snippets are withheld with a reason, and newly added identities appear after rebuilding. Unchanged files still return hash-verified snippets while another file is stale.
