@@ -37,13 +37,16 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 /// How long the startup liveness probe waits for an existing endpoint to
 /// answer a connect before treating it as active-and-unreachable. Bounded so
 /// a wedged listener cannot stall a new daemon's bind forever.
+#[cfg(any(unix, test))]
 const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long a bind waits out a contended endpoint lock before refusing.
 ///
 /// A quarter of `LIVENESS_PROBE_TIMEOUT`: long enough to absorb the millisecond
 /// window in which a previous holder is releasing, short enough that a
 /// genuinely-owned endpoint is still refused promptly.
+#[cfg(unix)]
 const LOCK_CONTENTION_WINDOW: Duration = Duration::from_millis(125);
+#[cfg(unix)]
 const LOCK_CONTENTION_POLL: Duration = Duration::from_millis(2);
 /// Ceiling on concurrently served connections. Each accepted connection
 /// spawns a task that may buffer up to MAX_REQUEST_BYTES before any
@@ -117,6 +120,7 @@ pub struct UnappliedEdits(std::sync::Mutex<Option<Unapplied>>);
 
 #[derive(Debug, Clone)]
 struct Unapplied {
+    revision: Arc<()>,
     /// Paths, summed across every refusal. An undercount is possible and is the
     /// right direction to be wrong in: a batch refused before it was counted
     /// still moves this off zero, and off zero is the whole claim.
@@ -127,6 +131,20 @@ struct Unapplied {
 }
 
 impl UnappliedEdits {
+    /// Before binding IPC, mark the startup sweep as unverified. This is not
+    /// a fabricated write failure: its zero batches get a distinct description.
+    pub fn begin_initial_sweep(&self) {
+        let mut slot = self.0.lock().expect("unapplied-edits mutex poisoned");
+        if slot.is_none() {
+            *slot = Some(Unapplied {
+                revision: Arc::new(()),
+                paths: 0,
+                batches: 0,
+                reason: "Initial reconciliation is in progress; freshness is unverified".to_owned(),
+            });
+        }
+    }
+
     /// Record that `paths` changed paths could not be written down.
     ///
     /// Never resets the count. Two refusals are more lost coverage than one.
@@ -135,12 +153,14 @@ impl UnappliedEdits {
         let reason = reason.to_string();
         match slot.as_mut() {
             Some(existing) => {
+                existing.revision = Arc::new(());
                 existing.paths = existing.paths.saturating_add(paths as u64);
                 existing.batches = existing.batches.saturating_add(1);
                 existing.reason = reason;
             }
             None => {
                 *slot = Some(Unapplied {
+                    revision: Arc::new(()),
                     paths: paths as u64,
                     batches: 1,
                     reason,
@@ -149,16 +169,26 @@ impl UnappliedEdits {
         }
     }
 
-    /// Retire the record, because the tree has been re-read from scratch.
-    ///
-    /// The only caller is a *successful* `reconcile_connect_time`, and that is
-    /// the point: it is the one pass that compares every source's content hash
-    /// against the stored generation, so whatever the dropped batches named is
-    /// either already indexed or has just been queued by name. Clearing on a
-    /// successful ordinary enqueue instead would retire a claim about edits that
-    /// enqueue never looked at.
-    pub fn cleared_by_sweep(&self) {
-        *self.0.lock().expect("unapplied-edits mutex poisoned") = None;
+    /// Capture the refusals known before discovery starts. Allocation identity
+    /// avoids counter overflow and delete/reinsert ABA, including equal counts.
+    pub fn sweep_watermark(&self) -> Option<Arc<()>> {
+        self.0
+            .lock()
+            .expect("unapplied-edits mutex poisoned")
+            .as_ref()
+            .map(|record| record.revision.clone())
+    }
+
+    /// A successful sweep covers only the record it observed before discovery.
+    /// A later refusal may name a file already scanned, so it survives even
+    /// when the sweep itself succeeds. A normal successful enqueue never clears it.
+    pub fn cleared_by_sweep(&self, watermark: Option<Arc<()>>) {
+        let mut slot = self.0.lock().expect("unapplied-edits mutex poisoned");
+        if let (Some(record), Some(mark)) = (slot.as_ref(), watermark) {
+            if Arc::ptr_eq(&record.revision, &mark) {
+                *slot = None;
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -188,6 +218,9 @@ impl UnappliedEdits {
     pub fn describe(&self) -> Option<String> {
         let slot = self.0.lock().expect("unapplied-edits mutex poisoned");
         let record = slot.as_ref()?;
+        if record.batches == 0 {
+            return Some(record.reason.clone());
+        }
         Some(format!(
             "{} changed path(s) in {} batch(es) could not be recorded as pending work and are \
 NOT in this generation: {}. This index is behind the tree by an amount only a rebuild can \
@@ -2801,6 +2834,46 @@ mod tests {
             !value["degraded_reason"].is_null(),
             "a caller that sees `is_fresh: false` must be told why, or it cannot \
              tell an empty store from a busy one"
+        );
+    }
+
+    #[test]
+    fn a_sweep_cannot_acknowledge_a_later_write_refusal() {
+        let dropped = UnappliedEdits::default();
+        dropped.record(1, "before discovery");
+        let watermark = dropped.sweep_watermark();
+        dropped.record(2, "after discovery");
+        dropped.cleared_by_sweep(watermark);
+        assert!(!dropped.is_empty());
+        assert!(dropped.describe().unwrap().contains("after discovery"));
+    }
+
+    #[test]
+    fn a_reused_sweep_mark_cannot_clear_a_new_record() {
+        let dropped = UnappliedEdits::default();
+        dropped.record(1, "first");
+        let old = dropped.sweep_watermark();
+        dropped.cleared_by_sweep(old.clone());
+        assert!(dropped.is_empty());
+        dropped.record(1, "second");
+        dropped.cleared_by_sweep(old);
+        assert!(!dropped.is_empty());
+        dropped.cleared_by_sweep(dropped.sweep_watermark());
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn initial_reconciliation_is_unverified_until_its_sweep_finishes() {
+        let dropped = UnappliedEdits::default();
+        dropped.begin_initial_sweep();
+        assert!(!dropped.is_empty());
+        assert!(dropped.describe().unwrap().contains("unverified"));
+        let snapshot = dropped.snapshot();
+        dropped.cleared_by_sweep(dropped.sweep_watermark());
+        assert!(dropped.is_empty());
+        assert!(
+            !snapshot.is_empty(),
+            "an in-flight query keeps its own observation"
         );
     }
 
