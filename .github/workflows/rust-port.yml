@@ -56,15 +56,15 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
 
       # 22 tree-sitter grammars compile C. A build failure here is a real
       # portability failure, not a test failure, so it is a separate step.
       - name: Build
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --keep-going
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
   # The shape an embedder links: this workspace's five parsing crates each
   # build without tree-sitter, answering questions about a persisted map
