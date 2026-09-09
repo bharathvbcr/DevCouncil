@@ -380,7 +380,8 @@ fn a_read_only_output_file_is_refused_without_replacing_its_bytes() {
     let target = dir.join(".claude-plugin/marketplace.json");
     std::fs::create_dir_all(target.parent().unwrap()).unwrap();
     std::fs::write(&target, "preserve this file").unwrap();
-    let mut perms = std::fs::metadata(&target).unwrap().permissions();
+    let original = std::fs::metadata(&target).unwrap().permissions();
+    let mut perms = original.clone();
     perms.set_readonly(true);
     std::fs::set_permissions(&target, perms).unwrap();
     let run = devmap(&["claude", "plugin", "--out", dir.to_str().unwrap()]);
@@ -390,9 +391,7 @@ fn a_read_only_output_file_is_refused_without_replacing_its_bytes() {
         std::fs::read_to_string(&target).unwrap(),
         "preserve this file"
     );
-    let mut perms = std::fs::metadata(&target).unwrap().permissions();
-    perms.set_readonly(false);
-    std::fs::set_permissions(&target, perms).unwrap();
+    std::fs::set_permissions(&target, original).unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
 

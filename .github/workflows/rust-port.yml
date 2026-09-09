@@ -63,14 +63,17 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
+        if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
 
       # 22 tree-sitter grammars compile C. A build failure here is a real
       # portability failure, not a test failure, so it is a separate step.
       - name: Build
+        if: ${{ !cancelled() }}
         run: cargo build --workspace --all-targets --keep-going
 
       - name: Test
+        if: ${{ !cancelled() }}
         run: cargo test --workspace --no-fail-fast
 
   # The shape an embedder links: this workspace's five parsing crates each
@@ -133,7 +136,7 @@ jobs:
         run: bash ./verify.sh
 
   parity:
-    name: parity vs frozen Python baseline
+    name: release build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
