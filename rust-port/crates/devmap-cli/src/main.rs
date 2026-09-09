@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
@@ -161,7 +161,7 @@ impl Cli {
     /// one. `claude validate <path>` is deliberately absent: its argument is a
     /// *file* to check, and treating it as a root would resolve the store
     /// relative to a hooks manifest.
-    fn root_hint(&self) -> &Path {
+    fn root_hint(&self) -> PathBuf {
         match &self.command {
             Commands::Build { path, .. }
             | Commands::Manifest { path, .. }
@@ -172,8 +172,12 @@ impl Cli {
             | Commands::Routes { path, .. }
             | Commands::ShapeCheck { path, .. }
             | Commands::ApiImpact { path, .. }
-            | Commands::Paths { path } => path,
-            _ => Path::new("."),
+            | Commands::Paths { path } => path.clone(),
+            // Hook templates retain project-relative paths for the host that
+            // will execute them; they are not a query against this checkout.
+            Commands::Claude { .. } => PathBuf::from("."),
+            _ => devmap_extract::git_worktree_root(Path::new("."))
+                .unwrap_or_else(|| PathBuf::from(".")),
         }
     }
 
@@ -2217,9 +2221,15 @@ fn build_manifest_payload(
     }))
 }
 
-fn open_for_read(db: &std::path::Path) -> anyhow::Result<Store> {
-    match Store::open_existing(db)? {
-        Some(store) => Ok(store),
+fn open_for_read(cli: &Cli) -> anyhow::Result<Store> {
+    let db = cli.db();
+    match Store::open_existing(&db)? {
+        Some(store) => {
+            if cli.db.is_none() {
+                store.validate_repo_root(&cli.root_hint())?;
+            }
+            Ok(store)
+        }
         None => Err(anyhow::anyhow!(
             "no devmap store at {} — run `devmap build` first",
             db.display()
@@ -2880,7 +2890,7 @@ fn render_error(error: &anyhow::Error) -> String {
 /// spelled can fail here.
 fn validate_root(cli: &Cli) -> Result<(), String> {
     let root = cli.root_hint();
-    match std::fs::metadata(root) {
+    match std::fs::metadata(&root) {
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(format!(
             "{}: not a directory; the path a subcommand names must be a repository root",
@@ -3128,18 +3138,27 @@ fn restore_default_sigpipe() {}
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    let started = Instant::now();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     // stderr, not the builder's default stdout. Every command that emits a
     // payload emits it on stdout — `emit_json` prints there, and `devmap mcp`
     // speaks JSON-RPC there — so a log line on stdout is not noise beside the
     // answer, it is a line *inside* the answer. `devmap search --json | jq`
     // fails on it, and an MCP client's next parse fails on it.
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+        .with_max_level(if cli.verbose {
+            Level::DEBUG
+        } else {
+            Level::INFO
+        })
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr)
         .finish();
-    tracing::subscriber::set_global_default(subscriber).ok();
+    if let Err(error) = tracing::subscriber::set_global_default(subscriber) {
+        eprintln!("DevMap logging unavailable: {error}");
+    }
 
-    let cli = Cli::parse();
     if !cli.command.serves() {
         restore_default_sigpipe();
     }
@@ -3152,6 +3171,24 @@ async fn main() -> std::process::ExitCode {
     match outcome {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
+            // Capture the open stage before closing it as failed. Do not log
+            // query arguments, preview buffers, or environment variables.
+            let root = std::path::absolute(cli.root_hint())
+                .unwrap_or_else(|_| cli.root_hint().to_path_buf());
+            let db = std::path::absolute(cli.db()).unwrap_or_else(|_| cli.db());
+            let context = serde_json::json!({
+                "command": matches.subcommand_name(),
+                "binary_version": version_line(),
+                "binary_path": std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned()),
+                "pid": std::process::id(),
+                "unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis()),
+                "root": root.to_string_lossy(),
+                "root_path_lossy": root.to_str().is_none(),
+                "db_path": db.to_string_lossy(),
+                "db_path_lossy": db.to_str().is_none(),
+                "elapsed_ms": started.elapsed().as_millis(),
+                "stage": progress.as_ref().and_then(|p| p.open.borrow().as_ref().map(|(label, _, _)| label.clone())),
+            });
             // The human line always, on stderr where every other diagnostic
             // this binary writes goes. Under `--json`, the same failure *also*
             // goes out as one line of JSON on stdout, because that is what
@@ -3163,21 +3200,26 @@ async fn main() -> std::process::ExitCode {
             // stdout stays exactly one JSON line either way.
             if let Some(progress) = progress.as_ref() {
                 progress.close_open_stage(false);
-                progress
-                    .display
-                    .diagnostic(format_args!("Error: {}", render_error(&error)));
-                progress.display.finish("build stopped before completion");
+                progress.display.diagnostic(format_args!(
+                    "Error: {} — build stopped before completion; DevMap context: {context}",
+                    render_error(&error)
+                ));
+                progress.display.finish("");
                 if cli.json {
                     println!(
                         "{}",
-                        serde_json::json!({ "error": render_error(&error),
+                        serde_json::json!({ "error": render_error(&error), "diagnostic_context": context,
                         "timings": progress.timings_json(), "progress_output": progress.display.output_json() })
                     );
                 }
             } else {
                 eprintln!("Error: {}", render_error(&error));
+                eprintln!("DevMap context: {context}");
                 if cli.json {
-                    println!("{}", serde_json::json!({ "error": render_error(&error) }));
+                    println!(
+                        "{}",
+                        serde_json::json!({ "error": render_error(&error), "diagnostic_context": context })
+                    );
                 }
             }
             std::process::ExitCode::FAILURE
@@ -3221,6 +3263,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             let _writer = Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)?;
             progress.display.detail("opening index");
             let store = Store::open(cli.db())?;
+            store.bind_repo_root(path)?;
             // A store this process can only read opens fine — queries need it
             // to — and would otherwise fail at the first write with a bare
             // SQLite code, after paying for the whole scan. Refuse before the
@@ -3232,7 +3275,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     cli.db().display()
                 );
             }
-            // K1(e2): stamped before discovery, on the queue's own wall clock.
+            // Capture the durable queue boundary before discovery.
             //
             // A build that walks the whole tree answers every request queued at
             // or before this instant, whatever that request named — which is
@@ -3240,7 +3283,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             // before the walk, never after: an event that arrives while this
             // build is extracting may describe an edit it did not see, and that
             // row has to survive.
-            let build_start = Store::queue_clock_now();
+            let build_start = store.pending_watermark()?;
 
             // K7: refuse an `--affected` path inside a tagged build cache.
             //
@@ -3430,7 +3473,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     // repository that is already current keeps a stale queue,
                     // and `status` reports NOT FRESH indefinitely.
                     let retired = store.clear_pending_superseded(
-                        devmap_store::PendingSupersede::WholeTreeBuiltAt(build_start),
+                        devmap_store::PendingSupersede::WholeTreeThrough(&build_start),
                     )?;
                     if !retired.is_empty() {
                         progress.note(format_args!(
@@ -3739,9 +3782,9 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 .collect();
             let narrowed = !*full && !split_csv(affected_flag).is_empty();
             let retired = store.clear_pending_superseded(if narrowed {
-                devmap_store::PendingSupersede::IndexedPaths(&indexed)
+                devmap_store::PendingSupersede::IndexedPathsThrough(&indexed, &build_start)
             } else {
-                devmap_store::PendingSupersede::WholeTreeBuiltAt(build_start)
+                devmap_store::PendingSupersede::WholeTreeThrough(&build_start)
             })?;
             if !retired.is_empty() {
                 progress.note(format_args!(
@@ -3899,7 +3942,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             budget,
             semantic,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
             let resp = if *semantic {
                 engine.search_semantic(query, *budget)?
@@ -3923,7 +3966,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             min_confidence,
             min_rung,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
             // Both floors apply, at different places: `min_confidence` goes to
             // the store, which drops rows before the engine sees them, and the
@@ -3951,7 +3994,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             min_rung,
             layers,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
             let req = Request {
                 query: target.clone(),
@@ -3991,7 +4034,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             min_confidence,
             min_rung,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
             // `check_rung` above has already refused an unparseable name, so a
             // `None` here means no floor was asked for and never that one was
@@ -4022,7 +4065,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             depth,
             min_rung,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
             let rung = min_rung.as_deref().and_then(devmap_query::Rung::parse);
             let resp = if let Some(destination) = to {
@@ -4055,7 +4098,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             }
         }
         Commands::Dead { budget } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let payload = StoreQueryEngine::new(&store).dead_symbols(*budget)?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&payload)?)?;
@@ -4070,7 +4113,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             depth,
             min_confidence,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let report = StoreQueryEngine::new(&store).explore(
                 query,
                 *limit,
@@ -4090,7 +4133,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             depth,
             min_confidence,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let report = StoreQueryEngine::new(&store).affected_tests(
                 targets,
                 *budget,
@@ -4307,7 +4350,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             }
         }
         Commands::Savings { query, budget } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let report = StoreQueryEngine::new(&store).savings(query.as_deref(), *budget)?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&report)?)?;
@@ -4336,7 +4379,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 devmap_extract::read_source(std::path::Path::new(content))
                     .map_err(|e| anyhow::anyhow!("cannot read {content}: {e}"))?
             };
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let report =
                 StoreQueryEngine::new(&store).preview(file, &source, *budget, *min_confidence)?;
             if cli.json {
@@ -4350,7 +4393,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             kind,
             min_nodes,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             // `value_parser` has already rejected anything but the two names,
             // so a `None` here can only be "no filter requested".
             let wanted = kind.as_deref().and_then(devmap_query::parse_clone_kind);
@@ -4371,7 +4414,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             stamps,
             inventory,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let outcome = write_consumer_artifacts(
                 &store,
                 ManifestRequest {
@@ -4736,6 +4779,9 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     cli.db().display()
                 );
             };
+            if cli.db.is_none() {
+                store.validate_repo_root(&cli.root_hint())?;
+            }
             let mut payload = store_status_fields(&store, &cli.db())?;
             payload.insert("schema_outdated".into(), serde_json::json!(false));
             payload.insert("schema_version".into(), serde_json::json!(stored_schema));
@@ -4760,7 +4806,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             emit_json(cli, &payload)?;
         }
         Commands::History { last } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let rows = store.build_history(*last)?;
 
             if cli.json {
@@ -4843,7 +4889,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
         } => {
             // `cli.db()` rather than `cli.db`: the store path is resolved per
             // repository now, and `--db` is an `Option`.
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             if !*fts && !*pending && !*page_size {
                 anyhow::bail!("specify a repair target, e.g. --fts, --pending or --page-size");
             }
@@ -4940,7 +4986,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             }
         }
         Commands::Snapshots { file, budget } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let extractions = store.latest_extractions()?;
             let resp = semantic_snapshots(
                 &extractions,
@@ -5155,7 +5201,7 @@ empty graph, which would read as 'this file has no control flow'.",
             }
         }
         Commands::Cypher { query, limit } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let graph = graph_core_for_read(&store)?;
             let result = devmap_query::cypher::run(&graph, query, *limit);
             if cli.json {
@@ -5201,7 +5247,7 @@ empty graph, which would read as 'this file has no control flow'.",
             limit,
             facets,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             if *facets {
                 let facets = devmap_query::ast::ast_facets(&store)?;
                 if cli.json {
@@ -5232,7 +5278,7 @@ empty graph, which would read as 'this file has no control flow'.",
             }
         }
         Commands::Export { path, out } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let graph = graph_value_for_read(&store, &cli.db())?;
             let gen_id = store.latest_generation_id()?.unwrap_or(0);
             let (xml, report) = devmap_query::export::export_graphml(&graph);
@@ -5292,7 +5338,7 @@ represent them",
             max_files,
             max_file_bytes,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let graph = graph_core_for_read(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
@@ -5312,7 +5358,7 @@ represent them",
             max_files,
             max_file_bytes,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let graph = graph_core_for_read(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
@@ -5330,7 +5376,7 @@ represent them",
             max_files,
             max_file_bytes,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let graph = graph_core_for_read(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
@@ -5347,7 +5393,7 @@ represent them",
             level,
             max_nodes,
         } => {
-            let store = open_for_read(&cli.db())?;
+            let store = open_for_read(cli)?;
             let gen_id = store.latest_generation_id()?.unwrap_or(0);
             let repo_root = store.latest_repo_root()?;
 

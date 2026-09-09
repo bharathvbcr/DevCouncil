@@ -669,9 +669,7 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
 /// payload identity. Missing evidence is a degraded reason, never freshness.
 /// One owner keeps CLI and daemon status on the same contract.
 pub fn index_is_fresh(status: &StoreStatus) -> bool {
-    status.latest_generation.is_some()
-        && status.pending_count == 0
-        && status.degraded_reason.is_none()
+    status.is_fresh()
 }
 
 /// Why the index is not current, when it is not.
@@ -724,22 +722,7 @@ pub fn coverage_gaps_json(status: &StoreStatus) -> serde_json::Value {
 }
 
 pub fn freshness_degraded_reason(status: &StoreStatus) -> Option<String> {
-    if let Some(reason) = status.degraded_reason.clone() {
-        return Some(reason);
-    }
-    if status.latest_generation.is_none() {
-        return Some(
-            "this store holds no generation: nothing has been indexed yet — run `devmap build`"
-                .to_string(),
-        );
-    }
-    if status.pending_count > 0 {
-        return Some(format!(
-            "{} source change(s) are pending",
-            status.pending_count
-        ));
-    }
-    None
+    status.freshness_reason()
 }
 
 /// Whether a *daemon* may call its index fresh.

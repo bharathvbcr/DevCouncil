@@ -3,6 +3,54 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[test]
+fn failures_identify_the_command_store_version_and_failed_stage() {
+    let root = temp_root();
+    let db = root.join("broken.sqlite");
+    fs::write(&db, "not a sqlite database").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .args(["build", "--json", "--progress", "never", "--db"])
+        .arg(&db)
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let context = &payload["diagnostic_context"];
+    assert_eq!(context["command"], "build");
+    assert_eq!(context["db_path"], db.to_string_lossy().as_ref());
+    assert!(context["binary_version"]
+        .as_str()
+        .unwrap()
+        .contains("store schema"));
+    assert!(context["stage"].as_str().unwrap().contains("scanning"));
+    assert!(context["elapsed_ms"].is_number());
+    assert!(context["pid"].as_u64().unwrap() > 0);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("DevMap context:"), "{stderr}");
+    assert!(!stderr.contains('\u{1b}'));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn non_build_failures_have_context_without_query_content() {
+    let root = temp_root();
+    let db = root.join("missing.sqlite");
+    let output = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .args(["search", "PRIVATE_QUERY_CONTENT", "--json", "--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["diagnostic_context"]["command"], "search");
+    assert!(!payload["diagnostic_context"]
+        .to_string()
+        .contains("PRIVATE_QUERY_CONTENT"));
+    assert!(payload["diagnostic_context"]["stage"].is_null());
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn verbose_artifact_output_releases_the_writer_before_stdout_backpressure() {

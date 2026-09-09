@@ -891,6 +891,11 @@ impl Daemon {
         &self,
         read_head: &dyn Fn(&std::path::Path) -> anyhow::Result<String>,
     ) -> anyhow::Result<usize> {
+        // Serialize the complete read/compute/publish cycle. Taking this only
+        // at persistence lets a competing build replace the base generation
+        // after this drain has read it, invalidating its carry-forward.
+        let _writer = self.store.lock_writer(Store::WRITER_LOCK_WAIT)?;
+        self.store.bind_repo_root(&self.root)?;
         let claims = self.store.claim_pending_batch(self.batch_limit)?;
         if claims.is_empty() {
             return Ok(0);
@@ -1002,7 +1007,9 @@ impl Daemon {
         // Charge the attempt now, to the paths that earned it, before any
         // batch-wide step can fail and take the whole batch down with it.
         if !failed.is_empty() {
-            self.store.bump_pending_attempts(&failed)?;
+            self.store.bump_pending_attempts(
+                &failed.iter().map(|path| claim_of(path)).collect::<Vec<_>>(),
+            )?;
         }
 
         if succeeded.is_empty() {
@@ -1129,15 +1136,7 @@ impl Daemon {
         // the next drain still sees a difference and rebuilds. See
         // `head_for_drain`.
         let head_sha = head.sha;
-        // K13: hold the cross-process writer lock across persist + prune. A
-        // `devmap build` running beside the daemon otherwise races it on
-        // SQLite's busy timeout alone, and the loser surfaces `database is
-        // locked` after paying for a full resolve. Taken *here* rather than at
-        // the top of the drain because everything above is reads and
-        // extraction, which two writers may safely do at once.
-        let _writer = self
-            .store
-            .lock_writer(devmap_store::Store::WRITER_LOCK_WAIT)?;
+        // Writer ownership has been held since before the base snapshot was read.
         self.store.save_generation_with_metadata(
             if full_rebuild { &extractions } else { &fresh },
             &resolution,
@@ -1205,6 +1204,7 @@ impl Daemon {
     /// gave up and killed the daemon it had just spawned after three seconds,
     /// then fell back to re-doing the work through the CLI, on every call.
     pub async fn run_loop(&self) -> anyhow::Result<()> {
+        self.store.bind_repo_root(&self.root)?;
         // Captured *first*, before the IPC endpoint binds, because the window
         // between binding and here is not empty: `reconcile_connect_time`
         // sweeps the tree in it, which on a large repository is seconds during
@@ -1822,6 +1822,44 @@ mod tests {
     // form is the correct one for them: no discovery step ran over what they
     // assembled. The drain itself must never use it.
     use devmap_analyze::analyze;
+
+    #[test]
+    fn agentic_drain_takes_the_writer_lock_before_reading_its_base() {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-agentic-writer-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("main.py"), "def main(): return 1\n").unwrap();
+        let db = root.join("index.sqlite");
+        let store = Store::open(&db).unwrap();
+        store.enqueue_pending_paths(&["main.py".into()]).unwrap();
+        let held = store.lock_writer(Duration::from_secs(1)).unwrap();
+        let daemon = Daemon::new(store, root.clone());
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            daemon.drain_pending_batch_with_head(&|_| {
+                sent.send(()).unwrap();
+                Ok("unavailable".into())
+            })
+        });
+        let read_while_locked = received.recv_timeout(Duration::from_millis(500));
+        drop(held);
+        let outcome = worker.join().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            matches!(
+                read_while_locked,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "drain read its base before obtaining writer ownership"
+        );
+    }
 
     /// The HEAD identity a drain reads in a scratch tree that is not a git
     /// repository: `current_git_head` fails there, and the drain stamps

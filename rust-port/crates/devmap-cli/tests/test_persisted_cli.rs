@@ -20,6 +20,150 @@ fn temp_root() -> std::path::PathBuf {
     root
 }
 
+fn staleness_query(root: &std::path::Path, args: &[&str]) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .current_dir(root)
+        .env("DEVMAP_AUTOSPAWN", "0")
+        .args(["--json", "--progress", "never", "--db"])
+        .arg(root.join("index.sqlite"))
+        .args(args)
+        .output()
+        .expect("run navigation probe");
+    assert!(
+        output.status.success(),
+        "{args:?}: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("navigation returns JSON")
+}
+
+#[test]
+fn staleness_audit_navigation_survives_repeated_edits_and_rebuilds() {
+    let root = temp_root();
+    let target = root.join("src/target.py");
+    let original = "def durable_symbol():\n    return 1\n";
+    let changed = "def renamed_symbol():\n    return 2\n";
+    assert_eq!(
+        original.len(),
+        changed.len(),
+        "same-sized edit defeats size-only checks"
+    );
+    fs::write(&target, original).unwrap();
+    fs::write(
+        root.join("src/caller.py"),
+        "from target import durable_symbol\n\ndef caller():\n    return durable_symbol()\n",
+    )
+    .unwrap();
+    staleness_query(&root, &["build", "."]);
+    for cycle in 0..20 {
+        let fresh = staleness_query(&root, &["status"]);
+        assert_eq!(fresh["is_fresh"], true, "cycle {cycle}: {fresh}");
+        fs::write(&target, changed).unwrap();
+        let stale = staleness_query(&root, &["status"]);
+        assert_eq!(
+            stale["is_fresh"], false,
+            "quiet queue cannot imply freshness"
+        );
+        assert_eq!(stale["pending_count"], 0);
+        assert_eq!(stale["query_ready"], true);
+        let hits = staleness_query(&root, &["search", "durable_symbol"]);
+        assert_eq!(hits["items"][0]["symbol_name"], "durable_symbol");
+        assert_eq!(hits["items"][0]["source_span"], "");
+        assert!(hits["items"][0]["source_unavailable_reason"]
+            .as_str()
+            .unwrap()
+            .contains("changed"));
+        assert_eq!(
+            staleness_query(&root, &["search", "renamed_symbol"])["total"],
+            0
+        );
+        let unaffected = staleness_query(&root, &["search", "caller"]);
+        assert!(unaffected["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["source_span"]
+                .as_str()
+                .is_some_and(|s| s.contains("def caller"))));
+        for args in [
+            vec!["deps", "src/caller.py"],
+            vec!["impact", "durable_symbol"],
+            vec!["trace", "caller", "durable_symbol"],
+            vec!["dead"],
+        ] {
+            let response = staleness_query(&root, &args);
+            assert_eq!(response["resolution"], "Available", "{args:?}: {response}");
+            assert_eq!(
+                response.get("source_freshness"),
+                Some(&serde_json::Value::Null)
+            );
+        }
+        let explore = staleness_query(&root, &["explore", "durable_symbol"]);
+        assert_eq!(explore["definitions"]["shown"], 1);
+        staleness_query(&root, &["build", "."]);
+        assert_eq!(staleness_query(&root, &["status"])["is_fresh"], true);
+        assert_eq!(
+            staleness_query(&root, &["search", "renamed_symbol"])["total"],
+            1
+        );
+        assert_eq!(
+            staleness_query(&root, &["search", "durable_symbol"])["total"],
+            0
+        );
+        fs::write(&target, original).unwrap();
+        staleness_query(&root, &["build", "."]);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn staleness_audit_add_rename_delete_and_restore_are_not_silent() {
+    let root = temp_root();
+    let source = "def durable_symbol():\n    return 1\n";
+    let target = root.join("src/target.py");
+    fs::write(&target, source).unwrap();
+    staleness_query(&root, &["build", "."]);
+    let added = root.join("src/added.py");
+    fs::write(&added, "def newly_added(): return 3\n").unwrap();
+    assert_eq!(staleness_query(&root, &["status"])["is_fresh"], false);
+    assert_eq!(
+        staleness_query(&root, &["search", "newly_added"])["total"],
+        0
+    );
+    staleness_query(&root, &["build", "."]);
+    assert_eq!(
+        staleness_query(&root, &["search", "newly_added"])["total"],
+        1
+    );
+    fs::rename(&target, root.join("src/renamed.py")).unwrap();
+    assert_eq!(staleness_query(&root, &["status"])["is_fresh"], false);
+    let stale = staleness_query(&root, &["search", "durable_symbol"]);
+    assert_eq!(stale["items"][0]["file_path"], "src/target.py");
+    assert_eq!(stale["items"][0]["source_span"], "");
+    assert!(stale["items"][0]["source_unavailable_reason"].is_string());
+    staleness_query(&root, &["build", "."]);
+    assert_eq!(
+        staleness_query(&root, &["search", "durable_symbol"])["items"][0]["file_path"],
+        "src/renamed.py"
+    );
+    fs::remove_file(root.join("src/renamed.py")).unwrap();
+    assert_eq!(staleness_query(&root, &["status"])["is_fresh"], false);
+    staleness_query(&root, &["build", "."]);
+    assert_eq!(
+        staleness_query(&root, &["search", "durable_symbol"])["total"],
+        0
+    );
+    fs::write(&target, source).unwrap();
+    staleness_query(&root, &["build", "."]);
+    assert_eq!(staleness_query(&root, &["status"])["is_fresh"], true);
+    assert_eq!(
+        staleness_query(&root, &["search", "durable_symbol"])["items"][0]["source_span"],
+        source.trim_end()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn query_commands_do_not_rebuild_or_require_sources() {
     let root = temp_root();

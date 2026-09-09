@@ -56,6 +56,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         "devmap-query",
         &[
             "artifacts_sidecar_adversarial",
+            "documentation_visibility",
             "freshness_parity",
             "git_is_bounded_on_the_artifact_path",
             "host_artifact_provider",

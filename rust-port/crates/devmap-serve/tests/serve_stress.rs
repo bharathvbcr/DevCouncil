@@ -766,16 +766,14 @@ async fn fifty_spawn_retire_cycles_and_a_kill_mid_drain_leave_the_store_usable()
     );
 
     let daemon = devmap_serve::Daemon::new(store, root.clone()).with_store_path(db.clone());
-    let drained = tokio::task::spawn_blocking(move || daemon.drain_pending_batch())
+    let _drained = tokio::task::spawn_blocking(move || daemon.drain_pending_batch())
         .await
         .expect("drain task")
         .expect("the next drain must complete the interrupted work");
-    if still_queued {
-        assert!(
-            drained >= 1,
-            "work left queued by the kill must be claimable, not stranded"
-        );
-    }
+    // Aborting a Tokio task does not terminate its spawn_blocking drain. That
+    // worker may finish after `still_queued` was read and before this drain
+    // obtains writer ownership. The final state below proves recovery whichever
+    // worker completed it; the real SIGKILL case lives in test_process_recovery.
 
     let store = Store::open(&db).expect("store");
     assert!(

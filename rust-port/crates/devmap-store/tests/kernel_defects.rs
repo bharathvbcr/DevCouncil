@@ -415,8 +415,8 @@ fn k1_reconcile_drops_rows_no_retry_could_ever_process() {
     let remaining = store.get_pending_paths().unwrap();
     assert_eq!(
         remaining,
-        vec!["src".to_string(), "src/a.py".to_string()],
-        "a real source and a real directory are still work"
+        vec!["src/a.py".to_string(), "src".to_string()],
+        "both paths remain in durable enqueue order"
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -502,29 +502,39 @@ fn k1_clear_after_build_retires_superseded_and_quarantined_rows() {
         .unwrap();
     for _ in 0..devmap_store::MAX_PENDING_ATTEMPTS {
         store
-            .bump_pending_attempts(&["quarantined.py".to_string()])
+            .bump_pending_attempts(
+                &store
+                    .claim_pending_batch(usize::MAX)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|claim| ["quarantined.py".to_string()].contains(&claim.path))
+                    .collect::<Vec<_>>(),
+            )
             .unwrap();
     }
 
     // A narrowed build: only the paths it was handed are answered.
     let cleared = store
-        .clear_pending_superseded(PendingSupersede::IndexedPaths(&[
-            "built.py".to_string(),
-            "other.py".to_string(),
-        ]))
+        .clear_pending_superseded(PendingSupersede::IndexedPathsThrough(
+            &["built.py".to_string(), "other.py".to_string()],
+            &store.pending_watermark().unwrap(),
+        ))
         .unwrap();
     assert!(cleared.contains(&"built.py".to_string()), "{cleared:?}");
     assert!(
-        cleared.contains(&"quarantined.py".to_string()),
-        "a build supersedes retries nobody could finish: {cleared:?}"
+        !cleared.contains(&"quarantined.py".to_string()),
+        "a narrowed build did not read this quarantined path: {cleared:?}"
     );
     assert!(
-        cleared.contains(&"\u{0}devmap:git-head-changed".to_string()),
-        "the generation was written at the current HEAD: {cleared:?}"
+        !cleared.contains(&"\u{0}devmap:git-head-changed".to_string()),
+        "a narrowed build does not reconcile the whole checkout: {cleared:?}"
     );
     assert_eq!(
         store.get_pending_paths().unwrap(),
-        vec!["still_pending.py".to_string()],
+        vec![
+            "still_pending.py".to_string(),
+            "\u{0}devmap:git-head-changed".to_string()
+        ],
         "work a narrowed build did not cover stays queued"
     );
 }
@@ -554,14 +564,14 @@ fn k1_a_whole_tree_build_supersedes_every_row_queued_before_it_started() {
     // The build starts here. Anything queued after this instant describes an
     // edit the walk may not have seen.
     std::thread::sleep(std::time::Duration::from_millis(5));
-    let build_start = Store::queue_clock_now();
+    let build_start = store.pending_watermark().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
     store
         .enqueue_pending_paths(&["src/edited_mid_build.py".to_string()])
         .unwrap();
 
     let cleared = store
-        .clear_pending_superseded(PendingSupersede::WholeTreeBuiltAt(build_start))
+        .clear_pending_superseded(PendingSupersede::WholeTreeThrough(&build_start))
         .unwrap();
     assert_eq!(
         cleared.len(),
@@ -587,7 +597,9 @@ fn k1_status_degraded_reason_names_the_quarantined_paths() {
     let stuck: Vec<String> = (0..7).map(|n| format!("stuck_{n}.py")).collect();
     store.enqueue_pending_paths(&stuck).unwrap();
     for _ in 0..devmap_store::MAX_PENDING_ATTEMPTS {
-        store.bump_pending_attempts(&stuck).unwrap();
+        store
+            .bump_pending_attempts(&store.claim_pending_batch(usize::MAX).unwrap())
+            .unwrap();
     }
 
     let status = store.status(":memory:").unwrap();
@@ -621,7 +633,14 @@ fn k1_drop_quarantined_returns_exactly_what_it_deleted() {
         .unwrap();
     for _ in 0..devmap_store::MAX_PENDING_ATTEMPTS {
         store
-            .bump_pending_attempts(&["stuck.py".to_string()])
+            .bump_pending_attempts(
+                &store
+                    .claim_pending_batch(usize::MAX)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|claim| ["stuck.py".to_string()].contains(&claim.path))
+                    .collect::<Vec<_>>(),
+            )
             .unwrap();
     }
 
@@ -720,7 +739,7 @@ fn k1_a_failing_path_does_not_charge_an_attempt_to_its_batch_mates() {
         // Make the writer lock unopenable for writing. Created and chmodded
         // here rather than mid-drain because the drain offers no seam: the
         // fault has to already exist when `lock_writer` reaches it. The claim
-        // and every read above it still work — this touches one lock file, not
+        // cannot proceed without the lock — this touches one lock file, not
         // the database.
         let lock_path = Store::writer_lock_path(&db);
         fs::write(&lock_path, b"").unwrap();
@@ -751,8 +770,8 @@ fn k1_a_failing_path_does_not_charge_an_attempt_to_its_batch_mates() {
     let store = Store::open(&db).unwrap();
     assert_eq!(
         store.pending_attempts(&poison).unwrap(),
-        Some(1),
-        "the path that actually failed carries the attempt"
+        Some(0),
+        "writer admission failed before any path was examined"
     );
     assert_eq!(
         store.pending_attempts("good.py").unwrap(),
@@ -775,7 +794,7 @@ fn k1_a_failing_path_does_not_charge_an_attempt_to_its_batch_mates() {
         None,
         "the path that succeeded is gone, not merely un-bumped"
     );
-    assert_eq!(store.pending_attempts(&poison).unwrap(), Some(2));
+    assert_eq!(store.pending_attempts(&poison).unwrap(), Some(1));
     let _ = fs::remove_dir_all(&dir);
 }
 

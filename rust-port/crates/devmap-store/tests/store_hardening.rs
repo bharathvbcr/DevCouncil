@@ -84,7 +84,7 @@ fn test_s7_quarantined_poison_path_stops_hot_loop_until_a_new_event() {
         .unwrap();
     for _ in 0..5 {
         store
-            .bump_pending_attempts(std::slice::from_ref(&path))
+            .bump_pending_attempts(&store.claim_pending_batch(1).unwrap())
             .unwrap();
     }
 
@@ -1814,22 +1814,15 @@ fn s3_an_uncanonicalizable_root_does_not_delete_rows_as_escaping_it() {
         "the fixture must make the root uncanonicalizable"
     );
 
-    let outcome = store.reconcile_pending_paths(&root).unwrap();
+    let error = store.reconcile_pending_paths(&root).unwrap_err();
+    assert!(
+        error.to_string().contains("cannot resolve worktree root"),
+        "{error}"
+    );
     let remaining = store.get_pending_paths().unwrap();
     assert!(
         remaining.contains(&absolute),
-        "an undecidable containment must keep the row, not delete it as \
-         escaping the root: {remaining:?} (dropped {:?})",
-        outcome.dropped
-    );
-    assert!(
-        outcome
-            .dropped
-            .iter()
-            .all(|(_, reason)| !reason.contains("escapes")),
-        "no row may be reported as escaping the root on a check that did not \
-         run: {:?}",
-        outcome.dropped
+        "an unreadable root must preserve pending work: {remaining:?}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

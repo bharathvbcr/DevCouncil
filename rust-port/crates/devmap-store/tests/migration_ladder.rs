@@ -149,6 +149,7 @@ fn seed_current_store(db_path: &Path) {
 /// traceable to a line of `schema.rs`.
 fn reduce_one_rung(conn: &Connection, from_version: i32) {
     let sql: &str = match from_version {
+        20 => "DROP TABLE pending_state; ALTER TABLE pending_paths DROP COLUMN revision;",
         // MIGRATION_V18_TO_V19: the per-file row digests. Purely additive, so
         // the reduction is the table and nothing else — there is no backfill to
         // undo, which is the property that lets a v18 store migrate by gaining
@@ -686,6 +687,7 @@ fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
     seed_current_store(&db_path);
     {
         let conn = Connection::open(&db_path).unwrap();
+        reduce_one_rung(&conn, CURRENT_SCHEMA_VERSION);
         conn.execute_batch(&format!(
             "ALTER TABLE generations DROP COLUMN repo_root;
              PRAGMA user_version = {};",
@@ -1068,4 +1070,38 @@ fn unresolved_by_generation(conn: &Connection) -> BTreeMap<i64, Vec<String>> {
         rows.sort();
     }
     out
+}
+
+#[test]
+fn concurrent_v19_openers_keep_pending_work_and_one_durable_identity() {
+    let dir = tmp_dir("v20-concurrent");
+    let db = store_at_version(&dir, 19);
+    assert!(
+        Store::open_read_only(&db).is_err(),
+        "a reader must not migrate v19"
+    );
+    let barrier = std::sync::Barrier::new(16);
+    std::thread::scope(|scope| {
+        for _ in 0..16 {
+            let barrier = &barrier;
+            let db = &db;
+            scope.spawn(move || {
+                barrier.wait();
+                let store = Store::open(db).unwrap();
+                assert_eq!(store.get_pending_paths().unwrap(), vec!["later.py"]);
+            });
+        }
+    });
+    let store = Store::open(&db).unwrap();
+    let watermark = store.pending_watermark().unwrap();
+    let claim = store.claim_pending_batch(1).unwrap();
+    drop(store);
+    let reopened = Store::open(&db).unwrap();
+    assert_eq!(watermark, reopened.pending_watermark().unwrap());
+    reopened
+        .enqueue_pending_paths(&["later.py".into()])
+        .unwrap();
+    assert_eq!(reopened.clear_claimed_pending_paths(&claim).unwrap(), 0);
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
 }

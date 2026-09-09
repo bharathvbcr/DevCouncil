@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tracing::warn;
 
 use devmap_extract::{
-    ignore_rule_files, is_gitignored_reporting, is_ignored_path, is_indexable_source,
+    git_metadata, ignore_rule_files, is_gitignored_reporting, is_ignored_path, is_indexable_source,
 };
 
 const MAX_IGNORE_CACHE_ENTRIES: usize = 8_192;
@@ -98,7 +98,7 @@ impl IgnoreVerdictCache {
 
     fn observe_rule_event(&mut self, path: &Path) -> bool {
         let is_rule = path.file_name().is_some_and(|name| name == ".gitignore")
-            || path.ends_with(".git/info/exclude");
+            || path.ends_with("info/exclude");
         if is_rule {
             self.entries.clear();
             // The diagnostics describe the file that just changed, so they are
@@ -302,21 +302,19 @@ pub const GIT_HEAD_SENTINEL: &str = "\u{0}devmap:git-head-changed";
 ///
 /// `.git/index` is excluded on purpose: it changes on `git add` with no change
 /// to the working tree, and the working tree is what the graph describes.
-fn is_git_ref_event(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return false;
+fn is_git_ref_event(root: &Path, path: &Path) -> anyhow::Result<bool> {
+    let dirs = match git_metadata(root)? {
+        Some(metadata) => vec![metadata.git_dir, metadata.common_dir],
+        None => vec![root.join(".git")],
     };
-    let relative = relative.to_string_lossy().replace('\\', "/");
-    let Some(rest) = relative.strip_prefix(".git/") else {
-        return false;
-    };
-    // `HEAD.lock` and `refs/heads/main.lock` are git's write-in-progress
-    // files. Ignoring them avoids waking twice per ref update; the real file
-    // follows immediately.
-    if rest.ends_with(".lock") {
-        return false;
-    }
-    rest == "HEAD" || rest == "packed-refs" || rest.starts_with("refs/")
+    Ok(dirs.iter().any(|dir| {
+        let Ok(relative) = path.strip_prefix(dir) else {
+            return false;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        !relative.ends_with(".lock")
+            && (relative == "HEAD" || relative == "packed-refs" || relative.starts_with("refs/"))
+    }))
 }
 
 /// The queue entry one watched path becomes, or `None` if there is nothing to
@@ -445,13 +443,21 @@ fn watch_event_paths(
             .into_iter()
             .filter_map(|path| {
                 if ignore_cache.observe_rule_event(&path) {
-                    return None;
+                    // Rules can expose or hide files without touching source.
+                    return whole_tree_rescan(root).into_iter().next();
                 }
                 // Checked before the ignore rules, because `.git/` is pruned by
                 // them and this is the one thing inside it the daemon has to
                 // see.
-                if is_git_ref_event(root, &path) {
-                    return Some(GIT_HEAD_SENTINEL.to_string());
+                match is_git_ref_event(root, &path) {
+                    Ok(true) => return Some(GIT_HEAD_SENTINEL.to_string()),
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(
+                            "cannot resolve Git metadata for {root:?}: {error}; requesting rescan"
+                        );
+                        return whole_tree_rescan(root).into_iter().next();
+                    }
                 }
                 admitted_watch_path(root, &path, ignore_cache)
             })
@@ -596,6 +602,28 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
         Config::default(),
     )?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
+    if let Some(metadata) = git_metadata(&root)? {
+        // Linked worktrees keep HEAD and shared refs/excludes outside the source
+        // root. Watch only metadata surfaces, never shared object storage.
+        let mut watched = BTreeSet::new();
+        for (path, recursive) in [
+            (metadata.git_dir, false),
+            (metadata.common_dir.clone(), false),
+            (metadata.common_dir.join("refs"), true),
+            (metadata.common_dir.join("info"), true),
+        ] {
+            if !path.starts_with(&root) && path.exists() && watched.insert(path.clone()) {
+                watcher.watch(
+                    &path,
+                    if recursive {
+                        RecursiveMode::Recursive
+                    } else {
+                        RecursiveMode::NonRecursive
+                    },
+                )?;
+            }
+        }
+    }
 
     let thread = std::thread::spawn(move || {
         let _watcher = watcher; // keep alive for the thread lifetime
@@ -632,6 +660,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn linked_worktree_ignore_rules_and_external_head_are_observed() {
+        let scratch = scratch_root("linked-metadata");
+        let root = scratch.join("worktree");
+        let common = scratch.join("shared.git");
+        let git_dir = common.join("worktrees/session");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::create_dir_all(common.join("info")).unwrap();
+        std::fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        std::fs::write(common.join("info/exclude"), "ignored.py\n").unwrap();
+        std::fs::write(root.join("ignored.py"), "pass\n").unwrap();
+        let mut cache = IgnoreVerdictCache::default();
+        assert!(cache
+            .is_ignored(&root, &root.join("ignored.py"), false)
+            .unwrap());
+        assert!(is_git_ref_event(&root, &git_dir.join("HEAD")).unwrap());
+        assert!(is_git_ref_event(&root, &common.join("refs/heads/main")).unwrap());
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn changing_ignore_rules_requests_a_rescan_without_a_source_edit() {
+        let root = scratch_root("ignore-rescan");
+        let event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(root.join(".gitignore"));
+        assert_eq!(
+            watch_event_paths(&root, event, &mut IgnoreVerdictCache::default()),
+            whole_tree_rescan(&root)
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// K-A3: the OS saying "I dropped events, rescan" is the one notice the
@@ -1556,6 +1622,10 @@ mod tests {
 #[cfg(test)]
 mod git_head_tests {
     use super::*;
+
+    fn is_git_ref_event(root: &Path, path: &Path) -> bool {
+        super::is_git_ref_event(root, path).expect("fixture metadata is readable")
+    }
 
     fn root() -> std::path::PathBuf {
         std::path::PathBuf::from("/repo")

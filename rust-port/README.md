@@ -1,5 +1,7 @@
 # Dev Map
 
+Concurrent agent worktrees: [design, audit and rollout contract](AGENTIC_WORKTREE_DESIGN.md).
+
 Host applications can link the query crate or use the versioned JSON and HTML
 process contract in [HOST_INTEGRATION.md](HOST_INTEGRATION.md).
 
@@ -109,7 +111,7 @@ overall percentage: resolving and writing have different costs.
 The final summary shows generation, elapsed time, file/symbol/edge counts,
 added/changed/removed sources and actual cache hits. Unchanged builds report the
 current generation once. `--verbose` retains phase, reclaim and resolution
-details; coverage refusals and reclaim failures remain visible by default.
+details and enables debug tracing; coverage refusals and reclaim failures remain visible by default.
 Requested consumer artifacts must finish before completion is announced.
 
 ```bash
@@ -139,6 +141,23 @@ An extraction value of `null` means it was skipped; zero cache hits means it ran
 without a hit. Removed sources are absent from the readable scan compared with
 the previous generation; discovery refusals are counted separately. See
 [PROGRESS_AUDIT.md](PROGRESS_AUDIT.md) for verification evidence and platform limits.
+
+Runtime failures include `diagnostic_context` in JSON and a `DevMap context:`
+line on stderr: command, binary/version, PID, timestamp, repository root, selected
+database, elapsed time, and the active build stage (null before a stage begins).
+Non-UTF-8 paths are marked as lossy display strings. Query text, preview buffers,
+and environment variables are excluded from this context. Build errors retain
+their cause chain, phase timings, and progress-delivery receipt.
+
+To capture a diagnosable build while keeping machine output separate:
+
+```bash
+devmap build . --json --progress always --verbose > /tmp/devmap-report.json 2> /tmp/devmap.log
+```
+
+These are caller-selected output files; the CLI does not keep an automatic log
+history. GitPulse's **Code → Map → Copy DevMap logs** combines its captured CLI
+diagnostics with the panel state and its existing rotating logs.
 
 ### Ask
 
@@ -245,6 +264,14 @@ devmap map-html .                      # subsystems, coloured by language
 `repo_map.json`, colouring each node by its dominant language in GitHub
 Linguist's own palette and carrying the coverage the map does *not* have —
 subsystems are a selected set, not a partition.
+
+Both HTML views offer **Hide notes & Markdown**. The code graph hides note and
+document nodes (including symbols owned by Markdown files) and their edges.
+The subsystem map hides an area only when all its attributed files are
+documentation; mixed areas and areas without indexed files stay visible. The
+control is off by default and filters only the loaded view, preserving index
+coverage and cap counts. Regenerate existing HTML to get the new control; use
+`devmap map-html . --force` to replace a preview whose map fingerprint is unchanged.
 
 One self-contained HTML file. It opens from a `file://` URL on a machine with no
 network and no package manager, because the renderer is embedded.

@@ -387,13 +387,23 @@ fn k1_build_reconciles_the_pending_queue_and_restores_freshness() {
         // Quarantine them all, the state the live store was found in.
         for _ in 0..devmap_store::MAX_PENDING_ATTEMPTS {
             store
-                .bump_pending_attempts(&[
-                    stale_absolute.clone(),
-                    "src".to_string(),
-                    "huge.c".to_string(),
-                    "README.md".to_string(),
-                    "src/a.py".to_string(),
-                ])
+                .bump_pending_attempts(
+                    &store
+                        .claim_pending_batch(usize::MAX)
+                        .unwrap()
+                        .into_iter()
+                        .filter(|claim| {
+                            [
+                                stale_absolute.clone(),
+                                "src".to_string(),
+                                "huge.c".to_string(),
+                                "README.md".to_string(),
+                                "src/a.py".to_string(),
+                            ]
+                            .contains(&claim.path)
+                        })
+                        .collect::<Vec<_>>(),
+                )
                 .unwrap();
         }
         let before = store.status("x").unwrap();
@@ -491,7 +501,14 @@ fn k1_repair_pending_drops_stuck_rows_and_reports_them() {
             .unwrap();
         for _ in 0..devmap_store::MAX_PENDING_ATTEMPTS {
             store
-                .bump_pending_attempts(&["stuck.py".to_string()])
+                .bump_pending_attempts(
+                    &store
+                        .claim_pending_batch(usize::MAX)
+                        .unwrap()
+                        .into_iter()
+                        .filter(|claim| ["stuck.py".to_string()].contains(&claim.path))
+                        .collect::<Vec<_>>(),
+                )
                 .unwrap();
         }
     }
