@@ -91,6 +91,10 @@ Thumbs.db
 .cursor/
 .openhands/
 .opencode/
+# Written by `dev integrate opencode --apply` with absolute, machine-specific
+# paths (DEVCOUNCIL_PROJECT_ROOT and the devmap --db path), so it cannot be
+# shared; every developer regenerates it.
+opencode.json
 .conductor/
 .conducor/
 .warp/
