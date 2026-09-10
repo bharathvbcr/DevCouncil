@@ -1273,6 +1273,55 @@ impl Resolver {
                     );
                 }
             }
+            // A `let x = self.field` (including through `if` / `&`) takes the
+            // field's type, so `x.run()` can dispatch. Field `Type` references
+            // are indexed just above; this pass is a second walk so a field
+            // declared later in the file still types an earlier `let`.
+            for reference in &ext.references {
+                if reference.kind != ReferenceKind::Name {
+                    continue;
+                }
+                let Some(local) = reference
+                    .assigned_to
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                else {
+                    continue;
+                };
+                if !reference
+                    .receiver_expr
+                    .as_deref()
+                    .is_some_and(Self::receiver_is_self)
+                {
+                    continue;
+                }
+                let Some(caller) = reference.enclosing_symbol.as_deref() else {
+                    continue;
+                };
+                let Some(type_name) = self
+                    .declaring_type_of(&ext.file_path, caller)
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                let field = reference.name.as_str();
+                let file = ext.file_path.as_str();
+                let field_type = [
+                    format!("{file}:{file}::{type_name}:{field}"),
+                    format!("{file}:{type_name}:{field}"),
+                ]
+                .into_iter()
+                .find_map(|key| self.scoped_receiver_types.get(&key).cloned());
+                let Some(field_type) = field_type else {
+                    continue;
+                };
+                Self::bind_receiver(
+                    &mut self.scoped_receiver_types,
+                    &mut self.poisoned_receiver_keys,
+                    format!("{file}:{caller}:{local}"),
+                    &field_type,
+                );
+            }
         }
     }
 

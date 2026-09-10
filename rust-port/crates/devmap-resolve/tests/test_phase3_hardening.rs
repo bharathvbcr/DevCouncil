@@ -1620,3 +1620,93 @@ fn a_python_reexport_alias_resolves_the_import_that_names_it() {
         "the import binding must resolve to the alias the module declares; got {resolved:?}"
     );
 }
+
+/// `let x = x()` is a call of the function, not a local of the binding it
+/// introduces. The same-named parameter case stays a local, which is the
+/// existing RA1 test.
+#[test]
+fn a_rust_let_initializer_call_is_not_a_local_binding() {
+    let extraction = extract_file(
+        "inv.rs",
+        concat!(
+            "fn test_commands() -> u8 { 1 }\n",
+            "fn go() {\n",
+            "    let test_commands = test_commands();\n",
+            "    let _ = test_commands;\n",
+            "}\n",
+            "fn takes(handler: u8) {\n",
+            "    let handler = handler();\n",
+            "    let _ = handler;\n",
+            "}\n",
+        ),
+    );
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(std::slice::from_ref(&extraction));
+    let res = resolver.resolve_all(std::slice::from_ref(&extraction));
+
+    let edge = res
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.edge_kind == EdgeKind::Calls
+                && edge.source_symbol.ends_with("::go")
+                && edge.target_symbol.ends_with("::test_commands")
+        })
+        .expect("go must call test_commands");
+    assert!(
+        matches!(
+            edge.resolution.as_deref(),
+            Some(Resolution::SameFile { .. })
+        ),
+        "the initializer names the function: {:?}",
+        edge.resolution
+    );
+
+    let handler = res
+        .unresolved
+        .iter()
+        .find(|u| u.callee_name == "handler" && u.source_symbol.ends_with("::takes"))
+        .expect("takes(handler) still shadows");
+    assert_eq!(
+        handler.class,
+        UnresolvedClass::LocalBinding,
+        "a parameter is in scope in a same-named let's initializer"
+    );
+}
+
+/// A closure parameter stays local inside the closure and does not hide a
+/// same-named function called from the enclosing function.
+#[test]
+fn a_rust_closure_parameter_does_not_hide_an_outer_function() {
+    let extraction = extract_file(
+        "hyg.rs",
+        concat!(
+            "fn marker(_path: &str, _prefix: &str) -> bool { false }\n",
+            "fn local_provider() {\n",
+            "    let has = |marker: &str| marker.starts_with(\"x\");\n",
+            "    let _ = has(\"n\") && marker(\"Cargo.toml\", \".\");\n",
+            "}\n",
+        ),
+    );
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(std::slice::from_ref(&extraction));
+    let res = resolver.resolve_all(std::slice::from_ref(&extraction));
+
+    let edge = res
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.edge_kind == EdgeKind::Calls
+                && edge.source_symbol.ends_with("::local_provider")
+                && edge.target_symbol.ends_with("::marker")
+        })
+        .expect("local_provider must call marker");
+    assert!(
+        matches!(
+            edge.resolution.as_deref(),
+            Some(Resolution::SameFile { .. })
+        ),
+        "the outer marker(...) names the function: {:?}",
+        edge.resolution
+    );
+}

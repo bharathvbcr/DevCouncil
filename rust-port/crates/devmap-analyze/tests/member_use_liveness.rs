@@ -262,3 +262,115 @@ fn the_method_half_of_a_call_emits_no_name_reference() {
         "the receiver is still a use: {name_refs:?}"
     );
 }
+
+/// Shapes that were extracted-tier dead on the rust-port itself: a use the
+/// graph could not see, not an unused function.
+#[test]
+fn rust_uses_that_are_not_ordinary_calls_keep_the_symbol_live() {
+    let reports = reports(&[(
+        "lib.rs",
+        concat!(
+            "fn unknown_ctime() -> i128 { -1 }\n",
+            "fn genuinely_dead() -> i128 { 0 }\n",
+            "#[derive(serde::Deserialize)]\n",
+            "struct Stamp {\n",
+            "    #[serde(default = \"unknown_ctime\")]\n",
+            "    ctime_ns: i128,\n",
+            "}\n",
+            "\n",
+            "fn test_commands() -> u8 { 1 }\n",
+            "fn go() {\n",
+            "    let test_commands = test_commands();\n",
+            "    let _ = test_commands;\n",
+            "}\n",
+            "\n",
+            "fn marker(_path: &str, _prefix: &str) -> bool { false }\n",
+            "fn local_provider() {\n",
+            "    let has = |marker: &str| marker.starts_with(\"x\");\n",
+            "    let _ = has(\"n\") && marker(\"Cargo.toml\", \".\");\n",
+            "}\n",
+            "\n",
+            "unsafe extern \"C\" {\n",
+            "    fn tree_sitter_liquid() -> *const ();\n",
+            "}\n",
+            "fn from_raw(_: unsafe extern \"C\" fn() -> *const ()) -> u8 { 0 }\n",
+            "const LANG: u8 = unsafe { from_raw(tree_sitter_liquid) };\n",
+            "\n",
+            "struct Cache;\n",
+            "impl Cache {\n",
+            "    fn stamp_rule() {}\n",
+            "    fn unused_method() {}\n",
+            "    fn rule_stamps() {\n",
+            "        let _ = [()].into_iter().map(Self::stamp_rule);\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "struct Daemon;\n",
+            "impl Daemon {\n",
+            "    fn vanished_reason(&self) -> Option<u8> { None }\n",
+            "    fn run_loop(&self) {\n",
+            "        tokio::select! {\n",
+            "            _ = ticker.tick() => {\n",
+            "                self.vanished_reason();\n",
+            "            }\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "struct Store;\n",
+            "impl Store {\n",
+            "    fn checkpoint_wal(&self) {\n",
+            "        fn run() {}\n",
+            "        run();\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "struct Adjacency;\n",
+            "impl Adjacency {\n",
+            "    fn run(&self, _rank: u32) {}\n",
+            "    fn unused_run(&self) {}\n",
+            "}\n",
+            "struct Edges {\n",
+            "    by_source_symbol: Adjacency,\n",
+            "    by_target_symbol: Adjacency,\n",
+            "}\n",
+            "impl Edges {\n",
+            "    fn symbols(&self, reverse: bool) {\n",
+            "        let adjacency = if reverse {\n",
+            "            &self.by_target_symbol\n",
+            "        } else {\n",
+            "            &self.by_source_symbol\n",
+            "        };\n",
+            "        adjacency.run(0);\n",
+            "    }\n",
+            "}\n",
+        ),
+    )]);
+    for live in [
+        "unknown_ctime",
+        "test_commands",
+        "marker",
+        "tree_sitter_liquid",
+        "Cache.stamp_rule",
+        "Daemon.vanished_reason",
+        "Store.checkpoint_wal.run",
+        "Adjacency.run",
+    ] {
+        assert!(
+            !is_reported(&reports, live),
+            "{live} is used and must not be dead: {reports:?}"
+        );
+    }
+    assert!(
+        is_reported(&reports, "genuinely_dead"),
+        "a helper nothing touches must still be reported: {reports:?}"
+    );
+    assert!(
+        is_reported(&reports, "Cache.unused_method"),
+        "a method nothing touches must still be reported: {reports:?}"
+    );
+    assert!(
+        is_reported(&reports, "Adjacency.unused_run"),
+        "typing adjacency must not amnesty every method of Adjacency: {reports:?}"
+    );
+}

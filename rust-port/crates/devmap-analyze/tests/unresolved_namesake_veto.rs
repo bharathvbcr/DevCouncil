@@ -297,28 +297,77 @@ fn the_veto_does_not_touch_exempt_symbols() {
     }
 }
 
-/// End to end, through the real resolver, on a shape taken from this repository.
+/// A nested Rust `fn` called from its enclosing method is live.
 ///
-/// Every test above injects the ledger so one class can be exercised in
-/// isolation. This one does not — and it is the test that proves the veto is
-/// reachable at all rather than dead configuration.
-///
-/// The shape is `devmap-store/src/edge_index.rs:430`, reduced: a nested `fn`
-/// declared inside a method and called from it several lines later. The
-/// extractor emits the nested function as a symbol, the resolver cannot bind
-/// the bare calls to it, and so the pre-veto kernel reported
-/// `GenerationEdges.map_bytes` as dead — a function called four times, in the
-/// same file, in this very workspace. Measured across the 474-file `rust-port`
-/// corpus, 303 unresolved sites name a declared symbol and this was the one
-/// that reached a finding.
+/// This was the original e2e fixture for the namesake veto: the extractor used
+/// to emit the helper as `GenerationEdges.map_bytes` (a Method of the impl
+/// type), the resolver refused to bind a bare `map_bytes()` to a Method, and
+/// the pre-veto kernel proposed deleting a function that is called on the
+/// next line. The extractor now stops the type walk at the enclosing callable,
+/// so the helper is `GenerationEdges.heap_bytes.map_bytes` and the lexical
+/// rung binds the call. The veto must not keep firing on a site the resolver
+/// can now explain.
 #[test]
-fn the_veto_fires_on_what_the_real_resolver_produces() {
+fn a_nested_rust_function_called_from_its_enclosing_method_is_live() {
     let extractions = vec![extract_file(
         "edge_index.rs",
         "pub struct GenerationEdges {\n    a: Vec<u32>,\n    b: Vec<u32>,\n}\n\n\
          impl GenerationEdges {\n    pub fn heap_bytes(&self) -> usize {\n        \
          fn map_bytes(m: &Vec<u32>) -> usize {\n            m.len() * 4\n        }\n        \
          map_bytes(&self.a) + map_bytes(&self.b)\n    }\n}\n",
+    )];
+
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+
+    assert!(
+        resolution.edges.iter().any(|edge| {
+            edge.edge_kind == EdgeKind::Calls
+                && edge.source_symbol.contains("heap_bytes")
+                && edge.target_symbol.contains("map_bytes")
+        }),
+        "the nested helper is called from the method that declares it: {:?}",
+        resolution.edges
+    );
+    assert!(
+        resolution
+            .unresolved
+            .iter()
+            .all(|row| row.callee_name != "map_bytes"),
+        "a bound nested call must not remain on the defect ledger: {:?}",
+        resolution.unresolved
+    );
+
+    let reports = analyze_liveness(&extractions, &resolution);
+    assert!(
+        reports
+            .iter()
+            .all(|report| !report.symbol_name.contains("map_bytes") || report.is_exempt),
+        "a nested helper the resolver bound is not a dead-code finding: {reports:?}"
+    );
+}
+
+/// End to end, through the real resolver, on a shape taken from this repository.
+///
+/// Every test above injects the ledger so one class can be exercised in
+/// isolation. This one does not — and it is the test that proves the veto is
+/// reachable at all rather than dead configuration.
+///
+/// Nested helpers now resolve (see the test above). The remaining gap is a
+/// Method invoked by its bare name: Rust requires `self.map_bytes()` or
+/// `Self::map_bytes()`, the extractor still records the bare call, and the
+/// ladder will not bind a Method without a receiver. That is exactly the
+/// ledger row the veto exists to read — a declared symbol whose only "callers"
+/// the resolver could not attribute.
+#[test]
+fn the_veto_fires_on_what_the_real_resolver_produces() {
+    let extractions = vec![extract_file(
+        "edge_index.rs",
+        "pub struct GenerationEdges {\n    a: Vec<u32>,\n    b: Vec<u32>,\n}\n\n\
+         impl GenerationEdges {\n    pub fn heap_bytes(&self) -> usize {\n        \
+         map_bytes(&self.a) + map_bytes(&self.b)\n    }\n    \
+         fn map_bytes(m: &Vec<u32>) -> usize {\n        m.len() * 4\n    }\n}\n",
     )];
 
     let mut resolver = Resolver::new();
@@ -347,7 +396,7 @@ fn the_veto_fires_on_what_the_real_resolver_produces() {
     let report = analyze_liveness(&extractions, &resolution)
         .into_iter()
         .find(|r| r.symbol_name.contains("map_bytes"))
-        .expect("the nested function must still be reported, not hidden");
+        .expect("the method must still be reported, not hidden");
     assert_eq!(
         report.exemption_reason.as_deref(),
         Some(UNRESOLVED_NAMESAKE_REASON),
