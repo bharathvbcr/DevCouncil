@@ -5,7 +5,7 @@
       "command": "devcouncil",
       "args": ["mcp-server"],
       "env": {
-        "DEVCOUNCIL_PROJECT_ROOT": "${CLAUDE_PROJECT_DIR}"
+        "DEVCOUNCIL_PROJECT_ROOT": "${CLAUDE_PROJECT_DIR:-.}"
       }
     }
   }
