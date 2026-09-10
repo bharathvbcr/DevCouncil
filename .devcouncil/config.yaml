@@ -20,7 +20,7 @@ integrations:
     mcp_config_path: .agents/mcp_config.json
   claude:
     enabled: true
-    scope: local
+    scope: project
     settings_path: .claude/settings.local.json
     write_gate: false
   cursor:
