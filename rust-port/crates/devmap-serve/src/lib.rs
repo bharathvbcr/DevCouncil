@@ -3,6 +3,7 @@ pub mod daemon;
 pub mod mcp;
 pub mod mcp_http;
 pub mod protocol;
+pub mod session_log;
 pub mod watcher;
 
 pub use admission::{Admission, Admitted};

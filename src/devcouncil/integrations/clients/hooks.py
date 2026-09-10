@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -609,6 +610,35 @@ def _install_cursor_hooks(project_root: Path, *, write_gate: bool = False) -> li
     return [path]
 
 
+def _devmap_hook_command(project_root: Path, *args: str) -> str:
+    """Absolute-enough command string for DevMap session hooks."""
+    executable = shutil.which("devmap") or "devmap"
+    db = project_root / ".devcouncil" / "codeintel" / "devmap.sqlite"
+    return _format_command([executable, "--db", str(db), *args])
+
+
+def _install_devmap_session_hooks(settings: dict, project_root: Path) -> None:
+    """SessionStart/SessionEnd insights for hosts that share Claude's hook schema."""
+    _upsert_hook(
+        settings,
+        "SessionStart",
+        "startup|resume|clear|compact|fork",
+        _devmap_hook_command(project_root, "session-report", "--last"),
+        "devmap-session-start",
+        timeout=5,
+        status_message="Dev Map last session",
+    )
+    _upsert_hook(
+        settings,
+        "SessionEnd",
+        "",
+        _devmap_hook_command(project_root, "session-report"),
+        "devmap-session-end",
+        timeout=10,
+        status_message="Dev Map session report",
+    )
+
+
 def _install_grok_hooks(project_root: Path, *, write_gate: bool = False) -> list[Path]:
     """Install Grok hooks. PostToolUse always; PreToolUse only with ``write_gate``."""
     hooks_dir = project_root / ".grok" / "hooks"
@@ -623,6 +653,7 @@ def _install_grok_hooks(project_root: Path, *, write_gate: bool = False) -> list
         _hook_command(project_root, "grok", "post-tool-use"),
         "devcouncil-post-tool-use",
     )
+    _install_devmap_session_hooks(settings, project_root)
     if write_gate:
         _upsert_hook(
             settings,

@@ -32,6 +32,7 @@ def _antigravity_mcp_path(project_root: Path) -> Path:
     return project_root / ".agents" / "mcp_config.json"
 
 def _antigravity_mcp_config(project_root: Path) -> dict:
+    db = str(project_root / ".devcouncil" / "codeintel" / "devmap.sqlite")
     return {
         "mcpServers": {
             "devcouncil": {
@@ -39,7 +40,11 @@ def _antigravity_mcp_config(project_root: Path) -> dict:
                 "args": ["mcp-server"],
                 "env": {"DEVCOUNCIL_PROJECT_ROOT": str(project_root)},
                 "cwd": str(project_root),
-            }
+            },
+            "devmap": {
+                "command": "devmap",
+                "args": ["--db", db, "mcp"],
+            },
         }
     }
 
@@ -57,7 +62,9 @@ def _write_antigravity_mcp_config(project_root: Path) -> Path:
     path = _antigravity_mcp_path(project_root)
     data = _load_json_strict(path, "Antigravity")
     mcp_servers = data.setdefault("mcpServers", {})
-    mcp_servers["devcouncil"] = _antigravity_mcp_config(project_root)["mcpServers"]["devcouncil"]
+    generated = _antigravity_mcp_config(project_root)["mcpServers"]
+    mcp_servers["devcouncil"] = generated["devcouncil"]
+    mcp_servers["devmap"] = generated["devmap"]
     _save_json(path, data)
     return path
 

@@ -239,10 +239,12 @@ dynamic imports and JSX). If `entry_roots` is empty or `liveness_unreachable_unr
 ignore `unreachable_files` entirely. Check `unwired_candidates` before creating a new module — \
 wire what you create into a real caller."
             .to_string(),
-        "8. Use `devmap explore <name>` for a symbol's whole neighbourhood in one call; \
-`devmap search`, `devmap impact`, `devmap trace <a> <b>`, `devmap dead` for the individual \
-questions; `devmap affected <target>` for the tests a change reaches. Read the `truncated` and \
-`total` on every envelope before treating a list as complete."
+        "8. Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, \
+`devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) over \
+GitNexus. CLI equivalents: `devmap explore <name>`, `devmap search`, `devmap impact`, \
+`devmap trace <a> <b>`, `devmap dead`, `devmap affected <target>`. Read `truncated` and \
+`total` on every envelope before treating a list as complete. When DevMap cannot answer, \
+record a gap in `.devcouncil/codeintel/sessions/gaps.jsonl` — do not switch indexes."
             .to_string(),
         format!(
             "9. The store (`{store_rel}`) is canonical — prefer `devmap` commands when \

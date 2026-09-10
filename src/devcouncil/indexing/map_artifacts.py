@@ -171,11 +171,12 @@ def agent_guide_text(repo_map_path: Path, repo_root: Path, repo_map: RepoMap) ->
             "`liveness_unreachable_unreliable`, ignore `unreachable_files` and mass inferred dead. "
             "Check `unwired_candidates` / `dead_symbol_candidates` before creating new modules — "
             "wire what you create into a real caller.",
-            "8. Use `dev map query <name>` / `dev map trace <a> <b>` / `dev map dead` "
-            "for symbol callers, paths, and dead-code tiers; `dev map graph-html` "
-            "(or `dev map html --symbols`) for the symbol visualizer. "
+            "8. Prefer DevMap MCP tools (`devmap_explore`, `devmap_impact`, `devmap_trace`, …) "
+            "over GitNexus. CLI: `dev map query <name>` / `dev map trace <a> <b>` / `dev map dead`; "
+            "`dev map graph-html` (or `dev map html --symbols`) for the symbol visualizer. "
             "The kernel store (`.devcouncil/codeintel/devmap.sqlite`) is canonical — prefer "
-            "`dev map` commands when `code_graph.json` is missing or a size-capped stub.",
+            "`dev map` / `devmap_*` when `code_graph.json` is missing or a size-capped stub. "
+            "When DevMap cannot answer, record a gap in `.devcouncil/codeintel/sessions/gaps.jsonl`.",
             "9. Run `dev map` (or `dev map --watch`) after large refactors; "
             "`dev map status` / `dev map doctor` report engine, store and freshness.",
             "",
@@ -184,8 +185,8 @@ def agent_guide_text(repo_map_path: Path, repo_root: Path, repo_map: RepoMap) ->
             "`devcouncil_verify_task`, …) for task state; do not guess.",
             "- Interactive Shell does not need a lease under assist (`hook_gate.mode=off`); "
             "checkout before writes only when write-gates / contain mode are active.",
-            "- Engineering skills live under `.claude/skills/` and `.cursor/skills/` "
-            "(`dev skills scaffold` / `dev integrate cursor --apply`).",
+            "- Engineering skills live under `.claude/skills/`, `.cursor/skills/`, and "
+            "`.agents/skills/` (`dev skills scaffold` / `dev integrate cursor --apply`).",
             "",
             "Important surfaces:",
             *_important_surfaces(repo_map),

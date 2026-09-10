@@ -378,9 +378,12 @@ devmap claude hooks             # print a hooks block for settings.json
 devmap claude validate <path>   # check a hooks/plugin/marketplace file
 ```
 
-`claude plugin` writes an installable bundle to `.devmap/devmap-plugin`: a
-single-repo marketplace, the MCP server entry, and a `PostToolUse` hook that
-re-indexes after an edit. Install it with:
+`claude plugin` writes an installable bundle to `.devmap/devmap-plugin` (or
+`.devcouncil/devmap-plugin` in a DevCouncil repo): a single-repo marketplace,
+the MCP server, agent skills that prefer DevMap over GitNexus, a `PostToolUse`
+hook that re-indexes after an edit, SessionStart status + last-session insights,
+and a SessionEnd `session-report` that writes query-log honesty flags (truncated,
+walk_incomplete, empty, errors) plus recorded capability gaps. Install it with:
 
 ```
 /plugin marketplace add <path-to-repo>/.devmap/devmap-plugin

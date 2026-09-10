@@ -146,11 +146,11 @@ def _skill_from_meta(path: Path, meta: dict, body: str) -> Skill:
 
 # Repo-local skill locations, scanned in addition to the packaged library so users
 # can drop their own skill markdown into a project and have it picked up.
-REPO_SKILL_DIRS = (".claude/skills", ".cursor/skills", ".devcouncil/skills")
+REPO_SKILL_DIRS = (".claude/skills", ".cursor/skills", ".agents/skills", ".devcouncil/skills")
 
 # Default destinations for ``scaffold_skills`` — Claude Code and Cursor both discover
 # skills under these trees. Callers can pass an explicit list to write fewer roots.
-DEFAULT_SKILL_DESTINATIONS = (".claude/skills", ".cursor/skills")
+DEFAULT_SKILL_DESTINATIONS = (".claude/skills", ".cursor/skills", ".agents/skills")
 
 
 def _try_skill_from_file(path: Path) -> Skill | None:

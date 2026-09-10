@@ -21,11 +21,16 @@ def _grok_config_path(project_root: Path) -> Path:
 
 def _grok_mcp_toml_snippet(project_root: Path) -> str:
     root = str(project_root)
+    db = f"{root}/.devcouncil/codeintel/devmap.sqlite"
     return (
         "[mcp_servers.devcouncil]\n"
         'command = "devcouncil"\n'
         'args = ["mcp-server"]\n'
         f'env = {{ DEVCOUNCIL_PROJECT_ROOT = "{root}" }}\n'
+        "\n"
+        "[mcp_servers.devmap]\n"
+        'command = "devmap"\n'
+        f'args = ["--db", "{db}", "mcp"]\n'
     )
 
 
@@ -50,10 +55,25 @@ def _merge_grok_config_toml(project_root: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     snippet = _grok_mcp_toml_snippet(project_root)
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    if "mcp_servers.devcouncil" in existing or "[mcp_servers.devcouncil]" in existing:
+    pieces: list[str] = []
+    if "[mcp_servers.devcouncil]" not in existing and "mcp_servers.devcouncil" not in existing:
+        pieces.append(
+            "[mcp_servers.devcouncil]\n"
+            'command = "devcouncil"\n'
+            'args = ["mcp-server"]\n'
+            f'env = {{ DEVCOUNCIL_PROJECT_ROOT = "{project_root}" }}\n'
+        )
+    if "[mcp_servers.devmap]" not in existing:
+        db = project_root / ".devcouncil" / "codeintel" / "devmap.sqlite"
+        pieces.append(
+            "[mcp_servers.devmap]\n"
+            'command = "devmap"\n'
+            f'args = ["--db", "{db}", "mcp"]\n'
+        )
+    if not pieces:
         return path
     separator = "\n" if existing and not existing.endswith("\n") else ""
-    path.write_text(f"{existing}{separator}\n{snippet}", encoding="utf-8")
+    path.write_text(f"{existing}{separator}\n" + "\n".join(pieces), encoding="utf-8")
     return path
 
 

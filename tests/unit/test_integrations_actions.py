@@ -53,6 +53,8 @@ def test_apply_cursor_writes_project_config(tmp_path, monkeypatch):
     assert server["command"] == "devcouncil"
     assert server["args"] == ["mcp-server"]
     assert server["env"]["DEVCOUNCIL_PROJECT_ROOT"] == str(tmp_path)
+    assert "devmap" in data["mcpServers"]
+    assert data["mcpServers"]["devmap"]["args"][-1] == "mcp"
     # One-shot surface also scaffolds skills + always-on rule.
     assert (tmp_path / ".cursor" / "skills" / "core-engineering" / "SKILL.md").exists()
     assert (tmp_path / ".claude" / "skills" / "core-engineering" / "SKILL.md").exists()

@@ -30,6 +30,7 @@ macro_rules! outln {
 
 mod claude;
 mod progress;
+mod session;
 
 use devmap_extract::collect_go_modules;
 use devmap_query::freshness::{self, FreshnessDigests, InventoryLimits, InventorySource};
@@ -971,6 +972,19 @@ enum Commands {
     /// prose, so a vendored-vs-on-disk grammar or schema mismatch is a structured
     /// refusal rather than a parse of free text.
     Doctor,
+    /// Write a session insights report from the MCP query log.
+    ///
+    /// SessionEnd hooks share a short budget, so this only reads the live log
+    /// and never builds an index. `--last` prints the previous report (for
+    /// SessionStart context) and writes nothing.
+    SessionReport {
+        /// Print the previous report instead of writing a new one.
+        #[arg(long)]
+        last: bool,
+        /// Host session id, when the hook has one.
+        #[arg(long)]
+        session_id: Option<String>,
+    },
     /// Where this repository's state lives — the state directory, the store, the
     /// artifacts, the workspace registry — resolved exactly as every other
     /// command resolves them, and reported without opening anything.
@@ -3128,6 +3142,7 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         Commands::Build { .. }
         | Commands::Status
         | Commands::Doctor
+        | Commands::SessionReport { .. }
         | Commands::Paths { .. }
         | Commands::Manifest { .. }
         | Commands::MapHtml { .. }
@@ -4896,6 +4911,17 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             let payload = doctor_report(&cli.db())?;
             emit_json(cli, &payload)?;
         }
+        Commands::SessionReport { last, session_id } => {
+            let payload = session::run(
+                &cli.db(),
+                *last,
+                session_id.as_deref(),
+                cli.json,
+            )?;
+            if cli.json {
+                emit_json(cli, &payload)?;
+            }
+        }
         Commands::History { last } => {
             let store = open_for_read(cli)?;
             let rows = store.build_history(*last)?;
@@ -5655,15 +5681,19 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
                 )?;
                 let files: serde_json::Map<String, serde_json::Value> = rendered
                     .into_iter()
-                    .map(|(path, json)| {
-                        Ok((
-                            path.to_str()
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("bundle path is not valid UTF-8: {path:?}")
-                                })?
-                                .to_string(),
-                            serde_json::from_str::<serde_json::Value>(&json)?,
-                        ))
+                    .map(|(path, body)| {
+                        let key = path
+                            .to_str()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("bundle path is not valid UTF-8: {path:?}")
+                            })?
+                            .to_string();
+                        let value = if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                            serde_json::from_str::<serde_json::Value>(&body)?
+                        } else {
+                            serde_json::Value::String(body)
+                        };
+                        Ok((key, value))
                     })
                     .collect::<anyhow::Result<_>>()?;
                 return emit_json(cli, &serde_json::Value::Object(files));

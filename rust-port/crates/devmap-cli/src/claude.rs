@@ -1135,9 +1135,9 @@ pub struct DevmapHook {
 
 /// Dev Map's hook table.
 ///
-/// Two entries, both read-only or index-only, both on events that cannot decide
-/// a permission. Every other event is settled as "no handler" in
-/// [`event_coverage`], with the reason, rather than left unexamined.
+/// Read-only or index-only, all on events that cannot decide a permission.
+/// Every other event is settled as "no handler" in [`event_coverage`], with the
+/// reason, rather than left unexamined.
 pub const DEVMAP_HOOKS: &[DevmapHook] = &[
     DevmapHook {
         event: "SessionStart",
@@ -1152,6 +1152,18 @@ pub const DEVMAP_HOOKS: &[DevmapHook] = &[
                   whether the index is fresh instead of trusting a stale map.",
     },
     DevmapHook {
+        event: "SessionStart",
+        matcher: SESSION_START_MATCHER,
+        subcommand: "session-report",
+        args: &["--last"],
+        timeout_secs: Some(5),
+        run_async: false,
+        status_message: "Dev Map last session",
+        purpose: "The previous session's withheld answers and recorded gaps are the first \
+                  thing the next session should know, so limits get fixed instead of \
+                  rediscovered.",
+    },
+    DevmapHook {
         event: "PostToolUse",
         matcher: WRITE_TOOL_MATCHER,
         subcommand: "build",
@@ -1161,6 +1173,18 @@ pub const DEVMAP_HOOKS: &[DevmapHook] = &[
         status_message: "",
         purpose: "An incremental rebuild after a write, run detached: indexing must never \
                   hold the agent's loop, and `build` early-returns when nothing changed.",
+    },
+    DevmapHook {
+        event: "SessionEnd",
+        matcher: "",
+        subcommand: "session-report",
+        args: &[],
+        timeout_secs: Some(10),
+        run_async: false,
+        status_message: "Dev Map session report",
+        purpose: "SessionEnd is the last chance to persist what this session asked and \
+                  what the index withheld. The command only reads the live query log; \
+                  it does not build.",
     },
 ];
 
@@ -1183,8 +1207,8 @@ pub fn event_coverage() -> Vec<(&'static str, Option<&'static DevmapHook>, &'sta
                      rebuild per batch would index the same change twice."
                 }
                 "SessionEnd" => {
-                    "Not handled: SessionEnd hooks share a 1.5-second budget, which no \
-                     index build fits inside."
+                    "Handled: session-report reads the MCP query log and writes insights. \
+                     It does not build; a 10s timeout fits the raised SessionEnd budget."
                 }
                 "Stop" | "SubagentStop" | "StopFailure" | "TeammateIdle" => {
                     "Not handled: Dev Map has no claim to verify at a stop, and blocking one \
@@ -1325,7 +1349,10 @@ pub fn hooks_block(executable: &Path, db: &Path, subcommands: &[String]) -> anyh
     let exe = utf8_path("the devmap executable path", executable)?;
     let db_arg = hook_db_arg(db)?;
 
-    let mut events: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    // Groups are keyed by (event, matcher): two handlers that fire on the same
+    // event+matcher belong in one group. Two groups with the same matcher are
+    // refused by Claude Code as a duplicate (both would fire, twice).
+    let mut grouped: BTreeMap<(&str, &str), Vec<Value>> = BTreeMap::new();
     for spec in DEVMAP_HOOKS {
         // Enforced here, in the writer, not only in a test: these three events
         // are the ones whose output can allow a tool call, deny it, rewrite its
@@ -1373,15 +1400,20 @@ pub fn hooks_block(executable: &Path, db: &Path, subcommands: &[String]) -> anyh
             handler.insert("statusMessage".into(), json!(spec.status_message));
         }
 
-        let mut group = Map::new();
-        if !spec.matcher.is_empty() {
-            group.insert("matcher".into(), json!(spec.matcher));
-        }
-        group.insert("hooks".into(), json!([Value::Object(handler)]));
-        events
-            .entry(spec.event)
+        grouped
+            .entry((spec.event, spec.matcher))
             .or_default()
-            .push(Value::Object(group));
+            .push(Value::Object(handler));
+    }
+
+    let mut events: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    for ((event, matcher), handlers) in grouped {
+        let mut group = Map::new();
+        if !matcher.is_empty() {
+            group.insert("matcher".into(), json!(matcher));
+        }
+        group.insert("hooks".into(), Value::Array(handlers));
+        events.entry(event).or_default().push(Value::Object(group));
     }
 
     let block = json!({
@@ -1430,10 +1462,35 @@ pub fn plugin_manifest(version: Option<&str>) -> anyhow::Result<Value> {
             "navigation"
         ]),
     );
+    manifest.insert("skills".into(), json!("./skills"));
     let value = Value::Object(manifest);
     Report::new(validate_plugin_manifest(&value), true).into_result()?;
     Ok(value)
 }
+
+/// Skill bodies shipped in the plugin bundle.
+///
+/// `include_str!` so a `cargo install` binary still emits them. Each entry is
+/// `(directory name under skills/, SKILL.md contents)`.
+pub const PLUGIN_SKILLS: &[(&str, &str)] = &[
+    ("devmap", include_str!("../skills/devmap/SKILL.md")),
+    (
+        "devmap-exploring",
+        include_str!("../skills/devmap-exploring/SKILL.md"),
+    ),
+    (
+        "devmap-debugging",
+        include_str!("../skills/devmap-debugging/SKILL.md"),
+    ),
+    (
+        "devmap-impact",
+        include_str!("../skills/devmap-impact/SKILL.md"),
+    ),
+    (
+        "devmap-refactoring",
+        include_str!("../skills/devmap-refactoring/SKILL.md"),
+    ),
+];
 
 /// A single-repository marketplace pointing at the bundled plugin, because
 /// `claude plugin install` installs from a marketplace and nothing else.
@@ -1444,8 +1501,8 @@ pub fn marketplace_manifest(version: Option<&str>) -> anyhow::Result<Value> {
     entry.insert(
         "description".into(),
         json!(
-            "Dev Map's Claude Code integration: index-refresh hooks and the code-graph \
-               MCP server."
+            "Dev Map's Claude Code integration: index-refresh hooks, session insights, \
+               agent skills, and the code-graph MCP server."
         ),
     );
     if let Some(version) = version {
@@ -1522,7 +1579,7 @@ pub fn render_plugin_bundle(
     subcommands: &[String],
 ) -> anyhow::Result<Vec<(PathBuf, String)>> {
     let plugin = PathBuf::from(PLUGIN_NAME);
-    Ok(vec![
+    let mut files = vec![
         (
             PathBuf::from(".claude-plugin").join("marketplace.json"),
             pretty(&marketplace_manifest(version)?),
@@ -1539,7 +1596,18 @@ pub fn render_plugin_bundle(
             plugin.join(".mcp.json"),
             pretty(&plugin_mcp_config(executable, db)?),
         ),
-    ])
+    ];
+    for (name, body) in PLUGIN_SKILLS {
+        let mut text = (*body).to_string();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        files.push((
+            plugin.join("skills").join(name).join("SKILL.md"),
+            text,
+        ));
+    }
+    Ok(files)
 }
 
 /// Write the bundle under `out_dir`.

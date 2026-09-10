@@ -42,6 +42,16 @@ def _opencode_mcp_entry(project_root: Path) -> dict:
         "timeout": 10000,
     }
 
+
+def _opencode_devmap_entry(project_root: Path) -> dict:
+    db = str(project_root / ".devcouncil" / "codeintel" / "devmap.sqlite")
+    return {
+        "type": "local",
+        "command": ["devmap", "--db", db, "mcp"],
+        "enabled": True,
+        "timeout": 10000,
+    }
+
 def _record_opencode_config(project_root: Path) -> None:
     def mutate(config: dict) -> None:
         opencode = config.setdefault("integrations", {}).setdefault("opencode", {})
@@ -58,6 +68,7 @@ def _write_opencode_config(project_root: Path) -> Path:
     data.setdefault("$schema", "https://opencode.ai/config.json")
     mcp = data.setdefault("mcp", {})
     mcp["devcouncil"] = _opencode_mcp_entry(project_root)
+    mcp["devmap"] = _opencode_devmap_entry(project_root)
     _save_json(path, data)
     return path
 
@@ -65,7 +76,10 @@ def _configure_opencode(project_root: Path, apply: bool) -> bool:
     path = _opencode_config_path(project_root)
     config = {
         "$schema": "https://opencode.ai/config.json",
-        "mcp": {"devcouncil": _opencode_mcp_entry(project_root)},
+        "mcp": {
+            "devcouncil": _opencode_mcp_entry(project_root),
+            "devmap": _opencode_devmap_entry(project_root),
+        },
     }
     if not apply:
         console.print("[bold]OpenCode[/bold]")

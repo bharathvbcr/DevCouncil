@@ -15,6 +15,13 @@ def test_library_loads_core_and_domains():
     names = {s.name for s in load_skills()}
     assert {"core-engineering", "android", "ios", "windows", "web", "ai-training"} <= names
     assert {"devcouncil", "devcouncil-hero-loop", "devcouncil-verification"} <= names
+    assert {
+        "devmap",
+        "devmap-exploring",
+        "devmap-debugging",
+        "devmap-impact",
+        "devmap-refactoring",
+    } <= names
     always = [s.name for s in load_skills() if s.always]
     assert always == ["core-engineering"]
     # The contributor README has no skill frontmatter and must not load as a skill.
@@ -37,6 +44,14 @@ def test_core_skill_merges_both_sources():
 def test_select_always_includes_core_for_empty_goal():
     selected = select_skills(goal="")
     assert [s.name for s in selected] == ["core-engineering"]
+
+
+def test_devmap_skills_select_when_devcouncil_marker_exists(tmp_path):
+    (tmp_path / ".devcouncil").mkdir()
+    selected = {s.name for s in select_skills(goal="", project_root=tmp_path)}
+    assert "core-engineering" in selected
+    assert "devmap" in selected
+    assert "devmap-exploring" in selected
 
 
 def test_select_matches_domain_by_keyword():

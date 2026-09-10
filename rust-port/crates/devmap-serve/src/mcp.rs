@@ -46,7 +46,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use devmap_store::Store;
 use serde_json::{json, Map, Value};
@@ -1488,10 +1488,13 @@ fn discover_result() -> Value {
 }
 
 /// Guidance handed to the model on connect. One copy, used by both eras.
-const INSTRUCTIONS: &str = "Ask the code graph before reading files. Every answer is budgeted and \
-reports what it withheld: check `truncated` and `walk_incomplete` before concluding that an \
-empty list means nothing exists. When a result looks wrong or empty, call devmap_status — an \
-unbuilt index answers 'nothing' to every question.";
+const INSTRUCTIONS: &str = "Ask the DevMap code graph before reading files. Prefer the devmap_* \
+tools over GitNexus or grep for callers, blast radius, traces and dead code. Every answer is \
+budgeted and reports what it withheld: check `truncated` and `walk_incomplete` before concluding \
+that an empty list means nothing exists. When a result looks wrong or empty, call devmap_status \
+— an unbuilt index answers 'nothing' to every question. When DevMap cannot answer (truncated, \
+walk_incomplete, empty on a built index, or a capability it does not have), record a gap rather \
+than switching tools.";
 
 /// Run one JSON-RPC method against the store.
 ///
@@ -1510,6 +1513,20 @@ async fn call_tool(
         .ok_or_else(|| RpcError::new(codes::INVALID_PARAMS, "tools/call requires a string 'name'"))?
         .to_string();
 
+    let started = Instant::now();
+    let db_path = store.db_path().to_path_buf();
+    let args = params.get("arguments").cloned();
+    let log_err = |message: &str| {
+        crate::session_log::append_query(
+            &db_path,
+            &name,
+            args.as_ref(),
+            None,
+            Some(message),
+            started.elapsed().as_millis() as u64,
+        );
+    };
+
     // Argument *value* faults are reported as tool errors, not JSON-RPC errors:
     // the agent that sent them is the one that must correct them, and a tool
     // error reaches the model while a protocol error reaches only the client
@@ -1519,7 +1536,10 @@ async fn call_tool(
     // where the fault is raised; this is only the routing.
     let command = match to_ipc_command(&name, params.get("arguments")) {
         Ok(command) => command,
-        Err(err) if err.is_tool_input_fault() => return Ok(tool_error(err.message)),
+        Err(err) if err.is_tool_input_fault() => {
+            log_err(err.message());
+            return Ok(tool_error(err.message()));
+        }
         Err(err) => return Err(err),
     };
 
@@ -1528,6 +1548,7 @@ async fn call_tool(
         command,
     };
     if let Err(reason) = validate_request(&request) {
+        log_err(&reason);
         return Ok(tool_error(reason));
     }
 
@@ -1540,7 +1561,17 @@ async fn call_tool(
     // a retryable condition rather than a permanent one.
     let store = match store.get() {
         Ok(store) => store,
-        Err(reason) => return Ok(tool_error(reason)),
+        Err(reason) => {
+            crate::session_log::append_query(
+                &db_path,
+                &name,
+                args.as_ref(),
+                None,
+                Some(&reason),
+                started.elapsed().as_millis() as u64,
+            );
+            return Ok(tool_error(reason));
+        }
     };
 
     // The flag is the caller's: a stdio session holds a second handle so a
@@ -1557,20 +1588,51 @@ async fn call_tool(
     let handle =
         tokio::task::spawn_blocking(move || dispatch(&store, request, &worker_cancel, &unapplied));
 
+    let latency_ms = || started.elapsed().as_millis() as u64;
     match tokio::time::timeout(CALL_TIMEOUT, handle).await {
-        Ok(Ok(Ok(value))) => Ok(tool_success(&name, value)),
-        Ok(Ok(Err(err))) => Ok(tool_error(err.to_string())),
+        Ok(Ok(Ok(value))) => {
+            crate::session_log::append_query(
+                &db_path,
+                &name,
+                args.as_ref(),
+                Some(&value),
+                None,
+                latency_ms(),
+            );
+            Ok(tool_success(&name, value))
+        }
+        Ok(Ok(Err(err))) => {
+            let message = err.to_string();
+            crate::session_log::append_query(
+                &db_path,
+                &name,
+                args.as_ref(),
+                None,
+                Some(&message),
+                latency_ms(),
+            );
+            Ok(tool_error(message))
+        }
         Ok(Err(join)) => Err(RpcError::new(
             codes::INTERNAL_ERROR,
             format!("tool task failed: {join}"),
         )),
         Err(_) => {
             cancel.cancel();
-            Ok(tool_error(format!(
+            let message = format!(
                 "tool '{name}' exceeded its {}s budget and was cancelled; no partial answer is \
 being reported because a partial traversal cannot be distinguished from a complete one",
                 CALL_TIMEOUT.as_secs()
-            )))
+            );
+            crate::session_log::append_query(
+                &db_path,
+                &name,
+                args.as_ref(),
+                None,
+                Some(&message),
+                latency_ms(),
+            );
+            Ok(tool_error(message))
         }
     }
 }

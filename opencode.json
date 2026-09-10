@@ -12,6 +12,17 @@
       },
       "enabled": true,
       "timeout": 10000
+    },
+    "devmap": {
+      "type": "local",
+      "command": [
+        "devmap",
+        "--db",
+        "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/codeintel/devmap.sqlite",
+        "mcp"
+      ],
+      "enabled": true,
+      "timeout": 10000
     }
   },
   "plugin": [

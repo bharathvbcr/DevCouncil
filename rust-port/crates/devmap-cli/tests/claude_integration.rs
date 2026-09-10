@@ -243,6 +243,89 @@ fn the_session_start_hook_succeeds_and_says_so_on_an_unindexed_repository() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// SessionEnd's report must succeed without an index: the hook cannot turn
+/// teardown into an error notice, and it must not create a store just to say
+/// nothing was queried.
+#[test]
+fn session_report_succeeds_on_an_unindexed_repository() {
+    let dir = scratch("session-fresh");
+    let db = devmap_extract::paths::store_path(&dir);
+    let out = Command::new(DEVMAP)
+        .arg("--db")
+        .arg(&db)
+        .arg("session-report")
+        .output()
+        .expect("devmap runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "session-report on a fresh clone must exit 0\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("no queries") || stdout.contains("DevMap session"),
+        "the hook must say what happened: {stdout}"
+    );
+    assert!(
+        !db.exists(),
+        "session-report must not create the store it did not need"
+    );
+    let last = Command::new(DEVMAP)
+        .arg("--db")
+        .arg(&db)
+        .arg("session-report")
+        .arg("--last")
+        .output()
+        .expect("devmap runs");
+    assert_eq!(last.status.code(), Some(0), "{}", String::from_utf8_lossy(&last.stderr));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn emitted_hooks_include_session_end_report() {
+    let block = devmap(&["--json", "claude", "hooks"]).ok().json();
+    let end = block["hooks"]["SessionEnd"]
+        .as_array()
+        .expect("SessionEnd group");
+    let args = end[0]["hooks"][0]["args"]
+        .as_array()
+        .expect("args")
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        args.iter().any(|a| *a == "session-report"),
+        "SessionEnd must run session-report: {args:?}"
+    );
+    let start = block["hooks"]["SessionStart"]
+        .as_array()
+        .expect("SessionStart groups");
+    assert_eq!(start.len(), 1, "one matcher group, two handlers: {start:?}");
+    let start_handlers = start[0]["hooks"].as_array().expect("handlers");
+    assert_eq!(
+        start_handlers.len(),
+        2,
+        "SessionStart must inject status and last-session insights: {start_handlers:?}"
+    );
+}
+
+#[test]
+fn plugin_manifest_points_at_bundled_skills() {
+    let dir = scratch("skills-manifest");
+    let out = dir.join("claude-plugin");
+    devmap(&["--json", "claude", "plugin", "--out", out.to_str().unwrap()]).ok();
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("devmap/.claude-plugin/plugin.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["skills"], "./skills");
+    let skill = out.join("devmap/skills/devmap/SKILL.md");
+    let body = std::fs::read_to_string(&skill).expect("preference skill");
+    assert!(body.contains("Do not use GitNexus"), "{body}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Coverage is reported as both numbers, over every documented event.
 #[test]
 fn coverage_names_every_event_and_never_reports_a_subset_as_the_whole() {
@@ -277,14 +360,49 @@ fn the_bundle_is_written_atomically_and_re_running_changes_nothing() {
         .ok()
         .json();
     let files = first["files"].as_array().expect("files");
-    assert_eq!(files.len(), 4, "{first}");
-    assert_eq!(first["changed"], 4, "a fresh directory writes every file");
+    let json_files: Vec<&Value> = files
+        .iter()
+        .filter(|f| {
+            f["path"]
+                .as_str()
+                .unwrap()
+                .ends_with(".json")
+        })
+        .collect();
+    let skill_files: Vec<&Value> = files
+        .iter()
+        .filter(|f| {
+            f["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("SKILL.md")
+        })
+        .collect();
+    assert_eq!(json_files.len(), 4, "json files: {first}");
+    assert_eq!(
+        skill_files.len(),
+        5,
+        "the plugin must ship the DevMap agent skills, not only hooks: {first}"
+    );
+    assert_eq!(
+        first["changed"],
+        files.len() as u64,
+        "a fresh directory writes every file"
+    );
 
     for file in files {
         let path = PathBuf::from(file["path"].as_str().unwrap());
         let text = std::fs::read_to_string(&path).expect("emitted file is readable");
-        serde_json::from_str::<Value>(&text)
-            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()));
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            serde_json::from_str::<Value>(&text)
+                .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()));
+        } else {
+            assert!(
+                text.contains("name:"),
+                "{} is not a skill file: {text}",
+                path.display()
+            );
+        }
         assert!(text.ends_with('\n'), "{}", path.display());
         // No temp file survived the write.
         assert!(
@@ -506,8 +624,8 @@ fn every_emitted_file_passes_our_own_validator_in_strict_mode() {
         .json();
     for file in emitted["files"].as_array().unwrap() {
         let path = file["path"].as_str().unwrap();
-        if path.ends_with(".mcp.json") {
-            continue; // an MCP server config, not one of the three hook shapes
+        if path.ends_with(".mcp.json") || path.ends_with("SKILL.md") {
+            continue; // MCP config and skills are not hook/manifest/marketplace JSON
         }
         let run = devmap(&["claude", "validate", path, "--strict"]);
         assert_eq!(

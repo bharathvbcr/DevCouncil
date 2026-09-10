@@ -15,6 +15,8 @@ def test_grok_integration_apply_writes_toml(tmp_path):
     text = written.read_text(encoding="utf-8")
     assert "[mcp_servers.devcouncil]" in text
     assert "mcp-server" in text
+    assert "[mcp_servers.devmap]" in text
+    assert "devmap" in text
     grok._record_grok_config(root)
     from devcouncil.cli.commands.integrate import _load_raw_config
 
@@ -29,4 +31,7 @@ def test_grok_hooks_installer(tmp_path):
     assert "PostToolUse" in data
     assert "PreToolUse" not in data
     assert "hook post-tool-use --client grok" in data
+    assert "SessionEnd" in data
+    assert "session-report" in data
+    assert "devmap-session-end" in data
     assert "grok" in common.SUPPORTED_HOOK_TOOLS

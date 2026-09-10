@@ -47,6 +47,7 @@ _cursor_mcp_command = _common.resolve_devcouncil_executable
 def _cursor_mcp_config(project_root: Path) -> dict:
     root = project_root.expanduser().resolve()
     env_path = _common.venv_augmented_path(root)
+    db = str(root / ".devcouncil" / "codeintel" / "devmap.sqlite")
     return {
         "mcpServers": {
             "devcouncil": {
@@ -57,7 +58,12 @@ def _cursor_mcp_config(project_root: Path) -> dict:
                     "DEVCOUNCIL_PROJECT_ROOT": str(root),
                     "PATH": env_path,
                 },
-            }
+            },
+            "devmap": {
+                "type": "stdio",
+                "command": shutil.which("devmap") or "devmap",
+                "args": ["--db", db, "mcp"],
+            },
         }
     }
 
@@ -66,7 +72,9 @@ def _write_cursor_config(project_root: Path) -> Path:
     path = _cursor_config_path(project_root)
     data = _load_json_strict(path, "Cursor")
     mcp_servers = data.setdefault("mcpServers", {})
-    mcp_servers["devcouncil"] = _cursor_mcp_config(project_root)["mcpServers"]["devcouncil"]
+    generated = _cursor_mcp_config(project_root)["mcpServers"]
+    mcp_servers["devcouncil"] = generated["devcouncil"]
+    mcp_servers["devmap"] = generated["devmap"]
     _save_json(path, data)
     return path
 
@@ -81,7 +89,7 @@ alwaysApply: true
 
 Use DevCouncil MCP tools for status, checkout, scope, and verify — do not guess task state.
 
-Navigate via `.devcouncil/repo_map.json` (subsystems, entry_points, critical_files). Prefer `dev map query|trace|dead` for symbol callers.
+Navigate via `.devcouncil/repo_map.json` (subsystems, entry_points, critical_files). Prefer DevMap MCP tools (`devmap_explore`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) — not GitNexus. CLI: `devmap` / `dev map query|trace|dead`. When DevMap is truncated or cannot answer, record a gap in `.devcouncil/codeintel/sessions/gaps.jsonl`.
 
 Interactive Cursor Shell/Write do **not** require a task lease under assist defaults
 (`integrations.cursor.write_gate: false`, `execution.hook_gate.mode: off`). Do not claim
