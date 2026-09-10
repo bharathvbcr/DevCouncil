@@ -23,16 +23,17 @@
 //!
 //! So the question moved with the evidence: *does anything depend on this
 //! file*. Every confident cross-file dependency edge answers it, and an import
-//! is one kind. The gate stays for the four languages whose import syntax names
-//! no file at all — C#, VB.NET, Swift, COBOL — where it is a documented
-//! decision rather than a gap.
+//! is one kind. The gate stays for the languages whose import syntax names
+//! no file at all — C#, VB.NET, COBOL, and SQL — where it is a documented
+//! decision rather than a gap. Swift left that list: `import MarkDevKit` names
+//! a module the way `import "app/store"` names a Go package.
 //!
 //! Both directions are asserted, and the "before" assertions are kept rather
 //! than deleted: they are what proves each gate is load-bearing.
 
 use devmap_extract::extract_file;
 use devmap_extract::languages::{capabilities_for_language, Capability};
-use devmap_extract::model::{Extraction, ParseOutcome};
+use devmap_extract::model::{Extraction, ParseOutcome, WiringKind};
 use devmap_query::code_graph::generate_code_graph_json;
 use devmap_query::model::FreshnessInfo;
 use devmap_resolve::Resolver;
@@ -91,7 +92,12 @@ fn csharp_project() -> Vec<Extraction> {
     ]
 }
 
-/// A Swift project of the same shape, for the second declined language.
+/// A Swift project of the same shape, now that Swift extracts imports.
+///
+/// `func run()` is not a script entry, so neither file is exempt as an entry
+/// root. They share a module (`Sources/App`) and import only Foundation, which
+/// is outside the corpus — so both are unwired candidates, and neither is
+/// dropped as import-blind.
 fn swift_project() -> Vec<Extraction> {
     vec![
         extract_file(
@@ -151,7 +157,7 @@ fn unwired(graph: &Value) -> Vec<String> {
 /// would be untested while looking tested.
 #[test]
 fn the_import_blind_fixtures_parse_clean() {
-    for extraction in csharp_project().iter().chain(swift_project().iter()) {
+    for extraction in csharp_project().iter() {
         assert!(
             matches!(extraction.parse_outcome, ParseOutcome::Clean),
             "{} must parse cleanly: {:?}",
@@ -161,8 +167,8 @@ fn the_import_blind_fixtures_parse_clean() {
         assert!(!extraction.is_parse_failure());
         assert!(
             extraction.imports.is_empty(),
-            "{} is expected to yield no imports: `using` and `import` name a \
-             namespace and a module, neither of which is a file",
+            "{} is expected to yield no imports: `using` names a namespace, \
+             which is not a file",
             extraction.file_path
         );
     }
@@ -183,7 +189,7 @@ fn the_import_blind_fixtures_parse_clean() {
 /// and their reasons are in `language_capabilities.rs`.
 #[test]
 fn the_bug_this_gate_closes() {
-    for language in ["csharp", "vb", "swift", "cobol"] {
+    for language in ["csharp", "vb", "cobol"] {
         assert!(
             !capabilities_for_language(language).contains(Capability::Imports),
             "{language} now extracts imports — the gate no longer needs to \
@@ -212,7 +218,7 @@ fn the_bug_this_gate_closes() {
 /// After the gate: zero candidates, and a non-zero exclusion count saying why.
 #[test]
 fn an_import_blind_project_reports_no_unwired_candidates() {
-    for (name, extractions) in [("csharp", csharp_project()), ("swift", swift_project())] {
+    for (name, extractions) in [("csharp", csharp_project())] {
         let graph = graph(&extractions);
         assert!(
             unwired(&graph).is_empty(),
@@ -320,7 +326,7 @@ fn the_two_exclusion_reasons_are_counted_apart() {
 /// now, so their answers are answers rather than another exclusion.
 #[test]
 fn the_formerly_blind_fixtures_extract_imports() {
-    for language in ["java", "cpp", "c", "ruby", "kotlin", "php"] {
+    for language in ["java", "cpp", "c", "ruby", "kotlin", "php", "swift"] {
         assert!(
             capabilities_for_language(language).contains(Capability::Imports),
             "{language} must extract imports, or the tests below pass by \
@@ -406,6 +412,169 @@ fn a_java_file_nothing_depends_on_is_still_a_candidate() {
     assert!(
         candidates.contains(&"Stranded.java".to_string()),
         "nothing calls, references or imports Stranded.java: {candidates:?}"
+    );
+}
+
+/// Two files in one Swift module that import only Foundation (outside the
+/// corpus) and never mention each other. Both are candidates, and neither is
+/// dropped as import-blind — the gate's job for Swift is done.
+#[test]
+fn a_swift_module_with_no_internal_edges_reports_both_files() {
+    let extractions = swift_project();
+    for ext in &extractions {
+        assert!(
+            ext.imports
+                .iter()
+                .any(|imp| imp.module_specifier == "Foundation"),
+            "{} must extract `import Foundation`",
+            ext.file_path
+        );
+    }
+    let graph = graph(&extractions);
+    let candidates = unwired(&graph);
+    for path in ["Sources/App/main.swift", "Sources/App/Orphan.swift"] {
+        assert!(
+            candidates.contains(&path.to_string()),
+            "{path} shares a module with a sibling that never mentions it, \
+             and Foundation is outside the corpus: {candidates:?}"
+        );
+    }
+    assert_eq!(
+        graph["meta"]["devmap_rust"]["unwired_excluded_import_blind"]
+            .as_u64()
+            .unwrap(),
+        0,
+        "Swift is answered for, not skipped"
+    );
+}
+
+/// Same-module Swift files wire each other by a call, the way same-package
+/// Java files do — no import of each other is written or needed.
+#[test]
+fn a_same_module_swift_file_is_wired_by_its_caller() {
+    let extractions = vec![
+        extract_file("Sources/App/main.swift", "func start() {\n    run()\n}\n"),
+        extract_file("Sources/App/Helper.swift", "func run() {}\n"),
+    ];
+    let graph = graph(&extractions);
+    let candidates = unwired(&graph);
+    assert!(
+        !candidates.contains(&"Sources/App/Helper.swift".to_string()),
+        "Helper.swift is called from main.swift in the same module: {candidates:?}"
+    );
+}
+
+/// A same-module `Type.method()` is production wiring even when the method
+/// name is shared. Importing the module is not what wires the file — the
+/// typed call is. A sibling that only tests mention stays unwired.
+#[test]
+fn a_same_module_type_method_wires_the_callee_file() {
+    let mut host = extract_file(
+        "app/Host/main.swift",
+        "import Kit\n\nfunc start() {\n    render()\n}\n",
+    );
+    host.wiring.push(devmap_extract::model::WiringAnnotation {
+        kind: WiringKind::ScriptEntry,
+        target_symbol: "app/Host/main.swift".to_string(),
+        details: "entry".to_string(),
+    });
+    let renderer = extract_file(
+        "app/Kit/Renderer.swift",
+        "public func render() {\n    Normalizer.normalize()\n}\n",
+    );
+    let normalizer = extract_file(
+        "app/Kit/Normalizer.swift",
+        "public enum Normalizer {\n    public static func normalize() {}\n}\n",
+    );
+    let other = extract_file(
+        "app/Kit/Other.swift",
+        "public enum Other {\n    public static func normalize() {}\n}\n",
+    );
+    let mut test = extract_file(
+        "app/Tests/KitTests.swift",
+        "@testable import Kit\n\nfunc testOther() {\n    Other.normalize()\n}\n",
+    );
+    test.wiring.push(devmap_extract::model::WiringAnnotation {
+        kind: WiringKind::TestFile,
+        target_symbol: "app/Tests/KitTests.swift".to_string(),
+        details: "test file".to_string(),
+    });
+    let graph = graph(&[host, renderer, normalizer, other, test]);
+    let candidates = unwired(&graph);
+    assert!(
+        !candidates.contains(&"app/Kit/Renderer.swift".to_string()),
+        "Host calls render(): {candidates:?}"
+    );
+    assert!(
+        !candidates.contains(&"app/Kit/Normalizer.swift".to_string()),
+        "Renderer calls Normalizer.normalize(); that is production wiring: {candidates:?}"
+    );
+    assert!(
+        candidates.contains(&"app/Kit/Other.swift".to_string()),
+        "Other.normalize is referenced only from a test: {candidates:?}"
+    );
+}
+
+/// `import Kit` names the module, not every file in it. A sibling that
+/// production never mentions is still unwired — the same rule as a Python
+/// module imported only by its test. Wiring the whole module hid unused
+/// product types that existed only because a test imported the kit.
+#[test]
+fn a_swift_file_only_tests_reference_is_unwired_even_if_its_module_is_imported() {
+    let mut host = extract_file(
+        "app/Host/main.swift",
+        "import Kit\n\nfunc start() {\n    open()\n}\n",
+    );
+    host.wiring.push(devmap_extract::model::WiringAnnotation {
+        kind: WiringKind::ScriptEntry,
+        target_symbol: "app/Host/main.swift".to_string(),
+        details: "entry".to_string(),
+    });
+    let store = extract_file("app/Kit/Store.swift", "public func open() {}\n");
+    let helpers = extract_file("app/Kit/Helpers.swift", "public func normalize() {}\n");
+    let mut test = extract_file(
+        "app/Tests/KitTests.swift",
+        "@testable import Kit\n\nfunc testNormalize() {\n    _ = normalize()\n}\n",
+    );
+    test.wiring.push(devmap_extract::model::WiringAnnotation {
+        kind: WiringKind::TestFile,
+        target_symbol: "app/Tests/KitTests.swift".to_string(),
+        details: "test file".to_string(),
+    });
+    let graph = graph(&[host, store, helpers, test]);
+    let candidates = unwired(&graph);
+    assert!(
+        !candidates.contains(&"app/Kit/Store.swift".to_string()),
+        "Host calls open(), so Store.swift is production-wired: {candidates:?}"
+    );
+    assert!(
+        candidates.contains(&"app/Kit/Helpers.swift".to_string()),
+        "Helpers.swift is referenced only from a test; importing Kit is not \
+         evidence that production depends on it: {candidates:?}"
+    );
+    assert!(
+        !candidates.contains(&"app/Tests/KitTests.swift".to_string()),
+        "a test file having no importer is its normal state: {candidates:?}"
+    );
+}
+
+#[test]
+fn a_swift_module_nothing_imports_is_still_a_candidate() {
+    let mut extractions = vec![
+        extract_file(
+            "app/Host/main.swift",
+            "import Kit\n\nfunc start() {\n    open()\n}\n",
+        ),
+        extract_file("app/Kit/Store.swift", "public func open() {}\n"),
+    ];
+    extractions.push(extract_file(
+        "app/OrphanKit/Idle.swift",
+        "public func idle() {}\n",
+    ));
+    let candidates = unwired(&graph(&extractions));
+    assert!(
+        candidates.contains(&"app/OrphanKit/Idle.swift".to_string()),
+        "OrphanKit is a module nothing imports: {candidates:?}"
     );
 }
 

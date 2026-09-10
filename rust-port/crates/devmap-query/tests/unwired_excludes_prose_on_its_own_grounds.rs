@@ -37,22 +37,18 @@ use serde_json::Value;
 
 /// Two import-blind source files and three files no grammar reads.
 ///
-/// C# and Swift, not the Java and Terraform this test was written with. Both of
-/// those gained import extraction in W0.3 move 2 and are no longer import-blind
-/// at all, which would have made the assertions below pass for the wrong reason
-/// — zero equals zero. C# and Swift are two of the four languages whose
-/// exclusion is a documented decision rather than a gap waiting to close, so
-/// the fixture cannot rot the same way.
+/// C# and SQL, not the Java, Terraform or Swift this test has previously
+/// used. Those gained import extraction and are no longer import-blind at
+/// all, which would have made the assertions below pass for the wrong reason
+/// — zero equals zero. C# is a documented decline; SQL is the remaining
+/// fallback grammar that extracts calls but not imports.
 fn corpus() -> Vec<Extraction> {
     vec![
         extract_file(
             "src/Helper.cs",
             "using System;\n\npublic class Helper {\n    public void Run() {}\n}\n",
         ),
-        extract_file(
-            "Sources/App/Helper.swift",
-            "import Foundation\n\nfunc helper() -> Int { return 1 }\n",
-        ),
+        extract_file("queries/report.sql", "SELECT helper(name) FROM widgets;\n"),
         extract_file("README.md", "# Title\n\nProse, and no imports.\n"),
         extract_file("data/config.json", "{\"a\": 1}\n"),
         extract_file("ci/pipeline.yaml", "steps:\n  - run: make\n"),
@@ -177,14 +173,14 @@ fn only_source_files_are_charged_as_import_blind() {
         .collect();
     assert_eq!(
         expected,
-        vec!["src/Helper.cs", "Sources/App/Helper.swift"],
+        vec!["src/Helper.cs", "queries/report.sql"],
         "fixture assumption: these are the two import-blind source files, and \
          the count below is about them and not about any other two"
     );
     assert_eq!(
         excluded,
         expected.len() as u64,
-        "the C# file and the Swift file are import-blind; the README, the JSON \
+        "the C# file and the SQL file are import-blind; the README, the JSON \
          and the YAML are not source and were never candidates"
     );
 

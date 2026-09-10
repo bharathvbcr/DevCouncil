@@ -234,10 +234,7 @@ mod tests {
 
     #[test]
     fn append_then_read_round_trips() {
-        let dir = std::env::temp_dir().join(format!(
-            "devmap-session-log-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("devmap-session-log-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let db = dir.join("devmap.sqlite");
         append_query(

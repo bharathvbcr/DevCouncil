@@ -27,7 +27,9 @@ use std::path::Path;
 
 use crate::artifacts::write_atomic;
 use crate::engine::{byte_span_to_line_range_in, resolve_source_path};
-use crate::manifest::{entry_root_paths, is_entry_root, CONSUMER_MAP_ENGINE};
+use crate::manifest::{
+    entry_root_paths, is_entry_root, CONSUMER_MAP_ENGINE, UNWIRED_CANDIDATE_CAP,
+};
 use crate::model::FreshnessInfo;
 use devmap_analyze::model::{AnalysisStatus, AnalysisSummary};
 use devmap_extract::languages::Capability;
@@ -303,6 +305,14 @@ pub(crate) struct UnwiredScan {
     /// file this run could not read and a re-index might, the other is a
     /// language this build cannot read imports for and no re-run will change.
     pub(crate) excluded_import_blind: usize,
+    /// Paths dropped by the import-blind gate, sorted.
+    ///
+    /// The count above is what a reader used to have, and a count of 61 with
+    /// no names is how "we excluded these files from unwired" came to read as
+    /// "there is no work". The list is the work: languages this build still
+    /// cannot see imports for, named, so they can be scheduled rather than
+    /// silently subtracted.
+    pub(crate) excluded_import_blind_paths: Vec<String>,
 }
 
 /// Whether any dynamic reference in the corpus names this file.
@@ -483,6 +493,14 @@ pub(crate) fn unwired_candidates(
             }
             continue;
         }
+        // A Swift `import Kit` lands on `module:Kit`. That names the module,
+        // not every file in it: a sibling production never mentions is still
+        // unwired, the same way a Python module imported only by its test is.
+        // Skipping the node here keeps `is_wiring_evidence` edges (calls,
+        // type uses) as the file-level answer.
+        if edge.target_file.starts_with("module:") {
+            continue;
+        }
         depended_on_by_production.insert(edge.target_file.as_str());
     }
 
@@ -504,6 +522,7 @@ pub(crate) fn unwired_candidates(
 
     let mut excluded_coverage_loss = 0usize;
     let mut excluded_import_blind = 0usize;
+    let mut excluded_import_blind_paths: Vec<String> = Vec::new();
     let mut candidates: Vec<String> = extractions
         .iter()
         .filter(|ext| {
@@ -567,6 +586,7 @@ pub(crate) fn unwired_candidates(
             // both holes is charged once, to the more specific of the two.
             if !ext.capabilities().contains(Capability::Imports) {
                 excluded_import_blind += 1;
+                excluded_import_blind_paths.push(ext.file_path.clone());
                 return false;
             }
             true
@@ -575,10 +595,12 @@ pub(crate) fn unwired_candidates(
         .collect();
     candidates.sort();
     candidates.dedup();
+    excluded_import_blind_paths.sort();
     UnwiredScan {
         paths: candidates,
         excluded_coverage_loss,
         excluded_import_blind,
+        excluded_import_blind_paths,
     }
 }
 
@@ -627,6 +649,7 @@ struct GraphProvenance {
     /// Files excluded because their language has no import extractor. See
     /// `UnwiredScan::excluded_import_blind`.
     unwired_excluded_import_blind: usize,
+    unwired_excluded_import_blind_files: Vec<String>,
 }
 
 /// Render `code_graph.json` from a committed generation.
@@ -1017,6 +1040,7 @@ pub fn build_code_graph_value(
     let unwired = unwired_candidates(extractions, edges);
     provenance.unwired_excluded_coverage_loss = unwired.excluded_coverage_loss;
     provenance.unwired_excluded_import_blind = unwired.excluded_import_blind;
+    provenance.unwired_excluded_import_blind_files = unwired.excluded_import_blind_paths;
 
     let analysis_status = match &analysis.status {
         AnalysisStatus::Ok => "ok".to_string(),
@@ -1213,6 +1237,12 @@ pub fn build_code_graph_value(
                 // Reported beside it rather than summed into it: a re-index can
                 // fix the first number and can never fix this one.
                 "unwired_excluded_import_blind": provenance.unwired_excluded_import_blind,
+                "unwired_excluded_import_blind_files": provenance
+                    .unwired_excluded_import_blind_files
+                    .iter()
+                    .take(UNWIRED_CANDIDATE_CAP)
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 // Provenance for the intel panels above. `god_nodes: []` from
                 // a pass that ran and `god_nodes: []` from a pass that never
                 // happened were the same bytes for the whole life of the

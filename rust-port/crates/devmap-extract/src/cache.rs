@@ -281,7 +281,36 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// they change an *exemption*, so a reused row either hides a real finding or
 /// publishes a delete-this verdict about code a framework reaches, and nothing
 /// about the row looks old.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "38";
+///
+/// v39 adds Swift `import` (including `@testable` and kinded
+/// `import struct Foundation.Date`) and shell `source` / `.` whose specifier
+/// is a word that names a file. v33 covered nineteen grammar keys and did not
+/// include either language, so a v38 row for a `.swift` file still carries an
+/// **empty** import list — the same worst shape v33 named. The capability bit
+/// moved in the same change, so `unwired_candidates` no longer charges the
+/// file import-blind: it looks examined and is blind. `classify_unresolved`
+/// cannot mark Foundation / XCTest names External without the import, so
+/// `devmap dead` sets `walk_incomplete` over tens of thousands of SDK sites
+/// that mean "the file imported Foundation", not "the graph is incomplete".
+/// Measured on MarkDev against a warm v38 cache: 288 files reused, status
+/// still reported `swift has no import extractor` for 219 files, and 28,207
+/// of 39,870 unresolved sites stayed unexplained.
+///
+/// v39 also refuses `defer { }` as a callee. A v38 Swift row records those as
+/// unresolved sites named `defer`, which is "the file uses defer", not a
+/// missing function.
+///
+/// v40 changes two Swift identities a v39 row asserts as complete. A nested
+/// enum's qualified name is now the full owner path
+/// (`Workspace.ActiveSaveRequest.CancellationDisposition`), not the shallow
+/// parent (`ActiveSaveRequest.CancellationDisposition`) — a v39 row cannot
+/// join a Type reference attributed to the nested class, so a live field type
+/// is confident-dead. And a Swift parameter's Type reference now carries
+/// `assigned_to` for the parameter name (`reader: Reader` binds `reader`). A
+/// v39 row leaves that empty, so `reader.read()` cannot dispatch on `Reader`
+/// and falls to AmbiguousGlobal the moment a second type also declares `read`
+/// — the MarkDev save/highlight shape, reported as examined and empty.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "40";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

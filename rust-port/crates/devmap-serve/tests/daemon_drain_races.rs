@@ -372,3 +372,40 @@ fn ra3_old_analyzer_payloads_are_stale_even_when_source_matches() {
     drop(_daemon);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// An empty commit moves HEAD and touches no indexed file. Full re-extraction
+/// used to run anyway because `head_moved` was treated as "the tree may have
+/// changed". Hashes already answer that; the drain must restamp provenance
+/// and keep the generation.
+#[test]
+fn an_empty_commit_restamps_head_without_rewriting_the_generation() {
+    let (root, daemon, reader) = repo_with_one_generation("empty-head-only");
+    let first_head = head_of(&root);
+    let generation = reader.latest_generation_id().unwrap();
+    let paths_before = generation_paths(&reader);
+
+    git(&root, &["commit", "-q", "--allow-empty", "-m", "two"]);
+    let second_head = head_of(&root);
+    assert_ne!(first_head, second_head);
+
+    reader
+        .enqueue_pending_paths(&[devmap_serve::watcher::GIT_HEAD_SENTINEL.to_string()])
+        .unwrap();
+    assert_eq!(daemon.drain_pending_batch().unwrap(), 1);
+
+    assert_eq!(
+        reader.latest_generation_id().unwrap(),
+        generation,
+        "matching files must not pay for a new generation just because HEAD moved"
+    );
+    assert_eq!(generation_paths(&reader), paths_before);
+    assert_eq!(
+        reader.latest_generation_head_sha().unwrap().as_deref(),
+        Some(second_head.as_str()),
+        "the existing generation must be restamped to the HEAD it still describes"
+    );
+    assert!(devmap_serve::index_is_fresh(
+        &reader.status("test").unwrap()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -162,7 +162,9 @@ fn build_report(db: &Path, session_id: Option<&str>) -> anyhow::Result<Value> {
                 bump(obj, "truncated");
                 truncated += 1;
             }
-            if row.get("walk_incomplete").is_some_and(|v| !v.is_null() && v != &Value::Bool(false))
+            if row
+                .get("walk_incomplete")
+                .is_some_and(|v| !v.is_null() && v != &Value::Bool(false))
             {
                 bump(obj, "walk_incomplete");
                 walk_incomplete += 1;
@@ -237,7 +239,10 @@ fn stamp_now() -> String {
 }
 
 fn brief(report: &Value) -> String {
-    let queries = report.get("query_count").and_then(Value::as_u64).unwrap_or(0);
+    let queries = report
+        .get("query_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let truncated = report.get("truncated").and_then(Value::as_u64).unwrap_or(0);
     let incomplete = report
         .get("walk_incomplete")

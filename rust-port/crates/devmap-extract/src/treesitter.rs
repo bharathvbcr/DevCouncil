@@ -5874,7 +5874,11 @@ fn maybe_push_name_reference(
         kind: ref_kind,
         span: node_span(node),
         enclosing_symbol: enclosing_emitted_symbol_for(node, source, lang, file_symbol_name),
-        assigned_to: rust_let_bound_from_field_use(node, source),
+        assigned_to: rust_let_bound_from_field_use(node, source).or_else(|| {
+            (ref_kind == ReferenceKind::Type)
+                .then(|| swift_parameter_bound_from_type(node, source))
+                .flatten()
+        }),
         // The object half of a member access, so the resolver can tell
         // `cfg.enabled` from a bare local named `enabled`.
         receiver_expr: member_access_receiver(node, source),
@@ -7073,6 +7077,47 @@ fn simple_binding_name(node: Node, source: &str) -> Option<String> {
         if !name.is_empty() {
             return Some(name);
         }
+    }
+    None
+}
+
+/// The parameter a Swift type annotation types, when `node` is that type.
+///
+/// tree-sitter-swift puts the parameter name *and* its type on the `name`
+/// field, so a Type reference for `Reader` in `func load(_ reader: Reader)`
+/// used to carry no `assigned_to`. Without that binding, `reader.read()`
+/// cannot dispatch on `Reader` and falls to AmbiguousGlobal the moment a
+/// second type also declares `read` — the MarkDev save/highlight shape.
+fn swift_parameter_bound_from_type(node: Node, source: &str) -> Option<String> {
+    let mut current = node;
+    for _ in 0..8 {
+        let parent = bounded_parent(current)?;
+        if parent.kind() == "parameter" {
+            let mut cursor = parent.walk();
+            if !cursor.goto_first_child() {
+                return None;
+            }
+            loop {
+                if cursor.field_name() == Some("name")
+                    && cursor.node().kind() == "simple_identifier"
+                {
+                    let name = get_node_text(cursor.node(), source);
+                    if is_user_ident(&name) && name != "_" {
+                        return Some(name);
+                    }
+                }
+                if !cursor.goto_next_sibling() {
+                    return None;
+                }
+            }
+        }
+        if matches!(
+            parent.kind(),
+            "function_declaration" | "function_body" | "statements" | "class_declaration"
+        ) {
+            return None;
+        }
+        current = parent;
     }
     None
 }
@@ -9209,7 +9254,24 @@ mod tests {
             rust.references
                 .iter()
                 .map(|r| (&r.name, &r.assigned_to))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+        );
+
+        let swift = extract_treesitter(
+            "f.swift",
+            "swift",
+            "func load(_ reader: Reader) -> Int {\n    return reader.read()\n}\n",
+        );
+        assert!(
+            swift.references.iter().any(|reference| {
+                reference.name == "Reader" && reference.assigned_to.as_deref() == Some("reader")
+            }),
+            "a Swift parameter type must bind the parameter name: {:?}",
+            swift
+                .references
+                .iter()
+                .map(|r| (&r.name, &r.assigned_to, r.kind))
+                .collect::<Vec<_>>(),
         );
 
         // A multi-target assignment binds nothing: `value, err := New()` does

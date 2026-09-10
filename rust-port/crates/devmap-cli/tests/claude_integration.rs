@@ -278,7 +278,12 @@ fn session_report_succeeds_on_an_unindexed_repository() {
         .arg("--last")
         .output()
         .expect("devmap runs");
-    assert_eq!(last.status.code(), Some(0), "{}", String::from_utf8_lossy(&last.stderr));
+    assert_eq!(
+        last.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&last.stderr)
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -362,21 +367,11 @@ fn the_bundle_is_written_atomically_and_re_running_changes_nothing() {
     let files = first["files"].as_array().expect("files");
     let json_files: Vec<&Value> = files
         .iter()
-        .filter(|f| {
-            f["path"]
-                .as_str()
-                .unwrap()
-                .ends_with(".json")
-        })
+        .filter(|f| f["path"].as_str().unwrap().ends_with(".json"))
         .collect();
     let skill_files: Vec<&Value> = files
         .iter()
-        .filter(|f| {
-            f["path"]
-                .as_str()
-                .unwrap()
-                .ends_with("SKILL.md")
-        })
+        .filter(|f| f["path"].as_str().unwrap().ends_with("SKILL.md"))
         .collect();
     assert_eq!(json_files.len(), 4, "json files: {first}");
     assert_eq!(

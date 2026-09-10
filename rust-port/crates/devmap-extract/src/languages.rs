@@ -406,7 +406,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Swift,
         lsp_id: "sourcekit-lsp",
         viz_color: "#F05138",
-        capabilities: Capabilities::new(CALLS | REFERENCES | HERITAGE),
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
     },
     LanguageSpec {
         name: "Kotlin",
@@ -681,7 +681,7 @@ pub fn detect_language(path: &Path) -> &'static str {
 /// already does for the registry. It could not before, and the notebook row was
 /// wrong for as long as nothing looked at it.
 pub const NON_REGISTRY_CAPABILITIES: &[(&str, Capabilities)] = &[
-    ("shell", Capabilities::new(CALLS | REFERENCES)),
+    ("shell", Capabilities::new(CALLS | IMPORTS | REFERENCES)),
     ("sql", Capabilities::new(CALLS | REFERENCES)),
     // No linked grammar. Both reach `crate::fallback`, which recovers
     // declarations by line pattern and by construction extracts nothing else —
@@ -816,6 +816,76 @@ pub fn is_ignored_path(rel_path: &str) -> bool {
         }
     }
     false
+}
+
+/// The Swift *module* a file belongs to, derived from its path.
+///
+/// A Swift target is a module: every file under it shares one unqualified
+/// namespace, and `import MarkDevKit` names that module, not a file. Same-module
+/// files import each other not at all — the Java-package / Go-package shape.
+///
+/// Derived from the path, not from a build graph this kernel does not read:
+///
+/// * `Sources/<Name>/…` and `Tests/<Name>/…` (Swift Package Manager) → `Name`
+/// * otherwise skip generic containers (`app`, `src`, `lib`, platform folders)
+///   and take the next directory (`app/MarkDevKit/Editor/Foo.swift` → `MarkDevKit`)
+///
+/// The container list is a *path convention*, not a reserved module name.
+/// SPM packages routinely call the target `App` or `Lib`; those sit in
+/// `Sources/App` and `Sources/Lib`, and treating them as the same `app`/`lib`
+/// folders the fallback skips left every file in those modules without a
+/// module identity. Same-module lookup then never fired, and a bare `run()`
+/// fell through to AmbiguousGlobal against every other `run` in the corpus.
+///
+/// `Package.swift` is a manifest, not a module member. A `.swift` file with no
+/// remaining directory after those rules belongs to no module this function
+/// can name, and same-module lookup simply does not fire for it.
+pub fn swift_module_of(path: &str) -> Option<String> {
+    let path = path.replace('\\', "/");
+    if !path.ends_with(".swift") {
+        return None;
+    }
+    let filename = path.rsplit('/').next().unwrap_or(&path);
+    if filename == "Package.swift" {
+        return None;
+    }
+    let mut dirs: Vec<&str> = path.split('/').collect();
+    dirs.pop();
+    for (index, segment) in dirs.iter().enumerate() {
+        if matches!(*segment, "Sources" | "Tests") {
+            if let Some(name) = dirs.get(index + 1).copied().filter(|name| !name.is_empty()) {
+                return Some(name.to_string());
+            }
+        }
+    }
+    let remaining: Vec<&str> = dirs
+        .into_iter()
+        .filter(|segment| !is_swift_generic_container(segment))
+        .collect();
+    remaining
+        .first()
+        .copied()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn is_swift_generic_container(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        "app"
+            | "src"
+            | "lib"
+            | "ios"
+            | "macos"
+            | "osx"
+            | "watchos"
+            | "tvos"
+            | "ipados"
+            | "visionos"
+            | "catalyst"
+            | "tests"
+            | "sources"
+    )
 }
 
 /// Whether a relative path should be indexed as source (not binary / build noise).
@@ -1056,5 +1126,33 @@ mod tests {
                 "{path} must reach extraction to be recoverable by tier 2"
             );
         }
+    }
+
+    #[test]
+    fn swift_module_of_follows_spm_then_the_target_directory() {
+        assert_eq!(
+            swift_module_of("Sources/App/main.swift").as_deref(),
+            Some("App")
+        );
+        assert_eq!(
+            swift_module_of("Sources/Lib/Core.swift").as_deref(),
+            Some("Lib"),
+            "SPM module names are not the app/src/lib path convention"
+        );
+        assert_eq!(
+            swift_module_of("Tests/AppTests/AppTests.swift").as_deref(),
+            Some("AppTests")
+        );
+        assert_eq!(
+            swift_module_of("app/MarkDevKit/Editor/Foo.swift").as_deref(),
+            Some("MarkDevKit")
+        );
+        assert_eq!(
+            swift_module_of("desktop/Sources/Tauri/Host.swift").as_deref(),
+            Some("Tauri")
+        );
+        assert_eq!(swift_module_of("Package.swift"), None);
+        assert_eq!(swift_module_of("Main.swift"), None);
+        assert_eq!(swift_module_of("src/lib.rs"), None);
     }
 }

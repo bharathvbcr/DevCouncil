@@ -314,6 +314,11 @@ func TestDiscoveryReportsNoKernelDistinctly(t *testing.T) {
 const (
 	kernelStatusOK = `{"db_path":"/tmp/devmap.sqlite","generation_id":7,"node_count":1234,` +
 		`"edge_count":5678,"pending_count":0,"quarantined_count":0,"is_fresh":true,"degraded_reason":null}`
+	kernelStatusEmpty = `{"db_path":"/tmp/devmap.sqlite","generation_id":0,"node_count":0,` +
+		`"edge_count":0,"pending_count":0,"quarantined_count":0,"is_fresh":false,"degraded_reason":null}`
+	kernelStatusDegraded = `{"db_path":"/tmp/devmap.sqlite","generation_id":7,"node_count":1234,` +
+		`"edge_count":5678,"pending_count":0,"quarantined_count":0,"is_fresh":false,` +
+		`"degraded_reason":"unlinked grammar vb"}`
 	kernelStatusBroken = ""
 )
 
@@ -356,7 +361,8 @@ esac
 case "$sub" in
   manifest) echo "--graph-output"; exit 0 ;;
   status) echo '` + statusJSON + `'; exit 0 ;;
-  *) exit 0 ;;
+  search) echo '{"ok":true,"hits":[]}'; exit 0 ;;
+  *) echo '{"ok":true}'; exit 0 ;;
 esac
 `
 	}
@@ -405,4 +411,397 @@ func TestAnExplicitBinaryThatDoesNotExistIsRefusedByName(t *testing.T) {
 	if !strings.Contains(err.Error(), missing) {
 		t.Errorf("the refusal must name the override: %v", err)
 	}
+}
+
+func TestAnExplicitBinaryThatIsADirectoryIsRefusedByName(t *testing.T) {
+	dir := t.TempDir()
+	capable := fakeKernel(t, kernelStatusOK)
+	t.Setenv("DEVMAP_BINARY", dir)
+	t.Setenv("PATH", filepath.Dir(capable))
+
+	got, err := discoverBinary(context.Background(), t.TempDir())
+	if err == nil {
+		t.Fatalf("DEVMAP_BINARY=%s is a directory and was silently replaced by %s", dir, got)
+	}
+	if !strings.Contains(err.Error(), dir) || !strings.Contains(err.Error(), "directory") {
+		t.Errorf("the refusal must name the directory: %v", err)
+	}
+}
+
+func TestDiscoveryFallsThroughAnIncapableLocalBuildToACapablePathBinary(t *testing.T) {
+	root := t.TempDir()
+	local := filepath.Join(root, "rust-port", "target", "release", "devmap")
+	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(local, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	capable := fakeKernel(t, kernelStatusOK)
+	t.Setenv("DEVMAP_BINARY", "")
+	t.Setenv("PATH", filepath.Dir(capable))
+
+	got, err := discoverBinary(context.Background(), root)
+	if err != nil {
+		t.Fatalf("an incapable local build must fall through to PATH: %v", err)
+	}
+	if got != capable {
+		t.Fatalf("discoverBinary = %s, want the capable PATH binary %s, not the local %s", got, capable, local)
+	}
+}
+
+func TestParseGlobalsRootEqualsFormSetsAnAbsoluteDirectory(t *testing.T) {
+	dir := t.TempDir()
+	env := &Env{}
+	rest, err := ParseGlobals(env, []string{"--root=" + dir, "status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 1 || rest[0] != "status" {
+		t.Errorf("rest = %v, want [status]", rest)
+	}
+	if env.Root != dir && !strings.HasPrefix(env.Root, "/") {
+		t.Errorf("root = %q, want an absolute path for %q", env.Root, dir)
+	}
+	info, err := os.Stat(env.Root)
+	if err != nil || !info.IsDir() {
+		t.Errorf("resolved root %q is not a directory: %v", env.Root, err)
+	}
+}
+
+func TestParseGlobalsRejectsAnEmptyRootValue(t *testing.T) {
+	env := &Env{}
+	if _, err := ParseGlobals(env, []string{"--root="}); err == nil {
+		t.Error("an empty --root= value must be an error")
+	}
+}
+
+func TestDefaultRootIsAbsolute(t *testing.T) {
+	got := DefaultRoot()
+	if got == "" {
+		t.Fatal("DefaultRoot returned empty")
+	}
+	if got != "." && !filepath.IsAbs(got) {
+		t.Errorf("DefaultRoot = %q, want an absolute path", got)
+	}
+}
+
+func TestDiagfOnNilStderrIsANoop(t *testing.T) {
+	env := &Env{}
+	env.Diagf("this must not panic")
+}
+
+func TestStatusDiscoversTheKernelWhenBinaryIsUnset(t *testing.T) {
+	kernel := fakeKernel(t, kernelStatusOK)
+	t.Setenv("DEVMAP_BINARY", kernel)
+	t.Setenv("PATH", t.TempDir())
+	env := &Env{JSON: true, Root: t.TempDir()}
+	stdout, _, code := runArgs(t, env, "status")
+	if code != 0 {
+		t.Fatalf("exit = %d, stdout=%q", code, stdout)
+	}
+	var payload statusPayload
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("stdout is not a status payload: %v\n%q", err, stdout)
+	}
+	if payload.Binary != kernel {
+		t.Errorf("binary = %q, want the discovered %s", payload.Binary, kernel)
+	}
+	if !payload.KernelFresh {
+		t.Error("kernel-view should be fresh for this fixture")
+	}
+}
+
+func TestStatusHumanModeReportsADegradedKernel(t *testing.T) {
+	env := &Env{JSON: false, Root: t.TempDir(), Binary: fakeKernel(t, kernelStatusDegraded)}
+	stdout, _, code := runArgs(t, env, "status")
+	if code != 0 {
+		t.Fatalf("exit = %d", code)
+	}
+	for _, want := range []string{"not fresh", "unlinked grammar"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("human status missing %q: %q", want, stdout)
+		}
+	}
+}
+
+func TestDoctorReportsAUsableStore(t *testing.T) {
+	kernel := fakeKernel(t, kernelStatusOK)
+	t.Setenv("DEVMAP_BINARY", kernel)
+	t.Setenv("PATH", t.TempDir())
+	env := &Env{JSON: true, Root: t.TempDir()}
+	stdout, _, code := runArgs(t, env, "doctor")
+	if code != 0 {
+		t.Fatalf("doctor reports, it does not fail: exit = %d stdout=%q", code, stdout)
+	}
+	var payload doctorPayload
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("stdout is not one JSON object: %v\n%q", err, stdout)
+	}
+	if !payload.OK {
+		t.Fatalf("doctor should be OK with a usable store: %+v", payload)
+	}
+	if payload.Binary != kernel {
+		t.Errorf("binary = %q, want %s", payload.Binary, kernel)
+	}
+	if payload.Remedy != "" {
+		t.Errorf("a passing doctor must not prescribe a fix, got %q", payload.Remedy)
+	}
+	names := doctorCheckNames(payload)
+	for _, want := range []string{"kernel", "store", "generation"} {
+		if !names[want] {
+			t.Errorf("missing check %q in %+v", want, payload.Checks)
+		}
+	}
+}
+
+func TestDoctorReportsAnUnreadableStoreWithoutInventingAGeneration(t *testing.T) {
+	kernel := fakeKernel(t, kernelStatusBroken)
+	t.Setenv("DEVMAP_BINARY", kernel)
+	t.Setenv("PATH", t.TempDir())
+	env := &Env{JSON: true, Root: t.TempDir()}
+	stdout, _, code := runArgs(t, env, "doctor")
+	if code != 0 {
+		t.Fatalf("doctor reports, it does not fail: exit = %d stdout=%q", code, stdout)
+	}
+	var payload doctorPayload
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("stdout is not one JSON object: %v\n%q", err, stdout)
+	}
+	if payload.OK {
+		t.Fatal("doctor should not be OK when status fails")
+	}
+	if payload.Remedy != "devmap build" {
+		t.Errorf("remedy = %q, want devmap build", payload.Remedy)
+	}
+	names := doctorCheckNames(payload)
+	if !names["store"] {
+		t.Errorf("store check missing: %+v", payload.Checks)
+	}
+	if names["generation"] {
+		t.Error("generation must not be invented when the store could not be read")
+	}
+}
+
+func TestDoctorReportsAnEmptyGeneration(t *testing.T) {
+	kernel := fakeKernel(t, kernelStatusEmpty)
+	t.Setenv("DEVMAP_BINARY", kernel)
+	t.Setenv("PATH", t.TempDir())
+	env := &Env{JSON: true, Root: t.TempDir()}
+	stdout, _, code := runArgs(t, env, "doctor")
+	if code != 0 {
+		t.Fatalf("exit = %d stdout=%q", code, stdout)
+	}
+	var payload doctorPayload
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("stdout is not one JSON object: %v\n%q", err, stdout)
+	}
+	if payload.OK {
+		t.Fatal("an empty generation is not a usable map")
+	}
+	if payload.Remedy != "devmap build" {
+		t.Errorf("remedy = %q, want devmap build", payload.Remedy)
+	}
+	found := false
+	for _, c := range payload.Checks {
+		if c.Name == "generation" {
+			found = true
+			if c.Passed {
+				t.Error("generation check should fail")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("generation check missing: %+v", payload.Checks)
+	}
+}
+
+func TestDoctorReportsDegradationWithoutPrescribingARebuildLoop(t *testing.T) {
+	kernel := fakeKernel(t, kernelStatusDegraded)
+	t.Setenv("DEVMAP_BINARY", kernel)
+	t.Setenv("PATH", t.TempDir())
+	env := &Env{JSON: true, Root: t.TempDir()}
+	stdout, _, code := runArgs(t, env, "doctor")
+	if code != 0 {
+		t.Fatalf("exit = %d stdout=%q", code, stdout)
+	}
+	var payload doctorPayload
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("stdout is not one JSON object: %v\n%q", err, stdout)
+	}
+	if payload.OK {
+		t.Fatal("a degraded kernel is not OK")
+	}
+	if !strings.Contains(payload.Remedy, "unlinked grammars are permanent") {
+		t.Errorf("remedy must not send the operator around a rebuild loop: %q", payload.Remedy)
+	}
+	found := false
+	for _, c := range payload.Checks {
+		if c.Name == "degraded" {
+			found = true
+			if c.Passed || !strings.Contains(c.Detail, "unlinked grammar") {
+				t.Errorf("degraded check = %+v", c)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("degraded check missing: %+v", payload.Checks)
+	}
+}
+
+func TestDoctorRejectsStrayArguments(t *testing.T) {
+	env := &Env{JSON: true, Root: t.TempDir(), Binary: fakeKernel(t, kernelStatusOK)}
+	stdout, _, code := runArgs(t, env, "doctor", "extra")
+	if code == 0 {
+		t.Fatal("stray arguments must not be silently ignored")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("stdout is not one JSON object: %v", err)
+	}
+	if payload["ok"] != false {
+		t.Errorf("ok = %v, want false", payload["ok"])
+	}
+}
+
+func TestDoctorHumanModeRendersEveryCheck(t *testing.T) {
+	kernel := fakeKernel(t, kernelStatusOK)
+	t.Setenv("DEVMAP_BINARY", kernel)
+	t.Setenv("PATH", t.TempDir())
+	env := &Env{JSON: false, Root: t.TempDir()}
+	stdout, _, code := runArgs(t, env, "doctor")
+	if code != 0 {
+		t.Fatalf("exit = %d stdout=%q", code, stdout)
+	}
+	if strings.HasPrefix(strings.TrimSpace(stdout), "{") {
+		t.Errorf("human mode should not emit JSON: %q", stdout)
+	}
+	for _, want := range []string{"kernel", "store", "generation", "[ok"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("human doctor missing %q: %q", want, stdout)
+		}
+	}
+}
+
+func TestDoctorHumanModePrintsAFixWhenTheKernelIsMissing(t *testing.T) {
+	env := &Env{JSON: false, Root: t.TempDir()}
+	t.Setenv("DEVMAP_BINARY", "")
+	t.Setenv("PATH", t.TempDir())
+	stdout, _, code := runArgs(t, env, "doctor")
+	if code != 0 {
+		t.Fatalf("exit = %d stdout=%q", code, stdout)
+	}
+	if !strings.Contains(stdout, "[FAIL]") {
+		t.Errorf("human doctor should mark the failure: %q", stdout)
+	}
+	if !strings.Contains(stdout, "fix:") {
+		t.Errorf("human doctor should print the remedy: %q", stdout)
+	}
+}
+
+func TestDelegatedJSONFlagIsPlacedBeforeTheSubcommand(t *testing.T) {
+	var captured bytes.Buffer
+	passthroughStdout = &captured
+	t.Cleanup(func() { passthroughStdout = os.Stdout })
+
+	path := filepath.Join(t.TempDir(), "devmap")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := &Env{JSON: true, Root: t.TempDir(), Binary: path}
+	stdout, stderr, code := runArgs(t, env, "search", "foo")
+	if code != 0 {
+		t.Fatalf("exit = %d stderr=%q", code, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("Run must not write beside the child, got %q", stdout)
+	}
+	got := strings.Split(strings.TrimSpace(captured.String()), "\n")
+	want := []string{"--json", "search", "foo"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("argv = %v, want %v", got, want)
+	}
+}
+
+func TestDelegatedCommandStreamsKernelStdoutWithoutASecondObject(t *testing.T) {
+	var captured bytes.Buffer
+	passthroughStdout = &captured
+	t.Cleanup(func() { passthroughStdout = os.Stdout })
+
+	kernel := fakeKernel(t, kernelStatusOK)
+	env := &Env{JSON: true, Root: t.TempDir(), Binary: kernel}
+	stdout, stderr, code := runArgs(t, env, "search", "foo")
+	if code != 0 {
+		t.Fatalf("delegated search exit = %d stderr=%q", code, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("Run must not append a second JSON object beside the kernel's, got %q", stdout)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(captured.Bytes(), &payload); err != nil {
+		t.Fatalf("kernel stdout is not one JSON object: %v\n%q", err, captured.String())
+	}
+	if payload["ok"] != true {
+		t.Errorf("kernel payload = %v", payload)
+	}
+}
+
+func TestDelegatedCommandWithoutJSONDoesNotInjectTheFlag(t *testing.T) {
+	var captured bytes.Buffer
+	passthroughStdout = &captured
+	t.Cleanup(func() { passthroughStdout = os.Stdout })
+
+	kernel := fakeKernel(t, kernelStatusOK)
+	env := &Env{JSON: false, Root: t.TempDir(), Binary: kernel}
+	stdout, stderr, code := runArgs(t, env, "search", "foo")
+	if code != 0 {
+		t.Fatalf("exit = %d stderr=%q", code, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("delegated stdout belongs to the child, got %q on Run's writer", stdout)
+	}
+	if !strings.Contains(captured.String(), `"ok": true`) && !strings.Contains(captured.String(), `"ok":true`) {
+		t.Errorf("kernel output missing: %q", captured.String())
+	}
+}
+
+func TestDelegatedCommandReportsAKernelFailure(t *testing.T) {
+	kernel := fakeKernel(t, kernelStatusBroken)
+	env := &Env{JSON: true, Root: t.TempDir(), Binary: kernel}
+	stdout, stderr, code := runArgs(t, env, "search", "foo")
+	if code == 0 {
+		t.Fatal("a failing kernel must not exit 0")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("stdout is not one JSON object: %v\n%q", err, stdout)
+	}
+	if payload["ok"] != false {
+		t.Errorf("ok = %v, want false", payload["ok"])
+	}
+	if !strings.Contains(stderr, "devmap search") {
+		t.Errorf("stderr should name the delegated command, got %q", stderr)
+	}
+}
+
+func TestDelegatedCommandRefusesWhenNoKernelExists(t *testing.T) {
+	t.Setenv("DEVMAP_BINARY", "")
+	t.Setenv("PATH", t.TempDir())
+	env := &Env{JSON: true, Root: t.TempDir()}
+	stdout, _, code := runArgs(t, env, "search", "foo")
+	if code == 0 {
+		t.Fatal("search with no kernel must not exit 0")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(stdout), &payload); err != nil {
+		t.Fatalf("stdout is not one JSON object: %v", err)
+	}
+}
+
+func doctorCheckNames(payload doctorPayload) map[string]bool {
+	names := map[string]bool{}
+	for _, c := range payload.Checks {
+		names[c.Name] = true
+	}
+	return names
 }

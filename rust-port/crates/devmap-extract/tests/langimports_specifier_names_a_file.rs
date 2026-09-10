@@ -284,21 +284,58 @@ fn csharp_using_is_deliberately_not_an_import() {
     );
 }
 
-/// Swift `import Foundation` names a **module**.
-///
-/// Worse than unresolvable: it is the one thing that cannot explain intra-repo
-/// wiring, because files in the *same* module — which is what a Swift target
-/// is, and what almost every file in a Swift repository belongs to — need no
-/// import of each other at all. A Swift file's inbound dependencies are
-/// invisible to import syntax by design, so `unwired_candidates` must keep
-/// excluding Swift and saying so.
+/// Swift `import` names a **module**, which this kernel now extracts: a
+/// module is the same shape as a Go package, so the specifier maps onto that
+/// module (or is recorded as external when it is Foundation, XCTest, …).
 #[test]
-fn swift_import_is_deliberately_not_a_file_import() {
+fn swift_import_names_the_module() {
     assert_specifiers(
         "Sources/App/main.swift",
         "import Foundation\nimport UIKit\n\nfunc run() {}\n",
-        &[],
+        &["Foundation", "UIKit"],
     );
+}
+
+#[test]
+fn swift_testable_import_still_names_the_module() {
+    assert_specifiers(
+        "Tests/AppTests/AppTests.swift",
+        "@testable import MarkDevKit\n\nfunc testRun() {}\n",
+        &["MarkDevKit"],
+    );
+}
+
+#[test]
+fn swift_kinded_import_names_the_module_and_the_member() {
+    let extraction = extract_file(
+        "Sources/App/main.swift",
+        "import struct Foundation.Date\n\nfunc run() {}\n",
+    );
+    assert!(
+        !extraction.is_parse_failure(),
+        "kinded import must parse: {:?}",
+        extraction.parse_outcome
+    );
+    assert_eq!(extraction.imports.len(), 1, "{:?}", extraction.imports);
+    assert_eq!(extraction.imports[0].module_specifier, "Foundation");
+    assert_eq!(
+        extraction.imports[0].imported_names,
+        vec!["Date".to_string()]
+    );
+}
+
+#[test]
+fn shell_source_and_dot_name_the_file() {
+    assert_specifiers(
+        "scripts/run.sh",
+        "source ./helper.sh\n. ./other.sh\n",
+        &["./helper.sh", "./other.sh"],
+    );
+}
+
+#[test]
+fn a_computed_shell_source_is_refused() {
+    assert_specifiers("scripts/run.sh", "source \"$HELPER\"\n", &[]);
 }
 
 // ---------------------------------------------------------------------------

@@ -656,8 +656,19 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // dead-code answer. A stale one is worse than a stale fact — it either
     // hides a real finding or publishes a delete-this verdict about code a
     // framework reaches, and nothing about the row looks old.
+    //
+    // v39 is the v33 shape again, for the two languages v33 left out: Swift
+    // `import` and shell `source` / `.`. A v38 `.swift` row has an empty import
+    // list under a capability bit that now claims the language is covered, so
+    // a warm cache answers "nothing imports this file" and "Foundation was
+    // never found" with the confidence of a fresh extraction.
+    //
+    // v40 changes two Swift identities a v39 row asserts as complete: a nested
+    // enum's owner path, and `assigned_to` on a parameter Type reference. A
+    // warm v39 row keeps the nested enum confident-dead and every typed
+    // `reader.read()` AmbiguousGlobal, both looking freshly examined.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "38",
+        EXTRACTION_SCHEMA_VERSION, "40",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

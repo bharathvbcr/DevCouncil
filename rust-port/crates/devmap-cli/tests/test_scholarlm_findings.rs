@@ -1076,6 +1076,134 @@ fn parameter_does_not_keep_a_same_file_function_of_the_same_name_live() {
 }
 
 #[test]
+fn swift_nested_enum_used_as_a_field_type_is_not_dead() {
+    let source = extract_file(
+        "Sources/App/Save.swift",
+        r#"@MainActor
+public final class Workspace {
+    private final class ActiveSaveRequest {
+        private enum CancellationDisposition {
+            case active
+            case detached
+            case operationOwner
+        }
+
+        private var disposition = CancellationDisposition.active
+
+        func resolve(detached: Bool) {
+            if disposition == .active {
+                disposition = detached ? .detached : .operationOwner
+            }
+        }
+    }
+}
+"#,
+    );
+    assert!(
+        source.symbols.iter().any(|symbol| {
+            symbol
+                .qualified_name
+                .ends_with("Workspace.ActiveSaveRequest.CancellationDisposition")
+        }),
+        "the nested enum must be a symbol: {:?}",
+        source
+            .symbols
+            .iter()
+            .map(|symbol| &symbol.qualified_name)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        source.references.iter().any(|reference| {
+            reference.name == "CancellationDisposition"
+                && matches!(
+                    reference.kind,
+                    ReferenceKind::Type | ReferenceKind::Name | ReferenceKind::TypeQualifier
+                )
+        }),
+        "a nested enum used as a field type must be a reference, got {:?}",
+        source.references
+    );
+    let result = resolve(std::slice::from_ref(&source));
+    let analysis = analyze(std::slice::from_ref(&source), &result);
+    assert!(
+        confident_dead(&analysis, "CancellationDisposition").is_none(),
+        "type-position / Type.case use must keep the nested enum live: dead={:?} edges={:?} refs={:?}",
+        analysis.dead_symbols,
+        result
+            .edges
+            .iter()
+            .map(|edge| format!(
+                "{:?} {} -> {}",
+                edge.edge_kind, edge.source_symbol, edge.target_symbol
+            ))
+            .collect::<Vec<_>>(),
+        source.references
+    );
+}
+
+#[test]
+fn rust_fn_item_passed_as_a_value_is_not_dead() {
+    let source = extract_file(
+        "core/src/vault/rename.rs",
+        r#"fn move_file(replace: bool) {
+    if replace {
+        move_file_with(std_rename)
+    } else {
+        move_file_with(rename_without_replacing)
+    }
+}
+
+fn move_file_with<F>(op: F)
+where
+    F: FnOnce(),
+{
+    op()
+}
+
+fn std_rename() {}
+
+#[cfg(target_os = "macos")]
+fn rename_without_replacing() {}
+
+#[cfg(not(target_os = "macos"))]
+fn rename_without_replacing() {}
+"#,
+    );
+    assert!(
+        source.references.iter().any(|reference| {
+            reference.name == "rename_without_replacing" && reference.kind == ReferenceKind::Name
+        }),
+        "a fn item passed as a value must be a Name reference, got {:?}",
+        source.references
+    );
+    let result = resolve(std::slice::from_ref(&source));
+    let analysis = analyze(std::slice::from_ref(&source), &result);
+    assert!(
+        result.edges.iter().any(|edge| {
+            edge.target_symbol.contains("rename_without_replacing")
+                && !matches!(
+                    edge.edge_kind,
+                    EdgeKind::Contains | EdgeKind::Defines | EdgeKind::MemberOf
+                )
+        }),
+        "the fn-item use must produce a non-structural edge: {:?}",
+        result
+            .edges
+            .iter()
+            .map(|edge| format!(
+                "{:?} {} -> {}",
+                edge.edge_kind, edge.source_symbol, edge.target_symbol
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        confident_dead(&analysis, "rename_without_replacing").is_none(),
+        "passing a fn item as a value is a use: {:?}",
+        analysis.dead_symbols
+    );
+}
+
+#[test]
 fn go_import_targets_the_package_node_not_every_file() {
     let importer = extract_file(
         "cmd/main.go",

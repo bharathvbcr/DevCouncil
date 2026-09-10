@@ -3583,6 +3583,13 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                             retired.len()
                         ));
                     }
+                    // Provenance, not a new graph. The hashes above proved this
+                    // generation still describes the tree; HEAD may have moved
+                    // (empty commit, identical-tree checkout) while no file
+                    // did. Leaving the stamp behind is what made `status`
+                    // report NOT FRESH after a skip that had nothing to do.
+                    let head = current_git_head(path).unwrap_or_else(|_| "unavailable".to_string());
+                    store.restamp_latest_head(&head)?;
                     // The artifacts, from the generation this build just
                     // proved current. On this path the stamp almost always
                     // holds, so nothing is read out of the store and nothing is
@@ -4912,12 +4919,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             emit_json(cli, &payload)?;
         }
         Commands::SessionReport { last, session_id } => {
-            let payload = session::run(
-                &cli.db(),
-                *last,
-                session_id.as_deref(),
-                cli.json,
-            )?;
+            let payload = session::run(&cli.db(), *last, session_id.as_deref(), cli.json)?;
             if cli.json {
                 emit_json(cli, &payload)?;
             }

@@ -102,6 +102,7 @@ fn no_always_empty_field_ships_without_provenance() {
         ("package_managers", "package_managers_computed"),
         ("test_commands", "test_commands_computed"),
         ("candidate_files", "candidate_files_computed"),
+        ("import_blind_files", "import_blind_files_computed"),
         ("lsp", "lsp_computed"),
         ("dependency_risks", "dependency_risks_computed"),
         ("processes", "processes_computed"),
@@ -306,4 +307,69 @@ fn the_new_fields_are_deterministic() {
         "two renderings of one generation disagree about subsystems"
     );
     assert_eq!(manifest()["frameworks"], manifest()["frameworks"]);
+}
+
+/// An empty import-blind list from a producer that looked is the answer
+/// "none remain", not "we did not look".
+#[test]
+fn import_blind_files_are_computed_even_when_none_remain() {
+    let map = manifest();
+    assert_eq!(
+        map["meta"]["devmap_rust"]["import_blind_files_computed"],
+        serde_json::json!(true)
+    );
+    let files = map["import_blind_files"]
+        .as_array()
+        .expect("import_blind_files array");
+    assert!(files.is_empty(), "this fixture is Python-only: {files:?}");
+    let meta = &map["liveness_meta"]["import_blind"];
+    assert_eq!(meta["shown"], serde_json::json!(0));
+    assert_eq!(meta["total"], serde_json::json!(0));
+    assert_eq!(meta["truncated"], serde_json::json!(false));
+}
+
+/// Import-blind files excluded from unwired are listed as work, not only counted.
+#[test]
+fn import_blind_files_are_named_not_only_counted() {
+    let extractions = vec![extract_file(
+        "src/Helper.cs",
+        "using System;\n\npublic class Helper {\n    public void Run() {}\n}\n",
+    )];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions);
+    let analysis = AnalysisSummary {
+        total_files: extractions.len(),
+        total_symbols: 1,
+        total_edges: resolution.edges.len(),
+        communities: vec![],
+        status: AnalysisStatus::Ok,
+        ..Default::default()
+    };
+    let (_, json) = generate_manifest_with_edges(
+        &extractions,
+        &analysis,
+        FreshnessInfo::new("head".into(), 1, 0),
+        &resolution.edges,
+        None,
+    );
+    let map: serde_json::Value = serde_json::from_str(&json).expect("manifest parses");
+    let files: Vec<&str> = map["import_blind_files"]
+        .as_array()
+        .expect("import_blind_files")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(files, vec!["src/Helper.cs"]);
+    let excluded: Vec<&str> = map["liveness_meta"]["unwired"]["excluded_import_blind_files"]
+        .as_array()
+        .expect("excluded_import_blind_files")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(excluded, vec!["src/Helper.cs"]);
+    assert_eq!(
+        map["liveness_meta"]["unwired"]["excluded_import_blind"],
+        serde_json::json!(1)
+    );
 }

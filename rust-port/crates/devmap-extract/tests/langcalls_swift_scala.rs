@@ -362,6 +362,33 @@ func f() {
 }
 
 #[test]
+fn swift_defer_is_not_a_callee() {
+    let source = r#"
+func f() {
+    defer { cleanup() }
+    work()
+}
+"#;
+    let extracted = extract("d.swift", "swift", source);
+    assert!(
+        !extracted.callees().contains(&"defer"),
+        "defer is a keyword parsed as a call; recording it produced hundreds \
+         of unresolved sites that meant the file uses defer: {:?}",
+        extracted.callees()
+    );
+    assert!(
+        extracted.callees().contains(&"cleanup"),
+        "the deferred body is a real call: {:?}",
+        extracted.callees()
+    );
+    assert!(
+        extracted.callees().contains(&"work"),
+        "the surrounding function still extracts: {:?}",
+        extracted.callees()
+    );
+}
+
+#[test]
 fn swift_subscripts_are_not_calls_to_the_collection() {
     // The grammar makes `items[0]` a `call_expression` whose callee is the
     // collection. Recording it would let an array named after a same-file

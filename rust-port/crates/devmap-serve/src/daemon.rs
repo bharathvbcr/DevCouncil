@@ -1058,17 +1058,12 @@ impl Daemon {
                 self.root
             );
         }
-        if head_moved {
-            warn!(
-                "git HEAD moved since the last generation; re-extracting {:?} in full",
-                self.root
-            );
-        }
-        // A moved HEAD invalidates the carry-forward for the same reason a
-        // stale payload does: `previous` describes a different checkout, and
-        // every file it holds that this batch did not touch may now differ.
-        // Carrying them forward would leave the graph describing a mixture of
-        // two commits, which is worse than describing the old one.
+        // A moved HEAD used to force a full re-extraction because carry-forward
+        // would mix two checkouts. That is required when the tree actually
+        // changed — a checkout the watcher missed is exactly B5 — and wasted
+        // when only the SHA moved (empty commit, identical-tree branch). File
+        // hashes decide; HEAD is provenance and is restamped below when they
+        // match. One scan either restamps or feeds the extract, never both.
         // K-A2, daemon half. What discovery refused cannot be seen in
         // `extractions` — a file turned away has no `Extraction` at all — so it
         // must travel beside them, or the analysis below reports full coverage
@@ -1110,11 +1105,29 @@ impl Daemon {
             inventory.extend(refused.clone());
             (carried, false, inventory)
         } else {
+            let scanned = if payload_is_current && head_moved {
+                let scanned = devmap_extract::scan_tree(&self.root)?;
+                let hashes = self.store.latest_file_hashes()?;
+                let stored_refusals = self.store.latest_discovery_refusals()?;
+                if scanned.matches_file_hashes(&hashes)
+                    && devmap_store::discovery_refusals(&scanned.report) == stored_refusals
+                {
+                    self.store.restamp_latest_head(&head.sha)?;
+                    self.store.clear_claimed_pending_paths(&succeeded)?;
+                    return Ok(succeeded.len());
+                }
+                warn!(
+                    "git HEAD moved since the last generation; re-extracting {:?} in full",
+                    self.root
+                );
+                scanned
+            } else {
+                devmap_extract::scan_tree(&self.root)?
+            };
             // The branch that actually walks the tree is the one that can
             // measure it. This report was discarded as `_report`, which is what
             // made a full re-extraction the *most* confident thing the daemon
             // did and the least entitled to be.
-            let scanned = devmap_extract::scan_tree(&self.root)?;
             let whole_tree =
                 devmap_store::extract_scanned_for_generation(&self.store, &scanned, None)?;
             let report = scanned.report;

@@ -165,6 +165,21 @@ pub struct Resolver {
     /// declared on its type, not in the package block, so a bare name cannot
     /// reach it.
     go_package_symbols: BTreeMap<(String, String, String), Vec<PackageDecl>>,
+    /// file_path → Swift module name derived from the path.
+    ///
+    /// A Swift target is one unqualified namespace. Computed from the path
+    /// (`Sources/<Name>/`, `app/MarkDevKit/…`) rather than from a build graph
+    /// this kernel does not read. See `devmap_extract::languages::swift_module_of`.
+    swift_module_by_file: BTreeMap<String, String>,
+    /// module name → every indexed file that constitutes it.
+    swift_module_files: BTreeMap<String, BTreeSet<String>>,
+    /// `(module, bare name)` → the **file-level** declarations of that name.
+    ///
+    /// The index behind [`Resolver::same_swift_module_target`]. Keyed on the
+    /// module rather than the directory because a Swift module is the target,
+    /// not a folder: `app/MarkDevKit/Editor/Foo.swift` and
+    /// `app/MarkDevKit/Core/Foo.swift` share one namespace.
+    swift_module_symbols: BTreeMap<(String, String), Vec<PackageDecl>>,
     /// `(file, scope, name)` for every value a callable binds itself.
     ///
     /// `declared_types` can only answer for a binding that carries a *written
@@ -238,6 +253,9 @@ impl Resolver {
             go_modules_fresh: false,
             go_package_by_file: BTreeMap::new(),
             go_package_symbols: BTreeMap::new(),
+            swift_module_by_file: BTreeMap::new(),
+            swift_module_files: BTreeMap::new(),
+            swift_module_symbols: BTreeMap::new(),
             scope_locals: BTreeSet::new(),
             max_indexed_path_depth: 0,
             unique_basename: BTreeMap::new(),
@@ -514,6 +532,17 @@ impl Resolver {
             {
                 return UnresolvedClass::Builtin;
             }
+            if family == LangFamily::Swift && !self.family_declares(family, callee_name) {
+                let modules = self.imported_swift_modules(file_path);
+                if let Some(module) = crate::builtins::swift_sdk_module(
+                    modules.iter().map(String::as_str),
+                    callee_name,
+                ) {
+                    return UnresolvedClass::External {
+                        module: module.to_string(),
+                    };
+                }
+            }
         }
 
         // The enclosing scope's own binding beats every wider authority, so it
@@ -534,6 +563,22 @@ impl Resolver {
         // matching method name as a builtin would exempt real calls.
         if receiver.is_none() && crate::builtins::is_builtin(family, callee_name) {
             return UnresolvedClass::Builtin;
+        }
+        if receiver.is_none()
+            && family == LangFamily::Swift
+            && !self.family_declares(family, callee_name)
+        {
+            if crate::builtins::is_prelude_type(family, callee_name) {
+                return UnresolvedClass::Builtin;
+            }
+            let modules = self.imported_swift_modules(file_path);
+            if let Some(module) =
+                crate::builtins::swift_sdk_module(modules.iter().map(String::as_str), callee_name)
+            {
+                return UnresolvedClass::External {
+                    module: module.to_string(),
+                };
+            }
         }
         let external = self.external_imports.get(file_path);
         // An import whose specifier is repo-relative and whose target is not
@@ -628,6 +673,33 @@ impl Resolver {
                 return UnresolvedClass::External {
                     module: module.clone(),
                 };
+            }
+        }
+
+        // Swift prelude / SDK methods on a typed value. SC25's import-handle
+        // lookup cannot see `s.count` where `s` is a `String` — String is a
+        // language type, not an imported binding. Prelude answers without an
+        // import; SDK types answer only when this file imported that module.
+        if family == LangFamily::Swift {
+            if let Some(declared_type) =
+                self.declared_receiver_type(file_path, enclosing_symbol, root)
+            {
+                if crate::builtins::is_prelude_type(family, declared_type)
+                    && !self.family_declares(family, declared_type)
+                {
+                    return UnresolvedClass::Builtin;
+                }
+                if !self.family_declares(family, declared_type) {
+                    let modules = self.imported_swift_modules(file_path);
+                    if let Some(module) = crate::builtins::swift_sdk_module(
+                        modules.iter().map(String::as_str),
+                        declared_type,
+                    ) {
+                        return UnresolvedClass::External {
+                            module: module.to_string(),
+                        };
+                    }
+                }
             }
         }
 
@@ -838,6 +910,9 @@ impl Resolver {
         self.symbol_parents.clear();
         self.go_package_by_file.clear();
         self.go_package_symbols.clear();
+        self.swift_module_by_file.clear();
+        self.swift_module_files.clear();
+        self.swift_module_symbols.clear();
         self.scope_locals.clear();
         self.max_indexed_path_depth = extractions
             .iter()
@@ -965,6 +1040,32 @@ impl Resolver {
                         .push((ext.file_path.clone(), sym.qualified_name.clone(), sym.kind));
                 }
             }
+            if ext.language == "swift" {
+                if let Some(module) = devmap_extract::languages::swift_module_of(&ext.file_path) {
+                    self.swift_module_by_file
+                        .insert(ext.file_path.clone(), module.clone());
+                    self.swift_module_files
+                        .entry(module.clone())
+                        .or_default()
+                        .insert(ext.file_path.clone());
+                    for sym in &ext.symbols {
+                        if sym.kind == SymbolKind::File {
+                            continue;
+                        }
+                        let file_level = sym
+                            .parent_symbol
+                            .as_deref()
+                            .is_none_or(|parent| parent == ext.file_path);
+                        if !file_level {
+                            continue;
+                        }
+                        self.swift_module_symbols
+                            .entry((module.clone(), sym.name.clone()))
+                            .or_default()
+                            .push((ext.file_path.clone(), sym.qualified_name.clone(), sym.kind));
+                    }
+                }
+            }
         }
 
         // Between the passes, and necessarily so: following a barrel needs the
@@ -1022,7 +1123,15 @@ impl Resolver {
                             })
                             .unwrap_or(name.as_str());
                         let spec = Self::import_spec_for_name(&imp.module_specifier, name);
-                        let direct = self.resolve_import_path(&ext.file_path, &ext.language, &spec);
+                        // A Swift kinded import (`import struct Foundation.Date`)
+                        // names a **module**, not a file. `resolve_import_path`
+                        // would look for a file called `Foundation` and either
+                        // miss or, worse, bind a coincidental `Foundation.swift`.
+                        let direct = if ext.language == "swift" {
+                            self.swift_file_declaring(&imp.module_specifier, name)
+                        } else {
+                            self.resolve_import_path(&ext.file_path, &ext.language, &spec)
+                        };
                         // `from pkg import cmd` binds an attribute of
                         // `pkg/__init__.py` when that file defines one, and the
                         // *submodule* `pkg/cmd.py` when it does not. Only the
@@ -1140,6 +1249,30 @@ impl Resolver {
                             }
                         }
                         continue;
+                    }
+                    if ext.language == "swift" {
+                        // `import Kit` puts Kit's file-level names in
+                        // unqualified scope. Only file-level declarations —
+                        // the same population `swift_module_symbols` holds —
+                        // so a method of some type cannot become a bare callee.
+                        if let Some(module) = self.swift_module_named_by(&imp.module_specifier) {
+                            for ((owner, name), decls) in &self.swift_module_symbols {
+                                if owner != module {
+                                    continue;
+                                }
+                                let others: Vec<_> = decls
+                                    .iter()
+                                    .filter(|(path, _, _)| path != &ext.file_path)
+                                    .collect();
+                                if others.len() != 1 {
+                                    continue;
+                                }
+                                let (file, _, _) = others[0];
+                                file_bindings
+                                    .entry(name.clone())
+                                    .or_insert_with(|| (file.clone(), name.clone()));
+                            }
+                        }
                     }
                     let local = alias.map(str::to_string).unwrap_or_else(|| {
                         Self::import_local_name(&ext.language, &imp.module_specifier)
@@ -1524,7 +1657,7 @@ impl Resolver {
                     }
                 }
 
-                // G20: Group Go package members for star topology
+                // G20: Group Go package / Swift module members for star topology
                 if family == LangFamily::Go {
                     if let Some(pkg_name) = go_package_name_of(ext) {
                         if pkg_name != "main" {
@@ -1535,6 +1668,15 @@ impl Resolver {
                                 .or_default()
                                 .insert(ext.file_path.clone());
                         }
+                    }
+                }
+                if family == LangFamily::Swift {
+                    if let Some(module) = self.swift_module_by_file.get(&ext.file_path) {
+                        let key = format!("module:{module}");
+                        package_groups
+                            .entry(key)
+                            .or_default()
+                            .insert(ext.file_path.clone());
                     }
                 }
 
@@ -1571,6 +1713,8 @@ impl Resolver {
                     }
                     let edge_targets = if ext.language == "go" {
                         self.go_import_edge_targets(&targets)
+                    } else if ext.language == "swift" {
+                        self.swift_import_edge_targets(&imp.module_specifier)
                     } else {
                         targets
                     };
@@ -1817,21 +1961,40 @@ impl Resolver {
                     // not evidence about what `recv` means at this call site.
                     if resolution.is_none() {
                         if let Some(recv) = &call.receiver_expr {
-                            let key = (family, recv.clone(), call.callee_name.clone());
-                            if let Some(hits) = self.type_methods.get(&key) {
-                                let corroborated = hits.len() == 1
-                                    && (hits[0].0 == ext.file_path
-                                        || self
-                                            .import_bindings
-                                            .get(&ext.file_path)
-                                            .is_some_and(|bindings| bindings.contains_key(recv)));
-                                if corroborated {
-                                    let (target_f, target_symbol) = &hits[0];
-                                    resolution = Some(Arc::new(Resolution::ReceiverType {
-                                        target_symbol: target_symbol.clone(),
-                                        target_file: target_f.clone(),
-                                        receiver_type: recv.clone(),
-                                    }));
+                            // `Renderer.shared.isScalable()` writes the type at
+                            // the call site and then a member; the receiver
+                            // text is `Renderer.shared`, which is not itself a
+                            // type. The leading capitalised segment is, when
+                            // this file (or an import here) corroborates it.
+                            let type_spellings = std::iter::once(recv.as_str()).chain(
+                                recv.split(['.', ':'])
+                                    .next()
+                                    .filter(|head| {
+                                        *head != recv.as_str()
+                                            && head
+                                                .chars()
+                                                .next()
+                                                .is_some_and(|ch| ch.is_uppercase())
+                                    }),
+                            );
+                            for type_name in type_spellings {
+                                let key =
+                                    (family, type_name.to_string(), call.callee_name.clone());
+                                if let Some(hits) = self.type_methods.get(&key) {
+                                    if let Some((target_f, target_symbol)) = self
+                                        .type_method_target(
+                                            &ext.file_path,
+                                            type_name,
+                                            hits,
+                                        )
+                                    {
+                                        resolution = Some(Arc::new(Resolution::ReceiverType {
+                                            target_symbol: target_symbol.to_string(),
+                                            target_file: target_f.to_string(),
+                                            receiver_type: type_name.to_string(),
+                                        }));
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -1853,6 +2016,27 @@ impl Resolver {
                     {
                         if let Some((target_file, target_symbol, package_name)) = self
                             .same_package_target(&ext.file_path, &call.callee_name, |kind| {
+                                kind != SymbolKind::Method
+                            })
+                        {
+                            resolution = Some(Arc::new(Resolution::SamePackage {
+                                target_symbol,
+                                target_file,
+                                package_name,
+                            }));
+                        }
+                    }
+                    // A Swift module is the same scope rule as a Go package:
+                    // every file-level name is unqualified throughout the
+                    // target. Reuses `SamePackage` rather than a second kind —
+                    // the evidence is the same, and the `package_name` slot
+                    // carries the module.
+                    if resolution.is_none()
+                        && family == LangFamily::Swift
+                        && call.receiver_expr.is_none()
+                    {
+                        if let Some((target_file, target_symbol, package_name)) = self
+                            .same_swift_module_target(&ext.file_path, &call.callee_name, |kind| {
                                 kind != SymbolKind::Method
                             })
                         {
@@ -2285,8 +2469,13 @@ impl Resolver {
             }
         }
 
-        // G20: Add Go synthetic package star edges
+        // G20: synthetic package / module star edges
         for (pkg_node, files) in package_groups {
+            let reason = if pkg_node.starts_with("module:") {
+                "Swift module star topology"
+            } else {
+                "Go package star topology"
+            };
             for file in files {
                 edges.push(ResolvedEdge::resolved(
                     file.clone(),
@@ -2298,7 +2487,7 @@ impl Resolver {
                         target_symbol: pkg_node.clone(),
                         target_file: pkg_node.clone(),
                     }),
-                    Some("Go package star topology".to_string()),
+                    Some(reason.to_string()),
                 ));
             }
         }
@@ -2761,6 +2950,161 @@ impl Resolver {
             .then(|| (target_file.clone(), target_symbol.clone(), package.clone()))
     }
 
+    /// Where a bare `name` written in `file` goes by Swift's module-scope rule.
+    ///
+    /// A Swift target is one unqualified namespace spanning every file that
+    /// constitutes it — the Go package-block shape, keyed on the module the
+    /// path names rather than on `(directory, package clause)`. Two files under
+    /// `app/MarkDevKit/` share a module even when they sit in different
+    /// folders; two files that merely share a folder do not, if they belong to
+    /// different targets.
+    ///
+    /// The declaring file must not be `file`: the same-file rungs own that.
+    /// Abstains when the module declares the name twice, for the same
+    /// input-order reason [`Self::same_package_target`] does.
+    /// The unique `type_methods` target that is evidence at this call site.
+    ///
+    /// Same-file and an import binding of the type were already enough.
+    /// Swift siblings need a third: no import is written between files of
+    /// one module, so `Normalizer.normalize()` in `Renderer.swift` must
+    /// still bind when `Other.normalize` exists elsewhere and would make
+    /// the global rung AmbiguousGlobal — the MarkDev Kit enum-helper shape.
+    ///
+    /// Overloads of one method on one type are several hits in the same
+    /// file (`present(_:Int)` and `present(_:String)`). `len == 1` treated
+    /// that as "no type", so `Viewer.shared.present(...)` fell to
+    /// AmbiguousGlobal and the file looked unwired. Dedup, then require
+    /// every remaining hit to name that one file.
+    fn type_method_target<'a>(
+        &self,
+        call_file: &str,
+        type_name: &str,
+        hits: &'a [(String, String)],
+    ) -> Option<(&'a str, &'a str)> {
+        let mut uniq: Vec<&(String, String)> = hits.iter().collect();
+        uniq.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        uniq.dedup();
+        if uniq.is_empty() || !uniq.iter().all(|hit| hit.0 == uniq[0].0) {
+            return None;
+        }
+        let (target_file, target_symbol) = uniq[0];
+        let corroborated = target_file == call_file
+            || self
+                .import_bindings
+                .get(call_file)
+                .is_some_and(|bindings| bindings.contains_key(type_name))
+            || match (
+                self.swift_module_by_file.get(call_file),
+                self.swift_module_by_file.get(target_file.as_str()),
+            ) {
+                (Some(caller_module), Some(target_module)) => caller_module == target_module,
+                _ => false,
+            };
+        corroborated.then_some((target_file.as_str(), target_symbol.as_str()))
+    }
+
+    fn same_swift_module_target(
+        &self,
+        file: &str,
+        name: &str,
+        accept: impl Fn(SymbolKind) -> bool,
+    ) -> Option<(String, String, String)> {
+        let module = self.swift_module_by_file.get(file)?;
+        let hits = self
+            .swift_module_symbols
+            .get(&(module.clone(), name.to_string()))?;
+        let mut visible = hits
+            .iter()
+            .filter(|(path, _, kind)| path != file && accept(*kind));
+        let (target_file, target_symbol, _) = visible.next()?;
+        visible
+            .next()
+            .is_none()
+            .then(|| (target_file.clone(), target_symbol.clone(), module.clone()))
+    }
+
+    /// The Swift module a specifier names, if this corpus indexed one.
+    fn swift_module_named_by<'a>(&'a self, specifier: &'a str) -> Option<&'a str> {
+        let first = specifier
+            .split('.')
+            .next()
+            .filter(|part| !part.is_empty())?;
+        if self.swift_module_files.contains_key(first) {
+            return Some(first);
+        }
+        let last = specifier.rsplit('.').next()?;
+        self.swift_module_files.contains_key(last).then_some(last)
+    }
+
+    /// The file in an imported Swift module that uniquely declares `name`.
+    fn swift_file_declaring(&self, specifier: &str, name: &str) -> Option<String> {
+        let module = self.swift_module_named_by(specifier)?;
+        let hits = self
+            .swift_module_symbols
+            .get(&(module.to_string(), name.to_string()))?;
+        let mut visible = hits
+            .iter()
+            .filter(|(_, _, kind)| *kind != SymbolKind::Method);
+        let (file, _, _) = visible.next()?;
+        visible.next().is_none().then(|| file.clone())
+    }
+
+    fn resolve_swift_import(&self, specifier: &str) -> Vec<String> {
+        let Some(module) = self.swift_module_named_by(specifier) else {
+            return Vec::new();
+        };
+        self.swift_module_files
+            .get(module)
+            .map(|files| files.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn swift_import_edge_targets(&self, specifier: &str) -> Vec<String> {
+        self.swift_module_named_by(specifier)
+            .map(|module| vec![format!("module:{module}")])
+            .unwrap_or_default()
+    }
+
+    /// Module names this Swift file imported that resolved to no indexed file.
+    ///
+    /// Both the local handle and the specifier are collected: a kinded
+    /// `import struct Foundation.Date` records `Date → Foundation`, and
+    /// classification needs `Foundation` as the module that was imported.
+    fn imported_swift_modules(&self, file: &str) -> Vec<String> {
+        let Some(map) = self.external_imports.get(file) else {
+            return Vec::new();
+        };
+        let mut modules = BTreeSet::new();
+        for (local, specifier) in map {
+            for name in [local.as_str(), specifier.as_str()] {
+                if let Some(root) = name.split('.').next().filter(|part| !part.is_empty()) {
+                    modules.insert(root.to_string());
+                }
+            }
+        }
+        modules.into_iter().collect()
+    }
+
+    fn declared_receiver_type<'a>(
+        &'a self,
+        file_path: &str,
+        enclosing_symbol: &str,
+        root: &str,
+    ) -> Option<&'a str> {
+        let scoped = |slot: &str| {
+            self.declared_types
+                .get(&format!("{file_path}:{enclosing_symbol}:{root}{slot}"))
+        };
+        let scope_knows = scoped("@mod").is_some() || scoped("@type").is_some();
+        if scope_knows {
+            scoped("@type").map(String::as_str)
+        } else {
+            self.declared_types
+                .get(&format!("{file_path}:{root}@type"))
+                .map(String::as_str)
+        }
+    }
+
     fn lookup_in_package(&self, file: &str, name: &str) -> Option<(String, String)> {
         let hits = self.symbol_index.get(name)?;
         let eligible = |path: &str, identity: &str| self.declared_at_file_level(path, identity);
@@ -2939,6 +3283,14 @@ impl Resolver {
     ) -> Vec<String> {
         if lang == "go" {
             return self.resolve_go_import(specifier);
+        }
+        // A Swift specifier names a **module**. Falling through to file-path
+        // resolution would look for a file called `Foundation` and either miss
+        // (leaving the import unexplained) or bind a coincidental
+        // `Foundation.swift`. Empty here means the module is outside the
+        // corpus, which `classify_unresolved` records as External.
+        if lang == "swift" {
+            return self.resolve_swift_import(specifier);
         }
         // A JVM wildcard import names a package, and a package is every file in
         // one directory. `import com.foo.*;` and `import foo.bar._` really do
@@ -3413,6 +3765,25 @@ impl Resolver {
                 ));
             }
         }
+        if family == LangFamily::Swift && receiver.is_none() {
+            if let Some((target_file, target_symbol, package_name)) =
+                self.same_swift_module_target(&ext.file_path, name, |kind| {
+                    !prefer_types || is_type(kind)
+                })
+            {
+                return Some(self.reference_edge(
+                    ext,
+                    &target_file,
+                    name,
+                    reference,
+                    Resolution::SamePackage {
+                        target_symbol,
+                        target_file: target_file.clone(),
+                        package_name,
+                    },
+                ));
+            }
+        }
 
         if let Some(hits) = self.symbol_index.get(name) {
             let family_hits: Vec<_> = hits
@@ -3471,7 +3842,13 @@ impl Resolver {
                 .filter(|(path, _, _, _)| path == file)
                 .map(|(_, kind, _, _)| *kind)
                 .collect();
-            (file_hits.len() == 1).then(|| file_hits[0])
+            // Two `#[cfg]` variants of one fn share an identity. `len == 1`
+            // treated that as "no kind", so a Name reference that
+            // `lexical_target` had already uniquely identified — a fn item
+            // passed as a value — produced no edge and the fn was
+            // confident-dead. Agreeing kinds are one kind.
+            let first = *file_hits.first()?;
+            file_hits.iter().all(|kind| *kind == first).then_some(first)
         })
     }
 

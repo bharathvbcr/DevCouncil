@@ -358,13 +358,15 @@ fn the_call_blind_clean_parsing_languages_are_named() {
     );
 }
 
-/// The four languages `unwired_candidates` still cannot answer for, by name.
+/// The three languages `unwired_candidates` still cannot answer for, by name.
 ///
 /// This assertion used to read `import_blind.len() == 24` and to be titled
 /// "the majority", because `unwired_candidates` asks whether a file has an
 /// inbound `Imports` edge and for 24 of 35 languages the answer was
 /// structurally *no*: the whole extractor had five `imports.push` sites and no
-/// `#include` handler anywhere. W0.3 move 2 turned that number into four.
+/// `#include` handler anywhere. W0.3 move 2 turned that number into four;
+/// Swift then left because `import Foundation` names a module the same way
+/// `import "app/store"` names a Go package.
 ///
 /// It is now pinned by **name with a reason**, not by count. A count says the
 /// list changed; it does not say whether a language left the list because an
@@ -376,11 +378,6 @@ fn the_call_blind_clean_parsing_languages_are_named() {
 ///   any number of files and one file may declare several, so no rule of the
 ///   language or its tooling maps a `using` to a file. Extracting one would
 ///   mean inventing a convention C# does not have.
-/// * **`swift`** — `import Foundation` names a *module*, and that is the one
-///   thing that cannot explain intra-repository wiring: files in the same
-///   module — which is what a Swift target is, and where almost every file in a
-///   Swift repository lives — import each other not at all. Swift's inbound
-///   dependencies are invisible to import syntax by design.
 /// * **`vb`** — `Imports System.Collections` is C#'s case again, and VB.NET has
 ///   no linked grammar besides: it reaches `scan_declarations`, whose
 ///   `Fallback` engine `grammar_read_this_file` already answers `false` for, so
@@ -392,6 +389,10 @@ fn the_call_blind_clean_parsing_languages_are_named() {
 ///   earlier branch. Claiming imports for a file no grammar read would be the
 ///   "a check that could not run reports what a check that passed reports"
 ///   failure this repository exists to refuse.
+///
+/// SQL is not in `LANGUAGE_SPECS`; it is the remaining `NON_REGISTRY` grammar
+/// that extracts calls but not imports (`.read` / `\i` are client commands,
+/// not language-level file imports). Named beside these so it cannot hide.
 ///
 /// The two that were added rather than declined are recorded here as well, so
 /// the boundary is legible from one place: `hcl` because
@@ -407,9 +408,21 @@ fn the_languages_without_import_extraction_are_named_with_reasons() {
         .collect();
     assert_eq!(
         import_blind,
-        vec!["csharp", "vb", "swift", "cobol"],
+        vec!["csharp", "vb", "cobol"],
         "the set of import-blind languages changed; each entry is a documented \
          decision, so adding or removing one means updating the reason above"
+    );
+
+    let fallback_calls_without_imports: Vec<&str> = NON_REGISTRY_CAPABILITIES
+        .iter()
+        .filter(|(_, caps)| caps.contains(Capability::Calls) && !caps.contains(Capability::Imports))
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(
+        fallback_calls_without_imports,
+        vec!["sql"],
+        "a NON_REGISTRY grammar that extracts calls but not imports must be \
+         named: shell left this list when `source` / `.` gained an extractor"
     );
 }
 
@@ -446,6 +459,12 @@ fn the_import_dispatcher_and_the_registry_agree() {
         .iter()
         .filter(|spec| spec.capabilities.contains(Capability::Imports))
         .map(|spec| spec.grammar)
+        .chain(
+            NON_REGISTRY_CAPABILITIES
+                .iter()
+                .filter(|(_, caps)| caps.contains(Capability::Imports))
+                .map(|(name, _)| *name),
+        )
         .collect();
     let dispatched: BTreeSet<&str> = IMPORT_EXTRACTION_LANGUAGES.iter().copied().collect();
     let specialised: BTreeSet<&str> = SPECIALISED.iter().copied().collect();

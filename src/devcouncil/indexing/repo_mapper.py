@@ -226,6 +226,11 @@ class RepoMap(BaseModel):
     # Liveness artifact (computed by default; omit with --no-liveness).
     entry_roots: List[str] = Field(default_factory=list)
     unwired_candidates: List[str] = Field(default_factory=list)
+    # Files whose language has no import extractor in this build. Capped; the
+    # true total is ``liveness_meta.import_blind.total``. An empty list with
+    # ``import_blind_files_computed: true`` and ``total: 0`` means every
+    # grammar this run could see imports for, not that nobody looked.
+    import_blind_files: List[str] = Field(default_factory=list)
     unreachable_files: List[str] = Field(default_factory=list)
     dead_symbol_candidates: List[str] = Field(default_factory=list)
     # True when production entry roots were empty — unreachable BFS was skipped

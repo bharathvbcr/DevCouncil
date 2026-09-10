@@ -1602,10 +1602,7 @@ pub fn render_plugin_bundle(
         if !text.ends_with('\n') {
             text.push('\n');
         }
-        files.push((
-            plugin.join("skills").join(name).join("SKILL.md"),
-            text,
-        ));
+        files.push((plugin.join("skills").join(name).join("SKILL.md"), text));
     }
     Ok(files)
 }

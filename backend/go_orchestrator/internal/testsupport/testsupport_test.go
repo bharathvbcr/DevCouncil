@@ -8,6 +8,29 @@ import (
 	"testing"
 )
 
+func TestUnavailableSkipsOnlyWhenTheOperatorOptsIn(t *testing.T) {
+	t.Setenv(AllowSkipEnv, "1")
+	Unavailable(t, "missing %s", "tool")
+	t.Fatal("Unavailable should have skipped")
+}
+
+func TestToolFindsAPresentBinary(t *testing.T) {
+	got := Tool(t, "go")
+	if got == "" {
+		t.Fatal("Tool returned an empty path for go")
+	}
+	if _, err := os.Stat(got); err != nil {
+		t.Fatalf("Tool(%q) is not a file: %v", got, err)
+	}
+}
+
+func TestRepoRootFindsTheRustWorkspace(t *testing.T) {
+	root := RepoRoot(t)
+	if _, err := os.Stat(filepath.Join(root, RustWorkspace, "Cargo.toml")); err != nil {
+		t.Fatalf("RepoRoot = %s does not contain %s/Cargo.toml: %v", root, RustWorkspace, err)
+	}
+}
+
 // TestBuiltBinaryIsNotAPathCargoRewrites is the defect this package's third
 // rule exists for.
 //
