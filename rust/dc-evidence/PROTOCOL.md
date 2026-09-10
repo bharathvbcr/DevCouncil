@@ -43,8 +43,10 @@ The complete byte-exact example is in `fixtures/v1/`: `contract.json`,
 types live in `src/types.rs`; `expected.json` represents independent admission
 data, not values a consumer should discover from `bundle.json`.
 
-All listed fields are required except `epoch_transitions`, which defaults to an
-empty list for journals that never changed worker epoch. Unknown fields, duplicate object keys (including
+All listed fields are required except `epoch_transitions`, `policy_sha256`,
+`outcome`, `interventions`, `human_actions`, `recoveries`, and `locator_hits`.
+Absent optional lists default to empty; absent `outcome` / `policy_sha256` mean
+those assertions cannot be discharged. Unknown fields, duplicate object keys (including
 inside fact values), unknown enum values, and unsupported versions are refused.
 Identifiers are 1–256 bytes without control characters. Hashes are 64 lowercase
 hex characters identifying SHA-256 of exact bytes. Reformatting JSON changes its
@@ -63,9 +65,26 @@ identity; Go and Rust must not hash their independently reserialized objects.
 }
 ```
 
-`fact` names an exact top-level key in the final observation's `facts` object;
-it is not a JSON pointer or executable expression. At least one criterion must
-be required. Optional criteria are still reported but do not block acceptance.
+`fact` names an exact top-level key in the final observation's `facts` object,
+or one of the reserved bundle facts below; it is not a JSON pointer or executable
+expression. At least one criterion must be required. Optional criteria are still
+reported but do not block acceptance.
+
+Reserved bundle facts (resolved from the evidence record, never from observation
+text — observation keys with the same name cannot override them):
+
+| Fact | Meaning |
+|---|---|
+| `outcome.id` | Bundle `outcome.id` when present; missing outcome is incomplete |
+| `outcome.kind` | Bundle `outcome.kind` (`success` or `business`) |
+| `human_control_returned` | Always present boolean: true iff any `interventions[].status` is `returned` |
+
+Contracts that expect a business outcome such as member-not-found assert
+`outcome.id` equals `not_found` (and typically `outcome.kind` equals `business`).
+That expected-not-found case **passes**. A contract that expected a success
+outcome (`outcome.id` equals a success id, or `outcome.kind` equals `success`)
+against a bundle that concluded `not_found` **fails** — business terminals are
+not hard failures in the journal, but they fail a success contract.
 
 | Predicate | Shape and meaning |
 |---|---|
@@ -82,20 +101,44 @@ out-of-range observations are incomplete. Criteria are checks of the recorded
 state, not proof that the chosen criterion is itself sufficient for user intent.
 
 The bundle carries `schema_version`, `run_id`, `session_id`, `epoch`,
-`contract_sha256`, `capability_sha256`, `journal_complete`, `degraded`, `actions`,
-`observations`, `epoch_transitions`, and `artifacts`:
+`contract_sha256`, `capability_sha256`, optional `policy_sha256`, optional
+`outcome`, `journal_complete`, `degraded`, `actions`, `observations`,
+`epoch_transitions`, `artifacts`, `interventions`, `human_actions`,
+`recoveries`, and `locator_hits`:
 
 ```json
 {
+  "outcome": {"id":"saved","kind":"success"},
+  "policy_sha256": "…64 lowercase hex…",
   "actions": [{"id":"action-1","sequence":1,"disposition":"succeeded"}],
   "observations": [{
     "sequence":2,"run_id":"run-1","session_id":"desktop-1","epoch":1,
     "after_action_id":"action-1",
     "facts":{"document.text":"Hello Jarvis"},"artifact_ids":["note"]
   }],
-  "artifacts": [{"id":"note","path":"note.txt","sha256":"...","size_bytes":12}]
+  "artifacts": [{"id":"note","path":"note.txt","sha256":"...","size_bytes":12}],
+  "interventions": [],
+  "human_actions": [],
+  "recoveries": [],
+  "locator_hits": []
 }
 ```
+
+Field names are stable snake_case for Manvi/Jarvis alignment (Manvi workflow
+schema may still be landing; keep these exact keys):
+
+| Field | Shape |
+|---|---|
+| `outcome` | `{id, kind}` where `kind` is `success` or `business` |
+| `policy_sha256` | 64 lowercase hex SHA-256 of the reviewed policy document |
+| `interventions[]` | `{id, sequence, reason_code, status}` with `status` in `requested`/`returned`/`abandoned` |
+| `human_actions[]` | `{id, sequence, kind, intervention_id}` referencing an intervention |
+| `recoveries[]` | `{id, sequence, step_id}` for each applied declared recovery |
+| `locator_hits[]` | `{target, strategy_index, sequence}`; index `> 0` is drift |
+
+Side records use their own strictly increasing positive `sequence` spaces and do
+not share the action/observation/epoch-transition sequence namespace. At most 256
+entries each. `human_actions[].intervention_id` must name a declared intervention.
 
 The shortened fragment above illustrates member shapes; the complete fixture
 contains all required bindings and actual digests. Each action/observation list

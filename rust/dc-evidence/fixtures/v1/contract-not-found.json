@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "id": "balance-not-found",
+  "criteria": [
+    {
+      "id": "outcome-id",
+      "fact": "outcome.id",
+      "required": true,
+      "predicate": {
+        "op": "equals",
+        "value": "not_found"
+      }
+    },
+    {
+      "id": "outcome-kind",
+      "fact": "outcome.kind",
+      "required": true,
+      "predicate": {
+        "op": "equals",
+        "value": "business"
+      }
+    }
+  ]
+}

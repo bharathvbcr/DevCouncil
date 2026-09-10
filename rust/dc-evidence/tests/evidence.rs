@@ -532,3 +532,139 @@ fn same_inputs_replay_to_exactly_the_same_report() {
         serde_json::to_vec(&verify(CONTRACT, BUNDLE, &expected(), &inputs()).unwrap()).unwrap();
     assert_eq!(one, two);
 }
+
+const NOT_FOUND_CONTRACT: &[u8] = include_bytes!("../fixtures/v1/contract-not-found.json");
+const NOT_FOUND_BUNDLE: &[u8] = include_bytes!("../fixtures/v1/bundle-not-found.json");
+
+fn not_found_expected() -> ExpectedRun {
+    ExpectedRun {
+        run_id: "run-1".into(),
+        session_id: "desktop-1".into(),
+        epoch: 1,
+        contract_sha256: sha256(NOT_FOUND_CONTRACT),
+        capability_sha256: "1a4bf7dac3b78318718a5047937473da4898acfb53cbbc9afdbe0c7fa9f3eec2"
+            .into(),
+    }
+}
+
+#[test]
+fn expected_not_found_business_outcome_passes() {
+    let report = verify(
+        NOT_FOUND_CONTRACT,
+        NOT_FOUND_BUNDLE,
+        &not_found_expected(),
+        &ArtifactInputs::new(),
+    )
+    .unwrap();
+    assert_eq!(report.verdict, Verdict::Passed);
+    assert!(report.issues.is_empty());
+    assert_eq!(report.criteria[0].id, "outcome-id");
+    assert_eq!(report.criteria[0].verdict, Verdict::Passed);
+    assert_eq!(report.criteria[1].verdict, Verdict::Passed);
+}
+
+#[test]
+fn expected_success_against_not_found_outcome_fails() {
+    let mut contract: Value = serde_json::from_slice(NOT_FOUND_CONTRACT).unwrap();
+    contract["criteria"] = json!([
+        {
+            "id": "want-success",
+            "fact": "outcome.kind",
+            "required": true,
+            "predicate": {"op": "equals", "value": "success"}
+        }
+    ]);
+    let contract = serde_json::to_vec(&contract).unwrap();
+    let mut expected = not_found_expected();
+    expected.contract_sha256 = sha256(&contract);
+    let bundle = {
+        let mut b: Value = serde_json::from_slice(NOT_FOUND_BUNDLE).unwrap();
+        b["contract_sha256"] = json!(expected.contract_sha256);
+        serde_json::to_vec(&b).unwrap()
+    };
+    assert_eq!(
+        verify(&contract, &bundle, &expected, &ArtifactInputs::new())
+            .unwrap()
+            .verdict,
+        Verdict::Failed
+    );
+}
+
+#[test]
+fn human_control_returned_tracks_intervention_status() {
+    let mut contract: Value = serde_json::from_slice(CONTRACT).unwrap();
+    contract["criteria"] = json!([{
+        "id": "handoff",
+        "fact": "human_control_returned",
+        "required": true,
+        "predicate": {"op": "equals", "value": true}
+    }]);
+    let contract = serde_json::to_vec(&contract).unwrap();
+    let mut expected = expected();
+    expected.contract_sha256 = sha256(&contract);
+    let resumed = include_bytes!("../fixtures/v1/bundle-resumed.json");
+    let mut bundle: Value = serde_json::from_slice(resumed).unwrap();
+    bundle["contract_sha256"] = json!(expected.contract_sha256);
+    let bundle = serde_json::to_vec(&bundle).unwrap();
+    assert_eq!(
+        verify(&contract, &bundle, &expected, &inputs())
+            .unwrap()
+            .verdict,
+        Verdict::Passed
+    );
+    let without_return = edit_bundle(|b| {
+        b["contract_sha256"] = json!(expected.contract_sha256);
+        b["interventions"] = json!([]);
+        b["human_actions"] = json!([]);
+    });
+    assert_eq!(
+        verify(&contract, &without_return, &expected, &inputs())
+            .unwrap()
+            .verdict,
+        Verdict::Failed
+    );
+}
+
+#[test]
+fn outcome_and_side_record_shape_is_validated() {
+    let missing_outcome_id = edit_bundle(|b| b["outcome"] = json!({"kind": "success"}));
+    assert!(parse_bundle(&missing_outcome_id).is_err());
+    let bad_kind = edit_bundle(|b| b["outcome"]["kind"] = json!("failed"));
+    assert!(parse_bundle(&bad_kind).is_err());
+    let bad_policy = edit_bundle(|b| b["policy_sha256"] = json!("not-a-digest"));
+    assert!(parse_bundle(&bad_policy).is_err());
+    let orphan_human = edit_bundle(|b| {
+        b["human_actions"] = json!([{
+            "id":"h1","sequence":1,"kind":"press","intervention_id":"missing"
+        }]);
+    });
+    assert!(parse_bundle(&orphan_human).is_err());
+    let unknown_side = edit_bundle(|b| b["interventions"] = json!([{"extra": true}]));
+    assert!(parse_bundle(&unknown_side).is_err());
+}
+
+#[test]
+fn additive_side_fields_default_when_absent() {
+    let mut bundle: Value = serde_json::from_slice(BUNDLE).unwrap();
+    for field in [
+        "outcome",
+        "policy_sha256",
+        "interventions",
+        "human_actions",
+        "recoveries",
+        "locator_hits",
+    ] {
+        bundle.as_object_mut().unwrap().remove(field);
+    }
+    let bytes = serde_json::to_vec(&bundle).unwrap();
+    let parsed = parse_bundle(&bytes).unwrap();
+    assert!(parsed.outcome.is_none());
+    assert!(parsed.policy_sha256.is_none());
+    assert!(parsed.interventions.is_empty());
+    assert_eq!(
+        verify(CONTRACT, &bytes, &expected(), &inputs())
+            .unwrap()
+            .verdict,
+        Verdict::Passed
+    );
+}

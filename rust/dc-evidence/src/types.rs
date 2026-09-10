@@ -41,11 +41,88 @@ pub struct Bundle {
     pub epoch_transitions: Vec<EpochTransition>,
     pub contract_sha256: String,
     pub capability_sha256: String,
+    /// SHA-256 of the reviewed policy document admitted with the run, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_sha256: Option<String>,
+    /// Terminal business or success outcome concluded by the capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Outcome>,
     pub journal_complete: bool,
     pub degraded: Vec<String>,
     pub actions: Vec<Action>,
     pub observations: Vec<Observation>,
     pub artifacts: Vec<Artifact>,
+    /// Typed intervention/handoff requests emitted while automation was stuck.
+    #[serde(default)]
+    pub interventions: Vec<Intervention>,
+    /// Human inputs taken during an intervention window.
+    #[serde(default)]
+    pub human_actions: Vec<HumanAction>,
+    /// Declared recoveries that matched and were applied during the run.
+    #[serde(default)]
+    pub recoveries: Vec<RecoveryApplied>,
+    /// Locator ladder resolution hits (strategy_index > 0 is drift).
+    #[serde(default)]
+    pub locator_hits: Vec<LocatorHit>,
+}
+
+/// Concluded capability outcome. `kind` mirrors Manvi workflow outcomes:
+/// `success` for completed goals, `business` for declared non-success terminals
+/// such as `not_found` (never recorded as a hard failure).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Outcome {
+    pub id: String,
+    pub kind: OutcomeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeKind {
+    Success,
+    Business,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Intervention {
+    pub id: String,
+    pub sequence: u64,
+    pub reason_code: String,
+    pub status: InterventionStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterventionStatus {
+    Requested,
+    Returned,
+    Abandoned,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanAction {
+    pub id: String,
+    pub sequence: u64,
+    pub kind: String,
+    pub intervention_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryApplied {
+    pub id: String,
+    pub sequence: u64,
+    pub step_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocatorHit {
+    pub target: String,
+    pub strategy_index: u64,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

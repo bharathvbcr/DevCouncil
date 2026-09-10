@@ -3,11 +3,12 @@
   "run_id": "run-1",
   "session_id": "desktop-1",
   "epoch": 1,
-  "contract_sha256": "bdf5f2cf064b49e340ba043d78511e8e10bdf6ee4276daa0b03fc5fc8922e816",
+  "contract_sha256": "5240e2287986d8fb321a5a106b829ba09d188e11666c8dd25461a24be8510d80",
   "capability_sha256": "1a4bf7dac3b78318718a5047937473da4898acfb53cbbc9afdbe0c7fa9f3eec2",
+  "policy_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "outcome": {
-    "id": "saved",
-    "kind": "success"
+    "id": "not_found",
+    "kind": "business"
   },
   "journal_complete": true,
   "degraded": [],
@@ -26,23 +27,20 @@
       "epoch": 1,
       "after_action_id": "action-1",
       "facts": {
-        "document.text": "Hello Jarvis"
+        "status.text": "Member not found"
       },
-      "artifact_ids": [
-        "note"
-      ]
+      "artifact_ids": []
     }
   ],
-  "artifacts": [
-    {
-      "id": "note",
-      "path": "note.txt",
-      "sha256": "6c0bbef0b972b783dc25154dc72d49a0167473dd147678f820d7923d9605b3b9",
-      "size_bytes": 12
-    }
-  ],
+  "artifacts": [],
   "interventions": [],
   "human_actions": [],
   "recoveries": [],
-  "locator_hits": []
+  "locator_hits": [
+    {
+      "target": "status",
+      "strategy_index": 0,
+      "sequence": 1
+    }
+  ]
 }

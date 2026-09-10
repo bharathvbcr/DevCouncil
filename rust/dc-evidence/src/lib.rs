@@ -9,7 +9,8 @@ mod types;
 
 pub use types::{
     Action, Artifact, Bundle, Contract, Criterion, CriterionResult, Disposition, EpochTransition,
-    ExpectedRun, Issue, Observation, Predicate, Report, Verdict,
+    ExpectedRun, HumanAction, Intervention, InterventionStatus, Issue, LocatorHit, Observation,
+    Outcome, OutcomeKind, Predicate, RecoveryApplied, Report, Verdict,
 };
 
 use serde::de::DeserializeOwned;
@@ -97,6 +98,12 @@ pub fn parse_bundle(bytes: &[u8]) -> Result<Bundle, Error> {
     }
     digest(&bundle.contract_sha256)?;
     digest(&bundle.capability_sha256)?;
+    if let Some(policy) = &bundle.policy_sha256 {
+        digest(policy)?;
+    }
+    if let Some(outcome) = &bundle.outcome {
+        identifier(&outcome.id)?;
+    }
     if bundle.actions.len() + bundle.observations.len() + bundle.epoch_transitions.len()
         > MAX_EVENTS
     {
@@ -108,6 +115,16 @@ pub fn parse_bundle(bytes: &[u8]) -> Result<Bundle, Error> {
     if bundle.degraded.len() > MAX_CRITERIA {
         return Err(Error("degraded diagnostic count exceeds 256".into()));
     }
+    if bundle.interventions.len() > MAX_CRITERIA
+        || bundle.human_actions.len() > MAX_CRITERIA
+        || bundle.recoveries.len() > MAX_CRITERIA
+        || bundle.locator_hits.len() > MAX_CRITERIA
+    {
+        return Err(Error(
+            "interventions, human_actions, recoveries, or locator_hits exceed 256".into(),
+        ));
+    }
+    validate_side_records(&bundle)?;
     let mut ids = BTreeSet::new();
     let mut paths = BTreeSet::new();
     let mut total_bytes = 0_u64;
@@ -127,6 +144,71 @@ pub fn parse_bundle(bytes: &[u8]) -> Result<Bundle, Error> {
         return Err(Error("artifacts exceed 64 MiB aggregate limit".into()));
     }
     Ok(bundle)
+}
+
+fn validate_side_records(bundle: &Bundle) -> Result<(), Error> {
+    let mut intervention_ids = BTreeSet::new();
+    let mut human_ids = BTreeSet::new();
+    let mut prior = 0_u64;
+    for intervention in &bundle.interventions {
+        identifier(&intervention.id)?;
+        identifier(&intervention.reason_code)?;
+        if intervention.sequence == 0 || intervention.sequence <= prior {
+            return Err(Error(
+                "intervention sequences must be positive and strictly increasing".into(),
+            ));
+        }
+        if !intervention_ids.insert(intervention.id.as_str()) {
+            return Err(Error("duplicate intervention id".into()));
+        }
+        prior = intervention.sequence;
+    }
+    prior = 0;
+    for action in &bundle.human_actions {
+        identifier(&action.id)?;
+        identifier(&action.kind)?;
+        identifier(&action.intervention_id)?;
+        if action.sequence == 0 || action.sequence <= prior {
+            return Err(Error(
+                "human_action sequences must be positive and strictly increasing".into(),
+            ));
+        }
+        if !human_ids.insert(action.id.as_str()) {
+            return Err(Error("duplicate human_action id".into()));
+        }
+        if !intervention_ids.contains(action.intervention_id.as_str()) {
+            return Err(Error(
+                "human_action references unknown intervention_id".into(),
+            ));
+        }
+        prior = action.sequence;
+    }
+    prior = 0;
+    let mut recovery_keys = BTreeSet::new();
+    for recovery in &bundle.recoveries {
+        identifier(&recovery.id)?;
+        identifier(&recovery.step_id)?;
+        if recovery.sequence == 0 || recovery.sequence <= prior {
+            return Err(Error(
+                "recovery sequences must be positive and strictly increasing".into(),
+            ));
+        }
+        if !recovery_keys.insert((recovery.id.as_str(), recovery.sequence)) {
+            return Err(Error("duplicate recovery id/sequence".into()));
+        }
+        prior = recovery.sequence;
+    }
+    prior = 0;
+    for hit in &bundle.locator_hits {
+        identifier(&hit.target)?;
+        if hit.sequence == 0 || hit.sequence <= prior {
+            return Err(Error(
+                "locator_hit sequences must be positive and strictly increasing".into(),
+            ));
+        }
+        prior = hit.sequence;
+    }
+    Ok(())
 }
 
 /// Portable relative paths only. The CLI additionally rejects symlinks and
@@ -252,13 +334,16 @@ pub fn verify(
     }
     // Only the final observation can establish the final state. Earlier success
     // cannot survive a later action or a later contradictory/missing fact.
+    // Bundle-level facts `outcome.id`, `outcome.kind`, and
+    // `human_control_returned` are resolved from the evidence record itself so
+    // contracts can accept declared business outcomes (e.g. not_found → passed).
     let latest = bundle.observations.last();
     let journal_valid = report.issues.is_empty();
     for criterion in &contract.criteria {
         let (verdict, reason) = if !journal_valid {
             (Verdict::Incomplete, "evidence prerequisites not satisfied")
-        } else if let Some(value) = latest.and_then(|o| o.facts.get(&criterion.fact)) {
-            predicate(&criterion.predicate, value)
+        } else if let Some(value) = resolve_fact(&bundle, latest, &criterion.fact) {
+            predicate(&criterion.predicate, &value)
         } else {
             (Verdict::Incomplete, "required observation fact is missing")
         };
@@ -273,6 +358,40 @@ pub fn verify(
         }
     }
     Ok(report)
+}
+
+/// Resolve a contract fact from bundle-level outcome/handoff state or the
+/// final observation. Bundle facts always win over identically named observation
+/// keys so producers cannot override `outcome.*` via forged observation text.
+fn resolve_fact(
+    bundle: &Bundle,
+    latest: Option<&Observation>,
+    fact: &str,
+) -> Option<Value> {
+    match fact {
+        "outcome.id" => bundle
+            .outcome
+            .as_ref()
+            .map(|outcome| Value::String(outcome.id.clone())),
+        "outcome.kind" => bundle.outcome.as_ref().map(|outcome| {
+            Value::String(
+                match outcome.kind {
+                    OutcomeKind::Success => "success",
+                    OutcomeKind::Business => "business",
+                }
+                .into(),
+            )
+        }),
+        "human_control_returned" => Some(Value::Bool(human_control_returned(bundle))),
+        _ => latest.and_then(|o| o.facts.get(fact).cloned()),
+    }
+}
+
+fn human_control_returned(bundle: &Bundle) -> bool {
+    bundle
+        .interventions
+        .iter()
+        .any(|i| matches!(i.status, InterventionStatus::Returned))
 }
 
 fn validate_journal(bundle: &Bundle, report: &mut Report) -> Result<(), Error> {

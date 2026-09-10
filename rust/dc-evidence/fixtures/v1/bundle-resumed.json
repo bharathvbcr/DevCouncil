@@ -5,10 +5,12 @@
   "epoch": 1,
   "contract_sha256": "bdf5f2cf064b49e340ba043d78511e8e10bdf6ee4276daa0b03fc5fc8922e816",
   "capability_sha256": "1a4bf7dac3b78318718a5047937473da4898acfb53cbbc9afdbe0c7fa9f3eec2",
+  "outcome": {
+    "id": "saved",
+    "kind": "success"
+  },
   "journal_complete": true,
-  "degraded": [
-
-  ],
+  "degraded": [],
   "actions": [
     {
       "id": "action-1",
@@ -65,5 +67,23 @@
       "to_epoch": 3,
       "reason": "resume"
     }
-  ]
+  ],
+  "interventions": [
+    {
+      "id": "intervention-1",
+      "sequence": 1,
+      "reason_code": "approval_pending",
+      "status": "returned"
+    }
+  ],
+  "human_actions": [
+    {
+      "id": "human-1",
+      "sequence": 1,
+      "kind": "press",
+      "intervention_id": "intervention-1"
+    }
+  ],
+  "recoveries": [],
+  "locator_hits": []
 }

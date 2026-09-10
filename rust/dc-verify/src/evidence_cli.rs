@@ -1,4 +1,5 @@
 //! Filesystem/process-entry adapter only. Acceptance semantics live in dc-evidence.
+//! Bundle `schema_version` stays 1; additive fields (outcome, side records) are optional.
 use dc_evidence::{
     ArtifactInputs, ExpectedRun, MAX_ARTIFACT_BYTES, MAX_BUNDLE_BYTES, MAX_CONTRACT_BYTES,
     MAX_TOTAL_ARTIFACT_BYTES,

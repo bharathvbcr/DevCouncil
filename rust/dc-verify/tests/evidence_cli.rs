@@ -94,6 +94,43 @@ fn live_cli_reads_real_fixture_artifacts_and_emits_one_bound_report() {
 }
 
 #[test]
+fn live_cli_accepts_expected_not_found_business_outcome() {
+    let fixture = Fixture::new();
+    let contract = include_bytes!("../../dc-evidence/fixtures/v1/contract-not-found.json");
+    let bundle = include_bytes!("../../dc-evidence/fixtures/v1/bundle-not-found.json");
+    std::fs::write(fixture.0.join("contract.json"), contract).unwrap();
+    std::fs::write(fixture.0.join("bundle.json"), bundle).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dcverify"));
+    command
+        .arg("evidence-check")
+        .arg("--contract")
+        .arg(fixture.0.join("contract.json"))
+        .arg("--bundle")
+        .arg(fixture.0.join("bundle.json"))
+        .arg("--artifacts-root")
+        .arg(&fixture.0)
+        .arg("--expected-contract-sha256")
+        .arg(dc_evidence::sha256(contract))
+        .arg("--expected-capability-sha256")
+        .arg("1a4bf7dac3b78318718a5047937473da4898acfb53cbbc9afdbe0c7fa9f3eec2")
+        .args([
+            "--expected-run-id",
+            "run-1",
+            "--expected-session-id",
+            "desktop-1",
+            "--expected-epoch",
+            "1",
+        ]);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let report = decoded(&output);
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["verdict"], "passed");
+    assert_eq!(report["criteria"][0]["id"], "outcome-id");
+    assert_eq!(report["criteria"][0]["verdict"], "passed");
+}
+
+#[test]
 fn corrupt_artifact_is_failed_but_missing_artifact_is_incomplete() {
     let fixture = Fixture::new();
     std::fs::write(fixture.0.join("note.txt"), b"Different content").unwrap();
