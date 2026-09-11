@@ -1,7 +1,7 @@
 [package]
 name = "dc-evidence"
 version.workspace = true
-edition.workspace = true
+edition = "2024"
 license.workspace = true
 description = "Deterministic acceptance verification over independently bound execution evidence"
 

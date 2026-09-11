@@ -14,7 +14,7 @@ import (
 
 // discoverBinary resolves the devmap kernel, in the order the Python seam uses
 // (`devmap_engine.find_engine_binary`): DEVMAP_BINARY, then builds under the
-// repository's rust-port target directories, then PATH.
+// repository's rust target directories, then PATH.
 //
 // PATH is deliberately *last*. On a developer machine PATH resolves
 // ~/.cargo/bin/devmap — whatever was last `cargo install`ed — which is
@@ -88,7 +88,7 @@ func binaryCandidates(root string) []string {
 	return out
 }
 
-// localBuilds returns devmap binaries under the repository's rust-port target
+// localBuilds returns devmap binaries under the repository's rust target
 // directories, newest first.
 //
 // Both `target` and `target-<lane>` are searched: concurrent fix lanes in this
@@ -104,7 +104,7 @@ func localBuilds(root string) []string {
 	}
 	var hits []found
 
-	targetParents, err := filepath.Glob(filepath.Join(root, "rust-port", "target*"))
+	targetParents, err := filepath.Glob(filepath.Join(root, "rust", "target*"))
 	if err != nil {
 		return nil
 	}

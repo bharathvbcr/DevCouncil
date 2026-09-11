@@ -1,25 +1,120 @@
 [workspace]
 resolver = "3"
-members = ["dc-glob", "dc-grep", "dc-store", "dc-verify", "dc-evidence"]
+members = [
+    "dc-glob",
+    "dc-grep",
+    "dc-store",
+    "dc-verify",
+    "dc-evidence",
+    "devmap-extract",
+    "devmap-resolve",
+    "devmap-analyze",
+    "devmap-store",
+    "devmap-query",
+    "devmap-serve",
+    "devmap-cli",
+]
+
+# The kernel is built rarely and run on every agent turn. Its hot loops —
+# tree-sitter walks in `devmap-extract`, the symbol-index lookups in
+# `devmap-resolve` — cross crate boundaries constantly, which is exactly what
+# a unified codegen unit and LTO can see through.
+#
+# `lto = "thin"` rather than `"fat"`: measured on this workspace, thin recovers
+# effectively all of fat's runtime win for a fraction of the link time.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# The daemon and MCP transports recover worker failures through Tokio's
+# JoinError. Aborting bypasses that recovery and every unwinding cleanup.
+# Tests force unwinding regardless of this setting; verify.sh therefore runs
+# worker_recovery_probe as an executable under the release profile.
+panic = "unwind"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [workspace.package]
 version = "0.1.1"
-edition = "2024"
+edition = "2021"
+authors = ["DevCouncil Team"]
 license = "Apache-2.0"
+repository = "https://github.com/bharathvbcr/DevCouncil"
 
-# No shared external dependencies, deliberately. Every crate a member pulls in
-# is a dependency-audit surface paid for weekly; the analysis plane earns one
-# when a task needs it, not before, and it is declared by the single member
-# that needs it rather than hoisted here where it would look like a house
-# standard. Two members have earned theirs: dc-store takes rusqlite (bundled,
-# so the store does not depend on the host's libsqlite3), and dc-grep takes
-# ripgrep's engine (grep-regex, grep-searcher, ignore) because reimplementing
-# ignore-rule resolution and a line-oriented searcher is exactly the second
-# engine this workspace exists to avoid keeping in step with the first. Its
-# optional index uses Microsoft's pinned tgrep-core for trigram extraction,
-# query planning and disk format, retaining the same final matcher.
+# Kernel crates share grammar and runtime deps. Analysis-plane crates that
+# opt into `[lints] workspace = true` keep `unsafe_code = forbid`; the kernel
+# does not opt in, because tree-sitter bindings require unsafe.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
+
+[workspace.dependencies]
+# "rc" lets Arc<T> derive Serialize/Deserialize. ResolvedEdge shares one
+# Resolution across every edge fanned out from the same ambiguous call site;
+# Arc<T> serializes as the inner T, so the wire form is unchanged.
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+toml = { version = "1.1", default-features = false, features = ["parse", "preserve_order", "serde", "std"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Only for `signal(2)` in the CLI: one-shot commands restore the default
+# SIGPIPE disposition so a closed pipe ends them quietly (devmap-cli/main.rs).
+libc = "0.2"
+rayon = "1.10"
+tokio = { version = "1.38", features = ["full"] }
+# MCP 2.0's modern transport (protocol 2026-07-28) is a self-contained HTTP POST:
+# no `initialize` handshake, no session id, one JSON-RPC request in and one
+# response out. It is the only way to reach that revision — the handshake
+# transports top out at 2025-11-25 — so serving it needs an HTTP server.
+# hyper directly rather than axum: this is one POST route with a hand-written
+# status mapping, and axum's router, extractor and middleware layers would be
+# dependency weight paying for nothing.
+hyper = { version = "1.5", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+http-body-util = "0.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+regex = "1.10"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+notify = "6.1"
+ignore = "0.4"
+tree-sitter = "0.25"
+tree-sitter-language = "0.1"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-hcl = "1.1"
+tree-sitter-java = "0.23"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-php = "0.24"
+tree-sitter-ruby = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-objc = "3.0"
+tree-sitter-cuda = "0.21"
+tree-sitter-swift = "0.7"
+tree-sitter-scala = "0.26"
+tree-sitter-dart = "0.2"
+tree-sitter-pascal = "0.10"
+tree-sitter-lua = "0.5"
+tree-sitter-luau = "1.2"
+tree-sitter-r = "1.3"
+tree-sitter-cfml = "0.26"
+tree-sitter-erlang = "0.20"
+tree-sitter-solidity = "1.2"
+# Shell and SQL are not in the frozen Python 35, so they have no LanguageSpec.
+# `detect_language` already routes `.sh`/`.bash`/`.zsh` to "shell" and `.sql` to
+# "sql" through its fallback table, and both returned ParseOutcome::Failed for
+# want of a grammar — 86 shell and 19 SQL files on the personal corpus.
+tree-sitter-bash = "0.25"
+tree-sitter-sequel = "0.3"
+tree-sitter-nix = "0.3"
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-svelte-ng = "1.0"
+tree-sitter-astro-next = "0.1"

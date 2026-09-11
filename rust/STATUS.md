@@ -1,9 +1,10 @@
 # Analysis Plane (Rust) — Port Status Ledger
 
-> **This is not the devmap kernel.** `rust-port/` is a separate workspace with separate
-> crates and its own ledger. Open work for both ports is indexed in
-> [`rust-port/AGENT_PLAN.md` → Consolidated open-work register](../rust-port/AGENT_PLAN.md#consolidated-open-work-register-2026-09-02)
-> (section E covers this workspace). This file stays authoritative for the detail.
+> **This is not the kernel ledger.** The kernel crates (`devmap-*`) now live
+> in this same workspace. Open work for both planes is indexed in
+> [`docs/devmap/AGENT_PLAN.md` → Consolidated open-work register](../docs/devmap/AGENT_PLAN.md#consolidated-open-work-register-2026-09-02)
+> (section E covers this plane). This file stays authoritative for the analysis-plane
+> detail; kernel status is [`docs/devmap/STATUS.md`](../docs/devmap/STATUS.md).
 
 **What this is:** the four `dc-*` crates and their Go clients, ported from the MANVI
 harness (`~/Code/devtools/Manvi`) into DevCouncil on 2026-09-01.
@@ -48,7 +49,7 @@ significant case it is measurably less capable, and cutting over would weaken a 
 > [`docs/COMPONENTS_AND_HARNESS.md`](../../Manvi/docs/COMPONENTS_AND_HARNESS.md).
 > This ledger covers only the analysis-plane components that landed here.
 
-This ledger follows `rust-port/STATUS.md`'s convention: claims are labelled
+This ledger follows `docs/devmap/STATUS.md`'s convention: claims are labelled
 **verified** (a command was run and its output read), **inferred**, or
 **unverified**. Passing tests are local mechanical evidence, not evidence of a
 soak, of CI, or of production parity.
@@ -76,23 +77,24 @@ The Go module is `github.com/bharathvbcr/DevCouncil/backend/go_orchestrator` and
 **zero third-party dependencies** (verified: `go.mod` has no `require` block; `go build ./...`
 and `go vet ./...` both exit 0).
 
-The Rust workspace takes three: `rusqlite` (bundled, pinned to `0.31` — the same line
-`rust-port/Cargo.toml` uses, so the two workspaces do not carry two SQLite builds),
-and ripgrep's `grep-regex` / `grep-searcher` / `ignore`.
+The Rust workspace pins `rusqlite` (bundled, `0.40.2`) so `dc-store` and
+`devmap-store` do not carry two SQLite builds, plus ripgrep's `grep-regex` /
+`grep-searcher` / `ignore`.
 
-### Why a second Cargo workspace rather than joining `rust-port/`
+### Why two CI jobs rather than `cargo test --workspace` on every PR
 
-`rust-port/` is the devmap port: 50k lines and ~36 tree-sitter grammars, a full
-build of which takes minutes. The analysis plane is 6.4k lines and three
-dependencies, and its whole value is that a test run is seconds. Folding it in
-would make every `dc-verify` test compile tree-sitter.
+The kernel is 50k lines and ~36 tree-sitter grammars; a full build takes minutes.
+The analysis plane is a few thousand lines and a handful of dependencies, and
+its whole value is that a test run is seconds. They share this workspace and
+lockfile so `dcstore` and `devmap` cannot drift onto two SQLite builds. They
+keep separate GitHub jobs so a `dc-grep` change does not compile the grammars.
 
-They are also different components. `rust-port/` answers *what does this code
+They are also different components. The kernel answers *what does this code
 mean*; `dc-*` answers *may this change proceed*. Both are DevCouncil components
 and MANVI consumes them identically — `devmap`, `dcstore`, `dcverify` and
 `dcgrep` are each resolved as a binary from `PATH`, linked by nothing. The
-harness draws no distinction between them, and neither should this workspace
-split, which is about build cost rather than about status.
+harness draws no distinction between them. The CI split is about build cost
+rather than about status.
 
 ---
 
@@ -204,13 +206,15 @@ differential run over real diffs says otherwise.
 **Closed since the port.**
 
 - **CI exists.** [`.github/workflows/analysis-plane.yml`](../.github/workflows/analysis-plane.yml)
-  covers `rust/**`, `backend/go_orchestrator/**` and `rust-port/**` in three jobs
-  that fail for three different reasons: the components on Linux/macOS/Windows;
-  the interop suite with `DC_STORE_REQUIRE_INTEROP=1` so the Python agreement is
-  demanded rather than hoped for; and the Go clients driving real binaries, with
-  a step that **fails if the live devmap contract tests skipped**. `rust-port/**`
-  is in the trigger paths on purpose: devmap and its Go client live in one
-  repository, so a devmap change must run the client's contract tests.
+  covers `rust/**` and `backend/go_orchestrator/**` in two jobs
+  that fail for different reasons: the `dc-*` crates on Linux/macOS/Windows
+  (named packages, not `--workspace`, so they do not compile tree-sitter);
+  and the Go clients driving real binaries, with
+  a step that **fails if the live devmap contract tests skipped**. Kernel crates
+  are gated by [`.github/workflows/rust.yml`](../.github/workflows/rust.yml).
+  `rust/**` is in the analysis-plane trigger paths on purpose: `dc-*` and the
+  Go clients live in one repository, so a component change must run the
+  client's contract tests.
 - **A build and install path.** [`scripts/install-components.sh`](../scripts/install-components.sh)
   builds all four release, health-checks each **before** installing any, and
   installs by atomic rename. Its `dcstore` check refuses a binary that does not
@@ -241,7 +245,7 @@ differential run over real diffs says otherwise.
 - **Windows is unproven for `dc-store`.** `dc-glob`, `dc-verify` and `dc-grep`
   were confirmed to `cargo check` for `x86_64-pc-windows-msvc` locally;
   `dc-store` compiles SQLite from source and could not be cross-checked from
-  macOS. It is in the CI matrix because `rust-port` already builds bundled
+  macOS. It is in the CI matrix because the kernel already builds bundled
   `rusqlite` on Windows, so the answer should be yes — but that is an inference,
   and the first Windows CI run is what settles it.
 - **Linux is unproven locally.** Everything here was run on darwin/arm64. The

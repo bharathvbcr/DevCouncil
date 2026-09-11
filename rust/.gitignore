@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target/
+/target-*/
 
 # Stores a test or a local run left behind. dc-store's suites write to the
 # system temp directory, not here, but `dcstore --db` will happily point at a
@@ -8,13 +9,26 @@
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+*.db
+
+# Mutation testing run output (regenerate with cargo mutants)
+mutants.out/
+mutants.out.old/
+
+# Generated coverage dump. Not source; paths go stale the moment the tree moves.
+lcov.info
 
 # testdata is extractor *input*, not build output.
 #
-# Same hazard rust-port documents at the bottom of its own ignore file: this
-# workspace sits inside a Python repository whose root patterns (`__pycache__`,
-# `build/`, `dist/`, `.venv/`) govern anything not re-included here. The fnmatch
-# parity fixture is the cross-language gate between this crate and the Go
-# matcher, so it must be tracked no matter what the parent ignores.
+# This workspace sits inside a repository whose root ignore patterns (`lib/`,
+# `build/`, `var/`, `dist/`, `share/`) would otherwise govern fixture files:
+# `testdata/vendor/lib/x.py` silently stopped being walked and the testdata
+# determinism digest moved. Language fixtures legitimately use those directory
+# names, so re-include the whole tree here — a nested ignore file takes
+# precedence over the parent's, and the directory must be re-included before
+# any file inside it can be.
 !testdata/
 !testdata/**
+# …but never the generated stores or OS cruft that live inside fixtures.
+testdata/**/.devcouncil/
+testdata/**/.DS_Store

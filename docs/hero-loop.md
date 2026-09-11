@@ -22,11 +22,11 @@ reach for first.
 | **Claude Code** | macOS, Linux | Slash commands (`/devcouncil:*`) shelling to MCP | **Certified / Stable** |
 | **Claude Code** | macOS, Linux | Subagent `devcouncil-implementer` | **Certified / Stable** |
 
-Golden coverage: `tests/unit/test_mcp_closed_loop.py` and `tests/unit/test_hero_loop_golden.py`.
+Integration coverage: Go MCP server tests (`backend/go_orchestrator/devcouncil/mcp`) and `dcverify` golden fixtures.
 
-### Deterministic self-repair (`dev go`)
+### Deterministic self-repair
 
-Stable repair contract (no LLM required): correction manifest from blocking gaps + next-actions; bounded re-runs (`execution.max_repair_attempts`); stop on unchanged blocking-gap fingerprint; optional LLM `RepairService` when a provider key is configured (Preview). See `tests/unit/test_go_repair_loop.py`.
+Stable repair contract (no LLM required): correction manifest from blocking gaps + typed `next_actions`; bounded re-runs; stop on unchanged blocking-gap fingerprint.
 
 ### Lease contract (long runs)
 
@@ -39,9 +39,9 @@ Stable repair contract (no LLM required): correction manifest from blocking gaps
 
 ### Best-effort adapters (Preview)
 
-Codex, Antigravity, Cursor Agent, Grok, OpenCode, Warp/Aider/Copilot/others reuse the same verifier and next-actions contract but are not certified for the full MCP closed loop. Gemini CLI is **deprecated** (use Antigravity). Prefer the Claude Code MCP path for production agent loops; confirm wiring with `dev integrate check`.
+Codex, Antigravity, Cursor Agent, Grok, OpenCode, Warp/Aider/Copilot/others reuse the same verifier and next-actions contract but are not certified for the full MCP closed loop. Gemini CLI is **deprecated** (use Antigravity). Prefer the Claude Code MCP path for production agent loops; confirm wiring with `devcouncil integrate <host> --check`.
 
-Large multi-agent goals with dependency DAGs should use **`dev campaign`** (Director → Coordinator → Worker pool + Reviewer QC), not the retired feudal-theme naming.
+Large multi-agent goals with dependency DAGs are orchestrated by upstream harnesses such as **Manvi**.
 
 ## The loop
 
@@ -236,19 +236,19 @@ disable the tool entirely (Claude still accepts `--advisor` / `advisorModel` but
 See [coding-cli-integration.md](coding-cli-integration.md) for more detail, including the
 unified **stop gate** (claim checks + optional active-task verify on Claude/Codex Stop hooks).
 
-## The lite on-ramp
+## CLI Verification Gateway
 
-Before committing to the full planning council, you can taste the evidence gate on whatever
-is already in your working tree — no LLM, no provider keys:
+You can run the same deterministic evidence gate against current changes via the CLI — no LLM or external provider keys needed:
 
 ```bash
-# Verify the current diff against an inline requirement, with diff coverage.
-dev check --verify --goal "reset tokens are single-use" --test "python -m pytest tests/test_auth.py -q"
+# Verify the task diff against planned scope and rigor gates
+devcouncil verify TASK-001
 
-# Make the diff-coverage gate blocking for this check.
-dev check --verify --test "python -m pytest -q" --enforce-coverage
+# Emit structured JSON for scripting and CI pipelines
+devcouncil verify TASK-001 --json
+
+# Run in an isolated container sandbox
+devcouncil verify TASK-001 --sandbox docker
 ```
 
-`dev check --verify` runs the same deterministic verifier as the hero loop and prints the
-verdict plus the next-actions contract (`--json` for machine consumption). Once you trust
-the gate here, `dev plan` graduates you to the full Requirement→Task→Diff→Evidence graph.
+`devcouncil verify` runs the native `dcverify` engine and prints the verdict along with typed `next_actions` for machine consumption.

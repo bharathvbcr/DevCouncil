@@ -186,4 +186,4 @@ RESUME_PORTFOLIO_POINTS_2026.md
 DevCouncil-blog.md
 DevCouncil-linkedin.md
 examples/password-reset/
-rust-port/crates/devmap-serve/sessions/
+rust/devmap-serve/sessions/

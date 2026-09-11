@@ -228,7 +228,7 @@ func TestDiscoveryPrefersAnExplicitBinaryOverLocalBuildsAndPath(t *testing.T) {
 	explicit := fakeKernel(t, kernelStatusOK)
 	onPath := fakeKernel(t, kernelStatusOK)
 	root := t.TempDir()
-	local := filepath.Join(root, "rust-port", "target", "release", "devmap")
+	local := filepath.Join(root, "rust", "target", "release", "devmap")
 	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +257,7 @@ func TestDiscoveryPrefersALocalBuildOverPath(t *testing.T) {
 	// repository must win, or a kernel change is not exercised by the next
 	// command that depends on it.
 	root := t.TempDir()
-	local := filepath.Join(root, "rust-port", "target", "release", "devmap")
+	local := filepath.Join(root, "rust", "target", "release", "devmap")
 	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -282,9 +282,9 @@ func TestDiscoveryPrefersALocalBuildOverPath(t *testing.T) {
 
 func TestDiscoveryFindsLaneTargetDirectories(t *testing.T) {
 	// Concurrent fix lanes each build into their own CARGO_TARGET_DIR
-	// (`rust-port/target-<lane>`), so that is where a current build usually is.
+	// (`rust/target-<lane>`), so that is where a current build usually is.
 	root := t.TempDir()
-	lane := filepath.Join(root, "rust-port", "target-lane1", "release", "devmap")
+	lane := filepath.Join(root, "rust", "target-lane1", "release", "devmap")
 	if err := os.MkdirAll(filepath.Dir(lane), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +430,7 @@ func TestAnExplicitBinaryThatIsADirectoryIsRefusedByName(t *testing.T) {
 
 func TestDiscoveryFallsThroughAnIncapableLocalBuildToACapablePathBinary(t *testing.T) {
 	root := t.TempDir()
-	local := filepath.Join(root, "rust-port", "target", "release", "devmap")
+	local := filepath.Join(root, "rust", "target", "release", "devmap")
 	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
 		t.Fatal(err)
 	}

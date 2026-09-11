@@ -1,7 +1,12 @@
-# DevCouncil analysis components
+# DevCouncil Rust workspace
 
-Five Rust crates that answer *may this change proceed*. Three build to
-standalone component binaries; the others are libraries linked into them.
+One Cargo workspace. Two planes share the lockfile and keep **separate CI
+jobs**, because a `dc-verify` test must not compile thirty tree-sitter grammars.
+
+| Plane | Crates | Answers |
+|---|---|---|
+| Analysis | `dc-glob`, `dc-grep`, `dc-store`, `dc-verify`, `dc-evidence` | May this change proceed |
+| Kernel | `devmap-extract` … `devmap-cli` | What does this code mean |
 
 DevCouncil owns these as **components**. A harness — [MANVI](https://github.com/bharathvbcr/Manvi)
 is the one they were built for — resolves each as a binary from `PATH` and
@@ -9,9 +14,7 @@ is the one they were built for — resolves each as a binary from `PATH` and
 replaced, or reused by something else without the consumer recompiling, and a
 consumer stays a single static binary that embeds anywhere.
 
-The code-intelligence component, `devmap`, lives in [`../rust-port/`](../rust-port/)
-and is a separate workspace because it carries ~36 tree-sitter grammars; folding
-it in here would make every `dc-verify` test compile them.
+The analysis-plane crates:
 
 | Crate | Binary | Answers |
 |---|---|---|
@@ -140,13 +143,18 @@ script below does.
 ## Build, test, install
 
 ```bash
-cargo build --workspace --release     # from this directory
-cargo test  --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+# Analysis plane only — does not compile tree-sitter grammars.
+cargo test -p dc-glob -p dc-grep -p dc-store -p dc-verify -p dc-evidence
+cargo clippy -p dc-glob -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets -- -D warnings
 cargo fmt --all -- --check
+
+# Kernel (compiles every grammar). `--exclude dc-*` matches rust.yml so a
+# new `devmap-*` crate is tested without a hard-coded package list.
+cargo test --workspace --exclude dc-glob --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence
+./verify.sh
 ```
 
-Install all four components (including `devmap` from `rust-port/`):
+Install all four components (including `devmap`) from this workspace:
 
 ```bash
 bash scripts/install-components.sh
@@ -210,7 +218,7 @@ the boundary; a cached lease is one that has already expired somewhere else.
 
 `dc/devmap`'s `TestTheLive*` tests drive the **real** `devmap` binary rather than
 a fake, because the field names they decode are a contract with a producer built
-from another workspace, and a fake asserts only that the test and the code were
+from another crate, and a fake asserts only that the test and the code were
 written by the same hand. They skip visibly when `devmap` is absent, and CI
 fails if they skipped.
 
@@ -218,12 +226,12 @@ fails if they skipped.
 
 ## Where to look next
 
-- [`STATUS.md`](STATUS.md) — the port ledger: what was verified and how, what is
+- [`STATUS.md`](STATUS.md) — the analysis-plane port ledger: what was verified and how, what is
   deliberately different from MANVI's mirror, what is still open. **§4 is the one
   to read before planning a cutover**: these components are not uniformly better
   than the Python they resemble, and `dcverify`'s stub detection is measurably
   weaker than `verification/stub_detector.py`, which does AST analysis.
-- [`../rust-port/STATUS.md`](../rust-port/STATUS.md) — devmap's own ledger.
+- [`../docs/devmap/STATUS.md`](../docs/devmap/STATUS.md) — the kernel's own ledger.
 - MANVI's `docs/COMPONENTS_AND_HARNESS.md` — the consumer's view: the resolution
   ladder, where a change belongs, and the checklist a newly ported component
   must satisfy before anything depends on it.
@@ -261,9 +269,8 @@ them back.
 
 So before the Python is deleted, either repoint the generator at the new
 implementation, regenerate, **and re-apply those three rows** — or freeze the
-baseline and open a divergence ledger, which is what `rust-port/` chose when it
-faced this: see its [`DIVERGENCES.md`](../rust-port/DIVERGENCES.md) and
-[`tools/parity/parity_harness.py`](../rust-port/tools/parity/parity_harness.py).
+baseline and open a divergence ledger, which is what the kernel chose when it
+faced this: see [`../docs/devmap/DIVERGENCES.md`](../docs/devmap/DIVERGENCES.md).
 Three hand-maintained rows in a comment header are already a divergence ledger
 in everything but name, which is the argument for making it one.
 

@@ -86,7 +86,7 @@ Failure codes a build can raise: `binary_missing`, `schema_newer_than_kernel`, `
 
 Freshness uses git HEAD, a tracked-file hash, and a content fingerprint so plain edits mark the map stale. Fingerprint / git errors fail closed (treat as stale). A **missing** `.devcouncil/repo_map.json` is also stale — hard rigor blocks checkout/verify until `dev map` runs. The guides a build writes are restamped into the fingerprint, so a build never makes its own map read stale. Post-tool-use hooks run `dev map --if-stale --no-wiki`; `dev map --watch` wakes on filesystem events (debounced, with a slow poll as the safety net) and checks exactly the fingerprint `--if-stale` reads.
 
-HTML visualizers: `dev map html` shells out to the devmap kernel, so it needs a build new enough to have `map-html` (rebuild with `cargo build --release -p devmap-cli` in `rust-port/` if it refuses). Set `indexing.write_graph_html: true` in config if you want bare `dev map` to also write `graph.html`. Otherwise use `dev map graph-html` / `dev map view` (or alias `dev graph html`) for the file/symbol graph, and `dev map html` for the subsystem map.
+HTML visualizers: `dev map html` shells out to the devmap kernel, so it needs a build new enough to have `map-html` (rebuild with `bash scripts/install-components.sh devmap` if needed). Set `indexing.write_graph_html: true` in config if you want bare `dev map` to also write `graph.html`. Otherwise use `dev map graph-html` / `dev map view` (or alias `dev graph html`) for the file/symbol graph, and `dev map html` for the subsystem map.
 
 ## Sample graph demo (no map)
 
@@ -164,8 +164,7 @@ dev map affected request_handler   # tests in the inbound impact closure (kernel
 engine that loaded the whole graph into process memory. Both take a symbol or a
 `path::symbol` — `affected` resolves its targets through the same traversal
 matcher `impact` uses, so a bare file path works only when the graph has an edge
-touching that file. Three contract changes came with the move, recorded in
-`rust-port/DIVERGENCES.md` (`Q1`–`Q6`):
+touching that file. Three contract changes came with the move, designed into the engine:
 
 - `explore` ranks its matches before the cut and reports the index-wide match
   count, not the size of the page it returned; each caller/callee list keeps its
@@ -183,69 +182,38 @@ Concurrent writers (`dev map` in two shells, a daemon drain and a build) seriali
 
 The daemon (`devmap serve`, started on demand by the Python client for queries) watches the tree, coalesces events, and drains pending paths into the same store. Paths it cannot process — outside the root, no longer existing, oversized, not a source file — are dropped, not retried forever; `dev map status` names any that remain quarantined and `dev map repair --pending` drops them. The daemon retires after 30 idle minutes, when its executable changes, on SIGTERM, and when its root or store disappears.
 
-### File inventory (Python side)
+### File inventory
 
 The freshness fingerprint and the goal ranking are computed over the git inventory (`RepoMapper.get_git_files`):
 
 - `indexing.include_untracked` (default **on**) — include untracked-but-not-ignored files. **Keep this on**: a file an agent just wrote and has not staged is otherwise absent from the fingerprint, so a build after that write reads fresh.
 - `indexing.max_indexed_files` (default 50000) — hard ceiling on the inventory. Untracked paths are dropped first and the overflow is logged, never silently truncated. Generated trees (`node_modules`, `target`, `coverage`, `vendor`, `Pods`, `.next`, `.devcouncil`, binaries, archives, …) are excluded at any depth regardless.
 
-## Rust engine (`devmap`)
+## Code Intelligence Architecture (`devmap`)
 
-The `dev map` engine is **`devmap`**, a seven-crate workspace under [`rust-port/`](../rust-port/):
+The `dev map` engine is **`devmap`**, a compiled multi-crate architecture:
 
 | Crate | Responsibility |
 | :--- | :--- |
 | `devmap-extract` | tree-sitter parsing, wiring annotations, framework matchers, explicit unavailable outcomes |
 | `devmap-resolve` | import, call, and receiver-type resolution with typed confidence |
 | `devmap-analyze` | liveness / dead-code tiers and weighted communities |
-| `devmap-store` | rusqlite v6 schema, pending queue, history, differential writes |
+| `devmap-store` | rusqlite schema, pending queue, history, differential writes |
 | `devmap-query` | token-budgeted search / deps / manifest |
 | `devmap-serve` | file watcher and durable pending drain |
-| `devmap-cli` | the `devmap` binary |
+| `devmap-cli` | the `devmap` command-line binary |
 
-**The kernel is the production map engine; there is no Python fallback for building.**
-`dev map` / `dev graph` / `dev ast` exec the `devmap` binary. The Python
-`devmap_engine.py` / `devmap_client.py` seam was deleted with the product package
-in Phase 7. Locate `devmap` via `DEVMAP_BIN` / `PATH` / `~/.local/bin` (the npm
-shim and Go host both do this).
+**The native engine is the production map engine; there is no Python fallback for building.**
+`dev map` / `dev graph` / `dev ast` exec the `devmap` binary. Locate `devmap` via `DEVMAP_BIN` / `PATH` / `~/.local/bin` (the npm shim and Go host both resolve this).
 
-Those Python query/MCP surfaces (`check`, `process`, `cypher`, `pdg`, …) were
-deleted with the product package in Phase 7. Use `devmap` query commands and
-DevMap MCP tools instead.
+Build and run `devmap` directly:
 
 ```bash
-cd rust-port && ./verify.sh
-cargo build --release -p devmap-cli
-./target/release/devmap --version                       # devmap 0.1.0 (schema N)
-./target/release/devmap --db /tmp/t.sqlite --progress always build ./testdata
-./target/release/devmap --db /tmp/t.sqlite search helper --budget 500
+bash scripts/install-components.sh devmap
+devmap --version
+devmap build --manifest
+devmap search helper --budget 500
 ```
-
-- **Grammar coverage and remaining kernel limits** are recorded in
-  [rust-port/STATUS.md](../rust-port/STATUS.md). The Python product package is deleted (Phase 7);
-  `devmap` is the live map engine.
-
-[rust-port/STATUS.md](../rust-port/STATUS.md) is the authoritative ledger of what is verified and
-what is open; [rust-port/PHASE1_CONTRACT.md](../rust-port/PHASE1_CONTRACT.md) freezes the
-35-language specification the Rust registry is written against.
-
-## Debugger and runtime behavior
-
-```bash
-dev debug discover --consent
-dev debug start --adapter debugpy --config-json '{"program":"app.py"}'
-dev debug break SESSION app.py 12
-dev debug stack SESSION --thread 1
-dev debug evaluate SESSION 'expression' --frame 2 --allow-side-effects
-dev debug trace --python-script app.py
-dev debug trace --import node.cpuprofile
-dev debug stop SESSION
-```
-
-Debugger CLI sessions live in a token-protected loopback broker so control survives separate CLI invocations. MCP owns sessions in-process. DAP controls execution and inspects stopped state; exact/sampled runtime evidence is deliberately separate: Python uses `sys.setprofile`, Node consumes CPU profiles, DAP stacks are sampled observations, and JSONL providers can be imported. `evaluate` is a separate side-effectful operation and requires explicit approval. Debug values are truncated and secret-redacted.
-
-Runtime edges never become timeless static facts. Every session records repository/dirty-tree, build/configuration, adapter executable, and provider fingerprints; observations contribute to liveness and paths only when the source fingerprint matches the current workspace.
 
 ## Dead-code confidence tiers
 

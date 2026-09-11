@@ -311,7 +311,7 @@ func resolveDevmap() (string, error) {
 	}
 	found, err := lookPath("devmap")
 	if err != nil {
-		return "", fmt.Errorf("devmap binary not found on PATH or ~/.local/bin; build rust-port and install the `devmap` binary")
+		return "", fmt.Errorf("devmap binary not found on PATH or ~/.local/bin; build rust/ and install the `devmap` binary")
 	}
 	return found, nil
 }

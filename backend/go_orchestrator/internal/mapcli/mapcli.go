@@ -224,7 +224,7 @@ func usage(w io.Writer) {
 	b.WriteString("  --json        Emit exactly one JSON object on stdout; diagnostics on stderr.\n")
 	b.WriteString("  --root DIR    Repository to operate on (default: current directory).\n")
 	b.WriteString("\nThe devmap kernel is DEVMAP_BINARY when set (used or refused by name, never\n")
-	b.WriteString("replaced), else the newest capable build under the repository's rust-port/target,\n")
+	b.WriteString("replaced), else the newest capable build under the repository's rust/target,\n")
 	b.WriteString("else PATH.\n")
 	io.WriteString(w, b.String())
 }

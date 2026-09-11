@@ -1,7 +1,7 @@
 [package]
 name = "dc-verify"
 version.workspace = true
-edition.workspace = true
+edition = "2024"
 license.workspace = true
 description = "Deterministic verifier core: diff parsing and planned-scope classification"
 

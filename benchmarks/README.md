@@ -190,11 +190,11 @@ See `tasks.py` for the task suite and each task's hidden checks.
 ## Code-intelligence performance
 
 Python code-intel ratchets (`tests/performance`, `scripts/codeintel-benchmark.py`)
-are retired. The mapping engine's required gate is `rust-port/verify.sh`
+are retired. The mapping engine's required gate is `rust/verify.sh`
 (determinism, peak RSS, growth plateau, incremental-vs-cold soak).
 
 ```bash
-cd rust-port && ./verify.sh
+cd rust && ./verify.sh
 ```
 
 ---
@@ -212,7 +212,7 @@ rebuilt by hooks, by the watcher, and by hand.
 ## Running it
 
 ```bash
-cd rust-port
+cd rust
 ./verify.sh
 cargo run --release -p devmap-cli -- --db /tmp/scratch.sqlite --progress never --json build ..
 ```
@@ -246,7 +246,7 @@ For a finer breakdown than the five stages, run the kernel directly — each pha
 reports its own cost, and the persist phase is split into its four parts:
 
 ```bash
-rust-port/target/release/devmap --progress always build .
+rust/target/release/devmap --progress always build .
 ```
 
 ## Results: 2026-09-02 optimization pass

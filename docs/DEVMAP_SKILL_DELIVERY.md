@@ -96,9 +96,9 @@ Run from the DevCouncil root:
 go -C backend/go_orchestrator test ./devcouncil/skills -count=1
 ```
 
-From `rust-port`, run `cargo test -p devmap-cli --test claude_integration`.
+Run `cargo test --manifest-path rust/Cargo.toml -p devmap-cli --test claude_integration`.
 When the Claude CLI is available, also run the explicitly ignored acceptance
-test: `cargo test -p devmap-cli --test claude_integration the_emitted_bundle_passes_claude_plugin_validate_strict -- --ignored`.
+test: `cargo test --manifest-path rust/Cargo.toml -p devmap-cli --test claude_integration the_emitted_bundle_passes_claude_plugin_validate_strict -- --ignored`.
 From GitPulse, run `npm test -- scripts/agent-guidance.test.ts`.
 
 The delivery suite exercises 36 thread-contended installs and 16 subprocess

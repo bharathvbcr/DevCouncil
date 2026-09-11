@@ -30,7 +30,7 @@ consumer. Updating the DevCouncil CLI alone does not change an installed
 GitPulse application. There is no independently running DevCouncil cleaner and
 these changes do not install or enable schedules.
 
-Validation: run `cargo test --manifest-path rust-port/Cargo.toml -p devmap-query
+Validation: from the repository root, run `cargo test --manifest-path rust/Cargo.toml -p devmap-query
 --no-default-features` and the same package's Clippy check. The regression cases
 cover path traversal, mixed path separators, case-insensitive preservation,
 retention bounds and canonical guide inclusion; existing guide tests exercise

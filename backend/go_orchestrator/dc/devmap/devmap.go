@@ -192,7 +192,7 @@ func (c *Client) runProbe(ctx context.Context) error {
 		return fmt.Errorf(
 			"devmap at %s is too old: no --graph-output, so manifest cannot write the code graph "+
 				"the write gate reads; rebuild it with `cargo build --release -p devmap-cli` in "+
-				"DevCouncil's rust-port/, or point MANVI_MAP_BINARY at a current build",
+				"DevCouncil's rust/, or point MANVI_MAP_BINARY at a current build",
 			c.Binary)
 	}
 	return nil

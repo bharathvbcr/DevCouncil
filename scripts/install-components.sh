@@ -8,7 +8,7 @@
 #   dcstore    tasks and the lease that makes concurrent building safe
 #   dcverify   unified-diff parsing, scope classification, rigor gates, coverage
 #   dcgrep     ignore-aware repository search on ripgrep's engine
-#   devmap     the code-intelligence graph (built from rust-port/)
+#   devmap     the code-intelligence graph (built from rust/)
 #
 # Usage:
 #   bash scripts/install-components.sh                 # install all four
@@ -41,13 +41,11 @@ case "$PROFILE" in
   *) echo "PROFILE must be 'release' or 'debug', got '$PROFILE'" >&2; exit 2 ;;
 esac
 
-# Which workspace each component is built from. devmap is a separate workspace
-# because it carries ~36 tree-sitter grammars, and folding it in would make
-# every dc-verify test compile them.
+# Which workspace each component is built from. All four live in rust/;
+# `cargo test -p dc-verify` still does not compile tree-sitter grammars.
 component_workspace() {
   case "$1" in
-    dcstore|dcverify|dcgrep) echo "rust" ;;
-    devmap)                  echo "rust-port" ;;
+    dcstore|dcverify|dcgrep|devmap) echo "rust" ;;
     *) return 1 ;;
   esac
 }

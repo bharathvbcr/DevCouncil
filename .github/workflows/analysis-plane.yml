@@ -1,11 +1,12 @@
 name: analysis components (rust/ + go clients)
 
-# The dc-* components and their Go clients. `rust-port.yml` covers devmap and
-# matches only `rust-port/**`.
+# The dc-* components and their Go clients. `rust.yml` covers the devmap
+# kernel. This job tests only the analysis-plane packages so a dc-grep change
+# does not compile thirty tree-sitter grammars.
 #
 # Two jobs, because they fail for different reasons:
 #
-#   rust — the components themselves, on three platforms.
+#   rust — the dc-* components themselves, on three platforms.
 #   go   — the clients, driving real component binaries rather than fakes.
 #
 # The Python TaskLeaseRepository / CLI stdout-contract jobs were removed with
@@ -17,13 +18,11 @@ on:
     paths:
       - "rust/**"
       - "backend/go_orchestrator/**"
-      - "rust-port/**"
       - ".github/workflows/analysis-plane.yml"
   pull_request:
     paths:
       - "rust/**"
       - "backend/go_orchestrator/**"
-      - "rust-port/**"
       - ".github/workflows/analysis-plane.yml"
   workflow_dispatch:
 
@@ -51,7 +50,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy -p dc-glob -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets -- -D warnings
 
       # dc-store compiles SQLite from source (rusqlite "bundled"), so a failure
       # here is a C toolchain or portability problem rather than a test problem.
@@ -60,11 +59,14 @@ jobs:
       # the four crates were confirmed to compile for the MSVC target locally,
       # and dc-store's C build could not be cross-checked from macOS — this job
       # is where that answer comes from.
+      #
+      # Packages are named rather than `--workspace` so this job does not
+      # compile the kernel's tree-sitter grammars.
       - name: Build
-        run: cargo build --workspace --all-targets
+        run: cargo build -p dc-glob -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test -p dc-glob -p dc-grep -p dc-store -p dc-verify -p dc-evidence
 
   go:
     name: clients (${{ matrix.os }})
@@ -105,14 +107,14 @@ jobs:
       # when it is absent. A skip is visible but the job still goes green, and
       # devmap lives in this repository — so a devmap change could break its own
       # Go client here with nothing to notice. Building it makes those three
-      # tests actually run, which is why rust-port/** is in this workflow's
+      # tests actually run, which is why rust/** is in this workflow's
       # trigger paths.
       - name: Build devmap
-        working-directory: rust-port
+        working-directory: rust
         run: cargo build -p devmap-cli --bin devmap
 
       - name: Put devmap on PATH
-        run: echo "$GITHUB_WORKSPACE/rust-port/target/debug" >> "$GITHUB_PATH"
+        run: echo "$GITHUB_WORKSPACE/rust/target/debug" >> "$GITHUB_PATH"
 
       - name: Formatting
         working-directory: backend/go_orchestrator

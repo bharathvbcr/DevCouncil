@@ -1,153 +1,121 @@
-# Daily Workflow
+# Developer & Agent Workflow
 
-**Platforms:** macOS, Linux, and Windows (Go `dev`/`devcouncil`, Rust `devmap`, Git; Node.js 18+ only for the optional npm shim).
-**Maturity:** see [project-status.md](project-status.md).
-**Calculator fixture:** [`examples/build-week-demo/`](../examples/build-week-demo/) (Python tests for the sample; the `dev check --verify` driver was retired).
+DevCouncil provides a gated, evidence-first workflow for AI-assisted software development. It ensures that changes made by coding agents are bounded by scope, protected by mutual-exclusion leases, verified deterministically, and backed by a deep code intelligence graph.
 
-DevCouncil's recommended default is **Manual Sidecar Mode**:
+---
 
-1. DevCouncil plans the work and creates a task graph.
-2. You ask DevCouncil for one constrained task prompt.
-3. You paste that prompt into your coding CLI or agent.
-4. The agent edits the repository.
-5. DevCouncil verifies the resulting diff against task constraints.
-6. If verification fails, DevCouncil creates a focused repair loop.
+## The Workflow Stages
 
-For coding agents that need one entrypoint instead of the task-by-task sidecar loop, run:
-
-```bash
-dev e2e "Describe the implementation goal" --executor codex
+```
+   ┌─────────────────────────────────────────────────────────────┐
+   │ 1. Code Awareness & Exploration (devmap)                   │
+   │    • devmap build --manifest                                │
+   │    • devmap impact <file>  |  devmap trace <a> <b>          │
+   └──────────────────────────────┬──────────────────────────────┘
+                                  │
+                                  ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │ 2. Environment & Skills Setup (devcouncil)                  │
+   │    • devcouncil integrate <host> --apply [--write-gate]     │
+   │    • devcouncil skills scaffold --skill <name>              │
+   └──────────────────────────────┬──────────────────────────────┘
+                                  │
+                                  ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │ 3. The Verified Task Loop (devcouncil mcp / dcverify)       │
+   │    • Checkout task & acquire lease (dcstore)                │
+   │    • Implement edits inside declared file scope             │
+   │    • Verify diff deterministically (dcverify)               │
+   │    • On failure: self-repair guided by typed next_actions   │
+   │    • On success: release lease & record evidence            │
+   └─────────────────────────────────────────────────────────────┘
 ```
 
-`dev e2e` and `dev go` share the same end-to-end implementation: plan, execute, verify, report. If `--executor` is omitted, they use `execution.default_executor` from `.devcouncil/config.yaml`.
+---
 
-**One-command onboarding:** `dev boot "goal"` runs setup, applies integrations (unless `--skip-integrations`), optionally scaffolds CI, then hands off to `dev go`. See [quickstart.md](quickstart.md).
+## Stage 1: Code Awareness & Impact Analysis
 
-For machine-readable integration, add `--agent` with the selected automated executor. It enables JSON report output and writes `.devcouncil/reports/latest.json`.
-
-## 1. Create The Implementation Plan
+Before any files are modified, use the `devmap` code intelligence engine to understand dependencies and avoid breaking call sites:
 
 ```bash
-dev plan "Add password reset with expiring single-use tokens"
+# 1. Update the code graph and workspace guides (AGENTS.md / CLAUDE.md)
+devmap build --manifest
+
+# 2. Check blast radius and reverse dependents of target files
+devmap impact src/service.go
+
+# 3. Trace call paths between components
+devmap trace EntryPoint TargetFunction
+
+# 4. Identify dead code or unwired modules before adding new ones
+devmap dead
 ```
 
-DevCouncil maps the repository, drafts requirements, runs planner and critic roles, and stores an approved task graph locally. To preview the interactive code-graph UI before mapping, run `dev map demo` (writes self-contained interactive `.devcouncil/graph/demo.html`; a static `demo.svg` may also be written).
+The precomputed index identifies callers, callees, and imports across 36+ languages without invoking an LLM.
 
-Before planning (or after large refactors), refresh navigation artifacts and preview the graph UI:
+---
+
+## Stage 2: Agent Integration & Skills Delivery
+
+Prepare the target repository for your coding agent or IDE (Cursor, Claude Code, Codex, Antigravity, OpenCode, Warp):
 
 ```bash
-dev map                 # repo_map.json + code_graph.json + AGENTS.md/CLAUDE.md
-dev map ingest          # unified analyze entry (sync + map + optional embeddings)
-dev map query SYMBOL    # callers / callees
-dev map dead            # dead-code tiers
-dev map demo            # sample self-contained interactive HTML (no map)
-dev map graph-html      # write symbol graph.html (`dev map html` = subsystems)
-dev map view            # serve interactive graph.html for this repo
-dev corpus build        # advisory docs/PDF/image index (optional verify gates)
+# 1. Apply integration configuration (registers MCP tools and config)
+devcouncil integrate cursor --apply
+devcouncil integrate claude --apply --write-gate
+devcouncil integrate antigravity --apply
+
+# 2. Distribute verified engineering and navigation skills into the project
+devcouncil skills scaffold --skill core-engineering
+devcouncil skills scaffold --skill devmap
 ```
 
-A missing or stale map fails closed on hard rigor — run `dev map` or `dev map ingest`
-before `dev verify` on strict tasks. Write policy soft-blocks edits outside planned
-files unless the target is in the same subsystem or a map neighbor (`dev scope update`
-to widen scope).
+Skills are placed in standard directories (`.agents/skills/`, `.claude/skills/`, `.cursor/skills/`) where coding agents automatically discover and execute them.
 
-See [code-graph.md](code-graph.md) for the full map/graph surface and [corpus.md](corpus.md)
-for the documentation side index.
+---
 
-Inspect the plan:
+## Stage 3: The Verified Task Loop
+
+### Option A: Autonomous Closed Loop via MCP (Recommended)
+
+When working with an agent capable of MCP tool calls (Claude Code, Cursor, Codex, Antigravity), DevCouncil runs as an MCP stdio server:
 
 ```bash
-dev status
-dev tasks
-dev show TASK-001
+devcouncil mcp
 ```
 
-## 2. Start One Task
+The agent executes the certified **Hero Loop**:
+1. **Task Checkout:** Calls `devcouncil_checkout_task`. Acquires an atomic lease in `dcstore`, locking the task against concurrent agents and receiving planned file scope and verification criteria.
+2. **Implementation:** Edits code strictly within declared planned files.
+3. **Task Verification:** Calls `devcouncil_verify_task`. The deterministic verifier (`dcverify`) evaluates the captured diff:
+   - **Scope Enforcement:** Detects unauthorized file edits outside planned boundaries.
+   - **Anti-Laziness:** Catches stubs, empty functions, and unfulfilled TODOs.
+   - **Coverage & Tests:** Verifies test execution against modified lines.
+   - **Secret Scanning:** Blocks committed API tokens and credentials.
+4. **Self-Repair:** If verification fails, DevCouncil emits structured, typed `next_actions`. The agent iterates on repairs until the gates pass.
+5. **Release:** Once verified, calls `devcouncil_release_task` to complete the task and record evidence.
+
+### Option B: Human-in-the-Loop CLI Verification
+
+For sidecar workflows where developers manually prompt agents or run local tests:
 
 ```bash
-dev run TASK-001 --executor manual
+# 1. Inspect diff and verify against task gates
+devcouncil verify TASK-001
+
+# 2. Machine-readable JSON output for local automation
+devcouncil verify TASK-001 --json
+
+# 3. Verification inside an isolated Docker sandbox container
+devcouncil verify TASK-001 --sandbox docker
 ```
 
-This creates a checkpoint and marks the task as running. DevCouncil expects the next repository diff to match this task's allowed files, acceptance criteria, and verification commands.
+---
 
-## 3. Generate The Coding Prompt
+## Stage 4: Autonomous Harness Orchestration (Manvi)
 
-```bash
-dev prompt TASK-001
-```
+For fully automated, multi-turn development campaigns, DevCouncil is designed to be paired with upstream harnesses such as **Manvi**:
+- **Manvi** owns the agent loop, LLM provider routing (OpenRouter, Vertex AI, Ollama), terminal UI, and role assignments.
+- **DevCouncil** provides the high-integrity substrate: Go host orchestrator, `devmap` code intelligence, atomic `dcstore` leases, and deterministic `dcverify` gating.
 
-Paste the full output into your coding CLI. The generated prompt includes the task objective, allowed files, constraints, acceptance criteria, and evidence requirements.
-
-## 4. Verify The Result
-
-After the coding CLI modifies the repository:
-
-```bash
-dev verify TASK-001
-```
-
-Verification records evidence and marks the task as either `verified` or `blocked`.
-
-Inspect the result:
-
-```bash
-dev status
-dev report
-dev report --json
-```
-
-## 5. Repair Gaps
-
-If verification blocks the task, convert the gaps into focused repair work:
-
-```bash
-dev repair
-dev tasks
-dev prompt REPAIR-001
-```
-
-Paste the repair prompt into the same coding CLI, then verify again:
-
-```bash
-dev verify REPAIR-001
-dev verify TASK-001
-```
-
-## 6. Continue Task By Task
-
-```bash
-dev tasks
-dev show TASK-002
-dev run TASK-002 --executor manual
-dev prompt TASK-002
-dev verify TASK-002
-dev report
-```
-
-Recommended working rules:
-
-- Run DevCouncil and the coding CLI from the same repository root.
-- Give the coding CLI one DevCouncil task prompt at a time.
-- Do not ask the coding CLI to broaden scope beyond the generated prompt.
-- In `gates.mode=enforce`, run `dev verify TASK-ID` before accepting
-  agent-generated changes. In `advisory`, verification is optional and findings
-  are non-blocking; in `off`, report completion as unverified.
-- Use `dev repair` for follow-up fixes instead of free-form retry prompts.
-- Use `dev rollback TASK-ID` if a task needs to be reverted from its checkpoint.
-- Treat `.devcouncil/` as local project state and the audit trail for the gated run.
-- With Claude/Codex hooks installed, Stop runs claim checks + optional task verify (`execution.stop_gate`); treat those messages as completion evidence, not just chat noise.
-
-## 7. Live review (`dev watch`)
-
-Optional Sage-style sidecar; under `gates.mode=enforce`, verification remains the final authority:
-
-```bash
-dev watch sessions --client claude
-dev watch review --client claude --latest
-dev watch follow --client claude --latest
-dev watch pending --client claude
-dev watch cards
-dev watch status --task-id TASK-001
-```
-
-`dev watch review` normalizes Claude-style or generic JSONL transcripts, writes critique cards under `.devcouncil/live/cards/`, and can block `dev verify` on open `Critical Issues` until `dev watch resolve CARD-ID`. Deterministic local reviewer by default; add `--llm` for the configured live-reviewer role. MCP: `devcouncil_live_review`, `devcouncil_live_cards`, `devcouncil_live_repair_prompt`.
+See [Architecture](architecture.md) and [Hero Loop](hero-loop.md) for more details.

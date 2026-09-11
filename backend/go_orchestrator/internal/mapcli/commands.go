@@ -141,7 +141,7 @@ func runDoctor(ctx context.Context, env *Env, args []string) (Payload, error) {
 			Detail: "no devmap binary answered the capability probe",
 		})
 		out.Reasons = append(out.Reasons, "kernel missing or incapable")
-		out.Remedy = "cargo install --path rust-port/crates/devmap-cli, or set DEVMAP_BINARY"
+		out.Remedy = "cargo install --path rust/devmap-cli, or set DEVMAP_BINARY"
 		// Without a kernel the remaining checks have nothing to ask, so the
 		// report ends here rather than inventing verdicts it did not measure.
 		return out, nil

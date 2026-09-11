@@ -1,4 +1,7 @@
-# Corpus side index
+# Corpus side index (Retired)
+
+> [!NOTE]
+> **Retirement Notice:** The Python `dev corpus` prototype CLI was retired in Phase 7. Repository search and concept exploration are consolidated into the native `devmap search` engine. See [PHASE7_LONG_TAIL.md](PHASE7_LONG_TAIL.md).
 
 Advisory mixed-corpus graph for docs, PDFs, and images. Separate from the
 deterministic code graph in `.devcouncil/graph/`, but can feed **opt-in verify

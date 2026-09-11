@@ -1,5 +1,8 @@
 # Model Routing
 
+> [!NOTE]
+> **Architectural Boundary:** LLM provider routing (OpenRouter, Vertex AI, Doubleword, Ollama) and role models are now owned by upstream agent harnesses such as **Manvi** (see [PHASE7_LONG_TAIL.md](PHASE7_LONG_TAIL.md)). DevCouncil provides the native Go/Rust verification and code intelligence substrate without requiring model provider keys.
+
 DevCouncil implements `ModelRouter` and `Provider` architectures.
 Provider-specific role defaults are loaded from `src/devcouncil/llm/model_defaults.yaml` and can be replaced at initialization time.
 It also supports Vertex AI through Google's OpenAI-compatible Chat Completions endpoint.

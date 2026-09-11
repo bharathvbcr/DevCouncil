@@ -56,11 +56,11 @@ func Unavailable(t testing.TB, format string, args ...any) {
 }
 
 // RepoRoot returns the directory that holds the Rust workspace used to build
-// dcstore/dcverify/dcgrep.
+// dcstore/dcverify/dcgrep/devmap.
 //
-// Canonical sources live in DevCouncil's `rust-port/` (Phase 3). Manvi keeps
-// only symlinks under `crates/` for local cargo. Walk for either marker so
-// tests run from both repositories.
+// Canonical sources live in DevCouncil's `rust/`. Manvi keeps only
+// symlinks under `crates/` for local cargo. Walk for either marker so tests
+// run from both repositories.
 func RepoRoot(t testing.TB) string {
 	t.Helper()
 	dir, err := os.Getwd()
@@ -68,7 +68,7 @@ func RepoRoot(t testing.TB) string {
 		t.Fatalf("getwd: %v", err)
 	}
 	for {
-		if _, err := os.Stat(filepath.Join(dir, "rust-port", "Cargo.toml")); err == nil {
+		if _, err := os.Stat(filepath.Join(dir, "rust", "Cargo.toml")); err == nil {
 			return dir
 		}
 		if _, err := os.Stat(filepath.Join(dir, "crates", "Cargo.toml")); err == nil {
@@ -76,7 +76,7 @@ func RepoRoot(t testing.TB) string {
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			t.Fatalf("no repository root above %s (looking for rust-port/Cargo.toml or crates/Cargo.toml)", dir)
+			t.Fatalf("no repository root above %s (looking for rust/Cargo.toml or crates/Cargo.toml)", dir)
 		}
 		dir = parent
 	}
@@ -142,7 +142,7 @@ func cargoBin(t testing.TB, crate, binary string) string {
 	buildsMu.Unlock()
 
 	b.once.Do(func() {
-		crates := filepath.Join(root, "rust-port")
+		crates := filepath.Join(root, "rust")
 		if _, err := os.Stat(filepath.Join(crates, "Cargo.toml")); err != nil {
 			crates = filepath.Join(root, "crates")
 		}

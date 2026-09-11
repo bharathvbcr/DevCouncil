@@ -1,74 +1,42 @@
 # Project Status
 
-DevCouncil is early-stage and under active development. Public commands are grouped by maturity so users can distinguish stable daily workflow surfaces from preview integrations.
+DevCouncil is under active development. Public commands and components are grouped by maturity to distinguish stable daily workflow surfaces from preview features and retired legacy subsystems.
 
-Status labels:
+Maturity labels:
+- **Stable**: Production-ready for daily development, verified by deterministic tests and golden fixtures.
+- **Preview**: Fully functional; API, flag names, or output formats may undergo refinement.
+- **Retired**: Legacy subsystems replaced or removed during the transition to compiled Go and Rust binaries.
 
-- **Stable**: intended for normal task planning, execution, verification, and reporting.
-- **Preview**: usable, but API/output shape and behavior may still change.
-- **Experimental**: available for local trials; keep it behind explicit user choice and DevCouncil verification gates.
+---
 
-**Flagship path — the Claude Code hero loop.** The certified end-to-end experience is the
-autonomous Claude Code + MCP closed loop: `checkout_task → implement → verify_task →
-next_actions → self-repair`, gated by deterministic verification including the
-diff↔coverage check. See [hero-loop.md](hero-loop.md). The underlying verifier, the
-diff↔coverage gate, the typed next-actions contract, and the lite `dev check --verify`
-on-ramp are Stable; the **certified Claude Code MCP closed loop** (checkout → write →
-verify → repair → release) is Stable — see [hero-loop.md](hero-loop.md#certified-path-stable).
-Other coding CLI hooks remain Preview as noted below.
+## Current Subsystems Matrix
 
-| Area | Status |
-| :--- | :--- |
-| **CLI & Storage** | Stable: Go `devcouncil` host (`mcp`, `integrate`, `skills`, `verify`) plus `dcstore`; `dev map`/`graph`/`ast` exec Rust `devmap` |
-| **Artifact Graph** | Stable: coverage engine and report generation |
-| **Council Debate** | Stable: multi-agent planning, critique, arbitration |
-| **Manual Executor** | Stable: sidecar mode |
-| **Coding CLI Executors** | Preview: Codex, Claude, OpenCode, Antigravity, Warp, Cursor Agent, Aider, Copilot, Goose, Amp, Qwen, Crush, and configured CLI agents. **Gemini CLI is deprecated** (compat via `--executor gemini`; migrate to Antigravity). |
-| **Ollama (local provider)** | Stable: offline planning and council roles via local Ollama models; no API key required |
-| **Engineering Skills** | Stable: `dev skills` listing/scaffolding; skills embedded in `dev prompt` and planning context |
-| **OKF & design.md** | Preview: `dev okf export`/`ingest`/`validate`/`html`; `dev design lint`/`export`/`check`; OKF ↔ skills bridge |
-| **CI Scaffolding** | Preview: `dev scaffold-ci` writes starter GitHub Actions workflows from configured commands (Python/Node/Go/Rust stacks); `dev scaffold-ci --evidence` adds verify → artifact upload with PR + push diff bases (`VERIFY_BASE`). Dogfooded in this repo |
-| **One-command onboarding (`dev boot`)** | Preview: `dev boot "goal"` runs setup, applies `dev integrate --apply` (unless `--skip-integrations`), optional `--scaffold-ci` / `--scaffold-ci-evidence`, then `dev go` |
-| **Cost & Run Telemetry** | Stable: `dev cost show` reads local model-call ledger; `dev runs list`/`show` inspects coding-agent run manifests |
-| **Security Scanning** | Stable: secret redaction and detection |
-| **Diff↔Coverage Gate** | Stable: proves the changed lines were exercised by tests; signal-first, opt-in blocking (`verification.diff_coverage`) |
-| **Next-Actions Contract** | Stable: typed, machine-routable repair steps from `dev verify --json`, `dev check --json`, and MCP `verify_task` |
-| **Lite Check (`dev check --verify`)** | Stable: deterministic working-tree evidence gate with no planning and no provider keys |
-| **Repair Loop (deterministic)** | Stable: `dev go`/`dev e2e` drive a bounded, attempt-accounted self-repair loop — correction manifest from blocking gaps + next-actions, capped by `execution.max_repair_attempts`, with no-progress fingerprint detection. Task-scoped failed evidence; repair plan files/tests merged into scope. |
-| **LLM repair inference** | Preview: optional `RepairService` sharpens correction-manifest root cause when a provider key is configured; not required for the deterministic loop |
-| **Native Executor** | Preview: `native` / `native-preview` — strict lease/scope writes and shared verify/next-actions loop in `enforce`; advisory/off relax or skip quality gates |
-| **MCP Server (Claude Code hero loop)** | Stable opt-in strict loop: lease-gated writes, typed next-actions, renew/list leases, golden e2e fixtures |
-| **Multi-agent Campaign (`dev campaign`)** | Preview: parallel dependency-wave dispatch, Reviewer QC gate, per-task leases, cost budget + dashboard progress. Tasks that share writable `planned_files` are serialized when `--max-parallel` > 1 (one git working tree). |
-| **Coding CLI Hooks** | Preview: unified stop gate on Claude/Codex Stop+SubagentStop (`execution.stop_gate`; `assist` seeded on integrate when unset). Cursor/Grok pre/post hooks only (no Stop gate). Gemini hooks deprecated (explicit `--tool gemini` only). |
-| **Stop gate & claim checks** | Preview: map completion claims → independent command/filesystem checks; combine with optional active-task verify. See [coding-cli-integration.md](coding-cli-integration.md#stop-gate-assist-vs-block-executionstop_gate). |
-| **Corpus side index** | Preview: `dev corpus build`/`query`/`status`; optional rigor gates `corpus_stale`, `doc_code_ref`, `acceptance_corpus` (soft by default). See [corpus.md](corpus.md). |
-| **PDG / CFG / taint** | Preview: opt-in Python intra-procedural analysis (`dev map --pdg`, `dev map pdg-query` / `explain`). Off by default. See [code-graph.md](code-graph.md). |
-| **Rust map engine (`devmap`)** | Stable for map/graph/ast: the live map is the seven-crate workspace under [`rust-port/`](../rust-port/). Python is not the live engine (the product package was deleted in Phase 7). `dev map` / `dev graph` / `dev ast` exec `devmap`. Ledger: [rust-port/STATUS.md](../rust-port/STATUS.md). |
-| **GitHub PR Checks** | Preview: `dev report --github` |
-| **GitHub/GitLab PR Comments** | Preview: `dev report --github-pr-comment`, `dev report --gitlab-pr-comment` |
-| **LSP / AST Indexing** | Preview: `dev lsp inspect`, `dev ast match` |
-| **Repo Map & Code Graph** | Stable: `dev map` umbrella (liveness, incremental `--watch` / `--if-stale`, plus `query|trace|dead|check|process|impact|graph-html|view|demo|export|ingest|search|cypher`) — sample self-contained interactive HTML via `dev map demo` → `demo.html` (see [code-graph.md](code-graph.md)). `dev graph …` is a compatibility alias. Opt-in PDG/taint and live LSP refs remain Preview (separate rows). **Known limits:** compatibility JSON may be skipped when over `indexing.graph_json_max_bytes` (store stays committed; `dev map doctor` flags degraded export); semantic embeddings are opt-in and generation-filtered with a soft scan cap; Louvain communities abort after 15s. MCP graph tools wait for sync freshness and mark `stale` when pending. |
-| **Live Dashboard** | Stable: local-only operator UI via `dev dashboard --open` — status panels, blocking-first gaps table, recent runs; loopback + token-guarded apply controls |
+| Subsystem | Binary / Implementation | Status | Description |
+|---|---|---|---|
+| **Host Orchestrator** | `devcouncil` / `dev` (Go) | **Stable** | Static native binary providing the MCP server (`mcp`), host integration (`integrate`), skills distribution (`skills`), and task verification (`verify`). |
+| **Code Intelligence** | `devmap` (Rust) | **Stable** | Compiler-grade code graph, 36+ tree-sitter extractors, symbol resolution, blast-radius impact analysis, dead code detection, and workspace guide generation. |
+| **Task & Lease Store** | `dcstore` (Rust) | **Stable** | SQLite-backed task repository with atomic mutual-exclusion leases for safe concurrent agent building. |
+| **Deterministic Verifier** | `dcverify` (Rust) | **Stable** | Unified-diff parsing, declared planned-file scope enforcement, anti-laziness stub detection, and typed `next_actions` repair signals. |
+| **Search Engine** | `dcgrep` (Rust) | **Stable** | Ripgrep-powered ignore-aware search engine with optional trigram indexing (`tgrep-core`). |
+| **Hero Loop (MCP Closed Loop)** | Go Host + `dcverify` | **Stable** | Autonomous closed loop for Claude Code and Cursor over MCP (`checkout → implement → verify → repair → release`). |
+| **Agent Integrations** | `devcouncil integrate` | **Stable** | Native configurations for Cursor, Claude Code, Codex, Antigravity, OpenCode, and Warp. |
+| **Engineering Skills** | `devcouncil skills` | **Stable** | Embedding and scaffolding of verified skills (`core-engineering`, `devmap`, etc.) into target repositories. |
+| **Sandboxed Verification** | `devcouncil verify --sandbox` | **Preview** | Execution of verification commands inside isolated Docker or Nix containers. |
 
-## Watch mode (`dev check --watch`)
+---
 
-**Status:** Preview — incremental gate selection re-runs only the lint/typecheck/test
-commands affected by each save, using a content-hash cache to skip unchanged inputs.
+## Retired Subsystems (Phase 7 Migration)
 
-**Known limitations:**
+As part of the consolidation into standalone native binaries, the following legacy Python orchestrator components were retired:
 
-- **Narrowed type-checking** — mypy/pyright gates are scoped to touched files plus
-  *direct import dependents* from `.devcouncil/repo_map.json`. Transitive or
-  dynamic-import type errors in other files can still be missed. Run full
-  `dev verify` (or `dev check --verify`) before commit when types matter.
-- **Config edits** — changing `pyproject.toml`, `ruff.toml`, `mypy.ini`, `tsconfig.json`,
-  and similar project config files now re-runs the matching stack gates (with the config
-  file in the cache inputs), but lockfile-only or toolchain-version changes outside that
-  set may still require a manual full verify.
+| Legacy Surface | Historical Function | Current Architecture / Successor |
+|---|---|---|
+| **Python CLI Launcher** | Typer/Click `dev` commands | Replaced by native Go `devcouncil` / `dev` binary and Node.js npm shim. |
+| **Council Debate & Planning** | Multi-agent LLM debate (`dev plan`, `dev approve`) | Transitioned to upstream agent harnesses (e.g. **Manvi**). |
+| **Agent Hub & Campaign** | Subprocess runner (`dev run`, `dev e2e`, `dev campaign`) | Handled over MCP via **Hero Loop** or orchestrated via **Manvi**. |
+| **Codebase Wiki & OKF** | Markdown wiki & OKF bundle generator (`dev wiki`, `dev okf`) | Replaced by `devmap build --guides` (`AGENTS.md`, `CLAUDE.md`). |
+| **Textual Dashboard** | Terminal dashboard (`dev dashboard`) | Replaced by DevMap visualizers (`devmap view`) and Manvi TUI. |
+| **Corpus Side Index** | Doc/PDF/image index (`dev corpus`) | Consolidated into `devmap search` and standard repository mapping. |
+| **Legacy Provider Routing** | Provider cost ledger & routing (`dev cost`, `dev setup`) | LLM routing is owned by upstream agent harnesses (e.g. **Manvi**). |
 
-## Near-term focus
-
-- Promote more Preview surfaces (hooks, corpus) once API shapes settle
-- PR-diff verify in CI scaffold
-- Broader Stop-gate support beyond Claude/Codex where host APIs allow
-- Deeper corpus ↔ acceptance criterion linking
+For complete rationale and architectural decisions regarding the retired surfaces, see [PHASE7_LONG_TAIL.md](PHASE7_LONG_TAIL.md).

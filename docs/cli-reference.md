@@ -1,199 +1,177 @@
 # CLI Command Reference
 
-**Platforms:** macOS, Linux, and Windows. Requires Go (`dev`/`devcouncil`), Rust/`cargo` (`devmap`), and Git. Node.js 18+ is only needed for the optional npm shim.
-**Maturity:** Stable / Preview / Experimental labels live in [project-status.md](project-status.md).
-**Live commands (Phase 7):** `devcouncil mcp|integrate|skills|verify` plus `dev map|graph|ast` (exec `devmap`). Other names below were the Python CLI and now exit 2.
-**Graph:** `dev map` / `devmap build --manifest`.
-**Calculator fixture:** [`examples/build-week-demo/`](../examples/build-week-demo/) (Python sample only; `dev check` is gone).
+This is the comprehensive reference for DevCouncil's native binaries: the Go host orchestrator (`devcouncil` / `dev`) and the Rust analysis components (`devmap`, `dcstore`, `dcverify`, `dcgrep`).
+
+**Platforms:** macOS, Linux, Windows.  
+**Maturity:** Stable / Preview labels live in [project-status.md](project-status.md).
+
+---
+
+## 1. Go Host Orchestrator (`devcouncil` / `dev`)
+
+The same binary is installed as both `devcouncil` and `dev`.
 
 ```bash
-dev init                    # Initialize DevCouncil in a repo
-dev init --provider vertexai --model YOUR_MODEL_ID # Initialize with one model for every role
-dev init --provider doubleword --model YOUR_MODEL_ID # Doubleword drop-in OpenAI-compatible provider
-dev init --provider ollama --model qwen2.5-coder:32b # Local Ollama provider (no API key)
-dev init --role-model planner_b=YOUR_MODEL_ID # Override one role model during init
-dev setup                   # Initialize, run doctor, offer first-run integrations, and print next steps
-dev doctor                  # Check dependencies and environment (includes subsystem maturity table)
-dev version                 # Display the installed DevCouncil version
-dev e2e "goal" --executor codex # Plan, execute, verify, and report in one command
-dev e2e "goal" --executor codex --agent # Agent preset: JSON plus .devcouncil/reports/latest.json
-dev e2e "goal" --executor codex --force  # Proceed past advisory planning gaps automatically
-dev e2e "goal" --executor codex --json --report-file .devcouncil/reports/latest.json # Write machine-readable report
-dev go "goal" --executor codex # Short alias for dev e2e
-dev map                     # Build the map + code graph through the devmap kernel (no LLM); no-op on an unchanged tree
-dev map --full              # Force a cold rebuild in the kernel (re-parse everything, new generation)
-dev map --goal "…"          # Optional goal text for candidate-file ranking (was a positional arg)
-dev map --if-stale          # Skip rebuild when the on-disk map fingerprint is still fresh
-dev map --pdg               # Also compute the opt-in Python PDG/CFG/taint layer
-dev map --wiki / --no-wiki  # Refresh codebase-wiki skeletons after map (default on)
-dev map --scan-deps         # Opt-in SCA auditors → dependency_risks (off by default)
-dev map --watch             # Rebuild on filesystem events (debounced; slow poll as the safety net)
-dev map html                # Write interactive .devcouncil/map.html (subsystem view)
-dev map html --open         # Write and open the subsystem map HTML
-dev map graph-html          # Write symbol-level .devcouncil/graph/graph.html
-dev map html --symbols      # Same as graph-html (alias path: `dev graph html`)
-dev map init | ingest | sync  # The same kernel build as `dev map`, JSON-friendly (`--json`); ingest reports the paths back
-dev map status              # Engine binary, store (schema, size, free pages, WAL), kernel freshness, daemon, artifact writers
-dev map doctor              # Verdicts with fixes; exit 1 on a critical finding (no kernel, store newer than kernel, foreign writer)
-dev map repair --pending    # Drop pending-queue entries the kernel can never index (quarantined, moved, oversized)
-dev map doctor --fix        # Apply every fix a repository can apply (marker, quarantine, repair, one build), then re-check
-dev map runs --last 10      # Records of recent kernel runs: argv, exit, duration, notes, diagnosis code (`--failed`, `--json`)
-dev map abort               # Stop the running kernel build safely (store stays on the prior generation)
-dev map query NAME          # 360° symbol view: definition, callers, callees, importers
-dev map trace A B           # Shortest path between two graph nodes
-dev map dead                # Dead-code report with confidence tiers (extracted|inferred|ambiguous); uncapped
-                            # Exits 3 when the index was built from a different commit than HEAD
-                            # (stale evidence is never silently green); refresh with `dev map`
-dev map dead --allow-stale  # Accept a stale-index report explicitly (exit 0)
-dev map dead --min-confidence inferred  # Filter to inferred+extracted only
-dev map check               # God nodes (top-connected) and circular-import detection
-dev map process [ENTRY]     # BFS call-flows from entry roots
-dev map impact PATH...      # Blast radius for paths (or --diff for working-tree changes)
-dev map search QUERY        # FTS5 symbol/path search over the committed generation
-dev map search QUERY --semantic  # Name-similarity ranking in the kernel (no embedding index)
-dev map cypher 'MATCH … RETURN …'  # Supported Cypher subset over native SQLite graph store
-dev map explain --category command-injection  # PDG taint findings (opt-in PDG layer)
-dev map pdg-query --mode controls --target SYMBOL  # PDG control dependence
-dev map pdg-query --mode flows --target SYMBOL --variable x  # PDG data flows
-dev map view                # Serve/open the graph HTML via a local HTTP server
-dev map demo                # Sample self-contained interactive HTML demo.html (no map); optional static demo.svg; see docs/code-graph.md
-dev map export -o out.graphml  # Export GraphML (or --format okf / okf-links)
-# Migration: `dev graph X` is a compatibility alias for `dev map X` (except `dev map html` = subsystems)
-dev scaffold-ci             # Write a starter .github/workflows/devcouncil.yml from configured commands
-dev scaffold-ci --force     # Overwrite an existing devcouncil.yml workflow
-dev scaffold-ci --evidence  # Also write .github/workflows/devcouncil-evidence.yml (verify → evidence artifacts)
-dev boot "goal"             # One-command setup + integrate --apply + go (see quickstart)
-dev boot "goal" --skip-integrations --scaffold-ci-evidence --executor codex # Opt out of integration apply; optional CI scaffold; pass executor to go
-dev plan "goal"             # Run the full planning council debate
-dev approve                 # Approve the latest generated plan (AWAITING_USER_DECISIONS -> PLAN_APPROVED)
-dev approve --force         # Approve even if blocking gate gaps remain
-dev approve --run-id RUN-ID # Approve a specific planning run's decision
-dev check                   # LLM audit of current changes (no planning required)
-dev check --verify -t "pytest -q" # Deterministic evidence gate on the working tree (no provider keys)
-dev check --verify --enforce-coverage # Block when changed lines are not exercised by tests
-dev check --json            # Machine-readable check output
-dev status                  # Show current project state and cost
-dev tasks                   # List planned tasks, statuses, and active lease owners (Lease column)
-dev tasks cancel TASK-001   # Cancel a task that is not done or cancelled
-dev tasks edit TASK-001 --title "New title" # Edit task metadata (title, priority, scope fields)
-dev tasks reprioritize TASK-001 --priority high # Change task priority (high | medium | low)
-dev gaps                    # List all verification gaps (blocking and advisory)
-dev gaps --blocking-only --fail-on-blocking # Exit non-zero when blocking gaps remain
-dev gaps --json             # Machine-readable gap list
-dev requirements            # List requirements with derived status and linked task counts
-dev requirements --json     # Machine-readable requirements summary
-dev export                  # Write requirements, tasks, and gaps to .devcouncil/export/state.json
-dev export --json           # Print export payload to stdout
-dev export -o ./snapshot.json # Write export to a custom path
-dev show TASK-001           # Show task details and constraints
-dev prompt TASK-001         # Generate prompt for an external agent
-dev run TASK-001            # Execute task via selected executor
-dev run TASK-001 --executor copilot # Built-in executors: codex, claude, opencode, antigravity, warp, cursor, aider, copilot, goose, amp, qwen, crush (gemini deprecated — compat only)
-dev verify TASK-001         # Verify diff, commands, and evidence
-dev verify TASK-001 --sandbox local|docker|nix # Run verification in a sandbox
-dev shell TASK-001 --command "pytest tests/" # Run one guarded shell command
-dev watch fs --task TASK-001 --once           # Attribute filesystem changes once
-dev semantic snapshot TASK-001 --stage before # Capture semantic snapshot
-dev semantic diff TASK-001                    # Compare semantic before/after snapshots
-dev evidence suggest TASK-001 --apply         # Append high-confidence expected tests
-dev handoff TASK-001 --from codex --to aider  # Write agent handoff manifest
-dev repair                  # Generate repair tasks from gaps
-dev report                  # Generate final evidence report
-dev report --github-pr-comment # Post the report as a GitHub PR comment
-dev report --gitlab-pr-comment # Post the report as a GitLab MR comment
-dev report release-health # Classify blockers as historical debt vs RC regressions
-dev okf export -o ./bundle   # Export the artifact graph as an Open Knowledge Format bundle
-dev okf validate ./bundle    # Validate an OKF bundle (typed docs, resolved links)
-dev okf ingest ./bundle      # Ingest an OKF bundle as planning/coding context
-dev okf html ./bundle -o ./site # Render an OKF bundle as a self-contained static HTML site
-dev design lint              # Lint the project design.md (refs, contrast, ordering)
-dev design export -f css     # Export design tokens (css | tailwind | w3c)
-dev design show              # Summarize design tokens and sections
-dev design check [files...]  # Fail on hardcoded color/spacing/typography literals that bypass design.md tokens (CI-friendly, exits non-zero)
-dev rollback TASK-001       # Revert changes using task checkpoint
-dev mcp-server              # Start DevCouncil MCP server over stdio
-dev integrate hooks --apply # Install Codex, Claude, Cursor, Grok, and OpenCode hooks (Gemini excluded from --tool all; deprecated explicit --tool gemini)
-dev integrate aider --apply   # Enable built-in Aider headless executor
-dev hook --help             # Show lower-level hook commands
-dev integrate all --apply   # Configure supported coding CLI integrations
-dev integrate cursor --apply # Write project Cursor MCP config for DevCouncil
-dev integrate opencode --apply # Write project OpenCode MCP config for DevCouncil
-dev integrate antigravity --apply # Write project Antigravity MCP config for DevCouncil
-dev integrate warp --apply  # Write Warp/Oz MCP config for DevCouncil
-dev integrate cli-agent NAME --command TOOL --apply # Register any prompt-taking CLI executor
-dev integrate <client> --decouple # Strip PreToolUse/before containment only; keep MCP + PostToolUse
-dev integrate <client> --uninstall # Surgically remove DevCouncil MCP/hooks/assets for that client
-dev integrate decouple --target all|hooks|claude|cursor|opencode|… # Multi-target decouple
-dev integrate uninstall --target all|hooks|claude|cursor|opencode|… # Multi-target uninstall
-dev integrate recommend
-dev integrate status
-dev integrate status --json
-dev integrate matrix
-dev integrate check
-dev integrate check --strict
-dev integrate check --json
-dev integrate check --report-file .devcouncil/integration-report.json
-dev integrate check -o .devcouncil/integration-report.json
-dev run TASK --stream       # Stream coding CLI output live during execution
-dev integrate all --apply --strict  # Apply integrations then run strict check
-dev go GOAL                 # Auto-picks first coding CLI on PATH when default_executor is manual
-dev integrate doctor        # Check optional integration tools
-dev agents                  # List built-in and custom CLI agents
-dev agents add NAME --command TOOL # Register a prompt-taking CLI agent
-dev agents doctor           # Check agent PATH, prompt mode, help command, and profile wiring
-dev agents run TASK-001 --agent NAME --profile default # Run a task with a named CLI agent
-dev agents optimize --agent codex --profile yolo --evals .devcouncil/evals/agent-profile.jsonl --dry-run # GEPA prompt-profile optimization
-dev skills                  # List bundled engineering skills and which apply to this repo
-dev skills show NAME        # Print the full body of one skill
-dev skills scaffold         # Write applicable skills to .claude/skills/<name>/SKILL.md
-dev cost show               # Report estimated model-call cost grouped by task and run
-dev cost show --json        # Machine-readable cost report
-dev runs list               # List recorded coding-agent runs, newest first
-dev runs list --json        # Machine-readable run summaries (includes orphaned flag)
-dev runs list --status running --limit 10 # Filter by status; default limit 20
-dev runs show RUN-ID        # Show a run manifest plus a redacted transcript tail
-dev runs show RUN-ID --json # Full manifest, orphaned flag, and redacted transcript tail
-dev runs timeline REF       # Full reversible trace for a run id or task id (events, checkpoints, diff stat)
-dev runs timeline REF --json --limit 40 # JSON timeline; default limit 40 events
-dev runs diff REF           # Workspace changes the run produced (from git checkpoints)
-dev runs diff REF --stat    # Diff stat only
-dev runs revert REF         # Reverse workspace effects (prompts for confirmation)
-dev runs revert REF --yes   # Skip confirmation (-y)
-dev runs supervise REF      # Supervisor verdict: keep | revert | repair (default --llm)
-dev runs supervise REF --no-llm # Deterministic heuristics only (no run_supervisor model role)
-dev runs supervise REF --apply  # CLI-only: revert immediately when verdict is revert
-dev runs supervise REF --json   # Machine-readable verdict payload
-dev lsp inspect             # Inspect optional language-server readiness
-dev lsp inspect --json        # Compact {mode, servers_detected, note} JSON for automation
-dev ast match "symbol"      # Search symbols with structural AST matching
-dev dashboard --open        # Serve the live local status dashboard and open a browser
-dev trace tail --follow     # Tail local DevCouncil trace events
-dev logs tail -n 100        # Tail the durable run log (.devcouncil/logs/devcouncil.log)
-dev logs tail -f --grep ERROR # Follow the log, showing only matching lines
-dev logs tail --run RUN-ID  # Read one executor run's isolated run.log
-dev logs runs               # List per-run logs, newest first
-dev <command> -v | -vv | -q # Raise/lower console log verbosity (file always DEBUG)
-dev artifacts validate      # Validate stored artifact integrity
-dev config                  # Inspect or update configuration
-dev config show             # Display key DevCouncil settings (executor, rigor, gates)
-# semantic_layer / FAISS (`uv sync --group semantic`) was retired with the Python package.
-dev config set execution.command_timeout 600 # Set a common dotted config key
-dev config set execution.stop_gate.mode assist # Stop-hook claim+verify gate (off|assist|block); see coding-cli-integration.md
-dev config set gates.mode off      # Skip quality gates/verification; hard safety remains active
-dev config set gates.mode advisory # Run checks and record non-blocking findings
-dev config set gates.mode enforce  # Run checks and block on failures (default)
-dev corpus build            # Build advisory doc/PDF/image corpus graph (config.yaml paths)
-dev corpus query "topic"    # Search corpus concepts
-dev corpus status           # Corpus freshness vs doc fingerprints
-dev config models --model YOUR_MODEL_ID # Update every configured model role
-dev config models --role-model critic_a=YOUR_MODEL_ID # Update one model role by name
-dev wiki update             # Generate/refresh the agent-facing codebase wiki (OKF bundle)
-dev wiki status             # Report wiki freshness vs the current repo map
-dev campaign run            # Parallel multi-agent campaign over the planned task graph
-dev campaign roster         # Show campaign role hierarchy
-dev campaign inbox          # Inspect the on-disk campaign mailbox
-dev baseline                # Capture a verification baseline of current changes
-dev optimize --agent codex --profile yolo --evals .devcouncil/evals/agent-profile.jsonl # Alias for dev agents optimize
-dev reset-demo-state        # Clear demo planning artifacts from the local DevCouncil state
-dev integrations status     # Alias for dev integrate status
+Usage:
+  devcouncil mcp                                       # Run the MCP stdio server
+  devcouncil integrate HOST [options]                  # Configure coding agent integrations
+  devcouncil integrate uninstall --target hooks        # Uninstall integration hooks
+  devcouncil skills list                               # List embedded agent skills
+  devcouncil skills scaffold [options]                 # Distribute skills into project
+  devcouncil verify TASK_ID [options]                  # Deterministically verify a task diff
+  devcouncil map [devmap args…]                        # Exec `devmap` (bare: build --manifest)
+  devcouncil graph …                                   # Alias of map
+  devcouncil ast …                                     # Exec `devmap ast`
 ```
+
+### Host MCP Server
+
+```bash
+devcouncil mcp
+# or: devcouncil mcp-server
+```
+
+Runs the Model Context Protocol (MCP) stdio server. Exposes tools for task management, atomic leases, diff inspection, policy write checks, and task verification to connected agents (Claude Code, Cursor, Codex, Antigravity).
+
+### Agent Host Integrations
+
+```bash
+devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR] [--write-gate]
+```
+
+Supported hosts: `cursor`, `claude`, `codex`, `gemini`, `opencode`, `warp`, `aider`, `antigravity`.
+
+- `--apply`: Write configuration files to the target repository.
+- `--check`: Read-only verification that integration files match expected content.
+- `--dry-run`: Print planned actions without modifying files.
+- `--write-gate`: Install blocking PreToolUse write gates (Claude Code, Cursor).
+- `--project-root DIR`: Specify target project directory (defaults to `$DEVCOUNCIL_PROJECT_ROOT` or `pwd`).
+
+```bash
+# Example usage:
+devcouncil integrate cursor --apply
+devcouncil integrate claude --apply --write-gate
+devcouncil integrate antigravity --apply
+devcouncil integrate claude --check
+devcouncil integrate uninstall --target hooks --apply
+```
+
+### Agent Skills Distribution
+
+```bash
+devcouncil skills list
+devcouncil skills scaffold [--skill NAME] [--project-root DIR] [--dry-run] [--check]
+```
+
+- `devcouncil skills list`: List packaged domain and code intelligence skills embedded in the binary.
+- `devcouncil skills scaffold`: Install skills into `.agents/skills`, `.claude/skills`, and `.cursor/skills`.
+- `--skill NAME`: Scaffold an individual skill (e.g. `--skill core-engineering` or `--skill devmap`).
+- `--check`: Verify existing skill files match current versions without modifying them.
+
+### Task Verification
+
+```bash
+devcouncil verify TASK_ID [--json] [--sandbox local|docker|nix] [--project-root DIR]
+```
+
+Verifies code changes associated with `TASK_ID` using the deterministic verification engine (`dcverify`).
+- Checks planned file scope, diff validity, anti-laziness/stubs, and test execution.
+- `--json`: Output machine-readable verification results and typed `next_actions` for agent self-repair.
+- `--sandbox local|docker|nix`: Run verification commands in a sandbox container or local environment.
+
+### DevMap Shorthands
+
+```bash
+dev map [args...]      # Runs `devmap`. Bare invocation runs: devmap build --manifest
+dev graph [args...]    # Alias for `dev map`
+dev ast [args...]      # Execs `devmap ast`
+```
+
+---
+
+## 2. Code Intelligence Engine (`devmap`)
+
+High-performance multi-language code graph and symbol analysis engine (extract → resolve → analyze → store → query → serve).
+
+```bash
+# Build & Lifecycle
+devmap build --manifest     # Generate repo_map.json and code_graph.json
+devmap build --watch        # Rebuild on filesystem events (debounced)
+devmap build --if-stale     # Build only if source files changed since last generation
+devmap build --full         # Force a cold rebuild (re-parse all files)
+devmap status [--json]      # Report store schema, page stats, generation, freshness
+devmap doctor [--fix]       # Check store health, orphan entries, and repair issues
+devmap paths [--json]       # Print resolved store, cache, and artifact paths
+
+# Code Exploration & Navigation
+devmap query <SYMBOL>       # 360° symbol view: definitions, callers, callees, importers
+devmap trace <SRC> <DST>    # Shortest dependency or call path between two graph nodes
+devmap impact <PATH...>     # Blast radius & reverse dependents for paths
+devmap dead [--json]        # Unreferenced code with confidence tiers (extracted|inferred|ambiguous)
+devmap search <QUERY>       # FTS5 symbol and path search over current generation
+devmap cypher '<QUERY>'     # Execute supported Cypher queries against the SQLite graph store
+
+# Visualizers & Servers
+devmap view                 # Serve and open interactive graph visualizer locally
+devmap demo                 # Output standalone demo.html visualizer
+devmap map-html             # Generate subsystem map HTML (.devcouncil/map.html)
+devmap graph-html           # Generate symbol-level graph HTML (.devcouncil/graph/graph.html)
+devmap serve --mcp          # Run standalone DevMap MCP server over stdio
+```
+
+---
+
+## 3. Analysis & State Suite (`dcstore`, `dcverify`, `dcgrep`)
+
+### Task & Lease Store (`dcstore`)
+
+Provides atomic mutual-exclusion leases and persistent SQLite task storage:
+
+```bash
+dcstore --db <PATH> health
+dcstore --db <PATH> acquire --task <ID> --owner <OWNER> --client-id <CLIENT> --ttl-seconds <N>
+dcstore --db <PATH> renew --task <ID> --token <TOKEN> --ttl-seconds <N>
+dcstore --db <PATH> release --task <ID> --token <TOKEN>
+dcstore --db <PATH> status --task <ID>
+dcstore --db <PATH> next-task
+```
+
+### Deterministic Verifier (`dcverify`)
+
+Diff parser, scope classifier, and rigor gate evaluator:
+
+```bash
+dcverify health
+dcverify check [--planned <FILE>] [--coverage <LCOV>] [--root <DIR>] < unified.diff
+dcverify evidence-check --contract <PATH> --bundle <PATH> [options]
+```
+
+### Ripgrep Engine Search (`dcgrep`)
+
+Ignore-aware high-speed repository search with optional trigram index:
+
+```bash
+dcgrep health
+dcgrep search < request.json
+dcgrep files < request.json
+dcgrep index < request.json
+```
+
+---
+
+## 4. Retired Commands
+
+With Phase 7 and the transition to native Go and Rust binaries, legacy Python CLI commands have been retired. Invoking them via the Go binary exits 2 with `unknown command`:
+
+| Retired Command | Historical Function | Current Architecture / Replacement |
+|---|---|---|
+| `dev setup` / `dev init` | Python repo setup & doctor | Run `devmap build --manifest` + `devcouncil integrate <host> --apply`. |
+| `dev plan` / `dev approve` | Multi-agent LLM debate & tasks | Managed by upstream agent harnesses (e.g. **Manvi**) or interactive prompts. |
+| `dev run` / `dev e2e` / `dev go` | Python subprocess coding agent runner | Run agents natively via MCP (**Hero Loop**) or via **Manvi**. |
+| `dev prompt` / `dev handoff` | Formatted text prompt generation | Handled over MCP via task checkout contexts and skills. |
+| `dev check` / `dev check --verify` | Python LLM audit / demo check | Use `devcouncil verify TASK_ID` or `dcverify check`. |
+| `dev wiki` / `dev okf` / `dev design` | Markdown wiki & OKF bundle generator | Replaced by `devmap build --guides` (`AGENTS.md`, `CLAUDE.md`). |
+| `dev dashboard` | Textual dashboard UI | Replaced by DevMap visualizers (`devmap view`) and Manvi TUI. |
+| `dev cost` / `dev doctor` | Python model pricing ledger & env checks | Health checks via `devmap doctor` and binary health flags. |
+
+For detailed rationale on the retirement decisions, see [PHASE7_LONG_TAIL.md](PHASE7_LONG_TAIL.md).

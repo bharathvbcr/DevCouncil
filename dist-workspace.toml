@@ -1,8 +1,8 @@
-# cargo-dist workspace root. The Cargo workspace itself lives under rust-port/;
+# cargo-dist workspace root. The Cargo workspace itself lives under rust/;
 # this file sits at the git root so `dist` (and the generated Release workflow)
 # find a project without needing a checkout-relative `cd`.
 [workspace]
-members = ["cargo:./rust-port"]
+members = ["cargo:./rust"]
 
 # Config for 'dist'
 [dist]

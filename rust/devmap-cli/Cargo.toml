@@ -1,0 +1,42 @@
+[package]
+name = "devmap-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "devmap CLI — symbol-level code intelligence for coding agents"
+build = "build.rs"
+
+[[bin]]
+name = "devmap"
+path = "src/main.rs"
+
+[dependencies]
+devmap-extract = { path = "../devmap-extract" }
+devmap-resolve = { path = "../devmap-resolve" }
+devmap-analyze = { path = "../devmap-analyze" }
+devmap-store = { path = "../devmap-store" }
+devmap-query = { path = "../devmap-query" }
+devmap-serve = { path = "../devmap-serve" }
+clap.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+# Retention tests assert that pruned generations leave no rows in any
+# generation-scoped table. That is a per-table row-count question with no
+# equivalent on the public Store API, and exposing a raw-SQL escape hatch on
+# Store purely for tests would be worse. Already a workspace dependency built
+# for devmap-store, so no new crate enters the tree.
+rusqlite.workspace = true
+# The worktree-stress example bounds editor/build fan-out the same way the
+# old Python harness did (`ThreadPoolExecutor(max_workers=…)`).
+rayon.workspace = true
+
+[[example]]
+name = "worktree_stress"
+path = "examples/worktree_stress/main.rs"

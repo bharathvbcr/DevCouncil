@@ -96,7 +96,7 @@ function Install-RustComponents {
         @{ Name = "dcstore"; Workspace = "rust"; Package = "dc-store" },
         @{ Name = "dcverify"; Workspace = "rust"; Package = "dc-verify" },
         @{ Name = "dcgrep"; Workspace = "rust"; Package = "dc-grep" },
-        @{ Name = "devmap"; Workspace = "rust-port"; Package = "devmap-cli" }
+        @{ Name = "devmap"; Workspace = "rust"; Package = "devmap-cli" }
     )
     foreach ($c in $components) {
         $ws = Join-Path $RepoRoot $c.Workspace

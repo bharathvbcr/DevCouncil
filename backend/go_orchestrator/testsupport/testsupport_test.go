@@ -35,7 +35,7 @@ import (
 func TestBuiltBinaryIsNotAPathCargoRewrites(t *testing.T) {
 	bin := DCStore(t)
 	root := RepoRoot(t)
-	crates := filepath.Join(root, "rust-port")
+	crates := filepath.Join(root, "rust")
 	if _, err := os.Stat(filepath.Join(crates, "Cargo.toml")); err != nil {
 		crates = filepath.Join(root, "crates")
 	}
