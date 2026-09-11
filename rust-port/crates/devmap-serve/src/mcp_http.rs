@@ -409,17 +409,27 @@ fn decode_header_value(value: &str) -> Option<String> {
     else {
         return Some(value.to_string());
     };
+    // RFC 4648 sections 3.2–3.5: padding belongs only at the end, the
+    // encoded quantum is four characters, and unused pad bits are zero.
+    // Stopping at the first '=' accepted an arbitrary suffix as a checked
+    // header, even when it contained characters outside the base64 alphabet.
+    if !encoded.len().is_multiple_of(4) {
+        return None;
+    }
+    let unpadded = encoded.trim_end_matches('=');
+    if encoded.len() - unpadded.len() > 2 {
+        return None;
+    }
     let mut bytes = Vec::with_capacity(encoded.len() * 3 / 4);
     let mut accumulator: u32 = 0;
     let mut bits: u32 = 0;
-    for byte in encoded.bytes() {
+    for byte in unpadded.bytes() {
         let sextet = match byte {
             b'A'..=b'Z' => byte - b'A',
             b'a'..=b'z' => byte - b'a' + 26,
             b'0'..=b'9' => byte - b'0' + 52,
             b'+' => 62,
             b'/' => 63,
-            b'=' => break,
             _ => return None,
         };
         accumulator = (accumulator << 6) | u32::from(sextet);
@@ -428,6 +438,9 @@ fn decode_header_value(value: &str) -> Option<String> {
             bits -= 8;
             bytes.push((accumulator >> bits) as u8);
         }
+    }
+    if accumulator & ((1 << bits) - 1) != 0 {
+        return None;
     }
     String::from_utf8(bytes).ok()
 }

@@ -40,6 +40,9 @@ cargo test --workspace
 
 if [ "$QUICK" -eq 1 ]; then echo "quick mode: skipping determinism/perf/mutants"; exit 0; fi
 
+step "release worker panic recovery (executable, not test profile)"
+cargo run --release --locked -q -p devmap-serve --example worker_recovery_probe
+
 # Where `cargo` actually put the release binary. Steps 5 and 8 run it directly
 # rather than through `cargo run`, so they have to agree with cargo about the
 # path — and `CARGO_TARGET_DIR` is set by anyone running two lanes against one

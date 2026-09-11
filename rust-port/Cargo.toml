@@ -27,11 +27,11 @@ members = [
 [profile.release]
 lto = "thin"
 codegen-units = 1
-# Abort rather than unwind. The CLI has no `catch_unwind` recovery anywhere — a
-# panic already ends the process — so unwinding tables are landing-pad code and
-# inlining barriers for a path that never runs. Tests keep the default unwind
-# profile, so `#[should_panic]` coverage is unaffected.
-panic = "abort"
+# The daemon and MCP transports recover worker failures through Tokio's
+# JoinError. Aborting bypasses that recovery and every unwinding cleanup.
+# Tests force unwinding regardless of this setting; verify.sh therefore runs
+# worker_recovery_probe as an executable under the release profile.
+panic = "unwind"
 
 # The profile that 'dist' will build with
 [profile.dist]

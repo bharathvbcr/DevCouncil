@@ -885,6 +885,40 @@ async fn hostile_header_values_are_refused_without_dropping_the_connection() {
     );
 }
 
+#[tokio::test]
+async fn audit_malformed_base64_cannot_pass_a_matching_header_check() {
+    let address = start().await;
+    let body = with_request_meta(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"devmap_status","arguments":{}}}"#,
+    );
+    for encoded in [
+        "ZGV2bWFwX3N0YXR1cw==trailing",
+        "ZGV2bWFwX3N0YXR1cw==!!!!",
+        "ZGV2bWFwX3N0YXR1cw===",
+        "ZGV2bWFwX3N0YXR1cw=",
+        "ZGV2bWFwX3N0YXR1cw",
+        "ZGV2bWFwX3N0YXR1cw=A",
+        "ZGV2bWFwX3N0YXR1cx==",
+    ] {
+        let headers: Vec<_> = mirrored_headers(&body)
+            .into_iter()
+            .map(|(name, value)| {
+                if name.eq_ignore_ascii_case("Mcp-Name") {
+                    (name, format!("=?base64?{encoded}?="))
+                } else {
+                    (name, value)
+                }
+            })
+            .collect();
+        let (status, response) = request(&address, &raw_post(&body, &headers)).await;
+        assert_eq!(
+            status, 400,
+            "malformed encoding {encoded:?} passed: {response}"
+        );
+        assert_eq!(response["error"]["code"], -32020);
+    }
+}
+
 /// `initialize` is not a method of the revision this endpoint serves.
 ///
 /// The handshake was removed in `2026-07-28` and `server/discover` replaces it,

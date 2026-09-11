@@ -1,0 +1,644 @@
+{
+  "audit_date": "2026-09-10",
+  "completed_utc": "2026-09-10T23:30:52.471751+00:00",
+  "provenance": {
+    "captured_utc": "2026-09-10T22:38:15.539873+00:00",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "python": "3.14.7",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+    "base_commit": "0197cdaa3b8e4ab15f55a219c6a237e8be646165",
+    "branch": "codex/devmap-rust-audit-20260910",
+    "canonical_repo": "/Users/bharath/Code/devtools/DevCouncil",
+    "audit_worktree": "/Users/bharath/.codex/worktrees/devmap-rust-audit-20260910/DevCouncil",
+    "baseline_dirty_patch_sha256": "472646bbd644b1b9f1e363ebdd9ed63682e487e91abe4e3f915dfc363c91850c",
+    "preflight_collisions": {
+      "overlapping_files": 53,
+      "scanned_worktrees": 2,
+      "unscanned_worktrees": 0,
+      "truncated": true
+    },
+    "new_dependencies": 0,
+    "installed_binaries_changed": false
+  },
+  "qualified_binary": {
+    "binary": "/tmp/devmap-rust-audit-20260910/qualified/devmap",
+    "sha256": "bea21be24a38d90f0024cf6d0638996c85491fc1b392d87ce2f20c1c6156d7d8",
+    "bytes": 62840032,
+    "version": "devmap 0.1.1 (store schema 20, code graph schema 2)",
+    "source_manifest_sha256": "2aa584d44d8edc22a3885ff69a63f7c3d480777223946126bc4b3e0af247f41b"
+  },
+  "workspace_tests": {
+    "passed": 2543,
+    "ignored": 3,
+    "result_groups": 230,
+    "ignored_tests": [
+      "the_emitted_bundle_passes_claude_plugin_validate_strict",
+      "a_storm_kill_restart_cycle_converges_on_the_cold_build",
+      "concurrent_prune_writer_child"
+    ]
+  },
+  "parser_free_tests": {
+    "per_crate": [
+      {
+        "crate": "devmap-extract",
+        "targets": 10,
+        "passed": 163,
+        "ignored": 0
+      },
+      {
+        "crate": "devmap-resolve",
+        "targets": 3,
+        "passed": 21,
+        "ignored": 0
+      },
+      {
+        "crate": "devmap-analyze",
+        "targets": 5,
+        "passed": 47,
+        "ignored": 0
+      },
+      {
+        "crate": "devmap-store",
+        "targets": 17,
+        "passed": 226,
+        "ignored": 1
+      },
+      {
+        "crate": "devmap-query",
+        "targets": 13,
+        "passed": 210,
+        "ignored": 0
+      }
+    ],
+    "passed": 667,
+    "ignored": 1
+  },
+  "self_build": {
+    "milliseconds": 2840,
+    "db_mib": 205,
+    "files": 1708,
+    "db_gate_mib": 266,
+    "peak_rss_mib": 862
+  },
+  "rss_gate_mib": 930,
+  "mutations": {
+    "distinct_generated": 62,
+    "assertion_caught": 58,
+    "timeouts": 4,
+    "residual_missed": 0,
+    "scope": "group_clones; parse_where; split_on_keyword; normalize_whitespace"
+  },
+  "input_fuzz": {
+    "seed": 20260910,
+    "requested_files_per_language": 8,
+    "rounds": 64,
+    "mutated_extractions_executed": 9984,
+    "elapsed_seconds": 264.15
+  },
+  "capacity_128": {
+    "worktrees": 128,
+    "simultaneous_daemons": 128,
+    "simultaneous_editors": 256,
+    "build_workers": 8,
+    "tokio_workers_per_process": 2,
+    "rayon_workers_per_process": 2,
+    "binary_sha256": "bea21be24a38d90f0024cf6d0638996c85491fc1b392d87ce2f20c1c6156d7d8",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "ipc_transport": "unix_socket",
+    "ipc_probe_process": false,
+    "latency_includes_probe_startup": false,
+    "latency_includes_probe_admission": false,
+    "ipc_probe_workers": 0,
+    "ipc_probe_admission_timeout_seconds": 0,
+    "initial_source_files_per_worktree": 65,
+    "initial_symbols_per_worktree": 579,
+    "initial_functions_per_worktree": 514,
+    "initial_call_edges_per_worktree": 449,
+    "fixture_functions_per_file": 8,
+    "rounds": 4,
+    "edit_operations": 12288,
+    "ipc_queries": 1024,
+    "metadata_checks": 512,
+    "cold_comparisons": 128,
+    "kills": 128,
+    "daemon_rss_kib_samples": [
+      3298048,
+      3267488,
+      3231920,
+      3188656
+    ],
+    "passed": true,
+    "filesystem_retry_attempts": 0,
+    "filesystem_retry_deadline_seconds": 5,
+    "initial_edges_per_worktree": 963,
+    "distinct_private_heads": 128,
+    "elapsed_seconds": 55.375,
+    "ipc_probe_peak_active": 0,
+    "query_latency_ms": {
+      "samples": 1024,
+      "p50": 31.554,
+      "p95": 150.701,
+      "max": 341.735
+    }
+  },
+  "capacity_large": {
+    "worktrees": 8,
+    "simultaneous_daemons": 8,
+    "simultaneous_editors": 16,
+    "build_workers": 4,
+    "tokio_workers_per_process": 2,
+    "rayon_workers_per_process": 2,
+    "binary_sha256": "bea21be24a38d90f0024cf6d0638996c85491fc1b392d87ce2f20c1c6156d7d8",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "ipc_transport": "unix_socket",
+    "ipc_probe_process": false,
+    "latency_includes_probe_startup": false,
+    "latency_includes_probe_admission": false,
+    "ipc_probe_workers": 0,
+    "ipc_probe_admission_timeout_seconds": 0,
+    "initial_source_files_per_worktree": 4097,
+    "initial_symbols_per_worktree": 135171,
+    "initial_functions_per_worktree": 131074,
+    "initial_call_edges_per_worktree": 126977,
+    "fixture_functions_per_file": 32,
+    "rounds": 6,
+    "edit_operations": 1152,
+    "ipc_queries": 96,
+    "metadata_checks": 32,
+    "cold_comparisons": 8,
+    "kills": 12,
+    "daemon_rss_kib_samples": [
+      6509776,
+      5862032,
+      5614272,
+      5230944,
+      5226560,
+      5221152
+    ],
+    "passed": true,
+    "filesystem_retry_attempts": 0,
+    "filesystem_retry_deadline_seconds": 5,
+    "initial_edges_per_worktree": 258051,
+    "distinct_private_heads": 8,
+    "elapsed_seconds": 166.782,
+    "ipc_probe_peak_active": 0,
+    "query_latency_ms": {
+      "samples": 96,
+      "p50": 2.153,
+      "p95": 4.135,
+      "max": 9.778
+    }
+  },
+  "daemon_storm": {
+    "cycles": 40,
+    "rss_first_half_mean_kib": 128470,
+    "rss_second_half_mean_kib": 124255,
+    "passed": true
+  },
+  "build_soak": {
+    "plateau": [
+      {
+        "metric": "rss",
+        "first_cycles": [
+          11,
+          25
+        ],
+        "first_mean_bytes": 23269649,
+        "second_cycles": [
+          26,
+          40
+        ],
+        "second_mean_bytes": 23288217,
+        "limit_bytes": 25596613
+      },
+      {
+        "metric": "db",
+        "first_cycles": [
+          11,
+          25
+        ],
+        "first_mean_bytes": 1484390,
+        "second_cycles": [
+          26,
+          40
+        ],
+        "second_mean_bytes": 1486574,
+        "limit_bytes": 1632829
+      }
+    ],
+    "log": "/Users/bharath/Documents/Codex/2026-09-10/devmap-rust-audit/evidence/build-soak-final.log",
+    "samples": "/Users/bharath/Documents/Codex/2026-09-10/devmap-rust-audit/evidence/build-soak-final.csv"
+  },
+  "daemon_soak": {
+    "plateau": [
+      {
+        "metric": "rss",
+        "first_cycles": [
+          400,
+          949
+        ],
+        "first_mean_bytes": 27099136,
+        "second_cycles": [
+          950,
+          1500
+        ],
+        "second_mean_bytes": 27199789,
+        "limit_bytes": 29809049
+      },
+      {
+        "metric": "db",
+        "first_cycles": [
+          400,
+          949
+        ],
+        "first_mean_bytes": 18520785,
+        "second_cycles": [
+          950,
+          1500
+        ],
+        "second_mean_bytes": 12592325,
+        "limit_bytes": 20372863
+      }
+    ],
+    "log": "/Users/bharath/Documents/Codex/2026-09-10/devmap-rust-audit/evidence/daemon-soak-1500-final.log",
+    "samples": "/Users/bharath/Documents/Codex/2026-09-10/devmap-rust-audit/evidence/daemon-soak-1500-final.csv"
+  },
+  "daemon_soak_stopped_store": {
+    "store": "/tmp/devmap-rust-audit-20260910/daemon-soak-1500-corpus/.devmap/codeintel/devmap.sqlite",
+    "database_bytes": 1687552,
+    "wal_bytes": 0,
+    "integrity": [
+      [
+        "ok"
+      ]
+    ],
+    "foreign_keys": [],
+    "page_size": 16384,
+    "page_count": 103,
+    "freelist_count": 12,
+    "generations": [
+      [
+        46
+      ],
+      [
+        47
+      ]
+    ],
+    "table_counts": {
+      "generations": 2,
+      "generation_files": 462,
+      "generation_nodes": 875,
+      "generation_edges": 791,
+      "generation_unresolved": 420,
+      "pending_paths": 0
+    }
+  },
+  "retained_failed_soaks": [
+    {
+      "label": "daemon-soak-final",
+      "argv": [
+        "bash",
+        "tools/soak.sh",
+        "/tmp/devmap-rust-audit-20260910/daemon-soak-corpus",
+        "100",
+        "--daemon"
+      ],
+      "cwd": "/Users/bharath/.codex/worktrees/devmap-rust-audit-20260910/DevCouncil/rust-port",
+      "started_utc": "2026-09-10T23:16:15.623029+00:00",
+      "timeout_seconds": 600,
+      "timed_out": false,
+      "exit_code": 1,
+      "elapsed_seconds": 36.6796875410364
+    },
+    {
+      "label": "daemon-soak-500-final",
+      "argv": [
+        "bash",
+        "tools/soak.sh",
+        "/tmp/devmap-rust-audit-20260910/daemon-soak-long-corpus",
+        "500",
+        "--daemon"
+      ],
+      "cwd": "/Users/bharath/.codex/worktrees/devmap-rust-audit-20260910/DevCouncil/rust-port",
+      "started_utc": "2026-09-10T23:18:17.390354+00:00",
+      "timeout_seconds": 600,
+      "timed_out": false,
+      "exit_code": 1,
+      "elapsed_seconds": 158.75824062497122
+    }
+  ],
+  "commands": {
+    "parser-free-final": {
+      "label": "parser-free-final",
+      "argv": [
+        "bash",
+        "/tmp/devmap-rust-audit-20260910/qualify-features.sh"
+      ],
+      "cwd": "/Users/bharath/.codex/worktrees/devmap-rust-audit-20260910/DevCouncil/rust-port",
+      "started_utc": "2026-09-10T22:57:29.539145+00:00",
+      "timeout_seconds": 900,
+      "timed_out": false,
+      "exit_code": 0,
+      "elapsed_seconds": 81.93427195900586
+    },
+    "verify-final": {
+      "label": "verify-final",
+      "argv": [
+        "bash",
+        "./verify.sh"
+      ],
+      "cwd": "/Users/bharath/.codex/worktrees/devmap-rust-audit-20260910/DevCouncil/rust-port",
+      "started_utc": "2026-09-10T22:59:11.063918+00:00",
+      "timeout_seconds": 1200,
+      "timed_out": false,
+      "exit_code": 0,
+      "elapsed_seconds": 426.5626619589748
+    },
+    "capacity-128-final": {
+      "label": "capacity-128-final",
+      "argv": [
+        "python3",
+        "tools/worktree_stress.py",
+        "--binary",
+        "/tmp/devmap-rust-audit-20260910/qualified/devmap",
+        "--worktrees",
+        "128",
+        "--rounds",
+        "4",
+        "--build-workers",
+        "8",
+        "--fixture-files",
+        "64",
+        "--functions-per-file",
+        "8",
+        "--output",
+        "/tmp/devmap-rust-audit-20260910/capacity-128-final.json"
+      ],
+      "cwd": "/Users/bharath/.codex/worktrees/devmap-rust-audit-20260910/DevCouncil/rust-port",
+      "started_utc": "2026-09-10T23:06:36.159789+00:00",
+      "timeout_seconds": 1800,
+      "timed_out": false,
+      "exit_code": 0,
+      "elapsed_seconds": 55.502521125017665
+    },
+    "capacity-large-final": {
+      "label": "capacity-large-final",
+      "argv": [
+        "python3",
+        "tools/worktree_stress.py",
+        "--binary",
+        "/tmp/devmap-rust-audit-20260910/qualified/devmap",
+        "--worktrees",
+        "8",
+        "--rounds",
+        "6",
+        "--build-workers",
+        "4",
+        "--fixture-files",
+        "4096",
+        "--functions-per-file",
+        "32",
+        "--output",
+        "/tmp/devmap-rust-audit-20260910/capacity-large-final.json"
+      ],
+      "cwd": "/Users/bharath/.codex/worktrees/devmap-rust-audit-20260910/DevCouncil/rust-port",
+      "started_utc": "2026-09-10T23:07:56.558113+00:00",
+      "timeout_seconds": 1800,
+      "timed_out": false,
+      "exit_code": 0,
+      "elapsed_seconds": 166.9470922080218
+    },
+    "additional-ci-final": {
+      "label": "additional-ci-final",
+      "argv": [
+        "bash",
+        "/tmp/devmap-rust-audit-20260910/qualify-ignored.sh"
+      ],
+      "cwd": "/Users/bharath/.codex/worktrees/devmap-rust-audit-20260910/DevCouncil/rust-port",
+      "started_utc": "2026-09-10T23:11:23.181160+00:00",
+      "timeout_seconds": 1800,
+      "timed_out": false,
+      "exit_code": 0,
+      "elapsed_seconds": 213.194471875031
+    },
+    "build-soak-final": {
+      "label": "build-soak-final",
+      "argv": [
+        "bash",
+        "tools/soak.sh",
+        "/tmp/devmap-rust-audit-20260910/build-soak-corpus",
+        "40"
+      ],
+      "cwd": "/Users/bharath/.codex/worktrees/devmap-rust-audit-20260910/DevCouncil/rust-port",
+      "started_utc": "2026-09-10T23:15:50.133204+00:00",
+      "timeout_seconds": 600,
+      "timed_out": false,
+      "exit_code": 0,
+      "elapsed_seconds": 6.5007437920430675
+    },
+    "daemon-soak-1500-final": {
+      "label": "daemon-soak-1500-final",
+      "argv": [
+        "bash",
+        "tools/soak.sh",
+        "/tmp/devmap-rust-audit-20260910/daemon-soak-1500-corpus",
+        "1500",
+        "--daemon"
+      ],
+      "cwd": "/Users/bharath/.codex/worktrees/devmap-rust-audit-20260910/DevCouncil/rust-port",
+      "started_utc": "2026-09-10T23:21:31.600760+00:00",
+      "timeout_seconds": 720,
+      "timed_out": false,
+      "exit_code": 0,
+      "elapsed_seconds": 464.55525466700783
+    }
+  },
+  "verification_environment": {
+    "RUST_TEST_THREADS": 2,
+    "TOKIO_WORKER_THREADS": 2,
+    "DEVMAP_AUTOSPAWN": 0,
+    "capacity_and_soak_RAYON_NUM_THREADS": 2
+  },
+  "native_platforms_verified": [
+    "macOS 27 arm64"
+  ],
+  "native_platforms_unverified": [
+    "Linux",
+    "Windows"
+  ],
+  "post_verification_documentation": [
+    "rust-port/STATUS.md",
+    "rust-port/RUST_AUDIT_2026-09-10.md",
+    "rust-port/RUST_AUDIT_2026-09-10.json"
+  ],
+  "installed_clients_changed": false,
+  "live_production_stores_changed": false,
+  "full_workspace_mutation_campaign_run": false,
+  "evidence_directory": "/Users/bharath/Documents/Codex/2026-09-10/devmap-rust-audit/evidence",
+  "final_navigation_index": {
+    "binary_version": "0.1.1",
+    "capabilities": {
+      "affected": true,
+      "build_manifest": true,
+      "explore": true,
+      "html": true,
+      "impact": true,
+      "manifest_graph_output": true,
+      "manifest_stamp_flags": true,
+      "search": true,
+      "status": true,
+      "trace": true
+    },
+    "coverage_gaps": {
+      "call_blind": {
+        "paths": [
+          {
+            "path": "rust-port/testdata/capabilities/probe.cfm",
+            "reason": "`cfml` has no call extractor in this build"
+          },
+          {
+            "path": "rust-port/testdata/capabilities/probe.tf",
+            "reason": "`hcl` has no call extractor in this build"
+          },
+          {
+            "path": "rust-port/testdata/fixtures/languages/cfml/main.cfc",
+            "reason": "`cfml` has no call extractor in this build"
+          },
+          {
+            "path": "rust-port/testdata/fixtures/languages/terraform/main.tf",
+            "reason": "`hcl` has no call extractor in this build"
+          }
+        ],
+        "shown": 4,
+        "total": 4,
+        "truncated": false
+      },
+      "discovery_refused": {
+        "paths": [
+          {
+            "path": "rust-port/vendor/grammars/cobol/parser.c",
+            "reason": "30660349 bytes exceeds the 1048576 byte source ceiling, so extraction can never succeed"
+          }
+        ],
+        "shown": 1,
+        "total": 1,
+        "truncated": false
+      },
+      "import_blind": {
+        "paths": [
+          {
+            "path": "rust-port/testdata/capabilities/Probe.cs",
+            "reason": "`csharp` has no import extractor in this build"
+          },
+          {
+            "path": "rust-port/testdata/capabilities/probe.sql",
+            "reason": "`sql` has no import extractor in this build"
+          },
+          {
+            "path": "rust-port/testdata/fixtures/languages/csharp/Main.cs",
+            "reason": "`csharp` has no import extractor in this build"
+          },
+          {
+            "path": "rust-port/tools/fanout.sql",
+            "reason": "`sql` has no import extractor in this build"
+          }
+        ],
+        "shown": 4,
+        "total": 4,
+        "truncated": false
+      },
+      "not_parsed": {
+        "paths": [
+          {
+            "path": "src/devcouncil/assets/vendor/force-graph.min.js",
+            "reason": "not parsed: minified bundle, whose only declarations are a minifier's mangled names"
+          }
+        ],
+        "shown": 1,
+        "total": 1,
+        "truncated": false
+      },
+      "parse_failed": {
+        "paths": [
+          {
+            "path": "rust-port/testdata/capabilities/probe.cob",
+            "reason": "the vendored tree-sitter-cobol grammar does not terminate on malformed input and cannot be bounded in-process; it yielded no declarations or calls even on well-formed source, so it is not linked"
+          },
+          {
+            "path": "rust-port/testdata/fixtures/languages/cobol/main.cob",
+            "reason": "the vendored tree-sitter-cobol grammar does not terminate on malformed input and cannot be bounded in-process; it yielded no declarations or calls even on well-formed source, so it is not linked"
+          },
+          {
+            "path": "scripts/install.ps1",
+            "reason": "no linked tree-sitter grammar for powershell"
+          }
+        ],
+        "shown": 3,
+        "total": 3,
+        "truncated": false
+      },
+      "pattern_recovered": {
+        "paths": [
+          {
+            "path": "rust-port/testdata/capabilities/Probe.vb",
+            "reason": "no linked tree-sitter grammar for vb; 3 declaration(s) recovered by pattern"
+          },
+          {
+            "path": "rust-port/testdata/capabilities/probe.proto",
+            "reason": "no linked tree-sitter grammar for protobuf; 4 declaration(s) recovered by pattern"
+          },
+          {
+            "path": "rust-port/testdata/capabilities/probe.ps1",
+            "reason": "no linked tree-sitter grammar for powershell; 2 declaration(s) recovered by pattern"
+          },
+          {
+            "path": "rust-port/testdata/fixtures/languages/vbnet/Main.vb",
+            "reason": "no linked tree-sitter grammar for vb; 2 declaration(s) recovered by pattern"
+          }
+        ],
+        "shown": 4,
+        "total": 4,
+        "truncated": false
+      }
+    },
+    "db_path": "/Users/bharath/.codex/worktrees/devmap-rust-audit-20260910/DevCouncil/.devcouncil/codeintel/devmap.sqlite",
+    "degraded_reason": "partial: call extraction did not cover the whole corpus: 3 file(s) failed to parse, 4 recovered by pattern (no calls extracted), 1 refused by discovery and never read at all \u2014 dead-code and unwired findings are a lower bound and are capped below the confident tier; 4 file(s) in a language with no call extractor at all (permanent for this build, not a transient failure)",
+    "edge_confidence_mismatches": 0,
+    "edge_count": 134827,
+    "edge_resolution_source": "stored",
+    "expected_schema_version": 20,
+    "generation_id": 2,
+    "host_contract_version": 1,
+    "is_fresh": true,
+    "node_count": 19587,
+    "pending_count": 0,
+    "quarantined_count": 0,
+    "quarantined_paths": [],
+    "query_ready": true,
+    "reader_ready": true,
+    "schema_outdated": false,
+    "schema_relation": "current",
+    "schema_version": 20
+  },
+  "integration": {
+    "checked_utc": "2026-09-10T23:34:21.836972+00:00",
+    "status": "not_applied_concurrent_source_drift",
+    "canonical_repo": "/Users/bharath/Code/devtools/DevCouncil",
+    "qualified_worktree": "/Users/bharath/.codex/worktrees/devmap-rust-audit-20260910/DevCouncil",
+    "initial_refusal": "source drift: [\"rust-port/crates/devmap-cli/src/main.rs\", \"rust-port/crates/devmap-serve/src/lib.rs\", \"rust-port/crates/devmap-serve/src/mcp.rs\"]",
+    "subsequently_observed_drift": [
+      "rust-port/crates/devmap-cli/src/claude.rs",
+      "rust-port/crates/devmap-cli/src/main.rs",
+      "rust-port/crates/devmap-serve/src/lib.rs",
+      "rust-port/crates/devmap-serve/src/mcp.rs"
+    ],
+    "canonical_files_applied": 0,
+    "qualified_files_manifest": "/tmp/devmap-rust-audit-20260910/frozen-source-files.json",
+    "staged": false,
+    "committed": false,
+    "installed": false,
+    "active_changes_overwritten": false,
+    "integration_requires": "Let the active MCP roots implementation reach a stable snapshot, merge the audit patch without replacing concurrent edits, then requalify the combined source."
+  }
+}

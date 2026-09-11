@@ -33,6 +33,16 @@ layout, and the legacy DevCouncil layout in their documented precedence.
 `open_read_only` requires an existing current-schema store and never creates,
 migrates, or heals it. Writer processes continue to own schema migration.
 
+Hosts embedding the daemon or MCP transport must preserve panic unwinding if
+they depend on worker recovery. Tokio returns unwinding worker panics through
+`JoinError`; `panic = "abort"` terminates the whole host before that error
+handling or cleanup can run. Cargo selects profiles from the host workspace,
+so DevMap's release setting cannot enforce this for an embedding application.
+The standalone workspace verifies its shipped profile with
+`cargo run --release -p devmap-serve --example worker_recovery_probe`.
+`cargo test --release` does not establish this property because test builds
+force unwinding.
+
 
 Query `Response<T>` envelopes carry `source_freshness: null` when whole-tree
 freshness was not checked. Snapshot completeness (`walk_incomplete`, counts,

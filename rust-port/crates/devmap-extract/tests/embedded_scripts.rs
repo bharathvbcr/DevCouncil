@@ -737,8 +737,10 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     //
     // v46 records the enclosing callable as `parent_symbol` of a nested
     // `const walk = () => {}`. A v45 row parents those arrows on the file.
+    // v47 preserves notebook completeness and remaps the complete parsed
+    // payload through actual raw JSON source positions.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "46",
+        EXTRACTION_SCHEMA_VERSION, "47",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

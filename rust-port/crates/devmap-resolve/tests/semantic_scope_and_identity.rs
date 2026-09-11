@@ -23,6 +23,16 @@ fn calls_from(result: &ResolutionResult, caller: &str) -> BTreeSet<String> {
 }
 
 #[test]
+fn notebook_cross_cell_calls_resolve_after_independent_cell_parsing() {
+    let notebook = r#"{"metadata":{"language_info":{"name":"python"}}, "cells":[
+        {"cell_type":"code", "source":"def helper():\n    return 1\n"},
+        {"cell_type":"code", "source":"def run():\n    return helper()\n"}
+    ]}"#;
+    let result = resolve(&[("calls.ipynb", notebook)]);
+    assert!(calls_from(&result, "calls.ipynb::run").contains("calls.ipynb::helper"));
+}
+
+#[test]
 fn ra1_python_parameter_shadows_the_module_declaration() {
     let r = resolve(&[(
         "a.py",
