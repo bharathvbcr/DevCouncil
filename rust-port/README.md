@@ -43,8 +43,18 @@ report the same result as a check that ran and passed.** An agent acting on
 "we stopped looking."
 
 `status` verifies current source bytes and analyzer identity before reporting
-freshness. Query envelopes use `source_freshness: null` when that whole-tree
-check was not performed; changed source snippets are withheld with a reason.
+freshness. Status reports nullable `source_freshness` and `analyzer_freshness`
+independently: a parser-free reader can verify source bytes while leaving
+analyzer compatibility unverified. Both must pass for overall `is_fresh`.
+Query envelopes use `source_freshness: null` when that whole-tree check was
+not performed; changed source snippets are withheld with a reason.
+
+Marker inventories publish their source, examined and total path counts,
+completeness, and error counts beside bounded error samples. Git discovery
+covers deep packages without a depth ceiling; non-Git discovery remains bounded
+in depth, directories, frontier size, entries and cooperative elapsed time.
+`*_computed` alone never proves completeness, and marker completeness does
+not imply complete language or call-graph coverage.
 See the [coverage and robustness audit](RELIABILITY_AUDIT_2026-09-09.md) for
 current fixes, measured stress results, and remaining language/platform limits.
 The [earlier reliability audit](RELIABILITY_AUDIT_2026-09-08.md) records the

@@ -208,33 +208,11 @@ fn a_depth_capped_layering_says_so_on_both_halves() {
     // A consumer reading only the bands and a consumer reading only the edges
     // must not disagree about whether the answer is a lower bound.
     //
-    // Note what is deliberately not asserted here: that a walk which ran out of
-    // graph reports `None`. On a store-backed walk it does not, and the cause is
-    // outside this crate. `traverse_graph_indexed`'s `has_admitted` probe
-    // (devmap-analyze/src/traversal.rs) counts a node's neighbours *before* the
-    // reverse-direction exclusions a few lines below it, so a leaf symbol whose
-    // only remaining inbound edge is the `Contains` edge from its own file reads
-    // as "still expanding" and sets `depth_capped`. The in-memory `QueryEngine`
-    // does not show it — the resolution edge list it walks holds no `Contains`
-    // — which is why `incomplete_answers_say_so.rs` can assert the `None` this
-    // test cannot. It overstates uncertainty rather than understating it, so it
-    // is fail-safe; it is still a marker that means less than it says.
     let complete = engine
         .impact_layered(request("delta", 3, 10_000))
         .expect("the store holds a generation");
-    let bands_say = complete.blast_radius.layers.walk_incomplete.is_some();
-    let edges_say = complete
-        .edges
-        .walk_incomplete
-        .as_deref()
-        .unwrap_or_default()
-        .contains("did not complete");
-    assert_eq!(
-        bands_say, edges_say,
-        "one walk, one verdict: the bands say incomplete={bands_say} and the edge \
-         half says incomplete={edges_say} ({:?} / {:?})",
-        complete.blast_radius.layers.walk_incomplete, complete.edges.walk_incomplete
-    );
+    assert_eq!(complete.blast_radius.layers.walk_incomplete, None);
+    assert_eq!(complete.edges.walk_incomplete, None);
 }
 
 /// The bands stop where the caller's depth bound stops.

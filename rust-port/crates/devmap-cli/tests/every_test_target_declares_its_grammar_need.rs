@@ -50,7 +50,12 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
     ("devmap-resolve", &["resolution_kind_is_one_owner"]),
     (
         "devmap-analyze",
-        &["adversarial_analyze", "pdg_bounds", "traversal_allocation"],
+        &[
+            "adversarial_analyze",
+            "pdg_bounds",
+            "transitive_oracle",
+            "traversal_allocation",
+        ],
     ),
     (
         "devmap-query",

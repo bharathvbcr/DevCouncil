@@ -37,8 +37,13 @@ migrates, or heals it. Writer processes continue to own schema migration.
 Query `Response<T>` envelopes carry `source_freshness: null` when whole-tree
 freshness was not checked. Snapshot completeness (`walk_incomplete`, counts,
 and truncation) does not prove that the working tree still matches the map.
-Use executable status to verify it; a parser-free library cannot certify a
-parser's current grammar identity and reports that verification as unavailable.
+`Store::status` and executable status expose independent nullable
+`source_freshness` and `analyzer_freshness` checks. True means verified current,
+false means a mismatch, and null (or an absent additive field in an older
+reader) means unverified. A parser-free library verifies current source bytes
+while leaving parser/analyzer compatibility unverified. Aggregate `is_fresh`
+requires both checks to pass, a committed generation, and no pending work or
+store degradation. Keep the reason even when persisted navigation is usable.
 
 Search reads verify each returned file against the content hash in the symbol's
 own generation. Changed or unreadable bytes leave the stored hit present with
@@ -103,6 +108,8 @@ name itself.
 | `generation_id` | Latest committed generation, or `null`; a query host requires a positive integer. |
 | `db_path` | Resolved store path; a query host requires a nonblank value. |
 | `is_fresh` | A committed generation has no pending work and current source inventory, content hashes, and analyzer payload identity were verified. Independent of schema readiness and extraction completeness. |
+| `source_freshness` | Current source inventory and bytes match the stored generation; `null` if unverified. |
+| `analyzer_freshness` | Stored parser/analyzer identity matches this binary; `null` for a reader unable to compare it. |
 | `degraded_reason` | Coverage, freshness, or compatibility problem; `null` only when none is known. |
 | `capabilities` | Operations and flags derived from the executable's command parser. |
 
@@ -155,3 +162,29 @@ Use `--level symbols` for symbol relationships. The JSON result reports
 `output`, `bytes`, `level`, and payload `counts`; the page embeds its renderer
 and makes no network request. Retain shown and total node/link counts in the
 host UI so a cap cannot become a coverage claim.
+
+## Marker inventory coverage
+
+The repository map keeps marker coverage separate from extraction and graph
+coverage. `package_managers_computed` and `test_commands_computed` say whether
+an inventory ran; also require `inventory_complete` before treating either
+list as complete within the documented marker policy.
+
+`inventory_source` names `git` or `filesystem`. Git lists tracked and unignored
+paths at any depth, bounded by the existing 30-second/64-MiB subprocess limits,
+then examines at most 50,000 eligible paths with a cooperative five-second
+metadata deadline. `inventory_files_total` is the pre-cap eligible path count;
+`inventory_entries_examined` counts paths actually examined. Non-Git fallback
+has an eight-level depth ceiling, 20,000 opened/pending directories, 200,000
+entries and the same cooperative deadline; its total is unknown (`null`).
+Neither cooperative deadline can interrupt an OS filesystem call in progress.
+
+Both apply the existing marker exclusions: dot-directories, dependency/build
+output directories, and root-only output names. An excluded tree is outside
+this inventory's scope. `inventory_walk_truncated` reports a bound hit.
+`inventory_unreadable` holds at most 64 observed failures and
+`inventory_unreadable_count` retains their count. Unreadable directories,
+malformed JSON, and unreadable manifest bytes cannot claim completeness.
+`inventory_refused_oversize` names manifests beyond the 256-KiB read limit.
+No marker completeness verdict certifies arbitrary language semantics or an
+atomic snapshot of a concurrently changing filesystem.
