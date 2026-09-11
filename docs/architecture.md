@@ -49,11 +49,11 @@ Ripgrep Engine & Trigram Index"]
     HostCLI -->|Execs| DevMap
     HostCLI -->|Integrates| HostInteg
     HostCLI -->|Scaffolds| HostSkills
-    HostVerify -->|Spawns & Validates| DCVerify
-    HostVerify -->|Checks Leases| DCStore
+    HostVerify -->|Scope, orphan, expected tests| DCStore
+    Manvi -->|Spawns dcverify rigor| DCVerify
 
-    HostMCP -->|Lease & Task Storage| DCStore
-    HostMCP -->|Diff Gates| DCVerify
+    HostMCP -->|Lease and task storage| DCStore
+    HostMCP -->|verify_task → Go Run| HostVerify
 ```
 
 ---
@@ -64,9 +64,9 @@ Ripgrep Engine & Trigram Index"]
 
 Located in `backend/go_orchestrator/`. Compiled as a single static native binary.
 - **Host MCP Server (`mcp`):** Provides stdio MCP tools for task checkout, leases, diff analysis, and verification gates.
-- **Agent Integration (`integrate`):** Installs and verifies configuration for Cursor, Claude Code, Codex, Antigravity, OpenCode, Warp, and Aider.
+- **Agent Integration (`integrate`):** Cursor writes `.cursor/mcp.json` + a rule. Claude writes `.mcp.json`. Codex writes a comment-only toml. Antigravity / OpenCode / Warp / Aider / Gemini return a stub receipt. `--write-gate` is discarded (TASK-P7-8).
 - **Skills Distribution (`skills`):** Scaffolds embedded engineering and code intelligence skills into agent directories (`.agents/skills`, `.claude/skills`, `.cursor/skills`).
-- **Verification Gateway (`verify`):** Invokes `dcverify` and checks leases in `dcstore`, returning human-readable or structured JSON verdicts.
+- **Verification Gateway (`verify`):** Checks leases in `dcstore` and runs Go `verify.Run()` (no-work, planned-file, orphan-diff, dependency-risk, expected-test commands). It does **not** spawn `dcverify`; stub, secret, and coverage rigor live in that binary and are invoked today by Manvi `runRigor`, not by `devcouncil verify` or MCP `devcouncil_verify_task`. `--sandbox` is recorded on the report; only local `/bin/sh -c` in the project root is implemented.
 - **DevMap Forwarding (`map`, `graph`, `ast`):** Dispatches directly to `devmap`.
 
 ### B. Code Intelligence Engine (`devmap`)
@@ -76,7 +76,7 @@ Multi-crate workspace providing compiler-grade code intelligence without calling
 - **Resolve (`devmap-resolve`):** High-speed cross-file symbol resolution and import binding.
 - **Analyze (`devmap-analyze`):** Blast radius, reverse dependents, circular dependency detection, and dead code classification.
 - **Store (`devmap-store`):** SQLite WAL-mode canonical code graph store (`.devcouncil/codeintel/devmap.sqlite`).
-- **Query & Serve (`devmap-query`, `devmap-serve`):** CLI queries (`query`, `trace`, `impact`, `dead`, `cypher`) and standalone DevMap MCP server.
+- **Query & Serve (`devmap-query`, `devmap-serve`):** CLI (`search`, `explore`, `trace`, `impact`, `dead`, `cypher`) and `devmap mcp` / `devmap serve`. There is no `devmap query` command.
 
 ### C. State & Lease Repository (`dcstore`)
 

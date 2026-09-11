@@ -1,23 +1,21 @@
 # Coding CLI Integration
 
-DevCouncil's components integrate with leading coding agents and IDEs: task scoping, mutual-exclusion leases, write-containment hooks, and deterministic verification. A host can take this integration alone, wrap the same modules through Manvi, or select individual binaries (`devmap`, `dcverify`, `dcstore`) without the rest of the suite.
+DevCouncil's components integrate with leading coding agents and IDEs: task scoping, mutual-exclusion leases, and deterministic verification. A host can take this integration alone, wrap the same modules through Manvi, or select individual binaries (`devmap`, `dcverify`, `dcstore`) without the rest of the suite.
 
 ---
 
 ## Supported Hosts
 
-DevCouncil includes built-in integrations for:
+`devcouncil integrate` and `devmap integrate` are **not** the Python installer. Go `Hosts` lists eight names; only three have adapters, and `--write-gate` is discarded (`integrateCursor` assigns `_ = writeGate`). `devmap integrate` accepts only `cursor|claude|codex`.
 
-| Host | MCP Tools | Write Hooks / Containment | Setup Command |
-|---|:---:|:---:|---|
-| **Claude Code** | Yes (`devcouncil mcp`) | Assistive PostToolUse; opt-in blocking PreToolUse (`--write-gate`) | `devcouncil integrate claude --apply --write-gate` |
-| **Cursor** | Yes (`.cursor/mcp.json`) | Assistive PostToolUse; opt-in blocking PreToolUse (`--write-gate`) | `devcouncil integrate cursor --apply --write-gate` |
-| **Google Antigravity** | Yes (`.agents/mcp_config.json`) | Verification-gated | `devcouncil integrate antigravity --apply` |
-| **Codex CLI** | Yes (`codex mcp`) | Assistive hooks + Stop/SubagentStop checks | `devcouncil integrate codex --apply` |
-| **OpenCode** | Yes (`opencode.json`) | Assistive plugin; opt-in blocking write gate | `devcouncil integrate opencode --apply` |
-| **Warp / Oz** | Yes (Warp MCP JSON) | Verification-gated | `devcouncil integrate warp --apply` |
-| **Aider** | Sidecar / CLI | Verification-gated | `devcouncil integrate aider --apply` |
-| **Gemini CLI** | Deprecated | Compatibility only | Migrate to **Antigravity** |
+| Host | What `--apply` actually writes | Write-gate / hooks | Setup command |
+|---|---|---|---|
+| **Cursor** | `.cursor/mcp.json` (devcouncil + devmap stdio) and `.cursor/rules/devcouncil.mdc`. Then `devmap integrate cursor` writes DevMap guides/skills. | No `.cursor/hooks.json`. `--write-gate` does not change that. | `devcouncil integrate cursor --apply` |
+| **Claude Code** | `.mcp.json` (devcouncil + devmap). No slash commands, plugin, subagents, or statusline. | `--write-gate` ignored. | `devcouncil integrate claude --apply` |
+| **Codex CLI** | `.codex/config.toml` containing only `# Managed by devcouncil integrate codex`. | None. | `devcouncil integrate codex --apply` |
+| **Antigravity, OpenCode, Warp, Aider, Gemini** | Stub receipt: `"Phase 4 writes a stub receipt; full adapter ports follow"`. `devmap integrate` then errors `unsupported host`. | None. | Do not treat `--apply` as a working installer |
+
+Python's golden `integrate claude --apply` receipt (43 files, slash commands, `claude-plugin`) is leftover testdata, not current behaviour.
 
 ---
 
@@ -29,13 +27,10 @@ To configure an agent host, run `devcouncil integrate` from your project root:
 # 1. Configure Cursor
 devcouncil integrate cursor --apply
 
-# 2. Configure Claude Code with strict write-containment
-devcouncil integrate claude --apply --write-gate
+# 2. Configure Claude Code (writes .mcp.json; --write-gate is currently ignored)
+devcouncil integrate claude --apply
 
-# 3. Configure Google Antigravity
-devcouncil integrate antigravity --apply
-
-# 4. Verify that integration files are in place
+# 3. Codex is a comment-only toml today — see TASK-P7-8
 devcouncil integrate cursor --check
 devcouncil integrate claude --check
 
@@ -57,50 +52,42 @@ DevCouncil provides two complementary Model Context Protocol (MCP) servers:
 
 ### 1. Host MCP Server (`devcouncil mcp`)
 
-The primary orchestration server. Configured automatically by `devcouncil integrate`:
+The primary orchestration server. Configured automatically by `devcouncil integrate`. The Go host advertises **eight** tools (`Registry.Specs()`), not the Python host's 78:
 
-- **Task Leases:** `devcouncil_checkout_task`, `devcouncil_renew_lease`, `devcouncil_release_task`
-- **Diff & Gaps:** `devcouncil_get_diff`, `devcouncil_get_gaps`
-- **Write Policy:** `devcouncil_policy_check_write` validates whether a target path is inside planned file scope before writing
-- **Verification:** `devcouncil_verify_task` executes deterministic gates and returns typed `next_actions` for repair
+- **Task leases:** `devcouncil_checkout_task`, `devcouncil_renew_lease`, `devcouncil_release_task`, `devcouncil_next_task`
+- **Diff & gaps:** `devcouncil_get_diff`, `devcouncil_get_gaps`
+- **Write policy:** `devcouncil_policy_check_write` — planned-file scope before writing
+- **Verification:** `devcouncil_verify_task` — Go `verify.Run()` (planned-file, orphan-diff, dependency-risk, expected-test commands). It does **not** spawn `dcverify`. Stub / secret / coverage rigor is in that binary; **Manvi** `runRigor` is the path that execs it today.
 
-### 2. DevMap Code Intelligence MCP Server (`devmap serve --mcp`)
+Filesystem, patch, and shell tools (`devcouncil_read_file`, `apply_patch`, `write_file`, `run_command`, …) are **not** on this server. They live on Manvi. `AllowedNextToolsForVerify` still names several of those Python-era tools; that list is stale (TASK-P7-1).
 
-Exposes compiler-grade symbol navigation and code graph exploration:
+### 2. DevMap Code Intelligence MCP Server (`devmap mcp`)
 
-- **`devmap_explore`**: Explore symbol definitions, callers, callees, and enclosing modules.
-- **`devmap_impact`**: Compute blast radius and reverse dependents of target files before refactoring.
-- **`devmap_trace`**: Trace shortest call or dependency paths between two symbols.
-- **`devmap_dead_symbols`**: Identify unreferenced symbols with confidence ratings.
+Eleven query tools: `status`, `search`, `dependencies`, `impact`, `trace`, `neighbors`, `dead_symbols`, `clones`, `preview`, `explore`, `affected_tests`. Always pass this repository's absolute `repo_path` and check `repository.root` in the envelope.
+
+CLI-only (named in `devmap-cli` `MISSING_CAPABILITIES`, not on kernel MCP): `cypher`, `pdg_query`, `taint_explain`, `route_map`, plus `detect_changes` / `rename` / `clusters_processes`. PDG construction in the CLI is Python-source only.
 
 ---
 
 ## Host-Specific Setup Details
 
-### Claude Code
-
-Claude Code represents the flagship integration for the **Hero Loop**:
-1. Run `devcouncil integrate claude --apply --write-gate`.
-2. This installs:
-   - MCP server definition in Claude Code's config.
-   - Project skills in `.claude/skills/`.
-   - PreToolUse write hook preventing Claude Code from modifying files outside the active task's scope.
-   - Slash commands for task status and verification.
-
 ### Cursor
 
-1. Run `devcouncil integrate cursor --apply --write-gate`.
-2. This writes:
-   - `.cursor/mcp.json` exposing the DevCouncil MCP server.
-   - `.cursor/hooks.json` enforcing write containment during Agent Mode turns.
-   - Packaged skills into `.cursor/skills/`.
+`devcouncil integrate cursor --apply` writes `.cursor/mcp.json` and `.cursor/rules/devcouncil.mdc`, then runs `devmap integrate cursor` (guides + DevMap skills). It does **not** write `.cursor/hooks.json`. `--write-gate` does not change the files.
 
-### Google Antigravity
+### Claude Code
 
-1. Run `devcouncil integrate antigravity --apply`.
-2. This configures:
-   - `.agents/mcp_config.json` exposing DevCouncil tools.
-   - Verified engineering skills in `.agents/skills/`.
+`devcouncil integrate claude --apply` writes `.mcp.json` (devcouncil + devmap stdio) and runs `devmap integrate claude`. It does **not** install slash commands, a plugin, PreToolUse hooks, or a statusline. `--write-gate` is ignored.
+
+### Codex
+
+`devcouncil integrate codex --apply` writes a one-line comment into `.codex/config.toml`. That is the whole Go adapter.
+
+### Other hosts
+
+`antigravity`, `opencode`, `warp`, `aider`, and `gemini` are listed in `integrate.Hosts` and return a stub receipt. `devmap integrate` refuses those names. There is no `.agents/mcp_config.json` writer in this binary.
+
+Domain skills still need `devcouncil skills scaffold` (or the `devmap skills install` spawn on cursor/claude). The packaged `devcouncil.md` / hero-loop skills currently describe Python-era tools (TASK-P7-9).
 
 ---
 

@@ -1,6 +1,6 @@
 //! Coverage invariants stated over **on-disk truth**, not the index's own view.
 //!
-//! This is the Class B gate from `docs/devmap/PLAN.md` §3.1. Two of the eight
+//! This is the Class B gate from `docs/archive/devmap/PLAN.md` §3.1. Two of the eight
 //! kernel findings were of this shape, and neither was visible to any measure
 //! that existed at the time:
 //!

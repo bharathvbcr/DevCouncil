@@ -11,17 +11,16 @@ DevCouncil builds a deterministic repository map and a symbol-level knowledge gr
 
 All map and graph operations live under **`dev map`**. `dev graph …` is a compatibility alias for the same command group.
 
-| Prefer | Alias (same behavior) |
+| Prefer | What it runs |
 | :--- | :--- |
-| `dev map` | — (build repo map + code graph) |
-| `dev map query` / `trace` / `dead` / … | `dev graph query` / `trace` / `dead` / … |
-| `dev map ingest` / `init` / `sync` / `watch` / `doctor` | `dev graph ingest` / … |
-| `dev map demo` / `view` / `export` / `search` / `cypher` | `dev graph demo` / … |
-| `dev map graph-html` or `dev map html --symbols` | `dev graph html` |
-| `dev map html` | subsystem map only (no graph alias) |
-| `dev map pdg build` / `explain` / `pdg-query` | `dev graph pdg build` / … |
+| `dev map` (no args) | `devmap build --manifest` |
+| `dev map query` / `trace` / `dead` / … | forwarded when the `devmap` subcommand exists (`search`, not `query`) |
+| `dev map html` | `devmap html` — **symbol graph**, not the subsystem map |
+| `dev map map-html` | `devmap map-html` — subsystem map from `repo_map.json` |
+| `dev map ingest` / `init` / `sync` / `watch` / `demo` / `view` / `graph-html` | **Retired** or unknown. Use `build`, `serve`, `html`, `map-html`. |
+| `dev map pdg FILE` | `devmap pdg FILE` (Python-only, intra-procedural; optional `--taint`) |
 
-**HTML split:** `dev map html` writes the subsystem map (`.devcouncil/map.html`). Symbol-level graph HTML is `dev map graph-html`, `dev map html --symbols`, or alias `dev graph html` (`.devcouncil/graph/graph.html`).
+**HTML split:** `devmap map-html` → `.devcouncil/map.html`. `devmap html` / Go `dev map html` → symbol graph HTML. There is no `graph-html` or `--symbols` flag.
 
 Rust-generated agent guides also include the portable [repository hygiene policy](repository-hygiene.md). The policy is reusable by embedding hosts; scheduling and deletion remain host responsibilities.
 
@@ -30,99 +29,57 @@ Rust-generated agent guides also include the portable [repository hygiene policy
 | Path | Role |
 | :--- | :--- |
 | `.devcouncil/repo_map.json` | File inventory, subsystems, entry roots, unwired/unreachable/dead-symbol candidate lists, reverse-import dependents |
-| `.devcouncil/graph/code_graph.json` | Compact export of symbol nodes + edges (imports, named imports, calls, inherits, contains) and tiered `dead_code`, written by the kernel from the same generation as the map. **The kernel store is canonical**; prefer `dev map query` / `trace` / `dead` when the JSON is missing. |
-| `.devcouncil/codeintel/devmap.sqlite` | **Canonical.** The Rust kernel's WAL-mode store: generations, nodes, edges, unresolved references, FTS5, the pending-path queue, build history. Written only by `devmap build` (every `dev map`, `init`, `ingest`, `sync`, verify/checkout refresh and MCP `devcouncil_graph_ingest` go through it). |
-| `.devcouncil/codeintel/index.sqlite` | Runtime evidence only: debugger sessions and the call edges they witnessed, written by the opt-in tracer (`dev debug`, the `devcouncil_debug_*` MCP tools) and merged into the graph by `dev map cypher`. It held the Python query cache until that store was deleted; nothing creates the file unless a debug session runs. Safe to delete — it is evidence, not an index, and losing it loses only past sessions. |
-| `.devcouncil/graph/graph.html` | Self-contained interactive visualizer (`dev map graph-html` / `dev map html --symbols` / alias `dev graph html`; **not** written by default on bare `dev map`) |
-| `.devcouncil/map.html` | Self-contained subsystem map visualizer (`dev map html`, rendered by the kernel's `devmap map-html`). Nodes are coloured by dominant language in GitHub Linguist's own palette; the header carries a repo-wide language bar and states how many indexed files the subsystems actually cover. Slim payload — the `files[]` inventory is aggregated into per-subsystem language histograms and not embedded, and `dependents{}` is dropped. |
-| `.devcouncil/graph/demo.html` | Sample self-contained interactive UI from `dev map demo` (no map required; primary demo artifact) |
-| `.devcouncil/graph/demo.svg` | Optional static companion written by `dev map demo` (not the interactive UI) |
-| `AGENTS.md` / `CLAUDE.md` | Marker-guarded workspace guides kept in sync with the map |
+| `.devcouncil/graph/code_graph.json` | Compact export of symbol nodes + edges (imports, named imports, calls, inherits, contains) and tiered `dead_code`, written by the kernel from the same generation as the map. **The kernel store is canonical**; prefer `devmap search` / `explore` / `trace` / `dead` when the JSON is missing. |
+| `.devcouncil/codeintel/devmap.sqlite` | **Canonical.** The Rust kernel's WAL-mode store. Written by `devmap build` (Go `dev map` execs that binary). There is no MCP `devcouncil_graph_ingest` on the Go host. |
+| `.devcouncil/codeintel/index.sqlite` | **Retired.** Was the Python query cache and DAP tracer store. The debug broker is gone; nothing in the native host creates this file. Safe to delete. |
+| `.devcouncil/graph/graph.html` | Self-contained symbol-graph visualizer (`devmap html` / `dev map html`) |
+| `.devcouncil/map.html` | Subsystem map (`devmap map-html`). Nodes coloured by dominant language; header carries a repo-wide language bar. |
+| `AGENTS.md` / `CLAUDE.md` | Marker-guarded workspace guides (`devmap build --manifest --guides`) |
 
 ## Build / refresh
 
 ```bash
-dev map                     # Build through the kernel: no-op on an unchanged tree, incremental otherwise
-dev map --full              # Force a cold rebuild in the kernel
-dev map --goal "…"          # Rank candidate_files for a goal (ripgrep-based, layered on the kernel's map)
-dev map --if-stale          # Exit 0 without building when fingerprints still match; never starts a cold build
-dev map --wiki / --no-wiki  # Refresh codebase-wiki skeletons after map (on by default)
-dev map --scan-deps         # Opt-in SCA (pip-audit / npm audit / osv-scanner) → dependency_risks
-dev map --pdg               # Opt-in Python PDG/CFG/taint layer over the kernel's graph
-dev map --watch             # Event-driven rebuild on edits (same as `dev map watch`)
-dev map html                # Write interactive .devcouncil/map.html (subsystems)
-dev map html --open         # Write and open the subsystem map
-dev map graph-html          # Write symbol-level .devcouncil/graph/graph.html
-dev map html --symbols      # Same as graph-html
-dev map init                # Same build as `dev map`, JSON-friendly report (`--json`)
-dev map ingest [paths]      # Same build; paths are reported back, the kernel decides incrementality
-dev map sync                # Same build
-dev map status              # Engine binary, store (schema, size, free pages, WAL), kernel freshness, daemon, artifacts
-dev map doctor              # Verdicts with fixes: kernel present/capable, store no newer than kernel, artifacts kernel-written, reclaim/WAL pressure
-dev map repair --pending    # Drop pending-queue entries the kernel can never index
-dev map abort               # Stop the kernel build running for this repository (SIGTERM, then SIGKILL)
+dev map                     # Execs `devmap build --manifest`
+dev map --full              # Same, plus `--full` (cold rebuild)
+dev map status              # `devmap status`
+dev map doctor              # `devmap doctor` (no `--fix` flag)
+dev map html                # Symbol graph HTML (`devmap html`)
+dev map map-html            # Subsystem map HTML (`devmap map-html`)
+dev map serve               # Watcher + IPC (`devmap serve`); not `dev map watch`
+dev map mcp                 # DevMap MCP stdio (`devmap mcp`); not `serve --mcp`
+dev map history             # Recent builds
+dev map repair              # Drop unindexable pending-queue rows
 ```
+
+Python-era flags that are **not** on this binary: `--wiki` / `--no-wiki`, `--scan-deps`, `--pdg` as a build flag, `--if-stale`, `init`, `ingest`, `sync`, `watch`, `abort`, `runs`, `demo`, `view`. PDG is `devmap pdg`. SCA is not a `devmap` build step (GitPulse Health is a related job).
 
 `--no-liveness` and `--lsp-refs` are gone: the kernel always computes liveness, and the LSP adjunct was cut with the Python engine. A flag that is accepted and ignored is worse than one that is rejected, so both are rejected.
 
 ### One writer
 
-The kernel is the only writer of `repo_map.json` and `code_graph.json`. `dev map`, `dev map init` / `ingest` / `sync`, the verify-time and checkout-time refresh, `dev plan`, `dev init`, and MCP `devcouncil_graph_ingest` all call `refresh_map_artifacts`, which runs `devmap build` + `devmap manifest` and then layers on what the kernel does not do: goal ranking, dependency auditing, the marker-guarded agent guides (`AGENTS.md` / `CLAUDE.md`), the wiki skeletons. Before 2026-09-02 those callers ran the retired Python engine into `index.sqlite` and rewrote the map from a generation built from an old HEAD — two writers, one artifact, and the last one to run won.
+The kernel is the only writer of `repo_map.json` and `code_graph.json`. The current command is `devmap build --manifest` (Go `dev map` / `dev graph` execs `devmap`). Python `dev map init|ingest|sync`, `dev plan`, `dev init`, verify/checkout map refresh, and MCP `devcouncil_graph_ingest` were deleted with Phase 7. Guides (`AGENTS.md` / `CLAUDE.md`) are written by `devmap build --manifest --guides` or `devmap integrate`.
 
 ### When a map looks wrong — for a person or an agent
 
-Every kernel run the seam launches (`build`, `manifest`, `repair`) is recorded in the project trace log (`.devcouncil/logs/traces.jsonl`, event type `devmap_run`) with its argv, exit code, duration, the kernel's notes (discovery refusals, reclaim, progress) and, on failure, a diagnosis code. A failing `dev map` prints `[code]`, the fix, and the run id. While a build runs, `.devcouncil/codeintel/devmap-build.live.json` carries its pid and latest progress line so another process can see it.
+Use **`devmap status --json`** and **`devmap doctor --json`**. `devmap history` lists recent builds. There is no `dev map abort`, `dev map runs`, or `devmap doctor --fix`. A stuck writer is an OS-level process against `devmap.sqlite`; `devmap serve` is the long-lived watcher.
 
-1. **`dev map status`** (`--json`) — which binary will run and when it was built, the store's schema against the binary's, free-page ratio and WAL size, the kernel's own `is_fresh` / pending / quarantined counts, whether a daemon holds the socket, who wrote each artifact, whether a build is **running** (pid, stage, elapsed, seconds since its last progress line) or left a marker behind, and the **last build** with its run id.
-2. **`dev map doctor`** (`--json`) — the same facts as verdicts. Every check carries `code` (what an agent branches on), `fix` (a sentence) and `fix_command` (what it runs). Critical (exit 1): `engine_missing`, `schema_newer_than_kernel` (rebuild it: `cargo build --release -p devmap-cli`, or point `DEVMAP_BINARY` at a newer build), `foreign_writer`, `store_unreadable`. Warnings: `reclaim_pressure`, `wal_large`, `stale_map`, `pending_paths`, `stale_build_marker`, `build_stuck` (no progress for 10 min while the pid lives), `last_build_failed:<code>`.
-3. **`dev map doctor --fix`** — applies every fix a repository can apply and re-checks: clears a dead build's marker, quarantines an unreadable store (kept as `devmap.sqlite.corrupt-<stamp>`), drops stuck queue rows, and runs **one** build for everything a build resolves. It never touches a running build and never rebuilds the kernel binary; those are listed under `not_applied` with their commands.
-4. **`dev map runs [--last N] [--failed] [--json]`** — the records. The run id from a failure is the key.
-5. **`dev map abort`** — stops the build the live marker names (SIGTERM, then SIGKILL after five seconds). Safe: a generation is one transaction, so the store stays on the prior generation and the OS releases the writer lock. Refuses a pid that is not a devmap process.
-6. **`dev map --full`** — when the store should be rebuilt from nothing.
+Doctor/status live on the **Rust CLI**. There are no Go-host MCP tools named `devcouncil_graph_doctor`, `devcouncil_graph_runs`, `devcouncil_graph_ingest`, or `devcouncil_tail_trace`. Use `devmap_*` MCP or the CLI. Host hooks that ran `dev map --if-stale --no-wiki` are retired.
 
-The same surfaces exist over MCP: `devcouncil_graph_doctor` (`fix: true` applies), `devcouncil_graph_runs` (`limit`, `failedOnly`), and `devcouncil_graph_ingest` returns the diagnosis (`kernel_code`, `fix`, `run_id`, `stage`) alongside `engine_unavailable` when a build fails. `devcouncil_tail_trace` shows the run records among the other trace events.
+Failure codes a build can raise: `binary_missing`, `schema_newer_than_kernel`, `store_locked` (another writer holds the store), `store_corrupt`, `store_unwritable`, `kernel_flag_unsupported`, `kernel_timeout`, `kernel_failed`.
 
-Failure codes a build can raise: `binary_missing`, `schema_newer_than_kernel`, `store_locked` (another writer holds the store; status shows it, `dev map abort` if it is stuck), `store_corrupt`, `store_unwritable`, `kernel_flag_unsupported` (the binary predates a flag the seam passes), `kernel_timeout` (the record carries the last progress line), `kernel_failed` (anything else, with the kernel's last lines as evidence).
+HTML visualizers: `devmap map-html` writes `.devcouncil/map.html` (subsystem map, no store required). `devmap html` / Go `dev map html` writes the symbol graph. There is no `dev map demo` / `dev map view` command.
 
-Freshness uses git HEAD, a tracked-file hash, and a content fingerprint so plain edits mark the map stale. Fingerprint / git errors fail closed (treat as stale). A **missing** `.devcouncil/repo_map.json` is also stale — hard rigor blocks checkout/verify until `dev map` runs. The guides a build writes are restamped into the fingerprint, so a build never makes its own map read stale. Post-tool-use hooks run `dev map --if-stale --no-wiki`; `dev map --watch` wakes on filesystem events (debounced, with a slow poll as the safety net) and checks exactly the fingerprint `--if-stale` reads.
-
-HTML visualizers: `dev map html` shells out to the devmap kernel, so it needs a build new enough to have `map-html` (rebuild with `bash scripts/install-components.sh devmap` if needed). Set `indexing.write_graph_html: true` in config if you want bare `dev map` to also write `graph.html`. Otherwise use `dev map graph-html` / `dev map view` (or alias `dev graph html`) for the file/symbol graph, and `dev map html` for the subsystem map.
-
-## Sample graph demo (no map)
+## Sample graph HTML
 
 ```bash
-dev map demo --project-root /tmp/devcouncil-docs-smoke --json
-# Open /tmp/devcouncil-docs-smoke/.devcouncil/graph/demo.html
-# Alias: `dev graph demo` (same command group)
+devmap html --root /path/to/repo
+devmap map-html --root /path/to/repo
+# Go aliases: `dev map html`, `dev map map-html`
 ```
 
-`dev map demo` writes a **self-contained interactive HTML** page with a synthetic import graph. Open `demo.html` for filters, path highlighting, and neighborhoods. A static `demo.svg` may also be written; it is not a substitute for the interactive page. Supported platforms for the CLI and npm wrapper: macOS, Linux, and Windows (Go `dev`/`devcouncil`, Rust `devmap`, Git; Node.js 18+ only for the optional npm shim).
+## PDG / CFG / taint (opt-in, Python source only)
 
-## PDG / CFG / taint (opt-in)
-
-Program-dependence analysis is **off by default** and does not run during normal `dev map` unless you pass `--pdg`. It is Python-only and intra-procedural in the MVP.
-
-| Layer | Scope | Artifact |
-| :--- | :--- | :--- |
-| CFG | per function | basic blocks + branch/fallthrough edges |
-| Reaching-def | intra-procedural | def line → use line per variable |
-| CDG | intra-procedural | controller block → dependent block (+ `guard` on early return) |
-| Taint | heuristic | source→sink findings by category |
-
-**Persistence**
-
-- Summary + capped findings (≤500): `graph.meta["pdg"]` in `code_graph.json`
-- Full per-file payload: `analysis_shards[path]["pdg"]` in `codeintel/index.sqlite`
-
-**CLI**
-
-```bash
-dev map --pdg                                    # map + PDG in one shot
-dev map pdg build --path src/foo/bar.py          # on-demand for paths
-dev map explain --category command-injection
-dev map pdg-query --mode controls --target my_fn
-dev map pdg-query --mode flows --target my_fn --variable x
-```
+`devmap pdg <FILE>` reads the file from disk (not the index). Optional `--taint` filters to heuristic sinks. There is no `dev map --pdg` build flag, no `pdg build` / `explain` / `pdg-query` subcommands, and no write into `index.sqlite`. Not on DevMap MCP (`MISSING_CAPABILITIES`).
 
 **Limitations (MVP)**
 
@@ -131,34 +88,25 @@ dev map pdg-query --mode flows --target my_fn --variable x
 3. No field-sensitive or alias analysis.
 4. CDG branch sense is coarse (`if`/`while` only; `match` arms treated uniformly).
 5. Taint uses pattern tables — expect false positives/negatives.
-6. Opt-in — default `dev map` unchanged without `--pdg`.
+6. Opt-in per file — default `devmap build` does not run PDG.
 
 ## Query the graph
 
 ```bash
-dev map query refresh_map_artifacts  # definition + callers/callees/importers
-dev map trace path/a.py path/b.py
-dev map dead                       # full dead-code report (uncapped)
-dev map dead --min-confidence inferred
-dev map check                      # god nodes + circular imports
-dev map process                    # BFS call-flows from entry roots
-dev map impact src/foo.py          # blast radius
-dev map impact --diff              # blast radius for working-tree changes
+devmap search refresh_map_artifacts
+devmap explore refresh_map_artifacts --json
+devmap trace path/a.py path/b.py
+devmap dead --json
+devmap impact src/foo.py --json
+devmap html
+devmap map-html
+devmap export
+devmap search "auth flow" --semantic
+devmap cypher 'MATCH (a)-[r:CALLS]->(b) RETURN a.id, b.id LIMIT 20'
+devmap affected request_handler
 ```
 
-`dev map check` / `process` / `impact` (and PageRank inside god-node ranking) follow **extracted** and **inferred** import/call edges only. Ambiguous call fan-out stays in the store for explanation UIs but does not invent hubs or inflate blast radius.
-
-```bash
-dev map graph-html                 # write symbol graph.html
-dev map html --symbols             # same as graph-html
-dev map view                       # serve/open the HTML
-dev map export -o out.graphml      # GraphML (or --format okf)
-dev map search request_handler     # FTS5 symbol/path search (kernel)
-dev map search "auth flow" --semantic  # Name-similarity ranking in the kernel; no embedding index
-dev map cypher 'MATCH (a)-[r:CALLS]->(b) RETURN a.id, b.id LIMIT 20'
-dev map explore request_handler    # source + callers/callees + blast radius (kernel)
-dev map affected request_handler   # tests in the inbound impact closure (kernel)
-```
+Unknown on current `devmap`: `query`, `check`, `process`, `view`, `demo`, `graph-html`. Use `search`/`explore` instead of `query`.
 
 `explore` and `affected` moved into the kernel on 2026-09-05, replacing a Python
 engine that loaded the whole graph into process memory. Both take a symbol or a
@@ -284,11 +232,11 @@ Verification can also enforce wiring / stale-map / dead-symbol / liveness-ratche
 
 1. Open `.devcouncil/repo_map.json` before guessing file locations.
 2. Use `subsystems` → `entry_points` / `critical_files` / `role_files` / `neighbors`.
-3. Prefer `dev map dead --confidence extracted` + greps; treat inferred as unconfirmed.
+3. Prefer `devmap dead --json` + greps; read each row's `confidence`. Treat inferred as unconfirmed.
    If entry roots are empty / unreliable, ignore unreachable and mass inferred dead.
    Check `unwired_candidates` / `dead_symbol_candidates` before adding modules.
-4. Use `dev map query` / `trace` / `dead` for symbol-level navigation.
-5. Run `dev map` after large refactors (or rely on hooks / `--watch`).
+4. Use `devmap search` / `explore` / `trace` / `dead` for symbol-level navigation.
+5. Run `devmap build --manifest` (or `dev map`) after large refactors. There is no `--watch` flag; `devmap serve` is the long-lived watcher.
 
 ## API route mapping
 
@@ -296,10 +244,9 @@ Native HTTP surface tools over `ROUTE` nodes and `routes_to` /
 `registers` edges (no external graph service):
 
 ```bash
-dev map routes --json
-dev map shape-check --json
-dev map shape-check --route /api/items --json
-dev map api-impact /api/items --json
+devmap routes --json
+devmap shape-check --json
+devmap api-impact /api/items --json
 ```
 
 - **`routes`** — handlers, registration owners, and client fetch sites
@@ -310,13 +257,8 @@ dev map api-impact /api/items --json
 - **`api-impact`** — consumers, middleware registrations, shape mismatches, and
   a risk tier (`high` / `medium` / `low` / `none`).
 
-MCP equivalents: `devcouncil_route_map`, `devcouncil_shape_check`,
-`devcouncil_api_impact`, `devcouncil_graph_ingest`, `devcouncil_graph_cypher`,
-`devcouncil_pdg_query`, `devcouncil_explain`.
+Those three are **CLI-only** on current `devmap` (`routes`, `shape-check`, `api-impact`). They are not Go-host MCP tools. DevMap MCP (`devmap mcp`) does not advertise them (`MISSING_CAPABILITIES` in `rust/devmap-cli/src/session.rs`). There is no `devcouncil_graph_ingest` / `devcouncil_graph_cypher` / `devcouncil_explain` on the Go host.
 
 ## Corpus side index
 
-For navigation over docs, PDFs, and images — separate from the
-deterministic code graph but able to feed opt-in verify gates — see
-[docs/corpus.md](corpus.md) and run `dev corpus build`, `dev corpus query`, and
-`dev corpus status`.
+Retired. See [corpus.md](corpus.md). There is no `dev corpus` command.

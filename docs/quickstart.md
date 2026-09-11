@@ -87,20 +87,15 @@ This creates:
 
 ## 4. Connect Your Coding Agent
 
-Connect DevCouncil's policy gates, skills, and MCP tools directly to your coding tool or IDE:
+Connect DevCouncil's MCP server and skills to Cursor or Claude Code. `--write-gate` does not install hooks (TASK-P7-8).
 
 ```bash
-# Supported hosts: cursor, claude, codex, gemini, opencode, warp, aider, antigravity
-
-# Apply configuration for Cursor
+# Working adapters: cursor, claude, codex (comment-only toml)
 devcouncil integrate cursor --apply
-
-# Apply configuration for Claude Code with blocking write gate
-devcouncil integrate claude --apply --write-gate
-
-# Apply configuration for Antigravity or Codex
-devcouncil integrate antigravity --apply
+devcouncil integrate claude --apply
 devcouncil integrate codex --apply
+
+# gemini / opencode / warp / aider / antigravity write a stub receipt
 ```
 
 Verify existing integration configs:
@@ -134,7 +129,7 @@ devcouncil skills scaffold --skill devmap
 
 ### MCP Integration (Recommended)
 
-When working with Claude Code, Cursor, or Antigravity, start the DevCouncil MCP server:
+When working with Claude Code or Cursor, start the DevCouncil MCP server:
 
 ```bash
 devcouncil mcp
@@ -143,7 +138,7 @@ devcouncil mcp
 Over MCP, agents follow the **Hero Loop**:
 1. **Checkout:** `devcouncil_checkout_task` acquires an atomic lease on a task in `dcstore`.
 2. **Implement:** Agent edits code within the declared file scope.
-3. **Verify:** `devcouncil_verify_task` runs deterministic verification in `dcverify`.
+3. **Verify:** `devcouncil_verify_task` runs Go `verify.Run()` (scope / orphan / expected tests). It does **not** spawn `dcverify` (TASK-P7-1). Manvi `runRigor` does.
 4. **Repair:** If verification fails, typed `next_actions` guide self-repair without manual prompt pasting.
 5. **Release:** `devcouncil_release_task` releases the lease upon successful verification.
 
@@ -158,8 +153,8 @@ devcouncil verify TASK-001
 # Emit structured JSON for scripting and automation
 devcouncil verify TASK-001 --json
 
-# Run in an isolated container sandbox
-devcouncil verify TASK-001 --sandbox docker
+# Sandbox flag is recorded only; docker/nix do not isolate (TASK-P7-2)
+devcouncil verify TASK-001 --sandbox local
 ```
 
 ---

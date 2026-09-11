@@ -23,4 +23,4 @@ dev map
 ```
 
 Maturity labels for public surfaces: [docs/project-status.md](../docs/project-status.md).
-Walkthrough: [docs/build-week-demo.md](../docs/build-week-demo.md).
+Walkthrough: [docs/archive/build-week-demo.md](../docs/archive/build-week-demo.md).

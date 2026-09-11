@@ -1,6 +1,6 @@
 # DevMap for concurrent agent worktrees
 
-Audit and implementation: 2026-09-09. Current qualification evidence is in [SCHEMA20_QUALIFICATION_2026-09-09.md](SCHEMA20_QUALIFICATION_2026-09-09.md); the initial local measurements below are historical. Canonical implementation lives in DevCouncil's Rust workspace; GitPulse embeds scoped copies of `devmap-store` and `devmap-extract`.
+Audit and implementation: 2026-09-09. Qualification evidence is archived in [SCHEMA20_QUALIFICATION_2026-09-09.md](../archive/devmap/SCHEMA20_QUALIFICATION_2026-09-09.md); the initial local measurements below are historical. Canonical implementation lives in DevCouncil's Rust workspace; GitPulse embeds scoped copies of `devmap-store` and `devmap-extract`.
 
 ## Navigation contract
 
@@ -58,7 +58,7 @@ The harness reports actual daemon/editor concurrency separately from the bounded
 
 ### Initial local results (superseded candidate)
 
-The frozen candidate completed the following macOS/local-filesystem workload. The machine-readable result is [AGENTIC_WORKTREE_VALIDATION.json](AGENTIC_WORKTREE_VALIDATION.json).
+The frozen candidate completed the following macOS/local-filesystem workload. The machine-readable result is [AGENTIC_WORKTREE_VALIDATION.json](../archive/devmap/AGENTIC_WORKTREE_VALIDATION.json).
 
 | Measurement | Observed result |
 |---|---:|
@@ -86,7 +86,7 @@ Reproduce from this workspace with `cargo run -p devmap-cli --example worktree_s
 
 Counts above are separate runs, not additive unique-test coverage. The full workspace and 128-worktree run preceded the last read-only fallback validation and a Clippy-only needless-borrow cleanup; the final delta was validated separately. The default kernel skips are the external Claude validator, the explicit long-running daemon soak, and a child-process helper invoked by its parent. This follow-up uses the separate 128-worktree crash workload. GitPulse's two library skips are an unrelated manual document-refresh benchmark and a live upstream-update check. Neither skipped external check is reported as passing.
 
-The initial audit's final candidate (`f0463d910a61de9beadb669ce8348d40ceb2b71419352b3df9d45fb3742be03a`) also passed a four-worktree/eight-editor smoke run: 384 file operations, 32 IPC queries, 16 metadata checks, four forced restarts, and four matching cold comparisons. [AGENTIC_WORKTREE_FINAL_DELTA.json](AGENTIC_WORKTREE_FINAL_DELTA.json) retains that result separately from the capacity run.
+The initial audit's final candidate (`f0463d910a61de9beadb669ce8348d40ceb2b71419352b3df9d45fb3742be03a`) also passed a four-worktree/eight-editor smoke run: 384 file operations, 32 IPC queries, 16 metadata checks, four forced restarts, and four matching cold comparisons. [AGENTIC_WORKTREE_FINAL_DELTA.json](../archive/devmap/AGENTIC_WORKTREE_FINAL_DELTA.json) retains that result separately from the capacity run.
 
 Retained adversarial cases live in `devmap-store/src/db.rs` (`agentic_queue_regressions`), store `embedded_reader` and `migration_ladder` tests, CLI `test_concurrency`, watcher tests, and extract `ignore_rule_tolerance`. GitPulse's `codeintel` tests check foreign-root refusal; `devmap_embedding` drives the candidate CLI through its existing adapter. The tracked canonical store/extract/serve diff is 985 lines added and 283 removed, plus the new 78-line Git metadata resolver and 286-line stress harness. These scoped counts include the earlier staleness audit and exclude the shared CLI, consumer, and documentation changes. No dependency was added.
 

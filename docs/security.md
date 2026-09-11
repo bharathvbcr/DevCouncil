@@ -9,13 +9,8 @@ DevCouncil is designed to minimize unsafe agent behavior:
 
 DevCouncil provides gates and evidence to make risky changes easier to detect. It does not replace human security review.
 
-## Sandbox configuration is a trust boundary
+## Verification commands run on the host
 
-`dev verify --sandbox docker` runs verification inside a container, and the
-`verification.sandbox.docker_setup_commands` entries from `.devcouncil/config.yaml` are passed to
-`sh -c` inside that container. The same applies to the configured verification commands themselves.
+`devcouncil verify --sandbox` records the flag on the report. Only local execution is implemented: expected-test and allowed-command lines are passed to `/bin/sh -c` with `Dir` set to the project root (`DefaultRunCommand`). Values `docker` and `nix` do not start a container or Nix sandbox (TASK-P7-2). There is no `verification.sandbox.docker_setup_commands` reader in the Go host.
 
-Treat `.devcouncil/config.yaml` as trusted input: anything (or anyone) that can write that file can
-execute arbitrary commands in the sandbox container, and — for the `local` sandbox — on the host.
-Review config changes in pull requests the same way you would review CI workflow changes, and do not
-run `dev verify` against configs from untrusted sources.
+Treat `.devcouncil/config.yaml` as trusted input: anything that can write that file can influence which commands verification will run on the host. Review config changes in pull requests the same way you would review CI workflow changes, and do not run `devcouncil verify` against configs from untrusted sources.

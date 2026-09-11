@@ -12,19 +12,18 @@ done. These are **modules** (lease, verify, MCP). **Manvi** wraps the same compo
 multi-agent campaigns. A host can take this loop without Manvi, or take Manvi without
 this loop.
 
-This is the one path DevCouncil certifies end to end. Other coding CLIs are supported (see
-[coding-cli-integration.md](coding-cli-integration.md)), but the loop below is the one to
-reach for first.
+Cursor and Claude can run this loop over the eight-tool host MCP. It is **Preview**, not a certified slash/hook/subagent install. Other names in `integrate.Hosts` are stub receipts (see
+[coding-cli-integration.md](coding-cli-integration.md)).
 
-## Certified path (Stable)
+## Certified path (Preview)
 
 | Agent | OS | Transport | Status |
 | --- | --- | --- | --- |
-| **Claude Code** | macOS, Linux | MCP (`devcouncil_*` tools) + optional hooks | **Certified / Stable** |
-| **Claude Code** | macOS, Linux | Slash commands (`/devcouncil:*`) shelling to MCP | **Certified / Stable** |
-| **Claude Code** | macOS, Linux | Subagent `devcouncil-implementer` | **Certified / Stable** |
+| **Claude Code** | macOS, Linux | MCP via `.mcp.json` (`devcouncil_*` eight-tool host) | **Preview** — integrate writes MCP only |
+| **Cursor** | macOS, Linux | MCP via `.cursor/mcp.json` + `.cursor/rules/devcouncil.mdc` | **Preview** — no hooks.json |
+| **Codex** | macOS, Linux | comment-only `.codex/config.toml` | **Stub** |
 
-Integration coverage: Go MCP server tests (`backend/go_orchestrator/devcouncil/mcp`) and `dcverify` golden fixtures.
+`devcouncil integrate claude` does **not** install slash commands, a plugin, PreToolUse hooks, a statusline, or a `devcouncil-implementer` subagent. Those were the Python installer. Coverage: Go MCP tests (`backend/go_orchestrator/devcouncil/mcp`) and `dcverify` golden fixtures. Those `dcverify` fixtures cover the Rust binary; host MCP `devcouncil_verify_task` currently runs Go `verify.Run()` and does not spawn `dcverify` (TASK-P7-1). Manvi `runRigor` is the path that execs it.
 
 ### Deterministic self-repair
 
@@ -41,7 +40,7 @@ Stable repair contract (no LLM required): correction manifest from blocking gaps
 
 ### Best-effort adapters (Preview)
 
-Codex, Antigravity, Cursor Agent, Grok, OpenCode, Warp/Aider/Copilot/others reuse the same verifier and next-actions contract but are not certified for the full MCP closed loop. Gemini CLI is **deprecated** (use Antigravity). Prefer the Claude Code MCP path for production agent loops; confirm wiring with `devcouncil integrate <host> --check`.
+Cursor Agent, Codex, and other CLIs can still *call* the same eight host MCP tools if you point them at `devcouncil mcp` by hand. `integrate` does not configure Antigravity / OpenCode / Warp / Aider / Gemini (stub receipt). Prefer Cursor or Claude MCP for the loop; confirm wiring with `devcouncil integrate cursor|claude --check`.
 
 Large multi-agent goals with dependency DAGs are orchestrated by **Manvi**, which wraps these same DevCouncil components rather than replacing them.
 
@@ -86,11 +85,11 @@ checkout_task ─▶ (agent implements) ─▶ verify_task ─▶ passed? ─▶
    `devcouncil_verify_task` again. The loop continues until `passed` is true.
 6. **`devcouncil_release_task`** — the lease is released.
 
-The agent never needs a human in the inner loop. A human reviews the final evidence report
-(`dev report`) — the durable Requirement→Task→Diff→Evidence artifact — not the chat
-history.
+The agent never needs a human in the inner loop. A human reviews the final evidence (`devcouncil verify TASK_ID --json` / MCP `devcouncil_get_gaps`) — not the chat history. There is no `dev report` command (unknown, exit 2).
 
 ## The diff↔coverage gate
+
+This gate lives in **`dcverify`**. Manvi `runRigor` execs it. Go `verify.Run()` / MCP `devcouncil_verify_task` do not (TASK-P7-1); they always record `"coverage profile not supplied"`.
 
 A green test suite is only acceptance evidence if it actually ran the lines the diff
 changed. The verifier runs the task's test command under coverage and intersects the
@@ -175,19 +174,16 @@ verification:
 
 Repair runs carry a **correction manifest** with prior diff, failing output, attempt
 history, stub findings, and non-negotiable **repair rules** (never weaken tests, never
-stub around a gap). Tune thresholds from evidence with `dev report rigor`.
+stub around a gap). There is no `dev report rigor` command.
 
 ## Setup
 
 ```bash
-# One-shot: MCP server, assistive hooks, slash commands, subagents, output style, skills, statusline.
-dev integrate claude --apply
-
-# Optional: add the blocking write-gate for autonomous runs.
-dev integrate claude --apply --write-gate
+# Writes .mcp.json (devcouncil + devmap). No slash commands, hooks, or statusline.
+devcouncil integrate claude --apply
 
 # Confirm the wiring.
-dev integrate check
+devcouncil integrate claude --check
 ```
 
 Then, inside Claude Code, drive the loop with the `devcouncil_*` MCP tools, or let an
@@ -249,8 +245,8 @@ devcouncil verify TASK-001
 # Emit structured JSON for scripting and CI pipelines
 devcouncil verify TASK-001 --json
 
-# Run in an isolated container sandbox
-devcouncil verify TASK-001 --sandbox docker
+# --sandbox is recorded on the report; docker/nix do not isolate today
+devcouncil verify TASK-001 --sandbox local
 ```
 
-`devcouncil verify` runs the native `dcverify` engine and prints the verdict along with typed `next_actions` for machine consumption.
+`devcouncil verify` runs Go `verify.Run()` (planned-file / orphan / expected tests) and prints the verdict along with typed `next_actions`. It does not spawn `dcverify`. Stub / secret / coverage rigor is in that binary; Manvi calls it. See [TODO.md](TODO.md) TASK-P7-1.

@@ -18,10 +18,10 @@ Maturity labels:
 | **Task & Lease Store** | `dcstore` (Rust) | **Stable** | SQLite-backed task repository with atomic mutual-exclusion leases for safe concurrent agent building. |
 | **Deterministic Verifier** | `dcverify` (Rust) | **Stable** | Unified-diff parsing, declared planned-file scope enforcement, anti-laziness stub detection, and typed `next_actions` repair signals. |
 | **Search Engine** | `dcgrep` (Rust) | **Stable** | Ripgrep-powered ignore-aware search engine with optional trigram indexing (`tgrep-core`). |
-| **Hero Loop (MCP Closed Loop)** | Go Host + `dcverify` | **Stable** | Autonomous closed loop for Claude Code and Cursor over MCP (`checkout → implement → verify → repair → release`). |
-| **Agent Integrations** | `devcouncil integrate` | **Stable** | Native configurations for Cursor, Claude Code, Codex, Antigravity, OpenCode, and Warp. |
-| **Engineering Skills** | `devcouncil skills` | **Stable** | Embedding and scaffolding of verified skills (`core-engineering`, `devmap`, etc.) into target repositories. |
-| **Sandboxed Verification** | `devcouncil verify --sandbox` | **Preview** | Execution of verification commands inside isolated Docker or Nix containers. |
+| **Hero Loop (MCP Closed Loop)** | Go Host MCP + thin `verify.Run()` | **Preview** | Checkout → implement → verify → repair → release over MCP. Host `devcouncil_verify_task` does **not** spawn `dcverify`; Manvi `runRigor` does. See TASK-P7-1. |
+| **Agent Integrations** | `devcouncil integrate` | **Preview** | Cursor: `.cursor/mcp.json` + rule. Claude: `.mcp.json` only. Codex: comment-only toml. Antigravity / OpenCode / Warp / Aider / Gemini: stub receipt. `--write-gate` is ignored. See TASK-P7-8. |
+| **Engineering Skills** | `devcouncil skills` | **Preview** | Embed and scaffold still ship Python-era hero-loop / verification contracts (TASK-P7-9). Domain skills (`core-engineering`, …) are the native set. |
+| **Sandboxed Verification** | `devcouncil verify --sandbox` | **Not implemented** | Flag is accepted and copied onto the report. Commands still run via `/bin/sh -c` in the project root. `docker` / `nix` do not isolate. See TASK-P7-2. |
 
 ---
 
@@ -38,5 +38,10 @@ As part of the consolidation into standalone native binaries, the following lega
 | **Textual Dashboard** | Terminal dashboard (`dev dashboard`) | Replaced by DevMap visualizers (`devmap view`) and Manvi TUI. |
 | **Corpus Side Index** | Doc/PDF/image index (`dev corpus`) | Consolidated into `devmap search` and standard repository mapping. |
 | **Legacy Provider Routing** | Provider cost ledger & routing (`dev cost`, `dev setup`) | LLM routing is owned by upstream agent harnesses (e.g. **Manvi**). |
+| **GitHub Checks + PR comments** | `integrations/github.py`, `reporting/github_check.py` | No Checks API writer in the Go host. GitPulse reads Dependabot / code scanning and can check out a PR; it does not post a check run from `devcouncil verify`. |
+| **Offline SCA** | `repo/sca.py` (`pip-audit` / `npm audit` / `osv-scanner`) | No DevCouncil verify gate. GitPulse Insights Health (`src-tauri/src/analyzer/deps.rs`) runs `pip-audit` / `npm audit` / `cargo-audit` / `govulncheck` as a related job when a repo opens. |
+| **Claim lie-detector** | `verification/claims/` | Swept up in the verification hard-cut; no mapper in Go verify. |
+| **DAP debug broker** | `devcouncil_debug_*` (8 tools) | PHASE7: unused adjunct; not rebuilt. |
+| **OpenHands / mini-SWE / Claude SDK executors** | `executors/` adapters | Manvi loop / hero-loop skill; those adapters were not transcribed. |
 
-For complete rationale and architectural decisions regarding the retired surfaces, see [PHASE7_LONG_TAIL.md](PHASE7_LONG_TAIL.md).
+For complete rationale and architectural decisions regarding the retired surfaces, see [PHASE7_LONG_TAIL.md](PHASE7_LONG_TAIL.md). Open follow-ups are in [TODO.md](TODO.md).

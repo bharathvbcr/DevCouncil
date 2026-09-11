@@ -1,6 +1,8 @@
 # dev map → Rust: Clean-Room Rewrite Plan
 
-**Status:** Phase 6 hybrid. `dev map` **already executes the Rust kernel** —
+> **Archived 2026-09-11.** Written for the Phase 6 hybrid. The Python seam (`src/devcouncil/devmap_engine.py`) was deleted in Phase 7. Live commands are `devmap` / Go `dev map` forwarding. See [TODO.md](../../TODO.md) and [PHASE7_LONG_TAIL.md](../../PHASE7_LONG_TAIL.md).
+
+**Status (as written):** Phase 6 hybrid. `dev map` **already executes the Rust kernel** —
 `rust-port/target/release/devmap`, with `src/devcouncil/devmap_engine.py` as the seam. Python
 `indexing/` + `codeintel/` are still present and still own the surfaces not yet migrated, but
 they are no longer what a `dev map` build runs. See [STATUS.md](STATUS.md) for what is actually

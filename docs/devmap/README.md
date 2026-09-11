@@ -1,18 +1,20 @@
 # Dev Map
 
-Kernel sources live under [`rust/`](../../rust/) (`devmap-*` crates, `vendor/`,
-`testdata/`, `verify.sh`). This folder is the design and audit record; older
-pages still say `rust-port/`.
+This folder is the **live** DevMap guide and contracts. Port ledgers, dated
+audits, and qualification dumps are in [archive/devmap/](../archive/devmap/).
 
-Concurrent agent worktrees: [design, audit and rollout contract](AGENTIC_WORKTREE_DESIGN.md), with [native qualification, exact artifacts and coordinated schema-20 cutover](SCHEMA20_QUALIFICATION_2026-09-09.md). Navigation is read-only; use explicit `devmap repair --schema` only after coordinating all installed readers and writers.
+Kernel sources live under [`rust/`](../../rust/) (`devmap-*` crates, `vendor/`,
+`testdata/`, `verify.sh`). Older archived pages still say `rust-port/`.
+
+Concurrent agent worktrees: [design, audit and rollout contract](AGENTIC_WORKTREE_DESIGN.md), with archived [native qualification and schema-20 cutover](../archive/devmap/SCHEMA20_QUALIFICATION_2026-09-09.md). Navigation is read-only; use explicit `devmap repair --schema` only after coordinating all installed readers and writers.
 
 Host applications can link the query crate or use the versioned JSON and HTML
 process contract in [HOST_INTEGRATION.md](HOST_INTEGRATION.md).
 
 **Components cutover (2026-09-10):** DevCouncil ships `devmap` + Go `devcouncil` +
 `dcstore` as the binary plugin contract. Python map/orchestration consumers are
-deleted — see [../docs/PHASE7_LONG_TAIL.md](../docs/PHASE7_LONG_TAIL.md) and
-[CONSUMERS.md](CONSUMERS.md).
+deleted — see [../PHASE7_LONG_TAIL.md](../PHASE7_LONG_TAIL.md). The Python
+consumer ledger is archived at [../archive/devmap/CONSUMERS.md](../archive/devmap/CONSUMERS.md).
 
 Symbol-level code intelligence for coding agents and the people who supervise
 them. One binary, one SQLite store, no daemon required and no network.
@@ -69,9 +71,9 @@ covers deep packages without a depth ceiling; non-Git discovery remains bounded
 in depth, directories, frontier size, entries and cooperative elapsed time.
 `*_computed` alone never proves completeness, and marker completeness does
 not imply complete language or call-graph coverage.
-See the [coverage and robustness audit](RELIABILITY_AUDIT_2026-09-09.md) for
+See the [coverage and robustness audit](../archive/devmap/RELIABILITY_AUDIT_2026-09-09.md) for
 current fixes, measured stress results, and remaining language/platform limits.
-The [earlier reliability audit](RELIABILITY_AUDIT_2026-09-08.md) records the
+The [earlier reliability audit](../archive/devmap/RELIABILITY_AUDIT_2026-09-08.md) records the
 previous binding and source-read repairs.
 
 An incomplete query can have several independent causes:
@@ -154,7 +156,7 @@ by Git. A missing store is an uninitialized checkout, not an empty graph.
 Run `devmap build --manifest` to create both the database and exported maps;
 use the same command to restore a missing map beside an existing database.
 Read-only discovery never creates or copies state from another worktree.
-See the [state-discovery audit](STATE_DISCOVERY_AUDIT_2026-09-09.md) for
+See the [state-discovery audit](../archive/devmap/STATE_DISCOVERY_AUDIT_2026-09-09.md) for
 reproduced failures, regression evidence, and qualification limits.
 
 Default discovery also skips `testdata/` directory segments, the
@@ -207,7 +209,7 @@ JSON `file_progress` carries scan and extraction counters plus source deltas.
 An extraction value of `null` means it was skipped; zero cache hits means it ran
 without a hit. Removed sources are absent from the readable scan compared with
 the previous generation; discovery refusals are counted separately. See
-[PROGRESS_AUDIT.md](PROGRESS_AUDIT.md) for verification evidence and platform limits.
+[PROGRESS_AUDIT.md](../archive/devmap/PROGRESS_AUDIT.md) for verification evidence and platform limits.
 
 Runtime failures include `diagnostic_context` in JSON and a `DevMap context:`
 line on stderr: command, binary/version, PID, timestamp, repository root, selected
@@ -524,9 +526,8 @@ cargo clippy --workspace --exclude dc-glob --exclude dc-grep --exclude dc-store 
 ./verify.sh                # the full gate: parity, growth, incremental equivalence
 ```
 
-`AGENT_PLAN.md`, `DIVERGENCES.md` and `STATUS.md` in this folder carry the port's
-history and every deliberate divergence from the Python implementation this
-replaced.
+`DIVERGENCES.md` in this folder is the live divergence ledger. Port history
+(`AGENT_PLAN.md`, `STATUS.md`, `PLAN.md`) is under [archive/devmap/](../archive/devmap/).
 
 ## License
 

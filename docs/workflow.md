@@ -16,16 +16,17 @@ DevCouncil provides a gated, evidence-first workflow for AI-assisted software de
                                   ▼
    ┌─────────────────────────────────────────────────────────────┐
    │ 2. Environment & Skills Setup (devcouncil)                  │
-   │    • devcouncil integrate <host> --apply [--write-gate]     │
+   │    • devcouncil integrate cursor|claude|codex --apply       │
    │    • devcouncil skills scaffold --skill <name>              │
    └──────────────────────────────┬──────────────────────────────┘
                                   │
                                   ▼
    ┌─────────────────────────────────────────────────────────────┐
-   │ 3. The Verified Task Loop (devcouncil mcp / dcverify)       │
+   │ 3. The Verified Task Loop (devcouncil mcp)                  │
    │    • Checkout task & acquire lease (dcstore)                │
    │    • Implement edits inside declared file scope             │
-   │    • Verify diff deterministically (dcverify)               │
+   │    • Verify via Go verify.Run() (scope / orphan / commands) │
+   │      dcverify rigor is spawned by Manvi today, not this CLI │
    │    • On failure: self-repair guided by typed next_actions   │
    │    • On success: release lease & record evidence            │
    └─────────────────────────────────────────────────────────────┘
@@ -57,13 +58,13 @@ The precomputed index identifies callers, callees, and imports across 36+ langua
 
 ## Stage 2: Agent Integration & Skills Delivery
 
-Prepare the target repository for your coding agent or IDE (Cursor, Claude Code, Codex, Antigravity, OpenCode, Warp):
+Prepare the target repository for Cursor, Claude Code, or Codex. Other names in `integrate.Hosts` return a stub receipt (TASK-P7-8). `--write-gate` is ignored.
 
 ```bash
-# 1. Apply integration configuration (registers MCP tools and config)
+# 1. Apply integration configuration (MCP + a Cursor rule; Claude is .mcp.json only)
 devcouncil integrate cursor --apply
-devcouncil integrate claude --apply --write-gate
-devcouncil integrate antigravity --apply
+devcouncil integrate claude --apply
+devcouncil integrate codex --apply
 
 # 2. Distribute verified engineering and navigation skills into the project
 devcouncil skills scaffold --skill core-engineering
@@ -78,7 +79,7 @@ Skills are placed in standard directories (`.agents/skills/`, `.claude/skills/`,
 
 ### Option A: Autonomous Closed Loop via MCP (Recommended)
 
-When working with an agent capable of MCP tool calls (Claude Code, Cursor, Codex, Antigravity), DevCouncil runs as an MCP stdio server:
+When working with an agent capable of MCP tool calls (Claude Code, Cursor), DevCouncil runs as an MCP stdio server:
 
 ```bash
 devcouncil mcp
@@ -87,11 +88,11 @@ devcouncil mcp
 The agent executes the certified **Hero Loop**:
 1. **Task Checkout:** Calls `devcouncil_checkout_task`. Acquires an atomic lease in `dcstore`, locking the task against concurrent agents and receiving planned file scope and verification criteria.
 2. **Implementation:** Edits code strictly within declared planned files.
-3. **Task Verification:** Calls `devcouncil_verify_task`. The deterministic verifier (`dcverify`) evaluates the captured diff:
-   - **Scope Enforcement:** Detects unauthorized file edits outside planned boundaries.
-   - **Anti-Laziness:** Catches stubs, empty functions, and unfulfilled TODOs.
-   - **Coverage & Tests:** Verifies test execution against modified lines.
-   - **Secret Scanning:** Blocks committed API tokens and credentials.
+3. **Task Verification:** Calls `devcouncil_verify_task`. Go `verify.Run()` evaluates the captured diff:
+   - **Scope enforcement:** Unauthorized file edits outside planned boundaries.
+   - **Orphan diffs / dependency-risk:** Files changed that were not planned.
+   - **Expected tests:** Task command list via `/bin/sh -c` in the project root.
+   Stub, secret, and coverage rigor live in `dcverify`; Manvi `runRigor` spawns it, this MCP tool currently does not (TASK-P7-1).
 4. **Self-Repair:** If verification fails, DevCouncil emits structured, typed `next_actions`. The agent iterates on repairs until the gates pass.
 5. **Release:** Once verified, calls `devcouncil_release_task` to complete the task and record evidence.
 
@@ -106,8 +107,8 @@ devcouncil verify TASK-001
 # 2. Machine-readable JSON output for local automation
 devcouncil verify TASK-001 --json
 
-# 3. Verification inside an isolated Docker sandbox container
-devcouncil verify TASK-001 --sandbox docker
+# 3. Sandbox flag is recorded only; docker/nix do not isolate (TASK-P7-2)
+devcouncil verify TASK-001 --sandbox local
 ```
 
 ---

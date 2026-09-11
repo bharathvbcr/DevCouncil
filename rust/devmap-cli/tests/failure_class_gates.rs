@@ -1,4 +1,4 @@
-//! Executable gates for the failure classes in `docs/devmap/PLAN.md` §3.1.
+//! Executable gates for the failure classes in `docs/archive/devmap/PLAN.md` §3.1.
 //!
 //! The classes exist because the per-finding acceptance tests did not prevent
 //! recurrence: four of the five shapes produced a *fresh* instance in the Rust

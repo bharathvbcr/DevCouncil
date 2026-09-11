@@ -46,7 +46,7 @@ devcouncil mcp
 # or: devcouncil mcp-server
 ```
 
-Runs the Model Context Protocol (MCP) stdio server. Exposes tools for task management, atomic leases, diff inspection, policy write checks, and task verification to connected agents (Claude Code, Cursor, Codex, Antigravity).
+Runs the Model Context Protocol (MCP) stdio server. Eight tools: checkout / renew / release / next_task / get_diff / verify_task / get_gaps / policy_check_write. What `integrate` installs into Cursor/Claude. Filesystem, grep, git, and `dcverify` rigor live on **Manvi**, not here.
 
 ### Agent Host Integrations
 
@@ -54,20 +54,21 @@ Runs the Model Context Protocol (MCP) stdio server. Exposes tools for task manag
 devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR] [--write-gate]
 ```
 
-Supported hosts: `cursor`, `claude`, `codex`, `gemini`, `opencode`, `warp`, `aider`, `antigravity`.
+`Hosts` lists `cursor`, `claude`, `codex`, `gemini`, `opencode`, `warp`, `aider`, `antigravity`. Only **cursor / claude / codex** have adapters (TASK-P7-8). The rest write a stub receipt; `devmap integrate` then refuses those names.
 
-- `--apply`: Write configuration files to the target repository.
+- `--apply`: Write configuration files (or a stub receipt) to the target repository.
 - `--check`: Read-only verification that integration files match expected content.
 - `--dry-run`: Print planned actions without modifying files.
-- `--write-gate`: Install blocking PreToolUse write gates (Claude Code, Cursor).
+- `--write-gate`: Parsed and labeled "containment mode", then discarded. Does not write `.cursor/hooks.json` or Claude PreToolUse hooks.
 - `--project-root DIR`: Specify target project directory (defaults to `$DEVCOUNCIL_PROJECT_ROOT` or `pwd`).
 
 ```bash
-# Example usage:
+# Working adapters today:
 devcouncil integrate cursor --apply
-devcouncil integrate claude --apply --write-gate
-devcouncil integrate antigravity --apply
+devcouncil integrate claude --apply
 devcouncil integrate claude --check
+
+# Removes leftover Python-era hook files if any remain. Integrate never writes those files now.
 devcouncil integrate uninstall --target hooks --apply
 ```
 
@@ -89,11 +90,10 @@ devcouncil skills scaffold [--skill NAME] [--project-root DIR] [--dry-run] [--ch
 devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local|docker|nix] [--project-root DIR]
 ```
 
-Verifies code changes associated with `TASK_ID` using the deterministic verification engine (`dcverify`).
-- Checks planned file scope, diff validity, anti-laziness/stubs, and test execution.
+Verifies the working-tree diff for `TASK_ID` through Go `verify.Run()`: no-work, planned-file scope, orphan diffs, dependency-risk, and expected-test / allowed-command execution. This command does **not** spawn `dcverify`. Stub, secret, and coverage rigor live in that binary; Manvi `runRigor` is the current caller. `dcverify` remains a separate CLI (`scripts/install-components.sh`).
 - `--mode`: `off` (default when unset) skips quality verification; `advisory` still blocks hard-safety gaps; `enforce` blocks every `Blocking` gap. Hard-safety write policy is unchanged.
 - `--json`: Output machine-readable verification results and typed `next_actions` for agent self-repair.
-- `--sandbox local|docker|nix`: Run verification commands in a sandbox container or local environment.
+- `--sandbox`: Copied onto the report. Only local execution is implemented (`/bin/sh -c` in the project root). `docker` and `nix` are accepted as labels and do **not** isolate (TASK-P7-2). Usage text still lists them; do not treat that as a working sandbox.
 
 ### DevMap Shorthands
 
@@ -112,28 +112,33 @@ High-performance multi-language code graph and symbol analysis engine (extract �
 ```bash
 # Build & Lifecycle
 devmap build --manifest     # Generate repo_map.json and code_graph.json
-devmap build --watch        # Rebuild on filesystem events (debounced)
-devmap build --if-stale     # Build only if source files changed since last generation
-devmap build --full         # Force a cold rebuild (re-parse all files)
-devmap status [--json]      # Report store schema, page stats, generation, freshness
-devmap doctor [--fix]       # Check store health, orphan entries, and repair issues
-devmap paths [--json]       # Print resolved store, cache, and artifact paths
+devmap build --full         # Cold rebuild
+devmap serve                # Watcher + IPC (not `build --watch`)
+devmap status [--json]
+devmap doctor               # No `--fix`
+devmap paths [--json]
+devmap history
+devmap repair
 
 # Code Exploration & Navigation
-devmap query <SYMBOL>       # 360° symbol view: definitions, callers, callees, importers
-devmap trace <SRC> <DST>    # Shortest dependency or call path between two graph nodes
-devmap impact <PATH...>     # Blast radius & reverse dependents for paths
-devmap dead [--json]        # Unreferenced code with confidence tiers (extracted|inferred|ambiguous)
-devmap search <QUERY>       # FTS5 symbol and path search over current generation
-devmap cypher '<QUERY>'     # Execute supported Cypher queries against the SQLite graph store
+devmap search <QUERY> [--semantic]
+devmap explore <NAME>
+devmap trace <SRC> <DST>
+devmap impact <TARGET>
+devmap dead [--json]
+devmap cypher '<QUERY>'
+devmap affected <TARGET>
+devmap pdg <FILE> [--taint]
+devmap ast …
 
 # Visualizers & Servers
-devmap view                 # Serve and open interactive graph visualizer locally
-devmap demo                 # Output standalone demo.html visualizer
-devmap map-html             # Generate subsystem map HTML (.devcouncil/map.html)
-devmap graph-html           # Generate symbol-level graph HTML (.devcouncil/graph/graph.html)
-devmap serve --mcp          # Run standalone DevMap MCP server over stdio
+devmap map-html             # Subsystem map (.devcouncil/map.html)
+devmap html                 # Symbol graph HTML
+devmap mcp                  # DevMap MCP stdio (not `serve --mcp`)
+devmap export               # GraphML
 ```
+
+Unknown: `query`, `view`, `demo`, `graph-html`, `doctor --fix`, `build --watch`, `build --if-stale`.
 
 ---
 
@@ -185,9 +190,10 @@ With Phase 7 and the transition to native Go and Rust binaries, legacy Python CL
 | `dev plan` / `dev approve` | Multi-agent LLM debate & tasks | Managed by upstream agent harnesses (e.g. **Manvi**) or interactive prompts. |
 | `dev run` / `dev e2e` / `dev go` | Python subprocess coding agent runner | Run agents natively via MCP (**Hero Loop**) or via **Manvi**. |
 | `dev prompt` / `dev handoff` | Formatted text prompt generation | Handled over MCP via task checkout contexts and skills. |
-| `dev check` / `dev check --verify` | Python LLM audit / demo check | Use `devcouncil verify TASK_ID` or `dcverify check`. |
+| `dev status` / `dev checkout` / `dev tasks` / `dev doctor` | Python orientation and lease bootstrap | Go unknown command (exit 2). Policy `NoTaskAllowedCommands` still allowlists them (TASK-P7-9). Use `devcouncil mcp` tools / `devmap status` / `devmap doctor`. |
+| `dev check` / `dev check --verify` | Python LLM audit / demo check | Use `devcouncil verify TASK_ID` or `dcverify`. |
 | `dev wiki` / `dev okf` / `dev design` | Markdown wiki & OKF bundle generator | Replaced by `devmap build --guides` (`AGENTS.md`, `CLAUDE.md`). |
 | `dev dashboard` | Textual dashboard UI | Replaced by DevMap visualizers (`devmap view`) and Manvi TUI. |
 | `dev cost` / `dev doctor` | Python model pricing ledger & env checks | Health checks via `devmap doctor` and binary health flags. |
 
-For detailed rationale on the retirement decisions, see [PHASE7_LONG_TAIL.md](PHASE7_LONG_TAIL.md).
+For detailed rationale on the retirement decisions, see [PHASE7_LONG_TAIL.md](PHASE7_LONG_TAIL.md). Open follow-ups: [TODO.md](TODO.md).

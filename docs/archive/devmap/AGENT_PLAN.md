@@ -1,5 +1,7 @@
 # AGENT_PLAN — building `devmap` (Rust) from scratch
 
+> **Archived 2026-09-11.** Port-execution plan from before Phase 7. The Python tree is gone. Do not follow this as current work. Live follow-ups: [TODO.md](../../TODO.md).
+
 **Audience:** a coding agent executing this port. Not a design document — PLAN.md owns design,
 AUDIT.html owns findings. This file owns *execution*: what to do, in what order, under which
 rules, with which proof.

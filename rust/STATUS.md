@@ -2,9 +2,9 @@
 
 > **This is not the kernel ledger.** The kernel crates (`devmap-*`) now live
 > in this same workspace. Open work for both planes is indexed in
-> [`docs/devmap/AGENT_PLAN.md` → Consolidated open-work register](../docs/devmap/AGENT_PLAN.md#consolidated-open-work-register-2026-09-02)
+> [`docs/archive/devmap/AGENT_PLAN.md` → Consolidated open-work register](../docs/archive/devmap/AGENT_PLAN.md#consolidated-open-work-register-2026-09-02)
 > (section E covers this plane). This file stays authoritative for the analysis-plane
-> detail; kernel status is [`docs/devmap/STATUS.md`](../docs/devmap/STATUS.md).
+> detail; the kernel port ledger is archived at [`docs/archive/devmap/STATUS.md`](../docs/archive/devmap/STATUS.md). Live follow-ups: [`docs/TODO.md`](../docs/TODO.md).
 
 **What this is:** the four `dc-*` crates and their Go clients, ported from the MANVI
 harness (`~/Code/devtools/Manvi`) into DevCouncil on 2026-09-01.
@@ -49,7 +49,7 @@ significant case it is measurably less capable, and cutting over would weaken a 
 > [`docs/COMPONENTS_AND_HARNESS.md`](../../Manvi/docs/COMPONENTS_AND_HARNESS.md).
 > This ledger covers only the analysis-plane components that landed here.
 
-This ledger follows `docs/devmap/STATUS.md`'s convention: claims are labelled
+This ledger follows `docs/archive/devmap/STATUS.md`'s convention: claims are labelled
 **verified** (a command was run and its output read), **inferred**, or
 **unverified**. Passing tests are local mechanical evidence, not evidence of a
 soak, of CI, or of production parity.

@@ -1,6 +1,8 @@
 # Consumer Contracts Ledger (Task 1.4)
 
-This document tracks all 37 external consumer files in `src/devcouncil/` that interface with code intelligence (`devcouncil.indexing` / `devcouncil.codeintel`), their touched surfaces, expected payload shapes, and tri-state expectations (X14: unknown ≠ verified-zero).
+> **Archived 2026-09-11.** This ledger describes the Python `src/devcouncil/` consumers of the DevMap kernel **before** the Phase 7 deletion (`3286db5`, 2026-09-10). Those Python files are gone. Current writers are `devmap build --manifest` and `devmap integrate`. Live: [code-graph.md](../../code-graph.md), [PHASE7_LONG_TAIL.md](../../PHASE7_LONG_TAIL.md). Do not treat `devcouncil_graph_ingest` or `index.sqlite` as current.
+
+This document tracked 37 external consumer files in `src/devcouncil/` that interfaced with code intelligence (`devcouncil.indexing` / `devcouncil.codeintel`), their touched surfaces, expected payload shapes, and tri-state expectations (X14: unknown ≠ verified-zero).
 
 ## Correction (2026-09-02, evening): one build path, no Python writers
 

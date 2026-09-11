@@ -6,4 +6,4 @@ evidence report.
 
 For a runnable provider-free red→green sample, use
 [`../build-week-demo/`](../build-week-demo/) via `bash scripts/build-week-demo.sh`.
-See [docs/build-week-demo.md](../../docs/build-week-demo.md).
+See [docs/archive/build-week-demo.md](../../docs/archive/build-week-demo.md).

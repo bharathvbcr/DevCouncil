@@ -25,7 +25,7 @@ DevCouncil's core runtime is a set of standalone, compiled native modules. Each 
 | Binary | Language | Role & Ownership |
 |--------|----------|------------------|
 | `devcouncil` / `dev` | **Go** | Host orchestrator: Stdio MCP server (`mcp`), multi-host agent integration (`integrate`), engineering skills distribution (`skills`), task verification (`verify`), and devmap forwarding (`map`, `graph`, `ast`). |
-| `devmap` | **Rust** | Code intelligence engine: 36+ tree-sitter language extractors, symbol resolution, blast-radius calculation, dead-code analysis, workspace guides (`AGENTS.md`), and DevMap MCP server (`serve --mcp`). |
+| `devmap` | **Rust** | Code intelligence engine: 36+ tree-sitter language extractors, symbol resolution, blast-radius calculation, dead-code analysis, workspace guides (`AGENTS.md`), and DevMap MCP server (`devmap mcp`). |
 | `dcstore` | **Rust** | State & lease store: SQLite-backed task repository, mutual-exclusion leases for concurrent agent building, evidence records, and gap tracking. |
 | `dcverify` | **Rust** | Deterministic verification: Unified-diff parsing, planned file scope classification, anti-laziness/stub gates, test coverage evaluation, and typed `next_actions` repair signals. |
 | `dcgrep` | **Rust** | Code search: Ripgrep-powered ignore-aware search engine with optional trigram indexing (`tgrep-core`). |
@@ -110,18 +110,14 @@ dcgrep health
 
 ### 1. Coding Agent Integration (`devcouncil integrate`)
 
-Connect DevCouncil's MCP servers, policy gates, and skills to your coding environment:
+Connect DevCouncil's MCP server to Cursor or Claude Code. `--write-gate` is ignored (TASK-P7-8).
 
 ```bash
-# Supported hosts: cursor, claude, codex, gemini, opencode, warp, aider, antigravity
-
-# Apply configuration for a specific host
 devcouncil integrate cursor --apply
 devcouncil integrate claude --apply
-devcouncil integrate antigravity --apply
 
-# Enforce the blocking write gate (Claude Code)
-devcouncil integrate claude --apply --write-gate
+# Stub receipt only — not a working installer:
+# devcouncil integrate antigravity --apply
 
 # Verify existing integration configuration
 devcouncil integrate cursor --check
@@ -178,23 +174,24 @@ devcouncil verify TASK-001
 # Machine-readable output for agent loops
 devcouncil verify TASK-001 --json
 
-# Run verification in a containerized sandbox
-devcouncil verify TASK-001 --sandbox docker
+# Sandbox flag is recorded only; docker/nix do not isolate (TASK-P7-2)
+devcouncil verify TASK-001 --sandbox local
 ```
 
-Verification enforces:
-- **Planned File Scope:** Rejects unauthorized edits outside declared task boundaries.
-- **Anti-Laziness & Stubs:** Detects empty implementations, placeholders, and unfulfilled promises.
-- **Test Coverage:** Intersects test execution with modified code paths.
-- **Secret Scanning:** Blocks accidental leaks of API tokens or credentials.
-- **Typed `next_actions`:** Generates structured repair instructions when verification fails.
+Verification today (Go `verify.Run()`) enforces:
+- **Planned file scope:** Rejects unauthorized edits outside declared task boundaries.
+- **Orphan diffs / dependency-risk:** Flags files changed that were not planned.
+- **Expected tests / allowed commands:** Runs the task's command list via `/bin/sh -c` in the project root.
+- **Typed `next_actions`:** Structured repair instructions when those gates fail.
+
+Stub detection, secret scanning, and coverage intersection live in the **`dcverify`** binary. **Manvi** `runRigor` spawns it; `devcouncil verify` and MCP `devcouncil_verify_task` currently do not (TASK-P7-1).
 
 ### 5. MCP Servers for AI Agents
 
 DevCouncil provides two complementary Model Context Protocol (MCP) servers:
 
-- **Host MCP Server (`devcouncil mcp`)**: Exposes task management, mutual-exclusion leases, diff inspection, policy-checked writes, and verification gates.
-- **DevMap MCP Server (`devmap serve --mcp`)**: Exposes symbol exploration, call graphs, impact analysis, and workspace navigation over stdio or HTTP.
+- **Host MCP Server (`devcouncil mcp`)**: Eight tools — checkout / renew / release / next_task / get_diff / verify_task / get_gaps / policy_check_write. `verify_task` runs Go `verify.Run()` and does not spawn `dcverify`.
+- **DevMap MCP Server (`devmap mcp`)**: Eleven query tools (status, search, dependencies, impact, trace, neighbors, dead_symbols, clones, preview, explore, affected_tests). Always pass `repo_path`.
 
 ---
 
@@ -237,11 +234,11 @@ flowchart TD
     CLI -->|Execs| DevMap
     CLI -->|Integrates| Integ
     CLI -->|Scaffolds| Skills
-    VerifyCmd -->|Execs & Validates| DCVerify
-    VerifyCmd -->|Checks Leases| DCStore
+    VerifyCmd -->|Scope, orphan, expected tests| DCStore
+    Manvi -->|Spawns dcverify rigor| DCVerify
 
-    MCP -->|Leases & Tasks| DCStore
-    MCP -->|Diff Gates| DCVerify
+    MCP -->|Leases and tasks| DCStore
+    MCP -->|verify_task → Go Run| VerifyCmd
 ```
 
 ---
@@ -266,7 +263,9 @@ DevCouncil/
 ## Documentation
 
 - [Release Notes (v0.2.0)](docs/releases/v0.2.0.md): Native orchestration and analysis migration.
+- [Native cutover follow-ups](docs/TODO.md): Open wiring and honesty work after Phase 7.
 - [Architecture Decisions & Python Retirement](docs/PHASE7_LONG_TAIL.md): Background on the transition to native Go and Rust binaries.
+- [Archived ledgers](docs/archive/README.md): Pre-cutover DevMap plans, audits, and qualification dumps.
 - [Code Graph & DevMap Guide](docs/code-graph.md): Symbol resolution, dead code, and blast radius.
 - [Hero Loop (MCP Closed Loop)](docs/hero-loop.md): Autonomous task loop with deterministic gates.
 - [Coding CLI Integration](docs/coding-cli-integration.md): Configuring Claude, Codex, Cursor, Warp, and Antigravity.
