@@ -1,19 +1,27 @@
 ---
 name: devmap-refactoring
 title: Refactoring with DevMap
-description: Use when renaming, extracting, splitting, moving, or restructuring code. Examples: "Rename this function", "Extract this into a module", "Move this to a separate file"
+description: Use DevMap to plan and verify renames, extractions, moves, splits, and
+  structural code changes.
 triggers:
-  keywords: [devmap preview, coordinated rename]
-  markers: [.devcouncil, .devmap]
+  keywords:
+  - devmap preview
+  - coordinated rename
+  markers:
+  - .devcouncil
+  - .devmap
 ---
 
 # Refactoring with DevMap
 
-1. `devmap_explore` / `devmap_impact` on the symbol being moved.
-2. `devmap_search` for every name that must change with it.
-3. `devmap_preview` on the edited file before write — callers the edit would break.
-4. After the edit, `devmap_affected_tests` and run those tests.
+Resolve this checkout with `devmap paths --json`, then check `devmap status --json`. Read the returned `repo_map` path; do not assume `.devcouncil` rather than `.devmap`. A missing, stale, or partially parsed index is not complete evidence. Rebuild with `devmap build --manifest` when needed and authorized, then recheck status.
 
-There is no graph-coordinated `rename` tool. Do not invent one and do not use GitNexus `rename`. Search + preview + tests is the path; record a `rename` gap if a multi-file graph rename is what was needed.
+Use the connected DevMap MCP tools if they target this checkout; otherwise use the CLI from its root. GitPulse's `gitpulse_codeintel_*` tools also query DevMap: pass the absolute `repo_path`. Discover the actual tool names and schemas; a host need not expose every CLI capability.
 
-Check `unwired_candidates` in `repo_map.json` before creating a new module — wire what you add to a real caller.
+1. Explore and assess impact with `devmap explore <name> --json` and `devmap impact <target> --json`.
+2. Find all references using symbol search and direct source inspection, including registries, generated bindings, and dynamic calls the graph may miss.
+3. Use the installed preview interface where supported. Do not invent a graph-coordinated rename command; use language tooling or a suitable available fallback when required.
+4. Inspect the resolved map's unwired candidates before adding a module, and verify its real callers after the edit.
+5. Review the complete diff and run candidate tests from `devmap affected <target> --json` plus the repository's required checks.
+
+Read `shown`, `total`, `truncated`, and `walk_incomplete`; say which references remain unverified. Prefer DevMap where it answers the question and explain any fallback. Explicit user and repository requirements take precedence.

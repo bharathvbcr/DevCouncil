@@ -1810,3 +1810,128 @@ fn self_edges_and_duplicates_survive_the_counting_sort() {
         }
     }
 }
+
+#[test]
+fn audit_dead_confidence_refuses_nan_instead_of_reporting_zero() {
+    for store in [
+        Store::open_in_memory().unwrap(),
+        store_with(&[("a.py", "def unused():\n    return 1\n")]),
+    ] {
+        assert!(
+            store.count_dead_at_least(f32::NAN).is_err(),
+            "an unevaluated comparison cannot report zero dead symbols"
+        );
+    }
+}
+
+#[test]
+fn audit_generation_id_exhaustion_rolls_back_without_wrapping_identity() {
+    let dir = tmp_dir("generation-overflow");
+    let db = dir.join("map.sqlite");
+    let store = Store::open(&db).unwrap();
+    let (extractions, resolution, analysis) = pipeline(&[]);
+    store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'generations'",
+        [i64::from(u32::MAX)],
+    )
+    .unwrap();
+    for _ in 0..32 {
+        let result = store.save_generation(&extractions, &resolution, &analysis);
+        assert!(
+            result.is_err(),
+            "generation IDs must not wrap to zero: {result:?}"
+        );
+    }
+    assert_eq!(store.latest_generation_id().unwrap(), Some(1));
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM generations", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    drop(conn);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn audit_path_id_exhaustion_rolls_back_the_failed_intern() {
+    let dir = tmp_dir("path-overflow");
+    let db = dir.join("map.sqlite");
+    let store = Store::open(&db).unwrap();
+    store.get_or_create_path_id("before.py").unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'paths'",
+        [i64::from(u32::MAX)],
+    )
+    .unwrap();
+    for _ in 0..32 {
+        assert!(store.get_or_create_path_id("overflow.py").is_err());
+    }
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM paths WHERE path = 'overflow.py'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "refusing an unrepresentable ID must not leave a persisted row"
+    );
+    drop(conn);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn audit_concurrent_path_interns_reuse_one_identity() {
+    let dir = tmp_dir("path-intern-stress");
+    let db = dir.join("map.sqlite");
+    let stores: Vec<Store> = (0..8).map(|_| Store::open(&db).unwrap()).collect();
+    let start = std::sync::Barrier::new(stores.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = stores
+            .into_iter()
+            .map(|store| {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    (0..128)
+                        .map(|step| {
+                            let name = format!("path-{}.py", step % 16);
+                            let id = store.get_or_create_path_id(&name).unwrap();
+                            (name, id)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut identities = std::collections::BTreeMap::new();
+        for handle in handles {
+            for (name, id) in handle.join().unwrap() {
+                if let Some(previous) = identities.insert(name, id) {
+                    assert_eq!(previous, id);
+                }
+            }
+        }
+        assert_eq!(identities.len(), 16);
+    });
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM paths", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        16
+    );
+    assert_eq!(
+        conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    drop(conn);
+    fs::remove_dir_all(dir).unwrap();
+}

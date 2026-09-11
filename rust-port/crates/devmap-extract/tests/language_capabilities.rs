@@ -269,7 +269,7 @@ fn every_declared_language_has_a_probe() {
         .collect();
     let missing: Vec<&str> = NON_REGISTRY_CAPABILITIES
         .iter()
-        .map(|(name, _)| *name)
+        .map(|(name, _, _)| *name)
         .filter(|name| !covered.contains(*name))
         .collect();
     assert!(
@@ -415,8 +415,10 @@ fn the_languages_without_import_extraction_are_named_with_reasons() {
 
     let fallback_calls_without_imports: Vec<&str> = NON_REGISTRY_CAPABILITIES
         .iter()
-        .filter(|(_, caps)| caps.contains(Capability::Calls) && !caps.contains(Capability::Imports))
-        .map(|(name, _)| *name)
+        .filter(|(_, caps, _)| {
+            caps.contains(Capability::Calls) && !caps.contains(Capability::Imports)
+        })
+        .map(|(name, _, _)| *name)
         .collect();
     assert_eq!(
         fallback_calls_without_imports,
@@ -462,8 +464,8 @@ fn the_import_dispatcher_and_the_registry_agree() {
         .chain(
             NON_REGISTRY_CAPABILITIES
                 .iter()
-                .filter(|(_, caps)| caps.contains(Capability::Imports))
-                .map(|(name, _)| *name),
+                .filter(|(_, caps, _)| caps.contains(Capability::Imports))
+                .map(|(name, _, _)| *name),
         )
         .collect();
     let dispatched: BTreeSet<&str> = IMPORT_EXTRACTION_LANGUAGES.iter().copied().collect();

@@ -74,6 +74,11 @@ class ProbeAdmission:
 
 
 def main():
+    # Integrity, coverage and cold/incremental equivalence are assertions below.
+    # Python -O (including inherited PYTHONOPTIMIZE) removes them entirely.
+    # Refuse before starting processes or writing a passing qualification.
+    if not __debug__:
+        raise RuntimeError("worktree stress requires assertions; remove -O/PYTHONOPTIMIZE")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--ipc-probe", type=Path, help="native ipc_probe example; required on Windows")

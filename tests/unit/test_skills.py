@@ -2,6 +2,7 @@ from typer.testing import CliRunner
 
 from devcouncil.cli.main import app
 from devcouncil.skills.registry import (
+    Skill,
     load_skills,
     render_preamble,
     scaffold_skills,
@@ -90,15 +91,13 @@ def test_skills_for_scaffold_prefers_library_over_stale_repo_copy(tmp_path):
 
     clear_skill_caches()
     lib = (LIBRARY_DIR / "devcouncil.md").read_text(encoding="utf-8")
-    stale_dir = tmp_path / ".cursor" / "skills" / "devcouncil"
-    stale_dir.mkdir(parents=True)
-    (stale_dir / "SKILL.md").write_text(
-        "---\nname: devcouncil\ndescription: stale\nalways: true\n---\n# Stale\n"
-        "checkout before writes, release when verified.\n",
-        encoding="utf-8",
-    )
+    # A generated older install is refreshable; an unowned local file is not.
+    scaffold_skills(tmp_path, [Skill(
+        name="devcouncil", description="stale", always=True,
+        body="# Stale\ncheckout before writes, release when verified.\n",
+    )])
     clear_skill_caches()
-    skills = skills_for_scaffold("", tmp_path)
+    skills = skills_for_scaffold("devcouncil", tmp_path)
     dc = next(s for s in skills if s.name == "devcouncil")
     assert "Stale" not in (dc.body or "")
     assert "Interactive Shell" in (dc.body or "") or "Interactive Shell" in lib
@@ -436,10 +435,10 @@ def test_scaffold_skips_repo_local_skill_sources(tmp_path):
     from devcouncil.skills.registry import discover_repo_skills
 
     local = next(s for s in discover_repo_skills(tmp_path) if s.name == "custom")
-    # Source is .claude/skills — skip that dest, but still mirror to .cursor/skills.
+    # Preserve the source while mirroring to both other supported hosts.
     written = scaffold_skills(tmp_path, [local])
     paths = {p.relative_to(tmp_path).as_posix() for p in written}
-    assert paths == {".cursor/skills/custom/SKILL.md"}
+    assert paths == {".cursor/skills/custom/SKILL.md", ".agents/skills/custom/SKILL.md"}
     # Explicit single-destination still skips when source is that dest.
     assert scaffold_skills(tmp_path, [local], destinations=(".claude/skills",)) == []
 

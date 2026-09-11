@@ -218,24 +218,27 @@ fn the_bug_this_gate_closes() {
 /// After the gate: zero candidates, and a non-zero exclusion count saying why.
 #[test]
 fn an_import_blind_project_reports_no_unwired_candidates() {
-    for (name, extractions) in [("csharp", csharp_project())] {
-        let graph = graph(&extractions);
-        assert!(
-            unwired(&graph).is_empty(),
-            "{name}: no file may be called unwired in a language where no \
-             import was ever looked for: {:?}",
-            unwired(&graph)
-        );
+    // C# is the one remaining language in this suite that parses cleanly and
+    // has no import extractor; the others this loop once covered — Java,
+    // Terraform, Swift — have since gained one, which is why it is a single
+    // name rather than a list.
+    let name = "csharp";
+    let graph = graph(&csharp_project());
+    assert!(
+        unwired(&graph).is_empty(),
+        "{name}: no file may be called unwired in a language where no \
+         import was ever looked for: {:?}",
+        unwired(&graph)
+    );
 
-        let excluded = graph["meta"]["devmap_rust"]["unwired_excluded_import_blind"]
-            .as_u64()
-            .expect("unwired_excluded_import_blind must be published");
-        assert!(
-            excluded > 0,
-            "{name}: a filtered list under a bare total is how \"we did not \
-             look\" comes to read as \"we looked and found nothing\""
-        );
-    }
+    let excluded = graph["meta"]["devmap_rust"]["unwired_excluded_import_blind"]
+        .as_u64()
+        .expect("unwired_excluded_import_blind must be published");
+    assert!(
+        excluded > 0,
+        "{name}: a filtered list under a bare total is how \"we did not \
+         look\" comes to read as \"we looked and found nothing\""
+    );
 }
 
 /// The OFF direction. A language that *does* extract imports keeps reporting.

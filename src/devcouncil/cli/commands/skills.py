@@ -83,14 +83,43 @@ def scaffold(
     goal: str = typer.Argument("", help="Optional goal text used to widen domain-skill selection."),
     project_root: Path = typer.Option(Path("."), "--project-root", help="Repository root to scaffold skills into."),
     all_skills: bool = typer.Option(False, "--all", help="Scaffold every skill, not just the ones that apply."),
+    names: list[str] | None = typer.Option(None, "--skill", help="Install an exact packaged skill; repeat for multiple skills."),
+    destinations: list[str] | None = typer.Option(None, "--destination", help="Relative skill directory, e.g. .agents/skills; repeat for multiple hosts."),
+    check: bool = typer.Option(False, "--check", help="Read-only verification; exit 1 when selected files differ or are missing."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show planned file changes without installing."),
 ):
-    """Write the applicable skills into <repo>/.claude/skills/<name>/SKILL.md."""
+    """Install skills for Claude Code, Cursor, and Codex without overwriting local edits."""
     root = project_root.expanduser().resolve()
-    chosen = load_skills(project_root=root) if all_skills else select_skills(goal, root)
-    written = scaffold_skills(root, chosen)
+    if names and (all_skills or goal):
+        raise typer.BadParameter("--skill cannot be combined with --all or a selection goal")
+    if check and dry_run:
+        raise typer.BadParameter("Choose --check or --dry-run")
+    try:
+        if names:
+            packaged = {skill.name: skill for skill in load_skills(project_root=None)}
+            unknown = sorted(set(names) - packaged.keys())
+            if unknown:
+                raise ValueError(f"Unknown skill: {', '.join(unknown)}")
+            chosen = [packaged[name] for name in dict.fromkeys(names)]
+        else:
+            chosen = load_skills(project_root=root) if all_skills else select_skills(goal, root)
+        if destinations is None and not (check or dry_run):
+            written = scaffold_skills(root, chosen)
+        else:
+            written = scaffold_skills(root, chosen, destinations=destinations, dry_run=check or dry_run)
+    except (OSError, ValueError) as error:
+        console.print(str(error), markup=False)
+        raise typer.Exit(code=1) from error
+    if check or dry_run:
+        console.print(f"{len(chosen)} selected skill(s); {len(written)} file(s) differ or are missing.")
+        for path in written:
+            console.print(f"  {path.relative_to(root).as_posix()}", markup=False)
+        if check and written:
+            raise typer.Exit(code=1)
+        return
     if not written:
         console.print(
-            f"[green]Skills already up to date in {root / '.claude' / 'skills'} "
+            f"[green]Skills already up to date in the selected destinations "
             f"({len(chosen)} applicable).[/green]"
         )
         return

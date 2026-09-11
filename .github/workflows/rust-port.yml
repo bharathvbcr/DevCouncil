@@ -78,6 +78,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --workspace --no-fail-fast
 
+      # cargo test --release still forces unwinding. This executable must use
+      # the shipped profile or an aborting worker can pass every Rust test.
+      - name: Release worker panic recovery
+        if: ${{ !cancelled() }}
+        run: cargo run --release --locked -p devmap-serve --example worker_recovery_probe
+
       - uses: actions/setup-python@v5
         if: ${{ !cancelled() }}
         with:

@@ -195,6 +195,10 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// only kill.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A response must acquire its writer and reach the peer within this bound.
+/// A stopped reader must not retain every admission permit indefinitely.
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Requests one connection may have outstanding at once.
 ///
 /// Requests are served concurrently — they have to be, or a cancellation cannot
@@ -1760,7 +1764,12 @@ fn rpc_error_frame_from(id: Option<Value>, error: &RpcError) -> Value {
 /// strings, and `1` and `"1"` are different ids that must not collide. Rendering
 /// through `Value::to_string` keeps them distinct (`1` vs `"1"`) without needing
 /// `Value` to be `Hash`.
-type InFlight = Arc<Mutex<std::collections::HashMap<String, devmap_query::Cancel>>>;
+type InFlight = Arc<Mutex<std::collections::HashMap<String, InFlightRequest>>>;
+
+struct InFlightRequest {
+    cancel: devmap_query::Cancel,
+    cancelled_by_client: bool,
+}
 
 /// One stdio session: the store, and whatever it currently has in flight.
 ///
@@ -1788,9 +1797,10 @@ impl Session {
     /// Absent is normal, not an error: a cancellation that loses the race with
     /// completion is exactly the case the specification says to tolerate.
     fn cancel(&self, id: &Value) {
-        if let Ok(map) = self.in_flight.lock() {
-            if let Some(cancel) = map.get(&id.to_string()) {
-                cancel.cancel();
+        if let Ok(mut map) = self.in_flight.lock() {
+            if let Some(request) = map.get_mut(&id.to_string()) {
+                request.cancelled_by_client = true;
+                request.cancel.cancel();
             }
         }
     }
@@ -1815,7 +1825,11 @@ longer account for what it is running and cannot promise this request would be c
         // first request's flag was dropped from the table, so the cancellation
         // the client later sent for that id reached the wrong call, and the
         // first request became unstoppable with nothing saying so.
-        if let Some(existing) = map.insert(id.to_string(), cancel) {
+        let request = InFlightRequest {
+            cancel,
+            cancelled_by_client: false,
+        };
+        if let Some(existing) = map.insert(id.to_string(), request) {
             // Put the original back: the *earlier* request is the one that owns
             // this id, and it is still running.
             map.insert(id.to_string(), existing);
@@ -1828,10 +1842,27 @@ answers indistinguishable and would leave the first call uncancellable."
         Ok(())
     }
 
-    /// Give back the slot `id` held.
-    fn release(&self, id: &Value) {
-        if let Ok(mut map) = self.in_flight.lock() {
-            map.remove(&id.to_string());
+    /// Give back the slot, remembering whether the client asked for silence.
+    /// Internal deadlines also cancel the worker, but still owe an error reply.
+    fn release(&self, id: &Value) -> bool {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id.to_string())
+            .is_some_and(|request| request.cancelled_by_client)
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Aborting async request tasks does not abort their blocking workers.
+        // Session teardown must tell every abandoned query to stop explicitly.
+        let requests = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for request in requests.values() {
+            request.cancel.cancel();
         }
     }
 }
@@ -1993,6 +2024,16 @@ pub async fn handle_method(
 /// is a *well-formed request*, and by then the id is recoverable, so a malformed
 /// request is reported as `-32600` against its own id.
 async fn dispatch_value(session: &Arc<Session>, value: Value) -> Option<Value> {
+    // One admission permit covers a whole frame. A batch shares one deadline,
+    // rather than multiplying the individual tool timeout by its member count.
+    dispatch_value_with_deadline(session, value, tokio::time::Instant::now() + CALL_TIMEOUT).await
+}
+
+async fn dispatch_value_with_deadline(
+    session: &Arc<Session>,
+    value: Value,
+    deadline: tokio::time::Instant,
+) -> Option<Value> {
     // JSON-RPC 2.0 §6: a batch is an Array of Request objects, answered with an
     // Array of the corresponding Responses. An empty Array is a single
     // `-32600`. Notifications inside a batch still get no entry, and a batch of
@@ -2043,7 +2084,7 @@ async fn dispatch_value(session: &Arc<Session>, value: Value) -> Option<Value> {
             // client can match to a pending id, with the id itself buried N
             // levels down. It was also the only unbounded recursion on the
             // request path.
-            if let Some(response) = dispatch_single(session, item).await {
+            if let Some(response) = dispatch_single(session, item, Some(deadline)).await {
                 // Unserializable is not "small enough", for the reason
                 // `oversized_result_refusal` gives: the frame cannot be written
                 // either way, and treating the failure as a zero would let it
@@ -2081,7 +2122,7 @@ ask for less in each.",
         };
     }
 
-    dispatch_single(session, value).await
+    dispatch_single(session, value, None).await
 }
 
 /// Decode one request object. Never a batch — see [`dispatch_value`].
@@ -2089,7 +2130,11 @@ ask for less in each.",
 /// JSON-RPC 2.0 §6 defines a batch as "an Array of Request objects". It does not
 /// nest, and keeping that fact in the type of this function is what stops a
 /// nested array from being answered with a nested response.
-async fn dispatch_single(session: &Arc<Session>, value: Value) -> Option<Value> {
+async fn dispatch_single(
+    session: &Arc<Session>,
+    value: Value,
+    deadline: Option<tokio::time::Instant>,
+) -> Option<Value> {
     let Value::Object(object) = &value else {
         return Some(rpc_error_frame(
             None,
@@ -2224,16 +2269,41 @@ method sent as a notification would run work whose result cannot be returned"
         }
     }
 
-    let outcome = handle_method_cancellable(&session.store, &method, params, cancel.clone()).await;
+    let operation = handle_method_cancellable(&session.store, &method, params, cancel.clone());
+    let outcome = if let Some(deadline) = deadline.filter(|_| has_id) {
+        // Check before polling: an immediately ready method must not start
+        // after earlier batch members have spent the shared budget. Validation
+        // and cancellation notifications above still run, so every request id
+        // can retire and a notification can still stop an unrelated request.
+        let completed = if tokio::time::Instant::now() >= deadline {
+            None
+        } else {
+            tokio::time::timeout_at(deadline, operation).await.ok()
+        };
+        match completed {
+            Some(outcome) => outcome,
+            None => {
+                // Dropping the async method detaches its blocking worker.
+                // Cancel it explicitly, then use the ordinary release/reply
+                // path; internal cancellation must not suppress the response.
+                cancel.cancel();
+                Err(RpcError::new(
+                    codes::INTERNAL_ERROR,
+                    "batch deadline exceeded; this request did not complete and any running \
+work was cancelled. Send fewer requests per batch, or ask for less in each.",
+                ))
+            }
+        }
+    } else {
+        operation.await
+    };
 
-    if has_id {
-        session.release(&id);
-    }
+    let cancelled_by_client = has_id && session.release(&id);
 
     // A cancelled request gets no response. The specification is explicit that
     // the receiver must not answer a request it was told to abandon, and an
     // answer here would also be a claim about a traversal that stopped early.
-    if cancel.is_cancelled() {
+    if cancelled_by_client {
         return None;
     }
 
@@ -2345,11 +2415,16 @@ where
         match available.iter().position(|byte| *byte == b'\n') {
             Some(offset) => {
                 if overflowed.is_none() {
+                    let seen = buffer.len().saturating_add(offset);
+                    if seen > MAX_FRAME_BYTES {
+                        reader.consume(offset + 1);
+                        return Ok(Frame::TooLarge(seen));
+                    }
                     buffer.extend_from_slice(&available[..offset]);
                 }
                 reader.consume(offset + 1);
                 return Ok(match overflowed {
-                    Some(seen) => Frame::TooLarge(seen + offset),
+                    Some(seen) => Frame::TooLarge(seen.saturating_add(offset)),
                     None => Frame::Line(buffer),
                 });
             }
@@ -2365,7 +2440,7 @@ where
                         buffer.extend_from_slice(available);
                     }
                 } else if let Some(seen) = overflowed.as_mut() {
-                    *seen += taken;
+                    *seen = seen.saturating_add(taken);
                 }
                 reader.consume(taken);
             }
@@ -2420,20 +2495,33 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let session = Arc::new(Session::new(store));
-    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    let writer = Arc::new(tokio::sync::Mutex::new(ResponseWriter {
+        stream: writer,
+        failed: false,
+    }));
     let mut reader = reader;
-    let mut tasks = Vec::new();
+    // JoinSet aborts unfinished async handlers when this scope exits. Retaining
+    // bare handles detached them on error and also discarded task/write faults.
+    let mut tasks = tokio::task::JoinSet::<anyhow::Result<()>>::new();
 
     loop {
-        let frame = match read_frame(&mut reader).await {
-            Ok(frame) => frame,
-            Err(err) => {
-                // A transport-level read failure is the end of the session; a
-                // *content* fault is not, and is handled below.
-                for task in tasks {
-                    let _ = task.await;
+        while let Some(completed) = tasks.try_join_next() {
+            completed??;
+        }
+        let frame = {
+            // Keep this future alive while reaping: read_frame holds a partial
+            // frame, so restarting it whenever a response completes loses bytes.
+            let incoming = read_frame(&mut reader);
+            tokio::pin!(incoming);
+            loop {
+                tokio::select! {
+                    frame = &mut incoming => break frame?,
+                    completed = tasks.join_next(), if !tasks.is_empty() => {
+                        if let Some(result) = completed {
+                            result??;
+                        }
+                    }
                 }
-                return Err(err.into());
             }
         };
 
@@ -2492,9 +2580,23 @@ continued for {seen} bytes in total before terminating"
         // well-formed request from a client doing nothing wrong is data loss
         // wearing a good error message, and an agent host draining a plan
         // pipelines hundreds of requests as a matter of course. The wait is
-        // bounded in the only way that matters — every admitted call is bounded
-        // by `CALL_TIMEOUT`, so a permit is never held forever.
-        let Some(admitted) = admission.admit().await else {
+        // bounded by the call deadline plus the response-write deadline, so a
+        // permit is never held forever.
+        let admitted = {
+            let permit = admission.admit();
+            tokio::pin!(permit);
+            loop {
+                tokio::select! {
+                    admitted = &mut permit => break admitted,
+                    completed = tasks.join_next(), if !tasks.is_empty() => {
+                        if let Some(result) = completed {
+                            result??;
+                        }
+                    }
+                }
+            }
+        };
+        let Some(admitted) = admitted else {
             // The pool is closed, which nothing here does. Ending the session
             // is the only honest answer: continuing would spawn unadmitted work
             // and put this loop back where the ceiling was added to fix it.
@@ -2503,25 +2605,30 @@ continued for {seen} bytes in total before terminating"
 
         let session = Arc::clone(&session);
         let writer = Arc::clone(&writer);
-        tasks.push(tokio::spawn(async move {
+        tasks.spawn(async move {
             let _admitted = admitted;
             if let Some(frame) = handle_line_in(&session, &text).await {
-                let _ = write_frame(&writer, &frame).await;
+                write_frame(&writer, &frame).await?;
             }
-        }));
-        // Finished handles are still reaped as we go, so a long session does not
-        // accumulate a handle per request it ever served. This bounds the vector
-        // and not the fan-out; the fan-out is the admission above.
-        tasks.retain(|task| !task.is_finished());
+            Ok(())
+        });
     }
 
-    for task in tasks {
-        let _ = task.await;
+    while let Some(result) = tasks.join_next().await {
+        result??;
     }
     Ok(())
 }
 
-async fn write_frame<W>(writer: &tokio::sync::Mutex<W>, frame: &Value) -> anyhow::Result<()>
+struct ResponseWriter<W> {
+    stream: W,
+    failed: bool,
+}
+
+async fn write_frame<W>(
+    writer: &tokio::sync::Mutex<ResponseWriter<W>>,
+    frame: &Value,
+) -> anyhow::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -2529,11 +2636,424 @@ where
     payload.push(b'\n');
     // The lock spans the write and the flush, so two concurrent responses cannot
     // interleave their bytes into one unparseable line.
-    let mut writer = writer.lock().await;
-    writer.write_all(&payload).await?;
-    // Flushed per frame. Buffered, a request/response protocol deadlocks: the
-    // client waits for an answer sitting in our buffer, and we wait for its next
-    // request.
-    writer.flush().await?;
+    tokio::time::timeout(RESPONSE_WRITE_TIMEOUT, async {
+        let mut writer = writer.lock().await;
+        anyhow::ensure!(
+            !writer.failed,
+            "MCP response stream failed on an earlier frame"
+        );
+        // Leave this set if writing fails or this future is cancelled. No
+        // concurrent handler may append another reply to a partial JSON frame.
+        writer.failed = true;
+        writer.stream.write_all(&payload).await?;
+        // Buffered output can deadlock a request/response protocol, so flushing
+        // shares the write deadline and mutex rather than extending either.
+        writer.stream.flush().await?;
+        writer.failed = false;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("MCP response write exceeded {RESPONSE_WRITE_TIMEOUT:?}"))??;
     Ok(())
+}
+
+#[cfg(test)]
+mod transport_audit_tests {
+    use super::{read_frame, serve_streams, Frame, StoreSlot, MAX_FRAME_BYTES};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn audit_expired_batch_deadline_preserves_ids_and_notifications() {
+        let session = Arc::new(super::Session::new(Arc::new(StoreSlot::new("unused"))));
+        let other_cancel = devmap_query::Cancel::new();
+        session
+            .register(&serde_json::json!(99), other_cancel.clone())
+            .unwrap();
+        let batch = serde_json::json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 99}},
+            {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "devmap_status"}},
+            {"jsonrpc": "2.0", "id": "second", "method": "ping"},
+            {"jsonrpc": "2.0", "id": 99, "method": "ping"},
+            {"jsonrpc": "1.0", "id": 3, "method": "ping"},
+            []
+        ]);
+        let response = super::dispatch_value_with_deadline(
+            &session,
+            batch,
+            tokio::time::Instant::now() - Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let responses = response.as_array().unwrap();
+        assert_eq!(responses.len(), 5, "notifications must remain unanswered");
+        for (index, id) in [serde_json::json!(1), serde_json::json!("second")]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(responses[index]["id"], id);
+            assert_eq!(
+                responses[index]["error"]["code"],
+                super::codes::INTERNAL_ERROR
+            );
+            assert!(responses[index]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("batch deadline"));
+        }
+        assert_eq!(responses[2]["id"], 99);
+        assert_eq!(responses[2]["error"]["code"], super::codes::INVALID_REQUEST);
+        assert_eq!(responses[3]["id"], 3);
+        assert_eq!(responses[3]["error"]["code"], super::codes::INVALID_REQUEST);
+        assert!(responses[4]["id"].is_null());
+        assert_eq!(responses[4]["error"]["code"], super::codes::INVALID_REQUEST);
+        assert!(other_cancel.is_cancelled());
+        assert!(session.release(&serde_json::json!(99)));
+        assert!(session.in_flight.lock().unwrap().is_empty());
+        let single = super::dispatch_value_with_deadline(
+            &session,
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+            tokio::time::Instant::now() - Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            single["result"]["resultType"], "complete",
+            "single requests retain their own deadline"
+        );
+    }
+
+    #[test]
+    fn audit_one_batch_deadline_cancels_the_worker_and_retires_all_ids() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel();
+            let (started, start) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            start.await.unwrap();
+            let store = Arc::new(devmap_store::Store::open_in_memory().unwrap());
+            let session = Arc::new(super::Session::new(Arc::new(StoreSlot::ready("unused", store))));
+            let active = session.clone();
+            let mut handler = tokio::spawn(async move {
+                super::dispatch_value_with_deadline(&active, serde_json::json!([
+                    {"jsonrpc": "2.0", "id": 0, "method": "ping"},
+                    {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "devmap_status"}},
+                    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                    {"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "devmap_status"}},
+                    {"jsonrpc": "2.0", "id": 9, "method": "ping"}
+                ]), tokio::time::Instant::now() + Duration::from_millis(100)).await
+            });
+            let cancel = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let Some(request) = session.in_flight.lock().unwrap().get("7") {
+                        break request.cancel.clone();
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("first tool must register before its deadline");
+            let completed = tokio::time::timeout(Duration::from_secs(1), &mut handler).await;
+            let worker_cancelled = cancel.is_cancelled();
+            let all_ids_retired = session.in_flight.lock().unwrap().is_empty();
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            let response = match completed {
+                Ok(result) => result.unwrap().unwrap(),
+                Err(_) => {
+                    handler.await.unwrap();
+                    panic!("the batch multiplied its deadline across members");
+                }
+            };
+            assert!(worker_cancelled, "batch timeout abandoned its blocking worker");
+            assert!(all_ids_retired, "batch timeout retained a pending request id");
+            let responses = response.as_array().unwrap();
+            assert_eq!(responses.len(), 4);
+            assert_eq!(responses[0]["id"], 0);
+            assert_eq!(responses[0]["result"]["resultType"], "complete");
+            for (response, id) in responses[1..].iter().zip([7, 8, 9]) {
+                assert_eq!(response["id"], id);
+                assert_eq!(response["error"]["code"], super::codes::INTERNAL_ERROR);
+                assert!(response["error"]["message"].as_str().unwrap().contains("batch deadline"));
+            }
+            let reuse = super::handle_line_in(&session, r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#).await.unwrap();
+            assert!(reuse.get("result").is_some(), "a timed-out id must be reusable");
+        });
+    }
+
+    #[tokio::test]
+    async fn audit_large_fast_batches_do_not_gain_a_member_limit() {
+        let session = Arc::new(super::Session::new(Arc::new(StoreSlot::new("unused"))));
+        let batch = serde_json::Value::Array(
+            (0..4096)
+                .map(|id| serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "ping"}))
+                .collect(),
+        );
+        let response = super::dispatch_value(&session, batch).await.unwrap();
+        let responses = response.as_array().unwrap();
+        assert_eq!(responses.len(), 4096);
+        for (id, response) in responses.iter().enumerate() {
+            assert_eq!(response["id"], id);
+            assert_eq!(response["result"]["resultType"], "complete");
+        }
+        assert!(session.in_flight.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn audit_dropping_a_session_cancels_its_unfinished_queries() {
+        let session = super::Session::new(Arc::new(StoreSlot::new("unused")));
+        let cancel = devmap_query::Cancel::new();
+        session
+            .register(&serde_json::json!(1), cancel.clone())
+            .unwrap();
+        drop(session);
+        assert!(
+            cancel.is_cancelled(),
+            "session teardown abandoned an uncancelled worker"
+        );
+    }
+
+    #[test]
+    fn audit_an_internal_timeout_returns_a_response_instead_of_silence() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel();
+            let (started, start) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(40)).unwrap();
+            });
+            start.await.unwrap();
+            let store = Arc::new(devmap_store::Store::open_in_memory().unwrap());
+            let slot = Arc::new(StoreSlot::ready("unused", store));
+            let response = super::handle_line(
+                &slot,
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"devmap_status"}}"#,
+            )
+            .await;
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            let response = response.expect("an internal deadline must answer its request id");
+            assert_eq!(response["id"], 7);
+            assert_eq!(response["result"]["isError"], true);
+            assert!(response["result"]["content"][0]["text"]
+                .as_str().unwrap().contains("exceeded"));
+        });
+    }
+
+    #[tokio::test]
+    async fn audit_newline_chunk_cannot_exceed_the_frame_ceiling() {
+        for capacity in [8_192, MAX_FRAME_BYTES + 2] {
+            for size in [MAX_FRAME_BYTES, MAX_FRAME_BYTES + 1] {
+                let mut bytes = vec![b'x'; size];
+                bytes.extend_from_slice(b"\nnext\n");
+                let mut reader = BufReader::with_capacity(capacity, bytes.as_slice());
+                let frame = read_frame(&mut reader).await.unwrap();
+                if size == MAX_FRAME_BYTES {
+                    assert!(matches!(frame, Frame::Line(ref line) if line.len() == size));
+                } else {
+                    assert!(
+                        matches!(frame, Frame::TooLarge(seen) if seen == size),
+                        "a newline in the last chunk bypassed the ceiling at reader capacity {capacity}"
+                    );
+                }
+                assert!(
+                    matches!(read_frame(&mut reader).await.unwrap(), Frame::Line(line) if line == b"next")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_a_response_write_failure_fails_the_session() {
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+        let (writer, peer) = tokio::io::duplex(32);
+        drop(peer);
+        let outcome = serve_streams(
+            Arc::new(StoreSlot::new("unused-by-ping")),
+            BufReader::new(&input[..]),
+            writer,
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a failed response write reported a successful session"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_no_reply_follows_a_partially_failed_frame() {
+        struct FailsOnce {
+            calls: usize,
+            bytes: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl tokio::io::AsyncWrite for FailsOnce {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buffer: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.calls += 1;
+                if self.calls == 2 {
+                    return std::task::Poll::Ready(Err(std::io::Error::other("write failed")));
+                }
+                let written = if self.calls == 1 { 1 } else { buffer.len() };
+                self.bytes
+                    .fetch_add(written, std::sync::atomic::Ordering::Relaxed);
+                std::task::Poll::Ready(Ok(written))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer = tokio::sync::Mutex::new(super::ResponseWriter {
+            stream: FailsOnce {
+                calls: 0,
+                bytes: bytes.clone(),
+            },
+            failed: false,
+        });
+        let frame = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {}});
+        assert!(super::write_frame(&writer, &frame).await.is_err());
+        assert!(
+            super::write_frame(&writer, &frame).await.is_err(),
+            "a second response was appended to an incomplete JSON frame"
+        );
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn audit_a_nonreading_peer_cannot_hold_a_session_forever() {
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
+        let (writer, mut peer) = tokio::io::duplex(1);
+        // Keep the read side open but never consume the response.
+        peer.shutdown().await.unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(7),
+            serve_streams(
+                Arc::new(StoreSlot::new("unused-by-ping")),
+                BufReader::new(&input[..]),
+                writer,
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "a nonreading peer retained the session past its write deadline"
+        );
+        assert!(
+            outcome.unwrap().is_err(),
+            "an undelivered response must fail the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_reaping_responses_preserves_a_partially_read_request() {
+        use tokio::io::AsyncBufReadExt;
+        let (client, server) = tokio::io::duplex(65_536);
+        let (input, output) = tokio::io::split(server);
+        let task = tokio::spawn(serve_streams(
+            Arc::new(StoreSlot::new("unused-by-ping")),
+            BufReader::with_capacity(17, input),
+            output,
+        ));
+        let (read, mut write) = tokio::io::split(client);
+        let mut lines = BufReader::new(read).lines();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"ping\"}\n")
+                .await
+                .unwrap();
+            for id in 1..=100 {
+                // The next frame is held inside read_frame while the previous
+                // request retires. Recreating that future loses this prefix.
+                write.write_all(b"{\"jsonrpc\":\"2.0\",").await.unwrap();
+                let line = lines.next_line().await.unwrap().unwrap();
+                let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(response["id"], id - 1);
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+                write
+                    .write_all(format!("\"id\":{id},\"method\":\"ping\"}}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            write.shutdown().await.unwrap();
+            let line = lines.next_line().await.unwrap().unwrap();
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["id"], 100);
+            assert!(lines.next_line().await.unwrap().is_none());
+            task.await.unwrap().unwrap();
+        })
+        .await
+        .expect("partial-frame stress must finish with every id accounted for");
+    }
+
+    #[test]
+    fn audit_aborted_session_handlers_cancel_their_queued_workers() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel();
+            let (started, start) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            start.await.unwrap();
+            let store = Arc::new(devmap_store::Store::open_in_memory().unwrap());
+            let session = Arc::new(super::Session::new(Arc::new(StoreSlot::ready("unused", store))));
+            let active = session.clone();
+            let handler = tokio::spawn(async move {
+                super::handle_line_in(
+                    &active,
+                    r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"devmap_status"}}"#,
+                )
+                .await
+            });
+            let cancel = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let Some(request) = session.in_flight.lock().unwrap().get("7") {
+                        break request.cancel.clone();
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("handler must register its worker");
+            handler.abort();
+            assert!(handler.await.unwrap_err().is_cancelled());
+            drop(session);
+            let cancelled = cancel.is_cancelled();
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            assert!(cancelled, "aborted async handler left its blocking worker uncancelled");
+        });
+    }
 }

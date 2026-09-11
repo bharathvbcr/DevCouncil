@@ -403,6 +403,15 @@ dead install as for a working one.
 
 ### Agent guides
 
+Codex discovers repository skills in `.agents/skills/<name>/SKILL.md`. The five
+DevMap skills also ship in the existing DevCouncil registry; install them with
+`dev skills scaffold --destination .agents/skills` and repeat `--skill` for the
+desired names. This does not install MCP settings or hooks. See the exact
+[installation and verification commands](../docs/DEVMAP_SKILL_DELIVERY.md).
+The Claude plugin and registry distributions have a content-parity regression
+test. Both prefer DevMap while allowing capability-based fallback and explicit
+user/repository instructions.
+
 ```bash
 devmap manifest . --guides
 ```

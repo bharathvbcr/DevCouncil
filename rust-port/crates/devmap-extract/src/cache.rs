@@ -310,7 +310,45 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// v39 row leaves that empty, so `reader.read()` cannot dispatch on `Reader`
 /// and falls to AmbiguousGlobal the moment a second type also declares `read`
 /// — the MarkDev save/highlight shape, reported as examined and empty.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "40";
+/// v41 records Svelte/Vue/HTML dynamic wiring the v40 row never saw:
+/// `import('./CloneModal.svelte')` as an Import, HTML `src=` / `from` as
+/// DynamicImport forms, `package.json` script CLIs, JS/TS TargetRoot for
+/// `src/main.ts` / Vite configs / `scripts/`, and template `{handler}` as a
+/// Call. A warm v40 cache keeps those files unwired and those handlers
+/// confident-dead.
+///
+/// v42 parses non-identifier template expressions as the embedded script
+/// language, so `onclick={() => copyText(name)}` is a Call to `copyText`
+/// rather than opaque text. A v41 row still reports those handlers dead.
+///
+/// v43 publishes methods on objects an exported factory returns, treats
+/// Vite/Rollup plugin methods as RuntimeEntryPoints, and vendors
+/// `src-tauri/framework/`. A v42 row still reports `createPacedQueue.has` dead
+/// and Tauri's copied tao/wry sources as unwired first-party files.
+///
+/// v44 carries the file-liveness annotations: `ScriptEntry` from a shebang,
+/// `PackageMarker`, `ToolConfig`, `AmbientDeclaration` and `Fixture`, and it
+/// moves `*.d.ts` and `*.config.*` off `TargetRoot`. A warm v43 row has none of
+/// them, so every `__init__.py`, every shebang script, every `testdata/**` file
+/// and every tool config in it stays an unwired candidate — which is exactly
+/// the finding this version exists to withdraw.
+///
+/// v45 records `Foo<T>` as a Type use of `Foo`. A v44 row still reports a
+/// type alias used only as a generic constructor confidently dead.
+///
+/// v46 records the enclosing callable as `parent_symbol` of a nested
+/// `const walk = () => {}`. A v45 row parents those arrows on the file, so
+/// `walk()` inside `collapseAll` cannot join to `collapseAll.walk`.
+/// v47 refuses malformed notebook code cells instead of silently discarding
+/// their contents and keeps the cell-cap verdict when the parsed prefix has
+/// only prose. All notebook source spans now map decoded code to the original
+/// JSON, and lexical bindings, exports and symbol wiring survive projection.
+/// A v46 row can claim Clean for a notebook it did not read, point into prose
+/// copies or metadata, drop Unicode-escaped declarations and omit bindings.
+/// Notebook cells now parse independently under one shared budget; a v46 row
+/// can invent a function that spans execution units. Python empty required
+/// suites also report Partial instead of inheriting the grammar's Clean bit.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "47";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
@@ -387,7 +425,13 @@ pub fn current_payload_identity(language: &str) -> (String, String) {
 #[cfg(feature = "parse")]
 pub fn grammar_version_for(language: &str) -> String {
     let base = base_grammar_identity(language);
-    let embedded = crate::embedded::permitted_embedded_languages(language);
+    let mut embedded = crate::embedded::permitted_embedded_languages(language);
+    // Kernel selection lives in notebook metadata, which is covered by the
+    // content hash. Every grammar that selection can reach must also be in
+    // the key so upgrading a linked kernel grammar invalidates warm payloads.
+    if language == "notebook" {
+        embedded.extend(crate::notebook::kernel_grammars());
+    }
     if embedded.is_empty() {
         return base;
     }

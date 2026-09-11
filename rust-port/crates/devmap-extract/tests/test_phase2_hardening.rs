@@ -764,6 +764,7 @@ fn scope_locals_are_keyed_by_the_identity_calls_report_as_their_caller() {
             "fn other() {\n",
             "    handler(\"y\");\n",
             "}\n",
+            "fn own(typed: &str, plain: i32) {}\n",
         ),
     );
     let locals_of = |ext: &devmap_extract::model::Extraction, scope: &str| -> Vec<String> {
@@ -780,8 +781,17 @@ fn scope_locals_are_keyed_by_the_identity_calls_report_as_their_caller() {
         "a `let`-bound closure is a local of the scope that binds it: {run_locals:?}"
     );
     assert!(
-        run_locals.contains(&"name".to_string()) && run_locals.contains(&"v".to_string()),
-        "closure parameters bind names, typed or not: {run_locals:?}"
+        !run_locals.contains(&"name".to_string()) && !run_locals.contains(&"v".to_string()),
+        "closure parameters must not leak into the enclosing function: {run_locals:?}"
+    );
+    // The former expectation merged Rust closure parameters into `run` and
+    // contradicted a_rust_closure_parameter_does_not_hide_an_outer_function:
+    // `|marker| ...; marker()` outside the closure must still call the module
+    // function. Keep the binding oracle on the scope that declares it.
+    let own_locals = locals_of(&rust, "lib/scope.rs::own");
+    assert!(
+        own_locals.contains(&"typed".to_string()) && own_locals.contains(&"plain".to_string()),
+        "the callable's own parameters must remain bound: {own_locals:?}"
     );
     assert!(
         locals_of(&rust, "lib/scope.rs::other").is_empty(),

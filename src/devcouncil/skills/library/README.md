@@ -2,13 +2,14 @@
 
 Each `*.md` file here (except this README) is a **skill**: reusable guidance that
 DevCouncil selects for a goal/repo, embeds into `dev prompt` output, and scaffolds
-into a target repo's `.claude/skills/<name>/SKILL.md`.
+into a target repo's `.claude/skills`, `.cursor/skills`, and `.agents/skills`
+directories as `<name>/SKILL.md`.
 
 A skill is a markdown file with YAML frontmatter:
 
 ```markdown
 ---
-name: my-domain            # required — unique slug; files without a name are ignored
+name: my-domain            # required — unique lowercase slug
 title: My Domain Intake    # optional human title
 description: One-line directive shown in `dev skills` and embedded into prompts.
 always: false              # true = always selected (only core-engineering uses this)
@@ -29,7 +30,15 @@ CLI/build tools to confirm *before* writing code.
 
 1. Create `<name>.md` with the frontmatter above.
 2. Choose triggers: `keywords` (goal text) and/or `globs` (repo files). Both are ORed.
-3. Verify: `dev skills` lists it; `dev skills show <name>` prints it.
+3. Verify: `dev skills` lists it; `dev skills show <name>` prints it. Quote YAML
+   strings containing colon-space, such as `description: 'Examples: debugging'`.
+   Invalid frontmatter raises an error; ordinary Markdown without frontmatter
+   (such as this README) is ignored.
+
+For the five `devmap*` skills, maintain the matching native assets under
+`rust-port/crates/devmap-cli/skills`. The delivery contract test requires identical
+names, descriptions, and bodies in both distributions. See
+[installation and verification](../../../../docs/DEVMAP_SKILL_DELIVERY.md).
 
 Selection is keyword-based inside `dev prompt` (fast, no repo walk) and
 keyword-plus-file-based for `dev skills` / `dev skills scaffold` / init scaffolding.
@@ -39,7 +48,8 @@ Keep `description` actionable — it is what the agent sees inline in the task p
 
 You don't have to edit this packaged library to add a skill. Drop your own
 `SKILL.md` (same frontmatter) into a project's **`.claude/skills/<name>/SKILL.md`**
-(or `.devcouncil/skills/*.md`) and DevCouncil discovers it automatically — it shows
+(or `.cursor/skills/<name>/SKILL.md`, `.agents/skills/<name>/SKILL.md`, or
+`.devcouncil/skills/*.md`) and DevCouncil discovers it automatically — it shows
 up in `dev skills` (source `repo`), participates in selection, and is folded into the
 codebase-aware prompt enhancer and the task prompts. A repo-local skill **overrides a
 packaged skill with the same name**, so a team can keep its own house rules for

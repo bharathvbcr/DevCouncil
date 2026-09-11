@@ -48,6 +48,8 @@ _IMPORTLIB_RE = re.compile(
     r"""(?:importlib(?:\.import_module)?|__import__)\s*\(\s*['"]([^'"]+)['"]"""
 )
 _DYNAMIC_IMPORT_RE = re.compile(r"""import\s*\(\s*['"]([^'"]+)['"]\s*\)""")
+_HTML_FROM_RE = re.compile(r"""from\s+['"]([^'"]+)['"]""")
+_HTML_SRC_RE = re.compile(r"""src\s*=\s*['"]([^'"]+)['"]""")
 # Vite/webpack ``new Worker(new URL("./x", import.meta.url))`` (and bare URL).
 _WORKER_URL_RE = re.compile(
     r"""(?:new\s+(?:Worker|SharedWorker)\s*\(\s*)?"""
@@ -71,6 +73,7 @@ _HATCH_CUSTOM_HOOK_RE = re.compile(
 )
 _CODE_CONFIG_SUFFIXES = {
     ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".svelte", ".vue", ".astro", ".html", ".htm",
     ".toml", ".json", ".yaml", ".yml", ".cfg", ".ini",
 }
 _ROUTE_DIR_HINTS = (
@@ -195,16 +198,23 @@ def is_private_symbol(name: str) -> bool:
 def is_vendored_path(path: str) -> bool:
     """True when ``path`` is a vendored/minified bundle, not first-class source.
 
-    Matches the :data:`_VENDOR_DIR_NAMES` path segments and the
-    :data:`_MINIFIED_SUFFIXES` basenames — the same two tables the kernel's
-    ``is_vendored_path`` holds, and the same convention
-    :func:`structural_exemptions` already encodes for file-level liveness.
+    Matches the :data:`_VENDOR_DIR_NAMES` path segments, the Tauri
+    ``src-tauri/framework/`` prefix, and the :data:`_MINIFIED_SUFFIXES`
+    basenames — the same tables the kernel's ``is_vendored_path`` holds, and
+    the same convention :func:`structural_exemptions` already encodes for
+    file-level liveness.
     """
     try:
         norm = _norm(path)
         name = Path(norm).name
-        parts = norm.lower().split("/")
+        norm_l = norm.lower()
+        parts = norm_l.split("/")
         if any(p in _VENDOR_DIR_NAMES for p in parts):
+            return True
+        # Tauri apps vendor tao/wry/webkit under ``src-tauri/framework/``.
+        # A bare ``framework`` segment would swallow ``src/framework/app.ts``.
+        # Lowercased to match the kernel: ``is_vendored_path`` lowercases first.
+        if norm_l.startswith("src-tauri/framework/") or "/src-tauri/framework/" in f"/{norm_l}/":
             return True
         return name.lower().endswith(_MINIFIED_SUFFIXES)
     except Exception:
@@ -1040,7 +1050,7 @@ _C_MAIN_RE = re.compile(r"\b(?:int|void)\s+main\s*\(")
 # "__main__" covers both quote styles of the run guard.
 _PY_MAIN_SEED_MARKERS = ("__main__", "FastAPI(", "Flask(", "uvicorn.run(")
 _MAIN_SEED_SNIFF_CAP = 512
-_JS_RESOLVE_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+_JS_RESOLVE_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".svelte", ".vue", ".astro")
 _JS_SUFFIXES = frozenset(_JS_RESOLVE_EXTS)
 
 
@@ -1443,7 +1453,7 @@ def _module_forms(value: str) -> Set[str]:
     """Comparable dotted + slash forms (extensions stripped) for boundary matching."""
     v = _norm(value)
     forms = {v, v.replace("/", "."), v.replace(".", "/")}
-    for ext in (".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
+    for ext in (".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".svelte", ".vue", ".astro"):
         if v.endswith(ext):
             base = v[: -len(ext)]
             forms.add(base)
@@ -1460,6 +1470,34 @@ def has_allow_unwired(project_root: Path, path: str) -> bool:
     except OSError:
         return False
     return ALLOW_UNWIRED in text
+
+
+def _append_js_module_spec(norm: str, spec: str, specs: List[str]) -> None:
+    """Resolve one JS/HTML specifier the same way the kernel's ``specs_for`` does."""
+    spec = (spec or "").strip()
+    if not spec:
+        return
+    if spec.startswith("/") and not spec.startswith("//"):
+        relative = spec.lstrip("/")
+        if relative:
+            specs.append(relative)
+            specs.append(f"public/{relative}")
+        return
+    if spec.startswith("."):
+        try:
+            joined = (Path(norm).parent / spec).as_posix()
+        except Exception:
+            return
+        resolved = _normalize_rel_path(joined)
+        hit_stem = resolved
+        for ext in _JS_RESOLVE_EXTS:
+            if resolved.endswith(ext):
+                hit_stem = resolved[: -len(ext)]
+                break
+        specs.append(resolved)
+        specs.append(hit_stem)
+        return
+    specs.append(spec)
 
 
 def dynamic_import_keys(path: str, source: str) -> Set[str]:
@@ -1479,44 +1517,12 @@ def dynamic_import_keys(path: str, source: str) -> Set[str]:
     specs: List[str] = [match.group(1) for match in _IMPORTLIB_RE.finditer(source)]
     for match in _DYNAMIC_IMPORT_RE.finditer(source):
         spec = match.group(1)
-        if not spec:
-            continue
-        if spec.startswith("."):
-            # Relative dynamic import — resolve against this file so
-            # ``import('./App')`` clears ``App.tsx`` via reference_cleared.
-            try:
-                joined = (Path(norm).parent / spec).as_posix()
-            except Exception:
-                continue
-            resolved = _normalize_rel_path(joined)
-            hit_stem = resolved
-            for ext in _JS_RESOLVE_EXTS:
-                if resolved.endswith(ext):
-                    hit_stem = resolved[: -len(ext)]
-                    break
-            specs.append(resolved)
-            specs.append(hit_stem)
-        else:
-            specs.append(spec)
+        if spec:
+            _append_js_module_spec(norm, spec, specs)
     for match in _WORKER_URL_RE.finditer(source):
         spec = match.group(1)
-        if not spec:
-            continue
-        if spec.startswith("."):
-            try:
-                joined = (Path(norm).parent / spec).as_posix()
-            except Exception:
-                continue
-            resolved = _normalize_rel_path(joined)
-            hit_stem = resolved
-            for ext in _JS_RESOLVE_EXTS:
-                if resolved.endswith(ext):
-                    hit_stem = resolved[: -len(ext)]
-                    break
-            specs.append(resolved)
-            specs.append(hit_stem)
-        else:
-            specs.append(spec)
+        if spec:
+            _append_js_module_spec(norm, spec, specs)
     for match in _PYTHON_DASH_M_RE.finditer(source):
         spec = match.group(1) or match.group(2)
         if spec:
@@ -1528,6 +1534,11 @@ def dynamic_import_keys(path: str, source: str) -> Set[str]:
             (Path(norm).parent / match.group(1)).with_suffix("").as_posix()
             for match in _HATCH_CUSTOM_HOOK_RE.finditer(source)
         )
+    if suffix in {".html", ".htm"}:
+        for match in _HTML_FROM_RE.finditer(source):
+            _append_js_module_spec(norm, match.group(1), specs)
+        for match in _HTML_SRC_RE.finditer(source):
+            _append_js_module_spec(norm, match.group(1), specs)
     keys = {form for spec in specs for form in _module_forms(spec)}
     keys |= extra_keys
     for name_re in (_GETATTR_NAME_RE, _GLOBALS_NAME_RE, _HASATTR_NAME_RE):

@@ -149,6 +149,11 @@ const MAX_DEBOUNCE_PATHS: usize = 4_096;
 /// answer the kernel's own "I dropped events" notice already gets (K-A3).
 const WATCH_QUEUE_CAPACITY: usize = 4_096;
 
+/// Dropping a notify watcher can only signal its backend thread to stop.
+/// Await callback-channel disconnection for this long before recording that
+/// the final event set is unknown and must be recovered by a durable rescan.
+const WATCH_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
 struct DebounceBuffer {
     debounce: Duration,
     pending: BTreeSet<String>,
@@ -245,12 +250,17 @@ impl DebounceBuffer {
 }
 
 pub struct WatcherHandle {
+    watcher: Option<RecommendedWatcher>,
     stop: Option<Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WatcherHandle {
     fn stop_and_join(&mut self) -> anyhow::Result<()> {
+        // Request provider shutdown before asking the consumer to flush.
+        // notify's Linux/Windows drops do not join their worker, so dropping
+        // this handle is not itself proof that the callbacks have stopped.
+        self.watcher.take();
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
@@ -390,6 +400,13 @@ fn admitted_watch_path(
             // descendants; the daemon re-checks indexability and scope.
             Some(absolute.to_string())
         }
+        Err(error) => {
+            // An unknown file type can also be an unreadable directory whose
+            // indexed descendants changed. Let the durable drain classify and
+            // retry it instead of discarding an observed change here.
+            warn!("cannot inspect watched path {path:?}; queueing it for retry: {error}");
+            Some(absolute.to_string())
+        }
         _ => None,
     }
 }
@@ -518,6 +535,20 @@ fn run_watch_loop<F: Fn(Vec<String>)>(
 
     loop {
         if stop_rx.try_recv().is_ok() {
+            // Provider shutdown was requested before this signal was sent. Its
+            // bounded raw queue can still contain events the debounce has not
+            // seen, including a coverage-loss notice. Drain that queue before
+            // flushing; a stop signal must not jump ahead of accepted edits.
+            for event in rx.try_iter().take(WATCH_QUEUE_CAPACITY) {
+                let admitted = match event {
+                    Ok(event) => watch_event_paths(root, event, &mut ignore_cache),
+                    Err(error) => watch_error_paths(root, &error),
+                };
+                buffer.push(admitted, Instant::now());
+            }
+            if overflowed.swap(false, Ordering::Relaxed) {
+                buffer.push(whole_tree_rescan(root), Instant::now());
+            }
             // Hand over what is buffered before the thread goes away.
             //
             // The debounce holds an observed edit in memory for `DEBOUNCE`, and
@@ -531,6 +562,43 @@ fn run_watch_loop<F: Fn(Vec<String>)>(
             // is a window and not a permanent loss; it is a window in which
             // every reader is told the index is current, and nothing has to
             // start a daemon to be told that.
+            if let Some(paths) = buffer.flush() {
+                callback(paths);
+            }
+
+            // The callback owns the sole raw-event sender. Disconnection,
+            // unlike the watcher's destructor returning, proves that no late
+            // backend callback can arrive. Flush already observed work first
+            // so waiting for a slow backend does not delay its durable record.
+            let deadline = Instant::now() + WATCH_SHUTDOWN_GRACE;
+            let quiesced = loop {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break false;
+                };
+                match rx.recv_timeout(remaining) {
+                    Ok(event) => {
+                        let admitted = match event {
+                            Ok(event) => watch_event_paths(root, event, &mut ignore_cache),
+                            Err(error) => watch_error_paths(root, &error),
+                        };
+                        buffer.push(admitted, Instant::now());
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break true,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break false,
+                }
+            };
+            if !quiesced {
+                warn!(
+                    "watcher callbacks did not stop within {WATCH_SHUTDOWN_GRACE:?}; \
+                     queueing a whole-tree rescan because final event coverage is unknown"
+                );
+                buffer.push(whole_tree_rescan(root), Instant::now());
+            }
+            // A callback may have refused an event after the first drain but
+            // before dropping its sender. Disconnection covers that refusal too.
+            if overflowed.swap(false, Ordering::Relaxed) {
+                buffer.push(whole_tree_rescan(root), Instant::now());
+            }
             if let Some(paths) = buffer.flush() {
                 callback(paths);
             }
@@ -573,6 +641,9 @@ fn run_watch_loop<F: Fn(Vec<String>)>(
                 // The producer is gone, so nothing more will arrive — but what
                 // already arrived is still owed to the queue, for the reason the
                 // stop path above gives.
+                if overflowed.swap(false, Ordering::Relaxed) {
+                    buffer.push(whole_tree_rescan(root), Instant::now());
+                }
                 if let Some(paths) = buffer.flush() {
                     callback(paths);
                 }
@@ -582,8 +653,9 @@ fn run_watch_loop<F: Fn(Vec<String>)>(
     }
 }
 
-/// Start a debounced recursive file watcher. The watcher thread owns the
-/// `RecommendedWatcher` so it is not dropped immediately (previous bug).
+/// Start a debounced recursive file watcher. The returned handle keeps the
+/// producer alive and requests shutdown before its consumer drains callbacks
+/// through channel disconnection, or records a rescan if the provider stalls.
 pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
     root_path: P,
     callback: F,
@@ -626,7 +698,6 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
     }
 
     let thread = std::thread::spawn(move || {
-        let _watcher = watcher; // keep alive for the thread lifetime
         run_watch_loop(
             &root,
             rx,
@@ -638,6 +709,7 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
     });
 
     Ok(WatcherHandle {
+        watcher: Some(watcher),
         stop: Some(stop_tx),
         thread: Some(thread),
     })
@@ -660,6 +732,241 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root.canonicalize().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_an_unreadable_source_is_queued_for_retry() {
+        let root = scratch_root("source-stat-error");
+        let path = root.join("broken.py");
+        std::os::unix::fs::symlink("broken.py", &path).unwrap();
+        let error = std::fs::metadata(&path).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        let mut cache = IgnoreVerdictCache::default();
+        assert_eq!(
+            admitted_watch_path(&root, &path, &mut cache),
+            Some(path.to_str().unwrap().to_string()),
+            "failure to stat a changed source must survive as pending work"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn audit_shutdown_preserves_unread_events_and_overflow() {
+        for overflowed in [false, true] {
+            let root = scratch_root("stop-unread-events");
+            let path = root.join("late.py");
+            std::fs::write(&path, "def late(): pass\n").unwrap();
+            let (tx, rx) = mpsc::sync_channel(1);
+            tx.send(Ok(notify::Event::new(EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(path.clone())))
+                .unwrap();
+            drop(tx);
+            let (stop_tx, stop_rx) = mpsc::channel();
+            stop_tx.send(()).unwrap();
+            let (delivered_tx, delivered_rx) = mpsc::channel();
+            run_watch_loop(
+                &root,
+                rx,
+                stop_rx,
+                &AtomicBool::new(overflowed),
+                Duration::from_secs(2),
+                |paths| delivered_tx.send(paths).unwrap(),
+            );
+            drop(delivered_tx);
+            let delivered: Vec<_> = delivered_rx.into_iter().flatten().collect();
+            let root_text = root.to_str().unwrap().to_string();
+            let path_text = path.to_str().unwrap().to_string();
+            assert!(
+                delivered.contains(&root_text) || (!overflowed && delivered.contains(&path_text)),
+                "shutdown lost an observed change: overflow={overflowed}, delivered={delivered:?}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn audit_shutdown_waits_for_callbacks_after_the_initial_flush() {
+        for (late_kind, stop_requested) in [
+            ("source", true),
+            ("error", true),
+            ("overflow", true),
+            ("overflow", false),
+        ] {
+            let root = scratch_root("late-shutdown-callback");
+            std::fs::write(root.join(".gitignore"), "ignored.py\n").unwrap();
+            for name in ["early.py", "late.py", "ignored.py"] {
+                std::fs::write(root.join(name), "def f(): pass\n").unwrap();
+            }
+            let event = |name: &str| {
+                Ok(
+                    notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                        .add_path(root.join(name)),
+                )
+            };
+            let (tx, rx) = mpsc::sync_channel(4);
+            tx.send(event("early.py")).unwrap();
+            let (stop_tx, stop_rx) = mpsc::channel();
+            if stop_requested {
+                stop_tx.send(()).unwrap();
+            }
+            let (flushed_tx, flushed_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (batches_tx, batches_rx) = mpsc::channel();
+            let loop_root = root.clone();
+            let overflowed = Arc::new(AtomicBool::new(false));
+            let loop_overflowed = overflowed.clone();
+            let consumer = std::thread::spawn(move || {
+                let first = AtomicBool::new(true);
+                run_watch_loop(
+                    &loop_root,
+                    rx,
+                    stop_rx,
+                    &loop_overflowed,
+                    if stop_requested {
+                        Duration::from_secs(30)
+                    } else {
+                        Duration::ZERO
+                    },
+                    |paths| {
+                        batches_tx.send(paths).unwrap();
+                        if first.swap(false, Ordering::Relaxed) {
+                            flushed_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        }
+                    },
+                );
+            });
+            // This latch proves the initial queue was drained before the late
+            // producer acts; it does not depend on scheduling a sleep correctly.
+            flushed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if late_kind != "overflow" {
+                tx.send(event("ignored.py")).unwrap();
+            }
+            match late_kind {
+                "source" => tx.send(event("late.py")).unwrap(),
+                "error" => tx
+                    .send(Err(notify::Error::generic("late backend error")))
+                    .unwrap(),
+                _ => overflowed.store(true, Ordering::Relaxed),
+            }
+            // Dropping the last callback sender acknowledges provider exit.
+            drop(tx);
+            release_tx.send(()).unwrap();
+            consumer.join().unwrap();
+            let delivered: Vec<_> = batches_rx.into_iter().flatten().collect();
+            let expected = if late_kind == "source" {
+                root.join("late.py")
+            } else {
+                root.clone()
+            };
+            assert!(
+                delivered.contains(&expected.to_string_lossy().into_owned()),
+                "late {late_kind} callback was dropped after the first flush \
+                 (stop_requested={stop_requested}): {delivered:?}"
+            );
+            assert!(!delivered.contains(&root.join("ignored.py").to_string_lossy().into_owned()));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn audit_a_provider_that_never_quiesces_leaves_a_durable_rescan() {
+        let root = scratch_root("shutdown-quiescence-timeout");
+        let database = root.join("pending.sqlite");
+        let store = Arc::new(devmap_store::Store::open(&database).unwrap());
+        let writer = store.clone();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        stop_tx.send(()).unwrap();
+        let (batches_tx, batches_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let loop_root = root.clone();
+        let consumer = std::thread::spawn(move || {
+            run_watch_loop(
+                &loop_root,
+                rx,
+                stop_rx,
+                &AtomicBool::new(false),
+                Duration::from_secs(30),
+                |paths| {
+                    writer.enqueue_pending_paths(&paths).unwrap();
+                    batches_tx.send(paths).unwrap();
+                },
+            );
+            finished_tx.send(()).unwrap();
+        });
+        // Keep the provider's sender alive beyond the entire shutdown. A
+        // bounded exit must acknowledge that the final callback is unknowable.
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("an unresponsive provider must not hang watcher shutdown");
+        consumer.join().unwrap();
+        assert_eq!(
+            batches_rx.into_iter().flatten().collect::<Vec<_>>(),
+            whole_tree_rescan(&root),
+            "unconfirmed provider shutdown must leave work for the next daemon"
+        );
+        drop(store);
+        let reopened = devmap_store::Store::open(&database).unwrap();
+        assert_eq!(
+            reopened.get_pending_paths().unwrap(),
+            whole_tree_rescan(&root)
+        );
+        drop(reopened);
+        drop(tx);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn audit_continuous_late_callbacks_do_not_extend_the_shutdown_deadline() {
+        let root = scratch_root("shutdown-continuous-provider");
+        std::fs::write(root.join(".gitignore"), "ignored.py\n").unwrap();
+        std::fs::write(root.join("ignored.py"), "def f(): pass\n").unwrap();
+        let (tx, rx) = mpsc::sync_channel(16);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        stop_tx.send(()).unwrap();
+        let (batches_tx, batches_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let producer_path = root.join("ignored.py");
+        let producer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(6);
+            while Instant::now() < deadline {
+                let event = Ok(notify::Event::new(EventKind::Modify(
+                    notify::event::ModifyKind::Any,
+                ))
+                .add_path(producer_path.clone()));
+                if matches!(tx.try_send(event), Err(mpsc::TrySendError::Disconnected(_))) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let loop_root = root.clone();
+        let consumer = std::thread::spawn(move || {
+            run_watch_loop(
+                &loop_root,
+                rx,
+                stop_rx,
+                &AtomicBool::new(false),
+                Duration::from_secs(30),
+                |paths| batches_tx.send(paths).unwrap(),
+            );
+            finished_tx.send(()).unwrap();
+        });
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("continuous late events cannot restart the absolute shutdown deadline");
+        consumer.join().unwrap();
+        producer.join().unwrap();
+        assert_eq!(
+            batches_rx.into_iter().flatten().collect::<Vec<_>>(),
+            whole_tree_rescan(&root),
+            "an active provider must leave a rescan, while ignored paths stay excluded"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

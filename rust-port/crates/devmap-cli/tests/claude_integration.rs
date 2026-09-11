@@ -300,7 +300,7 @@ fn emitted_hooks_include_session_end_report() {
         .map(|a| a.as_str().unwrap())
         .collect::<Vec<_>>();
     assert!(
-        args.iter().any(|a| *a == "session-report"),
+        args.contains(&"session-report"),
         "SessionEnd must run session-report: {args:?}"
     );
     let start = block["hooks"]["SessionStart"]
@@ -327,7 +327,12 @@ fn plugin_manifest_points_at_bundled_skills() {
     assert_eq!(manifest["skills"], "./skills");
     let skill = out.join("devmap/skills/devmap/SKILL.md");
     let body = std::fs::read_to_string(&skill).expect("preference skill");
-    assert!(body.contains("Do not use GitNexus"), "{body}");
+    assert!(
+        body.contains("Prefer DevMap for the questions it can answer"),
+        "{body}"
+    );
+    assert!(body.contains("devmap paths --json"), "{body}");
+    assert!(!body.contains("Do not use GitNexus"), "{body}");
     std::fs::remove_dir_all(&dir).ok();
 }
 

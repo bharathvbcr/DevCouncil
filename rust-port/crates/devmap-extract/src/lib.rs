@@ -483,7 +483,7 @@ pub fn extract_file(path: &str, source: &str) -> Extraction {
     // reconstructed buffer straight to the extractor would produce symbols
     // whose spans index a string that exists only in memory.
     if notebook::is_notebook(path) {
-        return notebook::extract_notebook(path, source, extract_treesitter);
+        return notebook::extract_notebook_bounded(path, source);
     }
     let lang = detect_language(Path::new(path));
     extract_treesitter(path, lang, source)

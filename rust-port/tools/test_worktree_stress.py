@@ -2,6 +2,10 @@
 import time
 import unittest
 import threading
+import os
+from pathlib import Path
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from worktree_stress import ProbeAdmission, retry_file_operation
 
@@ -102,6 +106,22 @@ class ProbeAdmissionTests(unittest.TestCase):
         for timeout in [-1, 31, float("inf"), float("nan")]:
             with self.assertRaises(ValueError):
                 ProbeAdmission(1, timeout=timeout)
+
+
+class VerificationModeTests(unittest.TestCase):
+    def test_optimized_python_cannot_run_with_the_oracles_removed(self):
+        script = Path(__file__).with_name("worktree_stress.py")
+        env = dict(os.environ)
+        env.pop("PYTHONOPTIMIZE", None)
+        normal = subprocess.run([sys.executable, str(script), "--help"],
+                                env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(normal.returncode, 0, normal.stderr)
+        for flags, settings in [(["-O"], env), ([], dict(env, PYTHONOPTIMIZE="1"))]:
+            result = subprocess.run([sys.executable, *flags, str(script), "--help"],
+                                    env=settings, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0,
+                                "optimization removed every integrity/equivalence assertion")
+            self.assertIn("assertions", result.stderr)
 
 
 if __name__ == "__main__":

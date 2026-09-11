@@ -235,3 +235,28 @@ fn a_cyclic_heritage_graph_terminates() {
         "the fixture declares methods, so something must be reported"
     );
 }
+
+/// A type alias used only as `Alias<…>` is still a use.
+///
+/// `is_defining_name` used to treat `generic_type`'s `name` field as a binding,
+/// so `export type Contract = AssertTrue<Extends<…>>` suppressed the only
+/// Type references those aliases have. They then landed at the extracted tier
+/// with nothing calling them, which is a compile-time contract looking unused.
+#[test]
+fn a_type_alias_used_as_a_generic_constructor_is_not_dead() {
+    let (extractions, resolution) = resolve(&[(
+        "f.ts",
+        "type Extends<A, B> = A extends B ? true : false;\n\
+         type AssertTrue<T extends true> = T;\n\
+         export type Contract = AssertTrue<Extends<string, string>>;\n",
+    )]);
+    let reports = analyze_liveness(&extractions, &resolution);
+    for name in ["AssertTrue", "Extends"] {
+        if let Some(report) = reports.iter().find(|r| r.symbol_name == name) {
+            assert!(
+                report.is_exempt || report.confidence < 0.85,
+                "{name} is used as a type constructor and must not be extracted-dead: {report:?}"
+            );
+        }
+    }
+}

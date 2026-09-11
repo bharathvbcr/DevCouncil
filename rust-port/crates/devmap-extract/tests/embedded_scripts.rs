@@ -260,6 +260,59 @@ fn a_svelte_script_block_declares_symbols_imports_calls_and_exports() {
 }
 
 #[test]
+fn a_svelte_template_identifier_is_a_call() {
+    const SOURCE: &str = r#"<script lang="ts">
+  function publishRelease() {}
+</script>
+<button onclick={publishRelease}>Publish</button>
+"#;
+    let extraction = extract_file("src/Ops.svelte", SOURCE);
+    assert!(
+        callees(&extraction).contains(&"publishRelease"),
+        "onclick={{publishRelease}} must be a call, or the handler stays a dead-symbol cluster: {:?}",
+        callees(&extraction)
+    );
+    assert_every_span_is_inside(&extraction, SOURCE);
+}
+
+#[test]
+fn a_svelte_arrow_handler_is_a_call() {
+    const SOURCE: &str = r#"<script lang="ts">
+  async function copyText(value: string) {}
+  function openBranchMenu(e: MouseEvent) {}
+</script>
+<button onclick={() => void copyText(name)}>Copy</button>
+<button oncontextmenu={(e) => openBranchMenu(e)}>Menu</button>
+"#;
+    let extraction = extract_file("src/Ops.svelte", SOURCE);
+    let callees = callees(&extraction);
+    assert!(
+        callees.contains(&"copyText"),
+        "onclick={{() => copyText(name)}} must record copyText, or the handler stays dead: {callees:?}"
+    );
+    assert!(
+        callees.contains(&"openBranchMenu"),
+        "an arrow wrapper around openBranchMenu must still be a call: {callees:?}"
+    );
+    assert_every_span_is_inside(&extraction, SOURCE);
+}
+
+#[test]
+fn a_svelte_dynamic_import_is_an_import() {
+    const SOURCE: &str = r#"<script lang="ts">
+  const load = () => import("./CloneModal.svelte");
+</script>
+"#;
+    let extraction = extract_file("src/App.svelte", SOURCE);
+    assert!(
+        modules(&extraction).contains(&"./CloneModal.svelte"),
+        "import() must be an Import, not a call to a function named import: {:?}",
+        modules(&extraction)
+    );
+    assert_every_span_is_inside(&extraction, SOURCE);
+}
+
+#[test]
 fn a_vue_script_block_declares_symbols_imports_and_calls() {
     let extraction = extract_file("src/Summary.vue", VUE);
 
@@ -667,8 +720,27 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // enum's owner path, and `assigned_to` on a parameter Type reference. A
     // warm v39 row keeps the nested enum confident-dead and every typed
     // `reader.read()` AmbiguousGlobal, both looking freshly examined.
+    //
+    // v42 parses `onclick={() => copyText(name)}` as a Call. A v41 row
+    // still reports those handlers dead.
+    //
+    // v43 publishes methods on objects an exported factory returns, treats
+    // Vite/Rollup plugin methods as RuntimeEntryPoints, and vendors
+    // `src-tauri/framework/`. A v42 row still reports those methods dead and
+    // those copies unwired.
+    //
+    // v44 carries the file-liveness annotations. A warm v43 row still reports
+    // shebang scripts, package markers and testdata as unwired.
+    //
+    // v45 records `Foo<T>` as a Type use of `Foo`. A v44 row still reports a
+    // type alias used only as a generic constructor confidently dead.
+    //
+    // v46 records the enclosing callable as `parent_symbol` of a nested
+    // `const walk = () => {}`. A v45 row parents those arrows on the file.
+    // v47 preserves notebook completeness and remaps the complete parsed
+    // payload through actual raw JSON source positions.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "40",
+        EXTRACTION_SCHEMA_VERSION, "47",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );
