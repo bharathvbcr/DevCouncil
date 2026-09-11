@@ -1,5 +1,8 @@
 # Dev Map host integration contract
 
+Dev Map is one DevCouncil **module**. A host takes it without taking the rest of
+the suite, and can update it independently of Manvi or of `dcstore` / `dcverify`.
+
 Dev Map has two supported host seams. Rust programs can link the read-only
 query crate. Programs in other languages can invoke `devmap` and consume its
 JSON contract. A host chooses the seam in configuration; neither requires a Python runtime.
@@ -44,8 +47,10 @@ The standalone workspace verifies its shipped profile with
 force unwinding.
 
 
-Query `Response<T>` envelopes carry `source_freshness: null` when whole-tree
-freshness was not checked. Snapshot completeness (`walk_incomplete`, counts,
+Query `Response<T>` envelopes carry a `source_freshness` object. `fresh` is
+`true`/`false` when verified against the working tree for the answered
+generation, or `null` with an explicit `reason` when whole-tree freshness was
+not checked. Snapshot completeness (`walk_incomplete`, counts,
 and truncation) does not prove that the working tree still matches the map.
 `Store::status` and executable status expose independent nullable
 `source_freshness` and `analyzer_freshness` checks. True means verified current,
@@ -54,6 +59,9 @@ reader) means unverified. A parser-free library verifies current source bytes
 while leaving parser/analyzer compatibility unverified. Aggregate `is_fresh`
 requires both checks to pass, a committed generation, and no pending work or
 store degradation. Keep the reason even when persisted navigation is usable.
+
+`edge_confidence_mismatches` is owned by `Store::edge_confidence_mismatches`
+(SQL); CLI and IPC status both call that single owner.
 
 Search reads verify each returned file against the content hash in the symbol's
 own generation. Changed or unreadable bytes leave the stored hit present with
@@ -118,7 +126,7 @@ name itself.
 | `generation_id` | Latest committed generation, or `null`; a query host requires a positive integer. |
 | `db_path` | Resolved store path; a query host requires a nonblank value. |
 | `is_fresh` | A committed generation has no pending work and current source inventory, content hashes, and analyzer payload identity were verified. Independent of schema readiness and extraction completeness. |
-| `source_freshness` | Current source inventory and bytes match the stored generation; `null` if unverified. |
+| `source_freshness` | Status: current source inventory/bytes vs stored generation (`true`/`false`/`null`). Query envelopes: `{fresh, generation_id?, reason?}` — `fresh: null` means unverified. |
 | `analyzer_freshness` | Stored parser/analyzer identity matches this binary; `null` for a reader unable to compare it. |
 | `degraded_reason` | Coverage, freshness, or compatibility problem; `null` only when none is known. |
 | `capabilities` | Operations and flags derived from the executable's command parser. |

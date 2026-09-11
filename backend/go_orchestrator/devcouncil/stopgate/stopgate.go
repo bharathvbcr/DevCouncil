@@ -1,7 +1,7 @@
-// Package stopgate is the Phase-5 port of Python execution/stop_gate decision
-// shapes. Hosts (Claude/Cursor hooks, Manvi) call Evaluate; the heavy verify
-// work is delegated to package verify. A check that could not run is never a
-// pass — Evaluate surfaces skip reasons on the result.
+// Package stopgate is the host-facing verify entry. MCP (and any other host)
+// calls Run; Evaluate is the decision-only half. The heavy work is delegated
+// to package verify. A check that could not run is never a pass — skip reasons
+// stay on the decision and never invent MCPResult.Passed.
 package stopgate
 
 import (
@@ -38,40 +38,55 @@ type Input struct {
 	SkipReason string
 }
 
+// Outcome is the host payload: the stop decision plus the MCP verify body
+// when a check actually ran. A skipped decision leaves MCP at its zero value
+// (Passed=false) so a host cannot treat "could not run" as a pass.
+type Outcome struct {
+	Decision Result
+	MCP      verify.MCPResult
+	Gaps     []verify.Gap
+}
+
 // Evaluate runs verification (unless skipped) and maps it to a stop decision.
 //
 // Invariant: SkipVerify / store-unavailable / verify error → Allow=false with
 // Skipped=true and an explicit reason. Never Allow=true because a check did
 // not run.
 func Evaluate(ctx context.Context, in Input) Result {
+	return Run(ctx, in).Decision
+}
+
+// Run is the MCP/host entry: one verify, then both the stop decision and the
+// MCP payload. Callers that only need the decision use Evaluate.
+func Run(ctx context.Context, in Input) Outcome {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if in.SkipVerify {
 		reason := in.SkipReason
 		if reason == "" {
 			reason = "stop gate skipped by host"
 		}
-		return Result{
+		return Outcome{Decision: Result{
 			OK: true, Allow: false, Skipped: true, SkipReason: reason,
 			TaskID: in.TaskID, Reason: reason, VerifiedAt: now,
-		}
+		}}
 	}
 	if in.Store == nil {
-		return Result{
+		return Outcome{Decision: Result{
 			OK: false, Allow: false, Skipped: true,
 			SkipReason: "DevCouncil store unavailable",
 			TaskID:     in.TaskID, Reason: "DevCouncil store unavailable",
 			VerifiedAt: now,
-		}
+		}}
 	}
 	if in.TaskID == "" {
-		return Result{
+		return Outcome{Decision: Result{
 			OK: false, Allow: false, Skipped: true,
 			SkipReason: "no task_id", Reason: "no task_id", VerifiedAt: now,
-		}
+		}}
 	}
 	gateMode := in.GateMode
 	if gateMode == "" {
-		gateMode = "enforce"
+		gateMode = "off"
 	}
 	sandbox := in.Sandbox
 	if sandbox == "" {
@@ -79,11 +94,11 @@ func Evaluate(ctx context.Context, in Input) Result {
 	}
 	mcp, gaps, err := verify.VerifyTask(ctx, in.Root, in.Store, in.TaskID, gateMode, sandbox)
 	if err != nil {
-		return Result{
+		return Outcome{Decision: Result{
 			OK: false, Allow: false, Skipped: true,
 			SkipReason: "verify could not run: " + err.Error(),
 			TaskID:     in.TaskID, Reason: err.Error(), VerifiedAt: now,
-		}
+		}}
 	}
 	actions := make([]string, 0, len(mcp.NextActions))
 	for _, a := range mcp.NextActions {
@@ -103,9 +118,13 @@ func Evaluate(ctx context.Context, in Input) Result {
 	if !mcp.Passed {
 		reason = "blocked by verification"
 	}
-	return Result{
-		OK: true, Allow: allow, Reason: reason, TaskID: in.TaskID,
-		Status: mcp.Status, BlockingGapCount: blocking,
-		VerifiedAt: now, NextActions: actions,
+	return Outcome{
+		Decision: Result{
+			OK: true, Allow: allow, Reason: reason, TaskID: in.TaskID,
+			Status: mcp.Status, BlockingGapCount: blocking,
+			VerifiedAt: now, NextActions: actions,
+		},
+		MCP:  mcp,
+		Gaps: gaps,
 	}
 }

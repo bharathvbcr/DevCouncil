@@ -10,8 +10,9 @@
 //! Measured on a 1,032-file Android corpus: one file declares seven
 //! `private fun <T>.toJson()` on seven different types and calls each of them as
 //! `it.toJson()` inside a `map { }`. The receiver `it` cannot be typed, so the
-//! resolver emits an *ambiguous* edge naming one candidate, and the other six —
-//! every one of them called on the next line — were reported dead at 0.9.
+//! ladder records an *uninferred receiver* naming `toJson`, and the other six —
+//! every one of them called on the next line — were reported dead at 0.9 until
+//! the unresolved-namesake veto demoted every candidate sharing that bare name.
 
 use devmap_analyze::*;
 use devmap_extract::extract_file;
@@ -44,8 +45,8 @@ const AMBIGUOUS: &str = concat!(
     "private fun neverCalled(): String = \"x\"\n",
 );
 
-/// An ambiguous call to a receiver-qualified name is evidence about **every**
-/// candidate that carries it, not only the one the resolver named.
+/// An untyped-receiver call to a receiver-qualified name is evidence about
+/// **every** candidate that carries that bare name, not only one of them.
 #[test]
 fn an_ambiguous_receiver_qualified_call_downgrades_every_candidate_that_shares_its_name() {
     let reports = reports(&[("Codec.kt", AMBIGUOUS)]);
@@ -59,8 +60,8 @@ fn an_ambiguous_receiver_qualified_call_downgrades_every_candidate_that_shares_i
         );
         assert_eq!(
             found.exemption_reason.as_deref(),
-            Some("only_ambiguous_callers"),
-            "and the reason must name the ambiguity rather than a blanket exemption"
+            Some(UNRESOLVED_NAMESAKE_REASON),
+            "and the reason must name the unresolved call site rather than a blanket exemption"
         );
     }
 }

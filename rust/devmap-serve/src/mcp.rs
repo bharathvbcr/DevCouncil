@@ -58,9 +58,7 @@ use crate::repo_scope::{
     canonicalize_path, infer_root_from_store, open_mcp_store, store_for_repo_path, RepositoryRef,
     StoreLru,
 };
-use crate::root_resolve::{
-    file_uri_to_path, roots_with_stores, RootResolveInput,
-};
+use crate::root_resolve::{file_uri_to_path, roots_with_stores, RootResolveInput, MAX_ROOTS};
 
 /// How this slot decides which store file to open.
 #[derive(Debug)]
@@ -68,14 +66,24 @@ enum SlotMode {
     /// A fixed path — tests, and callers that already resolved one.
     Pinned { db_path: PathBuf },
     /// Discover from MCP roots, then cwd, then optional `--db` override.
+    ///
+    /// `explicit_root` is a CLI `--root` pin: it wins over MCP-root ambiguity
+    /// and reports `resolved_from: "root"`. It is not the process cwd.
     Resolving {
         explicit_db: Option<PathBuf>,
         client_cwd: PathBuf,
+        explicit_root: Option<PathBuf>,
         /// Filled after `roots/list` (or left `None` when the client has no
         /// roots capability). `Some(vec![])` means "asked, empty".
         mcp_roots: Mutex<Option<Vec<PathBuf>>>,
         /// True when the client advertised `capabilities.roots` on initialize.
         client_has_roots: Mutex<bool>,
+        /// Last applied `devmap-roots-N` sequence number. Late replies with a
+        /// smaller N are dropped.
+        last_applied_seq: Mutex<u64>,
+        /// Most recent `roots/list` error body, kept when the previous good
+        /// list is retained. Cleared on a successful apply.
+        roots_error: Mutex<Option<String>>,
     },
 }
 
@@ -122,14 +130,25 @@ impl StoreSlot {
     ///
     /// `explicit_db` is only the override path from `--db` when the flag was
     /// actually passed; `None` is the global-registration case.
-    pub fn resolving(explicit_db: Option<PathBuf>, client_cwd: PathBuf) -> Self {
+    ///
+    /// `explicit_root` is a CLI `--root` pin. When set it resolves that
+    /// repository (`resolved_from: "root"`) even when other MCP roots also have
+    /// stores, and `repo_path` must name the same canonical repository.
+    pub fn resolving(
+        explicit_db: Option<PathBuf>,
+        client_cwd: PathBuf,
+        explicit_root: Option<PathBuf>,
+    ) -> Self {
         let client_cwd = canonicalize_path(&client_cwd);
         Self {
             mode: SlotMode::Resolving {
                 explicit_db: explicit_db.map(|p| canonicalize_path(&p)),
                 client_cwd,
+                explicit_root: explicit_root.map(|p| canonicalize_path(&p)),
                 mcp_roots: Mutex::new(None),
                 client_has_roots: Mutex::new(false),
+                last_applied_seq: Mutex::new(0),
+                roots_error: Mutex::new(None),
             },
             opened: Mutex::new(StoreLru::new()),
             unusable_mcp_roots: Mutex::new(0),
@@ -181,11 +200,16 @@ impl StoreSlot {
     /// Apply a `roots/list` answer. An empty list is recorded as empty, not as
     /// "never asked", so the resolve error can say so.
     pub fn set_mcp_roots(&self, roots: Vec<PathBuf>) {
-        self.set_mcp_roots_result(roots, 0);
+        self.set_mcp_roots_result(roots, 0, 0);
     }
 
-    pub fn set_mcp_roots_result(&self, roots: Vec<PathBuf>, skipped: usize) {
-        if let SlotMode::Resolving { mcp_roots, .. } = &self.mode {
+    pub fn set_mcp_roots_result(&self, roots: Vec<PathBuf>, skipped: usize, overflow: usize) {
+        if let SlotMode::Resolving {
+            mcp_roots,
+            roots_error,
+            ..
+        } = &self.mode
+        {
             let canonical: Vec<PathBuf> = roots
                 .into_iter()
                 .map(|root| {
@@ -200,8 +224,73 @@ impl StoreSlot {
                 *slot = Some(canonical);
             }
             if let Ok(mut count) = self.unusable_mcp_roots.lock() {
-                *count = skipped;
+                *count = skipped.saturating_add(overflow);
             }
+            if let Ok(mut err) = roots_error.lock() {
+                *err = None;
+            }
+        }
+    }
+
+    /// Apply a sequenced `devmap-roots-N` result. Returns false when `seq` is
+    /// stale relative to the last applied reply.
+    pub fn apply_roots_list_result(
+        &self,
+        seq: u64,
+        roots: Vec<PathBuf>,
+        skipped: usize,
+        overflow: usize,
+    ) -> bool {
+        if !self.note_roots_seq(seq) {
+            return false;
+        }
+        self.set_mcp_roots_result(roots, skipped, overflow);
+        true
+    }
+
+    /// Record a sequenced `roots/list` error without clearing a previous good list.
+    pub fn apply_roots_list_error(&self, seq: u64, message: String) -> bool {
+        if !self.note_roots_seq(seq) {
+            return false;
+        }
+        if let SlotMode::Resolving { roots_error, .. } = &self.mode {
+            if let Ok(mut err) = roots_error.lock() {
+                *err = Some(message);
+            }
+        }
+        true
+    }
+
+    fn note_roots_seq(&self, seq: u64) -> bool {
+        let SlotMode::Resolving {
+            last_applied_seq, ..
+        } = &self.mode
+        else {
+            return false;
+        };
+        let Ok(mut last) = last_applied_seq.lock() else {
+            return false;
+        };
+        if seq < *last {
+            return false;
+        }
+        *last = seq;
+        true
+    }
+
+    fn roots_error_message(&self) -> Option<String> {
+        match &self.mode {
+            SlotMode::Resolving { roots_error, .. } => {
+                roots_error.lock().ok().and_then(|g| g.clone())
+            }
+            SlotMode::Pinned { .. } => None,
+        }
+    }
+
+    fn explicit_root(&self) -> Option<PathBuf> {
+        match &self.mode {
+            SlotMode::Resolving { explicit_root, .. } => explicit_root.clone(),
+            SlotMode::Pinned { .. } => None,
         }
     }
 
@@ -243,10 +332,7 @@ impl StoreSlot {
     }
 
     fn unusable_root_count(&self) -> usize {
-        self.unusable_mcp_roots
-            .lock()
-            .map(|g| *g)
-            .unwrap_or(0)
+        self.unusable_mcp_roots.lock().map(|g| *g).unwrap_or(0)
     }
 
     fn resolve_path(&self) -> Result<PathBuf, String> {
@@ -255,19 +341,41 @@ impl StoreSlot {
             SlotMode::Resolving {
                 explicit_db,
                 client_cwd,
+                explicit_root,
                 mcp_roots,
                 ..
             } => {
+                if let Some(root) = explicit_root {
+                    let store = canonicalize_path(&devmap_extract::paths::store_path(root));
+                    if store.is_file() {
+                        return Ok(store);
+                    }
+                    return Err(format!(
+                        "could not resolve a DevMap store: --root {} has no readable store at {}. \
+Pass repo_path only when it names this same repository, or run `devmap build` there.",
+                        root.display(),
+                        store.display()
+                    ));
+                }
                 let roots = mcp_roots
                     .lock()
                     .map_err(|_| "mcp roots mutex was poisoned by an earlier panic".to_string())?
                     .clone();
                 let skipped = self.unusable_root_count();
+                if let Some(err) = self.roots_error_message() {
+                    if roots.as_ref().is_none_or(|r| r.is_empty()) {
+                        return Err(format!(
+                            "could not resolve a DevMap store: MCP roots/list failed ({err}). \
+Pass repo_path with an absolute repository path."
+                        ));
+                    }
+                }
                 if skipped > 0 && roots.as_ref().is_some_and(|r| r.is_empty()) {
                     return Err(format!(
                         "could not resolve a DevMap store: MCP roots/list returned {skipped} \
-entries that were not usable unix file paths. Windows-style and non-file URIs are skipped \
-rather than reinterpreted. Pass repo_path with an absolute repository path."
+entries that were not usable unix file paths (including any over the {MAX_ROOTS}-root cap). \
+Windows-style and non-file URIs are skipped rather than reinterpreted. Pass repo_path \
+with an absolute repository path."
                     ));
                 }
                 let input = RootResolveInput {
@@ -291,9 +399,20 @@ rather than reinterpreted. Pass repo_path with an absolute repository path."
             SlotMode::Resolving {
                 explicit_db,
                 client_cwd,
+                explicit_root,
                 mcp_roots,
                 ..
             } => {
+                if let Some(root) = explicit_root {
+                    let pin_store = canonicalize_path(&devmap_extract::paths::store_path(root));
+                    if pin_store == store {
+                        return RepositoryRef {
+                            root: root.clone(),
+                            store,
+                            resolved_from: "root",
+                        };
+                    }
+                }
                 let roots = mcp_roots
                     .lock()
                     .ok()
@@ -338,13 +457,30 @@ rather than reinterpreted. Pass repo_path with an absolute repository path."
     pub fn candidate_roots(&self) -> Vec<PathBuf> {
         match &self.mode {
             SlotMode::Pinned { .. } => Vec::new(),
-            SlotMode::Resolving { mcp_roots, .. } => {
-                let roots = mcp_roots
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .unwrap_or_default();
-                roots_with_stores(roots.iter())
+            SlotMode::Resolving {
+                mcp_roots,
+                client_cwd,
+                explicit_db,
+                explicit_root,
+                ..
+            } => {
+                let roots = mcp_roots.lock().ok().and_then(|g| g.clone());
+                let mut candidates = RootResolveInput {
+                    mcp_roots: roots,
+                    client_cwd: client_cwd.clone(),
+                    explicit_db: explicit_db.clone(),
+                }
+                .candidate_roots();
+                // A pin is itself a candidate so status stays honest about what
+                // this process could answer for, even when resolution prefers it.
+                if let Some(root) = explicit_root {
+                    if devmap_extract::paths::store_path(root).is_file()
+                        && !candidates.iter().any(|c| c == root)
+                    {
+                        candidates.push(root.clone());
+                    }
+                }
+                candidates
             }
         }
     }
@@ -382,6 +518,17 @@ rather than reinterpreted. Pass repo_path with an absolute repository path."
     ) -> Result<(Arc<Store>, RepositoryRef), String> {
         if let Some(raw) = repo_path {
             let attr = store_for_repo_path(raw)?;
+            if let Some(pin) = self.explicit_root() {
+                if attr.root != pin {
+                    return Err(format!(
+                        "repo_path {} does not match this server's --root pin {}. \
+A pinned MCP registration only answers for that repository; pass the pin path, or \
+use an unpinned shared server and select with repo_path.",
+                        attr.root.display(),
+                        pin.display()
+                    ));
+                }
+            }
             let store = self.cache_open(&attr.store, attr.clone())?;
             return Ok((store, attr));
         }
@@ -895,8 +1042,12 @@ underneath the answer.",
             }),
         ),
         "dead" => (
-            "Symbols with no inbound edges and no entry-point exemption. Every report \
-carries its confidence and reason; treat it as a candidate list to verify, not a delete list.",
+            "Dead-symbol candidates with per-row confidence — not one flat delete list. \
+High confidence (above the degraded ceiling) means no inbound evidence after the call walk; \
+`only_ambiguous_callers` and unresolved-namesake rows sit at 0.4 (unconfirmed). \
+`NoNamesake` sites are explained gaps in the unresolved ledger, not dead findings. \
+Read `walk_incomplete` before treating an empty or short list as complete; a partial \
+corpus caps findings below the confident tier. Always pass `repo_path`.",
             json!({
                 "type": "object",
                 "properties": {"budget": budget_prop(2000)},
@@ -1007,8 +1158,8 @@ fn repo_scope_arg_schema() -> Value {
     json!({
         "type": "string",
         "description": "Absolute path to the git repository this call is about. \
-Cursor shares one `devmap mcp` process across workspace tabs; pass this on every call \
-and check `repository.root` in the answer.",
+    Cursor shares one `devmap mcp` process across workspace tabs; pass this on every call \
+    and check `repository.root` in the answer.",
         "minLength": 1,
         "maxLength": 4096
     })
@@ -1029,6 +1180,21 @@ fn with_repo_scope_args(mut schema: Value) -> Value {
         properties.insert("root".into(), alias);
     }
     schema
+}
+
+/// Tool prose that a host may cache independently of `inputSchema`.
+///
+/// Cursor has been measured serving an empty `devmap_status` schema after a
+/// binary upgrade. The argument still exists; a description that names it is
+/// the one field that still reaches the model when the property list does not.
+fn with_repo_path_guidance(description: &str) -> String {
+    if description.contains("repo_path") {
+        description.to_string()
+    } else {
+        format!(
+            "{description} Always pass `repo_path` with the absolute repository path and check `repository.root` in the answer — Cursor shares one process across tabs."
+        )
+    }
 }
 
 /// The budget envelope every ranked answer is wrapped in.
@@ -1117,10 +1283,10 @@ fn describe_output(cmd: &str) -> Value {
         means 'not examined'."},
                 "candidate_roots": {"type": "array",
                     "description": "MCP roots that currently hold a DevMap store. Present so a \
-shared process can name every repository it could have answered from."},
+        shared process can name every repository it could have answered from."},
                 "ambiguous": {"type": "boolean",
-                    "description": "True when more than one MCP root has a store. Pass repo_path \
-to choose."}
+                    "description": "True when more than one repository has a store and this call \
+        did not name repo_path. False when repo_path was provided — that path is authoritative."}
             },
             "required": ["generation_id", "pending_count", "node_count", "edge_count",
                 "is_fresh", "degraded_reason", "quarantined_count", "coverage_gaps"],
@@ -1131,8 +1297,9 @@ to choose."}
         "impact" => budgeted_envelope("Symbols that reach the target, walked in reverse."),
         "trace" => budgeted_envelope("Call paths from the origin, or between the two endpoints."),
         "dead" => budgeted_envelope(
-            "Dead-symbol reports, each carrying its own confidence and reason. A candidate list \
-to verify, not a delete list.",
+            "Dead-symbol reports with per-row confidence and reason: confident vs unconfirmed \
+(`only_ambiguous_callers`, unresolved namesake, coverage-capped). Read `walk_incomplete` — \
+a partial corpus is a lower bound, not a clean bill. Candidate list to verify, not a delete list.",
         ),
         "neighbors" => json!({
             "type": "object",
@@ -1239,7 +1406,7 @@ fn repository_output_schema() -> Value {
     json!({
         "type": "object",
         "description": "Which repository this answer was read from. Check `root` before trusting \
-the payload — one MCP process is shared across workspace tabs.",
+    the payload — one MCP process is shared across workspace tabs.",
         "properties": {
             "root": {"type": "string"},
             "store": {"type": "string"},
@@ -1252,15 +1419,15 @@ fn with_repository_output(mut schema: Value) -> Value {
     let Some(object) = schema.as_object_mut() else {
         return schema;
     };
-    if let Some(properties) = object
-        .get_mut("properties")
-        .and_then(Value::as_object_mut)
-    {
+    if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
         properties.insert("repository".into(), repository_output_schema());
     }
     match object.get_mut("required") {
         Some(Value::Array(required)) => {
-            if !required.iter().any(|value| value.as_str() == Some("repository")) {
+            if !required
+                .iter()
+                .any(|value| value.as_str() == Some("repository"))
+            {
                 required.push(json!("repository"));
             }
         }
@@ -1394,7 +1561,7 @@ pub fn tool_specs() -> Vec<Value> {
             let (description, schema) = describe(cmd);
             json!({
                 "name": name,
-                "description": description,
+                "description": with_repo_path_guidance(description),
                 "inputSchema": schema,
                 // Declared because this server emits `structuredContent` on
                 // every successful call, and structured content a client cannot
@@ -1709,11 +1876,12 @@ fn initialize_result(params: Option<&Value>) -> Value {
     json!({
         "protocolVersion": negotiate(requested),
         "capabilities": {
-            // `listChanged: false` and meant literally: the tool list is built
-            // from literals and cannot change while this process runs, so this
-            // server never emits notifications/tools/list_changed. Advertising
-            // true would promise a notification that never comes.
-            "tools": {"listChanged": false}
+            // `listChanged: true` because this server emits
+            // `notifications/tools/list_changed` after `initialized`. Hosts
+            // cache `tools/list`; without the capability and the notification
+            // they keep a previous binary's schemas (measured: empty
+            // `devmap_status` properties after `repo_path` was added).
+            "tools": {"listChanged": true}
         },
         "serverInfo": server_info(),
         "instructions": INSTRUCTIONS
@@ -1732,33 +1900,42 @@ fn client_advertises_roots(params: Option<&Value>) -> bool {
 ///
 /// URI forms `file:///…` are accepted; anything else is skipped with a note in
 /// the returned skipped count so oversized or exotic schemes cannot be mistaken
-/// for an empty workspace.
-fn parse_roots_list_result(result: &Value) -> (Vec<PathBuf>, usize) {
+/// for an empty workspace. Parsed paths are capped at [`crate::root_resolve::MAX_ROOTS`];
+/// the overflow count is the number of otherwise-usable entries that did not fit.
+pub fn parse_roots_list_result(result: &Value) -> (Vec<PathBuf>, usize, usize) {
     let Some(roots) = result.get("roots").and_then(Value::as_array) else {
-        return (Vec::new(), 0);
+        return (Vec::new(), 0, 0);
     };
     let mut paths = Vec::new();
     let mut skipped = 0usize;
+    let mut overflow = 0usize;
     for root in roots {
         let Some(uri) = root.get("uri").and_then(Value::as_str) else {
             skipped += 1;
             continue;
         };
         match file_uri_to_path(uri) {
-            Some(path) => paths.push(path),
+            Some(path) => {
+                if paths.len() < MAX_ROOTS {
+                    paths.push(path);
+                } else {
+                    overflow += 1;
+                }
+            }
             None => skipped += 1,
         }
     }
-    (paths, skipped)
+    (paths, skipped, overflow)
 }
 
 /// Id used for the first `roots/list` request this server sends after initialize.
 /// Subsequent re-queries after `list_changed` use `devmap-roots-N`.
 pub const ROOTS_LIST_REQUEST_ID: &str = "devmap-roots-1";
 
-fn is_roots_list_response_id(id: &Value) -> bool {
-    id.as_str()
-        .is_some_and(|id| id.starts_with("devmap-roots-"))
+fn roots_list_response_seq(id: &Value) -> Option<u64> {
+    let id = id.as_str()?;
+    let rest = id.strip_prefix("devmap-roots-")?;
+    rest.parse().ok()
 }
 
 /// Who answered. One copy, reached two ways.
@@ -1891,13 +2068,23 @@ a stateless server has no earlier request to infer them from."
 
 /// How long a client may cache `tools/list` and `server/discover`.
 ///
-/// Five minutes, and the reasoning is the bound rather than the number: this
-/// server never emits `notifications/tools/list_changed` and correctly
-/// advertises `listChanged: false`, so an expiring TTL is the *only*
-/// invalidation a cached list gets. The list is built from literals and cannot
-/// change while the process runs, so the risk of a stale cache is zero today and
-/// the TTL exists to bound the day that stops being true.
+/// Five minutes is a bound, not a freshness claim. This server advertises
+/// `listChanged: true` and emits `notifications/tools/list_changed` after
+/// `initialized` so a host that cached a previous binary's schemas refetches
+/// on connect. The TTL covers hosts that ignore the notification.
 pub const CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// Invalidate a host's cached `tools/list`.
+///
+/// Cursor caches tool schemas across binary upgrades. Emitting this after
+/// `initialized` is what makes `listChanged: true` honest rather than a
+/// capability that never fires.
+pub fn tools_list_changed_notification() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed"
+    })
+}
 
 /// The `server/discover` payload.
 ///
@@ -1914,7 +2101,7 @@ pub const CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 fn discover_result() -> Value {
     json!({
         "supportedVersions": MODERN_PROTOCOL_VERSIONS,
-        "capabilities": {"tools": {"listChanged": false}},
+        "capabilities": {"tools": {"listChanged": true}},
         "instructions": INSTRUCTIONS,
         // Required fields: `DiscoverResult` extends `CacheableResult`. Whether a
         // given client reads them is a property of that client's revision, not a
@@ -2034,9 +2221,8 @@ async fn call_tool(
     // made at the one call site entitled to make it — a transport that *does*
     // watch a tree has to hand over its own.
     let unapplied = crate::protocol::UnappliedEdits::default();
-    let handle = tokio::task::spawn_blocking(move || {
-        dispatch(&engine, request, &worker_cancel, &unapplied)
-    });
+    let handle =
+        tokio::task::spawn_blocking(move || dispatch(&engine, request, &worker_cancel, &unapplied));
 
     let latency_ms = || started.elapsed().as_millis() as u64;
     match tokio::time::timeout(CALL_TIMEOUT, handle).await {
@@ -2049,7 +2235,13 @@ async fn call_tool(
                 None,
                 latency_ms(),
             );
-            Ok(tool_success(&name, value, &attribution, &candidates))
+            Ok(tool_success(
+                &name,
+                value,
+                &attribution,
+                &candidates,
+                repo_path.is_some(),
+            ))
         }
         Ok(Ok(Err(err))) => {
             let message = err.to_string();
@@ -2099,6 +2291,7 @@ fn tool_success(
     mut value: Value,
     attribution: &RepositoryRef,
     candidates: &[PathBuf],
+    repo_path_provided: bool,
 ) -> Value {
     if let Some(object) = value.as_object_mut() {
         object.insert("repository".into(), attribution.to_json());
@@ -2110,7 +2303,10 @@ fn tool_success(
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()),
             );
-            object.insert("ambiguous".into(), json!(candidates.len() > 1));
+            // Explicit repo_path is authoritative: the process may still know
+            // about other stores, but this answer is not ambiguous.
+            let ambiguous = !repo_path_provided && candidates.len() > 1;
+            object.insert("ambiguous".into(), json!(ambiguous));
         }
     }
     // Checked here, against the tool's own published `outputSchema`, because
@@ -2630,13 +2826,20 @@ async fn dispatch_single(
     if object.get("method").is_none()
         && (object.contains_key("result") || object.contains_key("error"))
     {
-        if is_roots_list_response_id(object.get("id").unwrap_or(&Value::Null)) {
+        if let Some(seq) = roots_list_response_seq(object.get("id").unwrap_or(&Value::Null)) {
             if let Some(result) = object.get("result") {
-                let (paths, skipped) = parse_roots_list_result(result);
-                session.store.set_mcp_roots_result(paths, skipped);
+                let (paths, skipped, overflow) = parse_roots_list_result(result);
+                let _ = session
+                    .store
+                    .apply_roots_list_result(seq, paths, skipped, overflow);
             } else {
-                // Error or empty: record "asked, got nothing" so resolve names it.
-                session.store.set_mcp_roots_result(Vec::new(), 0);
+                let message = object
+                    .get("error")
+                    .and_then(|err| err.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("roots/list returned an error without a message")
+                    .to_string();
+                let _ = session.store.apply_roots_list_error(seq, message);
             }
         }
         return None;
@@ -3105,6 +3308,7 @@ continued for {seen} bytes in total before terminating"
             && session.store.client_has_roots();
         let reask_roots = incoming_method.as_deref() == Some("notifications/roots/list_changed")
             && session.store.client_has_roots();
+        let notify_tools = incoming_method.as_deref() == Some("notifications/initialized");
         let session = Arc::clone(&session);
         let writer = Arc::clone(&writer);
         tasks.spawn(async move {
@@ -3112,15 +3316,19 @@ continued for {seen} bytes in total before terminating"
             if let Some(frame) = handle_line_in(&session, &text).await {
                 write_frame(&writer, &frame).await?;
             }
-            // After the host finishes the handshake, ask for the open workspace
-            // roots. Global `devmap mcp` has no `--db`; this is how one server
-            // finds the right store. Failure to answer is recorded as an empty
-            // list when the response arrives (or left as "not queried" if it
-            // never does) — resolve names both cases.
+            // After the host finishes the handshake, push tools/list_changed so
+            // a cached schema from a previous binary is dropped, then ask for
+            // the open workspace roots. Global `devmap mcp` has no `--db`; that
+            // roots/list is how one server finds the right store. Failure to
+            // answer is recorded as an empty list when the response arrives (or
+            // left as "not queried" if it never does) — resolve names both cases.
             //
             // `list_changed` re-sends the same request rather than clearing the
             // previous list: collapsing to `Some(vec![])` would make the next
             // tool call fall through to cwd while the new answer is in flight.
+            if notify_tools {
+                let _ = write_frame(&writer, &tools_list_changed_notification()).await;
+            }
             if ask_roots || reask_roots {
                 let _ = write_frame(&writer, &session.store.next_roots_list_request()).await;
             }

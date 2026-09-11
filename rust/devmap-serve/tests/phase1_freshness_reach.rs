@@ -82,13 +82,13 @@ fn db_override_wins_when_file_exists_else_discovery_continues() {
 }
 
 #[tokio::test]
-async fn mcp_roots_list_response_rebinds_the_store() {
+async fn mcp_roots_list_does_not_silently_replace_a_cwd_store() {
     let repo_a = scratch("mcp-a");
     let repo_b = scratch("mcp-b");
     plant_store(&repo_a);
-    let store_b = plant_store(&repo_b);
+    plant_store(&repo_b);
 
-    let slot = Arc::new(StoreSlot::resolving(None, repo_a.clone()));
+    let slot = Arc::new(StoreSlot::resolving(None, repo_a.clone(), None));
     assert!(
         slot.db_path().as_os_str().is_empty(),
         "an unresolved resolving slot must not preview store_path(cwd)"
@@ -103,11 +103,36 @@ async fn mcp_roots_list_response_rebinds_the_store() {
         }
     });
     assert!(handle_line(&slot, &response.to_string()).await.is_none());
-    let opened = slot.get().expect("store b opens");
+    let err = match slot.get() {
+        Ok(_) => panic!("cwd store and a different MCP root must not first-wins"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains(&repo_a.display().to_string()) && err.contains(&repo_b.display().to_string()),
+        "must name both repositories: {err}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_roots_list_opens_when_cwd_has_no_store() {
+    let cwd = scratch("mcp-empty-cwd");
+    let repo = scratch("mcp-root-only");
+    let store = plant_store(&repo);
+    let slot = Arc::new(StoreSlot::resolving(None, cwd, None));
+    slot.set_client_has_roots(true);
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": ROOTS_LIST_REQUEST_ID,
+        "result": {
+            "roots": [{"uri": format!("file://{}", repo.display())}]
+        }
+    });
+    assert!(handle_line(&slot, &response.to_string()).await.is_none());
+    let opened = slot.get().expect("a unique MCP-root store still opens");
     drop(opened);
     assert_eq!(
         slot.db_path(),
-        store_b.canonicalize().unwrap_or_else(|_| store_b.clone())
+        store.canonicalize().unwrap_or_else(|_| store.clone())
     );
 }
 
@@ -115,7 +140,7 @@ async fn mcp_roots_list_response_rebinds_the_store() {
 async fn mcp_initialize_records_roots_capability() {
     let cwd = scratch("mcp-init-cwd");
     plant_store(&cwd);
-    let slot = Arc::new(StoreSlot::resolving(None, cwd));
+    let slot = Arc::new(StoreSlot::resolving(None, cwd, None));
     let init = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -165,7 +190,7 @@ fn oversized_skip_is_not_a_coverage_refusal() {
 async fn concurrent_status_while_store_deleted_mid_session_fails_closed() {
     let root = scratch("race-del");
     let store_path = plant_store(&root);
-    let slot = Arc::new(StoreSlot::resolving(None, root.clone()));
+    let slot = Arc::new(StoreSlot::resolving(None, root.clone(), None));
     let _ = slot.get().expect("open");
     std::fs::remove_file(&store_path).unwrap();
     let err = match slot.get() {

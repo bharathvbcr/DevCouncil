@@ -3,10 +3,10 @@
 //! `degraded_reason` has always carried three numbers — "2 file(s) failed to
 //! parse, 1 recovered by pattern (no calls extracted), 1 refused by discovery
 //! and never read at all" — and no surface anywhere carried a path. On this
-//! repository the refusal is a 30.6 MB vendored `parser.c` against a 1 MiB
-//! ceiling, which is the *correct* verdict; the gap was that an operator could
-//! not tell that from a broken indexer without opening the database by hand,
-//! and the Python doctor prints the same three numbers for the same reason.
+//! repository a real refusal is an escaping symlink (or an unreadable /
+//! non-UTF-8 path); oversized sources are an ordinary skip under the 1 MiB
+//! ceiling (`DiscoverySkipReason::Oversized::is_refusal` is false), so they
+//! must not be used as the refusal fixture here.
 //!
 //! Each list is capped at `devmap_store::COVERAGE_GAP_SAMPLE` and carries
 //! `{shown, total, truncated}`, because a list that stops at fifty without
@@ -14,6 +14,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use devmap_store::Store;
 
 fn devmap() -> String {
     let mut path = std::env::current_exe().unwrap();
@@ -54,34 +56,53 @@ fn fixture(name: &str) -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    root
+    // macOS `temp_dir()` is a symlink (`/var` -> `/private/var`); canonicalize
+    // so the escaping-symlink refusal is measured against the same root the
+    // indexer walks.
+    root.canonicalize().unwrap()
 }
 
-/// One file over the source ceiling, one with no linked grammar, one ordinary.
-fn write_a_corpus_with_two_holes(root: &Path) {
+/// Plant a source-shaped symlink whose target sits outside the repository.
+fn plant_escaping_source(root: &Path, link_name: &str) -> PathBuf {
+    let outside = root.with_file_name(format!(
+        "{}-outside",
+        root.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("outside")
+    ));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).unwrap();
+    let target = outside.join("secret.py");
+    std::fs::write(&target, "def secret():\n    return 0\n").unwrap();
+    let link = root.join(link_name);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+    outside
+}
+
+/// One escaping-symlink refusal, one with no linked grammar, one ordinary.
+fn write_a_corpus_with_two_holes(root: &Path) -> PathBuf {
     std::fs::write(root.join("lib.py"), "def helper():\n    return 42\n").unwrap();
-    let pad = format!("# {}\n", "x".repeat(78));
-    let mut body = String::from("from lib import helper\n\n\ndef main():\n    return helper()\n");
-    while body.len() as u64 <= devmap_extract::MAX_SOURCE_BYTES {
-        body.push_str(&pad);
-    }
-    std::fs::write(root.join("app.py"), body).unwrap();
+    let outside = plant_escaping_source(root, "app.py");
     std::fs::write(
         root.join("svc.proto"),
         "syntax = \"proto3\";\nmessage Ping { string id = 1; }\n",
     )
     .unwrap();
+    outside
 }
 
 #[test]
 fn status_names_the_refused_and_the_unparsed_paths() {
     let root = fixture("holes");
-    write_a_corpus_with_two_holes(&root);
+    let outside = write_a_corpus_with_two_holes(&root);
 
     let build = json(&root, &["--json", "build", "."]);
     assert_eq!(
         build["discovery_refused_files"], 1,
-        "fixture precondition: the oversized caller is refused: {build}"
+        "fixture precondition: the escaping symlink is refused: {build}"
     );
 
     let status = json(&root, &["--json", "status"]);
@@ -103,7 +124,13 @@ fn status_names_the_refused_and_the_unparsed_paths() {
         refused["paths"][0]["reason"]
             .as_str()
             .unwrap()
-            .contains("source ceiling"),
+            .to_ascii_lowercase()
+            .contains("escapes")
+            || refused["paths"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("outside"),
         "the verdict is what distinguishes a correct refusal from a broken \
          indexer: {status}"
     );
@@ -134,6 +161,7 @@ fn status_names_the_refused_and_the_unparsed_paths() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 /// A corpus with no holes reports empty lists, not absent ones.
@@ -242,5 +270,15 @@ fn status_counts_stored_edges_whose_confidence_contradicts_their_evidence() {
         serde_json::json!(changed),
         "every tampered row must be counted: {after}"
     );
+
+    // CLI and IPC share one owner (`Store::edge_confidence_mismatches`). IPC is
+    // pinned the same way in `ipc_status_edge_confidence_mismatches_matches_sql_owner`.
+    let store = Store::open_read_only(&db).unwrap();
+    assert_eq!(
+        after["edge_confidence_mismatches"],
+        serde_json::json!(store.edge_confidence_mismatches().unwrap()),
+        "CLI status must report the SQL owner, not an in-memory recount"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }

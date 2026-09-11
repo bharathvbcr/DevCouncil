@@ -1147,6 +1147,26 @@ impl Daemon {
             .into_iter()
             .map(|(path, reason)| devmap_store::DiscoveryRefusal { path, reason })
             .collect();
+        // Prefer the CLI's identical-tree restamp before resolve/analyze: a
+        // batch whose bytes still match the latest generation (touch,
+        // rewrite-same-content, empty HEAD move already handled above) must not
+        // pay for a new generation or a full resolve. An empty store has no
+        // generation to restamp — empty hashes matching empty hashes is not
+        // that case.
+        if payload_is_current && self.store.latest_generation_id()?.is_some() {
+            let batch_hashes: std::collections::BTreeMap<String, u64> = extractions
+                .iter()
+                .map(|extraction| (extraction.file_path.clone(), extraction.content_hash))
+                .collect();
+            let stored_hashes = self.store.latest_file_hashes()?;
+            if batch_hashes == stored_hashes
+                && refusals == self.store.latest_discovery_refusals()?
+            {
+                self.store.restamp_latest_head(&head.sha)?;
+                self.store.clear_claimed_pending_paths(&succeeded)?;
+                return Ok(succeeded.len());
+            }
+        }
         let discovery = DiscoveryCoverage::refused(refusals.len());
         extractions.sort_by(|left, right| left.file_path.cmp(&right.file_path));
         let mut resolver = Resolver::new();
@@ -1862,6 +1882,7 @@ mod tests {
     // form is the correct one for them: no discovery step ran over what they
     // assembled. The drain itself must never use it.
     use devmap_analyze::analyze;
+    use devmap_analyze::model::AnalysisStatus;
 
     #[test]
     fn agentic_drain_takes_the_writer_lock_before_reading_its_base() {
@@ -2249,14 +2270,16 @@ mod tests {
     }
 
     /// A refused file inside a changed directory must neither block the
-    /// directory's resync nor delete its own previously-stored extraction.
+    /// directory's resync nor delete its healthy siblings.
     ///
     /// The directory branch bailed the whole batch when discovery refused any
-    /// file (oversized, unreadable): one poison file meant the directory could
-    /// never be resynced, and the watcher retried it with backoff forever.
-    /// Worse, had the bail been dropped naively, the refusal would have made
-    /// the poison path look *deleted* — the file still exists on disk, so
-    /// removing its stored row would be a falsehood about the tree.
+    /// file: one poison path meant the directory could never be resynced, and
+    /// the watcher retried it with backoff forever. The fixture uses an
+    /// escaping symlink (`EscapesRoot`) — a real refusal, not an oversized
+    /// skip — matching `one_symlink_rule_end_to_end`. Containment refusals
+    /// drop their own rows (a full build writes none); non-containment
+    /// refusals keep the last good extraction. Either way the sibling must
+    /// still update, and the generation must not claim `AnalysisStatus::Ok`.
     #[test]
     fn a_refused_file_in_a_changed_directory_neither_blocks_nor_deletes_siblings() {
         let stamp = SystemTime::now()
@@ -2264,8 +2287,15 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!("devmap-dir-poison-{stamp}"));
+        let outside = std::env::temp_dir().join(format!("devmap-dir-poison-outside-{stamp}"));
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
         fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        // Canonicalize: macOS `temp_dir()` is a symlink and the daemon compares
+        // against a canonical root.
+        let root = root.canonicalize().unwrap();
+        let outside = outside.canonicalize().unwrap();
         fs::write(root.join("good.py"), "def good_v1():\n    return 1\n").unwrap();
         fs::write(root.join("poison.py"), "def poison_v1():\n    return 2\n").unwrap();
 
@@ -2277,14 +2307,16 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         save_scratch_generation(&store, &initial, &resolution, &analysis);
 
-        // The edit: one legitimate change, and the sibling grows past the
-        // source-size limit so discovery refuses it.
+        // The edit: one legitimate change, and the sibling becomes a symlink
+        // that escapes the repository so discovery refuses it.
         fs::write(root.join("good.py"), "def good_v2():\n    return 11\n").unwrap();
-        fs::write(
-            root.join("poison.py"),
-            vec![b'x'; (MAX_SOURCE_BYTES + 1) as usize],
-        )
-        .unwrap();
+        fs::write(outside.join("secret.py"), "def secret():\n    return 0\n").unwrap();
+        fs::remove_file(root.join("poison.py")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("secret.py"), root.join("poison.py")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(outside.join("secret.py"), root.join("poison.py"))
+            .unwrap();
 
         store
             .enqueue_pending_paths(&[root.to_string_lossy().into_owned()])
@@ -2307,18 +2339,27 @@ mod tests {
             "the healthy sibling must be re-extracted"
         );
         assert!(
-            persisted.iter().any(|extraction| {
-                extraction.file_path == "poison.py"
-                    && extraction
-                        .symbols
-                        .iter()
-                        .any(|symbol| symbol.name == "poison_v1")
-            }),
-            "a refused-but-existing file must keep its stored row instead of \
-             being recorded as deleted"
+            !persisted
+                .iter()
+                .any(|extraction| extraction.file_path == "poison.py"),
+            "an EscapesRoot refusal is a containment refusal: a full build \
+             writes no rows for it, so the drain must drop them rather than \
+             keep claiming symbols for a file outside the repository"
+        );
+        let status = daemon
+            .store
+            .latest_analysis()
+            .unwrap()
+            .expect("the drain persisted a generation")
+            .status;
+        assert!(
+            !matches!(status, AnalysisStatus::Ok),
+            "a refused file in the changed directory must not leave the \
+             generation claiming a complete corpus: {status:?}"
         );
 
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     /// One unrepresentable filename must not stop the daemon from starting at

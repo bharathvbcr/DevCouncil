@@ -94,9 +94,19 @@ fn staleness_audit_navigation_survives_repeated_edits_and_rebuilds() {
         ] {
             let response = staleness_query(&root, &args);
             assert_eq!(response["resolution"], "Available", "{args:?}: {response}");
-            assert_eq!(
-                response.get("source_freshness"),
-                Some(&serde_json::Value::Null)
+            let freshness = response
+                .get("source_freshness")
+                .expect("query envelopes must carry source_freshness");
+            assert!(
+                freshness.get("fresh").is_some_and(|v| v.is_null()),
+                "{args:?}: unverified freshness must report fresh=null: {freshness}"
+            );
+            assert!(
+                freshness
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|reason| !reason.is_empty()),
+                "{args:?}: unverified freshness must name why: {freshness}"
             );
         }
         let explore = staleness_query(&root, &["explore", "durable_symbol"]);

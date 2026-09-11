@@ -7,7 +7,8 @@ import (
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gatescfg"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/stopgate"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/gate"
 )
 
@@ -51,6 +52,7 @@ type Registry struct {
 // is not initialized; tools then fail closed with not_initialized.
 func NewRegistry(root string, storeClient *store.Client, g *gate.Gate) *Registry {
 	lease := &LeaseService{Store: storeClient}
+	lease.GateMode = gatescfg.Load(root).VerificationMode
 	return &Registry{
 		Root:  root,
 		Store: storeClient,
@@ -226,15 +228,20 @@ func (r *Registry) callVerify(ctx context.Context, args map[string]any) any {
 	if r.Store == nil {
 		return ErrorPayload{OK: false, Code: "not_initialized", Error: "DevCouncil state is unavailable in this directory."}
 	}
-	gateMode := "enforce"
-	if r.Lease != nil && r.Lease.GateMode != "" {
+	gateMode := ""
+	if r.Lease != nil {
 		gateMode = r.Lease.GateMode
 	}
-	result, _, err := verify.VerifyTask(ctx, r.Root, r.Store, taskID, gateMode, "local")
-	if err != nil {
-		return ErrorPayload{OK: false, Code: "verify_error", Error: err.Error()}
+	if gateMode == "" {
+		gateMode = gatescfg.Load(r.Root).VerificationMode
 	}
-	return result
+	out := stopgate.Run(ctx, stopgate.Input{
+		Root: r.Root, Store: r.Store, TaskID: taskID, GateMode: gateMode, Sandbox: "local",
+	})
+	if out.Decision.Skipped {
+		return ErrorPayload{OK: false, Code: "verify_error", Error: out.Decision.Reason}
+	}
+	return out.MCP
 }
 
 func (r *Registry) callGetGaps(ctx context.Context, args map[string]any) any {

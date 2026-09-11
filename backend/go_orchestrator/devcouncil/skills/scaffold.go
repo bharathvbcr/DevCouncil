@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 // Bounds ported from Python skills/registry.py.
@@ -197,7 +199,7 @@ func Scaffold(opts Options) (*Result, error) {
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return nil, err
 		}
-		if err := atomicWrite(target, content); err != nil {
+		if err := safefile.WriteAtomic(target, content, 0o644); err != nil {
 			return nil, err
 		}
 		hashes[key] = sha256Hex(content)
@@ -215,7 +217,7 @@ func Scaffold(opts Options) (*Result, error) {
 		return nil, fmt.Errorf("%s: receipt exceeds byte limit", receiptRel)
 	}
 	receiptPath := filepath.Join(root, receiptRel)
-	if err := atomicWrite(receiptPath, prettyReceipt(hashes)); err != nil {
+	if err := safefile.WriteAtomic(receiptPath, prettyReceipt(hashes), 0o644); err != nil {
 		return nil, err
 	}
 	return &Result{Files: written, Receipt: hashes}, nil
@@ -327,24 +329,6 @@ func loadReceipt(root, rel string) (map[string]string, error) {
 		_ = k
 	}
 	return saved.Files, nil
-}
-
-func atomicWrite(path string, content []byte) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".skill-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(content); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
 }
 
 func sha256Hex(b []byte) string {

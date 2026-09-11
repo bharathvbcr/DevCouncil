@@ -47,7 +47,7 @@ func deriveFile(g Gap) *string {
 	}
 	for _, item := range g.Evidence {
 		if looksLikePath(item) {
-			return strPtr(item)
+			return filePtr(item)
 		}
 	}
 	return nil

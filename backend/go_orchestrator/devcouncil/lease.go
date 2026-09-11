@@ -8,6 +8,7 @@ import (
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gatescfg"
 )
 
 const DefaultLeaseTTL = 15 * time.Minute
@@ -65,9 +66,10 @@ func (s *LeaseService) ttl() time.Duration {
 
 func (s *LeaseService) gateMode() string {
 	if s.GateMode == "" {
-		return "enforce"
+		return gatescfg.ModeOff
 	}
-	return s.GateMode
+	mode, _ := gatescfg.Normalize(s.GateMode)
+	return mode
 }
 
 // Checkout acquires a lease and returns the Python MCP checkout payload shape.

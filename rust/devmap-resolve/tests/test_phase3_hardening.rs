@@ -819,9 +819,8 @@ fn unresolved_calls_separate_builtins_and_external_imports_from_real_failures() 
         }
     );
 
-    // No evidence either way: this is the only tier that means "possible bug",
-    // and it must stay visible.
-    assert_eq!(class_of("mysteryHelper"), UnresolvedClass::Unresolved);
+    // No evidence either way *and* no corpus namesake: explained as NoNamesake.
+    assert_eq!(class_of("mysteryHelper"), UnresolvedClass::NoNamesake);
 }
 
 /// The classifier must never launder a real failure into an expected one.
@@ -999,8 +998,8 @@ fn classification_tiers_are_structurally_exclusive() {
         ),
         (
             "app/b.py",
-            "import os\nfrom pathlib import Path\n\
-             def run(p):\n    print(p)\n    p.write_text('x')\n    os.getcwd()\n    mystery()\n",
+            "import os\nfrom pathlib import Path\nfrom .ghost import missing_name\n\
+             def run(p):\n    print(p)\n    p.write_text('x')\n    os.getcwd()\n    mystery()\n    missing_name()\n",
         ),
         (
             "web/c.ts",
@@ -1011,7 +1010,7 @@ fn classification_tiers_are_structurally_exclusive() {
         (
             "lib/d.rs",
             "fn run(v: String) {\n    println!(\"{}\", v);\n    let _ = v.to_string();\n    \
-             mystery();\n}\n",
+             mystery();\n    crate::missing::helper();\n}\n",
         ),
     ];
     let extractions: Vec<_> = sources
@@ -1053,9 +1052,12 @@ fn classification_tiers_are_structurally_exclusive() {
                 reference.source_file.ends_with(".ts")
                     || reference.source_file.ends_with(".tsx")
                     || reference.source_file.ends_with(".js")
-                    || reference.source_file.ends_with(".jsx"),
+                    || reference.source_file.ends_with(".jsx")
+                    || reference.source_file.ends_with(".svelte")
+                    || reference.source_file.ends_with(".vue")
+                    || reference.source_file.ends_with(".astro"),
                 "{}: `{}` was called a {environment} host global, but only the \
-                 JavaScript family has a global object",
+                 JavaScript family (and its embedded hosts) has a global object",
                 reference.source_file,
                 reference.callee_name
             );
@@ -1079,6 +1081,8 @@ fn classification_tiers_are_structurally_exclusive() {
         "host_global",
         "local_binding",
         "uninferred_receiver",
+        "no_namesake",
+        "module_path",
         "unresolved",
     ] {
         assert!(
@@ -1147,9 +1151,9 @@ fn a_runtime_supplied_global_is_its_own_tier_and_never_a_language_builtin() {
         );
     }
 
-    // The tier is a narrowing, not a widening: a name with no authority behind
-    // it stays exactly where it was.
-    assert_eq!(class_of("mysteryHelper"), UnresolvedClass::Unresolved);
+    // The tier is a narrowing, not a widening: a name with no authority and
+    // no corpus namesake is NoNamesake, not a host global.
+    assert_eq!(class_of("mysteryHelper"), UnresolvedClass::NoNamesake);
 }
 
 /// An import in the file outranks the global name list.
@@ -1351,7 +1355,7 @@ fn a_local_binding_does_not_leak_between_functions_in_one_file() {
     assert_eq!(in_scope("::takes"), UnresolvedClass::LocalBinding);
     assert_eq!(
         in_scope("::other"),
-        UnresolvedClass::Unresolved,
+        UnresolvedClass::NoNamesake,
         "`other` declares no `handler`; inheriting the binding `takes` wrote \
          would hide exactly the failure this tier exists to surface"
     );
@@ -1553,7 +1557,7 @@ fn an_untyped_local_binding_is_classified_by_its_scope() {
     );
     assert_eq!(
         class_of("next_gap_id", "::stray"),
-        UnresolvedClass::Unresolved,
+        UnresolvedClass::NoNamesake,
         "`stray` declares no `next_gap_id`; inheriting the binding `detect` \
          wrote would hide the failure this tier exists to surface"
     );
@@ -1564,7 +1568,7 @@ fn an_untyped_local_binding_is_classified_by_its_scope() {
     );
     assert_eq!(
         class_of("handler", "::other"),
-        UnresolvedClass::Unresolved,
+        UnresolvedClass::NoNamesake,
         "the binding belongs to `run`, not to the file"
     );
 }

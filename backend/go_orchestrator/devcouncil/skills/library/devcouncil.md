@@ -9,8 +9,7 @@ triggers:
 
 # DevCouncil Integration for Claude Code
 
-This repository is managed by **DevCouncil**: a planning, execution, and verification
-layer for coding agents. Evidence — not model confidence — decides when work is done.
+This repository uses **DevCouncil** as a **component and module layer** for coding agents — leases, verification, and code intelligence — not as a required end-to-end application. **Manvi** wraps those components into a harness. Host apps such as GitPulse select Manvi and DevCouncil modules independently. Evidence — not model confidence — decides when work is done.
 
 Check `gates.mode` before assuming verification is mandatory: `enforce` blocks,
 `advisory` records non-safety findings without blocking, and `off` skips quality

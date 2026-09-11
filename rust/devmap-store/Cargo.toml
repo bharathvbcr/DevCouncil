@@ -11,6 +11,7 @@ devmap-extract = { path = "../devmap-extract", default-features = false }
 devmap-resolve = { path = "../devmap-resolve", default-features = false }
 devmap-analyze = { path = "../devmap-analyze", default-features = false }
 rusqlite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 rayon.workspace = true

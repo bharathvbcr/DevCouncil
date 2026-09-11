@@ -289,6 +289,31 @@ fn a_filesystem_read_only_open_still_validates_queue_identity() {
 }
 
 #[test]
+fn open_read_only_unsupported_schema_is_typed_not_substring() {
+    // Plan D: classification must survive a wording change of the Display text.
+    let temp = Scratch::new();
+    drop(Store::open(temp.db()).unwrap());
+    {
+        let conn = rusqlite::Connection::open(temp.db()).unwrap();
+        conn.execute("PRAGMA user_version = 11", []).unwrap();
+    }
+    let err = match Store::open_read_only(temp.db()) {
+        Ok(_) => panic!("schema-behind must refuse"),
+        Err(err) => err,
+    };
+    let (found, expected) = Store::unsupported_schema_versions(&err).unwrap_or_else(|| {
+        panic!(
+            "open_read_only must return a typed unsupported-schema error, not a bare string; got: {err}"
+        )
+    });
+    assert_eq!(found, 11, "found schema must be what was stamped");
+    assert_eq!(
+        expected, CURRENT_SCHEMA_VERSION,
+        "expected must be this binary's schema"
+    );
+}
+
+#[test]
 fn a_queue_burst_can_wait_out_a_long_writer_without_losing_the_edit() {
     let temp = Scratch::new();
     let store = Store::open(temp.db()).unwrap();

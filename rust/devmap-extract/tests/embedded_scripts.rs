@@ -739,8 +739,14 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // `const walk = () => {}`. A v45 row parents those arrows on the file.
     // v47 preserves notebook completeness and remaps the complete parsed
     // payload through actual raw JSON source positions.
+    //
+    // v48 adds LocalBinding.declared_type / initializer, Go field Type refs,
+    // stronger Python isinstance/annotation Type uses, and Svelte rune Calls.
+    // A warm v47 row has none of those and still looks complete.
+    //
+    // v49 records dsl.Matcher Go parameters as RuntimeEntryPoint wiring.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "47",
+        EXTRACTION_SCHEMA_VERSION, "49",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

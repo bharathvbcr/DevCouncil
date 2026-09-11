@@ -1,20 +1,112 @@
 param(
-    [string]$Prefix = "$env:USERPROFILE\.local"
+    [string]$Prefix = "$env:USERPROFILE\.local",
+    [string[]]$Components = @(),
+    [switch]$Uninstall,
+    [switch]$All,
+    [switch]$Help,
+    [switch]$HostOnly,
+    [switch]$Yes,
+    [switch]$List
 )
 
 $ErrorActionPreference = "Stop"
 
+if ($Help) {
+    Write-Host @"
+Usage: .\scripts\install.ps1 [options]
+
+Install DevCouncil components into `$Prefix\bin (default: ~\.local\bin).
+
+  -Components NAME,...   subset: host, devmap, dcstore, dcverify, dcgrep, analysis, all
+  -HostOnly              Go host only
+  -Uninstall             remove named binaries
+  -All                   with -Uninstall, remove every catalog binary
+  -Yes                   skip uninstall confirmation
+  -List                  print the catalog
+  -Prefix DIR            install root
+  -Help                  this help
+
+Standalone code intelligence:
+  .\scripts\install.ps1 -Components devmap
+
+There is no uv / Python install path. These are native Go and Rust binaries.
+"@
+    exit 0
+}
+
+if ($List) {
+    Write-Host "presets: all analysis codeintel devmap host"
+    Write-Host "components: host devmap dcstore dcverify dcgrep"
+    exit 0
+}
+
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $bindir = Join-Path $Prefix "bin"
-New-Item -ItemType Directory -Force -Path $bindir | Out-Null
-
-if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
-    Write-Error "go is required. Install a Go toolchain and rerun this script."
-    exit 1
-}
 
 $goOut = Join-Path $bindir "devcouncil.exe"
 $devExe = Join-Path $bindir "dev.exe"
+
+$WantHost = $true
+$RustNames = @("dcstore", "dcverify", "dcgrep", "devmap")
+if ($HostOnly) {
+    $WantHost = $true
+    $RustNames = @()
+} elseif ($Components.Count -gt 0) {
+    $WantHost = $false
+    $RustNames = @()
+    foreach ($c in $Components) {
+        switch -Regex ($c.ToLowerInvariant()) {
+            '^(all)$' { $WantHost = $true; $RustNames = @("dcstore", "dcverify", "dcgrep", "devmap") }
+            '^(host)$' { $WantHost = $true }
+            '^(analysis)$' { $RustNames = @("dcstore", "dcverify", "dcgrep", "devmap") }
+            '^(codeintel|devmap)$' { $RustNames += "devmap" }
+            '^(dcstore|dcverify|dcgrep)$' { $RustNames += $c.ToLowerInvariant() }
+            default { throw "unknown component '$c' (see -Help)" }
+        }
+    }
+    $RustNames = @($RustNames | Select-Object -Unique)
+}
+
+if ($Uninstall) {
+    if ($All -and $Components.Count -gt 0) {
+        Write-Error "do not mix -All with -Components (see -Help)"
+        exit 2
+    }
+    if (-not $All -and $Components.Count -eq 0 -and -not $HostOnly) {
+        Write-Error "uninstall requires -Components NAME or -All (see -Help)"
+        exit 2
+    }
+    if ($All) {
+        $WantHost = $true
+        $RustNames = @("dcstore", "dcverify", "dcgrep", "devmap")
+    }
+    $targets = @()
+    if ($WantHost) { $targets += @("devcouncil.exe", "dev.exe") }
+    foreach ($n in $RustNames) { $targets += "$n.exe" }
+    if (-not $Yes) {
+        Write-Error "This will remove from $bindir : $($targets -join ', '). Re-run with -Yes to confirm."
+        exit 2
+    }
+    foreach ($t in $targets) {
+        $p = Join-Path $bindir $t
+        $item = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+        if (-not $item) { continue }
+        if ($item.PSIsContainer -and $item.LinkType -notin @('Junction', 'SymbolicLink')) {
+            Write-Host "note: left directory $p in place"
+            continue
+        }
+        Remove-Item -LiteralPath $p -Force
+        Write-Host "removed $p"
+    }
+    exit 0
+}
+
+New-Item -ItemType Directory -Force -Path $bindir | Out-Null
+
+if ($WantHost -and -not (Get-Command go -ErrorAction SilentlyContinue)) {
+    Write-Error "go is required to install the host. Install a Go toolchain, or pass -Components devmap to skip it."
+    exit 1
+}
 
 # `dev.exe` is our host under PATHEXT. Refuse a foreign `dev.exe` — Shopify's
 # CLI, a personal script, or a directory of that name. A previous Copy-Item of
@@ -57,47 +149,52 @@ function Get-DevReplaceBlocker {
     return "refusing to replace $Dest (not a symlink/junction to our binary). The Go host is $HostExe."
 }
 
-$devBlocker = Get-DevReplaceBlocker -Dest $devExe -HostExe $goOut
+if ($WantHost) {
+    $devBlocker = Get-DevReplaceBlocker -Dest $devExe -HostExe $goOut
 
-Write-Host "building Go host binary (devcouncil)"
-Push-Location (Join-Path $RepoRoot "backend\go_orchestrator")
-try {
-    go build -o $goOut ./cmd/devcouncil
-    if ($LASTEXITCODE -ne 0) { throw "go build failed with exit $LASTEXITCODE" }
-} finally {
-    Pop-Location
-}
+    Write-Host "building Go host binary (devcouncil)"
+    Push-Location (Join-Path $RepoRoot "backend\go_orchestrator")
+    try {
+        go build -o $goOut ./cmd/devcouncil
+        if ($LASTEXITCODE -ne 0) { throw "go build failed with exit $LASTEXITCODE" }
+    } finally {
+        Pop-Location
+    }
 
-if ($devBlocker) {
-    Write-Error $devBlocker
-    exit 1
-}
+    if ($devBlocker) {
+        Write-Error $devBlocker
+        exit 1
+    }
 
-$existingDev = Get-Item -LiteralPath $devExe -Force -ErrorAction SilentlyContinue
-if ($existingDev -and (($existingDev.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
-    Remove-Item -LiteralPath $devExe -Force
+    $existingDev = Get-Item -LiteralPath $devExe -Force -ErrorAction SilentlyContinue
+    if ($existingDev -and (($existingDev.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        Remove-Item -LiteralPath $devExe -Force
+    }
+    Copy-Item -LiteralPath $goOut -Destination $devExe -Force
+    Write-Host "installed $goOut and $devExe"
 }
-Copy-Item -LiteralPath $goOut -Destination $devExe -Force
-Write-Host "installed $goOut and $devExe"
 
 function Install-RustComponents {
+    param([string[]]$Names)
+    if ($Names.Count -eq 0) { return }
     $installer = Join-Path $RepoRoot "scripts\install-components.sh"
     $bash = Get-Command bash -ErrorAction SilentlyContinue
     if ($bash) {
         $env:PREFIX = $Prefix
-        & bash $installer
+        & bash $installer @Names
         if ($LASTEXITCODE -ne 0) { throw "install-components.sh failed with exit $LASTEXITCODE" }
         return
     }
 
     Write-Host "bash not found; installing Rust components with cargo (health checks skipped)"
     $profileName = if ($env:PROFILE -eq "debug") { "debug" } else { "release" }
-    $components = @(
+    $all = @(
         @{ Name = "dcstore"; Workspace = "rust"; Package = "dc-store" },
         @{ Name = "dcverify"; Workspace = "rust"; Package = "dc-verify" },
         @{ Name = "dcgrep"; Workspace = "rust"; Package = "dc-grep" },
         @{ Name = "devmap"; Workspace = "rust"; Package = "devmap-cli" }
     )
+    $components = $all | Where-Object { $Names -contains $_.Name }
     foreach ($c in $components) {
         $ws = Join-Path $RepoRoot $c.Workspace
         Push-Location $ws
@@ -124,11 +221,13 @@ function Install-RustComponents {
     }
 }
 
-if (Get-Command cargo -ErrorAction SilentlyContinue) {
-    Write-Host "installing Rust analysis components"
-    Install-RustComponents
-} else {
-    [Console]::Error.WriteLine("note: cargo is not on PATH; skipped dcstore/dcverify/dcgrep/devmap. Install a Rust toolchain and rerun, or run scripts/install-components.sh from Git Bash.")
+if ($RustNames.Count -gt 0) {
+    if (Get-Command cargo -ErrorAction SilentlyContinue) {
+        Write-Host "installing Rust analysis components"
+        Install-RustComponents -Names $RustNames
+    } else {
+        [Console]::Error.WriteLine("note: cargo is not on PATH; skipped analysis components. Install a Rust toolchain and rerun, or run scripts/install-components.sh from Git Bash.")
+    }
 }
 
 $bindirNorm = $bindir.TrimEnd('\', '/')

@@ -39,6 +39,8 @@ Earlier attempts hit `No space left on device`. Only checked, untracked, unused 
 - Stress-test source SHA-256: `6254cf5704adf9d67339d3d9caac591cad96be02a99ee2b395ee4363d95b9d65`.
 - Pinned test/executable: `/tmp/devmap-staleness-pinned/`.
 
-GitPulse's parser-free reader cannot certify the compiled grammar identity and reports that uncertainty. A fresh CLI status is a point-in-time observation, not an atomic filesystem snapshot or a guarantee against the next edit. Query `source_freshness: null` explicitly means that whole-tree freshness was not checked. Capped or incomplete graph traversal cannot justify skipping tests.
+GitPulse's parser-free reader cannot certify the compiled grammar identity and reports that uncertainty. A fresh CLI status is a point-in-time observation, not an atomic filesystem snapshot or a guarantee against the next edit. Query envelopes carry a `source_freshness` object: `fresh` is null with a
+`reason` when whole-tree freshness was not checked (never infer freshness from
+an empty result). Capped or incomplete graph traversal cannot justify skipping tests.
 
 Unverified: every operating system/filesystem, power-loss recovery, a multi-week production soak, full dynamic-language/static-analysis completeness, workspace-wide mutation coverage, and installed consumer cutover. These checks establish bounded local evidence on macOS, not universal correctness. Existing unrelated work and historical open items in `STATUS.md` remain separate.

@@ -29,6 +29,7 @@ macro_rules! outln {
 }
 
 mod claude;
+mod hook;
 mod integrate;
 mod progress;
 mod session;
@@ -225,7 +226,9 @@ impl Cli {
             | Commands::Paths { path } => path.clone(),
             // Hook templates retain project-relative paths for the host that
             // will execute them; they are not a query against this checkout.
-            Commands::Claude { .. } | Commands::Skills { .. } => PathBuf::from("."),
+            Commands::Claude { .. } | Commands::Skills { .. } | Commands::Hook { .. } => {
+                PathBuf::from(".")
+            }
             Commands::Integrate { project_root, .. } => project_root.clone(),
             _ => default_root_hint(),
         }
@@ -783,6 +786,14 @@ enum Commands {
         #[arg(long)]
         min_rung: Option<String>,
     },
+    /// Dead-symbol candidates with per-row confidence — not one flat delete list.
+    ///
+    /// High confidence (above the degraded ceiling) means no inbound evidence
+    /// after the call walk; `only_ambiguous_callers` and unresolved-namesake
+    /// rows sit at 0.4 (unconfirmed). Sites classified `NoNamesake` are
+    /// explained gaps in the unresolved ledger, not dead findings — they do
+    /// not appear here. Read `walk_incomplete` before treating an empty or
+    /// short list as complete coverage.
     Dead {
         #[arg(short, long, default_value_t = 2000)]
         budget: u32,
@@ -1283,6 +1294,15 @@ enum Commands {
         /// "1,000 of 12,103 nodes", never "1,000 nodes".
         #[arg(long, default_value_t = 1_500)]
         max_nodes: usize,
+    },
+
+    /// Host-neutral hook entry point for Claude Code, Cursor, and Codex.
+    ///
+    /// Reads one JSON object from stdin (bounded to 1 MiB). Exit 0 on success
+    /// or no-op, 1 on failure — never 2 (hosts treat exit 2 as "block").
+    Hook {
+        /// `session-start`, `post-tool-use`, or `session-end`.
+        event: String,
     },
 
     /// Emit and check Dev Map's own Claude Code integration.
@@ -1940,8 +1960,12 @@ fn doctor_report(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
         "build": build_identity_json(),
         "binaries": binaries,
         "binary_skew_warning": skew,
+        "missing_binary_warning": missing_binary_warning(&binaries),
         "duplicate_mcp_registration_warning": duplicate_mcp_registration_warning(),
         "stray_state_warning": stray_state_warning(),
+        "plugin_warning": plugin_warning(),
+        "stale_server_warning": stale_server_warning(),
+        "mcp_registrations": mcp_registration_inventory(),
     }))
 }
 
@@ -1968,6 +1992,7 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
                 "version": probe_devmap_version(&resolved),
                 "build_id": probe_devmap_build_id(&resolved),
                 "sha256": sha256::sha256_file(&resolved),
+                "exists": true,
             }));
         }
     }
@@ -1981,6 +2006,7 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
                     "version": Some(env!("CARGO_PKG_VERSION")),
                     "build_id": Some(env!("DEVMAP_BUILD_ID")),
                     "sha256": sha256::sha256_file(&resolved),
+                    "exists": true,
                 }));
             }
         }
@@ -1996,6 +2022,7 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
                     "version": probe_devmap_version(&resolved),
                     "build_id": probe_devmap_build_id(&resolved),
                     "sha256": sha256::sha256_file(&resolved),
+                    "exists": resolved.is_file(),
                 }));
             } else if let Some(existing) = rows.iter_mut().find(|r| r["path"] == key) {
                 let source = existing["source"].as_str().unwrap_or("").to_string();
@@ -2157,6 +2184,28 @@ fn binaries_skew_warning(binaries: &[serde_json::Value]) -> Option<String> {
     ))
 }
 
+fn missing_binary_warning(binaries: &[serde_json::Value]) -> Option<String> {
+    let missing: Vec<String> = binaries
+        .iter()
+        .filter_map(|row| {
+            let path = row.get("path")?.as_str()?;
+            let missing = match row.get("exists").and_then(serde_json::Value::as_bool) {
+                Some(false) => true,
+                Some(true) => false,
+                None => !Path::new(path).is_file(),
+            };
+            missing.then(|| path.to_string())
+        })
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "host MCP config names a devmap path that is not a file: {}; install the binary or re-run integrate so the config points at a real executable — this is not version skew",
+        missing.join("; ")
+    ))
+}
+
 fn mcp_entry_looks_like_devmap_mcp(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
@@ -2164,10 +2213,7 @@ fn mcp_entry_looks_like_devmap_mcp(path: &Path) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
         return false;
     };
-    let Some(entry) = value
-        .get("mcpServers")
-        .and_then(|s| s.get("devmap"))
-    else {
+    let Some(entry) = value.get("mcpServers").and_then(|s| s.get("devmap")) else {
         return false;
     };
     let args = entry
@@ -2179,22 +2225,93 @@ fn mcp_entry_looks_like_devmap_mcp(path: &Path) -> bool {
                 .any(|a| a == "mcp")
         })
         .unwrap_or(false);
-    args || entry.get("command").and_then(serde_json::Value::as_str).is_some()
+    args || entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+}
+
+fn mcp_entry_is_pinned(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let Some(args) = value
+        .pointer("/mcpServers/devmap/args")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    args.iter()
+        .filter_map(serde_json::Value::as_str)
+        .any(|a| a == "--root" || a == "--db")
+}
+
+fn mcp_registration_inventory() -> serde_json::Value {
+    let mut global = Vec::new();
+    let mut pinned = Vec::new();
+    for (label, path) in host_mcp_config_paths() {
+        if !path.is_file() || !mcp_entry_looks_like_devmap_mcp(&path) {
+            continue;
+        }
+        let row = serde_json::json!({
+            "label": label,
+            "path": path.display().to_string(),
+        });
+        if mcp_entry_is_pinned(&path) {
+            pinned.push(row);
+        } else {
+            global.push(row);
+        }
+    }
+    serde_json::json!({ "global": global, "pinned": pinned })
 }
 
 fn duplicate_mcp_registration_warning() -> Option<String> {
-    let files: Vec<String> = host_mcp_config_paths()
-        .into_iter()
-        .filter(|(_, path)| path.is_file() && mcp_entry_looks_like_devmap_mcp(path))
-        .map(|(label, path)| format!("{label} ({})", path.display()))
-        .collect();
-    if files.len() <= 1 {
+    let inventory = mcp_registration_inventory();
+    let globals = inventory
+        .get("global")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let pinned = inventory
+        .get("pinned")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if globals.len() <= 1 {
         return None;
     }
-    Some(format!(
-        "the same `devmap mcp` command is registered more than once: {}. Cursor shares one process across tabs, so duplicate global registrations are not a substitute for passing repo_path",
-        files.join("; ")
-    ))
+    let global_list = globals
+        .iter()
+        .filter_map(|row| {
+            Some(format!(
+                "{} ({})",
+                row.get("label")?.as_str()?,
+                row.get("path")?.as_str()?
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut message = format!(
+        "the same unpinned `devmap mcp` command is registered more than once: {global_list}. \
+         Cursor shares one process across tabs, so duplicate global registrations are not a \
+         substitute for passing repo_path"
+    );
+    if !pinned.is_empty() {
+        let pinned_list = pinned
+            .iter()
+            .filter_map(|row| row.get("path")?.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        message.push_str(&format!(
+            ". Pinned (--root/--db) registrations are listed separately and are not duplicates: \
+             {pinned_list}"
+        ));
+    }
+    Some(message)
 }
 
 fn stray_state_dir_without_store(dir: &Path) -> bool {
@@ -2203,23 +2320,222 @@ fn stray_state_dir_without_store(dir: &Path) -> bool {
 
 fn stray_state_warning() -> Option<String> {
     let mut hits = Vec::new();
+    let mut candidates = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
-        let dir = PathBuf::from(home).join(".devcouncil");
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".devcouncil"));
+        candidates.push(home.join(".devmap"));
+    }
+    for base in ["/tmp", "/private/tmp"] {
+        candidates.push(PathBuf::from(base).join(".devcouncil"));
+        candidates.push(PathBuf::from(base).join(".devmap"));
+    }
+    if let Ok(tmpdir) = std::env::var("TMPDIR") {
+        if !tmpdir.is_empty() {
+            let base = PathBuf::from(tmpdir);
+            candidates.push(base.join(".devcouncil"));
+            candidates.push(base.join(".devmap"));
+        }
+    }
+    for dir in candidates {
         if stray_state_dir_without_store(&dir) {
             hits.push(dir.display().to_string());
         }
-    }
-    let tmp = PathBuf::from("/tmp").join(".devcouncil");
-    if stray_state_dir_without_store(&tmp) {
-        hits.push(tmp.display().to_string());
     }
     if hits.is_empty() {
         return None;
     }
     Some(format!(
-        "state directory exists without a store: {} — leftover from an unresolved MCP session log or a refused index; safe to delete after confirming it is not a repository",
+        "state directory exists without a store: {} — leftover from an unresolved MCP session \
+         log or a refused index; safe to delete after confirming it is not a repository",
         hits.join(", ")
     ))
+}
+
+fn plugin_warning() -> Option<String> {
+    let mut issues = Vec::new();
+    let binary_version = env!("CARGO_PKG_VERSION");
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let cache = home
+        .join(".claude")
+        .join("plugins")
+        .join("cache")
+        .join("devmap-local")
+        .join("devmap");
+    let Ok(entries) = std::fs::read_dir(&cache) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let version_name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let hooks = dir.join("hooks").join("hooks.json");
+        let mcp = dir.join(".mcp.json");
+        if !hooks.is_file() || !mcp.is_file() {
+            issues.push(format!(
+                "{}: installed plugin dir is missing hooks/hooks.json or .mcp.json at root \
+                 (malformed layout)",
+                dir.display()
+            ));
+            continue;
+        }
+        if version_name != binary_version {
+            issues.push(format!(
+                "{}: installed plugin version {version_name} does not match binary {binary_version}",
+                dir.display()
+            ));
+        }
+        if let Ok(text) = std::fs::read_to_string(&hooks) {
+            if text.contains("\"args\"") || text.contains("\"async\"") {
+                issues.push(format!(
+                    "{}: hooks still use args/async; regenerate with `devmap claude plugin` \
+                     (shell-form required for Cursor/Codex)",
+                    hooks.display()
+                ));
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(groups) = value
+                    .pointer("/hooks/SessionEnd")
+                    .and_then(|v| v.as_array())
+                {
+                    for group in groups {
+                        if let Some(handlers) = group.get("hooks").and_then(|v| v.as_array()) {
+                            for handler in handlers {
+                                if let Some(timeout) =
+                                    handler.get("timeout").and_then(serde_json::Value::as_f64)
+                                {
+                                    if timeout > f64::from(claude::SESSION_END_MAX_TIMEOUT_SECS) {
+                                        issues.push(format!(
+                                            "{}: SessionEnd timeout {timeout} exceeds host budget \
+                                             (max {})",
+                                            hooks.display(),
+                                            claude::SESSION_END_MAX_TIMEOUT_SECS
+                                        ));
+                                    }
+                                }
+                                if let Some(command) =
+                                    handler.get("command").and_then(serde_json::Value::as_str)
+                                {
+                                    let trimmed = command.trim();
+                                    if !trimmed.contains('/')
+                                        && !trimmed.contains('\\')
+                                        && !trimmed.contains(' ')
+                                    {
+                                        issues.push(format!(
+                                            "{}: bare-name hook command {trimmed:?}; use an \
+                                             absolute shell-form path",
+                                            hooks.display()
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Codex trust records naming a missing hooks.json.
+    let codex_config = home.join(".codex").join("config.toml");
+    if let Ok(text) = std::fs::read_to_string(&codex_config) {
+        if let Ok(table) = text.parse::<toml::Table>() {
+            if let Some(trust) = table.get("hooks").and_then(|v| v.get("trust")) {
+                if let Some(map) = trust.as_table() {
+                    for (key, _) in map {
+                        let path = PathBuf::from(key);
+                        if key.contains("hooks.json") && !path.is_file() {
+                            issues.push(format!(
+                                "Codex hooks.trust names missing {}: stale trust record",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if issues.is_empty() {
+        None
+    } else {
+        Some(issues.join("; "))
+    }
+}
+
+fn stale_server_warning() -> Option<String> {
+    #[cfg(not(unix))]
+    {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(exe) = std::env::current_exe() else {
+            return None;
+        };
+        let Ok(meta) = std::fs::metadata(&exe) else {
+            return None;
+        };
+        let Ok(bin_mtime) = meta.modified() else {
+            return None;
+        };
+        let output = std::process::Command::new("ps")
+            .args(["-axo", "pid=,lstart=,command="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut stale = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.contains("devmap") || !line.contains("mcp") {
+                continue;
+            }
+            // `ps -axo pid=,lstart=,command=` — lstart is 24 chars like
+            // `Fri Sep 11 07:40:12 2026`.
+            let mut parts = line.split_whitespace();
+            let Some(pid) = parts.next() else {
+                continue;
+            };
+            let lstart: String = parts.by_ref().take(5).collect::<Vec<_>>().join(" ");
+            let Ok(started) = std::process::Command::new("date")
+                .args(["-j", "-f", "%a %b %d %T %Y", &lstart, "+%s"])
+                .output()
+            else {
+                continue;
+            };
+            if !started.status.success() {
+                continue;
+            }
+            let Ok(secs) = String::from_utf8_lossy(&started.stdout)
+                .trim()
+                .parse::<i64>()
+            else {
+                continue;
+            };
+            let started_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64);
+            if started_at < bin_mtime {
+                stale.push(pid.to_string());
+            }
+        }
+        if stale.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "devmap mcp process(es) started before the installed binary's mtime: pid {}; \
+                 restart hosts so they pick up the current binary",
+                stale.join(", ")
+            ))
+        }
+    }
 }
 
 fn store_status_fields(
@@ -2265,6 +2581,12 @@ fn store_status_fields(
         "analyzer_freshness": status.analyzer_freshness,
         "db_path": status.db_path,
         "degraded_reason": degraded_reason,
+        "delta": status.source_delta.as_ref().map(|delta| serde_json::json!({
+            "added": delta.added,
+            "changed": delta.changed,
+            "removed": delta.removed,
+            "sample_paths": delta.sample_paths,
+        })),
         "quarantined_count": status.quarantined_count,
         // K1(g): naming the stuck paths is what makes a degraded status
         // actionable — "64 path(s) exceeded the retry threshold" told an
@@ -2954,16 +3276,49 @@ fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
         emit_unavailable(reason);
         return;
     }
-    for row in &resp.items {
-        outln!(
+    // Two tiers, named — a single undifferentiated list is how a 0.4
+    // `only_ambiguous_callers` row used to read as "safe to delete".
+    let (confident, unconfirmed): (Vec<_>, Vec<_>) = resp
+        .items
+        .iter()
+        .partition(|row| row.confidence > devmap_analyze::HIGHEST_DEGRADED_CONFIDENCE);
+    if !confident.is_empty() {
+        outln!("confident (no inbound evidence):");
+        for row in &confident {
+            emit_dead_row(row);
+        }
+    }
+    if !unconfirmed.is_empty() {
+        outln!("unconfirmed (ambiguous callers, namesake evidence, or coverage-capped):");
+        for row in &unconfirmed {
+            emit_dead_row(row);
+        }
+    }
+    if resp.items.is_empty() {
+        outln!("(no dead-symbol candidates in budget)");
+    }
+    emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
+    if let Some(reason) = resp.walk_incomplete.as_ref() {
+        outln!("\nwalk incomplete: {reason}");
+    }
+    emit_dead_clusters(resp);
+}
+
+fn emit_dead_row(row: &devmap_analyze::DeadSymbolReport) {
+    match row.exemption_reason.as_deref() {
+        Some(reason) if !reason.is_empty() => outln!(
+            "{:.2}  {}::{}  ({reason})",
+            row.confidence,
+            row.file_path,
+            row.symbol_name
+        ),
+        _ => outln!(
             "{:.2}  {}::{}",
             row.confidence,
             row.file_path,
             row.symbol_name
-        );
+        ),
     }
-    emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
-    emit_dead_clusters(resp);
 }
 
 /// The abandoned cycles, printed beside the single-symbol list rather than
@@ -3632,7 +3987,8 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         | Commands::ApiImpact { .. }
         | Commands::Claude { .. }
         | Commands::Skills { .. }
-        | Commands::Integrate { .. } => Ok(()),
+        | Commands::Integrate { .. }
+        | Commands::Hook { .. } => Ok(()),
     }
 }
 
@@ -3698,7 +4054,17 @@ async fn main() -> std::process::ExitCode {
     let started = Instant::now();
     let (cli, matches) = on_command_stack(|| {
         let matches = Cli::command().get_matches();
-        let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+        let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| {
+            // Cursor/Codex treat exit 2 as "block the agent". A clap usage
+            // error under `devmap hook` must never surface as 2.
+            let hookish = std::env::args().nth(1).as_deref() == Some("hook")
+                || matches.subcommand_name() == Some("hook");
+            if hookish {
+                let _ = error.print();
+                std::process::exit(1);
+            }
+            error.exit()
+        });
         (cli, matches)
     });
     // stderr, not the builder's default stdout. Every command that emits a
@@ -4402,6 +4768,8 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             let mut local_binding_calls = 0usize;
             let mut external_calls = 0usize;
             let mut uninferred_receiver_calls = 0usize;
+            let mut no_namesake_calls = 0usize;
+            let mut module_path_calls = 0usize;
             let mut unattributed_calls = 0usize;
             for reference in &resolution.unresolved {
                 match reference.class {
@@ -4410,6 +4778,8 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     UnresolvedClass::LocalBinding => local_binding_calls += 1,
                     UnresolvedClass::External { .. } => external_calls += 1,
                     UnresolvedClass::UninferredReceiver => uninferred_receiver_calls += 1,
+                    UnresolvedClass::NoNamesake => no_namesake_calls += 1,
+                    UnresolvedClass::ModulePath => module_path_calls += 1,
                     UnresolvedClass::Unresolved => unattributed_calls += 1,
                 }
             }
@@ -4454,13 +4824,16 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         "unresolved_local_binding": local_binding_calls,
                         "unresolved_external": external_calls,
                         "unresolved_uninferred_receiver": uninferred_receiver_calls,
+                        "unresolved_no_namesake": no_namesake_calls,
+                        "unresolved_module_path": module_path_calls,
                         "unresolved_unattributed": unattributed_calls,
-                        // The arithmetic over the six counters above, done
+                        // The arithmetic over the counters above, done
                         // once and published, rather than left to a reader who
                         // will not do it. `net` excludes the misses that are
                         // explained — a language builtin, a runtime global, a
-                        // name an import proves is outside the corpus — and is
-                        // the figure worth ratcheting.
+                        // name an import proves is outside the corpus, a bare
+                        // name with no corpus namesake, or a local module path —
+                        // and is the figure worth ratcheting.
                         "resolution_rate": analysis.resolution_rate,
                         // The per-stage breakdown, so a caller profiling a slow
                         // build reads it from the result rather than scraping
@@ -4513,6 +4886,8 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     outln!("    local bindings:     {local_binding_calls}");
                     outln!("    external imports:   {external_calls}");
                     outln!("    uninferred receiver:{uninferred_receiver_calls}");
+                    outln!("    no namesake:        {no_namesake_calls}");
+                    outln!("    module path:        {module_path_calls}");
                     outln!("    unattributed:       {unattributed_calls}");
                     if let Some(manifest) = &manifest {
                         report_manifest(cli, &manifest.outcome)?;
@@ -5243,8 +5618,11 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 "plugin_dir": devmap_extract::paths::plugin_dir(&root),
                 "binaries": binaries,
                 "binary_skew_warning": skew,
+                "missing_binary_warning": missing_binary_warning(&binaries),
                 "duplicate_mcp_registration_warning": duplicate_mcp_registration_warning(),
                 "stray_state_warning": stray_state_warning(),
+                "plugin_warning": plugin_warning(),
+                "stale_server_warning": stale_server_warning(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "build": build_identity_json(),
             });
@@ -5726,12 +6104,18 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 return Ok(());
             }
 
-            let cwd = cli
-                .root
-                .clone()
-                .or_else(|| std::env::current_dir().ok())
+            // Global registration: resolve from MCP roots/list and cwd. An
+            // explicit `--root` is a pin (not folded into cwd), so a per-project
+            // registration keeps answering that repository when other tabs'
+            // roots also have stores.
+            let cwd = std::env::current_dir()
+                .ok()
                 .unwrap_or_else(|| PathBuf::from("."));
-            let slot = std::sync::Arc::new(devmap_serve::StoreSlot::resolving(cli.db.clone(), cwd));
+            let slot = std::sync::Arc::new(devmap_serve::StoreSlot::resolving(
+                cli.db.clone(),
+                cwd,
+                cli.root.clone(),
+            ));
             match http {
                 Some(address) => {
                     // A bare port means loopback. Spelling the default out here
@@ -6155,6 +6539,12 @@ raise --max-nodes to widen"
             }
         }
         Commands::Claude { action } => run_claude(cli, action)?,
+        Commands::Hook { event } => {
+            let code = run_hook_command(cli, event)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Commands::Skills { action } => run_skills(cli, action)?,
         Commands::Integrate {
             host,
@@ -6281,6 +6671,12 @@ fn run_integrate(
                     "removed_stale_db": m.removed_stale_db,
                     "note": m.note,
                 })).collect::<Vec<_>>(),
+                "hooks": report.hooks.iter().map(|m| serde_json::json!({
+                    "path": m.path.display().to_string(),
+                    "changed": m.changed,
+                    "note": m.note,
+                })).collect::<Vec<_>>(),
+                "notes": report.notes,
                 "dry_run": dry_run,
                 "check": check,
             }),
@@ -6312,11 +6708,48 @@ fn run_integrate(
         } else if !report.skills_differing.is_empty() {
             outln!("  skills differing {}", report.skills_differing.len());
         }
-        for mcp in report.global_mcp.iter().chain(report.project_mcp.iter()) {
+        for mcp in report
+            .global_mcp
+            .iter()
+            .chain(report.project_mcp.iter())
+            .chain(report.hooks.iter())
+        {
             outln!("  {}: {}", mcp.path.display(), mcp.note);
+        }
+        for note in &report.notes {
+            outln!("  note: {note}");
         }
     }
     Ok(())
+}
+
+fn run_hook_command(cli: &Cli, event_name: &str) -> anyhow::Result<i32> {
+    let Some(event) = hook::HookEvent::parse(event_name) else {
+        eprintln!(
+            "devmap hook: unknown event {event_name:?}; expected session-start, \
+             post-tool-use, or session-end"
+        );
+        return Ok(1);
+    };
+    let stdin = hook::read_stdin_bounded().unwrap_or_default();
+    let executable = std::env::current_exe()?;
+    let outcome = hook::run_hook(event, &stdin, &executable, cli.root.as_deref());
+    if let Some(line) = &outcome.stderr_line {
+        eprintln!("{line}");
+    }
+    if let Some(stdout) = &outcome.stdout {
+        if cli.json {
+            emit_json(cli, stdout)?;
+        } else if let Some(ctx) = stdout
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(|v| v.as_str())
+        {
+            outln!("{ctx}");
+        } else {
+            outln!("{stdout}");
+        }
+    }
+    Ok(outcome.exit_code)
 }
 
 /// Map context for integrate: prefer an on-disk repo map, else an empty shell
@@ -6376,7 +6809,7 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
                             "decides_permission":
                                 claude::PERMISSION_DECIDING_EVENTS.contains(event),
                             "matcher": hook.map(|h| h.matcher),
-                            "subcommand": hook.map(|h| h.subcommand),
+                            "hook_event": hook.map(|h| h.hook_event),
                             "reason": reason,
                         })
                     })
@@ -6396,8 +6829,8 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
                 for (event, hook, reason) in &coverage {
                     match hook {
                         Some(hook) => outln!(
-                            "{event:<20} handled   devmap {} (matcher {:?})\n{:22}{reason}",
-                            hook.subcommand,
+                            "{event:<20} handled   devmap hook {} (matcher {:?})\n{:22}{reason}",
+                            hook.hook_event,
                             hook.matcher,
                             ""
                         ),
@@ -6774,7 +7207,9 @@ mod tests {
             incomplete: Option<&str>,
         ) -> devmap_query::Response<devmap_analyze::DeadSymbolReport> {
             devmap_query::Response {
-                source_freshness: None,
+                source_freshness: devmap_query::SourceFreshness::unverified(
+                    "whole-tree source freshness was not checked for this answer",
+                ),
                 items: Vec::new(),
                 shown: 0,
                 hidden: 0,
@@ -6852,6 +7287,35 @@ mod tests {
         assert!(
             warning.contains("build") || warning.contains("aaa111") || warning.contains("bbb222"),
             "{warning}"
+        );
+    }
+
+    #[test]
+    fn missing_binary_warning_fires_when_a_listed_path_is_not_a_file() {
+        let binaries = vec![
+            serde_json::json!({
+                "path": "/tmp/a/devmap",
+                "source": "PATH",
+                "version": "0.2.0",
+                "build_id": "aaa111",
+                "sha256": "aa".repeat(32),
+                "exists": true,
+            }),
+            serde_json::json!({
+                "path": "/no/such/devmap-binary",
+                "source": "~/.claude.json",
+                "version": serde_json::Value::Null,
+                "build_id": serde_json::Value::Null,
+                "sha256": serde_json::Value::Null,
+                "exists": false,
+            }),
+        ];
+        let warning = missing_binary_warning(&binaries)
+            .expect("a host config path that is not a file is a distinct warning from skew");
+        assert!(warning.contains("/no/such/devmap-binary"), "{warning}");
+        assert!(
+            binaries_skew_warning(&binaries).is_none(),
+            "one real binary plus a missing path is not version skew"
         );
     }
 }

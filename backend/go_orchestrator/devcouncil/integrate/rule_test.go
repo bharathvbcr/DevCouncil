@@ -20,6 +20,8 @@ func TestCursorRuleDoesNotMandateTheTaskLoop(t *testing.T) {
 	for _, phrase := range []string{
 		"no task lease",
 		"opt-in",
+		"components and modules",
+		"Manvi",
 	} {
 		if !strings.Contains(cursorRule, phrase) {
 			t.Fatalf("the rule no longer says the task loop is optional: %q missing", phrase)

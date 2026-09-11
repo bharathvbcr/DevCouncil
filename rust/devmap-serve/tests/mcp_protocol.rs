@@ -471,18 +471,40 @@ async fn the_transport_loop_answers_a_whole_session() {
         .unwrap()
         .expect("transport loop must exit cleanly");
 
+    let responses: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame.get("id").is_some() && !frame["id"].is_null())
+        .collect();
     assert_eq!(
-        frames.len(),
+        responses.len(),
         3,
-        "three requests and one notification must produce exactly three frames"
+        "three requests must produce three response frames (ids 1, 2, 3); extra frames must be server notifications: {frames:?}"
     );
-    assert_eq!(frames[0]["id"], json!(1));
-    assert_eq!(frames[1]["id"], json!(2));
-    assert_eq!(frames[2]["id"], json!(3));
+    assert_eq!(responses[0]["id"], json!(1));
+    assert_eq!(responses[1]["id"], json!(2));
+    assert_eq!(responses[2]["id"], json!(3));
     assert_eq!(
-        frames[2]["result"]["isError"],
+        responses[2]["result"]["isError"],
         json!(false),
         "impact on an indexed symbol must succeed"
+    );
+    let notifications: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame.get("method").and_then(Value::as_str).is_some())
+        .collect();
+    assert_eq!(
+        notifications.len(),
+        1,
+        "initialized must emit exactly one tools/list_changed notification: {frames:?}"
+    );
+    assert_eq!(
+        notifications[0]["method"],
+        json!("notifications/tools/list_changed")
+    );
+    assert!(
+        notifications[0].get("id").is_none() || notifications[0]["id"].is_null(),
+        "list_changed is a notification: {}",
+        notifications[0]
     );
 }
 

@@ -197,9 +197,17 @@ fn no_unattributed_call_is_dropped_without_a_row() {
 /// An ambiguous call fans out into several edges and is still one site. Stated
 /// here as well as in `resolution_rate.rs` because the two crates can drift:
 /// the dedup lives there and the `Arc` sharing that makes it work lives here.
+///
+/// Uses a **bare** AmbiguousGlobal (two free functions named `build`). An
+/// untyped `w.build()` no longer fans out — that is UninferredReceiver.
 #[test]
 fn an_ambiguous_fan_out_shares_one_resolution_allocation() {
-    let (_, result) = resolve(&corpus());
+    let files = [
+        ("a.py", "def build():\n    return 1\n"),
+        ("b.py", "def build():\n    return 2\n"),
+        ("c.py", "def go():\n    return build()\n"),
+    ];
+    let (_, result) = resolve(&files);
 
     let fanned: Vec<_> = result
         .edges
@@ -212,9 +220,7 @@ fn an_ambiguous_fan_out_shares_one_resolution_allocation() {
         .collect();
     assert!(
         !fanned.is_empty(),
-        "the corpus declares `Widget.build` twice and calls it through an \
-         untyped parameter — if this finds no fan-out the fixture stopped \
-         testing what it says"
+        "two free-function `build` declarations and a bare call must AmbiguousGlobal"
     );
 
     let allocations: HashSet<*const Resolution> = fanned

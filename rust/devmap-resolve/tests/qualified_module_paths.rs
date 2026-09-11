@@ -119,9 +119,9 @@ fn a_crate_rooted_path_that_resolves_to_nothing_is_an_index_gap_not_external() {
 
     assert_eq!(
         classes_of(&result, "helper"),
-        vec!["unresolved".to_string()],
-        "`crate::` resolves against this repository by construction; calling \
-         the miss `external` files an index gap under 'expected'"
+        vec!["module_path".to_string()],
+        "`crate::` is a module path into this repository; the miss is explained \
+         as a module path rather than a bare defect"
     );
 }
 
@@ -170,7 +170,8 @@ fn shell_builtins_are_declared_by_the_shell_and_not_resolution_defects() {
 
 /// The OFF direction, and the reason the table stops where it does: an external
 /// *program* is not a shell builtin, and there is no import to prove where it
-/// comes from. It keeps the tier that says a human should look.
+/// comes from. With no corpus namesake it is [`NoNamesake`], not a host global
+/// and not a language builtin.
 #[test]
 fn an_external_program_is_not_folded_into_the_builtin_table() {
     let (_, result) = resolve(&[(
@@ -185,7 +186,7 @@ fn an_external_program_is_not_folded_into_the_builtin_table() {
         }
         assert_eq!(
             classes,
-            vec!["unresolved".to_string()],
+            vec!["no_namesake".to_string()],
             "`{name}` is whatever is on PATH — the shell does not declare it \
              and no import names it, so nothing here may call it expected"
         );

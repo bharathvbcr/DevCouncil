@@ -15,7 +15,7 @@
 
 use devmap_analyze::*;
 use devmap_extract::extract_file;
-use devmap_extract::model::Extraction;
+use devmap_extract::model::{Extraction, ExtractionEngine, ParseOutcome};
 use devmap_resolve::model::ResolutionResult;
 use devmap_resolve::Resolver;
 
@@ -177,12 +177,18 @@ fn a_cluster_verdict_stays_below_the_confident_tier() {
 #[test]
 fn coverage_loss_caps_a_cluster_finding() {
     let (mut extractions, _) = resolve(&[("orphan.py", ABANDONED)]);
-    // A file whose language has no call extractor: a real coverage hole that
-    // parses cleanly, exactly the W0.2 case.
-    extractions.push(extract_file(
-        "main.tf",
-        "resource \"aws_s3_bucket\" \"b\" {\n  bucket = lower(var.name)\n}\n",
-    ));
+    // Same-language coverage hole. An HCL call-blind file cannot reference
+    // Python, so language-scoped completeness would leave the cluster uncapped.
+    let mut hole = extract_file("lost.py", "def never_seen():\n    return 0\n");
+    hole.parse_outcome = ParseOutcome::Fallback {
+        reason: "forced pattern recovery for cluster coverage fixture".to_string(),
+    };
+    hole.engine = ExtractionEngine::RegexFallback {
+        requested_language: "python".to_string(),
+    };
+    hole.imports.clear();
+    hole.calls.clear();
+    extractions.push(hole);
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
     let resolution = resolver.resolve_all(&extractions);

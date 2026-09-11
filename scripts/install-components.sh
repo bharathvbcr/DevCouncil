@@ -13,8 +13,10 @@
 # Usage:
 #   bash scripts/install-components.sh                 # install all four
 #   bash scripts/install-components.sh dcstore dcgrep  # install a subset
+#   bash scripts/install-components.sh --only=devmap   # standalone devmap
 #   PREFIX=/usr/local bash scripts/install-components.sh
 #   DRY_RUN=1 bash scripts/install-components.sh       # build and verify only
+#   bash scripts/install-components.sh --help
 #
 # Environment:
 #   PREFIX    install root; binaries go to $PREFIX/bin (default: ~/.local)
@@ -27,12 +29,129 @@
 
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: bash scripts/install-components.sh [names…] [options]
+
+Build and install DevCouncil analysis binaries (not the Go host).
+
+Components: dcstore  dcverify  dcgrep  devmap
+Preset:     analysis (all four)
+
+Options:
+  --only NAME     install only NAME (repeatable)
+  --list          print component names and exit
+  --uninstall     remove named binaries from $PREFIX/bin
+  --all           with --uninstall, remove every analysis binary
+  --disable NAME  keep the binary, record it as skipped
+  --enable NAME   clear a disable mark
+  --yes           skip uninstall confirmation
+  --dry-run       build and health-check without installing (or print rm)
+  --prefix DIR    install root (or set PREFIX)
+  -h, --help      this help
+
+Standalone code intelligence:
+  bash scripts/install-components.sh devmap
+
+The Go host is a separate binary. Use scripts/install.sh (or
+`devcouncil install` once the host is on PATH) when you want it too.
+There is no uv / Python install path.
+EOF
+}
+
 repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$repo_root"
 
 PREFIX="${PREFIX:-$HOME/.local}"
 PROFILE="${PROFILE:-release}"
 DRY_RUN="${DRY_RUN:-}"
+ACTION=install
+YES=0
+LIST=0
+WANT_ALL=0
+DISABLE_NAME=""
+ENABLE_NAME=""
+POS=()
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --list) LIST=1; shift ;;
+    --uninstall) ACTION=uninstall; shift ;;
+    --all) WANT_ALL=1; shift ;;
+    --disable)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "--disable needs a component name (see --help)" >&2
+        exit 2
+      fi
+      DISABLE_NAME="$2"; shift 2
+      ;;
+    --disable=*)
+      DISABLE_NAME="${1#--disable=}"
+      if [ -z "$DISABLE_NAME" ]; then
+        echo "--disable needs a component name (see --help)" >&2
+        exit 2
+      fi
+      shift
+      ;;
+    --enable)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "--enable needs a component name (see --help)" >&2
+        exit 2
+      fi
+      ENABLE_NAME="$2"; shift 2
+      ;;
+    --enable=*)
+      ENABLE_NAME="${1#--enable=}"
+      if [ -z "$ENABLE_NAME" ]; then
+        echo "--enable needs a component name (see --help)" >&2
+        exit 2
+      fi
+      shift
+      ;;
+    --yes|-y) YES=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --prefix)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "--prefix needs a directory (see --help)" >&2
+        exit 2
+      fi
+      PREFIX="$2"; shift 2
+      ;;
+    --prefix=*)
+      PREFIX="${1#--prefix=}"
+      if [ -z "$PREFIX" ]; then
+        echo "--prefix needs a directory (see --help)" >&2
+        exit 2
+      fi
+      shift
+      ;;
+    --only)
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "--only needs a component name (see --help)" >&2
+        exit 2
+      fi
+      POS+=("$2"); shift 2
+      ;;
+    --only=*)
+      only="${1#--only=}"
+      if [ -z "$only" ]; then
+        echo "--only needs a component name (see --help)" >&2
+        exit 2
+      fi
+      POS+=("$only")
+      shift
+      ;;
+    --) shift; break ;;
+    -*)
+      echo "unknown option: $1 (see --help)" >&2
+      exit 2
+      ;;
+    *) POS+=("$1"); shift ;;
+  esac
+done
+while [ "$#" -gt 0 ]; do POS+=("$1"); shift; done
+
 bindir="$PREFIX/bin"
 
 case "$PROFILE" in
@@ -61,16 +180,93 @@ component_package() {
 }
 
 ALL=(dcstore dcverify dcgrep devmap)
-if [ "$#" -gt 0 ]; then
-  requested=("$@")
-  for c in "${requested[@]}"; do
-    if ! component_workspace "$c" >/dev/null 2>&1; then
-      echo "unknown component '$c' (known: ${ALL[*]})" >&2
+state_dir="$PREFIX/share/devcouncil"
+disabled_file="$state_dir/disabled"
+
+if [ "$LIST" -eq 1 ]; then
+  echo "components: ${ALL[*]}"
+  echo "preset: analysis"
+  exit 0
+fi
+
+if [ -n "$DISABLE_NAME" ]; then
+  case "$DISABLE_NAME" in
+    dcstore|dcverify|dcgrep|devmap) ;;
+    *)
+      echo "unknown component '$DISABLE_NAME' (known: ${ALL[*]})" >&2
       exit 2
-    fi
+      ;;
+  esac
+  mkdir -p "$state_dir"
+  touch "$disabled_file"
+  if ! grep -qx "$DISABLE_NAME" "$disabled_file" 2>/dev/null; then
+    printf '%s\n' "$DISABLE_NAME" >>"$disabled_file"
+  fi
+  echo "disabled $DISABLE_NAME (binary left in $bindir)"
+  exit 0
+fi
+
+if [ -n "$ENABLE_NAME" ]; then
+  case "$ENABLE_NAME" in
+    dcstore|dcverify|dcgrep|devmap) ;;
+    *)
+      echo "unknown component '$ENABLE_NAME' (known: ${ALL[*]})" >&2
+      exit 2
+      ;;
+  esac
+  if [ -f "$disabled_file" ]; then
+    tmp="$(mktemp)"
+    grep -vx "$ENABLE_NAME" "$disabled_file" >"$tmp" || true
+    mv "$tmp" "$disabled_file"
+  fi
+  echo "enabled $ENABLE_NAME"
+  exit 0
+fi
+
+requested=()
+if [ "$WANT_ALL" -eq 1 ] && [ "${#POS[@]}" -gt 0 ]; then
+  echo "do not mix --all with component names (see --help)" >&2
+  exit 2
+fi
+if [ "${#POS[@]}" -gt 0 ]; then
+  for n in "${POS[@]}"; do
+    case "$n" in
+      analysis|all) requested+=("${ALL[@]}") ;;
+      codeintel) requested+=("devmap") ;;
+      dcstore|dcverify|dcgrep|devmap) requested+=("$n") ;;
+      *)
+        echo "unknown component '$n' (known: ${ALL[*]} analysis)" >&2
+        exit 2
+        ;;
+    esac
   done
+elif [ "$ACTION" = uninstall ] && [ "$WANT_ALL" -ne 1 ]; then
+  echo "uninstall requires a component name or --all (see --help)" >&2
+  exit 2
 else
   requested=("${ALL[@]}")
+fi
+
+if [ "$ACTION" = uninstall ]; then
+  if [ "$YES" -ne 1 ] && [ -z "$DRY_RUN" ]; then
+    echo "This will remove from $bindir: ${requested[*]}" >&2
+    echo "Re-run with --yes to confirm." >&2
+    exit 2
+  fi
+  for name in "${requested[@]}"; do
+    dest="$bindir/$name"
+    if [ -d "$dest" ] && [ ! -L "$dest" ]; then
+      echo "note: left directory $dest in place" >&2
+      continue
+    fi
+    if [ -n "$DRY_RUN" ]; then
+      echo "rm $dest"
+      continue
+    fi
+    rm -f "$dest"
+    echo "removed $dest"
+  done
+  exit 0
 fi
 
 command -v cargo >/dev/null 2>&1 || {

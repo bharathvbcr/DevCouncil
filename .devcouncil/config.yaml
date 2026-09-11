@@ -9,7 +9,7 @@ execution:
     mode: 'off'
     verify_active_task: false
 gates:
-  mode: false
+  mode: off
 indexing:
   primary_languages:
   - swift

@@ -82,10 +82,9 @@ fn python_symbol_identity_matches_the_frozen_python_baseline() {
         kind: String,
     }
 
-    let golden: Vec<GoldenNode> = serde_json::from_str(include_str!(
-        "../../testdata/golden/python_app/nodes.json"
-    ))
-    .expect("frozen python_app nodes must be valid JSON");
+    let golden: Vec<GoldenNode> =
+        serde_json::from_str(include_str!("../../testdata/golden/python_app/nodes.json"))
+            .expect("frozen python_app nodes must be valid JSON");
     let extraction = extract_file(
         "app.py",
         include_str!("../../testdata/fixtures/tier_a/python_app/app.py"),

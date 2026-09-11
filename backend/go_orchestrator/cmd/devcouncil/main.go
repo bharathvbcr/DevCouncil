@@ -13,6 +13,7 @@ import (
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gatescfg"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/integrate"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/mcp"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/skills"
@@ -40,6 +41,16 @@ func dispatch(args []string) int {
 		return runSkills(args[1:])
 	case "verify":
 		return runVerify(args[1:])
+	case "install":
+		return runInstall(args[1:])
+	case "uninstall":
+		return runUninstall(args[1:])
+	case "disable":
+		return runDisable(args[1:])
+	case "enable":
+		return runEnable(args[1:])
+	case "gate":
+		return runGate(args[1:])
 	case "map", "graph":
 		return runDevmap(mapArgs(args[1:]))
 	case "ast":
@@ -64,15 +75,25 @@ The same binary is installed as `+"`dev`"+` and `+"`devcouncil`"+`.
 
 Usage:
   devcouncil mcp              Run the MCP stdio server
+  devcouncil install [names…] [--list] [--json] [--prefix DIR] [--dry-run]
+  devcouncil uninstall [names…] [--yes] [--prefix DIR]
+  devcouncil disable NAME [--prefix DIR]
+  devcouncil enable NAME [--prefix DIR]
+  devcouncil gate status [--json] [--project-root DIR]
+  devcouncil gate set --mode off|advisory|enforce [--hook off|contain]
   devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR] [--write-gate]
   devcouncil integrations …        Alias of integrate
   devcouncil integrate uninstall --target hooks [--dry-run] [--project-root DIR]
   devcouncil skills list
   devcouncil skills scaffold [--skill NAME] [--project-root DIR] [--dry-run] [--check]
-  devcouncil verify TASK_ID [--json] [--sandbox local|docker|nix] [--project-root DIR]
+  devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local|docker|nix]
   devcouncil map [devmap args…]   Exec `+"`devmap`"+` (bare invocation: build --manifest)
   devcouncil graph …              Alias of map
   devcouncil ast …                Exec `+"`devmap ast`"+`
+
+First-time / standalone (no host yet):
+  bash scripts/install.sh --only=devmap
+  bash scripts/install.sh --help
 
 Hosts: %s
 `, strings.Join(integrate.Hosts, ", "))
@@ -545,6 +566,7 @@ func runVerify(args []string) int {
 	jsonOut := false
 	sandbox := "local"
 	taskID := ""
+	modeFlag := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--json":
@@ -556,6 +578,13 @@ func runVerify(args []string) int {
 				return 2
 			}
 			sandbox = args[i]
+		case "--mode":
+			i++
+			if i >= len(args) {
+				fmt.Fprintln(os.Stderr, "--mode needs off, advisory, or enforce")
+				return 2
+			}
+			modeFlag = args[i]
 		case "--project-root":
 			i++
 			if i >= len(args) {
@@ -564,7 +593,7 @@ func runVerify(args []string) int {
 			}
 			root = args[i]
 		case "-h", "--help":
-			fmt.Fprintln(os.Stderr, "usage: devcouncil verify TASK_ID [--json] [--sandbox local]")
+			fmt.Fprintln(os.Stderr, "usage: devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local]")
 			return 0
 		default:
 			if strings.HasPrefix(args[i], "-") {
@@ -584,9 +613,20 @@ func runVerify(args []string) int {
 		return 2
 	}
 	reg := openRegistry(root)
-	gateMode := "enforce"
-	if reg.Lease != nil && reg.Lease.GateMode != "" {
+	gateMode := ""
+	if reg.Lease != nil {
 		gateMode = reg.Lease.GateMode
+	}
+	if modeFlag != "" {
+		parsed, err := gatescfg.ParseMode(modeFlag)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		gateMode = parsed
+	}
+	if gateMode == "" {
+		gateMode = gatescfg.Load(root).VerificationMode
 	}
 	return verify.RunCLI(context.Background(), root, reg.Store, taskID, gateMode, sandbox, jsonOut)
 }

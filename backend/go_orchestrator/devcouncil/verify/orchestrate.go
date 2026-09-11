@@ -13,6 +13,8 @@ import (
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/correction"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gating"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
@@ -43,7 +45,7 @@ func Run(in Input) (gaps []Gap, meta runMeta) {
 	}
 	meta.GateMode = in.GateMode
 	if meta.GateMode == "" {
-		meta.GateMode = "enforce"
+		meta.GateMode = "off"
 	}
 	meta.Difficulty = in.Difficulty
 	if meta.Difficulty == "" && in.Task != nil {
@@ -108,25 +110,42 @@ type runMeta struct {
 }
 
 // StatusFromGaps maps gaps to blocked/verified under gate_mode.
+//
+// off skips quality verification. advisory still blocks hard-safety gaps.
+// enforce blocks every gap marked Blocking. Unknown spellings cannot
+// silently enforce — they skip, matching gatescfg.Normalize.
 func StatusFromGaps(gaps []Gap, gateMode string) (status string, passed bool) {
-	blocking := 0
-	for _, g := range gaps {
-		if g.Blocking {
-			blocking++
-		}
-	}
-	if gateMode == "off" {
+	if verificationSkipped(gateMode) {
 		return "verified", true
 	}
-	if blocking > 0 {
+	mode := strings.TrimSpace(strings.ToLower(gateMode))
+	advisory := mode == "advisory" || mode == "warn"
+	for _, g := range gaps {
+		if !g.Blocking {
+			continue
+		}
+		if advisory && gating.MayDemote(g.GapType, true) {
+			continue
+		}
 		return "blocked", false
 	}
 	return "verified", true
 }
 
+func verificationSkipped(gateMode string) bool {
+	mode := strings.TrimSpace(strings.ToLower(gateMode))
+	switch mode {
+	case "advisory", "warn", "enforce", "true", "1", "yes":
+		return false
+	default:
+		return true
+	}
+}
+
 // ToMCP builds the leased verify_task payload.
 func ToMCP(taskID string, gaps []Gap, meta runMeta) MCPResult {
 	status, passed := StatusFromGaps(gaps, meta.GateMode)
+	skipped := verificationSkipped(meta.GateMode)
 	blocking, advisory := SplitNextActions(gaps)
 	blockingGaps := make([]Gap, 0)
 	for _, g := range gaps {
@@ -153,7 +172,7 @@ func ToMCP(taskID string, gaps []Gap, meta runMeta) MCPResult {
 		CoverageSkippedReason: meta.CoverageSkippedReason,
 		CompilerActive:        meta.CompilerActive,
 		VerificationMode:      meta.VerificationMode,
-		VerificationSkipped:   false,
+		VerificationSkipped:   skipped,
 		Sandbox:               meta.Sandbox,
 		RigorApplied:          rigor,
 		BlockingGaps:          blockingGaps,
@@ -166,6 +185,7 @@ func ToMCP(taskID string, gaps []Gap, meta runMeta) MCPResult {
 // ToCLITask builds one CLI task entry.
 func ToCLITask(taskID string, gaps []Gap, meta runMeta) TaskCLIResult {
 	status, _ := StatusFromGaps(gaps, meta.GateMode)
+	skipped := verificationSkipped(meta.GateMode)
 	blocking, advisory := SplitNextActions(gaps)
 	blockingCount := 0
 	for _, g := range gaps {
@@ -190,7 +210,7 @@ func ToCLITask(taskID string, gaps []Gap, meta runMeta) TaskCLIResult {
 		CoverageSkippedReason: meta.CoverageSkippedReason,
 		CompilerActive:        meta.CompilerActive,
 		VerificationMode:      meta.VerificationMode,
-		VerificationSkipped:   false,
+		VerificationSkipped:   skipped,
 		RigorApplied:          rigor,
 		GapCount:              len(gaps),
 		BlockingGapCount:      blockingCount,
@@ -355,5 +375,43 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID, 
 	gaps, meta := Run(in)
 	result := ToMCP(taskID, gaps, meta)
 	_ = Persist(ctx, client, taskID, gaps, meta, result.Status)
+	writeBlockedCorrection(root, taskID, &result, gaps)
 	return result, gaps, nil
+}
+
+// writeBlockedCorrection persists a repair brief when a check ran and
+// blocked. A write failure must not hide the verify result — gaps are already
+// in the store. A skipped or passing verify writes nothing.
+func writeBlockedCorrection(root, taskID string, result *MCPResult, gaps []Gap) {
+	if result == nil || result.Passed || result.VerificationSkipped {
+		return
+	}
+	if root == "" || taskID == "" {
+		return
+	}
+	manifestGaps := make([]correction.ManifestGap, 0, len(gaps))
+	for _, g := range gaps {
+		if !g.Blocking {
+			continue
+		}
+		file := ""
+		if g.File != nil {
+			file = *g.File
+		}
+		manifestGaps = append(manifestGaps, correction.ManifestGap{
+			ID: g.ID, GapType: g.GapType, Severity: g.Severity,
+			Blocking: true, Action: g.RecommendedFix, File: file,
+		})
+	}
+	actions := make([]string, 0, len(result.NextActions))
+	for _, a := range result.NextActions {
+		actions = append(actions, a.Action)
+	}
+	_, path, err := correction.Write(correction.WriteOptions{
+		Root: root, TaskID: taskID, Gaps: manifestGaps, NextActions: actions,
+	})
+	if err != nil {
+		return
+	}
+	result.CorrectionPath = path
 }

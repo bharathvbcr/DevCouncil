@@ -8,11 +8,12 @@ jobs**, because a `dc-verify` test must not compile thirty tree-sitter grammars.
 | Analysis | `dc-glob`, `dc-grep`, `dc-store`, `dc-verify`, `dc-evidence` | May this change proceed |
 | Kernel | `devmap-extract` … `devmap-cli` | What does this code mean |
 
-DevCouncil owns these as **components**. A harness — [MANVI](https://github.com/bharathvbcr/Manvi)
-is the one they were built for — resolves each as a binary from `PATH` and
-**links none of them**. That is the whole contract: a component can be rebuilt,
-replaced, or reused by something else without the consumer recompiling, and a
-consumer stays a single static binary that embeds anywhere.
+DevCouncil owns these as **components and modules**. A harness — [Manvi](https://github.com/bharathvbcr/Manvi)
+wraps them — resolves each as a binary from `PATH` and **links none of them**.
+Host apps such as [GitPulse](https://github.com/bharathvbcr/GitPulse) may instead
+vendor selected crates (for example `devmap-query`) while still wrapping Manvi
+for policy and workbench. Either way the contract is the same: a component can
+be rebuilt, replaced, or omitted without taking the whole suite.
 
 The analysis-plane crates:
 

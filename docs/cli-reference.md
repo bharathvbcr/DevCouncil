@@ -14,6 +14,12 @@ The same binary is installed as both `devcouncil` and `dev`.
 ```bash
 Usage:
   devcouncil mcp                                       # Run the MCP stdio server
+  devcouncil install [names…] [--list] [--json] [--prefix DIR] [--dry-run]
+  devcouncil uninstall [names…] [--yes] [--prefix DIR]
+  devcouncil disable NAME [--prefix DIR]
+  devcouncil enable NAME [--prefix DIR]
+  devcouncil gate status [--json] [--project-root DIR]
+  devcouncil gate set --mode off|advisory|enforce
   devcouncil integrate HOST [options]                  # Configure coding agent integrations
   devcouncil integrate uninstall --target hooks        # Uninstall integration hooks
   devcouncil skills list                               # List embedded agent skills
@@ -23,6 +29,15 @@ Usage:
   devcouncil graph …                                   # Alias of map
   devcouncil ast …                                     # Exec `devmap ast`
 ```
+
+First-time / standalone (no host binary yet):
+
+```bash
+bash scripts/install.sh --only=devmap
+bash scripts/install.sh --help
+```
+
+There is no `uv` / Python install path.
 
 ### Host MCP Server
 
@@ -71,11 +86,12 @@ devcouncil skills scaffold [--skill NAME] [--project-root DIR] [--dry-run] [--ch
 ### Task Verification
 
 ```bash
-devcouncil verify TASK_ID [--json] [--sandbox local|docker|nix] [--project-root DIR]
+devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local|docker|nix] [--project-root DIR]
 ```
 
 Verifies code changes associated with `TASK_ID` using the deterministic verification engine (`dcverify`).
 - Checks planned file scope, diff validity, anti-laziness/stubs, and test execution.
+- `--mode`: `off` (default when unset) skips quality verification; `advisory` still blocks hard-safety gaps; `enforce` blocks every `Blocking` gap. Hard-safety write policy is unchanged.
 - `--json`: Output machine-readable verification results and typed `next_actions` for agent self-repair.
 - `--sandbox local|docker|nix`: Run verification commands in a sandbox container or local environment.
 

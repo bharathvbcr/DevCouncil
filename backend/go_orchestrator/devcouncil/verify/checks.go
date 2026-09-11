@@ -61,7 +61,7 @@ func DetectPlannedFileGaps(taskID string, planned []dc.PlannedFile, changed []st
 			Evidence:       []string{},
 			RecommendedFix: "Modify " + path + " as planned or update the task.",
 			Blocking:       false,
-			File:           &path,
+			File:           filePtr(path),
 		})
 	}
 	return gaps
@@ -80,7 +80,6 @@ func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []str
 		}
 		_, isAdded := orphanAdded[cf]
 		newTest := isAdded && isTestPath(cf)
-		path := cf
 		if newTest {
 			gaps = append(gaps, Gap{
 				ID:       StableGapID(taskID, "ORPHAN-"+cf),
@@ -93,7 +92,7 @@ func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []str
 				RecommendedFix: "Append " + cf + " with `dev scope update <task_id> --lease-token <token> " +
 					"--planned-file " + cf + "` (or fold the tests into a planned test file).",
 				Blocking: false,
-				File:     &path,
+				File:     filePtr(cf),
 			})
 			continue
 		}
@@ -107,7 +106,7 @@ func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []str
 			RecommendedFix: "Revert changes to " + cf + " or append it with " +
 				"`dev scope update <task_id> --lease-token <token> --planned-file " + cf + "`.",
 			Blocking: true,
-			File:     &path,
+			File:     filePtr(cf),
 		})
 	}
 	return gaps
@@ -127,7 +126,6 @@ func DetectDependencyRiskGaps(taskID string, planned []dc.PlannedFile, changed [
 		if _, ok := plannedSet[path]; ok {
 			continue
 		}
-		p := path
 		gaps = append(gaps, Gap{
 			ID:             StableGapID(taskID, "DEP-"+path),
 			Severity:       "high",
@@ -137,7 +135,7 @@ func DetectDependencyRiskGaps(taskID string, planned []dc.PlannedFile, changed [
 			Evidence:       []string{path},
 			RecommendedFix: "Justify the dependency change or revert " + path + ".",
 			Blocking:       true,
-			File:           &p,
+			File:           filePtr(path),
 		})
 	}
 	return gaps

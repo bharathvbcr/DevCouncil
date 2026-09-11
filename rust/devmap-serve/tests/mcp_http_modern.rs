@@ -183,7 +183,7 @@ async fn discover_advertises_the_modern_revision_with_live_cache_hints() {
          transports it is sieved out by every version they can negotiate"
     );
     assert_eq!(result["cacheScope"], json!("private"));
-    assert_eq!(result["capabilities"]["tools"]["listChanged"], json!(false));
+    assert_eq!(result["capabilities"]["tools"]["listChanged"], json!(true));
 }
 
 /// `tools/list` is in the spec's cacheable set, so it carries the hint too.

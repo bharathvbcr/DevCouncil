@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 // Manifest is the repair brief an agent reads after a blocked verify.
@@ -81,7 +83,7 @@ func Write(opts WriteOptions) (Manifest, string, error) {
 	if err != nil {
 		return Manifest{}, "", err
 	}
-	if err := os.WriteFile(path, raw, 0o644); err != nil {
+	if err := safefile.WriteAtomic(path, raw, 0o644); err != nil {
 		return Manifest{}, "", err
 	}
 	return m, path, nil

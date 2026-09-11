@@ -20,7 +20,7 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gate
 		sandbox = "local"
 	}
 	if gateMode == "" {
-		gateMode = "enforce"
+		gateMode = "off"
 	}
 
 	var taskIDs []string

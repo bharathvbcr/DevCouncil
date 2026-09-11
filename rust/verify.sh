@@ -133,11 +133,13 @@ RSS_GATE=$(( 2 * 1024*1024*1024 ))
 # 12,831-file personal corpus at 3.40-3.55 GiB implies 278 KiB/file — the same
 # rate at 11x the size, which is what makes a per-file budget meaningful here.
 #
-# 512 KiB/file is 1.8x the measured rate. SC3's regime was 10.45 GiB over 4,742
-# files = 2.31 MiB/file, 4.5x over this budget, so the gate that did not exist
-# then would have been red. The headroom also absorbs allocator differences
-# between the macOS host these numbers were measured on and the Linux runner CI
-# uses, which has not been measured.
+# Recalibrated 2026-09-11 after AmbiguousGlobal sites stopped emitting capped
+# edge fan-out and instead record one unresolved ledger row with the full
+# candidate list: cold self-build peak is 610 MiB over 851 files (~734 KiB/file)
+# with only 214 fan-out edges. The old 512 KiB base assumed fan-out carried the
+# ambiguity cost; with honest resolve that cost sits in the base again (plus
+# grammar load). 896 KiB/file is ~1.22x the measured rate — enough headroom for
+# allocator noise, not enough to hide a return to multi-GiB SC3 behaviour.
 #
 # The fan-out term has TWO coefficients, not one, and for a while it had the
 # wrong one.
@@ -158,7 +160,7 @@ RSS_GATE=$(( 2 * 1024*1024*1024 ))
 # the same 1.5x headroom the single term had: 1050 and 130. `candidates` comes
 # from `generation_edges.candidate_total` (schema v16), which is what made the
 # right denominator derivable from a store at all.
-RSS_BASE_PER_FILE=$(( 512 * 1024 ))
+RSS_BASE_PER_FILE=$(( 896 * 1024 ))
 RSS_PER_FANOUT_EDGE=1050
 RSS_PER_CANDIDATE=130
 

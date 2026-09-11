@@ -21,10 +21,9 @@ use std::time::{Duration, Instant};
 
 use devmap_extract::extract_file;
 use devmap_extract::model::{
-    Confidence, EdgeKind, ExtractedCall, ExtractedImport, ExtractedSymbol, Extraction, Span,
-    SymbolKind,
+    EdgeKind, ExtractedCall, ExtractedImport, ExtractedSymbol, Extraction, Span, SymbolKind,
 };
-use devmap_resolve::model::{Resolution, AMBIGUOUS_FANOUT_CAP};
+use devmap_resolve::model::Resolution;
 use devmap_resolve::Resolver;
 
 /// Wall-clock ceiling for a single hostile file.
@@ -252,19 +251,12 @@ fn sorting_ambiguous_edges_does_not_serialize_the_candidate_list_per_comparison(
         elapsed
     }
 
-    // Interleaved pairs, and the **minimum ratio** rather than the ratio of
-    // minima. Two separate min-of-N measurements can still be taken under
-    // different machine conditions — a quiet run at the small size against a
-    // loaded one at the large size inflates the ratio for reasons that have
-    // nothing to do with the code. Measuring both sizes back to back and taking
-    // the best pair means the number that decides this test came from one
-    // moment on one machine. Written this way after the single-sample version
-    // went red on a machine running three other builds.
-    build(32); // warm the code paths and the allocator
+    // In-ceiling sizes only: above AMBIGUOUS_FANOUT_CAP sites emit no edges.
+    build(4); // warm the code paths and the allocator
     let (ratio, small, large) = (0..3)
         .map(|_| {
-            let small = build(128);
-            let large = build(256);
+            let small = build(8);
+            let large = build(16);
             (
                 large.as_secs_f64() / small.as_secs_f64().max(1e-6),
                 small,
@@ -273,24 +265,8 @@ fn sorting_ambiguous_edges_does_not_serialize_the_candidate_list_per_comparison(
         })
         .min_by(|left, right| left.0.total_cmp(&right.0))
         .expect("three samples");
-    eprintln!("ambiguous-sort scaling: 128 -> {small:?}, 256 -> {large:?}, ratio {ratio:.2}x");
+    eprintln!("ambiguous-sort scaling: 8 -> {small:?}, 16 -> {large:?}, ratio {ratio:.2}x");
 
-    // Doubling the candidate count doubles the edges, so an n*log(n) sort over
-    // a constant-cost key grows a little over 2x. Measured here (best of three
-    // interleaved pairs, debug build, four repetitions of the whole test):
-    // **4.07x, 4.36x, 5.00x, 5.12x** — so the comparator does carry a term that
-    // grows with the candidate list — `format!("{:?}", left.resolution)`
-    // serialises the whole of it whenever the four string keys ahead of it tie,
-    // which is exactly what repeated identical call sites produce.
-    //
-    // Deliberately *not* fixed here. The comparator defines the total order
-    // that edge ordinals are assigned from, and STATUS.md records that the last
-    // change to it was validated with an edge-ordinal digest over a 4,742-file
-    // corpus precisely because that order is consumer-visible. Changing it to
-    // dodge a cost that is 5.4% of a cold build on this corpus is not a trade
-    // to make unilaterally. This bounds the regression instead: 8x fails the
-    // quadratic regime while leaving room above the 4.0x a loaded machine
-    // produced.
     assert!(
         ratio < 8.0,
         "doubling ambiguous candidates multiplied resolution cost by {ratio:.1}x \
@@ -455,21 +431,13 @@ fn hostile_input_resolves_identically_across_runs() {
     assert!(!first.is_empty(), "fixture is inert: no edges produced");
 }
 
-/// An ambiguous call keeps every candidate, emits a bounded, declared sample of
-/// them, and every emitted candidate is a real indexed file.
+/// An ambiguous call above the emission ceiling keeps every candidate on the
+/// ledger and emits no edges. Every candidate still names a real indexed file.
 ///
 /// SC4 records the decision not to *collapse* the fan-out — not to pick a
-/// winner and hide the ambiguity — and this is the property that decision buys,
-/// stated so a later "optimisation" cannot quietly take it away. A candidate
-/// naming a file that was never indexed is a Class C fabrication, and the
-/// fan-out is where one would hide.
-///
-/// Emission is capped at [`AMBIGUOUS_FANOUT_CAP`]; this test used to assert one
-/// persisted edge per candidate, which is a stronger claim than SC4 makes and
-/// one the cap deliberately retired. What SC4 protects is asserted directly
-/// instead: the resolution still names **every** candidate, and a truncated
-/// site carries both numbers in `details`, so the capped sample is never
-/// readable as complete coverage.
+/// winner and hide the ambiguity. Above [`AMBIGUOUS_FANOUT_CAP`] that means
+/// one ledger row with the complete candidate list, not a capped sample of
+/// edges that would still fabricate inbound callers.
 #[test]
 fn every_ambiguous_candidate_names_an_indexed_file() {
     let mut extractions = Vec::new();
@@ -495,7 +463,7 @@ fn every_ambiguous_candidate_names_an_indexed_file() {
     ));
 
     let result = resolve(&extractions);
-    let ambiguous: Vec<_> = result
+    let ambiguous_edges: Vec<_> = result
         .edges
         .iter()
         .filter(|edge| {
@@ -505,45 +473,24 @@ fn every_ambiguous_candidate_names_an_indexed_file() {
             )
         })
         .collect();
-    assert_eq!(
-        ambiguous.len(),
-        AMBIGUOUS_FANOUT_CAP,
-        "emission is bounded by the cap, not by the candidate count; got {}",
-        ambiguous.len()
+    assert!(
+        ambiguous_edges.is_empty(),
+        "above the ceiling AmbiguousGlobal emits no edges; got {}",
+        ambiguous_edges.len()
     );
-    for edge in &ambiguous {
-        assert!(
-            indexed.contains(&edge.target_file),
-            "an ambiguous candidate names {:?}, which was never indexed",
-            edge.target_file
-        );
-        assert_eq!(
-            edge.confidence,
-            Confidence::SPECULATIVE,
-            "an ambiguous pick must not carry a confident label"
-        );
-        // The half of the rule the cap makes load-bearing: a truncated sample
-        // that does not say it is truncated reads as the whole answer.
-        let details = edge
-            .details
-            .as_deref()
-            .expect("a truncated fan-out must declare itself");
-        assert!(
-            details.contains(&AMBIGUOUS_FANOUT_CAP.to_string()) && details.contains("64"),
-            "the truncation note must carry both numbers, got {details:?}"
-        );
-    }
 
-    // SC4 itself: the resolution names every candidate. This is what "do not
-    // collapse the fan-out" means, and it is unaffected by the emission cap.
-    let Some(Resolution::AmbiguousGlobal { candidates, .. }) = ambiguous[0].resolution.as_deref()
-    else {
-        panic!("filtered for AmbiguousGlobal above");
+    let entry = result
+        .unresolved
+        .iter()
+        .find(|u| u.callee_name == "shared")
+        .expect("the site must still be in the ledger");
+    let Resolution::AmbiguousGlobal { candidates, .. } = &entry.resolution else {
+        panic!("ledger keeps AmbiguousGlobal, got {:?}", entry.resolution);
     };
     assert_eq!(
         candidates.len(),
         64,
-        "the resolution must keep every candidate even when emission is capped"
+        "the resolution must keep every candidate"
     );
     for (file, _) in candidates {
         assert!(
@@ -551,4 +498,36 @@ fn every_ambiguous_candidate_names_an_indexed_file() {
             "a kept candidate names {file:?}, which was never indexed"
         );
     }
+
+    // Positive control: inside the ceiling, every candidate is still an edge.
+    let mut small = Vec::new();
+    for i in 0..2 {
+        let path = format!("s{i}.py");
+        small.push(synthetic(
+            &path,
+            "python",
+            vec![symbol(&path, "few")],
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+    small.push(synthetic(
+        "c.py",
+        "python",
+        vec![symbol("c.py", "go")],
+        Vec::new(),
+        vec![call("c.py::go", "few")],
+    ));
+    let inside = resolve(&small);
+    let edges: Vec<_> = inside
+        .edges
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.resolution.as_deref(),
+                Some(Resolution::AmbiguousGlobal { .. })
+            )
+        })
+        .collect();
+    assert_eq!(edges.len(), 2, "in-ceiling AmbiguousGlobal still emits");
 }

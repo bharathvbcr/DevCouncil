@@ -7,6 +7,9 @@ Install: `go build -o ~/.local/bin/devcouncil ./cmd/devcouncil` (from `backend/g
 |---|---|
 | `devcouncil mcp` | Hand-rolled JSON-RPC MCP stdio server |
 | `devcouncil mcp-server` | Alias for hosts still using the Python argv |
+| `devcouncil install [names…]` | Catalog install (presets: all, analysis, devmap, host) |
+| `devcouncil uninstall / disable / enable` | Remove or skip a catalog binary |
+| `devcouncil gate status \| set` | Verification-gate mode (off / advisory / enforce) |
 | `devcouncil integrate <host> [--apply\|--check\|--dry-run]` | Host MCP/rules/hooks; spawns `devmap integrate` / `skills install` |
 | `devcouncil skills scaffold [--skill NAME]` | Embed.FS domain skills (17) with Python registry bounds |
 

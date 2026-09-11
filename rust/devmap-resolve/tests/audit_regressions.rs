@@ -488,22 +488,37 @@ fn an_unresolvable_reference_is_recorded_alongside_the_call() {
         result.unresolved
     );
 
-    // The declined rung, pinned so its scope is a stated fact rather than an
-    // accident: a **bare** `Name` in value position is one the resolver stops
-    // before the global lookup for, on purpose, so it is not a failed
-    // attribution and is not recorded. Python spells a parameter annotation as
-    // exactly this kind, which is why the fixture above is Rust.
+    // Python parameter annotations are Type references (same as Rust), so an
+    // unresolvable one is recorded — with NoNamesake when the corpus has no
+    // symbol of that name. The declined rung is a bare Name in *value*
+    // position (e.g. reading the parameter `r`), which never reaches the
+    // global lookup and therefore never enters the ledger.
     let declined = resolve(&[(
         "app.py",
         "def use(r: Missing):\n    alsoMissing()\n    return r\n",
     )]);
     assert!(
+        declined.unresolved.iter().any(|entry| {
+            entry.callee_name == "Missing"
+                && entry.kind == UnresolvedKind::Reference
+                && entry.class == UnresolvedClass::NoNamesake
+        }),
+        "an unresolvable type annotation must be recorded as NoNamesake: {:?}",
+        declined.unresolved
+    );
+    assert!(
+        declined.unresolved.iter().any(|entry| {
+            entry.callee_name == "alsoMissing" && entry.kind == UnresolvedKind::Call
+        }),
+        "the bare call must stay recorded: {:?}",
+        declined.unresolved
+    );
+    assert!(
         declined
             .unresolved
             .iter()
-            .all(|entry| entry.kind != UnresolvedKind::Reference),
-        "a bare Name reference is declined, not failed, and has no tier that \
-         says so: {:?}",
+            .all(|entry| entry.callee_name != "r"),
+        "reading the parameter `r` is a declined bare Name, not a ledger row: {:?}",
         declined.unresolved
     );
 
@@ -579,8 +594,8 @@ fn an_unindexed_relative_import_is_not_called_external() {
     );
 }
 
-/// R-7: an ambiguous call site's fan-out is bounded, and the truncation carries
-/// both numbers.
+/// R-7: an ambiguous call site above the emission ceiling emits no edges —
+/// the ledger carries the complete AmbiguousGlobal candidate list instead.
 #[test]
 fn an_ambiguous_fanout_is_capped_and_says_so() {
     let mut files: Vec<(String, String)> = (0..40)
@@ -606,32 +621,29 @@ fn an_ambiguous_fanout_is_capped_and_says_so() {
         .iter()
         .filter(|edge| edge.edge_kind == EdgeKind::Calls && edge.source_symbol == "caller.py::go")
         .collect();
-    assert_eq!(
-        fanout.len(),
-        AMBIGUOUS_FANOUT_CAP,
-        "one call site must not fan out without bound"
+    assert!(
+        fanout.is_empty(),
+        "above the ceiling a bare ambiguous call emits zero edges, got {}",
+        fanout.len()
     );
-    for edge in &fanout {
-        let details = edge
-            .details
-            .as_deref()
-            .expect("a truncated fan-out must say it was truncated");
-        assert!(
-            details.contains("40") && details.contains(&AMBIGUOUS_FANOUT_CAP.to_string()),
-            "both numbers must be carried, got {details:?}"
+    let entry = result
+        .unresolved
+        .iter()
+        .find(|u| u.callee_name == "spread" && u.source_symbol == "caller.py::go")
+        .expect("the site must still be in the ledger");
+    let Resolution::AmbiguousGlobal { candidates, .. } = &entry.resolution else {
+        panic!(
+            "ledger row must keep AmbiguousGlobal, got {:?}",
+            entry.resolution
         );
-    }
-    let Some(Resolution::AmbiguousGlobal { candidates, .. }) = fanout[0].resolution.as_deref()
-    else {
-        panic!("the fan-out rung is AmbiguousGlobal");
     };
     assert_eq!(
         candidates.len(),
         40,
-        "the resolution keeps the complete candidate list; only the edges are capped"
+        "the resolution keeps the complete candidate list"
     );
 
-    // Positive control: a fan-out inside the cap is untouched and unmarked.
+    // Positive control: a fan-out inside the cap still emits every candidate.
     let small = resolve(&[
         ("s0.py", "def few():\n    return 1\n"),
         ("s1.py", "def few():\n    return 1\n"),
@@ -650,7 +662,7 @@ fn an_ambiguous_fanout_is_capped_and_says_so() {
     for edge in small_fanout {
         assert_eq!(
             edge.details, None,
-            "an untruncated fan-out must not claim a truncation"
+            "an in-ceiling fan-out must not claim a truncation"
         );
     }
 }

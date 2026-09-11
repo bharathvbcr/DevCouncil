@@ -14,9 +14,10 @@ This is an **opt-in strict task workflow**. It does not override
 work. Run it only when the user explicitly requests the hero/task loop or when
 strict enforcement is active.
 
-DevCouncil's certified end-to-end path for Claude Code: the agent checks out a task,
+DevCouncil's certified end-to-end path for Claude Code uses the **verify, lease, and MCP modules**: the agent checks out a task,
 implements inside declared scope, verifies deterministically, self-repairs from typed
 next actions, and releases — **without a human pasting test output back and forth.**
+Manvi wraps the same components for multi-agent campaigns; GitPulse uses Manvi and selected DevCouncil modules rather than the full suite.
 
 ## The loop
 

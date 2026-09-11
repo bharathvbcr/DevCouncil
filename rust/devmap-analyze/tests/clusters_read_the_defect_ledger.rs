@@ -13,10 +13,10 @@
 //!
 //! Reproduced below, and measured before the fix:
 //!
-//! * `Widget.alpha`, ambiguously called, is reported at **0.4** with
-//!   `only_ambiguous_callers`.
-//! * `Task.alpha`, ambiguously called **by the same call site**, is reported
-//!   inside a cluster at **0.5**, and the reason says it is "reached by nothing
+//! * `Widget.alpha`, named by an untyped-receiver call the ladder could not
+//!   bind, is reported at **0.4** with the unresolved-namesake reason.
+//! * `Task.alpha`, named by **the same call site**, is reported inside a
+//!   cluster at **0.5**, and the reason says it is "reached by nothing
 //!   outside the component" — which is false; `drive` reaches it.
 //!
 //! Identical evidence, and the strictly stronger claim gets the higher
@@ -34,10 +34,13 @@
 //! to stop file nodes reading as public API — every circular import in every
 //! repository becomes a dead cluster.
 
-use devmap_analyze::{analyze, dead_clusters, DeadClusterScan, DEAD_CLUSTER_QUALIFIED_CONFIDENCE};
+use devmap_analyze::{
+    analyze, dead_clusters, DeadClusterScan, DEAD_CLUSTER_QUALIFIED_CONFIDENCE,
+    UNRESOLVED_NAMESAKE_REASON,
+};
 use devmap_extract::extract_file;
 use devmap_extract::model::{EdgeKind, ExtractedSymbol, Extraction, Span, SymbolKind};
-use devmap_resolve::model::{Resolution, ResolutionResult, ResolvedEdge};
+use devmap_resolve::model::{Resolution, ResolutionResult, ResolvedEdge, UnresolvedClass};
 use devmap_resolve::Resolver;
 use std::sync::Arc;
 
@@ -49,15 +52,20 @@ const CLUSTER: &str = concat!(
     "private fun Task.betaStep(): String = alpha()\n",
 );
 
-/// A second, unrelated `alpha`. Its only job is to make a bare cross-file call
-/// to `alpha` ambiguous, which is what stops the inbound edge from counting.
+/// A second, unrelated `alpha`. Its only job is to give the unresolved
+/// `it.alpha()` call site a namesake in more than one place — the defect
+/// ledger matches by bare name, so both `Task.alpha` and `Widget.alpha` are
+/// demoted by the same site.
 const OTHER: &str = concat!(
     "class Widget\n",
     "private fun Widget.alpha(): String = \"w\"\n",
 );
 
-/// Calls `alpha` through a receiver nothing can type: the resolver names both
-/// candidates and commits to neither.
+/// Calls `alpha` through a receiver nothing can type. The ladder no longer
+/// widens an explicit-receiver miss into `AmbiguousGlobal` (that fabricated
+/// edges for every `map.get()` / `String::new()`), so the site lands in the
+/// unresolved ledger as `UninferredReceiver` — the same evidence class the
+/// single-symbol namesake veto and the cluster qualifier both read.
 const CALLER: &str = concat!(
     "fun drive(items: List<Any>): String {\n",
     "    return items.map { it.alpha() }.toString()\n",
@@ -86,18 +94,29 @@ fn the_fixture_really_is_one_ambiguous_call_into_a_real_component() {
     let extractions = corpus();
     let resolution = resolve(&extractions);
 
-    let ambiguous_into_cluster = resolution.edges.iter().any(|edge| {
-        edge.edge_kind == EdgeKind::Calls
-            && edge.target_symbol == "app/Cluster.kt::Task.alpha"
-            && matches!(
-                edge.resolution.as_deref(),
-                Some(Resolution::AmbiguousGlobal { .. })
-            )
+    let unresolved_alpha = resolution.unresolved.iter().any(|row| {
+        row.callee_name == "alpha"
+            && row.receiver.as_deref() == Some("it")
+            && matches!(row.class, UnresolvedClass::UninferredReceiver)
     });
     assert!(
-        ambiguous_into_cluster,
-        "fixture assumption: `drive` reaches `Task.alpha` through an ambiguous \
-         edge: {:?}",
+        unresolved_alpha,
+        "fixture assumption: `drive` names `alpha` through an untyped \
+         receiver that the ladder could not bind: {:?}",
+        resolution.unresolved
+    );
+
+    // And there must be no confident Calls edge that would keep the cluster
+    // "reached" for free — otherwise the demotion path never fires.
+    let confident_into_cluster = resolution.edges.iter().any(|edge| {
+        edge.edge_kind == EdgeKind::Calls
+            && edge.target_symbol == "app/Cluster.kt::Task.alpha"
+            && edge.source_symbol == "app/Caller.kt::drive"
+    });
+    assert!(
+        !confident_into_cluster,
+        "fixture assumption: the untyped receiver must not produce a confident \
+         Calls edge into the cluster: {:?}",
         resolution.edges
     );
 
@@ -110,8 +129,8 @@ fn the_fixture_really_is_one_ambiguous_call_into_a_real_component() {
     assert_eq!(scan.clusters[0].size, 2);
 }
 
-/// The headline. The same call site, the same ambiguity, two verdicts — and the
-/// stronger claim must not be the more confident one.
+/// The headline. The same call site, the same unresolved namesake, two
+/// verdicts — and the stronger claim must not be the more confident one.
 #[test]
 fn a_cluster_does_not_outrank_the_single_symbol_verdict_on_the_same_evidence() {
     let extractions = corpus();
@@ -124,15 +143,15 @@ fn a_cluster_does_not_outrank_the_single_symbol_verdict_on_the_same_evidence() {
         .find(|report| report.symbol_name == "Widget.alpha" && !report.is_exempt)
         .unwrap_or_else(|| {
             panic!(
-                "`Widget.alpha` is ambiguously called and must be reported \
-                 qualified: {:?}",
+                "`Widget.alpha` is named by an unresolved call site and must be \
+                 reported qualified: {:?}",
                 summary.dead_symbols
             )
         });
     assert_eq!(
         single.exemption_reason.as_deref(),
-        Some("only_ambiguous_callers"),
-        "fixture assumption: the single-symbol path sees the ambiguity"
+        Some(UNRESOLVED_NAMESAKE_REASON),
+        "fixture assumption: the single-symbol path sees the unresolved namesake"
     );
 
     let cluster = summary
@@ -144,8 +163,8 @@ fn a_cluster_does_not_outrank_the_single_symbol_verdict_on_the_same_evidence() {
     assert!(
         cluster.confidence <= single.confidence,
         "`Task.alpha` and `Widget.alpha` are reached by one call site through \
-         one ambiguity. The component claim is strictly stronger than the \
-         symbol claim, so it cannot carry the higher confidence: cluster \
+         one unresolved namesake. The component claim is strictly stronger than \
+         the symbol claim, so it cannot carry the higher confidence: cluster \
          {} vs symbol {}",
         cluster.confidence,
         single.confidence

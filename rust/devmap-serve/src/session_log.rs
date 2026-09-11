@@ -270,21 +270,12 @@ mod tests {
 
     #[test]
     fn append_does_not_create_a_log_when_the_store_file_is_absent() {
-        let dir = std::env::temp_dir().join(format!(
-            "devmap-session-log-absent-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("devmap-session-log-absent-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let db = dir.join("codeintel").join("devmap.sqlite");
-        append_query(
-            &db,
-            "devmap_status",
-            None,
-            None,
-            Some("no store"),
-            1,
-        );
+        append_query(&db, "devmap_status", None, None, Some("no store"), 1);
         assert!(
             !live_log_path(&db).exists(),
             "an unresolved slot must not create {} from a missing store",

@@ -5,14 +5,14 @@
 //! measured failure), and one process must answer for whichever workspace the
 //! client has open.
 //!
-//! Precedence, when every source is present:
+//! Discovery candidates are the union of MCP `roots/list` stores and the
+//! process cwd (or `--root`, which the CLI passes as cwd). More than one
+//! distinct store is an error: Cursor shares one process across tabs, so
+//! first-wins would answer from the wrong repository. `repo_path` on the
+//! call selects among them. A unique candidate wins. `--db` is last, and
+//! only when that union is empty.
 //!
-//! 1. MCP `roots/list` — the workspace the host says is open.
-//! 2. The process working directory — hosts launch stdio servers with cwd set
-//!    to the project root.
-//! 3. An explicit `--db` — override for tests and legacy per-project configs.
-//!
-//! When nothing resolves, the error names all three attempts. An empty list and
+//! When nothing resolves, the error names every attempt. An empty list and
 //! a missing file are different facts and stay distinct in that message.
 
 use std::path::{Path, PathBuf};
@@ -47,6 +47,14 @@ pub struct RootResolveInput {
 impl RootResolveInput {
     /// Resolve a store path, or an error that names every attempt.
     pub fn resolve(&self) -> Result<PathBuf, String> {
+        let with_stores = self.discovery_roots_with_stores();
+        if with_stores.len() > 1 {
+            return Err(ambiguous_roots_error(&with_stores));
+        }
+        if with_stores.len() == 1 {
+            return Ok(canonical_store_path(store_for_root(&with_stores[0])));
+        }
+
         let mut attempts = Vec::new();
 
         match &self.mcp_roots {
@@ -63,16 +71,8 @@ impl RootResolveInput {
                 // Cap what we walk: an oversized list is a DoS against path
                 // resolution, not against the graph. The rest are named in the
                 // attempt detail so the operator sees the truncation.
-                const MAX_ROOTS: usize = 64;
                 let considered = roots.len().min(MAX_ROOTS);
                 let truncated = roots.len() > MAX_ROOTS;
-                let with_stores = roots_with_stores(roots.iter().take(considered));
-                if with_stores.len() > 1 {
-                    return Err(ambiguous_roots_error(&with_stores));
-                }
-                if with_stores.len() == 1 {
-                    return Ok(canonical_store_path(store_for_root(&with_stores[0])));
-                }
                 for root in roots.iter().take(considered) {
                     let candidate = store_for_root(root);
                     attempts.push(ResolveAttempt {
@@ -97,9 +97,6 @@ impl RootResolveInput {
         }
 
         let cwd_store = store_for_root(&self.client_cwd);
-        if cwd_store.is_file() {
-            return Ok(canonical_store_path(cwd_store));
-        }
         attempts.push(ResolveAttempt {
             source: "client cwd",
             detail: format!(
@@ -138,15 +135,33 @@ impl RootResolveInput {
         self.resolve()
     }
 
-    /// MCP roots that currently hold a readable store, de-duplicated by
-    /// canonical path. Used by `devmap_status` to report `candidate_roots`.
+    /// Repositories that currently hold a readable store, de-duplicated by
+    /// canonical path. Union of MCP `roots/list` and cwd/`--root`. Used by
+    /// `devmap_status` to report `candidate_roots`.
     pub fn candidate_roots(&self) -> Vec<PathBuf> {
-        match &self.mcp_roots {
-            Some(roots) => roots_with_stores(roots.iter().take(64)),
+        self.discovery_roots_with_stores()
+    }
+
+    /// MCP-root stores plus the cwd store, de-duplicated. `--db` is not a
+    /// discovery candidate: it is an override used only when this set is empty.
+    fn discovery_roots_with_stores(&self) -> Vec<PathBuf> {
+        let mut out = match &self.mcp_roots {
+            Some(roots) => roots_with_stores(roots.iter().take(MAX_ROOTS)),
             None => Vec::new(),
+        };
+        let cwd = self
+            .client_cwd
+            .canonicalize()
+            .unwrap_or_else(|_| self.client_cwd.clone());
+        if store_for_root(&cwd).is_file() && !out.iter().any(|root| root == &cwd) {
+            out.push(cwd);
         }
+        out
     }
 }
+
+/// Bound on MCP `roots/list` entries considered for discovery and parse.
+pub const MAX_ROOTS: usize = 64;
 
 /// Bound on `repo_path` / `root`, matching the GitPulse `MAX_ARG_CHARS` shape.
 pub const MAX_REPO_PATH_BYTES: usize = 4096;
@@ -174,14 +189,10 @@ pub fn validate_repo_path(raw: &str) -> Result<PathBuf, String> {
             "repo_path must be an absolute directory, not a relative path ({raw})"
         ));
     }
-    let meta = std::fs::metadata(path).map_err(|err| {
-        format!("invalid repo_path {}: {err}", path.display())
-    })?;
+    let meta = std::fs::metadata(path)
+        .map_err(|err| format!("invalid repo_path {}: {err}", path.display()))?;
     if !meta.is_dir() {
-        return Err(format!(
-            "repo_path {} is not a directory",
-            path.display()
-        ));
+        return Err(format!("repo_path {} is not a directory", path.display()));
     }
     path.canonicalize().map_err(|err| {
         format!(
@@ -239,9 +250,16 @@ fn percent_decode_strict(input: &str) -> Option<String> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        if bytes[i] == 0 {
+            return None;
+        }
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(hi), Some(lo)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
-                out.push((hi << 4) | lo);
+                let decoded = (hi << 4) | lo;
+                if decoded == 0 {
+                    return None;
+                }
+                out.push(decoded);
                 i += 3;
                 continue;
             }
@@ -287,7 +305,7 @@ pub fn roots_with_stores<'a>(roots: impl Iterator<Item = &'a PathBuf>) -> Vec<Pa
 
 fn ambiguous_roots_error(roots: &[PathBuf]) -> String {
     let mut lines = vec![
-        "more than one MCP root has a DevMap store; this process is shared across workspace tabs so first-wins is not safe. Pass repo_path with the absolute repository path:"
+        "more than one repository has a DevMap store (MCP roots/list and/or this process's cwd/--root); this process is shared across workspace tabs so first-wins is not safe. Pass repo_path with the absolute repository path:"
             .to_string(),
     ];
     for root in roots {
@@ -303,11 +321,54 @@ fn format_resolve_error(attempts: &[ResolveAttempt]) -> String {
     for attempt in attempts {
         lines.push(format!("  - {}: {}", attempt.source, attempt.detail));
     }
-    lines.push(
-        "run `devmap build` in the repository, open it as an MCP root, or pass an absolute --db"
-            .into(),
-    );
+    if attempts
+        .iter()
+        .any(|a| a.source == "client cwd" && cwd_attempt_is_unsafe(a))
+    {
+        lines.push(
+            "this process's cwd is $HOME, `/`, or a temp directory — DevMap will not create \
+state there. Pass `repo_path` (absolute repository path) on every MCP call, or start \
+`devmap mcp --root <repository>` / open the repository as an MCP root."
+                .into(),
+        );
+    } else {
+        lines.push(
+            "pass `repo_path` with the absolute repository path, run `devmap build` there, \
+open it as an MCP root, or pass an absolute --db"
+                .into(),
+        );
+    }
     lines.join("\n")
+}
+
+fn cwd_attempt_is_unsafe(attempt: &ResolveAttempt) -> bool {
+    // Detail is "no store at <store> (cwd <cwd>)".
+    let Some(cwd) = attempt
+        .detail
+        .rsplit_once("(cwd ")
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    is_unsafe_mcp_cwd(Path::new(cwd))
+}
+
+/// Paths where a repo_path-less MCP session must never create `.devmap` state.
+pub fn is_unsafe_mcp_cwd(root: &Path) -> bool {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut banned = vec![PathBuf::from("/"), std::env::temp_dir()];
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            banned.push(PathBuf::from(home));
+        }
+    }
+    for extra in ["/tmp", "/private/tmp", "/var/tmp"] {
+        banned.push(PathBuf::from(extra));
+    }
+    banned.iter().any(|path| {
+        let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+        path == root
+    })
 }
 
 /// Whether a `degraded_reason` (or schema status) means SessionStart should
@@ -364,21 +425,68 @@ mod tests {
     }
 
     #[test]
-    fn roots_win_over_cwd_and_db() {
+    fn single_mcp_root_and_different_cwd_store_is_ambiguous() {
+        // `--root` is passed as client_cwd. A shared Cursor process still
+        // advertises another tab's MCP root. Returning that one store is
+        // first-wins: the named repository is silently discarded.
         let via_root = scratch("via-root");
         let via_cwd = scratch("via-cwd");
-        let via_db = scratch("via-db");
-        let want = plant_store(&via_root);
+        plant_store(&via_root);
         plant_store(&via_cwd);
+
+        let err = RootResolveInput {
+            mcp_roots: Some(vec![via_root.clone()]),
+            client_cwd: via_cwd.clone(),
+            explicit_db: None,
+        }
+        .resolve()
+        .expect_err("cwd store and MCP-root store must not first-wins");
+        assert!(
+            err.contains(&via_root.display().to_string()),
+            "error must name the MCP root: {err}"
+        );
+        assert!(
+            err.contains(&via_cwd.display().to_string()),
+            "error must name the cwd/--root repository: {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("repo_path") || err.contains("more than one"),
+            "error must tell the caller how to disambiguate: {err}"
+        );
+    }
+
+    #[test]
+    fn roots_win_when_cwd_has_no_store() {
+        let via_root = scratch("via-root-only");
+        let empty_cwd = scratch("empty-cwd-only");
+        let via_db = scratch("ignored-db");
+        let want = plant_store(&via_root);
         let db = plant_store(&via_db);
 
         let resolved = RootResolveInput {
             mcp_roots: Some(vec![via_root]),
-            client_cwd: via_cwd,
+            client_cwd: empty_cwd,
             explicit_db: Some(db),
         }
         .resolve()
-        .expect("roots should win");
+        .expect("a unique MCP-root store wins when cwd has none");
+        assert_eq!(
+            resolved.canonicalize().unwrap_or(resolved),
+            want.canonicalize().unwrap_or(want)
+        );
+    }
+
+    #[test]
+    fn cwd_matching_the_only_mcp_root_is_not_ambiguous() {
+        let root = scratch("same-root");
+        let want = plant_store(&root);
+        let resolved = RootResolveInput {
+            mcp_roots: Some(vec![root.clone()]),
+            client_cwd: root,
+            explicit_db: None,
+        }
+        .resolve()
+        .expect("the same repository named twice is one store");
         assert_eq!(
             resolved.canonicalize().unwrap_or(resolved),
             want.canonicalize().unwrap_or(want)
@@ -434,6 +542,33 @@ mod tests {
         assert!(err.contains("--db"), "{err}");
         assert!(err.contains("empty roots list"), "{err}");
         assert!(err.contains("not set"), "{err}");
+        assert!(
+            err.contains("repo_path") || err.contains("devmap build"),
+            "refusal must name how to fix resolution: {err}"
+        );
+    }
+
+    #[test]
+    fn unsafe_temp_cwd_names_repo_path_fix() {
+        let store = devmap_extract::paths::store_path(std::env::temp_dir());
+        let existed = store.is_file();
+        let err = RootResolveInput {
+            mcp_roots: Some(vec![]),
+            client_cwd: std::env::temp_dir(),
+            explicit_db: None,
+        }
+        .resolve()
+        .expect_err("temp cwd is not a repository");
+        assert!(
+            err.contains("repo_path") && (err.contains("temp") || err.contains("$HOME")),
+            "must refuse creating state under a banned cwd: {err}"
+        );
+        if !existed {
+            assert!(
+                !store.is_file(),
+                "resolve must not create a store under the temp directory"
+            );
+        }
     }
 
     #[test]
@@ -528,5 +663,17 @@ mod tests {
         assert_eq!(local, PathBuf::from("/Users/example/project"));
         let encoded = file_uri_to_path("file:///tmp/foo%20bar").unwrap();
         assert_eq!(encoded, PathBuf::from("/tmp/foo bar"));
+        assert!(
+            file_uri_to_path("file:///tmp/foo%00bar").is_none(),
+            "a NUL in a file URI must not become a PathBuf"
+        );
+        assert!(
+            file_uri_to_path("file://127.0.0.1/Users/example/project").is_none(),
+            "only localhost is a recognised file URI host, not an IP"
+        );
+        assert!(
+            file_uri_to_path("file:/Users/example/project").is_none(),
+            "a single-slash file: URI is not a unix path"
+        );
     }
 }

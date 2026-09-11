@@ -179,11 +179,46 @@ fn build_from_home_refuses_instead_of_indexing() {
         combined.contains(&home.display().to_string()),
         "refusal must name the resolved root: {combined}"
     );
-    let store = home.join(".devcouncil").join("codeintel").join("devmap.sqlite");
+    let store = home
+        .join(".devcouncil")
+        .join("codeintel")
+        .join("devmap.sqlite");
     assert!(
         !store.exists(),
         "must not create a store under $HOME: {}",
         store.display()
+    );
+}
+
+#[test]
+fn doctor_warns_when_a_host_config_names_a_missing_binary() {
+    let home = scratch("doc-missing-bin");
+    let cwd = scratch("doc-missing-cwd");
+    let missing = home.join("no-such-devmap-binary");
+    write_mcp(&home.join(".claude.json"), &missing.display().to_string());
+    let out = run_in(&cwd, &["--json", "doctor"], Some(&home));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload = one_json(&out, "doctor");
+    let warning = payload
+        .get("missing_binary_warning")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        !warning.is_empty(),
+        "a host config pointing at a path that is not a file must not look like a clean doctor: {payload}"
+    );
+    assert!(
+        warning.contains(&missing.display().to_string()) || warning.contains("no-such-devmap"),
+        "warning must name the missing path: {warning}"
+    );
+    let skew = payload.get("binary_skew_warning");
+    assert!(
+        skew.is_some(),
+        "binary_skew_warning remains a distinct field (null when versions match): {payload}"
     );
 }
 

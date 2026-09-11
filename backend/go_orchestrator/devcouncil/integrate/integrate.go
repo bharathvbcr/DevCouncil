@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 // Mode is apply / check / dry-run.
@@ -61,6 +63,10 @@ alwaysApply: true
 Navigate with DevMap before reading or grepping: ` + "`devmap_explore`" + `, ` + "`devmap_search`" + `, ` + "`devmap_impact`" + `, ` + "`devmap_trace`" + `, ` + "`devmap_neighbors`" + `, ` + "`devmap_dead_symbols`" + `, ` + "`devmap_affected_tests`" + ` — or the matching ` + "`devmap`" + ` CLI commands. Run impact analysis before editing a symbol, and read ` + "`truncated`" + ` / ` + "`total`" + ` on every envelope before treating a list as complete. When DevMap cannot answer, record a gap in ` + "`.devcouncil/codeintel/sessions/gaps.jsonl`" + ` rather than switching to another index.
 
 ` + "`.devcouncil/repo_map.json`" + ` is the file-level index (subsystems, entry_points, critical_files).
+
+## Product stack
+
+DevCouncil is **components and modules** (` + "`devmap`" + `, ` + "`dcstore`" + `, ` + "`dcverify`" + `, ` + "`dcgrep`" + `, and this host). **Manvi** wraps them into a coding-agent harness. Host apps such as **GitPulse** use Manvi for policy, workbench and agent hosting, and DevCouncil components for code intelligence and related analysis. Take only the modules an app needs; update them independently.
 
 ## Tasks and gates are opt-in
 
@@ -265,11 +271,7 @@ func planWrite(path string, content []byte, mode Mode, receipt *Receipt, rel str
 			}
 			content = merged
 		}
-		tmp := path + ".tmp"
-		if err := os.WriteFile(tmp, content, 0o644); err != nil {
-			return err
-		}
-		if err := os.Rename(tmp, path); err != nil {
+		if err := safefile.WriteAtomic(path, content, 0o644); err != nil {
 			return err
 		}
 		receipt.Files[rel] = "wrote"

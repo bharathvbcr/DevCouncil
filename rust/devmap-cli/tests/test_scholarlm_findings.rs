@@ -185,12 +185,19 @@ fn go_replace_directive_retargets_an_external_module() {
 
 #[test]
 fn go_aliased_import_binds_the_alias_not_the_path_tail() {
+    // The import must resolve through the Go module ladder — a receiver call
+    // no longer falls through to UniqueGlobal on the bare method name.
     let importer = extract_file(
-        "pkg/a.go",
+        "cmd/a.go",
         "package a\nimport w \"example.com/mod/pkg/b\"\nfunc Use() { w.Helper() }\n",
     );
-    let target = extract_file("pkg/b.go", "package b\nfunc Helper() {}\n");
-    let result = resolve(&[importer, target]);
+    let target = extract_file("pkg/b/b.go", "package b\nfunc Helper() {}\n");
+    let modules = [GoModule {
+        prefix: "example.com/mod".into(),
+        dir: String::new(),
+        replaces: Vec::new(),
+    }];
+    let result = resolve_with_modules(&[importer, target], &modules);
     assert!(
         result.edges.iter().any(|edge| {
             edge.edge_kind == EdgeKind::Calls && edge.target_symbol.ends_with("Helper")

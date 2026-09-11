@@ -190,6 +190,10 @@ fn classes_with_affirmative_evidence_do_not_veto() {
                 module: "react".to_string(),
             },
         ),
+        // No indexed symbol carries the bare name — nothing to bind to.
+        ("no_namesake", UnresolvedClass::NoNamesake),
+        // A crate-local module path, not a value whose type went missing.
+        ("module_path", UnresolvedClass::ModulePath),
     ] {
         let reports =
             analyze_with_ledger(&corpus(), vec![row("render", UnresolvedKind::Call, class)]);

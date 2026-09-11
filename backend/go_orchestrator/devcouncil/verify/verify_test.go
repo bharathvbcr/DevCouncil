@@ -243,6 +243,43 @@ func TestOrphanAndDependency(t *testing.T) {
 	}
 }
 
+func TestStatusFromGapsModes(t *testing.T) {
+	nodiff := verify.Gap{GapType: "task_not_implemented", Blocking: true}
+	failed := verify.Gap{GapType: "test_failed", Blocking: true}
+
+	status, passed := verify.StatusFromGaps([]verify.Gap{nodiff, failed}, "")
+	if !passed || status != "verified" {
+		t.Fatalf("empty mode must skip quality: status=%s passed=%v", status, passed)
+	}
+	status, passed = verify.StatusFromGaps([]verify.Gap{nodiff, failed}, "off")
+	if !passed || status != "verified" {
+		t.Fatalf("off must skip quality: status=%s passed=%v", status, passed)
+	}
+
+	status, passed = verify.StatusFromGaps([]verify.Gap{failed}, "advisory")
+	if !passed || status != "verified" {
+		t.Fatalf("advisory must not block demotable test_failed: status=%s passed=%v", status, passed)
+	}
+	status, passed = verify.StatusFromGaps([]verify.Gap{nodiff}, "advisory")
+	if passed || status != "blocked" {
+		t.Fatalf("advisory must still block hard-safety NODIFF: status=%s passed=%v", status, passed)
+	}
+
+	status, passed = verify.StatusFromGaps([]verify.Gap{failed}, "enforce")
+	if passed || status != "blocked" {
+		t.Fatalf("enforce must block test_failed: status=%s passed=%v", status, passed)
+	}
+
+	status, passed = verify.StatusFromGaps([]verify.Gap{failed}, "yolo")
+	if !passed || status != "verified" {
+		t.Fatalf("unknown mode must not silently enforce: status=%s passed=%v", status, passed)
+	}
+	status, passed = verify.StatusFromGaps([]verify.Gap{failed}, "no")
+	if !passed || status != "verified" {
+		t.Fatalf("alias no must skip: status=%s passed=%v", status, passed)
+	}
+}
+
 func TestFixtureGoldenFilesExist(t *testing.T) {
 	root := filepath.Join("..", "..", "testdata", "golden")
 	for _, rel := range []string{

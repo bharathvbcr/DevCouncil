@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 
 use devmap_extract::extract_file;
 use devmap_extract::model::{Confidence, EdgeKind, Extraction};
-use devmap_resolve::model::{Resolution, ResolutionResult};
+use devmap_resolve::model::{Resolution, ResolutionResult, UnresolvedClass};
 use devmap_resolve::Resolver;
 
 fn resolve(files: &[(&str, &str)]) -> ResolutionResult {
@@ -198,27 +198,29 @@ fn ra1_a_default_expression_executes_outside_the_parameter_scope() {
 
 #[test]
 fn ra2_both_same_named_methods_remain_distinct_ambiguous_candidates() {
+    // Untyped `x.ping()` must not guess among Alpha/Beta — UninferredReceiver,
+    // not AmbiguousGlobal. AmbiguousGlobal is for bare names only.
     let r = resolve(&[("a.py", "class Alpha:\n def ping(self): return 1\nclass Beta:\n def ping(self): return 2\ndef run(x): return x.ping()\n")]);
-    assert_eq!(
-        calls_from(&r, "a.py::run"),
-        BTreeSet::from(["a.py::Alpha.ping".into(), "a.py::Beta.ping".into()])
+    assert!(
+        calls_from(&r, "a.py::run").is_empty(),
+        "untyped receiver must not fan out to Alpha.ping/Beta.ping"
     );
-    for e in r
-        .edges
+    let entry = r
+        .unresolved
         .iter()
-        .filter(|e| e.source_symbol == "a.py::run" && e.edge_kind == EdgeKind::Calls)
-    {
-        assert_eq!(e.confidence, Confidence::SPECULATIVE);
-        if let Some(Resolution::AmbiguousGlobal { candidates, .. }) = e.resolution.as_deref() {
-            assert_eq!(
-                candidates.iter().collect::<BTreeSet<_>>().len(),
-                2,
-                "candidate identities must be distinct"
-            );
-        } else {
-            panic!("missing ambiguity evidence: {e:?}");
-        }
-    }
+        .find(|u| u.callee_name == "ping" && u.source_symbol == "a.py::run")
+        .expect("x.ping must be recorded");
+    assert_eq!(entry.class, UnresolvedClass::UninferredReceiver);
+
+    let bare = resolve(&[
+        ("a.py", "def ping(): return 1\n"),
+        ("b.py", "def ping(): return 2\n"),
+        ("c.py", "def run(): return ping()\n"),
+    ]);
+    assert_eq!(
+        calls_from(&bare, "c.py::run"),
+        BTreeSet::from(["a.py::ping".into(), "b.py::ping".into()])
+    );
 }
 
 #[test]
@@ -229,24 +231,36 @@ fn ra2_ambiguity_caps_count_distinct_identities_in_one_file() {
     }
     source.push_str("def run(x): return x.ping()\n");
     let r = resolve(&[("a.py", &source)]);
-    assert_eq!(
-        calls_from(&r, "a.py::run").len(),
-        devmap_resolve::model::AMBIGUOUS_FANOUT_CAP
+    assert!(
+        calls_from(&r, "a.py::run").is_empty(),
+        "untyped x.ping must not emit AmbiguousGlobal edges"
     );
-    for e in r
-        .edges
+
+    let mut files: Vec<(String, String)> = (0..40)
+        .map(|i| (format!("d{i}.py"), "def ping():\n return 1\n".to_string()))
+        .collect();
+    files.push(("c.py".into(), "def run():\n return ping()\n".into()));
+    let borrowed: Vec<(&str, &str)> = files
         .iter()
-        .filter(|e| e.source_symbol == "a.py::run" && e.edge_kind == EdgeKind::Calls)
-    {
-        assert!(
-            e.details.as_deref().is_some_and(|d| d.contains("40")),
-            "{e:?}"
-        );
-        let Some(Resolution::AmbiguousGlobal { candidates, .. }) = e.resolution.as_deref() else {
-            panic!("{e:?}")
-        };
-        assert_eq!(candidates.iter().collect::<BTreeSet<_>>().len(), 40);
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+    let above = resolve(&borrowed);
+    assert!(
+        calls_from(&above, "c.py::run").is_empty(),
+        "above-ceiling bare AmbiguousGlobal emits no edges"
+    );
+    let entry = above
+        .unresolved
+        .iter()
+        .find(|u| u.callee_name == "ping")
+        .expect("ledger row");
+    match &entry.resolution {
+        Resolution::AmbiguousGlobal { candidates, .. } => {
+            assert_eq!(candidates.len(), 40);
+        }
+        other => panic!("expected AmbiguousGlobal on ledger, got {other:?}"),
     }
+    let _ = r;
 }
 
 #[test]

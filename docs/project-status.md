@@ -1,6 +1,6 @@
 # Project Status
 
-DevCouncil is under active development. Public commands and components are grouped by maturity to distinguish stable daily workflow surfaces from preview features and retired legacy subsystems.
+DevCouncil is **components and modules**. Public commands and components are grouped by maturity to distinguish stable daily workflow surfaces from preview features and retired legacy subsystems. Manvi wraps these modules into a harness; host apps such as GitPulse take only the components they need.
 
 Maturity labels:
 - **Stable**: Production-ready for daily development, verified by deterministic tests and golden fixtures.

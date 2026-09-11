@@ -816,6 +816,12 @@ pub(crate) fn dispatch(
                 "source_freshness": status.source_freshness,
                 "analyzer_freshness": status.analyzer_freshness,
                 "degraded_reason": daemon_degraded_reason(&status, unapplied),
+                "delta": status.source_delta.as_ref().map(|delta| json!({
+                    "added": delta.added,
+                    "changed": delta.changed,
+                    "removed": delta.removed,
+                    "sample_paths": delta.sample_paths,
+                })),
                 "quarantined_count": status.quarantined_count,
                 // The paths behind the three numbers `degraded_reason` states.
                 // Without them "1 refused by discovery" is a fact an operator
@@ -827,13 +833,9 @@ pub(crate) fn dispatch(
                 "edge_resolution_source": store
                     .latest_edge_resolution_source()?
                     .map(|source| source.label()),
-                // The read-side half of the honesty invariant: stored edges
-                // whose confidence contradicts their stored kind. Counted when
-                // the generation's index is built, which this process keeps,
-                // so the answer is free here; `null` with no generation.
-                "edge_confidence_mismatches": store
-                    .generation_edges()?
-                    .map(|index| index.confidence_mismatches()),
+                // One owner with the CLI: SQL over stored edges, never the
+                // in-memory index's divergent recount. `null` with no generation.
+                "edge_confidence_mismatches": store.edge_confidence_mismatches()?,
             }))
         }
         IpcCommand::Search {
@@ -3074,5 +3076,85 @@ mod hardening_limit_tests {
             Duration::from_secs(1),
             "the curve must saturate, not overflow"
         );
+    }
+
+    /// IPC Status must use `Store::edge_confidence_mismatches` (SQL), agreeing
+    /// with the CLI surface that reads the same owner — never an in-memory
+    /// `index.confidence_mismatches()` recount that can diverge after a tamper.
+    #[test]
+    fn ipc_status_edge_confidence_mismatches_matches_sql_owner() {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-ipc-confidence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.py"), "def helper():\n    return 42\n").unwrap();
+        std::fs::write(
+            root.join("app.py"),
+            "from lib import helper\n\n\ndef main():\n    return helper()\n",
+        )
+        .unwrap();
+        let lib = devmap_extract::extract_file(
+            "lib.py",
+            &std::fs::read_to_string(root.join("lib.py")).unwrap(),
+        );
+        let app = devmap_extract::extract_file(
+            "app.py",
+            &std::fs::read_to_string(root.join("app.py")).unwrap(),
+        );
+        let extractions = vec![lib, app];
+        let mut resolver = devmap_resolve::Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions);
+        let analysis = devmap_analyze::analyze(&extractions, &resolution);
+        let db = root.join("index.sqlite");
+        let store = Store::open(&db).unwrap();
+        store
+            .save_generation_with_opts(
+                &extractions,
+                &resolution,
+                &analysis,
+                devmap_store::GenerationWriteOpts {
+                    repo_root: Some(root.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let changed = {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute(
+                "UPDATE edge_rows SET confidence = 0.2
+                 WHERE valid_to IS NULL
+                   AND edge_kind = 'Calls'
+                   AND resolution IN ('ImportScoped', 'SameFile', 'UniqueGlobal', 'ReceiverType')",
+                [],
+            )
+            .unwrap()
+        };
+        assert!(changed >= 1, "fixture must hold a resolved Calls edge");
+        let sql = store.edge_confidence_mismatches().unwrap();
+        assert_eq!(sql, Some(changed as usize));
+        let ipc = dispatch(
+            &store,
+            IpcRequest {
+                version: PROTOCOL_VERSION,
+                command: IpcCommand::Status,
+            },
+            &devmap_query::Cancel::new(),
+            &UnappliedEdits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            ipc["edge_confidence_mismatches"],
+            serde_json::json!(sql),
+            "IPC Status must report the SQL owner: {ipc}"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -103,6 +103,13 @@ async fn concurrent_requests_never_interleave_or_lose_an_id() {
             panic!("a response line was not valid JSON ({err}); writes interleaved: {line}")
         });
         assert_eq!(frame["jsonrpc"], "2.0");
+        if frame.get("id").is_none() || frame["id"].is_null() {
+            assert_eq!(
+                frame["method"], "notifications/tools/list_changed",
+                "the only id-less frame this server writes is tools/list_changed: {frame}"
+            );
+            continue;
+        }
         let id = frame["id"]
             .as_u64()
             .unwrap_or_else(|| panic!("response carried no numeric id: {frame}"));

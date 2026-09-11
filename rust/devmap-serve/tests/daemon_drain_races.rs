@@ -409,3 +409,41 @@ fn an_empty_commit_restamps_head_without_rewriting_the_generation() {
     ));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A pending path whose bytes still match the indexed generation must restamp
+/// (or clear the claim) without paying for resolve/analyze or a new generation —
+/// the CLI warm path's identical-tree skip, on the daemon drain.
+#[test]
+fn identical_file_bytes_skip_a_new_generation() {
+    let (root, daemon, reader) = repo_with_one_generation("identical-bytes");
+    let generation = reader.latest_generation_id().unwrap();
+    let head = head_of(&root);
+    let paths_before = generation_paths(&reader);
+
+    // Same content, new mtime — the watcher would enqueue this.
+    std::fs::write(root.join("src/a.py"), "def a():\n    return 1\n").unwrap();
+    reader
+        .enqueue_pending_paths_under_root(&root, &["src/a.py".to_string()])
+        .unwrap();
+    assert_eq!(daemon.drain_pending_batch().unwrap(), 1);
+
+    assert_eq!(
+        reader.latest_generation_id().unwrap(),
+        generation,
+        "identical bytes must not open a new generation"
+    );
+    assert_eq!(generation_paths(&reader), paths_before);
+    assert_eq!(
+        reader.latest_generation_head_sha().unwrap().as_deref(),
+        Some(head.as_str())
+    );
+    assert_eq!(
+        reader.status("test").unwrap().pending_count,
+        0,
+        "the claimed path must be cleared"
+    );
+    assert!(devmap_serve::index_is_fresh(
+        &reader.status("test").unwrap()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -18,8 +18,12 @@ From a clone of this repository:
 # macOS and Linux: builds Go host and all analysis components into ~/.local/bin
 bash scripts/install.sh
 
+# Standalone DevMap (no Go host)
+bash scripts/install.sh --only=devmap
+
 # Windows (PowerShell):
 .\scripts\install.ps1
+.\scripts\install.ps1 -Components devmap
 ```
 
 To build and install the analysis components independently:

@@ -119,3 +119,41 @@ func TestLinkCountUsesOpenHandleAndRejectsEarlyTruncation(t *testing.T) {
 		t.Fatalf("link count %d: %v", links, err)
 	}
 }
+
+func TestWriteAtomicRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "note.txt")
+	if err := WriteAtomic(path, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "first" {
+		t.Fatalf("first write: %q %v", got, err)
+	}
+	if err := WriteAtomic(path, []byte("second"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(path)
+	if err != nil || string(got) != "second" {
+		t.Fatalf("replace: %q %v", got, err)
+	}
+}
+
+func TestWriteAtomicLeavesNoTemp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out")
+	if err := WriteAtomic(path, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, ".safefile-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("left temp: %v", matches)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "payload" {
+		t.Fatalf("got %q %v", got, err)
+	}
+}

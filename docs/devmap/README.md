@@ -26,7 +26,7 @@ what did that edit just do.
 devmap build --manifest # index this worktree and export its repository map
 devmap explore handler  # the whole neighbourhood of a symbol, in one call
 devmap affected src/api.py   # the tests a change here reaches
-devmap dead                  # dead-symbol candidates, each with its confidence
+devmap dead                  # confident vs unconfirmed dead candidates (not one flat list)
 ```
 
 ## Why not grep
@@ -38,8 +38,10 @@ Every answer carries what it could not see. A budgeted list reports
 `shown`/`hidden`/`total` and whether it was truncated. A walk stopped by its
 depth cap sets `walk_incomplete`. An edge carries the evidence tier it was
 resolved on, so a speculative match never reads like a certain one. A dead-code
-verdict is `extracted` (parsed, certain) or `inferred` (unconfirmed), never a
-flat list.
+verdict is confident (parsed, no inbound evidence) or unconfirmed
+(`only_ambiguous_callers`, unresolved namesake, or coverage-capped) — never a
+flat delete list. `NoNamesake` sites are explained gaps in the unresolved
+ledger, not dead findings.
 
 This is the whole design constraint: **a check that could not run must never
 report the same result as a check that ran and passed.** An agent acting on
@@ -50,8 +52,16 @@ report the same result as a check that ran and passed.** An agent acting on
 freshness. Status reports nullable `source_freshness` and `analyzer_freshness`
 independently: a parser-free reader can verify source bytes while leaving
 analyzer compatibility unverified. Both must pass for overall `is_fresh`.
-Query envelopes use `source_freshness: null` when that whole-tree check was
-not performed; changed source snippets are withheld with a reason.
+Query envelopes carry a `source_freshness` object: `fresh` is `true`/`false`
+when verified against the working tree, or `null` with a `reason` when that
+whole-tree check was not performed; changed source snippets are withheld with
+a reason.
+
+Calls with an explicit receiver no longer fall through to bare-name
+`AmbiguousGlobal` fan-out; external/std receivers classify as explained gaps
+instead of edges to every same-named method. `edge_confidence_mismatches` has
+one owner (`Store::edge_confidence_mismatches`); CLI and IPC status both read
+it.
 
 Marker inventories publish their source, examined and total path counts,
 completeness, and error counts beside bounded error samples. Git discovery
@@ -227,7 +237,7 @@ diagnostics with the panel state and its existing rotating logs.
 | `devmap trace <a> <b>` | A path between two symbols |
 | `devmap neighbors <targets…>` | Callers and callees for several targets at once |
 | `devmap affected <targets…>` | Test files the change reaches, nearest first |
-| `devmap dead` | Dead-symbol candidates, each carrying its own confidence |
+| `devmap dead` | Dead-symbol candidates: confident vs unconfirmed, each with reason |
 | `devmap clones` | Duplicated and structurally similar bodies |
 | `devmap preview --file f --content -` | What an *unsaved* edit would break |
 | `devmap savings` | What the index cost against reading the files |

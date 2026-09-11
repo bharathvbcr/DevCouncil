@@ -191,7 +191,10 @@ fn validate_relative(root: &Path, relative: &str) -> anyhow::Result<PathBuf> {
         bail!("Invalid skill destination: {relative:?}");
     }
     let parts: Vec<&str> = relative.split('/').collect();
-    if parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+    if parts
+        .iter()
+        .any(|p| p.is_empty() || *p == "." || *p == "..")
+    {
         bail!("Invalid skill destination: {relative:?}");
     }
     let mut path = root.to_path_buf();

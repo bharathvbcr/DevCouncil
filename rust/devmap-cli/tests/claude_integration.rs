@@ -69,62 +69,51 @@ fn devmap(args: &[&str]) -> Run {
 // What is emitted
 // ---------------------------------------------------------------------------
 
-/// Every emitted handler must be exec form, anchored to the project root, and
-/// naming a subcommand this binary registers.
-///
-/// Shell form would re-tokenize `${CLAUDE_PROJECT_DIR}` through `sh -c`, so a
-/// checkout under a path with a space becomes two arguments; an unanchored
-/// invocation resolves against Claude's current directory, which after a `cd` or
-/// a worktree entry is not the repository the index describes.
-///
-/// The anchor is `--root`, not `--db`: naming a store freezes the state layout
-/// as it stood when the hook was written, while a root is resolved through the
-/// same discovery every other invocation uses.
+/// Every emitted handler must be shell-form, absolute-path, and name
+/// `devmap hook <event>`. No `args`/`async`/`${CLAUDE_PROJECT_DIR}` — Cursor
+/// drops args (bare `devmap` exits 2 and blocks), Codex ignores async.
 #[test]
-fn emitted_hooks_are_exec_form_anchored_to_the_project_root() {
+fn emitted_hooks_are_shell_form_absolute_hook_commands() {
     let block = devmap(&["--json", "claude", "hooks"]).ok().json();
     let hooks = block["hooks"].as_object().expect("hooks object");
     assert!(!hooks.is_empty(), "no hooks emitted at all");
 
-    let help = devmap(&["--help"]);
     for (event, groups) in hooks {
         for group in groups.as_array().expect("groups array") {
             for handler in group["hooks"].as_array().expect("handlers array") {
                 assert_eq!(handler["type"], "command", "{event}");
+                assert!(
+                    handler.get("args").is_none(),
+                    "{event}: args must not be emitted: {handler}"
+                );
+                assert!(
+                    handler.get("async").is_none(),
+                    "{event}: async must not be emitted: {handler}"
+                );
                 let command = handler["command"].as_str().expect("command string");
                 assert!(
-                    Path::new(command).is_absolute(),
-                    "{event}: `command` must be this binary's absolute path, not a bare \
-                     name a host may not have on PATH: {command}"
-                );
-                let args: Vec<&str> = handler["args"]
-                    .as_array()
-                    .unwrap_or_else(|| panic!("{event}: exec form requires `args`"))
-                    .iter()
-                    .map(|a| a.as_str().expect("string arg"))
-                    .collect();
-                assert_eq!(
-                    args[0], "--root",
-                    "{event}: a hook must anchor to the project root rather than name a \
-                     store path: {args:?}"
-                );
-                assert_eq!(
-                    args[1], "${CLAUDE_PROJECT_DIR}",
-                    "{event}: the root must be the host's project placeholder, got {:?}",
-                    args[1]
+                    command.contains(" hook "),
+                    "{event}: shell-form must invoke `hook`: {command}"
                 );
                 assert!(
-                    !args.contains(&"--db"),
-                    "{event}: a baked store path fixes the state layout at the moment the \
-                     hook was written: {args:?}"
+                    !command.contains("${CLAUDE_PROJECT_DIR}"),
+                    "{event}: placeholder must not appear; discovery is inside hook: {command}"
                 );
-                // The subcommand is the parser's, checked against the parser.
+                // Leading quoted absolute path.
+                let trimmed = command.trim_start_matches('"');
+                let path_end = trimmed.find('"').unwrap_or(0);
+                let path = &trimmed[..path_end];
                 assert!(
-                    help.stdout.contains(args[2]),
-                    "{event}: `devmap {}` is not in this binary's help output, so the hook \
-                     would fail on every fire",
-                    args[2]
+                    Path::new(path).is_absolute(),
+                    "{event}: command must start with an absolute path: {command}"
                 );
+                if event == "SessionEnd" {
+                    let timeout = handler["timeout"].as_u64().expect("SessionEnd timeout");
+                    assert!(
+                        timeout <= 3,
+                        "{event}: SessionEnd timeout must be ≤ 3: {timeout}"
+                    );
+                }
             }
         }
     }
@@ -181,28 +170,40 @@ fn no_emitted_hook_sits_on_an_event_that_can_decide_a_permission() {
     }
 }
 
-/// The async refresh hook carries no `timeout`, because the field is documented
-/// as unenforced there — writing one would state a bound that never applies.
+/// Detached work lives inside `devmap hook`; emitted handlers must not claim
+/// `async` (Cursor/Codex do not honour it).
 #[test]
-fn the_async_refresh_hook_states_no_timeout_it_cannot_hold() {
+fn emitted_hooks_carry_no_async_field() {
     let block = devmap(&["--json", "claude", "hooks"]).ok().json();
-    let mut saw_async = false;
     for groups in block["hooks"].as_object().unwrap().values() {
         for group in groups.as_array().unwrap() {
             for handler in group["hooks"].as_array().unwrap() {
-                if handler.get("async").and_then(Value::as_bool) == Some(true) {
-                    saw_async = true;
-                    assert!(
-                        handler.get("timeout").is_none(),
-                        "an async hook's timeout is never enforced: {handler}"
-                    );
-                }
+                assert!(
+                    handler.get("async").is_none(),
+                    "async must not be emitted: {handler}"
+                );
             }
         }
     }
-    assert!(
-        saw_async,
-        "the index refresh must run detached, or it holds the agent's tool loop"
+    let refused = Command::new(DEVMAP)
+        .args(["claude", "validate"])
+        .arg({
+            let dir = scratch("args-refuse");
+            let path = dir.join("hooks.json");
+            std::fs::write(
+                &path,
+                r#"{"hooks":{"PostToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"/x hook post-tool-use","args":["x"]}]}]}}"#,
+            )
+            .unwrap();
+            path
+        })
+        .output()
+        .unwrap();
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "validate must refuse args: {}",
+        String::from_utf8_lossy(&refused.stderr)
     );
 }
 
@@ -296,25 +297,27 @@ fn emitted_hooks_include_session_end_report() {
     let end = block["hooks"]["SessionEnd"]
         .as_array()
         .expect("SessionEnd group");
-    let args = end[0]["hooks"][0]["args"]
-        .as_array()
-        .expect("args")
-        .iter()
-        .map(|a| a.as_str().unwrap())
-        .collect::<Vec<_>>();
+    let command = end[0]["hooks"][0]["command"].as_str().expect("command");
     assert!(
-        args.contains(&"session-report"),
-        "SessionEnd must run session-report: {args:?}"
+        command.contains("hook session-end"),
+        "SessionEnd must run hook session-end: {command}"
     );
     let start = block["hooks"]["SessionStart"]
         .as_array()
         .expect("SessionStart groups");
-    assert_eq!(start.len(), 1, "one matcher group, two handlers: {start:?}");
+    assert_eq!(start.len(), 1, "one matcher group: {start:?}");
     let start_handlers = start[0]["hooks"].as_array().expect("handlers");
     assert_eq!(
         start_handlers.len(),
-        2,
-        "SessionStart must inject status and last-session insights: {start_handlers:?}"
+        1,
+        "SessionStart consolidates into one hook session-start: {start_handlers:?}"
+    );
+    assert!(
+        start_handlers[0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("hook session-start"),
+        "{start_handlers:?}"
     );
 }
 
@@ -381,7 +384,7 @@ fn the_bundle_is_written_atomically_and_re_running_changes_nothing() {
         .iter()
         .filter(|f| f["path"].as_str().unwrap().ends_with("SKILL.md"))
         .collect();
-    assert_eq!(json_files.len(), 4, "json files: {first}");
+    assert_eq!(json_files.len(), 6, "json files: {first}");
     assert_eq!(
         skill_files.len(),
         5,

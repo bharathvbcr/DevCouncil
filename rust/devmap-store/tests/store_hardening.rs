@@ -846,6 +846,18 @@ fn build_history_separates_confident_ambiguous_and_unmeasured_values() {
             exemption_reason: Some("only_ambiguous_callers".into()),
         },
         DeadSymbolReport {
+            symbol_name: "namesake".into(),
+            file_path: "src/live.py".into(),
+            confidence: 0.4,
+            is_exempt: false,
+            exemption_reason: Some(
+                "an unresolved call site names this symbol — the resolver could not bind that site to \
+                 anything, so \"nothing calls this\" is a statement about the resolver, not the code \
+                 (matched by name across the whole corpus; the ledger records no target file)"
+                    .into(),
+            ),
+        },
+        DeadSymbolReport {
             symbol_name: "exempt".into(),
             file_path: "src/live.py".into(),
             confidence: 0.3,
@@ -872,7 +884,10 @@ fn build_history_separates_confident_ambiguous_and_unmeasured_values() {
     assert_eq!(row.parse_failed, 1);
     assert_eq!(row.languages_covered, 2);
     assert_eq!(row.dead_confident, 1);
-    assert_eq!(row.dead_ambiguous, 1);
+    assert_eq!(
+        row.dead_ambiguous, 2,
+        "both only_ambiguous_callers and unresolved-namesake 0.4 rows are dead_ambiguous"
+    );
     assert_eq!(
         row.build_ms, None,
         "unmeasured time must remain unavailable"

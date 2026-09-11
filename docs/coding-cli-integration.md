@@ -1,6 +1,6 @@
 # Coding CLI Integration
 
-DevCouncil integrates with leading coding agents and IDEs, providing task scoping, mutual-exclusion leases, write-containment hooks, and deterministic verification.
+DevCouncil's components integrate with leading coding agents and IDEs: task scoping, mutual-exclusion leases, write-containment hooks, and deterministic verification. A host can take this integration alone, wrap the same modules through Manvi, or select individual binaries (`devmap`, `dcverify`, `dcstore`) without the rest of the suite.
 
 ---
 
@@ -111,5 +111,5 @@ Coding agents interact with DevCouncil in two primary ways:
 1. **The Autonomous MCP Loop (Hero Loop):**  
    The agent checks out a task, performs edits, calls `devcouncil_verify_task`, and repairs any issues until the gates pass. See [Hero Loop](hero-loop.md).
 
-2. **Upstream Autonomous Harness (Manvi):**  
-   When running end-to-end multi-agent campaigns, **Manvi** acts as the driving harness, managing LLM provider routing and agent personas while using DevCouncil for leases, write containment, and verification.
+2. **Manvi (wraps the components):**  
+   When running end-to-end multi-agent campaigns, **Manvi** wraps DevCouncil's components: it owns LLM provider routing and agent personas, and it reaches leases, write containment, and verification across the process boundary. GitPulse uses that wrap for policy and workbench, and selected DevCouncil modules directly for code intelligence.

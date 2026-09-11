@@ -12,6 +12,104 @@ import (
 	"testing"
 )
 
+func TestDispatchInstallHelp(t *testing.T) {
+	stdout, restoreOut := swapStdout(t)
+	stderr, restoreErr := swapStderr(t)
+	code := dispatch([]string{"install", "--help"})
+	restoreErr()
+	restoreOut()
+	if code != 0 {
+		t.Fatalf("exit %d stderr=%s", code, stderr.String())
+	}
+	got := stdout.String() + stderr.String()
+	if !strings.Contains(got, "devmap") || !strings.Contains(got, "--list") {
+		t.Fatalf("help = %q", got)
+	}
+}
+
+func TestDispatchUninstallWithoutNamesRefuses(t *testing.T) {
+	prefix := t.TempDir()
+	stderr, restore := swapStderr(t)
+	code := dispatch([]string{"uninstall", "--yes", "--prefix", prefix})
+	restore()
+	if code != 2 {
+		t.Fatalf("empty uninstall exit %d want 2 stderr=%s", code, stderr.String())
+	}
+}
+
+func TestDispatchUninstallMixesAllWithNames(t *testing.T) {
+	prefix := t.TempDir()
+	stderr, restore := swapStderr(t)
+	code := dispatch([]string{"uninstall", "--all", "dcgrep", "--yes", "--prefix", prefix})
+	restore()
+	if code != 2 {
+		t.Fatalf("mixed --all exit %d want 2 stderr=%s", code, stderr.String())
+	}
+}
+
+func TestDispatchUninstallAllRequiresYes(t *testing.T) {
+	prefix := t.TempDir()
+	stderr, restore := swapStderr(t)
+	code := dispatch([]string{"uninstall", "--all", "--prefix", prefix})
+	restore()
+	if code != 2 {
+		t.Fatalf("uninstall --all without --yes exit %d want 2 stderr=%s", code, stderr.String())
+	}
+}
+
+func TestDispatchInstallPrefixEquals(t *testing.T) {
+	stdout, restoreOut := swapStdout(t)
+	stderr, restoreErr := swapStderr(t)
+	code := dispatch([]string{"install", "--list", "--json", "--prefix=/does/not/matter"})
+	restoreOut()
+	restoreErr()
+	if code != 0 {
+		t.Fatalf("exit %d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"id": "devmap"`) {
+		t.Fatalf("stdout=%s", stdout.String())
+	}
+}
+
+func TestDispatchInstallUnknownComponent(t *testing.T) {
+	stderr, restore := swapStderr(t)
+	code := dispatch([]string{"install", "uv"})
+	restore()
+	if code != 2 {
+		t.Fatalf("exit %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "unknown") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestDispatchGateStatusDefaultsOff(t *testing.T) {
+	root := t.TempDir()
+	stdout, restoreOut := swapStdout(t)
+	stderr, restoreErr := swapStderr(t)
+	code := dispatch([]string{"gate", "status", "--json", "--project-root", root})
+	restoreErr()
+	restoreOut()
+	if code != 0 {
+		t.Fatalf("exit %d stderr=%s stdout=%s", code, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), `"verification_mode": "off"`) {
+		t.Fatalf("stdout=%s", stdout.String())
+	}
+}
+
+func TestDispatchGateHelp(t *testing.T) {
+	stderr, restore := swapStderr(t)
+	code := dispatch([]string{"gate", "--help"})
+	restore()
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(stderr.String(), "advisory") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
 func TestUnknownCommandExit2(t *testing.T) {
 	for _, name := range []string{"hook", "boot", "status", "init", "doctor"} {
 		t.Run(name, func(t *testing.T) {

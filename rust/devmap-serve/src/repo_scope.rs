@@ -83,24 +83,15 @@ pub fn canonicalize_path(path: &Path) -> PathBuf {
 pub fn open_mcp_store(path: &Path) -> Result<Store, String> {
     match Store::open_read_only(path) {
         Ok(store) => Ok(store),
-        Err(err) => {
-            let text = err.to_string();
-            if text.contains("schema")
-                || text.contains("user_version")
-                || text.contains("migrate")
-            {
-                Err(format!(
-                    "rebuild_required: the DevMap store at {} is not this binary's schema and \
-will not be migrated in-place. Run `devmap build` in that repository. {text}",
-                    path.display()
-                ))
-            } else {
-                Err(format!(
-                    "devmap index at {} could not be opened: {err}",
-                    path.display()
-                ))
-            }
-        }
+        Err(err) if Store::is_unsupported_schema(&err) => Err(format!(
+            "rebuild_required: the DevMap store at {} is not this binary's schema and \
+will not be migrated in-place. Run `devmap build` in that repository. {err}",
+            path.display()
+        )),
+        Err(err) => Err(format!(
+            "devmap index at {} could not be opened: {err}",
+            path.display()
+        )),
     }
 }
 

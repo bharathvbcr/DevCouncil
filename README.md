@@ -1,4 +1,4 @@
-# DevCouncil: Gated AI Development & Code Intelligence
+# DevCouncil: Components and Modules for AI Development
 
 [![Website](https://img.shields.io/badge/website-devcouncil.vbcr.dev-10B981?style=flat&logo=safari&logoColor=white)](https://devcouncil.vbcr.dev/)
 [![CI](https://github.com/bharathvbcr/DevCouncil/actions/workflows/ci.yml/badge.svg)](https://github.com/bharathvbcr/DevCouncil/actions/workflows/ci.yml)
@@ -12,15 +12,15 @@
 > **"DevCouncil should not merely generate code. It should make AI-generated work prove that it satisfied the original intent."**  
 > *Evidence, not model confidence, is the final authority.*
 
-DevCouncil is a high-integrity orchestration platform and native analysis engine for AI-assisted software development. It transforms AI code generation from an unverified black-box loop into a gated, deterministic engineering workflow where changes are scoped, checked against mutual-exclusion leases, verified with rigor gates, and backed by a deep code intelligence graph.
+DevCouncil is **components and modules** for AI-assisted software development. It ships independently installable binaries and libraries — code intelligence (`devmap`), task and lease state (`dcstore`), deterministic verification (`dcverify`), ignore-aware search (`dcgrep`), and a Go host (`devcouncil` / `dev`) — so a harness or an app can take only the pieces it needs and update them one at a time.
 
-DevCouncil does not replace coding agents. It works natively beside Claude Code, Codex, Cursor, Google Antigravity, OpenCode, Warp, and Aider, owning the task scope, write policy, verification loop, and evidence trail.
+**Manvi wraps these components** into a coding-agent harness (turn loop, providers, policy, TUI, `manvi serve`). **GitPulse** uses Manvi for policy, workbench, and agent hosting, and DevCouncil components for code intelligence and related analysis. DevCouncil does not replace coding agents; it sits beside Claude Code, Codex, Cursor, and others as selectable modules.
 
 ---
 
 ## Architecture & Components
 
-DevCouncil's core runtime consists of standalone, compiled native binaries designed to sit on `PATH` or be spawned by agent harnesses:
+DevCouncil's core runtime is a set of standalone, compiled native modules. Each binary is useful on its own, sits on `PATH`, and can be spawned or linked by a host that wants that one job:
 
 | Binary | Language | Role & Ownership |
 |--------|----------|------------------|
@@ -30,10 +30,11 @@ DevCouncil's core runtime consists of standalone, compiled native binaries desig
 | `dcverify` | **Rust** | Deterministic verification: Unified-diff parsing, planned file scope classification, anti-laziness/stub gates, test coverage evaluation, and typed `next_actions` repair signals. |
 | `dcgrep` | **Rust** | Code search: Ripgrep-powered ignore-aware search engine with optional trigram indexing (`tgrep-core`). |
 
-### Upstream Wrappers & Ecosystem
+### How hosts consume the modules
 
-- **Manvi**: Agent harness, LLM provider routing, and TUI. Manvi imports the Go orchestrator module and spawns the native analysis binaries.
-- **GitPulse**: IDE mediation vendoring DevMap crates.
+- **Manvi** wraps the components: it drives the agent loop, provider routing, policy ladder, and TUI, and reaches each binary over JSON on stdio. A host that wants a harness embeds Manvi rather than reimplementing it.
+- **GitPulse** uses both for their respective jobs: Manvi (`manvi serve`) for policy, workbench, and agent hosting; selected DevCouncil crates and the `devmap` CLI for in-process code intelligence. It does not have to take every module.
+- **Other apps** pick the same way — `devmap` alone, `dcverify` alone, the Go host MCP, or the full set. Updating one module does not require shipping the rest.
 
 > [!NOTE]
 > DevCouncil is built entirely as native compiled Go and Rust binaries; legacy Python orchestration has been retired (see [docs/PHASE7_LONG_TAIL.md](docs/PHASE7_LONG_TAIL.md)).
@@ -52,8 +53,15 @@ From a clone of this repository:
 # macOS & Linux: builds Go host and all Rust analysis binaries into ~/.local/bin
 bash scripts/install.sh
 
+# Standalone DevMap (no Go host)
+bash scripts/install.sh --only=devmap
+
+# Analysis suite only (devmap dcstore dcverify dcgrep)
+bash scripts/install.sh analysis
+
 # Windows (PowerShell):
 .\scripts\install.ps1
+.\scripts\install.ps1 -Components devmap
 ```
 
 To build and install the analysis components (`devmap`, `dcstore`, `dcverify`, `dcgrep`):
@@ -194,13 +202,14 @@ DevCouncil provides two complementary Model Context Protocol (MCP) servers:
 
 ```mermaid
 flowchart TD
-    subgraph Agents["Coding Agents & IDEs"]
+    subgraph Agents["Harnesses, hosts, and coding agents"]
         Claude["Claude Code"]
         Cursor["Cursor"]
         Codex["Codex"]
         AGY["Antigravity"]
         Warp["Warp"]
-        Manvi["Manvi Harness"]
+        Manvi["Manvi (wraps these components)"]
+        GitPulse["GitPulse (selects modules)"]
     end
 
     subgraph Host["Go Host Orchestrator (devcouncil / dev)"]
@@ -220,8 +229,10 @@ flowchart TD
 
     Agents <-->|MCP Protocol| MCP
     Agents <-->|Direct / Tool Calls| CLI
-    Manvi -->|Imports & Spawns| Host
-    Manvi -->|Spawns| RustAnalysis
+    Manvi -->|Wraps: imports Go, spawns binaries| Host
+    Manvi -->|Spawns selected modules| RustAnalysis
+    GitPulse -->|Vendors selected crates| DevMap
+    GitPulse -->|manvi serve| Manvi
 
     CLI -->|Execs| DevMap
     CLI -->|Integrates| Integ

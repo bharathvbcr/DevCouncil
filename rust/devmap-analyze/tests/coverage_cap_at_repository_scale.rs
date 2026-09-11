@@ -340,6 +340,24 @@ fn a_symbol_in_a_call_blind_file_is_capped_by_its_own_file_not_the_corpus() {
     );
 }
 
+/// Force a Python extraction into the pattern-recovered hole state.
+///
+/// Language-scoped capping only demotes findings a hole can reach. An HCL
+/// call-blind file cannot reference Python, so repository-scale graded-ceiling
+/// fixtures use a same-language recovery instead of `call_blind_file`.
+fn python_pattern_hole(path: &str) -> Extraction {
+    let mut ext = extract_file(path, "def never_seen():\n    return 0\n");
+    ext.parse_outcome = ParseOutcome::Fallback {
+        reason: "forced pattern recovery for graded-ceiling fixture".to_string(),
+    };
+    ext.engine = ExtractionEngine::RegexFallback {
+        requested_language: "python".to_string(),
+    };
+    ext.imports.clear();
+    ext.calls.clear();
+    ext
+}
+
 /// The other direction, in one corpus: a finding whose own file was read takes
 /// the corpus ceiling, and a finding whose file was not takes the floor. The
 /// two must not be the same number, or the local rule is decorative.
@@ -347,12 +365,17 @@ fn a_symbol_in_a_call_blind_file_is_capped_by_its_own_file_not_the_corpus() {
 fn one_corpus_prices_a_readable_file_and_a_blind_file_differently() {
     let mut extractions = q1_pair();
     extractions.push(call_blind_file("infra/main.tf"));
-    extractions.extend(filler(97));
+    // Same-language hole so the Python readable finding is corpus-capped; the
+    // HCL file still takes the call-blind floor for its own symbols.
+    extractions.push(python_pattern_hole("lost.py"));
+    extractions.extend(filler(96));
     // `helper` keeps its caller here, so the readable-file finding under test is
     // `dangling`, which nothing calls in any corpus.
 
     let (reports, coverage) = liveness(&extractions, DiscoveryCoverage::none());
     assert_eq!(coverage.call_blind_files, 1);
+    assert_eq!(coverage.pattern_recovered_files, 1);
+    assert!(!coverage.is_complete_for("python"));
 
     let readable = finding(&reports, "lib.py", "dangling").confidence;
     let blind = finding(&reports, "infra/main.tf", "module.unreferenced").confidence;
@@ -458,7 +481,10 @@ fn a_large_cluster_is_capped_only_when_the_corpus_has_a_hole() {
         let mut extractions = vec![extract_file("ring.py", &ring(12))];
         extractions.extend(filler(99));
         if blind {
-            extractions.push(call_blind_file("infra/main.tf"));
+            // Same-language hole: an HCL call-blind file cannot reference
+            // Python and must not demote a Python cluster under language
+            // scoping.
+            extractions.push(python_pattern_hole("lost.py"));
         }
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
@@ -509,7 +535,7 @@ fn a_large_cluster_is_capped_only_when_the_corpus_has_a_hole() {
 fn cluster_and_symbol_ceilings_read_the_same_corpus() {
     let mut extractions = vec![extract_file("ring.py", ABANDONED)];
     extractions.extend(filler(99));
-    extractions.push(call_blind_file("infra/main.tf"));
+    extractions.push(python_pattern_hole("lost.py"));
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
@@ -519,7 +545,7 @@ fn cluster_and_symbol_ceilings_read_the_same_corpus() {
 
     let summary = analyze(&extractions, &resolution);
     let coverage = ExtractionCoverage {
-        call_blind_files: 1,
+        pattern_recovered_files: 1,
         files_with_call_extraction: 100,
         ..ExtractionCoverage::default()
     };

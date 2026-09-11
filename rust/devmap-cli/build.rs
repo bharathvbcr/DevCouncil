@@ -11,8 +11,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let repo = Path::new(&manifest).join("../..");
-    println!("cargo:rerun-if-changed={}", repo.join(".git/HEAD").display());
-    println!("cargo:rerun-if-changed={}", repo.join(".git/index").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        repo.join(".git/HEAD").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        repo.join(".git/index").display()
+    );
 
     let git_hash = git_output(&repo, &["rev-parse", "--short=12", "HEAD"])
         .unwrap_or_else(|| "unknown".to_string());

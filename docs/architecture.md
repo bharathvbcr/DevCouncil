@@ -1,18 +1,18 @@
 # DevCouncil Architecture
 
-DevCouncil is a high-integrity orchestration platform and native analysis engine for AI-assisted software development. It provides the deterministic substrate that makes AI-generated work verifiable, scoped, and traceable back to requirements.
+DevCouncil is **components and modules** for AI-assisted software development. It provides the deterministic substrate — code intelligence, leases, verification, search — that makes AI-generated work verifiable, scoped, and traceable back to requirements. Manvi wraps those modules into a harness; host apps such as GitPulse take Manvi and selected DevCouncil components for their respective jobs.
 
 ---
 
 ## 1. System Architecture
 
-DevCouncil is built on a decoupled, native binary architecture. Rather than linking large runtimes together via complex FFI or Python bindings, components communicate across clean process and protocol boundaries:
+DevCouncil is built as independently installable native modules. Rather than linking large runtimes together via complex FFI or Python bindings, components communicate across process and protocol boundaries, and a host may also link a selected crate when that is the right seam:
 
 ```mermaid
 flowchart TD
-    subgraph Upstream["Agent Harnesses & IDEs"]
-        Manvi["Manvi (Agent Loop / LLM / TUI)"]
-        GitPulse["GitPulse (IDE Mediation)"]
+    subgraph Upstream["Harnesses and host apps"]
+        Manvi["Manvi (wraps the components)"]
+        GitPulse["GitPulse (selects Manvi + DevCouncil modules)"]
         ExternalAgents["Coding Agents (Claude Code, Cursor, Codex, Antigravity)"]
     end
 
@@ -41,9 +41,10 @@ Ripgrep Engine & Trigram Index"]
     end
 
     ExternalAgents <-->|MCP Protocol| HostMCP
-    Manvi -->|Imports Go Packages| Host
-    Manvi -->|Spawns Native Binaries| Analysis
-    GitPulse -->|Vendors Crates| DevMap
+    Manvi -->|Imports Go packages| Host
+    Manvi -->|Spawns selected binaries| Analysis
+    GitPulse -->|Vendors selected crates| DevMap
+    GitPulse -->|manvi serve| Manvi
 
     HostCLI -->|Execs| DevMap
     HostCLI -->|Integrates| HostInteg
@@ -94,18 +95,22 @@ Evaluates task diffs against strict engineering invariants:
 
 ---
 
-## 3. Separation of Concerns: DevCouncil vs. Manvi
+## 3. Separation of Concerns: DevCouncil vs. Manvi vs. GitPulse
 
-In Phase 7, DevCouncil consolidated on its core identity as the high-integrity verification and code intelligence substrate:
-- **DevCouncil Owns:**
-  - Standalone compiled binaries (`devcouncil`, `devmap`, `dcstore`, `dcverify`, `dcgrep`).
+DevCouncil is the **components and modules**. Manvi **wraps** them. GitPulse **selects** both for their respective jobs. Each module can be updated on its own, and an app is not required to take the whole suite.
+
+- **DevCouncil owns:**
+  - Standalone compiled binaries and libraries (`devcouncil`, `devmap`, `dcstore`, `dcverify`, `dcgrep`).
   - Code graph extraction, symbol resolution, and workspace navigation.
   - Task state, atomic leases, write containment policy, and deterministic verification gates.
   - MCP servers for agent tooling.
-- **Manvi Owns:**
-  - LLM provider routing (OpenRouter, Vertex AI, Ollama, etc.).
+- **Manvi wraps those modules and owns:**
+  - The agent turn loop, LLM provider routing, and policy ladder.
   - Prompt construction, agent personas, and debate councils.
-  - Multi-agent campaign coordination and Terminal User Interface (TUI).
+  - Multi-agent campaign coordination, TUI, and `manvi serve` for embedding.
+- **GitPulse uses:**
+  - Manvi for policy, workbench, and agent hosting.
+  - Selected DevCouncil components (`devmap` CLI and crates, verification reads) for code intelligence and related analysis.
 
 ---
 

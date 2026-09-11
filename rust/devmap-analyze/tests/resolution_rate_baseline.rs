@@ -34,10 +34,10 @@ use std::path::{Path, PathBuf};
 const TOLERANCE_PERMILLE: i64 = 10;
 
 fn workspace_root() -> PathBuf {
+    // `devmap-analyze` sits directly under the Cargo workspace root (`rust/`).
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .and_then(Path::parent)
-        .expect("crates/<crate> sits two levels under the workspace root")
+        .expect("package sits under the workspace root")
         .to_path_buf()
 }
 

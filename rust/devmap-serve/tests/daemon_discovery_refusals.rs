@@ -1,10 +1,16 @@
 //! The daemon must not undo the build path's honesty about refused files.
 //!
-//! `devmap build` counts what discovery refused — a source past the 1 MiB
-//! ceiling, one that cannot be read, one whose name is not UTF-8 — and folds it
-//! into the analysis, so `AnalysisStatus` comes back `Partial` and the
+//! `devmap build` counts what discovery refused — an escaping or dangling
+//! symlink, one that cannot be read, one whose name is not UTF-8 — and folds
+//! it into the analysis, so `AnalysisStatus` comes back `Partial` and the
 //! dead-code pass drops out of `extracted` confidence. The file never read may
 //! hold the only call to a symbol the report is about to call dead.
+//!
+//! Oversized sources are *not* in that set: `DiscoverySkipReason::Oversized`
+//! is an ordinary skip (the 1 MiB ceiling), pinned by
+//! `oversized_skip_is_not_a_coverage_refusal`. These fixtures therefore use an
+//! escaping symlink — the same refusal class `one_symlink_rule_end_to_end`
+//! holds the cold walk and the drain to.
 //!
 //! The daemon reaches the same tree through the same walker and discarded the
 //! answer:
@@ -25,7 +31,6 @@
 //! `Ok` after the very same drain.
 
 use devmap_analyze::model::AnalysisStatus;
-use devmap_extract::MAX_SOURCE_BYTES;
 use devmap_serve::Daemon;
 use devmap_store::Store;
 use std::path::{Path, PathBuf};
@@ -53,6 +58,28 @@ fn scratch(name: &str) -> PathBuf {
 /// holding the call goes unread, `helper` looks dead.
 const LIB: &str = "def helper():\n    return 1\n";
 const APP: &str = "from lib import helper\n\n\ndef main():\n    return helper()\n";
+
+/// Plant a source-shaped symlink whose target sits outside the repository.
+///
+/// Returns the outside directory so the caller can clean it up with the root.
+fn plant_escaping_source(root: &Path, link_name: &str) -> PathBuf {
+    let outside = root.with_file_name(format!(
+        "{}-outside",
+        root.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("outside")
+    ));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).unwrap();
+    let target = outside.join("secret.py");
+    std::fs::write(&target, "def secret():\n    return 0\n").unwrap();
+    let link = root.join(link_name);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+    outside
+}
 
 /// Make the stored payloads look like an older kernel wrote them, which is what
 /// installing a new kernel over an existing store does. The drain answers a
@@ -118,16 +145,13 @@ fn status_after_full_rebuild(root: &Path) -> AnalysisStatus {
 
 #[test]
 fn a_full_rebuild_that_refused_a_file_does_not_persist_a_clean_status() {
-    let root = scratch("oversized");
+    let root = scratch("escape");
     std::fs::write(root.join("lib.py"), LIB).unwrap();
     std::fs::write(root.join("app.py"), APP).unwrap();
-    // Past the 1 MiB ceiling, so discovery refuses it by size. Nothing here
-    // depends on file permissions, so it behaves the same when CI runs as root.
-    std::fs::write(
-        root.join("unreadable.py"),
-        vec![b'x'; (MAX_SOURCE_BYTES + 1) as usize],
-    )
-    .unwrap();
+    // Escaping symlink: a real discovery refusal (`EscapesRoot`), not an
+    // oversized skip. Nothing here depends on file permissions, so it behaves
+    // the same when CI runs as root.
+    let outside = plant_escaping_source(&root, "escape.py");
 
     let status = status_after_full_rebuild(&root);
 
@@ -150,6 +174,7 @@ fn a_full_rebuild_that_refused_a_file_does_not_persist_a_clean_status() {
     }
 
     let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 /// The OFF direction, over the identical drain.
@@ -232,11 +257,7 @@ fn an_incremental_resync_does_not_erase_a_recorded_refusal() {
     let root = scratch("incremental");
     std::fs::write(root.join("lib.py"), LIB).unwrap();
     std::fs::write(root.join("app.py"), APP).unwrap();
-    std::fs::write(
-        root.join("unreadable.py"),
-        vec![b'x'; (MAX_SOURCE_BYTES + 1) as usize],
-    )
-    .unwrap();
+    let outside = plant_escaping_source(&root, "escape.py");
     let db_path = root.join("index.sqlite");
 
     let reader = first_generation_with_a_refusal(&root, &db_path);
@@ -284,6 +305,7 @@ fn an_incremental_resync_does_not_erase_a_recorded_refusal() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 /// The OFF direction for the incremental branch.
@@ -291,7 +313,7 @@ fn an_incremental_resync_does_not_erase_a_recorded_refusal() {
 /// A resync of a corpus with nothing refused must still come back `Ok`.
 /// Carrying a status forward unconditionally would pin the first `Partial` a
 /// repository ever recorded to every generation after it, so the marker could
-/// never clear even once the oversized file was deleted.
+/// never clear even once the refused path was repaired.
 #[test]
 fn an_incremental_resync_of_a_clean_corpus_stays_clean() {
     let root = scratch("incremental-clean");

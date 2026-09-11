@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 // Target names what Uninstall removes.
@@ -218,15 +220,7 @@ func readBoundedFile(path string) ([]byte, error) {
 }
 
 func writeFileAtomic(path string, content []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, content, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return safefile.WriteAtomic(path, content, 0o644)
 }
 
 func joinTargets(targets []Target) string {

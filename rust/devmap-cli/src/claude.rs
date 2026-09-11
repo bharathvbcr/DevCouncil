@@ -227,8 +227,8 @@ fn enumerated_matcher_values(event: &str) -> Option<&'static [&'static str]> {
 /// `mcp_tool` handler on this event.
 ///
 /// 600 everywhere, lowered to 30 on `UserPromptSubmit`, `PreModelSwitch` and
-/// `PostModelSwitch`, and to 10 on `MessageDisplay`. `SessionEnd` hooks share a
-/// 1.5-second budget which a longer per-hook timeout raises, to at most 60.
+/// `PostModelSwitch`, and to 10 on `MessageDisplay`. `SessionEnd` is capped at
+/// [`SESSION_END_MAX_TIMEOUT_SECS`] for Cursor/Codex compatibility.
 pub fn default_timeout_secs(event: &str) -> u32 {
     match event {
         "UserPromptSubmit" | "PreModelSwitch" | "PostModelSwitch" => 30,
@@ -238,9 +238,10 @@ pub fn default_timeout_secs(event: &str) -> u32 {
     }
 }
 
-/// The only documented hard ceiling: `SessionEnd` raises its shared budget to
-/// match a longer per-hook timeout "up to 60 seconds".
-pub const SESSION_END_MAX_TIMEOUT_SECS: u32 = 60;
+/// The only documented hard ceiling for SessionEnd across hosts: Codex caps at
+/// 3 seconds, and Claude Code's plugin SessionEnd budget is tighter still. Emit
+/// and accept at most 3; longer values cannot be honored on either host.
+pub const SESSION_END_MAX_TIMEOUT_SECS: u32 = 3;
 
 /// Dev Map's own ceiling, not a documented one.
 ///
@@ -466,9 +467,8 @@ fn check_timeout(event: &str, at: &str, handler: &Map<String, Value>, out: &mut 
         out.push(Diagnostic::error(
             at,
             format!(
-                "SessionEnd hooks share a 1.5-second budget that a longer per-hook \
-                 `timeout` raises to at most {SESSION_END_MAX_TIMEOUT_SECS} seconds; \
-                 {secs} cannot be honored"
+                "SessionEnd timeout is at most {SESSION_END_MAX_TIMEOUT_SECS} seconds \
+                 (Codex max; Claude plugin budget is tighter); {secs} cannot be honored"
             ),
         ));
         return;
@@ -531,23 +531,24 @@ fn check_handler(event: &str, at: &str, handler: &Value, out: &mut Vec<Diagnosti
                 }
             }
             if kind == "command" {
-                if let Some(args) = handler.get("args") {
-                    match args.as_array() {
-                        None => out.push(Diagnostic::error(
-                            at,
-                            "`args` must be an array of strings (exec form)",
-                        )),
-                        Some(items) => {
-                            for (i, item) in items.iter().enumerate() {
-                                if !item.is_string() {
-                                    out.push(Diagnostic::error(
-                                        format!("{at}.args[{i}]"),
-                                        "every `args` element must be a string",
-                                    ));
-                                }
-                            }
-                        }
-                    }
+                // Cursor and Codex drop `args` and do not honour `async`. Emitting
+                // either produces a bare `devmap` (exit 2 = block) on Cursor, so
+                // both are refused here for every host we install into.
+                if handler.contains_key("args") {
+                    out.push(Diagnostic::error(
+                        at,
+                        "`args` is refused: Cursor and Codex run hooks as a shell-string \
+                         `command` only, and Cursor drops `args` so the hook becomes bare \
+                         `devmap` (exit 2 blocks the agent). Use shell-form \
+                         `\"<abs>\" hook <event>` instead",
+                    ));
+                }
+                if handler.contains_key("async") {
+                    out.push(Diagnostic::error(
+                        at,
+                        "`async` is refused: Cursor and Codex do not support it; \
+                         `devmap hook post-tool-use` / `session-end` detach the work themselves",
+                    ));
                 }
                 if let Some(shell) = handler.get("shell").and_then(Value::as_str) {
                     if !matches!(shell, "bash" | "powershell") {
@@ -555,10 +556,18 @@ fn check_handler(event: &str, at: &str, handler: &Value, out: &mut Vec<Diagnosti
                             at,
                             format!("`shell` accepts \"bash\" or \"powershell\", got {shell:?}"),
                         ));
-                    } else if handler.contains_key("args") {
-                        out.push(Diagnostic::warning(
+                    }
+                }
+                if let Some(command) = handler.get("command").and_then(Value::as_str) {
+                    let trimmed = command.trim();
+                    // A bare name with no path separator is the Cursor failure mode.
+                    if !trimmed.contains('/') && !trimmed.contains('\\') && !trimmed.contains(' ') {
+                        out.push(Diagnostic::error(
                             at,
-                            "`shell` is ignored when `args` is set — exec form spawns no shell",
+                            format!(
+                                "hook `command` {trimmed:?} is a bare name; Cursor/Codex need an \
+                                 absolute-path shell-form command (\"/path/to/devmap\" hook <event>)"
+                            ),
                         ));
                     }
                 }
@@ -1095,9 +1104,10 @@ const PLUGIN_HOMEPAGE: &str = "https://github.com/bharathvbcr/DevCouncil";
 const PLUGIN_REPOSITORY: &str = "https://github.com/bharathvbcr/DevCouncil.git";
 const PLUGIN_LICENSE: &str = "Apache-2.0";
 
-/// Resolved at hook time to the project root the session started in. A hook runs
-/// in Claude's current directory, which after `cd` or a worktree entry is not
-/// the repository the index belongs to.
+/// Legacy host placeholder. Emitted hooks no longer carry it — root discovery
+/// happens inside `devmap hook` from stdin (`cwd`, `file_path`, `workspace_roots`,
+/// apply_patch paths). Kept for documentation and older fixtures.
+#[allow(dead_code)]
 pub const PROJECT_DIR: &str = "${CLAUDE_PROJECT_DIR}";
 
 /// `SessionStart` fires with one of five sources. `fork` arrived in v2.1.214 for
@@ -1120,15 +1130,10 @@ pub struct DevmapHook {
     pub event: &'static str,
     /// `""` means every occurrence of the event.
     pub matcher: &'static str,
-    /// A `devmap` subcommand. Checked against the parser's own subcommand list
-    /// before anything is written.
-    pub subcommand: &'static str,
-    /// Argument vector appended after the subcommand.
-    pub args: &'static [&'static str],
-    /// Seconds. `None` on an async hook, where the field is not enforced.
+    /// `devmap hook <event>` name (`session-start` / `post-tool-use` / `session-end`).
+    pub hook_event: &'static str,
+    /// Seconds. Detached work returns within ~100 ms; this bounds the hook process.
     pub timeout_secs: Option<u32>,
-    /// Run detached so the agent's loop is never blocked on indexing.
-    pub run_async: bool,
     pub status_message: &'static str,
     pub purpose: &'static str,
 }
@@ -1138,55 +1143,41 @@ pub struct DevmapHook {
 /// Read-only or index-only, all on events that cannot decide a permission.
 /// Every other event is settled as "no handler" in [`event_coverage`], with the
 /// reason, rather than left unexamined.
+///
+/// Handlers are shell-form only (`"<abs>" hook <event>`): Cursor drops `args`,
+/// Codex ignores `async`, and exit 2 blocks the agent on both.
 pub const DEVMAP_HOOKS: &[DevmapHook] = &[
     DevmapHook {
         event: "SessionStart",
         matcher: SESSION_START_MATCHER,
-        subcommand: "status",
-        args: &["--auto-rebuild"],
+        hook_event: "session-start",
         timeout_secs: Some(120),
-        run_async: false,
         status_message: "Dev Map index status",
         purpose: "SessionStart is one of the four events whose exit-0 stdout is added to \
                   the context Claude can see, so the agent starts the session knowing \
-                  whether the index is fresh instead of trusting a stale map. When the \
-                  index is payload-obsolete or schema-behind, `--auto-rebuild` runs a \
-                  bounded build instead of only reporting stale.",
-    },
-    DevmapHook {
-        event: "SessionStart",
-        matcher: SESSION_START_MATCHER,
-        subcommand: "session-report",
-        args: &["--last"],
-        timeout_secs: Some(5),
-        run_async: false,
-        status_message: "Dev Map last session",
-        purpose: "The previous session's withheld answers and recorded gaps are the first \
-                  thing the next session should know, so limits get fixed instead of \
-                  rediscovered.",
+                  whether the index is fresh instead of trusting a stale map. \
+                  `devmap hook session-start` runs status --auto-rebuild and the last \
+                  session summary synchronously.",
     },
     DevmapHook {
         event: "PostToolUse",
         matcher: WRITE_TOOL_MATCHER,
-        subcommand: "build",
-        args: &[PROJECT_DIR],
-        timeout_secs: None,
-        run_async: true,
+        hook_event: "post-tool-use",
+        timeout_secs: Some(5),
         status_message: "",
-        purpose: "An incremental rebuild after a write, run detached: indexing must never \
-                  hold the agent's loop, and `build` early-returns when nothing changed.",
+        purpose: "An incremental rebuild after a write. `devmap hook post-tool-use` \
+                  returns within ~100 ms and spawns a detached, coalesced build so \
+                  hosts without `async` never block the agent loop.",
     },
     DevmapHook {
         event: "SessionEnd",
         matcher: "",
-        subcommand: "session-report",
-        args: &[],
-        timeout_secs: Some(10),
-        run_async: false,
+        hook_event: "session-end",
+        timeout_secs: Some(SESSION_END_MAX_TIMEOUT_SECS),
         status_message: "Dev Map session report",
         purpose: "SessionEnd is the last chance to persist what this session asked and \
-                  what the index withheld. The command only reads the live query log; \
-                  it does not build.",
+                  what the index withheld. `devmap hook session-end` detaches \
+                  session-report within the 3-second cross-host budget.",
     },
 ];
 
@@ -1209,8 +1200,8 @@ pub fn event_coverage() -> Vec<(&'static str, Option<&'static DevmapHook>, &'sta
                      rebuild per batch would index the same change twice."
                 }
                 "SessionEnd" => {
-                    "Handled: session-report reads the MCP query log and writes insights. \
-                     It does not build; a 10s timeout fits the raised SessionEnd budget."
+                    "Handled: session-end detaches session-report within the 3s cross-host \
+                     budget. It does not build."
                 }
                 "Stop" | "SubagentStop" | "StopFailure" | "TeammateIdle" => {
                     "Not handled: Dev Map has no claim to verify at a stop, and blocking one \
@@ -1256,17 +1247,18 @@ fn utf8_path(label: &str, path: &Path) -> anyhow::Result<String> {
     })
 }
 
-/// The anchor every hook passes: the project root, resolved by the host.
+/// Absolute path for a hook `command`, even when PATH resolves to self.
 ///
-/// A hook runs in Claude's current directory — a worktree or any `cd` target,
-/// not necessarily the repository this index describes — so it has to say which
-/// repository it means. It says it as a *root* rather than as a store path:
-/// `--root` resolves the store through the same discovery every other
-/// invocation uses, while `--db ${CLAUDE_PROJECT_DIR}/<state path>` freezes the
-/// state layout as it stood when the hook was written, and a repository that
-/// keeps its state elsewhere then gets a second, empty store created beside it.
-fn hook_root_args() -> Vec<Value> {
-    vec![json!("--root"), json!(PROJECT_DIR)]
+/// MCP entries still use [`plugin_command`]'s bare-name rule; hooks must be
+/// absolute because Cursor/Codex do not expand a bare name the same way, and a
+/// bare `devmap` that clap-rejects exits 2 and blocks the agent.
+pub fn hook_executable(executable: &Path) -> PathBuf {
+    if executable.is_absolute() {
+        return executable.to_path_buf();
+    }
+    executable
+        .canonicalize()
+        .unwrap_or_else(|_| executable.to_path_buf())
 }
 
 /// Subcommands this binary's parser actually registers.
@@ -1344,25 +1336,28 @@ fn resolves_to_self(name: &str, executable: &Path, path_var: Option<&std::ffi::O
 
 /// Build the `{"hooks": {...}}` block Dev Map installs.
 ///
-/// `subcommands` is the parser's own list; a spec naming anything outside it is
+/// `subcommands` is the parser's own list; a missing `hook` subcommand is
 /// refused rather than written.
 ///
-/// Hooks anchor to the project root, not to a store path — see
-/// [`hook_root_args`].
+/// Shell-form only: `"command": "\"<abs>\" hook <event>"`. No `args`, no
+/// `async`, no `${CLAUDE_PROJECT_DIR}` — Cursor drops args, Codex ignores async,
+/// and root selection happens inside the hook from stdin.
 pub fn hooks_block(executable: &Path, subcommands: &[String]) -> anyhow::Result<Value> {
-    let exe = utf8_path("the devmap executable path", executable)?;
+    if !subcommands.iter().any(|name| name == "hook") {
+        anyhow::bail!(
+            "this binary does not register `devmap hook`, so the emitted handlers \
+             would fail on every fire. Known subcommands: {}",
+            subcommands.join(", ")
+        );
+    }
+    let exe = hook_executable(executable);
+    let exe_text = utf8_path("the devmap executable path", &exe)?;
 
     // Groups are keyed by (event, matcher): two handlers that fire on the same
     // event+matcher belong in one group. Two groups with the same matcher are
     // refused by Claude Code as a duplicate (both would fire, twice).
     let mut grouped: BTreeMap<(&str, &str), Vec<Value>> = BTreeMap::new();
     for spec in DEVMAP_HOOKS {
-        // Enforced here, in the writer, not only in a test: these three events
-        // are the ones whose output can allow a tool call, deny it, rewrite its
-        // input, or persist a permission rule. Dev Map is a code index; a
-        // handler here would widen what it is able to approve, and adding one
-        // must be a deliberate decision with its own security review rather
-        // than a line appended to a table.
         if PERMISSION_DECIDING_EVENTS.contains(&spec.event) {
             anyhow::bail!(
                 "{} decides an authorization outcome. Dev Map does not install hooks on \
@@ -1372,31 +1367,11 @@ pub fn hooks_block(executable: &Path, subcommands: &[String]) -> anyhow::Result<
                 PERMISSION_DECIDING_EVENTS.join(", ")
             );
         }
-        if !subcommands.iter().any(|name| name == spec.subcommand) {
-            anyhow::bail!(
-                "{} hook names `devmap {}`, which this binary does not register, so the \
-                 hook would fail on every fire. Known subcommands: {}",
-                spec.event,
-                spec.subcommand,
-                subcommands.join(", ")
-            );
-        }
-        // Exec form: `args` present means Claude Code resolves `command` as an
-        // executable and spawns it directly, passing each element verbatim with
-        // no shell to re-tokenize it. The documentation asks for exactly this
-        // whenever a path placeholder is involved, and every argument below
-        // carries one or is an absolute path.
-        let mut args: Vec<Value> = hook_root_args();
-        args.push(json!(spec.subcommand));
-        args.extend(spec.args.iter().map(|a| json!(a)));
+        let command = format!("\"{exe_text}\" hook {}", spec.hook_event);
 
         let mut handler = Map::new();
         handler.insert("type".into(), json!("command"));
-        handler.insert("command".into(), json!(exe));
-        handler.insert("args".into(), Value::Array(args));
-        if spec.run_async {
-            handler.insert("async".into(), json!(true));
-        }
+        handler.insert("command".into(), json!(command));
         if let Some(secs) = spec.timeout_secs {
             handler.insert("timeout".into(), json!(secs));
         }
@@ -1471,6 +1446,47 @@ pub fn plugin_manifest(version: Option<&str>) -> anyhow::Result<Value> {
     Report::new(validate_plugin_manifest(&value), true).into_result()?;
     Ok(value)
 }
+
+/// Codex plugin manifest written beside the Claude bundle under `.codex-plugin/`.
+pub fn codex_plugin_manifest(version: Option<&str>) -> anyhow::Result<Value> {
+    let mut manifest = Map::new();
+    manifest.insert("name".into(), json!(PLUGIN_NAME));
+    manifest.insert(
+        "description".into(),
+        json!(
+            "Dev Map: symbol-level code intelligence for Codex — hooks refresh the \
+             local index; trust via /hooks after install."
+        ),
+    );
+    if let Some(version) = version {
+        manifest.insert("version".into(), json!(version));
+    }
+    manifest.insert("hooks".into(), json!("./hooks/hooks.json"));
+    Ok(Value::Object(manifest))
+}
+
+/// Cursor native `.cursor/hooks.json` (version 1, camelCase, flat shell commands).
+///
+/// Marker-owned via `generatedBy: "devmap"`. `afterFileEdit` covers Write (Tab
+/// completions excluded — they are not repository edits Dev Map should index).
+pub fn cursor_hooks_document(executable: &Path) -> anyhow::Result<Value> {
+    let exe = utf8_path("the devmap executable path", &hook_executable(executable))?;
+    let cmd = |event: &str| format!("\"{exe}\" hook {event}");
+    Ok(json!({
+        "version": 1,
+        "generatedBy": "devmap",
+        "hooks": {
+            "sessionStart": [{ "command": cmd("session-start") }],
+            "afterFileEdit": [{ "command": cmd("post-tool-use") }],
+            "sessionEnd": [{
+                "command": cmd("session-end"),
+                "timeout": SESSION_END_MAX_TIMEOUT_SECS,
+            }],
+        }
+    }))
+}
+
+pub const CURSOR_HOOKS_MARKER: &str = "devmap";
 
 /// Skill bodies shipped in the plugin bundle.
 ///
@@ -1644,6 +1660,17 @@ pub fn render_plugin_bundle(
             plugin.join(".mcp.json"),
             pretty(&plugin_mcp_config(executable, db)?),
         ),
+        (
+            plugin.join(".codex-plugin").join("plugin.json"),
+            pretty(&codex_plugin_manifest(version)?),
+        ),
+        (
+            plugin
+                .join(".codex-plugin")
+                .join("hooks")
+                .join("hooks.json"),
+            pretty(&hooks_block(executable, subcommands)?),
+        ),
     ];
     for (name, body) in PLUGIN_SKILLS {
         let mut text = (*body).to_string();
@@ -1694,10 +1721,10 @@ pub fn validate_file(path: &Path, strict: bool) -> anyhow::Result<Report> {
         .map_err(|err| anyhow::anyhow!("{} is not valid JSON: {err}", path.display()))?;
     let diagnostics = if value.get("plugins").is_some() && value.get("owner").is_some() {
         validate_marketplace(&value)
-    } else if value.get("hooks").is_some() {
+    } else if value.get("hooks").and_then(Value::as_object).is_some() {
+        // Inline hooks object (settings or plugin). A string `hooks` path is a
+        // plugin manifest field, not a hooks document — handled below.
         let mut out = validate_hooks(&value);
-        // A plugin.json may carry hooks inline; a settings file will not have a
-        // `name`, so only then is it also a manifest.
         if value.get("name").is_some() {
             out.extend(validate_plugin_manifest(&value));
         }
@@ -1873,7 +1900,7 @@ mod tests {
             // The millisecond mistake: 150000 reads as 41.7 hours.
             ("PostToolUse", json!(150_000), "SECONDS"),
             // Documented ceiling, not a guess.
-            ("SessionEnd", json!(300), "at most 60"),
+            ("SessionEnd", json!(300), "at most 3"),
             ("PostToolUse", json!(f64::INFINITY), "must be a number"),
         ];
         for (event, timeout, needle) in cases {
@@ -1908,14 +1935,40 @@ mod tests {
     }
 
     #[test]
+    fn args_and_async_are_refused_for_cursor_codex_compatibility() {
+        let with_args = diagnose(one_handler(
+            "PostToolUse",
+            command_group(Some("Edit"), json!({"args": ["build"]})),
+        ));
+        assert!(
+            with_args
+                .iter()
+                .any(|d| d.contains("`args` is refused") && d.starts_with("error")),
+            "{with_args:?}"
+        );
+        let with_async = diagnose(one_handler(
+            "PostToolUse",
+            command_group(Some("Edit"), json!({"async": true})),
+        ));
+        assert!(
+            with_async
+                .iter()
+                .any(|d| d.contains("`async` is refused") && d.starts_with("error")),
+            "{with_async:?}"
+        );
+    }
+
+    #[test]
     fn a_timeout_on_an_async_hook_is_refused_because_it_is_never_enforced() {
         let found = diagnose(one_handler(
             "PostToolUse",
             command_group(Some("Edit"), json!({"async": true, "timeout": 30})),
         ));
         assert!(
-            found.iter().any(|d| d.contains("not enforced")),
-            "an unenforced timeout states a bound that does not exist: {found:?}"
+            found
+                .iter()
+                .any(|d| d.contains("`async` is refused") || d.contains("not enforced")),
+            "async must be refused for cross-host compatibility: {found:?}"
         );
     }
 
@@ -2020,7 +2073,11 @@ mod tests {
             (json!({"command": "/bin/true"}), "no `type`"),
             (
                 json!({"type": "command", "command": "x", "args": "not-an-array"}),
-                "must be an array",
+                "`args` is refused",
+            ),
+            (
+                json!({"type": "command", "command": "/abs/devmap hook session-start", "args": ["build"]}),
+                "`args` is refused",
             ),
             (
                 json!({"type": "command", "command": "x", "shell": "zsh"}),

@@ -8,7 +8,9 @@ DevCouncil's flagship integration is an **autonomous closed loop** with Claude C
 MCP: the agent checks out a task, implements it, asks DevCouncil to verify, receives a
 typed list of next actions, repairs, and re-verifies — **without a human pasting prompts
 or test output back and forth.** Evidence, not model confidence, decides when the work is
-done.
+done. These are **modules** (lease, verify, MCP). **Manvi** wraps the same components for
+multi-agent campaigns. A host can take this loop without Manvi, or take Manvi without
+this loop.
 
 This is the one path DevCouncil certifies end to end. Other coding CLIs are supported (see
 [coding-cli-integration.md](coding-cli-integration.md)), but the loop below is the one to
@@ -41,7 +43,7 @@ Stable repair contract (no LLM required): correction manifest from blocking gaps
 
 Codex, Antigravity, Cursor Agent, Grok, OpenCode, Warp/Aider/Copilot/others reuse the same verifier and next-actions contract but are not certified for the full MCP closed loop. Gemini CLI is **deprecated** (use Antigravity). Prefer the Claude Code MCP path for production agent loops; confirm wiring with `devcouncil integrate <host> --check`.
 
-Large multi-agent goals with dependency DAGs are orchestrated by upstream harnesses such as **Manvi**.
+Large multi-agent goals with dependency DAGs are orchestrated by **Manvi**, which wraps these same DevCouncil components rather than replacing them.
 
 ## The loop
 

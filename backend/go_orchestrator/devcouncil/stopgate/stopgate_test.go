@@ -28,3 +28,18 @@ func TestMissingStoreNeverAllows(t *testing.T) {
 		t.Fatal("missing store must be skipped, not a silent pass")
 	}
 }
+
+func TestRunSkipDoesNotInventMCPPass(t *testing.T) {
+	out := stopgate.Run(context.Background(), stopgate.Input{
+		SkipVerify: true, SkipReason: "no lease", TaskID: "T1",
+	})
+	if out.Decision.Allow {
+		t.Fatal("skipped stop gate must not allow")
+	}
+	if out.MCP.OK || out.MCP.Passed {
+		t.Fatalf("skipped run invented a pass: %+v", out.MCP)
+	}
+	if out.MCP.Status != "" {
+		t.Fatalf("skipped run invented a status: %q", out.MCP.Status)
+	}
+}

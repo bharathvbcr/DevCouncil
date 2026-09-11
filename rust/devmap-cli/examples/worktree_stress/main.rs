@@ -573,12 +573,7 @@ fn execute(
         parallel(args.build_workers, (0..n).collect(), |i| {
             let deadline = Instant::now() + Duration::from_secs(120);
             while Instant::now() < deadline {
-                if daemons[i]
-                    .lock()
-                    .expect("child")
-                    .try_wait()?
-                    .is_some()
-                {
+                if daemons[i].lock().expect("child").try_wait()?.is_some() {
                     bail!("daemon {i} exited during resync");
                 }
                 let snap = snapshot(&dbs[i])?;

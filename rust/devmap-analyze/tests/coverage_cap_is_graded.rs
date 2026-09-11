@@ -2,9 +2,10 @@
 //!
 //! `ExtractionCoverage::cap` was a *binary* gate: `is_complete()` asks whether
 //! any of four counters is non-zero, and if one is, every non-exempt finding in
-//! the generation is slammed to `COVERAGE_LOSS_CONFIDENCE_CAP`. The four
-//! counters are corpus-wide, so one oversized vendored file, one `.proto`, one
-//! `.tf` fixture — any of them — takes the whole repository down.
+//! the generation is slammed to `COVERAGE_LOSS_CONFIDENCE_CAP`. Before
+//! language-scoped capping, those counters were corpus-wide, so one oversized
+//! vendored file or one pattern-recovered hole in *any* language took every
+//! finding down — including languages that hole could never call into.
 //!
 //! Measured on this repository at the time this test was written: 1,502 files
 //! indexed, of which **10** were blind (3 parse failures, 2 pattern-recovered,
@@ -36,7 +37,7 @@ use devmap_analyze::{
     COVERAGE_LOSS_CONFIDENCE_CAP, HIGHEST_DEGRADED_CONFIDENCE,
 };
 use devmap_extract::extract_file;
-use devmap_extract::model::Extraction;
+use devmap_extract::model::{Extraction, ExtractionEngine, ParseOutcome};
 use devmap_resolve::Resolver;
 
 /// Two same-named extension functions and one call through an untypeable
@@ -57,22 +58,36 @@ const AMBIGUOUS: &str = concat!(
     "private fun neverCalled(): String = \"x\"\n",
 );
 
-/// Parses `Clean`, declares symbols, and has no call extractor in this build —
-/// so it is charged as `call_blind` and nothing about it is a *failure*.
-const TERRAFORM: &str = "module \"helper\" {\n  source = \"./helper\"\n}\n";
+/// Force a Kotlin extraction into the pattern-recovered hole state.
+///
+/// Findings under test live in `Codec.kt`. Language-scoped capping only demotes
+/// them for holes that can reference the JVM family, so these fixtures use a
+/// same-language recovery rather than a call-blind `.tf` file.
+fn kotlin_pattern_hole(path: &str) -> Extraction {
+    let mut ext = extract_file(path, "private fun neverSeen(): String = \"x\"\n");
+    ext.parse_outcome = ParseOutcome::Fallback {
+        reason: "forced pattern recovery for graded-ceiling fixture".to_string(),
+    };
+    ext.engine = ExtractionEngine::RegexFallback {
+        requested_language: "kotlin".to_string(),
+    };
+    ext.imports.clear();
+    ext.calls.clear();
+    ext
+}
 
-/// `filler` clean Python files, so the blind share is a measured fraction
-/// rather than "one of two".
+/// `filler` clean Kotlin files, so the blind share is a measured fraction of
+/// languages that can actually call into the findings under test.
 fn corpus(filler: usize, blind_files: usize) -> Vec<Extraction> {
     let mut extractions = vec![extract_file("Codec.kt", AMBIGUOUS)];
     for index in 0..filler {
         extractions.push(extract_file(
-            &format!("pkg/clean_{index}.py"),
-            "def live():\n    return 1\n\n\ndef caller():\n    return live()\n",
+            &format!("pkg/Clean_{index}.kt"),
+            "private fun live(): Int = 1\nprivate fun caller(): Int = live()\n",
         ));
     }
     for index in 0..blind_files {
-        extractions.push(extract_file(&format!("infra/mod_{index}.tf"), TERRAFORM));
+        extractions.push(kotlin_pattern_hole(&format!("pkg/lost_{index}.kt")));
     }
     extractions
 }
@@ -111,10 +126,13 @@ fn a_small_coverage_hole_does_not_flatten_the_ladder() {
     let extractions = corpus(99, 1);
     let (reports, coverage) = reports(&extractions);
 
-    assert_eq!(coverage.call_blind_files, 1, "one Terraform file is blind");
+    assert_eq!(
+        coverage.pattern_recovered_files, 1,
+        "one Kotlin file is pattern-recovered"
+    );
     assert!(
-        !coverage.is_complete(),
-        "the corpus is incomplete, or the cap under test never fires"
+        !coverage.is_complete_for("kotlin"),
+        "the Kotlin coverage is incomplete, or the cap under test never fires"
     );
 
     let confident = confidence_of(&reports, "neverCalled");
@@ -131,12 +149,11 @@ fn a_small_coverage_hole_does_not_flatten_the_ladder() {
 /// The honesty rule the grading must not buy its way past.
 #[test]
 fn an_incomplete_scan_still_never_reaches_the_extracted_tier() {
-    // A single blind file among ten thousand — the most flattering ratio a real
-    // repository could produce.
-    let mut extractions = corpus(2_000, 1);
-    extractions.push(extract_file("infra/one.tf", TERRAFORM));
+    // A single same-language hole among two thousand — the most flattering
+    // ratio a real repository could produce for the findings under test.
+    let extractions = corpus(2_000, 1);
     let (reports, coverage) = reports(&extractions);
-    assert!(!coverage.is_complete());
+    assert!(!coverage.is_complete_for("kotlin"));
 
     for report in reports.iter().filter(|report| !report.is_exempt) {
         assert!(
@@ -158,10 +175,10 @@ fn an_incomplete_scan_still_never_reaches_the_extracted_tier() {
 /// decorative.
 #[test]
 fn a_mostly_blind_corpus_still_bottoms_out_at_the_existing_cap() {
-    // One readable file, ninety-nine blind ones.
+    // One readable Kotlin file, ninety-nine same-language holes.
     let extractions = corpus(0, 99);
     let (reports, coverage) = reports(&extractions);
-    assert_eq!(coverage.call_blind_files, 99);
+    assert_eq!(coverage.pattern_recovered_files, 99);
 
     let confident = confidence_of(&reports, "neverCalled");
     assert!(
