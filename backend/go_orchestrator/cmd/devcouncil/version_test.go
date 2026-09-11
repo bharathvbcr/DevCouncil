@@ -39,6 +39,22 @@ func TestVersionAgreesWithNpmAndRustWorkspace(t *testing.T) {
 	}
 }
 
+func TestProductVersionHasReleaseNotes(t *testing.T) {
+	root := repoRoot(t)
+	notes := filepath.Join(root, "docs", "releases", "v"+Version+".md")
+	raw, err := os.ReadFile(notes)
+	if err != nil {
+		t.Fatalf("GitHub Release notes missing for %s: %v", Version, err)
+	}
+	text := string(raw)
+	if strings.TrimSpace(text) == "" {
+		t.Fatalf("release notes are empty: %s", notes)
+	}
+	if !strings.Contains(text, Version) {
+		t.Fatalf("release notes do not mention %s: %s", Version, notes)
+	}
+}
+
 func repoRoot(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)

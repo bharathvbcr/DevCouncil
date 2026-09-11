@@ -45,8 +45,34 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  # Version stamps, notes file, and "who creates the GitHub Release" must
+  # agree before cargo-dist spends build minutes. A tag that names 0.2.0
+  # while package.json still says otherwise, or two workflows both running
+  # `gh release create`, fails here instead of after the Windows zip.
+  identity:
+    runs-on: "ubuntu-22.04"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+      - name: Script tests
+        run: node --test scripts/check-release.test.mjs scripts/check-workflows.test.mjs
+      - name: Release identity
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            node scripts/check-release.mjs --tag "${{ github.ref_name }}"
+          else
+            node scripts/check-release.mjs
+          fi
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    needs:
+      - identity
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
@@ -127,7 +153,7 @@ jobs:
         run: |
           if ! command -v cargo > /dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
@@ -154,9 +180,11 @@ jobs:
         shell: bash
         run: |
           # Parse out what we just built and upload it to scratch storage
-          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "paths<<EOF"
+            dist print-upload-files-from-manifest --manifest dist-manifest.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
@@ -201,9 +229,11 @@ jobs:
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
-          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "paths<<EOF"
+            jq --raw-output ".upload_files[]" dist-manifest.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
@@ -231,6 +261,9 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
       - name: Install cached dist
         uses: actions/download-artifact@v8
         with:
@@ -244,6 +277,11 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      - name: Require every declared target before publishing
+        # Must run before `dist host --steps=release`. A missing Windows zip
+        # used to be noticed only at `gh release create`, after cargo-dist
+        # had already opened the GitHub Release.
+        run: node scripts/check-release.mjs --artifacts target/distrib
       - id: host
         shell: bash
         run: |
@@ -269,42 +307,43 @@ jobs:
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
       - name: Require every declared target
-        # Windows grammar builds are unverified under MSVC. A missing zip must
+        # Second look, after the flattened download. A missing zip must
         # fail the release loudly — never publish a partial set of platforms.
+        run: node scripts/check-release.mjs --artifacts artifacts
+      - name: Publish GitHub Release notes and archives
+        # Notes come from docs/releases/vX.Y.Z.md via --notes-file. They must
+        # not travel through GITHUB_ENV (48 KB cap). `gh release create` is
+        # skipped when cargo-dist already opened the tag so a second create
+        # cannot fail the job after the artifacts are built.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          required=(
-            "devmap-cli-x86_64-unknown-linux-gnu.tar.xz"
-            "devmap-cli-aarch64-apple-darwin.tar.xz"
-            "devmap-cli-x86_64-apple-darwin.tar.xz"
-            "devmap-cli-x86_64-pc-windows-msvc.zip"
-          )
-          missing=0
-          for name in "${required[@]}"; do
-            if ! find artifacts -type f -name "$name" | grep -q .; then
-              echo "ERROR: required release artifact missing: $name" >&2
-              missing=1
-            else
-              echo "found $name"
-            fi
-          done
-          if [[ "$missing" -ne 0 ]]; then
-            echo "Refusing to publish a partial release." >&2
-            find artifacts -type f | sort >&2 || true
+          NOTES_FILE="docs/releases/${RELEASE_TAG}.md"
+          if [[ ! -f "$NOTES_FILE" ]]; then
+            echo "ERROR: missing release notes file: $NOTES_FILE" >&2
             exit 1
           fi
-      - name: Create GitHub Release
-        env:
-          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
-          ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
-          ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
-          RELEASE_COMMIT: "${{ github.sha }}"
-        run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
-
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          mapfile -t files < <(find artifacts -type f ! -name '*-dist-manifest.json' | sort)
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "ERROR: no release artifacts to upload" >&2
+            exit 1
+          fi
+          title="DevCouncil ${RELEASE_TAG}"
+          extra=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            extra+=(--prerelease)
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; uploading artifacts and replacing notes."
+            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+            gh release edit "$RELEASE_TAG" --title "$title" --notes-file "$NOTES_FILE" --target "$RELEASE_COMMIT" "${extra[@]}"
+          else
+            gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" --title "$title" --notes-file "$NOTES_FILE" "${extra[@]}" "${files[@]}"
+          fi
 
   announce:
     needs:

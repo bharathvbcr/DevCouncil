@@ -13,3 +13,9 @@ rusqlite.workspace = true
 
 [lints]
 workspace = true
+
+# Installed by scripts/install.sh. cargo-dist would otherwise announce this
+# package beside the CLI and a Windows tgrep-core failure could take the
+# whole GitHub Release with it.
+[package.metadata.dist]
+dist = false

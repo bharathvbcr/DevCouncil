@@ -31,7 +31,11 @@
   "scripts": {
     "pack:check": "npm pack --dry-run",
     "smoke:package": "node scripts/npm-runtime-smoke.mjs",
-    "smoke:registry": "node scripts/npm-registry-smoke.mjs"
+    "smoke:registry": "node scripts/npm-registry-smoke.mjs",
+    "check:release": "node scripts/check-release.mjs",
+    "check:workflows": "node scripts/check-workflows.mjs",
+    "test:scripts": "node --test scripts/check-release.test.mjs scripts/check-workflows.test.mjs",
+    "ci:local": "node scripts/ci-local.mjs"
   },
   "engines": {
     "node": ">=18"

@@ -19,6 +19,11 @@ rayon.workspace = true
 [dev-dependencies]
 devmap-serve = { path = "../devmap-serve" }
 
+[package.metadata.dist]
+# hold_uncommitted_child is a test helper. cargo-dist announced it as a
+# v0.2.0 artifact until this flag was set; a GitHub Release must not ship it.
+dist = false
+
 [features]
 default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter

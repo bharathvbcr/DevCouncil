@@ -26,6 +26,9 @@ on:
       - ".github/workflows/analysis-plane.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   rust:
     name: components (${{ matrix.os }})

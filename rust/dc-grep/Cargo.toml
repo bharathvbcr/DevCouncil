@@ -42,6 +42,12 @@ serde_json = "1"
 [lints]
 workspace = true
 
+# Installed by scripts/install.sh. Disting this package would compile
+# tgrep-core for every cargo-dist target, including Windows MSVC, and a
+# grammar/C failure there would drop the whole GitHub Release.
+[package.metadata.dist]
+dist = false
+
 # Already in the tree — grep-searcher pulls it through memmap2 — so naming it
 # directly costs nothing new to audit and buys the two open(2) flags below
 # from the platform rather than from memory. Spelling O_NOFOLLOW out per

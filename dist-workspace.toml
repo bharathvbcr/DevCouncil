@@ -25,6 +25,9 @@ targets = [
 hosting = "github"
 # Checksums are published beside every archive (sha256).
 # Pull requests only plan — full builds run on version tags.
+# Only `devmap-cli` is dist-able. Analysis binaries and test helpers set
+# `[package.metadata.dist] dist = false` so cargo-dist cannot ship
+# `hold_uncommitted_child` or take the release down with tgrep-core on MSVC.
 pr-run-mode = "plan"
 # Keep hand edits to .github/workflows/release.yml (fail-fast=true so a
 # missing Windows target cannot ship).
