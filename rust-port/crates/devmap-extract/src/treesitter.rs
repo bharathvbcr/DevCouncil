@@ -2109,6 +2109,11 @@ fn ast_root(node: Node) -> Node {
 /// - `bounded_parent(variable_declarator)` is the `lexical_declaration`; the export
 ///   statement wraps that, not the declarator.
 fn js_symbol_is_exported(node: Node, source: &str) -> bool {
+    // One hop only: skip the factory that returns `{ method() {} }`, then
+    // resume. Skipping every enclosing function would publish methods of an
+    // unused helper nested inside an exported function.
+    let skip_one_factory = js_returned_object_method(node);
+    let mut skipped_factory = false;
     let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
@@ -2127,16 +2132,49 @@ fn js_symbol_is_exported(node: Node, source: &str) -> bool {
                 }
                 ancestor = bounded_parent(parent);
             }
-            // A value bound inside a callable does not escape by being written.
-            // Proving that a returned object reaches a caller needs escape
-            // analysis, which a syntax-directed extractor does not do, so stop
-            // here and report what is actually evident: not exported.
+            // A value bound inside a callable does not escape by being written,
+            // except the one-level returned-object case above.
             "function_declaration"
             | "generator_function_declaration"
             | "function_expression"
             | "arrow_function"
-            | "method_definition" => return false,
+            | "method_definition" => {
+                if skip_one_factory && !skipped_factory {
+                    skipped_factory = true;
+                    ancestor = bounded_parent(parent);
+                } else {
+                    return false;
+                }
+            }
             _ => ancestor = bounded_parent(parent),
+        }
+    }
+    false
+}
+
+/// A method on an object that is the (possibly nested / parenthesized) operand
+/// of a `return`, or the implicit return of an arrow.
+///
+/// Nested functions stay private: `export function outer() { function inner() {}
+/// return inner; }` is not this shape. An object passed as an argument is not
+/// this shape either — `return foo({ get() {} })` stops at `arguments`.
+fn js_returned_object_method(node: Node) -> bool {
+    if node.kind() != "method_definition" {
+        return false;
+    }
+    let mut ancestor = bounded_parent(node);
+    let mut saw_object = false;
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "object" => {
+                saw_object = true;
+                ancestor = bounded_parent(parent);
+            }
+            "pair" | "parenthesized_expression" | "sequence_expression" => {
+                ancestor = bounded_parent(parent);
+            }
+            "return_statement" | "arrow_function" => return saw_object,
+            _ => return false,
         }
     }
     false
@@ -2775,7 +2813,9 @@ fn extract_node(
                             scoped_qualified_name(node, source, file_symbol_name, &n)
                         });
                     if kind == "method_definition" {
-                        if let Some(reason) = crate::wiring::js_lifecycle_hook_reason(&n) {
+                        if let Some(reason) = crate::wiring::js_lifecycle_hook_reason(&n)
+                            .or_else(|| crate::wiring::js_bundler_plugin_hook_reason(&n))
+                        {
                             wiring.push(WiringAnnotation {
                                 kind: WiringKind::RuntimeEntryPoint,
                                 target_symbol: qualified_name.clone(),
@@ -2820,6 +2860,9 @@ fn extract_node(
                     if vk == "arrow_function" || vk == "function_expression" {
                         if let Some(n) = get_child_text(node, "name", source) {
                             let is_exported = js_symbol_is_exported(node, source);
+                            let parent_symbol =
+                                enclosing_callable_qualified(node, source, file_symbol_name)
+                                    .unwrap_or_else(|| file_symbol_name.to_string());
                             symbols.push(ExtractedSymbol {
                                 name: n.clone(),
                                 qualified_name: scoped_qualified_name(
@@ -2833,7 +2876,7 @@ fn extract_node(
                                 is_exported,
                                 docstring: None,
                                 signature: None,
-                                parent_symbol: Some(file_symbol_name.to_string()),
+                                parent_symbol: Some(parent_symbol),
                                 body_signature: None,
                                 declaration_hash: None,
                             });
@@ -3025,21 +3068,31 @@ fn extract_node(
             "call_expression" => {
                 if let Some(f) = node.child_by_field_name("function") {
                     let callee = get_node_text(f, source);
-                    if callee == "require" {
+                    // `import("./CloneModal.svelte")` is a module load, not a
+                    // call to a function named `import`. Until this arm treated
+                    // it like `require`, every Svelte lazy view had no Import
+                    // edge and showed up as unwired / dead.
+                    if callee == "require" || callee == "import" {
                         if let Some(args) = node.child_by_field_name("arguments") {
                             if let Some(arg) = args.named_child(0) {
-                                let mod_spec = get_node_text(arg, source)
-                                    .trim_matches('"')
-                                    .trim_matches('\'')
-                                    .to_string();
-                                imports.push(ExtractedImport {
-                                    raw_import: get_node_text(node, source),
-                                    module_specifier: mod_spec,
-                                    imported_names: vec![],
-                                    local_names: vec![],
-                                    alias: None,
-                                    span: span.clone(),
-                                });
+                                let raw = get_node_text(arg, source);
+                                if !raw.contains("${") {
+                                    let mod_spec = raw
+                                        .trim_matches('"')
+                                        .trim_matches('\'')
+                                        .trim_matches('`')
+                                        .to_string();
+                                    if !mod_spec.is_empty() {
+                                        imports.push(ExtractedImport {
+                                            raw_import: get_node_text(node, source),
+                                            module_specifier: mod_spec,
+                                            imported_names: vec![],
+                                            local_names: vec![],
+                                            alias: None,
+                                            span: span.clone(),
+                                        });
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -6099,6 +6152,14 @@ fn is_defining_name(node: Node) -> bool {
         ) {
             return false;
         }
+        // `Foo<T>` writes the instantiated type on the `name` field of
+        // `generic_type`. That is a use: `export type Contract = AssertTrue<…>`
+        // is the only mention of `AssertTrue` besides its alias, and treating
+        // it as a binding suppresses the Type reference, so a compile-time
+        // contract looks confidently dead.
+        if parent.kind() == "generic_type" {
+            return false;
+        }
         if field_contains(parent, "name", node)
             || field_contains(parent, "alias", node)
             || field_contains(parent, "parameter", node)
@@ -8574,6 +8635,21 @@ mod tests {
             ),
             "a callback nested in the default export is reached through it"
         );
+        assert!(
+            is_exported("export function make() { return { get() {} }; }\n", "get"),
+            "a method on the object an exported factory returns is public API"
+        );
+        assert!(
+            is_exported("export const make = () => ({ get() {} });\n", "get"),
+            "the same escape through an arrow's implicit return"
+        );
+        assert!(
+            is_exported(
+                "export function make() { return { nested: { inner() {} } }; }\n",
+                "inner"
+            ),
+            "a method nested on the returned object still escapes through the factory"
+        );
         for global in ["globalThis", "window", "global", "self"] {
             let source = format!("{global}.ResizeObserver = class {{ observe() {{}} }};\n");
             assert!(
@@ -8597,15 +8673,32 @@ mod tests {
             ("let obj = { deepDead() {} };\n", "deepDead"),
             // A bare identifier target is a binding, not the global object.
             ("ResizeObserver = class { observe() {} };\n", "observe"),
-            // Returned from a function is not *syntactically* an escape;
-            // proving it reaches a caller needs escape analysis this extractor
-            // does not do, so it reports what is evident.
-            ("export function make() { return { get() {} }; }\n", "get"),
             // A nested declaration does not inherit its enclosing function's
             // export.
             (
                 "export function outer() { function inner() {} return inner; }\n",
                 "inner",
+            ),
+            // Returned from a function that is itself not exported is not an
+            // escape; the factory is the thing that would have to be public.
+            ("function make() { return { get() {} }; }\n", "get"),
+            // An unused helper nested inside an exported function must not
+            // inherit that export. Skipping every enclosing function would
+            // publish `get` here.
+            (
+                "export function outer() { function make() { return { get() {} }; } }\n",
+                "get",
+            ),
+            // An object passed as an argument is not the return value.
+            (
+                "export function make() { foo({ get() {} }); return 1; }\n",
+                "get",
+            ),
+            // Bound then returned by name needs escape analysis this extractor
+            // does not do, so it reports what is evident.
+            (
+                "export function make() { const x = { get() {} }; return x; }\n",
+                "get",
             ),
         ] {
             assert!(
@@ -9466,6 +9559,88 @@ mod tests {
         );
     }
 
+    /// A generic type's `name` field is a use of the instantiated type.
+    ///
+    /// `is_defining_name` treats a grammar `name` field as a binding, which is
+    /// right for `type AssertTrue<T> = T` and wrong for `AssertTrue<Extends<…>>`
+    /// — that second `AssertTrue` is the only use the alias has. Forced to a
+    /// binding, the Type reference is suppressed and a compile-time contract
+    /// is reported dead at the extracted tier.
+    #[test]
+    fn a_generic_type_name_is_a_use_not_a_binding() {
+        let extraction = extract_treesitter(
+            "f.ts",
+            "typescript",
+            "type Extends<A, B> = A extends B ? true : false;\n\
+             type AssertTrue<T extends true> = T;\n\
+             export type Contract = AssertTrue<Extends<string, string>>;\n",
+        );
+        let type_uses = |name: &str| {
+            extraction
+                .references
+                .iter()
+                .filter(|reference| reference.name == name && reference.kind == ReferenceKind::Type)
+                .count()
+        };
+        assert!(
+            type_uses("AssertTrue") >= 1,
+            "`AssertTrue<…>` is a use of the alias: {:?}",
+            extraction
+                .references
+                .iter()
+                .map(|r| (&r.name, r.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            type_uses("Extends") >= 1,
+            "`Extends<…>` inside the argument list is a use of that alias"
+        );
+        assert!(
+            extraction
+                .references
+                .iter()
+                .all(|reference| reference.name != "AssertTrue"
+                    || reference.kind != ReferenceKind::Type
+                    || reference.enclosing_symbol.as_deref() != Some("f.ts::AssertTrue")),
+            "the alias's own name is a binding, not a self-reference"
+        );
+    }
+
+    /// A nested `const walk = () => {}` is owned by the enclosing function.
+    ///
+    /// The symbol emitter used the file as `parent_symbol` for every const
+    /// arrow, so `collapseAll.walk` looked like a sibling of `collapseAll`
+    /// rather than a child. The resolver's lexical join then could not tell
+    /// `walk()` inside `collapseAll` from a module-level `walk`.
+    #[test]
+    fn a_nested_const_arrow_is_parented_on_the_enclosing_function() {
+        let extraction = extract_treesitter(
+            "a.js",
+            "javascript",
+            "function collapseAll() {\n  const walk = (folders) => { walk(folders); };\n  walk([]);\n}\nconst top = () => {};\n",
+        );
+        let walk = extraction
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "a.js::collapseAll.walk")
+            .expect("the nested arrow is a symbol");
+        assert_eq!(
+            walk.parent_symbol.as_deref(),
+            Some("a.js::collapseAll"),
+            "the nested arrow's parent is the function that binds it, not the file"
+        );
+        let top = extraction
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "top")
+            .expect("the module-level arrow is a symbol");
+        assert_eq!(
+            top.parent_symbol.as_deref(),
+            Some("a.js"),
+            "a module-level const arrow is still parented on the file"
+        );
+    }
+
     /// A React lifecycle hook is an entry point only as a class method.
     ///
     /// `kind == "method_definition"` was invertible. The annotation says "the
@@ -9490,6 +9665,39 @@ mod tests {
             targets,
             ["f.jsx::Comp.componentDidMount"],
             "only the class method is a renderer entry point"
+        );
+    }
+
+    /// Bundler plugin hooks are object methods the bundler looks up by name.
+    ///
+    /// The same name as a free function is ordinary code. Applied there, the
+    /// annotation would suppress a real dead-code finding; withheld from the
+    /// plugin method it produces a confident false positive on every Vite plugin
+    /// in the tree, none of which has an in-repo caller.
+    #[test]
+    fn a_bundler_plugin_hook_is_an_entry_point_only_as_a_method() {
+        let extraction = extract_treesitter(
+            "vite.config.ts",
+            "typescript",
+            "function generateBundle() {}\nfunction gitpulseBundleBudget() {\n  return {\n    generateBundle() {}\n  };\n}\n",
+        );
+        let targets: Vec<&str> = extraction
+            .wiring
+            .iter()
+            .filter(|annotation| annotation.kind == WiringKind::RuntimeEntryPoint)
+            .map(|annotation| annotation.target_symbol.as_str())
+            .collect();
+        assert_eq!(
+            targets,
+            ["vite.config.ts::gitpulseBundleBudget.generateBundle"],
+            "only the plugin object method is a bundler entry point"
+        );
+        assert!(
+            !is_exported(
+                "function gitpulseBundleBudget() { return { generateBundle() {} }; }\n",
+                "generateBundle"
+            ),
+            "a non-exported factory does not publish the hook; the hook name does"
         );
     }
 

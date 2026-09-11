@@ -161,3 +161,67 @@ fn the_allow_unwired_marker_exempts_only_its_own_file() {
          whole corpus is a check switched off: {paths:?}"
     );
 }
+
+/// A Svelte lazy view is reached by `import()`, so it is not unwired.
+#[test]
+fn a_svelte_lazy_view_is_not_unwired() {
+    let extractions = vec![
+        extract_file(
+            "package.json",
+            "{\"name\":\"x\",\"main\":\"src/index.ts\"}\n",
+        ),
+        extract_file(
+            "src/App.svelte",
+            "const load = () => import('./lib/CloneModal.svelte');\n",
+        ),
+        extract_file(
+            "src/lib/CloneModal.svelte",
+            "<script>export let open = false;</script>\n",
+        ),
+    ];
+    let paths = unwired(&extractions);
+    assert!(
+        !paths.iter().any(|p| p == "src/lib/CloneModal.svelte"),
+        "a lazily loaded Svelte view is reachable: {paths:?}"
+    );
+
+    let mut without = extractions;
+    without[1] = extract_file(
+        "src/App.svelte",
+        "<script>export let ready = true;</script>\n",
+    );
+    let paths = unwired(&without);
+    assert!(
+        paths.iter().any(|p| p == "src/lib/CloneModal.svelte"),
+        "without the import() the view really is unwired: {paths:?}"
+    );
+}
+
+/// An HTML `<script src>` is the only record that the page boots a module.
+#[test]
+fn an_html_script_src_is_not_unwired() {
+    let extractions = vec![
+        extract_file(
+            "package.json",
+            "{\"name\":\"x\",\"scripts\":{\"dev\":\"vite\"}}\n",
+        ),
+        extract_file(
+            "index.html",
+            "<script type=\"module\" src=\"/src/status.ts\"></script>\n",
+        ),
+        extract_file("src/status.ts", "export const boot = 1;\n"),
+    ];
+    let paths = unwired(&extractions);
+    assert!(
+        !paths.iter().any(|p| p == "src/status.ts"),
+        "an HTML script src reaches the module it boots: {paths:?}"
+    );
+
+    let mut without = extractions;
+    without[1] = extract_file("index.html", "<html></html>\n");
+    let paths = unwired(&without);
+    assert!(
+        paths.iter().any(|p| p == "src/status.ts"),
+        "without the script src the module really is unwired: {paths:?}"
+    );
+}

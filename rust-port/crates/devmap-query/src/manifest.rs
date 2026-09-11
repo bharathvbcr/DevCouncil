@@ -92,11 +92,22 @@ pub fn generate_manifest_with_edges(
 /// budget and `code_graph.json` carries it uncapped, so having each derive
 /// "what is an entry root" separately is how the two artifacts start
 /// disagreeing about the same repository.
+///
+/// `ToolConfig` is here and `AmbientDeclaration` is not, though both are
+/// file-level exemptions and both used to arrive as `TargetRoot`. An entry
+/// root is where execution *starts* — `subsystem_map.is_entry_root` passes
+/// this on to a reader as exactly that claim — and a `vite.config.ts` is such
+/// a place while a `.d.ts` is a declaration the compiler consults and nothing
+/// runs. The exemption each one earns is the same; the sentence they let a
+/// consumer say is not.
 pub(crate) fn is_entry_root(ext: &Extraction) -> bool {
     ext.wiring.iter().any(|w| {
         matches!(
             w.kind,
-            WiringKind::ScriptEntry | WiringKind::FrameworkDecorator | WiringKind::TargetRoot
+            WiringKind::ScriptEntry
+                | WiringKind::FrameworkDecorator
+                | WiringKind::TargetRoot
+                | WiringKind::ToolConfig
         )
     })
 }
@@ -468,6 +479,14 @@ fn consumer_manifest_json(
     let all_unwired = crate::code_graph::unwired_candidates(extractions, edges);
     let unwired_excluded = all_unwired.excluded_coverage_loss;
     let unwired_excluded_import_blind = all_unwired.excluded_import_blind;
+    let unwired_excluded_not_code = all_unwired.excluded_not_code;
+    let unwired_excluded_not_code_reasons: serde_json::Map<String, Value> = all_unwired
+        .excluded_not_code_reasons
+        .iter()
+        .map(|(reason, count)| (reason.to_string(), json!(count)))
+        .collect();
+    let unwired_excluded_exempt = all_unwired.excluded_exempt;
+    let unwired_excluded_directory_unit = all_unwired.excluded_directory_unit;
     let unwired_excluded_import_blind_files: Vec<String> = all_unwired
         .excluded_import_blind_paths
         .iter()
@@ -722,6 +741,26 @@ fn consumer_manifest_json(
                 // from "we cannot see imports in this language at all".
                 "excluded_import_blind": unwired_excluded_import_blind,
                 "excluded_import_blind_files": unwired_excluded_import_blind_files,
+                // Files that were never in the population at all — prose, data,
+                // configuration, lockfiles, environment files — and files that
+                // are code something outside the import graph reaches: an entry
+                // root, a test, a fixture, a package marker, a tool config.
+                //
+                // Both were excluded before this key existed and neither was
+                // counted, so an empty `unwired_candidates` could not be told
+                // from a filter that had swallowed the repository. Additive:
+                // every counter above keeps its meaning, and GitPulse's
+                // `RepoMapUnwiredMeta` reads the new pair as optional.
+                "excluded_not_code": unwired_excluded_not_code,
+                // A bare count cannot tell "this repository is mostly
+                // documentation" from "a lockfile is being parsed as code", and
+                // those have different remedies.
+                "excluded_not_code_reasons": unwired_excluded_not_code_reasons,
+                "excluded_exempt": unwired_excluded_exempt,
+                // A sub-count of `excluded_exempt`, not a peer of it. Kept
+                // apart because no re-index can ever turn a `.tf` file into an
+                // answerable question: the unit of use is its directory.
+                "excluded_directory_unit": unwired_excluded_directory_unit,
             },
             "import_blind": {
                 "shown": import_blind_shown,
@@ -804,6 +843,11 @@ fn consumer_manifest_json(
                 // out. `true` makes both lists a lower bound rather than the
                 // repository's full set.
                 "inventory_walk_truncated": inventory.walk_truncated,
+            "inventory_complete": inventory.is_complete(),
+            "inventory_source": inventory.source,
+            "inventory_entries_examined": inventory.entries_examined,
+            "inventory_files_total": inventory.files_total,
+            "inventory_unreadable_count": inventory.unreadable_count,
                 "inventory_directories_visited": inventory.directories_visited,
                 "inventory_unavailable_reason": inventory.unavailable_reason,
                 // Goal-dependent; `dev map --goal` fills it downstream.

@@ -813,6 +813,8 @@ pub(crate) fn dispatch(
                 // a daemon that reported `index_is_fresh` alone reported an
                 // empty queue as a current index. See `UnappliedEdits`.
                 "is_fresh": daemon_index_is_fresh(&status, unapplied),
+                "source_freshness": status.source_freshness,
+                "analyzer_freshness": status.analyzer_freshness,
                 "degraded_reason": daemon_degraded_reason(&status, unapplied),
                 "quarantined_count": status.quarantined_count,
                 // The paths behind the three numbers `degraded_reason` states.

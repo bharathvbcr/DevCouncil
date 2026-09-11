@@ -1,17 +1,27 @@
 ---
 name: devmap-debugging
 title: Debugging with DevMap
-description: Use when debugging a bug, tracing an error, or asking why something fails. Examples: "Why is X failing?", "Where does this error come from?", "Trace this bug"
+description: Use DevMap when tracing a bug, locating an error source, or investigating
+  why code fails.
 triggers:
-  keywords: [devmap debug, walk_incomplete]
-  markers: [.devcouncil, .devmap]
+  keywords:
+  - devmap debug
+  - walk_incomplete
+  markers:
+  - .devcouncil
+  - .devmap
 ---
 
 # Debugging with DevMap
 
-1. `devmap_search` / `devmap_explore` on the error text or the suspect symbol.
-2. Callers (`explore` / `neighbors`) — who can reach the throw / the bad return.
-3. `devmap_trace` from an entry point to the suspect when the chain is the question.
-4. Read the source. Confirm the cause in the file, not only in the graph.
+Resolve this checkout with `devmap paths --json`, then check `devmap status --json`. Read the returned `repo_map` path; do not assume `.devcouncil` rather than `.devmap`. A missing, stale, or partially parsed index is not complete evidence. Rebuild with `devmap build --manifest` when needed and authorized, then recheck status.
 
-No GitNexus `query` / `context` / `cypher` / `detect_changes`. Recent-regression workaround: `git log` / `git diff` plus `devmap_impact` on the changed symbols. If the index cannot see a dynamic/reflected call, say `walk_incomplete` and record a gap.
+Use the connected DevMap MCP tools if they target this checkout; otherwise use the CLI from its root. GitPulse's `gitpulse_codeintel_*` tools also query DevMap: pass the absolute `repo_path`. Discover the actual tool names and schemas; a host need not expose every CLI capability.
+
+1. Reproduce the symptom with a bounded command or existing test and record the actual failure.
+2. Use `devmap search <name> --json` and `devmap explore <name> --json` to locate suspect symbols and callers. For literal error text that is not a symbol, search the source.
+3. Use `devmap trace <entry> <suspect> --json` when the call chain is the question. Confirm execution through call sites, logs, or instrumentation.
+4. Challenge the diagnosis, then add a regression that fails before the fix.
+5. Run `devmap impact <target> --json` before editing and `devmap affected <target> --json` for candidate tests; include the repository's required checks.
+
+For a recent regression, inspect `git diff` and `git log`, then query changed symbols. Read `shown`, `total`, `truncated`, and `walk_incomplete`; an unresolved dynamic call is an evidence gap. If DevMap cannot answer a required question, state why and use source inspection or an available fallback. Explicit user and repository requirements take precedence.

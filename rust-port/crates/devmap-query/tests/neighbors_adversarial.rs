@@ -519,13 +519,18 @@ fn a_partially_parsed_file_reports_that_it_has_no_traversal_start() {
 /// `walk_incomplete` is `Some(...)` while `truncated` is `false` and `hidden`
 /// is `0`, because the budget did not withhold anything — the walk did.
 ///
-/// This pins the honesty carrier on the Rust side. It matters because
-/// `BudgetedResponse` in `devmap_client.py` does not carry `walk_incomplete`
-/// at all, so the field is dropped at the Python seam and the default-depth
-/// answer arrives there indistinguishable from a complete one.
+/// Use a real two-hop chain. The original one-hop fixture only looked capped
+/// because the stop probe counted excluded reverse containment edges.
 #[test]
 fn the_default_depth_marks_its_walk_incomplete_rather_than_truncated() {
-    let store = simple();
+    let store = store_of(&[
+        ("core.py", CORE),
+        ("caller.py", CALLER),
+        (
+            "outer.py",
+            "from caller import run\n\ndef outer(rows):\n    return run(rows)\n",
+        ),
+    ]);
     let engine = StoreQueryEngine::new(&store);
     let answer = engine
         .neighbors(&["core.py".to_string()], 20_000, 0.0, 1)
@@ -542,6 +547,20 @@ fn the_default_depth_marks_its_walk_incomplete_rather_than_truncated() {
         "a depth-1 reverse walk over this fixture reported itself complete; \
          the only remaining signal for a capped walk would be gone"
     );
+
+    let complete = engine
+        .neighbors(&["core.py".into()], 20_000, 0.0, 2)
+        .unwrap();
+    assert_eq!(complete[0].callers.walk_incomplete, None);
+    assert!(complete[0]
+        .callers
+        .items
+        .iter()
+        .any(|edge| edge.source_symbol.ends_with("::outer")));
+    assert!(!callers
+        .items
+        .iter()
+        .any(|edge| edge.source_symbol.ends_with("::outer")));
 
     // Depth 0 is accepted by `validate_request` (0 <= MAX_TRAVERSAL_DEPTH) and
     // by the CLI. It visits nothing, and says so only through this field.

@@ -4,21 +4,26 @@ A *skill* is a markdown file with YAML frontmatter describing when it applies. T
 ``core-engineering`` skill is always selected; domain skills (android, ios, windows,
 web, ai-training, ...) are selected when the goal text or the repository's files match
 their triggers. Selected skills can be rendered into an agent prompt preamble or
-scaffolded into a target repo's ``.claude/skills/`` and ``.cursor/skills/`` directories.
+scaffolded into ``.claude/skills/``, ``.cursor/skills/``, and Codex's ``.agents/skills/``.
 """
 
 from __future__ import annotations
 
 import fnmatch
 import functools
+import hashlib
+import json
 import logging
 import os
 import re
+import stat
+import time
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from devcouncil.knowledge.frontmatter import build_frontmatter_markdown, split_frontmatter
+from devcouncil.utils.fsio import atomic_write_bytes, atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +120,7 @@ class Skill(BaseModel):
         return score
 
     def to_skill_md(self) -> str:
-        """Render as a Claude-Code-style SKILL.md (name + description frontmatter + body)."""
+        """Render portable SKILL.md frontmatter and body for all supported hosts."""
         return build_frontmatter_markdown(
             {"name": self.name, "description": self.description},
             self.body,
@@ -148,7 +153,7 @@ def _skill_from_meta(path: Path, meta: dict, body: str) -> Skill:
 # can drop their own skill markdown into a project and have it picked up.
 REPO_SKILL_DIRS = (".claude/skills", ".cursor/skills", ".agents/skills", ".devcouncil/skills")
 
-# Default destinations for ``scaffold_skills`` — Claude Code and Cursor both discover
+# Default destinations for ``scaffold_skills`` — Claude Code, Cursor, and Codex discover
 # skills under these trees. Callers can pass an explicit list to write fewer roots.
 DEFAULT_SKILL_DESTINATIONS = (".claude/skills", ".cursor/skills", ".agents/skills")
 
@@ -159,11 +164,14 @@ def _try_skill_from_file(path: Path) -> Skill | None:
     A markdown file is a skill only if its frontmatter carries a ``name``; plain docs
     (e.g. a contributor README) are ignored. Reads the file once — previously callers
     read it twice (an ``_is_skill_file`` check followed by a separate parse)."""
-    try:
-        meta, body = _split_frontmatter(path.read_text(encoding="utf-8"))
-    except OSError:
-        return None
+    data = _read_scaffold_file(path.resolve(), _SKILL_FILE_LIMIT)
+    if data is None:
+        raise FileNotFoundError(path)
+    text = data.decode("utf-8")
+    meta, body = _split_frontmatter(text)
     if not meta.get("name"):
+        if path.name == "SKILL.md" or text.startswith("---"):
+            raise ValueError(f"{path}: invalid skill frontmatter or missing name")
         return None
     return _skill_from_meta(path, meta, body)
 
@@ -433,21 +441,41 @@ def scaffold_skills(
     project_root: Path,
     skills: list[Skill],
     destinations: tuple[str, ...] | list[str] | None = None,
+    *,
+    dry_run: bool = False,
 ) -> list[Path]:
     """Write the given skills under each destination as ``<name>/SKILL.md``.
 
-    Defaults to both ``.claude/skills`` and ``.cursor/skills`` so Claude Code and
-    Cursor discover the same intake. Only rewrites a file when its content changes.
-    Per destination: skip when the skill's ``source_path`` already lives under that
-    root (do not re-materialize a repo-local skill onto itself).
+    Defaults to Claude Code, Cursor, and Codex. Preflight the complete batch,
+    serialize installers, and atomically replace only unchanged managed files.
+    Unknown or locally modified content is refused. Identical existing files are
+    adopted. A dry run returns differing paths without writing or claiming an
+    installation succeeded. Repository-local source files remain untouched.
     """
+    root = project_root.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError(f"{root}: skill destination root is not a directory")
     dest_rels = tuple(destinations) if destinations is not None else DEFAULT_SKILL_DESTINATIONS
-    written: list[Path] = []
+    if not dest_rels or len(dest_rels) > 16 or len(skills) > 256:
+        raise ValueError("Skill install limit: 1–16 destinations and at most 256 skills")
+    rendered: dict[Path, bytes] = {}
+    names: set[str] = set()
+    for rel in dest_rels:
+        _scaffold_path(root, rel)
     for skill in skills:
-        content = skill.to_skill_md()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", skill.name) or skill.name in {
+            "con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10)),
+        }:
+            raise ValueError(f"Invalid skill name: {skill.name!r}")
+        if skill.name in names:
+            raise ValueError(f"Conflicting duplicate skill name: {skill.name}")
+        names.add(skill.name)
+        content = skill.to_skill_md().encode("utf-8")
+        if len(content) > _SKILL_FILE_LIMIT:
+            raise ValueError(f"{skill.name}: skill exceeds byte limit")
         src = skill.source_path.resolve() if skill.source_path is not None else None
         for rel in dest_rels:
-            skills_root = project_root / rel
+            skills_root = root / rel
             # Don't re-materialize a skill that already lives in this destination.
             # Packaged library files inside a monorepo (e.g. src/.../skills/library/)
             # still scaffold — only skip when the source IS this destination root.
@@ -457,10 +485,111 @@ def scaffold_skills(
                     continue
                 except (ValueError, OSError):
                     pass
-            target = skills_root / skill.name / "SKILL.md"
-            if target.exists() and target.read_text(encoding="utf-8") == content:
-                continue
+            target = _scaffold_path(root, f"{rel}/{skill.name}/SKILL.md")
+            rendered[target] = content
+    if sum(map(len, rendered.values())) > 8 * 1024 * 1024:
+        raise ValueError("Skill install exceeds 8 MiB batch limit")
+    # Creating .devcouncil here would activate marker-based DevMap selection
+    # on the next invocation: installation itself must not widen the intake.
+    receipt = _scaffold_path(root, ".devcouncil-skills.json")
+    # Validate before creating even the lock directory. Repeat under the lock:
+    # another installer may finish between the first plan and acquisition.
+    plan, hashes = _scaffold_plan(root, rendered, receipt, check_only=dry_run)
+    if dry_run or not rendered:
+        return [target for target, _, _ in plan]
+    lock = root / ".devcouncil-skills.lock"
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            lock.mkdir()
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Skill installer is busy: {lock}") from None
+            time.sleep(0.01)
+    try:
+        plan, hashes = _scaffold_plan(root, rendered, receipt, check_only=False)
+        for target, content, previous in plan:
+            _scaffold_path(root, target.relative_to(root).as_posix())
+            if _read_scaffold_file(target, _SKILL_FILE_LIMIT) != previous:
+                raise ValueError(f"{target}: modified while installing skills")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-            written.append(target)
-    return written
+            atomic_write_bytes(target, content)
+        document = {"schema": 1, "files": hashes}
+        prior = _read_scaffold_file(receipt, _SKILL_RECEIPT_LIMIT)
+        if prior is None or json.loads(prior) != document:
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(receipt, document, sort_keys=True)
+        clear_skill_caches()
+        return [target for target, _, _ in plan]
+    finally:
+        lock.rmdir()
+
+
+_SKILL_FILE_LIMIT = 256 * 1024
+_SKILL_RECEIPT_LIMIT = 1024 * 1024
+
+
+def _scaffold_path(root: Path, relative: str) -> Path:
+    """Validate portable relative paths and refuse symlinks below the root."""
+    if not relative or "\\" in relative or ":" in relative or relative.startswith("/"):
+        raise ValueError(f"Invalid skill destination: {relative!r}")
+    parts = relative.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"Invalid skill destination: {relative!r}")
+    path = root
+    for index, part in enumerate(parts):
+        path /= part
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"{path}: refusing symlink in skill destination")
+        if index < len(parts) - 1 and not stat.S_ISDIR(mode):
+            raise ValueError(f"{path}: skill parent is not a directory")
+    return path
+
+
+def _read_scaffold_file(path: Path, limit: int) -> bytes | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as file:
+        info = os.fstat(file.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError(f"{path}: not a regular file within the {limit} byte limit")
+        data = file.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError(f"{path}: file grew beyond byte limit")
+        return data
+
+
+def _scaffold_plan(
+    root: Path, rendered: dict[Path, bytes], receipt: Path, *, check_only: bool,
+) -> tuple[list[tuple[Path, bytes, bytes | None]], dict[str, str]]:
+    _scaffold_path(root, receipt.relative_to(root).as_posix())
+    raw = _read_scaffold_file(receipt, _SKILL_RECEIPT_LIMIT)
+    try:
+        saved = json.loads(raw) if raw is not None else {"schema": 1, "files": {}}
+    except (ValueError, UnicodeError) as error:
+        raise ValueError(f"{receipt}: invalid skill installation receipt") from error
+    if not isinstance(saved, dict) or type(saved.get("schema")) is not int or saved.get("schema") != 1 or not isinstance(saved.get("files"), dict):
+        raise ValueError(f"{receipt}: invalid skill installation receipt")
+    hashes = saved["files"].copy()
+    if len(hashes) > 4096 or any(not isinstance(k, str) or not isinstance(v, str) or not re.fullmatch(r"[a-f0-9]{64}", v) for k, v in hashes.items()):
+        raise ValueError(f"{receipt}: invalid or oversized skill installation receipt")
+    plan = []
+    for target, content in rendered.items():
+        key = target.relative_to(root).as_posix()
+        _scaffold_path(root, key)
+        current = _read_scaffold_file(target, _SKILL_FILE_LIMIT)
+        if current != content:
+            if not check_only and current is not None and hashes.get(key) != hashlib.sha256(current).hexdigest():
+                raise ValueError(f"{target}: unmanaged or locally modified skill; preserve or move it before installing")
+            plan.append((target, content, current))
+        hashes[key] = hashlib.sha256(content).hexdigest()
+    if len(hashes) > 4096 or len(json.dumps({"schema": 1, "files": hashes}).encode("utf-8")) > _SKILL_RECEIPT_LIMIT:
+        raise ValueError(f"{receipt}: skill installation receipt exceeds limit")
+    return plan, hashes

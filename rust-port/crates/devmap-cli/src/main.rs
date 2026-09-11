@@ -1886,6 +1886,8 @@ fn store_status_fields(
         // Computing it here as `pending_count == 0` is what let a store with no
         // generation at all report as current.
         "is_fresh": devmap_serve::index_is_fresh(&status),
+        "source_freshness": status.source_freshness,
+        "analyzer_freshness": status.analyzer_freshness,
         "db_path": status.db_path,
         "degraded_reason": degraded_reason,
         "quarantined_count": status.quarantined_count,

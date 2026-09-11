@@ -55,7 +55,10 @@ def test_is_vendored_path():
     assert wiring.is_vendored_path("web/node_modules/lib/x.js")
     assert wiring.is_vendored_path("assets/vendor/force-graph.min.js")
     assert wiring.is_vendored_path("static/app.min.css")
+    assert wiring.is_vendored_path("src-tauri/framework/tao/src/lib.rs")
+    assert wiring.is_vendored_path("app/src-tauri/framework/wry/src/lib.rs")
     assert not wiring.is_vendored_path("src/app.py")
+    assert not wiring.is_vendored_path("src/framework/app.ts")
 
 
 def test_is_liveness_code_file():

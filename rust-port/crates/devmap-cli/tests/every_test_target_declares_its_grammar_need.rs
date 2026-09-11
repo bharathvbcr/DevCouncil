@@ -50,7 +50,12 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
     ("devmap-resolve", &["resolution_kind_is_one_owner"]),
     (
         "devmap-analyze",
-        &["adversarial_analyze", "pdg_bounds", "traversal_allocation"],
+        &[
+            "adversarial_analyze",
+            "pdg_bounds",
+            "transitive_oracle",
+            "traversal_allocation",
+        ],
     ),
     (
         "devmap-query",
@@ -80,6 +85,11 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "coverage_gap_inventory",
             "digest_scoped_delta",
             "embedded_reader",
+            // Landed unclassified in `0197cda`, which left this gate red at
+            // HEAD. `cargo check -p devmap-store --no-default-features
+            // --all-targets` compiles it, which is the instruction in this
+            // test's own failure message.
+            "head_stamp",
             "kernel_defects",
             "migration_ladder",
             "one_symlink_rule",

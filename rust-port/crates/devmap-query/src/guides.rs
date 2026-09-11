@@ -237,7 +237,10 @@ unattributed calls mean the list is a lower bound. Prefer `unwired_candidates` /
 `dead_symbol_candidates` in the map over `unreachable_files` (static BFS is noisy for routers, \
 dynamic imports and JSX). If `entry_roots` is empty or `liveness_unreachable_unreliable` is set, \
 ignore `unreachable_files` entirely. Check `unwired_candidates` before creating a new module — \
-wire what you create into a real caller."
+wire what you create into a real caller. Neither list can ever name prose, data, a lockfile, an \
+environment file, a Terraform file, a package marker, a fixture tree, a shebang script or a \
+tool config; how many were left out, and why, is in `liveness_meta.unwired.excluded_*`, so an \
+empty list means nothing is unwired rather than that the filter swallowed the repository."
             .to_string(),
         "8. Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, \
 `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) over \

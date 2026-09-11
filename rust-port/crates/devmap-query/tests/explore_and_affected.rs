@@ -78,6 +78,29 @@ fn fixture(root: &Path) -> Store {
     store
 }
 
+#[test]
+fn zero_depth_affected_tests_only_reports_seed_tests() {
+    let root = scratch("zero-depth");
+    let store = fixture(&root);
+    let engine = StoreQueryEngine::new(&store);
+    let answer = engine
+        .affected_tests(&["render".into()], 8_000, 0.0, 0)
+        .unwrap();
+    assert!(answer.tests.items.is_empty(), "{:?}", answer.tests.items);
+    assert!(answer.blast_radius.layers.items.is_empty());
+    assert!(answer
+        .tests
+        .walk_incomplete
+        .as_deref()
+        .unwrap_or_default()
+        .contains("depth 0"));
+    let seed = engine
+        .affected_tests(&["test_render".into()], 8_000, 0.0, 0)
+        .unwrap();
+    assert_eq!(seed.tests.items.len(), 1);
+    assert_eq!(seed.tests.items[0].depth, 0);
+}
+
 /// The best match survives a cut of one, whatever its path sorts like.
 ///
 /// Python built its match list as `exact_matches + partial_matches` and then

@@ -1,15 +1,18 @@
 ---
 name: devmap-exploring
-description: Use when the user asks how code works, wants architecture, callers, or an execution flow. Examples: "How does X work?", "What calls this function?", "Show me the auth flow"
+description: Use DevMap to explain code structure, architecture, callers, and execution
+  paths.
 ---
 
 # Exploring with DevMap
 
-1. `devmap_status` — refuse to interpret empty answers if the index is unbuilt.
-2. `devmap_explore` on the symbol or concept. One call: definitions, callers, callees, blast radius.
-3. `devmap_trace` when the question is "how does A reach B?".
-4. Read the source files the tool named. The graph is a map, not the code.
+Resolve this checkout with `devmap paths --json`, then check `devmap status --json`. Read the returned `repo_map` path; do not assume `.devcouncil` rather than `.devmap`. A missing, stale, or partially parsed index is not complete evidence. Rebuild with `devmap build --manifest` when needed and authorized, then recheck status.
 
-If `truncated` or `walk_incomplete` is set, raise `budget`/`depth` or say the neighbourhood is partial. Do not call GitNexus `query` / `context` / `gitnexus://` resources.
+Use the connected DevMap MCP tools if they target this checkout; otherwise use the CLI from its root. GitPulse's `gitpulse_codeintel_*` tools also query DevMap: pass the absolute `repo_path`. Discover the actual tool names and schemas; a host need not expose every CLI capability.
 
-Layout questions (which folder owns this): `.devcouncil/repo_map.json` subsystems, `entry_points`, `critical_files`.
+1. Run `devmap explore <name> --json` for definitions, callers, callees, and blast radius.
+2. Use `devmap trace <from> <to> --json` for a specific entry-to-symbol path.
+3. Use the resolved map's subsystems, entry points, and critical files for ownership.
+4. Confirm the explanation against source and call sites. Graph paths describe static relationships, not proof that a path executed.
+
+Read `shown`, `total`, `truncated`, and `walk_incomplete`. Increase query bounds only within supported limits. When DevMap cannot answer, explain the limitation and use source inspection or a suitable available fallback, subject to user and repository instructions.

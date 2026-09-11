@@ -320,3 +320,134 @@ fn a_makefile_that_declares_test_still_names_make_test() {
     assert_eq!(scanned.test_commands, vec!["make test".to_string()]);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn malformed_package_json_is_reported_as_unreadable() {
+    let root = root("malformed-json");
+    std::fs::write(root.join("package.json"), "{invalid").unwrap();
+    let scanned = inventory::scan(&root);
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        scanned
+            .unreadable
+            .iter()
+            .any(|reason| reason.starts_with("package.json:")),
+        "invalid JSON silently became an empty command list: {scanned:?}"
+    );
+}
+
+#[test]
+fn unreadable_directory_is_reported_in_inventory() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = root("unreadable-directory");
+    let blocked = root.join("blocked");
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::write(blocked.join("Cargo.toml"), "[package]\nname = 'nested'\n").unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let scanned = inventory::scan(&root);
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        scanned
+            .unreadable
+            .iter()
+            .any(|reason| reason.starts_with("blocked:")),
+        "unreadable directory silently disappeared: {scanned:?}"
+    );
+}
+
+#[test]
+fn tracked_deep_packages_are_not_lost_to_the_fallback_depth_limit() {
+    let root = root("deep-git");
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&root)
+        .status()
+        .unwrap()
+        .success());
+    let mut deep = root.clone();
+    for level in 0..inventory::WALK_DEPTH_CAP + 4 {
+        deep = deep.join(format!("d{level}"));
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("Cargo.toml"), "[package]\nname = 'deep'\n").unwrap();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["add", "."])
+        .status()
+        .unwrap()
+        .success());
+    let scanned = inventory::scan(&root);
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        scanned
+            .package_managers
+            .iter()
+            .any(|manager| manager == "cargo"),
+        "a tracked manifest was lost solely because of depth: {scanned:?}"
+    );
+    assert!(!scanned.walk_truncated);
+}
+
+#[test]
+fn invalid_package_shapes_and_empty_scripts_are_not_commands() {
+    let root = root("invalid-shapes");
+    for value in [
+        "null",
+        "[]",
+        r#"{"scripts":[]}"#,
+        r#"{"scripts":{"test":42}}"#,
+    ] {
+        std::fs::write(root.join("package.json"), value).unwrap();
+        let scanned = inventory::scan(&root);
+        assert!(
+            !scanned.is_complete(),
+            "invalid package shape looked complete: {value}"
+        );
+        assert!(!scanned.unreadable.is_empty());
+        assert!(scanned.test_commands.is_empty());
+    }
+    std::fs::write(root.join("package.json"), r#"{"scripts":{"test":"  "}}"#).unwrap();
+    let scanned = inventory::scan(&root);
+    assert!(scanned.is_complete());
+    assert!(scanned.test_commands.is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unreadable_git_paths_and_failed_git_inventory_cannot_claim_complete() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = root("git-errors");
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&root)
+        .status()
+        .unwrap()
+        .success());
+    let blocked = root.join("blocked");
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::write(blocked.join("Cargo.toml"), "[package]\nname = 'nested'\n").unwrap();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["add", "."])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let scanned = inventory::scan(&root);
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        !scanned.is_complete(),
+        "Git path errors cannot vanish: {scanned:?}"
+    );
+    assert!(!scanned.unreadable.is_empty() || !scanned.unavailable_reason.is_empty());
+    std::fs::remove_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".git"), "invalid git metadata").unwrap();
+    let scanned = inventory::scan(&root);
+    assert!(!scanned.computed);
+    assert!(!scanned.is_complete());
+    assert!(!scanned.unavailable_reason.is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
