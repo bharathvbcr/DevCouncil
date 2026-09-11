@@ -54,6 +54,24 @@ use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::admission::Admission;
 use crate::protocol::{dispatch, validate_request, IpcCommand, IpcRequest, PROTOCOL_VERSION};
+use crate::root_resolve::RootResolveInput;
+
+/// How this slot decides which store file to open.
+#[derive(Debug)]
+enum SlotMode {
+    /// A fixed path — tests, and callers that already resolved one.
+    Pinned { db_path: PathBuf },
+    /// Discover from MCP roots, then cwd, then optional `--db` override.
+    Resolving {
+        explicit_db: Option<PathBuf>,
+        client_cwd: PathBuf,
+        /// Filled after `roots/list` (or left `None` when the client has no
+        /// roots capability). `Some(vec![])` means "asked, empty".
+        mcp_roots: Mutex<Option<Vec<PathBuf>>>,
+        /// True when the client advertised `capabilities.roots` on initialize.
+        client_has_roots: Mutex<bool>,
+    },
+}
 
 /// The store, opened on first successful use rather than at startup.
 ///
@@ -68,29 +86,131 @@ use crate::protocol::{dispatch, validate_request, IpcCommand, IpcRequest, PROTOC
 /// at startup and cached that answer would stay wrong for the rest of the
 /// session. Each call retries until one succeeds; after that the handle is held
 /// for the life of the process, which is the point of this server.
+///
+/// Global MCP registration uses [`Self::resolving`]: the store path is not baked
+/// into `--db`, so one server serves whichever workspace the host has open.
 pub struct StoreSlot {
-    db_path: PathBuf,
-    opened: Mutex<Option<Arc<Store>>>,
+    mode: SlotMode,
+    /// `(resolved path, store)` so a mid-session root swap can reopen when the
+    /// resolved path changes.
+    opened: Mutex<Option<(PathBuf, Arc<Store>)>>,
 }
 
 impl StoreSlot {
+    /// Pin this slot to one store path. Used by tests and by callers that have
+    /// already decided where the index lives.
     pub fn new(db_path: impl Into<PathBuf>) -> Self {
         Self {
-            db_path: db_path.into(),
+            mode: SlotMode::Pinned {
+                db_path: db_path.into(),
+            },
+            opened: Mutex::new(None),
+        }
+    }
+
+    /// Discover the store from MCP roots, then client cwd, then optional `--db`.
+    ///
+    /// `explicit_db` is only the override path from `--db` when the flag was
+    /// actually passed; `None` is the global-registration case.
+    pub fn resolving(explicit_db: Option<PathBuf>, client_cwd: PathBuf) -> Self {
+        Self {
+            mode: SlotMode::Resolving {
+                explicit_db,
+                client_cwd,
+                mcp_roots: Mutex::new(None),
+                client_has_roots: Mutex::new(false),
+            },
             opened: Mutex::new(None),
         }
     }
 
     /// An already-open store, for tests and for callers that own one.
     pub fn ready(db_path: impl Into<PathBuf>, store: Arc<Store>) -> Self {
+        let db_path = db_path.into();
         Self {
-            db_path: db_path.into(),
-            opened: Mutex::new(Some(store)),
+            mode: SlotMode::Pinned {
+                db_path: db_path.clone(),
+            },
+            opened: Mutex::new(Some((db_path, store))),
         }
     }
 
-    pub fn db_path(&self) -> &Path {
-        &self.db_path
+    /// Record whether the client advertised MCP roots on `initialize`.
+    pub fn set_client_has_roots(&self, has: bool) {
+        if let SlotMode::Resolving {
+            client_has_roots, ..
+        } = &self.mode
+        {
+            if let Ok(mut slot) = client_has_roots.lock() {
+                *slot = has;
+            }
+        }
+    }
+
+    pub fn client_has_roots(&self) -> bool {
+        match &self.mode {
+            SlotMode::Resolving {
+                client_has_roots, ..
+            } => client_has_roots.lock().map(|g| *g).unwrap_or(false),
+            SlotMode::Pinned { .. } => false,
+        }
+    }
+
+    /// Apply a `roots/list` answer. An empty list is recorded as empty, not as
+    /// "never asked", so the resolve error can say so.
+    pub fn set_mcp_roots(&self, roots: Vec<PathBuf>) {
+        if let SlotMode::Resolving { mcp_roots, .. } = &self.mode {
+            if let Ok(mut slot) = mcp_roots.lock() {
+                *slot = Some(roots);
+            }
+        }
+    }
+
+    /// The path last resolved or pinned. For resolving slots that have never
+    /// opened, this is a best-effort preview (cwd / `--db`) for logging only —
+    /// [`Self::get`] is the authority.
+    pub fn db_path(&self) -> PathBuf {
+        if let Ok(opened) = self.opened.lock() {
+            if let Some((path, _)) = opened.as_ref() {
+                return path.clone();
+            }
+        }
+        match &self.mode {
+            SlotMode::Pinned { db_path } => db_path.clone(),
+            SlotMode::Resolving {
+                explicit_db,
+                client_cwd,
+                ..
+            } => explicit_db
+                .clone()
+                .unwrap_or_else(|| devmap_extract::paths::store_path(client_cwd)),
+        }
+    }
+
+    fn resolve_path(&self) -> Result<PathBuf, String> {
+        match &self.mode {
+            SlotMode::Pinned { db_path } => Ok(db_path.clone()),
+            SlotMode::Resolving {
+                explicit_db,
+                client_cwd,
+                mcp_roots,
+                ..
+            } => {
+                let roots = mcp_roots
+                    .lock()
+                    .map_err(|_| "mcp roots mutex was poisoned by an earlier panic".to_string())?
+                    .clone();
+                let input = RootResolveInput {
+                    mcp_roots: roots,
+                    client_cwd: client_cwd.clone(),
+                    explicit_db: explicit_db.clone(),
+                };
+                // `--db` wins when the file exists (legacy per-project configs);
+                // when it names a missing path — the unexpanded
+                // `${CLAUDE_PROJECT_DIR}` class — discovery continues.
+                input.resolve_with_db_override()
+            }
+        }
     }
 
     /// The store, or the reason there isn't one.
@@ -98,18 +218,23 @@ impl StoreSlot {
     /// The error is the message an agent sees, so it names the path and the
     /// command that fixes it. "No index" and "the symbol does not exist" are
     /// different facts and must not arrive looking alike.
-    fn get(&self) -> Result<Arc<Store>, String> {
+    pub fn get(&self) -> Result<Arc<Store>, String> {
+        let resolved = self.resolve_path()?;
         let mut slot = self
             .opened
             .lock()
             .map_err(|_| "store slot mutex was poisoned by an earlier panic".to_string())?;
-        if let Some(store) = slot.as_ref() {
-            return Ok(Arc::clone(store));
+        if let Some((path, store)) = slot.as_ref() {
+            if path == &resolved {
+                return Ok(Arc::clone(store));
+            }
+            // Root swap: drop the old handle and open the newly resolved path.
+            *slot = None;
         }
-        match Store::open_existing(&self.db_path) {
+        match Store::open_existing(&resolved) {
             Ok(Some(store)) => {
                 let store = Arc::new(store);
-                *slot = Some(Arc::clone(&store));
+                *slot = Some((resolved, Arc::clone(&store)));
                 Ok(store)
             }
             // `open_existing` answers `Ok(None)` for anything that is not a
@@ -118,45 +243,45 @@ impl StoreSlot {
             // "the index has not been built" makes a definite claim on behalf
             // of a check that never ran, and sends the caller to run
             // `devmap build`, which will fail again for the unstated reason.
-            Ok(None) => Err(self.explain_absence()),
+            Ok(None) => Err(explain_absence(&resolved)),
             Err(err) => Err(format!(
                 "devmap index at {} could not be opened: {err}",
-                self.db_path.display()
+                resolved.display()
             )),
         }
     }
+}
 
-    /// Why there is no store at this path — as distinct facts, not one guess.
-    ///
-    /// Each arm is a different problem with a different fix, and the caller is
-    /// an agent that will act on whichever one it is told. `symlink_metadata`
-    /// rather than `metadata` so a dangling symlink reports as itself instead of
-    /// as a missing file.
-    fn explain_absence(&self) -> String {
-        let path = self.db_path.display();
-        match std::fs::symlink_metadata(&self.db_path) {
-            Ok(meta) if meta.is_dir() => format!(
-                "the devmap index path {path} is a directory, not a database file. Nothing can \
+/// Why there is no store at this path — as distinct facts, not one guess.
+///
+/// Each arm is a different problem with a different fix, and the caller is
+/// an agent that will act on whichever one it is told. `symlink_metadata`
+/// rather than `metadata` so a dangling symlink reports as itself instead of
+/// as a missing file.
+fn explain_absence(db_path: &Path) -> String {
+    let path = db_path.display();
+    match std::fs::symlink_metadata(db_path) {
+        Ok(meta) if meta.is_dir() => format!(
+            "the devmap index path {path} is a directory, not a database file. Nothing can \
 be read from it and `devmap build` will not fix it — the path is wrong, or something else \
 created a directory there."
-            ),
-            Ok(meta) if meta.file_type().is_symlink() => format!(
-                "the devmap index path {path} is a symlink that does not resolve to a readable \
+        ),
+        Ok(meta) if meta.file_type().is_symlink() => format!(
+            "the devmap index path {path} is a symlink that does not resolve to a readable \
 file."
-            ),
-            Ok(_) => format!(
-                "the devmap index at {path} exists but could not be read as a file — most \
+        ),
+        Ok(_) => format!(
+            "the devmap index at {path} exists but could not be read as a file — most \
 likely a permissions problem on it or on a parent directory."
-            ),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => format!(
-                "no devmap index at {path} — run `devmap build` (or `dev map`) in this \
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => format!(
+            "no devmap index at {path} — run `devmap build` (or `dev map`) in this \
 repository first. This is 'the index has not been built', not 'the repository is empty'."
-            ),
-            Err(err) => format!(
-                "the devmap index at {path} could not be examined: {err}. This is not a \
+        ),
+        Err(err) => format!(
+            "the devmap index at {path} could not be examined: {err}. This is not a \
 statement about whether an index exists — the check itself failed."
-            ),
-        }
+        ),
     }
 }
 
@@ -1324,6 +1449,99 @@ fn initialize_result(params: Option<&Value>) -> Value {
     })
 }
 
+/// Whether the client's `initialize` params advertise MCP roots.
+fn client_advertises_roots(params: Option<&Value>) -> bool {
+    params
+        .and_then(|p| p.get("capabilities"))
+        .and_then(|c| c.get("roots"))
+        .is_some()
+}
+
+/// Parse a `roots/list` result into filesystem paths.
+///
+/// URI forms `file:///…` are accepted; anything else is skipped with a note in
+/// the returned skipped count so oversized or exotic schemes cannot be mistaken
+/// for an empty workspace.
+fn parse_roots_list_result(result: &Value) -> (Vec<PathBuf>, usize) {
+    let Some(roots) = result.get("roots").and_then(Value::as_array) else {
+        return (Vec::new(), 0);
+    };
+    let mut paths = Vec::new();
+    let mut skipped = 0usize;
+    for root in roots {
+        let Some(uri) = root.get("uri").and_then(Value::as_str) else {
+            skipped += 1;
+            continue;
+        };
+        match file_uri_to_path(uri) {
+            Some(path) => paths.push(path),
+            None => skipped += 1,
+        }
+    }
+    (paths, skipped)
+}
+
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let path = if let Some(rest) = uri.strip_prefix("file://") {
+        // `file:///Users/…` → `/Users/…`; `file://localhost/Users/…` is rare
+        // and treated as a non-file URI rather than silently misparsed.
+        if rest.starts_with('/') {
+            rest.to_string()
+        } else {
+            let stripped = rest.strip_prefix("localhost")?;
+            stripped.to_string()
+        }
+    } else if uri.starts_with('/') {
+        // Absolute path without a scheme — some hosts send that.
+        uri.to_string()
+    } else {
+        return None;
+    };
+    // Percent-decoding is enough for ordinary workspace paths; a malformed
+    // escape leaves the raw form rather than inventing a path.
+    let decoded = percent_decode(&path);
+    Some(PathBuf::from(decoded))
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Id used for the one `roots/list` request this server sends after initialize.
+pub const ROOTS_LIST_REQUEST_ID: &str = "devmap-roots-1";
+
+fn roots_list_request() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": ROOTS_LIST_REQUEST_ID,
+        "method": "roots/list",
+        "params": {}
+    })
+}
+
 /// Who answered. One copy, reached two ways.
 ///
 /// `initialize` publishes it as `serverInfo`, and [`complete`] publishes it in
@@ -1514,7 +1732,7 @@ async fn call_tool(
         .to_string();
 
     let started = Instant::now();
-    let db_path = store.db_path().to_path_buf();
+    let db_path = store.db_path();
     let args = params.get("arguments").cloned();
     let log_err = |message: &str| {
         crate::session_log::append_query(
@@ -1953,11 +2171,27 @@ server also serves {}.",
                 ),
             ))
         }
-        "initialize" => initialize_result(params.as_ref()),
+        "initialize" => {
+            let result = initialize_result(params.as_ref());
+            store.set_client_has_roots(client_advertises_roots(params.as_ref()));
+            result
+        }
         // Accepted and acted on nowhere. `notifications/cancelled` is handled by
         // the session before it ever reaches this function; reaching here means
         // there was no session, so there is nothing in flight to stop.
         "notifications/initialized" | "notifications/cancelled" => json!({}),
+        // Hosts that support listChanged may push an update; treat it as a
+        // fresh roots/list payload when present, otherwise clear so the next
+        // resolve re-queries via cwd/--db rather than trusting a stale list.
+        "notifications/roots/list_changed" => {
+            if let Some(roots_params) = params.as_ref() {
+                let (paths, _skipped) = parse_roots_list_result(roots_params);
+                store.set_mcp_roots(paths);
+            } else {
+                store.set_mcp_roots(Vec::new());
+            }
+            json!({})
+        }
         "ping" => json!({}),
         "server/discover" => discover_result(),
         "tools/list" => list_tools(params.as_ref())?,
@@ -2106,6 +2340,24 @@ async fn dispatch_single(session: &Arc<Session>, value: Value) -> Option<Value> 
         ));
     };
 
+    // A JSON-RPC *response* to a server-initiated request has `result`/`error`
+    // and no `method`. The only one this server sends is `roots/list`; absorb
+    // it here so it is not refused as a malformed request.
+    if object.get("method").is_none()
+        && (object.contains_key("result") || object.contains_key("error"))
+    {
+        if object.get("id").and_then(Value::as_str) == Some(ROOTS_LIST_REQUEST_ID) {
+            if let Some(result) = object.get("result") {
+                let (paths, _skipped) = parse_roots_list_result(result);
+                session.store.set_mcp_roots(paths);
+            } else {
+                // Error or empty: record "asked, got nothing" so resolve names it.
+                session.store.set_mcp_roots(Vec::new());
+            }
+        }
+        return None;
+    }
+
     // Presence, not value. JSON-RPC 2.0 §4: "A Notification is a Request object
     // without an 'id' member." A frame that carries an `id` member is a request
     // and is owed a response, whatever that member turned out to contain —
@@ -2189,11 +2441,15 @@ request was not run."
     // because a notification must not be answered. The refusal is loud on
     // stderr — the one channel stdio leaves open for it — and silent on the
     // wire, which is where the specification requires silence.
-    if !has_id && method != "notifications/initialized" {
+    if !has_id
+        && method != "notifications/initialized"
+        && method != "notifications/roots/list_changed"
+    {
         tracing::warn!(
             "discarded a frame with no id calling '{method}': the only notifications this \
-server accepts are notifications/initialized and notifications/cancelled, and a request \
-method sent as a notification would run work whose result cannot be returned"
+server accepts are notifications/initialized, notifications/roots/list_changed, and \
+notifications/cancelled, and a request method sent as a notification would run work whose \
+result cannot be returned"
         );
         return None;
     }
@@ -2503,10 +2759,27 @@ continued for {seen} bytes in total before terminating"
 
         let session = Arc::clone(&session);
         let writer = Arc::clone(&writer);
+        let ask_roots = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v.get("method")
+                    .and_then(Value::as_str)
+                    .map(|m| m == "notifications/initialized")
+            })
+            .unwrap_or(false)
+            && session.store.client_has_roots();
         tasks.push(tokio::spawn(async move {
             let _admitted = admitted;
             if let Some(frame) = handle_line_in(&session, &text).await {
                 let _ = write_frame(&writer, &frame).await;
+            }
+            // After the host finishes the handshake, ask for the open workspace
+            // roots. Global `devmap mcp` has no `--db`; this is how one server
+            // finds the right store. Failure to answer is recorded as an empty
+            // list when the response arrives (or left as "not queried" if it
+            // never does) — resolve names both cases.
+            if ask_roots {
+                let _ = write_frame(&writer, &roots_list_request()).await;
             }
         }));
         // Finished handles are still reaped as we go, so a long session does not

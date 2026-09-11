@@ -1143,13 +1143,15 @@ pub const DEVMAP_HOOKS: &[DevmapHook] = &[
         event: "SessionStart",
         matcher: SESSION_START_MATCHER,
         subcommand: "status",
-        args: &[],
-        timeout_secs: Some(10),
+        args: &["--auto-rebuild"],
+        timeout_secs: Some(120),
         run_async: false,
         status_message: "Dev Map index status",
         purpose: "SessionStart is one of the four events whose exit-0 stdout is added to \
                   the context Claude can see, so the agent starts the session knowing \
-                  whether the index is fresh instead of trusting a stale map.",
+                  whether the index is fresh instead of trusting a stale map. When the \
+                  index is payload-obsolete or schema-behind, `--auto-rebuild` runs a \
+                  bounded build instead of only reporting stale.",
     },
     DevmapHook {
         event: "SessionStart",
@@ -1254,18 +1256,17 @@ fn utf8_path(label: &str, path: &Path) -> anyhow::Result<String> {
     })
 }
 
-/// The `--db` argument a hook passes, anchored to the project root.
+/// The anchor every hook passes: the project root, resolved by the host.
 ///
-/// A relative store path is relative to the *hook's* working directory, which is
-/// Claude's current directory — a worktree or any `cd` target, not necessarily
-/// the repository this index describes.
-fn hook_db_arg(db: &Path) -> anyhow::Result<String> {
-    let text = utf8_path("the store path", db)?;
-    Ok(if db.is_absolute() {
-        text
-    } else {
-        format!("{PROJECT_DIR}/{text}")
-    })
+/// A hook runs in Claude's current directory — a worktree or any `cd` target,
+/// not necessarily the repository this index describes — so it has to say which
+/// repository it means. It says it as a *root* rather than as a store path:
+/// `--root` resolves the store through the same discovery every other
+/// invocation uses, while `--db ${CLAUDE_PROJECT_DIR}/<state path>` freezes the
+/// state layout as it stood when the hook was written, and a repository that
+/// keeps its state elsewhere then gets a second, empty store created beside it.
+fn hook_root_args() -> Vec<Value> {
+    vec![json!("--root"), json!(PROJECT_DIR)]
 }
 
 /// Subcommands this binary's parser actually registers.
@@ -1345,9 +1346,11 @@ fn resolves_to_self(name: &str, executable: &Path, path_var: Option<&std::ffi::O
 ///
 /// `subcommands` is the parser's own list; a spec naming anything outside it is
 /// refused rather than written.
-pub fn hooks_block(executable: &Path, db: &Path, subcommands: &[String]) -> anyhow::Result<Value> {
+///
+/// Hooks anchor to the project root, not to a store path — see
+/// [`hook_root_args`].
+pub fn hooks_block(executable: &Path, subcommands: &[String]) -> anyhow::Result<Value> {
     let exe = utf8_path("the devmap executable path", executable)?;
-    let db_arg = hook_db_arg(db)?;
 
     // Groups are keyed by (event, matcher): two handlers that fire on the same
     // event+matcher belong in one group. Two groups with the same matcher are
@@ -1383,7 +1386,8 @@ pub fn hooks_block(executable: &Path, db: &Path, subcommands: &[String]) -> anyh
         // no shell to re-tokenize it. The documentation asks for exactly this
         // whenever a path placeholder is involved, and every argument below
         // carries one or is an absolute path.
-        let mut args: Vec<Value> = vec![json!("--db"), json!(db_arg), json!(spec.subcommand)];
+        let mut args: Vec<Value> = hook_root_args();
+        args.push(json!(spec.subcommand));
         args.extend(spec.args.iter().map(|a| json!(a)));
 
         let mut handler = Map::new();
@@ -1524,17 +1528,40 @@ pub fn marketplace_manifest(version: Option<&str>) -> anyhow::Result<Value> {
 /// One owner for the formula: `devmap mcp --print-config` and the plugin bundle
 /// both call this, so a host configured from one cannot reach a different server
 /// than a host configured from the other.
-pub fn mcp_entry(executable: &Path, db: &Path, http: Option<&str>) -> anyhow::Result<Value> {
+///
+/// `db` is optional. Global registration omits `--db` so the server resolves
+/// the store from MCP `roots/list` then the client's cwd — that is what removes
+/// the `${CLAUDE_PROJECT_DIR}` failure class. When `db` is `Some`, it is passed
+/// as an override for legacy per-project configs.
+pub fn mcp_entry(
+    executable: &Path,
+    db: Option<&Path>,
+    http: Option<&str>,
+) -> anyhow::Result<Value> {
+    // Always the absolute path this binary validated. Emitting a bare `devmap`
+    // silently hands the host whichever build wins on PATH; two installs with
+    // different schemas is the skew doctor reports.
+    let command = utf8_path("the devmap executable path", executable)?;
     Ok(match http {
         Some(address) => json!({
             "type": "http",
             "url": format!("http://{}", normalize_http_address(address)),
         }),
-        None => json!({
-            "type": "stdio",
-            "command": utf8_path("the devmap executable path", executable)?,
-            "args": ["--db", utf8_path("the store path", db)?, "mcp"],
-        }),
+        None => {
+            if let Some(db) = db {
+                json!({
+                    "type": "stdio",
+                    "command": command,
+                    "args": ["--db", utf8_path("the store path", db)?, "mcp"],
+                })
+            } else {
+                json!({
+                    "type": "stdio",
+                    "command": command,
+                    "args": ["mcp"],
+                })
+            }
+        }
     })
 }
 
@@ -1548,11 +1575,11 @@ pub fn normalize_http_address(address: &str) -> String {
     }
 }
 
-/// The plugin's `.mcp.json`, with the store anchored to the project root for the
-/// same reason the hooks are.
-pub fn plugin_mcp_config(executable: &Path, db: &Path) -> anyhow::Result<Value> {
-    let anchored = PathBuf::from(hook_db_arg(db)?);
-    Ok(json!({"mcpServers": {MCP_SERVER_NAME: mcp_entry(executable, &anchored, None)?}}))
+/// The plugin's `.mcp.json`. Global shape: no `--db`, so the server resolves
+/// from MCP roots / cwd. The `db` argument is retained so call sites do not
+/// have to change shape; it is intentionally unused for the emitted entry.
+pub fn plugin_mcp_config(executable: &Path, _db: &Path) -> anyhow::Result<Value> {
+    Ok(json!({"mcpServers": {MCP_SERVER_NAME: mcp_entry(executable, None, None)?}}))
 }
 
 /// One file the bundle writes.
@@ -1590,7 +1617,7 @@ pub fn render_plugin_bundle(
         ),
         (
             plugin.join("hooks").join("hooks.json"),
-            pretty(&hooks_block(executable, db, subcommands)?),
+            pretty(&hooks_block(executable, subcommands)?),
         ),
         (
             plugin.join(".mcp.json"),
@@ -2192,7 +2219,7 @@ mod tests {
         let executable = Path::new("/usr/local/bin/devmap");
         let db = Path::new("/repo/.devcouncil/codeintel/devmap.sqlite");
         for address in ["8080", "127.0.0.1:9000", "[::1]:9100"] {
-            let entry = mcp_entry(executable, db, Some(address)).expect("http entry renders");
+            let entry = mcp_entry(executable, Some(db), Some(address)).expect("http entry renders");
             let url = entry["url"]
                 .as_str()
                 .unwrap_or_else(|| panic!("the http entry must carry a url: {entry}"));

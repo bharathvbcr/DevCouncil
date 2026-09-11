@@ -1,0 +1,24 @@
+{
+  "arguments": [
+    "policy-check",
+    "src/a.py",
+    "--json",
+    "--task-id",
+    "TASK-CLI"
+  ],
+  "capture_mode": "live",
+  "case": "cli_policy_check",
+  "exit_code": 0,
+  "notes": "",
+  "payload": {
+    "action": "allow",
+    "allowed": true,
+    "reason": "File change is allowed.",
+    "target": "src/a.py",
+    "task_id": "TASK-CLI"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "cli",
+  "tool_or_command": "dev policy-check"
+}

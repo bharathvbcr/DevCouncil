@@ -1,0 +1,19 @@
+{
+  "arguments": [
+    "next-task",
+    "--json"
+  ],
+  "capture_mode": "live",
+  "case": "cli_next_task",
+  "exit_code": 0,
+  "notes": "",
+  "payload": {
+    "ok": true,
+    "reason": "No unblocked, unleased task is available.",
+    "task": null
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "cli",
+  "tool_or_command": "dev next-task"
+}

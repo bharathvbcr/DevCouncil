@@ -8,11 +8,14 @@ import (
 
 // The default that would have silently inverted.
 //
-// DevCouncil declares `required: bool = True`, and pydantic omits defaults when
-// it serialises. Go zeroes an absent bool to false, so decoding with the plain
-// struct tag turns every criterion a producer left the key off into an optional
-// one. Nothing downstream would report it: the criterion is still listed, still
-// looks checked, and has simply stopped being something the work must satisfy.
+// DevCouncil's Python models used to declare `required: bool = True` and omit
+// defaults on the wire. Phase 7 deleted that producer; this package is now the
+// sole owner of the shape, and the default below is still load-bearing for any
+// artifact that leaves the key off. Go zeroes an absent bool to false, so
+// decoding with the plain struct tag turns every criterion without the key into
+// an optional one. Nothing downstream would report it: the criterion is still
+// listed, still looks checked, and has simply stopped being something the work
+// must satisfy.
 func TestAnAbsentRequiredFlagMeansRequired(t *testing.T) {
 	var ac AcceptanceCriterion
 	if err := json.Unmarshal([]byte(

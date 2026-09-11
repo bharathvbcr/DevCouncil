@@ -1,0 +1,22 @@
+{
+  "arguments": [
+    "release",
+    "TASK-CLI",
+    "--lease-token",
+    "<LEASE_TOKEN>",
+    "--json"
+  ],
+  "capture_mode": "live",
+  "case": "cli_release",
+  "exit_code": 0,
+  "notes": "",
+  "payload": {
+    "ok": true,
+    "released": true,
+    "task_id": "TASK-CLI"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "cli",
+  "tool_or_command": "dev release"
+}

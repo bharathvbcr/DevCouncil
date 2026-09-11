@@ -2,8 +2,7 @@
 
 Dev Map has two supported host seams. Rust programs can link the read-only
 query crate. Programs in other languages can invoke `devmap` and consume its
-JSON contract. A host chooses the seam in configuration; neither requires
-changes to DevCouncil's Python package.
+JSON contract. A host chooses the seam in configuration; neither requires a Python runtime.
 
 ## Rust module
 
@@ -26,7 +25,7 @@ let queries = StoreQueryEngine::new(&store);
 `default-features = false` removes the parser and grammar frontend. A host that
 also builds maps enables the default `parse` feature. `devmap-query` owns its
 HTML renderer asset, so vendoring the crate does not require copying or
-rewriting paths into DevCouncil's Python package. Always use
+rewriting paths into another language tree. Always use
 `paths::store_path(repository_root)` instead of appending `.devmap` or
 `.devcouncil`: the resolver honors `DEVMAP_HOME`, an existing standalone
 layout, and the legacy DevCouncil layout in their documented precedence.

@@ -1,0 +1,84 @@
+{
+  "arguments": [
+    "gaps",
+    "--json",
+    "--task-id",
+    "TASK-CLI"
+  ],
+  "capture_mode": "live",
+  "case": "cli_gaps",
+  "exit_code": 0,
+  "notes": "",
+  "payload": {
+    "blocking_count": 1,
+    "gaps": [
+      {
+        "acceptance_criterion_id": null,
+        "blocking": true,
+        "description": "Task TASK-CLI declares files to create or modify, but produced no changes. Verification cannot prove work that does not exist.",
+        "evidence": [
+          "planned files expecting change: ['src/a.py']"
+        ],
+        "expected_verification_method": null,
+        "file": null,
+        "gap_type": "task_not_implemented",
+        "id": "GAP-TASK-CLI-NODIFF-02b5ef802a",
+        "line": null,
+        "recommended_fix": "Implement the planned changes so the diff is non-empty, then re-verify. If you did make changes, ensure they are saved and visible to git (not reverted, stashed, or written outside the project root).",
+        "requirement_id": null,
+        "severity": "high",
+        "stderr_path": null,
+        "stdout_path": null,
+        "suggested_command": null,
+        "task_id": "TASK-CLI"
+      },
+      {
+        "acceptance_criterion_id": null,
+        "blocking": false,
+        "description": "Verification command could not run (not a code failure): '*'. It appears malformed or its tooling is unavailable, so this command proves nothing either way.",
+        "evidence": [
+          "Failed to run command: [Errno 2] No such file or directory: '*'"
+        ],
+        "expected_verification_method": null,
+        "file": null,
+        "gap_type": "invalid_verification_command",
+        "id": "GAP-TASK-CLI-BADCMD-bc55347fb2",
+        "line": null,
+        "recommended_fix": "Regenerate the task's verification commands with 'dev repair', or edit them to be a single runnable command (e.g. 'python -m pytest <file>').",
+        "requirement_id": null,
+        "severity": "medium",
+        "stderr_path": null,
+        "stdout_path": null,
+        "suggested_command": "*",
+        "task_id": "TASK-CLI"
+      },
+      {
+        "acceptance_criterion_id": null,
+        "blocking": false,
+        "description": "Planned file src/a.py was not modified.",
+        "evidence": [],
+        "expected_verification_method": null,
+        "file": "src/a.py",
+        "gap_type": "planned_file_not_changed",
+        "id": "GAP-TASK-CLI-FILEsrcapy-30ca4a038b",
+        "line": null,
+        "recommended_fix": "Modify src/a.py as planned or update the task.",
+        "requirement_id": null,
+        "severity": "medium",
+        "stderr_path": null,
+        "stdout_path": null,
+        "suggested_command": null,
+        "task_id": "TASK-CLI"
+      }
+    ],
+    "gates_mode": "enforce",
+    "initialized": true,
+    "ok": true,
+    "stored_blocking_count": 1,
+    "task_id": "TASK-CLI"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "cli",
+  "tool_or_command": "dev gaps"
+}

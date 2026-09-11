@@ -249,12 +249,9 @@ from devcouncil.domain.task import Task
 from devcouncil.execution.policy_engine import TaskPolicyEngine, normalize_allowlist_command
 ```
 
-Porting `policy_engine.py` breaks that generator — **silently**. Nothing imports
-it at build or test time, so MANVI's `TestCommandParityWithPythonEngine` keeps
-reading the committed `.tsv` and keeps passing, against a snapshot of an
-implementation nobody runs any more. The gate stays green while the thing it
-compares against has ceased to exist, and the first real divergence in the
-command gate arrives with no test able to notice.
+Porting `policy_engine.py` is no longer possible here: the Python package was
+deleted in Phase 7. MANVI's `TestCommandParityWithPythonEngine` now compares
+against a frozen snapshot of an implementation that is not in this tree.
 
 Regenerating is not the clean answer it looks like: the fixture's header records
 **three rows applied by hand after generation**, where MANVI deliberately

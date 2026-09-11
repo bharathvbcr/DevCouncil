@@ -107,18 +107,7 @@ func TestAHungBinaryFailsFastWithinTheCooldown(t *testing.T) {
 		"#!/bin/sh\nprintf '%s\\n' \"$@\" >> "+argvLog+"\nprintf '\\036\\n' >> "+argvLog+"\n"+
 			"case \" $* \" in *\" --help \"*) sleep 60;; esac\necho '{}'\n")
 	c := New(bin, dir)
-	// Two seconds, not 150ms. The assertion below counts lines the *child*
-	// writes before it hangs, and at 150ms the probe's own kill raced the
-	// operating system's ability to fork /bin/sh and reach the first printf:
-	// under `go test ./... -race`, where all seven packages spawn processes at
-	// once, the child was killed before it recorded anything and the count came
-	// back 0. Isolated, it passed 10 times out of 10 — which is exactly the
-	// shape of a test that is green until CI is busy.
-	//
-	// Nothing this test asserts is weakened by the larger bound: "the probe was
-	// bounded at all" is checked against 5s below, and the fail-fast assertion
-	// (50ms) never execs, because the cooldown short-circuits before it.
-	c.probeTimeout = 2 * time.Second
+	c.probeTimeout = 150 * time.Millisecond
 
 	start := time.Now()
 	err := c.Probe(context.Background())
@@ -150,12 +139,7 @@ func TestTheProbeRetriesAfterItsCooldown(t *testing.T) {
 	dir := t.TempDir()
 	bin, _ := countingDevmap(t, dir, "usage: devmap manifest\n      --graph-output <PATH>")
 	c := New(bin, dir)
-	// Generous on purpose, for the same reason its sibling above is: this test
-	// asserts that an expired cooldown *re-probes*, not that a probe is fast.
-	// The timeout is only a ceiling on waiting for a healthy `/bin/sh` script
-	// to answer, and under whole-module load the fork alone has exceeded
-	// 200ms — which failed the test for a reason it does not pin.
-	c.probeTimeout = 2 * time.Second
+	c.probeTimeout = 200 * time.Millisecond
 
 	// Seed a failure whose cooldown has already elapsed.
 	c.probeMu.Lock()

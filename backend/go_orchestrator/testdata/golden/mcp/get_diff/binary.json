@@ -1,0 +1,25 @@
+{
+  "arguments": {},
+  "capture_mode": "live",
+  "case": "binary",
+  "exit_code": null,
+  "notes": "",
+  "payload": {
+    "files": [
+      {
+        "additions": 0,
+        "deletions": 0,
+        "path": "blob.bin",
+        "status": "A"
+      }
+    ],
+    "ok": true,
+    "staged": false,
+    "truncated": false,
+    "unified_diff": "diff --git a/blob.bin b/blob.bin\nnew file mode 100644\n--- /dev/null\n+++ b/blob.bin\nBinary files /dev/null and b/blob.bin differ\n"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_get_diff"
+}

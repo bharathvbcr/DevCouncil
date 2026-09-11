@@ -125,6 +125,49 @@ entirely. Nothing is stored now, so there is no stale row to skip and no coverag
 warn about — the warning outlived the thing it warned about, which is the failure this ledger
 exists to prevent.
 
+## Correction (2026-09-10): what may be called unwired, and the counters that say what was not
+
+**One predicate now decides whether a file can be the subject of a file-level liveness
+verdict at all.** `Extraction::file_liveness()` in `devmap-extract/src/model.rs` answers
+`NotCode { reason }`, `Exempt { kind, reason }` or `Candidate`, and
+`unwired_candidates`, `files_wholly_inside_clusters` (which produces `unreachable_files`)
+and `analyze_liveness`'s file exemption all ask it. They decided separately before, and
+the first of them decided by asking `grammar_read_this_file()` — a question about *which
+engine ran*. Prose stayed out of `unwired_candidates` only because no grammar is linked
+for Markdown or YAML; linking one would have made every `.md`, `.json` and `.yaml` in
+every repository a delete-this suggestion again.
+
+**Nothing was removed from either artifact.** These keys are additive, and every
+pre-existing counter keeps its name and its meaning:
+
+| Artifact | Key | Meaning |
+|---|---|---|
+| `repo_map.json` | `liveness_meta.unwired.excluded_not_code` | Files that were never candidates: prose, data, configuration, lockfiles, environment files |
+| `repo_map.json` | `liveness_meta.unwired.excluded_not_code_reasons` | The same count, keyed by reason. "412 data files" and "412 lockfiles" are different problems |
+| `repo_map.json` | `liveness_meta.unwired.excluded_exempt` | Code reached by something no import edge records: an entry root, a test, a fixture, a package marker, a tool config, an ambient declaration |
+| `repo_map.json` | `liveness_meta.unwired.excluded_directory_unit` | A **subset** of `excluded_exempt` — a `.tf` file, whose unit of use is its directory. Never add the two |
+| `code_graph.json` | `meta.devmap_rust.unwired_excluded_not_code` (+ `_reasons`, `_exempt`, `_directory_unit`) | The same four, under the key `code_graph.json` already uses for a producer's account of its own run |
+| `code_graph.json` | `nodes[].extras.liveness` | `"not_applicable" \| "exempt" \| "candidate"`, on **file** nodes only |
+| `code_graph.json` | `nodes[].extras.liveness_reason` | Why, for the first two. Absent on a candidate |
+
+**A consumer that predates these keys is unaffected.** `RepoMap` in `repo_mapper.py`
+declares `liveness_meta` as a dict and pydantic ignores unknown keys, so no
+`model_validate` call site changes; `GraphNode.extras` is already a free-form map, which
+is why the liveness verdict went there rather than onto the node as a top-level field.
+GitPulse's `RepoMapUnwiredMeta` (`src/lib/codeintel/types.ts`) declares all four as
+**optional** for the same reason, and its panel renders an absent counter as no phrase
+rather than as zero — a map from an older kernel did not look, which is not the same fact
+as a kernel that looked and found none.
+
+**What changed in `entry_roots`.** `*.config.*` used to arrive as a `TargetRoot` and now
+arrives as a `ToolConfig`, which `is_entry_root` also accepts, so those files are still
+entry roots. `*.d.ts` used to arrive as a `TargetRoot` too and now arrives as an
+`AmbientDeclaration`, which `is_entry_root` does **not** accept: a declaration file is
+consulted by the compiler and nothing runs it, and `subsystem_map.is_entry_root` passes
+that list on to a reader as "this is where execution starts". A repository's
+`entry_roots` therefore shrinks by its `.d.ts` count. The files remain exempt from every
+liveness verdict.
+
 ## The 37 Consumers Matrix
 
 | # | File | Touched Surface / API | Expected Payload Shape | Tri-State / Cutover Notes |
@@ -175,3 +218,41 @@ The 6 files with direct private-internal imports that will break at cutover and 
 4. `src/devcouncil/verification/checks/liveness_ratchet.py` (`devcouncil.indexing.graph.liveness`)
 5. `src/devcouncil/knowledge/wiki.py` (`devcouncil.indexing.graph.communities`)
 6. `src/devcouncil/execution/prompt_builder.py` (`devcouncil.codeintel.store.sqlite`)
+
+## Phase 5 (2026-09-10): verification / execution port
+
+Go owns the verify surface; Python packages remain where other CLI surfaces still import them.
+
+### Ported (verified)
+
+| Surface | Location |
+|---------|----------|
+| Report / Gap / NextAction shapes + golden replay | `backend/go_orchestrator/devcouncil/verify` |
+| `devcouncil verify` CLI + `devcouncil_verify_task` / `get_gaps` MCP | `cmd/devcouncil`, `devcouncil/registry.go` |
+| Persist `verification_runs` + gap replace | `dc-store` (`run-record`, `gaps-clear`, `gap-upsert`) + Go `store.GapsReplace` |
+| Pure diff∩scope / stubs / secrets / coverage / dead JSON | `rust-port/crates/dc-verify` (`lib`, `rigor`, `coverage`, `dead`) |
+| Stop-gate decision + skip≠pass | `devcouncil/stopgate` |
+| Correction manifests | `devcouncil/correction` |
+| Hard-safety gap classification | `devcouncil/gating` |
+| `dev verify` CLI shim | `src/devcouncil/cli/commands/verify.py` → execs Go |
+
+### Incremental hard-cut (Phase 7 — closed 2026-09-10)
+
+Python orchestration packages listed below were **deleted**. Decisions and
+replacement pointers: [docs/PHASE7_LONG_TAIL.md](../docs/PHASE7_LONG_TAIL.md).
+
+Deleted trees: `verification/`, `execution/`, `planning/`, `gating/`, `executors/`,
+`llm/`, `knowledge/`, `reporting/`, `telemetry/`, `campaign/`, `live/`, `ui/`,
+`optimization/`, `integrations/`, `skills/`, `codeintel/`, `indexing/`, `storage/`,
+and the remainder of `src/devcouncil` except the thin CLI launcher.
+
+Live CLI shims: `dev mcp-server|integrate|skills|verify` → Go `devcouncil`;
+`dev map|graph|ast` → Rust `devmap`. All other legacy `dev <name>` commands exit 2
+with a recorded retirement message.
+
+### Manvi fold (no reimplementation)
+
+- Provider routing stays in `Manvi/manvi/llm` (adapters under `anthropic/`, `openaicompat/`, `local/`, `gemini/`, `xai/`). Do not port Python `llm/provider.py` / `router.py` into DevCouncil Go.
+- Executor profiles map to Manvi `manvi/agents` definitions; coding-CLI spawning stays on the Manvi agent loop, not a second Go executor registry.
+- Campaign / live watch / dashboard → Manvi TUI / `manvi watch` / `manvi run` (retired in Python, not ported).
+

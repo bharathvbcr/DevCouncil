@@ -29,8 +29,10 @@ macro_rules! outln {
 }
 
 mod claude;
+mod integrate;
 mod progress;
 mod session;
+mod skills;
 
 use devmap_extract::collect_go_modules;
 use devmap_query::freshness::{self, FreshnessDigests, InventoryLimits, InventorySource};
@@ -161,6 +163,22 @@ struct Cli {
     #[arg(short, long, global = true)]
     db: Option<PathBuf>,
 
+    /// The repository this invocation is about, when the working directory is
+    /// not it.
+    ///
+    /// Resolves the store the same way every other command does — through
+    /// `devmap_extract::paths` against this root — rather than naming a store
+    /// path. That is the difference a host hook needs: a hook runs in the
+    /// agent's current directory, which after a `cd` or a worktree entry is not
+    /// the repository the index belongs to, and baking
+    /// `--db ${CLAUDE_PROJECT_DIR}/.devcouncil/codeintel/devmap.sqlite` into a
+    /// hook fixes the state layout at the moment the hook was written. Which
+    /// state directory a repository uses is a property of the repository.
+    ///
+    /// `--db` still wins where both are given: it names a store outright.
+    #[arg(long, global = true)]
+    root: Option<PathBuf>,
+
     /// Machine-readable output. Global; see `--db`.
     #[arg(long, global = true, default_value_t = false)]
     json: bool,
@@ -186,6 +204,11 @@ impl Cli {
     /// *file* to check, and treating it as a root would resolve the store
     /// relative to a hooks manifest.
     fn root_hint(&self) -> PathBuf {
+        // An explicit `--root` is the caller stating which repository this is
+        // about, and it outranks every per-subcommand inference below.
+        if let Some(root) = &self.root {
+            return root.clone();
+        }
         match &self.command {
             Commands::Build { path, .. }
             | Commands::Manifest { path, .. }
@@ -200,7 +223,8 @@ impl Cli {
             | Commands::Paths { path } => path.clone(),
             // Hook templates retain project-relative paths for the host that
             // will execute them; they are not a query against this checkout.
-            Commands::Claude { .. } => PathBuf::from("."),
+            Commands::Claude { .. } | Commands::Skills { .. } => PathBuf::from("."),
+            Commands::Integrate { project_root, .. } => project_root.clone(),
             _ => default_root_hint(),
         }
     }
@@ -962,15 +986,24 @@ enum Commands {
         #[command(flatten)]
         inventory: InventoryFlags,
     },
-    Status,
+    /// Index health. With `--auto-rebuild`, SessionStart hooks rebuild when
+    /// `rebuild_required` is set (payload-obsolete or schema-behind) instead of
+    /// only reporting stale — bounded by the hook's own timeout.
+    Status {
+        /// When `rebuild_required`, run a bounded `devmap build` before answering.
+        ///
+        /// Distinct from `is_fresh`: source drift and pending edits stay
+        /// report-only; only payload-obsolete and schema-behind auto-rebuild.
+        #[arg(long)]
+        auto_rebuild: bool,
+    },
     /// Binary and store health for hosts that install or verify `devmap`.
     ///
     /// Emits the store schema on disk (if any), the schema this binary speaks,
     /// the code-graph artifact schema, how many tree-sitter grammars are linked
-    /// into this build, and the resolved store path. GitPulse and similar hosts
-    /// call `devmap doctor --json` rather than scraping `devmap --version`
-    /// prose, so a vendored-vs-on-disk grammar or schema mismatch is a structured
-    /// refusal rather than a parse of free text.
+    /// into this build, the resolved store path, and every `devmap` found on
+    /// `PATH` plus common host configs (with version), so binary skew is visible
+    /// before a hook or MCP entry points at the wrong one.
     Doctor,
     /// Write a session insights report from the MCP query log.
     ///
@@ -1262,6 +1295,61 @@ enum Commands {
     Claude {
         #[command(subcommand)]
         action: ClaudeAction,
+    },
+
+    /// Install the five embedded DevMap skills into a host skill directory.
+    ///
+    /// Receipt-guarded: identical files are adopted, unmanaged edits are
+    /// refused, concurrent installers serialize through a directory lock with
+    /// a five-second timeout. Bounds match the Python scaffolder (256 KiB per
+    /// skill, 8 MiB batch, 4,096 receipt entries).
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
+
+    /// Register DevMap with a host: guides, Cursor rule, skills, global MCP.
+    ///
+    /// Global Cursor/Claude MCP entries are `devmap mcp` without `--db` so one
+    /// registration serves every repository. Stale per-project `--db` entries
+    /// this installer owns are rewritten. Unrelated MCP servers are preserved.
+    Integrate {
+        /// Host to integrate: `cursor`, `claude`, or `codex`.
+        host: String,
+        /// Repository root (defaults to the current worktree).
+        #[arg(long, default_value_os_t = default_root_hint())]
+        project_root: PathBuf,
+        /// Report what would change without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Exit non-zero when on-disk assets differ from the expected install.
+        #[arg(long)]
+        check: bool,
+        /// Command path written into MCP entries. Unset: this binary.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillsAction {
+    /// Write the five DevMap skills under each `--destination`.
+    Install {
+        /// Repository root that owns the skill directories and receipt.
+        #[arg(long, default_value_os_t = default_root_hint())]
+        project_root: PathBuf,
+        /// Skill layout root, relative to the project (repeatable).
+        ///
+        /// Defaults to `.claude/skills`, `.cursor/skills`, and `.agents/skills`
+        /// when omitted.
+        #[arg(long = "destination")]
+        destinations: Vec<String>,
+        /// List differing paths without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Exit 0 only when every selected file already matches.
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -1833,10 +1921,13 @@ fn extend_host_contract(
 /// One owner for the fields a host needs to verify a binary against a store
 /// without scraping `--version` prose: the schema on disk (if any), the schema
 /// this binary speaks, the code-graph artifact schema, how many grammars are
-/// linked into this build, and the resolved store path. Absence of a store is
-/// reported as `schema_version: null`, never invented.
+/// linked into this build, the resolved store path, and every `devmap` found on
+/// `PATH` plus common host MCP configs (with version), so binary skew is a
+/// structured fact rather than a silent wrong hook.
 fn doctor_report(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
     let schema_version = Store::stored_schema_version(db)?;
+    let binaries = inventory_devmap_binaries()?;
+    let skew = binaries_skew_warning(&binaries);
     Ok(serde_json::json!({
         "schema_version": schema_version,
         "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
@@ -1844,7 +1935,119 @@ fn doctor_report(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
         "linked_grammar_count": devmap_extract::linked_grammar_count(),
         "store_path": db.display().to_string(),
         "version": env!("CARGO_PKG_VERSION"),
+        "binaries": binaries,
+        "binary_skew_warning": skew,
     }))
+}
+
+/// Every `devmap` on `PATH` and referenced from common host MCP configs.
+fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let candidate = dir.join("devmap");
+            let Ok(resolved) = candidate.canonicalize() else {
+                continue;
+            };
+            let key = resolved.display().to_string();
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            rows.push(serde_json::json!({
+                "path": key,
+                "source": "PATH",
+                "version": probe_devmap_version(&resolved),
+            }));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(resolved) = exe.canonicalize() {
+            let key = resolved.display().to_string();
+            if seen.insert(key.clone()) {
+                rows.push(serde_json::json!({
+                    "path": key,
+                    "source": "current_exe",
+                    "version": Some(env!("CARGO_PKG_VERSION")),
+                }));
+            }
+        }
+    }
+    for (label, config_path) in host_mcp_config_paths() {
+        if let Some(command) = read_devmap_command_from_mcp_config(&config_path) {
+            let resolved = PathBuf::from(&command)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(&command));
+            let key = resolved.display().to_string();
+            if seen.insert(key.clone()) {
+                rows.push(serde_json::json!({
+                    "path": key,
+                    "source": label,
+                    "version": probe_devmap_version(&resolved),
+                }));
+            } else if let Some(existing) = rows.iter_mut().find(|r| r["path"] == key) {
+                let source = existing["source"].as_str().unwrap_or("").to_string();
+                existing["source"] = serde_json::json!(format!("{source},{label}"));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn host_mcp_config_paths() -> Vec<(&'static str, PathBuf)> {
+    let mut out = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        out.push(("~/.cursor/mcp.json", home.join(".cursor/mcp.json")));
+        out.push(("~/.claude.json", home.join(".claude.json")));
+    }
+    out.push((
+        ".cursor/mcp.json",
+        PathBuf::from(".cursor").join("mcp.json"),
+    ));
+    out
+}
+
+fn read_devmap_command_from_mcp_config(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let servers = value.get("mcpServers")?.as_object()?;
+    let entry = servers.get("devmap")?;
+    entry.get("command")?.as_str().map(str::to_string)
+}
+
+fn probe_devmap_version(path: &Path) -> Option<String> {
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // `devmap 0.1.1 (store schema …)` — take the second token.
+    text.split_whitespace().nth(1).map(str::to_string)
+}
+
+fn binaries_skew_warning(binaries: &[serde_json::Value]) -> Option<String> {
+    let versions: std::collections::BTreeSet<String> = binaries
+        .iter()
+        .filter_map(|b| {
+            b.get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    if versions.len() <= 1 {
+        return None;
+    }
+    Some(format!(
+        "multiple devmap versions on PATH/host configs: {}; integrate writes the absolute path of the binary that validated the config — re-run integrate after installing",
+        versions.into_iter().collect::<Vec<_>>().join(", ")
+    ))
 }
 
 fn store_status_fields(
@@ -1920,6 +2123,54 @@ fn store_status_fields(
         unreachable!("json! of an object literal is an object")
     };
     Ok(fields)
+}
+
+/// `rebuild_required` / `rebuild_reason` — distinct from `is_fresh`.
+///
+/// Source drift and pending edits make an index stale without wanting an
+/// automatic SessionStart rebuild; payload-obsolete and schema-behind do.
+fn attach_rebuild_fields(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    schema_outdated: bool,
+) {
+    let degraded = fields
+        .get("degraded_reason")
+        .and_then(serde_json::Value::as_str);
+    let reason = devmap_serve::rebuild_required_reason(degraded, schema_outdated);
+    fields.insert(
+        "rebuild_required".into(),
+        serde_json::json!(reason.is_some()),
+    );
+    fields.insert(
+        "rebuild_reason".into(),
+        match reason {
+            Some(r) => serde_json::json!(r),
+            None => serde_json::Value::Null,
+        },
+    );
+}
+
+/// Run a child `devmap build` for SessionStart auto-rebuild. Stdout is
+/// discarded so the parent's status JSON stays the only line on the wire;
+/// stderr keeps progress. Failure is reported in the status payload rather
+/// than aborting the hook — a session that cannot rebuild must still start.
+fn run_auto_rebuild(cli: &Cli) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--db").arg(cli.db());
+    cmd.arg("build").arg(cli.root_hint());
+    cmd.stdout(std::process::Stdio::null());
+    let output = cmd.output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "auto-rebuild exited {}: {}",
+            output.status.code().unwrap_or(-1),
+            stderr.chars().take(500).collect::<String>()
+        ))
+    }
 }
 
 /// The `manifest` result, as JSON or as the two human lines it always printed.
@@ -3140,7 +3391,7 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         }
         // No numeric query arguments reach the engine from these.
         Commands::Build { .. }
-        | Commands::Status
+        | Commands::Status { .. }
         | Commands::Doctor
         | Commands::SessionReport { .. }
         | Commands::Paths { .. }
@@ -3159,7 +3410,9 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         | Commands::Routes { .. }
         | Commands::ShapeCheck { .. }
         | Commands::ApiImpact { .. }
-        | Commands::Claude { .. } => Ok(()),
+        | Commands::Claude { .. }
+        | Commands::Skills { .. }
+        | Commands::Integrate { .. } => Ok(()),
     }
 }
 
@@ -4756,6 +5009,8 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             // Both explicit --db and relative roots are invocation-relative.
             // Joining this to root again duplicates the repository directory.
             let db_path = std::path::absolute(cli.db())?;
+            let binaries = inventory_devmap_binaries()?;
+            let skew = binaries_skew_warning(&binaries);
             let payload = serde_json::json!({
                 "root": root,
                 "state_dir": state_dir,
@@ -4766,6 +5021,9 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 "code_graph": devmap_extract::paths::code_graph_path(&root),
                 "workspace": devmap_extract::paths::workspace_path(&root),
                 "plugin_dir": devmap_extract::paths::plugin_dir(&root),
+                "binaries": binaries,
+                "binary_skew_warning": skew,
+                "version": env!("CARGO_PKG_VERSION"),
             });
             if cli.json {
                 emit_json(cli, &payload)?;
@@ -4781,9 +5039,20 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 ] {
                     outln!("{key:<12} {}", payload[key].as_str().unwrap_or(""));
                 }
+                if let Some(warning) = skew {
+                    outln!("warning: {warning}");
+                }
+                for row in payload["binaries"].as_array().into_iter().flatten() {
+                    outln!(
+                        "binary      {} ({}) version={}",
+                        row["path"].as_str().unwrap_or(""),
+                        row["source"].as_str().unwrap_or(""),
+                        row["version"].as_str().unwrap_or("unknown")
+                    );
+                }
             }
         }
-        Commands::Status => {
+        Commands::Status { auto_rebuild } => {
             // Answers even with no store, but never creates one. The client
             // treats a missing store as "not built yet"; creating it here made
             // that a race (see `Store::open_existing`).
@@ -4820,18 +5089,16 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     // exit the seam's own probe takes.
                     "capabilities": kernel_capabilities(),
                 });
+                if let Some(obj) = payload.as_object_mut() {
+                    attach_rebuild_fields(obj, false);
+                }
                 extend_host_contract(&mut payload, None, None);
-                // Through `emit_json` like every other exit from this command.
-                // Printed pretty regardless of `--json`, this was the one
-                // `--json` path in the binary that emitted a multi-line
-                // document, so a caller reading a line at a time got a `{` and
-                // a parse error out of the case it most needs to handle: no
-                // store yet.
                 emit_json(cli, &payload)?;
                 return Ok(());
             };
             if stored_schema != devmap_store::CURRENT_SCHEMA_VERSION {
                 let version = stored_schema;
+                let migratable = Store::schema_is_migratable(version);
                 let mut payload = serde_json::json!({
                     "generation_id": serde_json::Value::Null,
                     "pending_count": 0,
@@ -4858,7 +5125,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                              install a matching or newer devmap binary",
                             devmap_store::CURRENT_SCHEMA_VERSION
                         )
-                    } else if Store::schema_is_migratable(version) {
+                    } else if migratable {
                         format!(
                             "store schema is {version}, this binary speaks {}; \
                              run `devmap build` to migrate it",
@@ -4882,6 +5149,36 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
                     "capabilities": kernel_capabilities(),
                 });
+                if let Some(obj) = payload.as_object_mut() {
+                    // Only migratable schema-behind auto-rebuilds; a newer or
+                    // Python store cannot be fixed by `devmap build`.
+                    attach_rebuild_fields(obj, migratable);
+                }
+                if *auto_rebuild
+                    && payload
+                        .get("rebuild_required")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                {
+                    match run_auto_rebuild(cli) {
+                        Ok(()) => {
+                            // Re-enter status after a successful migrate.
+                            // Avoid recursion through clap: re-open below by
+                            // falling through is awkward; re-exec status.
+                            let exe = std::env::current_exe()?;
+                            let mut cmd = std::process::Command::new(exe);
+                            cmd.arg("--json").arg("--db").arg(cli.db()).arg("status");
+                            let out = cmd.output()?;
+                            std::io::Write::write_all(&mut std::io::stdout(), &out.stdout)?;
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            if let Some(obj) = payload.as_object_mut() {
+                                obj.insert("auto_rebuild_error".into(), serde_json::json!(err));
+                            }
+                        }
+                    }
+                }
                 extend_host_contract(&mut payload, Some(version), None);
                 emit_json(cli, &payload)?;
                 return Ok(());
@@ -4903,6 +5200,35 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 serde_json::json!(devmap_store::CURRENT_SCHEMA_VERSION),
             );
             payload.insert("capabilities".into(), kernel_capabilities());
+            attach_rebuild_fields(&mut payload, false);
+            if *auto_rebuild
+                && payload
+                    .get("rebuild_required")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            {
+                match run_auto_rebuild(cli) {
+                    Ok(()) => {
+                        // Refresh fields after rebuild.
+                        if let Some(store) = Store::open_existing(cli.db())? {
+                            payload = store_status_fields(&store, &cli.db())?;
+                            payload.insert("schema_outdated".into(), serde_json::json!(false));
+                            payload
+                                .insert("schema_version".into(), serde_json::json!(stored_schema));
+                            payload.insert(
+                                "expected_schema_version".into(),
+                                serde_json::json!(devmap_store::CURRENT_SCHEMA_VERSION),
+                            );
+                            payload.insert("capabilities".into(), kernel_capabilities());
+                            attach_rebuild_fields(&mut payload, false);
+                            payload.insert("auto_rebuilt".into(), serde_json::json!(true));
+                        }
+                    }
+                    Err(err) => {
+                        payload.insert("auto_rebuild_error".into(), serde_json::json!(err));
+                    }
+                }
+            }
             payload.extend(host_contract_fields(
                 Some(stored_schema),
                 payload
@@ -5165,7 +5491,11 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 // other. It also refuses a non-UTF-8 path rather than writing
                 // `display()`'s replacement characters into a `command` that
                 // then names no file on disk.
-                let entry = claude::mcp_entry(&executable, &cli.db(), http.as_deref())?;
+                //
+                // Global registration: no `--db`. The server resolves the store
+                // from MCP roots/list, then cwd. Passing `--db` only when the
+                // flag was explicit keeps legacy per-project configs working.
+                let entry = claude::mcp_entry(&executable, cli.db.as_deref(), http.as_deref())?;
                 emit_json(
                     cli,
                     &serde_json::json!({"mcpServers": {claude::MCP_SERVER_NAME: entry}}),
@@ -5173,7 +5503,8 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 return Ok(());
             }
 
-            let slot = std::sync::Arc::new(devmap_serve::StoreSlot::new(cli.db()));
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let slot = std::sync::Arc::new(devmap_serve::StoreSlot::resolving(cli.db.clone(), cwd));
             match http {
                 Some(address) => {
                     // A bare port means loopback. Spelling the default out here
@@ -5597,9 +5928,196 @@ raise --max-nodes to widen"
             }
         }
         Commands::Claude { action } => run_claude(cli, action)?,
+        Commands::Skills { action } => run_skills(cli, action)?,
+        Commands::Integrate {
+            host,
+            project_root,
+            dry_run,
+            check,
+            binary,
+        } => run_integrate(cli, host, project_root, *dry_run, *check, binary.as_deref())?,
     }
 
     Ok(())
+}
+
+fn run_skills(cli: &Cli, action: &SkillsAction) -> anyhow::Result<()> {
+    match action {
+        SkillsAction::Install {
+            project_root,
+            destinations,
+            dry_run,
+            check,
+        } => {
+            let dests: Vec<&str> = if destinations.is_empty() {
+                skills::DEFAULT_DESTINATIONS.to_vec()
+            } else {
+                destinations.iter().map(String::as_str).collect()
+            };
+            let report = skills::install_devmap_skills(project_root, &dests, *dry_run, *check)?;
+            if *check && !report.check_ok {
+                anyhow::bail!(
+                    "skills install --check: {} file(s) missing or differ",
+                    report.differing.len()
+                );
+            }
+            if cli.json {
+                emit_json(
+                    cli,
+                    &serde_json::json!({
+                        "written": report.written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                        "differing": report.differing.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                        "receipt": report.receipt.display().to_string(),
+                        "check_ok": report.check_ok,
+                        "dry_run": dry_run,
+                        "check": check,
+                    }),
+                )?;
+            } else if *dry_run {
+                if report.differing.is_empty() {
+                    outln!("skills install: nothing to change");
+                } else {
+                    outln!(
+                        "skills install would write {} file(s):",
+                        report.differing.len()
+                    );
+                    for path in &report.differing {
+                        outln!("  {}", path.display());
+                    }
+                }
+            } else if *check {
+                outln!(
+                    "skills install --check: {} (receipt {})",
+                    if report.check_ok { "ok" } else { "drift" },
+                    report.receipt.display()
+                );
+            } else {
+                outln!(
+                    "skills install: wrote {} file(s); receipt {}",
+                    report.written.len(),
+                    report.receipt.display()
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_integrate(
+    cli: &Cli,
+    host_name: &str,
+    project_root: &Path,
+    dry_run: bool,
+    check: bool,
+    binary: Option<&Path>,
+) -> anyhow::Result<()> {
+    let host = integrate::Host::parse(host_name)?;
+    let executable = claude::plugin_command(&std::env::current_exe()?, binary);
+    let db = cli.db();
+    let (map, map_rel, graph_rel, store_rel) = integrate_map_context(project_root, &db)?;
+    let report = integrate::integrate(
+        host,
+        project_root,
+        &executable,
+        &map,
+        &map_rel,
+        &graph_rel,
+        &store_rel,
+        dry_run,
+        check,
+    )?;
+    if cli.json {
+        emit_json(
+            cli,
+            &serde_json::json!({
+                "host": host.as_str(),
+                "guides": report.guides.iter().map(|g| serde_json::json!({
+                    "path": g.path.display().to_string(),
+                    "disposition": match g.disposition {
+                        devmap_query::guides::GuideDisposition::Created => "created",
+                        devmap_query::guides::GuideDisposition::Updated => "updated",
+                        devmap_query::guides::GuideDisposition::Unchanged => "unchanged",
+                        devmap_query::guides::GuideDisposition::NotOurs => "not_ours",
+                    },
+                })).collect::<Vec<_>>(),
+                "skills_written": report.skills_written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "skills_differing": report.skills_differing.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "global_mcp": report.global_mcp.iter().map(|m| serde_json::json!({
+                    "path": m.path.display().to_string(),
+                    "changed": m.changed,
+                    "removed_stale_db": m.removed_stale_db,
+                    "note": m.note,
+                })).collect::<Vec<_>>(),
+                "project_mcp": report.project_mcp.iter().map(|m| serde_json::json!({
+                    "path": m.path.display().to_string(),
+                    "changed": m.changed,
+                    "removed_stale_db": m.removed_stale_db,
+                    "note": m.note,
+                })).collect::<Vec<_>>(),
+                "dry_run": dry_run,
+                "check": check,
+            }),
+        )?;
+    } else {
+        outln!(
+            "integrate {}:{}",
+            host.as_str(),
+            if dry_run {
+                " dry-run"
+            } else if check {
+                " check"
+            } else {
+                ""
+            }
+        );
+        for guide in &report.guides {
+            if guide.changed()
+                || !matches!(
+                    guide.disposition,
+                    devmap_query::guides::GuideDisposition::Unchanged
+                )
+            {
+                outln!("  guide {}: {:?}", guide.path.display(), guide.disposition);
+            }
+        }
+        if !report.skills_written.is_empty() {
+            outln!("  skills wrote {}", report.skills_written.len());
+        } else if !report.skills_differing.is_empty() {
+            outln!("  skills differing {}", report.skills_differing.len());
+        }
+        for mcp in report.global_mcp.iter().chain(report.project_mcp.iter()) {
+            outln!("  {}: {}", mcp.path.display(), mcp.note);
+        }
+    }
+    Ok(())
+}
+
+/// Map context for integrate: prefer an on-disk repo map, else an empty shell
+/// so guides still name the canonical relative paths.
+fn integrate_map_context(
+    project_root: &Path,
+    db: &Path,
+) -> anyhow::Result<(serde_json::Value, String, String, String)> {
+    let map_path = devmap_extract::paths::repo_map_path(project_root);
+    let graph_path = devmap_extract::paths::code_graph_path(project_root);
+    let relative = |absolute: &Path| -> String {
+        let text = absolute
+            .strip_prefix(project_root)
+            .unwrap_or(absolute)
+            .to_string_lossy()
+            .replace('\\', "/");
+        text.strip_prefix("./").unwrap_or(&text).to_string()
+    };
+    let map_rel = relative(&map_path);
+    let graph_rel = relative(&graph_path);
+    let store_rel = relative(db);
+    let map = if map_path.is_file() {
+        let text = std::fs::read_to_string(&map_path)?;
+        serde_json::from_str(&text).unwrap_or_else(|_| integrate::empty_map())
+    } else {
+        integrate::empty_map()
+    };
+    Ok((map, map_rel, graph_rel, store_rel))
 }
 
 /// `devmap claude …` — emission and validation of Dev Map's Claude Code surface.
@@ -5613,7 +6131,7 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
     match action {
         ClaudeAction::Hooks { binary } => {
             let executable = claude::plugin_command(&std::env::current_exe()?, binary.as_deref());
-            let block = claude::hooks_block(&executable, &cli.db(), &subcommands)?;
+            let block = claude::hooks_block(&executable, &subcommands)?;
             emit_json(cli, &block)
         }
         ClaudeAction::Events => {

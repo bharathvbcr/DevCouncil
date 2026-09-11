@@ -1,4 +1,4 @@
-//! Bounded native transport probe for tools/worktree_stress.py.
+//! Bounded native transport probe for the worktree_stress example.
 //! Kept outside the production CLI; reuses its request schema and Tokio runtime.
 use std::io::Write;
 use std::time::Duration;

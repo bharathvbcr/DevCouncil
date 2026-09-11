@@ -1,9 +1,8 @@
 # Daily Workflow
 
-**Platforms:** macOS, Linux, and Windows (Node.js 18+, Python 3.12+, Git).
-**Maturity:** see [project-status.md](project-status.md) / `dev doctor`.
-**Runnable fixture:** [`examples/build-week-demo/`](../examples/build-week-demo/) via
-`bash scripts/build-week-demo.sh` (provider-free red→green).
+**Platforms:** macOS, Linux, and Windows (Go `dev`/`devcouncil`, Rust `devmap`, Git; Node.js 18+ only for the optional npm shim).
+**Maturity:** see [project-status.md](project-status.md).
+**Calculator fixture:** [`examples/build-week-demo/`](../examples/build-week-demo/) (Python tests for the sample; the `dev check --verify` driver was retired).
 
 DevCouncil's recommended default is **Manual Sidecar Mode**:
 

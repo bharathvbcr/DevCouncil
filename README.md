@@ -1,15 +1,44 @@
-# DevCouncil: The Gated AI Orchestrator
+# DevCouncil: components for gated AI development
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/bharathvbcr/DevCouncil/main/src/devcouncil/assets/devcouncil_social_preview.jpg" alt="DevCouncil gated AI orchestration" width="720">
-</p>
+**Plugin contract (Phase 7):** standalone binaries on PATH —
+
+| Binary | Language | Owns |
+|--------|----------|------|
+| `devmap` | Rust | Code graph, guides, DevMap skills/mdc, DevMap MCP |
+| `devcouncil` | Go | Host MCP (lease/verify/diff), `integrate`, domain `skills`, `verify` |
+| `dcstore` | Rust | Tasks, leases, evidence, gaps, verification runs |
+
+Wrappers: **Manvi** (agent harness / LLM / TUI) imports the Go module and spawns
+binaries; **GitPulse** vendors DevMap crates for IDE mediation.
+
+Python is **not** the live map engine. Tests, benchmarks, and language fixtures
+may still be Python; the product CLI is Go (`dev` / `devcouncil`) and Rust
+(`devmap`). Decisions: [docs/PHASE7_LONG_TAIL.md](docs/PHASE7_LONG_TAIL.md).
+
+```bash
+# Install / build binaries (examples)
+cargo install --path rust-port/crates/devmap-cli   # → devmap
+cargo install --path rust-port/crates/dc-store     # → dcstore (see crate README)
+go -C backend/go_orchestrator build -o ~/.local/bin/devcouncil ./cmd/devcouncil
+ln -sf devcouncil ~/.local/bin/dev   # same Go binary as `dev`
+
+devmap build --manifest
+devcouncil integrate cursor --apply
+devcouncil skills scaffold --skill core-engineering
+devcouncil mcp   # stdio MCP
+```
+
+---
+
+# Legacy README (pre–Phase 7 narrative)
+
+> Social preview asset was removed with the Python `assets/` package. Prefer the
+> binary table above.
 
 [![Website](https://img.shields.io/badge/website-devcouncil.vbcr.dev-10B981?style=flat&logo=safari&logoColor=white)](https://devcouncil.vbcr.dev/)
 [![CI](https://github.com/bharathvbcr/DevCouncil/actions/workflows/ci.yml/badge.svg)](https://github.com/bharathvbcr/DevCouncil/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/devcouncil)](https://www.npmjs.com/package/devcouncil)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![uv](https://img.shields.io/badge/managed%20by-uv-purple.svg)](https://github.com/astral-sh/uv)
 
 <p align="center">
   <a href="https://devcouncil.vbcr.dev/"><strong>Explore the Interactive Architecture &amp; Code Graph Showcase (devcouncil.vbcr.dev) &rarr;</strong></a>
@@ -23,24 +52,23 @@ DevCouncil does not replace coding agents. Its primary native path is Claude Cod
 
 ### Quick Demo
 
-DevCouncil supports macOS, Linux, and Windows. Requires Node.js 18+, Python 3.12+, and Git. No model provider key is needed for the deterministic demos below:
+DevCouncil supports macOS, Linux, and Windows. Requires a Go toolchain (for `dev` / `devcouncil`), Rust/`cargo` (for `devmap` and the other analysis binaries), and Git. Node.js 18+ is only needed for the optional npm shim. No model provider key is needed for the commands below:
 
 ```bash
-# Install DevCouncil globally:
-npm install -g devcouncil
+# Install the Go host binary and analysis components from a checkout:
+bash scripts/install.sh
 devcouncil --help
+dev --help
 
-# Core demo: red verdict -> apply fix -> green verdict (no API keys)
-devcouncil-build-week-demo
-# Equivalent: bash "$(npm root -g)/devcouncil/scripts/build-week-demo.sh"
+# npm is a Node shim only — it does not install the binaries:
+npm install -g devcouncil
+# then still install Go/Rust binaries as above
 
-# Interactive graph artifact (self-contained HTML)
-mkdir -p /tmp/devcouncil-demo
-dev map demo --project-root /tmp/devcouncil-demo --json
-# Open /tmp/devcouncil-demo/.devcouncil/graph/demo.html
+# Map / graph (Rust `devmap` via the shim or `devcouncil map`)
+dev map
 ```
 
-Checkout fallback: clone the repo and run `bash scripts/build-week-demo.sh` (`uv sync --group dev` if you need a local `dev`).
+Checkout fallback: clone the repo and run `bash scripts/install.sh`. There is no Python/`uv` launcher. The old `devcouncil-build-week-demo` / `dev check --verify` path was retired with the Python package.
 
 See [docs/build-week-demo.md](docs/build-week-demo.md) for the provider-free demo walkthrough.
 
@@ -77,19 +105,20 @@ It creates a persistent **Requirement -> Task -> Diff -> Evidence** graph, block
 
 Run DevCouncil commands in a normal terminal from the root of the repository you want DevCouncil to manage. Do not run these commands inside a coding CLI chat.
 
-Install `uv` first if it is missing:
+Install the native binaries (Go `devcouncil` / `dev`, Rust `devmap`):
 
 ```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+# Windows
+.\scripts\install.ps1
 ```
 
 On macOS or Linux:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+bash scripts/install.sh
 ```
 
-Install DevCouncil from npm:
+The npm package is a Node shim that execs those binaries; it does not install Python:
 
 ```bash
 npm install -g devcouncil
@@ -191,12 +220,12 @@ dangerous-Git protections remain active in every mode.
 
 - **Repository onboarding:** `dev setup` initializes `.devcouncil/`, generates the repo map + `AGENTS.md`/`CLAUDE.md` guides, scaffolds applicable engineering skills, runs environment checks, offers integration setup, and prints the next useful commands. Use `--skip-map` / `--skip-skills` to opt out, or `--scaffold-ci` to also write a starter GitHub Actions workflow. **`dev boot "goal"`** chains setup, `dev integrate --apply`, optional CI scaffold flags, and `dev go` in one command (see [quickstart](docs/quickstart.md)).
 - **Repository mapping:** `dev map` writes `.devcouncil/repo_map.json` and a symbol-level `.devcouncil/graph/code_graph.json`, identifies important files and subsystems, filters generated/temp files, and keeps managed `AGENTS.md` / `CLAUDE.md` workspace guides synchronized. Subsystems, entry points, neighbors, and important surfaces are inferred generically for **any** repository — grouped from the directory tree and ranked by an import-graph in-degree. Freshness uses git HEAD, tracked-file hash, and a content fingerprint so plain edits mark the map stale; a **missing map is stale** (fail-closed on hard rigor). Post-tool-use hooks and `dev map --watch` refresh incrementally. Unified analyze entry: `dev map ingest`. Query with `dev map query|trace|dead|search|cypher|graph-html`. Liveness lists are capped at 5000 per list and 256 dependents per file (truncation metadata when hit). The map is also generated automatically on first init. (See [docs/code-graph.md](docs/code-graph.md) for details).
-- **Rust map engine (`devmap`, in progress):** the `dev map` subsystem is being rewritten in Rust under [`rust-port/`](rust-port/) as a seven-crate workspace (extract → resolve → analyze → store → query → serve → CLI). The **Python implementation remains the live production engine**; the Rust engine is opt-in. When a `devmap serve` daemon is reachable, consumers (`dev graph`, the MCP map/codeintel handlers, and the `dead_symbols` / `stale_map` / `wiring` verify checks) route through `devcouncil/devmap_client.py` and fall back to Python when it is not. Linked tree-sitter grammars currently cover 5 of the 35 registry languages (Python, JavaScript, TypeScript/TSX, Rust, Go); the rest return an explicit parse failure rather than fabricated output. No cutover, deletion of the Python path, or parity sign-off has happened yet — see [rust-port/STATUS.md](rust-port/STATUS.md) for the verified/open gate ledger.
+- **Rust map engine (`devmap`):** the live map is the seven-crate workspace under [`rust-port/`](rust-port/) (extract → resolve → analyze → store → query → serve → CLI). `dev map` / `dev graph` / `dev ast` exec `devmap`. Python remains a language DevMap indexes (fixtures + tree-sitter-python), not a product runtime.
   
   <p align="center">
     <img src="docs/graph_preview.png" alt="Repository Code Graph Preview" width="600">
   </p>
-- **Engineering skills:** `dev skills` lists the bundled skills and shows which apply to the repository; `dev skills scaffold` writes them into `.claude/skills/<name>/SKILL.md`. A merged always-on `core-engineering` skill (think-before-coding, simplicity, surgical changes, goal-driven execution, evidence-grounded communication) plus domain skills (Android, iOS, Windows, web, AI training) that brief the agent on current SDKs, deprecations, and tooling before coding. Applicable skills are also embedded into `dev prompt` output.
+- **Engineering skills:** `dev skills` lists the bundled skills and shows which apply to the repository; `dev skills scaffold` installs them into `.claude/skills`, `.cursor/skills`, and `.agents/skills` for Claude Code, Cursor, and Codex. Repeat `--skill <name>` to select packaged skills explicitly, use `--destination .agents/skills` to select one host, and add `--check` for read-only verification. Installations preserve local edits and record content hashes for subsequent upgrades. The library includes general engineering, domain, and all five DevMap navigation/debugging skills. Applicable skills are also embedded into `dev prompt` output. See [skill delivery and verification](docs/DEVMAP_SKILL_DELIVERY.md).
 - **CI scaffolding:** `dev scaffold-ci` writes a starter `.github/workflows/devcouncil.yml` derived from the configured test/lint/typecheck commands, filtered to the detected language stack; it never overwrites existing CI unless `--force`. Run `dev scaffold-ci --evidence` to generate `.github/workflows/devcouncil-evidence.yml` which automates verifying PRs and uploading evidence JSON and HTML reports.
 - **Planning council:** `dev plan` turns a goal into requirements, acceptance criteria, assumptions, critique findings, and executable tasks. When advisory gaps remain, the project stays in `AWAITING_USER_DECISIONS` until you run `dev approve` (or `dev e2e`/`dev go --force`).
 - **Task graph:** `dev tasks` and `dev show TASK-001` expose requirement links, acceptance-criterion links, planned files, expected tests, allowed commands, forbidden changes, dependencies, status, and active **lease** owners. Tasks can declare `depends_on`; the plan gate rejects unknown dependencies and cycles, and `dev go`/`dev e2e` run tasks in topological order and skip a task whose prerequisites didn't complete (rather than letting it fail spuriously and burn its repair budget). `dev tasks cancel`, `dev tasks edit`, and `dev tasks reprioritize` manage the live task graph without replanning.
@@ -214,7 +243,7 @@ dangerous-Git protections remain active in every mode.
 
 ### App Surfaces
 
-- **CLI:** `dev` and `devcouncil` expose the same Typer command surface for local terminal workflows.
+- **CLI:** `dev` and `devcouncil` are the same Go host binary. The npm package is a Node shim that execs it (`map` / `graph` / `ast` exec Rust `devmap`). The Python/Typer launcher is gone.
 - **Multi-agent campaigns:** `dev campaign run` executes a planned task graph as a parallel, dependency-aware multi-agent campaign (Director → Coordinator → Worker pool + Reviewer QC) with automatic file-overlap serialization, cost budgeting, ntfy push notifications, and a markdown progress dashboard at `.devcouncil/campaign/dashboard.md`. Roster and mailbox commands (`dev campaign roster` / `dev campaign inbox`) expose the role hierarchy and on-disk message bus.
 - **Agent hub:** `dev agents` lists built-in and custom agents, `dev agents add` registers prompt-taking CLIs, `dev agents doctor` checks wiring, `dev agents run` executes a task through a named agent/profile, and `dev agents optimize` uses GEPA to tune profile preambles from offline eval examples.
 - **Integration hub:** `dev integrate all --apply` configures supported coding CLI and MCP integrations in Claude-first, Codex-second order. `dev integrate matrix` reports each client's **capability posture**: `pre-action`, `advisory+verify`, or `verify-only`. `dev integrate check` verifies installed MCP/hook files (including Cursor/Grok assist vs `--write-gate`) rather than re-deriving the matrix.
@@ -227,7 +256,7 @@ dangerous-Git protections remain active in every mode.
 - **Config editor:** `dev config`, `dev config show`, `dev config set`, and `dev config models` inspect/update provider, model, executor, and command configuration.
 - **Artifact tools:** `dev artifacts validate` checks stored graph integrity.
 - **Code intelligence:** `dev lsp inspect` (with `--json` for automation) checks optional language-server readiness, and `dev ast match` searches code structurally.
-- **Doctor:** `dev doctor` validates local dependencies, configures coverage floor checks (`[tool.coverage.report] fail_under`), checks mypy status, and runs environment prerequisites before a workflow fails; it includes a subsystem maturity table aligned with `docs/project-status.md`.
+- **Doctor:** `dev doctor` was a Python CLI surface and is retired. Use `devmap` status/doctor for the map engine and `devcouncil --help` for the host binary. Maturity labels live in `docs/project-status.md`.
 
 ### Agent And Executor Support
 
@@ -325,10 +354,10 @@ The detailed task-by-task workflow lives in [docs/workflow.md](docs/workflow.md)
 
 ```mermaid
 flowchart TD
-    user["User runs dev/devcouncil"] --> cli["Typer CLI\nsrc/devcouncil/cli/main.py"]
-    cli --> config["Config + secrets\n.devcouncil/config.yaml\n.devcouncil/secrets.env"]
-    cli --> map["Repo map\nsrc/devcouncil/indexing/repo_mapper.py"]
-    cli --> planning["Planning commands\ndev plan / dev prompt / dev tasks"]
+    user["User runs dev/devcouncil"] --> cli["Go host binary\ncmd/devcouncil"]
+    cli --> config["Config + secrets\n.devcouncil/config.yaml"]
+    cli --> map["Repo map\nRust devmap"]
+    cli --> planning["Host commands\nintegrate / skills / verify"]
 
     config --> providers["Model providers\nOpenRouter, Vertex AI, Doubleword, or Ollama"]
     providers --> router["ModelRouter\nrole models, cache, telemetry, structured JSON repair"]
@@ -370,19 +399,10 @@ flowchart TD
 For local development inside this checkout:
 
 ```bash
-uv sync
-uv run dev --help
-```
-
-For a global install from this repository:
-
-```bash
-uv tool install --force --reinstall --editable .
+bash scripts/install.sh
 dev --help
-devcouncil --help
+devmap --version
 ```
-
-`--editable` keeps `~/.local/bin/dev` pointed at this checkout so map/graph and other WIP features stay current without reinstalling after every edit. Use `uv tool install --force .` (without `--editable`) for a frozen snapshot of the tree at install time.
 
 See [docs/code-graph.md](docs/code-graph.md) for `dev map` usage (`dev graph` alias) (dead code, blast radius, HTML visualizer).
 
@@ -407,7 +427,7 @@ Project ideas and execution patterns come from the open-source ecosystem:
 - [Sage](https://github.com/usetig/sage): peer-review-first model for planning and critique.
 - [karpathy/llm-council](https://github.com/karpathy/llm-council): for the multi-LLM peer-review pattern.
 - [GPT Pilot](https://github.com/Pythagora-io/gpt-pilot): for role-based software-team concept.
-- [astral-sh/uv](https://github.com/astral-sh/uv): for reproducible Python package/runtime workflows.
+- [astral-sh/uv](https://github.com/astral-sh/uv): historically used for the retired Python package; remaining `benchmarks/` scripts can still be run with a local Python interpreter.
 - [OpenHands](https://github.com/All-Hands-AI/OpenHands): for workspace-aware agent execution patterns.
 - [mini-SWE-agent](https://github.com/SWE-agent/mini-swe-agent): for lightweight execution loop inspiration.
 - [SWE-agent](https://github.com/SWE-agent/SWE-agent): for full-spectrum autonomous SWE-style tasking patterns.

@@ -1,0 +1,27 @@
+{
+  "arguments": {
+    "staged": true
+  },
+  "capture_mode": "live",
+  "case": "rename",
+  "exit_code": null,
+  "notes": "Staged git mv. Python get_diff currently parses non-z numstat rename paths like 'src/{a.py => renamed.py}' by splitting on ' => ', leaving a trailing '}' (status may also lack R*). Characterization of current behavior \u2014 ports may harden; document if they diverge.",
+  "payload": {
+    "files": [
+      {
+        "additions": 0,
+        "deletions": 0,
+        "path": "renamed.py}",
+        "status": "M"
+      }
+    ],
+    "ok": true,
+    "staged": true,
+    "truncated": false,
+    "unified_diff": "diff --git a/src/a.py b/src/renamed.py\nsimilarity index 100%\nrename from src/a.py\nrename to src/renamed.py\n"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_get_diff"
+}

@@ -1,9 +1,10 @@
 # CLI Command Reference
 
-**Platforms:** macOS, Linux, and Windows. Requires Node.js 18+, Python 3.12+, and Git.
-**Maturity:** Stable / Preview / Experimental labels live in [project-status.md](project-status.md) and are printed by `dev doctor`.
-**Graph demo:** `dev map demo` writes self-contained interactive HTML (`.devcouncil/graph/demo.html`); open that file for the UI. A static `demo.svg` companion may also be written.
-**Executable fixture:** [`examples/build-week-demo/`](../examples/build-week-demo/) — `bash scripts/build-week-demo.sh`.
+**Platforms:** macOS, Linux, and Windows. Requires Go (`dev`/`devcouncil`), Rust/`cargo` (`devmap`), and Git. Node.js 18+ is only needed for the optional npm shim.
+**Maturity:** Stable / Preview / Experimental labels live in [project-status.md](project-status.md).
+**Live commands (Phase 7):** `devcouncil mcp|integrate|skills|verify` plus `dev map|graph|ast` (exec `devmap`). Other names below were the Python CLI and now exit 2.
+**Graph:** `dev map` / `devmap build --manifest`.
+**Calculator fixture:** [`examples/build-week-demo/`](../examples/build-week-demo/) (Python sample only; `dev check` is gone).
 
 ```bash
 dev init                    # Initialize DevCouncil in a repo
@@ -175,10 +176,7 @@ dev <command> -v | -vv | -q # Raise/lower console log verbosity (file always DEB
 dev artifacts validate      # Validate stored artifact integrity
 dev config                  # Inspect or update configuration
 dev config show             # Display key DevCouncil settings (executor, rigor, gates)
-dev config set semantic_layer.enabled true  # Enable semantic LLM cache/routing/compression (uv sync --group semantic)
-dev config set semantic_layer.cache.enabled true # Toggle FAISS semantic cache (default on when layer enabled)
-dev config set semantic_layer.router.enabled true # Opt-in complexity routing for local Ollama tiers
-dev config set semantic_layer.compressor.enabled true # Toggle long-context compression before LLM calls
+# semantic_layer / FAISS (`uv sync --group semantic`) was retired with the Python package.
 dev config set execution.command_timeout 600 # Set a common dotted config key
 dev config set execution.stop_gate.mode assist # Stop-hook claim+verify gate (off|assist|block); see coding-cli-integration.md
 dev config set gates.mode off      # Skip quality gates/verification; hard safety remains active

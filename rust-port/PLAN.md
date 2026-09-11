@@ -112,11 +112,11 @@ to answer point queries.
 
 ### 2.1 Rust kernel — measured 2026-09-02
 
-The figures above are the incumbent. These are the shipped kernel, measured with
-`benchmarks/map_bench.py` against a scratch store (the real `.devcouncil/` is never
+The figures above are the incumbent. These are the shipped kernel, measured
+on 2026-09-02 against a scratch store (the real `.devcouncil/` is never
 touched), reporting the **minimum** of N runs rather than the mean: the minimum is the
 run least contaminated by other load, and a mean on a laptop mostly measures what else
-was scheduled.
+was scheduled. That staged Python harness is retired; `rust-port/verify.sh` is the live gate.
 
 | Stage | DevCouncil · 994 files · 41.8 MB | scholarlm · 3,674 files · 37.9 MB |
 |---|---:|---:|
@@ -1222,15 +1222,14 @@ harness instead, because the stages have different fixes and a single wall-clock
 hides which one moved:
 
 ```bash
-# Staged benchmark: cold / warm / touch / manifest / e2e, min-of-N, scratch store.
-python benchmarks/map_bench.py --repo /path/to/any/tree --repeat 5
-python benchmarks/map_bench.py --repo . --baseline benchmarks/results/map/<earlier>.json
+# Required kernel gate: determinism, peak RSS, growth plateau, soak.
+cd rust-port && ./verify.sh
 
 # Per-phase breakdown of one build, straight from the kernel.
-devmap --db /tmp/scratch.sqlite --progress never --json build /path/to/tree | jq .timings
+devmap --db /tmp/scratch.sqlite --progress never --json build /path/to/tree
 ```
 
-Two properties of the harness are load-bearing rather than incidental:
+Two properties of those 2026-09-02 figures are load-bearing rather than incidental:
 
 - **Minimum of N, not mean.** The minimum is the run least contaminated by other load; a
   mean on a laptop substantially measures what else was scheduled.
@@ -1239,6 +1238,5 @@ Two properties of the harness are load-bearing rather than incidental:
   stale working index cannot flatter a benchmark — which it did once during this pass, when
   a leftover store made a cold build appear *faster* than a warm one.
 
-Results land in `benchmarks/results/map/<timestamp>.{json,md}`; `--baseline` diffs against
-an earlier run. Corpus sizes are recorded in each JSON, so a figure can be checked against
+Those figures landed in `benchmarks/results/map/<timestamp>.{json,md}`. Corpus sizes are recorded in each JSON, so a figure can be checked against
 the tree it came from rather than trusted.

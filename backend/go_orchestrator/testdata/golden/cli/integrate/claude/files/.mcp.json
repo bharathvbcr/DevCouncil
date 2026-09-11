@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "devcouncil": {
+      "type": "stdio",
+      "command": "/Users/bharath/.local/bin/dev",
+      "args": [
+        "mcp-server"
+      ],
+      "env": {
+        "DEVCOUNCIL_PROJECT_ROOT": "<ROOT>"
+      }
+    }
+  }
+}

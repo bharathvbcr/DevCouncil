@@ -1,0 +1,21 @@
+{
+  "arguments": {
+    "lease_token": "<LEASE_TOKEN>",
+    "task_id": "TASK-001",
+    "ttl_seconds": 120
+  },
+  "capture_mode": "live",
+  "case": "renew_ok",
+  "exit_code": null,
+  "notes": "",
+  "payload": {
+    "expires_at": "<EXPIRES_AT>",
+    "ok": true,
+    "task_id": "TASK-001",
+    "ttl_seconds": 120
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_renew_lease"
+}

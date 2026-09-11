@@ -52,7 +52,7 @@ Older expectations were updated to preserve the new invariants: task cancellatio
 
 ## Capacity and verification
 
-`tools/worktree_stress.py` creates real detached linked worktrees with the same initial HEAD and relative paths. It runs one daemon per worktree and two simultaneously released editors per worktree. Each round includes atomic replacement, rename, creation/deletion, navigation over IPC, forced process death/restart of one quarter of the daemons, and convergence checks. It also changes shared `info/exclude` without source edits and creates private HEAD-only commits. Finally, every incremental graph must equal a cold build, including symbol paths/spans and edge resolution/confidence; SQLite integrity and foreign keys are checked.
+`examples/worktree_stress` creates real detached linked worktrees with the same initial HEAD and relative paths. It runs one daemon per worktree and two simultaneously released editors per worktree. Each round includes atomic replacement, rename, creation/deletion, navigation over IPC, forced process death/restart of one quarter of the daemons, and convergence checks. It also changes shared `info/exclude` without source edits and creates private HEAD-only commits. Finally, every incremental graph must equal a cold build, including symbol paths/spans and edge resolution/confidence; SQLite integrity and foreign keys are checked.
 
 The harness reports actual daemon/editor concurrency separately from the bounded number of CLI build/check workers. It records the candidate binary hash, elapsed time, operation counts and aggregate daemon RSS samples. It uses disposable trees and cleans up only processes and files it created. Native CI uses the bounded `ipc_probe` example for both Unix sockets and Windows named pipes; its latency explicitly includes starting the probe process. SQLite inspection handles are closed explicitly. Orderly shutdown must exit successfully and release the endpoint; abnormal termination, missing measurements and cleanup failure cannot become a passing receipt.
 
@@ -72,7 +72,7 @@ The frozen candidate completed the following macOS/local-filesystem workload. Th
 | IPC latency p50 / p95 / maximum | 38.374 / 204.218 / 521.545 ms |
 | Aggregate daemon RSS range across 12 samples | 3,767,056–3,788,384 KiB |
 
-Reproduce from this workspace with `python3 tools/worktree_stress.py --binary /absolute/path/to/candidate/devmap --worktrees 128 --rounds 12 --build-workers 16 --output /absolute/path/to/result.json`. This measures daemon IPC round trips, not the complete agent or MCP interaction latency. The frozen load-test binary SHA-256 is `8170efd7d02fa345ae5d3c7f6057a5034dfeed50e7617d66860ba973fc677027`.
+Reproduce from this workspace with `cargo run -p devmap-cli --example worktree_stress -- --binary /absolute/path/to/candidate/devmap --worktrees 128 --rounds 12 --build-workers 16 --output /absolute/path/to/result.json`. This measures daemon IPC round trips, not the complete agent or MCP interaction latency. The frozen load-test binary SHA-256 is `8170efd7d02fa345ae5d3c7f6057a5034dfeed50e7617d66860ba973fc677027`.
 
 | Check | Result and scope |
 |---|---|

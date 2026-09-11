@@ -1,15 +1,19 @@
 ---
 name: devmap-impact
-description: Use when the user wants to know what will break if they change something, or needs safety analysis before editing. Examples: "Is it safe to change X?", "What depends on this?", "What will break?"
+description: Use DevMap before changing code to identify callers, dependencies, candidate
+  tests, and the limits of blast-radius evidence.
 ---
 
 # Impact analysis with DevMap
 
-1. `devmap_status` — a missing index is not "nothing depends on this".
-2. `devmap_impact` on the symbol or file. Read `walk_incomplete` before calling the blast radius complete.
-3. `devmap_affected_tests` for the tests to run.
-4. `devmap_preview` with the proposed file contents before writing a risky edit.
+Resolve this checkout with `devmap paths --json`, then check `devmap status --json`. Read the returned `repo_map` path; do not assume `.devcouncil` rather than `.devmap`. A missing, stale, or partially parsed index is not complete evidence. Rebuild with `devmap build --manifest` when needed and authorized, then recheck status.
 
-Depth 1 edges are direct callers (will break). Deeper layers are transitive. A result with `truncated: true` is a partial blast radius.
+Use the connected DevMap MCP tools if they target this checkout; otherwise use the CLI from its root. GitPulse's `gitpulse_codeintel_*` tools also query DevMap: pass the absolute `repo_path`. Discover the actual tool names and schemas; a host need not expose every CLI capability.
 
-There is no `detect_changes`. Workaround: map `git diff` paths to symbols, then `devmap_impact` / `devmap_affected_tests`. Record a `detect_changes` gap if that workaround is what you actually needed.
+1. Run `devmap impact <target> --json` on the exact symbol or file.
+2. Inspect direct callers first, then transitive paths. Explain what may change; a dependency does not by itself prove a break.
+3. Run `devmap affected <target> --json` to locate candidate tests and inspect their assertions. These are graph-reachable tests, not a coverage guarantee.
+4. Use `devmap preview --help` or the exposed preview schema to check proposed source when useful.
+5. Review `git diff` against the intended scope and run relevant tests plus required repository checks.
+
+Read `shown`, `total`, `truncated`, and `walk_incomplete`. Never turn an incomplete or unavailable answer into a zero-risk verdict. For capabilities not exposed by this host, state the gap and use source inspection or an available fallback; follow user and repository requirements.

@@ -1,0 +1,23 @@
+{
+  "arguments": {
+    "lease_token": "<LEASE_TOKEN>",
+    "task_id": "TASK-001"
+  },
+  "capture_mode": "live",
+  "case": "expired_lease",
+  "exit_code": null,
+  "notes": "expires_at forced into the past in state.sqlite before verify",
+  "payload": {
+    "code": "lease_expired",
+    "error": "Lease TTL expired. Check out the task again with devcouncil_checkout_task.",
+    "hint": "Renew only works before TTL expiry; call checkout again after expiry.",
+    "ok": false,
+    "suggested_action": "checkout_again",
+    "suggested_tool": "devcouncil_checkout_task",
+    "task_id": "TASK-001"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_verify_task"
+}

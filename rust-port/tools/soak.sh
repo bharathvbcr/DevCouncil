@@ -166,6 +166,12 @@ if [ "$MODE" = "--daemon" ]; then
     echo "  its output was: $(tail -5 "$TIMEOUT_LOG" 2>/dev/null)"
     exit 1
   }
+  IPC_PROBE="${IPC_PROBE:-$(dirname "$DEVMAP")/examples/ipc_probe}"
+  [ -x "$IPC_PROBE" ] || {
+    echo "SOAK FAIL: no ipc_probe at $IPC_PROBE"
+    echo "  cargo build -p devmap-cli --example ipc_probe --release, or set IPC_PROBE"
+    exit 1
+  }
   # Of the processes whose argv names this socket — the `/usr/bin/time` wrapper
   # is one of them — the one whose executable is the binary being measured.
   # Matched against `$DEVMAP`'s own basename rather than the literal `devmap`,
@@ -181,35 +187,23 @@ if [ "$MODE" = "--daemon" ]; then
   done
   [ -n "$SERVE_PID" ] || { echo "SOAK FAIL: cannot identify the daemon process"; exit 1; }
   ask() {
-    python3 - "$ENDPOINT" "$1" "${2:-validate}" <<'PY'
-import json, socket, sys, time
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.settimeout(30)
-sock.connect(sys.argv[1])
-sock.sendall(sys.argv[2].encode() + b"\n")
-buf = b""
-deadline = time.monotonic() + 30
-while not buf.endswith(b"\n"):
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise TimeoutError("soak query exceeded its total deadline")
-    sock.settimeout(remaining)
-    chunk = sock.recv(65536)
-    if not chunk:
-        break
-    buf += chunk
-    if len(buf) > 8 * 1024 * 1024:
-        raise ValueError("soak query exceeded the probe's 8 MiB response bound")
-response = json.loads(buf.decode())
-if not isinstance(response, dict) or response.get("ok") is not True:
-    raise ValueError(f"soak query failed: {response!r}")
-if len(sys.argv) > 3 and sys.argv[3] == "fresh":
-    snapshot = response.get("result")
-    if not isinstance(snapshot, dict):
-        raise ValueError("status returned no snapshot")
-    if snapshot.get("is_fresh") is not True:
-        sys.exit(2)
-PY
+    local frame="$1"
+    local mode="${2:-validate}"
+    local reply
+    reply=$("$IPC_PROBE" "$ENDPOINT" "$frame") || return 1
+    if [ "$mode" = "fresh" ]; then
+      printf '%s' "$reply" | perl -MJSON::PP -e '
+        my $j = decode_json(do { local $/; <STDIN> });
+        exit 1 unless ref($j) eq "HASH" && $j->{ok};
+        my $r = $j->{result};
+        exit 2 unless ref($r) eq "HASH" && $r->{is_fresh};
+      '
+    else
+      printf '%s' "$reply" | perl -MJSON::PP -e '
+        my $j = decode_json(do { local $/; <STDIN> });
+        exit 1 unless ref($j) eq "HASH" && $j->{ok};
+      '
+    fi
   }
   for i in $(seq 1 "$CYCLES"); do
     printf '\n# soak cycle %s\ndef _soak_%s():\n    return %s\n' "$i" "$i" "$i" >> "$TARGET"
@@ -258,7 +252,7 @@ PY
   if [ "$FAILS" -eq 0 ]; then
     # Verify the stopped state too: shutdown can flush a late watcher batch.
     stopped=$("$DEVMAP" --json status) && \
-      printf '%s' "$stopped" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("is_fresh") is True else 1)' || {
+      printf '%s' "$stopped" | perl -MJSON::PP -e 'my $j = decode_json(do { local $/; <STDIN> }); exit($j->{is_fresh} ? 0 : 1)' || {
         echo "SOAK FAIL: stopped daemon left pending or stale work"; FAILS=1;
       }
   fi

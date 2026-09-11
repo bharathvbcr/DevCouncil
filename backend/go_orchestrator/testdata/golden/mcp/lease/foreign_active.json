@@ -1,0 +1,31 @@
+{
+  "arguments": {
+    "client_id": "golden-b",
+    "task_id": "TASK-001"
+  },
+  "capture_mode": "live",
+  "case": "foreign_active",
+  "exit_code": null,
+  "notes": "second client without --force hits lease_conflict while first holds lease",
+  "payload": {
+    "applied_skills": [
+      "core-engineering",
+      "devcouncil",
+      "devcouncil-hero-loop",
+      "devcouncil-verification",
+      "devmap",
+      "devmap-debugging",
+      "devmap-exploring",
+      "devmap-impact",
+      "devmap-refactoring"
+    ],
+    "code": "lease_conflict",
+    "error": "Active lease already exists for task TASK-001",
+    "ok": false,
+    "task_id": "TASK-001"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_checkout_task"
+}

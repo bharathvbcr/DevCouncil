@@ -48,6 +48,12 @@ pub const LEGACY_AGENT_GUIDE_MARKER: &str =
 /// The guide filenames, in the order they are written.
 pub const GUIDE_FILENAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 
+/// Cursor always-apply rule emitted beside the guides.
+///
+/// Owned by path: `devmap.mdc` is DevMap's claim. A hand-written rule that
+/// wants a different name is left alone; this file is rewritten idempotently.
+pub const CURSOR_RULE_REL: &str = ".cursor/rules/devmap.mdc";
+
 /// One guide file the writer considered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuideOutcome {
@@ -237,14 +243,18 @@ unattributed calls mean the list is a lower bound. Prefer `unwired_candidates` /
 `dead_symbol_candidates` in the map over `unreachable_files` (static BFS is noisy for routers, \
 dynamic imports and JSX). If `entry_roots` is empty or `liveness_unreachable_unreliable` is set, \
 ignore `unreachable_files` entirely. Check `unwired_candidates` before creating a new module — \
-wire what you create into a real caller."
+wire what you create into a real caller. Neither list can ever name prose, data, a lockfile, an \
+environment file, a Terraform file, a package marker, a fixture tree, a shebang script or a \
+tool config; how many were left out, and why, is in `liveness_meta.unwired.excluded_*`, so an \
+empty list means nothing is unwired rather than that the filter swallowed the repository."
             .to_string(),
         "8. Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, \
-`devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) over \
-GitNexus. CLI equivalents: `devmap explore <name>`, `devmap search`, `devmap impact`, \
-`devmap trace <a> <b>`, `devmap dead`, `devmap affected <target>`. Read `truncated` and \
-`total` on every envelope before treating a list as complete. When DevMap cannot answer, \
-record a gap in `.devcouncil/codeintel/sessions/gaps.jsonl` — do not switch indexes."
+`devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) \
+or the matching `devmap` CLI commands: `devmap explore <name>`, `devmap search`, \
+`devmap impact`, `devmap trace <a> <b>`, `devmap dead`, `devmap affected <target>`. \
+Read `truncated` and `total` on every envelope before treating a list as complete. \
+When DevMap cannot answer, record a gap in `.devcouncil/codeintel/sessions/gaps.jsonl` \
+— do not switch indexes."
             .to_string(),
         format!(
             "9. The store (`{store_rel}`) is canonical — prefer `devmap` commands when \
@@ -268,7 +278,61 @@ break before it is written."
     lines.join("\n")
 }
 
-/// Write the marker-guarded guides under `repo_root`.
+/// Cursor rule body: workflow summary plus the canonical hygiene rules.
+///
+/// Frontmatter sets `alwaysApply: true` so every Cursor session gets DevMap
+/// navigation without depending on a skill being selected.
+pub fn cursor_rule_text(map_rel: &str) -> String {
+    format!(
+        "---\n\
+description: DevMap navigation and repository hygiene\n\
+alwaysApply: true\n\
+---\n\
+\n\
+# DevMap\n\
+\n\
+Use `{map_rel}` as the primary file index for this workspace. Run `devmap paths --json` and `devmap status --json` before relying on graph answers. Generated state is per-worktree and is not copied by Git; if the store or map is missing, run `devmap build --manifest` from this worktree's root.\n\
+\n\
+Prefer DevMap MCP tools (`devmap_explore`, `devmap_search`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) or the matching `devmap` CLI commands. Read `truncated` and `total` on every envelope before treating a list as complete. When DevMap cannot answer, record a gap rather than silently switching indexes.\n\
+\n\
+Before editing a symbol, run impact analysis. Before committing, review the diff and query affected tests. Neither the index nor a skill replaces source review and the repository's required verification commands.\n\
+\n\
+{rules}\n",
+        map_rel = map_rel,
+        rules = crate::hygiene::AGENT_RULES
+    )
+}
+
+fn write_marked_file(
+    path: &Path,
+    text: &str,
+    ours: impl Fn(&str) -> bool,
+) -> std::io::Result<GuideDisposition> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) => {
+            if !ours(&existing) {
+                Ok(GuideDisposition::NotOurs)
+            } else if existing == text {
+                Ok(GuideDisposition::Unchanged)
+            } else {
+                std::fs::write(path, text)?;
+                Ok(GuideDisposition::Updated)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, text)?;
+            Ok(GuideDisposition::Created)
+        }
+        // Unreadable is not the same as absent: leave somebody's file alone.
+        Err(_) => Ok(GuideDisposition::NotOurs),
+    }
+}
+
+/// Write the marker-guarded guides and the Cursor always-apply rule under
+/// `repo_root`.
 ///
 /// Every file is reported, including the ones left alone, so a caller can say
 /// *why* a guide was not refreshed rather than reporting silence as success.
@@ -280,37 +344,24 @@ pub fn write_agent_guides(
     store_rel: &str,
 ) -> std::io::Result<Vec<GuideOutcome>> {
     let text = agent_guide_text(map, map_rel, graph_rel, store_rel) + "\n";
-    let mut outcomes = Vec::with_capacity(GUIDE_FILENAMES.len());
+    let mut outcomes = Vec::with_capacity(GUIDE_FILENAMES.len() + 1);
 
     for filename in GUIDE_FILENAMES {
         let path = repo_root.join(filename);
-        let disposition = match std::fs::read_to_string(&path) {
-            Ok(existing) => {
-                if !existing.contains(AGENT_GUIDE_MARKER)
-                    && !existing.contains(LEGACY_AGENT_GUIDE_MARKER)
-                {
-                    GuideDisposition::NotOurs
-                } else if existing == text {
-                    GuideDisposition::Unchanged
-                } else {
-                    std::fs::write(&path, &text)?;
-                    GuideDisposition::Updated
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&path, &text)?;
-                GuideDisposition::Created
-            }
-            // A guide that cannot be read is left alone rather than replaced.
-            // Unreadable is not the same as absent, and the difference is
-            // somebody's file.
-            Err(_) => GuideDisposition::NotOurs,
-        };
+        let disposition = write_marked_file(&path, &text, |existing| {
+            existing.contains(AGENT_GUIDE_MARKER) || existing.contains(LEGACY_AGENT_GUIDE_MARKER)
+        })?;
         outcomes.push(GuideOutcome { path, disposition });
     }
+
+    let rule_path = repo_root.join(CURSOR_RULE_REL);
+    let rule_text = cursor_rule_text(map_rel);
+    // Owned by path: this exact relative name is DevMap's. Idempotent rewrite.
+    let disposition = write_marked_file(&rule_path, &rule_text, |_| true)?;
+    outcomes.push(GuideOutcome {
+        path: rule_path,
+        disposition,
+    });
     Ok(outcomes)
 }
 
@@ -484,6 +535,38 @@ mod tests {
     }
 
     #[test]
+    fn write_agent_guides_also_emits_the_cursor_always_apply_rule() {
+        let dir = scratch("cursor-rule");
+        let outcomes =
+            write_agent_guides(&dir, &computed_map(), "m.json", "g.json", "s.sqlite").unwrap();
+        let rule = dir.join(CURSOR_RULE_REL);
+        let outcome = outcomes.iter().find(|o| o.path == rule).unwrap();
+        assert_eq!(outcome.disposition, GuideDisposition::Created);
+        let text = std::fs::read_to_string(&rule).unwrap();
+        assert!(text.contains("alwaysApply: true"), "{text}");
+        assert!(text.contains("## Repository hygiene"), "{text}");
+        assert!(text.contains("`m.json`"), "{text}");
+        assert!(text.contains("devmap paths --json"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_rule_is_owned_by_path_and_rewritten_idempotently() {
+        let dir = scratch("cursor-rule-owned");
+        let rule = dir.join(CURSOR_RULE_REL);
+        std::fs::create_dir_all(rule.parent().unwrap()).unwrap();
+        std::fs::write(&rule, "stale rule body\n").unwrap();
+        let outcomes =
+            write_agent_guides(&dir, &computed_map(), "m.json", "g.json", "s.sqlite").unwrap();
+        let outcome = outcomes.iter().find(|o| o.path == rule).unwrap();
+        assert_eq!(outcome.disposition, GuideDisposition::Updated);
+        assert!(std::fs::read_to_string(&rule)
+            .unwrap()
+            .contains("alwaysApply: true"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_guide_names_devmap_commands_and_not_the_orchestrators() {
         let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
         assert!(text.contains("devmap explore"), "{text}");
@@ -494,6 +577,20 @@ mod tests {
         assert!(
             !text.contains("devcouncil_"),
             "the standalone guide must not name DevCouncil MCP tools: {text}"
+        );
+    }
+
+    #[test]
+    fn the_generated_guide_does_not_name_gitnexus() {
+        let text = agent_guide_text(&computed_map(), "m.json", "g.json", "s.sqlite");
+        assert!(
+            !text.contains("GitNexus"),
+            "generated AGENTS.md must not name GitNexus: {text}"
+        );
+        let rule = cursor_rule_text("m.json");
+        assert!(
+            !rule.contains("GitNexus"),
+            "generated Cursor rule must not name GitNexus: {rule}"
         );
     }
 

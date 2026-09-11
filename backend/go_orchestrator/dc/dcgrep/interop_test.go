@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/internal/testsupport"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 // These run against the binary the harness actually execs, not a fake.

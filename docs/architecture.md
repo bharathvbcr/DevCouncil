@@ -4,7 +4,7 @@ DevCouncil is a gated orchestrator for AI-assisted software development. It ensu
 
 ## Core Components
 
-- **CLI**: Typer-based `dev` / `devcouncil` command surface for local terminal workflows.
+- **CLI**: Go `dev` / `devcouncil` host binary (`mcp`, `integrate`, `skills`, `verify`) plus a Node npm shim that execs it. `map` / `graph` / `ast` exec Rust `devmap`. The Python/Typer launcher is gone.
 - **Orchestrator & State Machine**: Manages transitions between planning, execution, and verification phases (see [Gating state machine](#gating-state-machine) below).
 - **Artifact Graph**: Directed graph linking requirements, tasks, files, evidence, and gaps (see [Artifact graph](#artifact-graph) below).
 - **Planning Council**: Multi-agent LLM debate for planning and critique.
@@ -19,12 +19,9 @@ DevCouncil is a gated orchestrator for AI-assisted software development. It ensu
 
 ```mermaid
 flowchart LR
-  entry["cli/main.py"] --> planning
-  entry --> execution
-  entry --> verification
-  entry --> indexing
-  execution --> mcp["mcp / agents"]
-  verification --> gaps["evidence / gaps"]
+  entry["cmd/devcouncil"] --> mcp["mcp / integrate / skills / verify"]
+  entry --> mapfwd["map / graph / ast"]
+  mapfwd --> devmap["devmap"]
 ```
 
 Sample UI with no repository map: `dev map demo` (self-contained interactive HTML at `.devcouncil/graph/demo.html`). Full guide: [code-graph.md](code-graph.md).

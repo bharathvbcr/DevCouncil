@@ -1,0 +1,22 @@
+{
+  "arguments": [
+    "skills",
+    "scaffold",
+    "--skill",
+    "core-engineering"
+  ],
+  "capture_mode": "live",
+  "case": "skills_refusal_unowned",
+  "exit_code": 1,
+  "notes": "unmanaged/locally modified skill must be refused; no force overwrite",
+  "payload": {
+    "exit_code": 1,
+    "file_unchanged": "---\nname: core-engineering\ndescription: local edit\n---\n# Locally modified\n",
+    "stderr": "",
+    "stdout": "<ROOT>/.claude/skills/core-engineering/SKIL\nL.md: unmanaged or locally modified skill; preserve or move it before installing\n"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "cli",
+  "tool_or_command": "dev skills scaffold"
+}

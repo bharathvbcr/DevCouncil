@@ -179,6 +179,17 @@ fn the_port_agrees_with_the_python_implementation() {
             &["src.routes.App", "src/routes/App"],
         ),
         (
+            "src/App.svelte",
+            "const load = () => import('./lib/CloneModal.svelte');",
+            &[
+                "src.lib.CloneModal",
+                "src.lib.CloneModal.svelte",
+                "src/lib/CloneModal",
+                "src/lib/CloneModal.svelte",
+                "src/lib/CloneModal/svelte",
+            ],
+        ),
+        (
             "src/routes/index.tsx",
             "import('../shared/Panel.tsx')",
             &[

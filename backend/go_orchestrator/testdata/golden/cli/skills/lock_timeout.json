@@ -1,0 +1,20 @@
+{
+  "arguments": {
+    "destinations": [
+      ".claude/skills"
+    ]
+  },
+  "capture_mode": "injected_monotonic_clock",
+  "case": "skills_lock_timeout",
+  "exit_code": null,
+  "notes": "installer waits \u22645s on .devcouncil-skills.lock then raises TimeoutError; never steals",
+  "payload": {
+    "error": "Skill installer is busy: <ROOT>/.devcouncil-skills.lock",
+    "lock_still_present": true,
+    "raised": "TimeoutError"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "python_api",
+  "tool_or_command": "scaffold_skills"
+}

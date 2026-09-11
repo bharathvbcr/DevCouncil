@@ -32,3 +32,10 @@ libc.workspace = true
 # Store purely for tests would be worse. Already a workspace dependency built
 # for devmap-store, so no new crate enters the tree.
 rusqlite.workspace = true
+# The worktree-stress example bounds editor/build fan-out the same way the
+# old Python harness did (`ThreadPoolExecutor(max_workers=…)`).
+rayon.workspace = true
+
+[[example]]
+name = "worktree_stress"
+path = "examples/worktree_stress/main.rs"

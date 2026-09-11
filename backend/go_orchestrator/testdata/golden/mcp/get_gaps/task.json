@@ -1,0 +1,57 @@
+{
+  "arguments": {
+    "task_id": "TASK-001"
+  },
+  "capture_mode": "live",
+  "case": "get_gaps_task",
+  "exit_code": null,
+  "notes": "",
+  "payload": {
+    "blocking_count": 1,
+    "gap_count": 3,
+    "gaps": [
+      {
+        "acceptance_criterion_id": null,
+        "blocking": true,
+        "file": null,
+        "gap_type": "task_not_implemented",
+        "id": "GAP-TASK-001-NODIFF-31d6a5192b",
+        "line": null,
+        "requirement_id": null,
+        "severity": "high",
+        "task_id": "TASK-001"
+      },
+      {
+        "acceptance_criterion_id": null,
+        "blocking": false,
+        "file": null,
+        "gap_type": "invalid_verification_command",
+        "id": "GAP-TASK-001-BADCMD-53e6757ddd",
+        "line": null,
+        "requirement_id": null,
+        "severity": "medium",
+        "task_id": "TASK-001"
+      },
+      {
+        "acceptance_criterion_id": null,
+        "blocking": false,
+        "file": "src/a.py",
+        "gap_type": "planned_file_not_changed",
+        "id": "GAP-TASK-001-FILEsrcapy-a71cc01ad9",
+        "line": null,
+        "requirement_id": null,
+        "severity": "medium",
+        "task_id": "TASK-001"
+      }
+    ],
+    "gates_mode": "enforce",
+    "initialized": true,
+    "ok": true,
+    "stored_blocking_count": 1,
+    "task_id": "TASK-001"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_get_gaps"
+}

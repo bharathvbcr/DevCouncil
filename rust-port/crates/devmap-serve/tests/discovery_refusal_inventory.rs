@@ -6,10 +6,11 @@
 //! `max(previous, this_batch)`, which bought that guarantee with two wrong
 //! answers in the other direction:
 //!
-//! 1. once the refused file is repaired — shrunk under `MAX_SOURCE_BYTES`, made
-//!    readable, a dangling symlink pointed at a real file — the count stays
-//!    high until a full re-extraction or a `devmap build` re-measures. The
-//!    corpus is complete and the kernel goes on reporting a hole in it;
+//! 1. once the refused file is repaired — made readable, a dangling symlink
+//!    pointed at a real file — the count stays high until a full re-extraction
+//!    or a `devmap build` re-measures. The corpus is complete and the kernel
+//!    goes on reporting a hole in it; (Oversized is a default ignore, not a
+//!    refusal inventory row — Phase 1.)
 //! 2. a refusal this batch met is only *counted* when it exceeds the carried
 //!    number, so a new refusal in a repository whose last full walk refused two
 //!    files disappears into the two. That one is an over-claim: coverage is
@@ -22,11 +23,13 @@
 //! nothing touched keeps its verdict (the watcher would have reported a
 //! change); a path this batch touched is re-decided by `candidate_kind`.
 
-use devmap_extract::MAX_SOURCE_BYTES;
 use devmap_serve::Daemon;
 use devmap_store::Store;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// A scratch repository named for the test using it. No `tempfile`
 /// dev-dependency exists in this workspace and this does not add one.
@@ -112,21 +115,22 @@ fn enqueue_and_drain(store: &Store, daemon: &Daemon, root: &Path, paths: &[&str]
 
 /// Residual 1: a repaired file must leave the inventory.
 #[test]
-fn a_shrunk_file_leaves_the_refusal_inventory() {
-    let root = scratch("shrunk");
+#[cfg(unix)]
+fn a_repaired_unreadable_file_leaves_the_refusal_inventory() {
+    let root = scratch("unreadable");
     std::fs::write(root.join("lib.py"), LIB).unwrap();
-    std::fs::write(
-        root.join("app.py"),
-        vec![b'x'; (MAX_SOURCE_BYTES + 1) as usize],
-    )
-    .unwrap();
+    let app = root.join("app.py");
+    std::fs::write(&app, APP).unwrap();
+    let mut perms = std::fs::metadata(&app).unwrap().permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(&app, perms).unwrap();
     let db_path = root.join("index.sqlite");
 
     let store = cold_build(&root, &db_path);
     assert_eq!(
         refused_count(&store),
         Some(1),
-        "fixture precondition: the cold walk must refuse the oversized file"
+        "fixture precondition: the cold walk must refuse the unreadable file"
     );
     assert_eq!(
         refused_paths(&store),
@@ -134,9 +138,11 @@ fn a_shrunk_file_leaves_the_refusal_inventory() {
         "the inventory must name the path, not just count it"
     );
 
-    // Repaired: the file is now well under the ceiling and is an ordinary
-    // source. One watcher event for it.
-    std::fs::write(root.join("app.py"), APP).unwrap();
+    // Repaired: the file is readable again and is an ordinary source.
+    let mut perms = std::fs::metadata(&app).unwrap().permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&app, perms).unwrap();
+    std::fs::write(&app, APP).unwrap();
     let daemon = Daemon::new(Store::open(&db_path).unwrap(), root.clone());
     enqueue_and_drain(&store, &daemon, &root, &["app.py"]);
 

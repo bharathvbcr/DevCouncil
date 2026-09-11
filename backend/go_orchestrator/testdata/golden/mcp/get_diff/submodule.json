@@ -1,0 +1,25 @@
+{
+  "arguments": {},
+  "capture_mode": "live",
+  "case": "submodule",
+  "exit_code": null,
+  "notes": "parent repo with nested submodule (or .gitmodules fallback); submodule_add_rc=128; dirty parent file still listed",
+  "payload": {
+    "files": [
+      {
+        "additions": 1,
+        "deletions": 1,
+        "path": "src/a.py",
+        "status": "M"
+      }
+    ],
+    "ok": true,
+    "staged": false,
+    "truncated": false,
+    "unified_diff": "diff --git a/src/a.py b/src/a.py\nindex b15b1b0..f3aa0a0 100644\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 9\n"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_get_diff"
+}

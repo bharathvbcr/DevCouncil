@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/internal/testsupport"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 // scopeFixture is a real store with one planned task and a live lease on it.

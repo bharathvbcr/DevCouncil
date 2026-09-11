@@ -1,0 +1,23 @@
+{
+  "arguments": [
+    "map",
+    "--no-wiki"
+  ],
+  "capture_mode": "live",
+  "case": "dev_map_run",
+  "exit_code": 0,
+  "notes": "guide bytes above come from init's write_agent_guides; map re-run recorded for exit shape",
+  "payload": {
+    "exit_code": 0,
+    "guides_sha256": {
+      "AGENTS.md": "f4862b268e17b148b7d23f78ab899c3e60058779d96d1385a643495c7f7b6100",
+      "CLAUDE.md": "f4862b268e17b148b7d23f78ab899c3e60058779d96d1385a643495c7f7b6100"
+    },
+    "stderr_tail": "Wrote repository map to \n<ROOT>/.devcouncil/repo_map.json\nWrote code graph to \n<ROOT>/.devcouncil/graph/code_graph.json\nwarning: unreachable_files low-confidence (liveness_unreachable_unreliable); prefer unwired_candidates / dead_symbol_candidates and `dev map dead --confidence extracted`\nliveness: 0 entry roots, 1 unwired, 0 unreachable, 0 dead symbols, app.py \n(prefer unwired + extracted dead; map clears on any non-test importer)\n",
+    "stdout_tail": "uded_not_code\": 0,\n      \"excluded_not_code_reasons\": {},\n      \"shown\": 1,\n      \"total\": 1,\n      \"truncated\": false\n    }\n  },\n  \"liveness_unreachable_unreliable\": false,\n  \"lsp\": {},\n  \"map_engine\": \"devmap-rust\",\n  \"meta\": {\n    \"devmap_rust\": {\n      \"candidate_files_computed\": false,\n      \"dependency_risks_computed\": false,\n      \"file_kinds_computed\": true,\n      \"frameworks_computed\": true,\n      \"handoff_paths_computed\": true,\n      \"import_blind_files_computed\": true,\n      \"inventory_directories_visited\": 1,\n      \"inventory_refused_oversize\": [],\n      \"inventory_unavailable_reason\": \"\",\n      \"inventory_unreadable\": [],\n      \"inventory_walk_truncated\": false,\n      \"lsp_computed\": false,\n      \"neighbors_computed\": true,\n      \"package_managers_computed\": true,\n      \"processes_computed\": false,\n      \"role_files_computed\": true,\n      \"subsystem_summaries_computed\": true,\n      \"test_commands_computed\": true\n    }\n  },\n  \"package_managers\": [],\n  \"processes\": [],\n  \"resolution_rate\": {\n    \"by_language\": {\n      \"python\": {\n        \"explained_sites\": 1,\n        \"extracts_calls\": true,\n        \"gross_permille\": 0,\n        \"net_permille\": null,\n        \"resolved_sites\": 0,\n        \"unresolved_sites\": 1\n      }\n    },\n    \"explained_sites\": 1,\n    \"gross_permille\": 0,\n    \"net_permille\": null,\n    \"resolved_sites\": 0,\n    \"unresolved_sites\": 1\n  },\n  \"subsystems\": [],\n  \"test_commands\": [],\n  \"unreachable_files\": [],\n  \"unwired_candidates\": [\n    \"app.py\"\n  ]\n}\n"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "cli",
+  "tool_or_command": "dev map --no-wiki"
+}

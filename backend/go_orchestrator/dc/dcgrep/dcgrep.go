@@ -34,7 +34,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/internal/proc"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 // BinaryEnv overrides binary discovery, so an operator who names a path means

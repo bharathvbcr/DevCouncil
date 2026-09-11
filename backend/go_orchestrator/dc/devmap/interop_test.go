@@ -2,11 +2,9 @@ package devmap
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -182,16 +180,6 @@ func TestTheLiveContractHolds(t *testing.T) {
 	if notes := m.DisagreementsWith(status.GenerationID, status.NodeCount); len(notes) != 0 {
 		t.Fatalf("a freshly written artifact must not read as diverged from the index it came from: %v", notes)
 	}
-	// Declared before compared. An artifact that names no schema decodes as
-	// version zero, and this build reports that as unknown rather than as a
-	// mismatch — so a producer that renamed or moved the key would otherwise be
-	// caught only by the value check below, which cannot say which of the two
-	// happened. The live binary is the only thing that can settle that the key
-	// is still spelled the way this build reads it.
-	if !p.SchemaDeclared {
-		t.Error("the artifact declares no schema version under the key this build reads; " +
-			"every field in it is now being interpreted on an assumption")
-	}
 	if p.SchemaVersion != repomap.SupportedSchema {
 		t.Errorf("the producer now writes schema %d and this build reads %d; "+
 			"check what moved before raising SupportedSchema", p.SchemaVersion, repomap.SupportedSchema)
@@ -322,120 +310,5 @@ func TestTheLiveProducerRefusalIsRecoverable(t *testing.T) {
 	}
 	if !again.Clean() {
 		t.Fatalf("a run over the producer's own artifacts is a clean run, got %v", again.Degraded())
-	}
-}
-
-// TestTheLiveCompactGraphBuildsTheSameMap drives the producer's second
-// encoding.
-//
-// `devmap manifest --compact-graph-output` writes the same model with each
-// distinct string written once and referred to by index, and `repomap` reads
-// it. Everything about that layout — the `encoding` identity, the `fields` and
-// `rows` shape, which columns are interned, that `strings` is where the indices
-// point — is a contract with a producer built from another workspace, and a
-// hand-written fixture asserting it would only assert that the fixture and the
-// decoder were written by the same hand.
-//
-// So this runs the real binary and requires that the two artifacts it writes
-// from one generation build the identical Map. They are two encodings of one
-// model, and the harness reads whichever it is pointed at: if they could differ,
-// the scope rung's answer would depend on which file was on disk.
-func TestTheLiveCompactGraphBuildsTheSameMap(t *testing.T) {
-	bin := devmapBinary(t)
-	root := fixtureRepo(t)
-	c := New(bin, root)
-	c.Timeout = 60 * time.Second
-	ctx := context.Background()
-
-	if _, err := c.Build(ctx, 5*time.Minute); err != nil {
-		t.Fatalf("build: %v", err)
-	}
-
-	mapPath := filepath.Join(root, "repo_map.json")
-	verbosePath := filepath.Join(root, "code_graph.json")
-	compactPath := filepath.Join(root, "code_graph.compact.json")
-
-	// The client's own runner rather than a raw exec, so the invocation carries
-	// the same timeout, process-group and output bounds as every other call
-	// this package makes. `Manifest` is not used because it does not write the
-	// compact artifact — nothing in production asks it to, and adding an
-	// argument no caller passes would be a second contract to keep in step.
-	var rendered struct {
-		GenerationID int `json:"generation_id"`
-	}
-	if _, err := c.decode(ctx, &rendered, 5*time.Minute, "manifest", ".",
-		"--output", mapPath, "--graph-output", verbosePath,
-		"--compact-graph-output", compactPath); err != nil {
-		t.Fatalf("manifest with both encodings: %v\n"+
-			"if the failure names --compact-graph-output, the producer on PATH predates the "+
-			"interned encoding and repomap's decoder for it is unexercised in this run", err)
-	}
-
-	// The producer's own account of the layout, checked before anything is
-	// decoded from it. A build reading an artifact whose identity it never
-	// looked at is reading a shape on an assumption — the same reason the
-	// schema check above exists.
-	raw, err := os.ReadFile(compactPath)
-	if err != nil {
-		t.Fatalf("the interned artifact devmap just wrote is not on disk: %v", err)
-	}
-	var declared struct {
-		Encoding       string   `json:"encoding"`
-		InternedTables []string `json:"interned_tables"`
-		Strings        []string `json:"strings"`
-	}
-	if err := json.Unmarshal(raw, &declared); err != nil {
-		t.Fatalf("the interned artifact is not JSON: %v", err)
-	}
-	if declared.Encoding != repomap.CompactEncoding {
-		t.Fatalf("the producer writes layout %q and this build reads %q; check what moved "+
-			"before changing repomap.CompactEncoding", declared.Encoding, repomap.CompactEncoding)
-	}
-	if len(declared.InternedTables) == 0 || len(declared.Strings) == 0 {
-		t.Fatalf("the interned artifact interned nothing (%d table(s), %d string(s)), so this "+
-			"test would compare two verbose documents and prove nothing about the encoding",
-			len(declared.InternedTables), len(declared.Strings))
-	}
-
-	fromVerbose, err := repomap.Load(verbosePath)
-	if err != nil {
-		t.Fatalf("the verbose artifact does not load: %v", err)
-	}
-	fromCompact, err := repomap.Load(compactPath)
-	if err != nil {
-		t.Fatalf("the interned artifact does not load: %v", err)
-	}
-	if !reflect.DeepEqual(fromVerbose.Stats(), fromCompact.Stats()) {
-		t.Errorf("stats differ:\n verbose  %+v\n interned %+v",
-			fromVerbose.Stats(), fromCompact.Stats())
-	}
-	if !reflect.DeepEqual(fromVerbose.Provenance(), fromCompact.Provenance()) {
-		t.Errorf("provenance differs:\n verbose  %+v\n interned %+v",
-			fromVerbose.Provenance(), fromCompact.Provenance())
-	}
-	if !reflect.DeepEqual(fromVerbose.Areas(), fromCompact.Areas()) {
-		t.Errorf("areas differ:\n verbose  %+v\n interned %+v",
-			fromVerbose.Areas(), fromCompact.Areas())
-	}
-	for _, area := range fromVerbose.Areas() {
-		if !reflect.DeepEqual(fromVerbose.Neighbours(area.Name), fromCompact.Neighbours(area.Name)) {
-			t.Errorf("neighbours of %s differ: %v against %v", area.Name,
-				fromVerbose.Neighbours(area.Name), fromCompact.Neighbours(area.Name))
-		}
-	}
-	if !reflect.DeepEqual(fromVerbose.Degraded(), fromCompact.Degraded()) {
-		t.Errorf("degradations differ:\n verbose  %v\n interned %v",
-			fromVerbose.Degraded(), fromCompact.Degraded())
-	}
-	// And every field, including the ones no assertion above names.
-	if !reflect.DeepEqual(fromVerbose, fromCompact) {
-		t.Errorf("the two encodings the producer wrote from one generation built different maps")
-	}
-
-	// The fixture has to be one where the map says something, or the comparison
-	// would hold for two empty maps.
-	if fromCompact.Stats().Files < 2 || fromCompact.Stats().Areas < 2 {
-		t.Fatalf("the fixture produced %+v; too small for the comparison to mean anything",
-			fromCompact.Stats())
 	}
 }

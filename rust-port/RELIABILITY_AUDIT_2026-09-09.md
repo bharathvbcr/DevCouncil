@@ -76,8 +76,8 @@ From `rust-port/`:
 ./verify.sh
 cargo test --locked -p devmap-query --test incomplete_answers_say_so --test paired_reads_are_one_generation --test search_ranks_before_paging
 DEVMAP_SOAK_CYCLES=40 cargo test --locked -p devmap-cli --test daemon_storm_soak -- --ignored --nocapture
-python3 -m unittest discover -s tools -p test_worktree_stress.py
-python3 tools/worktree_stress.py --binary /absolute/path/to/devmap --worktrees 128 --fixture-files 64 --rounds 4 --build-workers 8 --output /tmp/capacity.json
+cargo test --locked -p devmap-cli --test worktree_stress_support
+cargo run -p devmap-cli --example worktree_stress -- --binary /absolute/path/to/devmap --ipc-probe target/debug/examples/ipc_probe --worktrees 128 --fixture-files 64 --rounds 4 --build-workers 8 --output /tmp/capacity.json
 DEVMAP_BIN=/absolute/path/to/devmap SOAK_CSV=/tmp/build.csv tools/soak.sh /scratch/corpus 100
 DEVMAP_BIN=/absolute/path/to/devmap SOAK_CSV=/tmp/daemon.csv tools/soak.sh /scratch/corpus 1200 --daemon
 ```

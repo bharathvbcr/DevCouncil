@@ -1,5 +1,9 @@
 // Command dcmap is the Go port of DevCouncil's `dev map` command surface.
 //
+// Phase 3: superseded for agent workflows by the `devmap` Rust binary and
+// `manvi map`. Retained as a thin mapcli driver until those cover every
+// flag this package still exposes; do not add new surface area here.
+//
 // It is named dcmap rather than devmap because devmap is the Rust kernel this
 // CLI drives, and two binaries of that name on one PATH would make which one
 // runs a property of shell ordering.

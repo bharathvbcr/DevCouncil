@@ -1,0 +1,25 @@
+{
+  "arguments": {},
+  "capture_mode": "live",
+  "case": "untracked",
+  "exit_code": null,
+  "notes": "",
+  "payload": {
+    "files": [
+      {
+        "additions": 1,
+        "deletions": 0,
+        "path": "brand_new.py",
+        "status": "A"
+      }
+    ],
+    "ok": true,
+    "staged": false,
+    "truncated": false,
+    "unified_diff": "diff --git a/brand_new.py b/brand_new.py\nnew file mode 100644\n--- /dev/null\n+++ b/brand_new.py\n@@ -0,0 +1,1 @@\n+print('hello')\n"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_get_diff"
+}

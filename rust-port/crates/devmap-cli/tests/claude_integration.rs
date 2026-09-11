@@ -13,15 +13,6 @@ use serde_json::Value;
 
 const DEVMAP: &str = env!("CARGO_BIN_EXE_devmap");
 
-fn repo_root() -> PathBuf {
-    // <repo>/rust-port/crates/devmap-cli
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(3)
-        .expect("crate is three levels below the repository root")
-        .to_path_buf()
-}
-
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "devmap-claude-{tag}-{}-{}",
@@ -82,9 +73,13 @@ fn devmap(args: &[&str]) -> Run {
 /// naming a subcommand this binary registers.
 ///
 /// Shell form would re-tokenize `${CLAUDE_PROJECT_DIR}` through `sh -c`, so a
-/// checkout under a path with a space becomes two arguments; a relative `--db`
-/// resolves against Claude's current directory, which after a `cd` or a
-/// worktree entry is not the repository the index describes.
+/// checkout under a path with a space becomes two arguments; an unanchored
+/// invocation resolves against Claude's current directory, which after a `cd` or
+/// a worktree entry is not the repository the index describes.
+///
+/// The anchor is `--root`, not `--db`: naming a store freezes the state layout
+/// as it stood when the hook was written, while a root is resolved through the
+/// same discovery every other invocation uses.
 #[test]
 fn emitted_hooks_are_exec_form_anchored_to_the_project_root() {
     let block = devmap(&["--json", "claude", "hooks"]).ok().json();
@@ -108,12 +103,20 @@ fn emitted_hooks_are_exec_form_anchored_to_the_project_root() {
                     .iter()
                     .map(|a| a.as_str().expect("string arg"))
                     .collect();
-                assert_eq!(args[0], "--db", "{event}: {args:?}");
-                assert!(
-                    args[1].starts_with("${CLAUDE_PROJECT_DIR}/"),
-                    "{event}: a relative store path must be anchored to the project root, \
-                     got {:?}",
+                assert_eq!(
+                    args[0], "--root",
+                    "{event}: a hook must anchor to the project root rather than name a \
+                     store path: {args:?}"
+                );
+                assert_eq!(
+                    args[1], "${CLAUDE_PROJECT_DIR}",
+                    "{event}: the root must be the host's project placeholder, got {:?}",
                     args[1]
+                );
+                assert!(
+                    !args.contains(&"--db"),
+                    "{event}: a baked store path fixes the state layout at the moment the \
+                     hook was written: {args:?}"
                 );
                 // The subcommand is the parser's, checked against the parser.
                 assert!(
@@ -300,7 +303,7 @@ fn emitted_hooks_include_session_end_report() {
         .map(|a| a.as_str().unwrap())
         .collect::<Vec<_>>();
     assert!(
-        args.iter().any(|a| *a == "session-report"),
+        args.contains(&"session-report"),
         "SessionEnd must run session-report: {args:?}"
     );
     let start = block["hooks"]["SessionStart"]
@@ -327,7 +330,12 @@ fn plugin_manifest_points_at_bundled_skills() {
     assert_eq!(manifest["skills"], "./skills");
     let skill = out.join("devmap/skills/devmap/SKILL.md");
     let body = std::fs::read_to_string(&skill).expect("preference skill");
-    assert!(body.contains("Do not use GitNexus"), "{body}");
+    assert!(
+        body.contains("Prefer DevMap for the questions it can answer"),
+        "{body}"
+    );
+    assert!(body.contains("devmap paths --json"), "{body}");
+    assert!(!body.contains("Do not use GitNexus"), "{body}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -517,14 +525,57 @@ fn a_non_utf8_store_path_is_refused_rather_than_silently_mangled() {
     use std::os::unix::ffi::OsStrExt;
 
     let raw = OsStr::from_bytes(b".devcouncil/\xff\xfe/devmap.sqlite");
-    // Every command that turns a path into JSON, including `mcp --print-config`,
-    // which is the entry an agent host is configured from: a mangled `args`
-    // there points the host at a store that does not exist, and the host
-    // reports only that the server would not start.
+    // `mcp --print-config` is now the only command that turns a caller-named
+    // store into JSON, and it is the entry an agent host is configured from: a
+    // mangled `args` there points the host at a store that does not exist, and
+    // the host reports only that the server would not start.
+    //
+    // `claude hooks` and `claude plugin` used to be checked here too. Neither
+    // carries a store path any more — a hook anchors with `--root`, and the
+    // plugin's MCP entry omits `--db` so the server resolves from roots/cwd — so
+    // they moved to `installed_artifacts_carry_no_store_path_to_mangle`, which
+    // asserts the absence rather than leaving it implied.
+    let out = Command::new(DEVMAP)
+        .arg("--db")
+        .arg(raw)
+        .args(["mcp", "--print-config"])
+        .output()
+        .expect("devmap runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "a path JSON cannot carry must fail, not be emitted lossily: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not valid UTF-8"),
+        "the refusal must say why: {stderr}"
+    );
+    // And the lossy form must not appear anywhere in what was produced.
+    assert!(
+        !stdout.contains('\u{FFFD}'),
+        "no replacement character may reach the output"
+    );
+}
+
+/// The installed artifacts carry no store path, so none can be mangled into one.
+///
+/// The stronger half of the test above, and the reason two commands were taken
+/// out of it: both are emitted successfully even when `--db` names bytes JSON
+/// cannot carry, because a hook writes the project *root* and the MCP entry
+/// writes nothing — the store is discovered at fire time, by the same resolution
+/// the CLI uses.
+#[cfg(unix)]
+#[test]
+fn installed_artifacts_carry_no_store_path_to_mangle() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let raw = OsStr::from_bytes(b".devcouncil/\xff\xfe/devmap.sqlite");
     for args in [
-        vec!["claude", "hooks"],
-        vec!["mcp", "--print-config"],
-        vec!["claude", "plugin", "--dry-run"],
+        vec!["--json", "claude", "hooks"],
+        vec!["--json", "claude", "plugin", "--dry-run"],
     ] {
         let out = Command::new(DEVMAP)
             .arg("--db")
@@ -533,20 +584,19 @@ fn a_non_utf8_store_path_is_refused_rather_than_silently_mangled() {
             .output()
             .expect("devmap runs");
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert_ne!(
+        assert_eq!(
             out.status.code(),
             Some(0),
-            "{args:?}: a path JSON cannot carry must fail, not be emitted lossily: {stdout}"
+            "{args:?} names no store, so an unusable --db cannot fail it: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
         );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("not valid UTF-8"),
-            "{args:?}: the refusal must say why: {stderr}"
-        );
-        // And the lossy form must not appear anywhere in what was produced.
         assert!(
             !stdout.contains('\u{FFFD}'),
-            "{args:?}: no replacement character may reach the output"
+            "{args:?}: no replacement character may reach the output: {stdout}"
+        );
+        assert!(
+            !stdout.contains("devmap.sqlite") && !stdout.contains("--db"),
+            "{args:?}: an installed artifact must carry no store path at all: {stdout}"
         );
     }
 }
@@ -635,54 +685,62 @@ fn every_emitted_file_passes_our_own_validator_in_strict_mode() {
 }
 
 // ---------------------------------------------------------------------------
-// Differential: this table against the Python layer's
+// Contract: the emitted table against the documented surface
 // ---------------------------------------------------------------------------
 
-/// Extract a Python `frozenset({...})` / list literal's string members.
-fn python_strings(source: &str, anchor: &str) -> Vec<String> {
-    let start = source
-        .find(anchor)
-        .unwrap_or_else(|| panic!("{anchor} is gone from the Python source"));
-    let tail = &source[start..];
-    let open = tail.find('{').expect("literal opens");
-    let close = tail[open..].find('}').expect("literal closes") + open;
-    // `open + 1`: the slice must not include the opening brace, or the first
-    // member arrives as `{"PreToolUse"` and is silently dropped — which reads
-    // as the two tables disagreeing about an event that is in both.
-    tail[open + 1..close]
-        .split(',')
-        .filter_map(|piece| {
-            let piece = piece.trim();
-            piece
-                .strip_prefix('"')
-                .and_then(|p| p.strip_suffix('"'))
-                .map(str::to_string)
-        })
-        .collect()
-}
-
-/// The two implementations must agree on the event universe.
+/// Every documented event, frozen as a literal.
 ///
-/// They emit different hooks — Dev Map's name `devmap` subcommands, DevCouncil's
-/// name `devcouncil hook <slug>` — so the comparable artifact is the contract
-/// itself: which event names exist, which use the narrow matcher set, and what
-/// `SessionStart` accepts. A divergence here means one of the two is validating
-/// against a surface that moved.
-#[test]
-fn the_event_contract_agrees_with_the_python_layer_field_by_field() {
-    let python_path = repo_root().join("src/devcouncil/integrations/clients/hooks.py");
-    // Not skipped when absent: a differential that quietly does not run reports
-    // the same "passed" as one that ran and found agreement.
-    let source = std::fs::read_to_string(&python_path).unwrap_or_else(|err| {
-        panic!(
-            "the differential needs the Python emitter at {}: {err}",
-            python_path.display()
-        )
-    });
+/// This was a differential against DevCouncil's Python emitter until Phase 7
+/// deleted it. A second implementation is the better oracle and it is gone, so
+/// what replaces it is a frozen list rather than a re-derivation from
+/// `HOOK_EVENTS` — asserting the table against itself would pass on any rename
+/// and prove nothing. Updating this list is the deliberate act of accepting that
+/// the host's event universe moved; the documentation at
+/// <https://code.claude.com/docs/en/hooks#hook-events> decides.
+const DOCUMENTED_EVENTS: &[&str] = &[
+    "ConfigChange",
+    "CwdChanged",
+    "DirectoryAdded",
+    "Elicitation",
+    "ElicitationResult",
+    "FileChanged",
+    "InstructionsLoaded",
+    "MessageDisplay",
+    "Notification",
+    "PermissionDenied",
+    "PermissionRequest",
+    "PostCompact",
+    "PostModelSwitch",
+    "PostToolBatch",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PreCompact",
+    "PreModelSwitch",
+    "PreToolUse",
+    "SessionEnd",
+    "SessionStart",
+    "Setup",
+    "Stop",
+    "StopFailure",
+    "SubagentStart",
+    "SubagentStop",
+    "TaskCompleted",
+    "TaskCreated",
+    "TeammateIdle",
+    "UserPromptExpansion",
+    "UserPromptSubmit",
+    "WorktreeCreate",
+    "WorktreeRemove",
+];
 
-    let mut python_events = python_strings(&source, "CLAUDE_HOOK_EVENTS: frozenset[str]");
-    python_events.sort();
-    python_events.dedup();
+/// The emitted contract must match the documented surface field by field:
+/// which event names exist, and what `SessionStart` accepts.
+///
+/// An event missing from the table is one Dev Map never decided about; an event
+/// in the table that the host does not have is a handler that never fires.
+#[test]
+fn the_event_contract_matches_the_documented_surface() {
+    let expected: Vec<String> = DOCUMENTED_EVENTS.iter().map(|e| e.to_string()).collect();
 
     let ours = devmap(&["--json", "claude", "events"]).ok().json();
     let mut rust_events: Vec<String> = ours["events"]
@@ -694,36 +752,20 @@ fn the_event_contract_agrees_with_the_python_layer_field_by_field() {
     rust_events.sort();
 
     assert_eq!(
-        rust_events, python_events,
-        "the Rust and Python event tables disagree; the documentation at \
+        rust_events, expected,
+        "the emitted event table and the documented surface disagree; \
          https://code.claude.com/docs/en/hooks#hook-events decides which is right"
     );
 
-    let mut python_narrow = python_strings(&source, "_NARROW_MATCHER_EVENTS = frozenset");
-    python_narrow.sort();
-    assert_eq!(
-        python_narrow,
-        vec!["FileChanged".to_string(), "StopFailure".to_string()],
-        "the narrow-matcher set moved on one side"
-    );
-
     // SessionStart's alternation list is exact-matched, so a missing entry never
-    // fires. Both sides must carry the same five sources.
-    let python_session = source
-        .lines()
-        .find_map(|line| line.strip_prefix("SESSION_START_MATCHER = "))
-        .expect("SESSION_START_MATCHER is gone")
-        .trim()
-        .trim_matches('"')
-        .to_string();
+    // fires and nothing reports it. All five sources, spelled out.
     let block = devmap(&["--json", "claude", "hooks"]).ok().json();
     let rust_session = block["hooks"]["SessionStart"][0]["matcher"]
         .as_str()
-        .expect("SessionStart matcher")
-        .to_string();
+        .expect("SessionStart matcher");
     assert_eq!(
-        rust_session, python_session,
-        "the two emitters would register SessionStart for different session sources"
+        rust_session, "startup|resume|clear|compact|fork",
+        "a SessionStart source missing from the alternation never fires"
     );
 }
 
@@ -756,13 +798,13 @@ fn every_emitted_timeout_is_plausible_as_seconds() {
     assert!(seen > 0, "no timeout was checked at all");
 }
 
-/// The plugin manifest must carry the same identity fields the Python bundle
-/// does, so an installed Dev Map plugin can tell a user its terms and origin.
+/// The plugin manifest must carry every identity field, so an installed Dev Map
+/// plugin can tell a user its terms and origin.
+///
+/// Frozen as a literal for the reason [`DOCUMENTED_EVENTS`] is: this compared
+/// against DevCouncil's Python bundle until Phase 7 removed it.
 #[test]
-fn the_plugin_manifest_carries_the_same_identity_fields_as_the_python_bundle() {
-    let assets = repo_root().join("src/devcouncil/integrations/claude_assets.py");
-    let source = std::fs::read_to_string(&assets)
-        .unwrap_or_else(|err| panic!("the differential needs {}: {err}", assets.display()));
+fn the_plugin_manifest_carries_every_identity_field() {
     let dir = scratch("identity");
     let out = dir.join("claude-plugin");
     devmap(&["--json", "claude", "plugin", "--out", out.to_str().unwrap()]).ok();
@@ -771,8 +813,6 @@ fn the_plugin_manifest_carries_the_same_identity_fields_as_the_python_bundle() {
     )
     .unwrap();
 
-    // Every key the Python manifest sets, minus the ones whose values are
-    // DevCouncil's own text rather than a shared field.
     for key in [
         "name",
         "description",
@@ -784,12 +824,9 @@ fn the_plugin_manifest_carries_the_same_identity_fields_as_the_python_bundle() {
         "keywords",
     ] {
         assert!(
-            source.contains(&format!("\"{key}\"")),
-            "{key} is no longer in the Python manifest; re-derive this list"
-        );
-        assert!(
             manifest.get(key).is_some(),
-            "the Rust manifest omits {key}, which the Python bundle sets"
+            "the manifest omits {key}, so an installed plugin cannot state its \
+             origin or terms: {manifest}"
         );
     }
     assert_eq!(

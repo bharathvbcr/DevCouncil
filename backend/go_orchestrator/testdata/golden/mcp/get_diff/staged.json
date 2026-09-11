@@ -1,0 +1,27 @@
+{
+  "arguments": {
+    "staged": true
+  },
+  "capture_mode": "live",
+  "case": "staged",
+  "exit_code": null,
+  "notes": "",
+  "payload": {
+    "files": [
+      {
+        "additions": 1,
+        "deletions": 1,
+        "path": "src/a.py",
+        "status": "M"
+      }
+    ],
+    "ok": true,
+    "staged": true,
+    "truncated": false,
+    "unified_diff": "diff --git a/src/a.py b/src/a.py\nindex b15b1b0..95cd691 100644\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 3\n"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_get_diff"
+}

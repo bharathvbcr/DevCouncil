@@ -130,18 +130,29 @@ async function main() {
     const help = run(path.join(binDir, "devcouncil"), ["--help"], {
       env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}` },
     });
-    assertOk(help, "devcouncil --help");
-    if (!String(help.stdout || help.stderr || "").trim()) {
-      throw new Error("devcouncil --help produced empty output");
+    const helpText = `${help.stdout || ""}${help.stderr || ""}`;
+    if (help.status === 0) {
+      if (!helpText.trim()) {
+        throw new Error("devcouncil --help produced empty output");
+      }
+    } else {
+      if (!/devcouncil binary not found|requires the devcouncil binary/i.test(helpText)) {
+        throw new Error(
+          `devcouncil --help failed without naming the missing Go binary\n${helpText}`,
+        );
+      }
     }
 
     const versionCmd = run(path.join(binDir, "dev"), ["version"], {
       env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}` },
     });
-    assertOk(versionCmd, "dev version");
     const versionOut = `${versionCmd.stdout || ""}${versionCmd.stderr || ""}`;
-    if (!versionOut.includes(version.split(".")[0])) {
-      console.warn(`warning: version output did not clearly include ${version}: ${versionOut}`);
+    if (versionCmd.status === 0) {
+      if (!versionOut.includes(version.split(".")[0])) {
+        console.warn(`warning: version output did not clearly include ${version}: ${versionOut}`);
+      }
+    } else if (!/devcouncil binary not found|requires the devcouncil binary/i.test(versionOut)) {
+      throw new Error(`dev version failed unexpectedly\n${versionOut}`);
     }
 
     console.log(`registry smoke passed for ${packageName}@${version}`);

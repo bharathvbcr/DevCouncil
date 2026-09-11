@@ -1,0 +1,22 @@
+{
+  "arguments": [
+    "integrate",
+    "claude",
+    "--apply",
+    "--project-root",
+    "<ROOT>"
+  ],
+  "capture_mode": "live",
+  "case": "integrate_claude",
+  "exit_code": 0,
+  "notes": "",
+  "payload": {
+    "exit_code": 0,
+    "stderr_tail": "",
+    "stdout_tail": "Configuring Claude Code MCP integration...\nAdded stdio MCP server devcouncil with command: /Users/bharath/.local/bin/dev mcp-server to project config\nFile modified: <ROOT>/.mcp.json\nClaude Code integration configured.\nClaude Code integration installed (43 file(s), assist mode (no write-gate)): \nMCP, hooks, slash commands, subagents, output style, skills, statusline, \npermissions.\nAdd pre-action containment for autonomous runs with dev integrate claude --apply\n--write-gate\nBundle everything as an installable plugin with: dev integrate claude-plugin \n--apply\n"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "cli",
+  "tool_or_command": "dev integrate claude --apply"
+}

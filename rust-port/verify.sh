@@ -21,10 +21,10 @@ now_ns() {
     printf '%s\n' "$value"
   elif command -v gdate >/dev/null 2>&1; then
     gdate +%s%N
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import time; print(time.monotonic_ns())'
+  elif command -v perl >/dev/null 2>&1; then
+    perl -MTime::HiRes=time -e 'printf "%d\n", time() * 1e9'
   else
-    echo "no nanosecond monotonic clock available (need GNU date or python3)" >&2
+    echo "no nanosecond clock available (need GNU date, gdate, or perl)" >&2
     return 1
   fi
 }
@@ -85,12 +85,13 @@ RSS=$(PEAK_RSS_STDOUT_FILE="$TMP1/self.json" peak_rss_bytes "$TMP1/self.rss" "$D
   echo "GATE FAIL: could not measure peak RSS — refusing to report an unmeasured build as passing"; exit 1; }
 END=$(now_ns)
 MS=$(( (END - START) / 1000000 ))
-python3 - "$TMP1/self.json" <<'PY'
-import json, sys
-with open(sys.argv[1]) as source:
-    report = json.load(source)
-print("measured build stages:", json.dumps(report["timings"], separators=(",", ":")))
-PY
+perl -MJSON::PP -e '
+  open my $fh, "<", $ARGV[0] or die $!;
+  my $raw = do { local $/; <$fh> };
+  my $report = decode_json($raw);
+  die "RSS report has no timings object\n" unless ref($report->{timings}) eq "HASH";
+  print "measured build stages: ", encode_json($report->{timings}), "\n";
+' "$TMP1/self.json"
 # This measures a COLD build, and is compared against the per-generation budget.
 # The steady state — what a running repository actually sits at — is gated in
 # the growth step instead (SC27).

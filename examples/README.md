@@ -10,22 +10,16 @@ report snippets when documenting or judging DevCouncil.
 
 ## Documentation smoke (checkout)
 
-From the DevCouncil repository root (with a local `dev` on `PATH` or via `./.venv/bin/dev`):
+From the DevCouncil repository root (with a local `dev` / `devcouncil` on `PATH`):
 
 ```bash
-# Platforms: macOS, Linux, Windows — Node.js 18+, Python 3.12+, Git
+# Platforms: macOS, Linux, Windows — Go + Rust binaries; Node.js 18+ for the optional npm shim.
+# The build-week-demo calculator fixture is Python; the product CLI is not.
 dev version
-dev doctor                  # includes subsystem maturity (see docs/project-status.md)
+devcouncil --help
 
-# Graph demo: self-contained interactive HTML (primary). A static demo.svg may
-# also be written; open demo.html for the interactive UI.
 mkdir -p /tmp/devcouncil-docs-smoke
-dev map demo --project-root /tmp/devcouncil-docs-smoke --json
-test -f /tmp/devcouncil-docs-smoke/.devcouncil/graph/demo.html
-
-# Executable fixture (isolated /tmp repo; leaves this checkout untouched)
-bash scripts/build-week-demo.sh
-./.venv/bin/ruff check examples/build-week-demo
+dev map
 ```
 
 Maturity labels for public surfaces: [docs/project-status.md](../docs/project-status.md).

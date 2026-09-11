@@ -1,0 +1,16 @@
+{
+  "arguments": {},
+  "capture_mode": "live",
+  "case": "non_repo",
+  "exit_code": null,
+  "notes": "",
+  "payload": {
+    "code": "not_a_git_repo",
+    "error": "get_diff requires a git repository.",
+    "ok": false
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_get_diff"
+}

@@ -1,20 +1,16 @@
 name: analysis components (rust/ + go clients)
 
-# The dc-* components and their Go clients landed with no CI of any kind: every
-# gate had only ever run on one developer's macOS machine. That hides two things
-# at once — a platform-specific failure nobody can see, and the ordinary case of
-# a change that never had `cargo test` run against it.
+# The dc-* components and their Go clients. `rust-port.yml` covers devmap and
+# matches only `rust-port/**`.
 #
-# `rust-port.yml` covers devmap and matches only `rust-port/**`, so none of this
-# tree was reached by it.
+# Two jobs, because they fail for different reasons:
 #
-# Three jobs, because they fail for three different reasons and a single job
-# would make them indistinguishable in the summary:
+#   rust — the components themselves, on three platforms.
+#   go   — the clients, driving real component binaries rather than fakes.
 #
-#   rust    — the components themselves, on three platforms.
-#   interop — the components against DevCouncil's own Python, which is the only
-#             evidence that both sides agree about one state.sqlite.
-#   go      — the clients, driving real component binaries rather than fakes.
+# The Python TaskLeaseRepository / CLI stdout-contract jobs were removed with
+# the Python package. `dc-store` interop and `dc-verify` json_contract tests
+# skip when there is no `.venv`; they are not required here.
 
 on:
   push:
@@ -22,16 +18,12 @@ on:
       - "rust/**"
       - "backend/go_orchestrator/**"
       - "rust-port/**"
-      # The interop job drives DevCouncil's own CLI, so a change to the commands
-      # can break a gate here without touching a line of Rust.
-      - "src/devcouncil/cli/**"
       - ".github/workflows/analysis-plane.yml"
   pull_request:
     paths:
       - "rust/**"
       - "backend/go_orchestrator/**"
       - "rust-port/**"
-      - "src/devcouncil/cli/**"
       - ".github/workflows/analysis-plane.yml"
   workflow_dispatch:
 
@@ -73,57 +65,6 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
-
-  interop:
-    name: interop with DevCouncil's Python
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # dc-store's interop suite drives DevCouncil's own TaskLeaseRepository
-      # against the same state.sqlite the Rust store wrote. It needs the package
-      # importable from a .venv in the checkout root, which is where the test
-      # looks for the interpreter.
-      - name: Install DevCouncil
-        run: uv sync --all-groups --python 3.12
-
-      # The point of this job. Without DC_STORE_REQUIRE_INTEROP the suite
-      # *skips* when it cannot find an interpreter, and cargo prints ok — three
-      # checks that never ran, reported exactly like three that passed. With it
-      # set, an unreachable Python side is a failure that says the agreement is
-      # UNPROVEN. A check that could not run must never report what a check that
-      # ran and passed reports.
-      - name: Interop, required
-        working-directory: rust
-        env:
-          DC_STORE_REQUIRE_INTEROP: "1"
-        run: cargo test -p dc-store --test interop
-
-      # The --json stdout contract, driven against the real CLI. It belongs in
-      # this job rather than the `rust` matrix for the same reason the interop
-      # suite does: it needs DevCouncil importable, and without that it can only
-      # skip. DC_JSON_REQUIRE_CLI turns the skip into a failure, so a tree
-      # without `uv sync` cannot report "contract holds" for a run in which no
-      # command was ever executed.
-      #
-      # This is not a hypothetical gate: 17 of its 28 invocations failed against
-      # the pre-fix CLI, several of them while exiting 0, so exit status alone
-      # would have called them passes.
-      - name: --json stdout contract, required
-        working-directory: rust
-        env:
-          DC_JSON_REQUIRE_CLI: "1"
-        run: cargo test -p dc-verify --test json_contract
 
   go:
     name: clients (${{ matrix.os }})

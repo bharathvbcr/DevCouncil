@@ -9,14 +9,18 @@
 //! artifacts, the dead-code tier, the build result and `status` must all agree
 //! that the corpus was not read in full.
 //!
-//! The measured consequence is the fixture below. `app.py` is `helper`'s only
-//! caller and is one line over the ceiling, so an unfolded refusal reported
-//! `helper` dead at 0.9 with `resolution: Available` and `truncated: false` —
-//! a confident finding drawn from a scan that never read the file holding the
-//! answer.
+//! Phase 1: `Oversized` is a default ignore (1 MiB ceiling), not a refusal —
+//! fixtures and generated blobs must not leave `status` permanently `partial`.
+//! Genuine refusals remain `Unreadable` / escape / dangling-link shapes. The
+//! measured consequence below uses an unreadable `app.py` that is `helper`'s
+//! only caller: without that file, "nothing calls helper" is not a fact this
+//! run established.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 fn devmap() -> String {
     let mut path = std::env::current_exe().unwrap();
@@ -60,6 +64,28 @@ fn fixture(name: &str) -> PathBuf {
     root
 }
 
+/// `helper`'s only caller, made unreadable so discovery records a refusal.
+#[cfg(unix)]
+fn write_unreadable_caller(root: &Path) {
+    std::fs::write(root.join("lib.py"), "def helper():\n    return 42\n").unwrap();
+    let app = root.join("app.py");
+    std::fs::write(
+        &app,
+        "from lib import helper\n\n\ndef main():\n    return helper()\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&app).unwrap().permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(&app, perms).unwrap();
+}
+
+#[cfg(unix)]
+fn make_readable(path: &Path) {
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
 /// `helper`'s only caller, written one line past the source ceiling.
 fn write_oversized_caller(root: &Path) {
     std::fs::write(root.join("lib.py"), "def helper():\n    return 42\n").unwrap();
@@ -78,9 +104,10 @@ fn write_oversized_caller(root: &Path) {
 
 /// The audit's own reproduction, end to end through the real binary.
 #[test]
+#[cfg(unix)]
 fn a_refused_file_degrades_the_graph_and_demotes_the_findings_it_could_not_check() {
     let root = fixture("audit");
-    write_oversized_caller(&root);
+    write_unreadable_caller(&root);
 
     let build = json(&root, &["--json", "build", "."]);
     assert_eq!(
@@ -170,6 +197,33 @@ fn a_refused_file_degrades_the_graph_and_demotes_the_findings_it_could_not_check
         "status must report the degradation the artifacts carry: {status}"
     );
 
+    make_readable(&root.join("app.py"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Phase 1: an oversized source is a default ignore, not coverage loss.
+#[test]
+fn an_oversized_source_is_not_a_discovery_refusal() {
+    let root = fixture("oversized-ignore");
+    write_oversized_caller(&root);
+
+    let build = json(&root, &["--json", "build", "."]);
+    assert_eq!(
+        build["discovery_refused_files"], 0,
+        "the 1 MiB ceiling is a default ignore — it must not charge coverage: {build}"
+    );
+    assert_eq!(
+        build["files_indexed"], 1,
+        "only the readable-under-ceiling file is indexed: {build}"
+    );
+
+    let status = json(&root, &["--json", "status"]);
+    assert_eq!(
+        status["degraded_reason"],
+        serde_json::Value::Null,
+        "oversized fixtures must not leave status permanently partial: {status}"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -205,16 +259,17 @@ fn an_ordinary_non_source_file_is_not_a_refusal() {
 }
 
 /// A refusal on both sides of a rebuild is still "unchanged"; a file that
-/// shrinks back under the ceiling is not.
+/// becomes readable again is not.
 ///
 /// The early return is the most frequent build in the system, and it is also
 /// the one that must keep reporting the refusal it just re-checked — a warm
 /// build that answers `discovery_refused_files: 0` where the cold build said
 /// `1` would read as the degradation having lifted.
 #[test]
-fn a_refusal_is_stable_across_rebuilds_and_a_shrunken_file_is_re_extracted() {
+#[cfg(unix)]
+fn a_refusal_is_stable_across_rebuilds_and_a_readable_file_is_re_extracted() {
     let root = fixture("unchanged");
-    write_oversized_caller(&root);
+    write_unreadable_caller(&root);
 
     let first = json(&root, &["--json", "build", "."]);
     assert_eq!(first["discovery_refused_files"], 1, "{first}");
@@ -229,18 +284,14 @@ fn a_refusal_is_stable_across_rebuilds_and_a_shrunken_file_is_re_extracted() {
         "the unchanged result reports the refusals it re-checked: {second}"
     );
 
-    // Shrink the caller back under the ceiling: it is admissible again, so the
-    // graph must be rebuilt and the degradation must lift.
-    std::fs::write(
-        root.join("app.py"),
-        "from lib import helper\n\n\ndef main():\n    return helper()\n",
-    )
-    .unwrap();
+    // Make the caller readable again: it is admissible, so the graph must be
+    // rebuilt and the degradation must lift.
+    make_readable(&root.join("app.py"));
     let third = json(&root, &["--json", "build", "."]);
     assert_eq!(
         third["unchanged"],
         serde_json::Value::Null,
-        "a file that shrank under the ceiling must be re-extracted: {third}"
+        "a file that became readable must be re-extracted: {third}"
     );
     assert_eq!(third["discovery_refused_files"], 0, "{third}");
 
@@ -264,7 +315,8 @@ fn a_refusal_is_stable_across_rebuilds_and_a_shrunken_file_is_re_extracted() {
 }
 
 /// The rule that decides which skips are coverage loss has exactly one
-/// spelling, and `NonSource` is not one of them.
+/// spelling. `NonSource` and `Oversized` are ordinary skips (fixtures /
+/// ceiling), not holes charged against the graph.
 ///
 /// The CLI, the daemon and the report all ask `DiscoverySkipReason::is_refusal`.
 /// A second copy of the predicate is how the CLI and the daemon came to
@@ -274,14 +326,13 @@ fn only_genuine_refusals_are_charged_against_coverage() {
     use devmap_extract::model::DiscoverySkipReason;
 
     for reason in [
-        DiscoverySkipReason::Oversized {
-            bytes: 2_000_000,
-            limit: devmap_extract::MAX_SOURCE_BYTES,
-        },
         DiscoverySkipReason::Unreadable {
             reason: "permission denied".to_string(),
         },
         DiscoverySkipReason::NonUtf8Path,
+        DiscoverySkipReason::EscapesRoot {
+            target: "/outside/secret.py".into(),
+        },
     ] {
         assert!(
             reason.is_refusal(),
@@ -291,6 +342,14 @@ fn only_genuine_refusals_are_charged_against_coverage() {
     assert!(
         !DiscoverySkipReason::NonSource.is_refusal(),
         "NonSource is the ordinary case, not a refusal"
+    );
+    assert!(
+        !DiscoverySkipReason::Oversized {
+            bytes: 2_000_000,
+            limit: devmap_extract::MAX_SOURCE_BYTES,
+        }
+        .is_refusal(),
+        "Oversized is a default ignore (1 MiB ceiling), not coverage loss"
     );
 
     // And the charge reaches the analysis: an unmeasured discovery contributes

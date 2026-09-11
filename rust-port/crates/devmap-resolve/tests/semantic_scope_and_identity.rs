@@ -102,6 +102,36 @@ fn ra1_local_assignment_cannot_resolve_to_an_unrelated_global() {
     );
 }
 
+/// A nested `const walk = () => …; walk()` is a call of that arrow.
+///
+/// RA1 used to treat every local callee as an unknown value, so the extracted
+/// nested function had no inbound edge and became inferred-dead, while the
+/// `walk()` in the same function was the only caller it has. The parameter
+/// case above must stay unresolved: a parameter is not an extracted nested
+/// function.
+#[test]
+fn a_nested_const_arrow_call_resolves_to_that_arrow() {
+    let r = resolve(&[(
+        "a.js",
+        "function collapseAll() {\n  const walk = (folders) => { walk(folders); };\n  walk([]);\n}\nfunction walk() {}\n",
+    )]);
+    let from_collapse = calls_from(&r, "a.js::collapseAll");
+    assert!(
+        from_collapse.contains("a.js::collapseAll.walk"),
+        "the outer `walk([])` is the nested arrow, not the module function: {from_collapse:?}"
+    );
+    assert!(
+        !from_collapse.contains("a.js::walk"),
+        "the module-level `walk` must not absorb the nested call: {:?}",
+        r.edges
+    );
+    let from_nested = calls_from(&r, "a.js::collapseAll.walk");
+    assert!(
+        from_nested.contains("a.js::collapseAll.walk"),
+        "the recursive `walk(folders)` is the same arrow: {from_nested:?}"
+    );
+}
+
 #[test]
 fn ra1_receiver_members_cannot_bind_a_bare_import() {
     let r = resolve(&[

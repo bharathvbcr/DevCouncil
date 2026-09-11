@@ -96,7 +96,7 @@ dev map demo --project-root /tmp/devcouncil-docs-smoke --json
 # Alias: `dev graph demo` (same command group)
 ```
 
-`dev map demo` writes a **self-contained interactive HTML** page with a synthetic import graph. Open `demo.html` for filters, path highlighting, and neighborhoods. A static `demo.svg` may also be written; it is not a substitute for the interactive page. Supported platforms for the CLI and npm wrapper: macOS, Linux, and Windows (Node.js 18+, Python 3.12+, Git).
+`dev map demo` writes a **self-contained interactive HTML** page with a synthetic import graph. Open `demo.html` for filters, path highlighting, and neighborhoods. A static `demo.svg` may also be written; it is not a substitute for the interactive page. Supported platforms for the CLI and npm wrapper: macOS, Linux, and Windows (Go `dev`/`devcouncil`, Rust `devmap`, Git; Node.js 18+ only for the optional npm shim).
 
 ## PDG / CFG / taint (opt-in)
 
@@ -204,24 +204,15 @@ The `dev map` engine is **`devmap`**, a seven-crate workspace under [`rust-port/
 | `devmap-serve` | file watcher and durable pending drain |
 | `devmap-cli` | the `devmap` binary |
 
-**The kernel is the production map engine; there is no Python fallback for building.** The
-Python seam is two files: `src/devcouncil/devmap_engine.py` runs `devmap build` and
-`devmap manifest` and stamps freshness, and `src/devcouncil/devmap_client.py` speaks the
-newline-framed JSON IPC to a `devmap serve` daemon (one per repository, socket derived from the
-canonical root; spawned on demand, never by a status probe, and never when `DEVMAP_AUTOSPAWN=0`)
-with a CLI fallback for every request. The kernel binary is located by one rule for both:
-`DEVMAP_BINARY` if set (used or refused by name, never replaced by another kernel), else the newest capable build among `<repo>/rust-port/target/{release,debug}`,
-`<package>/rust-port/target/{release,debug}` and `PATH` — "capable" being what `manifest --help`
-advertises, because every build reports the same version string.
+**The kernel is the production map engine; there is no Python fallback for building.**
+`dev map` / `dev graph` / `dev ast` exec the `devmap` binary. The Python
+`devmap_engine.py` / `devmap_client.py` seam was deleted with the product package
+in Phase 7. Locate `devmap` via `DEVMAP_BIN` / `PATH` / `~/.local/bin` (the npm
+shim and Go host both do this).
 
-Query surfaces that still run on the Python side (`check`, `process`, `routes`, `shape-check`,
-`api-impact`, `cypher`, `pdg`, the HTML visualizers, and the MCP tools `devcouncil_graph_impact`,
-`devcouncil_route_map`, `devcouncil_shape_check`, `devcouncil_api_impact`, `devcouncil_pdg_query`,
-`devcouncil_explain`) parse the kernel's own `code_graph.json`. They read it through a Python
-`index.sqlite` cache until 2026-09-07, when that store was deleted: its writer had already lost
-every caller, so `cypher` in particular answered "No committed graph generation." on every
-repository. `explore` and `affected` left this list on 2026-09-05; every `devcouncil_code_*` MCP
-tool is kernel-only and reports `Unavailable` rather than substituting a second engine's answer.
+Those Python query/MCP surfaces (`check`, `process`, `cypher`, `pdg`, …) were
+deleted with the product package in Phase 7. Use `devmap` query commands and
+DevMap MCP tools instead.
 
 ```bash
 cd rust-port && ./verify.sh
@@ -231,14 +222,9 @@ cargo build --release -p devmap-cli
 ./target/release/devmap --db /tmp/t.sqlite search helper --budget 500
 ```
 
-Known limits, kept explicit rather than papered over:
-
-- **Grammar coverage is 5 of 35.** Only Python, JavaScript, TypeScript/TSX, Rust, and Go are
-  linked. Every other registry language returns `ParseOutcome::Failed` — a failed parse is never
-  promoted to fabricated clean output, and failed outcomes are not cache-admitted.
-- **No parity sign-off.** The parity harness still reports diffs against the Python-derived
-  goldens; local passing tests are mechanical evidence only, not a shadow soak or production run.
-- **No cutover, no deletion, no publication.** Phase 6 consumer migration is the active work.
+- **Grammar coverage and remaining kernel limits** are recorded in
+  [rust-port/STATUS.md](../rust-port/STATUS.md). The Python product package is deleted (Phase 7);
+  `devmap` is the live map engine.
 
 [rust-port/STATUS.md](../rust-port/STATUS.md) is the authoritative ledger of what is verified and
 what is open; [rust-port/PHASE1_CONTRACT.md](../rust-port/PHASE1_CONTRACT.md) freezes the

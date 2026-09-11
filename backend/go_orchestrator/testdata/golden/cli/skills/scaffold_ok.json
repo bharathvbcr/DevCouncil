@@ -1,0 +1,32 @@
+{
+  "arguments": [
+    "skills",
+    "scaffold",
+    "--skill",
+    "core-engineering"
+  ],
+  "capture_mode": "live",
+  "case": "skills_scaffold_ok",
+  "exit_code": 0,
+  "notes": "",
+  "payload": {
+    "exit_code": 0,
+    "files": [
+      ".claude/skills/core-engineering/SKILL.md",
+      ".cursor/skills/core-engineering/SKILL.md"
+    ],
+    "receipt": {
+      "files": {
+        ".claude/skills/core-engineering/SKILL.md": "146df996c626a42641bd509c4ae960b611c793d5b2b64643163ca6b3150dc15f",
+        ".cursor/skills/core-engineering/SKILL.md": "146df996c626a42641bd509c4ae960b611c793d5b2b64643163ca6b3150dc15f"
+      },
+      "schema": 1
+    },
+    "stderr": "",
+    "stdout": "Wrote 2 skill file(s):\n  .claude/skills/core-engineering/SKILL.md\n  .cursor/skills/core-engineering/SKILL.md\n"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "cli",
+  "tool_or_command": "dev skills scaffold"
+}

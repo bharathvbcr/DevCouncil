@@ -1,0 +1,22 @@
+{
+  "arguments": [
+    "integrate",
+    "codex",
+    "--apply",
+    "--project-root",
+    "<ROOT>"
+  ],
+  "capture_mode": "live",
+  "case": "integrate_codex",
+  "exit_code": 0,
+  "notes": "",
+  "payload": {
+    "exit_code": 0,
+    "stderr_tail": "",
+    "stdout_tail": "Configuring Codex CLI MCP integration...\nAdded global MCP server 'devcouncil'.\nCodex CLI integration configured.\nCodex integration installed (2 hook/config file(s)): MCP + native hooks.\nOpen Codex in this project and run /hooks to review and trust the generated \nhooks.\n"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "cli",
+  "tool_or_command": "dev integrate codex --apply"
+}

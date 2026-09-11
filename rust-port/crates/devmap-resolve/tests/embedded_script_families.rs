@@ -213,6 +213,31 @@ fn a_relative_import_in_a_template_script_is_not_classified_as_external() {
     );
 }
 
+/// `import("./CloneModal.svelte")` and extensionless `./CloneModal` both name
+/// the component file. Until `.svelte` was on the JS candidate list, the
+/// second form resolved to nothing.
+#[test]
+fn a_relative_import_resolves_a_svelte_module() {
+    const APP: &str = r#"<script lang="ts">
+  import Modal from "./CloneModal";
+  const load = () => import("./CloneModal.svelte");
+</script>
+<p>x</p>
+"#;
+    const MODAL: &str = "<script>export let open = false;</script>\n";
+    let result = resolve(&[("src/App.svelte", APP), ("src/CloneModal.svelte", MODAL)]);
+    let imports: Vec<(&str, &str)> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_kind == EdgeKind::Imports)
+        .map(|edge| (edge.source_file.as_str(), edge.target_file.as_str()))
+        .collect();
+    assert!(
+        imports.contains(&("src/App.svelte", "src/CloneModal.svelte")),
+        "a Svelte module specifier must resolve to the .svelte file: {imports:?}"
+    );
+}
+
 /// Every language whose script lives inside another language shares that
 /// script's family.
 ///

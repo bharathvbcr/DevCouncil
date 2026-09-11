@@ -1,0 +1,20 @@
+{
+  "arguments": {
+    "task_id": "TASK-001"
+  },
+  "capture_mode": "live",
+  "case": "empty_planned_scope",
+  "exit_code": null,
+  "notes": "empty planned_files must fail closed to empty diff, never full repo",
+  "payload": {
+    "files": [],
+    "ok": true,
+    "staged": false,
+    "truncated": false,
+    "unified_diff": ""
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_get_diff"
+}

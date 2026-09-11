@@ -1,0 +1,24 @@
+{
+  "arguments": [
+    "lease",
+    "renew",
+    "TASK-CLI",
+    "--lease-token",
+    "<LEASE_TOKEN>",
+    "--json"
+  ],
+  "capture_mode": "live",
+  "case": "cli_renew",
+  "exit_code": 0,
+  "notes": "",
+  "payload": {
+    "expires_at": "<EXPIRES_AT>",
+    "ok": true,
+    "task_id": "TASK-CLI",
+    "ttl_seconds": 1800
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "cli",
+  "tool_or_command": "dev lease renew"
+}

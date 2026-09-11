@@ -425,6 +425,42 @@ impl Resolver {
         None
     }
 
+    /// A local binding whose initializer this file extracted as a nested
+    /// callable: `const walk = (folders) => { walk(folders); }; walk([])`.
+    ///
+    /// Unlike [`Self::lexical_target`], this does **not** walk up to the file
+    /// scope. Walking up would turn `const walk = getWalk(); walk()` into a
+    /// call of a module-level `walk`, which is the RA1 defect. Matching only
+    /// a symbol whose parent is the caller (or the callee itself, for the
+    /// recursive call inside that arrow) is the one case the binding's value
+    /// is the extracted function.
+    fn local_extracted_callee(
+        &self,
+        file: &str,
+        caller: Option<&str>,
+        name: &str,
+    ) -> Option<String> {
+        let caller = caller?;
+        let hits = self.symbol_index.get(name)?;
+        let mut candidates = hits.iter().filter_map(|(path, _, _, identity)| {
+            if path != file {
+                return None;
+            }
+            let identity = identity.as_ref();
+            if identity == caller {
+                return Some(identity);
+            }
+            self.symbol_parents
+                .get(&(file.to_string(), identity.to_string()))
+                .is_some_and(|parent| parent == caller)
+                .then_some(identity)
+        });
+        let first = candidates.next()?;
+        candidates
+            .all(|other| other == first)
+            .then(|| first.to_string())
+    }
+
     /// The leftmost segment of a dotted, scoped or slashed path.
     ///
     /// One owner for a split that `classify_unresolved` was doing inline and
@@ -1761,11 +1797,30 @@ impl Resolver {
 
                     // RA1: local binding evidence must be consulted before a
                     // same-file/import/global rung can invent a target for it.
-                    if call.receiver_expr.is_none()
-                        && ext.local_binding_at(call.span.start_byte, &call.callee_name).is_some() {
-                        resolution = Some(Arc::new(Resolution::Unresolved {
-                            reason: "the callee is a local binding whose value is not known".to_string(),
-                        }));
+                    // A nested `const walk = () => { … }; walk()` is the one
+                    // local whose value *is* known: this file extracted that
+                    // arrow as a symbol whose parent is the caller. That join
+                    // is tried first and does not depend on `local_bindings`
+                    // covering nested const arrows (they are function
+                    // symbols, not site bindings).
+                    if call.receiver_expr.is_none() {
+                        if let Some(target_symbol) = self.local_extracted_callee(
+                            &ext.file_path,
+                            call.caller_symbol.as_deref(),
+                            &call.callee_name,
+                        ) {
+                            resolution = Some(Arc::new(Resolution::SameFile {
+                                target_symbol,
+                                target_file: ext.file_path.clone(),
+                            }));
+                        } else if ext
+                            .local_binding_at(call.span.start_byte, &call.callee_name)
+                            .is_some()
+                        {
+                            resolution = Some(Arc::new(Resolution::Unresolved {
+                                reason: "the callee is a local binding whose value is not known".to_string(),
+                            }));
+                        }
                     }
 
                     // 1. Receiver-based resolution (SameFile / Constructor tracking N6)
@@ -3943,10 +3998,16 @@ impl Resolver {
                 format!("{}.jsx", base),
                 format!("{}.mjs", base),
                 format!("{}.cjs", base),
+                format!("{}.svelte", base),
+                format!("{}.vue", base),
+                format!("{}.astro", base),
                 format!("{}/index.ts", base),
                 format!("{}/index.tsx", base),
                 format!("{}/index.js", base),
                 format!("{}/index.jsx", base),
+                format!("{}/index.svelte", base),
+                format!("{}/index.vue", base),
+                format!("{}/index.astro", base),
             ];
             for cand in candidates {
                 if self.file_symbols.contains_key(&cand) {

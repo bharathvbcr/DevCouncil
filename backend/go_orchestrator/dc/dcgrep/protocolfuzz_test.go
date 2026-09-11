@@ -9,7 +9,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/internal/testsupport"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 // The searcher boundary is the store's and the repo map's third sibling, and it

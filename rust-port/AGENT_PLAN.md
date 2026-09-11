@@ -271,23 +271,20 @@ Objective: the 37 consumers on the daemon; core Python analysis deleted.
 
 ## Phase 7 — Adjunct ports & final deletion
 
-Per project direction the port is *full*: the "keep in Python for now" items from
-PHASE1_CONTRACT land here, each against its audit spec, then the last Python goes.
+**Host-assets Phase 7 closed 2026-09-10** (see [docs/PHASE7_LONG_TAIL.md](../docs/PHASE7_LONG_TAIL.md)):
+Python orchestration deleted; thin `dev` launcher remains temporarily; Go/Rust
+binaries own the plugin contract.
 
-- **7.1 PDG** in devmap-analyze on a correct CFG contract: entry/exit threading (G1), leader
-  lines owned by blocks (G2), block-scoped line ordering (G13), parameters as sources +
-  exact-match sinks (G23), content-hash tie to generation (no stale PDG). Batch shard reads
-  (G10).
-- **7.2 Semantic snapshots** in devmap-query: no arbitrary 500-symbol cap — budgeted with
-  truncation flags (X16); imports from extraction, not regex (X17); per-language public
-  rules (X18).
-- **7.3 LSP adjunct** (optional — cut if unused): async client with separate write lock
-  (X12), init timeout = failure (X11), negotiated position encoding (X13), tri-state results
-  (X14). Decide keep/cut from real usage telemetry during the soak; record the decision.
-- **7.4 Delete the remainder** of `indexing/` + `codeintel/`; the parity harness archive and
-  `DIVERGENCES.md` stay as the historical record.
-- **Gate:** G1/G2/G13/G23 fixtures pass; zero Python analysis code remains; 117-property
-  suite green in CI.
+Kernel adjunct notes (separate from host-assets deletion):
+
+- **7.1 PDG** — `devmap pdg` exists in-tree; continue CFG contract work as needed.
+- **7.2 Semantic snapshots** — budgeted truncation in query; FAISS/torch Python
+  semantic index **retired** in favour of `devmap search --semantic`.
+- **7.3 LSP** — **cut** (DIVERGENCES X11–X13); unused.
+- **7.4** — `indexing/` + `codeintel/` deleted with the Phase 7 long-tail cut.
+
+- **Gate (host assets):** zero Python analysis/orchestration code remains;
+  thin launcher only; Go `devcouncil` + Rust `devmap`/`dcstore` documented.
 
 ---
 

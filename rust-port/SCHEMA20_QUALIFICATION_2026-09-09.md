@@ -73,8 +73,8 @@ Both runs used the exact CLI SHA above, two Tokio and two Rayon workers per proc
 To reproduce the release capacity profiles, build the CLI, set `CANDIDATE` to its absolute path, and run from `rust-port/`:
 
 ```sh
-python3 tools/worktree_stress.py --binary "$CANDIDATE" --worktrees 128 --fixture-files 256 --rounds 8 --build-workers 16 --output capacity-128.json
-python3 tools/worktree_stress.py --binary "$CANDIDATE" --worktrees 8 --fixture-files 4096 --functions-per-file 16 --rounds 6 --build-workers 8 --output capacity-large.json
+cargo run -p devmap-cli --example worktree_stress -- --binary "$CANDIDATE" --worktrees 128 --fixture-files 256 --rounds 8 --build-workers 16 --output capacity-128.json
+cargo run -p devmap-cli --example worktree_stress -- --binary "$CANDIDATE" --worktrees 8 --fixture-files 4096 --functions-per-file 16 --rounds 6 --build-workers 8 --output capacity-large.json
 ```
 
 The harness sets `TOKIO_WORKER_THREADS=2` and `RAYON_NUM_THREADS=2` for its child processes. A deployed launcher must carry the same settings to claim this 128-daemon envelope. The native workflow additionally passes its built `ipc_probe`; `--probe-workers` defaults to eight. The existing `verify.sh` remains the required repository performance and correctness gate.

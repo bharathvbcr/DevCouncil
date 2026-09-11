@@ -1,0 +1,56 @@
+{
+  "arguments": {
+    "client_id": "golden-a",
+    "task_id": "TASK-001"
+  },
+  "capture_mode": "live",
+  "case": "checkout_ok",
+  "exit_code": null,
+  "notes": "",
+  "payload": {
+    "allowed_commands": [
+      "*"
+    ],
+    "allowed_next_tools": [
+      "devcouncil_read_file",
+      "devcouncil_get_evidence",
+      "devcouncil_get_diff",
+      "devcouncil_run_command",
+      "devcouncil_apply_patch",
+      "devcouncil_write_file",
+      "devcouncil_update_task_scope",
+      "devcouncil_verify_task"
+    ],
+    "applied_skills": [
+      "core-engineering",
+      "devcouncil",
+      "devcouncil-hero-loop",
+      "devcouncil-verification",
+      "devmap",
+      "devmap-debugging",
+      "devmap-exploring",
+      "devmap-impact",
+      "devmap-refactoring"
+    ],
+    "expected_tests": [],
+    "expires_at": "<EXPIRES_AT>",
+    "gate_mode": "enforce",
+    "lease_token": "<LEASE_TOKEN>",
+    "ok": true,
+    "planned_files": [
+      {
+        "allowed_change": "modify",
+        "path": "src/a.py",
+        "reason": "golden"
+      }
+    ],
+    "prompt": "<PROMPT>",
+    "semantic_context": null,
+    "status": "planned",
+    "task_id": "TASK-001"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_checkout_task"
+}

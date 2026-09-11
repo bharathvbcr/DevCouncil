@@ -5,6 +5,11 @@ Concurrent agent worktrees: [design, audit and rollout contract](AGENTIC_WORKTRE
 Host applications can link the query crate or use the versioned JSON and HTML
 process contract in [HOST_INTEGRATION.md](HOST_INTEGRATION.md).
 
+**Components cutover (2026-09-10):** DevCouncil ships `devmap` + Go `devcouncil` +
+`dcstore` as the binary plugin contract. Python map/orchestration consumers are
+deleted — see [../docs/PHASE7_LONG_TAIL.md](../docs/PHASE7_LONG_TAIL.md) and
+[CONSUMERS.md](CONSUMERS.md).
+
 Symbol-level code intelligence for coding agents and the people who supervise
 them. One binary, one SQLite store, no daemon required and no network.
 
@@ -127,6 +132,11 @@ use the same command to restore a missing map beside an existing database.
 Read-only discovery never creates or copies state from another worktree.
 See the [state-discovery audit](STATE_DISCOVERY_AUDIT_2026-09-09.md) for
 reproduced failures, regression evidence, and qualification limits.
+
+Default discovery also skips `testdata/` directory segments, the
+`vendor/grammars/` prefix, and sources over the 1 MiB ceiling (they are not
+charged as coverage loss). Extend the skip list with
+`DEVMAP_INDEX_EXCLUDES` (comma-separated repo-relative prefixes).
 
 When a repository argument is omitted, builds, rendering, and queries agree
 on the nearest Git worktree root, including from a subdirectory. Explicit
@@ -402,6 +412,15 @@ handler never runs. A writer that only serializes reports the same success for a
 dead install as for a working one.
 
 ### Agent guides
+
+Codex discovers repository skills in `.agents/skills/<name>/SKILL.md`. The five
+DevMap skills also ship in the existing DevCouncil registry; install them with
+`dev skills scaffold --destination .agents/skills` and repeat `--skill` for the
+desired names. This does not install MCP settings or hooks. See the exact
+[installation and verification commands](../docs/DEVMAP_SKILL_DELIVERY.md).
+The Claude plugin and registry distributions have a content-parity regression
+test. Both prefer DevMap while allowing capability-based fallback and explicit
+user/repository instructions.
 
 ```bash
 devmap manifest . --guides

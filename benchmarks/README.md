@@ -145,9 +145,9 @@ under-credited `incomplete`/false `blocked` from the e2e benchmark) and a
 a rubber-stamped defect).
 
 ```bash
-uv run python benchmarks/local_monitor_probe.py                 # config's reviewer model
-uv run python benchmarks/local_monitor_probe.py --model qwen3:8b --samples 3 --per-criterion
-OLLAMA_THINK=false uv run python benchmarks/local_monitor_probe.py   # latency/quality tradeoff
+python3 benchmarks/local_monitor_probe.py                 # config's reviewer model
+python3 benchmarks/local_monitor_probe.py --model qwen3:8b --samples 3 --per-criterion
+OLLAMA_THINK=false python3 benchmarks/local_monitor_probe.py   # latency/quality tradeoff
 ```
 
 Requires only a running Ollama server. Results land in
@@ -187,44 +187,42 @@ Output: a `results/<timestamp>.json` (raw per-run data, including the
 
 See `tasks.py` for the task suite and each task's hidden checks.
 
-## Code-intelligence performance ratchets
+## Code-intelligence performance
 
-Separate from this effectiveness harness: `tests/performance` and
-`scripts/codeintel-benchmark.py` ratchet cold-build, one-file sync, RSS, and
-query latency for the schema-v2 code graph (`fast` = PR ratchet ~256 files;
-`heavy` = explicit 10k-file profile). Thresholds live in
-`tests/performance/thresholds.json`. Run:
+Python code-intel ratchets (`tests/performance`, `scripts/codeintel-benchmark.py`)
+are retired. The mapping engine's required gate is `rust-port/verify.sh`
+(determinism, peak RSS, growth plateau, incremental-vs-cold soak).
 
 ```bash
-uv run pytest tests/performance -q
-uv run python scripts/codeintel-benchmark.py --profile heavy \
-  --output artifacts/codeintel-heavy.json
+cd rust-port && ./verify.sh
 ```
 
 ---
 
-# `dev map` performance benchmark
+# `dev map` performance
 
-A second, separate harness: `map_bench.py` measures the **mapping engine**, not
-the council loop. Where `run_bench.py` asks whether the gated loop produces
-better code, this asks how long `dev map` takes and where the time goes.
+The mapping engine is measured by `verify.sh` and by the kernel's own `--json`
+timings, not by a Python harness. Where `run_bench.py` asks whether the gated
+loop produces better code, this asks how long `devmap` takes and where the
+time goes.
 
-It exists because the map is on the hot path of every agent turn — rebuilt by
-hooks, by the watcher, and by hand — so a second of avoidable overhead is paid
-hundreds of times a day.
+A second of avoidable overhead on the map is paid hundreds of times a day —
+rebuilt by hooks, by the watcher, and by hand.
 
 ## Running it
 
 ```bash
-python benchmarks/map_bench.py                                  # this repo
-python benchmarks/map_bench.py --repo ~/src/other --repeat 5    # any tree
-python benchmarks/map_bench.py --baseline benchmarks/results/map/<ts>.json
+cd rust-port
+./verify.sh
+cargo run --release -p devmap-cli -- --db /tmp/scratch.sqlite --progress never --json build ..
 ```
 
-Results land in `benchmarks/results/map/<timestamp>.{json,md}`. Pass a prior
-run's JSON as `--baseline` to get a change column.
+`--json` prints per-phase timings. `verify.sh` is the bound that must hold; a
+scratch `--db` is required so a benchmark cannot mutate the working index.
 
-## What each stage measures
+The staged numbers below (`cold` / `warm` / `touch` / `manifest` / `e2e`) were
+taken by a retired Python harness (`map_bench.py`) and are retained as the
+2026-09-02 optimization record. They are not a live command.
 
 | stage | what it times |
 |---|---|
@@ -320,7 +318,7 @@ overhead; the bound is what makes it acceptable, and it is asserted by
 
 ## Measuring a small change on a busy machine
 
-`map_bench.py --baseline` compares against a JSON written at some earlier time,
+Comparing a later run against a JSON written at some earlier time,
 and that comparison is only as good as the machine's state in between. On a
 loaded developer machine it is not good at all: three consecutive `cold` runs of
 one unchanged binary measured 4.35 s, 2.96 s and 5.20 s here, and the same

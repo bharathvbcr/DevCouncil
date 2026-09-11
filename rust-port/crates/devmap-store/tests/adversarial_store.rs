@@ -32,6 +32,10 @@ use devmap_resolve::model::ResolutionResult;
 use devmap_resolve::Resolver;
 use devmap_store::{Store, CURRENT_SCHEMA_VERSION, GENERATION_RETENTION};
 
+#[cfg(unix)]
+#[path = "support/hold_uncommitted.rs"]
+mod hold_uncommitted;
+
 fn tmp_dir(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let stamp = SystemTime::now()
@@ -630,45 +634,12 @@ fn a_writer_killed_mid_transaction_leaves_no_half_written_generation() {
 
     // A child process that opens the store, writes a generation row inside an
     // uncommitted transaction, announces itself, and then blocks forever.
-    let script = format!(
-        r#"
-import sqlite3, sys, time
-conn = sqlite3.connect({:?}, isolation_level=None)
-conn.execute("PRAGMA busy_timeout=5000")
-conn.execute("BEGIN IMMEDIATE")
-conn.execute("INSERT INTO generations (created_at, head_sha, analysis_json) VALUES (1.0, 'torn', '{{}}')")
-conn.execute("INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported) SELECT last_insert_rowid(), 0, 1, 'torn', 'torn', 'Function', 0, 1, 0")
-sys.stdout.write("ready\n")
-sys.stdout.flush()
-time.sleep(600)
-"#,
-        db_path.to_string_lossy()
+    let holder = hold_uncommitted::Holder::spawn(
+        &db_path,
+        hold_uncommitted::Script::TornGeneration,
+        "ready",
     );
-    let mut child = std::process::Command::new("python3")
-        .arg("-c")
-        .arg(&script)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("python3 is required to hold an uncommitted transaction");
-
-    use std::io::{BufRead, BufReader};
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while line.trim() != "ready" && std::time::Instant::now() < deadline {
-        line.clear();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-    }
-    assert_eq!(line.trim(), "ready", "child never opened its transaction");
-
-    // SIGKILL: no unwinding, no destructors, no rollback by the process itself.
-    unsafe {
-        libc_kill(child.id() as i32, 9);
-    }
-    let _ = child.wait();
+    holder.kill();
 
     let reopened = Store::open(&db_path).expect("the store must recover");
     assert_eq!(
@@ -697,12 +668,6 @@ time.sleep(600)
         "the store did not recover from a killed writer"
     );
     let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(unix)]
-extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 /// A reader running against a store that a second *process* is pruning sees

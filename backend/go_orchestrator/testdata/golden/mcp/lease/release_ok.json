@@ -1,0 +1,19 @@
+{
+  "arguments": {
+    "lease_token": "<LEASE_TOKEN>",
+    "task_id": "TASK-001"
+  },
+  "capture_mode": "live",
+  "case": "release_ok",
+  "exit_code": null,
+  "notes": "",
+  "payload": {
+    "ok": true,
+    "released": true,
+    "task_id": "TASK-001"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_release_task"
+}

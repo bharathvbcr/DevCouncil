@@ -1,0 +1,48 @@
+{
+  "arguments": [
+    "checkout",
+    "TASK-CLI",
+    "--client-id",
+    "cli-a",
+    "--json"
+  ],
+  "capture_mode": "live",
+  "case": "cli_checkout",
+  "exit_code": 0,
+  "notes": "",
+  "payload": {
+    "allowed_commands": [
+      "*"
+    ],
+    "allowed_next_tools": [
+      "devcouncil_read_file",
+      "devcouncil_get_evidence",
+      "devcouncil_get_diff",
+      "devcouncil_run_command",
+      "devcouncil_apply_patch",
+      "devcouncil_write_file",
+      "devcouncil_update_task_scope",
+      "devcouncil_verify_task"
+    ],
+    "expected_tests": [],
+    "expires_at": "<EXPIRES_AT>",
+    "gate_mode": "enforce",
+    "lease_token": "<LEASE_TOKEN>",
+    "ok": true,
+    "planned_files": [
+      {
+        "allowed_change": "modify",
+        "path": "src/a.py",
+        "reason": "golden"
+      }
+    ],
+    "prompt": "<PROMPT>",
+    "semantic_context": null,
+    "status": "planned",
+    "task_id": "TASK-CLI"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "cli",
+  "tool_or_command": "dev checkout"
+}

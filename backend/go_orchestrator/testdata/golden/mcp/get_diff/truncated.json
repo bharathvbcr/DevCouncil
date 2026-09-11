@@ -1,0 +1,26 @@
+{
+  "arguments": {},
+  "capture_mode": "live",
+  "case": "truncated",
+  "exit_code": null,
+  "notes": "oversized untracked content sets truncated:true; files remain authoritative",
+  "payload": {
+    "files": [
+      {
+        "additions": 1,
+        "deletions": 0,
+        "path": "big_new.txt",
+        "status": "A"
+      }
+    ],
+    "ok": true,
+    "staged": false,
+    "truncated": true,
+    "unified_diff": "diff --git a/big_new.txt b/big_new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/big_new.txt\n@@ -0,0 +1,1 @@\n+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n\u2026 <truncated for golden store; original_len=20035> \u2026\n",
+    "unified_diff_original_len": 20035
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_get_diff"
+}

@@ -10,12 +10,14 @@ Attached to GitHub Releases created from `v*.*.*` tags (see `.github/workflows/n
    npm install -g devcouncil@<version>
    devcouncil --help
    ```
-2. **Provider-free red → green evidence gate** (no API keys):
+2. **Host binary** (from a checkout, no API keys):
    ```bash
    git clone https://github.com/bharathvbcr/DevCouncil.git
    cd DevCouncil
-   bash scripts/build-week-demo.sh
+   bash scripts/install.sh
+   devcouncil --help
    ```
+   The old `bash scripts/build-week-demo.sh` / `dev check --verify` demo was retired with the Python package.
 3. **Interactive code graph** — self-contained HTML (not a blank canvas):
    ```bash
    mkdir -p /tmp/devcouncil-demo

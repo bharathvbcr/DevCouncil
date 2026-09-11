@@ -5,9 +5,9 @@ execution:
   hook_gate:
     mode: 'off'
   stop_gate:
-    check_claims: true
-    mode: assist
-    verify_active_task: true
+    check_claims: false
+    mode: 'off'
+    verify_active_task: false
 gates:
   mode: false
 indexing:
@@ -19,25 +19,25 @@ integrations:
     enabled: true
     mcp_config_path: .agents/mcp_config.json
   claude:
-    enabled: true
+    enabled: false
     scope: project
     settings_path: .claude/settings.local.json
     write_gate: false
   cursor:
     config_path: .cursor/mcp.json
-    enabled: true
+    enabled: false
     hooks_path: .cursor/hooks.json
     rules_path: .cursor/rules/devcouncil.mdc
     skills_path: .cursor/skills
     write_gate: false
   grok:
     config_path: .grok/config.toml
-    enabled: true
+    enabled: false
     hooks_path: .grok/hooks/devcouncil.json
     write_gate: false
   opencode:
     config_path: opencode.json
-    enabled: true
+    enabled: false
     write_gate: false
   warp:
     command: oz

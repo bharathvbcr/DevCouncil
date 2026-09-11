@@ -1,0 +1,22 @@
+{
+  "arguments": [
+    "integrate",
+    "cursor",
+    "--apply",
+    "--project-root",
+    "<ROOT>"
+  ],
+  "capture_mode": "live",
+  "case": "integrate_cursor",
+  "exit_code": 0,
+  "notes": "",
+  "payload": {
+    "exit_code": 0,
+    "stderr_tail": "",
+    "stdout_tail": "cursor native hooks configured: \n<ROOT>/.cursor/hooks.json\nCursor integration configured (assist mode (no write-gate)): MCP + hooks + \nskills + rules.\nAdd pre-action containment with dev integrate cursor --apply --write-gate\n"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "cli",
+  "tool_or_command": "dev integrate cursor --apply"
+}

@@ -21,41 +21,17 @@
   ],
   "bin": {
     "devcouncil": "bin/devcouncil.js",
-    "dev": "bin/devcouncil.js",
-    "devcouncil-build-week-demo": "scripts/build-week-demo.sh"
+    "dev": "bin/devcouncil.js"
   },
   "files": [
     "bin/",
-    "src/**/*.py",
-    "src/**/*.md",
-    "src/**/*.png",
-    "src/**/*.svg",
-    "src/**/*.yaml",
-    "src/**/*.mjs",
-    "src/**/*.js",
-    "packages/codeintel-grammars/pyproject.toml",
-    "packages/codeintel-grammars/hatch_build.py",
-    "packages/codeintel-grammars/src/devcouncil_codeintel_grammars/__init__.py",
-    "scripts/build-week-demo.sh",
-    "examples/build-week-demo/**",
-    "pyproject.toml",
-    "uv.lock",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "install:dev": "uv tool install --force '.[codeintel-full]'",
-    "install:editable": "uv pip install -e .",
-    "dev": "uv run devcouncil",
     "pack:check": "npm pack --dry-run",
-    "smoke:wheel": "uv run python scripts/check-wheel-assets.py",
     "smoke:package": "node scripts/npm-runtime-smoke.mjs",
-    "smoke:registry": "node scripts/npm-registry-smoke.mjs",
-    "demo:build-week": "bash scripts/build-week-demo.sh",
-    "test": "uv run pytest",
-    "lint": "uv run ruff check .",
-    "typecheck": "uv run mypy src",
-    "check": "uv run ruff check . && uv run mypy src && uv run pytest"
+    "smoke:registry": "node scripts/npm-registry-smoke.mjs"
   },
   "engines": {
     "node": ">=18"

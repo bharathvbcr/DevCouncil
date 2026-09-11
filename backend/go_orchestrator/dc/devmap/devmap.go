@@ -35,7 +35,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/internal/proc"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 // Client runs the devmap binary against a repository.
@@ -212,66 +212,23 @@ func formatDetail(detail string) string {
 
 // Status is what the index says about itself.
 type Status struct {
-	DBPath         string  `json:"db_path"`
-	GenerationID   int     `json:"generation_id"`
-	NodeCount      int     `json:"node_count"`
-	EdgeCount      int     `json:"edge_count"`
-	PendingCount   int     `json:"pending_count"`
-	Quarantined    int     `json:"quarantined_count"`
-	IsFresh        bool    `json:"is_fresh"`
-	DegradedReason *string `json:"degraded_reason"`
-	// CoverageGaps is what the index could not read. See CoverageGaps for why
-	// it is carried but not folded into a per-query verdict.
-	CoverageGaps CoverageGaps `json:"coverage_gaps"`
-}
-
-// GapSample is one class of file the index could not fully read, as a bounded
-// sample plus the count it was drawn from.
-//
-// Paths is capped by the producer, so Shown and Total are both carried: a
-// caller that reported len(Paths) as the size of the gap would be presenting a
-// capped sample as complete coverage, which is the failure this whole boundary
-// exists to prevent.
-type GapSample struct {
-	Paths     []string `json:"paths"`
-	Shown     int      `json:"shown"`
-	Total     int      `json:"total"`
-	Truncated bool     `json:"truncated"`
-}
-
-// CoverageGaps is the index's account of what it could not read, by class.
-//
-// It is decoded here so it reaches Go at all — the kernel has emitted it on
-// `status` since it began naming the files discovery refuses, and no type on
-// this side had a field for it, so it stopped at the process boundary.
-//
-// It is deliberately *not* folded into Result.Clean(). These are properties of
-// the index rather than of any one answer, and on a real repository at least
-// one class is non-empty essentially always — import blindness alone covers
-// most of the languages the extractor handles. A flag that is always on
-// carries no information, and turning every answer permanently unclean would
-// destroy the signal that Clean() exists to give. Callers that want to qualify
-// a specific finding read these numbers directly; queries whose own answer was
-// cut report it on walk_incomplete, which is per-answer and therefore
-// meaningful.
-type CoverageGaps struct {
-	DiscoveryRefused GapSample `json:"discovery_refused"`
-	ParseFailed      GapSample `json:"parse_failed"`
-	PatternRecovered GapSample `json:"pattern_recovered"`
-	CallBlind        GapSample `json:"call_blind"`
-	ImportBlind      GapSample `json:"import_blind"`
-	NotParsed        GapSample `json:"not_parsed"`
-}
-
-// Any reports whether the index named anything it could not fully read.
-func (g CoverageGaps) Any() bool {
-	for _, s := range []GapSample{g.DiscoveryRefused, g.ParseFailed, g.PatternRecovered,
-		g.CallBlind, g.ImportBlind, g.NotParsed} {
-		if s.Total > 0 {
-			return true
-		}
-	}
-	return false
+	DBPath                string         `json:"db_path"`
+	GenerationID          int            `json:"generation_id"`
+	NodeCount             int            `json:"node_count"`
+	EdgeCount             int            `json:"edge_count"`
+	PendingCount          int            `json:"pending_count"`
+	Quarantined           int            `json:"quarantined_count"`
+	IsFresh               bool           `json:"is_fresh"`
+	DegradedReason        *string        `json:"degraded_reason"`
+	SchemaVersion         int            `json:"schema_version"`
+	ExpectedSchemaVersion int            `json:"expected_schema_version"`
+	Capabilities          map[string]any `json:"capabilities,omitempty"`
+	HostContractVersion   int            `json:"host_contract_version"`
+	BinaryVersion         string         `json:"binary_version"`
+	SchemaRelation        string         `json:"schema_relation"`
+	ReaderReady           bool           `json:"reader_ready"`
+	QueryReady            bool           `json:"query_ready"`
+	CoverageGaps          map[string]any `json:"coverage_gaps,omitempty"`
 }
 
 // Symbol is one search hit.
@@ -319,118 +276,9 @@ type Edge struct {
 // identified reports whether the edge carries anything usable.
 func (e Edge) identified() bool { return e.SourceFile != "" || e.TargetFile != "" }
 
-// envelope is the honesty half of every query answer, shared by all three
-// query shapes because the kernel emits exactly one of these per response.
-//
-// It was `Hidden int` alone. The kernel states what an answer left out four
-// separate ways — the three budget counters, and a fourth field for the case
-// the counters cannot express — and reading one of the four amounts to
-// trusting the other three to agree without ever asking them. The Python
-// client on the same wire format reads all of them and enforces
-// `shown + hidden == total` and `truncated == (hidden > 0)` between them; two
-// consumers of one producer disagreeing about what counts as a complete answer
-// is how a capped result comes to be reported as the whole truth on one path
-// and not the other.
-//
-// Every field is optional on the wire and absence means "not stated", never a
-// positive claim: a decoder that read a missing field as a qualification would
-// trade a false clean for a false alarm on any producer that predates it.
-type envelope struct {
-	Shown     int  `json:"shown"`
-	Hidden    int  `json:"hidden"`
-	Total     int  `json:"total"`
-	Truncated bool `json:"truncated"`
-	// WalkIncomplete is set when the *producer* of the items stopped early, as
-	// distinct from the budget trimming a complete set. It is a pointer
-	// because the kernel omits it entirely on a complete answer, and a
-	// pointer is the only shape that distinguishes "complete" from "the field
-	// was there and empty".
-	WalkIncomplete *string `json:"walk_incomplete"`
-	// Resolution is whether the kernel could answer the question at all.
-	Resolution Resolution `json:"resolution"`
-}
-
-// suppressed is how many results the answer left out, taken from whichever
-// counter carries it.
-//
-// The two expressions agree on every answer the current kernel produces
-// (shown + hidden == total is an invariant it maintains), so the max is that
-// same number today. It is a max rather than a read of `hidden` so that a
-// producer stating suppression through the counters it did set is believed
-// rather than silently rounded down to zero.
-func (e envelope) suppressed() int {
-	if byTotal := e.Total - e.Shown; byTotal > e.Hidden {
-		return byTotal
-	}
-	return e.Hidden
-}
-
-// Resolution is the kernel's statement about whether it could answer.
-//
-// This is the highest-consequence field on the wire and the one nothing here
-// decoded. `devmap --json deps -- nosuch.py` answers with zero items, zero
-// hidden and `resolution: {"Unavailable": {"reason": "nosuch.py is not
-// indexed"}}` — an answer that, read through the counters alone, is
-// indistinguishable from "this file has no dependencies". One is a fact about
-// the code and the other is a fact about the index, and code gets deleted on
-// the first.
-type Resolution struct {
-	// Stated records whether the response carried the field at all, so absence
-	// is never mistaken for either verdict.
-	Stated bool
-	// OK is the verdict when Stated. False with Stated means the kernel
-	// declined to answer, and Reason says why.
-	OK bool
-	// Reason is the kernel's own words for why it could not resolve.
-	Reason string
-}
-
-// UnmarshalJSON decodes the two forms serde emits for the kernel's enum: the
-// bare string "Available", and {"Unavailable":{"reason":"…"}}.
-//
-// An unrecognised shape is an error rather than a default. The producer is a
-// separate binary that can change its field names without anything in this
-// build failing to compile, and the one reading that must never happen is a
-// changed contract landing as "available".
-func (r *Resolution) UnmarshalJSON(data []byte) error {
-	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
-		return nil
-	}
-	var available string
-	if err := json.Unmarshal(data, &available); err == nil {
-		if available != "Available" {
-			return fmt.Errorf("devmap reported resolution %q, which this build does not understand; "+
-				"treating an unknown verdict as available would report an unanswerable query as an empty answer", available)
-		}
-		*r = Resolution{Stated: true, OK: true}
-		return nil
-	}
-	var unavailable struct {
-		Unavailable *struct {
-			Reason string `json:"reason"`
-		} `json:"Unavailable"`
-	}
-	if err := json.Unmarshal(data, &unavailable); err != nil || unavailable.Unavailable == nil {
-		return fmt.Errorf("devmap reported a resolution this build does not understand (%s); "+
-			"treating it as available would report an unanswerable query as an empty answer", truncateForError(data))
-	}
-	*r = Resolution{Stated: true, Reason: unavailable.Unavailable.Reason}
-	return nil
-}
-
-// truncateForError bounds an unrecognised value quoted back in an error, so a
-// megabyte of nonsense cannot become a megabyte of log line.
-func truncateForError(data []byte) string {
-	const max = 120
-	if len(data) > max {
-		return string(data[:max]) + "…"
-	}
-	return string(data)
-}
-
 type edgeResult struct {
-	Items []Edge `json:"items"`
-	envelope
+	Items  []Edge `json:"items"`
+	Hidden int    `json:"hidden"`
 }
 
 // searchResult is the wire shape of a query that returns symbols.
@@ -441,13 +289,13 @@ func (s Symbol) identified() bool { return s.FilePath != "" || s.Name != "" }
 func (d DeadSymbol) identified() bool { return d.FilePath != "" || d.Name != "" }
 
 type searchResult struct {
-	Items []Symbol `json:"items"`
-	envelope
+	Items  []Symbol `json:"items"`
+	Hidden int      `json:"hidden"`
 }
 
 type deadResult struct {
-	Items []DeadSymbol `json:"items"`
-	envelope
+	Items  []DeadSymbol `json:"items"`
+	Hidden int          `json:"hidden"`
 }
 
 // Result wraps any answer with what the caller needs to judge it.
@@ -461,31 +309,10 @@ type Result[T any] struct {
 	Stale bool
 	// Degraded names why an answer is less than it appears.
 	Degraded []string
-	// WalkIncomplete is the producer's own reason for having stopped before it
-	// had seen everything, empty when it ran to completion.
-	//
-	// Carried separately from Degraded as well as folded into it, because the
-	// distinction it draws is the one a caller acts on: a budget-trimmed answer
-	// has a known remainder and can be asked for again with a larger budget,
-	// while a walk that stopped early withheld an unknown quantity and no
-	// budget will finish it.
-	WalkIncomplete string
-	// Resolution is whether the kernel could answer the question at all. An
-	// unavailable resolution means the empty Items above is a statement about
-	// the index, not about the code.
-	Resolution Resolution
 }
 
 // Clean reports whether the answer is complete and current.
-//
-// Every disqualification also writes a line into Degraded, so this is the same
-// verdict as len(Degraded) == 0. The named terms are kept because they are the
-// contract: an answer is clean when it is current, whole, and one the kernel
-// was able to resolve.
-func (r Result[T]) Clean() bool {
-	return !r.Stale && r.Hidden == 0 && r.WalkIncomplete == "" &&
-		!(r.Resolution.Stated && !r.Resolution.OK) && len(r.Degraded) == 0
-}
+func (r Result[T]) Clean() bool { return !r.Stale && r.Hidden == 0 && len(r.Degraded) == 0 }
 
 // Refusal is one file the indexer declined to read, and the reason it gave.
 type Refusal struct {
@@ -820,17 +647,7 @@ var errCapped = errors.New("output exceeded its bound")
 
 func (c *capped) Write(p []byte) (int, error) {
 	room := c.limit - c.buf.Len()
-	// `>=`, and the equality is the whole of it. A write that exactly fills the
-	// remaining room loses nothing, and the test was `>`: a stream of precisely
-	// limit bytes was marked truncated, which on stdout discarded a complete
-	// answer as "produced more than <limit> bytes" and on stderr told the
-	// operator that notices — including refusals — were never read when every
-	// one of them had been. A bound is a maximum, and the stream that meets it
-	// exactly is the one place where reporting "at" as "past" is the whole
-	// verdict rather than a rounding. Truncation is now recorded when a byte is
-	// actually dropped, which is on the next write, and the flood is stopped in
-	// the same place it always was.
-	if room >= len(p) {
+	if room > len(p) {
 		return c.buf.Write(p)
 	}
 	if room > 0 {
@@ -908,14 +725,14 @@ func (c *Client) Status(ctx context.Context) (*Status, error) {
 // make that accounting describe a bound the harness never set.
 func (c *Client) Search(ctx context.Context, query string) (Result[Symbol], error) {
 	return runQuery[Symbol, searchResult](ctx, c,
-		func(r searchResult) ([]Symbol, envelope) { return r.Items, r.envelope },
+		func(r searchResult) ([]Symbol, int) { return r.Items, r.Hidden },
 		"search", "--budget", strconv.Itoa(c.Budget), "--", query)
 }
 
 // Dead lists symbols with no discovered callers.
 func (c *Client) Dead(ctx context.Context) (Result[DeadSymbol], error) {
 	return runQuery[DeadSymbol, deadResult](ctx, c,
-		func(r deadResult) ([]DeadSymbol, envelope) { return r.Items, r.envelope },
+		func(r deadResult) ([]DeadSymbol, int) { return r.Items, r.Hidden },
 		"dead", "--budget", strconv.Itoa(c.Budget))
 }
 
@@ -929,7 +746,7 @@ func (c *Client) Dead(ctx context.Context) (Result[DeadSymbol], error) {
 // subcommand happens to be called.
 func (c *Client) Deps(ctx context.Context, file string) (Result[Edge], error) {
 	return runQuery[Edge, edgeResult](ctx, c,
-		func(r edgeResult) ([]Edge, envelope) { return r.Items, r.envelope },
+		func(r edgeResult) ([]Edge, int) { return r.Items, r.Hidden },
 		"deps", "--budget", strconv.Itoa(c.Budget), "--", file)
 }
 
@@ -1029,30 +846,17 @@ func (c *Client) Manifest(ctx context.Context, mapPath, graphPath string) (*Mani
 	if err != nil {
 		return nil, abandon(adopted, err)
 	}
-	for _, artifact := range manifestDestinations(mapPath, graphPath) {
-		info, statErr := os.Stat(artifact.path)
+	for _, artifact := range []string{mapPath, graphPath} {
+		info, statErr := os.Stat(artifact)
 		switch {
 		case statErr != nil:
 			return nil, abandon(adopted, fmt.Errorf(
 				"devmap manifest exited without error but %s is not on disk, so the "+
-					"artifact the scope rung reads is whatever was there before: %w", artifact.path, statErr))
+					"artifact the scope rung reads is whatever was there before: %w", artifact, statErr))
 		case info.Size() == 0:
 			return nil, abandon(adopted, fmt.Errorf(
 				"devmap manifest wrote %s as an empty file, which holds no nodes and would "+
-					"load as an index that has not been built", artifact.path))
-		}
-		// Present and non-empty were two thirds of one class, and the third is
-		// the one a producer can actually reach: a run that exits zero having
-		// written a truncated document. Size cannot catch it — half a code
-		// graph has a perfectly good size — so the file was reported as written
-		// and the failure surfaced later, in another process, as a parse error
-		// about a file nothing had said anything about. See destination.readable
-		// for why this asks only whether the document parses.
-		if err := artifact.readable(); err != nil {
-			return nil, abandon(adopted, fmt.Errorf(
-				"devmap manifest exited without error but the artifact it wrote could not be "+
-					"read back, so what the scope rung would load is neither the previous graph "+
-					"nor a complete one: %w", err))
+					"load as an index that has not been built", artifact))
 		}
 	}
 	report := &ManifestReport{
@@ -1100,44 +904,17 @@ func (c *Client) checkManifestAgainstIndex(ctx context.Context, report *Manifest
 // query issued after ten minutes of editing, when a status checked at startup
 // would still say fresh.
 func runQuery[T any, W any](ctx context.Context, c *Client,
-	extract func(W) ([]T, envelope), args ...string) (Result[T], error) {
+	extract func(W) ([]T, int), args ...string) (Result[T], error) {
 
 	var wire W
 	if _, err := c.decode(ctx, &wire, c.Timeout, args...); err != nil {
 		return Result[T]{}, err
 	}
-	items, env := extract(wire)
+	items, hidden := extract(wire)
 	if err := assertShape(args[0], items); err != nil {
 		return Result[T]{}, err
 	}
-	hidden := env.suppressed()
-	result := Result[T]{Items: items, Hidden: hidden, Resolution: env.Resolution}
-
-	// Resolution first: it decides whether the items below are an answer at
-	// all. An unavailable resolution with an empty list is the wire form of
-	// "the index could not tell you", and reporting it as "there is nothing
-	// there" is the one reading that gets code deleted.
-	if env.Resolution.Stated && !env.Resolution.OK {
-		reason := env.Resolution.Reason
-		if reason == "" {
-			reason = "no reason given"
-		}
-		result.Degraded = append(result.Degraded, fmt.Sprintf(
-			"devmap could not resolve this query (%s); an empty answer here describes the index, not the code",
-			reason))
-	}
-	if env.WalkIncomplete != nil && *env.WalkIncomplete != "" {
-		result.WalkIncomplete = *env.WalkIncomplete
-		result.Degraded = append(result.Degraded, fmt.Sprintf(
-			"the walk behind this answer stopped before it had seen everything: %s", *env.WalkIncomplete))
-	}
-	// Truncation with no count. The counters say nothing was left out and the
-	// flag says something was; believing the flag is the only direction that
-	// cannot turn a partial answer into a complete-looking one.
-	if env.Truncated && hidden == 0 {
-		result.Degraded = append(result.Degraded,
-			"devmap reported this answer as truncated without naming how much it withheld; treat it as a sample")
-	}
+	result := Result[T]{Items: items, Hidden: hidden}
 
 	status, err := c.Status(ctx)
 	if err != nil {
@@ -1152,15 +929,6 @@ func runQuery[T any, W any](ctx context.Context, c *Client,
 		result.Stale = true
 		result.Degraded = append(result.Degraded,
 			"the index is older than the working tree; these answers describe code as it was at the last build")
-	}
-	// The index's own statement that it is not what it should be. Available()
-	// refuses on this, but Available() is a startup question and the query path
-	// does not go through it — so this document was already being read here for
-	// three other fields while the one that says the index is degraded outright
-	// went past unexamined.
-	if status.DegradedReason != nil && *status.DegradedReason != "" {
-		result.Degraded = append(result.Degraded, fmt.Sprintf(
-			"the index reports itself degraded: %s", *status.DegradedReason))
 	}
 	if status.PendingCount > 0 {
 		result.Degraded = append(result.Degraded,

@@ -59,6 +59,10 @@ use devmap_resolve::Resolver;
 use devmap_store::{GenerationWriteOpts, Store};
 use rusqlite::Connection;
 
+#[cfg(unix)]
+#[path = "support/hold_uncommitted.rs"]
+mod hold_uncommitted;
+
 fn tmp_dir(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let stamp = SystemTime::now()
@@ -917,47 +921,9 @@ fn a_writer_killed_between_closing_and_inserting_leaves_every_edge_servable() {
     // A child that opens the store, closes every live edge and ledger row
     // inside an uncommitted transaction — the exact half-state the delta write
     // passes through — announces itself, and then blocks until it is killed.
-    let script = format!(
-        r#"
-import sqlite3, sys, time
-conn = sqlite3.connect({:?}, isolation_level=None)
-conn.execute("PRAGMA busy_timeout=5000")
-conn.execute("BEGIN IMMEDIATE")
-conn.execute("INSERT INTO generations (created_at, head_sha, analysis_json) VALUES (9.0, 'torn', '{{}}')")
-gen = conn.execute("SELECT max(id) FROM generations").fetchone()[0]
-conn.execute("UPDATE edge_rows SET valid_to = ? WHERE valid_to IS NULL", (gen,))
-conn.execute("UPDATE unresolved_rows SET valid_to = ? WHERE valid_to IS NULL", (gen,))
-sys.stdout.write("closed\n")
-sys.stdout.flush()
-time.sleep(600)
-"#,
-        db.to_string_lossy()
-    );
-    let mut child = std::process::Command::new("python3")
-        .arg("-c")
-        .arg(&script)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("python3 is required to hold an uncommitted transaction");
-
-    use std::io::{BufRead, BufReader};
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-    let mut line = String::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while line.trim() != "closed" && std::time::Instant::now() < deadline {
-        line.clear();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-    }
-    assert_eq!(line.trim(), "closed", "child never closed the rows");
-
-    // SIGKILL: no unwinding, no destructors, no rollback by the process itself.
-    unsafe {
-        libc_kill(child.id() as i32, 9);
-    }
-    let _ = child.wait();
+    let holder =
+        hold_uncommitted::Holder::spawn(&db, hold_uncommitted::Script::CloseRanges, "closed");
+    holder.kill();
 
     let reopened = Store::open(&db).expect("the store must recover");
     assert_eq!(
@@ -985,10 +951,4 @@ time.sleep(600)
         "a killed close left rows ended that nothing ended"
     );
     let _ = fs::remove_dir_all(&dir);
-}
-
-#[cfg(unix)]
-extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
 }

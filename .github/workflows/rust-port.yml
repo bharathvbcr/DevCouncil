@@ -78,10 +78,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --workspace --no-fail-fast
 
-      - uses: actions/setup-python@v5
-        if: ${{ !cancelled() }}
-        with:
-          python-version: "3.12"
       - name: Native worktree capacity and process recovery
         if: ${{ !cancelled() }}
         timeout-minutes: 20
@@ -90,9 +86,10 @@ jobs:
           set -euo pipefail
           suffix=""
           if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
-          python -m unittest discover -s tools -p test_worktree_stress.py
-          python tools/worktree_stress.py --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 2 --fixture-files 4 --rounds 1 --build-workers 2 --output capacity-smoke.json
-          python tools/worktree_stress.py --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 128 --fixture-files 64 --rounds 4 --build-workers 8 --output capacity-native.json
+          cargo test -p devmap-cli --test worktree_stress_support -- --nocapture
+          cargo build -p devmap-cli --example worktree_stress --example ipc_probe
+          "target/debug/examples/worktree_stress$suffix" --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 2 --fixture-files 4 --rounds 1 --build-workers 2 --output capacity-smoke.json
+          "target/debug/examples/worktree_stress$suffix" --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 128 --fixture-files 64 --rounds 4 --build-workers 8 --output capacity-native.json
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}
         with:
@@ -168,8 +165,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-port
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Build release binary
         run: cargo build --release

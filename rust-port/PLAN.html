@@ -368,7 +368,7 @@
 </table>
 <p>CLAUDE.md step 1 directs every agent to open <code>repo_map.json</code>. That single instruction is the largest token expenditure in the system, and <strong>78% of it is two lookup tables</strong> shipped whole to answer point queries.</p>
 <h3 id="21-rust-kernel--measured-2026-09-02">2.1 Rust kernel — measured 2026-09-02</h3>
-<p>The figures above are the incumbent. These are the shipped kernel, measured with <code>benchmarks/map_bench.py</code> against a scratch store (the real <code>.devcouncil/</code> is never touched), reporting the <strong>minimum</strong> of N runs rather than the mean: the minimum is the run least contaminated by other load, and a mean on a laptop mostly measures what else was scheduled.</p>
+<p>The figures above are the incumbent. These are the shipped kernel, measured on 2026-09-02 against a scratch store (the real <code>.devcouncil/</code> is never touched), reporting the <strong>minimum</strong> of N runs rather than the mean: the minimum is the run least contaminated by other load, and a mean on a laptop mostly measures what else was scheduled. That staged Python harness is retired; <code>rust-port/verify.sh</code> is the live gate.</p>
 <table>
 <thead>
 <tr>
@@ -474,6 +474,9 @@
 <p><strong>Two caveats on this subsection.</strong> <code>touch</code> is an incremental build and still costs 60% of a cold one at 3,674 files, because resolution is deliberately global on every changed build — narrowing it was tried and broke liveness and community detection, so the cost is a known consequence of a correctness decision, not an unexamined one. That is B3/SC2, and it is unresolved. Second, the <code>.devcouncil/codeintel/index.sqlite</code> in this repository is at <code>user_version=2</code> while the current binary writes <code>user_version=11</code>; the live store is nine schema versions stale, so it is not a valid sample of current behaviour and no figure above is drawn from it.</p>
 <hr />
 <h2 id="3-findings-as-specification">3. Findings as specification</h2>
+<blockquote>
+<p><strong>2026-09-02, second pass.</strong> Thirty-one further defects were found and fixed against the <em>shipped</em> kernel and its Python seam — <code>K1</code>(a–h), <code>K2</code>, <code>K3</code>, <code>K4</code>, <code>K5</code>, <code>K6</code>, <code>K7</code>, <code>K12</code>, <code>K13</code> in the store/build/drain, <code>S1</code>–<code>S10</code> in serve/query, and nine in the seam. They are recorded, with the failing-first test for each and the live before/after numbers, in the root <code>IMPROVEMENTS.md</code> → "Dev Map kernel audit, second pass (2026-09-02)" and summarised in <code>STATUS.md</code> → "Kernel audit, second pass". This section keeps the original 47 findings and <code>K1</code>–<code>K8</code> / <code>G1</code>–<code>G8</code>; it is not restated there.</p>
+</blockquote>
 <p>32 findings plus 7 reference-derived enhancements — 39 items. Each is a property the rewrite must hold, with the acceptance test that proves it.</p>
 <h3 id="correctness-and-concurrency">Correctness and concurrency</h3>
 <table>
@@ -1601,17 +1604,16 @@ python -c &quot;from devcouncil.codeintel.service import get_codeintel_service; 
 wc -c .devcouncil/repo_map.json .devcouncil/graph/code_graph.json   # ÷ 4 for tokens</code></pre>
 <h3 id="kernel-measurements-21--2026-09-02">Kernel measurements (§2.1) — 2026-09-02</h3>
 <p>Everything above profiles the Python incumbent. The kernel figures come from a staged harness instead, because the stages have different fixes and a single wall-clock number hides which one moved:</p>
-<pre class="bash"><code># Staged benchmark: cold / warm / touch / manifest / e2e, min-of-N, scratch store.
-python benchmarks/map_bench.py --repo /path/to/any/tree --repeat 5
-python benchmarks/map_bench.py --repo . --baseline benchmarks/results/map/&lt;earlier&gt;.json
+<pre class="bash"><code># Required kernel gate: determinism, peak RSS, growth plateau, soak.
+cd rust-port &amp;&amp; ./verify.sh
 
 # Per-phase breakdown of one build, straight from the kernel.
-devmap --db /tmp/scratch.sqlite --progress never --json build /path/to/tree | jq .timings</code></pre>
-<p>Two properties of the harness are load-bearing rather than incidental:</p>
+devmap --db /tmp/scratch.sqlite --progress never --json build /path/to/tree</code></pre>
+<p>Two properties of those 2026-09-02 figures are load-bearing rather than incidental:</p>
 <ul>
 <li><strong>Minimum of N, not mean.</strong> The minimum is the run least contaminated by other load; a mean on a laptop substantially measures what else was scheduled.</li>
 <li><strong>A scratch store, always.</strong> Every stage writes to a temporary database. The real <code>.devcouncil/</code> is never touched, so a benchmark cannot corrupt the working index and a stale working index cannot flatter a benchmark — which it did once during this pass, when a leftover store made a cold build appear <em>faster</em> than a warm one.</li>
 </ul>
-<p>Results land in <code>benchmarks/results/map/&lt;timestamp&gt;.{json,md}</code>; <code>--baseline</code> diffs against an earlier run. Corpus sizes are recorded in each JSON, so a figure can be checked against the tree it came from rather than trusted.</p>
+<p>Those figures landed in <code>benchmarks/results/map/&lt;timestamp&gt;.{json,md}</code>. Corpus sizes are recorded in each JSON, so a figure can be checked against the tree it came from rather than trusted.</p>
 
 </div>

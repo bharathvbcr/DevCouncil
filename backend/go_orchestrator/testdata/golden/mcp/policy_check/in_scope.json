@@ -1,0 +1,21 @@
+{
+  "arguments": {
+    "path": "src/a.py",
+    "task_id": "TASK-001"
+  },
+  "capture_mode": "live",
+  "case": "policy_check_in_scope",
+  "exit_code": null,
+  "notes": "",
+  "payload": {
+    "action": "allow",
+    "allowed": true,
+    "reason": "File change is allowed.",
+    "target": "src/a.py",
+    "task_id": "TASK-001"
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_policy_check_write"
+}

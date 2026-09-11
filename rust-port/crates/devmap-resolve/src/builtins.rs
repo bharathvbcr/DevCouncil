@@ -987,7 +987,7 @@ pub fn swift_sdk_module<'a>(
     name: &str,
 ) -> Option<&'static str> {
     let imported: Vec<&str> = imported_modules.into_iter().collect();
-    let imported = |module: &str| imported.iter().any(|item| *item == module);
+    let imported = |module: &str| imported.contains(&module);
 
     if name.starts_with("XCT") || SWIFT_XCTEST_TYPES.binary_search(&name).is_ok() {
         return imported("XCTest").then_some("XCTest");

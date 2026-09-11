@@ -2,9 +2,10 @@
 
 This is the shortest path for a new developer who wants to install DevCouncil, initialize a repository, connect a coding CLI, and run the first gated task.
 
-**Platforms:** macOS, Linux, and Windows. Requires Node.js 18+, Python 3.12+, and Git.
+**Platforms:** macOS, Linux, and Windows. Requires a Go toolchain (for `dev`/`devcouncil`), Rust/`cargo` (for `devmap` and the other analysis binaries), and Git. Node.js 18+ is only needed for the optional npm shim.
 **Maturity:** Public surfaces are labeled Stable / Preview / Experimental in
-[project-status.md](project-status.md) (also printed by `dev doctor`).
+[project-status.md](project-status.md).
+**Phase 7:** the live `dev` / `devcouncil` binary is Go (`mcp`, `integrate`, `skills`, `verify`, plus `map`/`graph`/`ast` via `devmap`). Retired Python commands exit 2. See [PHASE7_LONG_TAIL.md](PHASE7_LONG_TAIL.md).
 
 Run DevCouncil commands in a normal terminal from the root of the repository you want DevCouncil to manage. Do not run these commands inside the coding CLI chat. Later, you paste the generated `dev prompt TASK-ID` output into Codex, Claude Code, OpenCode, Antigravity, Warp, Cursor, Aider, Copilot, Goose, Amp, Qwen, Crush, or another registered CLI agent. (The legacy Gemini CLI is deprecated — use Antigravity instead.)
 
@@ -18,21 +19,17 @@ Run DevCouncil commands in a normal terminal from the root of the repository you
 
 ## 1. Install
 
-DevCouncil is a Python CLI distributed through an npm wrapper. The wrapper delegates to `uv`, so install `uv` first if it is missing.
-
-Windows:
-
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-macOS or Linux:
+DevCouncil is a set of native binaries. The npm package is a thin Node shim that
+execs those binaries; it does not install Python.
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+bash scripts/install.sh
+# or: go -C backend/go_orchestrator build -o ~/.local/bin/devcouncil ./cmd/devcouncil
+#     ln -sf devcouncil ~/.local/bin/dev
+#     bash scripts/install-components.sh
 ```
 
-For normal use, install DevCouncil from npm:
+For the npm shim only (still needs the Go/Rust binaries on PATH):
 
 ```bash
 npm install -g devcouncil
@@ -40,14 +37,7 @@ devcouncil --help
 dev --help
 ```
 
-From a local checkout:
-
-```bash
-uv tool install --force --reinstall --editable .
-devcouncil --help
-```
-
-`--editable` keeps the global `dev` / `devcouncil` shims pointed at this tree (useful while developing map/graph features). Omit `--editable` for a frozen install of the current tree.
+From a local checkout, install the Go binary (and `dev` symlink) with `bash scripts/install.sh`. There is no `uv tool install` / Python package.
 
 For local npm wrapper testing before publishing a new package version:
 
@@ -59,8 +49,8 @@ devcouncil --help
 For local development inside this repo:
 
 ```bash
-uv sync
-uv run dev --help
+bash scripts/install.sh
+dev --help
 ```
 
 ## 2. Initialize A Project
@@ -138,9 +128,9 @@ dev map demo
 This writes a **self-contained interactive HTML** file at
 `.devcouncil/graph/demo.html` (and may also write a static `demo.svg` companion).
 Open `demo.html` for the interactive UI — filters, path highlighting, and
-neighborhoods. A provider-free red→green evidence-gate fixture lives at
-[`examples/build-week-demo/`](../examples/build-week-demo/); run it with
-`bash scripts/build-week-demo.sh` (see [build-week-demo.md](build-week-demo.md)).
+neighborhoods. Calculator fixtures remain at
+[`examples/build-week-demo/`](../examples/build-week-demo/); the `dev check --verify`
+driver was retired (see [build-week-demo.md](build-week-demo.md)).
 
 To preview coding CLI integration commands:
 
@@ -288,16 +278,13 @@ dev scaffold-ci --evidence  # also write devcouncil-evidence.yml for PR verify +
 
 ## Documentation smoke
 
-From a DevCouncil checkout (local `dev` or `./.venv/bin/dev`):
+From a DevCouncil checkout with `dev` / `devcouncil` on `PATH` (not `./.venv/bin/dev`):
 
 ```bash
 dev version
-dev doctor
+devcouncil --help
 mkdir -p /tmp/devcouncil-docs-smoke
-dev map demo --project-root /tmp/devcouncil-docs-smoke --json
-test -f /tmp/devcouncil-docs-smoke/.devcouncil/graph/demo.html
-bash scripts/build-week-demo.sh
-./.venv/bin/ruff check examples/build-week-demo
+dev map
 ```
 
 Full fixture index: [examples/README.md](../examples/README.md).

@@ -1,0 +1,17 @@
+---
+description: DevCouncil task loop and navigation
+alwaysApply: true
+---
+
+# DevCouncil
+
+Use DevCouncil MCP tools for status, checkout, scope, and verify — do not guess task state.
+
+Navigate via `.devcouncil/repo_map.json` (subsystems, entry_points, critical_files). Prefer DevMap MCP tools (`devmap_explore`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_affected_tests`) — not GitNexus. CLI: `devmap` / `dev map query|trace|dead`. When DevMap is truncated or cannot answer, record a gap in `.devcouncil/codeintel/sessions/gaps.jsonl`.
+
+Interactive Cursor Shell/Write do **not** require a task lease under assist defaults
+(`integrations.cursor.write_gate: false`, `execution.hook_gate.mode: off`). Do not claim
+"Shell is gated" or checkout just to run shell. Only checkout when write-gates / contain
+mode are active (`dev integrate … --write-gate` or `execution.hook_gate.mode: contain`).
+
+Follow engineering skills under `.cursor/skills/` and `.claude/skills/` (`dev skills scaffold` / `dev integrate cursor --apply`).

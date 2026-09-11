@@ -1,0 +1,16 @@
+{
+  "arguments": {},
+  "capture_mode": "injected_git_repo_undetermined",
+  "case": "timeout",
+  "exit_code": null,
+  "notes": "Live hang would wait GIT_TIMEOUT (60s). Shape matches git_repo_state returning (None, 'timed out after Ns') which run_git surfaces as returncode 124. code=git_repo_undetermined \u2014 never not_a_git_repo.",
+  "payload": {
+    "code": "git_repo_undetermined",
+    "error": "get_diff could not determine whether this is a git repository: timed out after 60.0s",
+    "ok": false
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_get_diff"
+}

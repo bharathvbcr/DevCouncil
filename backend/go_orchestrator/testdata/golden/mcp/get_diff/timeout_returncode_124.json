@@ -1,0 +1,22 @@
+{
+  "arguments": [
+    "status"
+  ],
+  "capture_mode": "documented_contract",
+  "case": "timeout_returncode_124",
+  "exit_code": null,
+  "notes": "run_git never raises TimeoutExpired; it returns CompletedProcess with rc 124.",
+  "payload": {
+    "args": [
+      "git",
+      "status"
+    ],
+    "returncode": 124,
+    "stderr": "timed out after 5s",
+    "stdout": ""
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "unit_contract",
+  "tool_or_command": "devcouncil.utils.proc.run_git"
+}

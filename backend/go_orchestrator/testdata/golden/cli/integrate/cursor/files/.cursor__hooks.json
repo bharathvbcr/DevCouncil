@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "hooks": {
+    "postToolUse": [
+      {
+        "command": "/Users/bharath/.local/bin/dev hook post-tool-use --client cursor --project-root <ROOT>",
+        "matcher": "Shell|Write|Edit|MultiEdit"
+      }
+    ]
+  }
+}

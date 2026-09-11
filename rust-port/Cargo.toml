@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/devmap-extract",
     "crates/devmap-resolve",
@@ -8,6 +8,10 @@ members = [
     "crates/devmap-query",
     "crates/devmap-serve",
     "crates/devmap-cli",
+    "crates/dc-glob",
+    "crates/dc-grep",
+    "crates/dc-store",
+    "crates/dc-verify",
 ]
 
 # The release profile was left at cargo's defaults, which are tuned for build

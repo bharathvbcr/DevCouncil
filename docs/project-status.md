@@ -19,7 +19,7 @@ Other coding CLI hooks remain Preview as noted below.
 
 | Area | Status |
 | :--- | :--- |
-| **CLI & Storage** | Stable: SQLite + SQLModel, covered by unit tests and mypy; `dev tasks` shows active lease owners |
+| **CLI & Storage** | Stable: Go `devcouncil` host (`mcp`, `integrate`, `skills`, `verify`) plus `dcstore`; `dev map`/`graph`/`ast` exec Rust `devmap` |
 | **Artifact Graph** | Stable: coverage engine and report generation |
 | **Council Debate** | Stable: multi-agent planning, critique, arbitration |
 | **Manual Executor** | Stable: sidecar mode |
@@ -43,7 +43,7 @@ Other coding CLI hooks remain Preview as noted below.
 | **Stop gate & claim checks** | Preview: map completion claims → independent command/filesystem checks; combine with optional active-task verify. See [coding-cli-integration.md](coding-cli-integration.md#stop-gate-assist-vs-block-executionstop_gate). |
 | **Corpus side index** | Preview: `dev corpus build`/`query`/`status`; optional rigor gates `corpus_stale`, `doc_code_ref`, `acceptance_corpus` (soft by default). See [corpus.md](corpus.md). |
 | **PDG / CFG / taint** | Preview: opt-in Python intra-procedural analysis (`dev map --pdg`, `dev map pdg-query` / `explain`). Off by default. See [code-graph.md](code-graph.md). |
-| **Rust map engine (`devmap`)** | In progress, not production: clean-room seven-crate Rust rewrite of `dev map` under [`rust-port/`](../rust-port/). Python remains the live engine. Opt-in only — when a `devmap serve` daemon is reachable, `dev graph`, the MCP `map`/`codeintel` handlers, and the `dead_symbols`/`stale_map`/`wiring` checks route through `devcouncil/devmap_client.py` and fall back to Python otherwise. **Known limits:** 5 of 35 grammars linked (Python, JS, TS/TSX, Rust, Go — others fail explicitly); parity harness still reports diffs; no shadow soak, cutover, deletion, or publication. Ledger: [rust-port/STATUS.md](../rust-port/STATUS.md). |
+| **Rust map engine (`devmap`)** | Stable for map/graph/ast: the live map is the seven-crate workspace under [`rust-port/`](../rust-port/). Python is not the live engine (the product package was deleted in Phase 7). `dev map` / `dev graph` / `dev ast` exec `devmap`. Ledger: [rust-port/STATUS.md](../rust-port/STATUS.md). |
 | **GitHub PR Checks** | Preview: `dev report --github` |
 | **GitHub/GitLab PR Comments** | Preview: `dev report --github-pr-comment`, `dev report --gitlab-pr-comment` |
 | **LSP / AST Indexing** | Preview: `dev lsp inspect`, `dev ast match` |

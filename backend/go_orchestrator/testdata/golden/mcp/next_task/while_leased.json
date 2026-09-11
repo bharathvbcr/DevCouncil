@@ -1,0 +1,16 @@
+{
+  "arguments": {},
+  "capture_mode": "live",
+  "case": "next_task_while_leased",
+  "exit_code": null,
+  "notes": "only TASK-001 exists and is leased \u2014 expect task=null",
+  "payload": {
+    "ok": true,
+    "reason": "No unblocked, unleased task is available.",
+    "task": null
+  },
+  "recorded_at": "<CAPTURE_TIME>",
+  "schema": 1,
+  "surface": "mcp",
+  "tool_or_command": "devcouncil_next_task"
+}

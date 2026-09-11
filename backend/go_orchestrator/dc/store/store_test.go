@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/internal/testsupport"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 // binary returns the real dcstore binary. The tests drive it over a real
@@ -267,7 +267,7 @@ func TestConcurrentStressUnderHighLoad(t *testing.T) {
 // TestAvailableNeverManufacturesTheStoreItChecks.
 //
 // health used to open the path with SQLite's default flags, so a mistyped --db
-// was answered by a database this very call created: ok, schema 1, zero active
+// was answered by a database this very call created: ok, schema 9, zero active
 // leases, from a private file nobody else was using. Two harnesses configured
 // with two spellings of one path therefore shared no exclusion at all while
 // both reported healthy — which is the precise thing Available's contract says
@@ -308,7 +308,7 @@ func TestAvailableNeverManufacturesTheStoreItChecks(t *testing.T) {
 func TestAvailableRequiresTheExclusionIndexAssertion(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "old-store.sh")
-	body := "#!/bin/sh\necho '{\"ok\":true,\"store\":\"dc-store\",\"schema_version\":1,\"active_leases\":0}'\n"
+	body := "#!/bin/sh\necho '{\"ok\":true,\"store\":\"dc-store\",\"schema_version\":9,\"active_leases\":0}'\n"
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}

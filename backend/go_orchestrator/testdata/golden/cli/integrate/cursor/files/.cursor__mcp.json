@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "devcouncil": {
+      "type": "stdio",
+      "command": "/Users/bharath/.local/bin/devcouncil",
+      "args": [
+        "mcp-server"
+      ],
+      "env": {
+        "DEVCOUNCIL_PROJECT_ROOT": "<ROOT>",
+        "PATH": "/Users/bharath/Library/Python/3.14/bin:/Users/bharath/.local/bin:/Users/bharath/.antigravity-ide/antigravity-ide/bin:/Users/bharath/.local/bin:/opt/homebrew/share/android-commandlinetools/platform-tools:/opt/homebrew/share/android-commandlinetools/cmdline-tools/latest/bin:/opt/homebrew/opt/openjdk/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/Library/Apple/usr/bin:/Applications/Cursor.app/Contents/Resources/app/node_modules/@vscode/ripgrep/bin:/Users/bharath/Library/Python/3.14/bin:/Users/bharath/.local/bin:/Users/bharath/.antigravity-ide/antigravity-ide/bin:/opt/homebrew/share/android-commandlinetools/platform-tools:/opt/homebrew/share/android-commandlinetools/cmdline-tools/latest/bin:/Users/bharath/.cargo/bin:/opt/homebrew/opt/openjdk/bin:/Users/bharath/.local/bin:/Users/bharath/.local/bin"
+      }
+    },
+    "devmap": {
+      "type": "stdio",
+      "command": "/Users/bharath/.local/bin/devmap",
+      "args": [
+        "--db",
+        "<ROOT>/.devcouncil/codeintel/devmap.sqlite",
+        "mcp"
+      ]
+    }
+  }
+}

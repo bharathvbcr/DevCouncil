@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/devmap"
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/internal/proc"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 // statusPayload is `dcmap status`.
