@@ -45,7 +45,7 @@ func dispatch(args []string) int {
 	case "ast":
 		return runDevmap(astArgs(args[1:]))
 	case "version", "--version", "-V":
-		fmt.Println("devcouncil 0.1.0-phase7")
+		fmt.Println("devcouncil " + Version)
 		return 0
 	case "help", "-h", "--help":
 		usage()

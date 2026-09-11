@@ -37,7 +37,7 @@ inherits = "release"
 lto = "thin"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["DevCouncil Team"]
 license = "Apache-2.0"

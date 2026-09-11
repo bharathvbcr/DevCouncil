@@ -2098,7 +2098,7 @@ fn probe_devmap_version(path: &Path) -> Option<String> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    // `devmap 0.1.1 (store schema …)` — take the second token.
+    // `devmap 0.2.0 (store schema …)` — take the second token.
     text.split_whitespace().nth(1).map(str::to_string)
 }
 

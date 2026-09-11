@@ -97,11 +97,11 @@ fn k6_default_db_is_the_rust_store_the_python_seam_uses() {
 
 /// K3: `devmap --version` must state the schema version too.
 ///
-/// Every build of this workspace reports `devmap 0.1.0`, so the package version
-/// alone cannot tell a caller whether the binary in hand can open the store in
-/// hand. The schema number is the only part of the identity that answers that,
-/// and reading it otherwise means opening a store — which is exactly what a
-/// caller checking compatibility cannot safely do yet.
+/// Every crate in this workspace reports the same package version, so that
+/// string alone cannot tell a caller whether the binary in hand can open the
+/// store in hand. The schema number is the only part of the identity that
+/// answers that, and reading it otherwise means opening a store — which is
+/// exactly what a caller checking compatibility cannot safely do yet.
 #[test]
 fn k3_version_reports_the_schema_version_alongside_the_package_version() {
     let root = tmp_dir("k3-version");

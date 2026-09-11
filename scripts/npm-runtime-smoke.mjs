@@ -138,7 +138,7 @@ function main() {
         '  : > "$FAKE_ARGV_FILE"',
         '  for a in "$@"; do printf \'%s\\n\' "$a" >> "$FAKE_ARGV_FILE"; done',
         "fi",
-        'if [ "$1" = "version" ] || [ "$1" = "--version" ] || [ "$1" = "-V" ]; then echo \'devcouncil 0.1.0-phase7\'; exit 0; fi',
+        'if [ "$1" = "version" ] || [ "$1" = "--version" ] || [ "$1" = "-V" ]; then echo \'devcouncil 0.2.0\'; exit 0; fi',
         "echo 'devcouncil — DevCouncil host binary (Phase 7)' >&2",
         "exit 0",
         "",
