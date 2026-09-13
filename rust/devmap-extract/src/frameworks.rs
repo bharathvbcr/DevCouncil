@@ -1456,6 +1456,15 @@ def get_user(uid):
             [("ANY".into(), "/users".into(), "UserView".into())],
             "a class-based view is the route's handler, not an empty name"
         );
+        // This assertion is also the composition guard for the two halves of
+        // this pass, and the receiver `bp` is load-bearing rather than
+        // decorative: it needs the widened receiver *and* the `class` prefix
+        // together. Verified by mutation — restoring the old `(app|router|api)`
+        // allow-list while keeping the `class` prefix fails here with `left:
+        // []`, no route at all, and keeping the allow-list wide while dropping
+        // `class` yields `("POST", "/items", "")`. Do not "simplify" the
+        // receiver to `app`; that silently drops the intersection to whichever
+        // half is still present.
         assert_eq!(
             python_routes(
                 "@bp.post(\"/items\")\n@login_required\nclass Create(MethodView):\n    \
