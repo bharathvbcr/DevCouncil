@@ -1,0 +1,1323 @@
+{
+ "benchmark": "devmap cross-repository map performance",
+ "generated_utc": "20260913T195023Z",
+ "binary": {
+  "path": "/Users/bharath/Code/devtools/DevCouncil/rust/target/release/devmap",
+  "version": "devmap 0.2.1 (store schema 20, code graph schema 2, build 9d8e6db8b671)",
+  "sha256": "203c00244fd9712fce534aff3931c4294eefc44cd34a520a237ef903bd25ffc3"
+ },
+ "method": {
+  "repeats": 5,
+  "stages": {
+   "cold": "full index of every discovered file into an empty store",
+   "warm": "incremental build that finds no changed file",
+   "touch": "incremental build after exactly one file's content changes"
+  },
+  "store": "scratch --db outside every corpus; no repository's own .devcouncil/ was read or written",
+  "interleaving": "round-robin across repositories per repeat, so a load excursion is shared rather than charged to one repository",
+  "statistic": "minimum is the headline; median and max recorded beside it",
+  "host": "Apple M5 Pro (Mac17,8), 18 cores, macOS Darwin 27.0.0",
+  "machine_load": "a concurrent cargo test --workspace and Go test run held 1-minute load between 7.5 and 18.1 across the sweep's 60 samples; contended and, at the top of that range, fully subscribed on 18 cores, but not oversubscribed; per-sample load1_at_start is recorded on every row"
+ },
+ "corpus": {
+  "DevCouncil": {
+   "source_worktree": "/Users/bharath/Code/devtools/DevCouncil",
+   "commit": "9d8e6db8b6718aef4c6d1dece3721a9d0b7fe22c",
+   "corpus": "local clone at HEAD, in a disposable scratch directory"
+  },
+  "GitPulse": {
+   "source_worktree": "/Users/bharath/Code/devtools/GitPulse",
+   "commit": "bbafcb892e8a3c77d9fe800acfa42fbf1f516f63",
+   "corpus": "local clone at HEAD, in a disposable scratch directory"
+  },
+  "DevPrism": {
+   "source_worktree": "/Users/bharath/Code/devtools/DevPrism",
+   "commit": "feaef2ffd27fe6d77f897ebc9ba6f0db0b5dd458",
+   "corpus": "local clone at HEAD, in a disposable scratch directory"
+  },
+  "scholarlm": {
+   "source_worktree": "/Users/bharath/Code/scholarlm",
+   "commit": "7bb95186c5d44b431cd907bf2fc65e2d97c455aa",
+   "corpus": "local clone at HEAD, in a disposable scratch directory"
+  }
+ },
+ "excluded": {
+  "DevType": "/Users/bharath/Code/devtools/DevType holds only an empty .devcouncil/ directory: no source files and no git repository, so there is nothing to index"
+ },
+ "summary": {
+  "DevCouncil": {
+   "cold": {
+    "n": 5,
+    "min": 2.038088124987553,
+    "median": 2.0837539579952136,
+    "max": 2.7063783750054426,
+    "load1_min": 7.53076171875,
+    "load1_median": 8.73388671875,
+    "peak_rss_max_bytes": 693075968
+   },
+   "warm": {
+    "n": 5,
+    "min": 0.09163399999670219,
+    "median": 0.09400491700216662,
+    "max": 0.21640020800987259,
+    "load1_min": 8.73388671875,
+    "load1_median": 10.37060546875,
+    "peak_rss_max_bytes": 55279616
+   },
+   "touch": {
+    "n": 5,
+    "min": 0.782605667001917,
+    "median": 0.8104285000008531,
+    "max": 0.9865460000000894,
+    "load1_min": 8.73388671875,
+    "load1_median": 10.37060546875,
+    "peak_rss_max_bytes": 540114944
+   },
+   "graph": {
+    "files_indexed": 1077,
+    "symbols": 11375,
+    "edges": 37055,
+    "store_bytes": 169066496
+   }
+  },
+  "DevPrism": {
+   "cold": {
+    "n": 5,
+    "min": 0.796232125008828,
+    "median": 0.8073187080008211,
+    "max": 1.2969317079987377,
+    "load1_min": 8.3544921875,
+    "load1_median": 10.37060546875,
+    "peak_rss_max_bytes": 431210496
+   },
+   "warm": {
+    "n": 5,
+    "min": 0.039221583007019944,
+    "median": 0.04680495901266113,
+    "max": 0.05458816701138858,
+    "load1_min": 8.3544921875,
+    "load1_median": 10.37060546875,
+    "peak_rss_max_bytes": 33849344
+   },
+   "touch": {
+    "n": 5,
+    "min": 0.3617190410004696,
+    "median": 0.3685080840077717,
+    "max": 0.3886387500097044,
+    "load1_min": 8.3544921875,
+    "load1_median": 10.37060546875,
+    "peak_rss_max_bytes": 311033856
+   },
+   "graph": {
+    "files_indexed": 595,
+    "symbols": 6290,
+    "edges": 18534,
+    "store_bytes": 90357760
+   }
+  },
+  "GitPulse": {
+   "cold": {
+    "n": 5,
+    "min": 3.05996333299845,
+    "median": 3.567120374995284,
+    "max": 7.261216458995477,
+    "load1_min": 8.3544921875,
+    "load1_median": 10.37060546875,
+    "peak_rss_max_bytes": 1130774528
+   },
+   "warm": {
+    "n": 5,
+    "min": 0.099489457992604,
+    "median": 0.10227104199293535,
+    "max": 0.2858057919947896,
+    "load1_min": 8.3544921875,
+    "load1_median": 14.5185546875,
+    "peak_rss_max_bytes": 81215488
+   },
+   "touch": {
+    "n": 5,
+    "min": 1.3838584999903105,
+    "median": 1.4467545000079554,
+    "max": 3.133496499998728,
+    "load1_min": 8.3544921875,
+    "load1_median": 14.5185546875,
+    "peak_rss_max_bytes": 970260480
+   },
+   "graph": {
+    "files_indexed": 1992,
+    "symbols": 27834,
+    "edges": 91006,
+    "store_bytes": 339935232
+   }
+  },
+  "scholarlm": {
+   "cold": {
+    "n": 5,
+    "min": 5.626422082990757,
+    "median": 5.913246166004683,
+    "max": 7.665876541999751,
+    "load1_min": 7.92529296875,
+    "load1_median": 14.5185546875,
+    "peak_rss_max_bytes": 1755414528
+   },
+   "warm": {
+    "n": 5,
+    "min": 0.13183450000360608,
+    "median": 0.14184266699885484,
+    "max": 0.14945058300509118,
+    "load1_min": 7.53076171875,
+    "load1_median": 13.8359375,
+    "peak_rss_max_bytes": 143540224
+   },
+   "touch": {
+    "n": 5,
+    "min": 3.1107844579964876,
+    "median": 3.160980542001198,
+    "max": 3.368596208994859,
+    "load1_min": 7.53076171875,
+    "load1_median": 13.8359375,
+    "peak_rss_max_bytes": 1534230528
+   },
+   "graph": {
+    "files_indexed": 4324,
+    "symbols": 41900,
+    "edges": 145699,
+    "store_bytes": 567083008
+   }
+  }
+ },
+ "phase_breakdown": {
+  "repo": "scholarlm",
+  "rounds": 3,
+  "edit_target": "scholarlm/backend/go_orchestrator/internal/wisdev/temporal_activities.go",
+  "note": "minimum per phase across rounds; 'touch' is the one-file-changed build",
+  "phases": [
+   {
+    "phase": "scanning and extracting",
+    "top_level": true,
+    "cold_seconds": 2.2199565,
+    "touch_seconds": 1.589264833
+   },
+   {
+    "phase": "writer:wait",
+    "top_level": false,
+    "cold_seconds": 0.00025275,
+    "touch_seconds": 0.000333792
+   },
+   {
+    "phase": "store:open",
+    "top_level": false,
+    "cold_seconds": 0.002415333,
+    "touch_seconds": 0.001024917
+   },
+   {
+    "phase": "pending:reconcile",
+    "top_level": false,
+    "cold_seconds": 5.3209e-05,
+    "touch_seconds": 0.007073458
+   },
+   {
+    "phase": "scan:read",
+    "top_level": false,
+    "cold_seconds": 0.068226333,
+    "touch_seconds": 0.095910083
+   },
+   {
+    "phase": "scan:previous_hashes",
+    "top_level": false,
+    "cold_seconds": 7.0208e-05,
+    "touch_seconds": 0.001470167
+   },
+   {
+    "phase": "extract:files",
+    "top_level": false,
+    "cold_seconds": 1.032199584,
+    "touch_seconds": 0.370362334
+   },
+   {
+    "phase": "affected:closure",
+    "top_level": false,
+    "cold_seconds": 4.9042e-05,
+    "touch_seconds": 0.017510041
+   },
+   {
+    "phase": "discovering Go modules",
+    "top_level": false,
+    "cold_seconds": 0.035180917,
+    "touch_seconds": 0.034859458
+   },
+   {
+    "phase": "resolver:index",
+    "top_level": false,
+    "cold_seconds": 1.074483292,
+    "touch_seconds": 1.040985334
+   },
+   {
+    "phase": "resolving (whole tree)",
+    "top_level": true,
+    "cold_seconds": 0.481762791,
+    "touch_seconds": 0.454520292
+   },
+   {
+    "phase": "analyzing edges (whole tree)",
+    "top_level": true,
+    "cold_seconds": 0.260494875,
+    "touch_seconds": 0.260448125
+   },
+   {
+    "phase": "persisting",
+    "top_level": true,
+    "cold_seconds": 2.442867,
+    "touch_seconds": 0.698728375
+   },
+   {
+    "phase": "persist:write",
+    "top_level": false,
+    "cold_seconds": 2.433847416,
+    "touch_seconds": 0.694750125
+   },
+   {
+    "phase": "persist:prune_generations",
+    "top_level": false,
+    "cold_seconds": 5.3334e-05,
+    "touch_seconds": 3.8166e-05
+   },
+   {
+    "phase": "persist:prune_extractions",
+    "top_level": false,
+    "cold_seconds": 5.3333e-05,
+    "touch_seconds": 5.3375e-05
+   },
+   {
+    "phase": "persist:vacuum",
+    "top_level": false,
+    "cold_seconds": 0.005411875,
+    "touch_seconds": 0.00038925
+   }
+  ],
+  "cold_total_seconds": 5.405081166,
+  "touch_total_seconds": 3.002961625
+ },
+ "samples": [
+  {
+   "repo": "DevCouncil",
+   "stage": "cold",
+   "repeat": 0,
+   "wall_seconds": 2.0837539579952136,
+   "load1_at_start": 8.43896484375,
+   "peak_rss_bytes": 680001536,
+   "files_indexed": 1077,
+   "symbols": 11375,
+   "edges": 37055,
+   "delta": {
+    "added": 1077,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "warm",
+   "repeat": 0,
+   "wall_seconds": 0.09400491700216662,
+   "load1_at_start": 9.76513671875,
+   "peak_rss_bytes": 55197696,
+   "files_indexed": 1077,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 1077
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "touch",
+   "repeat": 0,
+   "wall_seconds": 0.782605667001917,
+   "load1_at_start": 9.76513671875,
+   "peak_rss_bytes": 538492928,
+   "files_indexed": 1077,
+   "symbols": 11375,
+   "edges": 37055,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 1076
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "cold",
+   "repeat": 0,
+   "wall_seconds": 0.796232125008828,
+   "load1_at_start": 9.76513671875,
+   "peak_rss_bytes": 418414592,
+   "files_indexed": 595,
+   "symbols": 6290,
+   "edges": 18534,
+   "delta": {
+    "added": 595,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "warm",
+   "repeat": 0,
+   "wall_seconds": 0.039221583007019944,
+   "load1_at_start": 9.76513671875,
+   "peak_rss_bytes": 33849344,
+   "files_indexed": 595,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 595
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "touch",
+   "repeat": 0,
+   "wall_seconds": 0.3886387500097044,
+   "load1_at_start": 9.76513671875,
+   "peak_rss_bytes": 309641216,
+   "files_indexed": 595,
+   "symbols": 6290,
+   "edges": 18534,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 594
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "cold",
+   "repeat": 0,
+   "wall_seconds": 4.387973833989236,
+   "load1_at_start": 9.76513671875,
+   "peak_rss_bytes": 1111031808,
+   "files_indexed": 1992,
+   "symbols": 27834,
+   "edges": 91006,
+   "delta": {
+    "added": 1992,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "warm",
+   "repeat": 0,
+   "wall_seconds": 0.10227104199293535,
+   "load1_at_start": 9.78369140625,
+   "peak_rss_bytes": 81084416,
+   "files_indexed": 1992,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 1992
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "touch",
+   "repeat": 0,
+   "wall_seconds": 1.4318175410007825,
+   "load1_at_start": 9.78369140625,
+   "peak_rss_bytes": 969228288,
+   "files_indexed": 1992,
+   "symbols": 27834,
+   "edges": 91006,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 1991
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "cold",
+   "repeat": 0,
+   "wall_seconds": 5.626422082990757,
+   "load1_at_start": 9.78369140625,
+   "peak_rss_bytes": 1666957312,
+   "files_indexed": 4324,
+   "symbols": 41900,
+   "edges": 145699,
+   "delta": {
+    "added": 4324,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "warm",
+   "repeat": 0,
+   "wall_seconds": 0.14184266699885484,
+   "load1_at_start": 9.3203125,
+   "peak_rss_bytes": 143130624,
+   "files_indexed": 4324,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 4324
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "touch",
+   "repeat": 0,
+   "wall_seconds": 3.1562408750032773,
+   "load1_at_start": 9.3203125,
+   "peak_rss_bytes": 1534230528,
+   "files_indexed": 4324,
+   "symbols": 41900,
+   "edges": 145699,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 4323
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "cold",
+   "repeat": 1,
+   "wall_seconds": 2.038088124987553,
+   "load1_at_start": 8.73388671875,
+   "peak_rss_bytes": 690733056,
+   "files_indexed": 1077,
+   "symbols": 11375,
+   "edges": 37055,
+   "delta": {
+    "added": 1077,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "warm",
+   "repeat": 1,
+   "wall_seconds": 0.09163399999670219,
+   "load1_at_start": 8.73388671875,
+   "peak_rss_bytes": 54935552,
+   "files_indexed": 1077,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 1077
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "touch",
+   "repeat": 1,
+   "wall_seconds": 0.7957725000014761,
+   "load1_at_start": 8.73388671875,
+   "peak_rss_bytes": 540000256,
+   "files_indexed": 1077,
+   "symbols": 11375,
+   "edges": 37055,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 1076
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "cold",
+   "repeat": 1,
+   "wall_seconds": 0.8073187080008211,
+   "load1_at_start": 8.3544921875,
+   "peak_rss_bytes": 417005568,
+   "files_indexed": 595,
+   "symbols": 6290,
+   "edges": 18534,
+   "delta": {
+    "added": 595,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "warm",
+   "repeat": 1,
+   "wall_seconds": 0.04680495901266113,
+   "load1_at_start": 8.3544921875,
+   "peak_rss_bytes": 33472512,
+   "files_indexed": 595,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 595
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "touch",
+   "repeat": 1,
+   "wall_seconds": 0.3626489589951234,
+   "load1_at_start": 8.3544921875,
+   "peak_rss_bytes": 309346304,
+   "files_indexed": 595,
+   "symbols": 6290,
+   "edges": 18534,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 594
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "cold",
+   "repeat": 1,
+   "wall_seconds": 3.05996333299845,
+   "load1_at_start": 8.3544921875,
+   "peak_rss_bytes": 1128415232,
+   "files_indexed": 1992,
+   "symbols": 27834,
+   "edges": 91006,
+   "delta": {
+    "added": 1992,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "warm",
+   "repeat": 1,
+   "wall_seconds": 0.099489457992604,
+   "load1_at_start": 8.3544921875,
+   "peak_rss_bytes": 81199104,
+   "files_indexed": 1992,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 1992
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "touch",
+   "repeat": 1,
+   "wall_seconds": 1.3838584999903105,
+   "load1_at_start": 8.3544921875,
+   "peak_rss_bytes": 961429504,
+   "files_indexed": 1992,
+   "symbols": 27834,
+   "edges": 91006,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 1991
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "cold",
+   "repeat": 1,
+   "wall_seconds": 5.75096950000443,
+   "load1_at_start": 7.92529296875,
+   "peak_rss_bytes": 1687339008,
+   "files_indexed": 4324,
+   "symbols": 41900,
+   "edges": 145699,
+   "delta": {
+    "added": 4324,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "warm",
+   "repeat": 1,
+   "wall_seconds": 0.1419522079959279,
+   "load1_at_start": 7.53076171875,
+   "peak_rss_bytes": 143212544,
+   "files_indexed": 4324,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 4324
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "touch",
+   "repeat": 1,
+   "wall_seconds": 3.160980542001198,
+   "load1_at_start": 7.53076171875,
+   "peak_rss_bytes": 1524039680,
+   "files_indexed": 4324,
+   "symbols": 41900,
+   "edges": 145699,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 4323
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "cold",
+   "repeat": 2,
+   "wall_seconds": 2.374304832992493,
+   "load1_at_start": 7.53076171875,
+   "peak_rss_bytes": 677298176,
+   "files_indexed": 1077,
+   "symbols": 11375,
+   "edges": 37055,
+   "delta": {
+    "added": 1077,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "warm",
+   "repeat": 2,
+   "wall_seconds": 0.21640020800987259,
+   "load1_at_start": 10.37060546875,
+   "peak_rss_bytes": 55279616,
+   "files_indexed": 1077,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 1077
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "touch",
+   "repeat": 2,
+   "wall_seconds": 0.9865460000000894,
+   "load1_at_start": 10.37060546875,
+   "peak_rss_bytes": 537264128,
+   "files_indexed": 1077,
+   "symbols": 11375,
+   "edges": 37055,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 1076
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "cold",
+   "repeat": 2,
+   "wall_seconds": 0.925068625001586,
+   "load1_at_start": 10.37060546875,
+   "peak_rss_bytes": 431210496,
+   "files_indexed": 595,
+   "symbols": 6290,
+   "edges": 18534,
+   "delta": {
+    "added": 595,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "warm",
+   "repeat": 2,
+   "wall_seconds": 0.050956582999788225,
+   "load1_at_start": 10.37060546875,
+   "peak_rss_bytes": 33783808,
+   "files_indexed": 595,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 595
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "touch",
+   "repeat": 2,
+   "wall_seconds": 0.3685080840077717,
+   "load1_at_start": 10.37060546875,
+   "peak_rss_bytes": 311033856,
+   "files_indexed": 595,
+   "symbols": 6290,
+   "edges": 18534,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 594
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "cold",
+   "repeat": 2,
+   "wall_seconds": 7.261216458995477,
+   "load1_at_start": 10.37060546875,
+   "peak_rss_bytes": 1125367808,
+   "files_indexed": 1992,
+   "symbols": 27834,
+   "edges": 91006,
+   "delta": {
+    "added": 1992,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "warm",
+   "repeat": 2,
+   "wall_seconds": 0.2858057919947896,
+   "load1_at_start": 18.083984375,
+   "peak_rss_bytes": 81035264,
+   "files_indexed": 1992,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 1992
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "touch",
+   "repeat": 2,
+   "wall_seconds": 3.133496499998728,
+   "load1_at_start": 18.083984375,
+   "peak_rss_bytes": 964100096,
+   "files_indexed": 1992,
+   "symbols": 27834,
+   "edges": 91006,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 1991
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "cold",
+   "repeat": 2,
+   "wall_seconds": 7.612831292004557,
+   "load1_at_start": 17.7568359375,
+   "peak_rss_bytes": 1755414528,
+   "files_indexed": 4324,
+   "symbols": 41900,
+   "edges": 145699,
+   "delta": {
+    "added": 4324,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "warm",
+   "repeat": 2,
+   "wall_seconds": 0.14064524999412242,
+   "load1_at_start": 16.81494140625,
+   "peak_rss_bytes": 143540224,
+   "files_indexed": 4324,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 4324
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "touch",
+   "repeat": 2,
+   "wall_seconds": 3.368596208994859,
+   "load1_at_start": 16.81494140625,
+   "peak_rss_bytes": 1526136832,
+   "files_indexed": 4324,
+   "symbols": 41900,
+   "edges": 145699,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 4323
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "cold",
+   "repeat": 3,
+   "wall_seconds": 2.053723541990621,
+   "load1_at_start": 18.03076171875,
+   "peak_rss_bytes": 693075968,
+   "files_indexed": 1077,
+   "symbols": 11375,
+   "edges": 37055,
+   "delta": {
+    "added": 1077,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "warm",
+   "repeat": 3,
+   "wall_seconds": 0.09183987499272916,
+   "load1_at_start": 18.03076171875,
+   "peak_rss_bytes": 55246848,
+   "files_indexed": 1077,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 1077
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "touch",
+   "repeat": 3,
+   "wall_seconds": 0.8174482499889564,
+   "load1_at_start": 18.03076171875,
+   "peak_rss_bytes": 540114944,
+   "files_indexed": 1077,
+   "symbols": 11375,
+   "edges": 37055,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 1076
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "cold",
+   "repeat": 3,
+   "wall_seconds": 0.8027077500009909,
+   "load1_at_start": 18.03076171875,
+   "peak_rss_bytes": 417988608,
+   "files_indexed": 595,
+   "symbols": 6290,
+   "edges": 18534,
+   "delta": {
+    "added": 595,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "warm",
+   "repeat": 3,
+   "wall_seconds": 0.043158291999134235,
+   "load1_at_start": 16.82666015625,
+   "peak_rss_bytes": 33701888,
+   "files_indexed": 595,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 595
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "touch",
+   "repeat": 3,
+   "wall_seconds": 0.3617190410004696,
+   "load1_at_start": 16.82666015625,
+   "peak_rss_bytes": 309919744,
+   "files_indexed": 595,
+   "symbols": 6290,
+   "edges": 18534,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 594
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "cold",
+   "repeat": 3,
+   "wall_seconds": 3.567120374995284,
+   "load1_at_start": 16.82666015625,
+   "peak_rss_bytes": 1078919168,
+   "files_indexed": 1992,
+   "symbols": 27834,
+   "edges": 91006,
+   "delta": {
+    "added": 1992,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "warm",
+   "repeat": 3,
+   "wall_seconds": 0.1193080840021139,
+   "load1_at_start": 16.82666015625,
+   "peak_rss_bytes": 81215488,
+   "files_indexed": 1992,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 1992
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "touch",
+   "repeat": 3,
+   "wall_seconds": 1.5250966669991612,
+   "load1_at_start": 16.82666015625,
+   "peak_rss_bytes": 970260480,
+   "files_indexed": 1992,
+   "symbols": 27834,
+   "edges": 91006,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 1991
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "cold",
+   "repeat": 3,
+   "wall_seconds": 7.665876541999751,
+   "load1_at_start": 17.32080078125,
+   "peak_rss_bytes": 1743437824,
+   "files_indexed": 4324,
+   "symbols": 41900,
+   "edges": 145699,
+   "delta": {
+    "added": 4324,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "warm",
+   "repeat": 3,
+   "wall_seconds": 0.13183450000360608,
+   "load1_at_start": 17.615234375,
+   "peak_rss_bytes": 143409152,
+   "files_indexed": 4324,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 4324
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "touch",
+   "repeat": 3,
+   "wall_seconds": 3.1107844579964876,
+   "load1_at_start": 17.615234375,
+   "peak_rss_bytes": 1524809728,
+   "files_indexed": 4324,
+   "symbols": 41900,
+   "edges": 145699,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 4323
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "cold",
+   "repeat": 4,
+   "wall_seconds": 2.7063783750054426,
+   "load1_at_start": 16.52490234375,
+   "peak_rss_bytes": 683081728,
+   "files_indexed": 1077,
+   "symbols": 11375,
+   "edges": 37055,
+   "delta": {
+    "added": 1077,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "warm",
+   "repeat": 4,
+   "wall_seconds": 0.10286966600688174,
+   "load1_at_start": 16.52490234375,
+   "peak_rss_bytes": 55066624,
+   "files_indexed": 1077,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 1077
+   }
+  },
+  {
+   "repo": "DevCouncil",
+   "stage": "touch",
+   "repeat": 4,
+   "wall_seconds": 0.8104285000008531,
+   "load1_at_start": 16.52490234375,
+   "peak_rss_bytes": 537591808,
+   "files_indexed": 1077,
+   "symbols": 11375,
+   "edges": 37055,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 1076
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "cold",
+   "repeat": 4,
+   "wall_seconds": 1.2969317079987377,
+   "load1_at_start": 15.521484375,
+   "peak_rss_bytes": 416677888,
+   "files_indexed": 595,
+   "symbols": 6290,
+   "edges": 18534,
+   "delta": {
+    "added": 595,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "warm",
+   "repeat": 4,
+   "wall_seconds": 0.05458816701138858,
+   "load1_at_start": 15.521484375,
+   "peak_rss_bytes": 33669120,
+   "files_indexed": 595,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 595
+   }
+  },
+  {
+   "repo": "DevPrism",
+   "stage": "touch",
+   "repeat": 4,
+   "wall_seconds": 0.3795952080108691,
+   "load1_at_start": 15.521484375,
+   "peak_rss_bytes": 309559296,
+   "files_indexed": 595,
+   "symbols": 6290,
+   "edges": 18534,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 594
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "cold",
+   "repeat": 4,
+   "wall_seconds": 3.1259379999974044,
+   "load1_at_start": 15.521484375,
+   "peak_rss_bytes": 1130774528,
+   "files_indexed": 1992,
+   "symbols": 27834,
+   "edges": 91006,
+   "delta": {
+    "added": 1992,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "warm",
+   "repeat": 4,
+   "wall_seconds": 0.10012437499244697,
+   "load1_at_start": 14.5185546875,
+   "peak_rss_bytes": 80953344,
+   "files_indexed": 1992,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 1992
+   }
+  },
+  {
+   "repo": "GitPulse",
+   "stage": "touch",
+   "repeat": 4,
+   "wall_seconds": 1.4467545000079554,
+   "load1_at_start": 14.5185546875,
+   "peak_rss_bytes": 968359936,
+   "files_indexed": 1992,
+   "symbols": 27834,
+   "edges": 91006,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 1991
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "cold",
+   "repeat": 4,
+   "wall_seconds": 5.913246166004683,
+   "load1_at_start": 14.5185546875,
+   "peak_rss_bytes": 1683734528,
+   "files_indexed": 4324,
+   "symbols": 41900,
+   "edges": 145699,
+   "delta": {
+    "added": 4324,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 0
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "warm",
+   "repeat": 4,
+   "wall_seconds": 0.14945058300509118,
+   "load1_at_start": 13.8359375,
+   "peak_rss_bytes": 143441920,
+   "files_indexed": 4324,
+   "symbols": null,
+   "edges": null,
+   "delta": {
+    "added": 0,
+    "changed": 0,
+    "removed": 0,
+    "unchanged": 4324
+   }
+  },
+  {
+   "repo": "scholarlm",
+   "stage": "touch",
+   "repeat": 4,
+   "wall_seconds": 3.195023417007178,
+   "load1_at_start": 13.8359375,
+   "peak_rss_bytes": 1523793920,
+   "files_indexed": 4324,
+   "symbols": 41900,
+   "edges": 145699,
+   "delta": {
+    "added": 0,
+    "changed": 1,
+    "removed": 0,
+    "unchanged": 4323
+   }
+  }
+ ]
+}
