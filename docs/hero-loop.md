@@ -109,8 +109,9 @@ discipline):
 **There is no way to opt into blocking today.** The `verification.diff_coverage.enforce`,
 `min_ratio`, and `verification.rigor.enforce_coverage_on_hard` keys that earlier revisions
 of this page described belonged to the retired Python verifier. No component in this tree
-reads them: `dcverify` implements the gates but takes no enforcement setting, and this
-host does not spawn `dcverify` at all (TASK-P7-1). Setting them in
+reads them: since TASK-P7-1 `verify.Run()` does spawn `dcverify`, but `dcverify` takes no
+enforcement setting and the host raises the coverage gap (`diff_not_exercised`) as
+non-blocking unconditionally — see `Blocking: false` in `verify/rigor.go`. Setting them in
 `.devcouncil/config.yaml` is inert — the file still accepts them, because `verification.*`
 is DevCouncil core config shared with Manvi, but nothing here acts on them.
 
@@ -119,8 +120,10 @@ declared and read by nothing, and have been **removed** from the catalogue rathe
 to imply a switch existed. `manvi flags` no longer lists them, and a config file or
 `MANVI_*` variable that still sets them is refused by name.
 
-Promoting an unexercised diff to a blocking gap is **[TASK-P7-1](TODO.md)**: it needs the
-`dcverify` wiring first, because there is no coverage gap in this host to promote.
+Promoting an unexercised diff to a blocking gap is still unbuilt, but it is no longer
+waiting on the wiring: since TASK-P7-1 there *is* a gap to promote. What is missing is a
+setting to promote it by, and the two deleted flags were not one — they were read by
+nothing.
 
 It currently measures **Python** (via the target repo's `coverage.py`), including inline
 `python -c "..."` acceptance checks. It assumes tests run against the **source tree**
@@ -176,10 +179,12 @@ verification:
 > **Not read in this tree.** The block above is the retired Python verifier's settings
 > surface, kept here because `.devcouncil/config.yaml` is shared with Manvi. Nothing in
 > this repository consults these keys — the gates they configure live in `dcverify`, which
-> this host does not spawn (TASK-P7-1), and `dcverify` itself takes no enforcement setting.
-> `enabled` and `enforce_coverage_on_hard` in particular promise nothing here. The rest of
-> this section describes the rigor layer's intended behaviour, not what `verify.Run()` does
-> today; see [TODO.md](TODO.md) TASK-P7-1.
+> this host spawns since TASK-P7-1, but `dcverify` takes no enforcement setting and the host
+> maps its findings to fixed severities. `enabled` and `enforce_coverage_on_hard` in
+> particular promise nothing here: task difficulty is never sent to `dcverify` (the request
+> carries the diff, the planned paths and an optional coverage profile), so it cannot change
+> what blocks. The rest of this section describes the rigor layer's intended behaviour, not
+> what `verify.Run()` does today.
 
 Repair runs carry a **correction manifest** with prior diff, failing output, attempt
 history, stub findings, and non-negotiable **repair rules** (never weaken tests, never
@@ -258,4 +263,4 @@ devcouncil verify TASK-001 --json
 devcouncil verify TASK-001 --sandbox local
 ```
 
-`devcouncil verify` runs Go `verify.Run()` (planned-file / orphan / expected tests) and prints the verdict along with typed `next_actions`. It does not spawn `dcverify`. Stub / secret / coverage rigor is in that binary; Manvi calls it. See [TODO.md](TODO.md) TASK-P7-1.
+`devcouncil verify` runs Go `verify.Run()` (planned-file / orphan / expected tests) and prints the verdict along with typed `next_actions`. It also spawns `dcverify` for the stub and secret gates; add `--coverage PATH` to include diff↔coverage. When `dcverify` is not installed, `rigor_applied` is empty and `rigor_skipped_reason` names what is missing — never a silent pass.

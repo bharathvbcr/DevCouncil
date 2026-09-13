@@ -735,14 +735,17 @@ var retirements = []Retirement{
 		Why: "there is one engine — the devmap Rust binary; which path executed is already reported on each navigation answer",
 	},
 	// The two verification switches. Both named a gate that runs in another
-	// process, and this host never asked that process anything.
+	// process, and neither was ever read to decide anything.
 	//
-	// Stub, effort and diff↔coverage rigor live in the dcverify binary, which
-	// Manvi's runRigor execs. Go verify.Run() does not spawn it (TASK-P7-1):
-	// it sets RigorApplied to the empty slice and records "coverage profile
-	// not supplied" on every run. So verify.rigor.enabled defaulted to true
-	// and enabled nothing, and verify.diff_coverage.enforce offered to promote
-	// a gap that is never produced here.
+	// Stub, effort and diff↔coverage rigor live in the dcverify binary. When
+	// these two were retired, Go verify.Run() did not spawn it at all
+	// (TASK-P7-1): it set RigorApplied to the empty slice and recorded
+	// "coverage profile not supplied" on every run. TASK-P7-1 has since landed
+	// and verify.Run() does spawn dcverify — which changes nothing for these
+	// keys, and is the point. The gates are reached by finding the binary, and
+	// what blocks is fixed in verify/rigor.go; no code path consults either
+	// key, so restoring them would re-advertise a switch that still switches
+	// nothing.
 	//
 	// That is worse than a switch with no effect. These two were documented to
 	// teams as the way to opt into blocking, so setting enforce: true bought a
@@ -759,11 +762,11 @@ var retirements = []Retirement{
 	// never aliased. Retiring them would refuse the real shared file.
 	{
 		Key: "verify.diff_coverage.enforce",
-		Why: "it was never read; the diff↔coverage gate runs in dcverify, which Manvi's runRigor execs and this host does not (TASK-P7-1)",
+		Why: "it was never read; the diff↔coverage gate runs in dcverify, and the gap it produces is non-blocking by construction in verify/rigor.go — no code path consults this key to decide otherwise",
 	},
 	{
 		Key: "verify.rigor.enabled",
-		Why: "it was never read; stub and effort detection run in dcverify, which Manvi's runRigor execs and this host does not (TASK-P7-1)",
+		Why: "it was never read; stub and effort detection run in dcverify, which verify.Run spawns whenever the binary is present — reaching those gates never depended on this key",
 	},
 }
 

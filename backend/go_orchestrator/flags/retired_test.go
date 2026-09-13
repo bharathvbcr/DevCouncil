@@ -78,10 +78,16 @@ func TestARetiredKeyInTheConfigFileSaysItWasRemoved(t *testing.T) {
 
 // The two verification switches were declared, described as promoting a gap to
 // blocking and as enabling stub/effort detection, and read by nothing: the
-// gates they name live in dcverify, which Manvi's runRigor execs and this
-// host does not (TASK-P7-1). A team that set `enforce: true` got no change in
-// behaviour, which is the worst of the three possible outcomes — a check that
-// could not run reported the same clean result as one that ran and passed.
+// gates they name live in dcverify, and nothing consults either key to decide
+// whether they run or what they block. A team that set `enforce: true` got no
+// change in behaviour, which is the worst of the three possible outcomes — a
+// check that could not run reported the same clean result as one that ran and
+// passed.
+//
+// This held when verify.Run() spawned no verifier at all, and it still holds
+// now that TASK-P7-1 has it spawn dcverify: the gates are reached by finding
+// the binary, and what blocks is fixed in verify/rigor.go. That the wiring
+// landed without either key coming back is the evidence they were dead.
 func TestTheVerificationSwitchesAreGone(t *testing.T) {
 	reg := New()
 	if err := DefineHarnessFlags(reg); err != nil {
@@ -93,7 +99,8 @@ func TestTheVerificationSwitchesAreGone(t *testing.T) {
 	} {
 		if _, ok := reg.Def(key); ok {
 			t.Errorf("%s is still defined, and nothing in this host reads it: "+
-				"the gate it names runs in dcverify, which Manvi's runRigor execs and verify.Run does not", key)
+				"the gate it names runs in dcverify, which verify.Run reaches by finding the binary, "+
+				"not by consulting this key", key)
 		}
 	}
 }

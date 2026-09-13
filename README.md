@@ -194,7 +194,7 @@ Stub detection, secret scanning, and coverage intersection live in the **`dcveri
 
 DevCouncil provides two complementary Model Context Protocol (MCP) servers:
 
-- **Host MCP Server (`devcouncil mcp`)**: Eight tools — checkout / renew / release / next_task / get_diff / verify_task / get_gaps / policy_check_write. `verify_task` runs Go `verify.Run()` and does not spawn `dcverify`.
+- **Host MCP Server (`devcouncil mcp`)**: Eight tools — checkout / renew / release / next_task / get_diff / verify_task / get_gaps / policy_check_write. `verify_task` runs Go `verify.Run()`, which spawns `dcverify` for the stub and secret gates; diff↔coverage needs a profile this tool has no field for, so use `devcouncil verify --coverage PATH`.
 - **DevMap MCP Server (`devmap mcp`)**: Eleven query tools (status, search, dependencies, impact, trace, neighbors, dead_symbols, clones, preview, explore, affected_tests). Always pass `repo_path`.
 
 ---
