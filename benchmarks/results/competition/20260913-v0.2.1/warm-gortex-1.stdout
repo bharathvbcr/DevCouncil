@@ -1,0 +1,16 @@
+{
+  "duration_ms": 608,
+  "edge_count": 243168,
+  "file_count": 1134,
+  "full_retrack": false,
+  "node_count": 34512,
+  "result": {
+    "derived_invalidation": {},
+    "duration_ms": 608,
+    "edge_count": 243168,
+    "file_count": 1134,
+    "node_count": 34512
+  },
+  "scope": "repository",
+  "stale_file_count": 0
+}

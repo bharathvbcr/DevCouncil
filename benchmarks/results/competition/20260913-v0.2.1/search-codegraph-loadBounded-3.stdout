@@ -1,0 +1,26 @@
+[
+  {
+    "node": {
+      "id": "function:b7bd1556dc158eebe0a7b3db13c6e108",
+      "kind": "function",
+      "name": "loadBounded",
+      "qualifiedName": "loadBounded",
+      "filePath": "backend/go_orchestrator/repomap/repomap.go",
+      "language": "go",
+      "startLine": 331,
+      "endLine": 357,
+      "startColumn": 0,
+      "endColumn": 1,
+      "docstring": "loadBounded is Load with the bound as an argument, so a test can drive the\nrefusal without producing a quarter of a gigabyte to reach it.",
+      "signature": "(graphPath string, max int64) (*Map, error)",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false,
+      "isAbstract": false,
+      "returnType": "Map",
+      "updatedAt": 1789263024316
+    },
+    "score": 108.97621740671364
+  }
+]

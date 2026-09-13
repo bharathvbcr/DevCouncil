@@ -1,0 +1,16 @@
+{
+  "status": "found",
+  "symbol": {
+    "uid": "Function:benchmarks/tasks.py:devmap_competition_revision_3",
+    "name": "devmap_competition_revision_3",
+    "kind": "Function",
+    "filePath": "benchmarks/tasks.py",
+    "startLine": 265,
+    "endLine": 266,
+    "content": " def devmap_competition_revision_3():     return 3 "
+  },
+  "epistemic": "exact",
+  "incoming": {},
+  "outgoing": {},
+  "processes": []
+}

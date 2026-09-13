@@ -1,0 +1,32 @@
+[
+  {
+    "repo": "zzet/gortex",
+    "version": "v0.64.3",
+    "name": "gortex_darwin_arm64.tar.gz",
+    "url": "https://github.com/zzet/gortex/releases/download/v0.64.3/gortex_darwin_arm64.tar.gz",
+    "sha256": "7a0b418aba3f33336953ac428a348a7c3b92dd4ab9f9d36f56515eb47923fe58",
+    "bytes": 50919858,
+    "executable": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/tools/gortex/gortex",
+    "binary_sha256": "62813625fa4d121322cab6f1bced00397713a59688af0297882812da2ab912bf"
+  },
+  {
+    "repo": "DeusData/codebase-memory-mcp",
+    "version": "v0.10.8",
+    "name": "codebase-memory-mcp-darwin-arm64.tar.gz",
+    "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.10.8/codebase-memory-mcp-darwin-arm64.tar.gz",
+    "sha256": "9bd840dfb3ec7eaef4f310382057adaa5b0e904df883104d03ffcf39836afd07",
+    "bytes": 40416962,
+    "executable": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/tools/codebase-memory-mcp/codebase-memory-mcp",
+    "binary_sha256": "2412e017268bef8f847f38d1b0f79f63185b38c27fe6fba637067bfc87c0eedf"
+  },
+  {
+    "repo": "colbymchenry/codegraph",
+    "version": "v1.6.0",
+    "name": "codegraph-darwin-arm64.tar.gz",
+    "url": "https://github.com/colbymchenry/codegraph/releases/download/v1.6.0/codegraph-darwin-arm64.tar.gz",
+    "sha256": "1c73033512d55f67be04717e81532e8beaf7be6fb8531f51a179fa23064ad480",
+    "bytes": 56818676,
+    "executable": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/tools/codegraph/codegraph-darwin-arm64/bin/codegraph",
+    "binary_sha256": "3184bbf582b5db7cffd07373017631fdc4392842860c2e3991be3f23b6fb3559"
+  }
+]
