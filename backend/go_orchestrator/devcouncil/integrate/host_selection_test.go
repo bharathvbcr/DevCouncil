@@ -109,10 +109,53 @@ func TestAdvertisedHostsMatchTheRustIntegrator(t *testing.T) {
 	}
 }
 
-func TestSupportedHostsAreStillAccepted(t *testing.T) {
+// Every advertised host reaches an adapter that configures something.
+//
+// This replaces `TestSupportedHostsAreStillAccepted`, which ranged over
+// `Hosts` and asserted `checkHost` accepted each one — but `checkHost` returns
+// nil exactly when `slices.Contains(Hosts, host)`, so the assertion reduced to
+// `Hosts ⊆ Hosts` and could not fail for any value of `Hosts`. Its name
+// claimed the invariant `integrate.go` still enforces at runtime, in the
+// `default` arm: `host %q is advertised but has no adapter`. Adding a seventh
+// name to `Hosts` would have kept that test green and shipped a host that
+// exits non-zero the first time anyone selects it.
+//
+// Driving `Run` rather than comparing `Hosts` against a hand-copied list of
+// switch cases is deliberate: a mirrored list is the drift this package was
+// already bitten by once, and dry-run exercises the real dispatch — the
+// `switch`, then `hostMcpDocs` — while writing nothing.
+func TestEveryAdvertisedHostHasAnAdapter(t *testing.T) {
 	for _, host := range Hosts {
-		if err := checkHost(host); err != nil {
-			t.Fatalf("%s is advertised but refused: %v", host, err)
+		t.Run(host, func(t *testing.T) {
+			root := t.TempDir()
+			receipt, err := Run(Options{Root: root, Host: host, Mode: ModeDryRun})
+			if err != nil {
+				t.Fatalf("%s is advertised but has no working adapter: %v", host, err)
+			}
+			if len(receipt.Files) == 0 {
+				t.Fatalf("%s reached an adapter that plans no file: %+v", host, receipt)
+			}
+			// A dry run that touched the tree would make the check itself the
+			// thing that changed the repository.
+			entries, readErr := os.ReadDir(root)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("dry run wrote %d entr(ies) for %s", len(entries), host)
+			}
+		})
+	}
+}
+
+// The converse: a server document for a name `Hosts` does not offer is dead
+// configuration. `checkHost` refuses anything outside `Hosts` before the switch
+// is reached, so such an entry can never be selected — and reads as support
+// for a host that is not actually on offer.
+func TestEveryServerDocumentBelongsToAnAdvertisedHost(t *testing.T) {
+	for host := range hostMcpDocs {
+		if !slices.Contains(Hosts, host) {
+			t.Errorf("hostMcpDocs configures %q, which Hosts does not advertise", host)
 		}
 	}
 }
