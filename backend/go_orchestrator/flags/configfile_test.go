@@ -249,10 +249,12 @@ llm:
 		t.Errorf("llm.local.model = %q, want qwen3.8:27b-mlx", model)
 	}
 
-	// Verify alias verification.rigor.enabled -> verify.rigor.enabled
-	rigor, _, err := r.Bool(VerifyRigorEnabled)
-	if err != nil || !rigor {
-		t.Errorf("verify.rigor.enabled = %v, want true", rigor)
+	// The verification.* block is DevCouncil core config consumed outside this
+	// tree, and loading cleanly means passing over it — not mirroring one of
+	// its keys onto a harness flag that no code here reads. That mirror was
+	// what let the docs tell teams enforcement was theirs to switch on.
+	if _, ok := r.Def("verify.rigor.enabled"); ok {
+		t.Error("verification.rigor.enabled is being mirrored onto a harness flag again")
 	}
 }
 

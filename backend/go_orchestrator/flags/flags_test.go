@@ -100,7 +100,7 @@ func TestBadEnvValueIsReportedNotIgnored(t *testing.T) {
 // turn off its own gate has no gate.
 func TestAgentCannotChangeSafetyFlags(t *testing.T) {
 	r := testRegistry(t)
-	for _, key := range []string{PolicyFileMode, GrantsAgentEnabled, GrantsAgentMaxTTL, VerifyRigorEnabled} {
+	for _, key := range []string{PolicyFileMode, GrantsAgentEnabled, GrantsAgentMaxTTL, GrantsAgentCommands} {
 		if err := r.Set(Agent, key, defaultOpposite(t, r, key)); err == nil {
 			t.Fatalf("an agent must not be able to change %q", key)
 		}

@@ -36,10 +36,6 @@ const (
 	GrantsRequireReason = "grants.require_reason"
 	GrantsAgentCommands = "grants.agent.allow_commands"
 
-	// Verification.
-	VerifyDiffCoverageEnforce = "verify.diff_coverage.enforce"
-	VerifyRigorEnabled        = "verify.rigor.enabled"
-
 	// Orchestration.
 	AgentsMaxSpawnDepth     = "agents.max_spawn_depth"
 	AgentsMaxFanout         = "agents.max_fanout"
@@ -293,17 +289,6 @@ func DefineHarnessFlags(r *Registry) error {
 			Key: GrantsAgentCommands, Kind: KindBool, Default: "false",
 			Mutable: HumanOnly, Safety: true,
 			Description: "Let an agent clear its own command-allowlist blocks, matching DevCouncil's agent_appended_allowed_commands. Off by default: an unplanned file write is still bounded by the gates above and by the verifier, whereas an arbitrary command is the mechanism those gates run through. Git-safety rules stay closed either way.",
-		},
-
-		{
-			Key: VerifyDiffCoverageEnforce, Kind: KindBool, Default: "false",
-			Mutable:     HumanOnly,
-			Description: "Promote an unexercised diff to a blocking gap. Mirrors DevCouncil verification.diff_coverage.enforce. Files with no coverage data are promoted too: an absent measurement is not evidence the lines ran, and exempting it would make \"stop collecting coverage\" the cheapest way to satisfy an enforced gate.",
-		},
-		{
-			Key: VerifyRigorEnabled, Kind: KindBool, Default: "true",
-			Mutable: HumanOnly, Safety: true,
-			Description: "Stub, effort, and coarse-acceptance-proof detection on added diff lines.",
 		},
 
 		{
@@ -748,6 +733,37 @@ var retirements = []Retirement{
 	{
 		Key: "codeintel.engine",
 		Why: "there is one engine — the devmap Rust binary; which path executed is already reported on each navigation answer",
+	},
+	// The two verification switches. Both named a gate that runs in another
+	// process, and this host never asked that process anything.
+	//
+	// Stub, effort and diff↔coverage rigor live in the dcverify binary, which
+	// Manvi's runRigor execs. Go verify.Run() does not spawn it (TASK-P7-1):
+	// it sets RigorApplied to the empty slice and records "coverage profile
+	// not supplied" on every run. So verify.rigor.enabled defaulted to true
+	// and enabled nothing, and verify.diff_coverage.enforce offered to promote
+	// a gap that is never produced here.
+	//
+	// That is worse than a switch with no effect. These two were documented to
+	// teams as the way to opt into blocking, so setting enforce: true bought a
+	// belief that an unexercised diff would now be caught, and the verifier
+	// went on reporting clean — a check that could not run answering exactly
+	// as a check that ran and passed. Deleting them leaves one description of
+	// where the gate lives instead of two that disagree.
+	//
+	// The DevCouncil spellings verification.rigor.enabled and
+	// verification.diff_coverage.enforce are deliberately not listed here.
+	// Those are core config shared with Manvi through .devcouncil/config.yaml,
+	// consumed outside this tree; this harness passes over the whole
+	// verification.* namespace, as it always has for every sibling key it
+	// never aliased. Retiring them would refuse the real shared file.
+	{
+		Key: "verify.diff_coverage.enforce",
+		Why: "it was never read; the diff↔coverage gate runs in dcverify, which Manvi's runRigor execs and this host does not (TASK-P7-1)",
+	},
+	{
+		Key: "verify.rigor.enabled",
+		Why: "it was never read; stub and effort detection run in dcverify, which Manvi's runRigor execs and this host does not (TASK-P7-1)",
 	},
 }
 

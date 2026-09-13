@@ -104,28 +104,29 @@ discipline):
   own coverage tooling, and changed *executable* lines to measure. Otherwise it degrades
   silently and the verifier behaves as before — it never blocks correct work for lack of
   measurement.
-- It is **signal-first**: by default the gap is non-blocking and informational. Teams opt
-  into blocking with `verification.diff_coverage.enforce: true` (and an optional
-  `min_ratio`).
+- It is **signal-first**: the gap is non-blocking and informational.
 
-```yaml
-# .devcouncil/config.yaml
-verification:
-  diff_coverage:
-    measure: true     # record diff coverage as evidence whenever tooling is present
-    enforce: false    # promote an unexercised diff to a *blocking* gap
-    min_ratio: 0.0    # 0.0 = "at least one changed line exercised"; higher demands more
-```
+**There is no way to opt into blocking today.** The `verification.diff_coverage.enforce`,
+`min_ratio`, and `verification.rigor.enforce_coverage_on_hard` keys that earlier revisions
+of this page described belonged to the retired Python verifier. No component in this tree
+reads them: `dcverify` implements the gates but takes no enforcement setting, and this
+host does not spawn `dcverify` at all (TASK-P7-1). Setting them in
+`.devcouncil/config.yaml` is inert — the file still accepts them, because `verification.*`
+is DevCouncil core config shared with Manvi, but nothing here acts on them.
+
+The matching harness flags `verify.diff_coverage.enforce` and `verify.rigor.enabled` were
+declared and read by nothing, and have been **removed** from the catalogue rather than left
+to imply a switch existed. `manvi flags` no longer lists them, and a config file or
+`MANVI_*` variable that still sets them is refused by name.
+
+Promoting an unexercised diff to a blocking gap is **[TASK-P7-1](TODO.md)**: it needs the
+`dcverify` wiring first, because there is no coverage gap in this host to promote.
 
 It currently measures **Python** (via the target repo's `coverage.py`), including inline
 `python -c "..."` acceptance checks. It assumes tests run against the **source tree**
 (the normal setup for a repo under active development — editable install or `src` on the
 path); a suite that exercises an installed *copy* of the package instead may under-report.
-This is one more reason enforcement is opt-in.
-
-On **hard** tasks, `verification.rigor.enforce_coverage_on_hard` (default `true`) promotes
-this gate to blocking even when `diff_coverage.enforce` is `false` — see [Anti-laziness
-rigor](#anti-laziness-rigor) below.
+That under-reporting is one more reason enforcement should stay opt-in when it is built.
 
 ## Anti-laziness rigor
 
@@ -136,7 +137,7 @@ LLM calls for stub/effort detection) and scales strictness by **task difficulty*
 | Difficulty | Default behavior |
 |---|---|
 | `easy` / `normal` | Stub/effort/coarse-proof findings are **advisory** — surfaced in gaps and `next_actions` but non-blocking |
-| `hard` | Same gates **block** verification; diff coverage is enforced; repair budget widens |
+| `hard` | Same gates **block** verification; repair budget widens |
 
 Tasks are classified as `easy` / `normal` / `hard` by a deterministic scorer
 (`devcouncil.verification.difficulty`) from planned scope, acceptance-criteria count, and
@@ -171,6 +172,14 @@ verification:
     min_added_lines_per_planned_file: 5
     acceptance_samples_on_hard: 2   # self-consistency voting on hard tasks
 ```
+
+> **Not read in this tree.** The block above is the retired Python verifier's settings
+> surface, kept here because `.devcouncil/config.yaml` is shared with Manvi. Nothing in
+> this repository consults these keys — the gates they configure live in `dcverify`, which
+> this host does not spawn (TASK-P7-1), and `dcverify` itself takes no enforcement setting.
+> `enabled` and `enforce_coverage_on_hard` in particular promise nothing here. The rest of
+> this section describes the rigor layer's intended behaviour, not what `verify.Run()` does
+> today; see [TODO.md](TODO.md) TASK-P7-1.
 
 Repair runs carry a **correction manifest** with prior diff, failing output, attempt
 history, stub findings, and non-negotiable **repair rules** (never weaken tests, never
