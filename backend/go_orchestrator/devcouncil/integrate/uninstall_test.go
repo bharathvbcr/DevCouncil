@@ -21,8 +21,8 @@ func TestUninstallHooksRemovesOwnedFiles(t *testing.T) {
 	root := t.TempDir()
 	cursorHooks := filepath.Join(root, ".cursor", "hooks.json")
 	grokHooks := filepath.Join(root, ".grok", "hooks", "devcouncil.json")
-	writeFile(t, cursorHooks, `{"version":1,"hooks":{"sessionStart":[]}}`)
-	writeFile(t, grokHooks, `{"hooks":{}}`)
+	writeFile(t, cursorHooks, `{"version":1,"hooks":{"sessionStart":[{"command":"dev hook session-start"}]}}`)
+	writeFile(t, grokHooks, `{"hooks":{"Stop":[{"hooks":[{"command":"dev hook agent-response"}]}]}}`)
 
 	receipt, err := Uninstall(UninstallOptions{Root: root, Target: TargetHooks, Mode: ModeApply})
 	if err != nil {
@@ -44,7 +44,7 @@ func TestUninstallHooksRemovesOwnedFiles(t *testing.T) {
 func TestUninstallHooksDryRunRemovesNothing(t *testing.T) {
 	root := t.TempDir()
 	cursorHooks := filepath.Join(root, ".cursor", "hooks.json")
-	writeFile(t, cursorHooks, `{"version":1}`)
+	writeFile(t, cursorHooks, `{"version":1,"hooks":{"stop":[{"command":"dev hook agent-response"}]}}`)
 
 	receipt, err := Uninstall(UninstallOptions{Root: root, Target: TargetHooks, Mode: ModeDryRun})
 	if err != nil {
@@ -189,7 +189,7 @@ func TestUninstallRefusesUnparsableSettings(t *testing.T) {
 func TestIntegrateCursorWritesNoHooksFile(t *testing.T) {
 	root := t.TempDir()
 	receipt := &Receipt{Host: "cursor", Mode: string(ModeApply), Files: map[string]string{}}
-	if err := integrateCursor(root, "/bin/true", "/bin/true", ModeApply, false, receipt); err != nil {
+	if err := integrateCursor(root, "/bin/true", "/bin/true", ModeApply, receipt); err != nil {
 		t.Fatalf("integrateCursor: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, ".cursor", "hooks.json")); !os.IsNotExist(err) {

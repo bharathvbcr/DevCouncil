@@ -41,8 +41,9 @@ Modes:
   advisory   record non-safety findings; hard-safety gaps still block
   enforce    every blocking verification gap blocks
 
-Hook gate is off unless you pass --write-gate to integrate. Changing it here
-does not install hooks.
+The hook setting is retained for configuration compatibility. Host lifecycle
+hooks are retired; this setting does not install or enforce them. Integrate
+refuses --write-gate. Use dev hook status to inspect stale registrations.
 
 This command is for a human operator. Agents should not flip gates.
 `

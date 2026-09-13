@@ -37,11 +37,13 @@ type Options struct {
 
 // Receipt records what was written or would be written.
 type Receipt struct {
-	Host    string            `json:"host"`
-	Mode    string            `json:"mode"`
-	Files   map[string]string `json:"files"` // rel path -> action (wrote|unchanged|would_write|missing)
-	Spawned []string          `json:"spawned,omitempty"`
-	Notes   []string          `json:"notes,omitempty"`
+	HookEntries map[string]int    `json:"hook_entries,omitempty"` // managed entries found before cleanup
+	Backups     map[string]string `json:"backups,omitempty"`      // original relative path -> recoverable backup
+	Host        string            `json:"host"`
+	Mode        string            `json:"mode"`
+	Files       map[string]string `json:"files"` // rel path -> action (wrote|unchanged|would_write|missing)
+	Spawned     []string          `json:"spawned,omitempty"`
+	Notes       []string          `json:"notes,omitempty"`
 }
 
 // cursorRule is deliberately split in two registers.
@@ -70,19 +72,23 @@ DevCouncil is **components and modules** (` + "`devmap`" + `, ` + "`dcstore`" + 
 
 ## Tasks and gates are opt-in
 
-Nothing here gates you. DevCouncil host hooks are retired, ` + "`execution.hook_gate.mode`" + ` is
-off and ` + "`integrations.cursor.write_gate`" + ` is false, so **interactive Shell and Write need
-no task lease**. Do not claim "Shell is gated", and do not check out a task in order to
+DevCouncil host hooks are retired. Legacy ` + "`execution.hook_gate.mode`" + ` and
+` + "`integrations.cursor.write_gate`" + ` settings do not enforce host operations, so
+**interactive Shell and Write need no task lease**. Do not claim "Shell is gated", and do not check out a task in order to
 run a command. Use the ` + "`devcouncil_*`" + ` MCP tools when you actually want task state,
-scope or verification — and prefer them over guessing it. A lease matters only where
-containment is switched on deliberately (` + "`devcouncil integrate … --write-gate`" + ` or
-` + "`execution.hook_gate.mode: contain`" + `).
+scope or verification — and prefer them over guessing it. A host that uses MCP policy
+must honor its results. Retired hooks do not enforce old containment settings;
+` + "`--write-gate`" + ` is refused rather than claiming to install enforcement.
 
 Engineering skills live under ` + "`.cursor/skills/`" + ` and ` + "`.claude/skills/`" + ` (` + "`devcouncil skills scaffold`" + `).
 `
 
 // Run configures one host.
 func Run(opts Options) (*Receipt, error) {
+	if opts.WriteGate {
+		return nil, fmt.Errorf("--write-gate is unavailable: DevCouncil lifecycle hooks are retired; use MCP policy and verification explicitly")
+	}
+
 	root, err := filepath.Abs(opts.Root)
 	if err != nil {
 		return nil, err
@@ -108,7 +114,7 @@ func Run(opts Options) (*Receipt, error) {
 
 	switch host {
 	case "cursor":
-		if err := integrateCursor(root, selfBin, devmap, mode, opts.WriteGate, receipt); err != nil {
+		if err := integrateCursor(root, selfBin, devmap, mode, receipt); err != nil {
 			return receipt, err
 		}
 	case "claude":
@@ -175,7 +181,7 @@ func skillInstallArgs(root, host string) []string {
 	return args
 }
 
-func integrateCursor(root, selfBin, devmap string, mode Mode, writeGate bool, receipt *Receipt) error {
+func integrateCursor(root, selfBin, devmap string, mode Mode, receipt *Receipt) error {
 	mcpPath := filepath.Join(root, ".cursor", "mcp.json")
 	rulePath := filepath.Join(root, ".cursor", "rules", "devcouncil.mdc")
 
@@ -196,7 +202,6 @@ func integrateCursor(root, selfBin, devmap string, mode Mode, writeGate bool, re
 			},
 		},
 	}
-	_ = writeGate
 
 	if err := planWrite(mcpPath, mustJSON(mcp), mode, receipt, ".cursor/mcp.json"); err != nil {
 		return err

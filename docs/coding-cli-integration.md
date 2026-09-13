@@ -6,12 +6,12 @@ DevCouncil's components integrate with leading coding agents and IDEs: task scop
 
 ## Supported Hosts
 
-`devcouncil integrate` and `devmap integrate` are **not** the Python installer. Go `Hosts` lists eight names; only three have adapters, and `--write-gate` is discarded (`integrateCursor` assigns `_ = writeGate`). `devmap integrate` accepts only `cursor|claude|codex`.
+`devcouncil integrate` and `devmap integrate` are **not** the Python installer. Go `Hosts` lists eight names; only three have adapters, and `--write-gate` is refused because lifecycle hooks are retired. `devmap integrate` accepts only `cursor|claude|codex`.
 
 | Host | What `--apply` actually writes | Write-gate / hooks | Setup command |
 |---|---|---|---|
-| **Cursor** | `.cursor/mcp.json` (devcouncil + devmap stdio) and `.cursor/rules/devcouncil.mdc`. Then `devmap integrate cursor` writes DevMap guides/skills. | No `.cursor/hooks.json`. `--write-gate` does not change that. | `devcouncil integrate cursor --apply` |
-| **Claude Code** | `.mcp.json` (devcouncil + devmap). No slash commands, plugin, subagents, or statusline. | `--write-gate` ignored. | `devcouncil integrate claude --apply` |
+| **Cursor** | `.cursor/mcp.json` (devcouncil + devmap stdio) and `.cursor/rules/devcouncil.mdc`. Then `devmap integrate cursor` writes DevMap guides/skills. | No `.cursor/hooks.json`. `--write-gate` is refused. | `devcouncil integrate cursor --apply` |
+| **Claude Code** | `.mcp.json` (devcouncil + devmap). No slash commands, plugin, subagents, or statusline. | `--write-gate` refused. | `devcouncil integrate claude --apply` |
 | **Codex CLI** | `.codex/config.toml` containing only `# Managed by devcouncil integrate codex`. | None. | `devcouncil integrate codex --apply` |
 | **Antigravity, OpenCode, Warp, Aider, Gemini** | Stub receipt: `"Phase 4 writes a stub receipt; full adapter ports follow"`. `devmap integrate` then errors `unsupported host`. | None. | Do not treat `--apply` as a working installer |
 
@@ -27,7 +27,7 @@ To configure an agent host, run `devcouncil integrate` from your project root:
 # 1. Configure Cursor
 devcouncil integrate cursor --apply
 
-# 2. Configure Claude Code (writes .mcp.json; --write-gate is currently ignored)
+# 2. Configure Claude Code (writes .mcp.json; --write-gate is refused)
 devcouncil integrate claude --apply
 
 # 3. Codex is a comment-only toml today — see TASK-P7-8
@@ -38,11 +38,19 @@ devcouncil integrate claude --check
 devcouncil integrate codex --dry-run
 ```
 
-To uninstall hooks:
+To inspect and selectively remove legacy hooks:
 
 ```bash
-devcouncil integrate uninstall --target hooks --apply
+dev hook status --project-root /path/to/project
+dev hook disable --project-root /path/to/project --client claude --dry-run
+dev hook disable --project-root /path/to/project --client claude
 ```
+
+Cleanup preserves other tools and creates recoverable backups. Status exits 1
+when registrations remain or inspection fails; its receipt distinguishes them.
+Old event commands now exit 0 silently, even before a host reloads its cached
+configuration. No verification is performed by retired hooks. MCP policy and
+host permissions are unchanged. See [cleanup details](cli-reference.md#retired-hook-compatibility-and-cleanup).
 
 ---
 
@@ -73,11 +81,11 @@ CLI-only (named in `devmap-cli` `MISSING_CAPABILITIES`, not on kernel MCP): `cyp
 
 ### Cursor
 
-`devcouncil integrate cursor --apply` writes `.cursor/mcp.json` and `.cursor/rules/devcouncil.mdc`, then runs `devmap integrate cursor` (guides + DevMap skills). It does **not** write `.cursor/hooks.json`. `--write-gate` does not change the files.
+`devcouncil integrate cursor --apply` writes `.cursor/mcp.json` and `.cursor/rules/devcouncil.mdc`, then runs `devmap integrate cursor` (guides + DevMap skills). It does **not** write `.cursor/hooks.json`. `--write-gate` is refused before files are written.
 
 ### Claude Code
 
-`devcouncil integrate claude --apply` writes `.mcp.json` (devcouncil + devmap stdio) and runs `devmap integrate claude`. It does **not** install slash commands, a plugin, PreToolUse hooks, or a statusline. `--write-gate` is ignored.
+`devcouncil integrate claude --apply` writes `.mcp.json` (devcouncil + devmap stdio) and runs `devmap integrate claude`. It does **not** install slash commands, a plugin, PreToolUse hooks, or a statusline. `--write-gate` is refused before files are written.
 
 ### Codex
 

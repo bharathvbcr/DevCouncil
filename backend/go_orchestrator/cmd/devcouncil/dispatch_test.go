@@ -111,7 +111,7 @@ func TestDispatchGateHelp(t *testing.T) {
 }
 
 func TestUnknownCommandExit2(t *testing.T) {
-	for _, name := range []string{"hook", "boot", "status", "init", "doctor"} {
+	for _, name := range []string{"boot", "status", "init", "doctor"} {
 		t.Run(name, func(t *testing.T) {
 			stderr, restore := swapStderr(t)
 			code := dispatch([]string{name})
@@ -294,7 +294,7 @@ func TestIntegrateUninstallTargetHooks(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(hooks), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(hooks, []byte(`{"version":1}`), 0o644); err != nil {
+	if err := os.WriteFile(hooks, []byte(`{"version":1,"hooks":{"stop":[{"command":"dev hook agent-response"}]}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	stdout, restoreOut := swapStdout(t)

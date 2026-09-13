@@ -51,6 +51,8 @@ func dispatch(args []string) int {
 		return runEnable(args[1:])
 	case "gate":
 		return runGate(args[1:])
+	case "hook":
+		return runHook(args[1:])
 	case "map", "graph":
 		return runDevmap(mapArgs(args[1:]))
 	case "ast":
@@ -81,7 +83,9 @@ Usage:
   devcouncil enable NAME [--prefix DIR]
   devcouncil gate status [--json] [--project-root DIR]
   devcouncil gate set --mode off|advisory|enforce [--hook off|contain]
-  devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR] [--write-gate]
+  devcouncil hook <event>     Retired lifecycle compatibility (silent no-op)
+  devcouncil hook status|disable [--project-root DIR] [--client HOST]
+  devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR]
   devcouncil integrations …        Alias of integrate
   devcouncil integrate uninstall --target hooks [--dry-run] [--project-root DIR]
   devcouncil skills list
@@ -384,7 +388,7 @@ func runIntegrate(args []string) int {
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(receipt)
 	if opts.Mode == integrate.ModeApply {
-		fmt.Fprintf(os.Stderr, "%s integration configured (%s).\n", opts.Host, modeLabel(opts))
+		fmt.Fprintf(os.Stderr, "%s integration configured (host hooks retired).\n", opts.Host)
 	}
 	return 0
 }
@@ -394,52 +398,58 @@ func runIntegrate(args []string) int {
 // the one command that takes their registrations back off a host.
 func runIntegrateUninstall(args []string) int {
 	opts := integrate.UninstallOptions{Root: projectRoot(), Target: integrate.TargetHooks, Mode: integrate.ModeApply}
+	modeSet := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "--target":
-			i++
-			if i >= len(args) {
-				fmt.Fprintln(os.Stderr, "--target needs a value")
+		case "--apply", "--dry-run", "--check":
+			mode := integrate.Mode(strings.TrimPrefix(args[i], "--"))
+			if modeSet && opts.Mode != mode {
+				fmt.Fprintln(os.Stderr, "conflicting cleanup modes")
 				return 2
 			}
-			opts.Target = integrate.Target(args[i])
-		case "--apply":
-			opts.Mode = integrate.ModeApply
-		case "--dry-run", "--check":
-			opts.Mode = integrate.ModeDryRun
-		case "--project-root":
+			opts.Mode = mode
+			modeSet = true
+		case "--target", "--project-root", "--client":
+			flag := args[i]
 			i++
-			if i >= len(args) {
-				fmt.Fprintln(os.Stderr, "--project-root needs a value")
+			if i >= len(args) || args[i] == "" || strings.HasPrefix(args[i], "--") {
+				fmt.Fprintf(os.Stderr, "%s needs a value\n", flag)
 				return 2
 			}
-			opts.Root = args[i]
+			switch flag {
+			case "--target":
+				opts.Target = integrate.Target(args[i])
+			case "--project-root":
+				opts.Root = args[i]
+			case "--client":
+				opts.Client = args[i]
+			}
 		case "--json":
-			// receipt JSON always goes to stdout
+		case "--help", "-h":
+			fmt.Fprint(os.Stdout, hookHelp)
+			return 0
 		default:
-			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", args[i])
+			fmt.Fprintf(os.Stderr, "unknown cleanup flag: %s\n", args[i])
 			return 2
 		}
 	}
 	receipt, err := integrate.Uninstall(opts)
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
+	if receipt != nil {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if e := enc.Encode(receipt); e != nil {
+			fmt.Fprintf(os.Stderr, "receipt: %v\n", e)
+			return 1
+		}
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "integrate uninstall: %v\n", err)
-		if receipt != nil {
-			_ = enc.Encode(receipt)
-		}
 		return 1
 	}
-	_ = enc.Encode(receipt)
-	return 0
-}
-
-func modeLabel(opts integrate.Options) string {
-	if opts.WriteGate {
-		return "containment mode (write-gate)"
+	if opts.Mode == integrate.ModeCheck && len(receipt.HookEntries) > 0 {
+		return 1
 	}
-	return "assist mode (no write-gate)"
+	return 0
 }
 
 func runSkills(args []string) int {

@@ -87,7 +87,7 @@ This creates:
 
 ## 4. Connect Your Coding Agent
 
-Connect DevCouncil's MCP server and skills to Cursor or Claude Code. `--write-gate` does not install hooks (TASK-P7-8).
+Connect DevCouncil's MCP server and skills to Cursor or Claude Code. `--write-gate` is refused because lifecycle hooks are retired.
 
 ```bash
 # Working adapters: cursor, claude, codex (comment-only toml)
