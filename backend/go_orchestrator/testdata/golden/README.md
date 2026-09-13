@@ -10,7 +10,7 @@ explicit hardening note, never a silent drift.
 
 - `manifest.json` — case index and replay instructions
 - `mcp/` — MCP tool JSON envelopes (`devcouncil_get_diff`, lease, verify, …)
-- `cli/` — CLI JSON envelopes plus integrate/skills/map file bytes
+- `cli/` — CLI JSON envelopes plus skills/map file bytes
 
 Each `*.json` envelope has:
 
@@ -50,6 +50,42 @@ stored payloads. A new recapture would need a replacement scrubber; none ships.
   shape from `devcouncil.utils.proc.run_git`.
 - `cli/skills/lock_timeout.json` — busy `.devcouncil-skills.lock` with injected
   monotonic clock (≤5s bound, no steal).
+
+## Retired cases
+
+**2026-09-13 — the twelve `cli/integrate/*` cases were removed.** The hardening
+note this section exists for:
+
+They captured `dev integrate {claude,codex,cursor} --apply` from the Python era.
+Every one recorded `/Users/<user>/.local/bin/dev` as the server command, a
+`devcouncil` entry written by a binary that no longer exists, and stdout naming
+`claude-plugin` and an "assist mode (no write-gate)" that has since been
+removed. They were captures of a program, not expectations of this one.
+
+They were also the wrong *shape* for what `integrate` now does. `planWrite`
+folds our entry into whatever the host already has and compares against the
+merged result, so the bytes of `.mcp.json` are a function of the repository it
+runs in. A whole-file byte golden asserts the opposite — that the file equals
+these bytes — which is false the moment a neighbour server exists.
+
+What replaced the coverage: `devcouncil/integrate/host_documents_test.go`,
+`host_selection_test.go` and `integrate_write_security_test.go` assert the
+properties instead of the bytes — our entry added or replaced with neighbours
+untouched, the per-host entry shape, a preamble established but not imposed, a
+second apply clean and `--check` agreeing with it, an unreadable config kept
+rather than replaced, a dry run writing nothing, unknown and retired hosts
+refused before any write or spawn, and symlinked config components refused
+rather than followed.
+
+## What `case_count` counts
+
+Stored cases, not replayed ones. `cmd/devcouncil-golden-replay` loads exactly
+one envelope from this tree (`mcp/get_diff/dirty.json`) and otherwise asserts
+`get_diff` behaviour, the embedded skills count and the tool registry size in
+code. The other 34 entries in `manifest.json` are an index of committed
+fixtures that nothing currently diffs against. Read the number as inventory,
+never as passing checks — and when a case here is what you needed verified,
+replay it explicitly rather than trusting the count.
 
 ## Known characterization quirks
 
