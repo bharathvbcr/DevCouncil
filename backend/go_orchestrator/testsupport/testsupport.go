@@ -55,6 +55,27 @@ func Unavailable(t testing.TB, format string, args ...any) {
 		"Set "+AllowSkipEnv+"=1 to skip instead of failing, accepting that this seam goes uncovered.", args...)
 }
 
+// workspaceDirs are the names the Rust workspace goes by. DevCouncil keeps the
+// crates in `rust/`; Manvi keeps only symlinks to them under `crates/`.
+//
+// One list, spelled once. `RepoRoot` accepts a directory *because* one of these
+// holds a Cargo.toml, and `RustWorkspace` then returns which one — so a second
+// spelling of the same set would not merely duplicate, it would decide the two
+// answers separately. The day they disagreed, `RepoRoot` would accept a
+// directory whose workspace `RustWorkspace` could not name.
+var workspaceDirs = []string{"rust", "crates"}
+
+// workspaceIn reports the Rust workspace directly under root, if there is one.
+func workspaceIn(root string) (string, bool) {
+	for _, name := range workspaceDirs {
+		dir := filepath.Join(root, name)
+		if _, err := os.Stat(filepath.Join(dir, "Cargo.toml")); err == nil {
+			return dir, true
+		}
+	}
+	return "", false
+}
+
 // RepoRoot returns the directory that holds the Rust workspace used to build
 // dcstore/dcverify/dcgrep/devmap.
 //
@@ -68,18 +89,38 @@ func RepoRoot(t testing.TB) string {
 		t.Fatalf("getwd: %v", err)
 	}
 	for {
-		if _, err := os.Stat(filepath.Join(dir, "rust", "Cargo.toml")); err == nil {
-			return dir
-		}
-		if _, err := os.Stat(filepath.Join(dir, "crates", "Cargo.toml")); err == nil {
+		if _, ok := workspaceIn(dir); ok {
 			return dir
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			t.Fatalf("no repository root above %s (looking for rust/Cargo.toml or crates/Cargo.toml)", dir)
+			t.Fatalf("no repository root above %s (looking for Cargo.toml under any of %v)", dir, workspaceDirs)
 		}
 		dir = parent
 	}
+}
+
+// RustWorkspace returns the directory holding the Rust workspace manifest.
+//
+// A caller that needs a path *inside* the workspace — a crate's source, its
+// target directory — asks here rather than joining "rust" itself, so the two
+// layouts cannot drift apart one caller at a time.
+//
+// Not finding one is fatal rather than a guess. Returning `root/crates`
+// unchecked would be safe only by an invariant nothing stated: it holds today
+// because `RepoRoot` accepted this directory for the very same markers. Sharing
+// `workspaceDirs` is what makes that true by construction instead of by
+// coincidence, and this refusal is what says so if it ever stops being true —
+// rather than handing back a path that exists in neither layout and leaving
+// every caller to report its own unrelated failure.
+func RustWorkspace(t testing.TB) string {
+	t.Helper()
+	root := RepoRoot(t)
+	dir, ok := workspaceIn(root)
+	if !ok {
+		t.Fatalf("no Rust workspace under %s: RepoRoot accepted it, so the marker lists have diverged", root)
+	}
+	return dir
 }
 
 type build struct {
@@ -131,7 +172,10 @@ func DCGrep(t testing.TB) string { return cargoBin(t, "dc-grep", "dcgrep") }
 // the wrong one would reintroduce exactly the failure this exists to prevent.
 func cargoBin(t testing.TB, crate, binary string) string {
 	t.Helper()
-	root := RepoRoot(t)
+	// Resolved before the sync.Once, not inside it: a caller that arrives
+	// second skips the Do entirely, so a root check placed in there would
+	// pass for every caller but the first.
+	crates := RustWorkspace(t)
 
 	buildsMu.Lock()
 	b, ok := builds[binary]
@@ -142,10 +186,6 @@ func cargoBin(t testing.TB, crate, binary string) string {
 	buildsMu.Unlock()
 
 	b.once.Do(func() {
-		crates := filepath.Join(root, "rust")
-		if _, err := os.Stat(filepath.Join(crates, "Cargo.toml")); err != nil {
-			crates = filepath.Join(root, "crates")
-		}
 		target := filepath.Join(crates, "target")
 		if b.err = os.MkdirAll(target, 0o755); b.err != nil {
 			return
