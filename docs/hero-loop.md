@@ -89,7 +89,7 @@ The agent never needs a human in the inner loop. A human reviews the final evide
 
 ## The diff↔coverage gate
 
-This gate lives in **`dcverify`**. Manvi `runRigor` execs it. Go `verify.Run()` / MCP `devcouncil_verify_task` do not (TASK-P7-1); they always record `"coverage profile not supplied"`.
+This gate lives in **`dcverify`**, which Go `verify.Run()`, MCP `devcouncil_verify_task`, and Manvi `runRigor` all exec. It measures only when a coverage profile is supplied: `devcouncil verify --coverage PATH` (Go `-coverprofile` output or LCOV), or `verify.Input.CoveragePath` for a library caller that runs its own tests under coverage. MCP `devcouncil_verify_task` supplies none — its tool schema has no field for a path — so over MCP this gate records `"coverage profile not supplied"` and the stub and secret gates still run.
 
 A green test suite is only acceptance evidence if it actually ran the lines the diff
 changed. The verifier runs the task's test command under coverage and intersects the

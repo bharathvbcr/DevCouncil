@@ -31,6 +31,7 @@ var categoryByGapType = map[string]string{
 	"stale_map":                      "refresh_map",
 	"skipped_verification_command":   "fix_verification",
 	"architecture_check_unavailable": "review",
+	"rigor_check_unavailable":        "fix_verification",
 }
 
 func looksLikePath(value string) bool {

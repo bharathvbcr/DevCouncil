@@ -138,7 +138,7 @@ devcouncil mcp
 Over MCP, agents follow the **Hero Loop**:
 1. **Checkout:** `devcouncil_checkout_task` acquires an atomic lease on a task in `dcstore`.
 2. **Implement:** Agent edits code within the declared file scope.
-3. **Verify:** `devcouncil_verify_task` runs Go `verify.Run()` (scope / orphan / expected tests). It does **not** spawn `dcverify` (TASK-P7-1). Manvi `runRigor` does.
+3. **Verify:** `devcouncil_verify_task` runs Go `verify.Run()` (scope / orphan / expected tests) and spawns `dcverify` for the stub and secret gates. Diff↔coverage needs a profile the MCP tool has no field for; run `devcouncil verify --coverage PATH` for that gate. If `dcverify` is absent the result says so in `rigor_skipped_reason` rather than reporting clean.
 4. **Repair:** If verification fails, typed `next_actions` guide self-repair without manual prompt pasting.
 5. **Release:** `devcouncil_release_task` releases the lease upon successful verification.
 

@@ -7,6 +7,7 @@ package verify
 
 import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/dcverify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 )
 
@@ -66,6 +67,7 @@ type MCPResult struct {
 	VerificationSkipped   bool         `json:"verification_skipped"`
 	Sandbox               string       `json:"sandbox"`
 	RigorApplied          []string     `json:"rigor_applied"`
+	RigorSkippedReason    string       `json:"rigor_skipped_reason,omitempty"`
 	BlockingGaps          []Gap        `json:"blocking_gaps"`
 	NextActions           []NextAction `json:"next_actions"`
 	AdvisoryActions       []NextAction `json:"advisory_actions"`
@@ -86,6 +88,7 @@ type TaskCLIResult struct {
 	VerificationMode      string       `json:"verification_mode"`
 	VerificationSkipped   bool         `json:"verification_skipped"`
 	RigorApplied          []string     `json:"rigor_applied"`
+	RigorSkippedReason    string       `json:"rigor_skipped_reason,omitempty"`
 	GapCount              int          `json:"gap_count"`
 	BlockingGapCount      int          `json:"blocking_gap_count"`
 	Gaps                  []Gap        `json:"gaps"`
@@ -122,6 +125,15 @@ type Input struct {
 
 	// Commands are expected_tests, falling back to allowed_commands.
 	Commands []string
+
+	// Rigor runs the stub, secret and diff∩coverage gates by spawning
+	// dcverify. Nil means they do not run, which is reported as
+	// RigorSkippedReason and never as a clean rigor pass.
+	Rigor *dcverify.Client
+	// CoveragePath is a coverage profile (Go coverprofile or LCOV) for the same
+	// change. Empty means the coverage gate does not run; the findings gates
+	// still do.
+	CoveragePath string
 
 	// RunCommand executes one verification command. Nil means commands are
 	// skipped with reason "command runner unavailable".

@@ -33,6 +33,10 @@ type Input struct {
 	TaskID   string
 	GateMode string
 	Sandbox  string
+	// CoveragePath is an optional coverage profile for the diff∩coverage gate.
+	// Empty means that gate does not run and the report says so. The MCP tool
+	// leaves it empty: its input schema carries no field for a path.
+	CoveragePath string
 	// SkipVerify forces a skipped result (e.g. gate mode off, no lease).
 	SkipVerify bool
 	SkipReason string
@@ -92,7 +96,7 @@ func Run(ctx context.Context, in Input) Outcome {
 	if sandbox == "" {
 		sandbox = "local"
 	}
-	mcp, gaps, err := verify.VerifyTask(ctx, in.Root, in.Store, in.TaskID, gateMode, sandbox)
+	mcp, gaps, err := verify.VerifyTask(ctx, in.Root, in.Store, in.TaskID, gateMode, sandbox, in.CoveragePath)
 	if err != nil {
 		return Outcome{Decision: Result{
 			OK: false, Allow: false, Skipped: true,

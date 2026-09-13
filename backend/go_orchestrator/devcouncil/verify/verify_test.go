@@ -1,6 +1,7 @@
 package verify_test
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -40,7 +41,7 @@ func TestGoldenLeasedVerifyShape(t *testing.T) {
 			}
 		},
 	}
-	gaps, meta := verify.Run(in)
+	gaps, meta := verify.Run(context.Background(), in)
 	result := verify.ToMCP("TASK-001", gaps, meta)
 
 	if result.Passed {
@@ -115,7 +116,7 @@ func TestGoldenCLIVerifyShape(t *testing.T) {
 			}
 		},
 	}
-	gaps, meta := verify.Run(in)
+	gaps, meta := verify.Run(context.Background(), in)
 	entry := verify.ToCLITask("TASK-CLI", gaps, meta)
 	if entry.GapCount != 3 {
 		t.Fatalf("gap_count=%d want 3", entry.GapCount)
@@ -177,7 +178,7 @@ func TestSkippedNeverPass(t *testing.T) {
 			return verify.CommandOutcome{Skipped: true, Reason: "pytest not installed"}
 		},
 	}
-	gaps, meta := verify.Run(in)
+	gaps, meta := verify.Run(context.Background(), in)
 	result := verify.ToMCP("TASK-SKIP", gaps, meta)
 	if meta.CoverageMeasured {
 		t.Fatal("unmeasured coverage must not look measured")

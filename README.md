@@ -188,7 +188,7 @@ Verification today (Go `verify.Run()`) enforces:
 - **Expected tests / allowed commands:** Runs the task's command list via `/bin/sh -c` in the project root.
 - **Typed `next_actions`:** Structured repair instructions when those gates fail.
 
-Stub detection, secret scanning, and coverage intersection live in the **`dcverify`** binary. **Manvi** `runRigor` spawns it; `devcouncil verify` and MCP `devcouncil_verify_task` currently do not (TASK-P7-1).
+Stub detection, secret scanning, and coverage intersection live in the **`dcverify`** binary. `devcouncil verify`, MCP `devcouncil_verify_task`, and **Manvi** `runRigor` all spawn it. When `dcverify` is not installed the report carries an empty `rigor_applied` **and** a `rigor_skipped_reason` naming what to install — never a silent clean pass. Diff↔coverage runs only when a profile is supplied (`devcouncil verify --coverage PATH`); otherwise `coverage_skipped_reason` says so.
 
 ### 5. MCP Servers for AI Agents
 

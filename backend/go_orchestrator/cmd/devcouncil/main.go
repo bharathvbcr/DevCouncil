@@ -92,7 +92,7 @@ Usage:
   devcouncil integrate uninstall --target hooks [--dry-run] [--project-root DIR]
   devcouncil skills list
   devcouncil skills scaffold [--skill NAME] [--project-root DIR] [--dry-run] [--check]
-  devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local|docker|nix]
+  devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local|docker|nix] [--coverage PATH]
   devcouncil map [devmap args…]   Exec `+"`devmap`"+` (bare invocation: build --manifest)
   devcouncil graph …              Alias of map
   devcouncil ast …                Exec `+"`devmap ast`"+`
@@ -605,10 +605,18 @@ func runVerify(args []string) int {
 	sandbox := "local"
 	taskID := ""
 	modeFlag := ""
+	coveragePath := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--json":
 			jsonOut = true
+		case "--coverage":
+			i++
+			if i >= len(args) {
+				console.Errorln("--coverage needs a path to a coverage profile")
+				return 2
+			}
+			coveragePath = args[i]
 		case "--sandbox":
 			i++
 			if i >= len(args) {
@@ -631,7 +639,8 @@ func runVerify(args []string) int {
 			}
 			root = args[i]
 		case "-h", "--help":
-			console.Errorln("usage: devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local]")
+			console.Errorln("usage: devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] " +
+				"[--sandbox local] [--coverage PATH]")
 			return 0
 		default:
 			if strings.HasPrefix(args[i], "-") {
@@ -666,5 +675,5 @@ func runVerify(args []string) int {
 	if gateMode == "" {
 		gateMode = gatescfg.Load(root).VerificationMode
 	}
-	return verify.RunCLI(console.Context(), root, reg.Store, taskID, gateMode, sandbox, jsonOut)
+	return verify.RunCLI(console.Context(), root, reg.Store, taskID, gateMode, sandbox, coveragePath, jsonOut)
 }

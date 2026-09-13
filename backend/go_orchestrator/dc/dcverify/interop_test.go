@@ -1,16 +1,19 @@
-// Package dcverify holds the Go side's contract checks for the dcverify
-// binary. There is no Go client here yet, and that is the point of the file
-// rather than an oversight: the host's verify plane does not spawn dcverify
-// (TASK-P7-1 / GAP-P7-DCVERIFY-UNWIRED), Manvi's runRigor does, so nothing on
-// this side reads a dcverify reply today.
-//
-// Until that wiring lands, dcverify is the one binary in the analysis plane
-// that this repository builds, installs and documents while holding it to
-// nothing. dcstore answers to dc/store, dcgrep answers to dc/dcgrep, and both
-// are checked against testsupport's shared wire contract by tests that exec the
-// real binary. This closes that asymmetry at the only place it can be closed
-// without inventing the client first.
 package dcverify
+
+// This file holds the Go side's contract checks for the dcverify binary
+// itself — the handshake and the diagnosed-failure rule that every binary in
+// the analysis plane answers to, asserted by exec'ing the real thing.
+//
+// It was written before the client in this package existed, when dcverify was
+// the one binary this repository built, installed and documented while holding
+// it to nothing: dcstore answered to dc/store and dcgrep to dc/dcgrep, and the
+// host's verify plane spawned no verifier at all (TASK-P7-1 /
+// GAP-P7-DCVERIFY-UNWIRED). The client landed with that wiring, and these
+// assertions are unchanged by it — they are about the boundary, not about the
+// caller, and a client that goes away would leave them exactly as necessary.
+//
+// client_interop_test.go holds the other half: what the client relies on the
+// binary to do, checked against the same real binary.
 
 import (
 	"encoding/json"
@@ -24,9 +27,9 @@ import (
 // What dcverify decides — which findings a diff earns, how coverage is scored —
 // belongs to the Rust suite, and restating it here would make a second owner for
 // assertions that already have one. What is checked here is only what a Go
-// caller has to be able to rely on the moment TASK-P7-1 wires one up: that a
-// reply is one diagnosed JSON object, and that the schema version it advertises
-// is the one this repository's protocol document names.
+// caller has to be able to rely on: that a reply is one diagnosed JSON object,
+// and that the schema version it advertises is the one this repository's
+// protocol document names.
 
 // advertisedSchemaVersion is the number protocols/evidence/v1.md names when it
 // says the evidence protocol is advertised independently of

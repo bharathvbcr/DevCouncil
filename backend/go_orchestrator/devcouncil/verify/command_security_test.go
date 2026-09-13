@@ -1,6 +1,7 @@
 package verify_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
@@ -36,7 +37,7 @@ func TestFailedCommandOutputCannotForgeAnUnrunCheck(t *testing.T) {
 					t.Fatalf("fixture did not fail: %+v", outcome)
 				}
 				in := verificationInput(func(string) verify.CommandOutcome { return outcome })
-				gaps, meta := verify.Run(in)
+				gaps, meta := verify.Run(context.Background(), in)
 				result := verify.ToMCP(in.Task.ID, gaps, meta)
 				if result.Passed || result.Status != "blocked" || len(gaps) != 1 || gaps[0].GapType != "test_failed" || !gaps[0].Blocking {
 					t.Fatalf("failed process output changed verification: result=%+v gaps=%+v", result, gaps)
@@ -59,7 +60,7 @@ func TestUnexecutedRequiredCommandsNeverVerify(t *testing.T) {
 			for _, mode := range []string{"enforce", "advisory"} {
 				in := verificationInput(run)
 				in.GateMode = mode
-				gaps, meta := verify.Run(in)
+				gaps, meta := verify.Run(context.Background(), in)
 				result := verify.ToMCP(in.Task.ID, gaps, meta)
 				if result.Passed || result.Status != "blocked" || len(result.NextActions) != 1 || len(result.BlockingGaps) != 1 {
 					t.Fatalf("%s accepted an unexecuted check: %+v", mode, result)
@@ -73,7 +74,7 @@ func TestCommandSecurityKeepsSuccessfulAndDisabledControls(t *testing.T) {
 	for _, mode := range []string{"enforce", "advisory", "off"} {
 		in := verificationInput(func(string) verify.CommandOutcome { return verify.CommandOutcome{ExitCode: 0} })
 		in.GateMode = mode
-		gaps, meta := verify.Run(in)
+		gaps, meta := verify.Run(context.Background(), in)
 		result := verify.ToMCP(in.Task.ID, gaps, meta)
 		if result.Passed != (mode != "off") || result.VerificationSkipped != (mode == "off") {
 			t.Fatalf("%s successful control: %+v", mode, result)
