@@ -262,12 +262,14 @@ func TestRepoRootFailsWhenThereIsNoWorkspaceAbove(t *testing.T) {
 // replaced got wrong.
 //
 // The literal "crates" below is deliberate and load-bearing; do not read it from
-// whatever list the package walks. This is the only test that covers that
-// marker, and the fixture it plants is what makes the coverage real: renaming
-// the marker in RepoRoot reddens this test as written, whereas a version that
-// built its fixture from the package's own list would plant the renamed
-// directory, find it, and pass — leaving the branch guarded by nothing. That is
-// the whole difference between a test and a restatement of the code.
+// workspaceDirs. Measured at package scope, and the numbers are in the comment
+// on TestRepoRootFindsTheRustWorkspace: renaming that entry reddens this test
+// and nothing else, so this is the marker's only guard. The fixture is what
+// makes the guard real — a version building its fixture from the package's own
+// list would plant the renamed directory, find it, and pass, leaving the branch
+// covered by nothing. That is the whole difference between a test and a
+// restatement of the code, and it is why this one test carries more here than
+// the two navigation sites that merely fatal when the other marker moves.
 func TestRepoRootFindsTheManviLayout(t *testing.T) {
 	root := t.TempDir()
 	workspace := filepath.Join(root, "crates")
@@ -321,11 +323,11 @@ func TestRepoRootFindsTheManviLayout(t *testing.T) {
 func TestTheExportedBinariesNameRealCargoTargets(t *testing.T) {
 	Tool(t, "cargo")
 
-	root := RepoRoot(t)
-	workspace := filepath.Join(root, "rust")
-	if _, err := os.Stat(filepath.Join(workspace, "Cargo.toml")); err != nil {
-		workspace = filepath.Join(root, "crates")
-	}
+	// Navigation, not assertion: this only needs a directory to run cargo in, so
+	// it asks the package where the workspace is rather than spelling the markers
+	// again. The two tests above that assert *where* the workspace lives
+	// deliberately do not, and say why.
+	workspace := RustWorkspace(t)
 
 	cmd := exec.Command("cargo", "metadata", "--no-deps", "--format-version", "1", "--offline")
 	cmd.Dir = workspace
@@ -405,11 +407,10 @@ func TestTheExportedBinariesNameRealCargoTargets(t *testing.T) {
 // no reason to touch — which either holds or does not.
 func TestBuiltBinaryIsNotAPathCargoRewrites(t *testing.T) {
 	bin := DCStore(t)
-	root := RepoRoot(t)
-	crates := filepath.Join(root, "rust")
-	if _, err := os.Stat(filepath.Join(crates, "Cargo.toml")); err != nil {
-		crates = filepath.Join(root, "crates")
-	}
+	// Navigation: somewhere to run cargo from, which is what RustWorkspace
+	// answers. What this test asserts is about the binary's path, not about
+	// where the workspace is.
+	crates := RustWorkspace(t)
 
 	before, err := os.Stat(bin)
 	if err != nil {
