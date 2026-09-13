@@ -69,6 +69,16 @@ func TestRetiredHostsAreNotOffered(t *testing.T) {
 			t.Fatalf("%s was dropped without an explanation for callers", host)
 		}
 	}
+	// And no retired name may reappear in `Hosts` later. The loop above only
+	// knows the two names retired so far; this one holds for every entry of
+	// either table. `checkHost` tests `Hosts` first, so a name in both is
+	// accepted and its `retiredHosts` explanation becomes unreachable — the
+	// successor it points at would never be printed.
+	for host := range retiredHosts {
+		if slices.Contains(Hosts, host) {
+			t.Fatalf("%s is both advertised and retired; its explanation is unreachable", host)
+		}
+	}
 }
 
 // Dropping a host from installation says nothing about removal. A
@@ -291,28 +301,44 @@ func rustIntegratorHosts(source string) ([]string, error) {
 // exits non-zero the first time anyone selects it.
 //
 // Driving `Run` rather than reading the switch's case labels is deliberate:
-// reading the thing under test back is what made the old check tautological,
-// and dry-run exercises the real dispatch — the `switch`, then `hostMcpDocs` —
-// while writing nothing.
+// reading the thing under test back is what made the old check tautological.
+//
+// `ModeCheck`, not `ModeDryRun`, and the difference is not cosmetic. The DevMap
+// composition block runs `if mode == ModeApply || mode == ModeDryRun`
+// (`integrate.go:197`), so a dry run spawns two real `devmap` subprocesses per
+// host — twelve across the table — against whichever binary happens to be
+// installed, and hands them this `TempDir` as their project root. The empty-tree
+// assertion below would then also be asserting that that binary honours
+// `--dry-run`, so a stale global `devmap` reddens this test naming a host, for a
+// cause with nothing to do with that host's adapter: the false signal this test
+// replaced, one layer down. `ModeCheck` reaches the same `switch`, fills the same
+// `receipt.Files`, and spawns nothing.
 func TestEveryAdvertisedHostHasAnAdapter(t *testing.T) {
 	for _, host := range Hosts {
 		t.Run(host, func(t *testing.T) {
 			root := t.TempDir()
-			receipt, err := Run(Options{Root: root, Host: host, Mode: ModeDryRun})
+			receipt, err := Run(Options{Root: root, Host: host, Mode: ModeCheck})
 			if err != nil {
 				t.Fatalf("%s is advertised but has no working adapter: %v", host, err)
 			}
 			if len(receipt.Files) == 0 {
 				t.Fatalf("%s reached an adapter that plans no file: %+v", host, receipt)
 			}
-			// A dry run that touched the tree would make the check itself the
+			// Asserted rather than assumed: this is what keeps the check's
+			// result attributable to the adapter instead of to an installed
+			// binary's behaviour.
+			if len(receipt.Spawned) != 0 {
+				t.Fatalf("%s spawned %v; a check mode must not run anything",
+					host, receipt.Spawned)
+			}
+			// A check that touched the tree would make the check itself the
 			// thing that changed the repository.
 			entries, readErr := os.ReadDir(root)
 			if readErr != nil {
 				t.Fatal(readErr)
 			}
 			if len(entries) != 0 {
-				t.Fatalf("dry run wrote %d entr(ies) for %s", len(entries), host)
+				t.Fatalf("check mode wrote %d entr(ies) for %s", len(entries), host)
 			}
 		})
 	}
