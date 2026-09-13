@@ -92,11 +92,16 @@ fn axum_re() -> Result<&'static Regex, String> {
 /// had: `app.get(name)` with one argument is Express's settings *getter*, so
 /// `app.get('view engine')` was recorded as a `GET view engine` route carrying
 /// no handler — verified against the pre-change matcher.
+///
+/// The receiver is captured, not discarded, because two things downstream need
+/// it: `non_router_receivers` asks whether this file bound it to a package, and
+/// nothing else in the match can answer that. What it is *not* used for is a
+/// list of acceptable names — that is the defect this matcher exists to undo.
 fn express_re() -> Result<&'static Regex, String> {
     static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?m)\b(?:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.(get|post|put|delete|patch)\s*\(\s*["'](\*|/[^"']*)["']\s*,"#,
+            r#"(?m)\b([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\.(get|post|put|delete|patch)\s*\(\s*["'](\*|/[^"']*)["']\s*,"#,
         )
         .map_err(|error| format!("invalid Express route matcher: {error}"))
     })
@@ -564,10 +569,130 @@ fn django_regex_to_template(pattern: &str) -> String {
 /// function expression — named or anonymous. An anonymous handler genuinely has
 /// no name, and yields `None` rather than a placeholder: a placeholder would
 /// resolve to any symbol that happened to share it.
-fn express_handler_name(source: &str, after: usize) -> Option<String> {
-    let (arguments, _) = call_arguments(source, after)?;
+/// Names this file binds to a third-party package, which is not a router.
+///
+/// The shape test on the final argument settles `axios.get(url, {headers})`,
+/// but not `axios.get(url, config)` — an identifier config is shaped exactly
+/// like a handler. The receiver is what separates them, and the file says what
+/// the receiver is without any need to resolve across modules.
+///
+/// An Express router is *constructed* — `express()`, `express.Router()`,
+/// `Router()` — never imported ready-made from a package. So a receiver this
+/// file binds directly to a **bare** specifier other than express is not a
+/// router: `require('axios')`, `import got from 'got'`,
+/// `import * as ky from 'ky'`. A relative specifier (`./routes/users`) is left
+/// alone, because a local module genuinely can export a router.
+///
+/// This is a deny-list of *bindings read out of this file*, not a list of names
+/// anyone guessed. That distinction is the whole point: an allow-list of
+/// receiver names is what produced the defect this pass exists to fix, and it
+/// failed on every name nobody thought of. A binding cannot be missing from a
+/// list of things the author wrote — at worst the author wrote nothing here,
+/// and an unknown receiver stays a candidate rather than being turned away.
+fn non_router_receivers(source: &str) -> std::collections::HashSet<String> {
+    let mut bound = std::collections::HashSet::new();
+    let Ok(imports) = package_binding_re() else {
+        return bound;
+    };
+    for capture in imports.captures_iter(source) {
+        // The require arm and the import arm each carry their own specifier
+        // group, because one regex cannot name the same group twice.
+        let Some(specifier) = capture
+            .name("from")
+            .or_else(|| capture.name("from2"))
+            .map(|m| m.as_str())
+        else {
+            continue;
+        };
+        // A relative or absolute path may export a router; express itself and
+        // its own subpaths are the router's source, not a rival to it.
+        if specifier.starts_with('.')
+            || specifier.starts_with('/')
+            || specifier == "express"
+            || specifier.starts_with("express/")
+        {
+            continue;
+        }
+        for group in ["default", "namespace", "required"] {
+            if let Some(name) = capture.name(group) {
+                bound.insert(name.as_str().to_string());
+            }
+        }
+        if let Some(named) = capture.name("named") {
+            for entry in named.as_str().split(',') {
+                // `{ get as httpGet }` binds the alias, which is the name a
+                // call site would use.
+                let binding = entry.rsplit(" as ").next().unwrap_or(entry).trim();
+                if !binding.is_empty() && binding.chars().all(is_binding_char) {
+                    bound.insert(binding.to_string());
+                }
+            }
+        }
+    }
 
-    // The handler is the last top-level argument; earlier ones are middleware.
+    // One hop of propagation, for the client-factory idiom: `axios.create()`
+    // returns a client, so whatever it was assigned to is no more a router than
+    // `axios` is. One hop is enough for every form of this in the wild, and
+    // stopping there keeps the scan linear.
+    if let Ok(factory) = factory_binding_re() {
+        for capture in factory.captures_iter(source) {
+            let (Some(name), Some(source_name)) = (capture.get(1), capture.get(2)) else {
+                continue;
+            };
+            if bound.contains(source_name.as_str()) {
+                bound.insert(name.as_str().to_string());
+            }
+        }
+    }
+    bound
+}
+
+fn is_binding_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '_' || character == '$'
+}
+
+/// `const X = require("pkg")` and the three ESM import forms, as whole bindings.
+///
+/// The require arm is anchored to end of statement so `require("express")
+/// .Router()` is not read as a bare package binding: that expression
+/// *constructs* a router, and only the un-suffixed form binds the module
+/// itself.
+fn package_binding_re() -> Result<&'static Regex, String> {
+    static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?m)^[ \t]*(?:(?:const|let|var)[ \t]+(?P<required>[A-Za-z_$][A-Za-z0-9_$]*)[ \t]*=[ \t]*require[ \t]*\([ \t]*["'](?P<from>[^"']+)["'][ \t]*\)[ \t]*;?[ \t]*$|import[ \t]+(?:(?P<default>[A-Za-z_$][A-Za-z0-9_$]*)|\*[ \t]+as[ \t]+(?P<namespace>[A-Za-z_$][A-Za-z0-9_$]*)|\{(?P<named>[^}]*)\})[ \t]+from[ \t]*["'](?P<from2>[^"']+)["'])"#,
+        )
+        .map_err(|error| format!("invalid package binding matcher: {error}"))
+    })
+    .as_ref()
+    .map_err(Clone::clone)
+}
+
+/// `const client = axios.create(...)` — a binding whose value comes from a call
+/// on another binding.
+fn factory_binding_re() -> Result<&'static Regex, String> {
+    static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?m)^[ \t]*(?:const|let|var)[ \t]+([A-Za-z_$][A-Za-z0-9_$]*)[ \t]*=[ \t]*([A-Za-z_$][A-Za-z0-9_$]*)(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*[ \t]*\("#,
+        )
+        .map_err(|error| format!("invalid factory binding matcher: {error}"))
+    })
+    .as_ref()
+    .map_err(Clone::clone)
+}
+
+/// The final top-level argument of a call, trimmed.
+///
+/// One owner for a question two callers ask of the same text: which argument is
+/// the handler, and is it shaped like one at all. Nesting and string literals
+/// are tracked so a comma inside an arrow body, a nested call, an array of
+/// middleware, an options object or a quoted string is not read as a separator.
+///
+/// An argument list with no top-level comma yields the whole list, which is the
+/// right answer: a call with one argument has that argument as its last.
+fn last_top_level_argument(arguments: &str) -> &str {
     let mut depth = 0i32;
     let mut quote: Option<char> = None;
     let mut escaped = false;
@@ -583,7 +708,44 @@ fn express_handler_name(source: &str, after: usize) -> Option<String> {
             _ => {}
         }
     }
-    let candidate = last.trim();
+    last.trim()
+}
+
+/// Whether a call's final argument is shaped like an Express handler.
+///
+/// `app.METHOD(path, ...callbacks)` is Express's whole signature: every
+/// argument after the path is a callback, and the framework has no form that
+/// takes trailing options. An HTTP client's `get` is the opposite shape —
+/// `axios.get(url, config)` — so the final argument is the one place the two
+/// differ structurally, whatever the receiver is called.
+///
+/// Data is rejected: an object literal (`{headers}`, `{params: {...}}` — the
+/// axios config), a string, a template literal, a number, a boolean, `null` and
+/// `undefined`. Everything callable is accepted: an identifier, a member
+/// expression, a function expression, an arrow function, a call returning a
+/// handler (`asyncHandler(getUsers)` — the wrapper idiom), and an array literal,
+/// because Express documents `app.get(path, [mw1, mw2])`.
+///
+/// An empty argument is not a handler: that is the settings getter,
+/// `app.get('view engine')`, whose argument list ends at the path.
+fn express_final_argument_is_a_handler(candidate: &str) -> bool {
+    let Some(first) = candidate.chars().next() else {
+        return false;
+    };
+    // An object literal is data. `{` opening an arrow body cannot appear here:
+    // an arrow's `{` always follows its `=>`, never starts the argument.
+    if first == '{' || first == '"' || first == '\'' || first == '`' {
+        return false;
+    }
+    if first.is_ascii_digit() || (first == '-' && candidate.len() > 1) {
+        return false;
+    }
+    !matches!(candidate, "null" | "undefined" | "true" | "false")
+}
+
+fn express_handler_name(source: &str, after: usize) -> Option<String> {
+    let (arguments, _) = call_arguments(source, after)?;
+    let candidate = last_top_level_argument(arguments);
 
     // A named function expression names the handler.
     if let Some(tail) = candidate.strip_prefix("function") {
@@ -718,14 +880,41 @@ pub fn extract_framework_routes(
         || framework_name == "typescript"
         || framework_name == "express"
     {
+        // Scanned once per file, not once per site: the bindings are a property
+        // of the file, and a site-by-site scan would be quadratic in a server
+        // that registers many routes.
+        let not_routers = non_router_receivers(source);
         for cap in express_re()?.captures_iter(source) {
-            let Some(full) = cap.get(0) else {
+            let (Some(full), Some(receiver)) = (cap.get(0), cap.get(1)) else {
                 continue;
             };
+            // `axios.get('/api/users', config)` is shaped exactly like a route
+            // and is not one. The file's own bindings say so: only the root of
+            // the receiver carries the binding, since `client.api.get(...)`
+            // reaches through whatever `client` was bound to.
+            let root = receiver.as_str().split('.').next().unwrap_or_default();
+            if not_routers.contains(root) {
+                continue;
+            }
+            // Express takes callbacks after the path and nothing else, so an
+            // options object in the final position means this call belongs to
+            // some other API.
+            //
+            // A call whose arguments cannot be read — unbalanced, or longer
+            // than the shared scan cap — is left as it was found rather than
+            // dropped: the check did not run, and reporting "not a handler" for
+            // a list nobody could read would turn an unread call into a
+            // deletion. The path and the trailing comma already matched.
+            let readable_arguments = call_arguments(source, full.end())
+                .map(|(arguments, _)| last_top_level_argument(arguments));
+            if matches!(readable_arguments, Some(last) if !express_final_argument_is_a_handler(last))
+            {
+                continue;
+            }
             routes.push(ExtractedRoute {
                 framework: "express".to_string(),
-                http_method: cap[1].to_uppercase(),
-                path_pattern: cap[2].to_string(),
+                http_method: cap[2].to_uppercase(),
+                path_pattern: cap[3].to_string(),
                 handler_name: express_handler_name(source, full.end()).unwrap_or_default(),
                 span: Span {
                     start_byte: full.start(),
@@ -1791,6 +1980,110 @@ mod express_receiver_tests {
             routes("app.set('view engine', 'pug');\napp.get('/x', handleX);\n"),
             ["GET /x -> handleX"],
             "the real route beside a settings call is still extracted"
+        );
+    }
+
+    /// An HTTP client call with a config argument is not a route.
+    ///
+    /// This is the case the path test and the second-argument test both let
+    /// through: `axios.get('/api/users', {headers})` has a `/` path and a
+    /// second argument, and once the receiver stopped being an allow-list there
+    /// was nothing left to tell it from `app.get('/api/users', handler)`.
+    ///
+    /// Two properties settle it, neither of them a list of names. Express's
+    /// signature is `app.METHOD(path, ...callbacks)` — every argument after the
+    /// path is a callback and the framework has no form taking trailing options
+    /// — so an object literal in the final position is some other API. And an
+    /// Express router is constructed, never imported ready-made, so a receiver
+    /// this file binds to a bare package specifier is not a router whatever it
+    /// was named.
+    ///
+    /// The second property is what makes an *identifier* config decidable:
+    /// `axios.get(url, config)` is shaped exactly like a route, and only the
+    /// binding of `axios` says otherwise.
+    #[test]
+    fn an_http_client_call_is_not_a_route() {
+        for (source, why) in [
+            (
+                "app.get('/api/users', {headers});\n",
+                "an options object is data; Express takes only callbacks after the path",
+            ),
+            (
+                "client.get('/api/users', { params: { page: 1 } });\n",
+                "a nested options object is still an options object",
+            ),
+            (
+                "const axios = require('axios');\naxios.get('/api/users', config);\n",
+                "an identifier config is shaped like a handler; the require says it is not",
+            ),
+            (
+                "import axios from 'axios';\naxios.get('/api/users', config);\n",
+                "the ESM default import binds the same evidence",
+            ),
+            (
+                "import * as ky from 'ky';\nky.get('/api/users', options);\n",
+                "a namespace import binds it too",
+            ),
+            (
+                "const axios = require('axios');\nconst client = axios.create({});\n\
+                 client.get('/api/users', config);\n",
+                "a client built by a factory is no more a router than its factory",
+            ),
+            (
+                "const got = require('got');\ngot.get('/x', opts);\n",
+                "no client is named in the matcher; the binding is read from the file",
+            ),
+        ] {
+            assert!(routes(source).is_empty(), "{why}: {:?}", routes(source));
+        }
+    }
+
+    /// The client guards must not cost a single real route.
+    ///
+    /// Both new tests reject, so both can be satisfied by rejecting too much.
+    /// A router is *constructed*, and every construction form has to survive —
+    /// including in the file that also imports a client, which is the ordinary
+    /// shape of a server that makes outbound calls.
+    #[test]
+    fn a_router_beside_an_http_client_still_registers_its_routes() {
+        assert_eq!(
+            routes(
+                "const express = require('express');\nconst axios = require('axios');\n\
+                 const app = express();\nconst api = express.Router();\n\
+                 app.get('/health', health);\napi.get('/users', listUsers);\n\
+                 axios.get('/upstream', config);\n"
+            ),
+            ["GET /health -> health", "GET /users -> listUsers"],
+            "the client's call drops out and both real routes stay"
+        );
+        assert_eq!(
+            routes(
+                "const usersRouter = require('./routes/users');\nusersRouter.get('/x', handleX);\n"
+            ),
+            ["GET /x -> handleX"],
+            "a relative import may export a router, so it is not treated as a client"
+        );
+        assert_eq!(
+            routes(
+                "import express from 'express';\nconst app = express();\napp.get('/x', handleX);\n"
+            ),
+            ["GET /x -> handleX"],
+            "express is the router's own source and never a rival to it"
+        );
+        assert_eq!(
+            routes("const router = require('express').Router();\nrouter.get('/x', handleX);\n"),
+            ["GET /x -> handleX"],
+            "a suffixed require constructs a router rather than binding a module"
+        );
+        assert_eq!(
+            routes("app.get('/x', asyncHandler(getUsers));\n"),
+            ["GET /x -> "],
+            "a wrapper call returns a handler; it is callable, not data"
+        );
+        assert_eq!(
+            routes("app.get('/x', [auth, log]);\n"),
+            ["GET /x -> "],
+            "Express documents an array of callbacks as the final argument"
         );
     }
 
