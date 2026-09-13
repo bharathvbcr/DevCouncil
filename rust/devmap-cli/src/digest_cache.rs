@@ -165,15 +165,32 @@ impl BinaryDigests {
         }
     }
 
-    /// The SHA-256 of `path`, from the memo when the file is unchanged.
+    /// The SHA-256 of `path`, from the memo when the file is unchanged, and
+    /// otherwise hashed within what is left of `budget`.
     ///
-    /// `None` for anything that cannot be stated or read, which is what every
-    /// caller already renders as "no digest available" rather than as a zero
-    /// digest.
-    pub fn digest(&mut self, path: &Path) -> Option<String> {
-        let meta = std::fs::metadata(path).ok()?;
+    /// **A hit costs no budget.** That is the whole arrangement between the two
+    /// bounds: the memo makes a repeated inventory free, and the budget makes
+    /// the first one finite. Charging a hit would let a machine with many
+    /// remembered binaries exhaust the allowance on work it did not do.
+    ///
+    /// The budget belongs here rather than at the call sites because this is the
+    /// only production path that reads a binary's bytes. A second entry point
+    /// without the bound is how the bound comes to be optional.
+    pub fn digest_within(
+        &mut self,
+        path: &Path,
+        budget: &mut sha256::Budget,
+    ) -> sha256::FileDigest {
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(error) => {
+                return sha256::FileDigest::Unavailable(format!(
+                    "not hashed: cannot stat: {error}"
+                ));
+            }
+        };
         if !meta.is_file() {
-            return None;
+            return sha256::FileDigest::Unavailable("not hashed: not a regular file".to_string());
         }
         let key = devmap_query::stat_memo::stat_key(&meta);
         let name = memo_key(path);
@@ -189,12 +206,18 @@ impl BinaryDigests {
                         entry.used = self.now;
                         self.dirty = true;
                     }
-                    return Some(entry.sha256.clone());
+                    return sha256::FileDigest::Hashed(entry.sha256.clone());
                 }
             }
         }
 
-        let digest = sha256::sha256_file(path)?;
+        let digest = match sha256::sha256_file_within(path, budget) {
+            sha256::FileDigest::Hashed(digest) => digest,
+            // Nothing is remembered for a refusal. A budget that ran out says
+            // nothing about the file, so storing anything here would turn one
+            // busy pass into a permanent wrong answer.
+            unavailable => return unavailable,
+        };
 
         // Re-stat before remembering. A file rewritten *while* it was being
         // hashed yields a digest of a torn read: returning it matches what an
@@ -217,7 +240,7 @@ impl BinaryDigests {
             );
             self.dirty = true;
         }
-        Some(digest)
+        sha256::FileDigest::Hashed(digest)
     }
 
     /// Persist, if anything changed and a state directory was resolved.
@@ -428,6 +451,23 @@ mod tests_support {
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
     }
+
+    /// A budget no test can exhaust, so a test that is not about the bound does
+    /// not accidentally depend on it.
+    pub fn generous() -> sha256::Budget {
+        sha256::Budget::new(std::time::Duration::from_secs(60), u64::MAX)
+    }
+
+    /// `digest_within` reduced to the `Option` these tests were written against.
+    ///
+    /// A test that wants to see a refusal calls `digest_within` directly; this
+    /// is for the ones whose subject is the memo rather than the bound.
+    pub fn digest_of(memo: &mut BinaryDigests, path: &Path) -> Option<String> {
+        match memo.digest_within(path, &mut generous()) {
+            sha256::FileDigest::Hashed(hex) => Some(hex),
+            sha256::FileDigest::Unavailable(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -506,8 +546,8 @@ mod tests {
         for state in [None, Some(absent.as_path())] {
             let mut memo = BinaryDigests::open(state);
             assert_eq!(
-                memo.digest(&file).as_deref(),
-                Some(sha256::sha256_file(&file).expect("digest").as_str())
+                digest_of(&mut memo, &file).as_deref(),
+                Some(sha256::sha256_hex(&std::fs::read(&file).unwrap()).as_str())
             );
             memo.save();
         }
@@ -524,23 +564,26 @@ mod tests {
         std::fs::write(&file, b"first").expect("write");
 
         let mut writer = BinaryDigests::open(Some(&state));
-        let first = writer.digest(&file).expect("digest");
+        let first = digest_of(&mut writer, &file).expect("digest");
         writer.save();
 
         // Reopened in a fresh memo, the entry is a hit: same key, same digest.
         let mut reader = BinaryDigests::open(Some(&state));
         assert_eq!(reader.entries.len(), 1, "the memo persisted one entry");
-        assert_eq!(reader.digest(&file).as_deref(), Some(first.as_str()));
+        assert_eq!(
+            digest_of(&mut reader, &file).as_deref(),
+            Some(first.as_str())
+        );
 
         // Changed bytes, changed answer — through a fresh memo, so the result
         // cannot come from in-process state.
         std::fs::write(&file, b"second and different").expect("rewrite");
         let mut after = BinaryDigests::open(Some(&state));
-        let second = after.digest(&file).expect("digest");
+        let second = digest_of(&mut after, &file).expect("digest");
         assert_ne!(second, first);
         assert_eq!(
             second,
-            sha256::sha256_file(&file).expect("digest"),
+            sha256::sha256_hex(&std::fs::read(&file).unwrap()),
             "the answer must be the digest of the bytes on disk"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -592,13 +635,13 @@ mod tests {
         // and it must cost a rehash rather than an error.
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o555)).expect("chmod");
         let mut memo = BinaryDigests::open(Some(&state));
-        let digest = memo.digest(&file);
+        let digest = digest_of(&mut memo, &file);
         memo.save();
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
         assert_eq!(
             digest.as_deref(),
-            Some(sha256::sha256_file(&file).expect("digest").as_str()),
+            Some(sha256::sha256_hex(&std::fs::read(&file).unwrap()).as_str()),
             "a read-only state directory must not change the answer"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -608,8 +651,11 @@ mod tests {
     fn a_directory_and_a_missing_file_have_no_digest() {
         let dir = scratch("shapes");
         let mut memo = BinaryDigests::open(None);
-        assert!(memo.digest(&dir).is_none(), "a directory is not a binary");
-        assert!(memo.digest(&dir.join("nope")).is_none(), "missing");
+        assert!(
+            digest_of(&mut memo, &dir).is_none(),
+            "a directory is not a binary"
+        );
+        assert!(digest_of(&mut memo, &dir.join("nope")).is_none(), "missing");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -624,10 +670,10 @@ mod tests {
         std::fs::write(&file, b"contents").expect("write");
 
         let mut memo = BinaryDigests::open(Some(&state));
-        let first = memo.digest(&file);
+        let first = digest_of(&mut memo, &file);
         memo.save();
         assert!(!memo.dirty, "saving settles the memo");
-        let second = memo.digest(&file);
+        let second = digest_of(&mut memo, &file);
         assert_eq!(first, second);
         assert!(
             !memo.dirty,
@@ -816,13 +862,13 @@ mod lifecycle {
         std::fs::write(&file, b"contents").expect("write");
 
         let mut first = BinaryDigests::open(Some(&state));
-        first.digest(&file).expect("digest");
+        digest_of(&mut first, &file).expect("digest");
         first.save();
         let memo = state.join(RELPATH);
         let before = std::fs::metadata(&memo).expect("stat memo");
 
         let mut second = BinaryDigests::open(Some(&state));
-        second.digest(&file).expect("digest");
+        digest_of(&mut second, &file).expect("digest");
         assert!(!second.dirty, "a fresh hit must not dirty the memo");
         second.save();
 
@@ -845,7 +891,7 @@ mod lifecycle {
         std::fs::write(&file, b"contents").expect("write");
 
         let mut memo = BinaryDigests::open(Some(&state));
-        let digest = memo.digest(&file).expect("digest");
+        let digest = digest_of(&mut memo, &file).expect("digest");
         memo.save();
 
         // Age the stored stamp past the refresh window and look again.
@@ -854,7 +900,10 @@ mod lifecycle {
         aged.entries.get_mut(&key).expect("entry").used =
             aged.now.saturating_sub(USED_REFRESH_SECONDS + 1);
         aged.dirty = false;
-        assert_eq!(aged.digest(&file).as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            digest_of(&mut aged, &file).as_deref(),
+            Some(digest.as_str())
+        );
         assert!(aged.dirty, "a stale stamp must be refreshed");
         assert_eq!(aged.entries[&key].used, aged.now);
         let _ = std::fs::remove_dir_all(&dir);
@@ -870,7 +919,7 @@ mod lifecycle {
         std::fs::write(&file, b"contents").expect("write");
 
         let mut memo = BinaryDigests::open(Some(&state));
-        let digest = memo.digest(&file);
+        let digest = digest_of(&mut memo, &file);
         // `devmap build` republishing state, a cleanup pass, a worktree torn
         // down — the directory is gone by the time the answer is ready.
         std::fs::remove_dir_all(&state).expect("rmdir state");
@@ -951,7 +1000,7 @@ mod recency {
         let mut loaded = BinaryDigests::open(Some(&state));
         let real = dir.join("real-binary");
         std::fs::write(&real, b"a binary that is actually in use").expect("write");
-        loaded.digest(&real).expect("digest");
+        digest_of(&mut loaded, &real).expect("digest");
         loaded.save();
 
         let after = BinaryDigests::open(Some(&state));
@@ -998,7 +1047,7 @@ mod eviction_ordering {
                 },
             );
         }
-        memo.digest(&real).expect("digest");
+        digest_of(&mut memo, &real).expect("digest");
         memo.save();
 
         let after = BinaryDigests::open(Some(&state));
@@ -1026,11 +1075,11 @@ mod read_only {
         std::fs::write(&file, b"contents").expect("write");
 
         let mut probe = BinaryDigests::open_read_only(Some(&state));
-        let digest = probe.digest(&file).expect("digest");
+        let digest = digest_of(&mut probe, &file).expect("digest");
         probe.save();
         assert_eq!(
             digest,
-            sha256::sha256_file(&file).expect("digest"),
+            sha256::sha256_hex(&std::fs::read(&file).unwrap()),
             "read-only must not change the answer"
         );
         assert!(
@@ -1040,7 +1089,7 @@ mod read_only {
 
         // But it does read one another caller left.
         let mut writer = BinaryDigests::open(Some(&state));
-        writer.digest(&file).expect("digest");
+        digest_of(&mut writer, &file).expect("digest");
         writer.save();
         let planted = "b".repeat(64);
         let mut tampered = BinaryDigests::open(Some(&state));
@@ -1051,7 +1100,7 @@ mod read_only {
 
         let mut reader = BinaryDigests::open_read_only(Some(&state));
         assert_eq!(
-            reader.digest(&file).as_deref(),
+            digest_of(&mut reader, &file).as_deref(),
             Some(planted.as_str()),
             "a read-only memo must still consult what is on disk"
         );

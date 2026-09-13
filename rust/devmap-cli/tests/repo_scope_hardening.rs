@@ -222,10 +222,41 @@ fn doctor_warns_when_a_host_config_names_a_missing_binary() {
     );
 }
 
+/// Given a fixture rather than the developer's own machine, for two reasons.
+///
+/// It used to run against the real `HOME` and assert that *some* listed binary
+/// carried a hash — which held only because hashing was unbounded and would
+/// therefore pay any price to finish. Now that the binary inventory has a
+/// budget, "a hash is always present" is no longer a property of the diagnostic
+/// but of how large the binaries on the machine are and how much CPU the
+/// machine has to spare; on a loaded host an unoptimised 61 MiB binary does not
+/// fit, and reporting that honestly is the fix, not a regression.
+///
+/// So the binary this test hashes is one it puts there itself, small enough
+/// that it fits any budget, and the assertions are strengthened rather than
+/// relaxed: *every* listed path must be absolute (it was *some*), and the bare
+/// `devmap` named by the host config must resolve onto `PATH` and come back
+/// with a real digest.
 #[test]
 fn doctor_resolves_bare_devmap_and_hashes_binaries() {
     let cwd = scratch("doc-hash");
-    let out = run_in(&cwd, &["--json", "doctor"], None);
+    let home = scratch("doc-hash-home");
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let discovered = bin.join("devmap");
+    std::fs::write(&discovered, b"#!/bin/sh\nexit 0\n").unwrap();
+    // A bare command name is the resolution this test is named for: doctor must
+    // report where it lands, never echo back "devmap".
+    write_mcp(&home.join(".cursor/mcp.json"), "devmap");
+
+    let out = Command::new(devmap())
+        .args(["--json", "doctor"])
+        .current_dir(&cwd)
+        .env("HOME", &home)
+        .env("PATH", &bin)
+        .env_remove("DEVMAP_HOME")
+        .output()
+        .expect("devmap --json doctor");
     assert!(
         out.status.success(),
         "{}",
@@ -234,12 +265,22 @@ fn doctor_resolves_bare_devmap_and_hashes_binaries() {
     let payload = one_json(&out, "doctor");
     let binaries = payload["binaries"].as_array().expect("binaries");
     assert!(
-        binaries.iter().any(|b| {
-            b.get("sha256").and_then(Value::as_str).is_some()
-                && b.get("path")
-                    .and_then(Value::as_str)
-                    .is_some_and(|p| Path::new(p).is_absolute())
+        binaries.iter().all(|b| {
+            b.get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|p| Path::new(p).is_absolute())
         }),
-        "each listed binary must be a resolved path with a hash: {payload}"
+        "every listed binary must be a resolved absolute path: {payload}"
     );
+    let resolved = discovered.canonicalize().unwrap().display().to_string();
+    let row = binaries
+        .iter()
+        .find(|b| b.get("path").and_then(Value::as_str) == Some(resolved.as_str()))
+        .unwrap_or_else(|| panic!("bare `devmap` was not resolved onto PATH: {payload}"));
+    assert_eq!(
+        row.get("sha256").and_then(Value::as_str).map(str::len),
+        Some(64),
+        "a discovered binary that fits the budget must be hashed: {row}"
+    );
+    assert_eq!(row["sha256_status"], "hashed", "{row}");
 }
