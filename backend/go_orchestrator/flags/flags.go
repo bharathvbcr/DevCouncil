@@ -246,17 +246,6 @@ func (r *Registry) isHarnessNamespace(key string) bool {
 	return false
 }
 
-func resolveFlagAlias(key string) string {
-	switch key {
-	case "verification.rigor.enabled":
-		return "verify.rigor.enabled"
-	case "verification.diff_coverage.enforce":
-		return "verify.diff_coverage.enforce"
-	default:
-		return ""
-	}
-}
-
 // LoadConfig applies a config-file layer. Every harness key must be defined and every
 // value must be legal — a typo in harness settings is reported, never ignored.
 // Shared repository settings outside harness namespaces are passed over safely.
@@ -267,18 +256,7 @@ func (r *Registry) LoadConfig(values map[string]string) error {
 	toSet := map[string]string{}
 
 	for k, v := range values {
-		targetKey := k
-		d, ok := r.defs[targetKey]
-		if !ok {
-			if alias := resolveFlagAlias(k); alias != "" {
-				if ad, aok := r.defs[alias]; aok {
-					d = ad
-					targetKey = alias
-					ok = true
-				}
-			}
-		}
-
+		d, ok := r.defs[k]
 		if !ok {
 			if r.isHarnessNamespace(k) {
 				unknown = append(unknown, k)
@@ -289,7 +267,7 @@ func (r *Registry) LoadConfig(values map[string]string) error {
 		if err := validate(d, normalize(v)); err != nil {
 			return fmt.Errorf("flags: config %q: %w", k, err)
 		}
-		toSet[targetKey] = normalize(v)
+		toSet[k] = normalize(v)
 	}
 
 	if len(unknown) > 0 {
