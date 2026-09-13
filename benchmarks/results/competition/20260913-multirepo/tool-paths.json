@@ -1,0 +1,8 @@
+{
+  "devmap": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-multirepo/devmap",
+  "codegraph": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/tools/codegraph/codegraph-darwin-arm64/bin/codegraph",
+  "cbm": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/tools/codebase-memory-mcp/codebase-memory-mcp",
+  "gortex": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/tools/gortex/gortex",
+  "graphify": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/tools/graphify-venv/bin/graphify",
+  "gitnexus": "/opt/homebrew/bin/gitnexus"
+}

@@ -1,0 +1,12 @@
+
+  GitNexus Analyzer
+
+[2K  Skipped 1 large files (>512KB, likely generated/vendored)
+[2K  - tools/protoc.zip
+[2K  Set GITNEXUS_MAX_FILE_SIZE=<KB> to include files above the default cap.
+
+  Repository indexed successfully (38.5s)
+
+  44,931 nodes | 156,307 edges | 1928 clusters | 300 flows
+  /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-multirepo/gitnexus-scholarlm
+

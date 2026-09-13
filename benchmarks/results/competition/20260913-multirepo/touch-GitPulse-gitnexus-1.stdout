@@ -1,0 +1,14 @@
+
+  GitNexus Analyzer
+
+[2K  Skipped 1 large files (>512KB, likely generated/vendored)
+[2K  - src-tauri/icons/icon.icns
+[2K  Set GITNEXUS_MAX_FILE_SIZE=<KB> to include files above the default cap.
+[2KIncremental: changed=1, added=0, deleted=0 (skipping wipe + 1911 unchanged file rows preserved)
+[2KParse cache: pruned 1 stale chunk entries
+
+  Repository indexed successfully (36.5s)
+
+  40,709 nodes | 89,094 edges | 1661 clusters | 300 flows
+  /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-multirepo/gitnexus-GitPulse
+

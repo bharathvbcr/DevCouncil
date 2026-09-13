@@ -1,0 +1,19 @@
+  warning: 2 file(s) had syntax errors and may be partially extracted: apps/desktop/src/__tests__/lib/latex-rich-doc.test.ts (first error at line 9, 1 symbol(s) extracted), apps/desktop/src/__tests__/lib/resume-synthesis-metric-normalization.test.ts (first error at line 139, no symbols extracted)
+        4.82 real         8.23 user         5.10 sys
+           322011136  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              166889  page reclaims
+                  16  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 786  voluntary context switches
+               40366  involuntary context switches
+         82293352740  instructions retired
+         18101848322  cycles elapsed
+           307413976  peak memory footprint

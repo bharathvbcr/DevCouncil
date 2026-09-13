@@ -1,0 +1,20 @@
+  warning: 7 .sql file(s) contributed nothing to the graph because a dependency is missing: tree_sitter_sql not installed. Install it with: pip install "graphifyy[sql]" (#1745)
+  warning: 149 file(s) had syntax errors and may be partially extracted: harness/CoverageHost.svelte (first error at line 1, 1 symbol(s) extracted), harness/DevmapHost.svelte (first error at line 1, 8 symbol(s) extracted), harness/DiagnosticsHost.svelte (first error at line 1, no symbols extracted), harness/LoopCanary.svelte (first error at line 1, no symbols extracted), harness/OnboardingHost.svelte (first error at line 4, 3 symbol(s) extracted) (+144 more)
+       11.72 real        18.15 user         8.17 sys
+           682246144  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              330872  page reclaims
+                 182  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                2615  voluntary context switches
+               82941  involuntary context switches
+        204768846652  instructions retired
+         46258046167  cycles elapsed
+           668763072  peak memory footprint

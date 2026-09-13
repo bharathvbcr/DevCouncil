@@ -1,0 +1,25 @@
+[graphify extract] scanning /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-multirepo/graphify-GitPulse
+[graphify extract] --code-only: skipping 183 non-code file(s) (167 docs, 0 papers, 16 images) — no LLM extraction
+[graphify extract] found 1861 code, 0 docs, 0 papers, 0 images
+[graphify extract] 64 file(s) not classified (no supported extension or shebang), skipped: .all-contributorsrc, .gitattributes, .gitignore, .gitmodules, .license_template, AndroidManifest.xml (+58 more)
+[graphify extract] AST extraction on 1861 code files...
+  AST extraction: 100/1861 uncached files (5%) [18 workers]
+  AST extraction: 200/1861 uncached files (10%) [18 workers]
+  AST extraction: 300/1861 uncached files (16%) [18 workers]
+  AST extraction: 400/1861 uncached files (21%) [18 workers]
+  AST extraction: 500/1861 uncached files (26%) [18 workers]
+  AST extraction: 600/1861 uncached files (32%) [18 workers]
+  AST extraction: 700/1861 uncached files (37%) [18 workers]
+  AST extraction: 800/1861 uncached files (42%) [18 workers]
+  AST extraction: 900/1861 uncached files (48%) [18 workers]
+  AST extraction: 1000/1861 uncached files (53%) [18 workers]
+  AST extraction: 1100/1861 uncached files (59%) [18 workers]
+  AST extraction: 1200/1861 uncached files (64%) [18 workers]
+  AST extraction: 1300/1861 uncached files (69%) [18 workers]
+  AST extraction: 1400/1861 uncached files (75%) [18 workers]
+  AST extraction: 1500/1861 uncached files (80%) [18 workers]
+  AST extraction: 1600/1861 uncached files (85%) [18 workers]
+  AST extraction: 1700/1861 uncached files (91%) [18 workers]
+  AST extraction: 1800/1861 uncached files (96%) [18 workers]
+  AST extraction: 1861/1861 uncached files (100%) [18 workers]
+[graphify extract] wrote /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-multirepo/graphify-GitPulse/graphify-out/graph.json — 35122 nodes, 90473 edges (no clustering)

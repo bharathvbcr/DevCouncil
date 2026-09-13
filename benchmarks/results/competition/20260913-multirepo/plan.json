@@ -1,0 +1,66 @@
+{
+  "benchmark": "devmap cross-repository competitor comparison",
+  "scratch": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-multirepo",
+  "devmap_binary": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-multirepo/devmap",
+  "snapshots": {
+    "DevCouncil": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/372a7af4-05a3-473b-9f5d-9386945f80c7/scratchpad/corpus/DevCouncil",
+    "GitPulse": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/372a7af4-05a3-473b-9f5d-9386945f80c7/scratchpad/corpus/GitPulse",
+    "DevPrism": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/372a7af4-05a3-473b-9f5d-9386945f80c7/scratchpad/corpus/DevPrism",
+    "scholarlm": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/372a7af4-05a3-473b-9f5d-9386945f80c7/scratchpad/corpus/scholarlm"
+  },
+  "corpus_commits": {
+    "DevCouncil": "9d8e6db8b6718aef4c6d1dece3721a9d0b7fe22c",
+    "GitPulse": "bbafcb892e8a3c77d9fe800acfa42fbf1f516f63",
+    "DevPrism": "feaef2ffd27fe6d77f897ebc9ba6f0db0b5dd458",
+    "scholarlm": "7bb95186c5d44b431cd907bf2fc65e2d97c455aa"
+  },
+  "edit_targets": {
+    "DevCouncil": "rust/devmap-cli/tests/file_liveness_reaches_every_artifact.rs",
+    "DevPrism": "apps/desktop/src/components/settings-toggle-row.tsx",
+    "GitPulse": "src-tauri/vendored/devmap-extract/src/langdecl/kotlin.rs",
+    "scholarlm": "backend/go_orchestrator/internal/wisdev/temporal_activities.go"
+  },
+  "sources": {
+    "DevCouncil": "/Users/bharath/Code/devtools/DevCouncil",
+    "GitPulse": "/Users/bharath/Code/devtools/GitPulse",
+    "DevPrism": "/Users/bharath/Code/devtools/DevPrism",
+    "scholarlm": "/Users/bharath/Code/scholarlm"
+  },
+  "tool_identities": {
+    "devmap": {
+      "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-multirepo/devmap",
+      "exists": true,
+      "sha256": "203c00244fd9712fce534aff3931c4294eefc44cd34a520a237ef903bd25ffc3"
+    },
+    "codegraph": {
+      "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/tools/codegraph/codegraph-darwin-arm64/bin/codegraph",
+      "exists": true,
+      "sha256": "3184bbf582b5db7cffd07373017631fdc4392842860c2e3991be3f23b6fb3559"
+    },
+    "cbm": {
+      "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/tools/codebase-memory-mcp/codebase-memory-mcp",
+      "exists": true,
+      "sha256": "2412e017268bef8f847f38d1b0f79f63185b38c27fe6fba637067bfc87c0eedf"
+    },
+    "gortex": {
+      "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/tools/gortex/gortex",
+      "exists": true,
+      "sha256": "62813625fa4d121322cab6f1bced00397713a59688af0297882812da2ab912bf"
+    },
+    "graphify": {
+      "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/tools/graphify-venv/bin/graphify",
+      "exists": true,
+      "sha256": "0bfd195de40114ab88bf40840708d9634c4da1f563ef185da05aa8a66dfe859e"
+    },
+    "gitnexus": {
+      "path": "/opt/homebrew/bin/gitnexus",
+      "exists": true,
+      "sha256": "233ece3066020a9098aa7fa448e04beff8452169497248cb1e5c316e508bfbbc"
+    }
+  },
+  "host": [
+    "Mac17,8",
+    "18"
+  ],
+  "note": "Each tool indexes its own APFS clone of the pinned snapshot. No working checkout and no live product index is read or written."
+}

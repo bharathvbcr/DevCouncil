@@ -1,0 +1,15 @@
+┌  Initializing CodeGraph
+│
+◆  Initialized in /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-multirepo/codegraph-DevCouncil
+│
+Scanning files...
+Parsing code...
+Resolving refs...
+Linking dynamic dispatch...
+│
+◆  Indexed 833 files
+│
+●  16,345 nodes, 59,481 edges in 713ms
+│
+└  Done
+

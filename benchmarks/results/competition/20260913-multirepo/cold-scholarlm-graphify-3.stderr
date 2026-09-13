@@ -1,0 +1,23 @@
+  warning: 2 source file(s) produced zero nodes and are absent from the graph: pyproject.toml, Cargo.toml. A re-run will retry them (empties are no longer cached); if it persists, please report the file(s) (#1666).
+  warning: 30 .sql file(s) contributed nothing to the graph because a dependency is missing: tree_sitter_sql not installed. Install it with: pip install "graphifyy[sql]" (#1745)
+  warning: 6 .tf file(s) contributed nothing to the graph because a dependency is missing: tree_sitter_hcl not installed. Install it with: pip install "graphifyy[terraform]" (#1745)
+  warning: 1 .hcl file(s) contributed nothing to the graph because a dependency is missing: tree_sitter_hcl not installed. Install it with: pip install "graphifyy[terraform]" (#1745)
+  warning: 4 file(s) had syntax errors and may be partially extracted: frontend/contexts/AuthContext.tsx (first error at line 1, 5 symbol(s) extracted), frontend/services/memoryTypes.ts (first error at line 2, no symbols extracted), frontend/services/searchPriorityPolicyService.test.ts (first error at line 19, no symbols extracted), frontend/services/wisdevAgent/contracts.ts (first error at line 14, no symbols extracted)
+       25.92 real        37.75 user        17.09 sys
+          1123565568  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              450771  page reclaims
+                  49  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                5698  voluntary context switches
+              183340  involuntary context switches
+        465397434559  instructions retired
+        103068608483  cycles elapsed
+          1109116128  peak memory footprint

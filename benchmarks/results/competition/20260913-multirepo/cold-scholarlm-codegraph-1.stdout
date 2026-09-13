@@ -1,0 +1,15 @@
+┌  Initializing CodeGraph
+│
+◆  Initialized in /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-multirepo/codegraph-scholarlm
+│
+Scanning files...
+Parsing code...
+Resolving refs...
+Linking dynamic dispatch...
+│
+◆  Indexed 3,906 files
+│
+●  67,156 nodes, 217,224 edges in 2.3s
+│
+└  Done
+
