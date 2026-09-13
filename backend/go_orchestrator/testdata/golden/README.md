@@ -10,7 +10,7 @@ explicit hardening note, never a silent drift.
 
 - `manifest.json` — case index and replay instructions
 - `mcp/` — MCP tool JSON envelopes (`devcouncil_get_diff`, lease, verify, …)
-- `cli/` — CLI JSON envelopes plus integrate/skills/map file bytes
+- `cli/` — CLI JSON envelopes plus skills/map file bytes
 
 Each `*.json` envelope has:
 
