@@ -199,18 +199,32 @@ func TestToolIsUnavailableWhenTheBinaryIsMissing(t *testing.T) {
 // ".." levels, were wrong by one, and so skipped everything while printing ok.
 //
 // RepoRoot's contract is that cargo can be run from the workspace under what it
-// returns, so that is what is checked — against the same two markers cargoBin
-// resolves cmd.Dir with, restated here rather than shared with it. The package
-// accepts both, because DevCouncil holds the crates in rust/ and Manvi keeps
-// only symlinks to them under crates/.
+// returns, so that is what is checked — against the two markers the package
+// accepts, restated here rather than shared with it. Both are accepted because
+// DevCouncil holds the crates in rust/ and Manvi keeps only symlinks to them
+// under crates/. (This sentence used to say "the same two markers cargoBin
+// resolves cmd.Dir with". cargoBin resolves nothing now — it asks
+// RustWorkspace — so that was a comment describing machinery deleted under it.)
 //
 // The restatement is deliberate; do not replace it with whatever list the
 // package walks. Asserting against the code under test is how a check stops
 // being able to fail — rename a marker and it renames on both sides at once.
-// This pair is exhaustive and non-overlapping, measured: renaming the rust/
-// marker reddens this test and only this test, and renaming crates/ reddens
-// TestRepoRootFindsTheManviLayout and only that one. Each marker has exactly
-// one guard, so folding either into a shared list drops a marker's only cover.
+//
+// Measured at package scope on this tree, because the earlier version of this
+// paragraph claimed "reddens this test and only this test" for each marker and
+// that was measured under `-run TestRepoRoot`, which hid everything else:
+//
+//	rust   -> rustMUT:   3 fail — this test, plus
+//	                     TestTheExportedBinariesNameRealCargoTargets and
+//	                     TestBuiltBinaryIsNotAPathCargoRewrites
+//	crates -> cratesMUT: 1 fail — TestRepoRootFindsTheManviLayout
+//
+// So the two markers are not symmetric. crates/ has exactly one guard, and it is
+// the one below; folding that one into a shared list would drop the marker's only
+// cover. rust/ has three, but only this test is an assertion about the marker —
+// the other two are navigation sites that fatal incidentally once the workspace
+// cannot be found, so they would fall silent together with everything else if the
+// list were shared.
 func TestRepoRootFindsTheRustWorkspace(t *testing.T) {
 	root := RepoRoot(t)
 
