@@ -55,72 +55,64 @@ func Unavailable(t testing.TB, format string, args ...any) {
 		"Set "+AllowSkipEnv+"=1 to skip instead of failing, accepting that this seam goes uncovered.", args...)
 }
 
-// workspaceDirs are the names the Rust workspace goes by. DevCouncil keeps the
-// crates in `rust/`; Manvi keeps only symlinks to them under `crates/`.
+// workspaceDirs names the directories a Rust workspace manifest may sit in.
+// Canonical sources live in DevCouncil's `rust/`; Manvi keeps only symlinks to
+// them under `crates/`. Spelled once so `RepoRoot` and `RustWorkspace` cannot
+// come to disagree about which layouts exist.
 //
-// One list, spelled once. `RepoRoot` accepts a directory *because* one of these
-// holds a Cargo.toml, and `RustWorkspace` then returns which one — so a second
-// spelling of the same set would not merely duplicate, it would decide the two
-// answers separately. The day they disagreed, `RepoRoot` would accept a
-// directory whose workspace `RustWorkspace` could not name.
+// Navigation may share this list; an assertion must not. A test checking where
+// the workspace lives restates the markers itself — one that iterates this
+// variable would follow a rename into agreeing with it, which is the same
+// tautology as reading `Hosts` back to assert something about `Hosts`.
 var workspaceDirs = []string{"rust", "crates"}
 
-// workspaceIn reports the Rust workspace directly under root, if there is one.
-func workspaceIn(root string) (string, bool) {
-	for _, name := range workspaceDirs {
-		dir := filepath.Join(root, name)
-		if _, err := os.Stat(filepath.Join(dir, "Cargo.toml")); err == nil {
-			return dir, true
-		}
-	}
-	return "", false
-}
-
-// RepoRoot returns the directory that holds the Rust workspace used to build
-// dcstore/dcverify/dcgrep/devmap.
+// findWorkspace walks up from the working directory to the repository root and
+// returns it together with the workspace directory inside it.
 //
-// Canonical sources live in DevCouncil's `rust/`. Manvi keeps only
-// symlinks under `crates/` for local cargo. Walk for either marker so tests
-// run from both repositories.
-func RepoRoot(t testing.TB) string {
+// One walk answers both questions, so there is no second lookup that could
+// fail after the first succeeded — the old `RustWorkspace` joined "rust", and
+// on a miss returned `root/crates` without checking it, which was correct only
+// by the unstated invariant that `RepoRoot` had just accepted one of the two.
+func findWorkspace(t testing.TB) (root, workspace string) {
 	t.Helper()
 	dir, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
 	for {
-		if _, ok := workspaceIn(dir); ok {
-			return dir
+		for _, name := range workspaceDirs {
+			candidate := filepath.Join(dir, name)
+			if _, err := os.Stat(filepath.Join(candidate, "Cargo.toml")); err == nil {
+				return dir, candidate
+			}
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			t.Fatalf("no repository root above %s (looking for Cargo.toml under any of %v)", dir, workspaceDirs)
+			t.Fatalf("no repository root above %s (looking for %v each holding Cargo.toml)", dir, workspaceDirs)
 		}
 		dir = parent
 	}
+}
+
+// RepoRoot returns the directory that holds the Rust workspace used to build
+// dcstore/dcverify/dcgrep/devmap.
+func RepoRoot(t testing.TB) string {
+	t.Helper()
+	root, _ := findWorkspace(t)
+	return root
 }
 
 // RustWorkspace returns the directory holding the Rust workspace manifest.
 //
 // A caller that needs a path *inside* the workspace — a crate's source, its
 // target directory — asks here rather than joining "rust" itself, so the two
-// layouts cannot drift apart one caller at a time.
-//
-// Not finding one is fatal rather than a guess. Returning `root/crates`
-// unchecked would be safe only by an invariant nothing stated: it holds today
-// because `RepoRoot` accepted this directory for the very same markers. Sharing
-// `workspaceDirs` is what makes that true by construction instead of by
-// coincidence, and this refusal is what says so if it ever stops being true —
-// rather than handing back a path that exists in neither layout and leaving
-// every caller to report its own unrelated failure.
+// layouts cannot drift apart one caller at a time. The directory returned is
+// one whose `Cargo.toml` was just stat'd, never a path assembled on the
+// assumption that it must be there.
 func RustWorkspace(t testing.TB) string {
 	t.Helper()
-	root := RepoRoot(t)
-	dir, ok := workspaceIn(root)
-	if !ok {
-		t.Fatalf("no Rust workspace under %s: RepoRoot accepted it, so the marker lists have diverged", root)
-	}
-	return dir
+	_, workspace := findWorkspace(t)
+	return workspace
 }
 
 type build struct {

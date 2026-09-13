@@ -139,7 +139,23 @@ func TestTheProbeRetriesAfterItsCooldown(t *testing.T) {
 	dir := t.TempDir()
 	bin, _ := countingDevmap(t, dir, "usage: devmap manifest\n      --graph-output <PATH>")
 	c := New(bin, dir)
-	c.probeTimeout = 200 * time.Millisecond
+	// No probeTimeout override here, deliberately — unlike the hung-binary test
+	// above, which needs a short one to time out a fixture that sleeps 60s.
+	//
+	// This test's subject is the *cooldown*: an expired one re-asks a healthy
+	// binary. It never measures elapsed time, so a tight bound adds no assertion
+	// and only makes the healthy fixture race a deadline. It lost that race on
+	// 2026-09-13 during a `cargo test --workspace` run, failing with "did not
+	// answer `manifest --help` within 200ms and is presumed hung" — the fixture
+	// forks /bin/sh, appends to a journal and cats a heredoc, and under a
+	// parallel build that takes longer than 200ms. `defaultProbeTimeout` is 10s,
+	// which is a 50x margin on the same work and asserts exactly as much.
+	//
+	// Verified by mechanism rather than by waiting for the flake: with the 200ms
+	// bound and a fixture slowed to ~300ms this failed with that exact message,
+	// and with the default it passes the same fixture. 100 unmodified runs under
+	// CPU saturation and under a concurrent cargo build never reproduced it, so
+	// the slow-fixture proof is the evidence, not the load.
 
 	// Seed a failure whose cooldown has already elapsed.
 	c.probeMu.Lock()

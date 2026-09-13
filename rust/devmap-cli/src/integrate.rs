@@ -17,7 +17,17 @@ use serde_json::{json, Map, Value};
 use crate::claude::{self, CURSOR_HOOKS_MARKER, MCP_SERVER_NAME};
 use crate::skills;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A host `devmap integrate` can configure.
+///
+/// The variants are the single list of *names*: clap derives the positional's
+/// accepted values and its `--help` from them, and [`Host::parse`] and the
+/// refusal it returns are generated from the same list, so none of the three
+/// can advertise a host the others do not accept.
+///
+/// A new host still needs its arm in each match below — that is per-host
+/// behaviour, and the compiler asks for it. What it no longer needs is for
+/// anyone to remember a list of names written somewhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Host {
     Cursor,
     Claude,
@@ -29,6 +39,8 @@ pub enum Host {
     /// OpenCode. Reads `opencode.json` at the repository root — a *user-owned*
     /// file, not a dot-directory this tool owns — under an `mcp` key whose
     /// entries name the program as an argv array rather than command+args.
+    // clap's default rename would spell this `open-code`; the host is one word.
+    #[value(name = "opencode")]
     OpenCode,
     /// Warp / Oz. Reads `.devcouncil/integrations/warp-mcp.json`, a file
     /// DevCouncil writes and passes explicitly via `oz agent run --mcp`, so
@@ -37,21 +49,48 @@ pub enum Host {
 }
 
 impl Host {
+    /// Parse a host name, for callers holding a string rather than a parsed
+    /// argument. `devmap integrate` itself gets its `Host` from clap.
+    ///
+    /// Acceptance and refusal are both generated from the variant list, so the
+    /// message cannot name a set of hosts the parser does not accept — the way
+    /// the `--help` text came to promise three of six.
+    ///
+    /// Retained, not wired: since the positional is typed, the only in-tree
+    /// caller is the test below. The attribute states that rather than letting
+    /// a blanket allow hide a later unwiring.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn parse(name: &str) -> anyhow::Result<Self> {
-        match name {
-            "cursor" => Ok(Self::Cursor),
-            "claude" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
-            "antigravity" => Ok(Self::Antigravity),
-            "opencode" => Ok(Self::OpenCode),
-            "warp" => Ok(Self::Warp),
-            other => bail!(
-                "unsupported host {other:?}; expected cursor, claude, codex, \
-                 antigravity, opencode, or warp"
-            ),
+        <Self as clap::ValueEnum>::from_str(name, false).map_err(|_| {
+            anyhow!(
+                "unsupported host {name:?}; expected {}",
+                Self::accepted_names()
+            )
+        })
+    }
+
+    /// The accepted names as prose: `a, b, or c`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn accepted_names() -> String {
+        let names: Vec<&str> = <Self as clap::ValueEnum>::value_variants()
+            .iter()
+            .map(|host| host.as_str())
+            .collect();
+        match names.as_slice() {
+            // Unreachable while the enum has variants, but a refusal that had
+            // nothing to name must say so rather than trail off after "expected".
+            [] => "no host: this build accepts none".to_string(),
+            [only] => (*only).to_string(),
+            [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
         }
     }
 
+    /// The canonical name of this host, as typed on the command line.
+    ///
+    /// Tied to clap's own accepted values by a test below, and read out of this
+    /// source by the Go integrator's drift check
+    /// (`backend/go_orchestrator/devcouncil/integrate/host_selection_test.go`),
+    /// which needs the arms of this match to stay literal.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cursor => "cursor",
@@ -1137,6 +1176,7 @@ pub fn empty_map() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::ValueEnum;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn scratch(label: &str) -> PathBuf {
@@ -1150,6 +1190,69 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The name clap accepts for a host and the name this code prints for it
+    /// are the same string, for every host.
+    ///
+    /// Iterating `value_variants()` rather than a list written here is the
+    /// point: clap derives that list from the enum, so a host added tomorrow is
+    /// checked by this test without anyone remembering to add it. A variant
+    /// whose clap spelling drifts from `as_str` — `OpenCode` renaming itself to
+    /// `open-code`, say — would make `devmap integrate opencode` refuse a name
+    /// the rest of this file, the Go integrator and the receipts all use.
+    #[test]
+    fn clap_and_as_str_spell_every_host_the_same_way() {
+        for host in <Host as clap::ValueEnum>::value_variants() {
+            let possible = host
+                .to_possible_value()
+                .expect("every host is selectable on the command line");
+            assert_eq!(
+                possible.get_name(),
+                host.as_str(),
+                "{host:?} is typed one way and printed another"
+            );
+            assert_eq!(
+                Host::parse(host.as_str()).unwrap(),
+                *host,
+                "{host:?} does not survive a round trip through its own name"
+            );
+        }
+    }
+
+    /// The refusal names every host the parser actually accepts.
+    ///
+    /// This is the check the old hand-written message could not pass: it
+    /// promised six names from a `match` that was free to accept a different
+    /// set. Built from `value_variants()`, the two cannot disagree.
+    #[test]
+    fn an_unknown_host_is_refused_by_naming_the_real_ones() {
+        let error = Host::parse("banana")
+            .expect_err("banana is not a host")
+            .to_string();
+        assert!(error.contains("banana"), "{error}");
+        for host in <Host as clap::ValueEnum>::value_variants() {
+            assert!(
+                error.contains(host.as_str()),
+                "refusal does not name {}: {error}",
+                host.as_str()
+            );
+        }
+    }
+
+    /// Case is not a spelling this accepts.
+    ///
+    /// `Host::parse` is the string door into the same values clap parses, and
+    /// clap is case-sensitive here; a door that quietly took `CURSOR` would
+    /// write receipts under a name the CLI would then refuse.
+    #[test]
+    fn a_host_name_is_matched_exactly() {
+        for name in ["Cursor", "CURSOR", "open-code", " cursor", ""] {
+            assert!(
+                Host::parse(name).is_err(),
+                "{name:?} was accepted as a host name"
+            );
+        }
     }
 
     #[test]

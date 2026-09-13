@@ -163,7 +163,11 @@ Four, all forced by the move. Everything else is byte-identical to MANVI.
    demand the evidence; unset, the behaviour is unchanged.
 4. **`testsupport` workspace location.** MANVI's Rust workspace is `crates/`;
    DevCouncil's is `rust/`. The literal was spelled in five places, so it is now
-   one exported constant, `testsupport.RustWorkspace`.
+   one exported helper, `testsupport.RustWorkspace(t)` — a func, not a constant,
+   because it stats the candidate before returning it. The marker names
+   themselves are the package-level `workspaceDirs`, read by nothing but
+   `findWorkspace`; a test asserting where the workspace lives restates them
+   independently rather than importing the list it is checking.
 
 **Not changed, and deliberately flagged:** `testsupport.AllowSkipEnv` is still
 `MANVI_TEST_ALLOW_SKIP` and the build lock is still `.manvi-testbin.lock`.

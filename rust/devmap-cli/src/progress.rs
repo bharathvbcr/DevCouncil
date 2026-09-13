@@ -900,6 +900,22 @@ mod tests {
             frame.render(0, 80, false, false),
             frame.render(1, 80, false, false)
         );
+        // Rows are sized to their content and nothing pads, but the width they
+        // are handed must still be spent. A detail longer than any window here
+        // fills each one bar the autowrap column, so a wider terminal buys more
+        // of the path rather than leaving the space unused.
+        let overflowing = Frame {
+            current: 1,
+            label: "scanning".into(),
+            detail: format!("/var/folders/{}", "deeply/nested/".repeat(30)),
+            started: Instant::now(),
+            files: None,
+        };
+        for width in [24, 48, 72, 80, 110, 120, 300] {
+            let line = overflowing.render(0, width, false, false);
+            let cells: usize = line.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+            assert_eq!(cells, width - 1, "width={width}: {line}");
+        }
         assert!(frame.render(0, 80, true, false).contains("\x1b[36m"));
         assert_eq!(safe_text("a\r\nb\x1b"), "a\\r\\nb\\u{1b}");
         assert_eq!(fit("世界x", 4), "世~");
