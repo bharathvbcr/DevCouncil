@@ -11,11 +11,33 @@ use crate::model::*;
 /// and the one downstream verb matching already understands as a wildcard.
 const UNSPECIFIED_METHOD: &str = "ANY";
 
+/// A Python route decorator: any receiver, and a path the framework would accept.
+///
+/// The receiver used to be an allow-list of three names — `app`, `router`,
+/// `api` — which is not how either framework is written. A Flask blueprint is
+/// `bp = Blueprint(...)` and a FastAPI router is `users = APIRouter()`, so the
+/// receiver is whatever the author named the object, and `@bp.route("/users")`
+/// extracted nothing at all. A module holding only blueprint routes answered
+/// `count: 0` over a scan reporting `complete: true`.
+///
+/// Precision moves from the receiver's *name* to the path's *shape*, which is a
+/// property of the frameworks rather than a guess about how authors name
+/// things: Werkzeug's `Rule.__init__` raises `ValueError` unless the rule
+/// starts with `/`, and Starlette's `Route.__init__` asserts
+/// `path.startswith("/")`. A decorator whose first argument is a string literal
+/// not starting with `/` is therefore not a route in either framework. That one
+/// test is what keeps `@mock.patch("os.path.exists")` out of the route table:
+/// it has an identifier receiver, an HTTP-verb attribute, a string literal and
+/// a decorated `def`, so every *other* signal admits it.
+///
+/// Anchored to the start of a line because a Python decorator can begin nowhere
+/// else — which also stops a commented-out `# @app.route("/x")` from binding a
+/// handler that nothing reaches any more.
 fn python_route_re() -> Result<&'static Regex, String> {
     static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?m)@(app|router|api)\.(get|post|put|delete|patch|options|head|route)\s*\(\s*["']([^"']+)["']"#,
+            r#"(?m)^[ \t]*@(?:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.(get|post|put|delete|patch|options|head|route)\s*\(\s*["'](/[^"']*)["']"#,
         )
         .map_err(|error| format!("invalid Python route matcher: {error}"))
     })
@@ -53,11 +75,30 @@ fn axum_re() -> Result<&'static Regex, String> {
     .map_err(Clone::clone)
 }
 
+/// An Express route: any receiver, a path, and a handler argument after it.
+///
+/// `(app|router)` missed every router bound to another name —
+/// `const api = express.Router()`, `const v1 = Router()`, `this.router` — and
+/// the widening the Python matcher gets applies here for the same reason.
+///
+/// JavaScript then needs a second guard that Python does not, because `X.get`
+/// with a string argument is one of the most common shapes in the language:
+/// `axios.get('/api/users')`, `redis.get('key')`, `cache.get(k)`. Two
+/// properties separate a route from all of those. The path starts with `/`, or
+/// is the `*` catch-all Express documents. And the call has a *second*
+/// argument, because a route without a handler is not a route.
+///
+/// That second test also closes a false positive the old `app` receiver already
+/// had: `app.get(name)` with one argument is Express's settings *getter*, so
+/// `app.get('view engine')` was recorded as a `GET view engine` route carrying
+/// no handler — verified against the pre-change matcher.
 fn express_re() -> Result<&'static Regex, String> {
     static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"(?m)\b(app|router)\.(get|post|put|delete|patch)\s*\(\s*["']([^"']+)["']"#)
-            .map_err(|error| format!("invalid Express route matcher: {error}"))
+        Regex::new(
+            r#"(?m)\b(?:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.(get|post|put|delete|patch)\s*\(\s*["'](\*|/[^"']*)["']\s*,"#,
+        )
+        .map_err(|error| format!("invalid Express route matcher: {error}"))
     })
     .as_ref()
     .map_err(Clone::clone)
@@ -588,11 +629,11 @@ pub fn extract_framework_routes(
             let call = call_arguments(source, full.end());
             let handler = python_decorated_handler(source, call.map_or(full.end(), |(_, end)| end))
                 .unwrap_or_default();
-            for method in python_route_methods(&cap[2], call.map(|(arguments, _)| arguments)) {
+            for method in python_route_methods(&cap[1], call.map(|(arguments, _)| arguments)) {
                 routes.push(ExtractedRoute {
                     framework: "fastapi/flask".to_string(),
                     http_method: method,
-                    path_pattern: cap[3].to_string(),
+                    path_pattern: cap[2].to_string(),
                     handler_name: handler.clone(),
                     span: Span {
                         start_byte: full.start(),
@@ -683,8 +724,8 @@ pub fn extract_framework_routes(
             };
             routes.push(ExtractedRoute {
                 framework: "express".to_string(),
-                http_method: cap[2].to_uppercase(),
-                path_pattern: cap[3].to_string(),
+                http_method: cap[1].to_uppercase(),
+                path_pattern: cap[2].to_string(),
                 handler_name: express_handler_name(source, full.end()).unwrap_or_default(),
                 span: Span {
                     start_byte: full.start(),
@@ -1139,6 +1180,111 @@ def get_user(uid):
             "an argument list longer than the cap names no handler"
         );
     }
+
+    /// A route decorator's receiver is whatever the author named the object.
+    ///
+    /// The matcher used to hard-code `app`, `router` or `api`, which is not how
+    /// either framework is written: a Flask blueprint is `bp = Blueprint(...)`
+    /// and a FastAPI router is `users = APIRouter()`. A module holding only
+    /// blueprint routes produced no routes at all — and `devmap routes --json`
+    /// reported `count: 0` under a scan claiming `complete: true`, which is an
+    /// answer that ran and is wrong presented as one that is whole.
+    ///
+    /// Losing the route loses the handler's only inbound edge, so the endpoint
+    /// is absent from `routes`, `api-impact`, `shape-check`, `cypher` and the
+    /// `HandlesRoute` edges the graph carries.
+    #[test]
+    fn a_route_decorators_receiver_may_be_any_name() {
+        assert_eq!(
+            python_routes(
+                "@bp.route(\"/users\")\ndef list_users():\n    return []\n\n\
+                 @bp.post(\"/users/new\")\ndef create_user():\n    return {}\n"
+            ),
+            [
+                ("ANY".into(), "/users".into(), "list_users".into()),
+                ("POST".into(), "/users/new".into(), "create_user".into())
+            ],
+            "a blueprint-only module holds real routes, and must not answer none"
+        );
+        assert_eq!(
+            python_routes("@users.get(\"/items\")\ndef list_items():\n    return []\n"),
+            [("GET".into(), "/items".into(), "list_items".into())],
+            "a FastAPI router bound to its own name is still a router"
+        );
+        assert_eq!(
+            python_routes("@api_v2.router.get(\"/x\")\ndef read_x():\n    return 1\n"),
+            [("GET".into(), "/x".into(), "read_x".into())],
+            "a router reached through an attribute chain is still a router"
+        );
+
+        // The mixed module that reproduced the defect: one of its four routes
+        // survived the receiver allow-list.
+        assert_eq!(
+            python_routes(
+                "@app.route(\"/health\")\ndef health():\n    return \"ok\"\n\n\
+                 @bp.route(\"/users\")\ndef list_users():\n    return []\n\n\
+                 @users.get(\"/items\")\ndef list_items():\n    return []\n\n\
+                 @bp.post(\"/users/new\")\ndef create_user():\n    return {}\n"
+            )
+            .len(),
+            4,
+            "every route in a mixed module is extracted, not only the `app` one"
+        );
+    }
+
+    /// What tells a route decorator from a look-alike: the shape of its path.
+    ///
+    /// Once the receiver stops being an allow-list, the receiver's name carries
+    /// no information, so precision has to come from somewhere the frameworks
+    /// themselves define. Werkzeug's `Rule.__init__` raises `ValueError` unless
+    /// the rule starts with `/`, and Starlette's `Route.__init__` asserts
+    /// `path.startswith("/")` — so a decorator whose first argument is a string
+    /// literal not starting with `/` is not a route in either framework.
+    ///
+    /// `@mock.patch` is the case that needs it: an identifier receiver, an
+    /// HTTP-verb attribute, a string literal first argument and a decorated
+    /// `def` — every other signal admits it. A false `HandlesRoute` edge is not
+    /// merely a wrong row in a listing: it is what tells liveness a symbol is
+    /// reached from outside the call graph, so it also silences a genuinely
+    /// dead symbol.
+    #[test]
+    fn a_decorators_path_must_be_one_the_framework_would_accept() {
+        for (source, why) in [
+            (
+                "@mock.patch(\"os.path.exists\")\ndef test_it(exists):\n    return 1\n",
+                "a patch target is not a route path: no framework would accept it",
+            ),
+            (
+                "@cache.get(\"session:1\")\ndef loader():\n    return 1\n",
+                "a cache key is not a route path",
+            ),
+            (
+                "# @app.route(\"/x\")\ndef handle():\n    return 1\n",
+                "a commented-out route decorates nothing, and must not bind a \
+                 handler nothing reaches any more",
+            ),
+            (
+                "value = registry.get(\"/x\")\ndef handle():\n    return 1\n",
+                "a decorator can begin nowhere but the start of a line",
+            ),
+        ] {
+            assert!(
+                python_routes(source).is_empty(),
+                "{why}: {:?}",
+                python_routes(source)
+            );
+        }
+
+        // An indented decorator is still a decorator: a router registered on a
+        // method inside a class is ordinary FastAPI.
+        assert_eq!(
+            python_routes(
+                "class Api:\n    @router.get(\"/x\")\n    def read_x(self):\n        return 1\n"
+            ),
+            [("GET".into(), "/x".into(), "read_x".into())],
+            "leading indentation does not stop a decorator from being one"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1533,6 +1679,135 @@ mod django_route_tests {
             django_routes(&urlconf("    path(\"x/\", views.detail\n")),
             [],
             "an entry whose call never closes is not a route"
+        );
+    }
+}
+
+#[cfg(test)]
+mod express_receiver_tests {
+    use super::*;
+
+    /// `METHOD /path -> handler` for every route the Express matcher finds.
+    fn routes(source: &str) -> Vec<String> {
+        extract_framework_routes("javascript", source)
+            .expect("matcher compiles")
+            .into_iter()
+            .map(|route| {
+                format!(
+                    "{} {} -> {}",
+                    route.http_method, route.path_pattern, route.handler_name
+                )
+            })
+            .collect()
+    }
+
+    /// A router bound to any name is still a router.
+    ///
+    /// The same `(app|router)` allow-list as the Python side, with the same
+    /// consequence: `const api = express.Router()` — the idiom the Express
+    /// router guide itself uses — extracted nothing, so every handler mounted
+    /// on it lost its only inbound edge.
+    #[test]
+    fn extracts_routes_from_a_router_bound_to_any_name() {
+        assert_eq!(
+            routes("const api = express.Router();\napi.get('/users', handleUsers);\n"),
+            ["GET /users -> handleUsers"]
+        );
+        assert_eq!(
+            routes("v1.post('/users/new', createUser);\n"),
+            ["POST /users/new -> createUser"]
+        );
+        assert_eq!(
+            routes("this.router.put('/x', handlePut);\n"),
+            ["PUT /x -> handlePut"],
+            "a class-based server reaches its router through a dotted receiver"
+        );
+        assert_eq!(
+            routes("app.get('*', handleFallback);\n"),
+            ["GET * -> handleFallback"],
+            "the catch-all Express documents is a path, and its handler is real"
+        );
+    }
+
+    /// What tells a route from an ordinary `X.get("string")` call.
+    ///
+    /// JavaScript needs a guard Python does not: `@` makes a Python decorator
+    /// unmistakable, while `X.get('/thing')` is one of the most common shapes
+    /// in JavaScript and would flood the route table once the receiver stopped
+    /// being an allow-list. Two properties separate a route: a path that starts
+    /// with `/` (or the `*` catch-all), and a second argument, because a route
+    /// with no handler is not a route.
+    ///
+    #[test]
+    fn a_route_is_told_from_a_get_call_by_its_path_and_its_handler() {
+        for (source, why) in [
+            (
+                "axios.get('/api/users');\n",
+                "an HTTP client call names no handler",
+            ),
+            (
+                "redis.get('session:1', loadSession);\n",
+                "a cache key is not a route path, even with a callback after it",
+            ),
+            (
+                "const id = headers.get('x-request-id', fallback);\n",
+                "a header name is not a route path, even with a second argument",
+            ),
+            (
+                "cache.get('users', () => load());\n",
+                "a cache lookup with a callback is not a route",
+            ),
+        ] {
+            assert!(routes(source).is_empty(), "{why}: {:?}", routes(source));
+        }
+    }
+
+    /// `app.get(name)` with one argument is Express's settings getter.
+    ///
+    /// This is a *separate* defect from the receiver allow-list, and predates
+    /// it: `app` was already on that list, so `app.get('view engine')` matched,
+    /// and the site was pushed anyway because an absent handler became `""`
+    /// rather than a reason to reject it. `devmap routes --json` listed a route
+    /// `GET view engine` with `normalized_path: "/view engine"` and an empty
+    /// handler list — reproduced against the pre-change release binary.
+    ///
+    /// It gets its own test because the requirement that closes it — a second
+    /// argument — is not scaffolding for widening the receiver, and must not be
+    /// dropped by whoever next touches the receiver logic.
+    ///
+    /// The harm is a phantom row in `routes`, `api-impact` and `shape-check`
+    /// and a route node binding nothing — *not* a wrongly exempted dead symbol.
+    /// With an empty handler name the resolver has no symbol to bind, so the
+    /// node dangles rather than producing a live `HandlesRoute` edge to
+    /// something real.
+    #[test]
+    fn a_settings_getter_is_not_a_route() {
+        assert!(
+            routes("const engine = app.get('view engine');\n").is_empty(),
+            "a one-argument app.get reads a setting and registers no route: {:?}",
+            routes("const engine = app.get('view engine');\n")
+        );
+        assert_eq!(
+            routes("app.set('view engine', 'pug');\napp.get('/x', handleX);\n"),
+            ["GET /x -> handleX"],
+            "the real route beside a settings call is still extracted"
+        );
+    }
+
+    /// A path Express itself would never route is not a route.
+    ///
+    /// The `/`-or-`*` test is the JS side's only discriminator once the
+    /// receiver stops being an allow-list, so it is worth stating what it
+    /// costs. Express matches a request's `req.path`, which always begins with
+    /// `/`, so a *string* path without one routes nothing — there is no real
+    /// route this turns away. A RegExp path — `app.get(/^\/x/, h)` — is not a
+    /// string literal, so neither this matcher nor the one it replaces ever saw
+    /// it: that gap is unchanged, not newly introduced.
+    #[test]
+    fn a_regexp_path_is_out_of_reach_of_a_string_literal_matcher() {
+        assert!(
+            routes("app.get(/^\\/users/, handleUsers);\n").is_empty(),
+            "a RegExp path is not a string literal, before or after this change"
         );
     }
 }
