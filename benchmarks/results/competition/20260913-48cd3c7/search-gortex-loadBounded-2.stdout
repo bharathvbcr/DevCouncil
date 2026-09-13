@@ -1,0 +1,20 @@
+{
+  "query_class": "symbol",
+  "results": [
+    {
+      "absolute_file_path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-48cd3c7/gortex-corpus/backend/go_orchestrator/repomap/repomap.go",
+      "doc": "loadBounded is Load with the bound as an argument, so a test can drive the refus…",
+      "file_path": "devcouncil-bench/backend/go_orchestrator/repomap/repomap.go",
+      "id": "devcouncil-bench/backend/go_orchestrator/repomap/repomap.go::loadBounded",
+      "kind": "function",
+      "name": "loadBounded",
+      "project_id": "devcouncil-bench",
+      "repo_prefix": "devcouncil-bench",
+      "start_line": 331,
+      "visibility": "package",
+      "workspace_id": "devcouncil-bench"
+    }
+  ],
+  "total": 1,
+  "truncated": false
+}

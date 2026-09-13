@@ -1,21 +1,27 @@
 # DevMap competitor benchmarks
 
-- [DevMap v0.2.1 rerun — six graph tools, ripgrep, and alternating version control](20260913-v0.2.1/REPORT.md)
+- [DevMap build 48cd3c7 rerun — six graph tools, ripgrep, and alternating build control](20260913-48cd3c7/REPORT.md)
+- [Prior v0.2.1 run against build 506a617](20260913-v0.2.1/REPORT.md)
 - [Prior v0.2.0 expanded comparison — Graphify, Gortex, GitNexus, CodeGraph, codebase-memory-mcp, and ripgrep](20260912-expanded/REPORT.md)
 - [Initial DevMap/GitNexus comparison and Rust verification](20260912-52d63a1a/REPORT.md)
 
-The v0.2.1 report is the latest source for per-tool **positives,
+The build-`48cd3c7` report is the latest source for per-tool **positives,
 negatives, and comparisons**: indexing and query latency with explicit
-“× faster/slower” factors, memory and storage,
-caller checks, update/deletion behavior, warnings and recovery, methodology,
-unverified scenarios, and inferred DevMap improvement priorities. Its raw
-measurements and audit remain linked beside the conclusions.
+“× faster/slower” factors, memory and storage, caller checks, update/deletion
+behavior, warnings and recovery, methodology, unverified scenarios, and
+inferred DevMap improvement priorities. Its raw measurements and audit remain
+linked beside the conclusions.
 
-All use the same frozen DevCouncil corpus. Their samples were collected
-separately. The v0.2.1 rerun has 261 competitive timing samples plus 82
-supplemental samples alternating the preserved 0.2.0 and 0.2.1 binaries.
-Keep its two campaigns and the historical timings separate. The initial run
-retains its own measurements and separate Rust verification evidence.
-Read each report's interface, coverage, and reproducibility limits before
-comparing results. The [DevMap guide](../../../docs/devmap/README.md#benchmark-comparison)
-provides a shorter summary without replacing the full report.
+It exists because the installed DevMap executable advanced 49 commits past the
+build the v0.2.1 report measured, so that report stopped describing the
+shipping binary. Both are version 0.2.1 and are distinguished by build id.
+
+All runs use the same frozen DevCouncil corpus at commit `ee07c183`. Their
+samples were collected separately. The latest rerun has 261 competitive timing
+samples plus 82 supplemental samples alternating the preserved `506a617` and
+`48cd3c7` binaries. Keep each run's campaigns and the historical timings
+separate. The initial run retains its own measurements and separate Rust
+verification evidence. Read each report's interface, coverage, and
+reproducibility limits before comparing results. The
+[DevMap guide](../../../docs/devmap/README.md#benchmark-comparison) provides a
+shorter summary without replacing the full report.

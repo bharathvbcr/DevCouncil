@@ -1,0 +1,1 @@
+{"function":"loadBounded","direction":"inbound","callers_total":2,"callers":{"cols":["name","hop"],"groups":[{"qn_prefix":"devcouncil-bench.backend.go_orchestrator.repomap","rows":[["Load",1],["TestAnInternedGraphIsHeldToTheSameBound",1]]}]}}

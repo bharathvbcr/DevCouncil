@@ -1,0 +1,823 @@
+{
+  "protocol": "Same corpus, independent stores, alternating build order; no simultaneous timing processes. Supplemental to the competitor samples. Both executables are version 0.2.1 and differ by 49 commits.",
+  "timing_samples": 82,
+  "versions": {
+    "506a617": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-v0.2.1/devmap",
+    "48cd3c7": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-48cd3c7/devmap"
+  },
+  "builds": {
+    "506a617": {
+      "build": "506a617498a5",
+      "source_commit": "506a617498a5f1dae8a89519f91b4ee67031e352",
+      "sha256": "0cf3428a85de9099d6ae30172d4f149b57c3135bcaaaaaad9ec5f73d5a72541f"
+    },
+    "48cd3c7": {
+      "build": "48cd3c7c5a84",
+      "source_commit": "48cd3c7c5a84570e3047779f23d2a4c4777b5278",
+      "sha256": "6d9a60cdcea4ef8d9ffce70c29c238a1b6e74c84614b5ed977bc32971864224f"
+    }
+  },
+  "groups": [
+    {
+      "version": "506a617",
+      "stage": "cold",
+      "target": null,
+      "samples": 3,
+      "seconds": {
+        "median": 2.0192359999928158,
+        "min": 1.956759000007878,
+        "max": 2.0617649170017103
+      },
+      "sampled_tree_peak_bytes": 639713280,
+      "store_bytes": 145670144
+    },
+    {
+      "version": "506a617",
+      "stage": "warm",
+      "target": null,
+      "samples": 5,
+      "seconds": {
+        "median": 0.08282887499080971,
+        "min": 0.07798412500414997,
+        "max": 0.1066520829917863
+      },
+      "sampled_tree_peak_bytes": 3883008,
+      "store_bytes": null
+    },
+    {
+      "version": "506a617",
+      "stage": "edit",
+      "target": null,
+      "samples": 3,
+      "seconds": {
+        "median": 0.7860930830065627,
+        "min": 0.7315993749944028,
+        "max": 0.8436717080039671
+      },
+      "sampled_tree_peak_bytes": 498860032,
+      "store_bytes": null
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "db_size_gate_bytes",
+      "samples": 5,
+      "seconds": {
+        "median": 0.023194207999040373,
+        "min": 0.021833250008057803,
+        "max": 0.023994707997189835
+      },
+      "sampled_tree_peak_bytes": 3866624,
+      "store_bytes": null
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "loadBounded",
+      "samples": 5,
+      "seconds": {
+        "median": 0.023727584004518576,
+        "min": 0.022286834006081335,
+        "max": 0.02417787499143742
+      },
+      "sampled_tree_peak_bytes": 4456448,
+      "store_bytes": null
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "describe_corpus",
+      "samples": 5,
+      "seconds": {
+        "median": 0.023227124998811632,
+        "min": 0.02128883299883455,
+        "max": 0.032356749987229705
+      },
+      "sampled_tree_peak_bytes": 3866624,
+      "store_bytes": null
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "db_size_gate_bytes",
+      "samples": 5,
+      "seconds": {
+        "median": 0.03968674999487121,
+        "min": 0.03863191699201707,
+        "max": 0.043054584006313235
+      },
+      "sampled_tree_peak_bytes": 3866624,
+      "store_bytes": null
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "loadBounded",
+      "samples": 5,
+      "seconds": {
+        "median": 0.041574500006390736,
+        "min": 0.04015412500302773,
+        "max": 0.04460862500127405
+      },
+      "sampled_tree_peak_bytes": 3866624,
+      "store_bytes": null
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "describe_corpus",
+      "samples": 5,
+      "seconds": {
+        "median": 0.03974145799293183,
+        "min": 0.038291042001219466,
+        "max": 0.041533374998834915
+      },
+      "sampled_tree_peak_bytes": 3883008,
+      "store_bytes": null
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "cold",
+      "target": null,
+      "samples": 3,
+      "seconds": {
+        "median": 1.917735333001474,
+        "min": 1.9012150000053225,
+        "max": 2.083598291996168
+      },
+      "sampled_tree_peak_bytes": 631537664,
+      "store_bytes": 145670144
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "warm",
+      "target": null,
+      "samples": 5,
+      "seconds": {
+        "median": 0.0788416249997681,
+        "min": 0.07417216699104756,
+        "max": 0.08450633300526533
+      },
+      "sampled_tree_peak_bytes": 3883008,
+      "store_bytes": null
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "edit",
+      "target": null,
+      "samples": 3,
+      "seconds": {
+        "median": 0.7842560420103837,
+        "min": 0.7307528749952326,
+        "max": 0.8063330830045743
+      },
+      "sampled_tree_peak_bytes": 497188864,
+      "store_bytes": null
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "db_size_gate_bytes",
+      "samples": 5,
+      "seconds": {
+        "median": 0.02449304101173766,
+        "min": 0.02212254100595601,
+        "max": 0.02492108300793916
+      },
+      "sampled_tree_peak_bytes": 3899392,
+      "store_bytes": null
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "loadBounded",
+      "samples": 5,
+      "seconds": {
+        "median": 0.023062292006216012,
+        "min": 0.021287708994350396,
+        "max": 0.024407499993685633
+      },
+      "sampled_tree_peak_bytes": 3866624,
+      "store_bytes": null
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "describe_corpus",
+      "samples": 5,
+      "seconds": {
+        "median": 0.023360042003332637,
+        "min": 0.02202795899938792,
+        "max": 0.025178332987707108
+      },
+      "sampled_tree_peak_bytes": 3866624,
+      "store_bytes": null
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "db_size_gate_bytes",
+      "samples": 5,
+      "seconds": {
+        "median": 0.04016570799285546,
+        "min": 0.038726458995370194,
+        "max": 0.041489667011774145
+      },
+      "sampled_tree_peak_bytes": 3866624,
+      "store_bytes": null
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "loadBounded",
+      "samples": 5,
+      "seconds": {
+        "median": 0.040704374987399206,
+        "min": 0.03919787499762606,
+        "max": 0.04166954199899919
+      },
+      "sampled_tree_peak_bytes": 3866624,
+      "store_bytes": null
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "describe_corpus",
+      "samples": 5,
+      "seconds": {
+        "median": 0.040041166997980326,
+        "min": 0.038958375007496215,
+        "max": 0.043384625008911826
+      },
+      "sampled_tree_peak_bytes": 3866624,
+      "store_bytes": null
+    }
+  ],
+  "answers": [
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "db_size_gate_bytes",
+      "iteration": 1,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "db_size_gate_bytes",
+      "iteration": 1,
+      "matched": [
+        "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+        "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "db_size_gate_bytes",
+      "iteration": 1,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "db_size_gate_bytes",
+      "iteration": 1,
+      "matched": [
+        "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+        "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "loadBounded",
+      "iteration": 1,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "loadBounded",
+      "iteration": 1,
+      "matched": [
+        "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+        "backend/go_orchestrator/repomap/repomap.go::Load"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "loadBounded",
+      "iteration": 1,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "loadBounded",
+      "iteration": 1,
+      "matched": [
+        "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+        "backend/go_orchestrator/repomap/repomap.go::Load"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "describe_corpus",
+      "iteration": 1,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "describe_corpus",
+      "iteration": 1,
+      "matched": [
+        "benchmarks/map_bench.py::main"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "describe_corpus",
+      "iteration": 1,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "describe_corpus",
+      "iteration": 1,
+      "matched": [
+        "benchmarks/map_bench.py::main"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "db_size_gate_bytes",
+      "iteration": 2,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "db_size_gate_bytes",
+      "iteration": 2,
+      "matched": [
+        "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+        "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "db_size_gate_bytes",
+      "iteration": 2,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "db_size_gate_bytes",
+      "iteration": 2,
+      "matched": [
+        "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+        "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "loadBounded",
+      "iteration": 2,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "loadBounded",
+      "iteration": 2,
+      "matched": [
+        "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+        "backend/go_orchestrator/repomap/repomap.go::Load"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "loadBounded",
+      "iteration": 2,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "loadBounded",
+      "iteration": 2,
+      "matched": [
+        "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+        "backend/go_orchestrator/repomap/repomap.go::Load"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "describe_corpus",
+      "iteration": 2,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "describe_corpus",
+      "iteration": 2,
+      "matched": [
+        "benchmarks/map_bench.py::main"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "describe_corpus",
+      "iteration": 2,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "describe_corpus",
+      "iteration": 2,
+      "matched": [
+        "benchmarks/map_bench.py::main"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "db_size_gate_bytes",
+      "iteration": 3,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "db_size_gate_bytes",
+      "iteration": 3,
+      "matched": [
+        "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+        "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "db_size_gate_bytes",
+      "iteration": 3,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "db_size_gate_bytes",
+      "iteration": 3,
+      "matched": [
+        "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+        "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "loadBounded",
+      "iteration": 3,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "loadBounded",
+      "iteration": 3,
+      "matched": [
+        "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+        "backend/go_orchestrator/repomap/repomap.go::Load"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "loadBounded",
+      "iteration": 3,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "loadBounded",
+      "iteration": 3,
+      "matched": [
+        "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+        "backend/go_orchestrator/repomap/repomap.go::Load"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "describe_corpus",
+      "iteration": 3,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "describe_corpus",
+      "iteration": 3,
+      "matched": [
+        "benchmarks/map_bench.py::main"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "describe_corpus",
+      "iteration": 3,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "describe_corpus",
+      "iteration": 3,
+      "matched": [
+        "benchmarks/map_bench.py::main"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "db_size_gate_bytes",
+      "iteration": 4,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "db_size_gate_bytes",
+      "iteration": 4,
+      "matched": [
+        "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+        "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "db_size_gate_bytes",
+      "iteration": 4,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "db_size_gate_bytes",
+      "iteration": 4,
+      "matched": [
+        "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+        "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "loadBounded",
+      "iteration": 4,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "loadBounded",
+      "iteration": 4,
+      "matched": [
+        "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+        "backend/go_orchestrator/repomap/repomap.go::Load"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "loadBounded",
+      "iteration": 4,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "loadBounded",
+      "iteration": 4,
+      "matched": [
+        "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+        "backend/go_orchestrator/repomap/repomap.go::Load"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "describe_corpus",
+      "iteration": 4,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "describe_corpus",
+      "iteration": 4,
+      "matched": [
+        "benchmarks/map_bench.py::main"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "describe_corpus",
+      "iteration": 4,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "describe_corpus",
+      "iteration": 4,
+      "matched": [
+        "benchmarks/map_bench.py::main"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "db_size_gate_bytes",
+      "iteration": 5,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "db_size_gate_bytes",
+      "iteration": 5,
+      "matched": [
+        "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+        "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "db_size_gate_bytes",
+      "iteration": 5,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "db_size_gate_bytes",
+      "iteration": 5,
+      "matched": [
+        "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+        "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "loadBounded",
+      "iteration": 5,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "loadBounded",
+      "iteration": 5,
+      "matched": [
+        "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+        "backend/go_orchestrator/repomap/repomap.go::Load"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "loadBounded",
+      "iteration": 5,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "loadBounded",
+      "iteration": 5,
+      "matched": [
+        "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+        "backend/go_orchestrator/repomap/repomap.go::Load"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "506a617",
+      "stage": "search",
+      "target": "describe_corpus",
+      "iteration": 5,
+      "exact_definition": true
+    },
+    {
+      "version": "506a617",
+      "stage": "callers",
+      "target": "describe_corpus",
+      "iteration": 5,
+      "matched": [
+        "benchmarks/map_bench.py::main"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "search",
+      "target": "describe_corpus",
+      "iteration": 5,
+      "exact_definition": true
+    },
+    {
+      "version": "48cd3c7",
+      "stage": "callers",
+      "target": "describe_corpus",
+      "iteration": 5,
+      "matched": [
+        "benchmarks/map_bench.py::main"
+      ],
+      "missing": [],
+      "additional_unjudged": []
+    }
+  ],
+  "corpus_verification": {
+    "tool": "devmap",
+    "files": 1186,
+    "mismatches": []
+  }
+}

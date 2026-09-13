@@ -1,0 +1,9 @@
+{
+  "XDG_CONFIG_HOME": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-48cd3c7/xdg/config",
+  "XDG_DATA_HOME": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-48cd3c7/xdg/data",
+  "XDG_CACHE_HOME": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-48cd3c7/xdg/cache",
+  "GORTEX_DAEMON_SOCKET": "/tmp/dmbench-48cd3c7.sock",
+  "GORTEX_DAEMON_PIDFILE": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-48cd3c7/gortex.pid",
+  "GORTEX_DAEMON_LOGFILE": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-48cd3c7/gortex.log",
+  "DO_NOT_TRACK": "1"
+}

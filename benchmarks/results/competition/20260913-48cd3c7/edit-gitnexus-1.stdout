@@ -1,0 +1,12 @@
+
+  GitNexus Analyzer
+
+[2KIncremental: changed=1, added=0, deleted=0 (skipping wipe + 1061 unchanged file rows preserved)
+[2KIncremental: +4 importer(s) added to writable set (BFS depth ≤ 4)
+[2KParse cache: pruned 1 stale chunk entries
+
+  Repository indexed successfully (32.8s)
+
+  16,285 nodes | 47,124 edges | 798 clusters | 300 flows
+  /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-48cd3c7/gitnexus-corpus
+

@@ -29,7 +29,7 @@ DevCouncil's core runtime is a set of standalone, compiled native modules. Each 
 | Binary | Language | Role & Ownership |
 |--------|----------|------------------|
 | `devcouncil` / `dev` | **Go** | Host orchestrator: Stdio MCP server (`mcp`), multi-host agent integration (`integrate`), engineering skills distribution (`skills`), task verification (`verify`), and devmap forwarding (`map`, `graph`, `ast`). |
-| `devmap` | **Rust** | Code intelligence engine: 36+ tree-sitter language extractors, symbol resolution, blast-radius calculation, dead-code analysis, workspace guides (`AGENTS.md`), and DevMap MCP server (`devmap mcp`). |
+| `devmap` | **Rust** | Code intelligence engine: 35 named tree-sitter language extractors plus a generic tree-sitter fallback, symbol resolution, blast-radius calculation, dead-code analysis, workspace guides (`AGENTS.md`), and DevMap MCP server (`devmap mcp`). |
 | `dcstore` | **Rust** | State & lease store: SQLite-backed task repository, mutual-exclusion leases for concurrent agent building, evidence records, and gap tracking. |
 | `dcverify` | **Rust** | Deterministic verification: Unified-diff parsing, planned file scope classification, anti-laziness/stub gates, test coverage evaluation, and typed `next_actions` repair signals. |
 | `dcgrep` | **Rust** | Code search: Ripgrep-powered ignore-aware search engine with optional trigram indexing (`tgrep-core`). |
@@ -42,6 +42,48 @@ DevCouncil's core runtime is a set of standalone, compiled native modules. Each 
 
 > [!NOTE]
 > DevCouncil is built entirely as native compiled Go and Rust binaries; legacy Python orchestration has been retired (see [docs/PHASE7_LONG_TAIL.md](docs/PHASE7_LONG_TAIL.md)).
+
+---
+
+## Benchmarks: DevMap vs Graphify, Gortex, GitNexus, CodeGraph, and codebase-memory-mcp
+
+Every number below is a measured median from a reproducible run with the raw
+evidence committed beside it — not a marketing estimate. Six code-graph tools
+plus a ripgrep text baseline indexed the **same frozen 1,186-file / 46.9 MB
+repository** on one Apple M5 Pro, with 261 timed samples and per-tool
+correctness checks. Head-to-head breakdown:
+**[DevMap vs GitNexus, CodeGraph, Graphify, Gortex, and codebase-memory-mcp](docs/devmap/comparison.md)**.
+Full method, caveats, and raw output:
+**[benchmark report](benchmarks/results/competition/20260913-48cd3c7/REPORT.md)**.
+
+| Tool | Cold index | Unchanged refresh | Single-file edit | Peak RSS | Caller pairs found |
+|---|---:|---:|---:|---:|---:|
+| **DevMap 0.2.1** | **2.031 s** | **107.1 ms** | 957.8 ms | **610 MiB** | **5/5** |
+| CodeGraph 1.6.0 | 2.912 s | 241.9 ms | **417.2 ms** | 2438 MiB | 3/5 |
+| codebase-memory-mcp 0.10.8 | 8.019 s | 6.160 s | 9.347 s | 1208 MiB | **5/5** |
+| Graphify 0.9.59 | 16.456 s | 4.327 s | 3.945 s | 3293 MiB | 3/5 |
+| GitNexus 1.6.9 | 34.102 s | 567.5 ms | 33.417 s | 3095 MiB | 3/5 |
+| Gortex 0.64.3 | 38.835 s | 967.5 ms | 5.754 s | 2206 MiB | 4/5 |
+
+**Where DevMap won.** Lowest cold-index median (**1.4× faster than CodeGraph**,
+**16.8× faster than GitNexus**), lowest unchanged-refresh median, the lowest
+median in **all six symbol-query cells** — definition lookups ran 30–33 ms,
+**4.8–5.2× faster than CodeGraph** and **31–33× faster than GitNexus** — the
+lowest sampled peak memory of any graph tool, and all five source-inspected
+caller pairs.
+
+**Where DevMap lost.** CodeGraph re-indexed a single edited file in 417 ms
+against DevMap's 958 ms — **2.3× faster**, the one stage where a competitor is
+consistently ahead. DevMap's 139 MiB store is also larger than Graphify's
+42 MiB, CodeGraph's 63 MiB, and codebase-memory-mcp's 67 MiB.
+
+**What these numbers are not.** One corpus, one machine, three-to-five
+repetitions, three symbols, and five inspected caller pairs. They do not
+establish general graph accuracy, persistent-MCP latency, or coding-agent task
+success. Tool output scopes differ, so equal latency is not equal analysis.
+The report states every limit explicitly and keeps the failures in — including
+GitNexus retaining a deleted symbol through ordinary refreshes until a forced
+rebuild.
 
 ---
 
@@ -222,7 +264,7 @@ flowchart TD
     end
 
     subgraph RustAnalysis["Rust Analysis & State Suite"]
-        DevMap["devmap\nCode Graph & 36+ Language ASTs"]
+        DevMap["devmap\nCode Graph & 35 Language ASTs"]
         DCStore["dcstore\nAtomic Task Leases & SQLite Store"]
         DCVerify["dcverify\nUnified Diff Parser & Rigor Gates"]
         DCGrep["dcgrep\nRipgrep Engine & Trigram Index"]
@@ -271,7 +313,8 @@ DevCouncil/
 - [Architecture Decisions & Python Retirement](docs/PHASE7_LONG_TAIL.md): Background on the transition to native Go and Rust binaries.
 - [Archived ledgers](docs/archive/README.md): Pre-cutover DevMap plans, audits, and qualification dumps.
 - [Code Graph & DevMap Guide](docs/code-graph.md): Symbol resolution, dead code, and blast radius.
-- [DevMap competitor benchmarks](docs/devmap/README.md#benchmark-comparison): Measured strengths, weaknesses, speed, memory, storage, and correctness against Graphify, Gortex, GitNexus, CodeGraph, codebase-memory-mcp, and ripgrep, with scope limits and raw evidence.
+- [DevMap vs other code-graph tools](docs/devmap/comparison.md): Head-to-head comparison written for the "which code intelligence tool should my agent use" question, with per-tool sections and the limits stated.
+- [DevMap competitor benchmark report](benchmarks/results/competition/20260913-48cd3c7/REPORT.md): Full measured comparison against Graphify, Gortex, GitNexus, CodeGraph, codebase-memory-mcp, and ripgrep — indexing and query latency, memory, storage, caller accuracy, stale-index recovery, scope limits, and committed raw evidence. The [DevMap guide](docs/devmap/README.md#benchmark-comparison) carries the shorter summary and the [competition index](benchmarks/results/competition/README.md) links every prior run.
 - [Hero Loop (MCP Closed Loop)](docs/hero-loop.md): Autonomous task loop with deterministic gates.
 - [Coding CLI Integration](docs/coding-cli-integration.md): Configuring Claude, Codex, Cursor, Warp, and Antigravity.
 - [Security Model](docs/security.md): Redaction, write isolation, and containment rules.

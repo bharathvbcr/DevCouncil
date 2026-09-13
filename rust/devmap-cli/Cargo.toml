@@ -4,7 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "devmap CLI — symbol-level code intelligence for coding agents"
+description = "devmap CLI — symbol-level code intelligence for coding agents: tree-sitter code graph, blast radius, dead-code analysis, and an MCP server"
+# crates.io caps keywords at 5 (max 20 chars each) and categories at 5, drawn
+# from its fixed category slug list. Both feed crates.io search ranking.
+keywords = ["code-graph", "static-analysis", "tree-sitter", "mcp", "codebase"]
+categories = [
+    "development-tools",
+    "command-line-utilities",
+    "development-tools::debugging",
+    "parser-implementations",
+]
 build = "build.rs"
 
 [[bin]]

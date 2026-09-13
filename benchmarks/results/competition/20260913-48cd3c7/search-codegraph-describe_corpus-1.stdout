@@ -1,0 +1,24 @@
+[
+  {
+    "node": {
+      "id": "function:5d6de4c9ea1dc746c6688437d73c5d8e",
+      "kind": "function",
+      "name": "describe_corpus",
+      "qualifiedName": "describe_corpus",
+      "filePath": "benchmarks/map_bench.py",
+      "language": "python",
+      "startLine": 240,
+      "endLine": 271,
+      "startColumn": 0,
+      "endColumn": 5,
+      "signature": "(repo: Path) -> Dict[str, object]",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false,
+      "isAbstract": false,
+      "updatedAt": 1789322194101
+    },
+    "score": 94.58807154372084
+  }
+]

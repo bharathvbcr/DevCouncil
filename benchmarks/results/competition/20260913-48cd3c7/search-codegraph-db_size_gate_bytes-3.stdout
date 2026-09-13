@@ -1,0 +1,24 @@
+[
+  {
+    "node": {
+      "id": "function:58baf1613acbc079828cefac3b97de41",
+      "kind": "function",
+      "name": "db_size_gate_bytes",
+      "qualifiedName": "db_size_gate_bytes",
+      "filePath": "rust/devmap-extract/src/model.rs",
+      "language": "rust",
+      "startLine": 225,
+      "endLine": 227,
+      "startColumn": 0,
+      "endColumn": 1,
+      "signature": "(file_count: u64) -> u64",
+      "visibility": "public",
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false,
+      "isAbstract": false,
+      "updatedAt": 1789322194234
+    },
+    "score": 109.5070568403491
+  }
+]

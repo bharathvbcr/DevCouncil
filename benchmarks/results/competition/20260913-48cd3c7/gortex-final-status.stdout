@@ -1,0 +1,33 @@
+ daemon    v0.64.3+56a1c29                                                                                                                          
+ pid       81379                                                                                                                                    
+ socket    /tmp/dmbench-48cd3c7.sock                                                                                                                
+ uptime    2m18s                                                                                                                                    
+ state     ready (warmup 35s)                                                                                                                       
+ sessions  1                                                                                                                                        
+ memory    102.0 MiB                                                                                                                                
+ search    sqlite-fts5  docs=23353  disk-resident (indexed in the graph store)                                                                      
+ trigram   live=0/3  heap=0 B/256.0 MiB  idle_ttl=10m0s                                                                                             
+ lsp       alive=2/6                                                                                                                                
+             gopls@/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-48cd3c7/gortex-corpus  last_used=4s ago  in_use=0        
+             pyright@/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-48cd3c7/gortex-corpus  last_used=4s ago  in_use=0      
+ runtime   alloc=102.0 MiB  sys=1.1 GiB  heap_inuse=119.9 MiB  heap_idle=1005.3 MiB  heap_released=951.8 MiB  stacks=2.8 MiB  gc=293  goroutines=34 
+
+workspaces: 1 (one per repo, default — every repo is its own workspace)
+  Group repos into a shared workspace with `gortex workspace set <repo> <slug> --global`
+  or `gortex workspace set-all <slug> --root <path> --global`. See `gortex workspace --help`.
+
+tracked repos:
+┌──────────────────┬───────────┬───────┬───────┬────────┬─────────┬─────────┬──────────┬───────────┬───────────────────────────────────────────────────────────────────────────────────────────────┐
+│ repo             │ total     │ files │ nodes │  edges │ nodes_b │ edges_b │ search_b │ vectors_b │ path                                                                                          │
+├──────────────────┼───────────┼───────┼───────┼────────┼─────────┼─────────┼──────────┼───────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ devcouncil-bench │       0 B │  1134 │ 35041 │ 245850 │     0 B │     0 B │      0 B │       0 B │ /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-48cd3c7/gortex-corpus │
+├──────────────────┼───────────┼───────┼───────┼────────┼─────────┼─────────┼──────────┼───────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
+│ other            │ 102.0 MiB │       │       │        │         │         │          │           │ embedder + runtime + caches (not attributed)                                                  │
+└──────────────────┴───────────┴───────┴───────┴────────┴─────────┴─────────┴──────────┴───────────┴───────────────────────────────────────────────────────────────────────────────────────────────┘
+
+MCP sessions:
+┌───────────────────────┬────────┬─────────┬───────────┬─────┐
+│ id                    │ client │ version │ connected │ cwd │
+├───────────────────────┼────────┼─────────┼───────────┼─────┤
+│ sess_b73e0ec9819dd961 │ cli    │         │        0s │     │
+└───────────────────────┴────────┴─────────┴───────────┴─────┘

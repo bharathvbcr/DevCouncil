@@ -1,0 +1,68 @@
+{
+  "status": "prepared",
+  "corpus_repo": "/Users/bharath/Code/devtools/DevCouncil",
+  "corpus_commit": "ee07c183b127e7291c38f993f4d71ca75f1121dc",
+  "devmap_binary": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-48cd3c7/devmap",
+  "scratch": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-48cd3c7",
+  "binary_assets": [
+    {
+      "repo": "zzet/gortex",
+      "version": "v0.64.3",
+      "name": "gortex_darwin_arm64.tar.gz",
+      "url": "https://github.com/zzet/gortex/releases/download/v0.64.3/gortex_darwin_arm64.tar.gz",
+      "sha256": "7a0b418aba3f33336953ac428a348a7c3b92dd4ab9f9d36f56515eb47923fe58",
+      "bytes": 50919858
+    },
+    {
+      "repo": "DeusData/codebase-memory-mcp",
+      "version": "v0.10.8",
+      "name": "codebase-memory-mcp-darwin-arm64.tar.gz",
+      "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.10.8/codebase-memory-mcp-darwin-arm64.tar.gz",
+      "sha256": "9bd840dfb3ec7eaef4f310382057adaa5b0e904df883104d03ffcf39836afd07",
+      "bytes": 40416962
+    },
+    {
+      "repo": "colbymchenry/codegraph",
+      "version": "v1.6.0",
+      "name": "codegraph-darwin-arm64.tar.gz",
+      "url": "https://github.com/colbymchenry/codegraph/releases/download/v1.6.0/codegraph-darwin-arm64.tar.gz",
+      "sha256": "1c73033512d55f67be04717e81532e8beaf7be6fb8531f51a179fa23064ad480",
+      "bytes": 56818676
+    }
+  ],
+  "python_package": {
+    "name": "graphifyy",
+    "version": "0.9.59",
+    "extras": [],
+    "environment": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/tools/graphify-venv"
+  },
+  "existing_tools": {
+    "gitnexus": "1.6.9",
+    "ripgrep": "15.1.0"
+  },
+  "measurement_protocol": {
+    "cold_repeats": 3,
+    "warm_repeats": 5,
+    "edit_repeats": 3,
+    "query_repeats": 5,
+    "source_snapshot_files": 1186,
+    "named_symbols": [
+      "db_size_gate_bytes",
+      "loadBounded",
+      "describe_corpus"
+    ],
+    "correctness": [
+      "exact definition and file",
+      "five source-inspected direct caller pairs",
+      "new definitions visible after each edit",
+      "deleted definitions absent after restore",
+      "nonexistent-name control",
+      "full corpus SHA-256 restored"
+    ]
+  },
+  "comparison_baseline": "../20260913-v0.2.1",
+  "devmap_version": "0.2.1",
+  "prepared_utc": "2026-09-13T17:52:59.393934+00:00",
+  "supplemental_version_control_samples": 82,
+  "total_timed_records": 405
+}

@@ -1,0 +1,5 @@
+{"type":"begin","data":{"path":{"text":"./benchmarks/map_bench.py"}}}
+{"type":"match","data":{"path":{"text":"./benchmarks/map_bench.py"},"lines":{"text":"def describe_corpus(repo: Path) -> Dict[str, object]:\n"},"line_number":240,"absolute_offset":10043,"submatches":[{"match":{"text":"describe_corpus"},"start":4,"end":19}]}}
+{"type":"match","data":{"path":{"text":"./benchmarks/map_bench.py"},"lines":{"text":"    corpus = describe_corpus(repo)\n"},"line_number":1086,"absolute_offset":46363,"submatches":[{"match":{"text":"describe_corpus"},"start":13,"end":28}]}}
+{"type":"end","data":{"path":{"text":"./benchmarks/map_bench.py"},"binary_offset":null,"stats":{"elapsed":{"secs":0,"nanos":28375,"human":"0.000028s"},"searches":1,"searches_with_match":1,"bytes_searched":48580,"bytes_printed":569,"matched_lines":2,"matches":2}}}
+{"data":{"elapsed_total":{"human":"0.016088s","nanos":16087542,"secs":0},"stats":{"bytes_printed":569,"bytes_searched":46472467,"elapsed":{"human":"0.015992s","nanos":15992369,"secs":0},"matched_lines":2,"matches":2,"searches":1186,"searches_with_match":1}},"type":"summary"}

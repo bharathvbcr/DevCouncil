@@ -1,0 +1,367 @@
+{
+  "by_kind": {
+    "builtin": 37,
+    "closure": 218,
+    "config_key": 2,
+    "constant": 1095,
+    "contract": 16,
+    "doc": 993,
+    "enum_member": 3,
+    "field": 2726,
+    "file": 853,
+    "fixture": 281,
+    "function": 7477,
+    "generic_param": 92,
+    "image": 2,
+    "import": 1033,
+    "interface": 18,
+    "license": 2,
+    "local": 6442,
+    "macro": 2,
+    "method": 1299,
+    "module": 148,
+    "package": 291,
+    "param": 7233,
+    "resource": 1,
+    "string": 299,
+    "type": 894,
+    "variable": 3584
+  },
+  "by_language": {
+    "": 6,
+    "astro": 13,
+    "bash": 144,
+    "c": 7,
+    "cobol": 13,
+    "contract": 16,
+    "cpp": 7,
+    "csharp": 9,
+    "css": 2,
+    "cuda": 7,
+    "dart": 8,
+    "erlang": 7,
+    "gitignore": 3,
+    "go": 13517,
+    "hcl": 9,
+    "html": 178,
+    "image": 4,
+    "java": 10,
+    "javascript": 152,
+    "js": 2,
+    "json": 1234,
+    "jupyter": 1,
+    "kotlin": 8,
+    "liquid": 4,
+    "lua": 8,
+    "luau": 8,
+    "markdown": 1982,
+    "mcp_config": 3,
+    "nix": 5,
+    "objc": 6,
+    "pascal": 7,
+    "php": 10,
+    "powershell": 8,
+    "protobuf": 5,
+    "py": 2,
+    "python": 525,
+    "r": 5,
+    "ruby": 7,
+    "rust": 16382,
+    "scala": 9,
+    "solidity": 14,
+    "sql": 146,
+    "svelte": 18,
+    "swift": 10,
+    "text": 2,
+    "toml": 373,
+    "tsv": 5,
+    "typescript": 41,
+    "vue": 14,
+    "yaml": 85
+  },
+  "cumulative_savings": {
+    "calls_counted": 38,
+    "cost_avoided_usd": {
+      "claude-fable-5": 5.27386,
+      "claude-haiku-4-5": 0.527386,
+      "claude-mythos-5": 5.27386,
+      "claude-mythos-preview": 5.27386,
+      "claude-opus-4-6": 2.63693,
+      "claude-opus-4-7": 2.63693,
+      "claude-opus-4-8": 2.63693,
+      "claude-opus-5": 2.63693,
+      "claude-sonnet-4-6": 1.582158,
+      "claude-sonnet-5": 1.054772,
+      "deepseek-chat": 0.14239422,
+      "deepseek-reasoner": 0.22150212,
+      "gemini-2.5-flash": 0.1582158,
+      "gemini-2.5-flash-lite": 0.052738600000000004,
+      "gemini-2.5-pro": 0.6592325,
+      "gemini-3.1-flash-lite": 0.1318465,
+      "gemini-3.1-pro": 1.054772,
+      "gemini-3.5-flash": 0.791079,
+      "glm-4.5": 0.3164316,
+      "glm-4.5-air": 0.10547720000000001,
+      "glm-4.5-airx": 0.5801246000000001,
+      "glm-4.5-flash": 0,
+      "glm-4.5-x": 1.1602492000000002,
+      "glm-4.6": 0.3164316,
+      "glm-4.7": 0.3164316,
+      "glm-4.7-flash": 0,
+      "glm-4.7-flashx": 0.03691702,
+      "glm-5": 0.527386,
+      "glm-5-turbo": 0.6328632,
+      "glm-5.1": 0.7383403999999999,
+      "glm-5.2": 0.7383403999999999,
+      "gpt-4.1": 1.054772,
+      "gpt-4.1-mini": 0.21095440000000001,
+      "gpt-4.1-nano": 0.052738600000000004,
+      "gpt-4o": 1.318465,
+      "gpt-4o-mini": 0.0791079,
+      "gpt-5.4": 1.318465,
+      "gpt-5.4-mini": 0.3955395,
+      "gpt-5.4-nano": 0.10547720000000001,
+      "gpt-5.5": 2.63693,
+      "gpt-5.6-luna": 0.527386,
+      "gpt-5.6-sol": 2.63693,
+      "gpt-5.6-terra": 1.318465,
+      "o3": 1.054772,
+      "o4-mini": 0.5801246000000001
+    },
+    "first_seen": "2026-09-13T18:06:28Z",
+    "last_updated": "2026-09-13T18:07:53Z",
+    "tokens_returned": 32680,
+    "tokens_saved": 527386
+  },
+  "edge_identity_revisions": 298,
+  "notifications": {
+    "daemon_health": {
+      "subscribers": 0
+    },
+    "diagnostics": {
+      "subscribers": 0
+    },
+    "stale_refs": {
+      "subscribers": 0
+    },
+    "workspace_readiness": {
+      "last_state": {
+        "enriched": true,
+        "phase": "enrichment_complete",
+        "ready": true,
+        "ts": "2026-09-13T18:06:10.704839Z",
+        "warmup_ms": 35285,
+        "warmup_seconds": 35
+      },
+      "subscribers": 0
+    }
+  },
+  "ppr_cache": {
+    "capacity": 512,
+    "hit_rate": 0,
+    "hits": 0,
+    "misses": 2,
+    "size": 2
+  },
+  "semantic": {
+    "enabled": true,
+    "providers": [
+      {
+        "coverage_percent": 39.43096234309623,
+        "language": "go",
+        "last_result": {
+          "bound_reason": "cap",
+          "coverage_percent": 39.43096234309623,
+          "duration_ms": 1363,
+          "edges_added": 7926,
+          "edges_confirmed": 2817,
+          "edges_rebound": 0,
+          "edges_refuted": 0,
+          "language": "go",
+          "nodes_enriched": 5139,
+          "provider": "go-types",
+          "symbols_covered": 4712,
+          "symbols_total": 11950
+        },
+        "name": "go-types",
+        "status": "ready"
+      },
+      {
+        "language": "java",
+        "name": "java-types",
+        "status": "ready"
+      },
+      {
+        "coverage_percent": 88.4931506849315,
+        "language": "python",
+        "last_result": {
+          "bound_reason": "cap",
+          "budget_seconds": 600.6,
+          "coverage_percent": 88.4931506849315,
+          "duration_ms": 123,
+          "edges_added": 0,
+          "edges_confirmed": 32,
+          "edges_rebound": 0,
+          "edges_refuted": 0,
+          "language": "python",
+          "nodes_enriched": 73,
+          "provider": "python-types",
+          "symbols_covered": 323,
+          "symbols_total": 365
+        },
+        "name": "python-types",
+        "status": "ready"
+      },
+      {
+        "language": "ruby",
+        "name": "ruby-types",
+        "status": "ready"
+      },
+      {
+        "coverage_percent": 99.68031091330785,
+        "language": "rust",
+        "last_result": {
+          "bound_reason": "cap",
+          "budget_seconds": 617.16,
+          "coverage_percent": 99.68031091330785,
+          "duration_ms": 4198,
+          "edges_added": 0,
+          "edges_confirmed": 1140,
+          "edges_rebound": 0,
+          "edges_refuted": 0,
+          "language": "rust",
+          "nodes_enriched": 2340,
+          "provider": "rust-types",
+          "symbols_covered": 15902,
+          "symbols_total": 15953
+        },
+        "name": "rust-types",
+        "status": "ready"
+      },
+      {
+        "coverage_percent": 43.888888888888886,
+        "language": "typescript",
+        "last_result": {
+          "bound_reason": "cap",
+          "budget_seconds": 600.32,
+          "coverage_percent": 43.888888888888886,
+          "duration_ms": 89,
+          "edges_added": 0,
+          "edges_confirmed": 0,
+          "edges_rebound": 0,
+          "edges_refuted": 0,
+          "language": "typescript",
+          "nodes_enriched": 0,
+          "provider": "typescript-types",
+          "symbols_covered": 79,
+          "symbols_total": 180
+        },
+        "name": "typescript-types",
+        "status": "ready"
+      },
+      {
+        "coverage_percent": 43.888888888888886,
+        "language": "javascript",
+        "last_result": {
+          "bound_reason": "cap",
+          "budget_seconds": 600.32,
+          "coverage_percent": 43.888888888888886,
+          "duration_ms": 89,
+          "edges_added": 0,
+          "edges_confirmed": 0,
+          "edges_rebound": 0,
+          "edges_refuted": 0,
+          "language": "typescript",
+          "nodes_enriched": 0,
+          "provider": "typescript-types",
+          "symbols_covered": 79,
+          "symbols_total": 180
+        },
+        "name": "typescript-types",
+        "status": "ready"
+      },
+      {
+        "language": "csharp",
+        "name": "csharp-types",
+        "status": "ready"
+      },
+      {
+        "language": "php",
+        "name": "php-types",
+        "status": "ready"
+      },
+      {
+        "language": "kotlin",
+        "name": "kotlin-types",
+        "status": "ready"
+      },
+      {
+        "language": "go",
+        "last_result": {
+          "bound_reason": "completed_all",
+          "coverage_percent": 0,
+          "duration_ms": 0,
+          "edges_added": 0,
+          "edges_confirmed": 0,
+          "edges_rebound": 0,
+          "edges_refuted": 0,
+          "language": "go",
+          "nodes_enriched": 0,
+          "provider": "go-ast-types",
+          "symbols_covered": 0,
+          "symbols_total": 0
+        },
+        "name": "go-ast-types",
+        "status": "ready"
+      },
+      {
+        "language": "c",
+        "name": "lsp-clangd",
+        "status": "ready"
+      },
+      {
+        "language": "cpp",
+        "name": "lsp-clangd",
+        "status": "ready"
+      },
+      {
+        "language": "objc",
+        "name": "lsp-clangd",
+        "status": "ready"
+      },
+      {
+        "language": "objcpp",
+        "name": "lsp-clangd",
+        "status": "ready"
+      },
+      {
+        "language": "go",
+        "name": "lsp-gopls",
+        "status": "ready"
+      },
+      {
+        "language": "python",
+        "name": "lsp-pyright",
+        "status": "ready"
+      },
+      {
+        "language": "rust",
+        "name": "lsp-rust-analyzer",
+        "status": "unavailable"
+      },
+      {
+        "language": "swift",
+        "name": "lsp-sourcekit-lsp",
+        "status": "ready"
+      }
+    ]
+  },
+  "token_savings": {
+    "calls_counted": 0,
+    "efficiency_ratio": 0,
+    "tokens_returned": 0,
+    "tokens_saved": 0
+  },
+  "total_edges": 215473,
+  "total_nodes": 34212
+}
