@@ -118,8 +118,8 @@ on the same file.
 
 **Go — verified.** `go test ./...` in `backend/go_orchestrator`: **862 test and
 subtest executions, 862 passed, 0 skipped, 0 failed.** These are not mock-only:
-`internal/testsupport` builds the real `dcstore` / `dcverify` / `dcgrep` binaries
-out of `rust/` and the tests exec them.
+`testsupport` builds the real `dcstore` / `dcverify` / `dcgrep` binaries out of
+`rust/` and the tests exec them.
 
 **The live devmap contract — verified.** `dc/devmap`'s three `TestTheLive*` tests
 build a fixture repository and drive the **real** `devmap` binary
@@ -162,8 +162,8 @@ Four, all forced by the move. Everything else is byte-identical to MANVI.
    machine. `DC_STORE_REQUIRE_INTEROP=1` turns the skip into a failure so CI can
    demand the evidence; unset, the behaviour is unchanged.
 4. **`testsupport` workspace location.** MANVI's Rust workspace is `crates/`;
-   DevCouncil's is `rust/`. The literal was spelled in five places, so it is now
-   one exported constant, `testsupport.RustWorkspace`.
+   DevCouncil's is `rust/`. The literal was spelled in five places; the package now
+   discovers which of the two holds `Cargo.toml` instead of hard-coding either.
 
 **Not changed, and deliberately flagged:** `testsupport.AllowSkipEnv` is still
 `MANVI_TEST_ALLOW_SKIP` and the build lock is still `.manvi-testbin.lock`.

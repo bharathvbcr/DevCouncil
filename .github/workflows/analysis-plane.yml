@@ -91,9 +91,9 @@ jobs:
           # tree-sitter grammars are not recompiled on every run.
           cache-all-crates: true
 
-      # internal/testsupport builds dcstore, dcverify and dcgrep out of rust/
-      # and the tests exec them, so this job needs a Rust toolchain even though
-      # nothing here is Rust. A C compiler comes with both runner images.
+      # testsupport builds dcstore, dcverify and dcgrep out of rust/ and the
+      # tests exec them, so this job needs a Rust toolchain even though nothing
+      # here is Rust. A C compiler comes with both runner images.
       #
       # sqlite3 is not optional: the requirements suite plants a task row with
       # it, and testsupport.Unavailable *fails* by default rather than skipping,
