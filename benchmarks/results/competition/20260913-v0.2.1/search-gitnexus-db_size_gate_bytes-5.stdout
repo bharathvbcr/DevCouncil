@@ -1,0 +1,16 @@
+{
+  "status": "found",
+  "symbol": {
+    "uid": "Function:rust/devmap-extract/src/model.rs:db_size_gate_bytes",
+    "name": "db_size_gate_bytes",
+    "kind": "Function",
+    "filePath": "rust/devmap-extract/src/model.rs",
+    "startLine": 224,
+    "endLine": 226,
+    "content": "pub const DB_SIZE_GATE_FLOOR: u64 = 60 * 1024 * 1024; pub fn db_size_gate_bytes(file_count: u64) -> u64 {     DB_SIZE_GATE_FLOOR.max(file_count.saturating_mul(DB_SIZE_GATE_PER_FILE)) } /// Budget for a store that has reached its retention ceiling (SC27)."
+  },
+  "epistemic": "exact",
+  "incoming": {},
+  "outgoing": {},
+  "processes": []
+}

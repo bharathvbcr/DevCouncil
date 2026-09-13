@@ -1,0 +1,4 @@
+{
+  "repeated_normal_refresh_stale": true,
+  "force_clears_deleted_symbol": true
+}

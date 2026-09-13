@@ -187,10 +187,10 @@ Output: a `results/<timestamp>.json` (raw per-run data, including the
 
 See `tasks.py` for the task suite and each task's hidden checks.
 
-## DevMap competitor comparison: 2026-09-12
+## DevMap v0.2.1 competitor comparison: 2026-09-13 UTC
 
-The [expanded competitor report](results/competition/20260912-expanded/REPORT.md)
-is the canonical record of the DevMap, Graphify, Gortex, GitNexus, CodeGraph,
+The [v0.2.1 competitor report](results/competition/20260913-v0.2.1/REPORT.md)
+is the latest record of the DevMap, Graphify, Gortex, GitNexus, CodeGraph,
 codebase-memory-mcp, and ripgrep comparison. It includes per-tool positives and
 negatives, cold/warm/edit and query timings, memory/storage tradeoffs, inspected
 caller pairs, stale-index recovery, capped-query follow-ups, coverage warnings,
@@ -199,13 +199,26 @@ reproducibility limits, and suggested next experiments. The
 summary; the [competition index](results/competition/README.md) also links the
 initial GitNexus comparison and its separate Rust verification evidence.
 
-The expanded run completed 261 timing samples on a frozen 1,186-file DevCouncil
-snapshot. DevMap had the lowest cold/unchanged medians and sampled cold RSS;
+The rerun completed 261 competitive timing samples on the same frozen
+1,186-file DevCouncil snapshot. DevMap 0.2.1 had the lowest cold/unchanged/query
+medians and sampled cold RSS;
 CodeGraph had the lowest one-file edit median and a smaller store. CBM matched
 DevMap's five inspected caller pairs. Gortex returned four by default and five
 with name-only inclusion. GitNexus needed a forced rebuild to remove a deleted
 probe. These are observations for the pinned builds and measured modes, not a
 general accuracy ranking or an end-to-end coding-agent evaluation.
+
+An additional 82 timing samples alternated the preserved 0.2.0 and 0.2.1
+binaries on that corpus. In this control, v0.2.1's cold median was 8.6% higher,
+unchanged-refresh median 14.3% lower, and edit median 2.3% lower: **1.09×
+slower**, **1.17× faster**, and **1.02× faster**, respectively. The observed
+ranges overlap and desktop load remains a limitation. The report keeps these
+samples separate from the competitor campaign and the historical comparison;
+the old report and raw measurements are preserved. The report and guide now
+include explicit speed-factor tables for each competitor. For example,
+DevMap cold indexing was **15.64× faster than GitNexus**, while DevMap edits
+were **1.72× slower than CodeGraph** (1.72 times as long). Factors use the
+unrounded elapsed-time medians and retain the different-pipeline caveats.
 
 The task-local Python recorders invoke real vendor CLIs and retain commands,
 raw output, wall time, process-tree samples, and correctness checks. They do not

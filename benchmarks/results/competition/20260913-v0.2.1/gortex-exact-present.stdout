@@ -1,0 +1,12 @@
+{
+  "absolute_file_path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-v0.2.1/gortex-corpus/rust/devmap-extract/src/model.rs",
+  "file_path": "devcouncil-bench/rust/devmap-extract/src/model.rs",
+  "id": "devcouncil-bench/rust/devmap-extract/src/model.rs::db_size_gate_bytes",
+  "kind": "function",
+  "name": "db_size_gate_bytes",
+  "project_id": "devcouncil-bench",
+  "repo_prefix": "devcouncil-bench",
+  "start_line": 225,
+  "visibility": "public",
+  "workspace_id": "devcouncil-bench"
+}

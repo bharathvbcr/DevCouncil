@@ -189,21 +189,6 @@ func TestHookCleanupLeavesUnownedEmptyFiles(t *testing.T) {
 	}
 }
 
-func TestIntegrateRejectsRetiredWriteGateBeforeWrites(t *testing.T) {
-	root := t.TempDir()
-	_, err := Run(Options{Root: root, Host: "claude", Mode: ModeApply, WriteGate: true, DevmapBin: "/bin/true"})
-	if err == nil {
-		t.Fatal("unsupported write gate reported success")
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("wrote before rejecting flag: %v", entries)
-	}
-}
-
 func TestHookCleanupBackupAndReadOnlyModes(t *testing.T) {
 	root := t.TempDir()
 	rel := ".claude/settings.local.json"

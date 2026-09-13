@@ -380,3 +380,67 @@ func swapWriter(t *testing.T, slot **os.File) (*bytes.Buffer, func()) {
 	t.Cleanup(restore)
 	return buf, restore
 }
+
+// `--write-gate` named a pre-tool-use write gate that DevCouncil's retired
+// lifecycle hooks installed. Nothing has enforced it since they were retired,
+// and it is now removed rather than accepted-and-refused.
+//
+// This replaces the field-level test that used to live in the integrate
+// package: the guarantee it protected — that the retired gate never causes a
+// write — now has to hold one layer out, because the flag no longer reaches
+// Run at all.
+func TestRetiredWriteGateIsRefusedByNameAndWritesNothing(t *testing.T) {
+	root := t.TempDir()
+	stderr, restore := swapStderr(t)
+	code := dispatch([]string{"integrate", "claude", "--apply", "--write-gate", "--project-root", root})
+	restore()
+
+	if code == 0 {
+		t.Fatal("--write-gate reported success")
+	}
+	got := stderr.String()
+	if strings.Contains(got, "unknown flag") {
+		t.Fatalf("answered as an unknown flag instead of a retired one: %s", got)
+	}
+	// The reason is the part a caller needs: not merely that it is gone, but
+	// that nothing gated a write before it was removed either.
+	for _, want := range []string{"--write-gate was removed", "retired"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stderr does not explain the retirement (%q missing): %s", want, got)
+		}
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("wrote before refusing the flag: %v", entries)
+	}
+}
+
+// `gate status` must not advertise a knob that enforces nothing.
+func TestGateStatusDoesNotAdvertiseAWriteGate(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".devcouncil"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A config that still carries the retired key is inert, not an error.
+	cfg := "gates:\n  mode: off\nintegrations:\n  cursor:\n    write_gate: true\n"
+	if err := os.WriteFile(filepath.Join(root, ".devcouncil", "config.yaml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"gate", "status", "--project-root", root},
+		{"gate", "status", "--json", "--project-root", root},
+	} {
+		stdout, restoreOut := swapStdout(t)
+		code := dispatch(args)
+		restoreOut()
+		if code != 0 {
+			t.Fatalf("%v: exit %d", args, code)
+		}
+		if strings.Contains(stdout.String(), "write_gate") {
+			t.Fatalf("%v still reports a write gate: %s", args, stdout.String())
+		}
+	}
+}

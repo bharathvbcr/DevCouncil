@@ -6,14 +6,17 @@ DevCouncil's components integrate with leading coding agents and IDEs: task scop
 
 ## Supported Hosts
 
-`devcouncil integrate` and `devmap integrate` are **not** the Python installer. Go `Hosts` lists eight names; only three have adapters, and `--write-gate` is refused because lifecycle hooks are retired. `devmap integrate` accepts only `cursor|claude|codex`.
+`devcouncil integrate` and `devmap integrate` are **not** the Python installer. Go `Hosts` lists six names and all six have adapters. `--write-gate` has been removed: it named a pre-tool-use gate that only the retired lifecycle hooks installed, and nothing enforced it. `devmap integrate` accepts only `cursor|claude|codex`.
 
-| Host | What `--apply` actually writes | Write-gate / hooks | Setup command |
+| Host | What `--apply` actually writes | Hooks | Setup command |
 |---|---|---|---|
-| **Cursor** | `.cursor/mcp.json` (devcouncil + devmap stdio) and `.cursor/rules/devcouncil.mdc`. Then `devmap integrate cursor` writes DevMap guides/skills. | No `.cursor/hooks.json`. `--write-gate` is refused. | `devcouncil integrate cursor --apply` |
-| **Claude Code** | `.mcp.json` (devcouncil + devmap). No slash commands, plugin, subagents, or statusline. | `--write-gate` refused. | `devcouncil integrate claude --apply` |
+| **Cursor** | `.cursor/mcp.json` (devcouncil + devmap stdio) and `.cursor/rules/devcouncil.mdc`. Then `devmap integrate cursor` writes DevMap guides/skills. | No `.cursor/hooks.json`. | `devcouncil integrate cursor --apply` |
+| **Claude Code** | `.mcp.json` (devcouncil + devmap). No slash commands, plugin, subagents, or statusline. | None. | `devcouncil integrate claude --apply` |
 | **Codex CLI** | `.codex/config.toml` containing only `# Managed by devcouncil integrate codex`. | None. | `devcouncil integrate codex --apply` |
-| **Antigravity, OpenCode, Warp, Aider, Gemini** | Stub receipt: `"Phase 4 writes a stub receipt; full adapter ports follow"`. `devmap integrate` then errors `unsupported host`. | None. | Do not treat `--apply` as a working installer |
+| **Antigravity** | `.agents/mcp_config.json` — the `devcouncil` server, merged into any `mcpServers` already there. Skills land in `.agents/skills`, shared with Codex. | None documented. | `devcouncil integrate antigravity --apply` |
+| **OpenCode** | `opencode.json` — the `devcouncil` server under `mcp`, plus every unrelated key preserved. | `<state>/integrations/opencode_devmap_plugin.mjs`, listed in `plugin`. Registers `tool.execute.after` only. | `devcouncil integrate opencode --apply` |
+| **Warp / Oz** | `.devcouncil/integrations/warp-mcp.json` — a bare server map, passed to `oz agent run --mcp <path>`. | None documented. | `devcouncil integrate warp --apply` |
+| **Gemini, Aider** | Refused, exit 1. Gemini CLI was replaced upstream by Antigravity; Aider exposes no MCP server and is a launch-command executor. Existing `.gemini/settings.json` hooks are still removable. | None. | `integrate antigravity` / run Aider directly (it uses the `devmap` CLI, not MCP) |
 
 Python's golden `integrate claude --apply` receipt (43 files, slash commands, `claude-plugin`) is leftover testdata, not current behaviour.
 
@@ -27,7 +30,7 @@ To configure an agent host, run `devcouncil integrate` from your project root:
 # 1. Configure Cursor
 devcouncil integrate cursor --apply
 
-# 2. Configure Claude Code (writes .mcp.json; --write-gate is refused)
+# 2. Configure Claude Code (writes .mcp.json)
 devcouncil integrate claude --apply
 
 # 3. Codex is a comment-only toml today — see TASK-P7-8
@@ -81,11 +84,11 @@ CLI-only (named in `devmap-cli` `MISSING_CAPABILITIES`, not on kernel MCP): `cyp
 
 ### Cursor
 
-`devcouncil integrate cursor --apply` writes `.cursor/mcp.json` and `.cursor/rules/devcouncil.mdc`, then runs `devmap integrate cursor` (guides + DevMap skills). It does **not** write `.cursor/hooks.json`. `--write-gate` is refused before files are written.
+`devcouncil integrate cursor --apply` writes `.cursor/mcp.json` and `.cursor/rules/devcouncil.mdc`, then runs `devmap integrate cursor` (guides + DevMap skills). It does **not** write `.cursor/hooks.json`. `--write-gate` no longer exists; passing it exits 2 with the reason.
 
 ### Claude Code
 
-`devcouncil integrate claude --apply` writes `.mcp.json` (devcouncil + devmap stdio) and runs `devmap integrate claude`. It does **not** install slash commands, a plugin, PreToolUse hooks, or a statusline. `--write-gate` is refused before files are written.
+`devcouncil integrate claude --apply` writes `.mcp.json` (devcouncil + devmap stdio) and runs `devmap integrate claude`. It does **not** install slash commands, a plugin, PreToolUse hooks, or a statusline. `--write-gate` no longer exists; passing it exits 2 with the reason.
 
 ### Codex
 
@@ -93,7 +96,7 @@ CLI-only (named in `devmap-cli` `MISSING_CAPABILITIES`, not on kernel MCP): `cyp
 
 ### Other hosts
 
-`antigravity`, `opencode`, `warp`, `aider`, and `gemini` are listed in `integrate.Hosts` and return a stub receipt. `devmap integrate` refuses those names. There is no `.agents/mcp_config.json` writer in this binary.
+`antigravity`, `opencode` and `warp` have adapters here: this binary writes the `devcouncil` server into each host's document and `devmap integrate` writes the `devmap` entry into the same file. Each merges only its own entry, so the two commands compose in either order and neither disturbs a server the user added. `gemini` and `aider` are no longer accepted.
 
 Domain skills still need `devcouncil skills scaffold` (or the `devmap skills install` spawn on cursor/claude). The packaged `devcouncil.md` / hero-loop skills currently describe Python-era tools (TASK-P7-9).
 

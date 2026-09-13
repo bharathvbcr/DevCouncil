@@ -8,6 +8,7 @@
 //!   insufficient for multi-tab Cursor — callers must still pass `repo_path`)
 
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
@@ -21,6 +22,18 @@ pub enum Host {
     Cursor,
     Claude,
     Codex,
+    /// Google Antigravity CLI. Reads `.agents/mcp_config.json`, the same
+    /// `mcpServers` document shape Cursor and Claude use, and shares
+    /// `.agents/skills` with Codex.
+    Antigravity,
+    /// OpenCode. Reads `opencode.json` at the repository root — a *user-owned*
+    /// file, not a dot-directory this tool owns — under an `mcp` key whose
+    /// entries name the program as an argv array rather than command+args.
+    OpenCode,
+    /// Warp / Oz. Reads `.devcouncil/integrations/warp-mcp.json`, a file
+    /// DevCouncil writes and passes explicitly via `oz agent run --mcp`, so
+    /// the document is a bare server map with no wrapper key.
+    Warp,
 }
 
 impl Host {
@@ -29,7 +42,13 @@ impl Host {
             "cursor" => Ok(Self::Cursor),
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
-            other => bail!("unsupported host {other:?}; expected cursor, claude, or codex"),
+            "antigravity" => Ok(Self::Antigravity),
+            "opencode" => Ok(Self::OpenCode),
+            "warp" => Ok(Self::Warp),
+            other => bail!(
+                "unsupported host {other:?}; expected cursor, claude, codex, \
+                 antigravity, opencode, or warp"
+            ),
         }
     }
 
@@ -38,6 +57,9 @@ impl Host {
             Self::Cursor => "cursor",
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
+            Self::OpenCode => "opencode",
+            Self::Warp => "warp",
         }
     }
 
@@ -45,7 +67,13 @@ impl Host {
         match self {
             Self::Cursor => &[".cursor/skills"],
             Self::Claude => &[".claude/skills"],
-            Self::Codex => &[".agents/skills"],
+            // Antigravity reads the same `.agents` tree Codex does, so the
+            // skills a Codex integration already installed are the skills it
+            // sees; writing them twice would be the same bytes.
+            Self::Codex | Self::Antigravity => &[".agents/skills"],
+            // Neither host documents a project skill directory. Writing one on
+            // a guess would leave files no host reads.
+            Self::OpenCode | Self::Warp => &[],
         }
     }
 
@@ -102,7 +130,7 @@ pub fn integrate(
             devmap_query::guides::agent_guide_text(map, map_rel, graph_rel, store_rel) + "\n";
         for name in devmap_query::guides::GUIDE_FILENAMES {
             let path = root.join(name);
-            let disposition = match fs::read_to_string(&path) {
+            let disposition = match read_host_config(&path) {
                 Ok(existing)
                     if existing.contains(devmap_query::guides::AGENT_GUIDE_MARKER)
                         || existing.contains(devmap_query::guides::LEGACY_AGENT_GUIDE_MARKER) =>
@@ -129,7 +157,7 @@ pub fn integrate(
         }
         let rule_path = root.join(devmap_query::guides::CURSOR_RULE_REL);
         let rule_text = devmap_query::guides::cursor_rule_text(map_rel);
-        let rule_differs = fs::read_to_string(&rule_path)
+        let rule_differs = read_host_config(&rule_path)
             .map(|existing| existing != rule_text)
             .unwrap_or(true);
         if rule_differs {
@@ -147,10 +175,27 @@ pub fn integrate(
             devmap_query::guides::write_agent_guides(&root, map, map_rel, graph_rel, store_rel)?;
     }
 
-    let skill_report =
-        skills::install_devmap_skills(&root, host.skill_destinations(), dry_run, check)?;
-    report.skills_written = skill_report.written;
-    report.skills_differing = skill_report.differing;
+    // A host with no documented project skill directory installs no skills.
+    // That is a state, not a malformed request: the installer's 1-16
+    // destination bound guards against a caller passing nonsense, and handing
+    // it an empty slice to mean "nowhere" tripped that guard instead.
+    // Vacuously satisfied where nothing is installed: a check that had no
+    // destinations to inspect must not report the same failure as one that
+    // inspected a destination and found it wrong.
+    let mut skills_check_ok = true;
+    if host.skill_destinations().is_empty() {
+        report.notes.push(format!(
+            "{}: no project skill directory is documented for this host; \
+             skills were not installed",
+            host.as_str()
+        ));
+    } else {
+        let skill_report =
+            skills::install_devmap_skills(&root, host.skill_destinations(), dry_run, check)?;
+        report.skills_written = skill_report.written;
+        report.skills_differing = skill_report.differing;
+        skills_check_ok = skill_report.check_ok;
+    }
 
     if host.registers_global_mcp() {
         for path in global_mcp_paths(host)? {
@@ -168,6 +213,23 @@ pub fn integrate(
              regenerating hooks re-requires trust)"
                 .into(),
         );
+    }
+
+    // Hosts whose project document this module owns end-to-end. Cursor and
+    // Claude are handled by the `mcpServers` merge further down, which also
+    // reaches their user-level files; these three have no user-level document.
+    if let Some(outcome) = merge_host_mcp(host, &root, executable, dry_run || check)? {
+        report.project_mcp.push(outcome);
+    }
+
+    // OpenCode has no hooks document: it loads an ES module named in
+    // `opencode.json`. Antigravity and Warp are absent here on purpose —
+    // neither documents a project hook mechanism, and a handler written on a
+    // guess is a file the host never calls.
+    if host == Host::OpenCode {
+        report
+            .hooks
+            .extend(merge_opencode_plugin(&root, executable, dry_run || check)?);
     }
 
     if host == Host::Cursor {
@@ -205,7 +267,7 @@ pub fn integrate(
             .chain(report.project_mcp.iter())
             .chain(report.hooks.iter())
             .any(|m| m.changed);
-        if guides_dirty || skills_dirty || mcp_dirty || !skill_report.check_ok {
+        if guides_dirty || skills_dirty || mcp_dirty || !skills_check_ok {
             bail!("integrate --check: assets differ from the expected DevMap installation");
         }
     }
@@ -218,7 +280,10 @@ fn global_mcp_paths(host: Host) -> anyhow::Result<Vec<PathBuf>> {
     Ok(match host {
         Host::Cursor => vec![home.join(".cursor").join("mcp.json")],
         Host::Claude => vec![home.join(".claude.json")],
-        Host::Codex => Vec::new(),
+        // Project-scoped only. Antigravity and OpenCode keep their server list
+        // beside the repository, and Warp's file is handed to `oz` per run, so
+        // there is no user-level document to merge into for any of them.
+        Host::Codex | Host::Antigravity | Host::OpenCode | Host::Warp => Vec::new(),
     })
 }
 
@@ -229,8 +294,390 @@ fn project_mcp_paths(host: Host, root: &Path) -> Vec<PathBuf> {
             root.join(".mcp.json"),
             root.join(".claude").join("mcp.json"),
         ],
-        Host::Codex => Vec::new(),
+        // The three below are written by `host_mcp_document`, which knows each
+        // one's container key and entry shape. They are deliberately absent
+        // here: this list feeds the `mcpServers` merge, and two of them do not
+        // use that key at all.
+        Host::Codex | Host::Antigravity | Host::OpenCode | Host::Warp => Vec::new(),
     }
+}
+
+/// Where one host keeps its server list, and how that document is shaped.
+///
+/// Three hosts, three shapes, and the differences are load-bearing:
+/// Antigravity nests servers under `mcpServers`, OpenCode under `mcp`, and
+/// Warp's file *is* the server map with no wrapper at all. Declaring the shape
+/// once, here, is what lets a single writer serve all of them rather than
+/// three near-copies that drift.
+struct HostMcpDoc {
+    /// Path relative to the repository root.
+    rel: &'static str,
+    /// Key the server map lives under, or `None` when the document root is it.
+    container: Option<&'static str>,
+    /// Extra top-level keys to establish when creating the file.
+    preamble: &'static [(&'static str, &'static str)],
+    /// Whether entries name the program as an argv array (`command: [...]`)
+    /// instead of `command` + `args`.
+    argv_form: bool,
+}
+
+impl Host {
+    /// The project-scoped server document this host reads, if this module
+    /// writes one for it.
+    ///
+    /// Cursor and Claude are absent because their documents go through the
+    /// `mcpServers` merge in [`offer_project_mcp`], which also handles their
+    /// global counterparts. Codex registers through its own TOML writer.
+    fn mcp_document(self) -> Option<HostMcpDoc> {
+        match self {
+            Self::Cursor | Self::Claude | Self::Codex => None,
+            Self::Antigravity => Some(HostMcpDoc {
+                rel: ".agents/mcp_config.json",
+                container: Some("mcpServers"),
+                preamble: &[],
+                argv_form: false,
+            }),
+            Self::OpenCode => Some(HostMcpDoc {
+                rel: "opencode.json",
+                container: Some("mcp"),
+                // OpenCode validates against this schema; a file created
+                // without it loses editor completion for every other key.
+                preamble: &[("$schema", "https://opencode.ai/config.json")],
+                argv_form: true,
+            }),
+            Self::Warp => Some(HostMcpDoc {
+                rel: ".devcouncil/integrations/warp-mcp.json",
+                container: None,
+                preamble: &[],
+                argv_form: false,
+            }),
+        }
+    }
+}
+
+/// Register `devmap` in one host's project server document.
+///
+/// The entry is always [`claude::mcp_entry_with_root`]'s shape — the absolute
+/// path of the binary that was validated, and `--root <abs>` rather than a
+/// pinned `--db`. Both halves matter and both were wrong in the configurations
+/// this replaces: a bare `devmap` hands the host whichever build wins on PATH,
+/// and a baked store path fixes the state layout as of the day it was written,
+/// which is not a property of the binary but of the repository.
+///
+/// Every other key in the file survives. `opencode.json` in particular is a
+/// *user's* configuration that happens to hold a server list, not a file this
+/// tool owns, so a write that dropped an unrelated key would be a bug even if
+/// the server entry came out right.
+pub fn merge_host_mcp(
+    host: Host,
+    root: &Path,
+    executable: &Path,
+    dry_run: bool,
+) -> anyhow::Result<Option<McpMergeOutcome>> {
+    let Some(doc) = host.mcp_document() else {
+        return Ok(None);
+    };
+    let path = root.join(doc.rel);
+
+    let mut document = match read_host_config(&path) {
+        Ok(text) if text.trim().is_empty() => empty_map(),
+        Ok(text) => serde_json::from_str::<Value>(&text).map_err(|err| {
+            // Refuse rather than overwrite: an unparseable config is far more
+            // likely to be a file worth keeping than one worth replacing.
+            anyhow!(
+                "{}: not JSON ({err}); refuse to overwrite a host config this \
+                 module cannot read",
+                path.display()
+            )
+        })?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => empty_map(),
+        Err(err) => return Err(anyhow!("{}: {err}", path.display())),
+    };
+    if !document.is_object() {
+        bail!(
+            "{}: top level is {}, not a JSON object",
+            path.display(),
+            kind_of(&document)
+        );
+    }
+
+    for (key, value) in doc.preamble {
+        document
+            .as_object_mut()
+            .expect("object checked above")
+            .entry(key.to_string())
+            .or_insert_with(|| json!(value));
+    }
+
+    let entry = host_mcp_entry(&doc, executable, root)?;
+    let before = servers_of(&document, &doc).cloned();
+    if before.as_ref() == Some(&entry) {
+        return Ok(Some(McpMergeOutcome {
+            path,
+            changed: false,
+            removed_stale_db: false,
+            note: format!("{} already current", doc.rel),
+        }));
+    }
+    // Reported rather than folded into "changed": replacing a pinned store
+    // path is the repair this exists for, and a receipt that does not
+    // distinguish it from a first-time write cannot show the repair happened.
+    let removed_stale_db = before.as_ref().is_some_and(entry_names_a_store);
+
+    servers_mut(&mut document, &doc)?.insert(MCP_SERVER_NAME.to_string(), entry);
+
+    if !dry_run {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        write_json_pretty(&path, &document)?;
+    }
+    Ok(Some(McpMergeOutcome {
+        path,
+        changed: true,
+        removed_stale_db,
+        note: if removed_stale_db {
+            format!("{}: replaced a pinned --db entry with --root", doc.rel)
+        } else {
+            format!("{}: registered devmap", doc.rel)
+        },
+    }))
+}
+
+/// The devmap entry in this host's spelling.
+fn host_mcp_entry(doc: &HostMcpDoc, executable: &Path, root: &Path) -> anyhow::Result<Value> {
+    let standard = claude::mcp_entry_with_root(executable, root, None)?;
+    if !doc.argv_form {
+        return Ok(standard);
+    }
+    // OpenCode names the program and its arguments as one argv array. Build it
+    // from the standard entry rather than re-deriving the path and flags, so
+    // the two spellings cannot disagree about what gets run.
+    let command = standard
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("mcp entry has no command"))?;
+    let mut argv = vec![json!(command)];
+    for arg in standard
+        .get("args")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        argv.push(arg.clone());
+    }
+    Ok(json!({
+        "type": "local",
+        "command": Value::Array(argv),
+        "enabled": true,
+        "timeout": 10_000,
+    }))
+}
+
+/// True when an existing entry pins a store path, in either spelling.
+fn entry_names_a_store(entry: &Value) -> bool {
+    if entry_has_db_arg(entry) {
+        return true;
+    }
+    entry
+        .get("command")
+        .and_then(Value::as_array)
+        .is_some_and(|argv| argv.iter().any(|a| a.as_str() == Some("--db")))
+}
+
+fn servers_of<'a>(document: &'a Value, doc: &HostMcpDoc) -> Option<&'a Value> {
+    match doc.container {
+        None => document.get(MCP_SERVER_NAME),
+        Some(key) => document.get(key).and_then(|map| map.get(MCP_SERVER_NAME)),
+    }
+}
+
+fn servers_mut<'a>(
+    document: &'a mut Value,
+    doc: &HostMcpDoc,
+) -> anyhow::Result<&'a mut Map<String, Value>> {
+    let Some(key) = doc.container else {
+        return document
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("document root is not an object"));
+    };
+    let root = document
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("document root is not an object"))?;
+    let slot = root.entry(key.to_string()).or_insert_with(empty_map);
+    if !slot.is_object() {
+        bail!("`{key}` is {}, not a JSON object", kind_of(slot));
+    }
+    slot.as_object_mut()
+        .ok_or_else(|| anyhow!("`{key}` is not an object"))
+}
+
+fn kind_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// OpenCode reaches hooks through an ES module named in `opencode.json`'s
+/// `plugin` key, not through a hooks document.
+///
+/// The module name is DevMap's claim on that file: a plugin the user wrote
+/// keeps its own name and is left alone.
+const OPENCODE_PLUGIN_FILE: &str = "opencode_devmap_plugin.mjs";
+
+/// The one event with evidence behind it.
+///
+/// The retired DevCouncil plugin this shape is recovered from registered
+/// `tool.execute.after` and nothing else. Session start and end are not
+/// emitted here — not because a refresh at those moments would be useless, but
+/// because no handler name for them is documented, and a listener registered
+/// under a guessed key is a file the host silently never calls.
+const OPENCODE_AFTER_TOOL: &str = "tool.execute.after";
+
+/// The plugin body. `devmap hook post-tool-use` returns within its own budget
+/// and detaches the rebuild itself, so a synchronous spawn here does not hold
+/// the agent's tool loop open — that bound is the reason the native dispatch
+/// exists.
+fn opencode_plugin_source(executable: &Path) -> anyhow::Result<String> {
+    let exe = serde_json::to_string(&claude::utf8_path(
+        "the devmap executable path",
+        executable,
+    )?)?;
+    Ok(format!(
+        r#"// Written by `devmap integrate opencode`. Edits here are overwritten.
+//
+// Refreshes the DevMap index after a tool writes, so the next question is
+// answered against the current tree rather than the tree as it was at session
+// start. `hook post-tool-use` returns immediately and detaches the rebuild.
+import {{ spawnSync }} from "node:child_process";
+
+const projectRoot = process.env.DEVMAP_PROJECT_ROOT || process.cwd();
+
+export const DevMapOpenCodeHook = async () => ({{
+  "{event}": async () => {{
+    spawnSync({exe}, ["--root", projectRoot, "hook", "post-tool-use"], {{
+      input: JSON.stringify({{ cwd: projectRoot }}),
+      encoding: "utf-8",
+    }});
+  }},
+}});
+"#,
+        event = OPENCODE_AFTER_TOOL,
+        exe = exe,
+    ))
+}
+
+/// Install the OpenCode plugin and list it in `opencode.json`.
+///
+/// Two files, and both must agree: the module on disk, and the `plugin` entry
+/// that makes OpenCode load it. Writing one without the other yields either a
+/// module nothing calls or a reference to a file that is not there.
+pub fn merge_opencode_plugin(
+    root: &Path,
+    executable: &Path,
+    dry_run: bool,
+) -> anyhow::Result<Vec<McpMergeOutcome>> {
+    let mut outcomes = Vec::new();
+    let plugin_abs = devmap_extract::paths::state_dir(root)
+        .join("integrations")
+        .join(OPENCODE_PLUGIN_FILE);
+    // Listed relative to the repository root: `opencode.json` is committed in
+    // some projects, and an absolute path there names one developer's machine.
+    let plugin_rel = plugin_abs
+        .strip_prefix(root)
+        .map(|rel| rel.to_path_buf())
+        .unwrap_or_else(|_| plugin_abs.clone());
+    let plugin_ref = claude::utf8_path("the opencode plugin path", &plugin_rel)?.replace('\\', "/");
+
+    let source = opencode_plugin_source(executable)?;
+    let current = fs::read_to_string(&plugin_abs).ok();
+    let module_changed = current.as_deref() != Some(source.as_str());
+    if module_changed && !dry_run {
+        if let Some(parent) = plugin_abs.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::write(&plugin_abs, &source)
+            .with_context(|| format!("writing {}", plugin_abs.display()))?;
+    }
+    outcomes.push(McpMergeOutcome {
+        path: plugin_abs,
+        changed: module_changed,
+        removed_stale_db: false,
+        note: if module_changed {
+            format!("wrote {plugin_ref}")
+        } else {
+            format!("{plugin_ref} already current")
+        },
+    });
+
+    // Now the reference. `plugin` is a string in some configs and an array in
+    // others; both are read, and an array is what gets written back.
+    let config = root.join("opencode.json");
+    let mut document = match read_host_config(&config) {
+        Ok(text) if text.trim().is_empty() => empty_map(),
+        Ok(text) => serde_json::from_str::<Value>(&text)
+            .map_err(|err| anyhow!("{}: not JSON ({err})", config.display()))?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => empty_map(),
+        Err(err) => return Err(anyhow!("{}: {err}", config.display())),
+    };
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{}: top level is not a JSON object", config.display()))?;
+
+    let mut entries: Vec<Value> = match object.get("plugin") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(one)) => vec![json!(one)],
+        Some(Value::Array(many)) => many.clone(),
+        Some(other) => bail!(
+            "{}: `plugin` is {}, not a string or array",
+            config.display(),
+            kind_of(other)
+        ),
+    };
+    let already = entries.iter().any(|entry| {
+        entry
+            .as_str()
+            .is_some_and(|text| is_our_plugin_ref(text, &plugin_ref))
+    });
+    let reference_changed = !already;
+    if reference_changed {
+        entries.push(json!(plugin_ref));
+        object.insert("plugin".into(), Value::Array(entries));
+        if !dry_run {
+            write_json_pretty(&config, &document)?;
+        }
+    }
+    outcomes.push(McpMergeOutcome {
+        path: config,
+        changed: reference_changed,
+        removed_stale_db: false,
+        note: if reference_changed {
+            "opencode.json: listed the DevMap plugin".into()
+        } else {
+            "opencode.json: plugin already listed".into()
+        },
+    });
+    Ok(outcomes)
+}
+
+/// Whether an existing `plugin` entry already names our module.
+///
+/// Accepts the spellings the host tolerates — a `file:` URI, a `./` prefix,
+/// backslashes — so a second run appends nothing. Matching on the file name
+/// alone would be wrong: another project's plugin may share it.
+fn is_our_plugin_ref(entry: &str, ours: &str) -> bool {
+    let normalize = |text: &str| {
+        let text = text.replace('\\', "/");
+        let text = text.strip_prefix("file://").unwrap_or(&text).to_string();
+        let text = text.strip_prefix("./").unwrap_or(&text).to_string();
+        text.trim_start_matches('/').to_string()
+    };
+    normalize(entry) == normalize(ours)
 }
 
 fn dirs_home() -> anyhow::Result<PathBuf> {
@@ -430,11 +877,58 @@ fn entry_has_db_arg(entry: &Value) -> bool {
         .is_some_and(|args| args.iter().any(|a| a.as_str() == Some("--db")))
 }
 
+/// The most a host config this module inspects may weigh.
+///
+/// Matches the Go host's `maxHostConfigBytes`: these are settings files, and a
+/// file that large is a wedged or hostile one, not a config to merge into.
+const MAX_HOST_CONFIG_BYTES: u64 = 1 << 20;
+
+/// Read one host config with a bound and a file-type check.
+///
+/// Every read of an existing config in this module goes through here. A plain
+/// `read_to_string` had no ceiling and no notion of what it opened, so a
+/// character device or an oversized file at a known config name was read until
+/// it stopped or the process did.
+fn read_host_config(path: &Path) -> io::Result<String> {
+    let file = fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: not a regular file", path.display()),
+        ));
+    }
+    if meta.len() > MAX_HOST_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: {} bytes exceeds the {MAX_HOST_CONFIG_BYTES}-byte host config bound",
+                path.display(),
+                meta.len()
+            ),
+        ));
+    }
+    let mut text = String::new();
+    // Bounded independently of the stat above: the file can grow between them.
+    file.take(MAX_HOST_CONFIG_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_HOST_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: grew past the {MAX_HOST_CONFIG_BYTES}-byte host config bound",
+                path.display()
+            ),
+        ));
+    }
+    Ok(text)
+}
+
 fn read_json_object(path: &Path) -> anyhow::Result<Value> {
     if !path.exists() {
         return Ok(json!({"mcpServers": {}}));
     }
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = read_host_config(path).with_context(|| format!("reading {}", path.display()))?;
     let value: Value = serde_json::from_str(&text).map_err(|err| {
         anyhow!(
             "{}: not strict JSON ({err}); JSON-with-comments is refused rather than rewritten",
@@ -477,7 +971,7 @@ pub fn merge_cursor_hooks(
 ) -> anyhow::Result<McpMergeOutcome> {
     let expected = claude::cursor_hooks_document(executable)?;
     if path.is_file() {
-        let existing_text = fs::read_to_string(path)?;
+        let existing_text = read_host_config(path)?;
         let existing: Value = serde_json::from_str(&existing_text).map_err(|err| {
             anyhow!(
                 "{}: not JSON ({err}); refuse to overwrite a broken hooks file",
@@ -528,7 +1022,7 @@ pub fn merge_codex_mcp(
         .ok_or_else(|| anyhow!("executable path is not UTF-8"))?;
 
     let existing = if path.is_file() {
-        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+        read_host_config(path).with_context(|| format!("reading {}", path.display()))?
     } else {
         String::new()
     };
@@ -572,7 +1066,11 @@ pub fn merge_codex_mcp(
         }
         let text = toml::to_string_pretty(&toml::Value::Table(table))
             .map_err(|err| anyhow!("serialize Codex config: {err}"))?;
-        fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        // The JSON configs next door publish through safe_fs; a plain
+        // `fs::write` here truncated whatever the name resolved to, link or
+        // not, and left a half-written config behind on a failed write.
+        devmap_query::write_atomic(path, text.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
     }
 
     Ok(McpMergeOutcome {
@@ -606,7 +1104,7 @@ pub fn write_codex_plugin_assets(
         (&hooks_path, &hooks, "wrote .codex-plugin/hooks/hooks.json"),
     ] {
         let changed = if path.is_file() {
-            let existing = fs::read_to_string(path).unwrap_or_default();
+            let existing = read_host_config(path).unwrap_or_default();
             let pretty = {
                 let mut text = serde_json::to_string_pretty(value)?;
                 text.push('\n');
@@ -788,6 +1286,414 @@ mod tests {
             outcome.note
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- project server documents for antigravity / opencode / warp --------
+    //
+    // These three configurations existed on disk before this module wrote
+    // them, left behind by the retired Python installer, and both of the
+    // registrations it produced violated the contract this module enforces
+    // everywhere else: a bare `devmap` (whichever build wins on PATH) and a
+    // pinned `--db` (a store layout frozen on the day it was written).
+
+    fn read(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn devmap_entry(host: Host, root: &Path) -> Value {
+        let doc = host.mcp_document().expect("host writes a document");
+        let file = read(&root.join(doc.rel));
+        match doc.container {
+            None => file.get("devmap").cloned().unwrap(),
+            Some(key) => file.get(key).unwrap().get("devmap").cloned().unwrap(),
+        }
+    }
+
+    /// No `--db` anywhere, and the program is an absolute path.
+    fn assert_contract(entry: &Value, exe: &Path) {
+        let text = entry.to_string();
+        assert!(!text.contains("--db"), "still pins a store: {text}");
+        assert!(text.contains("--root"), "does not scope by root: {text}");
+        let program = entry
+            .get("command")
+            .and_then(|c| match c {
+                Value::String(s) => Some(s.clone()),
+                Value::Array(a) => a.first().and_then(Value::as_str).map(str::to_string),
+                _ => None,
+            })
+            .expect("an entry names a program");
+        assert_eq!(
+            Path::new(&program),
+            exe,
+            "program is not the validated absolute path"
+        );
+    }
+
+    // ---- OpenCode plugin -------------------------------------------------
+    //
+    // OpenCode has no hooks document: it loads an ES module listed in
+    // `opencode.json`. Two artifacts must agree — the module on disk and the
+    // reference that makes the host load it — so every test here checks both.
+
+    fn plugin_list(root: &Path) -> Vec<String> {
+        read(&root.join("opencode.json"))
+            .get("plugin")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn plugin_module(root: &Path) -> String {
+        fs::read_to_string(root.join(".devmap/integrations/opencode_devmap_plugin.mjs"))
+            .or_else(|_| {
+                fs::read_to_string(root.join(".devcouncil/integrations/opencode_devmap_plugin.mjs"))
+            })
+            .expect("the plugin module was written")
+    }
+
+    #[test]
+    fn the_opencode_plugin_is_written_and_listed() {
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let root = scratch("oc-plugin");
+        merge_opencode_plugin(&root, &exe, false).unwrap();
+
+        let source = plugin_module(&root);
+        // The native dispatch, not a legacy subcommand: a plugin calling
+        // `devmap build` directly would bypass the coalescing and the budget
+        // that make a post-write refresh safe to run on every tool call.
+        assert!(source.contains("hook"), "{source}");
+        assert!(source.contains("post-tool-use"), "{source}");
+        assert!(
+            !source.contains("\"build\""),
+            "calls build directly: {source}"
+        );
+        assert!(source.contains("DevMapOpenCodeHook"), "{source}");
+        assert!(source.contains("tool.execute.after"), "{source}");
+        assert!(source.contains("/opt/devmap/bin/devmap"), "{source}");
+
+        let listed = plugin_list(&root);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert!(
+            listed[0].ends_with("opencode_devmap_plugin.mjs"),
+            "{listed:?}"
+        );
+        // Relative to the repository: `opencode.json` is committed in some
+        // projects, and an absolute path there names one developer's machine.
+        assert!(
+            !listed[0].starts_with('/'),
+            "absolute path listed: {listed:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_second_run_adds_no_duplicate_plugin_entry() {
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let root = scratch("oc-idem");
+        merge_opencode_plugin(&root, &exe, false).unwrap();
+        let outcomes = merge_opencode_plugin(&root, &exe, false).unwrap();
+        assert!(
+            outcomes.iter().all(|o| !o.changed),
+            "second run reported a change: {:?}",
+            outcomes.iter().map(|o| &o.note).collect::<Vec<_>>()
+        );
+        assert_eq!(plugin_list(&root).len(), 1);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn another_projects_plugins_are_kept_in_every_spelling() {
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        // `plugin` is a bare string in some configs and an array in others.
+        for existing in [
+            json!("./theirs.mjs"),
+            json!(["./theirs.mjs", "file:///abs/other.mjs"]),
+        ] {
+            let root = scratch("oc-keep");
+            fs::write(
+                root.join("opencode.json"),
+                serde_json::to_string(&json!({"plugin": existing, "theme": "dark"})).unwrap(),
+            )
+            .unwrap();
+            merge_opencode_plugin(&root, &exe, false).unwrap();
+            let listed = plugin_list(&root);
+            assert!(
+                listed.iter().any(|p| p.contains("theirs.mjs")),
+                "dropped a user plugin: {listed:?}"
+            );
+            assert!(
+                listed
+                    .iter()
+                    .any(|p| p.ends_with("opencode_devmap_plugin.mjs")),
+                "{listed:?}"
+            );
+            assert_eq!(read(&root.join("opencode.json"))["theme"], json!("dark"));
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn our_entry_is_recognised_however_it_is_spelled() {
+        // A config hand-edited to a `file:` URI or a `./` prefix still names
+        // our module; appending a second reference would load it twice.
+        let ours = ".devmap/integrations/opencode_devmap_plugin.mjs";
+        for spelling in [
+            ".devmap/integrations/opencode_devmap_plugin.mjs",
+            "./.devmap/integrations/opencode_devmap_plugin.mjs",
+            ".devmap\\integrations\\opencode_devmap_plugin.mjs",
+        ] {
+            assert!(is_our_plugin_ref(spelling, ours), "{spelling}");
+        }
+        assert!(!is_our_plugin_ref("other/opencode_devmap_plugin.mjs", ours));
+        assert!(!is_our_plugin_ref("./theirs.mjs", ours));
+    }
+
+    #[test]
+    fn a_wrongly_shaped_plugin_key_is_refused_not_replaced() {
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let root = scratch("oc-bad");
+        let body = r#"{"plugin": {"not": "a list"}}"#;
+        fs::write(root.join("opencode.json"), body).unwrap();
+        assert!(merge_opencode_plugin(&root, &exe, false).is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("opencode.json")).unwrap(),
+            body
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_opencode_dry_run_writes_neither_artifact() {
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let root = scratch("oc-dry");
+        let outcomes = merge_opencode_plugin(&root, &exe, true).unwrap();
+        assert!(outcomes.iter().any(|o| o.changed), "dry run reports intent");
+        assert!(!root.join("opencode.json").exists(), "wrote the config");
+        assert!(
+            !root
+                .join(".devmap/integrations/opencode_devmap_plugin.mjs")
+                .exists()
+                && !root
+                    .join(".devcouncil/integrations/opencode_devmap_plugin.mjs")
+                    .exists(),
+            "wrote the module"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_module_is_rewritten_when_the_binary_moves() {
+        // The executable path is baked into the module. An install that moved
+        // must refresh it, or the plugin spawns a binary that is gone.
+        let root = scratch("oc-move");
+        merge_opencode_plugin(&root, Path::new("/old/devmap"), false).unwrap();
+        assert!(plugin_module(&root).contains("/old/devmap"));
+        let outcomes = merge_opencode_plugin(&root, Path::new("/new/devmap"), false).unwrap();
+        assert!(
+            outcomes.iter().any(|o| o.changed),
+            "module was not refreshed"
+        );
+        let source = plugin_module(&root);
+        assert!(source.contains("/new/devmap"), "{source}");
+        assert!(!source.contains("/old/devmap"), "{source}");
+        // The reference does not change, so it must not be appended twice.
+        assert_eq!(plugin_list(&root).len(), 1);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_pinned_db_registration_is_repaired_for_every_host() {
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        for (host, rel, stale) in [
+            (
+                Host::Antigravity,
+                ".agents/mcp_config.json",
+                json!({"mcpServers": {
+                    "devcouncil": {"command": "devcouncil", "args": ["mcp-server"]},
+                    "devmap": {"command": "devmap", "args": ["--db", "/old/devmap.sqlite", "mcp"]},
+                }}),
+            ),
+            (
+                Host::OpenCode,
+                "opencode.json",
+                json!({
+                    "$schema": "https://opencode.ai/config.json",
+                    "theme": "tokyonight",
+                    "mcp": {
+                        "devcouncil": {"type": "local", "command": ["devcouncil", "mcp-server"]},
+                        "devmap": {"type": "local",
+                                   "command": ["devmap", "--db", "/old/devmap.sqlite", "mcp"]},
+                    },
+                }),
+            ),
+            (
+                Host::Warp,
+                ".devcouncil/integrations/warp-mcp.json",
+                json!({"devcouncil": {"command": "devcouncil", "args": ["mcp-server"]}}),
+            ),
+        ] {
+            let root = scratch(host.as_str());
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, serde_json::to_string_pretty(&stale).unwrap()).unwrap();
+
+            let outcome = merge_host_mcp(host, &root, &exe, false)
+                .unwrap()
+                .expect("this host writes a document");
+            assert!(outcome.changed, "{host:?} reported no change");
+            assert_contract(&devmap_entry(host, &root), &exe);
+
+            // The other server in the file is not ours to touch.
+            let after = read(&path);
+            let servers = match host.mcp_document().unwrap().container {
+                None => after.clone(),
+                Some(key) => after.get(key).cloned().unwrap(),
+            };
+            assert!(
+                servers.get("devcouncil").is_some(),
+                "{host:?} dropped the devcouncil server: {after}"
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn only_the_two_hosts_that_pinned_a_store_report_that_repair() {
+        // Warp carried no devmap entry at all, so registering one is a first
+        // write, not a repair. A receipt that called both the same could not
+        // show that the stale registrations were actually replaced.
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let root = scratch("warp-fresh");
+        let outcome = merge_host_mcp(Host::Warp, &root, &exe, false)
+            .unwrap()
+            .unwrap();
+        assert!(outcome.changed);
+        assert!(!outcome.removed_stale_db, "{}", outcome.note);
+        assert!(
+            outcome.note.contains("registered devmap"),
+            "{}",
+            outcome.note
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_opencode_file_keeps_every_key_that_is_not_ours() {
+        // `opencode.json` is a user's configuration that happens to hold a
+        // server list. Losing an unrelated key is a bug even when the server
+        // entry comes out right.
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let root = scratch("opencode-keys");
+        fs::write(
+            root.join("opencode.json"),
+            serde_json::to_string_pretty(&json!({
+                "$schema": "https://opencode.ai/config.json",
+                "theme": "tokyonight",
+                "model": "anthropic/claude-opus-5",
+                "keybinds": {"leader": "ctrl+x"},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        merge_host_mcp(Host::OpenCode, &root, &exe, false).unwrap();
+        let after = read(&root.join("opencode.json"));
+        assert_eq!(after["theme"], json!("tokyonight"));
+        assert_eq!(after["model"], json!("anthropic/claude-opus-5"));
+        assert_eq!(after["keybinds"]["leader"], json!("ctrl+x"));
+        assert_eq!(after["$schema"], json!("https://opencode.ai/config.json"));
+        // argv form, not command+args.
+        assert!(after["mcp"]["devmap"]["command"].is_array());
+        assert_eq!(after["mcp"]["devmap"]["type"], json!("local"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_second_run_changes_nothing() {
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        for host in [Host::Antigravity, Host::OpenCode, Host::Warp] {
+            let root = scratch(&format!("idem-{}", host.as_str()));
+            merge_host_mcp(host, &root, &exe, false).unwrap();
+            let first = read(&root.join(host.mcp_document().unwrap().rel));
+            let again = merge_host_mcp(host, &root, &exe, false).unwrap().unwrap();
+            assert!(!again.changed, "{host:?} rewrote an identical file");
+            assert!(again.note.contains("already current"), "{}", again.note);
+            assert_eq!(
+                first,
+                read(&root.join(host.mcp_document().unwrap().rel)),
+                "{host:?} changed bytes while reporting no change"
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn a_dry_run_writes_nothing() {
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let root = scratch("dry");
+        let outcome = merge_host_mcp(Host::Warp, &root, &exe, true)
+            .unwrap()
+            .unwrap();
+        assert!(outcome.changed, "a dry run still reports what it would do");
+        assert!(
+            !root.join(".devcouncil/integrations/warp-mcp.json").exists(),
+            "dry run created the file"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_unreadable_or_wrongly_shaped_config_is_refused_not_overwritten() {
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        for (label, body) in [
+            ("not-json", "{ this is not json"),
+            ("top-level-array", "[1, 2, 3]"),
+            ("top-level-string", "\"hello\""),
+            ("container-is-a-string", "{\"mcp\": \"not an object\"}"),
+        ] {
+            let root = scratch(label);
+            let path = root.join("opencode.json");
+            fs::write(&path, body).unwrap();
+            let result = merge_host_mcp(Host::OpenCode, &root, &exe, false);
+            assert!(result.is_err(), "{label} was accepted");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                body,
+                "{label} was overwritten despite being refused"
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn an_empty_file_is_treated_as_an_empty_document() {
+        // A zero-byte config is what an interrupted write leaves behind. It
+        // carries no user keys to lose, so it is filled in rather than refused.
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let root = scratch("empty");
+        fs::write(root.join("opencode.json"), "   \n").unwrap();
+        merge_host_mcp(Host::OpenCode, &root, &exe, false).unwrap();
+        let after = read(&root.join("opencode.json"));
+        assert_eq!(after["$schema"], json!("https://opencode.ai/config.json"));
+        assert!(after["mcp"]["devmap"]["command"].is_array());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_hosts_without_their_own_document_are_left_to_the_existing_merge() {
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let root = scratch("nodoc");
+        for host in [Host::Cursor, Host::Claude, Host::Codex] {
+            assert!(
+                merge_host_mcp(host, &root, &exe, false).unwrap().is_none(),
+                "{host:?} must keep going through offer_project_mcp"
+            );
+        }
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

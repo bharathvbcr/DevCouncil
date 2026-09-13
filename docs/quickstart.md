@@ -87,7 +87,7 @@ This creates:
 
 ## 4. Connect Your Coding Agent
 
-Connect DevCouncil's MCP server and skills to Cursor or Claude Code. `--write-gate` is refused because lifecycle hooks are retired.
+Connect DevCouncil's MCP server and skills to Cursor or Claude Code. `--write-gate` has been removed: it named a pre-tool-use gate that only the retired lifecycle hooks installed, and nothing enforced it.
 
 ```bash
 # Working adapters: cursor, claude, codex (comment-only toml)
@@ -95,7 +95,7 @@ devcouncil integrate cursor --apply
 devcouncil integrate claude --apply
 devcouncil integrate codex --apply
 
-# gemini / opencode / warp / aider / antigravity write a stub receipt
+# opencode / warp / antigravity write their host's server document; gemini and aider are refused
 ```
 
 Verify existing integration configs:

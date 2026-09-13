@@ -41,7 +41,7 @@ suite passed before new regressions were added, demonstrating its coverage gaps.
 | Earlier files changed before a later malformed file was discovered | The entire selected scope is planned and validated before applying changes. |
 | Symlinked files/parents, oversized or ambiguous JSON, invalid modes and uninspectable hook shapes could look successful | Scoped filesystem handles, regular-file checks, 1 MiB reads, 64-level JSON depth, duplicate-key checks, and explicit shape/mode validation now refuse these cases. |
 | Concurrent cleanup or external edits could lose state | Exclusive cleanup lock, before/after identity and byte checks, unique staging files, exact recoverable backups and truthful partial receipts. |
-| `--write-gate` claimed containment while ignoring the request | Refused before writes; help, rules, quickstart, CLI reference and release notes now describe the actual retired-hook contract. |
+| `--write-gate` claimed containment while ignoring the request | First refused before writes; **removed outright 2026-09-13**, together with `execution.hook_gate.mode` and its `contain` label. `gate status` no longer reports either — it was printing `write_gate: true` for a gate that did not exist. Both are answered by name, so an existing script gets the reason rather than "unknown flag". |
 
 **Security impact:** no authorization, lease, verification-mode, host-permission,
 credential or billing policy was changed. Retired event compatibility performs no

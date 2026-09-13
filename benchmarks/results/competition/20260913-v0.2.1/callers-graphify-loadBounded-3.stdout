@@ -1,0 +1,5 @@
+Affected nodes for loadBounded()
+Relations: calls
+Depth: 1
+- Load() [calls] backend/go_orchestrator/repomap/repomap.go:L327
+- TestAnInternedGraphIsHeldToTheSameBound() [calls] backend/go_orchestrator/repomap/compact_test.go:L547

@@ -2,7 +2,6 @@ package main
 
 import (
 	"path/filepath"
-	"strings"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gatescfg"
@@ -39,9 +38,10 @@ Modes:
   advisory   record non-safety findings; hard-safety gaps still block
   enforce    every blocking verification gap blocks
 
-The hook setting is retained for configuration compatibility. Host lifecycle
-hooks are retired; this setting does not install or enforce them. Integrate
-refuses --write-gate. Use dev hook status to inspect stale registrations.
+Host lifecycle hooks are retired. The settings that named pre-tool-use
+containment are gone with them: --hook / execution.hook_gate.mode (including
+its "contain" mode) and integrate's --write-gate. None of them enforced
+anything. Use dev hook status to inspect stale registrations.
 
 This command is for a human operator. Agents should not flip gates.
 `
@@ -77,8 +77,6 @@ func runGateStatus(args []string) int {
 		return 0
 	}
 	console.Printf("verification_mode: %s (%s)\n", snap.VerificationMode, snap.VerificationOrigin)
-	console.Printf("hook_gate:         %s\n", snap.HookGate)
-	console.Printf("write_gate:        %v\n", snap.WriteGate)
 	console.Printf("config:            %s", snap.ConfigPath)
 	if !snap.ConfigPresent {
 		console.Print(" (missing; defaults apply)")
@@ -90,7 +88,6 @@ func runGateStatus(args []string) int {
 func runGateSet(args []string) int {
 	root := projectRoot()
 	mode := ""
-	hook := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-h", "--help":
@@ -104,12 +101,14 @@ func runGateSet(args []string) int {
 			}
 			mode = args[i]
 		case "--hook":
-			i++
-			if i >= len(args) {
-				console.Errorln("--hook needs off or contain")
-				return 2
-			}
-			hook = args[i]
+			// Retired by name rather than left to "unknown flag": `contain`
+			// was the containment mode, and a caller who set it is owed the
+			// reason it went away.
+			console.Errorln("--hook was removed: execution.hook_gate.mode named a " +
+				"pre-tool-use gate that only DevCouncil's retired lifecycle hooks " +
+				"installed. `contain` contained nothing. Use gates.mode for " +
+				"verification, and the devcouncil_* MCP policy tools for write scope.")
+			return 2
 		case "--project-root":
 			i++
 			if i >= len(args) {
@@ -122,8 +121,8 @@ func runGateSet(args []string) int {
 			return 2
 		}
 	}
-	if mode == "" && hook == "" {
-		console.Errorln("gate set requires --mode and/or --hook")
+	if mode == "" {
+		console.Errorln("gate set requires --mode")
 		return 2
 	}
 	path := filepath.Join(root, ".devcouncil", "config.yaml")
@@ -134,13 +133,6 @@ func runGateSet(args []string) int {
 		}
 		canonical, _ := gatescfg.ParseMode(mode)
 		console.Printf("gates.mode = %s\n", canonical)
-	}
-	if hook != "" {
-		if err := gatescfg.SetHookGate(path, hook); err != nil {
-			console.Errorf("gate set: %v\n", err)
-			return 1
-		}
-		console.Printf("execution.hook_gate.mode = %s\n", strings.ToLower(hook))
 	}
 	return 0
 }

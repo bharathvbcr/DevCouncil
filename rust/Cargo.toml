@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "dc-glob",
+    "dc-proc",
     "dc-grep",
     "dc-store",
     "dc-verify",

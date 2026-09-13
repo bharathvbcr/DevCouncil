@@ -95,15 +95,16 @@ When delegated, use the bundled subagents:
 
 ## Rules of engagement
 
-- **Scope:** edit only files declared in the task's planned scope. When write-gates /
-  contain mode are active, out-of-scope or protected paths are rejected by the write gate.
+- **Scope:** edit only files declared in the task's planned scope. No host hook
+  enforces this — write-gates and contain mode are retired — so honour it yourself,
+  and use `devcouncil_policy_check_write` when you want the scope decision checked.
 - **Evidence:** in `enforce`, run tests and call `devcouncil_verify_task`.
   In `advisory`, verification is optional and findings cannot block (except hard
   safety). In `off`, skip quality verification and report completion as unverified.
-- **Interactive Shell:** under assist defaults (no `--write-gate`, `hook_gate.mode=off`),
+- **Interactive Shell:** host lifecycle hooks are retired and nothing gates a write,
   Cursor/Claude Shell does **not** need a lease — do not block on checkout for ad-hoc commands.
-- **Leases:** one agent owns a task at a time; checkout before MCP gated writes / verify when
-  write-gates / contain mode are active (or when running the hero loop), then release.
+- **Leases:** one agent owns a task at a time; checkout before MCP gated writes or
+  verification (or when running the hero loop), then release.
 - **Repairs:** in `enforce`, read `devcouncil_get_next_actions` and close effective
   blocking gaps. Outside enforce, stored quality gaps are advisory history, not a
   reason to block ordinary work.

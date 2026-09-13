@@ -58,7 +58,7 @@ The precomputed index identifies callers, callees, and imports across 36+ langua
 
 ## Stage 2: Agent Integration & Skills Delivery
 
-Prepare the target repository for Cursor, Claude Code, or Codex. Other names in `integrate.Hosts` return a stub receipt (TASK-P7-8). `--write-gate` is refused before any file is written: retired lifecycle hooks cannot provide containment.
+Prepare the target repository for any of the six hosts in `integrate.Hosts`. `--write-gate` has been removed: it named a pre-tool-use gate that only the retired lifecycle hooks installed, and nothing enforced it. Use `gates.mode` for verification and the `devcouncil_*` MCP policy tools for write scope.
 
 ```bash
 # 1. Apply integration configuration (MCP + a Cursor rule; Claude is .mcp.json only)

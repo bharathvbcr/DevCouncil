@@ -1,0 +1,9 @@
+Node: devmap_competition_revision_3()
+  ID:        benchmarks_tasks_devmap_competition_revision_3
+  Source:    benchmarks/tasks.py L266
+  Type:      code
+  Community: 
+  Degree:    1
+
+Connections (1):
+  <-- tasks.py [contains] [EXTRACTED] benchmarks/tasks.py:L266

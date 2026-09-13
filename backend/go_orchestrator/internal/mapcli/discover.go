@@ -4,11 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/devmap"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 // discoverBinary uses an explicitly selected DEVMAP_BINARY or an installed
@@ -50,41 +49,12 @@ func discoverBinary(ctx context.Context, root string) (string, error) {
 }
 
 // binaryCandidates excludes repository-owned executables before any probe.
-// Resolve both sides so PATH symlinks and alternate root spellings cannot
-// turn repository content into an implicitly trusted installation.
+// The exclusion itself lives in proc.LookPathOutside, which every process
+// boundary that resolves a program by name shares: a second copy here is
+// exactly what drifts when one of them is tightened.
 func binaryCandidates(root string) []string {
-	if root == "" {
-		var err error
-		root, err = os.Getwd()
-		if err != nil {
-			return nil
-		}
-	}
-	canonicalRoot, err := filepath.EvalSymlinks(root)
+	candidate, err := proc.LookPathOutside("devmap", root)
 	if err != nil {
-		return nil
-	}
-	canonicalRoot, err = filepath.Abs(canonicalRoot)
-	if err != nil {
-		return nil
-	}
-	candidate, err := exec.LookPath("devmap")
-	if err != nil {
-		return nil
-	}
-	candidate, err = filepath.EvalSymlinks(candidate)
-	if err != nil {
-		return nil
-	}
-	candidate, err = filepath.Abs(candidate)
-	if err != nil {
-		return nil
-	}
-	relative, err := filepath.Rel(canonicalRoot, candidate)
-	if err != nil || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))) {
-		return nil
-	}
-	if info, err := os.Stat(candidate); err != nil || !info.Mode().IsRegular() {
 		return nil
 	}
 	return []string{candidate}
