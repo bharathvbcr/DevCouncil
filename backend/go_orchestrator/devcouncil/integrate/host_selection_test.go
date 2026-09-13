@@ -219,21 +219,12 @@ impl Host {
 // cannot reach a merge on a stale entry.
 func readRustIntegrator(t *testing.T) string {
 	t.Helper()
-	root := testsupport.RepoRoot(t)
-	// DevCouncil holds the crates in `rust/`; Manvi symlinks them as `crates/`.
-	// `RepoRoot` accepts either marker, so look under both.
-	for _, workspace := range []string{"rust", "crates"} {
-		path := filepath.Join(root, workspace, "devmap-cli", "src", "integrate.rs")
-		raw, err := os.ReadFile(path)
-		if err == nil {
-			return string(raw)
-		}
-		if !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("cannot read the Rust integrator at %s: %v", path, err)
-		}
+	path := filepath.Join(testsupport.RustWorkspace(t), "devmap-cli", "src", "integrate.rs")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("cannot read the Rust integrator at %s: %v", path, err)
 	}
-	t.Fatalf("no devmap-cli/src/integrate.rs under %s (looked in rust/ and crates/)", root)
-	return ""
+	return string(raw)
 }
 
 // rustStringLiteral matches one Rust string literal, escapes included.

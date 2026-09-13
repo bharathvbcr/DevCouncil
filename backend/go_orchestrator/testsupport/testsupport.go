@@ -55,47 +55,64 @@ func Unavailable(t testing.TB, format string, args ...any) {
 		"Set "+AllowSkipEnv+"=1 to skip instead of failing, accepting that this seam goes uncovered.", args...)
 }
 
-// RepoRoot returns the directory that holds the Rust workspace used to build
-// dcstore/dcverify/dcgrep/devmap.
+// workspaceDirs names the directories a Rust workspace manifest may sit in.
+// Canonical sources live in DevCouncil's `rust/`; Manvi keeps only symlinks to
+// them under `crates/`. Spelled once so `RepoRoot` and `RustWorkspace` cannot
+// come to disagree about which layouts exist.
 //
-// Canonical sources live in DevCouncil's `rust/`. Manvi keeps only
-// symlinks under `crates/` for local cargo. Walk for either marker so tests
-// run from both repositories.
-func RepoRoot(t testing.TB) string {
+// Navigation may share this list; an assertion must not. A test checking where
+// the workspace lives restates the markers itself — one that iterates this
+// variable would follow a rename into agreeing with it, which is the same
+// tautology as reading `Hosts` back to assert something about `Hosts`.
+var workspaceDirs = []string{"rust", "crates"}
+
+// findWorkspace walks up from the working directory to the repository root and
+// returns it together with the workspace directory inside it.
+//
+// One walk answers both questions, so there is no second lookup that could
+// fail after the first succeeded — the old `RustWorkspace` joined "rust", and
+// on a miss returned `root/crates` without checking it, which was correct only
+// by the unstated invariant that `RepoRoot` had just accepted one of the two.
+func findWorkspace(t testing.TB) (root, workspace string) {
 	t.Helper()
 	dir, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
 	for {
-		if _, err := os.Stat(filepath.Join(dir, "rust", "Cargo.toml")); err == nil {
-			return dir
-		}
-		if _, err := os.Stat(filepath.Join(dir, "crates", "Cargo.toml")); err == nil {
-			return dir
+		for _, name := range workspaceDirs {
+			candidate := filepath.Join(dir, name)
+			if _, err := os.Stat(filepath.Join(candidate, "Cargo.toml")); err == nil {
+				return dir, candidate
+			}
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			t.Fatalf("no repository root above %s (looking for rust/Cargo.toml or crates/Cargo.toml)", dir)
+			t.Fatalf("no repository root above %s (looking for %v each holding Cargo.toml)", dir, workspaceDirs)
 		}
 		dir = parent
 	}
 }
 
+// RepoRoot returns the directory that holds the Rust workspace used to build
+// dcstore/dcverify/dcgrep/devmap.
+func RepoRoot(t testing.TB) string {
+	t.Helper()
+	root, _ := findWorkspace(t)
+	return root
+}
+
 // RustWorkspace returns the directory holding the Rust workspace manifest.
 //
-// DevCouncil keeps the crates in `rust/`; Manvi keeps only symlinks to them
-// under `crates/`. A caller that needs a path *inside* the workspace — a
-// crate's source, its target directory — asks here rather than joining "rust"
-// itself, so the two layouts cannot drift apart one caller at a time.
+// A caller that needs a path *inside* the workspace — a crate's source, its
+// target directory — asks here rather than joining "rust" itself, so the two
+// layouts cannot drift apart one caller at a time. The directory returned is
+// one whose `Cargo.toml` was just stat'd, never a path assembled on the
+// assumption that it must be there.
 func RustWorkspace(t testing.TB) string {
 	t.Helper()
-	root := RepoRoot(t)
-	dir := filepath.Join(root, "rust")
-	if _, err := os.Stat(filepath.Join(dir, "Cargo.toml")); err != nil {
-		dir = filepath.Join(root, "crates")
-	}
-	return dir
+	_, workspace := findWorkspace(t)
+	return workspace
 }
 
 type build struct {
