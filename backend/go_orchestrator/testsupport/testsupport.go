@@ -82,6 +82,22 @@ func RepoRoot(t testing.TB) string {
 	}
 }
 
+// RustWorkspace returns the directory holding the Rust workspace manifest.
+//
+// DevCouncil keeps the crates in `rust/`; Manvi keeps only symlinks to them
+// under `crates/`. A caller that needs a path *inside* the workspace — a
+// crate's source, its target directory — asks here rather than joining "rust"
+// itself, so the two layouts cannot drift apart one caller at a time.
+func RustWorkspace(t testing.TB) string {
+	t.Helper()
+	root := RepoRoot(t)
+	dir := filepath.Join(root, "rust")
+	if _, err := os.Stat(filepath.Join(dir, "Cargo.toml")); err != nil {
+		dir = filepath.Join(root, "crates")
+	}
+	return dir
+}
+
 type build struct {
 	once sync.Once
 	path string
@@ -131,7 +147,10 @@ func DCGrep(t testing.TB) string { return cargoBin(t, "dc-grep", "dcgrep") }
 // the wrong one would reintroduce exactly the failure this exists to prevent.
 func cargoBin(t testing.TB, crate, binary string) string {
 	t.Helper()
-	root := RepoRoot(t)
+	// Resolved before the sync.Once, not inside it: a caller that arrives
+	// second skips the Do entirely, so a root check placed in there would
+	// pass for every caller but the first.
+	crates := RustWorkspace(t)
 
 	buildsMu.Lock()
 	b, ok := builds[binary]
@@ -142,10 +161,6 @@ func cargoBin(t testing.TB, crate, binary string) string {
 	buildsMu.Unlock()
 
 	b.once.Do(func() {
-		crates := filepath.Join(root, "rust")
-		if _, err := os.Stat(filepath.Join(crates, "Cargo.toml")); err != nil {
-			crates = filepath.Join(root, "crates")
-		}
 		target := filepath.Join(crates, "target")
 		if b.err = os.MkdirAll(target, 0o755); b.err != nil {
 			return
