@@ -20,7 +20,7 @@ fn resolve(files: &[(&str, &str)]) -> ResolutionResult {
     let exts = extractions(files);
     let mut resolver = Resolver::new();
     resolver.index_extractions(&exts);
-    resolver.resolve_all(&exts)
+    resolver.resolve_all(&exts).unwrap()
 }
 
 fn calls(result: &ResolutionResult) -> Vec<String> {
@@ -216,7 +216,7 @@ fn every_edge_confidence_matches_the_evidence_it_names() {
             family: LangFamily::Python,
         },
         Resolution::AmbiguousGlobal {
-            candidates: Vec::new(),
+            candidates: Vec::new().into(),
             family: LangFamily::Python,
         },
         Resolution::Unresolved {
@@ -685,10 +685,11 @@ fn ambiguous_candidates_do_not_depend_on_input_order() {
         resolver.index_extractions(exts);
         resolver
             .resolve_all(exts)
+            .unwrap()
             .edges
             .iter()
             .filter_map(|edge| match edge.resolution.as_deref() {
-                Some(Resolution::AmbiguousGlobal { candidates, .. }) => Some(candidates.clone()),
+                Some(Resolution::AmbiguousGlobal { candidates, .. }) => Some(candidates.to_vec()),
                 _ => None,
             })
             .collect()
@@ -737,7 +738,7 @@ fn a_second_snapshot_does_not_reuse_the_first_snapshots_go_modules() {
     let mut resolver = Resolver::new();
     resolver.index_go_modules(&modules);
     resolver.index_extractions(&first);
-    let resolved = resolver.resolve_all(&first);
+    let resolved = resolver.resolve_all(&first).unwrap();
     assert!(
         resolved
             .edges
@@ -763,7 +764,7 @@ fn a_second_snapshot_does_not_reuse_the_first_snapshots_go_modules() {
         ("x/s.go", "package x\nfunc Do() {}\n"),
     ]);
     resolver.index_extractions(&second);
-    let stale = resolver.resolve_all(&second);
+    let stale = resolver.resolve_all(&second).unwrap();
     let module_tier_hits: Vec<_> = stale
         .edges
         .iter()

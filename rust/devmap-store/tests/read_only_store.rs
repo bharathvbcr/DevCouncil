@@ -46,7 +46,7 @@ fn write_one_generation(db: &Path) {
     let extractions = vec![extraction];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = analyze(&extractions, &resolution);
     store
         .save_generation(&extractions, &resolution, &analysis)
@@ -146,7 +146,7 @@ fn a_write_to_a_read_only_store_is_refused_by_name() {
         let extractions = vec![extract_file("lib.py", "def keep():\n    return 2\n")];
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         let analysis = analyze(&extractions, &resolution);
         store.save_generation(&extractions, &resolution, &analysis)?;
         Ok(())
@@ -194,7 +194,7 @@ fn a_store_made_writable_again_is_writable_despite_read_only_sidecars() {
         let extractions = vec![extract_file("lib.py", "def keep():\n    return 2\n")];
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         let analysis = analyze(&extractions, &resolution);
         Ok(store.save_generation(&extractions, &resolution, &analysis)?)
     })();

@@ -27,7 +27,7 @@ fn test_large_repo_stress() -> anyhow::Result<()> {
     let start_res = Instant::now();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let resolution_elapsed = start_res.elapsed();
     println!("Resolution completed in {:?}", resolution_elapsed);
     assert!(resolution_elapsed.as_secs_f32() < 2.0);

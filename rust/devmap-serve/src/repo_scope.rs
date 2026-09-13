@@ -112,7 +112,8 @@ another repository.",
     }
     Ok(RepositoryRef {
         root,
-        store: canonicalize_path(&store),
+        store: devmap_extract::safe_fs::resolve_file_alias(&store)
+            .map_err(|error| format!("unsafe store path {}: {error}", store.display()))?,
         resolved_from: "repo_path",
     })
 }

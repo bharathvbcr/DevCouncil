@@ -1,0 +1,50 @@
+Invokes any tool the daemon's MCP surface registers — the generic escape
+hatch when no dedicated CLI verb exists yet. The argument object is assembled
+from three layers (last wins per key):
+
+  1. a base object from --json-file <path> or --json - (stdin)
+  2. an inline --json '<obj>' merged over the base
+  3. one or more --arg key=value merged on top
+
+--arg coercion is deterministic: true/false -> bool, an integer or float ->
+number, null -> null, a value starting with [ or { -> parsed JSON, key:=<raw>
+forces raw-JSON parse of the right-hand side (so version:="1.0" stays the
+string "1.0"), key= -> the empty string, and anything else stays a string.
+The walrus is recognised only when ":=" opens the token, so a value that quotes
+":=" is passed through verbatim. Repeating a key replaces the earlier value.
+
+Use --dry to print the lowered argument object and the target tool without
+calling the daemon (works with no daemon running). Use --format to pick the
+wire format the tool renders (json|gcx|toon|text). --format json always prints
+parseable JSON: a tool that answers in prose is wrapped as
+{"tool":…,"format":"text","text":…}.
+
+When <tool> is one of the compact public tool names, this command automatically
+selects the compact surface for that connection and accepts the exact MCP
+argument object. Other names explicitly use the legacy-compatible surface.
+Use --legacy to preserve the old handler contract for shared names such as
+analyze, explore, review, and ask.
+Discover compact operations with:
+  gortex call capabilities --arg domain=read --arg operation=source --arg detail=schema
+
+Requires a running daemon that tracks the repo (except for --dry).
+
+Usage:
+  gortex call <tool> [flags]
+
+Flags:
+      --arg stringArray    add one key=value argument (repeatable); see help for coercion rules
+      --dry                print the lowered argument object and target tool without calling the daemon
+      --format string      output / wire format forwarded to the tool: json|gcx|toon|text (default "json")
+  -h, --help               help for call
+      --index string       repository path the daemon must track (default ".")
+      --json string        base argument object as inline JSON, or "-" to read from stdin
+      --json-file string   read the base argument object from a JSON file
+      --legacy             use the legacy MCP contract for a shared tool name
+      --quiet              suppress the stderr note when calling a mutating tool
+      --repo string        alias for --index (default ".")
+
+Global Flags:
+      --config string      config file (default .gortex.yaml)
+      --log-level string   log level: debug|info|warn|error (default "info")
+      --no-progress        disable animated progress output (also honored: NO_COLOR, TERM=dumb, CI, non-TTY stderr)

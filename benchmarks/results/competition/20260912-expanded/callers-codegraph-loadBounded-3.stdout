@@ -1,0 +1,17 @@
+{
+  "symbol": "loadBounded",
+  "callers": [
+    {
+      "name": "TestAnInternedGraphIsHeldToTheSameBound",
+      "kind": "function",
+      "filePath": "backend/go_orchestrator/repomap/compact_test.go",
+      "startLine": 544
+    },
+    {
+      "name": "Load",
+      "kind": "function",
+      "filePath": "backend/go_orchestrator/repomap/repomap.go",
+      "startLine": 327
+    }
+  ]
+}

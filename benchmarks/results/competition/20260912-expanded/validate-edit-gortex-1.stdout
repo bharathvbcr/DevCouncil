@@ -1,0 +1,19 @@
+{
+  "query_class": "symbol",
+  "results": [
+    {
+      "absolute_file_path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/gortex-corpus/benchmarks/tasks.py",
+      "file_path": "devcouncil-bench/benchmarks/tasks.py",
+      "id": "devcouncil-bench/benchmarks/tasks.py::devmap_competition_revision_1",
+      "kind": "function",
+      "name": "devmap_competition_revision_1",
+      "project_id": "devcouncil-bench",
+      "repo_prefix": "devcouncil-bench",
+      "start_line": 266,
+      "visibility": "public",
+      "workspace_id": "devcouncil-bench"
+    }
+  ],
+  "total": 1,
+  "truncated": false
+}

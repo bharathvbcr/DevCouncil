@@ -55,7 +55,7 @@ fn commit(store: &Store, generation: usize) {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     store
         .save_generation_with_opts(

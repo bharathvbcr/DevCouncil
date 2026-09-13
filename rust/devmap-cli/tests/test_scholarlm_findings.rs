@@ -17,14 +17,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn resolve(files: &[Extraction]) -> ResolutionResult {
     let mut resolver = Resolver::new();
     resolver.index_extractions(files);
-    resolver.resolve_all(files)
+    resolver.resolve_all(files).unwrap()
 }
 
 fn resolve_with_modules(files: &[Extraction], modules: &[GoModule]) -> ResolutionResult {
     let mut resolver = Resolver::new();
     resolver.index_go_modules(modules);
     resolver.index_extractions(files);
-    resolver.resolve_all(files)
+    resolver.resolve_all(files).unwrap()
 }
 
 fn temp_dir(label: &str) -> PathBuf {

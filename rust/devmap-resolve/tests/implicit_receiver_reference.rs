@@ -38,7 +38,7 @@ fn resolve(files: &[(&str, &str)]) -> ResolutionResult {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    resolver.resolve_all(&extractions)
+    resolver.resolve_all(&extractions).unwrap()
 }
 
 fn edges_from<'a>(

@@ -26,7 +26,7 @@ fn resolve(files: &[(&str, &str)]) -> (Vec<Extraction>, ResolutionResult) {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     (extractions, resolution)
 }
 
@@ -191,7 +191,7 @@ fn coverage_loss_caps_a_cluster_finding() {
     extractions.push(hole);
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     let summary = analyze(&extractions, &resolution);
     assert!(

@@ -1,0 +1,21 @@
+{
+  "target": {
+    "id": "Function:rust/devmap-extract/src/model.rs:db_size_gate_bytes",
+    "name": "db_size_gate_bytes",
+    "type": "Function",
+    "filePath": "rust/devmap-extract/src/model.rs"
+  },
+  "direction": "upstream",
+  "impactedCount": 0,
+  "risk": "LOW",
+  "epistemic": "exact",
+  "summary": {
+    "direct": 0,
+    "processes_affected": 0,
+    "modules_affected": 0
+  },
+  "byDepthCounts": {},
+  "affected_processes": [],
+  "affected_modules": [],
+  "byDepth": {}
+}

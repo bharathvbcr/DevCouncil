@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 
@@ -15,6 +16,78 @@ type PackageDecl = (String, String, SymbolKind);
 
 /// Candidate file, kind, language family, and stable qualified identity.
 type IndexedSymbol = (String, SymbolKind, LangFamily, Arc<str>);
+
+type CandidateSet = Arc<[(String, String)]>;
+
+fn escaped_evidence_bytes(value: &str) -> u64 {
+    value.bytes().fold(0u64, |total, byte| {
+        // Ordinary printable ASCII is literal in both compact JSON and Rust
+        // Debug strings. Keep the six-byte bound for quotes, backslashes,
+        // control characters and each UTF-8 byte that may need escaping.
+        total.saturating_add(
+            if (0x20..=0x7e).contains(&byte) && !matches!(byte, b'"' | b'\\') {
+                1
+            } else {
+                6
+            },
+        )
+    })
+}
+
+struct GlobalCandidates {
+    rows: CandidateSet,
+    declarations: usize,
+    evidence_bytes: u64,
+}
+type CandidateKey = (LangFamily, String, String);
+
+#[derive(Default)]
+struct GlobalCandidateCache {
+    sets: BTreeMap<CandidateKey, Arc<GlobalCandidates>>,
+    visits: u64,
+    retained_bytes: u64,
+}
+
+fn charge(
+    value: &mut u64,
+    additional: u64,
+    limit: u64,
+    resource: &'static str,
+) -> Result<(), ResolutionLimitError> {
+    let attempted = value.saturating_add(additional);
+    if attempted > limit {
+        return Err(ResolutionLimitError {
+            resource,
+            limit,
+            attempted,
+        });
+    }
+    *value = attempted;
+    Ok(())
+}
+
+fn charge_ambiguity(
+    counter: &AtomicU64,
+    candidates: &GlobalCandidates,
+    limit: u64,
+) -> Result<(), ResolutionLimitError> {
+    let rows = if candidates.rows.len() > AMBIGUOUS_FANOUT_CAP {
+        1
+    } else {
+        candidates.rows.len() as u64
+    };
+    let additional = candidates.evidence_bytes.saturating_mul(rows);
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(additional).filter(|next| *next <= limit)
+        })
+        .map(|_| ())
+        .map_err(|used| ResolutionLimitError {
+            resource: "ambiguity evidence bytes",
+            limit,
+            attempted: used.saturating_add(additional),
+        })
+}
 
 /// Where the name a resolution rung failed on was written.
 ///
@@ -1767,7 +1840,20 @@ impl Resolver {
         chains
     }
 
-    pub fn resolve_all(&self, extractions: &[Extraction]) -> ResolutionResult {
+    pub fn resolve_all(
+        &self,
+        extractions: &[Extraction],
+    ) -> Result<ResolutionResult, ResolutionLimitError> {
+        self.resolve_all_with_limits(extractions, ResolutionLimits::default())
+    }
+
+    pub fn resolve_all_with_limits(
+        &self,
+        extractions: &[Extraction],
+        limits: ResolutionLimits,
+    ) -> Result<ResolutionResult, ResolutionLimitError> {
+        let global_candidates = Mutex::new(GlobalCandidateCache::default());
+        let ambiguity_bytes = AtomicU64::new(0);
         // Per-file resolution runs in parallel.
         //
         // Sound because the loop body below reads only `self` — the symbol and
@@ -1796,7 +1882,8 @@ impl Resolver {
         );
         let per_file: Vec<FileResolution> = extractions
             .par_iter()
-            .map(|ext| {
+            .map(|ext| -> Result<FileResolution, ResolutionLimitError> {
+                let mut local_candidates: BTreeMap<&str, Arc<GlobalCandidates>> = BTreeMap::new();
                 let mut edges: Vec<ResolvedEdge> = Vec::new();
                 let mut unresolved: Vec<UnresolvedReference> = Vec::new();
                 let mut package_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -2276,86 +2363,30 @@ impl Resolver {
                         }));
                     }
 
-                    // 3. Global lookup (UniqueGlobal vs AmbiguousGlobal - G5, G3)
-                    //
-                    // Bare names only. A call with an explicit receiver is
-                    // resolved only through the receiver rungs above (1, 1b,
-                    // 2b, 2d). Falling through to bare-name global here is what
-                    // turned `String::new()` / `map.get()` into AmbiguousGlobal
-                    // edges to every `new` / `get` in the corpus — 71% of
-                    // GitPulse edges before this gate.
+                    // Bare global names share one immutable set per visibility
+                    // scope. Receiver and earlier proven rungs stay unchanged.
                     if resolution.is_none() && call.receiver_expr.is_none() {
-                        if let Some(hits) = self.symbol_index.get(&call.callee_name) {
-                            // The same scope test rung 2c applies, for the same
-                            // reason: a bare `run()` cannot reach a method of
-                            // some class, and letting the global rung do what
-                            // 2c was stopped from doing would move the
-                            // fabricated edge rather than remove it — the
-                            // fabricated caller still shields the method from
-                            // the dead-code pass, only at HIGH instead of
-                            // DETERMINISTIC.
-                            //
-                            // Cross-file, the sibling shape cannot apply at all:
-                            // an implicit receiver reaches the enclosing type,
-                            // which is a different symbol in a different file.
-                            // So the test is a plain "declared at file level",
-                            // and it is applied only to the families whose
-                            // scoping rules are stated in `bare_name_is_in_scope`
-                            // — a C++ method defined in a `.cpp` and declared in
-                            // its header is exactly the cross-file sibling this
-                            // would otherwise sever.
-                            let family_hits: Vec<_> = hits
-                                .iter()
-                                .filter(|(path, _kind, candidate_family, identity)| {
-                                    family.admits(*candidate_family)
-                                        && (*candidate_family != LangFamily::Go
-                                            || Self::go_symbol_visible_from(
-                                                &ext.file_path,
-                                                path,
-                                                &call.callee_name,
-                                            ))
-                                        && (!Self::family_needs_explicit_receiver(family)
-                                            || self.declared_at_file_level(path, identity))
-                                })
-                                .collect();
-                            if family_hits.len() == 1 {
-                                let (target_f, _, _, target_identity) = family_hits[0];
-                                // G3: Python stdlib-name guard inside UniqueGlobal rung only
-                                let is_python_stdlib_guard = family == LangFamily::Python
-                                    && matches!(
-                                        call.callee_name.as_str(),
-                                        "open" | "dir" | "print" | "type" | "id" | "len"
-                                    )
-                                    && target_f != &ext.file_path;
-
-                                if !is_python_stdlib_guard {
-                                    resolution = Some(Arc::new(Resolution::UniqueGlobal {
-                                        target_symbol: target_identity.to_string(),
-                                        target_file: target_f.clone(),
-                                        family,
-                                    }));
-                                }
-                            } else if family_hits.len() > 1 {
-                                // G5: Multi-candidate pick MUST NOT emit Extracted / HIGH confidence
-                                let mut candidates: Vec<(String, String)> = family_hits
-                                    .iter()
-                                    .map(|(f, _, _, identity)| ((*f).clone(), identity.to_string()))
-                                    .collect();
-                                // R4. `symbol_index` values are in input-slice
-                                // order, and that order used to flow straight
-                                // into `candidates` — a field of every emitted
-                                // edge, a key in the sort comparator and a term
-                                // in the dedup predicate. Reversing the input
-                                // slice reversed every candidate list. Sorting
-                                // here is also what makes the fan-out ceiling
-                                // below decide on a stable total.
-                                candidates.sort();
-                                candidates.dedup();
-                                resolution = Some(Arc::new(Resolution::AmbiguousGlobal {
-                                    candidates,
-                                    family,
+                        let candidates = match local_candidates.get(call.callee_name.as_str()) {
+                            Some(candidates) => Arc::clone(candidates),
+                            None => {
+                                let candidates = self.global_candidates(&global_candidates, &ext.file_path, family, &call.callee_name, limits)?;
+                                local_candidates.insert(&call.callee_name, Arc::clone(&candidates));
+                                candidates
+                            }
+                        };
+                        if candidates.declarations == 1 {
+                            let (target_f, target_identity) = &candidates.rows[0];
+                            let is_python_stdlib_guard = family == LangFamily::Python
+                                && matches!(call.callee_name.as_str(), "open" | "dir" | "print" | "type" | "id" | "len")
+                                && target_f != &ext.file_path;
+                            if !is_python_stdlib_guard {
+                                resolution = Some(Arc::new(Resolution::UniqueGlobal {
+                                    target_symbol: target_identity.clone(), target_file: target_f.clone(), family,
                                 }));
                             }
+                        } else if candidates.declarations > 1 {
+                            charge_ambiguity(&ambiguity_bytes, &candidates, limits.ambiguity_evidence_bytes)?;
+                            resolution = Some(Arc::new(Resolution::AmbiguousGlobal { candidates: Arc::clone(&candidates.rows), family }));
                         }
                     }
 
@@ -2660,9 +2691,9 @@ impl Resolver {
                         Some(route.framework.clone()),
                     ));
                 }
-                (edges, unresolved, package_groups)
+                Ok((edges, unresolved, package_groups))
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut edges: Vec<ResolvedEdge> = Vec::new();
         let mut unresolved: Vec<UnresolvedReference> = Vec::new();
@@ -2752,12 +2783,79 @@ impl Resolver {
             ))
         });
 
-        ResolutionResult {
+        Ok(ResolutionResult {
             edges,
             receiver_types: self.receiver_types.clone(),
             reexport_chains: self.reexport_chains.clone(),
             unresolved,
+        })
+    }
+    fn global_candidates(
+        &self,
+        cache: &Mutex<GlobalCandidateCache>,
+        file: &str,
+        family: LangFamily,
+        name: &str,
+        limits: ResolutionLimits,
+    ) -> Result<Arc<GlobalCandidates>, ResolutionLimitError> {
+        // Unexported Go names have directory visibility. Exported Go names and
+        // other families share the same family/name view across source files.
+        let visibility = if family == LangFamily::Go && !Self::go_name_is_exported(name) {
+            Self::parent_dir(file)
+        } else {
+            String::new()
+        };
+        let key = (family, name.to_string(), visibility);
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(known) = cache.sets.get(&key) {
+            return Ok(Arc::clone(known));
         }
+        let hits = self
+            .symbol_index
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        charge(
+            &mut cache.visits,
+            hits.len() as u64,
+            limits.candidate_visits,
+            "candidate visits",
+        )?;
+        let mut candidates = Vec::new();
+        for (path, _, candidate_family, identity) in hits {
+            if family.admits(*candidate_family)
+                && (*candidate_family != LangFamily::Go
+                    || Self::go_symbol_visible_from(file, path, name))
+                && (!Self::family_needs_explicit_receiver(family)
+                    || self.declared_at_file_level(path, identity))
+            {
+                let bytes =
+                    (std::mem::size_of::<(String, String)>() + path.len() + identity.len()) as u64;
+                charge(
+                    &mut cache.retained_bytes,
+                    bytes,
+                    limits.retained_candidate_bytes,
+                    "retained candidate bytes",
+                )?;
+                candidates.push((path.clone(), identity.to_string()));
+            }
+        }
+        let declarations = candidates.len();
+        candidates.sort();
+        candidates.dedup();
+        // Conservative JSON/Debug upper bound, computed once per shared set.
+        let evidence_bytes = candidates.iter().fold(64u64, |total, (file, symbol)| {
+            total.saturating_add(16 + escaped_evidence_bytes(file) + escaped_evidence_bytes(symbol))
+        });
+        let candidates = Arc::new(GlobalCandidates {
+            rows: candidates.into(),
+            declarations,
+            evidence_bytes,
+        });
+        cache.sets.insert(key, Arc::clone(&candidates));
+        Ok(candidates)
     }
 
     fn parent_dir(current_file: &str) -> String {
@@ -4392,6 +4490,19 @@ fn go_package_name_of(ext: &Extraction) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn evidence_size_keeps_an_escape_bound_for_hostile_names() {
+        assert_eq!(super::escaped_evidence_bytes("defs/ordinary.rs"), 16);
+        for value in (0u8..=127)
+            .map(|byte| char::from(byte).to_string())
+            .chain(["é", "\u{85}", "\u{200d}", "\u{2028}", "😀"].map(str::to_owned))
+        {
+            let debug_bytes = format!("{value:?}").len() - 2;
+            assert!(super::escaped_evidence_bytes(&value) >= debug_bytes as u64);
+        }
+        assert_eq!(super::escaped_evidence_bytes("\"\\\n\0"), 24);
+    }
+
     #[cfg(feature = "parse")]
     use super::*;
     #[cfg(feature = "parse")]
@@ -4404,7 +4515,7 @@ mod tests {
         let b = extract_file("pkg/b.js", "export function fromB() {}\n");
         let mut resolver = Resolver::new();
         resolver.index_extractions(&[a.clone(), b.clone()]);
-        let result = resolver.resolve_all(&[a, b]);
+        let result = resolver.resolve_all(&[a, b]).unwrap();
         assert!(
             result.edges.iter().any(|e| {
                 e.edge_kind == EdgeKind::Imports
@@ -5311,7 +5422,7 @@ mod ladder_tests {
             ),
             ("helpers.py", "def open(path):\n    return path\n"),
         ]);
-        let result = cross.resolve_all(&cross_exts);
+        let result = cross.resolve_all(&cross_exts).unwrap();
         assert!(
             !result.edges.iter().any(|edge| {
                 edge.source_file == "caller.py"
@@ -5333,7 +5444,7 @@ mod ladder_tests {
             "local.py",
             "def open(path):\n    return path\n\ndef go():\n    return open('x')\n",
         )]);
-        let local = same.resolve_all(&same_exts);
+        let local = same.resolve_all(&same_exts).unwrap();
         assert!(
             local.edges.iter().any(|edge| {
                 edge.edge_kind == EdgeKind::Calls && edge.target_symbol.ends_with("open")
@@ -5357,7 +5468,7 @@ mod ladder_tests {
                 "package pkg\nfunc use() string { return open(\"x\") }\n",
             ),
         ]);
-        let go_result = go.resolve_all(&go_exts);
+        let go_result = go.resolve_all(&go_exts).unwrap();
         assert!(
             go_result
                 .edges
@@ -5389,7 +5500,7 @@ mod reference_resolution_tests {
             .collect();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        resolver.resolve_all(&extractions)
+        resolver.resolve_all(&extractions).unwrap()
     }
 
     #[cfg(feature = "parse")]

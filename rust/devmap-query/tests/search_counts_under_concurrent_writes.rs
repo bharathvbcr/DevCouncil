@@ -35,7 +35,7 @@ fn generation_of(store: &Store, count: usize) {
     let extractions = vec![extract_file("mod.py", &body)];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     store
         .save_generation(&extractions, &resolution, &analysis)

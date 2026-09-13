@@ -187,7 +187,12 @@ fn terminal_fixture_handles_cannot_leak_into_concurrent_child_builds() {
 fn an_error_still_returns_json_when_the_progress_pipe_is_full() {
     use std::os::fd::AsRawFd;
     use std::time::{Duration, Instant};
-    for json in [true, false] {
+    for (json, command_name) in [
+        (true, "build"),
+        (false, "build"),
+        (true, "search"),
+        (false, "search"),
+    ] {
         let root = temp_root();
         let (_reader, writer) = std::io::pipe().unwrap();
         let fd = writer.as_raw_fd();
@@ -214,10 +219,15 @@ fn an_error_still_returns_json_when_the_progress_pipe_is_full() {
         if json {
             command.arg("--json");
         }
+        command
+            .args([command_name, "--progress", "always", "--db"])
+            .arg(root.join("src/main.py/impossible.sqlite"));
+        if command_name == "build" {
+            command.arg(&root);
+        } else {
+            command.arg("needle");
+        }
         let mut child = command
-            .args(["build", "--progress", "always", "--db"])
-            .arg(root.join("src/main.py/impossible.sqlite"))
-            .arg(&root)
             .stderr(writer)
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -232,7 +242,10 @@ fn an_error_still_returns_json_when_the_progress_pipe_is_full() {
         }
         let output = child.wait_with_output().unwrap();
         fs::remove_dir_all(root).unwrap();
-        assert!(!blocked, "a diagnostic blocked the error result");
+        assert!(
+            !blocked,
+            "{command_name}: a diagnostic blocked the error result"
+        );
         assert!(!output.status.success());
         if !json {
             let text = String::from_utf8(output.stdout).unwrap();
@@ -249,11 +262,13 @@ fn an_error_still_returns_json_when_the_progress_pipe_is_full() {
             payload["progress_output"]["diagnostics"]["unrendered_total"],
             1
         );
-        assert!(payload["timings"]["stages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|stage| stage.get("open").is_none()));
+        if command_name == "build" {
+            assert!(payload["timings"]["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|stage| stage.get("open").is_none()));
+        }
     }
 }
 
@@ -556,6 +571,17 @@ fn terminal_build(
     term: &str,
     after_spawn: impl FnOnce(&std::sync::mpsc::Receiver<()>, i32, u32),
 ) -> (std::process::Output, String) {
+    terminal_build_output(root, args, term, true, after_spawn)
+}
+
+#[cfg(unix)]
+fn terminal_build_output(
+    root: &std::path::Path,
+    args: &[&str],
+    term: &str,
+    json: bool,
+    after_spawn: impl FnOnce(&std::sync::mpsc::Receiver<()>, i32, u32),
+) -> (std::process::Output, String) {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::time::{Duration, Instant};
@@ -579,16 +605,20 @@ fn terminal_build(
     };
     let before = termios();
     let mut command = Command::new(env!("CARGO_BIN_EXE_devmap"));
+    if json {
+        command.arg("--json").stdout(std::process::Stdio::piped());
+    } else {
+        command.stdout(slave.try_clone().unwrap());
+    }
     command
-        .args(["build", "--json", "--db"])
+        .args(["build", "--db"])
         .arg(root.join("index.sqlite"))
         .arg(root)
         .args(args)
         .env("TERM", term)
         .env("NO_COLOR", "1")
         .env("LC_ALL", "en_US.UTF-8")
-        .stderr(slave)
-        .stdout(std::process::Stdio::piped());
+        .stderr(slave);
     let mut child = command.spawn().unwrap();
     drop(command); // Drop the parent's slave before waiting for terminal EOF.
     let (first_frame, rendered) = std::sync::mpsc::sync_channel(1);
@@ -648,6 +678,78 @@ fn terminal_build(
 
 #[cfg(unix)]
 #[test]
+fn human_terminal_gets_a_card_and_plain_modes_keep_the_compact_report() {
+    let root = temp_root();
+    for (mode, term, decorated) in [
+        ("auto", "xterm-256color", true),
+        ("always", "xterm-256color", true),
+        ("never", "xterm-256color", false),
+        ("always", "dumb", false),
+    ] {
+        let (output, terminal) = terminal_build_output(
+            &root,
+            &["--progress", mode, "--full"],
+            term,
+            false,
+            |_, _, _| {},
+        );
+        assert!(output.status.success(), "{terminal}");
+        assert!(
+            output.stdout.is_empty(),
+            "human result should be on the terminal"
+        );
+        assert_eq!(
+            terminal.contains("devmap / Map ready"),
+            decorated,
+            "{terminal}"
+        );
+        assert!(terminal.contains("1 file"), "{terminal}");
+        assert!(terminal.contains("generation #"), "{terminal}");
+        assert_eq!(
+            terminal.matches("Built generation").count(),
+            1,
+            "{terminal}"
+        );
+        assert!(!terminal.contains("\x1b[36m"), "NO_COLOR: {terminal}");
+        if !decorated {
+            assert!(!terminal.contains('\x1b'), "{terminal}");
+        }
+    }
+    let (output, terminal) =
+        terminal_build_output(&root, &[], "xterm-256color", false, |_, _, _| {});
+    assert!(output.status.success(), "{terminal}");
+    assert!(terminal.contains("devmap / Already mapped"), "{terminal}");
+    assert_eq!(terminal.matches("still current").count(), 1, "{terminal}");
+    assert!(!terminal.contains("Map ready"), "{terminal}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn even_a_fast_build_draws_the_devmap_loader() {
+    let root = temp_root();
+    let (output, terminal) = terminal_build(
+        &root,
+        &["--progress", "always"],
+        "xterm-256color",
+        |_, _, _| {},
+    );
+    assert!(output.status.success(), "{terminal}");
+    assert!(
+        terminal.contains("\r\x1b[2K"),
+        "fast build had no loader: {terminal}"
+    );
+    assert!(
+        terminal.contains("devmap"),
+        "loader has no identity: {terminal}"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["progress_output"]["incomplete"], false);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn a_real_terminal_animates_during_work_and_stops_before_the_result() {
     use std::time::Duration;
     let root = temp_root();
@@ -671,7 +773,7 @@ fn a_real_terminal_animates_during_work_and_stops_before_the_result() {
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["files_indexed"], 1);
     assert!(terminal.contains("\r\x1b[2K"), "no live redraw: {terminal}");
-    assert!(terminal.contains("╺━━"), "no stage bar: {terminal}");
+    assert!(terminal.contains("─·─·─·─·"), "no node trail: {terminal}");
     let frames: std::collections::BTreeSet<_> = terminal
         .chars()
         .filter(|c| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(*c))
@@ -1213,4 +1315,89 @@ fn an_unchanged_build_reports_its_own_timings() {
         "the vacuum decision must be a timed stage: {timings}"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn repair_combinations_and_fts_each_emit_one_complete_json_receipt() {
+    let root = temp_root();
+    let db = root.join("index.sqlite");
+    let built = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .args(["build", "--progress", "never", "--db"])
+        .arg(&db)
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(built.status.success());
+    for flags in [
+        vec!["--fts"],
+        vec!["--schema"],
+        vec!["--fts", "--pending", "--page-size"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_devmap"))
+            .args(["repair", "--json", "--db"])
+            .arg(&db)
+            .args(&flags)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "{flags:?}: {error}: {}",
+                    String::from_utf8_lossy(&output.stdout)
+                )
+            });
+        if flags.contains(&"--fts") {
+            assert_eq!(payload["fts_repaired"], true);
+        }
+        if flags.contains(&"--schema") {
+            assert!(payload["schema_version"].is_number());
+        }
+        if flags.len() > 1 {
+            assert!(payload["page_size_after"].is_number());
+            assert!(payload["structural_pass_ran"].is_boolean());
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn export_cannot_mix_raw_graphml_with_a_json_receipt() {
+    let root = temp_root();
+    let db = root.join("index.sqlite");
+    let built = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .args(["build", "--progress", "never", "--db"])
+        .arg(&db)
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(built.status.success());
+    let output = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .args(["export", "--out", "-", "--json", "--db"])
+        .arg(&db)
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "incompatible output formats were accepted"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(payload["error"].as_str().unwrap().contains("--json"));
+    let raw = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .args(["export", "--out", "-", "--progress", "always", "--db"])
+        .arg(&db)
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(raw.status.success());
+    let xml = String::from_utf8(raw.stdout).unwrap();
+    assert!(xml.starts_with("<?xml"));
+    assert!(xml.trim_end().ends_with("</graphml>"));
+    assert!(!xml.contains("devmap /"));
+    fs::remove_dir_all(root).unwrap();
 }

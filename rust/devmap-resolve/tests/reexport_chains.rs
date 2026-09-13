@@ -32,7 +32,7 @@ fn resolve(files: &[(&str, &str)]) -> (Vec<Extraction>, ResolutionResult) {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     (extractions, resolution)
 }
 

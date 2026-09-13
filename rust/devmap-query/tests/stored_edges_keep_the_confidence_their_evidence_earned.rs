@@ -94,7 +94,7 @@ fn a_stored_edge_reads_back_at_the_confidence_the_resolver_gave_it() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
 
     let store = Store::open_in_memory().expect("store");
@@ -191,7 +191,7 @@ fn an_ambiguous_edge_does_not_gain_confidence_by_being_stored() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().expect("store");
     store

@@ -111,7 +111,7 @@ func TestDispatchGateHelp(t *testing.T) {
 }
 
 func TestUnknownCommandExit2(t *testing.T) {
-	for _, name := range []string{"hook", "boot", "status", "init", "doctor"} {
+	for _, name := range []string{"boot", "status", "init", "doctor"} {
 		t.Run(name, func(t *testing.T) {
 			stderr, restore := swapStderr(t)
 			code := dispatch([]string{name})

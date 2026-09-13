@@ -149,7 +149,19 @@ fn the_read_arms_never_run_git_log_and_export_still_does() {
     }
 
     let _ = std::fs::remove_file(&log);
-    let export = run(&db, &root, &log, &["export", "-o", "-"]);
+    let destination = dir.join("graph.graphml");
+    let export = run(
+        &db,
+        &root,
+        &log,
+        &["export", "-o", destination.to_str().unwrap()],
+    );
+    let receipt: serde_json::Value = serde_json::from_str(&export).unwrap();
+    assert!(receipt["nodes"].as_u64().unwrap() > 0);
+    assert!(std::fs::read_to_string(&destination)
+        .unwrap()
+        .trim_end()
+        .ends_with("</graphml>"));
     assert!(
         export.contains("\"nodes\""),
         "export writes the artifact: {}",

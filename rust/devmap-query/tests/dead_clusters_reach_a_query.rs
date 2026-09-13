@@ -60,7 +60,7 @@ fn persisted() -> Store {
     let extractions = extractions();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = analyze(&extractions, &resolution);
     assert!(
         !analysis.dead_clusters.clusters.is_empty(),
@@ -154,7 +154,7 @@ fn a_clean_corpus_reports_an_empty_scan_and_not_a_missing_one() {
     )];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = analyze(&extractions, &resolution);
     assert!(analysis.dead_clusters.clusters.is_empty());
 
@@ -253,7 +253,7 @@ fn a_refused_scan_arrives_as_an_absence_with_a_reason_not_as_an_empty_finding() 
     let extractions = extractions();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let mut analysis = analyze(&extractions, &resolution);
     assert!(
         !analysis.dead_clusters.clusters.is_empty(),
@@ -372,7 +372,7 @@ fn a_capped_cluster_list_carries_what_the_cap_cut() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = analyze(&extractions, &resolution);
     assert_eq!(
         analysis.dead_clusters.clusters.len(),

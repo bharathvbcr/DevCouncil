@@ -206,7 +206,7 @@ fn corpus(rng: &mut Rng) -> Vec<Extraction> {
 fn graph(extractions: &[Extraction]) -> Value {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    let resolution = resolver.resolve_all(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
     let analysis = devmap_analyze::analyze(extractions, &resolution);
     let json = generate_code_graph_json(
         extractions,

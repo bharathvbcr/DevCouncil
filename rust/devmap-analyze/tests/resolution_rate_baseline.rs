@@ -80,7 +80,7 @@ fn measure() -> BTreeMap<String, BTreeMap<String, Option<u32>>> {
             .collect();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         let analysis = devmap_analyze::analyze(&extractions, &resolution);
 
         let by_language = analysis

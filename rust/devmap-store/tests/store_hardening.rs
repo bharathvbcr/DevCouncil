@@ -109,7 +109,7 @@ fn deletion_reconciliation_removes_live_nodes() {
     let b = extract_file("b.py", "def gone():\n    return 2\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[a.clone(), b.clone()]);
-    let resolution = resolver.resolve_all(&[a.clone(), b.clone()]);
+    let resolution = resolver.resolve_all(&[a.clone(), b.clone()]).unwrap();
     let analysis = analyze(&[a.clone(), b.clone()], &resolution);
 
     let store = Store::open_in_memory().unwrap();
@@ -124,7 +124,7 @@ fn deletion_reconciliation_removes_live_nodes() {
     // Rebuild with b.py deleted and only a.py present.
     let mut resolver2 = Resolver::new();
     resolver2.index_extractions(std::slice::from_ref(&a));
-    let resolution2 = resolver2.resolve_all(std::slice::from_ref(&a));
+    let resolution2 = resolver2.resolve_all(std::slice::from_ref(&a)).unwrap();
     let analysis2 = analyze(std::slice::from_ref(&a), &resolution2);
     let g2 = store
         .save_generation_with_opts(
@@ -156,7 +156,7 @@ fn fts_rowids_do_not_collide_across_generations() {
     let a = extract_file("a.py", "def alpha():\n    return 1\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&a));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&a));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&a)).unwrap();
     let analysis = analyze(std::slice::from_ref(&a), &resolution);
     let store = Store::open_in_memory().unwrap();
     let g1 = store
@@ -165,7 +165,7 @@ fn fts_rowids_do_not_collide_across_generations() {
     let a2 = extract_file("a.py", "def alpha():\n    return 2\n");
     let mut resolver2 = Resolver::new();
     resolver2.index_extractions(std::slice::from_ref(&a2));
-    let resolution2 = resolver2.resolve_all(std::slice::from_ref(&a2));
+    let resolution2 = resolver2.resolve_all(std::slice::from_ref(&a2)).unwrap();
     let analysis2 = analyze(std::slice::from_ref(&a2), &resolution2);
     let g2 = store
         .save_generation(&[a2], &resolution2, &analysis2)
@@ -184,7 +184,7 @@ fn test_s18_busy_truncate_checkpoint_falls_back_to_passive() {
     let first = extract_file("a.py", "def alpha():\n    return 1\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&first));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&first));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&first)).unwrap();
     let analysis = analyze(std::slice::from_ref(&first), &resolution);
     store
         .save_generation(std::slice::from_ref(&first), &resolution, &analysis)
@@ -199,7 +199,7 @@ fn test_s18_busy_truncate_checkpoint_falls_back_to_passive() {
     let second = extract_file("a.py", "def alpha():\n    return 2\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&second));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&second));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&second)).unwrap();
     let analysis = analyze(std::slice::from_ref(&second), &resolution);
     store
         .save_generation(std::slice::from_ref(&second), &resolution, &analysis)
@@ -230,7 +230,7 @@ fn fts_hostile_queries_are_syntax_safe() {
     let ext = extract_file("src/fts.py", "def alpha_beta(): pass\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = analyze(std::slice::from_ref(&ext), &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -263,7 +263,7 @@ fn prune_zero_retains_latest_generation_and_search_index() {
         let ext = extract_file("src/alpha.py", &source);
         let mut resolver = Resolver::new();
         resolver.index_extractions(std::slice::from_ref(&ext));
-        let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
         let analysis = analyze(std::slice::from_ref(&ext), &resolution);
         assert_eq!(
             store
@@ -309,7 +309,7 @@ fn stress_extract_and_store_thousands_of_files() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = analyze(&extractions, &resolution);
 
     let t1 = Instant::now();
@@ -350,7 +350,7 @@ fn phase5_persisted_search_p95_is_under_50ms_at_10k_files() {
     let extractions = extract_all(&refs);
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -486,7 +486,7 @@ fn test_s2_migration_v5_to_v6_preserves_graph_and_adds_history() {
     let ext = extract_file("legacy.py", "def legacy():\n    return 1\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = analyze(std::slice::from_ref(&ext), &resolution);
     {
         let store = Store::open(&db_path).unwrap();
@@ -593,7 +593,7 @@ fn test_b4_reader_unblocked_during_generation_write() {
     let ext = extract_file("a.py", "def alpha(): pass\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = analyze(std::slice::from_ref(&ext), &resolution);
 
     store
@@ -639,7 +639,9 @@ fn persisted_generation_answers_queries_without_source_tree() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[target.clone(), caller.clone()]);
-    let resolution = resolver.resolve_all(&[target.clone(), caller.clone()]);
+    let resolution = resolver
+        .resolve_all(&[target.clone(), caller.clone()])
+        .unwrap();
     let analysis = analyze(&[target.clone(), caller.clone()], &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -660,7 +662,7 @@ fn analysis_rows_are_generation_scoped_and_persisted() {
     let ext = extract_file("src/dead.py", "def abandoned():\n    return 1\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = analyze(std::slice::from_ref(&ext), &resolution);
     assert!(analysis
         .dead_symbols
@@ -687,7 +689,7 @@ fn generation_metadata_preserves_the_supplied_head_identity() {
     let ext = extract_file("src/head.py", "def head(): pass\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = analyze(std::slice::from_ref(&ext), &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -714,7 +716,7 @@ fn durable_generation_does_not_duplicate_raw_source_text() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = analyze(std::slice::from_ref(&ext), &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -747,7 +749,7 @@ fn go_package_star_survives_reload_without_source_code() {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&files);
-    let resolution = resolver.resolve_all(&files);
+    let resolution = resolver.resolve_all(&files).unwrap();
     let analysis = analyze(&files, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -769,7 +771,7 @@ fn go_package_star_survives_reload_without_source_code() {
 
     let mut reloaded = Resolver::new();
     reloaded.index_extractions(&durable);
-    let again = reloaded.resolve_all(&durable);
+    let again = reloaded.resolve_all(&durable).unwrap();
     assert!(
         again.edges.iter().any(|edge| {
             edge.edge_kind == devmap_extract::model::EdgeKind::MemberOf
@@ -828,7 +830,7 @@ fn build_history_separates_confident_ambiguous_and_unmeasured_values() {
     let extractions = vec![clean, unavailable];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let mut analysis = analyze(&extractions, &resolution);
     analysis.dead_symbols = vec![
         DeadSymbolReport {
@@ -924,7 +926,7 @@ fn count_search_symbols_is_driven_by_the_fts_match_not_the_generation_map() {
     let extractions = extract_all(&refs);
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -975,7 +977,7 @@ fn vacuum_returns_freed_pages_to_the_filesystem() {
         ));
         let mut resolver = Resolver::new();
         resolver.index_extractions(&churn);
-        let resolution = resolver.resolve_all(&churn);
+        let resolution = resolver.resolve_all(&churn).unwrap();
         let analysis = analyze(&churn, &resolution);
         store
             .save_generation(&churn, &resolution, &analysis)
@@ -1070,7 +1072,7 @@ fn new_stores_use_incremental_auto_vacuum_and_reclaim_without_a_full_rewrite() {
         ));
         let mut resolver = Resolver::new();
         resolver.index_extractions(&churn);
-        let resolution = resolver.resolve_all(&churn);
+        let resolution = resolver.resolve_all(&churn).unwrap();
         let analysis = analyze(&churn, &resolution);
         store
             .save_generation(&churn, &resolution, &analysis)
@@ -1160,7 +1162,7 @@ fn a_legacy_none_mode_store_is_converted_to_incremental_by_its_next_reclaim() {
             ));
             let mut resolver = Resolver::new();
             resolver.index_extractions(&churn);
-            let resolution = resolver.resolve_all(&churn);
+            let resolution = resolver.resolve_all(&churn).unwrap();
             let analysis = analyze(&churn, &resolution);
             store
                 .save_generation(&churn, &resolution, &analysis)
@@ -1241,7 +1243,7 @@ fn vacuum_declines_when_the_freelist_is_below_threshold() {
     }
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = analyze(&extractions, &resolution);
     store
         .save_generation(&extractions, &resolution, &analysis)
@@ -1351,7 +1353,7 @@ fn a_generation_payload_serves_cache_misses_only_on_matching_identity() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = analyze(std::slice::from_ref(&ext), &resolution);
     store
         .save_generation(std::slice::from_ref(&ext), &resolution, &analysis)
@@ -1432,7 +1434,7 @@ fn unresolved_calls_are_persisted_and_pruned_with_their_generation() {
     )];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     assert!(
         !resolution.unresolved.is_empty(),
         "fixture precondition: the call must actually be unresolved"
@@ -1507,7 +1509,7 @@ fn body_signatures_survive_an_incremental_carry_forward() {
     let all = [a.clone(), b.clone(), c.clone()];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&all);
-    let resolution = resolver.resolve_all(&all);
+    let resolution = resolver.resolve_all(&all).unwrap();
     let analysis = analyze(&all, &resolution);
 
     let store = Store::open_in_memory().unwrap();
@@ -1525,7 +1527,7 @@ fn body_signatures_survive_an_incremental_carry_forward() {
     let after = [a, b, c2];
     let mut resolver2 = Resolver::new();
     resolver2.index_extractions(&after);
-    let resolution2 = resolver2.resolve_all(&after);
+    let resolution2 = resolver2.resolve_all(&after).unwrap();
     let analysis2 = analyze(&after, &resolution2);
     store
         .save_generation_with_opts(
@@ -1587,7 +1589,7 @@ fn store_with_two_callers() -> Store {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -1782,6 +1784,40 @@ fn s3_a_stat_that_could_not_run_keeps_the_pending_row_instead_of_deleting_it() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn an_unexamined_cache_marker_keeps_previously_queued_work() {
+    let dir = tmp_dir("cache-marker-pending");
+    let root = dir.join("repo");
+    fs::create_dir_all(root.join("pkg/CACHEDIR.TAG")).unwrap();
+    fs::write(root.join("pkg/main.py"), "def f(): pass\n").unwrap();
+    let store = Store::open(dir.join("devmap.sqlite")).unwrap();
+    let paths = ["pkg/main.py".to_string()];
+    store.enqueue_pending_paths(&paths).unwrap();
+    let admission = store
+        .enqueue_pending_paths_under_root(&root, &paths)
+        .unwrap();
+    assert!(admission.enqueued.is_empty());
+    assert_eq!(admission.refused.len(), 1);
+    assert!(admission.refused[0].1.contains("CACHEDIR.TAG"));
+    let outcome = store.reconcile_pending_paths(&root).unwrap();
+    assert!(outcome.dropped.is_empty(), "{outcome:?}");
+    assert_eq!(store.get_pending_paths().unwrap(), paths);
+
+    // A successfully examined cache marker is definitive and still allows
+    // obsolete source work to be dropped.
+    fs::remove_dir(root.join("pkg/CACHEDIR.TAG")).unwrap();
+    fs::write(
+        root.join("pkg/CACHEDIR.TAG"),
+        devmap_extract::CACHEDIR_TAG_SIGNATURE,
+    )
+    .unwrap();
+    let outcome = store.reconcile_pending_paths(&root).unwrap();
+    assert_eq!(outcome.dropped.len(), 1);
+    assert!(store.get_pending_paths().unwrap().is_empty());
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// S-3, one level up: a `canonicalize` that could not run is not "outside the
 /// repository root".
 ///
@@ -1937,7 +1973,7 @@ fn s2_build_history_counts_the_whole_generation_not_the_written_slice() {
     let cold = vec![live.clone(), broken.clone()];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&cold);
-    let resolution = resolver.resolve_all(&cold);
+    let resolution = resolver.resolve_all(&cold).unwrap();
     let analysis = analyze(&cold, &resolution);
 
     let store = Store::open_in_memory().unwrap();
@@ -1963,7 +1999,7 @@ fn s2_build_history_counts_the_whole_generation_not_the_written_slice() {
     let fresh = vec![live2];
     let mut resolver2 = Resolver::new();
     resolver2.index_extractions(&fresh);
-    let resolution2 = resolver2.resolve_all(&fresh);
+    let resolution2 = resolver2.resolve_all(&fresh).unwrap();
     let analysis2 = analyze(&fresh, &resolution2);
     store
         .save_generation_with_metadata(
@@ -2017,7 +2053,7 @@ fn store_with_one_cached_file(dir: &std::path::Path) -> (Store, PathBuf, CacheKe
     let key = CacheKey::for_source(&ext.language, source);
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = analyze(std::slice::from_ref(&ext), &resolution);
     store
         .save_generation(std::slice::from_ref(&ext), &resolution, &analysis)
@@ -2368,7 +2404,7 @@ fn s11_every_symbol_reader_refuses_a_corrupt_span_instead_of_publishing_zero() {
     let ext = extract_file("compute.py", &format!("def compute(rows, rate):{body}"));
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = analyze(std::slice::from_ref(&ext), &resolution);
     store
         .save_generation(std::slice::from_ref(&ext), &resolution, &analysis)
@@ -2453,7 +2489,7 @@ fn the_stored_parse_failure_rule_matches_the_canonical_classifier() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&corpus);
-    let resolution = resolver.resolve_all(&corpus);
+    let resolution = resolver.resolve_all(&corpus).unwrap();
     let analysis = analyze(&corpus, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -2470,7 +2506,7 @@ fn the_stored_parse_failure_rule_matches_the_canonical_classifier() {
     let fresh = vec![extract_file("a.py", "def a():\n    return 2\n")];
     let mut resolver2 = Resolver::new();
     resolver2.index_extractions(&fresh);
-    let resolution2 = resolver2.resolve_all(&fresh);
+    let resolution2 = resolver2.resolve_all(&fresh).unwrap();
     let analysis2 = analyze(&fresh, &resolution2);
     store
         .save_generation_with_opts(

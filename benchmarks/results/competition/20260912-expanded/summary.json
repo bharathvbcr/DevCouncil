@@ -1,0 +1,1313 @@
+[
+  {
+    "stage": "callers",
+    "tool": "cbm",
+    "target": "db_size_gate_bytes",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 4.003102957998635,
+      "min": 3.9440519170002517,
+      "max": 4.142591958001503
+    },
+    "time_rusage_peak_bytes": {
+      "median": 3325952,
+      "min": 3309568,
+      "max": 3342336
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 18677760,
+      "min": 18317312,
+      "max": 21086208
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "cbm",
+    "target": "describe_corpus",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 3.972397708999779,
+      "min": 3.9432705829985935,
+      "max": 4.004017416998977
+    },
+    "time_rusage_peak_bytes": {
+      "median": 3309568,
+      "min": 3309568,
+      "max": 3325952
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 18350080,
+      "min": 18300928,
+      "max": 19316736
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "cbm",
+    "target": "loadBounded",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 3.969663916999707,
+      "min": 3.9377258750009787,
+      "max": 4.0009436670006835
+    },
+    "time_rusage_peak_bytes": {
+      "median": 3325952,
+      "min": 3309568,
+      "max": 3342336
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 21020672,
+      "min": 18300928,
+      "max": 23265280
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "codegraph",
+    "target": "db_size_gate_bytes",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.10762266699930478,
+      "min": 0.10048125000139407,
+      "max": 0.12232404200040037
+    },
+    "time_rusage_peak_bytes": {
+      "median": 90587136,
+      "min": 90341376,
+      "max": 90701824
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 85032960,
+      "min": 80232448,
+      "max": 92110848
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "codegraph",
+    "target": "describe_corpus",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.11178670799927204,
+      "min": 0.10294620800050325,
+      "max": 0.120977499998844
+    },
+    "time_rusage_peak_bytes": {
+      "median": 90783744,
+      "min": 90275840,
+      "max": 90947584
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 81756160,
+      "min": 79511552,
+      "max": 88195072
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "codegraph",
+    "target": "loadBounded",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.10626208299981954,
+      "min": 0.10266637499989884,
+      "max": 0.15093787499972677
+    },
+    "time_rusage_peak_bytes": {
+      "median": 90898432,
+      "min": 90505216,
+      "max": 92356608
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 86720512,
+      "min": 74776576,
+      "max": 92225536
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "devmap",
+    "target": "db_size_gate_bytes",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.03812058299990895,
+      "min": 0.03744091699991259,
+      "max": 0.050026499999148655
+    },
+    "time_rusage_peak_bytes": {
+      "median": 27967488,
+      "min": 27803648,
+      "max": 28082176
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 2703360,
+      "min": 2670592,
+      "max": 3833856
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "devmap",
+    "target": "describe_corpus",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.0379702919999545,
+      "min": 0.03707412500079954,
+      "max": 0.04103354200015019
+    },
+    "time_rusage_peak_bytes": {
+      "median": 27705344,
+      "min": 27639808,
+      "max": 28983296
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 3833856,
+      "min": 3588096,
+      "max": 3833856
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "devmap",
+    "target": "loadBounded",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.038103791999674286,
+      "min": 0.03772712499994668,
+      "max": 0.042228625001371256
+    },
+    "time_rusage_peak_bytes": {
+      "median": 27869184,
+      "min": 27688960,
+      "max": 27918336
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 3833856,
+      "min": 3817472,
+      "max": 3833856
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "gitnexus",
+    "target": "db_size_gate_bytes",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.8042799169998034,
+      "min": 0.7976385420006409,
+      "max": 0.9257010830006038
+    },
+    "time_rusage_peak_bytes": {
+      "median": 680640512,
+      "min": 665321472,
+      "max": 688553984
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 633552896,
+      "min": 576585728,
+      "max": 664961024
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "gitnexus",
+    "target": "describe_corpus",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.8106252079996921,
+      "min": 0.7944709169987618,
+      "max": 1.0589764999986073
+    },
+    "time_rusage_peak_bytes": {
+      "median": 683032576,
+      "min": 676462592,
+      "max": 689602560
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 675151872,
+      "min": 493223936,
+      "max": 685342720
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "gitnexus",
+    "target": "loadBounded",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.8014292500010924,
+      "min": 0.7959157909990608,
+      "max": 0.9716810419995454
+    },
+    "time_rusage_peak_bytes": {
+      "median": 684113920,
+      "min": 678805504,
+      "max": 692109312
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 660996096,
+      "min": 600621056,
+      "max": 677511168
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "gortex",
+    "target": "db_size_gate_bytes",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.08769591599957494,
+      "min": 0.08756012499907229,
+      "max": 0.2991822919993865
+    },
+    "time_rusage_peak_bytes": {
+      "median": 45596672,
+      "min": 45236224,
+      "max": 45891584
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 2747039744,
+      "min": 2539749376,
+      "max": 2747334656
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "gortex",
+    "target": "describe_corpus",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.07265499999994063,
+      "min": 0.0721474580004724,
+      "max": 0.626546250001411
+    },
+    "time_rusage_peak_bytes": {
+      "median": 45137920,
+      "min": 44761088,
+      "max": 46301184
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 2701541376,
+      "min": 2700656640,
+      "max": 2750595072
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "gortex",
+    "target": "loadBounded",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.0774947499994596,
+      "min": 0.07523729199965601,
+      "max": 0.078019000000495
+    },
+    "time_rusage_peak_bytes": {
+      "median": 45629440,
+      "min": 45154304,
+      "max": 45678592
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 2701590528,
+      "min": 2484584448,
+      "max": 2701836288
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "graphify",
+    "target": "db_size_gate_bytes",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.19887266600017028,
+      "min": 0.19386908399974345,
+      "max": 0.2952742079996824
+    },
+    "time_rusage_peak_bytes": {
+      "median": 138149888,
+      "min": 138002432,
+      "max": 139001856
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 141918208,
+      "min": 127926272,
+      "max": 142016512
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "graphify",
+    "target": "describe_corpus",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.19664320900119492,
+      "min": 0.19391174999873328,
+      "max": 0.2348256669993134
+    },
+    "time_rusage_peak_bytes": {
+      "median": 138215424,
+      "min": 137969664,
+      "max": 138444800
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 141934592,
+      "min": 135708672,
+      "max": 142131200
+    }
+  },
+  {
+    "stage": "callers",
+    "tool": "graphify",
+    "target": "loadBounded",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.1968782090007153,
+      "min": 0.19220108300032734,
+      "max": 0.20766333299980033
+    },
+    "time_rusage_peak_bytes": {
+      "median": 138035200,
+      "min": 137986048,
+      "max": 138625024
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 141885440,
+      "min": 139558912,
+      "max": 142098432
+    }
+  },
+  {
+    "stage": "cold",
+    "tool": "cbm",
+    "target": null,
+    "attempted": 3,
+    "succeeded": 3,
+    "failed_labels": [],
+    "seconds": {
+      "median": 7.789523542000097,
+      "min": 7.630662457999279,
+      "max": 8.014631292000558
+    },
+    "time_rusage_peak_bytes": {
+      "median": 3358720,
+      "min": 3358720,
+      "max": 3375104
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 1276280832,
+      "min": 1274281984,
+      "max": 1279098880
+    }
+  },
+  {
+    "stage": "cold",
+    "tool": "codegraph",
+    "target": null,
+    "attempted": 3,
+    "succeeded": 3,
+    "failed_labels": [],
+    "seconds": {
+      "median": 2.9002877500006434,
+      "min": 2.7525070410010812,
+      "max": 2.903513291001218
+    },
+    "time_rusage_peak_bytes": {
+      "median": 2503950336,
+      "min": 2492448768,
+      "max": 2576433152
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 2539765760,
+      "min": 2520989696,
+      "max": 2624159744
+    }
+  },
+  {
+    "stage": "cold",
+    "tool": "devmap",
+    "target": null,
+    "attempted": 3,
+    "succeeded": 3,
+    "failed_labels": [],
+    "seconds": {
+      "median": 1.971358834000057,
+      "min": 1.919299791999947,
+      "max": 2.4599038750002364
+    },
+    "time_rusage_peak_bytes": {
+      "median": 637321216,
+      "min": 635863040,
+      "max": 638746624
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 641187840,
+      "min": 639549440,
+      "max": 642678784
+    }
+  },
+  {
+    "stage": "cold",
+    "tool": "gitnexus",
+    "target": null,
+    "attempted": 3,
+    "succeeded": 3,
+    "failed_labels": [],
+    "seconds": {
+      "median": 30.051404750000074,
+      "min": 28.96855933400002,
+      "max": 30.128618124999775
+    },
+    "time_rusage_peak_bytes": {
+      "median": 3232956416,
+      "min": 3113664512,
+      "max": 3265101824
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 3347972096,
+      "min": 3228647424,
+      "max": 3379380224
+    }
+  },
+  {
+    "stage": "cold",
+    "tool": "gortex",
+    "target": null,
+    "attempted": 3,
+    "succeeded": 3,
+    "failed_labels": [],
+    "seconds": {
+      "median": 29.525805415998548,
+      "min": 28.527223583001614,
+      "max": 31.56383966700014
+    },
+    "time_rusage_peak_bytes": {
+      "median": 2192900096,
+      "min": 19283968,
+      "max": 2199732224
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 2222637056,
+      "min": 2215919616,
+      "max": 2398044160
+    }
+  },
+  {
+    "stage": "cold",
+    "tool": "graphify",
+    "target": null,
+    "attempted": 3,
+    "succeeded": 3,
+    "failed_labels": [],
+    "seconds": {
+      "median": 21.673686666999856,
+      "min": 16.48570241699963,
+      "max": 23.69036820800102
+    },
+    "time_rusage_peak_bytes": {
+      "median": 2299887616,
+      "min": 2298265600,
+      "max": 2301263872
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 3453403136,
+      "min": 3441229824,
+      "max": 3463987200
+    }
+  },
+  {
+    "stage": "edit",
+    "tool": "cbm",
+    "target": null,
+    "attempted": 3,
+    "succeeded": 3,
+    "failed_labels": [],
+    "seconds": {
+      "median": 8.897922082998775,
+      "min": 8.006197000000611,
+      "max": 9.691717583000354
+    },
+    "time_rusage_peak_bytes": {
+      "median": 3375104,
+      "min": 3358720,
+      "max": 3407872
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 1272594432,
+      "min": 1270644736,
+      "max": 1291468800
+    }
+  },
+  {
+    "stage": "edit",
+    "tool": "codegraph",
+    "target": null,
+    "attempted": 3,
+    "succeeded": 3,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.3764946669998608,
+      "min": 0.33975145799922757,
+      "max": 1.1809079170016048
+    },
+    "time_rusage_peak_bytes": {
+      "median": 129695744,
+      "min": 128843776,
+      "max": 136757248
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 129990656,
+      "min": 127205376,
+      "max": 131989504
+    }
+  },
+  {
+    "stage": "edit",
+    "tool": "devmap",
+    "target": null,
+    "attempted": 3,
+    "succeeded": 3,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.8174459159999969,
+      "min": 0.7078859170014766,
+      "max": 1.094187917000454
+    },
+    "time_rusage_peak_bytes": {
+      "median": 499712000,
+      "min": 499056640,
+      "max": 503889920
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 503611392,
+      "min": 502824960,
+      "max": 507674624
+    }
+  },
+  {
+    "stage": "edit",
+    "tool": "gitnexus",
+    "target": null,
+    "attempted": 3,
+    "succeeded": 3,
+    "failed_labels": [],
+    "seconds": {
+      "median": 31.79181591700035,
+      "min": 30.061122875000365,
+      "max": 32.40592975000072
+    },
+    "time_rusage_peak_bytes": {
+      "median": 3258613760,
+      "min": 3215048704,
+      "max": 3300327424
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 3369746432,
+      "min": 3327508480,
+      "max": 3414130688
+    }
+  },
+  {
+    "stage": "edit",
+    "tool": "gortex",
+    "target": null,
+    "attempted": 3,
+    "succeeded": 3,
+    "failed_labels": [],
+    "seconds": {
+      "median": 3.9230681669996557,
+      "min": 3.893250416000228,
+      "max": 3.9358114579990797
+    },
+    "time_rusage_peak_bytes": {
+      "median": 45678592,
+      "min": 45563904,
+      "max": 46022656
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 2513076224,
+      "min": 2443640832,
+      "max": 2513125376
+    }
+  },
+  {
+    "stage": "edit",
+    "tool": "graphify",
+    "target": null,
+    "attempted": 3,
+    "succeeded": 3,
+    "failed_labels": [],
+    "seconds": {
+      "median": 3.764341208001497,
+      "min": 3.57267016699916,
+      "max": 3.787179458000537
+    },
+    "time_rusage_peak_bytes": {
+      "median": 178683904,
+      "min": 178421760,
+      "max": 179273728
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 809369600,
+      "min": 779321344,
+      "max": 811040768
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "cbm",
+    "target": "db_size_gate_bytes",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 3.9699312499997177,
+      "min": 3.9483492920007848,
+      "max": 4.29278712499945
+    },
+    "time_rusage_peak_bytes": {
+      "median": 3325952,
+      "min": 3309568,
+      "max": 3325952
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 18350080,
+      "min": 18317312,
+      "max": 19349504
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "cbm",
+    "target": "describe_corpus",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 3.9596363339987874,
+      "min": 3.9417014999999083,
+      "max": 4.00079737499982
+    },
+    "time_rusage_peak_bytes": {
+      "median": 3309568,
+      "min": 3309568,
+      "max": 3325952
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 18317312,
+      "min": 18317312,
+      "max": 19333120
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "cbm",
+    "target": "loadBounded",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 3.9697473329997592,
+      "min": 3.952748542000336,
+      "max": 4.058024083000419
+    },
+    "time_rusage_peak_bytes": {
+      "median": 3325952,
+      "min": 3309568,
+      "max": 3325952
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 18333696,
+      "min": 18317312,
+      "max": 18382848
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "codegraph",
+    "target": "db_size_gate_bytes",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.10839116699935403,
+      "min": 0.10169570799916983,
+      "max": 0.13543004200073483
+    },
+    "time_rusage_peak_bytes": {
+      "median": 90882048,
+      "min": 90456064,
+      "max": 93388800
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 88326144,
+      "min": 76333056,
+      "max": 89882624
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "codegraph",
+    "target": "describe_corpus",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.11373645799903898,
+      "min": 0.10645020800075145,
+      "max": 0.11891875000037544
+    },
+    "time_rusage_peak_bytes": {
+      "median": 90505216,
+      "min": 90259456,
+      "max": 91045888
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 84869120,
+      "min": 76136448,
+      "max": 91340800
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "codegraph",
+    "target": "loadBounded",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.10709883299932699,
+      "min": 0.10606316600024002,
+      "max": 0.14176262500041048
+    },
+    "time_rusage_peak_bytes": {
+      "median": 90308608,
+      "min": 90177536,
+      "max": 91783168
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 87064576,
+      "min": 74006528,
+      "max": 87900160
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "devmap",
+    "target": "db_size_gate_bytes",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.021958916999210487,
+      "min": 0.021036292000644607,
+      "max": 0.027392583000619197
+    },
+    "time_rusage_peak_bytes": {
+      "median": 16154624,
+      "min": 16056320,
+      "max": 16203776
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 3801088,
+      "min": 2654208,
+      "max": 4947968
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "devmap",
+    "target": "describe_corpus",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.022279875000094762,
+      "min": 0.021611832999042235,
+      "max": 0.023685334001129377
+    },
+    "time_rusage_peak_bytes": {
+      "median": 16056320,
+      "min": 16023552,
+      "max": 16072704
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 3735552,
+      "min": 2801664,
+      "max": 3833856
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "devmap",
+    "target": "loadBounded",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.02248820800014073,
+      "min": 0.021003166999435052,
+      "max": 0.023595250000653323
+    },
+    "time_rusage_peak_bytes": {
+      "median": 15925248,
+      "min": 15794176,
+      "max": 15990784
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 3833856,
+      "min": 2654208,
+      "max": 3850240
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "gitnexus",
+    "target": "db_size_gate_bytes",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.806395125000563,
+      "min": 0.7932167920007487,
+      "max": 0.9655992499992863
+    },
+    "time_rusage_peak_bytes": {
+      "median": 678772736,
+      "min": 669908992,
+      "max": 688553984
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 652656640,
+      "min": 579747840,
+      "max": 676216832
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "gitnexus",
+    "target": "describe_corpus",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.8127990829998453,
+      "min": 0.7979439999999158,
+      "max": 0.8618831660005526
+    },
+    "time_rusage_peak_bytes": {
+      "median": 685244416,
+      "min": 678379520,
+      "max": 698630144
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 663764992,
+      "min": 635142144,
+      "max": 693846016
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "gitnexus",
+    "target": "loadBounded",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.8005901670003368,
+      "min": 0.7942579999998998,
+      "max": 0.8509189590004098
+    },
+    "time_rusage_peak_bytes": {
+      "median": 685211648,
+      "min": 673202176,
+      "max": 690176000
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 655097856,
+      "min": 575340544,
+      "max": 688865280
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "gortex",
+    "target": "db_size_gate_bytes",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.09464375000061409,
+      "min": 0.09125466600016807,
+      "max": 0.10733720899952459
+    },
+    "time_rusage_peak_bytes": {
+      "median": 45481984,
+      "min": 44793856,
+      "max": 45957120
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 2746597376,
+      "min": 2530508800,
+      "max": 2747121664
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "gortex",
+    "target": "describe_corpus",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.07761824999943201,
+      "min": 0.07623583399981726,
+      "max": 0.07797233299970685
+    },
+    "time_rusage_peak_bytes": {
+      "median": 45465600,
+      "min": 45088768,
+      "max": 46088192
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 2700673024,
+      "min": 2485174272,
+      "max": 2701836288
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "gortex",
+    "target": "loadBounded",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.08345891700082575,
+      "min": 0.08118908300093608,
+      "max": 0.08587408299899835
+    },
+    "time_rusage_peak_bytes": {
+      "median": 45809664,
+      "min": 45285376,
+      "max": 46120960
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 2702573568,
+      "min": 2485075968,
+      "max": 2702802944
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "graphify",
+    "target": "db_size_gate_bytes",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.4375729169987608,
+      "min": 0.42637070899945684,
+      "max": 0.5776588330008963
+    },
+    "time_rusage_peak_bytes": {
+      "median": 150913024,
+      "min": 150306816,
+      "max": 151404544
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 152944640,
+      "min": 150913024,
+      "max": 155041792
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "graphify",
+    "target": "describe_corpus",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.4317216660001577,
+      "min": 0.4266503750004631,
+      "max": 0.4668559580004512
+    },
+    "time_rusage_peak_bytes": {
+      "median": 149979136,
+      "min": 149815296,
+      "max": 150437888
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 153747456,
+      "min": 152748032,
+      "max": 154370048
+    }
+  },
+  {
+    "stage": "search",
+    "tool": "graphify",
+    "target": "loadBounded",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.44179216700104007,
+      "min": 0.42369700000017474,
+      "max": 0.47150191599939717
+    },
+    "time_rusage_peak_bytes": {
+      "median": 149733376,
+      "min": 149405696,
+      "max": 150224896
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 153288704,
+      "min": 152780800,
+      "max": 153632768
+    }
+  },
+  {
+    "stage": "text",
+    "tool": "ripgrep",
+    "target": "db_size_gate_bytes",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.03177862499978801,
+      "min": 0.03102720900096756,
+      "max": 0.06222516699926928
+    },
+    "time_rusage_peak_bytes": {
+      "median": 9175040,
+      "min": 9142272,
+      "max": 9224192
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 3129344,
+      "min": 2670592,
+      "max": 3555328
+    }
+  },
+  {
+    "stage": "text",
+    "tool": "ripgrep",
+    "target": "describe_corpus",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.031010124999738764,
+      "min": 0.030959041001551668,
+      "max": 0.032662958999935654
+    },
+    "time_rusage_peak_bytes": {
+      "median": 9191424,
+      "min": 9142272,
+      "max": 9306112
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 3801088,
+      "min": 2670592,
+      "max": 3833856
+    }
+  },
+  {
+    "stage": "text",
+    "tool": "ripgrep",
+    "target": "loadBounded",
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.033283332999417325,
+      "min": 0.030456292000963003,
+      "max": 0.03888504200040188
+    },
+    "time_rusage_peak_bytes": {
+      "median": 9093120,
+      "min": 9027584,
+      "max": 9158656
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 3784704,
+      "min": 2686976,
+      "max": 3833856
+    }
+  },
+  {
+    "stage": "warm",
+    "tool": "cbm",
+    "target": null,
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 5.906979166999008,
+      "min": 5.696802958998887,
+      "max": 6.239884041999176
+    },
+    "time_rusage_peak_bytes": {
+      "median": 3358720,
+      "min": 3342336,
+      "max": 3457024
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 67387392,
+      "min": 38830080,
+      "max": 72433664
+    }
+  },
+  {
+    "stage": "warm",
+    "tool": "codegraph",
+    "target": null,
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.21124033300111478,
+      "min": 0.17978879200018127,
+      "max": 0.25333524999950896
+    },
+    "time_rusage_peak_bytes": {
+      "median": 102318080,
+      "min": 101548032,
+      "max": 103366656
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 99844096,
+      "min": 98320384,
+      "max": 101433344
+    }
+  },
+  {
+    "stage": "warm",
+    "tool": "devmap",
+    "target": null,
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.07416087499950663,
+      "min": 0.06100187499941967,
+      "max": 0.08241716599877691
+    },
+    "time_rusage_peak_bytes": {
+      "median": 46366720,
+      "min": 46284800,
+      "max": 46579712
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 3850240,
+      "min": 2916352,
+      "max": 3850240
+    }
+  },
+  {
+    "stage": "warm",
+    "tool": "gitnexus",
+    "target": null,
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.5086118340004759,
+      "min": 0.4463924579995364,
+      "max": 0.6523399999987305
+    },
+    "time_rusage_peak_bytes": {
+      "median": 132759552,
+      "min": 131006464,
+      "max": 134234112
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 250839040,
+      "min": 245350400,
+      "max": 274972672
+    }
+  },
+  {
+    "stage": "warm",
+    "tool": "gortex",
+    "target": null,
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 0.29980150000119465,
+      "min": 0.2886096250003902,
+      "max": 3.8325749169998744
+    },
+    "time_rusage_peak_bytes": {
+      "median": 46055424,
+      "min": 45809664,
+      "max": 46972928
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 2432385024,
+      "min": 2432155648,
+      "max": 2448441344
+    }
+  },
+  {
+    "stage": "warm",
+    "tool": "graphify",
+    "target": null,
+    "attempted": 5,
+    "succeeded": 5,
+    "failed_labels": [],
+    "seconds": {
+      "median": 3.8039252500002476,
+      "min": 3.549339917000907,
+      "max": 4.527897541998755
+    },
+    "time_rusage_peak_bytes": {
+      "median": 178749440,
+      "min": 177946624,
+      "max": 184287232
+    },
+    "sampled_tree_peak_bytes": {
+      "median": 795787264,
+      "min": 784121856,
+      "max": 824459264
+    }
+  }
+]

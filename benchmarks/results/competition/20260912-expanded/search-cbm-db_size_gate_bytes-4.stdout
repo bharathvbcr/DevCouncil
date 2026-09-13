@@ -1,0 +1,1 @@
+{"total":1,"count":1,"cols":["name","label","lines","in","out"],"groups":[{"qn_prefix":"devcouncil-bench.rust.devmap-extract.src.model","file":"rust/devmap-extract/src/model.rs","rows":[["db_size_gate_bytes","Function","225-227",4,3]]}],"has_more":false}

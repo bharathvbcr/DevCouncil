@@ -17,6 +17,7 @@ fn targets(files: &[(&str, &str)]) -> Vec<String> {
     resolver.index_extractions(&extractions);
     resolver
         .resolve_all(&extractions)
+        .unwrap()
         .edges
         .into_iter()
         .filter(|edge| edge.edge_kind == EdgeKind::Imports && edge.source_file == files[0].0)

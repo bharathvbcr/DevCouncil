@@ -1,0 +1,20 @@
+{
+  "query_class": "symbol",
+  "results": [
+    {
+      "absolute_file_path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/gortex-corpus/benchmarks/map_bench.py",
+      "doc": "Count tracked files and code files so throughput has a denominator.",
+      "file_path": "devcouncil-bench/benchmarks/map_bench.py",
+      "id": "devcouncil-bench/benchmarks/map_bench.py::describe_corpus",
+      "kind": "function",
+      "name": "describe_corpus",
+      "project_id": "devcouncil-bench",
+      "repo_prefix": "devcouncil-bench",
+      "start_line": 240,
+      "visibility": "public",
+      "workspace_id": "devcouncil-bench"
+    }
+  ],
+  "total": 1,
+  "truncated": false
+}

@@ -50,7 +50,7 @@ fn manifest() -> serde_json::Value {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     let communities = ["core/base.rb", "web/user.rb"]
         .iter()
@@ -113,7 +113,7 @@ fn inheritance_alone_couples_two_areas() {
         ),
     ];
     resolver.index_extractions(&extractions);
-    let edges = resolver.resolve_all(&extractions).edges;
+    let edges = resolver.resolve_all(&extractions).unwrap().edges;
     let cross: Vec<_> = edges
         .iter()
         .filter(|edge| edge.source_file != edge.target_file)

@@ -61,6 +61,39 @@ fn structured(response: &Value) -> &Value {
     &response["result"]["structuredContent"]
 }
 
+#[tokio::test]
+#[cfg(unix)]
+async fn raw_state_directory_aliases_are_refused_before_canonicalization() {
+    let base = scratch("linked-state");
+    let root = base.join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let db = plant_store(&root);
+    let normal = Arc::new(StoreSlot::new(db.clone()));
+    assert_eq!(
+        call(&normal, "devmap_status", json!({})).await["result"]["isError"],
+        false
+    );
+    drop(normal);
+    let state = db.parent().unwrap().parent().unwrap();
+    let outside = base.join("outside");
+    std::fs::rename(state, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, state).unwrap();
+    let log = outside.join("codeintel/sessions/live.jsonl");
+    let before = std::fs::read(&log).ok();
+    let slots = [
+        StoreSlot::new(db.clone()),
+        StoreSlot::resolving(Some(db), base.clone(), None),
+        StoreSlot::resolving(None, base.clone(), Some(root.clone())),
+        StoreSlot::resolving(None, base.clone(), None),
+    ];
+    for slot in slots {
+        let response = call(&Arc::new(slot), "devmap_status", json!({"repo_path":root})).await;
+        assert!(!tool_error_text(&response).is_empty());
+        assert_eq!(std::fs::read(&log).ok(), before);
+    }
+    std::fs::remove_dir_all(base).unwrap();
+}
+
 #[test]
 fn every_tool_declares_optional_repo_path() {
     for spec in tool_specs() {

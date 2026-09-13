@@ -10,7 +10,7 @@ fn resolve(files: &[(&str, &str)]) -> ResolutionResult {
     let files: Vec<Extraction> = files.iter().map(|(p, s)| extract_file(p, s)).collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&files);
-    resolver.resolve_all(&files)
+    resolver.resolve_all(&files).unwrap()
 }
 
 fn calls_from(result: &ResolutionResult, caller: &str) -> BTreeSet<String> {

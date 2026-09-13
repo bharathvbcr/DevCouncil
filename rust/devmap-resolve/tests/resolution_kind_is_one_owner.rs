@@ -39,7 +39,7 @@ fn every_variant() -> Vec<Resolution> {
             family: LangFamily::Python,
         },
         Resolution::AmbiguousGlobal {
-            candidates: vec![(file.clone(), symbol.clone())],
+            candidates: vec![(file.clone(), symbol.clone())].into(),
             family: LangFamily::Python,
         },
         Resolution::Unresolved {

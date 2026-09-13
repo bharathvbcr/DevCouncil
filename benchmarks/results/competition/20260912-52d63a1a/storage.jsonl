@@ -1,0 +1,12 @@
+{"stage": "cold", "tool": "devmap", "iteration": 1, "bytes": 145588224}
+{"stage": "cold", "tool": "gitnexus", "iteration": 1, "bytes": 278531984}
+{"stage": "cold", "tool": "gitnexus", "iteration": 2, "bytes": 277368720}
+{"stage": "cold", "tool": "devmap", "iteration": 2, "bytes": 145588224}
+{"stage": "cold", "tool": "devmap", "iteration": 3, "bytes": 145588224}
+{"stage": "cold", "tool": "gitnexus", "iteration": 3, "bytes": 277753744}
+{"stage": "edit", "tool": "devmap", "iteration": 1, "bytes": 151879680}
+{"stage": "edit", "tool": "gitnexus", "iteration": 1, "bytes": 359372556}
+{"stage": "edit", "tool": "devmap", "iteration": 2, "bytes": 158695424}
+{"stage": "edit", "tool": "gitnexus", "iteration": 2, "bytes": 360875788}
+{"stage": "edit", "tool": "devmap", "iteration": 3, "bytes": 158695424}
+{"stage": "edit", "tool": "gitnexus", "iteration": 3, "bytes": 372692748}

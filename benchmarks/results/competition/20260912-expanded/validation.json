@@ -1,0 +1,46 @@
+{
+  "corpora": [
+    {
+      "tool": "devmap",
+      "files": 1186,
+      "mismatches": []
+    },
+    {
+      "tool": "graphify",
+      "files": 1186,
+      "mismatches": []
+    },
+    {
+      "tool": "gitnexus",
+      "files": 1186,
+      "mismatches": []
+    },
+    {
+      "tool": "codegraph",
+      "files": 1186,
+      "mismatches": []
+    },
+    {
+      "tool": "cbm",
+      "files": 1186,
+      "mismatches": []
+    },
+    {
+      "tool": "gortex",
+      "files": 1186,
+      "mismatches": []
+    }
+  ],
+  "report_local_links_ok": true,
+  "owned_daemon_pids": [
+    64551,
+    66802,
+    62709,
+    58731,
+    84788
+  ],
+  "alive_owned_daemons": [],
+  "socket_removed": true,
+  "report_bytes": 12718,
+  "completed_utc": "2026-09-12T17:08:41.757897+00:00"
+}

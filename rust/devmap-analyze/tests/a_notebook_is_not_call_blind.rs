@@ -140,7 +140,7 @@ fn a_notebook_symbol_is_not_capped_as_if_its_file_were_blind() {
     let extractions = vec![notebook()];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let outcome =
         analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none());
 

@@ -3,7 +3,9 @@ package devcouncil
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,7 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 const (
@@ -24,7 +28,9 @@ const (
 	// DiffOutputLimit matches Python _CLI_OUTPUT_LIMIT.
 	DiffOutputLimit = 20_000
 
-	binaryProbeBytes = 8192
+	binaryProbeBytes    = 8192
+	untrackedInputLimit = 8 * 1024 * 1024
+	untrackedFileLimit  = 4096
 )
 
 // DiffFile is one path in a get_diff payload.
@@ -292,7 +298,16 @@ func gitDiff(ctx context.Context, root string, paths []string, staged bool) (Dif
 	}, nil
 }
 
-func collectUntracked(root string, paths []string, known map[string]struct{}) ([]DiffFile, string, string) {
+func collectUntracked(root string, paths []string, known map[string]struct{}) (files []DiffFile, unified string, failure string) {
+	held, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, "", err.Error()
+	}
+	defer func() {
+		if err := held.Close(); err != nil {
+			files, unified, failure = nil, "", errors.Join(errors.New(failure), err).Error()
+		}
+	}()
 	args := []string{"ls-files", "--others", "--exclude-standard", "-z"}
 	if len(paths) > 0 {
 		args = append(args, "--")
@@ -314,40 +329,90 @@ func collectUntracked(root string, paths []string, known map[string]struct{}) ([
 		}
 		return nil, "", detail
 	}
-	var files []DiffFile
 	var fragments []string
+	remaining := int64(untrackedInputLimit)
 	for _, rel := range strings.Split(out.stdout, "\x00") {
-		rel = strings.TrimSpace(strings.ReplaceAll(rel, "\\", "/"))
 		if rel == "" {
 			continue
 		}
 		if _, ok := known[rel]; ok {
 			continue
 		}
-		full := filepath.Join(root, filepath.FromSlash(rel))
-		info, err := os.Stat(full)
-		if err != nil || !info.Mode().IsRegular() {
-			continue
+		if len(files) >= untrackedFileLimit {
+			return nil, "", fmt.Sprintf("untracked diff exceeds %d-file input limit; narrow the requested paths", untrackedFileLimit)
 		}
-		fragment, additions := formatUntrackedFileDiff(rel, full)
+		// Git's NUL-delimited names are native file names. Use policy only
+		// for authorization; never reopen its normalized spelling.
+		if policy.ReadRefused(root, rel) {
+			return nil, "", fmt.Sprintf("untracked diff read refused by file policy: %q", rel)
+		}
+		raw, err := readUntrackedFile(held, filepath.FromSlash(rel), remaining)
+		if err != nil {
+			return nil, "", fmt.Sprintf("untracked diff %q: %v", rel, err)
+		}
+		remaining -= int64(len(raw))
+		fragment, additions := formatUntrackedFileDiff(rel, raw)
 		if fragment == "" {
 			continue
 		}
 		files = append(files, DiffFile{Path: rel, Status: "A", Additions: additions, Deletions: 0})
 		fragments = append(fragments, strings.TrimRight(fragment, "\n"))
 	}
-	unified := strings.Join(fragments, "\n")
+	unified = strings.Join(fragments, "\n")
 	if unified != "" {
 		unified += "\n"
 	}
 	return files, unified, ""
 }
 
-func formatUntrackedFileDiff(relPath, fullPath string) (string, int) {
-	raw, err := os.ReadFile(fullPath)
+// readUntrackedFile authorizes content from the opened object, never a second
+// path lookup. Reads and total collection input are bounded before allocation.
+func readUntrackedFile(root *os.Root, name string, limit int64) (raw []byte, resultErr error) {
+	f, err := safefile.OpenNoFollow(root, name, os.O_RDONLY, 0)
 	if err != nil {
-		return "", 0
+		return nil, err
 	}
+	defer func() { resultErr = errors.Join(resultErr, f.Close()) }()
+	before, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, errors.New("not an ordinary file")
+	}
+	links, err := safefile.LinkCount(f)
+	if err != nil {
+		return nil, err
+	}
+	if links != 1 {
+		return nil, errors.New("hard-linked files are not readable through untracked diffs")
+	}
+	if before.Size() > limit {
+		return nil, errors.New("untracked diff input byte limit exceeded; narrow the requested paths")
+	}
+	raw, err = io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > limit {
+		return nil, errors.New("untracked diff input byte limit exceeded during read")
+	}
+	after, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	named, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(before, after) || !os.SameFile(after, named) || named.Mode()&os.ModeSymlink != 0 ||
+		before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		return nil, errors.New("untracked file changed during read")
+	}
+	return raw, nil
+}
+
+func formatUntrackedFileDiff(relPath string, raw []byte) (string, int) {
 	header := []string{
 		fmt.Sprintf("diff --git a/%s b/%s", relPath, relPath),
 		"new file mode 100644",

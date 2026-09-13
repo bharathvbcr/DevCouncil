@@ -29,7 +29,7 @@ fn resolve_sources(files: &[(&str, &str)]) -> devmap_resolve::model::ResolutionR
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    resolver.resolve_all(&extractions)
+    resolver.resolve_all(&extractions).unwrap()
 }
 
 fn resolve_fixture_dir(relative: &str) -> devmap_resolve::model::ResolutionResult {

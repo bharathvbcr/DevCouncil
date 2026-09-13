@@ -59,7 +59,7 @@ fn cold_build(root: &Path, db_path: &Path) -> Store {
         devmap_store::extract_tree_cached_with_report(&store, root).unwrap();
     let mut resolver = devmap_resolve::Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let refusals = devmap_store::discovery_refusals(&report);
     let analysis = devmap_analyze::analyze_with_discovery(
         &extractions,

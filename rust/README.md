@@ -1,5 +1,9 @@
 # DevCouncil Rust workspace
 
+The [repository input and verification contracts](../docs/SECURITY_BOUNDARIES.md)
+describe managed filesystem operations, query read limits, and the fallible
+resolver and cache-marker APIs used by embedders.
+
 One Cargo workspace. Two planes share the lockfile and keep **separate CI
 jobs**, because a `dc-verify` test must not compile thirty tree-sitter grammars.
 

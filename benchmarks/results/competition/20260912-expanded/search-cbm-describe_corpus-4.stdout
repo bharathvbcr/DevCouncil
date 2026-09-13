@@ -1,0 +1,1 @@
+{"total":1,"count":1,"cols":["name","label","lines","in","out"],"groups":[{"qn_prefix":"devcouncil-bench.benchmarks.map_bench","file":"benchmarks/map_bench.py","rows":[["describe_corpus","Function","240-271",1,9]]}],"has_more":false}

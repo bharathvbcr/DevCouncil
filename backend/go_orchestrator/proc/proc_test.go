@@ -203,3 +203,35 @@ func itoa(n int) string {
 	}
 	return string(digits)
 }
+
+func TestCleanupGraceWaitsForReapingButRemainsBounded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	entered, reaped := make(chan struct{}), make(chan struct{})
+	start := time.Now()
+	_, timeout := RunBoundedWithCleanup(ctx, func() error {
+		close(entered)
+		cancel()
+		<-ctx.Done()
+		time.Sleep(20 * time.Millisecond)
+		close(reaped)
+		return ctx.Err()
+	})
+	if !timeout {
+		t.Fatal("cancellation was reported as completion")
+	}
+	select {
+	case <-reaped:
+	default:
+		t.Fatal("returned before the child cleanup completed")
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("cleanup exceeded its bound")
+	}
+	blocked := make(chan struct{})
+	defer close(blocked)
+	start = time.Now()
+	_, timeout = RunBoundedWithCleanup(ctx, func() error { <-blocked; return nil })
+	if !timeout || time.Since(start) > time.Second {
+		t.Fatal("stuck cleanup blocked cancellation")
+	}
+}

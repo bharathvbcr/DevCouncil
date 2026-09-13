@@ -1,0 +1,47 @@
+{
+  "status": "found",
+  "symbol": {
+    "uid": "Function:backend/go_orchestrator/repomap/repomap.go:loadBounded",
+    "name": "loadBounded",
+    "kind": "Function",
+    "filePath": "backend/go_orchestrator/repomap/repomap.go",
+    "startLine": 330,
+    "endLine": 356,
+    "content": "// loadBounded is Load with the bound as an argument, so a test can drive the // refusal without producing a quarter of a gigabyte to reach it. func loadBounded(graphPath string, max int64) (*Map, error) { file, err := os.Open(graphPath) if err != nil { return nil, fmt.Errorf(\"repomap: reading %s: %w\", graphPath, err) } defer file.Close() raw, err := readBounded(file, max) if err != nil { return nil, fmt.Errorf(\"repomap: reading %s: %w\", graphPath, err) } g, err := decodeGraph(raw) if err != nil { // A layout this build cannot read is a different report from a file it // cannot parse, and keeping them apart is the difference between \"the // producer moved ahead of this harness\" and \"the artifact is damaged\". // They send an operator to different places. if errors.Is(err, ErrUnknownCompactLayout) { return nil, fmt.Errorf(\"repomap: %s: %w\", graphPath, err) } return nil, fmt.Errorf(\"repomap: %s is not a code graph: %w\", graphPath, err) } if len(g.Nodes) == 0 { return nil, fmt.Errorf(\"repomap: %s holds no nodes; the index has not been built\", graphPath) } return build(g), nil } // readBounded reads a source whole, or refuses it for being larger than max."
+  },
+  "epistemic": "exact",
+  "incoming": {
+    "calls": [
+      {
+        "uid": "Function:backend/go_orchestrator/repomap/compact_test.go:TestAnInternedGraphIsHeldToTheSameBound",
+        "name": "TestAnInternedGraphIsHeldToTheSameBound",
+        "filePath": "backend/go_orchestrator/repomap/compact_test.go"
+      },
+      {
+        "uid": "Function:backend/go_orchestrator/repomap/repomap.go:Load",
+        "name": "Load",
+        "filePath": "backend/go_orchestrator/repomap/repomap.go"
+      }
+    ]
+  },
+  "outgoing": {
+    "calls": [
+      {
+        "uid": "Function:backend/go_orchestrator/repomap/compact.go:decodeGraph",
+        "name": "decodeGraph",
+        "filePath": "backend/go_orchestrator/repomap/compact.go"
+      },
+      {
+        "uid": "Function:backend/go_orchestrator/repomap/repomap.go:readBounded",
+        "name": "readBounded",
+        "filePath": "backend/go_orchestrator/repomap/repomap.go"
+      },
+      {
+        "uid": "Function:backend/go_orchestrator/repomap/repomap.go:build",
+        "name": "build",
+        "filePath": "backend/go_orchestrator/repomap/repomap.go"
+      }
+    ]
+  },
+  "processes": []
+}

@@ -118,3 +118,7 @@ required-features = ["parse"]
 [[test]]
 name = "dead_hardening_characterization"
 required-features = ["parse"]
+
+[[test]]
+name = "ambiguity_budget"
+required-features = ["parse"]

@@ -68,7 +68,7 @@ fn refuse(ext: &mut Extraction) {
 fn artifacts(extractions: &[Extraction]) -> (Value, Value) {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    let resolution = resolver.resolve_all(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
     let analysis = devmap_analyze::analyze(extractions, &resolution);
 
     let graph = generate_code_graph_json(

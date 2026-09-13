@@ -1,0 +1,24 @@
+ M backend/go_orchestrator/cmd/devcouncil/dispatch_test.go
+ M backend/go_orchestrator/cmd/devcouncil/gate.go
+ M backend/go_orchestrator/cmd/devcouncil/install.go
+ M backend/go_orchestrator/cmd/devcouncil/main.go
+ M backend/go_orchestrator/devcouncil/components/install.go
+ M backend/go_orchestrator/devcouncil/integrate/integrate.go
+ M backend/go_orchestrator/devcouncil/integrate/uninstall.go
+ M backend/go_orchestrator/devcouncil/verify/cli.go
+ M backend/go_orchestrator/devcouncil/verify/orchestrate.go
+ M backend/go_orchestrator/devcouncil/verify/verify_test.go
+ M docs/devmap/README.md
+ M rust/devmap-cli/src/main.rs
+ M rust/devmap-cli/src/progress.rs
+ M rust/devmap-cli/tests/test_progress.rs
+?? backend/go_orchestrator/cmd/devcouncil/hook.go
+?? backend/go_orchestrator/cmd/devcouncil/hook_compat_test.go
+?? backend/go_orchestrator/cmd/devcouncil/hook_test.go
+?? backend/go_orchestrator/cmd/devcouncil/presentation.go
+?? backend/go_orchestrator/cmd/devcouncil/presentation_test.go
+?? backend/go_orchestrator/console/
+?? backend/go_orchestrator/devcouncil/integrate/hook_safety_test.go
+?? backend/go_orchestrator/devcouncil/verify/presentation_test.go
+?? benchmarks/results/competition/
+?? rust/devmap-cli/src/presentation.rs

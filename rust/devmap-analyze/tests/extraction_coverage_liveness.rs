@@ -60,7 +60,7 @@ fn refuse(ext: &mut Extraction) {
 fn summarize(extractions: &[Extraction]) -> AnalysisSummary {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    let resolution = resolver.resolve_all(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
     analyze(extractions, &resolution)
 }
 
@@ -268,7 +268,7 @@ fn both_liveness_entry_points_apply_the_same_cap() {
     refuse(&mut extractions[1]);
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     let bare = analyze_liveness(&extractions, &resolution);
     let full = analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none());
@@ -411,7 +411,7 @@ fn a_cfml_file_is_charged_as_call_blind() {
     let outcome = {
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none())
     };
 
@@ -450,7 +450,7 @@ fn prose_and_data_files_are_not_call_blind() {
     let outcome = {
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none())
     };
 
@@ -492,7 +492,7 @@ fn a_pattern_recovered_file_is_not_also_charged_as_call_blind() {
     let outcome = {
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none())
     };
 
@@ -529,7 +529,7 @@ fn import_blindness_is_charged_without_capping_the_call_verdict() {
     let outcome = {
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none())
     };
 

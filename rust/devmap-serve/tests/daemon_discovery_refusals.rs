@@ -222,7 +222,7 @@ fn first_generation_with_a_refusal(root: &Path, db_path: &Path) -> Store {
         devmap_store::extract_tree_cached_with_report(&store, root).unwrap();
     let mut resolver = devmap_resolve::Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     // The inventory, exactly as the CLI build path supplies it: the count a
     // consumer reads is `COUNT(*)` over these rows, and `save_generation`
     // refuses a generation whose summary claims a refusal the inventory cannot

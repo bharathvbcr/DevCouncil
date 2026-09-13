@@ -130,6 +130,8 @@ func decodeGraph(raw []byte) (graph, error) {
 		internedTables []string
 	)
 
+	seenKeys := make(map[string]bool)
+
 	for decoder.More() {
 		token, err := decoder.Token()
 		if err != nil {
@@ -139,6 +141,14 @@ func decodeGraph(raw []byte) (graph, error) {
 		if !ok {
 			return graph{}, fmt.Errorf("a code graph's keys are strings and this document has %v", token)
 		}
+		switch key {
+		case "encoding", "strings", "interned_tables", "schema_version", "meta", "nodes", "edges":
+			if seenKeys[key] {
+				return graph{}, fmt.Errorf("the code graph has a repeated %s key", key)
+			}
+			seenKeys[key] = true
+		}
+
 		switch key {
 		case "encoding":
 			var encoding string
@@ -390,11 +400,17 @@ func readInternedTable(decoder *json.Decoder, name string, want []string) (*pend
 		}
 		switch key {
 		case "fields":
+			if fieldsSeen {
+				return nil, fmt.Errorf("the interned table %s has a repeated fields key", name)
+			}
 			if err := table.readFields(decoder, wanted); err != nil {
 				return nil, err
 			}
 			fieldsSeen = true
 		case "rows":
+			if rowsSeen {
+				return nil, fmt.Errorf("the interned table %s has a repeated rows key", name)
+			}
 			if !fieldsSeen {
 				return nil, fmt.Errorf("the interned table %s puts its rows before its field "+
 					"list, so there is nothing that says what its cells are", name)
@@ -705,6 +721,17 @@ func resolve[T any](t *pendingTable, pool []string, row func([]string) T, out *[
 	if t == nil {
 		return nil
 	}
+	cardinalityMatches := func(columns, size int) bool {
+		if columns == 0 {
+			return size == 0
+		}
+		return columns > 0 && size%columns == 0 && size/columns == t.rows
+	}
+	if t.rows < 0 || !cardinalityMatches(t.internedColumns, len(t.index)) ||
+		!cardinalityMatches(t.rawColumns, len(t.literal)) {
+		return fmt.Errorf("the interned table %s has inconsistent row storage", t.name)
+	}
+
 	*out = make([]T, 0, t.rows)
 	cells := make([]string, t.slots)
 	for index := 0; index < t.rows; index++ {
@@ -715,7 +742,7 @@ func resolve[T any](t *pendingTable, pool []string, row func([]string) T, out *[
 		for _, column := range t.columns {
 			if column.interned {
 				slot := t.index[index*t.internedColumns+interned]
-				if int(slot) >= len(pool) {
+				if slot < 0 || int(slot) >= len(pool) {
 					return fmt.Errorf("row %d of %s names string %d of the %d in the table, so "+
 						"the artifact and its string table are not from the same write",
 						index, t.name, slot, len(pool))

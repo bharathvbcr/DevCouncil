@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 fn verdicts(extractions: &[Extraction]) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    let resolution = resolver.resolve_all(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
     let analysis = analyze(extractions, &resolution);
     let symbols = analysis
         .dead_symbols

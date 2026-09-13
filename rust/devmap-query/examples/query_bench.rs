@@ -688,7 +688,7 @@ impl Corpus {
         let started = Instant::now();
         let mut resolver = devmap_resolve::Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         println!(
             "  resolve                 {:>11.2?}  {} edges",
             started.elapsed(),

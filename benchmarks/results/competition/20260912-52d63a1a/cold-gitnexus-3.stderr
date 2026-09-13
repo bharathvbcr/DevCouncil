@@ -1,0 +1,19 @@
+{"level":40,"time":1789229000226,"name":"gitnexus","msg":"Skipping 1 cobol file(s) — cobol parser not available (native binding may not have built). Try: npm rebuild tree-sitter-cobol"}
+       29.15 real        47.52 user         6.95 sys
+          3171647488  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              509773  page reclaims
+                 236  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   9  messages sent
+                   8  messages received
+                   0  signals received
+                5790  voluntary context switches
+              190282  involuntary context switches
+          2483214358  instructions retired
+           879119189  cycles elapsed
+            75343400  peak memory footprint

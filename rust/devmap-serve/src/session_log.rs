@@ -7,7 +7,8 @@
 //!
 //! Path: `<store-dir>/sessions/live.jsonl`.
 
-use std::fs::{self, OpenOptions};
+#[cfg(test)]
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -82,15 +83,27 @@ pub fn append_query(
     if !db_path.is_file() {
         return;
     }
-    let dir = sessions_dir(db_path);
-    if fs::create_dir_all(&dir).is_err() {
-        return;
+    let result = (|| -> std::io::Result<()> {
+        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+        // Inspect the raw database ancestry too: a linked state directory must
+        // not become permission to create telemetry in its target.
+        let _database = SafeFile::open(db_path, Access::Read, Creation::Never)?;
+        let mut file =
+            SafeFile::open(&live_log_path(db_path), Access::Append, Creation::IfMissing)?;
+        if line.len() > 16 * 1024
+            || file.metadata()?.len().saturating_add(line.len() as u64 + 1) > MAX_SESSION_BYTES
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "session log limit reached; finish or rotate the session",
+            ));
+        }
+        writeln!(file, "{line}")?;
+        file.flush()
+    })();
+    if let Err(error) = result {
+        tracing::warn!("MCP query logging skipped: {error}");
     }
-    let path = dir.join("live.jsonl");
-    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
-        return;
-    };
-    let _ = writeln!(file, "{line}");
 }
 
 fn now_ms() -> u64 {
@@ -101,6 +114,7 @@ fn now_ms() -> u64 {
 }
 
 const ARGS_CAP: usize = 2048;
+pub const MAX_SESSION_BYTES: u64 = 8 * 1024 * 1024;
 
 fn sanitize_args(args: Option<&Value>) -> Value {
     let Some(value) = args else {
@@ -188,26 +202,52 @@ fn find_flag(value: &Value, key: &str, depth: u8) -> Option<Value> {
 }
 
 /// Load the live log as parsed records. Missing file is an empty session.
-pub fn read_live(db_path: &Path) -> Vec<Map<String, Value>> {
-    let path = live_log_path(db_path);
-    let Ok(text) = fs::read_to_string(&path) else {
-        return Vec::new();
+pub fn read_live(db_path: &Path) -> std::io::Result<Vec<Map<String, Value>>> {
+    use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+    let mut file = match SafeFile::open(&live_log_path(db_path), Access::Read, Creation::Never) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
+    let text = file.read_text(MAX_SESSION_BYTES)?;
     text.lines()
         .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|value| value.as_object().cloned())
+        .map(|line| {
+            serde_json::from_str::<Map<String, Value>>(line)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })
         .collect()
 }
 
-/// Rotate `live.jsonl` next to a finished report. A missing log is a no-op.
-pub fn rotate_live(db_path: &Path, stamp: &str) {
-    let live = live_log_path(db_path);
-    if !live.exists() {
-        return;
+/// Rotate within the checked session directory. Only a missing log is a no-op.
+pub fn rotate_live(db_path: &Path, stamp: &str) -> std::io::Result<bool> {
+    use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
+    let directory = match PinnedDir::open(&sessions_dir(db_path), false) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match directory.open_file(
+        std::ffi::OsStr::new("live.jsonl"),
+        Access::Read,
+        Creation::Never,
+    ) {
+        Ok(file) => file.require_owned()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
     }
-    let dest = sessions_dir(db_path).join(format!("{stamp}.jsonl"));
-    let _ = fs::rename(&live, &dest);
+    let name = format!("{stamp}.jsonl");
+    match directory.open_file(std::ffi::OsStr::new(&name), Access::Read, Creation::Never) {
+        Ok(file) => file.require_owned()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    // rename_child validates both names as single path components.
+    directory.rename_child(
+        std::ffi::OsStr::new("live.jsonl"),
+        std::ffi::OsStr::new(&name),
+    )?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -252,7 +292,7 @@ mod tests {
             None,
             4,
         );
-        let rows = read_live(&db);
+        let rows = read_live(&db).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["tool"], "devmap_search");
         assert_eq!(rows[0]["empty"], true);

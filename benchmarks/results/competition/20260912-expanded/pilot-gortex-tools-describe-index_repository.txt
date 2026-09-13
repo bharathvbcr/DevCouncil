@@ -1,0 +1,21 @@
+index_repository
+
+Index or re-index a local repository path into Gortex. Call once at session start if not already running with --watch.
+
+parameters:
+{
+  "additionalProperties": false,
+  "properties": {
+    "path": {
+      "description": "Absolute path to repository",
+      "type": "string"
+    },
+    "view": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "type": "object"
+}

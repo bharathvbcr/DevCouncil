@@ -1,0 +1,50 @@
+{
+  "target": {
+    "id": "Function:backend/go_orchestrator/repomap/repomap.go:loadBounded",
+    "name": "loadBounded",
+    "type": "Function",
+    "filePath": "backend/go_orchestrator/repomap/repomap.go"
+  },
+  "direction": "upstream",
+  "impactedCount": 2,
+  "risk": "LOW",
+  "epistemic": "exact",
+  "summary": {
+    "direct": 2,
+    "processes_affected": 0,
+    "modules_affected": 1
+  },
+  "byDepthCounts": {
+    "1": 2
+  },
+  "affected_processes": [],
+  "affected_modules": [
+    {
+      "name": "Repomap",
+      "hits": 2,
+      "impact": "direct"
+    }
+  ],
+  "byDepth": {
+    "1": [
+      {
+        "depth": 1,
+        "id": "Function:backend/go_orchestrator/repomap/compact_test.go:TestAnInternedGraphIsHeldToTheSameBound",
+        "name": "TestAnInternedGraphIsHeldToTheSameBound",
+        "filePath": "backend/go_orchestrator/repomap/compact_test.go",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 1,
+        "id": "Function:backend/go_orchestrator/repomap/repomap.go:Load",
+        "name": "Load",
+        "filePath": "backend/go_orchestrator/repomap/repomap.go",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      }
+    ]
+  }
+}

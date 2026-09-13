@@ -37,11 +37,13 @@ type Options struct {
 
 // Receipt records what was written or would be written.
 type Receipt struct {
-	Host    string            `json:"host"`
-	Mode    string            `json:"mode"`
-	Files   map[string]string `json:"files"` // rel path -> action (wrote|unchanged|would_write|missing)
-	Spawned []string          `json:"spawned,omitempty"`
-	Notes   []string          `json:"notes,omitempty"`
+	HookEntries map[string]int    `json:"hook_entries,omitempty"` // managed entries found before cleanup
+	Backups     map[string]string `json:"backups,omitempty"`      // original relative path -> recoverable backup
+	Host        string            `json:"host"`
+	Mode        string            `json:"mode"`
+	Files       map[string]string `json:"files"` // rel path -> action (wrote|unchanged|would_write|missing)
+	Spawned     []string          `json:"spawned,omitempty"`
+	Notes       []string          `json:"notes,omitempty"`
 }
 
 // cursorRule is deliberately split in two registers.

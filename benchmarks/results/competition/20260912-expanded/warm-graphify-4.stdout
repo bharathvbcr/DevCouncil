@@ -1,0 +1,11 @@
+[graphify extract] incremental scan of /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/graphify-corpus
+[graphify extract] re-queuing 232 manifest-stamped code file(s) with no nodes in graph.json (prior failed extraction, #2543)
+[graphify extract] --code-only: skipping 142 non-code file(s) (140 docs, 0 papers, 2 images) — no LLM extraction
+[graphify extract] 244 code, 0 docs, 0 papers, 0 images changed; 980 unchanged; 0 deleted
+[graphify extract] 49 file(s) not classified (no supported extension or shebang), skipped: .codex__config.toml, .cursor__rules__devcouncil.mdc, .gitignore, 2e6bc46761a01ee2, 7878b58459359f84, 82bd359c89570b5e (+43 more)
+[graphify extract] 1 file(s) skipped as potentially sensitive (rename or move if wrongly flagged): secrets.env.example
+[graphify extract] AST extraction on 244 code files...
+  AST extraction: 100/244 uncached files (40%) [18 workers]
+  AST extraction: 200/244 uncached files (81%) [18 workers]
+  AST extraction: 244/244 uncached files (100%) [18 workers]
+[graphify extract] wrote /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/graphify-corpus/graphify-out/graph.json — 12843 nodes, 34613 edges (no clustering)

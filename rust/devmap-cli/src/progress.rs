@@ -14,7 +14,8 @@ use super::ProgressMode;
 mod terminal;
 
 const TICK: Duration = Duration::from_millis(80);
-const REVEAL_DELAY: Duration = Duration::from_millis(150);
+// Fast builds get a first frame too; only the persistent phase trail waits.
+const TRAIL_DELAY: Duration = Duration::from_millis(150);
 const FINISH_WAIT: Duration = Duration::from_millis(100);
 const DIAGNOSTIC_LIMIT: usize = 64;
 const TEXT_LIMIT: usize = 4096;
@@ -74,9 +75,70 @@ pub(super) struct Display {
     stats: Arc<OutputStats>,
 }
 
+/// Cloneable logging endpoint for worker threads and tracing. It shares the
+/// display's bounded queue and delivery receipt; it never owns terminal I/O.
+#[derive(Clone)]
+pub(super) struct DiagnosticSink {
+    sender: Option<SyncSender<Event>>,
+    stats: Arc<OutputStats>,
+}
+
+impl DiagnosticSink {
+    pub(super) fn diagnostic(&self, message: impl std::fmt::Display) {
+        self.stats.diagnostic_total.fetch_add(1, Ordering::Relaxed);
+        let diagnostic = Arc::new(Diagnostic {
+            text: bounded(&message.to_string()),
+            rendered: AtomicBool::new(false),
+        });
+        let mut retained = self
+            .stats
+            .diagnostics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if retained.len() < DIAGNOSTIC_LIMIT {
+            retained.push(Arc::clone(&diagnostic));
+        }
+        drop(retained);
+        if self
+            .sender
+            .as_ref()
+            .is_none_or(|sender| sender.try_send(Event::Line(diagnostic)).is_err())
+        {
+            self.stats.dropped_updates.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl std::io::Write for DiagnosticSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let retained = bytes.len().min(TEXT_LIMIT);
+        let text = String::from_utf8_lossy(&bytes[..retained]);
+        self.diagnostic(text.trim_end_matches(['\r', '\n']));
+        if retained < bytes.len() {
+            self.stats.dropped_updates.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(bytes.len()) // Optional logging; delivery failures live in the receipt.
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Display {
     pub(super) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Called after the renderer has stopped and the writer lock is released.
+    /// Redirected stdout keeps the compact, unstyled report even with a live stderr.
+    pub(super) fn summary(&self, heading: &str, rows: &[String]) {
+        let width = terminal_width(false);
+        let output = if self.live && std::io::stdout().is_terminal() && width > 1 {
+            summary_card(heading, rows, width, color_enabled(), ascii_output())
+        } else {
+            format!("{}\n", rows.join("\n"))
+        };
+        super::write_stdout_raw(format_args!("{output}"));
     }
     pub(super) fn new(mode: ProgressMode, json: bool, verbose: bool) -> Self {
         let is_terminal = std::io::stderr().is_terminal();
@@ -89,14 +151,8 @@ impl Display {
             && enabled
             && is_terminal
             && std::env::var_os("TERM").is_none_or(|t| t != "dumb");
-        let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-        let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
-            .into_iter()
-            .filter_map(|name| std::env::var(name).ok())
-            .find(|value| !value.is_empty());
-        // The owned Windows handle uses byte writes. Keep console output ASCII
-        // without assuming its active code page is UTF-8.
-        let ascii = cfg!(windows) || ascii_locale(locale.as_deref());
+        let color = color_enabled();
+        let ascii = ascii_output();
         let stats = Arc::new(OutputStats::default());
         let (sender, receiver) = mpsc::sync_channel(32);
         let (done_tx, done) = mpsc::sync_channel(1);
@@ -197,22 +253,18 @@ impl Display {
         }
     }
 
-    pub(super) fn diagnostic(&self, message: impl std::fmt::Display) {
-        self.stats.diagnostic_total.fetch_add(1, Ordering::Relaxed);
-        let diagnostic = Arc::new(Diagnostic {
-            text: bounded(&message.to_string()),
-            rendered: AtomicBool::new(false),
-        });
-        let mut retained = self
-            .stats
-            .diagnostics
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if retained.len() < DIAGNOSTIC_LIMIT {
-            retained.push(Arc::clone(&diagnostic));
+    pub(super) fn diagnostic_sink(&self) -> DiagnosticSink {
+        DiagnosticSink {
+            sender: self
+                .worker
+                .borrow()
+                .as_ref()
+                .map(|worker| worker.sender.clone()),
+            stats: Arc::clone(&self.stats),
         }
-        drop(retained);
-        self.emit(Event::Line(diagnostic));
+    }
+    pub(super) fn diagnostic(&self, message: impl std::fmt::Display) {
+        self.diagnostic_sink().diagnostic(message);
     }
     pub(super) fn note(&self, message: impl std::fmt::Display) {
         if self.enabled && self.verbose {
@@ -320,6 +372,19 @@ fn ascii_locale(locale: Option<&str>) -> bool {
     })
 }
 
+pub(super) fn color_enabled() -> bool {
+    std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+}
+
+pub(super) fn ascii_output() -> bool {
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.is_empty());
+    // Windows byte writes cannot assume a UTF-8 console code page.
+    cfg!(windows) || ascii_locale(locale.as_deref())
+}
+
 fn ascii_text(text: &str, ascii: bool) -> String {
     if !ascii {
         return text.to_string();
@@ -335,8 +400,8 @@ fn ascii_text(text: &str, ascii: bool) -> String {
         .collect()
 }
 
-fn draw_due(elapsed: Duration, since_frame: Duration) -> bool {
-    elapsed >= REVEAL_DELAY && since_frame >= TICK
+fn draw_due(revealed: bool, since_frame: Duration) -> bool {
+    !revealed || since_frame >= TICK
 }
 
 fn safe_text(text: &str) -> String {
@@ -374,7 +439,93 @@ fn fit(text: &str, width: usize) -> String {
     result
 }
 
-fn terminal_width() -> usize {
+fn cells(text: &str) -> usize {
+    text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
+/// Wrap result details instead of truncating counts or coverage disclosures.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    for word in text.split_whitespace() {
+        if !row.is_empty() && cells(&row) + 1 + cells(word) > width {
+            rows.push(std::mem::take(&mut row));
+        }
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        for c in word.chars() {
+            if cells(&row) + if c.is_ascii() { 1 } else { 2 } > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+            }
+            row.push(c);
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+pub(super) fn accent_numbers(text: &str) -> String {
+    let mut output = String::new();
+    let mut number = false;
+    for c in text.chars() {
+        if c.is_ascii_digit() != number {
+            number = c.is_ascii_digit();
+            output.push_str(if number { "\x1b[1;36m" } else { "\x1b[0m" });
+        }
+        output.push(c);
+    }
+    if number {
+        output.push_str("\x1b[0m");
+    }
+    output
+}
+
+fn summary_card(heading: &str, rows: &[String], width: usize, color: bool, ascii: bool) -> String {
+    if width <= 1 {
+        return String::new();
+    }
+    // Tiny terminals have no room for a gutter or wide glyphs.
+    let ascii = ascii || width < 24;
+    let gutter = if width < 24 {
+        ""
+    } else if ascii {
+        "  | "
+    } else {
+        "  │ "
+    };
+    let available = width.saturating_sub(1).max(1);
+    let room = available.saturating_sub(cells(gutter)).max(1);
+    let heading = format!("{} devmap / {heading}", if ascii { "*" } else { "◆" });
+    let mut output = String::from("\n");
+    for (index, text) in std::iter::once(&heading).chain(rows).enumerate() {
+        let text = ascii_text(&safe_text(text), ascii);
+        for line in wrap(&text, room) {
+            if color {
+                output.push_str(if index == 0 { "\x1b[1;32m" } else { "\x1b[2m" });
+            }
+            output.push_str(gutter);
+            if color && index > 0 {
+                output.push_str("\x1b[0m");
+            }
+            if color && index > 0 {
+                output.push_str(&accent_numbers(&line));
+            } else {
+                output.push_str(&line);
+            }
+            if color {
+                output.push_str("\x1b[0m");
+            }
+            output.push('\n');
+        }
+    }
+    output.push('\n');
+    output
+}
+
+fn terminal_width(_stderr: bool) -> usize {
     #[cfg(unix)]
     {
         let mut size = libc::winsize {
@@ -383,10 +534,13 @@ fn terminal_width() -> usize {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        // SAFETY: size is a writable winsize and fd 2 is queried, not owned.
-        if unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut size) } == 0
-            && size.ws_col > 0
-        {
+        let fd = if _stderr {
+            libc::STDERR_FILENO
+        } else {
+            libc::STDOUT_FILENO
+        };
+        // SAFETY: size is writable and the inherited fd is queried, not owned.
+        if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } == 0 && size.ws_col > 0 {
             return usize::from(size.ws_col);
         }
     }
@@ -405,6 +559,30 @@ struct Frame {
     files: Option<Arc<devmap_extract::progress::FileProgress>>,
 }
 
+fn phase_title(current: usize, label: &str) -> &str {
+    match current {
+        1 => "Reading the terrain",
+        2 if label.ends_with(" unchanged") => "Already mapped",
+        2 => "Connecting the dots",
+        3 => "Finding the patterns",
+        4 => "Saving your map",
+        5 => "Packing the essentials",
+        _ => label,
+    }
+}
+
+fn phase_detail(detail: &str) -> &str {
+    match detail {
+        "reading" => "Reading source files",
+        "checking content hashes" => "Spotting what changed",
+        "persist:write" => "Writing the graph",
+        "persist:prune_generations" => "Tidying older maps",
+        "persist:prune_extractions" => "Tidying cached files",
+        "persist:vacuum" => "Reclaiming space",
+        _ => detail,
+    }
+}
+
 impl Frame {
     fn render(&self, tick: usize, width: usize, color: bool, ascii: bool) -> String {
         let spinner = if ascii {
@@ -412,27 +590,52 @@ impl Frame {
         } else {
             ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'][tick % 10]
         };
-        let current = self.current.clamp(1, TOTAL_STAGES);
-        let bar: String = (1..=TOTAL_STAGES)
+        let current = if self.current == 0 {
+            (tick / 2) % TOTAL_STAGES + 1
+        } else {
+            self.current.clamp(1, TOTAL_STAGES)
+        };
+        let nodes: Vec<&str> = (1..=TOTAL_STAGES)
             .map(|n| match (ascii, n.cmp(&current)) {
-                (true, std::cmp::Ordering::Less) => "===",
-                (true, std::cmp::Ordering::Equal) => ">--",
-                (true, std::cmp::Ordering::Greater) => "---",
-                (false, std::cmp::Ordering::Less) => "━━━",
-                (false, std::cmp::Ordering::Equal) => "╺━━",
-                (false, std::cmp::Ordering::Greater) => "───",
+                (true, std::cmp::Ordering::Less) => "o",
+                (true, std::cmp::Ordering::Equal) => ["*", "+", "*", "o"][tick % 4],
+                (true, std::cmp::Ordering::Greater) => ".",
+                (false, std::cmp::Ordering::Less) => "●",
+                (false, std::cmp::Ordering::Equal) => ["◉", "◎", "○", "◎"][tick % 4],
+                (false, std::cmp::Ordering::Greater) => "·",
             })
             .collect();
+        let trail = nodes.join(if ascii { "-" } else { "─" });
         let elapsed = duration(self.started.elapsed().as_secs_f64());
-        let prefix = if width >= 72 {
-            format!("{spinner} [{bar}] {current}/{TOTAL_STAGES} ")
+        let stage = if self.current == 0 {
+            String::new()
         } else {
-            format!("{spinner} {current}/{TOTAL_STAGES} ")
+            format!("{current}/{TOTAL_STAGES} ")
         };
-        let label = if self.detail.is_empty() {
-            self.label.clone()
+        let prefix = if width >= 72 {
+            format!("{spinner} devmap  {trail}  {stage}")
+        } else if width >= 48 {
+            format!("{spinner} devmap {stage}")
         } else {
-            format!("{} · {}", self.detail, self.label)
+            format!("{spinner} {stage}")
+        };
+        // Stage numbers describe the pipeline, never a made-up work percentage.
+        // An unchanged build's second stage does no resolution at all.
+        let title = phase_title(self.current, &self.label);
+        let detail = phase_detail(&self.detail);
+        let label = if width >= 110 && self.current != 0 {
+            format!(
+                "{title} / {}",
+                if self.detail.is_empty() {
+                    &self.label
+                } else {
+                    detail
+                }
+            )
+        } else if !self.detail.is_empty() {
+            detail.to_string()
+        } else {
+            title.to_string()
         };
         let label = ascii_text(&label, ascii);
         let measured = self.files.as_ref().map(|files| files.snapshot());
@@ -455,16 +658,16 @@ impl Frame {
             } else {
                 format!("  {elapsed}")
             };
-        let cells = |s: &str| {
-            s.chars()
-                .map(|c| if c.is_ascii() { 1 } else { 2 })
-                .sum::<usize>()
-        };
         let available = width.saturating_sub(1); // Avoid the terminal's autowrap column.
         let room = available.saturating_sub(cells(&prefix) + cells(&tail));
-        let line = fit(&format!("{prefix}{}{tail}", fit(&label, room)), available);
+        let label = fit(&label, room);
+        let line = fit(&format!("{prefix}{label}{tail}"), available);
         if color {
-            format!("\x1b[36m{line}\x1b[0m")
+            if cells(&prefix) + cells(&label) + cells(&tail) <= available {
+                format!("\x1b[36m{prefix}\x1b[0m{label}\x1b[2m{tail}\x1b[0m")
+            } else {
+                format!("\x1b[36m{line}\x1b[0m")
+            }
         } else {
             line
         }
@@ -497,7 +700,11 @@ fn animate(
         match event {
             Ok(Event::Stage(current, label)) => {
                 if !live {
-                    line = format!("[{current}/{TOTAL_STAGES}] {label}\n");
+                    line = if current == 0 {
+                        format!("[devmap] {label}\n")
+                    } else {
+                        format!("[{current}/{TOTAL_STAGES}] {label}\n")
+                    };
                 }
                 frame = Some(Frame {
                     current,
@@ -526,8 +733,13 @@ fn animate(
                         if succeeded { "took" } else { "failed after" },
                         duration(seconds)
                     );
-                } else if revealed {
+                } else if revealed && (!succeeded || started.elapsed() >= TRAIL_DELAY) {
                     let current = frame.as_ref().map_or(1, |f| f.current);
+                    let label = if succeeded {
+                        phase_title(current, &label)
+                    } else {
+                        &label
+                    };
                     line = format!(
                         "  {} [{current}/{TOTAL_STAGES}] {label}{} · {}\n",
                         if succeeded { "✓" } else { "!" },
@@ -550,15 +762,10 @@ fn animate(
                 }
                 finished = true;
             }
-            Err(RecvTimeoutError::Timeout) => {
-                tick = tick.wrapping_add(1);
-            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        let draw = live
-            && !finished
-            && frame.is_some()
-            && draw_due(started.elapsed(), last_frame.elapsed());
+        let draw = live && !finished && frame.is_some() && draw_due(revealed, last_frame.elapsed());
         let clear = painted && (!line.is_empty() || draw || finished || frame.is_none());
         let mut output = String::new();
         if clear {
@@ -575,11 +782,12 @@ fn animate(
             }
             output.push_str(&frame.as_ref().expect("draw has a frame").render(
                 tick,
-                terminal_width(),
+                terminal_width(true),
                 color,
                 ascii,
             ));
             last_frame = Instant::now();
+            tick = tick.wrapping_add(1);
         }
         if !output.is_empty() {
             match sink.write(output.as_bytes(), stopped) {
@@ -604,6 +812,74 @@ fn animate(
 mod tests {
     use super::{fit, safe_text, Frame};
     use std::time::Instant;
+
+    #[test]
+    fn result_cards_wrap_without_losing_counts_or_terminal_safety() {
+        let rows = vec![
+            "Built generation #1 · 36 files · 158 symbols · 466 edges · 60ms".into(),
+            "Unresolved: 0 unattributed, 2169 uninferred receivers (details: --verbose)".into(),
+            "path 世界\n\x1b[31m".into(),
+        ];
+        for width in [0, 1, 2, 8, 23, 24, 40, 80, 120] {
+            for ascii in [false, true] {
+                let card = super::summary_card("Map ready", &rows, width, false, ascii);
+                for line in card.lines() {
+                    assert!(super::cells(line) < width, "width={width}: {line}");
+                    assert!(!line.chars().any(char::is_control), "{line}");
+                }
+                if width > 1 {
+                    let rejoined = card
+                        .replace(['│', '|'], "")
+                        .split_whitespace()
+                        .collect::<String>();
+                    assert!(rejoined.contains("2169uninferredreceivers"), "{card}");
+                    assert!(rejoined.contains("36files"), "{card}");
+                    assert!(rejoined.contains("details:--verbose"), "{card}");
+                }
+                if ascii || width < 24 {
+                    assert!(card.is_ascii(), "{card}");
+                }
+            }
+        }
+        assert!(super::summary_card("Map ready", &rows, 80, true, false).contains("\x1b[1;32m"));
+        let accented = super::accent_numbers("36 files / 2169 receivers");
+        assert_eq!(accented.matches("\x1b[1;36m").count(), 2);
+        assert_eq!(
+            accented.replace("\x1b[1;36m", "").replace("\x1b[0m", ""),
+            "36 files / 2169 receivers"
+        );
+    }
+
+    #[test]
+    fn phase_titles_and_node_motion_follow_actual_work() {
+        for (stage, label, expected) in [
+            (1, "scanning", "Reading the terrain"),
+            (2, "resolving 36 files", "Connecting the dots"),
+            (2, "36 files unchanged", "Already mapped"),
+            (3, "analyzing", "Finding the patterns"),
+            (4, "persisting", "Saving your map"),
+            (5, "writing consumer artifacts", "Packing the essentials"),
+        ] {
+            let frame = Frame {
+                current: stage,
+                label: label.into(),
+                detail: String::new(),
+                started: Instant::now(),
+                files: None,
+            };
+            let first = frame.render(0, 120, false, false);
+            let next = frame.render(1, 120, false, false);
+            assert!(first.contains(expected), "{first}");
+            assert!(
+                first.contains('◉') && next.contains('◎'),
+                "{first} / {next}"
+            );
+            assert!(
+                !first.contains('%'),
+                "unknown work cannot claim a percentage"
+            );
+        }
+    }
 
     #[test]
     fn animated_rows_fit_narrow_and_wide_terminals_and_escape_paths() {
@@ -636,24 +912,13 @@ mod tests {
     }
 
     #[test]
-    fn fast_builds_and_frame_floods_obey_reveal_and_refresh_deadlines() {
+    fn first_frame_is_immediate_but_frame_floods_remain_throttled() {
         use std::time::Duration;
-        for milliseconds in 0..150 {
-            assert!(!super::draw_due(
-                Duration::from_millis(milliseconds),
-                Duration::from_secs(1)
-            ));
-        }
+        assert!(super::draw_due(false, Duration::ZERO));
         for milliseconds in 0..80 {
-            assert!(!super::draw_due(
-                Duration::from_secs(1),
-                Duration::from_millis(milliseconds)
-            ));
+            assert!(!super::draw_due(true, Duration::from_millis(milliseconds)));
         }
-        assert!(super::draw_due(
-            Duration::from_millis(150),
-            Duration::from_millis(80)
-        ));
+        assert!(super::draw_due(true, Duration::from_millis(80)));
     }
 
     #[test]

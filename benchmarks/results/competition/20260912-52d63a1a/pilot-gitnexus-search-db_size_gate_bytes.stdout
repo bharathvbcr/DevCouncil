@@ -1,0 +1,15 @@
+{
+  "status": "found",
+  "symbol": {
+    "uid": "Function:rust/devmap-extract/src/model.rs:db_size_gate_bytes",
+    "name": "db_size_gate_bytes",
+    "kind": "Function",
+    "filePath": "rust/devmap-extract/src/model.rs",
+    "startLine": 224,
+    "endLine": 226
+  },
+  "epistemic": "exact",
+  "incoming": {},
+  "outgoing": {},
+  "processes": []
+}

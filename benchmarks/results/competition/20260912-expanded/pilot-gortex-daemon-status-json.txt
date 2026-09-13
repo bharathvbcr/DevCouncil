@@ -1,0 +1,15 @@
+Error: unknown flag: --json
+Usage:
+  gortex daemon status [flags]
+
+Flags:
+      --exact               recount nodes and edges from the store instead of reading the counters the indexer maintains, and repair any that have drifted. Proportional to the whole corpus — tens of seconds on a large store
+  -h, --help                help for status
+      --interval duration   refresh interval in --watch mode (clamped to >=200ms) (default 2s)
+  -w, --watch               continuously refresh the status until interrupted (alt-screen buffer)
+
+Global Flags:
+      --config string      config file (default .gortex.yaml)
+      --log-level string   log level: debug|info|warn|error (default "info")
+      --no-progress        disable animated progress output (also honored: NO_COLOR, TERM=dumb, CI, non-TTY stderr)
+

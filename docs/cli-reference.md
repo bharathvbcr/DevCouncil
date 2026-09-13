@@ -5,6 +5,39 @@ This is the comprehensive reference for DevCouncil's native binaries: the Go hos
 **Platforms:** macOS, Linux, Windows.  
 **Maturity:** Stable / Preview labels live in [project-status.md](project-status.md).
 
+## Interactive command output
+
+Finite `devmap` commands and the Go host's installation, component, skills,
+integration, verification, and gate commands share an immediate loader, an
+80 ms animation cadence, and a completion summary. Labels describe the current
+operation; an orbit means work is active, not a fabricated percentage or ETA.
+DevMap build retains its measured five-stage trail and file counters.
+
+- `--progress auto` is the default: animate interactive stderr, with decorated
+  result details only when stdout is also a terminal.
+- `--progress always` also emits plain activity lines in redirected logs. With
+  `--json`, progress stays on stderr and stdout remains a single JSON document.
+- `--progress never` suppresses decoration and activity, retaining diagnostics.
+- `NO_COLOR=1` removes color. `TERM=dumb` uses plain output. Non-UTF-8 locales
+  use ASCII. Windows uses the plain fallback; cross-compilation is not native
+  terminal qualification.
+- `devcouncil map`, `graph`, and `ast` forward presentation flags to DevMap.
+  MCP, hook payloads, raw GraphML, and generated configuration retain their
+  protocol format. The JSON-only components never animate.
+
+Optional output has bounded queues and shutdown waits. A full or disconnected
+stderr must not block an independent primary result stream. Primary stdout
+retains normal backpressure. Errors writing a result fail the command; the
+three JSON components return exit 1 for transport failure without a panic.
+
+`devcouncil install devmap --dry-run --json` emits the planned command receipt
+without executing it. `devmap repair --fts --pending --page-size --json`
+returns one combined receipt; `--schema` remains exclusive. Raw GraphML
+(`devmap export --out -`) cannot also request `--json`.
+
+See [CLI presentation audit](CLI_PRESENTATION_AUDIT.md) for reproductions,
+verification commands, measured coverage, and platform limits.
+
 ---
 
 ## 1. Go Host Orchestrator (`devcouncil` / `dev`)
@@ -91,8 +124,8 @@ devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox loca
 ```
 
 Verifies the working-tree diff for `TASK_ID` through Go `verify.Run()`: no-work, planned-file scope, orphan diffs, dependency-risk, and expected-test / allowed-command execution. This command does **not** spawn `dcverify`. Stub, secret, and coverage rigor live in that binary; Manvi `runRigor` is the current caller. `dcverify` remains a separate CLI (`scripts/install-components.sh`).
-- `--mode`: `off` (default when unset) skips quality verification; `advisory` still blocks hard-safety gaps; `enforce` blocks every `Blocking` gap. Hard-safety write policy is unchanged.
-- `--json`: Output machine-readable verification results and typed `next_actions` for agent self-repair.
+- `--mode`: `off` (default when unset) skips quality verification and reports `status: "skipped"`, `passed: false`, and `verification_skipped: true`; `advisory` still blocks hard-safety gaps; `enforce` blocks every `Blocking` gap. Hard-safety write policy is unchanged.
+- `--json`: Output machine-readable verification results and typed `next_actions` for agent self-repair. Skipped tasks increment `completed_without_verification`, not `verified_tasks`. Completion and verification remain separate outcomes.
 - `--sandbox`: Copied onto the report. Only local execution is implemented (`/bin/sh -c` in the project root). `docker` and `nix` are accepted as labels and do **not** isolate (TASK-P7-2). Usage text still lists them; do not treat that as a working sandbox.
 
 ### DevMap Shorthands

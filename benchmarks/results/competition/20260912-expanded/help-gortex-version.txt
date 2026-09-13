@@ -1,0 +1,5 @@
+gortex v0.64.3+56a1c29
+  commit:  56a1c29
+  built:   2026-09-10T13:09:34Z
+  go:      go1.27.0
+  os/arch: darwin/arm64

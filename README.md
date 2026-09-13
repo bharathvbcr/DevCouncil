@@ -14,6 +14,10 @@
 
 DevCouncil is **components and modules** for AI-assisted software development. It ships independently installable binaries and libraries — code intelligence (`devmap`), task and lease state (`dcstore`), deterministic verification (`dcverify`), ignore-aware search (`dcgrep`), and a Go host (`devcouncil` / `dev`) — so a harness or an app can take only the pieces it needs and update them one at a time.
 
+See [repository input and verification boundaries](docs/SECURITY_BOUNDARIES.md)
+for executable selection, filesystem protections, resource limits, and the
+difference between unavailable evidence and a passing check.
+
 **Manvi wraps these components** into a coding-agent harness (turn loop, providers, policy, TUI, `manvi serve`). **GitPulse** uses Manvi for policy, workbench, and agent hosting, and DevCouncil components for code intelligence and related analysis. DevCouncil does not replace coding agents; it sits beside Claude Code, Codex, Cursor, and others as selectable modules.
 
 ---
@@ -267,6 +271,7 @@ DevCouncil/
 - [Architecture Decisions & Python Retirement](docs/PHASE7_LONG_TAIL.md): Background on the transition to native Go and Rust binaries.
 - [Archived ledgers](docs/archive/README.md): Pre-cutover DevMap plans, audits, and qualification dumps.
 - [Code Graph & DevMap Guide](docs/code-graph.md): Symbol resolution, dead code, and blast radius.
+- [DevMap competitor benchmarks](docs/devmap/README.md#benchmark-comparison): Measured strengths, weaknesses, speed, memory, storage, and correctness against Graphify, Gortex, GitNexus, CodeGraph, codebase-memory-mcp, and ripgrep, with scope limits and raw evidence.
 - [Hero Loop (MCP Closed Loop)](docs/hero-loop.md): Autonomous task loop with deterministic gates.
 - [Coding CLI Integration](docs/coding-cli-integration.md): Configuring Claude, Codex, Cursor, Warp, and Antigravity.
 - [Security Model](docs/security.md): Redaction, write isolation, and containment rules.

@@ -97,7 +97,7 @@ fn resolve_with_threads(files: &[Extraction], threads: usize) -> ResolutionResul
     pool.install(|| {
         let mut resolver = Resolver::new();
         resolver.index_extractions(files);
-        resolver.resolve_all(files)
+        resolver.resolve_all(files).unwrap()
     })
 }
 

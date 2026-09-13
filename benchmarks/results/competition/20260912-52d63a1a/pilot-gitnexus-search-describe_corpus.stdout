@@ -1,0 +1,31 @@
+{
+  "status": "found",
+  "symbol": {
+    "uid": "Function:benchmarks/map_bench.py:describe_corpus",
+    "name": "describe_corpus",
+    "kind": "Function",
+    "filePath": "benchmarks/map_bench.py",
+    "startLine": 239,
+    "endLine": 270
+  },
+  "epistemic": "exact",
+  "incoming": {
+    "calls": [
+      {
+        "uid": "Function:benchmarks/map_bench.py:main",
+        "name": "main",
+        "filePath": "benchmarks/map_bench.py"
+      }
+    ]
+  },
+  "outgoing": {
+    "calls": [
+      {
+        "uid": "Function:benchmarks/map_bench.py:run",
+        "name": "run",
+        "filePath": "benchmarks/map_bench.py"
+      }
+    ]
+  },
+  "processes": []
+}

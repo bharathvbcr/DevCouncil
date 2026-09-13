@@ -34,7 +34,7 @@ fn repo_with_matches(root: &std::path::Path, matches: usize) -> WorkspaceRepo {
     let extractions = vec![extract_file("things.py", &source)];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
 
     let repo = WorkspaceRepo {

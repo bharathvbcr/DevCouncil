@@ -95,7 +95,7 @@ fn test_x6_partial_error_range_symbol_is_exempt() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let result = resolver.resolve_all(std::slice::from_ref(&ext));
+    let result = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let reports = analyze_liveness(&[ext], &result);
     let broken = reports
         .iter()
@@ -121,7 +121,7 @@ fn symbol_scoped_exemption_reports_its_own_reason_not_the_files() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let result = resolver.resolve_all(std::slice::from_ref(&ext));
+    let result = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let reports = analyze_liveness(&[ext], &result);
 
     let init = reports
@@ -156,7 +156,7 @@ fn file_scoped_exemption_still_covers_every_symbol_in_the_file() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let result = resolver.resolve_all(std::slice::from_ref(&ext));
+    let result = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let reports = analyze_liveness(&[ext], &result);
 
     for name in ["one", "two"] {
@@ -196,7 +196,9 @@ fn test_ambiguous_calls_do_not_prove_a_candidate_live() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[first.clone(), second.clone(), caller.clone()]);
-    let resolution = resolver.resolve_all(&[first.clone(), second.clone(), caller]);
+    let resolution = resolver
+        .resolve_all(&[first.clone(), second.clone(), caller])
+        .unwrap();
     let reports = analyze_liveness(&[first, second], &resolution);
 
     assert!(reports.iter().any(|report| {
@@ -432,7 +434,7 @@ fn unresolved_call_count_reaches_the_analysis_summary() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&source));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&source));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&source)).unwrap();
     let analysis = analyze(std::slice::from_ref(&source), &resolution);
     assert_eq!(analysis.unresolved_calls, 2);
 }
@@ -452,7 +454,7 @@ fn impact_does_not_climb_containment_to_the_containing_file() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&source));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&source));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&source)).unwrap();
 
     assert!(
         resolution
@@ -497,7 +499,7 @@ fn analyze_files(files: &[(&str, &str)]) -> AnalysisSummary {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     analyze(&extractions, &resolution)
 }
 

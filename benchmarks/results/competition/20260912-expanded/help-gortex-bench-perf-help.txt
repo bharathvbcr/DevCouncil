@@ -1,0 +1,34 @@
+Runs the reference-repo perf table across gin / nestjs / react
+(+ optional linux). Validates the sub-millisecond impact-analysis
+claim as a budget gate; --strict turns gate violations into a
+non-zero exit so CI catches regressions.
+
+Default behavior:
+  - Clones each repo to ~/.gortex/cache/bench/<slug>/ on first run
+  - Reuses the clone on subsequent runs (rm -rf <slug> to refresh)
+  - Honors --out-dir (artifacts land at <dir>/perf.{md,json,csv})
+
+Examples:
+  gortex bench perf
+  gortex bench perf --include-linux --strict --out-dir bench/results
+  gortex bench perf --repos local:./my-repo --strict
+
+Usage:
+  gortex bench perf [flags]
+
+Flags:
+      --budget-impact-p95-ms float   fail when impact p95 exceeds this (0 disables) (default 1)
+      --budget-search-p95-ms float   fail when search p95 exceeds this (0 disables) (default 50)
+  -h, --help                         help for perf
+      --include-linux                include the linux kernel preset (multi-GB clone; off by default)
+      --perf-cache-dir string        override perf-bench clone cache (default $XDG_CACHE_HOME/gortex/bench)
+      --queries string               JSON query set (default "bench/perf/queries.json")
+      --repos string                 comma-separated repo set (preset slug, owner/repo, https URL, or local:/path) (default "gin,nestjs,react")
+      --strict                       exit 1 when any repo trips a budget gate
+
+Global Flags:
+      --config string      config file (default .gortex.yaml)
+      --format string      output format: markdown or json (default "markdown")
+      --log-level string   log level: debug|info|warn|error (default "info")
+      --no-progress        disable animated progress output (also honored: NO_COLOR, TERM=dumb, CI, non-TTY stderr)
+      --out-dir string     directory for per-run artifacts (default: stdout only)

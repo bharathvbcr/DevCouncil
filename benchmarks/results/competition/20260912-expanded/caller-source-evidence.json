@@ -1,0 +1,32 @@
+[
+  {
+    "file": "rust/devmap-extract/src/model.rs",
+    "start_line": 1626,
+    "end_line": 1658,
+    "source": "            db_size_gate_steady_bytes(10_000),\n            3_604_480_000,\n            \"steady-state budget doubles the per-generation one\"\n        );\n        assert_eq!(DB_SIZE_GATE_FLOOR, 62_914_560, \"60 MiB floor\");\n        // The floor covers repositories up to 349 files at 176 KiB/file; past\n        // that the per-file budget takes over (was 384 files at 160 KiB).\n        assert_eq!(\n            db_size_gate_bytes(100),\n            DB_SIZE_GATE_FLOOR,\n            \"floor dominates small repos\"\n        );\n        assert_eq!(\n            db_size_gate_bytes(349),\n            DB_SIZE_GATE_FLOOR,\n            \"the crossover stays on the floor\"\n        );\n        assert_eq!(\n            db_size_gate_bytes(350),\n            63_078_400,\n            \"one file past the crossover scales\"\n        );\n        assert_eq!(\n            db_size_gate_bytes(10_000),\n            1_802_240_000,\n            \"per-file dominates large repos\"\n        );\n    }\n\n    /// `binding_pairs` reverses each `(imported, local)` into `(local, imported)`\n    /// and drops nothing.\n    ///\n    /// The whole body was replaceable with `vec![]` and with a single blank"
+  },
+  {
+    "file": "rust/devmap-cli/tests/test_scholarlm_findings.rs",
+    "start_line": 773,
+    "end_line": 794,
+    "source": "#[test]\nfn db_size_gate_scales_with_file_count_and_keeps_a_floor() {\n    // Derived from the constant, not a repeated literal: the two drifted once\n    // already (SC15), and a test that restates the number cannot notice.\n    let floor = devmap_extract::model::DB_SIZE_GATE_FLOOR;\n    let per_file = devmap_extract::model::DB_SIZE_GATE_PER_FILE;\n    let floor_files = floor / per_file;\n\n    assert_eq!(db_size_gate_bytes(0), floor, \"an empty repo gets the floor\");\n    assert_eq!(\n        db_size_gate_bytes(floor_files),\n        floor,\n        \"at the crossover the floor still wins\"\n    );\n    assert_eq!(\n        db_size_gate_bytes(floor_files + 1),\n        (floor_files + 1) * per_file,\n        \"past the crossover the budget scales per file\"\n    );\n    assert!(db_size_gate_bytes(15_000) > floor);\n    // Saturating: a pathological count must not wrap to a tiny budget.\n    assert!(db_size_gate_bytes(u64::MAX) >= floor);"
+  },
+  {
+    "file": "backend/go_orchestrator/repomap/repomap.go",
+    "start_line": 323,
+    "end_line": 334,
+    "source": "// answers \"unknown area\" to every question, which the policy layer records as a\n// degradation \u2014 correct but useless \u2014 whereas an error at load time tells the\n// caller to build the index. The distinction is the difference between a gate\n// that knows it is blind and one that reports blindness on every decision.\nfunc Load(graphPath string) (*Map, error) { return loadBounded(graphPath, MaxGraphBytes) }\n\n// loadBounded is Load with the bound as an argument, so a test can drive the\n// refusal without producing a quarter of a gigabyte to reach it.\nfunc loadBounded(graphPath string, max int64) (*Map, error) {\n\tfile, err := os.Open(graphPath)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"repomap: reading %s: %w\", graphPath, err)"
+  },
+  {
+    "file": "backend/go_orchestrator/repomap/compact_test.go",
+    "start_line": 544,
+    "end_line": 553,
+    "source": "func TestAnInternedGraphIsHeldToTheSameBound(t *testing.T) {\n\tbody := internTables(t, compactFixture(t))\n\tp := writeRawGraph(t, \"code_graph.compact.json\", body)\n\tif _, err := loadBounded(p, int64(len(body))); err != nil {\n\t\tt.Fatalf(\"a document exactly at the bound must load: %v\", err)\n\t}\n\t_, err := loadBounded(p, int64(len(body))-1)\n\tif err == nil {\n\t\tt.Fatal(\"a document past the bound must be refused before it is decoded\")\n\t}"
+  },
+  {
+    "file": "benchmarks/map_bench.py",
+    "start_line": 1045,
+    "end_line": 1091,
+    "source": "\n    if args.repeat < 3:\n        # Three is the floor for reporting a spread at all. A one-run benchmark\n        # is not a measurement, and this file's own header says so.\n        print(\"error: --repeat must be >= 3; a single run is not a measurement\", file=sys.stderr)\n        return 2\n    if args.growth_rounds < 2:\n        print(\"error: --growth-rounds must be >= 2 to describe a curve\", file=sys.stderr)\n        return 2\n\n    synthetic_dir: Optional[tempfile.TemporaryDirectory] = None\n    if args.synthetic:\n        synthetic_dir = tempfile.TemporaryDirectory(prefix=\"devmap-synth-\")\n        repo = Path(synthetic_dir.name)\n        try:\n            generate_synthetic(repo, args.synthetic)\n        except BenchError as exc:\n            print(f\"error: {exc}\", file=sys.stderr)\n            return 2\n        print(\n            f\"generated a synthetic corpus of {args.synthetic} modules in {repo}\",\n            file=sys.stderr,\n        )\n    else:\n        repo = args.repo.expanduser().resolve()\n        if not repo.is_dir():\n            print(f\"error: no such repo: {repo}\", file=sys.stderr)\n            return 2\n\n    requested = [s.strip() for s in args.stages.split(\",\") if s.strip()]\n    unknown = [s for s in requested if s not in ALL_STAGES]\n    if unknown:\n        print(f\"error: unknown stage(s): {', '.join(unknown)}\", file=sys.stderr)\n        return 2\n\n    try:\n        binary = args.binary or find_devmap()\n    except BenchError as exc:\n        print(f\"error: {exc}\", file=sys.stderr)\n        return 1\n\n    corpus = describe_corpus(repo)\n    print(\n        f\"benchmarking {repo} \u2014 {corpus['tracked_files']} tracked / \"\n        f\"{corpus['code_files']} code files, {args.repeat} repeat(s)\",\n        file=sys.stderr,\n    )"
+  }
+]

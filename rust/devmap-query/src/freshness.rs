@@ -340,19 +340,24 @@ fn keep_indexable(
     root: &Path,
     caches: &mut devmap_extract::CacheDirectoryCache,
     paths: Vec<String>,
-) -> Vec<String> {
-    paths
+) -> Result<Vec<String>, String> {
+    let mut kept = Vec::new();
+    for path in paths {
+        if is_runtime_or_generated_file(&path) {
+            continue;
+        }
+        match caches.tagged_ancestor(root, &path) {
+            devmap_extract::CacheVerdict::Unreadable { directory, reason } => {
+                return Err(format!("cannot examine {directory}/CACHEDIR.TAG: {reason}"))
+            }
+            devmap_extract::CacheVerdict::Outside => {}
+            _ => continue,
+        }
+        kept.push(path);
+    }
+    Ok(kept
         .into_iter()
         .filter(|path| {
-            if is_runtime_or_generated_file(path) {
-                return false;
-            }
-            if !matches!(
-                caches.tagged_ancestor(root, path),
-                devmap_extract::CacheVerdict::Outside
-            ) {
-                return false;
-            }
             // A tracked symlink whose target resolves outside the repository is
             // the second shape of the disagreement this function exists to
             // close. `git ls-files` lists it — it is an ordinary mode-120000
@@ -378,7 +383,7 @@ fn keep_indexable(
             // bulk of a tree whose build output is not ignored.
             root.join(path).is_file()
         })
-        .collect()
+        .collect())
 }
 
 /// `RepoMapper.get_git_files`, git path only.
@@ -396,8 +401,8 @@ pub fn inventory_with_program(program: &OsStr, root: &Path, limits: InventoryLim
     let mut caches = devmap_extract::CacheDirectoryCache::default();
     let mut keep = |paths: Vec<String>| keep_indexable(root, &mut caches, paths);
 
-    let tracked = match ls_files(program, root, &["--cached"]) {
-        Ok(paths) => keep(paths),
+    let tracked = match ls_files(program, root, &["--cached"]).and_then(&mut keep) {
+        Ok(paths) => paths,
         Err(reason) => {
             return Inventory {
                 files: Vec::new(),
@@ -407,11 +412,11 @@ pub fn inventory_with_program(program: &OsStr, root: &Path, limits: InventoryLim
         }
     };
     let untracked = if limits.include_untracked {
-        match ls_files(program, root, &["--others", "--exclude-standard"]) {
+        match ls_files(program, root, &["--others", "--exclude-standard"]).and_then(&mut keep) {
             Ok(paths) => {
                 let tracked_set: std::collections::HashSet<&str> =
                     tracked.iter().map(String::as_str).collect();
-                keep(paths)
+                paths
                     .into_iter()
                     .filter(|path| !tracked_set.contains(path.as_str()))
                     .collect()

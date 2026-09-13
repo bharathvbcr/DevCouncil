@@ -1,0 +1,83 @@
+[
+  {
+    "tool": "devmap",
+    "symbol": "devmap_competition_revision_1",
+    "stale_symbol_found": false,
+    "exit_code": 0,
+    "argv": [
+      "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/devmap",
+      "--db",
+      "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/cold-3.sqlite",
+      "--json",
+      "search",
+      "devmap_competition_revision_1"
+    ]
+  },
+  {
+    "tool": "devmap",
+    "symbol": "devmap_competition_revision_2",
+    "stale_symbol_found": false,
+    "exit_code": 0,
+    "argv": [
+      "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/devmap",
+      "--db",
+      "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/cold-3.sqlite",
+      "--json",
+      "search",
+      "devmap_competition_revision_2"
+    ]
+  },
+  {
+    "tool": "devmap",
+    "symbol": "devmap_competition_revision_3",
+    "stale_symbol_found": false,
+    "exit_code": 0,
+    "argv": [
+      "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/devmap",
+      "--db",
+      "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/cold-3.sqlite",
+      "--json",
+      "search",
+      "devmap_competition_revision_3"
+    ]
+  },
+  {
+    "tool": "gitnexus",
+    "symbol": "devmap_competition_revision_1",
+    "stale_symbol_found": false,
+    "exit_code": 0,
+    "argv": [
+      "gitnexus",
+      "context",
+      "devmap_competition_revision_1",
+      "-r",
+      "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/gitnexus-corpus"
+    ]
+  },
+  {
+    "tool": "gitnexus",
+    "symbol": "devmap_competition_revision_2",
+    "stale_symbol_found": false,
+    "exit_code": 0,
+    "argv": [
+      "gitnexus",
+      "context",
+      "devmap_competition_revision_2",
+      "-r",
+      "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/gitnexus-corpus"
+    ]
+  },
+  {
+    "tool": "gitnexus",
+    "symbol": "devmap_competition_revision_3",
+    "stale_symbol_found": true,
+    "exit_code": 0,
+    "argv": [
+      "gitnexus",
+      "context",
+      "devmap_competition_revision_3",
+      "-r",
+      "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/gitnexus-corpus"
+    ]
+  }
+]

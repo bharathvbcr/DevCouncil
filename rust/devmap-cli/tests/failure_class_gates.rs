@@ -322,7 +322,7 @@ mod class_a_status_is_computed_not_asserted {
         ];
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
 
         let summary = analyze(&extractions, &resolution);
         assert!(
@@ -346,7 +346,7 @@ mod class_a_status_is_computed_not_asserted {
         ];
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
 
         let detection = detect_communities(&extractions, &resolution);
         assert!(
@@ -376,7 +376,7 @@ mod class_a_status_is_computed_not_asserted {
     #[test]
     fn nothing_to_analyze_is_not_a_degraded_analysis() {
         let extractions: Vec<devmap_extract::Extraction> = Vec::new();
-        let resolution = Resolver::new().resolve_all(&extractions);
+        let resolution = Resolver::new().resolve_all(&extractions).unwrap();
         let detection = detect_communities(&extractions, &resolution);
 
         assert!(detection.communities.is_empty());

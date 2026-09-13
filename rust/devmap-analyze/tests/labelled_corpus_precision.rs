@@ -118,7 +118,7 @@ fn extract_fixture(source: &Path) -> Vec<Extraction> {
 fn kernel_verdicts(extractions: &[Extraction]) -> BTreeMap<String, f32> {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    let resolution = resolver.resolve_all(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
     let analysis = analyze(extractions, &resolution);
 
     let mut claimed = BTreeMap::new();

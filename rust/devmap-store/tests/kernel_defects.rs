@@ -232,7 +232,7 @@ fn k5_build_history_parse_failed_excludes_grammarless_prose() {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = analyze(&extractions, &resolution);
 
     let store = Store::open_in_memory().unwrap();
@@ -444,7 +444,7 @@ fn k1_reconcile_keeps_deletions_the_drain_still_has_to_process() {
     fs::write(root.join("kept.py"), "def kept(): pass\n").unwrap();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = analyze(&extractions, &resolution);
     store
         .save_generation(&extractions, &resolution, &analysis)
@@ -1035,12 +1035,12 @@ fn k7_a_cachedir_tag_without_the_signature_is_not_a_cache_directory() {
     let bare = dir.join("bare");
     fs::create_dir_all(&bare).unwrap();
 
-    assert!(devmap_extract::is_cache_directory(&tagged));
-    assert!(!devmap_extract::is_cache_directory(&impostor));
+    assert!(devmap_extract::is_cache_directory(&tagged).unwrap());
+    assert!(!devmap_extract::is_cache_directory(&impostor).unwrap());
     assert!(
-        !devmap_extract::is_cache_directory(&short),
+        !devmap_extract::is_cache_directory(&short).unwrap(),
         "a file shorter than the signature cannot carry it"
     );
-    assert!(!devmap_extract::is_cache_directory(&bare));
+    assert!(!devmap_extract::is_cache_directory(&bare).unwrap());
     let _ = fs::remove_dir_all(&dir);
 }

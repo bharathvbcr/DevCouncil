@@ -1699,65 +1699,67 @@ pub(crate) fn enclosing_callable_qualified(
     source: &str,
     file_symbol_name: &str,
 ) -> Option<String> {
+    let mut scope_node = node;
     let mut ancestor = bounded_parent(node);
+    let mut names = Vec::new();
+    let mut base = None;
+    let mut since_check = 0;
     while let Some(parent) = ancestor {
+        since_check += 1;
+        if walk_overran() || (since_check >= PARENT_CHECK_STRIDE && walk_deadline_passed()) {
+            return None;
+        }
+        if since_check >= PARENT_CHECK_STRIDE {
+            since_check = 0;
+        }
         // Python defaults are evaluated by the enclosing scope, before the
         // function's parameters exist. Calls in the body keep the callable.
         if parent.kind() == "function_definition"
-            && node.kind() == "call"
+            && scope_node.kind() == "call"
             && parent.child_by_field_name("name").is_some()
-            && field_contains(parent, "parameters", node)
+            && field_contains(parent, "parameters", scope_node)
         {
             ancestor = bounded_parent(parent);
             continue;
         }
-        // The C family derives its name and its owner together: no C-family
-        // declaration has a `name` field for `callable_binding_name` to read,
-        // and an out-of-line definition names its owner inside its own
-        // declarator rather than through any ancestor. Both come from the same
-        // helper the symbol emitter uses, so the scope string and the node
-        // identity cannot drift apart — which is precisely how they drifted
-        // before: `callable_binding_name` returned `None` for every C-family
-        // function, so every reference and every call made inside one was
-        // attributed to the *file*. On the measurement corpus all 117 C-family
-        // `References` edges had the file as their source.
+        // Use the symbol emitter's owner/name pair for C-family out-of-line
+        // definitions; their owner is not necessarily an ancestor node.
         if is_c_family_callable(parent) {
             if let Some((owner, name)) = c_callable_identity(parent, source) {
-                return Some(match owner {
+                base = Some(match owner {
                     Some(type_name) => format!("{file_symbol_name}::{type_name}.{name}"),
                     None => format!("{file_symbol_name}::{name}"),
                 });
+                break;
             }
         }
         if let Some(name) = callable_binding_name(parent, source) {
-            // A Go method is owned by its receiver type, which is a field of
-            // the `method_declaration` itself rather than an enclosing node, so
-            // the ancestor walk in `enclosing_type_name` cannot find it.
-            //
-            // Without this, every method in a file reported the bare
-            // `file::name`, so `func (a *A) Read()` and `func (b *B) Read()`
-            // were indistinguishable as scopes — which is what let two types'
-            // receiver bindings collide (SC9). It also left Go method call
-            // edges naming a source symbol (`file::Read`) that matches no
-            // node's qualified name (`file::A.Read`), making those edges
-            // unjoinable to the node they come from.
+            // Go receivers live on the declaration itself. Other method
+            // owners are found through the same type lookup used by symbols.
             let owner = (parent.kind() == "method_declaration")
                 .then(|| go_receiver(parent, source).map(|(_, type_name)| type_name))
                 .flatten()
                 .or_else(|| enclosing_type_name(parent, source));
-            // Must produce exactly the identity the symbol itself carries, or
-            // every call made inside a nested function names a source no node
-            // has — the same unjoinable-edge failure as SC9/SC10. `parent` is
-            // the callable we just matched, so recursing from it walks the rest
-            // of the enclosing scope chain.
-            return Some(match owner {
-                Some(type_name) => format!("{file_symbol_name}::{type_name}.{name}"),
-                None => scoped_qualified_name(parent, source, file_symbol_name, &name),
-            });
+            if let Some(type_name) = owner {
+                base = Some(format!("{file_symbol_name}::{type_name}.{name}"));
+                break;
+            }
+            names.push(name);
+            // This is the starting node the former recursive scope lookup
+            // would receive, including its Python-default evaluation rules.
+            scope_node = parent;
         }
         ancestor = bounded_parent(parent);
     }
-    None
+    let mut qualified = match base {
+        Some(base) => base,
+        None => format!("{file_symbol_name}::{}", names.pop()?),
+    };
+    for name in names.iter().rev() {
+        qualified.push('.');
+        qualified.push_str(name);
+    }
+    Some(qualified)
 }
 
 /// Whether `node` is a C-family callable.
@@ -6641,7 +6643,7 @@ fn extraction_overran(deadline: std::time::Instant) -> bool {
 }
 
 /// Deadline check for a helper running inside the walk. Latches the flag.
-fn walk_deadline_passed() -> bool {
+pub(crate) fn walk_deadline_passed() -> bool {
     match WALK_DEADLINE.with(|slot| slot.get()) {
         Some(deadline) if std::time::Instant::now() >= deadline => {
             WALK_OVERRAN.with(|slot| slot.set(true));

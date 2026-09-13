@@ -71,7 +71,7 @@ fn graph() -> serde_json::Value {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = AnalysisSummary {
         total_files: extractions.len(),
         total_symbols: 8,
@@ -225,7 +225,7 @@ fn a_capped_god_node_list_says_it_was_capped() {
     }
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = AnalysisSummary {
         total_files: extractions.len(),
         total_symbols: 80,

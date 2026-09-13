@@ -65,13 +65,14 @@ pub fn run(
         .unwrap_or("session")
         .to_string();
     let dir = session_log::sessions_dir(db);
-    fs::create_dir_all(&dir)?;
     let json_path = dir.join(format!("{stamp}.json"));
     let md_path = dir.join(format!("{stamp}.md"));
     let rendered = serde_json::to_vec_pretty(&report)?;
-    fs::write(&json_path, rendered)?;
-    fs::write(&md_path, render_markdown(&report))?;
-    session_log::rotate_live(db, &stamp);
+    devmap_extract::safe_fs::preflight_write(&json_path)?;
+    devmap_extract::safe_fs::preflight_write(&md_path)?;
+    devmap_query::write_atomic(&json_path, &rendered)?;
+    devmap_query::write_atomic(&md_path, render_markdown(&report).as_bytes())?;
+    session_log::rotate_live(db, &stamp)?;
     if json_out {
         return Ok(report);
     }
@@ -102,39 +103,44 @@ fn print_last(db: &Path, json_out: bool) -> anyhow::Result<Value> {
 }
 
 fn newest_report(db: &Path) -> anyhow::Result<Option<Value>> {
+    use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
     let dir = session_log::sessions_dir(db);
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Ok(None);
+    let directory = match PinnedDir::open(&dir, false) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
-    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    for entry in entries.filter_map(Result::ok) {
+    let mut newest = None;
+    for (index, entry) in fs::read_dir(&dir)?.enumerate() {
+        anyhow::ensure!(
+            index < 4096,
+            "session report inventory exceeds 4096 entries"
+        );
+        let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        if path.extension().and_then(|e| e.to_str()) != Some("json")
+            || path.file_name().and_then(|n| n.to_str()) == Some("gaps.json")
+        {
             continue;
         }
-        if path.file_name().and_then(|n| n.to_str()) == Some("gaps.json") {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        let Ok(modified) = meta.modified() else {
-            continue;
-        };
-        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
-            newest = Some((modified, path));
+        let file = directory.open_file(&entry.file_name(), Access::Read, Creation::Never)?;
+        let modified = file.metadata()?.modified()?;
+        if newest.as_ref().is_none_or(|(time, _)| modified > *time) {
+            newest = Some((modified, entry.file_name()));
         }
     }
-    let Some((_, path)) = newest else {
+    let Some((_, name)) = newest else {
         return Ok(None);
     };
-    let text = fs::read_to_string(&path)?;
+    let text = directory
+        .open_file(&name, Access::Read, Creation::Never)?
+        .read_text(session_log::MAX_SESSION_BYTES)?;
     Ok(Some(serde_json::from_str(&text)?))
 }
 
 fn build_report(db: &Path, session_id: Option<&str>) -> anyhow::Result<Value> {
-    let queries = session_log::read_live(db);
-    let gaps = read_gaps(db);
+    let queries = session_log::read_live(db)?;
+    let gaps = read_gaps(db)?;
     let stamp = stamp_now();
     let mut truncated = 0u64;
     let mut walk_incomplete = 0u64;
@@ -215,13 +221,17 @@ fn notable_queries(queries: &[Map<String, Value>]) -> Vec<Value> {
         .collect()
 }
 
-fn read_gaps(db: &Path) -> Vec<Value> {
-    let Ok(text) = fs::read_to_string(gaps_path(db)) else {
-        return Vec::new();
+fn read_gaps(db: &Path) -> anyhow::Result<Vec<Value>> {
+    use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+    let mut file = match SafeFile::open(&gaps_path(db), Access::Read, Creation::Never) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
     };
-    text.lines()
+    file.read_text(session_log::MAX_SESSION_BYTES)?
+        .lines()
         .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str(line).ok())
+        .map(|line| serde_json::from_str(line).map_err(Into::into))
         .collect()
 }
 
@@ -362,6 +372,32 @@ fn render_markdown(report: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    #[cfg(unix)]
+    fn linked_session_reports_and_gaps_are_refused() {
+        for case in ["report", "gaps"] {
+            let root = std::env::temp_dir()
+                .join(format!("devmap-session-read-{case}-{}", std::process::id()));
+            fs::create_dir_all(root.join("sessions")).unwrap();
+            let victim = root.join("outside");
+            fs::write(&victim, "{\"private\":\"outside sentinel\"}\n").unwrap();
+            let leaf = if case == "report" {
+                "report.json"
+            } else {
+                "gaps.jsonl"
+            };
+            std::os::unix::fs::symlink(&victim, root.join("sessions").join(leaf)).unwrap();
+            let db = root.join("store.sqlite");
+            let refused = if case == "report" {
+                newest_report(&db).is_err()
+            } else {
+                build_report(&db, None).is_err()
+            };
+            fs::remove_dir_all(root).unwrap();
+            assert!(refused, "linked {case} source was accepted");
+        }
+    }
 
     #[test]
     fn brief_names_counts() {

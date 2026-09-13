@@ -15,7 +15,7 @@ use devmap_resolve::Resolver;
 fn rate_of(extractions: &[Extraction]) -> ResolutionRate {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    let resolution = resolver.resolve_all(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
     resolution_rate(extractions, &resolution)
 }
 
@@ -110,7 +110,7 @@ fn an_ambiguous_fanout_counts_once() {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     let ambiguous_edges = resolution
         .edges
@@ -179,7 +179,7 @@ fn net_excludes_explained_misses_and_gross_does_not() {
     )];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let rate = resolution_rate(&extractions, &resolution);
 
     assert!(
@@ -206,7 +206,7 @@ fn local_bindings_are_not_excluded_from_the_net_denominator() {
     let extractions = vec![extract_file("lib.py", "def f():\n    return 1\n")];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let mut resolution = resolver.resolve_all(&extractions);
+    let mut resolution = resolver.resolve_all(&extractions).unwrap();
     resolution.unresolved = vec![UnresolvedReference {
         source_file: "lib.py".to_string(),
         source_symbol: "lib.py::f".to_string(),

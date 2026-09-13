@@ -15,16 +15,29 @@ use std::process::ExitCode;
 
 use dc_grep::{IDENTITY, IndexRequest, ListRequest, Request, SCHEMA_VERSION};
 
+// A disconnected consumer is a transport failure, not a Rust panic. Keep
+// diagnostics off this JSON protocol, including the error response path.
+macro_rules! respond {
+    ($($argument:tt)*) => {{
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        if out.write_fmt(format_args!("{}\n", format_args!($($argument)*)))
+            .and_then(|()| out.flush()).is_err() {
+            return ExitCode::FAILURE;
+        }
+    }};
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(json) => {
-            println!("{json}");
+            respond!("{json}");
             ExitCode::SUCCESS
         }
         Err(message) => {
             // Hand-rolled rather than serialised, because this is the path
             // taken when serialisation itself is what failed.
-            println!(
+            respond!(
                 "{{\"ok\":false,\"error\":{}}}",
                 serde_json::to_string(&message)
                     .unwrap_or_else(|_| "\"error message was not renderable\"".to_string())

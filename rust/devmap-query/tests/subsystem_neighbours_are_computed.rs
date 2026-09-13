@@ -43,7 +43,7 @@ fn manifest() -> serde_json::Value {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     let communities = ["alpha/core.py", "beta/app.py", "gamma/lonely.py"]
         .iter()
@@ -187,7 +187,7 @@ fn no_neighbour_is_a_synthetic_node_the_consumer_can_never_match() {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     let communities = ["gopkg/lib/lib.go", "gopkg/app/app.go"]
         .iter()

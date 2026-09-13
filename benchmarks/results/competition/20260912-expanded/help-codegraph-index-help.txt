@@ -1,0 +1,10 @@
+Usage: codegraph index [options] [path]
+
+Rebuild the full index from scratch (same result as a fresh init)
+
+Options:
+  -f, --force    Index even if the path looks like your home directory or a
+                 filesystem root
+  -q, --quiet    Suppress progress output
+  -v, --verbose  Show detailed worker lifecycle and memory info
+  -h, --help     display help for command

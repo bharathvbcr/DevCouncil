@@ -286,6 +286,13 @@ fn classify_pending_entry(
         devmap_extract::CacheVerdict::NotRepoRelative(why) => {
             return Err(format!("{why}, so it names nothing inside the repository"));
         }
+        devmap_extract::CacheVerdict::Unreadable { .. } => {
+            // This classifier only deletes definitively unprocessable work.
+            // Keep an unexamined path pending, just as for an undecidable
+            // source stat below. Admission and extraction still refuse the
+            // unsafe marker; retaining the row cannot authorize a read.
+            return Ok(());
+        }
         devmap_extract::CacheVerdict::Outside => {}
     }
     let absolute = root.join(canonical);
@@ -743,7 +750,7 @@ struct CachedSourceFreshness {
 /// cross-process lock to exclude.
 #[derive(Debug)]
 pub struct WriterLock {
-    file: Option<std::fs::File>,
+    file: Option<devmap_extract::safe_fs::SafeFile>,
     path: Option<std::path::PathBuf>,
 }
 
@@ -2927,64 +2934,20 @@ impl Store {
             metadata.nlink()
         };
         #[cfg(windows)]
-        let links = u64::from(Self::windows_hard_link_count(path).map_err(|error| {
+        let links = devmap_extract::safe_fs::file_link_count(
+            &std::fs::File::open(path).map_err(|error| refusal(error.to_string()))?,
+        )
+        .map_err(|error| {
             refusal(format!(
                 "cannot inspect database hard links at {}: {error}",
                 path.display()
             ))
-        })?);
+        })?;
         #[cfg(any(unix, windows))]
         if links > 1 {
             return Err(refusal(format!("database {} has multiple hard links; use an independent store or SQLite backup so WAL and writer ownership cannot diverge", path.display())));
         }
         Ok(())
-    }
-
-    /// Stable Rust does not expose MetadataExt::number_of_links on Windows.
-    /// Query the documented Win32 file-information ABI through a live handle;
-    /// zero/failed metadata is unknown, never evidence of a single owner.
-    #[cfg(windows)]
-    fn windows_hard_link_count(path: &Path) -> std::io::Result<u32> {
-        use std::os::windows::io::AsRawHandle;
-
-        // BY_HANDLE_FILE_INFORMATION: DWORD fields and three FILETIME pairs.
-        // FILETIME is two DWORDs, with four-byte alignment on both Win32/Win64.
-        #[repr(C)]
-        struct FileInformation {
-            _attributes: u32,
-            _created: [u32; 2],
-            _accessed: [u32; 2],
-            _written: [u32; 2],
-            _volume: u32,
-            _size_high: u32,
-            _size_low: u32,
-            links: u32,
-            _index_high: u32,
-            _index_low: u32,
-        }
-        const _: [(); 52] = [(); std::mem::size_of::<FileInformation>()];
-        #[link(name = "kernel32")]
-        extern "system" {
-            #[link_name = "GetFileInformationByHandle"]
-            fn file_information(
-                handle: *mut std::ffi::c_void,
-                information: *mut FileInformation,
-            ) -> i32;
-        }
-
-        let file = std::fs::File::open(path)?;
-        let mut information = std::mem::MaybeUninit::<FileInformation>::uninit();
-        // SAFETY: File owns the handle for the whole call; the output pointer
-        // names writable, correctly aligned storage for the documented ABI.
-        if unsafe { file_information(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: success initializes every field of BY_HANDLE_FILE_INFORMATION.
-        let links = unsafe { information.assume_init() }.links;
-        if links == 0 {
-            return Err(std::io::Error::other("file link count was unavailable"));
-        }
-        Ok(links)
     }
 
     /// Open an existing, current-schema store for an embedding reader.
@@ -2994,7 +2957,9 @@ impl Store {
     /// even when the application has write access to the file. A writer must
     /// upgrade an older store explicitly before an advisory reader can use it.
     pub fn open_read_only<P: AsRef<Path>>(db_path: P) -> Result<Self> {
-        let path = db_path.as_ref();
+        let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path.as_ref())
+            .map_err(|error| refusal(error.to_string()))?;
+        let path = resolved.as_path();
         Self::validate_database_file(path)?;
         let metadata = std::fs::metadata(path).map_err(|error| {
             refusal(format!(
@@ -3008,6 +2973,7 @@ impl Store {
                 path.display()
             )));
         }
+        let _sidecars = Self::checked_sidecars(path)?;
         let mut conn = Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -3042,13 +3008,15 @@ impl Store {
     }
 
     pub fn open<P: AsRef<Path>>(db_path: P) -> Result<Self> {
-        let path = db_path.as_ref();
+        let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path.as_ref())
+            .map_err(|error| refusal(error.to_string()))?;
+        let path = resolved.as_path();
         Self::validate_database_file(path)?;
         // Before the connection exists: SQLite maps the `-shm` sidecar as it
         // opens a WAL database, with whatever mode the sidecar has, so a
         // repair after `Connection::open` is a repair the connection never
         // sees. See `repair_sidecar_modes`.
-        Self::repair_sidecar_modes(path);
+        Self::repair_sidecar_modes(path)?;
         let mut conn = Connection::open(path)?;
         let store = path.display().to_string();
 
@@ -3171,39 +3139,132 @@ impl Store {
     /// kernel's to keep consistent. Best-effort and owner-only: a sidecar
     /// another user owns is left for that user, and the write that follows
     /// reports it.
-    #[cfg(unix)]
-    fn repair_sidecar_modes(db_path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        const OWNER_WRITE: u32 = 0o200;
-        let Ok(own) = std::fs::metadata(db_path) else {
-            return;
-        };
-        // Runs before the connection exists, so "writable" is the store's own
-        // owner-write bit: a store without it is read-only and its sidecars
-        // are left exactly as SQLite made them.
-        if own.permissions().mode() & OWNER_WRITE == 0 {
-            return;
-        }
-        let target = own.permissions().mode() | OWNER_WRITE;
-        let name = db_path.as_os_str().to_os_string();
+    fn checked_sidecars(db_path: &Path) -> Result<Vec<devmap_extract::safe_fs::SafeFile>> {
+        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+        // Validate both siblings before SQLite or permission repair touches
+        // either. A missing sibling is normal; an unsafe one is a refusal.
+        let mut sidecars = Vec::new();
         for suffix in ["-wal", "-shm"] {
-            let mut sidecar = name.clone();
-            sidecar.push(suffix);
-            let sidecar = std::path::PathBuf::from(sidecar);
-            let Ok(meta) = std::fs::metadata(&sidecar) else {
-                continue;
-            };
-            let mode = meta.permissions().mode();
-            if mode & OWNER_WRITE == 0 {
-                let mut permissions = meta.permissions();
-                permissions.set_mode(target & 0o7777 | (mode & 0o7777));
-                let _ = std::fs::set_permissions(&sidecar, permissions);
+            let mut name = db_path.as_os_str().to_os_string();
+            name.push(suffix);
+            let path = std::path::PathBuf::from(name);
+            match SafeFile::open(&path, Access::Read, Creation::Never) {
+                Ok(file) => {
+                    if devmap_extract::safe_fs::file_link_count(&file)
+                        .map_err(|error| refusal(error.to_string()))?
+                        != 1
+                    {
+                        return Err(refusal(format!(
+                            "sidecar {} has multiple hard links",
+                            path.display()
+                        )));
+                    }
+                    sidecars.push(file);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(refusal(format!(
+                        "cannot safely inspect sidecar {}: {error}",
+                        path.display()
+                    )))
+                }
             }
         }
+        Ok(sidecars)
     }
 
-    #[cfg(not(unix))]
-    fn repair_sidecar_modes(_db_path: &Path) {}
+    fn repair_sidecar_modes(db_path: &Path) -> Result<()> {
+        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+        let sidecars = Self::checked_sidecars(db_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            const OWNER_WRITE: u32 = 0o200;
+            let database = match SafeFile::open(db_path, Access::Read, Creation::Never) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(refusal(error.to_string())),
+            };
+            let own = database
+                .metadata()
+                .map_err(|error| refusal(error.to_string()))?;
+            // Only our own writable database authorizes repairing our sidecars.
+            if own.mode() & OWNER_WRITE == 0
+                || !database
+                    .is_owned_by_current_user()
+                    .map_err(|error| refusal(error.to_string()))?
+            {
+                return Ok(());
+            }
+            let mut repairs = Vec::new();
+            for file in sidecars {
+                let metadata = file
+                    .metadata()
+                    .map_err(|error| refusal(error.to_string()))?;
+                if metadata.uid() == own.uid() && metadata.mode() & OWNER_WRITE == 0 {
+                    repairs.push((file, metadata.permissions()));
+                }
+            }
+            if repairs.is_empty() {
+                return Ok(());
+            }
+            // An immutable read cannot modify the database or its sidecars.
+            // Reject unrelated/unsupported databases before any fchmod. The
+            // ordinary open rechecks the live WAL view before migrating.
+            let probe = Self::open_immutable(db_path)?;
+            let stamped: i32 = probe.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if !Self::schema_is_migratable(stamped) {
+                return Err(Self::unsupported_schema(
+                    &db_path.display().to_string(),
+                    stamped,
+                ));
+            }
+            if stamped == CURRENT_SCHEMA_VERSION {
+                Self::validate_schema(&probe)?;
+            } else if stamped == 0 {
+                let objects: i64 = probe.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if objects != 0 {
+                    return Err(refusal(
+                        "cannot repair sidecar permissions for an unrecognized unstamped database",
+                    ));
+                }
+            } else {
+                // Historical stores need migration before full current-schema
+                // validation. Confirm their original identity without writes.
+                let (table, column) = if stamped == 3 {
+                    ("extraction_cache", "content_hash")
+                } else {
+                    ("generations", "analysis_json")
+                };
+                if !Self::relation_is_table(&probe, table)?
+                    || !Self::has_column(&probe, table, column)?
+                {
+                    return Err(refusal(
+                        "cannot repair sidecar permissions without a recognized DevMap schema",
+                    ));
+                }
+            }
+            drop(probe);
+            database
+                .check_unchanged()
+                .map_err(|error| refusal(error.to_string()))?;
+            for (file, mut permissions) in repairs {
+                file.require_owned()
+                    .map_err(|error| refusal(error.to_string()))?;
+                file.check_unchanged()
+                    .map_err(|error| refusal(error.to_string()))?;
+                // Restore only owner-write, never database group/other bits.
+                permissions.set_mode(permissions.mode() | OWNER_WRITE);
+                file.set_permissions(permissions)
+                    .map_err(|error| refusal(error.to_string()))?;
+            }
+        }
+        Ok(())
+    }
 
     /// The one place a write against a read-only store is refused, so the
     /// refusal is the same sentence from every writer and names the store
@@ -3292,45 +3353,36 @@ impl Store {
     ///
     /// The holder writes its pid into the file, so the timeout can say who.
     pub fn lock_writer_at(db_path: &Path, wait: std::time::Duration) -> anyhow::Result<WriterLock> {
-        use std::io::{Seek, Write};
-
-        Self::validate_database_file(db_path)?;
-        let lock_path = Self::writer_lock_path(db_path);
-        if let Some(parent) = lock_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|error| {
+        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+        let db_path = devmap_extract::safe_fs::resolve_file_alias(db_path)?;
+        Self::validate_database_file(&db_path)?;
+        let lock_path = Self::writer_lock_path(&db_path);
+        let mut file = SafeFile::open(&lock_path, Access::ReadWrite, Creation::IfMissing).map_err(
+            |error| {
                 anyhow::anyhow!(
-                    "cannot create the writer lock {}: {error}; a build needs the store's \
-                     directory to be writable, though the store can still be queried",
+                    "cannot safely open writer lock {}: {error}",
                     lock_path.display()
                 )
-            })?;
+            },
+        )?;
 
         Self::poll_writer_lock(|| file.try_lock(), wait, Self::WRITER_LOCK_POLL, &lock_path)?;
 
-        // Record ownership for the *next* waiter's diagnostic. Best-effort: a
-        // failure to write the pid does not weaken the lock, it only makes a
-        // future timeout less specific.
-        let _ = file.set_len(0);
-        let _ = file.rewind();
-        let _ = write!(file, "{}", std::process::id());
-        let _ = file.flush();
-        // Windows byte-range locks also prohibit another handle from reading
-        // the locked bytes. Keep diagnostic identity outside that locked range;
-        // the kernel lock remains the sole authority for exclusion.
+        // The prior holder may have updated its pid while this caller waited.
+        // After taking the lock, validate ownership of the actual descriptor
+        // and replace its diagnostic record without a stale content snapshot.
+        use std::io::{Seek, Write};
+        file.require_owned()?;
+        file.rewind()?;
+        file.set_len(0)?;
+        file.write_all(std::process::id().to_string().as_bytes())?;
+        file.flush()?;
+        // Windows byte-range locks prohibit diagnostic reads of the locked
+        // bytes. The separate owner file follows the same checked-write rule.
         #[cfg(windows)]
-        std::fs::write(
-            lock_path.with_extension("lock.owner"),
-            std::process::id().to_string(),
+        devmap_extract::safe_fs::write(
+            &lock_path.with_extension("lock.owner"),
+            std::process::id().to_string().as_bytes(),
         )?;
         Ok(WriterLock {
             file: Some(file),
@@ -3392,17 +3444,16 @@ impl Store {
     /// Diagnostic only: the lock is the `flock`, not the file's contents, so
     /// every failure here degrades the message rather than the exclusion.
     fn writer_lock_holder(lock_path: &Path) -> String {
-        use std::io::Read;
+        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
 
         #[cfg(windows)]
         let owner_path = lock_path.with_extension("lock.owner");
         #[cfg(not(windows))]
         let owner_path = lock_path;
-        let mut holder = String::new();
-        std::fs::File::open(owner_path)
-            .and_then(|handle| handle.take(64).read_to_string(&mut holder))
+        SafeFile::open(owner_path, Access::Read, Creation::Never)
+            .and_then(|mut handle| handle.read_text(64))
             .ok()
-            .map(|_| holder.trim().to_string())
+            .map(|holder| holder.trim().to_string())
             .filter(|pid| pid.parse::<u32>().is_ok_and(|pid| pid > 0))
             .unwrap_or_else(|| "unknown".to_string())
     }
@@ -3743,6 +3794,13 @@ impl Store {
                             report.refused.push((
                                 raw.clone(),
                                 format!("{why}, so it names nothing inside the repository"),
+                            ));
+                            continue;
+                        }
+                        devmap_extract::CacheVerdict::Unreadable { directory, reason } => {
+                            report.refused.push((
+                                raw.clone(),
+                                format!("cannot examine {directory}/CACHEDIR.TAG: {reason}"),
                             ));
                             continue;
                         }
@@ -8277,7 +8335,7 @@ mod carry_forward_tests {
     fn commit(store: &Store, exts: &[Extraction], opts: GenerationWriteOpts) -> Result<u32> {
         let mut resolver = Resolver::new();
         resolver.index_extractions(exts);
-        let resolution = resolver.resolve_all(exts);
+        let resolution = resolver.resolve_all(exts).unwrap();
         let analysis = analyze(exts, &resolution);
         store.save_generation_with_opts(exts, &resolution, &analysis, opts)
     }

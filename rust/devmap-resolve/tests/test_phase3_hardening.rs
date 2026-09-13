@@ -11,7 +11,7 @@ fn test_g5_no_multicandidate_extracted() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[ext1.clone(), ext2.clone(), caller.clone()]);
-    let res = resolver.resolve_all(&[ext1, ext2, caller]);
+    let res = resolver.resolve_all(&[ext1, ext2, caller]).unwrap();
 
     let edge = res
         .edges
@@ -39,7 +39,9 @@ fn test_g3_stdlib_guard_python_only() {
         js_file.clone(),
         js_candidate.clone(),
     ]);
-    let res = resolver.resolve_all(&[py_file, py_candidate, js_file, js_candidate]);
+    let res = resolver
+        .resolve_all(&[py_file, py_candidate, js_file, js_candidate])
+        .unwrap();
 
     assert!(!res.edges.iter().any(|edge| {
         edge.edge_kind == EdgeKind::Calls
@@ -60,7 +62,7 @@ fn test_g6_import_scoped_no_silent_widening() {
     let ext_b = extract_file("b.py", "def foo(): pass\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[ext_a.clone(), ext_b.clone()]);
-    let res = resolver.resolve_all(&[ext_a, ext_b]);
+    let res = resolver.resolve_all(&[ext_a, ext_b]).unwrap();
 
     let edge = res
         .edges
@@ -81,7 +83,7 @@ fn test_g20_go_package_star_topology() {
     let go2 = extract_file("pkg/b.go", "package pkg\nfunc B() {}\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[go1.clone(), go2.clone()]);
-    let res = resolver.resolve_all(&[go1, go2]);
+    let res = resolver.resolve_all(&[go1, go2]).unwrap();
 
     assert!(res
         .edges
@@ -101,7 +103,7 @@ fn test_import_bindings_do_not_depend_on_input_order() {
     // after the complete symbol/file index exists.
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[importer.clone(), target.clone()]);
-    let result = resolver.resolve_all(&[importer, target]);
+    let result = resolver.resolve_all(&[importer, target]).unwrap();
 
     let call = result
         .edges
@@ -131,7 +133,7 @@ fn test_aliased_named_import_resolves_to_local_call_name() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[importer.clone(), target.clone()]);
-    let result = resolver.resolve_all(&[importer, target]);
+    let result = resolver.resolve_all(&[importer, target]).unwrap();
     let call = result
         .edges
         .iter()
@@ -162,7 +164,7 @@ fn test_multiple_named_import_aliases_remain_independent() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[importer.clone(), target.clone()]);
-    let result = resolver.resolve_all(&[importer, target]);
+    let result = resolver.resolve_all(&[importer, target]).unwrap();
 
     for (local_call, exported_symbol) in [("runFirst", "first"), ("runSecond", "second")] {
         let call = result
@@ -192,7 +194,7 @@ fn test_default_import_resolves_to_local_binding() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[importer.clone(), target.clone()]);
-    let result = resolver.resolve_all(&[importer, target]);
+    let result = resolver.resolve_all(&[importer, target]).unwrap();
     let call = result
         .edges
         .iter()
@@ -217,7 +219,7 @@ fn test_g7_unique_global_resolution_never_crosses_language_families() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[python.clone(), typescript.clone()]);
-    let result = resolver.resolve_all(&[python, typescript]);
+    let result = resolver.resolve_all(&[python, typescript]).unwrap();
 
     assert!(
         !result.edges.iter().any(|edge| {
@@ -239,7 +241,7 @@ fn test_g5_ambiguous_global_resolution_preserves_all_candidates() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[first.clone(), second.clone(), caller.clone()]);
-    let result = resolver.resolve_all(&[first, second, caller]);
+    let result = resolver.resolve_all(&[first, second, caller]).unwrap();
     let candidates: std::collections::BTreeSet<_> = result
         .edges
         .iter()
@@ -279,7 +281,7 @@ fn tsx_relative_imports_use_the_jsts_resolution_ladder() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[importer.clone(), target.clone()]);
-    let result = resolver.resolve_all(&[importer, target]);
+    let result = resolver.resolve_all(&[importer, target]).unwrap();
 
     assert!(result.edges.iter().any(|edge| {
         edge.edge_kind == EdgeKind::Imports
@@ -301,7 +303,7 @@ fn rust_self_and_super_imports_probe_relative_modules() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[lib.clone(), worker.clone(), nested.clone()]);
-    let result = resolver.resolve_all(&[lib, worker, nested]);
+    let result = resolver.resolve_all(&[lib, worker, nested]).unwrap();
 
     for source in ["src/lib.rs", "src/nested/mod.rs"] {
         assert!(result.edges.iter().any(|edge| {
@@ -320,7 +322,7 @@ fn constructor_assignment_drives_receiver_resolution_not_method_name() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&source));
-    let result = resolver.resolve_all(&[source]);
+    let result = resolver.resolve_all(&[source]).unwrap();
 
     assert_eq!(
         result.receiver_types.get("worker.py:worker"),
@@ -348,7 +350,7 @@ fn receiver_resolution_crosses_files_only_through_the_inferred_type() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[implementation.clone(), caller.clone()]);
-    let result = resolver.resolve_all(&[implementation, caller]);
+    let result = resolver.resolve_all(&[implementation, caller]).unwrap();
 
     let call = result
         .edges
@@ -379,7 +381,7 @@ fn ambiguous_constructor_types_do_not_seed_receiver_resolution() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[first.clone(), second.clone(), caller.clone()]);
-    let result = resolver.resolve_all(&[first, second, caller]);
+    let result = resolver.resolve_all(&[first, second, caller]).unwrap();
 
     assert_eq!(result.receiver_types.get("app.py:worker"), None);
     assert!(result.edges.iter().all(|edge| {
@@ -398,7 +400,7 @@ fn duplicate_same_file_methods_do_not_become_a_deterministic_bare_call() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&source));
-    let result = resolver.resolve_all(&[source]);
+    let result = resolver.resolve_all(&[source]).unwrap();
 
     assert!(result.edges.iter().all(|edge| {
         !(edge.edge_kind == EdgeKind::Calls
@@ -416,7 +418,7 @@ fn repeated_call_sites_do_not_duplicate_the_same_graph_edge() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&source));
-    let result = resolver.resolve_all(&[source]);
+    let result = resolver.resolve_all(&[source]).unwrap();
     let duplicates = result
         .edges
         .iter()
@@ -448,7 +450,7 @@ fn route_handler_prefers_its_own_file_over_index_order() {
     });
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[earlier.clone(), routed.clone()]);
-    let result = resolver.resolve_all(&[earlier, routed]);
+    let result = resolver.resolve_all(&[earlier, routed]).unwrap();
     let route = result
         .edges
         .iter()
@@ -476,7 +478,7 @@ fn unresolvable_calls_are_recorded_rather_than_silently_dropped() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&source));
-    let result = resolver.resolve_all(&[source]);
+    let result = resolver.resolve_all(&[source]).unwrap();
 
     assert!(
         !result
@@ -536,7 +538,7 @@ func (s *MemStore) uniqueToMem(key string) []string {
     let ext = devmap_extract::extract_file("store.go", source);
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let result = resolver.resolve_all(std::slice::from_ref(&ext));
+    let result = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
 
     let target_of = |caller: &str| -> Option<String> {
         result
@@ -603,7 +605,7 @@ func (w *Widget) caller() int { return w.helper() }
     let ext = devmap_extract::extract_file("store.go", source);
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let result = resolver.resolve_all(std::slice::from_ref(&ext));
+    let result = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
 
     let edge = result
         .edges
@@ -669,7 +671,7 @@ export function makeResolver() {
     let ext = devmap_extract::extract_file("js.ts", source);
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let result = resolver.resolve_all(std::slice::from_ref(&ext));
+    let result = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
 
     let identities: std::collections::BTreeSet<&str> = ext
         .symbols
@@ -739,7 +741,7 @@ pub fn first_item(s: &Store) -> String {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let result = resolver.resolve_all(std::slice::from_ref(&ext));
+    let result = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
 
     let edge = result
         .edges
@@ -789,7 +791,7 @@ fn unresolved_calls_separate_builtins_and_external_imports_from_real_failures() 
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&go));
-    let res = resolver.resolve_all(std::slice::from_ref(&go));
+    let res = resolver.resolve_all(std::slice::from_ref(&go)).unwrap();
 
     let class_of = |callee: &str| {
         res.unresolved
@@ -843,7 +845,7 @@ fn builtin_names_behind_a_receiver_are_not_classified_as_builtins() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&go));
-    let res = resolver.resolve_all(std::slice::from_ref(&go));
+    let res = resolver.resolve_all(std::slice::from_ref(&go)).unwrap();
 
     for callee in ["len", "Fatalf"] {
         let found = res.unresolved.iter().find(|u| u.callee_name == callee);
@@ -890,7 +892,7 @@ fn a_receiver_typed_by_an_external_import_is_classified_external() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&go));
-    let res = resolver.resolve_all(std::slice::from_ref(&go));
+    let res = resolver.resolve_all(std::slice::from_ref(&go)).unwrap();
 
     let fatalf = res
         .unresolved
@@ -935,7 +937,7 @@ fn a_receiver_typed_by_a_local_type_is_never_called_external() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&go));
-    let res = resolver.resolve_all(std::slice::from_ref(&go));
+    let res = resolver.resolve_all(std::slice::from_ref(&go)).unwrap();
 
     if let Some(reference) = res
         .unresolved
@@ -1019,7 +1021,7 @@ fn classification_tiers_are_structurally_exclusive() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let res = resolver.resolve_all(&extractions);
+    let res = resolver.resolve_all(&extractions).unwrap();
 
     assert!(
         !res.unresolved.is_empty(),
@@ -1116,7 +1118,7 @@ fn a_runtime_supplied_global_is_its_own_tier_and_never_a_language_builtin() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ts));
-    let res = resolver.resolve_all(std::slice::from_ref(&ts));
+    let res = resolver.resolve_all(std::slice::from_ref(&ts)).unwrap();
 
     let class_of = |callee: &str| {
         res.unresolved
@@ -1175,7 +1177,7 @@ fn an_import_outranks_the_host_global_table() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ts));
-    let res = resolver.resolve_all(std::slice::from_ref(&ts));
+    let res = resolver.resolve_all(std::slice::from_ref(&ts)).unwrap();
 
     let fetched = res
         .unresolved
@@ -1222,7 +1224,9 @@ fn a_call_to_the_enclosing_symbols_own_parameter_is_a_local_binding() {
     for extraction in [rust, go] {
         let mut resolver = Resolver::new();
         resolver.index_extractions(std::slice::from_ref(&extraction));
-        let res = resolver.resolve_all(std::slice::from_ref(&extraction));
+        let res = resolver
+            .resolve_all(std::slice::from_ref(&extraction))
+            .unwrap();
 
         let callee = if extraction.file_path.ends_with(".rs") {
             "handler"
@@ -1276,7 +1280,7 @@ fn a_parameter_shadowing_a_builtin_is_classified_by_its_scope() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&go));
-    let res = resolver.resolve_all(std::slice::from_ref(&go));
+    let res = resolver.resolve_all(std::slice::from_ref(&go)).unwrap();
 
     let in_scope = |scope: &str| {
         res.unresolved
@@ -1333,7 +1337,7 @@ fn a_local_binding_does_not_leak_between_functions_in_one_file() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&rust));
-    let res = resolver.resolve_all(std::slice::from_ref(&rust));
+    let res = resolver.resolve_all(std::slice::from_ref(&rust)).unwrap();
 
     let in_scope = |scope: &str| {
         res.unresolved
@@ -1386,7 +1390,7 @@ fn declared_type_bindings_do_not_leak_between_functions_sharing_a_parameter_name
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&go));
-    let res = resolver.resolve_all(std::slice::from_ref(&go));
+    let res = resolver.resolve_all(std::slice::from_ref(&go)).unwrap();
 
     if let Some(tracked) = res
         .unresolved
@@ -1415,7 +1419,7 @@ fn the_receiver_is_recorded_exactly_when_the_call_has_one() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&go));
-    let res = resolver.resolve_all(std::slice::from_ref(&go));
+    let res = resolver.resolve_all(std::slice::from_ref(&go)).unwrap();
 
     let trim = res
         .unresolved
@@ -1460,7 +1464,7 @@ fn rust_associated_function_calls_resolve_and_keep_receiver_typing() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let res = resolver.resolve_all(std::slice::from_ref(&ext));
+    let res = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
 
     let targets: Vec<&str> = res
         .edges
@@ -1526,7 +1530,7 @@ fn an_untyped_local_binding_is_classified_by_its_scope() {
     let extractions = vec![python, rust];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let res = resolver.resolve_all(&extractions);
+    let res = resolver.resolve_all(&extractions).unwrap();
 
     let class_of = |callee: &str, scope: &str| {
         res.unresolved
@@ -1607,7 +1611,7 @@ fn a_python_reexport_alias_resolves_the_import_that_names_it() {
     let extractions = vec![common, integrate, agents];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let res = resolver.resolve_all(&extractions);
+    let res = resolver.resolve_all(&extractions).unwrap();
 
     let resolved: Vec<(&str, Confidence)> = res
         .edges
@@ -1646,7 +1650,9 @@ fn a_rust_let_initializer_call_is_not_a_local_binding() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&extraction));
-    let res = resolver.resolve_all(std::slice::from_ref(&extraction));
+    let res = resolver
+        .resolve_all(std::slice::from_ref(&extraction))
+        .unwrap();
 
     let edge = res
         .edges
@@ -1694,7 +1700,9 @@ fn a_rust_closure_parameter_does_not_hide_an_outer_function() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&extraction));
-    let res = resolver.resolve_all(std::slice::from_ref(&extraction));
+    let res = resolver
+        .resolve_all(std::slice::from_ref(&extraction))
+        .unwrap();
 
     let edge = res
         .edges

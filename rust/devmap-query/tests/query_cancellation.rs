@@ -102,7 +102,7 @@ fn a_cancelled_engine_refuses_instead_of_answering() {
     let ext = extract_file("mod.py", source);
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = devmap_analyze::analyze(std::slice::from_ref(&ext), &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -156,7 +156,7 @@ fn an_uncancelled_engine_still_answers() {
     let ext = extract_file("mod.py", source);
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = devmap_analyze::analyze(std::slice::from_ref(&ext), &resolution);
     let store = Store::open_in_memory().unwrap();
     store

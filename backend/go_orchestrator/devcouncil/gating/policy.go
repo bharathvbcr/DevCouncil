@@ -12,7 +12,8 @@ var HardSafetyGapTypes = map[string]struct{}{
 	"orphan_diff":                  {},
 	"task_not_implemented":         {},
 	"stub_detected":                {},
-	"invalid_verification_command": {}, // advisory by default, but never silently dropped
+	"invalid_verification_command": {},
+	"skipped_verification_command": {}, // required evidence was not produced
 }
 
 // IsHardSafetyGap reports whether a gap type is in the hard-safety set.
@@ -28,11 +29,6 @@ func MayDemote(gapType string, blocking bool) bool {
 		return false
 	}
 	if IsHardSafetyGap(gapType) {
-		// invalid_verification_command is listed for visibility but Python
-		// treats it as non-blocking; demotion does not apply.
-		if gapType == "invalid_verification_command" {
-			return false
-		}
 		return false
 	}
 	return true

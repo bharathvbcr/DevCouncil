@@ -1,0 +1,24 @@
+{
+  "scope": "documentation only; no timing run or product-code changes",
+  "completed_utc": "2026-09-12T17:27:18.854422+00:00",
+  "timing_samples": 261,
+  "groups": 57,
+  "raw_evidence_unchanged": true,
+  "changed_archived_files": [
+    "REPORT.md",
+    "write_report.py"
+  ],
+  "guide_medians_match_summary": true,
+  "source_case_names_match_audit": true,
+  "gortex_surfaces_reported_separately": true,
+  "report_regeneration_identical": true,
+  "local_links_checked": 68,
+  "preexisting_relative_links_fixed": [
+    "docs/devmap/README.md -> docs/DEVMAP_SKILL_DELIVERY.md",
+    "docs/devmap/README.md -> docs/repository-hygiene.md"
+  ],
+  "external_links_not_rechecked": 13,
+  "product_tests_not_rerun_reason": "Only documentation and its report generator changed; retained answer audit and Python compilation were checked.",
+  "report_bytes": 22005,
+  "original_validation_preserved": "validation.json describes the original benchmark completion; documentation-validation.json describes this later documentation refresh."
+}

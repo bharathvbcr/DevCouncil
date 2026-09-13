@@ -33,7 +33,7 @@ use devmap_resolve::Resolver;
 fn manifest_for(extractions: Vec<devmap_extract::model::Extraction>) -> serde_json::Value {
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     let communities = extractions
         .iter()

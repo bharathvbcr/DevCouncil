@@ -123,7 +123,7 @@ fn python_project() -> Vec<Extraction> {
 fn graph(extractions: &[Extraction]) -> Value {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    let resolution = resolver.resolve_all(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
     let analysis = devmap_analyze::analyze(extractions, &resolution);
     let json = generate_code_graph_json(
         extractions,
@@ -649,7 +649,7 @@ fn go_graph(extractions: &[Extraction]) -> Value {
     let mut resolver = Resolver::new();
     resolver.index_go_modules(&modules);
     resolver.index_extractions(extractions);
-    let resolution = resolver.resolve_all(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
     let analysis = devmap_analyze::analyze(extractions, &resolution);
     let json = generate_code_graph_json(
         extractions,
@@ -680,7 +680,7 @@ fn a_go_import_resolves_to_a_package_node_not_to_files() {
     let mut resolver = Resolver::new();
     resolver.index_go_modules(&modules);
     resolver.index_extractions(&extractions);
-    let resolved = resolver.resolve_all(&extractions);
+    let resolved = resolver.resolve_all(&extractions).unwrap();
     let targets: Vec<&str> = resolved
         .edges
         .iter()

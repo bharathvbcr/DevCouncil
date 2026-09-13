@@ -269,7 +269,7 @@ fn a_bound_route_with_a_hostile_path_leaves_no_dangling_endpoint() {
 
     let mut resolver = devmap_resolve::Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     // Three route edges. The resolver also emits the file's `Contains` edge,
     // which is not what this counts.
     let bound = resolution

@@ -3,14 +3,16 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gatescfg"
@@ -24,7 +26,7 @@ import (
 )
 
 func main() {
-	os.Exit(dispatch(os.Args[1:]))
+	os.Exit(runCLI(os.Args[1:]))
 }
 
 func dispatch(args []string) int {
@@ -51,25 +53,27 @@ func dispatch(args []string) int {
 		return runEnable(args[1:])
 	case "gate":
 		return runGate(args[1:])
+	case "hook":
+		return runHook(args[1:])
 	case "map", "graph":
 		return runDevmap(mapArgs(args[1:]))
 	case "ast":
 		return runDevmap(astArgs(args[1:]))
 	case "version", "--version", "-V":
-		fmt.Println("devcouncil " + Version)
+		console.Println("devcouncil " + Version)
 		return 0
 	case "help", "-h", "--help":
 		usage()
 		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
+		console.Errorf("unknown command: %s\n", args[0])
 		usage()
 		return 2
 	}
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `devcouncil — DevCouncil host binary (Phase 7)
+	console.Errorf(`devcouncil — DevCouncil host binary (Phase 7)
 
 The same binary is installed as `+"`dev`"+` and `+"`devcouncil`"+`.
 
@@ -81,6 +85,7 @@ Usage:
   devcouncil enable NAME [--prefix DIR]
   devcouncil gate status [--json] [--project-root DIR]
   devcouncil gate set --mode off|advisory|enforce [--hook off|contain]
+  devcouncil hook <event> [--client HOST] [--project-root DIR]
   devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR] [--write-gate]
   devcouncil integrations …        Alias of integrate
   devcouncil integrate uninstall --target hooks [--dry-run] [--project-root DIR]
@@ -90,6 +95,9 @@ Usage:
   devcouncil map [devmap args…]   Exec `+"`devmap`"+` (bare invocation: build --manifest)
   devcouncil graph …              Alias of map
   devcouncil ast …                Exec `+"`devmap ast`"+`
+
+Presentation: --progress auto|always|never (default: auto). JSON stays on stdout.
+NO_COLOR removes color; TERM=dumb and non-UTF-8 locales use simpler output.
 
 First-time / standalone (no host yet):
   bash scripts/install.sh --only=devmap
@@ -115,7 +123,7 @@ func runMCP() int {
 	reg := openRegistry(root)
 	srv := &mcp.Server{Registry: reg}
 	if err := srv.Serve(); err != nil {
-		fmt.Fprintf(os.Stderr, "devcouncil mcp: %v\n", err)
+		console.Errorf("devcouncil mcp: %v\n", err)
 		return 1
 	}
 	return 0
@@ -291,10 +299,12 @@ const devmapPassthroughTimeout = 10 * time.Minute
 func runDevmap(args []string) int {
 	bin, err := resolveDevmap()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		console.Errorln(err)
 		return 1
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), devmapPassthroughTimeout)
+	parent, stop := signal.NotifyContext(console.Context(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithTimeout(parent, devmapPassthroughTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	proc.ConfigureGroup(cmd)
@@ -302,16 +312,20 @@ func runDevmap(args []string) int {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.WaitDelay = 2 * time.Second
-	runErr, timedOut := proc.RunBounded(ctx, cmd.Run)
+	runErr, timedOut := proc.RunBoundedWithCleanup(ctx, cmd.Run)
 	if timedOut {
-		fmt.Fprintf(os.Stderr, "devmap did not return within %s\n", devmapPassthroughTimeout)
+		if ctx.Err() == context.Canceled {
+			console.Errorln("DevMap command cancelled")
+			return 130
+		}
+		console.Errorf("devmap did not return within %s\n", devmapPassthroughTimeout)
 		return 1
 	}
 	if runErr != nil {
 		if ee, ok := runErr.(*exec.ExitError); ok {
 			return ee.ExitCode()
 		}
-		fmt.Fprintf(os.Stderr, "devcouncil: %v\n", runErr)
+		console.Errorf("devcouncil: %v\n", runErr)
 		return 1
 	}
 	return 0
@@ -339,7 +353,7 @@ func resolveDevmap() (string, error) {
 
 func runIntegrate(args []string) int {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "integrate requires a host")
+		console.Errorln("integrate requires a host")
 		return 2
 	}
 	if args[0] == "uninstall" {
@@ -359,14 +373,14 @@ func runIntegrate(args []string) int {
 		case "--project-root":
 			i++
 			if i >= len(args) {
-				fmt.Fprintln(os.Stderr, "--project-root needs a value")
+				console.Errorln("--project-root needs a value")
 				return 2
 			}
 			opts.Root = args[i]
 		case "--json":
 			// always print receipt JSON on stdout for scripting
 		default:
-			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", args[i])
+			console.Errorf("unknown flag: %s\n", args[i])
 			return 2
 		}
 	}
@@ -374,17 +388,18 @@ func runIntegrate(args []string) int {
 	opts.SelfBin = self
 	receipt, err := integrate.Run(opts)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "integrate: %v\n", err)
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(receipt)
+		console.Errorf("integrate: %v\n", err)
+		if writeErr := console.JSON(receipt); writeErr != nil {
+			console.Errorln(writeErr)
+		}
 		return 1
 	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(receipt)
+	if err := console.JSON(receipt); err != nil {
+		console.Errorln(err)
+		return 1
+	}
 	if opts.Mode == integrate.ModeApply {
-		fmt.Fprintf(os.Stderr, "%s integration configured (%s).\n", opts.Host, modeLabel(opts))
+		console.Errorf("%s integration configured (%s).\n", opts.Host, modeLabel(opts))
 	}
 	return 0
 }
@@ -399,7 +414,7 @@ func runIntegrateUninstall(args []string) int {
 		case "--target":
 			i++
 			if i >= len(args) {
-				fmt.Fprintln(os.Stderr, "--target needs a value")
+				console.Errorln("--target needs a value")
 				return 2
 			}
 			opts.Target = integrate.Target(args[i])
@@ -410,28 +425,32 @@ func runIntegrateUninstall(args []string) int {
 		case "--project-root":
 			i++
 			if i >= len(args) {
-				fmt.Fprintln(os.Stderr, "--project-root needs a value")
+				console.Errorln("--project-root needs a value")
 				return 2
 			}
 			opts.Root = args[i]
 		case "--json":
 			// receipt JSON always goes to stdout
 		default:
-			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", args[i])
+			console.Errorf("unknown flag: %s\n", args[i])
 			return 2
 		}
 	}
 	receipt, err := integrate.Uninstall(opts)
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "integrate uninstall: %v\n", err)
+		console.Errorf("integrate uninstall: %v\n", err)
 		if receipt != nil {
-			_ = enc.Encode(receipt)
+			if writeErr := console.JSON(receipt); writeErr != nil {
+				console.Errorln(writeErr)
+				return 1
+			}
 		}
 		return 1
 	}
-	_ = enc.Encode(receipt)
+	if writeErr := console.JSON(receipt); writeErr != nil {
+		console.Errorln(writeErr)
+		return 1
+	}
 	return 0
 }
 
@@ -444,7 +463,7 @@ func modeLabel(opts integrate.Options) string {
 
 func runSkills(args []string) int {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: devcouncil skills list|scaffold ...")
+		console.Errorln("usage: devcouncil skills list|scaffold ...")
 		return 2
 	}
 	switch args[0] {
@@ -453,8 +472,8 @@ func runSkills(args []string) int {
 	case "scaffold":
 		return runSkillsScaffold(args[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "unknown skills subcommand: %s\n", args[0])
-		fmt.Fprintln(os.Stderr, "usage: devcouncil skills list|scaffold ...")
+		console.Errorf("unknown skills subcommand: %s\n", args[0])
+		console.Errorln("usage: devcouncil skills list|scaffold ...")
 		return 2
 	}
 }
@@ -466,13 +485,13 @@ func runSkillsList(args []string) int {
 		case "--json":
 			jsonOut = true
 		default:
-			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", args[i])
+			console.Errorf("unknown flag: %s\n", args[i])
 			return 2
 		}
 	}
 	all, err := skills.Embedded.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "skills: %v\n", err)
+		console.Errorf("skills: %v\n", err)
 		return 1
 	}
 	if jsonOut {
@@ -480,13 +499,14 @@ func runSkillsList(args []string) int {
 		for _, s := range all {
 			names = append(names, s.Name)
 		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(map[string]any{"skills": names, "total": len(names)})
+		if err := console.JSON(map[string]any{"skills": names, "total": len(names)}); err != nil {
+			console.Errorln(err)
+			return 1
+		}
 		return 0
 	}
 	for _, s := range all {
-		fmt.Println(s.Name)
+		console.Println(s.Name)
 	}
 	return 0
 }
@@ -515,13 +535,13 @@ func runSkillsScaffold(args []string) int {
 			}
 			filter = append(filter, args[i])
 		default:
-			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", args[i])
+			console.Errorf("unknown flag: %s\n", args[i])
 			return 2
 		}
 	}
 	all, err := skills.Embedded.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "skills: %v\n", err)
+		console.Errorf("skills: %v\n", err)
 		return 1
 	}
 	selected := all
@@ -537,7 +557,7 @@ func runSkillsScaffold(args []string) int {
 			}
 		}
 		if len(selected) == 0 {
-			fmt.Fprintf(os.Stderr, "no matching skills for %v\n", filter)
+			console.Errorf("no matching skills for %v\n", filter)
 			return 1
 		}
 	}
@@ -545,18 +565,19 @@ func runSkillsScaffold(args []string) int {
 		Root: root, Skills: selected, DryRun: dryRun, CheckOnly: checkOnly,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "skills scaffold: %v\n", err)
+		console.Errorf("skills scaffold: %v\n", err)
 		return 1
 	}
 	if dryRun || checkOnly {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(result)
+		if err := console.JSON(result); err != nil {
+			console.Errorln(err)
+			return 1
+		}
 		return 0
 	}
-	fmt.Printf("Wrote %d skill file(s):\n", len(result.Files))
+	console.Printf("Wrote %d skill file(s):\n", len(result.Files))
 	for _, f := range result.Files {
-		fmt.Printf("  %s\n", f)
+		console.Printf("  %s\n", f)
 	}
 	return 0
 }
@@ -574,42 +595,42 @@ func runVerify(args []string) int {
 		case "--sandbox":
 			i++
 			if i >= len(args) {
-				fmt.Fprintln(os.Stderr, "--sandbox needs a value")
+				console.Errorln("--sandbox needs a value")
 				return 2
 			}
 			sandbox = args[i]
 		case "--mode":
 			i++
 			if i >= len(args) {
-				fmt.Fprintln(os.Stderr, "--mode needs off, advisory, or enforce")
+				console.Errorln("--mode needs off, advisory, or enforce")
 				return 2
 			}
 			modeFlag = args[i]
 		case "--project-root":
 			i++
 			if i >= len(args) {
-				fmt.Fprintln(os.Stderr, "--project-root needs a value")
+				console.Errorln("--project-root needs a value")
 				return 2
 			}
 			root = args[i]
 		case "-h", "--help":
-			fmt.Fprintln(os.Stderr, "usage: devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local]")
+			console.Errorln("usage: devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local]")
 			return 0
 		default:
 			if strings.HasPrefix(args[i], "-") {
-				fmt.Fprintf(os.Stderr, "unknown flag: %s\n", args[i])
+				console.Errorf("unknown flag: %s\n", args[i])
 				return 2
 			}
 			if taskID == "" {
 				taskID = args[i]
 			} else {
-				fmt.Fprintf(os.Stderr, "unexpected argument: %s\n", args[i])
+				console.Errorf("unexpected argument: %s\n", args[i])
 				return 2
 			}
 		}
 	}
 	if taskID == "" {
-		fmt.Fprintln(os.Stderr, "verify requires TASK_ID")
+		console.Errorln("verify requires TASK_ID")
 		return 2
 	}
 	reg := openRegistry(root)
@@ -620,7 +641,7 @@ func runVerify(args []string) int {
 	if modeFlag != "" {
 		parsed, err := gatescfg.ParseMode(modeFlag)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			console.Errorln(err)
 			return 2
 		}
 		gateMode = parsed
@@ -628,5 +649,5 @@ func runVerify(args []string) int {
 	if gateMode == "" {
 		gateMode = gatescfg.Load(root).VerificationMode
 	}
-	return verify.RunCLI(context.Background(), root, reg.Store, taskID, gateMode, sandbox, jsonOut)
+	return verify.RunCLI(console.Context(), root, reg.Store, taskID, gateMode, sandbox, jsonOut)
 }

@@ -96,6 +96,35 @@ func TestNoFollowRootAndDirectOpensPreserveLinkTarget(t *testing.T) {
 	}
 }
 
+func TestRootedNoFollowRejectsLinkedParents(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "real"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "real", "file"), []byte("original"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(dir, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if f, err := OpenNoFollow(root, filepath.Join("alias", "file"), os.O_RDONLY, 0); err == nil {
+		f.Close()
+		t.Fatal("rooted no-follow accepted an ancestor symlink")
+	}
+	f, err := OpenNoFollow(root, filepath.Join("real", "file"), os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLinkCountUsesOpenHandleAndRejectsEarlyTruncation(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "file")

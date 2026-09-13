@@ -44,7 +44,7 @@ fn resolve(files: &[(&str, &str)]) -> ResolutionResult {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    resolver.resolve_all(&extractions)
+    resolver.resolve_all(&extractions).unwrap()
 }
 
 /// Every edge out of `source_symbol` whose target is named `target_name`.
@@ -222,7 +222,7 @@ func identity(paper search.Paper) string {
     let module = devmap_extract::parse_go_mod("go.mod", GOMOD).expect("go.mod parses");
     resolver.index_go_modules(std::slice::from_ref(&module));
     resolver.index_extractions(&extractions);
-    let result = resolver.resolve_all(&extractions);
+    let result = resolver.resolve_all(&extractions).unwrap();
 
     let edges = edges_from(&result, "internal/api/gateway.go::identity", "Paper");
     assert_eq!(

@@ -1,0 +1,25 @@
+Start the daemon
+
+Usage:
+  gortex daemon start [flags]
+
+Flags:
+      --backend string                storage backend: sqlite (pure-Go embedded SQL, persists to --backend-path so warm restarts skip re-indexing). It is the only backend; point --backend-path at a throwaway file for a store that does not outlive the run (default "sqlite")
+      --backend-path string           path to the store file (its parent directory is created if absent). Defaults to ~/.gortex/store/store.sqlite
+      --conversation-host strings     extra Host values (beyond loopback) the conversation-log inspector accepts without a token; repeatable
+      --cors-origin string            allowed CORS origin for the HTTP surface (use '*' for any); applies to both /mcp and /v1 when --http-addr is set (default "*")
+      --detach gortex daemon logs     fork to background after starting (logs to the daemon log file — see gortex daemon logs)
+      --embeddings                    load a semantic embedding provider (opt-in — adds ~87 MB model download on first use and ~60 ms/symbol warmup)
+      --embeddings-model string       embedding model for --embeddings-url (default: auto-detect — text-embedding-3-small for OpenAI, nomic-embed-text for Ollama)
+      --embeddings-url string         OpenAI-compatible (or Ollama) embedding API base URL (e.g. https://api.openai.com/v1). A non-empty URL forces the api provider, overriding the embedding: config. Key via $GORTEX_EMBEDDINGS_API_KEY or $OPENAI_API_KEY (openai.com only).
+  -h, --help                          help for start
+      --http-addr string              also expose the MCP 2026 Streamable HTTP transport on this TCP address (e.g. 127.0.0.1:7411); empty disables
+      --http-allowed-origin strings   web origin permitted to call /mcp cross-origin (e.g. https://ui.example); repeatable. Empty refuses every browser origin — a loopback bind is reachable from any page the user visits
+      --http-auth-token string        bearer token required on every Streamable HTTP request (default: read $GORTEX_DAEMON_HTTP_TOKEN; empty allows unauthenticated localhost binds)
+      --tools string                  restrict the published MCP tool surface to a preset: core (default)|full|readonly|edit|nav (optionally with ,+tool / ,-tool deltas). GORTEX_TOOLS overrides this
+      --tools-mode string             how a --tools preset hides tools: hide (remove from tools/list + block calls) or defer (keep reachable via tools_search). Default hide
+
+Global Flags:
+      --config string      config file (default .gortex.yaml)
+      --log-level string   log level: debug|info|warn|error (default "info")
+      --no-progress        disable animated progress output (also honored: NO_COLOR, TERM=dumb, CI, non-TTY stderr)

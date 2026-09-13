@@ -336,7 +336,9 @@ fn test_import_resolution() {
         ts_ext3.clone(),
         ts_ext4.clone(),
     ]);
-    let res = resolver.resolve_all(&[ts_ext1, ts_ext2, ts_ext3, ts_ext4]);
+    let res = resolver
+        .resolve_all(&[ts_ext1, ts_ext2, ts_ext3, ts_ext4])
+        .unwrap();
 
     // sibling.ts -> mod.ts
     assert!(res
@@ -358,7 +360,7 @@ fn test_import_resolution() {
 
     let mut py_resolver = Resolver::new();
     py_resolver.index_extractions(&[py_ext1.clone(), py_ext2.clone()]);
-    let py_res = py_resolver.resolve_all(&[py_ext1, py_ext2]);
+    let py_res = py_resolver.resolve_all(&[py_ext1, py_ext2]).unwrap();
     assert!(py_res
         .edges
         .iter()
@@ -369,7 +371,7 @@ fn test_import_resolution() {
     let rs_ext2 = extract_file("src/main.rs", "use crate::module::x;");
     let mut rs_resolver = Resolver::new();
     rs_resolver.index_extractions(&[rs_ext1.clone(), rs_ext2.clone()]);
-    let rs_res = rs_resolver.resolve_all(&[rs_ext1, rs_ext2]);
+    let rs_res = rs_resolver.resolve_all(&[rs_ext1, rs_ext2]).unwrap();
     assert!(rs_res
         .edges
         .iter()
@@ -647,7 +649,7 @@ fn test_runtime_entry_points_are_exempt_without_exempting_their_file() {
         let ext = extract_file(case.path, case.source);
         let mut resolver = Resolver::new();
         resolver.index_extractions(std::slice::from_ref(&ext));
-        let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
         let analysis = analyze(std::slice::from_ref(&ext), &resolution);
 
         let confidently_dead = |name: &str| {
@@ -713,13 +715,15 @@ fn test_dead_code_detection() {
         f_route.clone(),
         f_pb2.clone(),
     ]);
-    let resolution = resolver.resolve_all(&[
-        f1.clone(),
-        f2.clone(),
-        f_test.clone(),
-        f_route.clone(),
-        f_pb2.clone(),
-    ]);
+    let resolution = resolver
+        .resolve_all(&[
+            f1.clone(),
+            f2.clone(),
+            f_test.clone(),
+            f_route.clone(),
+            f_pb2.clone(),
+        ])
+        .unwrap();
 
     let analysis = analyze(&[f1, f2, f_test, f_route, f_pb2], &resolution);
 
@@ -819,7 +823,9 @@ fn test_ambiguous_calls_do_not_prove_a_candidate_live() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[first.clone(), second.clone(), caller.clone()]);
-    let resolution = resolver.resolve_all(&[first.clone(), second.clone(), caller]);
+    let resolution = resolver
+        .resolve_all(&[first.clone(), second.clone(), caller])
+        .unwrap();
     let reports = analyze_liveness(&[first, second], &resolution);
 
     assert!(reports.iter().any(|report| {
@@ -896,7 +902,7 @@ fn test_incremental_store() -> anyhow::Result<()> {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&exts);
-    let resolution = resolver.resolve_all(&exts);
+    let resolution = resolver.resolve_all(&exts).unwrap();
     let analysis = analyze(&exts, &resolution);
 
     let _gen1 = store.save_generation(&exts, &resolution, &analysis)?;
@@ -915,7 +921,7 @@ fn test_incremental_store() -> anyhow::Result<()> {
 
     let mut res2 = Resolver::new();
     res2.index_extractions(&exts2);
-    let resolution2 = res2.resolve_all(&exts2);
+    let resolution2 = res2.resolve_all(&exts2).unwrap();
     let analysis2 = analyze(&exts2, &resolution2);
 
     let opts = GenerationWriteOpts {
@@ -961,7 +967,7 @@ fn test_fts_query() -> anyhow::Result<()> {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext1));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext1));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext1)).unwrap();
     let analysis = analyze(std::slice::from_ref(&ext1), &resolution);
 
     store.save_generation(std::slice::from_ref(&ext1), &resolution, &analysis)?;
@@ -1022,7 +1028,7 @@ fn test_stress_scale() -> anyhow::Result<()> {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&exts);
-    let resolution = resolver.resolve_all(&exts);
+    let resolution = resolver.resolve_all(&exts).unwrap();
 
     let analysis = analyze(&exts, &resolution);
 

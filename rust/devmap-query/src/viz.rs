@@ -642,7 +642,7 @@ if (!DATA.nodes.length) {{
   const graph = ForceGraph()(el)
     .backgroundColor('#0f1419')
     .nodeId('id')
-    .nodeLabel(n => n.name + '  ·  ' + n.path)
+    .nodeLabel(n => esc(n.name + '  ·  ' + n.path))
     .nodeColor(colorFor)
     .nodeRelSize(3)
     .nodeVal(n => 1 + Math.min(n.degree || 0, VIEW.degree_cap || 40))

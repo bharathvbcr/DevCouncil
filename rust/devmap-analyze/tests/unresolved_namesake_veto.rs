@@ -28,7 +28,7 @@ use devmap_resolve::Resolver;
 fn analyze_with(extractions: &[Extraction]) -> Vec<DeadSymbolReport> {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    let resolution = resolver.resolve_all(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
     analyze_liveness(extractions, &resolution)
 }
 
@@ -45,7 +45,7 @@ fn analyze_with_ledger(
 ) -> Vec<DeadSymbolReport> {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    let mut resolution = resolver.resolve_all(extractions);
+    let mut resolution = resolver.resolve_all(extractions).unwrap();
     resolution.unresolved = rows;
     analyze_liveness(extractions, &resolution)
 }
@@ -323,7 +323,7 @@ fn a_nested_rust_function_called_from_its_enclosing_method_is_live() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     assert!(
         resolution.edges.iter().any(|edge| {
@@ -376,7 +376,7 @@ fn the_veto_fires_on_what_the_real_resolver_produces() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     let named: Vec<&UnresolvedReference> = resolution
         .unresolved

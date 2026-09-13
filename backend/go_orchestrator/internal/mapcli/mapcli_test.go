@@ -251,11 +251,8 @@ func TestDiscoveryPrefersAnExplicitBinaryOverLocalBuildsAndPath(t *testing.T) {
 	}
 }
 
-func TestDiscoveryPrefersALocalBuildOverPath(t *testing.T) {
-	// PATH resolves whatever was last `cargo install`ed, which is independent
-	// of the working tree and routinely months stale. A build inside the
-	// repository must win, or a kernel change is not exercised by the next
-	// command that depends on it.
+func TestDiscoveryRequiresExplicitSelectionOfLocalBuilds(t *testing.T) {
+	// Default discovery must not execute repository build artifacts.
 	root := t.TempDir()
 	local := filepath.Join(root, "rust", "target", "release", "devmap")
 	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
@@ -275,12 +272,16 @@ func TestDiscoveryPrefersALocalBuildOverPath(t *testing.T) {
 	if len(got) == 0 {
 		t.Fatal("no candidates found")
 	}
-	if got[0] != local {
-		t.Errorf("candidates[0] = %s, want the local build %s", got[0], local)
+	want, err := filepath.EvalSymlinks(filepath.Join(onPath, "devmap"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("candidates = %v, want only installed PATH binary %s", got, want)
 	}
 }
 
-func TestDiscoveryFindsLaneTargetDirectories(t *testing.T) {
+func TestDiscoveryDoesNotAutomaticallyProbeLaneTargetDirectories(t *testing.T) {
 	// Concurrent fix lanes each build into their own CARGO_TARGET_DIR
 	// (`rust/target-<lane>`), so that is where a current build usually is.
 	root := t.TempDir()
@@ -295,8 +296,8 @@ func TestDiscoveryFindsLaneTargetDirectories(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 
 	got := binaryCandidates(root)
-	if len(got) != 1 || got[0] != lane {
-		t.Errorf("candidates = %v, want [%s]", got, lane)
+	if len(got) != 0 {
+		t.Errorf("candidates = %v; lane build %s requires explicit selection", got, lane)
 	}
 }
 
@@ -369,7 +370,11 @@ esac
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return path
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return canonical
 }
 
 // An operator naming a binary is entitled to have that binary used — or told
@@ -428,7 +433,7 @@ func TestAnExplicitBinaryThatIsADirectoryIsRefusedByName(t *testing.T) {
 	}
 }
 
-func TestDiscoveryFallsThroughAnIncapableLocalBuildToACapablePathBinary(t *testing.T) {
+func TestDiscoveryUsesInstalledPathWithoutProbingLocalBuild(t *testing.T) {
 	root := t.TempDir()
 	local := filepath.Join(root, "rust", "target", "release", "devmap")
 	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
@@ -443,7 +448,7 @@ func TestDiscoveryFallsThroughAnIncapableLocalBuildToACapablePathBinary(t *testi
 
 	got, err := discoverBinary(context.Background(), root)
 	if err != nil {
-		t.Fatalf("an incapable local build must fall through to PATH: %v", err)
+		t.Fatalf("an installed PATH binary must remain usable: %v", err)
 	}
 	if got != capable {
 		t.Fatalf("discoverBinary = %s, want the capable PATH binary %s, not the local %s", got, capable, local)

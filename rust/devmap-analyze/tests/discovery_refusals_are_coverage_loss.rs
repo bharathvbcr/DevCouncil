@@ -42,7 +42,7 @@ fn summarize(discovery: DiscoveryCoverage) -> devmap_analyze::model::AnalysisSum
     let extractions = corpus();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     analyze_with_discovery(&extractions, &resolution, discovery)
 }
 
@@ -121,7 +121,7 @@ fn the_plain_entry_point_still_reports_a_complete_corpus() {
     let extractions = corpus();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let summary = analyze(&extractions, &resolution);
     assert!(
         matches!(summary.status, AnalysisStatus::Ok),

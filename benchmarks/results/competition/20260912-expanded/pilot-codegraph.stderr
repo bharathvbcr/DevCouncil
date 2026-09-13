@@ -1,0 +1,19 @@
+✗ CodeGraph not initialized in /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/codegraph-corpus
+        0.16 real         0.04 user         0.04 sys
+            56983552  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                2037  page reclaims
+                2191  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  56  voluntary context switches
+                 925  involuntary context switches
+           696625594  instructions retired
+           343690357  cycles elapsed
+            20367928  peak memory footprint

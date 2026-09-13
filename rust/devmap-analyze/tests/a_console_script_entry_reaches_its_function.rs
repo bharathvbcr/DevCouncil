@@ -63,7 +63,7 @@ fn fixture(manifest: &str) -> Vec<Extraction> {
 fn verdicts(extractions: &[Extraction]) -> Vec<(String, String, bool, Option<String>)> {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    let resolution = resolver.resolve_all(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
     analyze(extractions, &resolution)
         .dead_symbols
         .iter()
@@ -248,7 +248,7 @@ fn the_exemption_reaches_the_cluster_pass_too() {
     let extractions = fixture(FLAT_MANIFEST);
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let exempt = exempt_symbol_names(&extractions, &resolution);
     assert!(
         exempt.contains("pkg/cli.py::main_entry"),

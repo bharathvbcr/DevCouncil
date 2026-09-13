@@ -187,6 +187,35 @@ Output: a `results/<timestamp>.json` (raw per-run data, including the
 
 See `tasks.py` for the task suite and each task's hidden checks.
 
+## DevMap competitor comparison: 2026-09-12
+
+The [expanded competitor report](results/competition/20260912-expanded/REPORT.md)
+is the canonical record of the DevMap, Graphify, Gortex, GitNexus, CodeGraph,
+codebase-memory-mcp, and ripgrep comparison. It includes per-tool positives and
+negatives, cold/warm/edit and query timings, memory/storage tradeoffs, inspected
+caller pairs, stale-index recovery, capped-query follow-ups, coverage warnings,
+reproducibility limits, and suggested next experiments. The
+[DevMap guide](../docs/devmap/README.md#benchmark-comparison) has the shorter
+summary; the [competition index](results/competition/README.md) also links the
+initial GitNexus comparison and its separate Rust verification evidence.
+
+The expanded run completed 261 timing samples on a frozen 1,186-file DevCouncil
+snapshot. DevMap had the lowest cold/unchanged medians and sampled cold RSS;
+CodeGraph had the lowest one-file edit median and a smaller store. CBM matched
+DevMap's five inspected caller pairs. Gortex returned four by default and five
+with name-only inclusion. GitNexus needed a forced rebuild to remove a deleted
+probe. These are observations for the pinned builds and measured modes, not a
+general accuracy ranking or an end-to-end coding-agent evaluation.
+
+The task-local Python recorders invoke real vendor CLIs and retain commands,
+raw output, wall time, process-tree samples, and correctness checks. They do not
+replace the native engine gates below or reinstate the retired mapping harness.
+Cold indexes and source edits live in disposable corpus copies; do not rerun
+them over a working product index. The dated scripts refuse to overwrite their
+existing cold-run directories. Preserve the report's distinction between
+standalone queries, Gortex's resident daemon, and unmeasured persistent MCP
+performance for the other tools.
+
 ## Code-intelligence performance
 
 Python code-intel ratchets (`tests/performance`, `scripts/codeintel-benchmark.py`)
@@ -201,10 +230,11 @@ cd rust && ./verify.sh
 
 # `dev map` performance
 
-The mapping engine is measured by `verify.sh` and by the kernel's own `--json`
-timings, not by a Python harness. Where `run_bench.py` asks whether the gated
-loop produces better code, this asks how long `devmap` takes and where the
-time goes.
+The mapping engine's native gates use `verify.sh` and the kernel's own `--json`
+timings. The dated competitor comparison above adds a CLI wall-time recorder;
+the historical Python mapping harness described below remains retired. Where
+`run_bench.py` asks whether the gated loop produces better code, this section
+asks how long `devmap` takes and where the time goes.
 
 A second of avoidable overhead on the map is paid hundreds of times a day —
 rebuilt by hooks, by the watcher, and by hand.

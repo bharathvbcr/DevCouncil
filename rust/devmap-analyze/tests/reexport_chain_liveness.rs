@@ -28,7 +28,7 @@ fn a_barrel_project_does_not_report_its_public_api_as_dead() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let reports = devmap_analyze::analyze_liveness(&extractions, &resolution);
     let dead: Vec<_> = reports
         .iter()

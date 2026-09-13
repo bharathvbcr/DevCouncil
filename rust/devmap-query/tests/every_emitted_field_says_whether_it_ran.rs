@@ -60,7 +60,7 @@ fn manifest() -> serde_json::Value {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     let communities = ["api/routes.py", "core/model.py"]
         .iter()
@@ -163,7 +163,7 @@ fn a_repository_with_no_routes_still_reports_frameworks_as_computed() {
     let extractions = vec![extract_file("core/model.py", "class Row:\n    pass\n")];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = AnalysisSummary {
         total_files: 1,
         total_symbols: 1,
@@ -337,7 +337,7 @@ fn import_blind_files_are_named_not_only_counted() {
     )];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = AnalysisSummary {
         total_files: extractions.len(),
         total_symbols: 1,

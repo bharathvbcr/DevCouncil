@@ -30,7 +30,7 @@ fn scan(files: &[(&str, &str)]) -> DeadClusterScan {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     dead_clusters(&extractions, &resolution)
 }
 

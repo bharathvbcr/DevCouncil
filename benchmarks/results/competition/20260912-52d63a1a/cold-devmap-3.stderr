@@ -1,0 +1,18 @@
+        1.94 real         6.04 user         0.43 sys
+           645365760  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               48769  page reclaims
+                   8  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 281  voluntary context switches
+               12724  involuntary context switches
+         83904743394  instructions retired
+         27634113791  cycles elapsed
+           561808368  peak memory footprint

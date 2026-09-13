@@ -2,7 +2,10 @@
 // boundary.
 package proc
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // RunBounded runs one subprocess invocation under the caller's deadline and
 // reports whether the deadline won.
@@ -15,12 +18,29 @@ import "context"
 // When the deadline wins, the goroutine is abandoned. The caller must not read
 // state the goroutine may still be writing, such as an output buffer.
 func RunBounded(ctx context.Context, run func() error) (err error, timedOut bool) {
+	return runBounded(ctx, run, 0)
+}
+
+// RunBoundedWithCleanup gives CommandContext up to 100 ms to kill and reap
+// children after cancellation. CLI callers use it before exiting the process;
+// a stuck Start or escaped descendant still cannot hold that exit indefinitely.
+func RunBoundedWithCleanup(ctx context.Context, run func() error) (err error, timedOut bool) {
+	return runBounded(ctx, run, 100*time.Millisecond)
+}
+
+func runBounded(ctx context.Context, run func() error, cleanup time.Duration) (err error, timedOut bool) {
 	done := make(chan error, 1)
 	go func() { done <- run() }()
 	select {
 	case err = <-done:
 		return err, false
 	case <-ctx.Done():
+		if cleanup > 0 {
+			select {
+			case <-done:
+			case <-time.After(cleanup):
+			}
+		}
 		return nil, true
 	}
 }

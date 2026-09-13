@@ -66,7 +66,7 @@ fn indexed_git_repo(label: &str) -> (PathBuf, Store, String, u32) {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(&files);
-    let resolution = resolver.resolve_all(&files);
+    let resolution = resolver.resolve_all(&files).unwrap();
     let analysis = analyze(&files, &resolution);
     let store = Store::open_in_memory().unwrap();
     let head = current_git_head(&root).unwrap();

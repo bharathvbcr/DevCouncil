@@ -1,0 +1,7 @@
+Usage: codegraph sync [options] [path]
+
+Sync changes since last index
+
+Options:
+  -q, --quiet  Suppress output (for git hooks)
+  -h, --help   display help for command

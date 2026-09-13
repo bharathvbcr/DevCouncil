@@ -1,0 +1,16 @@
+{
+  "source": "rust/verify.sh DIGEST_SQL",
+  "equality": true,
+  "results": [
+    {
+      "stage": "cold",
+      "edge_digest": "eb37614fdb88da708e9c32ae75fe5cdc995039ea283e420b22ec2470c34a2264",
+      "retained_generations": 1
+    },
+    {
+      "stage": "restored",
+      "edge_digest": "eb37614fdb88da708e9c32ae75fe5cdc995039ea283e420b22ec2470c34a2264",
+      "retained_generations": 2
+    }
+  ]
+}

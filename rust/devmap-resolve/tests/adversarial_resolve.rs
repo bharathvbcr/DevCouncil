@@ -39,7 +39,7 @@ const HOSTILE_FILE_BUDGET: Duration = Duration::from_secs(10);
 fn resolve(extractions: &[Extraction]) -> devmap_resolve::model::ResolutionResult {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    resolver.resolve_all(extractions)
+    resolver.resolve_all(extractions).unwrap()
 }
 
 fn span() -> Span {
@@ -492,7 +492,7 @@ fn every_ambiguous_candidate_names_an_indexed_file() {
         64,
         "the resolution must keep every candidate"
     );
-    for (file, _) in candidates {
+    for (file, _) in candidates.iter() {
         assert!(
             indexed.contains(file),
             "a kept candidate names {file:?}, which was never indexed"

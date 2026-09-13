@@ -104,7 +104,7 @@ fn liveness(
 ) -> (Vec<DeadSymbolReport>, ExtractionCoverage) {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    let resolution = resolver.resolve_all(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
     let outcome = analyze_liveness_with_coverage(extractions, &resolution, discovery);
     (outcome.reports, outcome.coverage)
 }
@@ -488,7 +488,7 @@ fn a_large_cluster_is_capped_only_when_the_corpus_has_a_hole() {
         }
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         analyze(&extractions, &resolution)
     };
 
@@ -539,7 +539,7 @@ fn cluster_and_symbol_ceilings_read_the_same_corpus() {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let scan = dead_clusters(&extractions, &resolution);
     assert!(!scan.clusters.is_empty(), "{scan:?}");
 

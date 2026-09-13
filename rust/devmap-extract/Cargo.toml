@@ -273,3 +273,7 @@ required-features = ["parse"]
 name = "extract_bindings"
 required-features = ["parse"]
 
+
+[[test]]
+name = "nested_source_limits"
+required-features = ["parse"]

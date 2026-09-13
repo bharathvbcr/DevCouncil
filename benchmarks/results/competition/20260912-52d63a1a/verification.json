@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "bash",
+    "rust/verify.sh"
+  ],
+  "cwd": "/Users/bharath/Code/devtools/DevCouncil",
+  "exit_code": 0,
+  "timed_out": false,
+  "seconds": 333.80962633299987,
+  "scope": "Current DevCouncil working tree including pre-existing edits; not a reproducible rebuild of the pinned dirty release binary."
+}

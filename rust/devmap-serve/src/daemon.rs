@@ -1175,7 +1175,7 @@ impl Daemon {
             Err(error) => warn!("go.mod collection failed for {:?}: {error}", self.root),
         }
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions)?;
         let analysis = analyze_with_discovery(&extractions, &resolution, discovery);
         // The reading the carry-forward decision was made against, not a fresh
         // one: a checkout that landed while the resolve above was running must
@@ -2302,7 +2302,7 @@ mod tests {
         let initial = extract_tree(&root).unwrap();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&initial);
-        let resolution = resolver.resolve_all(&initial);
+        let resolution = resolver.resolve_all(&initial).unwrap();
         let analysis = analyze(&initial, &resolution);
         let store = Store::open_in_memory().unwrap();
         save_scratch_generation(&store, &initial, &resolution, &analysis);
@@ -2383,7 +2383,7 @@ mod tests {
         let initial = extract_tree(&root).unwrap();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&initial);
-        let resolution = resolver.resolve_all(&initial);
+        let resolution = resolver.resolve_all(&initial).unwrap();
         let analysis = analyze(&initial, &resolution);
         let store = Store::open_in_memory().unwrap();
         save_scratch_generation(&store, &initial, &resolution, &analysis);
@@ -2507,7 +2507,7 @@ mod tests {
         let initial = extract_tree(&root).unwrap();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&initial);
-        let resolution = resolver.resolve_all(&initial);
+        let resolution = resolver.resolve_all(&initial).unwrap();
         let analysis = analyze(&initial, &resolution);
         let store = Store::open_in_memory().unwrap();
         save_scratch_generation(&store, &initial, &resolution, &analysis);
@@ -2568,7 +2568,7 @@ mod tests {
         let initial = extract_tree(&root).unwrap();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&initial);
-        let resolution = resolver.resolve_all(&initial);
+        let resolution = resolver.resolve_all(&initial).unwrap();
         let analysis = analyze(&initial, &resolution);
         let store = Store::open_in_memory().unwrap();
         save_scratch_generation(&store, &initial, &resolution, &analysis);
@@ -3219,7 +3219,7 @@ mod tests {
         let initial = extract_tree(&root).unwrap();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&initial);
-        let resolution = resolver.resolve_all(&initial);
+        let resolution = resolver.resolve_all(&initial).unwrap();
         let analysis = analyze(&initial, &resolution);
         let store = Store::open_in_memory().unwrap();
         save_scratch_generation(&store, &initial, &resolution, &analysis);
@@ -3318,7 +3318,7 @@ mod tests {
         let initial = extract_tree(&root).unwrap();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&initial);
-        let resolution = resolver.resolve_all(&initial);
+        let resolution = resolver.resolve_all(&initial).unwrap();
         let analysis = analyze(&initial, &resolution);
         let store = Store::open_in_memory().unwrap();
         save_scratch_generation(&store, &initial, &resolution, &analysis);
@@ -3750,7 +3750,7 @@ mod tests {
         let initial = extract_tree(&root).unwrap();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&initial);
-        let resolution = resolver.resolve_all(&initial);
+        let resolution = resolver.resolve_all(&initial).unwrap();
         let analysis = analyze(&initial, &resolution);
         let database = root.join(".devcouncil/codeintel/index.sqlite");
         let store = Store::open(&database).unwrap();

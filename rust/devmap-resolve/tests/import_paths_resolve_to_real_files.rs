@@ -22,7 +22,7 @@ fn import_edges(files: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolved = resolver.resolve_all(&extractions);
+    let resolved = resolver.resolve_all(&extractions).unwrap();
     let mut edges: Vec<(String, String)> = resolved
         .edges
         .iter()

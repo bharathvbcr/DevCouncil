@@ -95,7 +95,7 @@ fn corpus(filler: usize, blind_files: usize) -> Vec<Extraction> {
 fn reports(extractions: &[Extraction]) -> (Vec<DeadSymbolReport>, ExtractionCoverage) {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    let resolution = resolver.resolve_all(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
     let outcome =
         analyze_liveness_with_coverage(extractions, &resolution, DiscoveryCoverage::none());
     (outcome.reports, outcome.coverage)

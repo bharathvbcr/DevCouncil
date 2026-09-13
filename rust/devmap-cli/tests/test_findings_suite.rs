@@ -71,12 +71,12 @@ fn test_r4_g26_deterministic_double_build() {
     ];
     let mut r1 = Resolver::new();
     r1.index_extractions(&files);
-    let res1 = r1.resolve_all(&files);
+    let res1 = r1.resolve_all(&files).unwrap();
     let ana1 = analyze(&files, &res1);
 
     let mut r2 = Resolver::new();
     r2.index_extractions(&files);
-    let res2 = r2.resolve_all(&files);
+    let res2 = r2.resolve_all(&files).unwrap();
     let ana2 = analyze(&files, &res2);
 
     let j1 = serde_json::to_string(&ana1.communities).unwrap();
@@ -93,7 +93,7 @@ fn test_t1_manifest_within_budget() {
     }
     let mut resolver = Resolver::new();
     resolver.index_extractions(&files);
-    let resolution = resolver.resolve_all(&files);
+    let resolution = resolver.resolve_all(&files).unwrap();
     let analysis = analyze(&files, &resolution);
     let (_, json) = generate_manifest(
         &files,
@@ -118,7 +118,7 @@ fn test_v12_dead_honest_counts() {
     let ext = extract_file("dead.py", &src);
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = analyze(std::slice::from_ref(&ext), &resolution);
     let dead: Vec<_> = analysis
         .dead_symbols
@@ -164,7 +164,7 @@ fn test_s3_fts_fuzz_corpus() {
     let ext = extract_file("fts.py", "def alpha_beta(): pass\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = analyze(std::slice::from_ref(&ext), &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -208,7 +208,7 @@ fn differential_membership_preserves_full_generation_while_b3_write_amplificatio
     }
     let mut resolver = Resolver::new();
     resolver.index_extractions(&files);
-    let resolution = resolver.resolve_all(&files);
+    let resolution = resolver.resolve_all(&files).unwrap();
     let analysis = analyze(&files, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -219,7 +219,7 @@ fn differential_membership_preserves_full_generation_while_b3_write_amplificatio
     edited[0] = extract_file("src/f0.py", "def fn_0(): return 1\n");
     let mut resolver2 = Resolver::new();
     resolver2.index_extractions(&edited);
-    let resolution2 = resolver2.resolve_all(&edited);
+    let resolution2 = resolver2.resolve_all(&edited).unwrap();
     let analysis2 = analyze(&edited, &resolution2);
     let gen2 = store
         .save_generation_with_opts(
@@ -254,7 +254,7 @@ fn test_explore_p95_soft_ratchet_2k() {
     }
     let mut resolver = Resolver::new();
     resolver.index_extractions(&files);
-    let resolution = resolver.resolve_all(&files);
+    let resolution = resolver.resolve_all(&files).unwrap();
     let engine = QueryEngine::new(&files, &resolution);
 
     let mut latencies = Vec::new();
@@ -311,7 +311,7 @@ fn lexical_search_operates_while_rrf_remains_open() {
     let ext = extract_file("search.py", "def find_me(): pass\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let engine = QueryEngine::new(std::slice::from_ref(&ext), &resolution);
     let resp = engine.search(Request {
         query: "find_me".into(),

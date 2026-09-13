@@ -35,7 +35,7 @@ fn corpus_store() -> Arc<Store> {
         .collect();
     let mut resolver = devmap_resolve::Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().expect("in-memory store");
     store
@@ -699,7 +699,7 @@ async fn unbroken_a_store_that_appears_mid_session_is_picked_up() {
             .collect();
         let mut resolver = devmap_resolve::Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         let analysis = devmap_analyze::analyze(&extractions, &resolution);
         let store = Store::open(&db).unwrap();
         store

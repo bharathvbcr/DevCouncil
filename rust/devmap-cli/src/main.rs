@@ -1,23 +1,41 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use anyhow::Context;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
+static DIAGNOSTICS: std::sync::OnceLock<progress::DiagnosticSink> = std::sync::OnceLock::new();
+
+fn diagnostic(message: std::fmt::Arguments<'_>) {
+    if let Some(sink) = DIAGNOSTICS.get() {
+        sink.diagnostic(message);
+    } else {
+        let fallback = progress::Display::new(ProgressMode::Never, false, false);
+        fallback.diagnostic(message);
+        fallback.finish("");
+    }
+}
+
 // All one-shot stdout uses this path, including JSON and large exports.
 // Windows has no SIGPIPE; a consumer closing its pipe must not panic the CLI.
 fn write_stdout(message: std::fmt::Arguments<'_>) {
+    if !presentation::write_human(message) {
+        write_stdout_raw(message);
+    }
+}
+
+fn write_stdout_raw(message: std::fmt::Arguments<'_>) {
     use std::io::Write;
     if let Err(error) = std::io::stdout().lock().write_fmt(message) {
         if error.kind() == std::io::ErrorKind::BrokenPipe {
             std::process::exit(0);
         }
         // A diagnostic sink may itself be gone; the failure exit still survives.
-        let _ = writeln!(
-            std::io::stderr().lock(),
-            "DevMap could not write stdout: {error}"
-        );
+        let display = progress::Display::new(ProgressMode::Never, false, false);
+        display.diagnostic(format_args!("DevMap could not write stdout: {error}"));
+        display.finish("");
         std::process::exit(1);
     }
 }
@@ -31,6 +49,7 @@ macro_rules! outln {
 mod claude;
 mod hook;
 mod integrate;
+mod presentation;
 mod progress;
 mod session;
 mod sha256;
@@ -186,7 +205,7 @@ struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     json: bool,
 
-    /// Build progress policy. Auto animates stages on interactive stderr;
+    /// Command progress policy. Auto animates work on interactive stderr;
     /// always also emits plain progress in logs. JSON stdout stays clean.
     #[arg(long, value_enum, global = true, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
@@ -1802,7 +1821,7 @@ fn write_consumer_artifacts(
         if let Some(progress) = request.progress {
             progress.diagnostic(message);
         } else {
-            eprintln!("{message}");
+            diagnostic(format_args!("{message}"));
         }
     };
     match ArtifactStamp::of(inputs, stamp_generated_head, &outputs) {
@@ -1986,12 +2005,15 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
             if !seen.insert(key.clone()) {
                 continue;
             }
+            let probe = inspect_devmap_identity(&resolved);
             rows.push(serde_json::json!({
                 "path": key,
                 "source": "PATH",
-                "version": probe_devmap_version(&resolved),
-                "build_id": probe_devmap_build_id(&resolved),
-                "sha256": sha256::sha256_file(&resolved),
+                "version": probe.version,
+                "build_id": probe.build_id,
+                "probe_error": probe.error,
+                "probe_status": probe.status,
+                "sha256": if resolved.is_file() { sha256::sha256_file(&resolved) } else { None },
                 "exists": true,
             }));
         }
@@ -2003,9 +2025,11 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
                 rows.push(serde_json::json!({
                     "path": key,
                     "source": "current_exe",
+                    "probe_status": "current_process",
+                    "probe_error": serde_json::Value::Null,
                     "version": Some(env!("CARGO_PKG_VERSION")),
                     "build_id": Some(env!("DEVMAP_BUILD_ID")),
-                    "sha256": sha256::sha256_file(&resolved),
+                    "sha256": if resolved.is_file() { sha256::sha256_file(&resolved) } else { None },
                     "exists": true,
                 }));
             }
@@ -2016,12 +2040,15 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
             let resolved = resolve_devmap_command(&command);
             let key = resolved.display().to_string();
             if seen.insert(key.clone()) {
+                let probe = inspect_devmap_identity(&resolved);
                 rows.push(serde_json::json!({
                     "path": key,
                     "source": label,
-                    "version": probe_devmap_version(&resolved),
-                    "build_id": probe_devmap_build_id(&resolved),
-                    "sha256": sha256::sha256_file(&resolved),
+                    "version": probe.version,
+                    "build_id": probe.build_id,
+                "probe_error": probe.error,
+                "probe_status": probe.status,
+                    "sha256": if resolved.is_file() { sha256::sha256_file(&resolved) } else { None },
                     "exists": resolved.is_file(),
                 }));
             } else if let Some(existing) = rows.iter_mut().find(|r| r["path"] == key) {
@@ -2116,37 +2143,36 @@ fn read_devmap_command_from_mcp_config(path: &Path) -> Option<String> {
     entry.get("command")?.as_str().map(str::to_string)
 }
 
-fn probe_devmap_version(path: &Path) -> Option<String> {
-    let output = std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    // `devmap 0.2.0 (store schema …)` — take the second token.
-    text.split_whitespace().nth(1).map(str::to_string)
+struct BinaryIdentity {
+    version: Option<String>,
+    build_id: Option<String>,
+    error: Option<String>,
+    status: &'static str,
 }
 
-fn probe_devmap_build_id(path: &Path) -> Option<String> {
-    let output = std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+// Diagnostics describe registrations; opening a checkout never authorizes its
+// commands to execute. Even PATH entries can point into the repository. Only
+// this already-running process supplies an authenticated build identity.
+fn inspect_devmap_identity(path: &Path) -> BinaryIdentity {
+    let is_current = std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .is_ok_and(|exe| exe == path);
+    if is_current {
+        return BinaryIdentity {
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            build_id: Some(env!("DEVMAP_BUILD_ID").to_string()),
+            error: None,
+            status: "current_process",
+        };
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut parts = text.split_whitespace();
-    while let Some(token) = parts.next() {
-        if token == "build" {
-            return parts
-                .next()
-                .map(|token| token.trim_end_matches(')').to_string());
-        }
+    BinaryIdentity {
+        version: None,
+        build_id: None,
+        error: Some(
+            "execution skipped: diagnostics inspect registrations without running them".into(),
+        ),
+        status: "skipped",
     }
-    None
 }
 
 fn build_identity_json() -> serde_json::Value {
@@ -2485,10 +2511,13 @@ fn stale_server_warning() -> Option<String> {
         let Ok(bin_mtime) = meta.modified() else {
             return None;
         };
-        let output = std::process::Command::new("ps")
-            .args(["-axo", "pid=,lstart=,command="])
-            .output()
-            .ok()?;
+        let mut command = std::process::Command::new("ps");
+        command.args(["-axo", "pid=,lstart=,command="]);
+        let output = match devmap_extract::subprocess::run_bounded(&mut command,
+            devmap_extract::subprocess::Bounds { deadline: std::time::Duration::from_millis(500), stdout_cap: 1024 * 1024, stderr_cap: 4096 }) {
+            Ok(output) if !output.stdout_truncated && !output.stderr_truncated => output,
+            _ => return Some("stale-server check unavailable: process inventory did not complete within its time/output bounds".into()),
+        };
         if !output.status.success() {
             return None;
         }
@@ -2506,14 +2535,23 @@ fn stale_server_warning() -> Option<String> {
                 continue;
             };
             let lstart: String = parts.by_ref().take(5).collect::<Vec<_>>().join(" ");
-            let Ok(started) = std::process::Command::new("date")
-                .args(["-j", "-f", "%a %b %d %T %Y", &lstart, "+%s"])
-                .output()
-            else {
-                continue;
+            let mut command = std::process::Command::new("date");
+            command.args(["-j", "-f", "%a %b %d %T %Y", &lstart, "+%s"]);
+            let Ok(started) = devmap_extract::subprocess::run_bounded(
+                &mut command,
+                devmap_extract::subprocess::Bounds {
+                    deadline: std::time::Duration::from_millis(100),
+                    stdout_cap: 4096,
+                    stderr_cap: 4096,
+                },
+            ) else {
+                return Some(
+                    "stale-server check unavailable: process timestamp probe did not complete"
+                        .into(),
+                );
             };
-            if !started.status.success() {
-                continue;
+            if !started.status.success() || started.stdout_truncated || started.stderr_truncated {
+                return Some("stale-server check unavailable: process timestamp could not be read completely on this platform".into());
             }
             let Ok(secs) = String::from_utf8_lossy(&started.stdout)
                 .trim()
@@ -4041,7 +4079,9 @@ fn on_command_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static
         .stack_size(8 * 1024 * 1024)
         .spawn(work)
         .unwrap_or_else(|error| {
-            eprintln!("DevMap could not start command introspection: {error}");
+            diagnostic(format_args!(
+                "DevMap could not start command introspection: {error}"
+            ));
             std::process::exit(1);
         });
     thread
@@ -4067,35 +4107,49 @@ async fn main() -> std::process::ExitCode {
         });
         (cli, matches)
     });
-    // stderr, not the builder's default stdout. Every command that emits a
-    // payload emits it on stdout — `emit_json` prints there, and `devmap mcp`
-    // speaks JSON-RPC there — so a log line on stdout is not noise beside the
-    // answer, it is a line *inside* the answer. `devmap search --json | jq`
-    // fails on it, and an MCP client's next parse fails on it.
+    if !cli.command.serves() {
+        restore_default_sigpipe();
+    }
+    let progress = matches!(cli.command, Commands::Build { .. })
+        .then(|| ProgressReporter::new(cli.progress, cli.json, cli.verbose));
+    let presentation = presentation::Session::start(&cli);
+    let fallback = (progress.is_none() && presentation.is_none())
+        .then(|| progress::Display::new(ProgressMode::Never, cli.json, cli.verbose));
+    let display = progress
+        .as_ref()
+        .map(|reporter| &reporter.display)
+        .or_else(|| presentation.as_ref().map(|session| &session.display))
+        .or(fallback.as_ref())
+        .expect("every command has a diagnostic output scope");
+    let sink = display.diagnostic_sink();
+    if DIAGNOSTICS.set(sink.clone()).is_err() {
+        display.diagnostic("DevMap diagnostic output was already initialized");
+    }
+    // No worker or server request can block on a log write. JSON-RPC stdout
+    // remains owned by its transport; presentation owns all ANSI styling.
     let subscriber = FmtSubscriber::builder()
         .with_max_level(if cli.verbose {
             Level::DEBUG
         } else {
             Level::INFO
         })
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
         .finish();
     if let Err(error) = tracing::subscriber::set_global_default(subscriber) {
-        eprintln!("DevMap logging unavailable: {error}");
+        diagnostic(format_args!("DevMap logging unavailable: {error}"));
     }
-
-    if !cli.command.serves() {
-        restore_default_sigpipe();
-    }
-    let progress = matches!(cli.command, Commands::Build { .. })
-        .then(|| ProgressReporter::new(cli.progress, cli.json, cli.verbose));
     let outcome = match validate_limits(&cli.command).and_then(|()| validate_root(&cli)) {
         Ok(()) => run(&cli, progress.as_ref()).await,
         Err(message) => Err(anyhow::anyhow!(message)),
     };
     match outcome {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(()) => {
+            if let Some(presentation) = &presentation {
+                presentation.finish(true);
+            }
+            std::process::ExitCode::SUCCESS
+        }
         Err(error) => {
             // Capture the open stage before closing it as failed. Do not log
             // query arguments, preview buffers, or environment variables.
@@ -4153,13 +4207,30 @@ async fn main() -> std::process::ExitCode {
                     }
                 }
             } else {
-                eprintln!("Error: {}", render_error(&error));
-                eprintln!("DevMap context: {context}");
+                display.diagnostic(format_args!(
+                    "Error: {}; DevMap context: {context}",
+                    render_error(&error)
+                ));
+                display.finish("");
+                if let Some(session) = &presentation {
+                    session.finish(false);
+                }
                 if cli.json {
                     outln!(
                         "{}",
-                        serde_json::json!({ "error": render_error(&error), "diagnostic_context": context })
+                        serde_json::json!({ "error": render_error(&error), "diagnostic_context": context,
+                            "progress_output": display.output_json() })
                     );
+                } else {
+                    for line in display.output_json()["diagnostics"]["unrendered"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(line) = line.as_str() {
+                            outln!("{line}");
+                        }
+                    }
                 }
             }
             std::process::ExitCode::FAILURE
@@ -4250,6 +4321,9 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         "--affected names {candidate}, which {why}. Paths must be \
                          relative to the repository root {}; drop it from the change set.",
                         path.display()
+                    ),
+                    devmap_extract::CacheVerdict::Unreadable { directory, reason } => anyhow::bail!(
+                        "--affected names {candidate}, whose cache marker {directory}/CACHEDIR.TAG could not be examined: {reason}"
                     ),
                     devmap_extract::CacheVerdict::Outside => {}
                 }
@@ -4487,11 +4561,14 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                             }),
                         )?;
                     } else {
-                        outln!(
-                            "No source changes; generation #{generation} still current \
+                        progress.display.summary(
+                            "Already mapped",
+                            &[format!(
+                                "No source changes; generation #{generation} still current \
                              ({}) in {}.",
-                            progress::count(file_count, "file"),
-                            progress::duration(progress.started_at.elapsed().as_secs_f64())
+                                progress::count(file_count, "file"),
+                                progress::duration(progress.started_at.elapsed().as_secs_f64())
+                            )],
                         );
                         progress.display.report_loss();
                         if cli.verbose {
@@ -4609,7 +4686,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 2,
                 format_args!("resolving {}", progress::count(extractions.len(), "file")),
             );
-            let resolution = resolver.resolve_all(&extractions);
+            let resolution = resolver.resolve_all(&extractions)?;
             progress.stage(
                 3,
                 format_args!(
@@ -4844,36 +4921,36 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     }),
                 )?;
             } else {
-                outln!(
-                    "Built generation #{gen_id} · {} · {} · {} · {}",
-                    progress::count(analysis.total_files, "file"),
-                    progress::count(analysis.total_symbols, "symbol"),
-                    progress::count(analysis.total_edges, "edge"),
-                    progress::duration(progress.started_at.elapsed().as_secs_f64())
-                );
-                outln!(
-                    "  Changes: +{} ~{} -{} · {} unchanged · {} cached",
-                    file_delta.added,
-                    file_delta.changed,
-                    file_delta.removed,
-                    file_delta.unchanged,
-                    extraction_snapshot.cache_hits
-                );
+                let mut summary = vec![
+                    format!(
+                        "Built generation #{gen_id} · {} · {} · {} · {}",
+                        progress::count(analysis.total_files, "file"),
+                        progress::count(analysis.total_symbols, "symbol"),
+                        progress::count(analysis.total_edges, "edge"),
+                        progress::duration(progress.started_at.elapsed().as_secs_f64())
+                    ),
+                    format!(
+                        "  Changes: +{} ~{} -{} · {} unchanged · {} cached",
+                        file_delta.added,
+                        file_delta.changed,
+                        file_delta.removed,
+                        file_delta.unchanged,
+                        extraction_snapshot.cache_hits
+                    ),
+                ];
+                if refused_count > 0 {
+                    summary.push(format!(
+                        "    of which refused by discovery: {refused_count} \
+                         (recorded as lost coverage, not parsed)"
+                    ));
+                }
+                if !cli.verbose && (unattributed_calls > 0 || uninferred_receiver_calls > 0) {
+                    summary.push(format!("  Unresolved: {unattributed_calls} unattributed, {uninferred_receiver_calls} uninferred receivers (details: --verbose)"));
+                }
+                progress.display.summary("Map ready", &summary);
                 progress.display.report_loss();
                 if cli.verbose {
                     outln!("  Files indexed: {}", analysis.total_files);
-                }
-                if refused_count > 0 {
-                    // Said here as well as on stderr: the count belongs beside
-                    // the file total it is part of, or a reader takes the total
-                    // for a count of files that were read.
-                    outln!(
-                        "    of which refused by discovery: {refused_count} \
-                         (recorded as lost coverage, not parsed)"
-                    );
-                }
-                if !cli.verbose && (unattributed_calls > 0 || uninferred_receiver_calls > 0) {
-                    outln!("  Unresolved: {unattributed_calls} unattributed, {uninferred_receiver_calls} uninferred receivers (details: --verbose)");
                 }
                 if cli.verbose {
                     outln!("  Symbols extracted: {}", analysis.total_symbols);
@@ -5958,39 +6035,55 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             if cli.db.is_none() {
                 store.validate_repo_root(&cli.root_hint())?;
             }
+            let mut receipt = serde_json::Map::new();
             if *schema {
-                emit_json(
-                    cli,
-                    &serde_json::json!({
-                        "schema_before": before,
-                        "schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
-                        "upgraded": before != Some(devmap_store::CURRENT_SCHEMA_VERSION),
-                    }),
-                )?;
+                receipt.insert("schema_before".into(), serde_json::json!(before));
+                receipt.insert(
+                    "schema_version".into(),
+                    serde_json::json!(devmap_store::CURRENT_SCHEMA_VERSION),
+                );
+                receipt.insert(
+                    "upgraded".into(),
+                    serde_json::json!(before != Some(devmap_store::CURRENT_SCHEMA_VERSION)),
+                );
+                if !cli.json {
+                    outln!(
+                        "Store schema {} (previous: {:?}).",
+                        devmap_store::CURRENT_SCHEMA_VERSION,
+                        before
+                    );
+                }
             }
             if *page_size {
-                let outcome = store.convert_page_size()?;
-                if cli.json {
-                    emit_json(
-                        cli,
-                        &serde_json::json!({
-                            "page_size_before": outcome.before,
-                            "page_size_after": outcome.after,
-                            "converted": outcome.converted,
-                        }),
-                    )?;
-                } else if outcome.converted {
-                    outln!(
-                        "Store rewritten at {} byte pages (was {}).",
-                        outcome.after,
-                        outcome.before
-                    );
-                } else {
-                    outln!("Store already uses {} byte pages.", outcome.after);
+                let outcome = store.convert_page_size().with_context(|| {
+                    format!(
+                        "page-size repair failed; completed results: {}",
+                        serde_json::json!(receipt)
+                    )
+                })?;
+                receipt.insert("page_size_before".into(), serde_json::json!(outcome.before));
+                receipt.insert("page_size_after".into(), serde_json::json!(outcome.after));
+                receipt.insert("converted".into(), serde_json::json!(outcome.converted));
+                if !cli.json {
+                    if outcome.converted {
+                        outln!(
+                            "Store rewritten at {} byte pages (was {}).",
+                            outcome.after,
+                            outcome.before
+                        );
+                    } else {
+                        outln!("Store already uses {} byte pages.", outcome.after);
+                    }
                 }
             }
             if *fts {
-                store.repair_fts()?;
+                store.repair_fts().with_context(|| {
+                    format!(
+                        "FTS repair failed; completed results: {}",
+                        serde_json::json!(receipt)
+                    )
+                })?;
+                receipt.insert("fts_repaired".into(), serde_json::json!(true));
                 if !cli.json {
                     outln!("FTS search index repaired.");
                 }
@@ -6013,25 +6106,25 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 let quarantined = store.drop_quarantined_pending_paths()?;
 
                 if cli.json {
-                    emit_json(
-                        cli,
-                        &serde_json::json!({
-                            "repo_root": root.as_ref().map(|root| root.display().to_string()),
-                            "structural_pass_ran": root.is_some(),
-                            "dropped_unprocessable": structural.dropped
-                                .iter()
-                                .map(|(path, reason)| serde_json::json!({
-                                    "path": path, "reason": reason,
-                                }))
-                                .collect::<Vec<_>>(),
-                            "normalized": structural.rewritten
-                                .iter()
-                                .map(|(from, to)| serde_json::json!({ "from": from, "to": to }))
-                                .collect::<Vec<_>>(),
-                            "dropped_quarantined": quarantined,
-                            "retained": structural.retained.saturating_sub(quarantined.len()),
-                        }),
-                    )?;
+                    let pending_receipt = serde_json::json!({
+                        "repo_root": root.as_ref().map(|root| root.display().to_string()),
+                        "structural_pass_ran": root.is_some(),
+                        "dropped_unprocessable": structural.dropped
+                            .iter()
+                            .map(|(path, reason)| serde_json::json!({
+                                "path": path, "reason": reason,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "normalized": structural.rewritten
+                            .iter()
+                            .map(|(from, to)| serde_json::json!({ "from": from, "to": to }))
+                            .collect::<Vec<_>>(),
+                        "dropped_quarantined": quarantined,
+                        "retained": structural.retained.saturating_sub(quarantined.len()),
+                    });
+                    if let serde_json::Value::Object(fields) = pending_receipt {
+                        receipt.extend(fields);
+                    }
                 } else {
                     if root.is_none() {
                         outln!(
@@ -6059,6 +6152,9 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         structural.rewritten.len(),
                     );
                 }
+            }
+            if cli.json {
+                emit_json(cli, &serde_json::Value::Object(receipt))?;
             }
         }
         Commands::Snapshots { file, budget } => {
@@ -6369,6 +6465,9 @@ empty graph, which would read as 'this file has no control flow'.",
             }
         }
         Commands::Export { path, out } => {
+            if cli.json && out.as_deref() == Some(std::path::Path::new("-")) {
+                anyhow::bail!("--json cannot be combined with --out -: choose a JSON receipt with an output file, or raw GraphML on stdout");
+            }
             let store = open_for_read(cli)?;
             let graph = graph_value_for_read(&store, &cli.db())?;
             let gen_id = store.latest_generation_id()?.unwrap_or(0);
@@ -6382,8 +6481,7 @@ empty graph, which would read as 'this file has no control flow'.",
             if to_stdout {
                 write_stdout(format_args!("{xml}"));
             } else {
-                ensure_parent(&destination)?;
-                std::fs::write(&destination, &xml)?;
+                devmap_query::write_atomic(&destination, xml.as_bytes())?;
             }
 
             if cli.json {
@@ -6506,8 +6604,7 @@ represent them",
             let destination = out
                 .clone()
                 .unwrap_or_else(|| devmap_extract::paths::state_dir(path).join("graph.html"));
-            ensure_parent(&destination)?;
-            std::fs::write(&destination, &html)?;
+            devmap_query::write_atomic(&destination, html.as_bytes())?;
 
             let counts = &payload["counts"];
             if cli.json {
@@ -6725,17 +6822,17 @@ fn run_integrate(
 
 fn run_hook_command(cli: &Cli, event_name: &str) -> anyhow::Result<i32> {
     let Some(event) = hook::HookEvent::parse(event_name) else {
-        eprintln!(
+        diagnostic(format_args!(
             "devmap hook: unknown event {event_name:?}; expected session-start, \
              post-tool-use, or session-end"
-        );
+        ));
         return Ok(1);
     };
     let stdin = hook::read_stdin_bounded().unwrap_or_default();
     let executable = std::env::current_exe()?;
     let outcome = hook::run_hook(event, &stdin, &executable, cli.root.as_deref());
     if let Some(line) = &outcome.stderr_line {
-        eprintln!("{line}");
+        diagnostic(format_args!("{line}"));
     }
     if let Some(stdout) = &outcome.stdout {
         if cli.json {
@@ -7318,4 +7415,29 @@ mod tests {
             "one real binary plus a missing path is not version skew"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn passive_identity_cannot_wait_for_a_hung_binary() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("devmap-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let program = dir.join("devmap");
+    std::fs::write(&program, "#!/bin/sh\nexec /bin/sleep 3\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let started = Instant::now();
+    let probe = inspect_devmap_identity(&program);
+    assert!(probe.version.is_none());
+    assert_eq!(probe.status, "skipped");
+    assert!(probe
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("execution skipped"));
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "passive inspection waited for the hung program"
+    );
 }

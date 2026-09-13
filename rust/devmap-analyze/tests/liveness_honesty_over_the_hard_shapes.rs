@@ -115,7 +115,7 @@ fn corpus() -> (Vec<Extraction>, devmap_resolve::model::ResolutionResult) {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     (extractions, resolution)
 }
 
@@ -189,7 +189,7 @@ fn a_symbol_nothing_reaches_is_still_reported() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     let reports = analyze_liveness(&extractions, &resolution);
     assert!(

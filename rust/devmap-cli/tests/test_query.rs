@@ -17,7 +17,7 @@ fn test_token_budgeting() {
     let ext = extract_file("src/handler.py", "def process_request():\n    pass\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
 
     let extractions = vec![ext];
     let engine = QueryEngine::new(&extractions, &resolution);
@@ -167,7 +167,7 @@ fn test_search_never_exceeds_hard_token_budget() {
     );
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let engine = QueryEngine::new(std::slice::from_ref(&ext), &resolution);
 
     let response = engine.search(Request {
@@ -241,7 +241,7 @@ fn test_empty_search_is_fail_closed() {
     let ext = extract_file("src/empty_query.py", "def visible(): pass\n");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let engine = QueryEngine::new(std::slice::from_ref(&ext), &resolution);
 
     let response = engine.search(Request {
@@ -339,7 +339,7 @@ fn clones_round_trip_through_the_store() {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
 
     let store = Store::open_in_memory().unwrap();
@@ -451,7 +451,7 @@ fn clone_filters_apply_before_the_token_budget() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -534,7 +534,7 @@ fn savings_counts_files_it_could_not_read_rather_than_calling_them_empty() {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -587,7 +587,7 @@ fn savings_reports_the_query_side_without_assuming_a_saving() {
     let extractions = vec![extract_file("tiny.py", tiny)];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
     store

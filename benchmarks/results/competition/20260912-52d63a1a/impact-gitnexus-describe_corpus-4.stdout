@@ -1,0 +1,75 @@
+{
+  "target": {
+    "id": "Function:benchmarks/map_bench.py:describe_corpus",
+    "name": "describe_corpus",
+    "type": "Function",
+    "filePath": "benchmarks/map_bench.py"
+  },
+  "direction": "upstream",
+  "impactedCount": 1,
+  "risk": "LOW",
+  "epistemic": "exact",
+  "summary": {
+    "direct": 1,
+    "processes_affected": 1,
+    "modules_affected": 1
+  },
+  "byDepthCounts": {
+    "1": 1
+  },
+  "affected_processes": [
+    {
+      "name": "main",
+      "type": "Function",
+      "filePath": "benchmarks/map_bench.py",
+      "affected_process_count": 4,
+      "total_hits": 4,
+      "earliest_broken_step": 1
+    }
+  ],
+  "affected_modules": [
+    {
+      "name": "Benchmarks",
+      "hits": 1,
+      "impact": "direct"
+    }
+  ],
+  "byDepth": {
+    "1": [
+      {
+        "depth": 1,
+        "id": "Function:benchmarks/map_bench.py:main",
+        "name": "main",
+        "filePath": "benchmarks/map_bench.py",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_272_main",
+            "label": "Main → _store_shape",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_159_main",
+            "label": "Main → _base_argv",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_271_main",
+            "label": "Main → _reset_store",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_160_main",
+            "label": "Main → Run",
+            "processType": "cross_community",
+            "step": 1
+          }
+        ]
+      }
+    ]
+  }
+}

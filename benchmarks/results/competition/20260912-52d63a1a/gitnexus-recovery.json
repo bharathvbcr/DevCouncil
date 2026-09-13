@@ -1,0 +1,71 @@
+[
+  {
+    "label": "reanalyze",
+    "exit_code": 0,
+    "seconds": 0.7345380410006328,
+    "argv": [
+      "gitnexus",
+      "analyze",
+      "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/gitnexus-corpus",
+      "--index-only",
+      "--name",
+      "devcouncil-bench-52d63a1a"
+    ]
+  },
+  {
+    "label": "still-stale",
+    "exit_code": 0,
+    "seconds": 1.5259590830000889,
+    "argv": [
+      "gitnexus",
+      "context",
+      "devmap_competition_revision_3",
+      "-r",
+      "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/gitnexus-corpus"
+    ],
+    "response": {
+      "status": "found",
+      "symbol": {
+        "uid": "Function:benchmarks/tasks.py:devmap_competition_revision_3",
+        "name": "devmap_competition_revision_3",
+        "kind": "Function",
+        "filePath": "benchmarks/tasks.py",
+        "startLine": 265,
+        "endLine": 266
+      },
+      "epistemic": "exact",
+      "incoming": {},
+      "outgoing": {},
+      "processes": []
+    }
+  },
+  {
+    "label": "force-rebuild",
+    "exit_code": 0,
+    "seconds": 50.540738165999755,
+    "argv": [
+      "gitnexus",
+      "analyze",
+      "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/gitnexus-corpus",
+      "--force",
+      "--index-only",
+      "--name",
+      "devcouncil-bench-52d63a1a"
+    ]
+  },
+  {
+    "label": "after-force",
+    "exit_code": 0,
+    "seconds": 0.9877511250006137,
+    "argv": [
+      "gitnexus",
+      "context",
+      "devmap_competition_revision_3",
+      "-r",
+      "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/gitnexus-corpus"
+    ],
+    "response": {
+      "error": "Symbol 'devmap_competition_revision_3' not found"
+    }
+  }
+]

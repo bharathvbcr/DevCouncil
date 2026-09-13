@@ -1,0 +1,10 @@
+Usage: codegraph query [options] <search>
+
+Search for symbols in the codebase
+
+Options:
+  -p, --path <path>     Project path
+  -l, --limit <number>  Maximum results (default: "10")
+  -k, --kind <kind>     Filter by node kind (function, class, etc.)
+  -j, --json            Output as JSON
+  -h, --help            display help for command

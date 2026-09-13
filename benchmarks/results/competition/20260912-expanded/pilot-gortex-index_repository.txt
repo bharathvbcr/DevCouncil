@@ -1,0 +1,7 @@
+{
+  "derived_invalidation": {},
+  "duration_ms": 947,
+  "edge_count": 215473,
+  "file_count": 1133,
+  "node_count": 34212
+}

@@ -27,7 +27,7 @@ fn test_store_operations() -> anyhow::Result<()> {
     let ext = extract_file("src/main.rs", "fn main() {}");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let resolution = resolver.resolve_all(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let analysis = analyze(std::slice::from_ref(&ext), &resolution);
 
     let gen_id = store.save_generation(&[ext], &resolution, &analysis)?;
@@ -47,7 +47,7 @@ fn test_deletion_reconciliation_and_incremental_write() -> anyhow::Result<()> {
 
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[ext1.clone(), ext2.clone()]);
-    let res1 = resolver.resolve_all(&[ext1.clone(), ext2.clone()]);
+    let res1 = resolver.resolve_all(&[ext1.clone(), ext2.clone()]).unwrap();
     let ana1 = analyze(&[ext1.clone(), ext2.clone()], &res1);
 
     let gen1 = store.save_generation(&[ext1.clone(), ext2.clone()], &res1, &ana1)?;
@@ -60,7 +60,7 @@ fn test_deletion_reconciliation_and_incremental_write() -> anyhow::Result<()> {
 
     let mut resolver2 = Resolver::new();
     resolver2.index_extractions(std::slice::from_ref(&ext1));
-    let res2 = resolver2.resolve_all(std::slice::from_ref(&ext1));
+    let res2 = resolver2.resolve_all(std::slice::from_ref(&ext1)).unwrap();
     // Analysed from the resolution this generation writes, not from gen 1's.
     // Reusing `ana1` here described two files while storing one, which the
     // store now refuses: an analysis that does not match the edges beside it is
@@ -107,7 +107,7 @@ fn test_generation_pruning() -> anyhow::Result<()> {
     let ext = extract_file("src/f1.py", "def fn1(): pass");
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&ext));
-    let res = resolver.resolve_all(std::slice::from_ref(&ext));
+    let res = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
     let ana = analyze(std::slice::from_ref(&ext), &res);
 
     for _ in 0..10 {

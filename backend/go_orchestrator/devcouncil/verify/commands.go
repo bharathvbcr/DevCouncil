@@ -5,44 +5,11 @@ import (
 	"strings"
 )
 
-// Signatures that mean the command could not run (tooling/plan defect), so a
-// non-zero exit proves nothing about the implementation.
-var malformedSignatures = []string{
-	"syntaxerror",
-	"invalid syntax",
-	"indentationerror",
-	"no module named",
-	"can't open file",
-	"no such file or directory",
-	"file or directory not found",
-	"no tests ran",
-	"no tests collected",
-	"error: not found",
-	"is not recognized as an internal or external command",
-	"command not found",
-	"executable file not found",
-	"failed to run command",
-	"importerror",
-	"modulenotfounderror",
-}
-
-// CommandIsMalformed reports whether a non-zero outcome is unrunnable tooling
-// rather than a real test failure.
+// CommandIsMalformed uses the runner's structured outcome. Child output is
+// untrusted text: a failing test may print any tooling error without changing
+// the fact that its process ran and failed.
 func CommandIsMalformed(outcome CommandOutcome) bool {
-	if outcome.Skipped {
-		return true
-	}
-	text := strings.ToLower(outcome.Summary + "\n" + outcome.Stdout + "\n" + outcome.Stderr)
-	for _, sig := range malformedSignatures {
-		if strings.Contains(text, sig) {
-			return true
-		}
-	}
-	// Exit -1 is the synthetic "could not launch" used by the default runner.
-	if outcome.ExitCode < 0 {
-		return true
-	}
-	return false
+	return outcome.Skipped || outcome.ExitCode < 0
 }
 
 // RunVerificationCommands executes planner/config verification commands.
@@ -66,7 +33,7 @@ func RunVerificationCommands(taskID string, commands []string, run func(string) 
 					"': command runner unavailable.",
 				Evidence:         []string{"command runner unavailable"},
 				RecommendedFix:   "Replace it with a command for this repo's stack, or remove it from the task's expected_tests.",
-				Blocking:         false,
+				Blocking:         true,
 				SuggestedCommand: &c,
 			})
 		}
@@ -89,7 +56,7 @@ func RunVerificationCommands(taskID string, commands []string, run func(string) 
 				Description:      "Skipped verification command '" + cmd + "': " + reason + ".",
 				Evidence:         []string{reason},
 				RecommendedFix:   "Replace it with a command for this repo's stack, or remove it from the task's expected_tests.",
-				Blocking:         false,
+				Blocking:         true,
 				SuggestedCommand: &c,
 			})
 			continue
@@ -119,7 +86,7 @@ func RunVerificationCommands(taskID string, commands []string, run func(string) 
 				Evidence: []string{truncate(summary, 500)},
 				RecommendedFix: "Regenerate the task's verification commands with 'dev repair', or edit them " +
 					"to be a single runnable command (e.g. 'python -m pytest <file>').",
-				Blocking:         false,
+				Blocking:         true,
 				SuggestedCommand: &c,
 			})
 			continue

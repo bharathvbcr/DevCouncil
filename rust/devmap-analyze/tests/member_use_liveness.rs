@@ -20,7 +20,7 @@ fn reports(sources: &[(&str, &str)]) -> Vec<DeadSymbolReport> {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     analyze_liveness(&extractions, &resolution)
 }
 
@@ -112,7 +112,7 @@ fn a_reexporting_package_still_binds_to_its_init() {
             .collect();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        resolver.resolve_all(&extractions)
+        resolver.resolve_all(&extractions).unwrap()
     };
     let target = result
         .edges
@@ -151,7 +151,7 @@ fn a_module_qualified_call_does_not_bind_to_a_same_named_local() {
             .collect();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        resolver.resolve_all(&extractions)
+        resolver.resolve_all(&extractions).unwrap()
     };
     let self_call = result.edges.iter().any(|edge| {
         edge.edge_kind == EdgeKind::Calls

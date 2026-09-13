@@ -52,7 +52,7 @@ impl RootResolveInput {
             return Err(ambiguous_roots_error(&with_stores));
         }
         if with_stores.len() == 1 {
-            return Ok(canonical_store_path(store_for_root(&with_stores[0])));
+            return canonical_store_path(store_for_root(&with_stores[0]));
         }
 
         let mut attempts = Vec::new();
@@ -111,7 +111,7 @@ impl RootResolveInput {
                 source: "--db",
                 detail: "not set (global registration does not pass --db)".into(),
             }),
-            Some(db) if db.is_file() => return Ok(canonical_store_path(db.clone())),
+            Some(db) if db.is_file() => return canonical_store_path(db.clone()),
             Some(db) => attempts.push(ResolveAttempt {
                 source: "--db",
                 detail: format!("no store at {}", db.display()),
@@ -127,7 +127,7 @@ impl RootResolveInput {
     pub fn resolve_with_db_override(&self) -> Result<PathBuf, String> {
         if let Some(db) = &self.explicit_db {
             if db.is_file() {
-                return Ok(canonical_store_path(db.clone()));
+                return canonical_store_path(db.clone());
             }
             // Fall through so the error still names roots and cwd: a bad --db
             // with a working root is recoverable by dropping the flag.
@@ -283,8 +283,9 @@ fn store_for_root(root: &Path) -> PathBuf {
     paths::store_path(root)
 }
 
-fn canonical_store_path(path: PathBuf) -> PathBuf {
-    path.canonicalize().unwrap_or(path)
+fn canonical_store_path(path: PathBuf) -> Result<PathBuf, String> {
+    devmap_extract::safe_fs::resolve_file_alias(&path)
+        .map_err(|error| format!("unsafe store path {}: {error}", path.display()))
 }
 
 /// MCP roots that have a store, de-duplicated by canonical directory path.

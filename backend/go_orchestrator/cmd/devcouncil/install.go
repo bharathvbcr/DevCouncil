@@ -2,44 +2,77 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/components"
 )
 
 func runInstall(args []string) int {
 	list, jsonOut, dry, prefix, names, help, err := parseInstallArgs(args)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		console.Errorln(err)
 		return 2
 	}
 	if help {
-		fmt.Print(components.HelpText)
+		console.Print(components.HelpText)
 		return 0
 	}
 	if list {
 		if jsonOut {
 			b, err := components.ListJSON()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "install: %v\n", err)
+				console.Errorf("install: %v\n", err)
 				return 1
 			}
-			fmt.Println(string(b))
+			if _, err := console.Println(string(b)); err != nil {
+				console.Errorln(err)
+				return 1
+			}
 			return 0
 		}
-		fmt.Print(components.HelpText)
+		console.Print(components.HelpText)
 		return 0
 	}
 	cs, err := components.Resolve(names)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		console.Errorln(err)
 		return 2
 	}
-	if err := components.Install(cs, components.Options{Prefix: prefix, DryRun: dry}); err != nil {
-		fmt.Fprintf(os.Stderr, "install: %v\n", err)
+	opts := components.Options{Prefix: prefix, DryRun: dry}
+	var installErr error
+	// A dry-run plan is already structured; do not print shell commands into JSON.
+	if !jsonOut || !dry {
+		installErr = components.Install(cs, opts)
+	}
+	if jsonOut {
+		ids := make([]string, 0, len(cs))
+		for _, c := range cs {
+			ids = append(ids, c.ID)
+		}
+		receipt := struct {
+			OK         bool     `json:"ok"`
+			DryRun     bool     `json:"dry_run"`
+			Components []string `json:"components"`
+			Commands   []string `json:"commands,omitempty"`
+			Error      string   `json:"error,omitempty"`
+		}{OK: installErr == nil, DryRun: dry, Components: ids}
+		if dry {
+			receipt.Commands = components.PlannedCommands(cs, opts)
+		}
+		if installErr != nil {
+			receipt.Error = installErr.Error()
+		}
+		if err := console.JSON(receipt); err != nil {
+			console.Errorln(err)
+			return 1
+		}
+	}
+	if installErr != nil {
+		console.Errorf("install: %v\n", installErr)
 		return 1
 	}
+
 	return 0
 }
 
@@ -92,7 +125,7 @@ func runUninstall(args []string) int {
 		case "--prefix":
 			i++
 			if i >= len(args) {
-				fmt.Fprintln(os.Stderr, "--prefix needs a directory")
+				console.Errorln("--prefix needs a directory")
 				return 2
 			}
 			prefix = args[i]
@@ -100,28 +133,28 @@ func runUninstall(args []string) int {
 			if strings.HasPrefix(args[i], "--prefix=") {
 				prefix = strings.TrimPrefix(args[i], "--prefix=")
 				if prefix == "" {
-					fmt.Fprintln(os.Stderr, "--prefix needs a directory")
+					console.Errorln("--prefix needs a directory")
 					return 2
 				}
 				continue
 			}
 			if strings.HasPrefix(args[i], "-") {
-				fmt.Fprintf(os.Stderr, "unknown flag: %s\n", args[i])
+				console.Errorf("unknown flag: %s\n", args[i])
 				return 2
 			}
 			names = append(names, args[i])
 		}
 	}
 	if help {
-		fmt.Fprintln(os.Stderr, "usage: devcouncil uninstall [names…] [--all] [--yes] [--prefix DIR] [--dry-run]")
+		console.Errorln("usage: devcouncil uninstall [names…] [--all] [--yes] [--prefix DIR] [--dry-run]")
 		return 0
 	}
 	if all && len(names) > 0 {
-		fmt.Fprintln(os.Stderr, "uninstall: do not mix --all with component names")
+		console.Errorln("uninstall: do not mix --all with component names")
 		return 2
 	}
 	if !all && len(names) == 0 {
-		fmt.Fprintln(os.Stderr, "uninstall requires a component name or --all (see --help)")
+		console.Errorln("uninstall requires a component name or --all (see --help)")
 		return 2
 	}
 	if all {
@@ -129,7 +162,7 @@ func runUninstall(args []string) int {
 	}
 	cs, err := components.Resolve(names)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		console.Errorln(err)
 		return 2
 	}
 	root := prefix
@@ -137,11 +170,11 @@ func runUninstall(args []string) int {
 		root = components.DefaultPrefix()
 	}
 	if !yes && !dry {
-		fmt.Fprintf(os.Stderr, "This will remove %d component(s) from %s. Re-run with --yes.\n", len(cs), root)
+		console.Errorf("This will remove %d component(s) from %s. Re-run with --yes.\n", len(cs), root)
 		return 2
 	}
 	if err := components.Uninstall(cs, components.Options{Prefix: prefix, DryRun: dry, Yes: yes}); err != nil {
-		fmt.Fprintf(os.Stderr, "uninstall: %v\n", err)
+		console.Errorf("uninstall: %v\n", err)
 		return 1
 	}
 	return 0
@@ -170,7 +203,7 @@ func runDisableEnable(args []string, disable bool) int {
 		case "--prefix":
 			i++
 			if i >= len(args) {
-				fmt.Fprintln(os.Stderr, "--prefix needs a directory")
+				console.Errorln("--prefix needs a directory")
 				return 2
 			}
 			prefix = args[i]
@@ -178,37 +211,41 @@ func runDisableEnable(args []string, disable bool) int {
 			if strings.HasPrefix(args[i], "--prefix=") {
 				prefix = strings.TrimPrefix(args[i], "--prefix=")
 				if prefix == "" {
-					fmt.Fprintln(os.Stderr, "--prefix needs a directory")
+					console.Errorln("--prefix needs a directory")
 					return 2
 				}
 				continue
 			}
 			if strings.HasPrefix(args[i], "-") {
-				fmt.Fprintf(os.Stderr, "unknown flag: %s\n", args[i])
+				console.Errorf("unknown flag: %s\n", args[i])
 				return 2
 			}
 			if name != "" {
-				fmt.Fprintf(os.Stderr, "unexpected argument: %s\n", args[i])
+				console.Errorf("unexpected argument: %s\n", args[i])
 				return 2
 			}
 			name = args[i]
 		}
 	}
 	if help {
-		fmt.Fprintf(os.Stderr, "usage: devcouncil %s NAME [--prefix DIR]\n", verb)
-		fmt.Fprintln(os.Stderr, "NAME is a component id, or 'hooks' to uninstall write-gate hooks.")
+		console.Errorf("usage: devcouncil %s NAME [--prefix DIR]\n", verb)
+		console.Errorln("NAME is a component id, or 'hooks' to uninstall write-gate hooks.")
 		return 0
 	}
 	if name == "" {
-		fmt.Fprintf(os.Stderr, "%s requires NAME (see --help)\n", verb)
+		console.Errorf("%s requires NAME (see --help)\n", verb)
 		return 2
 	}
 	if strings.EqualFold(name, "hooks") {
 		if !disable {
-			fmt.Fprintln(os.Stderr, "enable hooks: re-run `devcouncil integrate HOST --write-gate`")
+			console.Errorln("enable hooks: re-run `devcouncil integrate HOST --write-gate`")
 			return 2
 		}
-		return runIntegrate([]string{"uninstall", "--target", "hooks"})
+		uninstallArgs := []string{"uninstall", "--target", "hooks"}
+		if dry {
+			uninstallArgs = append(uninstallArgs, "--dry-run")
+		}
+		return runIntegrate(uninstallArgs)
 	}
 	opts := components.Options{Prefix: prefix, DryRun: dry}
 	var err error
@@ -218,7 +255,7 @@ func runDisableEnable(args []string, disable bool) int {
 		err = components.Enable(name, opts)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", verb, err)
+		console.Errorf("%s: %v\n", verb, err)
 		return 1
 	}
 	return 0

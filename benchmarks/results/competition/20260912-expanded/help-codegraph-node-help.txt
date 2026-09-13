@@ -1,0 +1,12 @@
+Usage: codegraph node [options] [name]
+
+One symbol's source + caller/callee trail, or read a file with line numbers +
+dependents (same output as the codegraph_node MCP tool)
+
+Options:
+  -p, --path <path>  Project path
+  -f, --file <file>  Treat as file mode (or disambiguate a symbol to this file)
+  --offset <number>  File mode: 1-based start line
+  --limit <number>   File mode: maximum lines
+  --symbols-only     File mode: just the symbol map + dependents
+  -h, --help         display help for command

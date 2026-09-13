@@ -49,7 +49,7 @@ fn the_core_graph_carries_the_artifacts_nodes_and_edges_and_nothing_else() {
     let extractions = corpus();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = AnalysisSummary {
         total_files: extractions.len(),
         total_symbols: extractions.iter().map(|ext| ext.symbols.len()).sum(),

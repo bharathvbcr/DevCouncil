@@ -3,6 +3,10 @@
 This folder is the **live** DevMap guide and contracts. Port ledgers, dated
 audits, and qualification dumps are in [archive/devmap/](../archive/devmap/).
 
+[Repository input and verification boundaries](../SECURITY_BOUNDARIES.md)
+cover unsafe paths, passive diagnostics, bounded analysis and unavailable
+source evidence, including Rust API changes for embedders.
+
 Kernel sources live under [`rust/`](../../rust/) (`devmap-*` crates, `vendor/`,
 `testdata/`, `verify.sh`). Older archived pages still say `rust-port/`.
 
@@ -92,6 +96,54 @@ Impact, trace, affected tests, and the layers in composed answers retain these
 coverage qualifications. Rebuilding refreshes stale source data; it does not
 remove language limitations or make unresolved dynamic calls deterministic.
 
+## Benchmark comparison
+
+The [2026-09-12 competitor report](../../benchmarks/results/competition/20260912-expanded/REPORT.md)
+records **261 timing samples** against Graphify, Gortex, GitNexus, CodeGraph,
+codebase-memory-mcp, and a ripgrep text baseline. All graph tools received the
+same 1,186-file DevCouncil snapshot. The report is the canonical source for
+per-tool positives and negatives, query timings, memory/storage, correctness,
+warnings, methodology, and raw evidence.
+
+**Verified medians for that run:**
+
+| Tool | Cold index | Unchanged refresh | Single-file edit | Inspected caller pairs |
+|---|---:|---:|---:|---:|
+| DevMap | 1.971 s | 74.2 ms | 817.4 ms | 5/5 |
+| CodeGraph | 2.900 s | 211.2 ms | 376.5 ms | 3/5 |
+| codebase-memory-mcp | 7.790 s | 5.907 s | 8.898 s | 5/5 |
+| Graphify | 21.674 s | 3.804 s | 3.764 s | 3/5 |
+| Gortex | 29.526 s | 299.8 ms | 3.923 s | 4/5 default; 5/5 with name-only inclusion |
+| GitNexus | 30.051 s | 508.6 ms | 31.792 s | 3/5 |
+
+**DevMap positives:** the lowest cold-index, unchanged-refresh, and measured
+query medians; the lowest sampled cold process-tree RSS (611.5 MiB); all five
+inspected caller pairs; and successful update/deletion checks.
+
+**DevMap negatives:** CodeGraph had lower edit latency and a smaller store.
+DevMap's 138.8 MiB store also exceeded Graphify's 42.5 MiB and CBM's 67.1 MiB.
+Its query envelopes still reported 91,784 remaining unresolved attribution
+sites, eight SQL import-extractor gaps, and a PowerShell pattern fallback.
+Five selected caller pairs do not establish complete graph accuracy.
+
+**Competitor findings:** CBM matched the five caller pairs; Graphify had the
+smallest measured index/cache directory; Gortex recovered its fifth pair with
+an explicit lower-confidence setting and verified deletion through exact-ID
+lookups. GitNexus retained a deleted probe across two ordinary refreshes; a
+forced rebuild cleared it. Graphify, GitNexus, and CodeGraph missed the two
+inspected Rust test callers. The report preserves these failures and the
+successful controls together.
+
+These are different native pipelines: Graphify used AST-only extraction with
+clustering disabled, and Gortex's cold time includes enrichment (query-ready
+median: 12.072 s). Gortex queries used a resident daemon; the other measured
+interfaces were standalone CLIs. CBM's roughly four-second CLI queries do not
+measure its persistent MCP engine. Index formats and sampled RSS also differ.
+The binary was a preserved `0.2.0` dirty build, not a reproducible clean release
+or necessarily the currently installed binary. Read the report's ranges,
+provenance, unverified scenarios, and inferred follow-up priorities before
+using these results to choose a tool or claim a performance improvement.
+
 ## Install
 
 No-checkout install (verified: succeeds without a local clone; cold build ~1–2
@@ -169,17 +221,29 @@ on the nearest Git worktree root, including from a subdirectory. Explicit
 paths retain their scope: `devmap build .` deliberately indexes the current
 directory. Outside Git, omitted roots use the current directory.
 
-Interactive builds show an animated stage bar, the active operation (including
-writer-lock waits), and elapsed stage time. Animation appears after 150 ms and
-refreshes at most every 80 ms, so fast unchanged builds stay quiet. Reading and
+Finite commands now share a command-specific loader: search follows a thread,
+impact traces ripples, status takes a pulse, and repair mends the map. Their
+orbit is indeterminate; it does not imply measured progress. Interactive result
+details retain their full counts and coverage disclosures, with numeric accents
+and a completion card. Protocols, raw exports, and generated configuration opt
+out of decoration.
+
+Interactive builds show a pulsing five-node trail, the active operation (including
+writer-lock waits), and elapsed stage time. The first frame appears immediately;
+subsequent frames refresh at most every 80 ms. There is no artificial minimum
+build duration. Phases move from “Reading the terrain” to “Connecting the dots,”
+“Finding the patterns,” “Saving your map,” and, when requested, “Packing the
+essentials.” Completed phases leave a compact trail after 150 ms of work. Reading and
 extraction show measured file counts and a phase percentage once their total is
 known. Wider terminals also show throughput and an approximate phase ETA after
-at least ten files and one second of measured work. The stage bar is not an
+at least ten files and one second of measured work. The node trail is not an
 overall percentage: resolving and writing have different costs.
 
-The final summary shows generation, elapsed time, file/symbol/edge counts,
+An interactive completion card shows generation, elapsed time, file/symbol/edge counts,
 added/changed/removed sources and actual cache hits. Unchanged builds report the
-current generation once. `--verbose` retains phase, reclaim and resolution
+current generation once under “Already mapped.” Details wrap to the terminal
+width without dropping counts or coverage disclosures. Redirected output and
+`--progress never` retain the compact plain report. `--verbose` retains phase, reclaim and resolution
 details and enables debug tracing; coverage refusals and reclaim failures remain visible by default.
 Requested consumer artifacts must finish before completion is announced.
 
@@ -198,7 +262,9 @@ output never contains progress animation escapes. Paths and diagnostics escape
 terminal control characters.
 
 Progress output has a bounded queue and shutdown. A paused, full or disconnected
-stderr cannot hold the indexing result on a separate stdout pipe. Primary result
+stderr cannot hold the command result on a separate stdout pipe. Server tracing
+uses the same bounded diagnostic channel, so a full stderr cannot stop MCP HTTP
+startup or request handling. Primary result
 output still follows ordinary stdout backpressure, after releasing the build's
 writer lock. `progress_output` in JSON
 reports failed writes, dropped updates, and retained/omitted diagnostics; a
@@ -216,7 +282,16 @@ line on stderr: command, binary/version, PID, timestamp, repository root, select
 database, elapsed time, and the active build stage (null before a stage begins).
 Non-UTF-8 paths are marked as lossy display strings. Query text, preview buffers,
 and environment variables are excluded from this context. Build errors retain
-their cause chain, phase timings, and progress-delivery receipt.
+their cause chain, phase timings, and progress-delivery receipt. Other runtime
+errors carry the same bounded diagnostic-delivery receipt. `doctor` and `paths`
+inspect binary paths and identity without executing configured or discovered
+programs. The current process reports its compiled version; external versions
+remain unavailable, with skipped execution explained in `probe_error`. An
+unavailable version is not evidence that two installations match. See
+[SECURITY_BOUNDARIES.md](../SECURITY_BOUNDARIES.md) for the execution and source
+access contracts.
+See [CLI_PRESENTATION_AUDIT.md](../CLI_PRESENTATION_AUDIT.md) for the command-wide
+audit and verification limits.
 
 To capture a diagnosable build while keeping machine output separate:
 
@@ -378,6 +453,9 @@ symbol and a parsed one are different claims.
 
 ### Export
 
+`--out -` writes only GraphML. Combining it with `--json` is rejected before
+export work; use an output file when requesting a JSON receipt.
+
 ```bash
 devmap export .                 # -> .devmap/graph.graphml
 devmap export . --out -         # stdout
@@ -443,7 +521,7 @@ Codex discovers repository skills in `.agents/skills/<name>/SKILL.md`. The five
 DevMap skills also ship in the existing DevCouncil registry; install them with
 `dev skills scaffold --destination .agents/skills` and repeat `--skill` for the
 desired names. This does not install MCP settings or hooks. See the exact
-[installation and verification commands](../docs/DEVMAP_SKILL_DELIVERY.md).
+[installation and verification commands](../DEVMAP_SKILL_DELIVERY.md).
 The Claude plugin and registry distributions have a content-parity regression
 test. Both prefer DevMap while allowing capability-based fallback and explicit
 user/repository instructions.
@@ -538,5 +616,5 @@ manifest and that file all say so, and a test fails if they stop agreeing.
 
 `devmap-query::hygiene` supplies portable output eligibility, preservation rules,
 retention validation and agent guidance, including in no-parser builds. See the
-[host contract](../docs/repository-hygiene.md). Hosts own authorization, activity
+[host contract](../repository-hygiene.md). Hosts own authorization, activity
 checks, scheduling and execution; the policy module never deletes files.

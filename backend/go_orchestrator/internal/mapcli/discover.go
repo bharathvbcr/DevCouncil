@@ -6,26 +6,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
-	"time"
+	"strings"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/devmap"
 )
 
-// discoverBinary resolves the devmap kernel, in the order the Python seam uses
-// (`devmap_engine.find_engine_binary`): DEVMAP_BINARY, then builds under the
-// repository's rust target directories, then PATH.
-//
-// PATH is deliberately *last*. On a developer machine PATH resolves
-// ~/.cargo/bin/devmap — whatever was last `cargo install`ed — which is
-// independent of the working tree and routinely months old. Preferring a local
-// build means a kernel change is exercised by the very next command instead of
-// silently measuring a stale install.
-//
-// "Newest" is by modification time, but newest alone is not enough: a build can
-// be new and still lack a capability this CLI needs. Each candidate is probed,
-// and the first that answers correctly wins, so a fresh but incapable build
-// falls through to an older capable one rather than failing the invocation.
+// discoverBinary uses an explicitly selected DEVMAP_BINARY or an installed
+// PATH binary outside the selected checkout. A repository's build artifacts
+// are executable content, so capability probing requires explicit selection.
 func discoverBinary(ctx context.Context, root string) (string, error) {
 	// An explicit override is used or refused, never replaced. The candidate
 	// list puts it first, but "first candidate that answers the probe" fell
@@ -61,72 +49,45 @@ func discoverBinary(ctx context.Context, root string) (string, error) {
 	return "", ErrNoBinary
 }
 
-// binaryCandidates lists possible kernels, most-preferred first. The explicit
-// override is not a candidate: discoverBinary uses or refuses it before this
-// list is consulted, so it can never be out-ranked or fallen through from.
+// binaryCandidates excludes repository-owned executables before any probe.
+// Resolve both sides so PATH symlinks and alternate root spellings cannot
+// turn repository content into an implicitly trusted installation.
 func binaryCandidates(root string) []string {
-	var out []string
-	seen := map[string]bool{}
-	add := func(p string) {
-		if p == "" || seen[p] {
-			return
-		}
-		if info, err := os.Stat(p); err != nil || info.IsDir() {
-			return
-		}
-		seen[p] = true
-		out = append(out, p)
-	}
-
-	for _, built := range localBuilds(root) {
-		add(built)
-	}
-
-	if p, err := exec.LookPath("devmap"); err == nil {
-		add(p)
-	}
-	return out
-}
-
-// localBuilds returns devmap binaries under the repository's rust target
-// directories, newest first.
-//
-// Both `target` and `target-<lane>` are searched: concurrent fix lanes in this
-// repository each build into their own CARGO_TARGET_DIR to avoid serializing on
-// one lock, so the lane directories are where a current build usually is.
-func localBuilds(root string) []string {
 	if root == "" {
-		return nil
+		var err error
+		root, err = os.Getwd()
+		if err != nil {
+			return nil
+		}
 	}
-	type found struct {
-		path string
-		mod  time.Time
-	}
-	var hits []found
-
-	targetParents, err := filepath.Glob(filepath.Join(root, "rust", "target*"))
+	canonicalRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return nil
 	}
-	for _, parent := range targetParents {
-		// release before debug only as a tie-break; mtime decides overall,
-		// because a debug build made after a release build is the newer code.
-		for _, profile := range []string{"release", "debug"} {
-			candidate := filepath.Join(parent, profile, "devmap")
-			info, err := os.Stat(candidate)
-			if err != nil || info.IsDir() {
-				continue
-			}
-			hits = append(hits, found{path: candidate, mod: info.ModTime()})
-		}
+	canonicalRoot, err = filepath.Abs(canonicalRoot)
+	if err != nil {
+		return nil
 	}
-	sort.SliceStable(hits, func(i, j int) bool { return hits[i].mod.After(hits[j].mod) })
-
-	paths := make([]string, 0, len(hits))
-	for _, h := range hits {
-		paths = append(paths, h.path)
+	candidate, err := exec.LookPath("devmap")
+	if err != nil {
+		return nil
 	}
-	return paths
+	candidate, err = filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return nil
+	}
+	candidate, err = filepath.Abs(candidate)
+	if err != nil {
+		return nil
+	}
+	relative, err := filepath.Rel(canonicalRoot, candidate)
+	if err != nil || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))) {
+		return nil
+	}
+	if info, err := os.Stat(candidate); err != nil || !info.Mode().IsRegular() {
+		return nil
+	}
+	return []string{candidate}
 }
 
 // capable reports whether the binary answers the capability probe.

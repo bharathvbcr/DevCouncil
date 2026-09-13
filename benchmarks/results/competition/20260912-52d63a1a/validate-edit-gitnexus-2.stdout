@@ -1,0 +1,15 @@
+{
+  "status": "found",
+  "symbol": {
+    "uid": "Function:benchmarks/tasks.py:devmap_competition_revision_2",
+    "name": "devmap_competition_revision_2",
+    "kind": "Function",
+    "filePath": "benchmarks/tasks.py",
+    "startLine": 265,
+    "endLine": 266
+  },
+  "epistemic": "exact",
+  "incoming": {},
+  "outgoing": {},
+  "processes": []
+}

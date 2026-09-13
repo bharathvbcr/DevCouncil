@@ -93,7 +93,7 @@ fn pipeline(
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = analyze(&extractions, &resolution);
     (extractions, resolution, analysis)
 }

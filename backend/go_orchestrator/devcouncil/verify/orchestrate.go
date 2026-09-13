@@ -116,7 +116,7 @@ type runMeta struct {
 // silently enforce — they skip, matching gatescfg.Normalize.
 func StatusFromGaps(gaps []Gap, gateMode string) (status string, passed bool) {
 	if verificationSkipped(gateMode) {
-		return "verified", true
+		return "skipped", false
 	}
 	mode := strings.TrimSpace(strings.ToLower(gateMode))
 	advisory := mode == "advisory" || mode == "warn"

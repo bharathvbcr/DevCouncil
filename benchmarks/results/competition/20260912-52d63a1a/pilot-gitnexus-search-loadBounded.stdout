@@ -1,0 +1,46 @@
+{
+  "status": "found",
+  "symbol": {
+    "uid": "Function:backend/go_orchestrator/repomap/repomap.go:loadBounded",
+    "name": "loadBounded",
+    "kind": "Function",
+    "filePath": "backend/go_orchestrator/repomap/repomap.go",
+    "startLine": 330,
+    "endLine": 356
+  },
+  "epistemic": "exact",
+  "incoming": {
+    "calls": [
+      {
+        "uid": "Function:backend/go_orchestrator/repomap/compact_test.go:TestAnInternedGraphIsHeldToTheSameBound",
+        "name": "TestAnInternedGraphIsHeldToTheSameBound",
+        "filePath": "backend/go_orchestrator/repomap/compact_test.go"
+      },
+      {
+        "uid": "Function:backend/go_orchestrator/repomap/repomap.go:Load",
+        "name": "Load",
+        "filePath": "backend/go_orchestrator/repomap/repomap.go"
+      }
+    ]
+  },
+  "outgoing": {
+    "calls": [
+      {
+        "uid": "Function:backend/go_orchestrator/repomap/compact.go:decodeGraph",
+        "name": "decodeGraph",
+        "filePath": "backend/go_orchestrator/repomap/compact.go"
+      },
+      {
+        "uid": "Function:backend/go_orchestrator/repomap/repomap.go:readBounded",
+        "name": "readBounded",
+        "filePath": "backend/go_orchestrator/repomap/repomap.go"
+      },
+      {
+        "uid": "Function:backend/go_orchestrator/repomap/repomap.go:build",
+        "name": "build",
+        "filePath": "backend/go_orchestrator/repomap/repomap.go"
+      }
+    ]
+  },
+  "processes": []
+}

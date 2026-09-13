@@ -1,0 +1,13 @@
+{
+  "condition": "symbol_not_found",
+  "data": {
+    "id": "devcouncil-bench/benchmarks/tasks.py::devmap_competition_nonexistent_52d63a1a"
+  },
+  "message": "no symbol with id \"devcouncil-bench/benchmarks/tasks.py::devmap_competition_nonexistent_52d63a1a\" is in the index — it may be spelled differently, live in an unindexed file, or be a local. Search for it rather than reading by id.",
+  "recoverable": true,
+  "suggested_tools": [
+    "search_symbols",
+    "find_usages",
+    "search_text"
+  ]
+}

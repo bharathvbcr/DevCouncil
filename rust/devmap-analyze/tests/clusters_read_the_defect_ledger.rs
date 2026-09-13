@@ -83,7 +83,7 @@ fn corpus() -> Vec<Extraction> {
 fn resolve(extractions: &[Extraction]) -> ResolutionResult {
     let mut resolver = Resolver::new();
     resolver.index_extractions(extractions);
-    resolver.resolve_all(extractions)
+    resolver.resolve_all(extractions).unwrap()
 }
 
 /// The fixture really does produce the shape this file is about. Asserted

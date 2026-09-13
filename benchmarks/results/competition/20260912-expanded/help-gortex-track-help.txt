@@ -1,0 +1,16 @@
+Resolves the path to absolute, validates it exists, and adds it to the global config.
+
+Usage:
+  gortex track <path> [flags]
+
+Flags:
+      --as-worktree             Track a linked git worktree as an independent instance even when its repo is already tracked elsewhere
+  -h, --help                    help for track
+      --name string             Explicit repo prefix override (default: directory basename)
+      --wait                    Block until the daemon has indexed the repo and the graph is queryable (useful for CI / one-shot scripts)
+      --wait-timeout duration   With --wait, fail if indexing has not settled within this duration (0 = wait forever) (default 10m0s)
+
+Global Flags:
+      --config string      config file (default .gortex.yaml)
+      --log-level string   log level: debug|info|warn|error (default "info")
+      --no-progress        disable animated progress output (also honored: NO_COLOR, TERM=dumb, CI, non-TTY stderr)

@@ -39,7 +39,7 @@ fn ruleguard_matcher_rule_is_not_confident_dead() {
     let extractions = vec![extraction];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let summary = analyze(&extractions, &resolution);
 
     let report: Option<&DeadSymbolReport> = summary

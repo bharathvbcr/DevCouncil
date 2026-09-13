@@ -62,7 +62,7 @@ fn the_refusal_count_is_derived_from_the_inventory_and_never_carried() {
     let extractions = vec![python("lib.py", "def helper():\n    return 1\n")];
     let mut resolver = devmap_resolve::Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     let with_one = devmap_analyze::analyze_with_discovery(
         &extractions,
@@ -155,7 +155,7 @@ fn a_summary_claiming_a_refusal_the_inventory_cannot_name_is_refused() {
     let extractions = vec![python("lib.py", "def helper():\n    return 1\n")];
     let mut resolver = devmap_resolve::Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze_with_discovery(
         &extractions,
         &resolution,
@@ -199,7 +199,7 @@ fn status_names_the_paths_behind_every_coverage_number() {
     ];
     let mut resolver = devmap_resolve::Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze_with_discovery(
         &extractions,
         &resolution,

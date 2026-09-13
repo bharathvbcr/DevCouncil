@@ -161,7 +161,7 @@ fn fixture_store_on_disk(path: &std::path::Path) -> String {
     }
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open(path).expect("store");
     store

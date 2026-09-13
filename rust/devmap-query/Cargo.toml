@@ -204,3 +204,7 @@ required-features = ["parse"]
 [[test]]
 name = "unwired_never_names_a_non_code_file"
 required-features = ["parse"]
+
+[[test]]
+name = "source_read_security"
+required-features = ["parse"]

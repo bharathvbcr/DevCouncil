@@ -346,7 +346,10 @@ impl StoreSlot {
                 ..
             } => {
                 if let Some(root) = explicit_root {
-                    let store = canonicalize_path(&devmap_extract::paths::store_path(root));
+                    let store = devmap_extract::safe_fs::resolve_file_alias(
+                        &devmap_extract::paths::store_path(root),
+                    )
+                    .map_err(|error| format!("unsafe store path: {error}"))?;
                     if store.is_file() {
                         return Ok(store);
                     }
@@ -486,7 +489,8 @@ with an absolute repository path."
     }
 
     fn cache_open(&self, store_path: &Path, attr: RepositoryRef) -> Result<Arc<Store>, String> {
-        let key = canonicalize_path(store_path);
+        let key = devmap_extract::safe_fs::resolve_file_alias(store_path)
+            .map_err(|error| format!("unsafe store path: {error}"))?;
         {
             let mut cache = self
                 .opened

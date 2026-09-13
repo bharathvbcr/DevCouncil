@@ -1,0 +1,18 @@
+{
+  "task_id": "52d63a1a-266d-4a5a-8a09-9b8458a98334",
+  "repo": "/Users/bharath/Code/devtools/DevCouncil",
+  "commit": "ee07c183b127e7291c38f993f4d71ca75f1121dc",
+  "scratch": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a",
+  "source_status_before": " M backend/go_orchestrator/cmd/devcouncil/dispatch_test.go\n M backend/go_orchestrator/cmd/devcouncil/install.go\n M backend/go_orchestrator/cmd/devcouncil/main.go\n M backend/go_orchestrator/devcouncil/integrate/integrate.go\n M backend/go_orchestrator/devcouncil/integrate/uninstall.go\n M docs/devmap/README.md\n M rust/devmap-cli/src/main.rs\n M rust/devmap-cli/src/progress.rs\n M rust/devmap-cli/tests/test_progress.rs\n?? backend/go_orchestrator/cmd/devcouncil/hook.go\n?? backend/go_orchestrator/cmd/devcouncil/hook_compat_test.go\n?? backend/go_orchestrator/cmd/devcouncil/hook_test.go\n?? backend/go_orchestrator/devcouncil/integrate/hook_safety_test.go\n",
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "machine": "Apple M5 Pro",
+  "memory_bytes": 68719476736,
+  "cpu_count": 18,
+  "devmap_binary": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-52d63a1a/devmap",
+  "devmap_sha256": "e5e2dc8c19731cc98c14e675c349614da90651d176403194a27d622819c8b572",
+  "devmap_version": "devmap 0.2.0 (store schema 20, code graph schema 2, build ee07c183b127-dirty)",
+  "gitnexus_version": "1.6.9",
+  "rg_version": "ripgrep 15.1.0",
+  "corpus_files": 1186,
+  "corpus_bytes": 46940219
+}

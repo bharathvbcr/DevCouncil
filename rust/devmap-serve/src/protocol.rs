@@ -1277,7 +1277,7 @@ pub struct UnixIpcServer {
     /// sequence: the loser unlinked the winner's live socket and bound its own,
     /// leaving an orphaned listener that answered nothing while still holding
     /// the store open and running its watcher and drain loops.
-    _lock: std::fs::File,
+    _lock: devmap_extract::safe_fs::SafeFile,
 }
 
 /// Where an endpoint's advisory lock lives: beside the socket, named after it.
@@ -1300,7 +1300,7 @@ pub(crate) fn ipc_lock_path(path: &std::path::Path) -> std::path::PathBuf {
 /// caller must keep the returned file alive for as long as it owns the
 /// endpoint.
 #[cfg(unix)]
-fn lock_ipc_endpoint(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+fn lock_ipc_endpoint(path: &std::path::Path) -> anyhow::Result<devmap_extract::safe_fs::SafeFile> {
     lock_ipc_endpoint_with(path, || {})
 }
 
@@ -1308,18 +1308,24 @@ fn lock_ipc_endpoint(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
 fn lock_ipc_endpoint_with(
     path: &std::path::Path,
     mut on_contention: impl FnMut(),
-) -> anyhow::Result<std::fs::File> {
+) -> anyhow::Result<devmap_extract::safe_fs::SafeFile> {
     use std::io::Write;
 
+    use devmap_extract::safe_fs::{Access, Creation, PinnedDir, SafeFile};
     let lock_path = ipc_lock_path(path);
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let parent_path = lock_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let parent = PinnedDir::open(parent_path, true)?;
+    let is_managed_runtime_dir = parent_path.parent() == Some(std::env::temp_dir().as_path())
+        && parent_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("devmap-"));
+    if is_managed_runtime_dir {
+        parent.make_private()?;
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)?;
+    let file = SafeFile::open(&lock_path, Access::ReadWrite, Creation::IfMissing)?;
 
     // `WouldBlock` is contention; anything else is the check failing to run.
     // Collapsing them reported "another live daemon owns this endpoint" for an
@@ -1410,17 +1416,6 @@ impl UnixIpcServer {
         // file. Losing means a live daemon already owns this endpoint.
         let lock = lock_ipc_endpoint(path)?;
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-            let is_managed_runtime_dir = parent.parent() == Some(std::env::temp_dir().as_path())
-                && parent
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("devmap-"));
-            if is_managed_runtime_dir {
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-            }
-        }
         if path.exists() {
             match probe_endpoint_liveness(path) {
                 Some(true) => {
@@ -2329,7 +2324,9 @@ mod tests {
         let extraction = devmap_extract::extract_file("things.py", &source);
         let mut resolver = devmap_resolve::Resolver::new();
         resolver.index_extractions(std::slice::from_ref(&extraction));
-        let resolution = resolver.resolve_all(std::slice::from_ref(&extraction));
+        let resolution = resolver
+            .resolve_all(std::slice::from_ref(&extraction))
+            .unwrap();
         let analysis = devmap_analyze::analyze(std::slice::from_ref(&extraction), &resolution);
         let store = Store::open_in_memory().expect("in-memory store");
         store
@@ -3110,7 +3107,7 @@ mod hardening_limit_tests {
         let extractions = vec![lib, app];
         let mut resolver = devmap_resolve::Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         let analysis = devmap_analyze::analyze(&extractions, &resolution);
         let db = root.join("index.sqlite");
         let store = Store::open(&db).unwrap();

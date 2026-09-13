@@ -2,10 +2,8 @@ package verify
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"os"
 
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 )
 
@@ -77,16 +75,20 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gate
 		if entry.Status == "blocked" {
 			cli.BlockedTasks++
 			cli.OK = false
+		} else if entry.VerificationSkipped {
+			cli.CompletedWithoutVerification++
 		} else {
 			cli.VerifiedTasks++
 		}
 	}
 	if jsonOut {
-		writeJSON(cli)
+		if !writeJSON(cli) {
+			return 1
+		}
 	} else {
-		fmt.Printf("verified=%d blocked=%d gaps=%d\n", cli.VerifiedTasks, cli.BlockedTasks, cli.TotalGaps)
+		console.Printf("verified=%d skipped=%d blocked=%d gaps=%d\n", cli.VerifiedTasks, cli.CompletedWithoutVerification, cli.BlockedTasks, cli.TotalGaps)
 		for _, t := range cli.Tasks {
-			fmt.Printf("  %s status=%s gaps=%d blocking=%d\n", t.TaskID, t.Status, t.GapCount, t.BlockingGapCount)
+			console.Printf("  %s status=%s gaps=%d blocking=%d\n", t.TaskID, t.Status, t.GapCount, t.BlockingGapCount)
 		}
 	}
 	if !cli.OK {
@@ -95,8 +97,10 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gate
 	return 0
 }
 
-func writeJSON(v any) {
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(v)
+func writeJSON(v any) bool {
+	if err := console.JSON(v); err != nil {
+		console.Errorf("verify output: %v\n", err)
+		return false
+	}
+	return true
 }

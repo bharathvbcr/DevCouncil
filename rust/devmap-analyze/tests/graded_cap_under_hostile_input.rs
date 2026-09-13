@@ -175,7 +175,7 @@ fn an_analysis_told_everything_was_refused_still_answers() {
     let extractions = vec![extract_file("app/lib.py", "def helper():\n    return 1\n")];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let summary = devmap_analyze::analyze_with_discovery(
         &extractions,
         &resolution,
@@ -316,7 +316,7 @@ fn the_component_scan_is_deterministic() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     let first = analyze(&extractions, &resolution);
     for _ in 0..5 {
@@ -365,7 +365,7 @@ fn a_symbol_named_only_by_separators_does_not_panic_the_join() {
                     name.to_string(),
                     EdgeKind::Calls,
                     Arc::new(Resolution::AmbiguousGlobal {
-                        candidates: vec![("f.py".to_string(), name.to_string())],
+                        candidates: vec![("f.py".to_string(), name.to_string())].into(),
                         family: devmap_resolve::model::LangFamily::Python,
                     }),
                     None,

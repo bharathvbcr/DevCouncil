@@ -35,7 +35,7 @@ fn resolve(files: &[(&str, &str)]) -> ResolutionResult {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    resolver.resolve_all(&extractions)
+    resolver.resolve_all(&extractions).unwrap()
 }
 
 /// The class of every unresolved row for `callee_name`.

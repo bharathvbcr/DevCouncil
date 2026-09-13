@@ -37,7 +37,7 @@ fn dependencies_disclose_unbound_calls_but_not_known_builtins() {
         let extractions = vec![extract_file("app.py", source)];
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         let req = || Request {
             query: "app.py".into(),
             token_budget: 2000,
@@ -185,7 +185,7 @@ fn memory_queries_refuse_nan_like_the_store_queries() {
     )];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let engine = QueryEngine::new(&extractions, &resolution);
     let req = |query: &str| Request {
         query: query.into(),
@@ -214,7 +214,7 @@ fn memory_traversal_enforces_the_same_depth_ceiling_as_storage() {
     let extractions = vec![extract_file("app.py", &source)];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let memory = QueryEngine::new(&extractions, &resolution);
     let store = store_of(&[("app.py", &source)], &[]);
     let req = || Request {
@@ -239,7 +239,7 @@ fn confidence_filtering_cannot_walk_through_an_excluded_bridge() {
     let extractions = vec![extract_file("app.py", "def target():\n    return 1\ndef bridge():\n    return target()\ndef entry():\n    return bridge()\n")];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let mut resolution = resolver.resolve_all(&extractions);
+    let mut resolution = resolver.resolve_all(&extractions).unwrap();
     let bridge = resolution
         .edges
         .iter_mut()
@@ -444,7 +444,7 @@ fn in_memory_traversals_keep_the_same_attribution_warning_as_storage() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let memory = QueryEngine::new(&extractions, &resolution);
     let store = store_of(&files, &[]);
     let stored = StoreQueryEngine::new(&store);
@@ -527,7 +527,7 @@ fn a_depth_capped_impact_walk_reports_that_it_stopped() {
     let extractions = chain();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let engine = QueryEngine::new(&extractions, &resolution);
 
     let capped = engine.impact(Request {
@@ -560,7 +560,7 @@ fn a_complete_walk_does_not_claim_to_be_incomplete() {
     let extractions = chain();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let engine = QueryEngine::new(&extractions, &resolution);
 
     let complete = engine.impact(Request {
@@ -583,7 +583,7 @@ fn a_depth_capped_trace_walk_reports_that_it_stopped() {
     let extractions = chain();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let engine = QueryEngine::new(&extractions, &resolution);
 
     let capped = engine.trace(Request {
@@ -623,7 +623,7 @@ fn store_of(files: &[(&str, &str)], refuse: &[&str]) -> Store {
     }
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -798,7 +798,7 @@ fn degrade(ext: &mut Extraction, outcome: ParseOutcome) {
 fn store_of_extractions(extractions: Vec<Extraction>) -> Store {
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -860,7 +860,7 @@ fn dependencies_over_a_degraded_parse_say_the_edge_list_is_a_lower_bound() {
 
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         let in_memory = QueryEngine::new(&extractions, &resolution).dependencies(Request {
             query: "app.py".to_string(),
             token_budget: 10_000,
@@ -1208,7 +1208,7 @@ fn the_in_memory_search_carries_the_same_caveat() {
         .retain(|sym| sym.kind == SymbolKind::File);
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
 
     let found = QueryEngine::new(&extractions, &resolution).search(Request {
         query: "only_declared_here".to_string(),
@@ -1231,7 +1231,7 @@ fn the_in_memory_search_carries_the_same_caveat() {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&clean);
-    let resolution = resolver.resolve_all(&clean);
+    let resolution = resolver.resolve_all(&clean).unwrap();
     let complete = QueryEngine::new(&clean, &resolution).search(Request {
         query: "helper".to_string(),
         token_budget: 10_000,

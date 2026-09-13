@@ -58,18 +58,18 @@ func TestGoldenLeasedVerifyShape(t *testing.T) {
 	if result.VerificationMode != "coarse" {
 		t.Fatalf("verification_mode=%q", result.VerificationMode)
 	}
-	if len(result.BlockingGaps) != 1 || result.BlockingGaps[0].GapType != "task_not_implemented" {
+	if len(result.BlockingGaps) != 2 || result.BlockingGaps[0].GapType != "task_not_implemented" {
 		t.Fatalf("blocking_gaps=%+v", result.BlockingGaps)
 	}
 	wantID := "GAP-TASK-001-NODIFF-31d6a5192b"
 	if result.BlockingGaps[0].ID != wantID {
 		t.Fatalf("NODIFF id=%q want %q", result.BlockingGaps[0].ID, wantID)
 	}
-	if len(result.NextActions) != 1 || result.NextActions[0].Category != "plan" {
+	if len(result.NextActions) != 2 || result.NextActions[0].Category != "plan" {
 		t.Fatalf("next_actions=%+v", result.NextActions)
 	}
 	foundBad, foundFile := false, false
-	for _, a := range result.AdvisoryActions {
+	for _, a := range append(result.NextActions, result.AdvisoryActions...) {
 		if a.GapType == "invalid_verification_command" {
 			foundBad = true
 			if a.GapID != "GAP-TASK-001-BADCMD-53e6757ddd" {
@@ -87,7 +87,7 @@ func TestGoldenLeasedVerifyShape(t *testing.T) {
 		}
 	}
 	if !foundBad || !foundFile {
-		t.Fatalf("advisory missing: bad=%v file=%v actions=%+v", foundBad, foundFile, result.AdvisoryActions)
+		t.Fatalf("repair actions missing: bad=%v file=%v actions=%+v", foundBad, foundFile, result.AdvisoryActions)
 	}
 }
 
@@ -120,7 +120,7 @@ func TestGoldenCLIVerifyShape(t *testing.T) {
 	if entry.GapCount != 3 {
 		t.Fatalf("gap_count=%d want 3", entry.GapCount)
 	}
-	if entry.BlockingGapCount != 1 {
+	if entry.BlockingGapCount != 2 {
 		t.Fatalf("blocking_gap_count=%d", entry.BlockingGapCount)
 	}
 	ids := map[string]bool{}
@@ -189,8 +189,8 @@ func TestSkippedNeverPass(t *testing.T) {
 	for _, g := range gaps {
 		if g.GapType == "skipped_verification_command" {
 			found = true
-			if g.Blocking {
-				t.Fatal("skipped command must not be blocking by default")
+			if !g.Blocking {
+				t.Fatal("a skipped required command must block verification")
 			}
 		}
 		if g.GapType == "test_failed" && !g.Blocking {
@@ -200,7 +200,9 @@ func TestSkippedNeverPass(t *testing.T) {
 	if !found {
 		t.Fatalf("expected skipped_verification_command, gaps=%+v", gaps)
 	}
-	_ = result
+	if result.Passed || result.Status != "blocked" {
+		t.Fatalf("skipped required command must not verify: %+v", result)
+	}
 }
 
 func TestStableGapIDMatchesPython(t *testing.T) {
@@ -248,11 +250,11 @@ func TestStatusFromGapsModes(t *testing.T) {
 	failed := verify.Gap{GapType: "test_failed", Blocking: true}
 
 	status, passed := verify.StatusFromGaps([]verify.Gap{nodiff, failed}, "")
-	if !passed || status != "verified" {
+	if passed || status != "skipped" {
 		t.Fatalf("empty mode must skip quality: status=%s passed=%v", status, passed)
 	}
 	status, passed = verify.StatusFromGaps([]verify.Gap{nodiff, failed}, "off")
-	if !passed || status != "verified" {
+	if passed || status != "skipped" {
 		t.Fatalf("off must skip quality: status=%s passed=%v", status, passed)
 	}
 
@@ -271,11 +273,11 @@ func TestStatusFromGapsModes(t *testing.T) {
 	}
 
 	status, passed = verify.StatusFromGaps([]verify.Gap{failed}, "yolo")
-	if !passed || status != "verified" {
+	if passed || status != "skipped" {
 		t.Fatalf("unknown mode must not silently enforce: status=%s passed=%v", status, passed)
 	}
 	status, passed = verify.StatusFromGaps([]verify.Gap{failed}, "no")
-	if !passed || status != "verified" {
+	if passed || status != "skipped" {
 		t.Fatalf("alias no must skip: status=%s passed=%v", status, passed)
 	}
 }

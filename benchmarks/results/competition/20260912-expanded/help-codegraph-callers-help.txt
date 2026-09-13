@@ -1,0 +1,9 @@
+Usage: codegraph callers [options] <symbol>
+
+Find all functions/methods that call a specific symbol
+
+Options:
+  -p, --path <path>     Project path
+  -l, --limit <number>  Maximum results (default: "20")
+  -j, --json            Output as JSON
+  -h, --help            display help for command

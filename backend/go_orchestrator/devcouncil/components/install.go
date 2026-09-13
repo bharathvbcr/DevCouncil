@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
@@ -76,19 +77,22 @@ type Runner interface {
 type ExecRunner struct{}
 
 func (ExecRunner) Run(name string, args []string, dir string, env []string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	ctx, cancel := context.WithTimeout(console.Context(), 15*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	proc.ConfigureGroup(cmd)
 	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = console.ChildOutput()
+	cmd.Stderr = console.Stderr()
 	cmd.WaitDelay = 2 * time.Second
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
 	}
-	runErr, timedOut := proc.RunBounded(ctx, cmd.Run)
+	runErr, timedOut := proc.RunBoundedWithCleanup(ctx, cmd.Run)
 	if timedOut {
+		if ctx.Err() == context.Canceled {
+			return fmt.Errorf("%s cancelled: %w", name, ctx.Err())
+		}
 		return fmt.Errorf("%s timed out after 15m", name)
 	}
 	return runErr
@@ -240,7 +244,7 @@ func rustBinaryName(id string) string {
 func Install(cs []Component, o Options) error {
 	if o.DryRun {
 		for _, c := range PlannedCommands(cs, o) {
-			fmt.Println(c)
+			console.Println(c)
 		}
 		return nil
 	}
@@ -421,7 +425,7 @@ func Uninstall(cs []Component, o Options) error {
 			} else {
 				kind, err := classifyDevLink(dev)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "note: left %s in place: %v\n", dev, err)
+					console.Errorf("note: left %s in place: %v\n", dev, err)
 				} else if kind == devLinkOurs {
 					if _, err := removeOwned(prefix, dev, o.DryRun); err != nil {
 						return err
@@ -470,11 +474,11 @@ func removeOwned(prefix, path string, dry bool) (bool, error) {
 		return false, err
 	}
 	if info.IsDir() {
-		fmt.Fprintf(os.Stderr, "note: left directory %s in place\n", path)
+		console.Errorf("note: left directory %s in place\n", path)
 		return false, nil
 	}
 	if dry {
-		fmt.Println("rm", path)
+		console.Println("rm", path)
 		return true, nil
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -514,7 +518,7 @@ func Disable(id string, o Options) error {
 		return err
 	}
 	if o.DryRun {
-		fmt.Println("disable", id)
+		console.Println("disable", id)
 		return nil
 	}
 	st := LoadState(o.prefix())
@@ -529,7 +533,7 @@ func Enable(id string, o Options) error {
 		return err
 	}
 	if o.DryRun {
-		fmt.Println("enable", id)
+		console.Println("enable", id)
 		return nil
 	}
 	st := LoadState(o.prefix())

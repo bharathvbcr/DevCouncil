@@ -1,0 +1,15 @@
+┌  Initializing CodeGraph
+│
+◆  Initialized in /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/codegraph-corpus
+│
+Scanning files...
+Parsing code...
+Resolving refs...
+Linking dynamic dispatch...
+│
+◆  Indexed 727 files
+│
+●  14,120 nodes, 52,054 edges in 2.7s
+│
+└  Done
+

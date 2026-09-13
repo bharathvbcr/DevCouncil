@@ -1,0 +1,8 @@
+{
+  "iteration": 2,
+  "pid": 64551,
+  "query_ready_seconds": 12.072399250000672,
+  "enriched_seconds": 31.295911749999505,
+  "database": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260912-expanded/gortex-cold-2.sqlite",
+  "log": "gortex-cold-2.log"
+}

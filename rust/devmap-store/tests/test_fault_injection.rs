@@ -70,7 +70,7 @@ fn build_generations(store: &Store, rounds: usize) {
 
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
-        let resolution = resolver.resolve_all(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
         let analysis = analyze(&extractions, &resolution);
         store
             .save_generation(&extractions, &resolution, &analysis)
@@ -371,7 +371,7 @@ fn the_edge_cache_is_invalidated_by_a_new_generation() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = analyze(&extractions, &resolution);
     store
         .save_generation(&extractions, &resolution, &analysis)
