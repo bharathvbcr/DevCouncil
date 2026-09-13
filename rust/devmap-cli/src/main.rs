@@ -1988,10 +1988,64 @@ fn doctor_report(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
     }))
 }
 
+/// What the whole binary inventory may spend hashing, shared across every file
+/// it discovers rather than granted to each.
+///
+/// A health check that can run for an unbounded time is worse than one that
+/// reports "unknown": `devmap paths` is what the generated agent guide tells
+/// every agent to run first, and hashing this process's own 104 MiB unoptimised
+/// executable used to take it past half a minute with nothing to stop it.
+///
+/// The byte ceiling is the bound that actually decides the common case, and it
+/// is set well above any devmap that exists — a release binary is ~61 MiB, an
+/// unoptimised one ~104 MiB — so a real install always gets a real digest, on
+/// an idle machine and a busy one alike. The clock is the backstop for a
+/// filesystem that answers slowly rather than for work that is merely large;
+/// eight seconds leaves better than twice the headroom under the twenty this
+/// command's own passive-diagnostics test allows a single invocation.
+const BINARY_HASH_WALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+const BINARY_HASH_BYTE_BUDGET: u64 = 512 * 1024 * 1024;
+
+/// The three hash fields of one inventory row.
+///
+/// Three states, never two: hashed, absent (there is no file to hash), and
+/// unavailable (there is, and the budget or the filesystem stopped us). The
+/// last must not arrive looking like either of the others.
+struct BinaryHash {
+    sha256: serde_json::Value,
+    status: &'static str,
+    error: serde_json::Value,
+}
+
+fn hash_binary(resolved: &Path, exists: bool, budget: &mut sha256::Budget) -> BinaryHash {
+    if !exists {
+        return BinaryHash {
+            sha256: serde_json::Value::Null,
+            status: "absent",
+            error: serde_json::Value::Null,
+        };
+    }
+    match sha256::sha256_file_within(resolved, budget) {
+        sha256::FileDigest::Hashed(digest) => BinaryHash {
+            sha256: serde_json::json!(digest),
+            status: "hashed",
+            error: serde_json::Value::Null,
+        },
+        sha256::FileDigest::Unavailable(reason) => BinaryHash {
+            sha256: serde_json::Value::Null,
+            status: "unavailable",
+            error: serde_json::json!(reason),
+        },
+    }
+}
+
 /// Every `devmap` on `PATH` and referenced from common host MCP configs.
 fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
     let mut rows = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
+    // One budget for the whole inventory. Per-file budgets would let n binaries
+    // cost n times the bound the caller was promised.
+    let mut budget = sha256::Budget::new(BINARY_HASH_WALL_BUDGET, BINARY_HASH_BYTE_BUDGET);
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
             if dir.as_os_str().is_empty() {
@@ -2006,6 +2060,7 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
                 continue;
             }
             let probe = inspect_devmap_identity(&resolved);
+            let hash = hash_binary(&resolved, resolved.is_file(), &mut budget);
             rows.push(serde_json::json!({
                 "path": key,
                 "source": "PATH",
@@ -2013,7 +2068,9 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
                 "build_id": probe.build_id,
                 "probe_error": probe.error,
                 "probe_status": probe.status,
-                "sha256": if resolved.is_file() { sha256::sha256_file(&resolved) } else { None },
+                "sha256": hash.sha256,
+                "sha256_status": hash.status,
+                "sha256_error": hash.error,
                 "exists": true,
             }));
         }
@@ -2022,6 +2079,7 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
         if let Ok(resolved) = exe.canonicalize() {
             let key = resolved.display().to_string();
             if seen.insert(key.clone()) {
+                let hash = hash_binary(&resolved, resolved.is_file(), &mut budget);
                 rows.push(serde_json::json!({
                     "path": key,
                     "source": "current_exe",
@@ -2029,7 +2087,9 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
                     "probe_error": serde_json::Value::Null,
                     "version": Some(env!("CARGO_PKG_VERSION")),
                     "build_id": Some(env!("DEVMAP_BUILD_ID")),
-                    "sha256": if resolved.is_file() { sha256::sha256_file(&resolved) } else { None },
+                    "sha256": hash.sha256,
+                    "sha256_status": hash.status,
+                    "sha256_error": hash.error,
                     "exists": true,
                 }));
             }
@@ -2041,15 +2101,19 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
             let key = resolved.display().to_string();
             if seen.insert(key.clone()) {
                 let probe = inspect_devmap_identity(&resolved);
+                let exists = resolved.is_file();
+                let hash = hash_binary(&resolved, exists, &mut budget);
                 rows.push(serde_json::json!({
                     "path": key,
                     "source": label,
                     "version": probe.version,
                     "build_id": probe.build_id,
-                "probe_error": probe.error,
-                "probe_status": probe.status,
-                    "sha256": if resolved.is_file() { sha256::sha256_file(&resolved) } else { None },
-                    "exists": resolved.is_file(),
+                    "probe_error": probe.error,
+                    "probe_status": probe.status,
+                    "sha256": hash.sha256,
+                    "sha256_status": hash.status,
+                    "sha256_error": hash.error,
+                    "exists": exists,
                 }));
             } else if let Some(existing) = rows.iter_mut().find(|r| r["path"] == key) {
                 let source = existing["source"].as_str().unwrap_or("").to_string();
@@ -2199,15 +2263,48 @@ fn binaries_skew_warning(binaries: &[serde_json::Value]) -> Option<String> {
     let versions = distinct("version");
     let build_ids = distinct("build_id");
     let hashes = distinct("sha256");
+    // A hash the inventory could not take is not a hash that agreed. Returning
+    // plain `None` from a comparison that never ran is how "these binaries
+    // match" comes to mean "nobody looked", so the gap travels with the answer
+    // in both directions: alone when nothing else disagrees, and appended to
+    // the skew report when something does — because the sha256 list it prints
+    // is then a subset of the binaries found.
+    let unhashed: Vec<String> = binaries
+        .iter()
+        .filter(|row| {
+            row.get("sha256_status").and_then(serde_json::Value::as_str) == Some("unavailable")
+        })
+        .filter_map(|row| {
+            row.get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
     if versions.len() <= 1 && build_ids.len() <= 1 && hashes.len() <= 1 {
-        return None;
+        if unhashed.is_empty() {
+            return None;
+        }
+        return Some(format!(
+            "binary hash comparison incomplete: {} could not be hashed inside the diagnostic's \
+             budget; reported versions and build ids agree, but whether these binaries are \
+             byte-identical is unverified",
+            unhashed.join(", ")
+        ));
     }
-    Some(format!(
+    let mut warning = format!(
         "multiple devmap binaries on PATH/host configs: versions [{}], build ids [{}], sha256 [{}]; integrate writes the absolute path of the binary that validated the config — re-run integrate after installing",
         versions.into_iter().collect::<Vec<_>>().join(", "),
         build_ids.into_iter().collect::<Vec<_>>().join(", "),
         hashes.into_iter().take(4).collect::<Vec<_>>().join(", ")
-    ))
+    );
+    if !unhashed.is_empty() {
+        warning.push_str(&format!(
+            "; that sha256 list is incomplete — {} could not be hashed inside the diagnostic's \
+             budget",
+            unhashed.join(", ")
+        ));
+    }
+    Some(warning)
 }
 
 fn missing_binary_warning(binaries: &[serde_json::Value]) -> Option<String> {
@@ -2516,18 +2613,55 @@ fn stale_server_warning() -> Option<String> {
         let output = match devmap_extract::subprocess::run_bounded(&mut command,
             devmap_extract::subprocess::Bounds { deadline: std::time::Duration::from_millis(500), stdout_cap: 1024 * 1024, stderr_cap: 4096 }) {
             Ok(output) if !output.stdout_truncated && !output.stderr_truncated => output,
-            _ => return Some("stale-server check unavailable: process inventory did not complete within its time/output bounds".into()),
+            // Two different unavailabilities, and they were reported as one. A
+            // `ps` that is not on `PATH` never ran; saying it "did not complete
+            // within its bounds" sends the reader looking for a slow machine.
+            Ok(_) => return Some("stale-server check unavailable: process inventory did not complete within its time/output bounds".into()),
+            Err(failure) => return Some(format!("stale-server check unavailable: process inventory could not be read: {failure}")),
         };
         if !output.status.success() {
             return None;
         }
         let text = String::from_utf8_lossy(&output.stdout);
+        // Every matching line costs a `date` child of its own — and a child
+        // here is not cheap: `run_bounded` gives each one two drain threads, a
+        // process group and a polled reap. Each was bounded at 100 ms; the
+        // fan-out across them was not, and the fan-out is what scales. Measured
+        // on this path at ~13 ms per matching line, so a developer with sixty
+        // MCP servers open paid three seconds of it on the command the
+        // generated agent guide tells every agent to run first, and a machine
+        // with thousands of lines would have paid minutes.
+        //
+        // Both the count and the clock are capped. Whichever bites, the answer
+        // carries how many of how many were examined: a scan that looked at
+        // part of the list must never read as one that looked at all of it.
+        const PROBE_LIMIT: usize = 64;
+        const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+        let probing_since = std::time::Instant::now();
         let mut stale = Vec::new();
+        let mut examined = 0usize;
+        let mut matched = 0usize;
+        let mut capped: Option<&'static str> = None;
         for line in text.lines() {
             let line = line.trim();
             if !line.contains("devmap") || !line.contains("mcp") {
                 continue;
             }
+            // Counted before any cap is applied, so the report can say how much
+            // of the list it did not reach.
+            matched += 1;
+            if capped.is_some() {
+                continue;
+            }
+            if examined >= PROBE_LIMIT {
+                capped = Some("process count");
+                continue;
+            }
+            if probing_since.elapsed() >= PROBE_BUDGET {
+                capped = Some("time budget");
+                continue;
+            }
+            examined += 1;
             // `ps -axo pid=,lstart=,command=` — lstart is 24 chars like
             // `Fri Sep 11 07:40:12 2026`.
             let mut parts = line.split_whitespace();
@@ -2564,14 +2698,25 @@ fn stale_server_warning() -> Option<String> {
                 stale.push(pid.to_string());
             }
         }
-        if stale.is_empty() {
-            None
-        } else {
-            Some(format!(
-                "devmap mcp process(es) started before the installed binary's mtime: pid {}; \
+        let coverage = match capped {
+            Some(why) => format!(
+                " (scan capped by {why}: {examined} of {matched} devmap mcp processes examined)"
+            ),
+            None => String::new(),
+        };
+        match (stale.is_empty(), capped) {
+            // Nothing stale and nothing skipped: the check ran and passed.
+            (true, None) => None,
+            // Nothing stale among the ones we reached is not "nothing stale".
+            (true, Some(_)) => Some(format!(
+                "stale-server check incomplete{coverage}; none of the processes examined predates \
+                 the installed binary, but the rest were not checked"
+            )),
+            (false, _) => Some(format!(
+                "devmap mcp process(es) started before the installed binary's mtime: pid {}{coverage}; \
                  restart hosts so they pick up the current binary",
                 stale.join(", ")
-            ))
+            )),
         }
     }
 }
@@ -7402,6 +7547,60 @@ mod tests {
             warning.contains("build") || warning.contains("aaa111") || warning.contains("bbb222"),
             "{warning}"
         );
+    }
+
+    /// A check that could not run must never report the same result as a check
+    /// that ran and passed. Two binaries whose versions and build ids agree but
+    /// whose bytes were never compared are *unverified*, not *identical*.
+    #[test]
+    fn a_hash_that_could_not_be_taken_is_not_reported_as_agreement() {
+        let binaries = vec![
+            serde_json::json!({
+                "path": "/tmp/a/devmap",
+                "version": "0.2.1",
+                "build_id": "aaa111",
+                "sha256": "aa".repeat(32),
+                "sha256_status": "hashed",
+            }),
+            serde_json::json!({
+                "path": "/tmp/b/devmap",
+                "version": "0.2.1",
+                "build_id": "aaa111",
+                "sha256": serde_json::Value::Null,
+                "sha256_status": "unavailable",
+                "sha256_error": "not hashed: exceeded the 3s shared budget",
+            }),
+        ];
+        let warning = binaries_skew_warning(&binaries)
+            .expect("a hash comparison that never ran must not read as 'no skew'");
+        assert!(warning.contains("/tmp/b/devmap"), "{warning}");
+        assert!(warning.contains("unverified"), "{warning}");
+    }
+
+    /// …and the gap is appended to a real skew report too, because the sha256
+    /// list that report prints is then a subset of the binaries found.
+    #[test]
+    fn a_skew_report_says_when_its_hash_list_is_incomplete() {
+        let binaries = vec![
+            serde_json::json!({
+                "path": "/tmp/a/devmap",
+                "version": "0.2.1",
+                "build_id": "aaa111",
+                "sha256": "aa".repeat(32),
+                "sha256_status": "hashed",
+            }),
+            serde_json::json!({
+                "path": "/tmp/b/devmap",
+                "version": "0.2.0",
+                "build_id": "bbb222",
+                "sha256": serde_json::Value::Null,
+                "sha256_status": "unavailable",
+                "sha256_error": "not hashed: exceeded the 3s shared budget",
+            }),
+        ];
+        let warning = binaries_skew_warning(&binaries).expect("differing versions are skew");
+        assert!(warning.contains("0.2.0"), "{warning}");
+        assert!(warning.contains("incomplete"), "{warning}");
     }
 
     #[test]
