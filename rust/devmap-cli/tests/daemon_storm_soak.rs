@@ -6,18 +6,16 @@
 //! need a sequence — a queue that grows a little each cycle, a generation
 //! written half-way, an endpoint reclaimed 49 times out of 50.
 //!
-//! Three assertions, and the first is the one the others exist to support:
+//! Three checks, with distinct scopes:
 //!
-//! 1. **The store converges on a cold build.** After every storm and every
-//!    abrupt death, a daemon left to quiesce must arrive at exactly the graph a
-//!    `devmap build` of the same tree produces — same node and edge counts, and
-//!    the same symbols by name and file. Counts alone are not enough: two
-//!    different graphs of equal size are a thing this kernel can produce, and
-//!    "the numbers matched" would report them as agreement.
-//! 2. **RSS plateaus.** Compared as two half-means after a warm-up quarter,
-//!    which is `tools/soak.sh`'s method and for its reason: the early cycles are
-//!    a process loading its graph, and a soak that called that growth a leak
-//!    would fail on every healthy kernel.
+//! 1. **Each restarted daemon empties its queue.** After all cycles, the final
+//!    store is compared with a cold build for node/edge counts and symbol
+//!    membership by file, name and kind. Exact edge tuples, confidence and
+//!    resolution are not compared, and there is no per-cycle cold comparison.
+//! 2. **RSS across restarted daemons stays within a tolerance.** Two half-means
+//!    are compared after discarding a warm-up quarter. These are samples of
+//!    separate processes handling different storm shapes, not a measurement
+//!    of one continuously running daemon's memory growth.
 //! 3. **Nothing is left behind.** No socket, no endpoint lock, after the last
 //!    daemon exits — and, at every restart in between, the *next* daemon binds
 //!    with no manual cleanup. `serve_stress.rs`'s kill test removes the stale
@@ -80,12 +78,12 @@ fn json(args: &[&str]) -> serde_json::Value {
 
 /// What a generation actually holds: every symbol, by file, name and kind.
 ///
-/// A count is a summary, and two different graphs can share one — so the
-/// comparison is on membership, not on a statistic about it.
+/// Symbol membership supplements node/edge counts; this does not compare the
+/// edge tuples or confidence values of two generations.
 ///
 /// `ast` is budgeted like every other answer here, and its default page is 100.
-/// A digest built from that page would be a capped sample presented as a whole
-/// graph, which is the one thing this file must not do, so the limit is raised
+/// A digest built from that page would be a capped sample presented as all
+/// symbols, which is the one thing this file must not do, so the limit is raised
 /// past the corpus and `hidden` is asserted to be zero. `corpus_symbols` is the
 /// exact total the command reports, and it is what the limit is checked
 /// against — not a number chosen here.
@@ -96,7 +94,7 @@ fn symbol_digest(db: &Path) -> BTreeSet<String> {
     let total = value["corpus_symbols"].as_i64().unwrap_or(-1);
     assert_eq!(
         hidden, 0,
-        "the digest must be the whole graph and not a page of it: {total} symbols \
+        "the digest must include all symbols and not a page of them: {total} symbols \
          in the corpus and {hidden} withheld. Raise the limit."
     );
     let matches = value["matches"]
@@ -145,16 +143,34 @@ fn seed(tree: &Path, count: usize) {
 /// One storm. Four shapes, rotated, each a different way for a watcher to lose
 /// track of what the tree contains.
 fn storm(tree: &Path, cycle: usize) -> &'static str {
+    fn checked<T>(result: std::io::Result<T>, cycle: usize, operation: &str, path: &Path) -> T {
+        result.unwrap_or_else(|error| {
+            panic!(
+                "storm cycle {cycle}: {operation} at {} failed: {error}",
+                path.display()
+            )
+        })
+    }
+
     let churn = tree.join("churn");
     match cycle % 4 {
         // Ten thousand creations in one directory, as fast as the filesystem
         // will take them.
         0 => {
-            let _ = std::fs::create_dir_all(&churn);
+            // Later rounds retain the previous reborn files and cycle_a.py.
+            checked(
+                std::fs::create_dir_all(&churn),
+                cycle,
+                "create directory",
+                &churn,
+            );
             for i in 0..10_000 {
-                let _ = std::fs::write(
-                    churn.join(format!("burst_{i}.py")),
-                    format!("def burst_{i}():\n    return {i}\n"),
+                let path = churn.join(format!("burst_{i}.py"));
+                checked(
+                    std::fs::write(&path, format!("def burst_{i}():\n    return {i}\n")),
+                    cycle,
+                    "write burst source",
+                    &path,
                 );
             }
             "10,000 creations in one directory"
@@ -162,26 +178,55 @@ fn storm(tree: &Path, cycle: usize) -> &'static str {
         // Rename every one of them. No content changes at all, so a watcher
         // that keys on content sees nothing while every path it knows is wrong.
         1 => {
-            if let Ok(entries) = std::fs::read_dir(&churn) {
-                for entry in entries.flatten() {
-                    let from = entry.path();
-                    let Some(name) = from.file_name().and_then(|n| n.to_str()) else {
-                        continue;
-                    };
-                    let _ = std::fs::rename(&from, churn.join(format!("moved_{name}")));
-                }
+            let entries = checked(
+                std::fs::read_dir(&churn),
+                cycle,
+                "enumerate churn directory",
+                &churn,
+            );
+            // Finish enumeration before mutating the directory. A live
+            // iterator can revisit renamed entries and rename them repeatedly.
+            let entries = checked(
+                entries.collect::<std::io::Result<Vec<_>>>(),
+                cycle,
+                "read churn directory entry",
+                &churn,
+            );
+            for entry in entries {
+                let from = entry.path();
+                let mut name = std::ffi::OsString::from("moved_");
+                name.push(entry.file_name());
+                checked(
+                    std::fs::rename(&from, churn.join(name)),
+                    cycle,
+                    "rename churn entry",
+                    &from,
+                );
             }
             "mass rename of the whole directory"
         }
         // Delete the directory and recreate it with different content. Every
         // path that existed is gone and every path that exists is new.
         2 => {
-            let _ = std::fs::remove_dir_all(&churn);
-            let _ = std::fs::create_dir_all(&churn);
+            checked(
+                std::fs::remove_dir_all(&churn),
+                cycle,
+                "remove churn directory",
+                &churn,
+            );
+            checked(
+                std::fs::create_dir_all(&churn),
+                cycle,
+                "recreate churn directory",
+                &churn,
+            );
             for i in 0..500 {
-                let _ = std::fs::write(
-                    churn.join(format!("reborn_{i}.py")),
-                    format!("def reborn_{i}(v):\n    return v * {i}\n"),
+                let path = churn.join(format!("reborn_{i}.py"));
+                checked(
+                    std::fs::write(&path, format!("def reborn_{i}(v):\n    return v * {i}\n")),
+                    cycle,
+                    "write reborn source",
+                    &path,
                 );
             }
             "directory deleted and recreated with different content"
@@ -193,16 +238,117 @@ fn storm(tree: &Path, cycle: usize) -> &'static str {
             let a = churn.join("cycle_a.py");
             let b = churn.join("cycle_b.py");
             let c = churn.join("cycle_c.py");
-            let _ = std::fs::create_dir_all(&churn);
-            let _ = std::fs::write(&a, "def cycled():\n    return 1\n");
+            checked(
+                std::fs::create_dir_all(&churn),
+                cycle,
+                "create directory",
+                &churn,
+            );
+            checked(
+                std::fs::write(&a, "def cycled():\n    return 1\n"),
+                cycle,
+                "write rename-cycle source",
+                &a,
+            );
             for _ in 0..1_000 {
-                let _ = std::fs::rename(&a, &b);
-                let _ = std::fs::rename(&b, &c);
-                let _ = std::fs::rename(&c, &a);
+                checked(std::fs::rename(&a, &b), cycle, "rename a to b", &a);
+                checked(std::fs::rename(&b, &c), cycle, "rename b to c", &b);
+                checked(std::fs::rename(&c, &a), cycle, "rename c to a", &c);
             }
             "1,000 a->b->c->a rename cycles"
         }
     }
+}
+
+#[test]
+fn every_storm_shape_refuses_a_file_in_place_of_its_directory() {
+    let work = short_scratch("blocked-churn");
+    std::fs::write(work.join("churn"), "directory creation is blocked\n").unwrap();
+    for cycle in 0..4 {
+        let attempted = std::panic::catch_unwind(|| storm(&work, cycle));
+        assert!(
+            attempted.is_err(),
+            "storm shape {cycle} reported success although churn is a regular file"
+        );
+    }
+    std::fs::remove_dir_all(work).unwrap();
+}
+
+#[test]
+fn creation_storm_refuses_an_unwritable_file_destination() {
+    let work = short_scratch("blocked-write");
+    std::fs::create_dir_all(work.join("churn/burst_0.py")).unwrap();
+    let attempted = std::panic::catch_unwind(|| storm(&work, 0));
+    assert!(
+        attempted.is_err(),
+        "the creation storm reported success when its first destination was a directory"
+    );
+    std::fs::remove_dir_all(work).unwrap();
+}
+
+#[test]
+fn rename_cycle_refuses_a_blocked_intermediate_destination() {
+    let work = short_scratch("blocked-rename");
+    std::fs::create_dir_all(work.join("churn/cycle_b.py")).unwrap();
+    std::fs::write(
+        work.join("churn/cycle_b.py/marker"),
+        "cannot replace this directory\n",
+    )
+    .unwrap();
+    let attempted = std::panic::catch_unwind(|| storm(&work, 3));
+    assert!(
+        attempted.is_err(),
+        "the rename storm reported success when the a-to-b rename could not run"
+    );
+    std::fs::remove_dir_all(work).unwrap();
+}
+
+#[test]
+fn storm_shapes_produce_the_requested_files_in_first_and_later_rounds() {
+    let work = short_scratch("shape-controls");
+    let churn = work.join("churn");
+    for cycle in 0..8 {
+        storm(&work, cycle);
+        let names: BTreeSet<_> = std::fs::read_dir(&churn)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                assert!(entry.file_type().unwrap().is_file());
+                entry.file_name().into_string().unwrap()
+            })
+            .collect();
+        match cycle % 4 {
+            0 | 1 => {
+                let prefix = if cycle % 4 == 0 { "" } else { "moved_" };
+                assert_eq!(names.len(), if cycle < 4 { 10_000 } else { 10_501 });
+                for index in 0..10_000 {
+                    assert!(names.contains(&format!("{prefix}burst_{index}.py")));
+                }
+                if cycle >= 4 {
+                    assert!(names.contains(&format!("{prefix}cycle_a.py")));
+                    for index in 0..500 {
+                        assert!(names.contains(&format!("{prefix}reborn_{index}.py")));
+                    }
+                }
+            }
+            2 => {
+                assert_eq!(names.len(), 500);
+                for index in 0..500 {
+                    assert!(names.contains(&format!("reborn_{index}.py")));
+                }
+            }
+            _ => {
+                assert_eq!(names.len(), 501);
+                assert!(names.contains("cycle_a.py"));
+                assert!(!names.contains("cycle_b.py") && !names.contains("cycle_c.py"));
+                assert_eq!(
+                    std::fs::read_to_string(churn.join("cycle_a.py")).unwrap(),
+                    "def cycled():\n    return 1\n"
+                );
+            }
+        }
+    }
+    std::fs::remove_dir_all(work).unwrap();
 }
 
 struct Daemon {
@@ -384,7 +530,7 @@ fn a_storm_kill_restart_cycle_converges_on_the_cold_build() {
          of {cycles}"
     );
 
-    // 1. Convergence. A fresh cold build of the same tree, into its own store.
+    // 1. Final counts and symbol membership against a fresh cold build.
     let cold_db = work.join("cold.sqlite");
     let cold = devmap(&[
         "--db",
@@ -407,7 +553,7 @@ fn a_storm_kill_restart_cycle_converges_on_the_cold_build() {
         (soaked_nodes, soaked_edges),
         (cold_nodes, cold_edges),
         "after {cycles} storms and {cycles} abrupt deaths the incrementally \
-         maintained store must hold the same graph a single build produces"
+         maintained store must match a cold build's node and edge counts"
     );
 
     let soaked = symbol_digest(&db);
@@ -424,8 +570,8 @@ fn a_storm_kill_restart_cycle_converges_on_the_cold_build() {
         );
     }
 
-    // 2. Plateau, by `tools/soak.sh`'s method: two half-means after a warm-up
-    //    quarter, because the early cycles are a process loading its graph.
+    // 2. Compare RSS from restarted daemons across the storm shapes. This
+    //    does not establish a continuously running daemon's memory plateau.
     let warmup = rss_samples.len() / 4;
     let measured = &rss_samples[warmup..];
     if measured.len() >= 4 {
@@ -440,8 +586,7 @@ fn a_storm_kill_restart_cycle_converges_on_the_cold_build() {
         assert!(
             growth < 0.25,
             "resident memory grew {:.1}% between the halves of the measured \
-             window ({a:.0} -> {b:.0} KiB); a daemon an agent host keeps open for \
-             hours must plateau",
+             window ({a:.0} -> {b:.0} KiB) across restarted daemon processes",
             growth * 100.0
         );
     } else {

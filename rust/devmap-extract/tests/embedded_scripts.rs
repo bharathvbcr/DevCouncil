@@ -745,8 +745,13 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // A warm v47 row has none of those and still looks complete.
     //
     // v49 records dsl.Matcher Go parameters as RuntimeEntryPoint wiring.
+    // v50 invalidates resolver-origin classifications even for unchanged
+    // source: explicit imports/local bindings outrank builtin/prelude tables,
+    // and a bare self value no longer supplies Rust module-path evidence.
+    // v51 rebuilds the classification of captured receivers using their exact
+    // binding facts; unchanged v50 generations otherwise keep stale globals.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "49",
+        EXTRACTION_SCHEMA_VERSION, "51",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

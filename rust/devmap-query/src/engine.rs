@@ -3854,7 +3854,7 @@ fn attribution_coverage_gap(
         Some(coverage) if coverage.unresolved_sites == total && coverage.explained_sites <= total => {
             let remaining = total - coverage.explained_sites;
             (remaining > 0).then(|| format!(
-                "{remaining} of {total} unresolved attribution site(s) have no indexed target after excluding {} known builtin, runtime-global, and external-import site(s); these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it",
+                "{remaining} of {total} unresolved attribution site(s) have no indexed target after excluding {} site(s) classified as builtin, runtime-global, external-import, no-namesake, or module-path; classification does not prove complete source coverage; these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it",
                 coverage.explained_sites,
             ))
         }

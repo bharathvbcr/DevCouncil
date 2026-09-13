@@ -14,7 +14,9 @@
 
 use devmap_extract::extract_file;
 use devmap_extract::model::{EdgeKind, Extraction};
-use devmap_resolve::model::{Resolution, ResolutionKind, ResolutionResult, UnresolvedClass};
+use devmap_resolve::model::{
+    Resolution, ResolutionKind, ResolutionResult, UnresolvedClass, UnresolvedKind,
+};
 use devmap_resolve::Resolver;
 
 fn resolve(files: &[(&str, &str)]) -> ResolutionResult {
@@ -161,6 +163,61 @@ fn swift_prelude_constructors_are_language_declared() {
             .all(|row| matches!(row.class, UnresolvedClass::Builtin)),
         "String is a prelude type and needs no import: {rows:?}"
     );
+}
+
+#[test]
+fn a_python_module_import_does_not_make_swift_sdk_names_bare_globals() {
+    let result = resolve(&[(
+        "main.py",
+        "import Foundation\n\ndef build():\n    return NSString()\n",
+    )]);
+    let calls: Vec<_> = result
+        .unresolved
+        .iter()
+        .filter(|row| row.kind == UnresolvedKind::Call && row.callee_name == "NSString")
+        .collect();
+    assert!(
+        !calls.is_empty(),
+        "the unbound bare call must remain recorded"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|row| row.class == UnresolvedClass::NoNamesake),
+        "Python's import binds Foundation, not the bare name NSString: {calls:?}"
+    );
+}
+
+#[test]
+fn typed_swift_prelude_values_and_local_types_keep_distinct_classifications() {
+    for local_type in [false, true] {
+        let mut files = vec![(
+            "Sources/App/main.swift",
+            "func build(_ value: String) {\n    _ = value.lowercased()\n}\n",
+        )];
+        if local_type {
+            files.push(("Sources/App/Value.swift", "struct String {}\n"));
+        }
+        let result = resolve(&files);
+        let calls: Vec<_> = result
+            .unresolved
+            .iter()
+            .filter(|row| row.kind == UnresolvedKind::Call && row.callee_name == "lowercased")
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "the method call must remain recorded (local type: {local_type})"
+        );
+        let expected = if local_type {
+            UnresolvedClass::UninferredReceiver
+        } else {
+            UnresolvedClass::Builtin
+        };
+        assert!(
+            calls.iter().all(|row| row.class == expected),
+            "a local String must veto the prelude table; an unshadowed String must use it: {calls:?}"
+        );
+    }
 }
 
 #[test]

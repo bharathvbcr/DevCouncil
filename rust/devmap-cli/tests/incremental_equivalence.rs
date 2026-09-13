@@ -751,3 +751,116 @@ fn an_unchanged_tree_over_an_aged_store_is_still_rebuilt() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+/// Resolver changes need the same generation invalidation as extractor changes.
+/// A v49 store can otherwise keep an incorrectly explained local import forever
+/// because unchanged source returns before resolution runs.
+#[test]
+fn an_unchanged_v49_generation_recomputes_attribution_after_upgrade() {
+    assert_unchanged_attribution_upgrade(
+        "49",
+        "src/use.py",
+        "from .missing import len\ndef run(rows):\n    return len(rows)\n",
+        "len",
+        "builtin",
+        "unresolved",
+    );
+}
+
+#[test]
+fn an_unchanged_v50_generation_recomputes_captured_receiver_attribution_after_upgrade() {
+    assert_unchanged_attribution_upgrade(
+        "50",
+        "src/use.ts",
+        "export function outer(Math: number) {\n\
+         function inner() { return Math.toFixed(); }\n\
+         return inner();\n}\n",
+        "toFixed",
+        "host_global",
+        "uninferred_receiver",
+    );
+}
+
+fn assert_unchanged_attribution_upgrade(
+    old_version: &str,
+    relative_path: &str,
+    source: &str,
+    callee: &str,
+    old_class: &str,
+    expected_class: &str,
+) {
+    let root = std::env::temp_dir().join(format!(
+        "devmap-v{old_version}-attribution-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join(relative_path), source).unwrap();
+    build(&root);
+    let before = {
+        let store = devmap_store::Store::open(db_path(&root)).unwrap();
+        store.latest_generation_id().unwrap().unwrap()
+    };
+    {
+        let conn = rusqlite::Connection::open(db_path(&root)).unwrap();
+        let correct: i64 = conn.query_row(
+            "SELECT count(*) FROM generation_unresolved WHERE generation_id = (SELECT max(id) FROM generations) AND callee_name = ?1 AND classification = ?2",
+            [callee, expected_class], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            correct > 0,
+            "fixture must first observe the repaired source classification"
+        );
+        conn.execute(
+            "UPDATE file_payloads SET analyzer_version = ?1",
+            [format!("0.2.0:extract-v{old_version}")],
+        )
+        .unwrap();
+        let changed = conn.execute(
+            "UPDATE unresolved_rows SET classification = ?1 WHERE callee_name = ?2 AND source_file = ?3 AND valid_to IS NULL",
+            [old_class, callee, relative_path],
+        ).unwrap();
+        assert!(
+            changed > 0,
+            "fixture must preserve an old incorrectly explained call"
+        );
+    }
+
+    build(&root);
+    assert_eq!(
+        std::fs::read_to_string(root.join(relative_path)).unwrap(),
+        source
+    );
+    {
+        let store = devmap_store::Store::open(db_path(&root)).unwrap();
+        assert!(
+            store.latest_generation_id().unwrap().unwrap() > before,
+            "unchanged source must not reuse a v{old_version} generation after attribution semantics change"
+        );
+        assert!(store.latest_generation_payload_is_current().unwrap());
+        let conn = rusqlite::Connection::open(db_path(&root)).unwrap();
+        let (remaining, wrong): (i64, i64) = conn.query_row(
+            "SELECT count(*), count(CASE WHEN classification <> ?2 THEN 1 END) FROM generation_unresolved WHERE generation_id = (SELECT max(id) FROM generations) AND callee_name = ?1",
+            [callee, expected_class], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert!(
+            remaining > 0,
+            "the upgrade must retain the attribution site"
+        );
+        assert_eq!(
+            wrong, 0,
+            "the upgrade must recompute the source classification for {callee}"
+        );
+    }
+    let scratch = std::env::temp_dir().join(format!(
+        "devmap-v{old_version}-attribution-cold-{}",
+        std::process::id()
+    ));
+    assert_eq!(
+        generation(&root),
+        cold_generation(&root, &scratch),
+        "upgraded unchanged state must equal a fresh build's graph and analysis"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&scratch);
+}

@@ -226,6 +226,34 @@ are retired. The mapping engine's required gate is `rust/verify.sh`
 cd rust && ./verify.sh
 ```
 
+### Pinned local tool comparison
+
+`competition_bench.py` compares DevMap, CodeGraph and CBM on fresh clones of
+explicit Git revisions. It checks exact definition names and paths across ten
+language fixtures, standalone queries and persistent MCP queries, and repeated
+edit, rename, delete and empty-file restoration scenarios. Raw responses,
+unsuccessful checks, executable hashes and source manifests are retained.
+
+Pass a JSON configuration containing absolute executable paths under `devmap`,
+`codegraph` and `cbm`, and a `repositories` array whose entries have `name`,
+`path` and `revision`. Repository names must use lowercase letters, digits,
+underscores or hyphens. The output directory must not already exist.
+
+```bash
+python3 benchmarks/competition_bench.py --config comparison.json --out results/comparison --repeat 3
+python3 -m unittest discover -s benchmarks -p 'test_*bench.py'
+```
+
+The runner installs no tools or providers. Its adapters target the native
+command and response contracts recorded in each run's version/schema artifacts;
+an unknown response is unverified, never an empty successful answer. One cold
+sample is recorded per tool/repository. Native build work and bundled provider
+availability differ, and synthetic definition checks do not estimate caller
+recall. Read [the hardening audit](../docs/devmap/BENCHMARK_HARDENING_AUDIT.md)
+before interpreting the results as a product comparison. This comparative
+runner supplements the Rust gates; the historical `map_bench.py` stages below
+remain retired.
+
 ---
 
 # `dev map` performance

@@ -3612,7 +3612,7 @@ fn emit_clones(report: &devmap_query::CloneReport) {
     );
 }
 
-/// Files whose edges a change can reach, or `None` for a full resolve.
+/// Suggested source-file write set, or `None` for a full generation write.
 ///
 /// Resolution reads two global maps — the symbol index and the type/method
 /// index — and both are keyed by symbol *name*. A file's edges can therefore
@@ -3620,10 +3620,14 @@ fn emit_clones(report: &devmap_query::CloneReport) {
 /// defined or removed elsewhere. The closure is the changed files plus every
 /// file mentioning such a name.
 ///
-/// Returns `None` (meaning "resolve everything") whenever the cheap, safe
+/// Resolution and analysis always receive the whole repository. This set only
+/// narrows persistence; the store independently checks content and row digests
+/// before carrying anything forward.
+///
+/// Returns `None` (meaning "write everything") whenever the cheap, safe
 /// answer is unavailable: no previous generation, a file added or deleted, or
 /// a closure so large that narrowing it saves nothing. Falling back to a full
-/// resolve is always correct; the danger is only ever narrowing too far.
+/// write is always correct; the danger is only ever narrowing too far.
 fn affected_closure(
     store: &Store,
     extractions: &[devmap_extract::model::Extraction],
@@ -4270,10 +4274,10 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             // Taking it first means the loser waits for the winner and then
             // does useful work, or fails immediately with a message naming the
             // pid that holds the store.
-            progress.display.detail("waiting for writer lock");
-            let _writer = Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)?;
-            progress.display.detail("opening index");
-            let store = Store::open(cli.db())?;
+            let _writer = progress.timed("writer:wait", || {
+                Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)
+            })?;
+            let store = progress.timed("store:open", || Store::open(cli.db()))?;
             store.bind_repo_root(path)?;
             // A store this process can only read opens fine — queries need it
             // to — and would otherwise fail at the first write with a bare
@@ -4337,7 +4341,8 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             // did not touch the queue at all. This runs on every build
             // including the unchanged early return below, because a store whose
             // sources have not moved is exactly where a stale queue hides.
-            let reconciled = store.reconcile_pending_paths(path)?;
+            let reconciled =
+                progress.timed("pending:reconcile", || store.reconcile_pending_paths(path))?;
             if !reconciled.dropped.is_empty() {
                 progress.display.diagnostic(format_args!(
                     "  pending queue: dropped {} unprocessable row(s):",
@@ -4377,7 +4382,9 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             progress
                 .display
                 .files("reading", std::sync::Arc::clone(&scan_progress));
-            let scanned = devmap_extract::scan_tree_with_progress(path, Some(&scan_progress))?;
+            let scanned = progress.timed("scan:read", || {
+                devmap_extract::scan_tree_with_progress(path, Some(&scan_progress))
+            })?;
             let scan_snapshot = scan_progress.snapshot();
             progress.display.detail("checking content hashes");
             // Report what discovery refused. A file dropped for being oversized
@@ -4440,7 +4447,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             // for a key built from those same bytes and a matching `file_path`
             // — so the verdict is the one extraction would have produced, for
             // the cost of an FNV pass instead of 1,311 store round-trips.
-            let previous = store.latest_file_hashes()?;
+            let previous = progress.timed("scan:previous_hashes", || store.latest_file_hashes())?;
             let file_delta = scanned.file_delta(&previous);
             if !*full
                 && !previous.is_empty()
@@ -4601,23 +4608,28 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             progress
                 .display
                 .files("extracting", std::sync::Arc::clone(&extraction_progress));
-            let extractions = if *full {
-                let refs: Vec<devmap_extract::FileRef<'_>> = scanned
-                    .sources
-                    .iter()
-                    .map(|(file, source)| devmap_extract::FileRef {
-                        path: file.as_str(),
-                        source: source.as_str(),
-                    })
-                    .collect();
-                devmap_extract::extract_all_with_progress(&refs, Some(&extraction_progress))
-            } else {
-                devmap_store::extract_scanned_for_generation(
-                    &store,
-                    &scanned,
-                    Some(&extraction_progress),
-                )?
-            };
+            let extractions = progress.timed("extract:files", || {
+                if *full {
+                    let refs: Vec<devmap_extract::FileRef<'_>> = scanned
+                        .sources
+                        .iter()
+                        .map(|(file, source)| devmap_extract::FileRef {
+                            path: file.as_str(),
+                            source: source.as_str(),
+                        })
+                        .collect();
+                    Ok(devmap_extract::extract_all_with_progress(
+                        &refs,
+                        Some(&extraction_progress),
+                    ))
+                } else {
+                    devmap_store::extract_scanned_for_generation(
+                        &store,
+                        &scanned,
+                        Some(&extraction_progress),
+                    )
+                }
+            })?;
             let extraction_snapshot = extraction_progress.snapshot();
             // The corpus text is dead the moment extraction has consumed it,
             // but it is bound in this scope and would otherwise stay resident
@@ -4674,14 +4686,19 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             let affected = if *full {
                 None
             } else {
-                affected_closure(&store, &extractions)?
+                progress.timed("affected:closure", || {
+                    affected_closure(&store, &extractions)
+                })?
             };
 
             let mut resolver = Resolver::new();
             let go_modules =
                 progress.timed("discovering Go modules", || collect_go_modules(path))?;
-            resolver.index_go_modules(&go_modules);
-            resolver.index_extractions(&extractions);
+            progress.timed("resolver:index", || {
+                resolver.index_go_modules(&go_modules);
+                resolver.index_extractions(&extractions);
+                Ok::<(), std::convert::Infallible>(())
+            })?;
             progress.stage(
                 2,
                 format_args!("resolving {}", progress::count(extractions.len(), "file")),

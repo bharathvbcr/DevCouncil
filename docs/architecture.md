@@ -64,7 +64,7 @@ Ripgrep Engine & Trigram Index"]
 
 Located in `backend/go_orchestrator/`. Compiled as a single static native binary.
 - **Host MCP Server (`mcp`):** Provides stdio MCP tools for task checkout, leases, diff analysis, and verification gates.
-- **Agent Integration (`integrate`):** Cursor writes `.cursor/mcp.json` + a rule. Claude writes `.mcp.json`. Codex writes a comment-only toml. Antigravity / OpenCode / Warp / Aider / Gemini return a stub receipt. `--write-gate` is discarded (TASK-P7-8).
+- **Agent Integration (`integrate`):** Cursor writes `.cursor/mcp.json` + a rule. Claude writes `.mcp.json`. Codex writes a comment-only toml. Antigravity / OpenCode / Warp / Aider / Gemini return a stub receipt. `--write-gate` is refused before writes (TASK-P7-8).
 - **Skills Distribution (`skills`):** Scaffolds embedded engineering and code intelligence skills into agent directories (`.agents/skills`, `.claude/skills`, `.cursor/skills`).
 - **Verification Gateway (`verify`):** Checks leases in `dcstore` and runs Go `verify.Run()` (no-work, planned-file, orphan-diff, dependency-risk, expected-test commands). It does **not** spawn `dcverify`; stub, secret, and coverage rigor live in that binary and are invoked today by Manvi `runRigor`, not by `devcouncil verify` or MCP `devcouncil_verify_task`. `--sandbox` is recorded on the report; only local `/bin/sh -c` in the project root is implemented.
 - **DevMap Forwarding (`map`, `graph`, `ast`):** Dispatches directly to `devmap`.

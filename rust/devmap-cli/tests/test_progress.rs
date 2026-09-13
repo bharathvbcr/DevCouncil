@@ -1401,3 +1401,113 @@ fn export_cannot_mix_raw_graphml_with_a_json_receipt() {
     assert!(!xml.contains("devmap /"));
     fs::remove_dir_all(root).unwrap();
 }
+
+/// The coarse scan/extract stage also holds writer contention, store setup,
+/// cache reads, affected-set computation and resolver indexing. Timing only
+/// the Go-module walk cannot identify which of these explains an edit delay.
+#[test]
+fn update_profiles_separate_work_and_do_not_invent_skipped_phases() {
+    let root = temp_root();
+    let db = root.join("index.sqlite");
+    let build = |full: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_devmap"));
+        command
+            .args(["--json", "--progress", "never", "--db"])
+            .arg(&db)
+            .arg("build")
+            .arg(&root);
+        if full {
+            command.arg("--full");
+        }
+        let output = command.output().expect("run profiled build");
+        assert!(
+            output.status.success(),
+            "build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("JSON build receipt")
+    };
+    let validate = |payload: &serde_json::Value, extracts: bool, full: bool| {
+        let stage = &payload["timings"]["stages"][0];
+        let parts = stage["sub"].as_array().expect("scan/extract sub-phases");
+        let names: Vec<_> = parts
+            .iter()
+            .map(|part| part["stage"].as_str().expect("phase name"))
+            .collect();
+        for expected in [
+            "writer:wait",
+            "store:open",
+            "pending:reconcile",
+            "scan:read",
+            "scan:previous_hashes",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}: {stage}");
+        }
+        for expected in ["extract:files", "resolver:index"] {
+            assert_eq!(
+                names.contains(&expected),
+                extracts,
+                "{expected} must exist exactly when it ran: {stage}"
+            );
+        }
+        assert_eq!(
+            names.contains(&"affected:closure"),
+            extracts && !full,
+            "a full build bypasses the closure; an unchanged build skips it: {stage}"
+        );
+        let mut sum = 0.0;
+        for part in parts {
+            let seconds = part["seconds"].as_f64().expect("numeric duration");
+            assert!(seconds.is_finite() && seconds >= 0.0, "{part}");
+            sum += seconds;
+        }
+        assert!(
+            sum <= stage["seconds"].as_f64().expect("stage duration") + 1e-6,
+            "nested work must not exceed its enclosing phase: {stage}"
+        );
+    };
+    let cold = build(false);
+    validate(&cold, true, false);
+    let unchanged = build(false);
+    assert_eq!(unchanged["unchanged"], true);
+    validate(&unchanged, false, false);
+    fs::write(
+        root.join("src/main.py"),
+        "def helper():\n    return 1\ndef main():\n    return helper()\n",
+    )
+    .expect("edit one source");
+    let edit = build(false);
+    assert_eq!(edit["file_progress"]["delta"]["changed"], 1);
+    validate(&edit, true, false);
+    let full = build(true);
+    validate(&full, true, true);
+    assert_eq!(full["edges"], edit["edges"]);
+    assert_eq!(full["symbols"], edit["symbols"]);
+    fs::remove_dir_all(root).expect("remove owned fixture");
+}
+
+#[test]
+fn a_failed_store_open_is_timed_without_claiming_extraction_ran() {
+    let root = temp_root();
+    let db = root.join("broken.sqlite");
+    fs::write(&db, "not a sqlite database").expect("write damaged store fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .args(["--json", "--progress", "never", "--db"])
+        .arg(&db)
+        .arg("build")
+        .arg(&root)
+        .output()
+        .expect("run failed build");
+    assert!(!output.status.success());
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("failure receipt");
+    let stage = &payload["timings"]["stages"][0];
+    let parts = stage["sub"].as_array().expect("failed work has timings");
+    let names: Vec<_> = parts
+        .iter()
+        .map(|part| part["stage"].as_str().expect("phase name"))
+        .collect();
+    assert_eq!(names, ["writer:wait", "store:open"]);
+    assert!(payload["error"].is_string());
+    fs::remove_dir_all(root).expect("remove owned fixture");
+}

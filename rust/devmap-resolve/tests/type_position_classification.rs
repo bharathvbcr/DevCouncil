@@ -206,3 +206,48 @@ fn the_defect_tier_holds_no_prelude_type_and_no_placeholder() {
          names the language itself declares: {offenders:?}"
     );
 }
+
+#[test]
+fn an_explicit_import_shadows_a_rust_prelude_type() {
+    let (_, result) = resolve(&[(
+        "src/imported.rs",
+        "use outside::String;\npub fn consume(value: String) -> String { value }\n",
+    )]);
+    let rows = rows_for(&result, "String");
+    assert!(!rows.is_empty(), "the imported type must be represented");
+    assert!(
+        rows.iter().all(|(_, class)| class == "external"),
+        "an explicit import outranks the prelude: {rows:?}"
+    );
+}
+
+#[test]
+fn a_missing_relative_import_shadows_a_rust_prelude_type() {
+    let (_, result) = resolve(&[(
+        "src/imported.rs",
+        "use crate::missing::String;\npub fn consume(value: String) -> String { value }\n",
+    )]);
+    let rows = rows_for(&result, "String");
+    assert!(
+        !rows.is_empty(),
+        "the missing local type must be represented"
+    );
+    assert!(
+        rows.iter().all(|(_, class)| class == "unresolved"),
+        "an explicit local import cannot be explained by the prelude: {rows:?}"
+    );
+}
+
+#[test]
+fn a_generic_binding_shadows_a_rust_prelude_type() {
+    let (_, result) = resolve(&[(
+        "src/generic.rs",
+        "pub fn consume<String>(value: String) -> String { value }\n",
+    )]);
+    let rows = rows_for(&result, "String");
+    assert!(!rows.is_empty(), "the generic type must be represented");
+    assert!(
+        rows.iter().all(|(_, class)| class == "local_binding"),
+        "the enclosing generic parameter outranks the prelude: {rows:?}"
+    );
+}

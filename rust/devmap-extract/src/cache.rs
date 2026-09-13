@@ -362,7 +362,16 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// v49 records `dsl.Matcher` Go parameters as `RuntimeEntryPoint` wiring so
 /// ruleguard rules are not confident-dead. A v48 row has no such annotation.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "49";
+///
+/// v50 invalidates generations whose attribution classification preceded the
+/// import/local-binding precedence and Rust `self` receiver fixes. This key
+/// also gates the unchanged-source shortcut before resolution: a resolver
+/// semantics change must invalidate it even when extraction bytes are stable.
+///
+/// v51 invalidates classifications that omitted exact receiver-binding facts
+/// for captured values. An unchanged v50 generation may still explain a local
+/// parameter named `Math` as a runtime global, even after the resolver is fixed.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "51";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

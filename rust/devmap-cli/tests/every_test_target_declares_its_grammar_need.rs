@@ -79,9 +79,8 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        // No `[[test]]` entry in this crate: nothing under `tests/` reaches a
-        // grammar, because the store's whole job is reading back what was
-        // already extracted.
+        // These targets read persisted model/storage data. retention_churn
+        // separately requires parse for its extraction-to-retention scenarios.
         "devmap-store",
         &[
             "a_corrupt_analysis_is_not_an_absent_one",

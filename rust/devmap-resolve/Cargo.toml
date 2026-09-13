@@ -122,3 +122,7 @@ required-features = ["parse"]
 [[test]]
 name = "ambiguity_budget"
 required-features = ["parse"]
+
+[[test]]
+name = "captured_receiver_attribution"
+required-features = ["parse"]

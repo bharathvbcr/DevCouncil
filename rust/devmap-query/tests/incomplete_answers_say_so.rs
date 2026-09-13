@@ -363,6 +363,14 @@ fn mixed_attribution_counts_exclude_explained_sites_and_name_their_scope() {
         !reason.contains("missing that many edges"),
         "unresolved sites are not an exact edge count: {reason}"
     );
+    assert!(
+        reason.contains("no-namesake") && reason.contains("module-path"),
+        "the explanation must include every class excluded from the count: {reason}"
+    );
+    assert!(
+        reason.contains("classification does not prove complete source coverage"),
+        "an explanation is a resolver classification, not independent source proof: {reason}"
+    );
 }
 
 #[test]
