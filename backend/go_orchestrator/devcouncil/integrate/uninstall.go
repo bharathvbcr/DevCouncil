@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,17 +37,18 @@ const openCodeHookPlugin = ".devcouncil/integrations/opencode_devcouncil_plugin.
 type hookConfig struct {
 	client, path string
 	removeEmpty  bool
+	root         string
 }
 
 var hookConfigs = []hookConfig{
-	{"cursor", ".cursor/hooks.json", true},
-	{"claude", ".claude/settings.json", false},
-	{"claude", ".claude/settings.local.json", false},
-	{"codex", ".codex/hooks.json", true},
-	{"gemini", ".gemini/settings.json", false},
-	{"grok", ".grok/hooks/devcouncil.json", true},
-	{"opencode", "opencode.json", false},
-	{"opencode", openCodeHookPlugin, true},
+	{"cursor", ".cursor/hooks.json", true, ""},
+	{"claude", ".claude/settings.json", false, ""},
+	{"claude", ".claude/settings.local.json", false, ""},
+	{"codex", ".codex/hooks.json", true, ""},
+	{"gemini", ".gemini/settings.json", false, ""},
+	{"grok", ".grok/hooks/devcouncil.json", true, ""},
+	{"opencode", "opencode.json", false, ""},
+	{"opencode", openCodeHookPlugin, true, ""},
 }
 
 type hookEdit struct {
@@ -108,6 +110,7 @@ func Uninstall(opts UninstallOptions) (receipt *Receipt, resultErr error) {
 		if client != "" && client != "all" && spec.client != client {
 			continue
 		}
+		spec.root = rootPath
 		data, info, err := readHookFile(root, spec.path)
 		if os.IsNotExist(err) {
 			receipt.Files[spec.path] = "missing"
@@ -292,12 +295,15 @@ func cleanHookJSON(data []byte, spec hookConfig) ([]byte, int, error) {
 	if settings == nil {
 		return nil, 0, errors.New("expected a JSON object")
 	}
+	if err := validateHookSettings(settings, spec.client); err != nil {
+		return nil, 0, err
+	}
 	removed := 0
 	if spec.client == "opencode" {
 		if entries, ok := settings["plugin"].([]any); ok {
 			kept := make([]any, 0, len(entries))
 			for _, entry := range entries {
-				if isOpenCodeHookRef(entry) {
+				if isOpenCodeHookRef(entry, spec.root) {
 					removed++
 				} else {
 					kept = append(kept, entry)
@@ -310,7 +316,7 @@ func cleanHookJSON(data []byte, spec hookConfig) ([]byte, int, error) {
 					settings["plugin"] = kept
 				}
 			}
-		} else if isOpenCodeHookRef(settings["plugin"]) {
+		} else if isOpenCodeHookRef(settings["plugin"], spec.root) {
 			delete(settings, "plugin")
 			removed++
 		}
@@ -319,6 +325,21 @@ func cleanHookJSON(data []byte, spec hookConfig) ([]byte, int, error) {
 			entries, ok := raw.([]any)
 			if !ok {
 				continue
+			}
+			for _, rawEntry := range entries {
+				entry, ok := rawEntry.(map[string]any)
+				if !ok {
+					continue
+				}
+				if children, ok := entry["hooks"].([]any); ok {
+					for _, child := range children {
+						if err := checkNamedHook(child); err != nil {
+							return nil, 0, err
+						}
+					}
+				} else if err := checkNamedHook(entry); err != nil {
+					return nil, 0, err
+				}
 			}
 			kept, n := stripHookEntries(entries)
 			removed += n
@@ -335,38 +356,98 @@ func cleanHookJSON(data []byte, spec hookConfig) ([]byte, int, error) {
 			delete(settings, "hooks")
 		}
 	}
+	// Legacy installs wrote a DevCouncil status line beside the hooks.
+	// isDevCouncilHookEntry holds this to our own value, so a host's own
+	// statusLine is never touched. Counting it as a removal here, before
+	// the no-op guard, keeps a file whose only DevCouncil artifact is the
+	// status line from being reported unchanged.
 	if isDevCouncilHookEntry(settings["statusLine"]) {
 		delete(settings, "statusLine")
 		removed++
 	}
-	if spec.removeEmpty {
-		if hooks, ok := settings["hooks"].(map[string]any); ok {
-			allEmpty := true
-			for _, v := range hooks {
-				if arr, ok := v.([]any); ok && len(arr) > 0 {
-					allEmpty = false
-					break
-				}
-			}
-			if allEmpty {
-				delete(settings, "hooks")
-			}
-		}
-		if len(settings) == 0 || (len(settings) == 1 && settings["version"] != nil) {
-			if removed == 0 {
-				removed = 1
-			}
-			return nil, removed, nil
-		}
-	}
 	if removed == 0 {
 		return data, 0, nil
+	}
+	if spec.removeEmpty && (len(settings) == 0 || (len(settings) == 1 && settings["version"] != nil)) {
+		return nil, removed, nil
 	}
 	after, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return nil, 0, err
 	}
 	return append(after, '\n'), removed, nil
+}
+
+// Validate the portions we inspect; unrelated host fields stay opaque. An
+// unsupported shape cannot be reported as a successful inspection with no hooks.
+func validateHookSettings(settings map[string]any, client string) error {
+	if client == "opencode" {
+		raw, exists := settings["plugin"]
+		if !exists {
+			return nil
+		}
+		if _, ok := raw.(string); ok {
+			return nil
+		}
+		entries, ok := raw.([]any)
+		if !ok {
+			return errors.New("plugin must be a string or array of strings")
+		}
+		for _, entry := range entries {
+			if _, ok := entry.(string); !ok {
+				return errors.New("plugin entries must be strings")
+			}
+		}
+		return nil
+	}
+	raw, exists := settings["hooks"]
+	if !exists {
+		return nil
+	}
+	hooks, ok := raw.(map[string]any)
+	if !ok {
+		return errors.New("hooks must be an object")
+	}
+	for _, raw := range hooks {
+		entries, ok := raw.([]any)
+		if !ok {
+			return errors.New("hook events must contain arrays")
+		}
+		for _, raw := range entries {
+			entry, ok := raw.(map[string]any)
+			if !ok {
+				return errors.New("hook entries must be objects")
+			}
+			nested, exists := entry["hooks"]
+			if !exists {
+				continue
+			}
+			children, ok := nested.([]any)
+			if !ok {
+				return errors.New("matcher hooks must contain an array")
+			}
+			for _, child := range children {
+				if _, ok := child.(map[string]any); !ok {
+					return errors.New("matcher hook entries must be objects")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// A known managed name with customized wiring needs manual review, not a
+// misleading clean receipt or deletion based on a substring in a shell script.
+func checkNamedHook(raw any) error {
+	entry, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	name, _ := entry["name"].(string)
+	if strings.HasPrefix(name, "devcouncil-") && !isDevCouncilHookEntry(entry) {
+		return errors.New("unrecognized DevCouncil-named hook command; review this entry manually (no changes applied)")
+	}
+	return nil
 }
 
 func stripHookEntries(entries []any) ([]any, int) {
@@ -406,13 +487,28 @@ func stripHookEntries(entries []any) ([]any, int) {
 	return kept, removed
 }
 
-func isOpenCodeHookRef(raw any) bool {
+func isOpenCodeHookRef(raw any, root string) bool {
 	ref, ok := raw.(string)
 	if !ok {
 		return false
 	}
 	ref = strings.ReplaceAll(ref, "\\", "/")
-	return strings.TrimPrefix(ref, "./") == openCodeHookPlugin
+	if strings.HasPrefix(ref, "file:") {
+		parsed, err := url.Parse(ref)
+		if err != nil || (parsed.Host != "" && parsed.Host != "localhost") || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return false
+		}
+		ref = parsed.Path
+		// Windows file URIs have a leading slash before the drive letter.
+		if len(ref) > 3 && ref[0] == '/' && ref[2] == ':' {
+			ref = ref[1:]
+		}
+	}
+	clean := filepath.ToSlash(filepath.Clean(ref))
+	if clean == openCodeHookPlugin {
+		return true
+	}
+	return root != "" && clean == filepath.ToSlash(filepath.Join(root, openCodeHookPlugin))
 }
 
 func isDevCouncilHookEntry(raw any) bool {

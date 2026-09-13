@@ -106,7 +106,6 @@ func TestHookUnknownEventIsNoop(t *testing.T) {
 	}
 }
 
-// TestHookDelegatesDevmapEvents confirms that session-start, post-tool-use,
 // TestHookAgentResponseWithGateOff confirms agent-response is a no-op when
 // hook_gate.mode is off (the default).
 func TestHookAgentResponseWithGateOff(t *testing.T) {

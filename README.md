@@ -114,7 +114,7 @@ dcgrep health
 
 ### 1. Coding Agent Integration (`devcouncil integrate`)
 
-Connect DevCouncil's MCP server to Cursor or Claude Code. `--write-gate` is ignored (TASK-P7-8).
+Connect DevCouncil's MCP server to Cursor or Claude Code. `--write-gate` is refused because lifecycle hooks are retired. Use `dev hook status` to inspect old registrations and `dev hook disable --dry-run` to preview cleanup.
 
 ```bash
 devcouncil integrate cursor --apply

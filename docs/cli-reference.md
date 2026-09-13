@@ -92,7 +92,7 @@ devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR] [--wr
 - `--apply`: Write configuration files (or a stub receipt) to the target repository.
 - `--check`: Read-only verification that integration files match expected content.
 - `--dry-run`: Print planned actions without modifying files.
-- `--write-gate`: Parsed and labeled "containment mode", then discarded. Does not write `.cursor/hooks.json` or Claude PreToolUse hooks.
+- `--write-gate`: Refused before writes. Retired host hooks cannot provide containment; use MCP policy and verification explicitly.
 - `--project-root DIR`: Specify target project directory (defaults to `$DEVCOUNCIL_PROJECT_ROOT` or `pwd`).
 
 ```bash
@@ -101,9 +101,42 @@ devcouncil integrate cursor --apply
 devcouncil integrate claude --apply
 devcouncil integrate claude --check
 
-# Removes leftover Python-era hook files if any remain. Integrate never writes those files now.
+# Removes only recognized legacy registrations, with backups. Other tools are preserved.
 devcouncil integrate uninstall --target hooks --apply
 ```
+
+### Retired hook compatibility and cleanup
+
+```bash
+dev hook status --project-root /path/to/project --client claude
+dev hook disable --project-root /path/to/project --client claude --dry-run
+dev disable hooks --project-root /path/to/project --client claude
+```
+
+Legacy `dev hook EVENT` calls are silent no-ops: no stdin reads, policy decisions,
+project access, index builds, or child processes. This also covers cached commands
+and unknown future event arguments. This behavior does not claim verification ran.
+
+`status` and `integrate uninstall --target hooks --check` are read-only and exit 1
+when registrations remain or inspection fails. Read the receipt to distinguish
+those states. `--dry-run` returns a preview without creating backups or locks;
+`disable` applies cleanup. Conflicting modes are refused. The `--client` filter
+accepts Claude, Cursor, Codex, Gemini, Grok, OpenCode, or `all` (the default).
+Use a home directory as the explicit root to inspect user settings separately.
+
+Cleanup scans eight known paths in the selected root. It preserves unrelated
+hooks, numbers, permissions, MCP registrations and OpenCode plugins. All files are
+validated before applying changes; malformed, oversized, duplicate-key, symlinked
+or nonregular files cause a refusal. Apply records exact backups in the receipt.
+Independent cleanup writers serialize with a lock; intervening edits are checked
+before each replacement. A stale lock is an error and is never stolen automatically.
+
+Compound/custom hook commands whose ownership cannot be proven are preserved.
+Plugin caches and Git map-refresh hooks are outside this lifecycle cleanup scope.
+Reload the host session to discard cached registrations. `dev hook enable` reports
+that lifecycle hooks are retired. DevMap's separate hooks remain available for
+index maintenance. See [the migration audit](hook-migration-audit.md) for test
+coverage and remaining platform limits.
 
 ### Agent Skills Distribution
 

@@ -194,12 +194,25 @@ func runDisableEnable(args []string, disable bool) int {
 		verb = "disable"
 	}
 	prefix, dry, name, help := "", false, "", false
+	root, client := "", ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-h", "--help":
 			help = true
 		case "--dry-run":
 			dry = true
+		case "--project-root", "--client":
+			flag := args[i]
+			i++
+			if i >= len(args) || args[i] == "" || strings.HasPrefix(args[i], "--") {
+				console.Errorf("%s needs a value\n", flag)
+				return 2
+			}
+			if flag == "--project-root" {
+				root = args[i]
+			} else {
+				client = args[i]
+			}
 		case "--prefix":
 			i++
 			if i >= len(args) {
@@ -229,7 +242,7 @@ func runDisableEnable(args []string, disable bool) int {
 	}
 	if help {
 		console.Errorf("usage: devcouncil %s NAME [--prefix DIR]\n", verb)
-		console.Errorln("NAME is a component id, or 'hooks' to uninstall write-gate hooks.")
+		console.Errorln("NAME is a component id, or hooks to remove retired host registrations (--project-root DIR, --client HOST, --dry-run).")
 		return 0
 	}
 	if name == "" {
@@ -238,14 +251,27 @@ func runDisableEnable(args []string, disable bool) int {
 	}
 	if strings.EqualFold(name, "hooks") {
 		if !disable {
-			console.Errorln("enable hooks: re-run `devcouncil integrate HOST --write-gate`")
+			return runHook([]string{"enable"})
+		}
+		if prefix != "" {
+			console.Errorln("hooks use --project-root, not --prefix")
 			return 2
 		}
-		uninstallArgs := []string{"uninstall", "--target", "hooks"}
+		hookArgs := []string{}
 		if dry {
-			uninstallArgs = append(uninstallArgs, "--dry-run")
+			hookArgs = append(hookArgs, "--dry-run")
 		}
-		return runIntegrate(uninstallArgs)
+		if root != "" {
+			hookArgs = append(hookArgs, "--project-root", root)
+		}
+		if client != "" {
+			hookArgs = append(hookArgs, "--client", client)
+		}
+		return runIntegrateUninstall(hookArgs)
+	}
+	if root != "" || client != "" {
+		console.Errorln("--project-root and --client apply only to hooks")
+		return 2
 	}
 	opts := components.Options{Prefix: prefix, DryRun: dry}
 	var err error
