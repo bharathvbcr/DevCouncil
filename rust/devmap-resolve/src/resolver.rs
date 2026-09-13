@@ -27,12 +27,27 @@ type IndexedSymbol = (String, SymbolKind, LangFamily, Arc<str>);
 /// actually exists, instead of a caller pre-deciding which class to file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsePosition<'a> {
-    /// A call, or an identifier in expression position.
-    Value,
+    /// A call or expression-position identifier, with its exact receiver
+    /// binding. Graph caller scopes cannot distinguish anonymous callbacks.
+    Value {
+        receiver_binding: Option<&'a LocalBinding>,
+    },
     /// A type annotation. `types` names the value this annotation types — `t`
     /// for `t *testing.T` — when the extractor recorded one, because that is
     /// the key the `TypeQualifier` sibling was indexed under.
     Type { types: Option<&'a str> },
+}
+
+impl<'a> UsePosition<'a> {
+    fn value_at(extraction: &'a Extraction, start_byte: usize, receiver: Option<&str>) -> Self {
+        Self::Value {
+            receiver_binding: receiver.and_then(|receiver| {
+                extraction
+                    .local_binding_at(start_byte, Resolver::path_root(receiver))
+                    .or_else(|| extraction.local_binding_at(start_byte, receiver))
+            }),
+        }
+    }
 }
 
 pub struct Resolver {
@@ -667,7 +682,7 @@ impl Resolver {
         // Ordered the way the value rungs are: file-specific evidence (the
         // qualifier the author wrote) outranks a name list, for the same reason
         // an import outranks the host-global table.
-        if let UsePosition::Type { types } = position {
+        if let UsePosition::Type { types: Some(typed) } = position {
             // `t *testing.T`. The extractor splits the written type into a bare
             // name for dispatch and a `TypeQualifier` sibling for provenance
             // (SC25), so by the time the bare `T` fails the ladder the qualifier
@@ -675,59 +690,28 @@ impl Resolver {
             // through `declared_types`, which is where that sibling was
             // indexed, and scoped-first for the SC9 reason: a qualifier this
             // scope wrote may not speak for a same-named binding in another.
-            if let Some(typed) = types {
-                let qualifier = self
-                    .declared_types
-                    .get(&format!("{file_path}:{enclosing_symbol}:{typed}@mod"))
-                    .or_else(|| self.declared_types.get(&format!("{file_path}:{typed}@mod")));
-                if let Some(qualifier) = qualifier {
-                    if let Some(module) = self
-                        .external_imports
-                        .get(file_path)
-                        .and_then(|imports| imports.get(qualifier.as_str()))
-                    {
-                        return UnresolvedClass::External {
-                            module: module.clone(),
-                        };
-                    }
-                    // A repo-relative qualifier that named no indexed file is an
-                    // index gap, exactly as it is for a call — never `External`.
-                    if self
-                        .unindexed_local_imports
-                        .get(file_path)
-                        .is_some_and(|imports| imports.contains_key(qualifier.as_str()))
-                    {
-                        return UnresolvedClass::Unresolved;
-                    }
-                }
-            }
-            // X43. The qualifier itself, when it *is* a reserved standard-library
-            // root: `p: std::path::PathBuf` emits a `TypeQualifier` reference
-            // named `std`, which is a module and not a type anything declares.
-            if crate::builtins::is_reserved_module_root(family, callee_name) {
-                return UnresolvedClass::External {
-                    module: callee_name.to_string(),
-                };
-            }
-            // A prelude type, and **nothing in this corpus declares the name**.
-            // The second half is the whole guard: where a file does declare it,
-            // the reference either resolved to that declaration or the resolver
-            // abstained between several, and an abstention is not evidence that
-            // the language owns the name. See `builtins::RUST_PRELUDE_TYPES`.
-            if crate::builtins::is_prelude_type(family, callee_name)
-                && !self.family_declares(family, callee_name)
-            {
-                return UnresolvedClass::Builtin;
-            }
-            if family == LangFamily::Swift && !self.family_declares(family, callee_name) {
-                let modules = self.imported_swift_modules(file_path);
-                if let Some(module) = crate::builtins::swift_sdk_module(
-                    modules.iter().map(String::as_str),
-                    callee_name,
-                ) {
+            let qualifier = self
+                .declared_types
+                .get(&format!("{file_path}:{enclosing_symbol}:{typed}@mod"))
+                .or_else(|| self.declared_types.get(&format!("{file_path}:{typed}@mod")));
+            if let Some(qualifier) = qualifier {
+                if let Some(module) = self
+                    .external_imports
+                    .get(file_path)
+                    .and_then(|imports| imports.get(qualifier.as_str()))
+                {
                     return UnresolvedClass::External {
-                        module: module.to_string(),
+                        module: module.clone(),
                     };
+                }
+                // A repo-relative qualifier that named no indexed file is an
+                // index gap, exactly as it is for a call — never `External`.
+                if self
+                    .unindexed_local_imports
+                    .get(file_path)
+                    .is_some_and(|imports| imports.contains_key(qualifier.as_str()))
+                {
+                    return UnresolvedClass::Unresolved;
                 }
             }
         }
@@ -745,28 +729,6 @@ impl Resolver {
             return UnresolvedClass::LocalBinding;
         }
 
-        // A bare callee that the language itself declares. Checked only without
-        // a receiver: `strings.TrimSpace` is library API, and treating a
-        // matching method name as a builtin would exempt real calls.
-        if receiver.is_none() && crate::builtins::is_builtin(family, callee_name) {
-            return UnresolvedClass::Builtin;
-        }
-        if receiver.is_none()
-            && family == LangFamily::Swift
-            && !self.family_declares(family, callee_name)
-        {
-            if crate::builtins::is_prelude_type(family, callee_name) {
-                return UnresolvedClass::Builtin;
-            }
-            let modules = self.imported_swift_modules(file_path);
-            if let Some(module) =
-                crate::builtins::swift_sdk_module(modules.iter().map(String::as_str), callee_name)
-            {
-                return UnresolvedClass::External {
-                    module: module.to_string(),
-                };
-            }
-        }
         let external = self.external_imports.get(file_path);
         // An import whose specifier is repo-relative and whose target is not
         // indexed. Consulted at every point `external` is, and *ahead* of it in
@@ -790,6 +752,42 @@ impl Resolver {
             if local_gap.is_some_and(|imports| imports.contains_key(callee_name)) {
                 return UnresolvedClass::Unresolved;
             }
+            // Type names obey the same binding precedence as callees:
+            // `use other::String` and a generic `<String>` both shadow the
+            // prelude. Qualified types were handled above; only a bare name
+            // with no stronger origin may be explained by a name table.
+            if matches!(position, UsePosition::Type { .. }) {
+                if crate::builtins::is_reserved_module_root(family, callee_name) {
+                    return UnresolvedClass::External {
+                        module: callee_name.to_string(),
+                    };
+                }
+                if crate::builtins::is_prelude_type(family, callee_name)
+                    && !self.family_declares(family, callee_name)
+                {
+                    return UnresolvedClass::Builtin;
+                }
+            }
+            // Written imports outrank the language/prelude table. In
+            // particular, `from .missing import len` is an index gap rather
+            // than a builtin merely because its spelling matches one.
+            if crate::builtins::is_builtin(family, callee_name) {
+                return UnresolvedClass::Builtin;
+            }
+            if family == LangFamily::Swift && !self.family_declares(family, callee_name) {
+                if crate::builtins::is_prelude_type(family, callee_name) {
+                    return UnresolvedClass::Builtin;
+                }
+                let modules = self.imported_swift_modules(file_path);
+                if let Some(module) = crate::builtins::swift_sdk_module(
+                    modules.iter().map(String::as_str),
+                    callee_name,
+                ) {
+                    return UnresolvedClass::External {
+                        module: module.to_string(),
+                    };
+                }
+            }
             // `setTimeout()` / `fetch()`: no import binds it because the
             // runtime puts it on the global object. Checked *after* the import
             // rung on purpose — an explicit `import { fetch } from 'node-fetch'`
@@ -807,14 +805,21 @@ impl Resolver {
         // `std::fs::write()` is evidence about `std`. Both separators are
         // handled because Rust's `scoped_identifier` receivers use `::`.
         let root = Self::path_root(receiver);
+        let receiver_binding = match position {
+            UsePosition::Value { receiver_binding } => receiver_binding,
+            UsePosition::Type { .. } => None,
+        };
 
         if let Some(imports) = external {
             // `strings.TrimSpace()` / `assert.Equal()`: the receiver is the
             // local handle for a module that resolved to no indexed file.
-            if let Some(module) = imports.get(root) {
-                return UnresolvedClass::External {
-                    module: module.clone(),
-                };
+            // A captured value bearing that name is a different binding.
+            if receiver_binding.is_none() {
+                if let Some(module) = imports.get(root) {
+                    return UnresolvedClass::External {
+                        module: module.clone(),
+                    };
+                }
             }
 
             // SC25. `t.Fatalf()` where `t` is a `*testing.T`: the receiver is a
@@ -833,30 +838,26 @@ impl Resolver {
             //
             // So: if this scope says anything at all about the receiver, only
             // this scope may speak for it.
-            let scoped = |slot: &str| {
-                self.declared_types
-                    .get(&format!("{file_path}:{enclosing_symbol}:{root}{slot}"))
-            };
-            let scope_knows_receiver = scoped("@mod").is_some() || scoped("@type").is_some();
             let declared = |slot: &str| {
-                if scope_knows_receiver {
-                    scoped(slot)
-                } else {
-                    self.declared_types
-                        .get(&format!("{file_path}:{root}{slot}"))
-                }
+                self.declared_receiver_slot(
+                    file_path,
+                    enclosing_symbol,
+                    root,
+                    receiver_binding,
+                    slot,
+                )
             };
 
             // `t *testing.T`: the type is written with its package, and that
             // package is the import that resolved to nothing.
-            if let Some(module) = declared("@mod").and_then(|q| imports.get(q.as_str())) {
+            if let Some(module) = declared("@mod").and_then(|q| imports.get(q)) {
                 return UnresolvedClass::External {
                     module: module.clone(),
                 };
             }
             // `use reqwest::Client; c: &Client`: no qualifier survives at the
             // use site, but the bare type name is itself an imported binding.
-            if let Some(module) = declared("@type").and_then(|t| imports.get(t.as_str())) {
+            if let Some(module) = declared("@type").and_then(|t| imports.get(t)) {
                 return UnresolvedClass::External {
                     module: module.clone(),
                 };
@@ -868,9 +869,13 @@ impl Resolver {
         // language type, not an imported binding. Prelude answers without an
         // import; SDK types answer only when this file imported that module.
         if family == LangFamily::Swift {
-            if let Some(declared_type) =
-                self.declared_receiver_type(file_path, enclosing_symbol, root)
-            {
+            if let Some(declared_type) = self.declared_receiver_slot(
+                file_path,
+                enclosing_symbol,
+                root,
+                receiver_binding,
+                "@type",
+            ) {
                 if crate::builtins::is_prelude_type(family, declared_type)
                     && !self.family_declares(family, declared_type)
                 {
@@ -894,7 +899,8 @@ impl Resolver {
         // and that module is not indexed. The receiver *is* typed — by an
         // import — so this is not an uninferred receiver; it is the same index
         // gap as the bare case above.
-        if local_gap.is_some_and(|imports| imports.contains_key(root)) {
+        if receiver_binding.is_none() && local_gap.is_some_and(|imports| imports.contains_key(root))
+        {
             return UnresolvedClass::Unresolved;
         }
 
@@ -922,7 +928,11 @@ impl Resolver {
         //   reduces to the same string — the scope's own binding tables are the
         //   only thing that separates them, and they are asked in the same
         //   direction the `LocalBinding` rung asks them.
-        let root_is_a_value_here = self.scope_declares_local(file_path, enclosing_symbol, root)
+        // A positive use-site fact is authoritative even for an untyped
+        // capture. Absence is not proof of no binding: older/hand-built
+        // extractions may omit site facts, so retain their wider evidence.
+        let root_is_a_value_here = receiver_binding.is_some()
+            || self.scope_declares_local(file_path, enclosing_symbol, root)
             || self
                 .declared_types
                 .contains_key(&format!("{file_path}:{root}@type"))
@@ -940,11 +950,19 @@ impl Resolver {
             // Repo-relative by construction: `crate::missing::helper()` cannot
             // name anything outside this tree, so a miss is an index gap and
             // keeps the tier that says a human should look.
-            if matches!(root, "crate" | "self" | "super")
-                || self
-                    .local_module_roots
-                    .get(file_path)
-                    .is_some_and(|roots| roots.contains(root))
+            // These module roots are Rust evidence. A Python closure's
+            // `self.member`, or a Rust `self.field`, is a value access. The
+            // reduced receiver "self" cannot distinguish `self::item` from
+            // `self.item`, so only a surviving `self::module` path proves a
+            // module; keep the bare ambiguous form in the attribution gaps.
+            if family == LangFamily::Rust
+                && ((matches!(root, "crate" | "super")
+                    || (root == "self" && Self::receiver_is_module_path(receiver)))
+                    || (root != "self"
+                        && self
+                            .local_module_roots
+                            .get(file_path)
+                            .is_some_and(|roots| roots.contains(root))))
             {
                 return UnresolvedClass::ModulePath;
             }
@@ -2433,7 +2451,11 @@ impl Resolver {
                             &call.callee_name,
                             call.receiver_expr.as_deref(),
                             &caller_sym,
-                            UsePosition::Value,
+                            UsePosition::value_at(
+                                ext,
+                                call.span.start_byte,
+                                call.receiver_expr.as_deref(),
+                            ),
                         );
                         unresolved.push(UnresolvedReference {
                             source_file: ext.file_path.clone(),
@@ -2514,7 +2536,11 @@ impl Resolver {
                             types: reference.assigned_to.as_deref(),
                         }
                     } else {
-                        UsePosition::Value
+                        UsePosition::value_at(
+                            ext,
+                            reference.span.start_byte,
+                            reference.receiver_expr.as_deref(),
+                        )
                     };
                     let class = self.classify_unresolved(
                         &ext.file_path,
@@ -3291,22 +3317,33 @@ impl Resolver {
         modules.into_iter().collect()
     }
 
-    fn declared_receiver_type<'a>(
+    fn declared_receiver_slot<'a>(
         &'a self,
         file_path: &str,
         enclosing_symbol: &str,
         root: &str,
+        binding: Option<&LocalBinding>,
+        slot: &str,
     ) -> Option<&'a str> {
-        let scoped = |slot: &str| {
-            self.declared_types
-                .get(&format!("{file_path}:{enclosing_symbol}:{root}{slot}"))
+        let scope = match binding {
+            Some(binding) => binding.scope.as_deref(),
+            None => Some(enclosing_symbol),
         };
-        let scope_knows = scoped("@mod").is_some() || scoped("@type").is_some();
+        let scoped = |slot: &str| {
+            scope.and_then(|scope| {
+                self.declared_types
+                    .get(&format!("{file_path}:{scope}:{root}{slot}"))
+            })
+        };
+        // A known capture belongs only to its recorded declaring scope. A
+        // missing annotation there cannot inherit a sibling's imported type.
+        let scope_knows =
+            binding.is_some() || scoped("@mod").is_some() || scoped("@type").is_some();
         if scope_knows {
-            scoped("@type").map(String::as_str)
+            scoped(slot).map(String::as_str)
         } else {
             self.declared_types
-                .get(&format!("{file_path}:{root}@type"))
+                .get(&format!("{file_path}:{root}{slot}"))
                 .map(String::as_str)
         }
     }

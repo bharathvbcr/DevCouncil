@@ -1,4 +1,4 @@
-//! Extract-bindings hardening (schema v48+; current schema tracks ruleguard too).
+//! Extract-bindings hardening (schema v48+; identity includes attribution semantics).
 //!
 //! Declared types and simple initializers ride on `LocalBinding`; Go field
 //! types become Type references with `assigned_to`; Python `isinstance` /
@@ -12,8 +12,8 @@ use devmap_extract::model::{LocalBinding, ReferenceKind};
 fn extraction_schema_version_tracks_binding_and_ruleguard() {
     assert_eq!(
         devmap_extract::cache::EXTRACTION_SCHEMA_VERSION,
-        "49",
-        "v49 adds dsl.Matcher RuntimeEntryPoint wiring on top of v48 bindings"
+        "51",
+        "v51 rebuilds captured-receiver classifications while retaining v48 bindings, v49 ruleguard wiring, and v50 attribution fixes"
     );
 }
 

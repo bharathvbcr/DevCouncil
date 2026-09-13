@@ -29,3 +29,7 @@ default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter
 # and answers questions about a persisted map rather than building one.
 parse = ["devmap-extract/parse", "devmap-resolve/parse", "devmap-analyze/parse"]
+
+[[test]]
+name = "retention_churn"
+required-features = ["parse"]

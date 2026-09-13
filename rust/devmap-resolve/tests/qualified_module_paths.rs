@@ -146,6 +146,21 @@ fn a_local_named_like_a_crate_is_not_treated_as_one() {
 }
 
 #[test]
+fn a_captured_typed_value_is_not_a_host_global_object() {
+    let (_, result) = resolve(&[(
+        "src/captured.ts",
+        "type Count = number;\nexport function outer(Math: Count) {\n\
+         function inner() { return Math.toFixed(); }\n\
+         return inner();\n}\n",
+    )]);
+    assert_eq!(
+        classes_of(&result, "toFixed"),
+        vec!["uninferred_receiver".to_string()],
+        "the nested function captures a written number value; Math is not the runtime object"
+    );
+}
+
+#[test]
 fn shell_builtins_are_declared_by_the_shell_and_not_resolution_defects() {
     let (_, result) = resolve(&[(
         "scripts/run.sh",

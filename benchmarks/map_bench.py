@@ -7,8 +7,7 @@ map is rebuilt by hooks, by the watcher, and by hand, so a second of avoidable
 overhead is a second paid hundreds of times a day.
 
 **Staged, not just end-to-end.** A single wall-clock number for `dev map` cannot
-tell you whether the cost is indexing, artifact generation, or the Python
-wrapper around them — and those have wildly different fixes. Each stage is timed
+tell you whether the cost is indexing or artifact generation. Each stage is timed
 in isolation against a scratch store so one slow stage cannot hide behind
 another:
 
@@ -18,7 +17,6 @@ another:
 | `warm`      | incremental build that finds no changed file (the common case)|
 | `touch`     | incremental build after one file's mtime/content changes     |
 | `manifest`  | writing `repo_map.json` + `code_graph.json` from the store    |
-| `e2e`       | the real `dev map` command, wrapper and all                   |
 | `search`    | FTS lookup against the persisted graph                        |
 | `impact`    | reverse blast radius of the most-called symbol in the corpus  |
 | `path`      | `trace from to` across a real call edge                       |
@@ -28,7 +26,7 @@ another:
 **Peak RSS beside wall time.** A stage that got faster by holding the whole
 corpus in memory has not got better, and until now nothing here would have
 said so. Each build and query stage records peak resident bytes measured with
-`/usr/bin/time`, through `rust-port/tools/peak_rss.sh` — the same helper
+`/usr/bin/time`, through `rust/tools/peak_rss.sh` — the same helper
 `verify.sh` uses, sourced rather than re-implemented, because two spellings of
 "peak RSS" that disagree is worse than one. An unavailable reading is a stage
 failure, never a silent zero.
@@ -66,6 +64,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -87,7 +86,6 @@ ALL_STAGES = (
     "warm",
     "touch",
     "manifest",
-    "e2e",
     "search",
     "impact",
     "path",
@@ -95,9 +93,8 @@ ALL_STAGES = (
     "growth",
 )
 
-# Stages whose numbers describe the *engine*. `e2e` is excluded because it
-# measures the Python wrapper as much as the kernel, and `growth` because it
-# reports sizes rather than a single duration.
+# Growth reports sizes rather than a single duration. The retired Python
+# wrapper is no longer a stage; the native CLI is measured directly.
 DURATION_STAGES = tuple(s for s in ALL_STAGES if s != "growth")
 
 
@@ -142,8 +139,8 @@ def find_devmap() -> str:
     string is exactly the confusion this avoids.
     """
     candidates = [
-        REPO_ROOT / "rust-port" / "target" / "release" / "devmap",
-        REPO_ROOT / "rust-port" / "target" / "debug" / "devmap",
+        REPO_ROOT / "rust" / "target" / "release" / "devmap",
+        REPO_ROOT / "rust" / "target" / "debug" / "devmap",
     ]
     for candidate in candidates:
         if candidate.is_file() and os.access(candidate, os.X_OK):
@@ -153,15 +150,15 @@ def find_devmap() -> str:
         return found
     raise BenchError(
         "no devmap binary found — build it with "
-        "`cargo build --release -p devmap-cli` in rust-port/"
+        "`cargo build --release --locked -p devmap-cli` in rust/"
     )
 
 
-PEAK_RSS_HELPER = REPO_ROOT / "rust-port" / "tools" / "peak_rss.sh"
+PEAK_RSS_HELPER = REPO_ROOT / "rust" / "tools" / "peak_rss.sh"
 
 
 def peak_rss_bytes(argv: List[str], *, cwd: Path, timeout: float = 1800.0) -> int:
-    """Peak resident bytes of one command, via `rust-port/tools/peak_rss.sh`.
+    """Peak resident bytes of one command, via `rust/tools/peak_rss.sh`.
 
     Sourced rather than re-implemented. `/usr/bin/time` spells the flag `-l` on
     BSD/macOS and `-v` on GNU, and reports bytes on one and kibibytes on the
@@ -201,27 +198,30 @@ def peak_rss_bytes(argv: List[str], *, cwd: Path, timeout: float = 1800.0) -> in
 def binary_identity(binary: str) -> Dict[str, object]:
     """Record what was actually measured, so two results can be compared.
 
-    Size and mtime, not just the version string: every build of this workspace
-    reports `devmap 0.1.0`, so a version alone cannot distinguish an optimized
-    binary from the one it replaced.
+    Hash the executable as well as recording its version. Failed probes and
+    executables replaced during the probe cannot establish provenance.
     """
-    path = Path(binary)
+    path = Path(binary).resolve()
     try:
-        stat = path.stat()
-        size, mtime = stat.st_size, stat.st_mtime
-    except OSError:
-        size, mtime = -1, -1.0
-    try:
-        version = subprocess.run(
-            [binary, "--version"], capture_output=True, text=True, timeout=30
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        version = "unknown"
+        before = path.stat()
+        with path.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        version = run([str(path), "--version"], cwd=path.parent, timeout=30).stdout.strip()
+        after = path.stat()
+    except OSError as exc:
+        raise BenchError(f"cannot inspect binary {path}: {exc}") from exc
+    if not version:
+        raise BenchError(f"empty version response from {path}")
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+    ):
+        raise BenchError(f"binary changed during provenance probe: {path}")
     return {
         "path": str(path),
         "version": version,
-        "size_bytes": size,
-        "mtime": datetime.fromtimestamp(mtime, timezone.utc).isoformat() if mtime > 0 else None,
+        "sha256": digest,
+        "size_bytes": after.st_size,
+        "mtime": datetime.fromtimestamp(after.st_mtime, timezone.utc).isoformat(),
     }
 
 
@@ -620,7 +620,7 @@ class MapBench:
         to report nothing rather than to report zero. A precision of 0.0 and
         "no corpus to score" must never render the same.
         """
-        golden = REPO_ROOT / "rust-port" / "testdata" / "golden"
+        golden = REPO_ROOT / "rust" / "testdata" / "golden"
         if not golden.is_dir():
             return {}
 
@@ -636,7 +636,7 @@ class MapBench:
                     truth = json.loads(truth_path.read_text(encoding="utf-8"))
                 except (OSError, ValueError):
                     continue
-                source = REPO_ROOT / "rust-port" / str(truth.get("source") or "")
+                source = REPO_ROOT / "rust" / str(truth.get("source") or "")
                 if not source.is_dir():
                     continue
                 labels = {
@@ -821,24 +821,6 @@ class MapBench:
             "extraction_cache_bytes": float(cached[1]),
         }
 
-    def stage_e2e(self) -> Dict[str, float]:
-        """The real `dev map`, wrapper included.
-
-        Run through `python -m devcouncil.cli.main` rather than the `dev`
-        console script so the interpreter and the source tree being measured
-        are the ones in this checkout, not whatever `dev` on PATH was installed
-        from. Writes to the target repo's own `.devcouncil/` — that is what the
-        command does, and stubbing it out would measure something else.
-        """
-        argv = [sys.executable, "-m", "devcouncil.cli.main", "map"]
-
-        def once() -> None:
-            run(argv, cwd=self.repo)
-
-        once()  # prime the store so this measures steady state, not a cold index
-        return time_stage(once, repeat=self.repeat)
-
-
 # --------------------------------------------------------------------------
 # reporting
 # --------------------------------------------------------------------------
@@ -966,7 +948,7 @@ def render_markdown(payload: Dict[str, object]) -> str:
             "## `dead` accuracy",
             "",
             f"Scored with **this binary** against the hand-labelled corpus "
-            f"(`rust-port/testdata/golden/*/truth.json`), "
+            f"(`rust/testdata/golden/*/truth.json`), "
             f"{int(dead['accuracy_fixtures'])} fixture(s).",
             "",
             f"- precision: {precision} ({claims} claim(s))",
@@ -1083,6 +1065,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    try:
+        initial_identity = binary_identity(binary)
+    except BenchError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     corpus = describe_corpus(repo)
     print(
         f"benchmarking {repo} — {corpus['tracked_files']} tracked / "
@@ -1105,12 +1093,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 1
             print(f" {_fmt(stages[name]['min_s'])}", file=sys.stderr)
 
+    try:
+        final_identity = binary_identity(binary)
+    except BenchError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if initial_identity["sha256"] != final_identity["sha256"]:
+        print("error: binary changed during measurement; timings invalid", file=sys.stderr)
+        return 1
+
     payload: Dict[str, object] = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "repo": str(repo),
         "label": args.label,
         "repeat": args.repeat,
-        "binary": binary_identity(binary),
+        "binary": initial_identity,
         "corpus": corpus,
         "corpus_kind": "synthetic" if args.synthetic else "repository",
         "synthetic_files": args.synthetic,

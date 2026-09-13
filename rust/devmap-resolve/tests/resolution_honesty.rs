@@ -356,3 +356,136 @@ fn an_import_that_shadows_a_builtin_still_binds_to_the_import() {
         "an import statement in this file naming the target is a fact: {edge:?}"
     );
 }
+
+/// Written imports shadow the builtin table even when their target is outside
+/// the indexed corpus. Otherwise an unresolved local import can be hidden in
+/// the explained builtin count.
+#[test]
+fn an_imported_builtin_name_keeps_its_written_external_origin() {
+    for (path, source, name, module) in [
+        (
+            "external.py",
+            "from outside_lib import len\ndef run(rows):\n    return len(rows)\n",
+            "len",
+            "outside_lib",
+        ),
+        (
+            "external.js",
+            "import { parseInt } from 'outside-lib';\nexport function run(x) { return parseInt(x); }\n",
+            "parseInt",
+            "outside-lib",
+        ),
+    ] {
+        let (_, result) = resolve(&[(path, source)]);
+        let calls: Vec<_> = result.unresolved.iter().filter(|row| {
+            row.kind == devmap_resolve::model::UnresolvedKind::Call && row.callee_name == name
+        }).collect();
+        assert_eq!(calls.len(), 1, "the imported call must retain one ledger site: {result:?}");
+        assert_eq!(calls[0].class, devmap_resolve::model::UnresolvedClass::External {
+            module: module.to_string(),
+        }, "the source import outranks the builtin table in {path}");
+    }
+}
+
+#[test]
+fn a_missing_relative_import_of_a_builtin_name_remains_an_index_gap() {
+    for (path, source, name) in [
+        (
+            "pkg/local.py",
+            "from .missing import len\ndef run(rows):\n    return len(rows)\n",
+            "len",
+        ),
+        (
+            "pkg/local.js",
+            "import { parseInt } from './missing';\nexport function run(x) { return parseInt(x); }\n",
+            "parseInt",
+        ),
+    ] {
+        let (_, result) = resolve(&[(path, source)]);
+        let calls: Vec<_> = result.unresolved.iter().filter(|row| {
+            row.kind == devmap_resolve::model::UnresolvedKind::Call && row.callee_name == name
+        }).collect();
+        assert_eq!(calls.len(), 1, "the missing local call must retain one ledger site: {result:?}");
+        assert_eq!(calls[0].class, devmap_resolve::model::UnresolvedClass::Unresolved,
+            "a missing repo-relative import cannot be explained as a builtin in {path}");
+    }
+}
+
+#[test]
+fn a_local_callback_still_shadows_an_imported_builtin_name() {
+    let (_, result) = resolve(&[(
+        "callback.py",
+        "from outside_lib import len\ndef run(len, rows):\n    return len(rows)\n",
+    )]);
+    let calls: Vec<_> = result
+        .unresolved
+        .iter()
+        .filter(|row| {
+            row.kind == devmap_resolve::model::UnresolvedKind::Call && row.callee_name == "len"
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "the callback remains a ledger site");
+    assert_eq!(
+        calls[0].class,
+        devmap_resolve::model::UnresolvedClass::LocalBinding
+    );
+}
+
+#[test]
+fn unshadowed_builtin_names_keep_their_language_origin() {
+    for (path, source, name) in [
+        (
+            "builtin.py",
+            "def run(rows):\n    return len(rows)\n",
+            "len",
+        ),
+        (
+            "builtin.js",
+            "export function run(x) { return parseInt(x); }\n",
+            "parseInt",
+        ),
+    ] {
+        let (_, result) = resolve(&[(path, source)]);
+        let calls: Vec<_> = result
+            .unresolved
+            .iter()
+            .filter(|row| {
+                row.kind == devmap_resolve::model::UnresolvedKind::Call && row.callee_name == name
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "the builtin remains a ledger site");
+        assert_eq!(
+            calls[0].class,
+            devmap_resolve::model::UnresolvedClass::Builtin
+        );
+    }
+}
+
+#[test]
+fn a_self_value_is_not_explained_as_a_rust_module_path() {
+    for (path, source, name) in [
+        (
+            "self_value.py",
+            "class Example:\n    def run(self):\n        def nested():\n            return self.missing()\n        return nested()\n",
+            "missing",
+        ),
+        (
+            "src/self_value.rs",
+            "pub struct Example { pub field: u32 }\nimpl Example { pub fn run(&self) -> u32 { self.field } }\n",
+            "field",
+        ),
+        (
+            "src/self_import_gap.rs",
+            "use self::omitted::Type;\npub struct Example { pub field: u32 }\nimpl Example { pub fn run(&self) -> u32 { self.field } }\n",
+            "field",
+        ),
+    ] {
+        let (_, result) = resolve(&[(path, source)]);
+        let rows: Vec<_> = result.unresolved.iter().filter(|row| {
+            row.callee_name == name && row.receiver.as_deref() == Some("self")
+        }).collect();
+        assert!(!rows.is_empty(), "fixture must exercise the unresolved self receiver in {path}");
+        assert!(rows.iter().all(|row| row.class != devmap_resolve::model::UnresolvedClass::ModulePath),
+            "self is a value, not proof of an unresolved Rust module: {rows:?}");
+    }
+}

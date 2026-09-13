@@ -8012,6 +8012,24 @@ generation {latest}; run `devmap status` to re-verify",
             [],
         )?;
 
+        // Interned paths are shared by every retained generation and by edge
+        // endpoints that need not have an extraction payload. Retire an id
+        // only after every persisted reference has gone. Otherwise repeated
+        // renames grow this table forever, and PathRanks reads and sorts the
+        // entire history on every edge load. Keep this inside the same
+        // transaction so a failed retirement also rolls back the prune.
+        tx.execute(
+            "DELETE FROM paths WHERE id NOT IN (
+                SELECT file_id FROM generation_nodes
+                UNION SELECT file_id FROM file_payloads
+                UNION SELECT file_id FROM generation_file_rows
+                UNION SELECT file_id FROM generation_file_digests
+                UNION SELECT source_file_id FROM edge_rows
+                UNION SELECT target_file_id FROM edge_rows
+             )",
+            [],
+        )?;
+
         // FTS5 deletes only tombstone their postings; without a merge the freed
         // space stays inside the index and the prune reclaims nothing there.
         //

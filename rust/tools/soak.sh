@@ -24,6 +24,20 @@ CYCLES="${2:-40}"
 # Under 40 cycles the run is a smoke test: the digest must return after every
 # restore, and growth is reported but not asserted. `verify.sh` uses that.
 MODE="${3:-build}"
+SOAK_SETTLE_SECONDS="${SOAK_SETTLE_SECONDS:-45}"
+case "$SOAK_SETTLE_SECONDS" in
+  ''|*[!0-9]*) echo "SOAK FAIL: SOAK_SETTLE_SECONDS must be 1..300"; exit 1 ;;
+esac
+[ "$SOAK_SETTLE_SECONDS" -ge 1 ] && [ "$SOAK_SETTLE_SECONDS" -le 300 ] || {
+  echo "SOAK FAIL: SOAK_SETTLE_SECONDS must be 1..300"; exit 1; }
+SOAK_SETTLE_SECONDS=$(( 10#$SOAK_SETTLE_SECONDS ))
+SOAK_SHUTDOWN_SECONDS="${SOAK_SHUTDOWN_SECONDS:-10}"
+case "$SOAK_SHUTDOWN_SECONDS" in
+  ''|*[!0-9]*) echo "SOAK FAIL: SOAK_SHUTDOWN_SECONDS must be 1..30"; exit 1 ;;
+esac
+[ "$SOAK_SHUTDOWN_SECONDS" -ge 1 ] && [ "$SOAK_SHUTDOWN_SECONDS" -le 30 ] || {
+  echo "SOAK FAIL: SOAK_SHUTDOWN_SECONDS must be 1..30"; exit 1; }
+SOAK_SHUTDOWN_SECONDS=$(( 10#$SOAK_SHUTDOWN_SECONDS ))
 TOOLS="$(cd "$(dirname "$0")" && pwd)"
 # Honour CARGO_TARGET_DIR: lanes build into their own target directory, and a
 # soak that silently measured a stale `rust/target/release/devmap` would
@@ -92,6 +106,12 @@ db_bytes() {
 # would be rewritten by the build it is supposed to perturb.
 TARGET=$(find . -name '*.py' -not -path './.*' | head -1)
 [ -n "$TARGET" ] || { echo "SOAK FAIL: no target file"; exit 1; }
+TARGET_RELATIVE="${TARGET#./}"
+check_cli_symbol() {
+  local name="$1" mode="$2" reply
+  reply=$("$DEVMAP" --json search "$name") || return 1
+  printf '%s' "$reply" | perl "$TOOLS/soak-query-check.pl" cli "$mode" "$name" "$TARGET_RELATIVE"
+}
 ORIG="$ROOT/.soak_orig.$$"
 cp "$TARGET" "$ORIG"
 restore() { cmp -s "$ORIG" "$TARGET" || cp "$ORIG" "$TARGET"; }
@@ -133,34 +153,120 @@ if [ "$MODE" = "--daemon" ]; then
   [ -n "$PEAK_RSS_TIME_FLAG" ] || { echo "SOAK FAIL: no /usr/bin/time supporting -l or -v"; exit 1; }
   # A socket of this soak's own, under the workdir. Two reasons: the default
   # endpoint is shared with whatever daemon the developer's own checkout is
-  # already running, and matching on this path is how the daemon's pid is found
-  # without `pgrep -n -x devmap` — which on a machine with an unrelated daemon
-  # open (one was, for 2h40m, during the run that found this) picks whichever
-  # devmap happens to be newest and samples a process the soak never started.
+  # already running, and this socket lets us observe our own startup. Process
+  # identity comes from the child of this soak's `/usr/bin/time` wrapper;
+  # matching the newest devmap can instead sample an unrelated daemon.
   # Under TMPDIR, not under the workdir: `sun_path` is 104 bytes on this
   # platform and a scratch workdir path is routinely longer than that, so a
   # socket named beside the corpus is silently never bound — the daemon exits
   # and the soak reports "never bound" without saying why.
   ENDPOINT="${TMPDIR:-/tmp}/devmap-soak-$$.sock"
   rm -f "$ENDPOINT"
-  DEVMAP_MAX_IDLE_SECS=0 /usr/bin/time "$PEAK_RSS_TIME_FLAG" \
+  SERVE_PID=""
+  DAEMON_STOPPED=0
+  DAEMON_STOP_STATUS=0
+  # Keep every descendant in an owned session even if the time wrapper dies
+  # before startup identifies its child. Perl and POSIX are already available
+  # to this harness; exec preserves this child's PID as the session/group ID.
+  DEVMAP_MAX_IDLE_SECS=0 perl -MPOSIX=setsid -e '
+    my $session = setsid();
+    defined($session) && $session == $$ or die "cannot create soak session: $!";
+    exec @ARGV;
+    die "cannot start soak timer: $!";
+  ' -- /usr/bin/time "$PEAK_RSS_TIME_FLAG" \
     "$DEVMAP" serve . --socket "$ENDPOINT" >/dev/null 2>"$TIMEOUT_LOG" &
   TIME_PID=$!
-  for _ in $(seq 1 150); do [ -S "$ENDPOINT" ] && break; sleep 0.2; done
   # Every exit from here on must take the daemon with it. Killing the
   # `/usr/bin/time` wrapper does not: it leaves the daemon serving, watching the
   # workdir and writing generations into the very store the *next* soak is about
   # to measure. One such orphan ran for five minutes beside a build-mode soak on
   # the same corpus before this trap existed, and every number that soak
   # produced described two writers rather than one.
-  daemon_cleanup() {
-    [ -n "${SERVE_PID:-}" ] && kill "$SERVE_PID" 2>/dev/null
-    [ -n "${TIME_PID:-}" ] && kill "$TIME_PID" 2>/dev/null
-    pkill -f -- "--socket $ENDPOINT" 2>/dev/null
-    rm -f "$ENDPOINT" "$ORIG"
+  process_running() {
+    kill -0 "$1" 2>/dev/null || return 1
+    # A zombie has exited and is safe to reap. If ps cannot examine a live
+    # process, retain it as running so cleanup cannot falsely report success.
+    case "$(ps -o stat= -p "$1" 2>/dev/null)" in *Z*) return 1 ;; esac
     return 0
   }
-  trap 'restore; daemon_cleanup' EXIT
+  daemon_group_running() {
+    local members result pid
+    members=$(pgrep -g "$TIME_PID" 2>/dev/null)
+    result=$?
+    case "$result" in 1) return 1 ;; 0) ;; *) return 0 ;; esac
+    for pid in $members; do process_running "$pid" && return 0; done
+    return 1
+  }
+  await_daemon_exit() {
+    local deadline=$(( SECONDS + $1 ))
+    # Before setsid executes there is a live owned launcher but no group yet.
+    while process_running "$TIME_PID" || daemon_group_running; do
+      [ "$SECONDS" -lt "$deadline" ] || return 1
+      sleep 0.1
+    done
+    return 0
+  }
+  stop_daemon() {
+    [ "${DAEMON_STOPPED:-0}" -eq 0 ] || return "$DAEMON_STOP_STATUS"
+    DAEMON_STOPPED=1
+    DAEMON_STOP_STATUS=0
+    local exit_status
+    if [ -n "${SERVE_PID:-}" ]; then
+      kill "$SERVE_PID" 2>/dev/null || true
+    else
+      echo "SOAK FAIL: daemon shutdown began before its child identity was verified"
+      DAEMON_STOP_STATUS=1
+      kill -TERM -- "-$TIME_PID" 2>/dev/null || true
+    fi
+    # Preserve the time wrapper until its child exits so graceful shutdown
+    # retains the peak-RSS receipt. Every wait is preceded by exit observation.
+    if ! await_daemon_exit "$SOAK_SHUTDOWN_SECONDS"; then
+      echo "SOAK FAIL: daemon shutdown exceeded ${SOAK_SHUTDOWN_SECONDS} seconds; forcing termination"
+      DAEMON_STOP_STATUS=1
+      # Stop the launcher first so it cannot create the group after we signal
+      # it. Already-created descendants remain in the owned group below.
+      kill -KILL "$TIME_PID" 2>/dev/null || true
+      kill -KILL -- "-$TIME_PID" 2>/dev/null || true
+      await_daemon_exit 2 || \
+        echo "SOAK FAIL: daemon shutdown could not confirm termination after SIGKILL (owned process group: $TIME_PID)"
+    fi
+    if ! process_running "$TIME_PID"; then
+      wait "$TIME_PID" 2>/dev/null
+      exit_status=$?
+      # The native daemon handles TERM and returns success. A panic, failure
+      # or external signal is not a successful graceful shutdown.
+      if [ "$exit_status" -ne 0 ]; then
+        echo "SOAK FAIL: daemon shutdown exited with status $exit_status"
+        DAEMON_STOP_STATUS=1
+      fi
+    fi
+    return "$DAEMON_STOP_STATUS"
+  }
+  daemon_cleanup() {
+    local result=0
+    stop_daemon || result=1
+    rm -f "$ENDPOINT" "$ORIG"
+    return "$result"
+  }
+  trap 'exit_status=$?; restore; daemon_cleanup || exit_status=1; exit "$exit_status"' EXIT
+  for _ in $(seq 1 150); do
+    if [ -z "$SERVE_PID" ]; then
+      children=$(pgrep -P "$TIME_PID" 2>/dev/null)
+      result=$?
+      case "$result" in
+        0)
+          case "$children" in
+            ''|*[!0-9]*) echo "SOAK FAIL: ambiguous daemon child identity"; exit 1 ;;
+            *) SERVE_PID="$children" ;;
+          esac ;;
+        1) ;;
+        *) echo "SOAK FAIL: cannot examine daemon child identity"; exit 1 ;;
+      esac
+    fi
+    [ -S "$ENDPOINT" ] && [ -n "$SERVE_PID" ] && break
+    process_running "$TIME_PID" || break
+    sleep 0.2
+  done
   [ -S "$ENDPOINT" ] || {
     echo "SOAK FAIL: the daemon never bound $ENDPOINT"
     echo "  its output was: $(tail -5 "$TIMEOUT_LOG" 2>/dev/null)"
@@ -172,49 +278,42 @@ if [ "$MODE" = "--daemon" ]; then
     echo "  cargo build -p devmap-cli --example ipc_probe --release, or set IPC_PROBE"
     exit 1
   }
-  # Of the processes whose argv names this socket — the `/usr/bin/time` wrapper
-  # is one of them — the one whose executable is the binary being measured.
-  # Matched against `$DEVMAP`'s own basename rather than the literal `devmap`,
-  # because a lane pins `DEVMAP_BIN` to a copy it has saved aside (so a rebuild
-  # cannot change the binary halfway through a two-hour soak) and that copy is
-  # not called `devmap`.
-  SERVE_NAME="${DEVMAP##*/}"
-  SERVE_PID=""
-  for pid in $(pgrep -f -- "$ENDPOINT"); do
-    case "$(ps -o comm= -p "$pid" 2>/dev/null)" in
-      */"$SERVE_NAME"|"$SERVE_NAME") SERVE_PID="$pid" ;;
-    esac
-  done
   [ -n "$SERVE_PID" ] || { echo "SOAK FAIL: cannot identify the daemon process"; exit 1; }
   ask() {
     local frame="$1"
     local mode="${2:-validate}"
     local reply
     reply=$("$IPC_PROBE" "$ENDPOINT" "$frame") || return 1
-    if [ "$mode" = "fresh" ]; then
-      printf '%s' "$reply" | perl -MJSON::PP -e '
-        my $j = decode_json(do { local $/; <STDIN> });
-        exit 1 unless ref($j) eq "HASH" && $j->{ok};
-        my $r = $j->{result};
-        exit 2 unless ref($r) eq "HASH" && $r->{is_fresh};
-      '
-    else
-      printf '%s' "$reply" | perl -MJSON::PP -e '
-        my $j = decode_json(do { local $/; <STDIN> });
-        exit 1 unless ref($j) eq "HASH" && $j->{ok};
-      '
-    fi
+    printf '%s' "$reply" | perl "$TOOLS/soak-query-check.pl" ipc "$mode" "${3:-}" "${4:-}"
+  }
+  await_symbol() {
+    local name="$1" mode="$2" result
+    local deadline=$(( SECONDS + SOAK_SETTLE_SECONDS ))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      ask "{\"version\":1,\"cmd\":\"search\",\"query\":\"$name\",\"budget\":2000}" "$mode" "$name" "$TARGET_RELATIVE"
+      result=$?
+      case "$result" in
+        0)
+          ask '{"version":1,"cmd":"status"}' fresh
+          result=$?
+          [ "$result" -ne 0 ] || return 0
+          [ "$result" -eq 2 ] || return 1 ;;
+        2) ;;
+        *) return 1 ;;
+      esac
+      sleep 0.2
+    done
+    echo "SOAK FAIL: $name was not verified $mode and fresh within $SOAK_SETTLE_SECONDS seconds (IPC exchanges are separately capped at 30 seconds)"
+    return 1
   }
   for i in $(seq 1 "$CYCLES"); do
     printf '\n# soak cycle %s\ndef _soak_%s():\n    return %s\n' "$i" "$i" "$i" >> "$TARGET"
-    # Long enough for the watcher to see the write and queue it. Without it the
-    # edit is undone before the daemon ever notices, and the soak measures a
-    # process answering queries against a tree nobody is changing.
-    sleep 0.2
-    ask '{"version":1,"cmd":"status"}' || { echo "SOAK FAIL: status cycle $i"; FAILS=1; break; }
-    ask '{"version":1,"cmd":"search","query":"soak","budget":2000}' || { echo "SOAK FAIL: search cycle $i"; FAILS=1; break; }
+    # An OK envelope does not prove the edit was indexed. Keep the edited
+    # bytes in place until the exact symbol/file and freshness are observed.
+    await_symbol "_soak_$i" present || { echo "SOAK FAIL: inserted symbol cycle $i"; FAILS=1; break; }
     ask '{"version":1,"cmd":"impact","target":"main"}' || { echo "SOAK FAIL: impact cycle $i"; FAILS=1; break; }
     restore
+    await_symbol "_soak_$i" absent || { echo "SOAK FAIL: removed symbol cycle $i"; FAILS=1; break; }
     RSS=$(ps -o rss= -p "$SERVE_PID" 2>/dev/null | tr -d ' ')
     [ -n "$RSS" ] || { echo "SOAK FAIL: the daemon died at cycle $i"; FAILS=1; break; }
     echo "$i,$(( RSS * 1024 )),$(db_bytes)" >> "$CSV"
@@ -246,8 +345,7 @@ if [ "$MODE" = "--daemon" ]; then
     D=$(digest) || { echo "SOAK FAIL: final graph could not be measured"; FAILS=1; }
     [ "$D" = "$BASE_DIGEST" ] || { echo "SOAK FAIL: final daemon graph differs from baseline"; FAILS=1; }
   fi
-  kill "$SERVE_PID" 2>/dev/null
-  wait "$TIME_PID" 2>/dev/null
+  stop_daemon || FAILS=1
   rm -f "$ENDPOINT"
   if [ "$FAILS" -eq 0 ]; then
     # Verify the stopped state too: shutdown can flush a late watcher batch.
@@ -264,6 +362,7 @@ else
     # Perturb, rebuild, then restore and rebuild: the digest must return.
     printf '\n# soak cycle %s\ndef _soak_%s():\n    return %s\n' "$i" "$i" "$i" >> "$TARGET"
     "$DEVMAP" build . >/dev/null 2>&1 || { echo "SOAK FAIL: build (dirty) cycle $i"; FAILS=1; break; }
+    check_cli_symbol "_soak_$i" present || { echo "SOAK FAIL: inserted symbol cycle $i"; FAILS=1; break; }
     for q in search dead status; do
       args=("$q")
       [ "$q" != search ] || args+=(soak)
@@ -274,6 +373,7 @@ else
     [ "$FAILS" -eq 0 ] || break
     restore
     RSS=$(peak_rss_bytes "$TIMEOUT_LOG" "$DEVMAP" build .) || { echo "SOAK FAIL: build (restored) cycle $i"; FAILS=1; break; }
+    check_cli_symbol "_soak_$i" absent || { echo "SOAK FAIL: removed symbol cycle $i"; FAILS=1; break; }
     D=$(digest) || { echo "SOAK FAIL: graph read cycle $i"; FAILS=1; break; }
     if [ "$D" != "$BASE_DIGEST" ]; then
       echo "SOAK FAIL: digest drift at cycle $i (${D:0:12} != ${BASE_DIGEST:0:12})"; FAILS=1; break
