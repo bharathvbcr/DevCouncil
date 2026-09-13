@@ -188,8 +188,13 @@ func TestUninstallRefusesUnparsableSettings(t *testing.T) {
 // integrate cursor --apply must not put a hook config back.
 func TestIntegrateCursorWritesNoHooksFile(t *testing.T) {
 	root := t.TempDir()
+	repo, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatalf("OpenRoot: %v", err)
+	}
+	defer repo.Close()
 	receipt := &Receipt{Host: "cursor", Mode: string(ModeApply), Files: map[string]string{}}
-	if err := integrateCursor(root, "/bin/true", "/bin/true", ModeApply, receipt); err != nil {
+	if err := integrateCursor(repo, root, "/bin/true", "/bin/true", ModeApply, receipt); err != nil {
 		t.Fatalf("integrateCursor: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, ".cursor", "hooks.json")); !os.IsNotExist(err) {

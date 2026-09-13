@@ -1,0 +1,32 @@
+[
+  {
+    "tool": "devmap",
+    "files": 1186,
+    "mismatches": []
+  },
+  {
+    "tool": "graphify",
+    "files": 1186,
+    "mismatches": []
+  },
+  {
+    "tool": "gitnexus",
+    "files": 1186,
+    "mismatches": []
+  },
+  {
+    "tool": "codegraph",
+    "files": 1186,
+    "mismatches": []
+  },
+  {
+    "tool": "cbm",
+    "files": 1186,
+    "mismatches": []
+  },
+  {
+    "tool": "gortex",
+    "files": 1186,
+    "mismatches": []
+  }
+]

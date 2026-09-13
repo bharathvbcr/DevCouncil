@@ -136,6 +136,14 @@ func noFollowParent(root *os.Root, name string) (*os.Root, string, error) {
 // WriteAtomic writes content through OpenNoFollow into a sibling temp file
 // and renames it onto path. A symlink at the temp name is refused rather than
 // followed; truncation is never requested of OpenNoFollow.
+//
+// It does NOT contain the parent. `filepath.Dir(path)` is resolved by the
+// operating system, so a symlinked ancestor directory lands the temp file, and
+// therefore the rename, wherever that link points. The no-follow guarantee
+// covers the leaf only. Callers whose path components can be chosen by
+// repository content must validate the ancestors first (see
+// skills.scaffoldPath) or hold an *os.Root and use OpenNoFollow directly (see
+// integrate.writeRooted) rather than relying on this function for containment.
 func WriteAtomic(path string, content []byte, perm fs.FileMode) error {
 	if perm == 0 {
 		perm = 0o644

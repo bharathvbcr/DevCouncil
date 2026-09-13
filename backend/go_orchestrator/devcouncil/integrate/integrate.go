@@ -1,14 +1,20 @@
 package integrate
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 // Mode is apply / check / dry-run.
@@ -102,27 +108,49 @@ func Run(opts Options) (*Receipt, error) {
 	if selfBin == "" {
 		selfBin, _ = os.Executable()
 	}
+	// Two different questions, and conflating them is what let repository
+	// content be executed. `devmap` is the name written into the host config,
+	// which the *host* resolves later on its own PATH. `runnable` is the
+	// program this process is willing to spawn, and PATH discovery there
+	// refuses any candidate whose canonical location is inside the repository.
+	// An explicit --devmap-bin stays an operator's choice, used or refused.
 	devmap := opts.DevmapBin
+	runnable := opts.DevmapBin
 	if devmap == "" {
-		devmap, _ = exec.LookPath("devmap")
-		if devmap == "" {
-			devmap = "devmap"
+		devmap = "devmap"
+		discovered, err := proc.LookPathOutside("devmap", root)
+		if err != nil {
+			runnable = ""
+		} else {
+			devmap = discovered
+			runnable = discovered
 		}
 	}
 
 	receipt := &Receipt{Host: host, Mode: string(mode), Files: map[string]string{}}
 
+	// Every host config below is repository content: a clone owns `.mcp.json`,
+	// `.cursor/` and `.codex/`, and a tracked symlink there would otherwise
+	// aim a read or a write outside the checkout. Reads and writes go through
+	// this root and the package's own no-follow helpers, which is the
+	// containment `integrate uninstall` has always used.
+	repo, err := os.OpenRoot(root)
+	if err != nil {
+		return receipt, err
+	}
+	defer func() { _ = repo.Close() }()
+
 	switch host {
 	case "cursor":
-		if err := integrateCursor(root, selfBin, devmap, mode, receipt); err != nil {
+		if err := integrateCursor(repo, root, selfBin, devmap, mode, receipt); err != nil {
 			return receipt, err
 		}
 	case "claude":
-		if err := integrateClaude(root, selfBin, devmap, mode, receipt); err != nil {
+		if err := integrateClaude(repo, root, selfBin, devmap, mode, receipt); err != nil {
 			return receipt, err
 		}
 	case "codex":
-		if err := integrateCodex(root, mode, receipt); err != nil {
+		if err := integrateCodex(repo, mode, receipt); err != nil {
 			return receipt, err
 		}
 	default:
@@ -131,30 +159,58 @@ func Run(opts Options) (*Receipt, error) {
 
 	// Compose DevMap assets rather than reimplementing them.
 	if mode == ModeApply || mode == ModeDryRun {
+		if runnable == "" {
+			receipt.Notes = append(receipt.Notes,
+				"devmap assets skipped: no devmap outside the repository was found on PATH. "+
+					"Repository build outputs are not run implicitly; pass --devmap-bin to choose one.")
+			return receipt, nil
+		}
 		args := []string{"integrate", host}
 		if mode == ModeDryRun {
 			args = append(args, "--dry-run")
 		}
-		cmd := exec.Command(devmap, args...)
-		cmd.Dir = root
-		out, err := cmd.CombinedOutput()
+		out, err := runDevmap(runnable, args, root)
 		receipt.Spawned = append(receipt.Spawned, "devmap "+strings.Join(args, " "))
 		if err != nil {
-			receipt.Notes = append(receipt.Notes, fmt.Sprintf("devmap integrate: %v (%s)", err, truncate(string(out), 400)))
+			receipt.Notes = append(receipt.Notes, fmt.Sprintf("devmap integrate: %v (%s)", err, truncate(out, 400)))
 		}
 		skillArgs := append([]string{"skills", "install"}, skillInstallArgs(root, host)...)
 		if mode == ModeDryRun {
 			skillArgs = append(skillArgs, "--dry-run")
 		}
-		scmd := exec.Command(devmap, skillArgs...)
-		scmd.Dir = root
-		sout, serr := scmd.CombinedOutput()
+		sout, serr := runDevmap(runnable, skillArgs, root)
 		receipt.Spawned = append(receipt.Spawned, "devmap "+strings.Join(skillArgs, " "))
 		if serr != nil {
-			receipt.Notes = append(receipt.Notes, fmt.Sprintf("devmap skills install: %v (%s)", serr, truncate(string(sout), 400)))
+			receipt.Notes = append(receipt.Notes, fmt.Sprintf("devmap skills install: %v (%s)", serr, truncate(sout, 400)))
 		}
 	}
 	return receipt, nil
+}
+
+// devmapAssetBudget bounds one composed DevMap invocation. A skill install on
+// a cold cache is the slow case; anything past this is a hang, not work.
+const devmapAssetBudget = 5 * time.Minute
+
+// runDevmap spawns one composed DevMap command under the shared process bound,
+// so a child that never exits cannot hold `integrate` open forever.
+func runDevmap(binary string, args []string, dir string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), devmapAssetBudget)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, args...)
+	proc.ConfigureGroup(cmd)
+	cmd.Dir = dir
+	cmd.WaitDelay = 2 * time.Second
+	var out []byte
+	runErr, timedOut := proc.RunBoundedWithCleanup(ctx, func() error {
+		var err error
+		out, err = cmd.CombinedOutput()
+		return err
+	})
+	if timedOut {
+		// The abandoned goroutine may still be writing `out`; do not read it.
+		return "", fmt.Errorf("timed out after %s", devmapAssetBudget)
+	}
+	return string(out), runErr
 }
 
 // hostSkillDirs maps a host to the skill layout it reads. A host absent here
@@ -181,10 +237,7 @@ func skillInstallArgs(root, host string) []string {
 	return args
 }
 
-func integrateCursor(root, selfBin, devmap string, mode Mode, receipt *Receipt) error {
-	mcpPath := filepath.Join(root, ".cursor", "mcp.json")
-	rulePath := filepath.Join(root, ".cursor", "rules", "devcouncil.mdc")
-
+func integrateCursor(repo *os.Root, root, selfBin, devmap string, mode Mode, receipt *Receipt) error {
 	mcp := map[string]any{
 		"mcpServers": map[string]any{
 			"devcouncil": map[string]any{
@@ -203,10 +256,10 @@ func integrateCursor(root, selfBin, devmap string, mode Mode, receipt *Receipt) 
 		},
 	}
 
-	if err := planWrite(mcpPath, mustJSON(mcp), mode, receipt, ".cursor/mcp.json"); err != nil {
+	if err := planWrite(repo, ".cursor/mcp.json", mustJSON(mcp), mode, receipt); err != nil {
 		return err
 	}
-	if err := planWrite(rulePath, []byte(cursorRule), mode, receipt, ".cursor/rules/devcouncil.mdc"); err != nil {
+	if err := planWrite(repo, ".cursor/rules/devcouncil.mdc", []byte(cursorRule), mode, receipt); err != nil {
 		return err
 	}
 	// No .cursor/hooks.json: DevCouncil lifecycle hooks are retired, and an
@@ -216,8 +269,7 @@ func integrateCursor(root, selfBin, devmap string, mode Mode, receipt *Receipt) 
 	return nil
 }
 
-func integrateClaude(root, selfBin, devmap string, mode Mode, receipt *Receipt) error {
-	mcpPath := filepath.Join(root, ".mcp.json")
+func integrateClaude(repo *os.Root, root, selfBin, devmap string, mode Mode, receipt *Receipt) error {
 	mcp := map[string]any{
 		"mcpServers": map[string]any{
 			"devcouncil": map[string]any{
@@ -231,20 +283,29 @@ func integrateClaude(root, selfBin, devmap string, mode Mode, receipt *Receipt) 
 			},
 		},
 	}
-	return planWrite(mcpPath, mustJSON(mcp), mode, receipt, ".mcp.json")
+	return planWrite(repo, ".mcp.json", mustJSON(mcp), mode, receipt)
 }
 
-func integrateCodex(root string, mode Mode, receipt *Receipt) error {
-	cfg := filepath.Join(root, ".codex", "config.toml")
+func integrateCodex(repo *os.Root, mode Mode, receipt *Receipt) error {
 	body := []byte("# Managed by devcouncil integrate codex\n")
-	return planWrite(cfg, body, mode, receipt, ".codex/config.toml")
+	return planWrite(repo, ".codex/config.toml", body, mode, receipt)
 }
 
-func planWrite(path string, content []byte, mode Mode, receipt *Receipt, rel string) error {
-	existing, err := os.ReadFile(path)
+// planWrite inspects and rewrites one host config named *relative to the
+// repository root*.
+//
+// `rel` is never joined onto an absolute path here. It is resolved inside
+// `repo` by readHookFile and writeRooted, which refuse a symlink at any
+// component and bound the read at maxHostConfigBytes. Both are the helpers
+// `integrate uninstall` uses: repository content chooses these filenames, so
+// the read must not follow a link out of the checkout (which would copy an
+// outside file's contents into the merged result) and the write must not
+// land outside it.
+func planWrite(repo *os.Root, rel string, content []byte, mode Mode, receipt *Receipt) error {
+	existing, _, err := readHookFile(repo, rel)
 	exists := err == nil
-	if err != nil && !os.IsNotExist(err) {
-		return err
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%s: %w", rel, err)
 	}
 	switch mode {
 	case ModeCheck:
@@ -262,12 +323,14 @@ func planWrite(path string, content []byte, mode Mode, receipt *Receipt, rel str
 		receipt.Files[rel] = "would_write"
 		return nil
 	case ModeApply:
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return err
+		if dir := path.Dir(rel); dir != "." {
+			if err := repo.MkdirAll(dir, 0o755); err != nil {
+				return fmt.Errorf("%s: %w", rel, err)
+			}
 		}
 		// Refuse JSON-with-comments for mcp.json: encoding/json cannot round-trip it.
 		if strings.HasSuffix(rel, "mcp.json") && exists {
-			if err := refuseJSONComments(existing, path); err != nil {
+			if err := refuseJSONComments(existing, rel); err != nil {
 				return err
 			}
 			merged, err := mergeMCPJSON(existing, content)
@@ -276,13 +339,28 @@ func planWrite(path string, content []byte, mode Mode, receipt *Receipt, rel str
 			}
 			content = merged
 		}
-		if err := safefile.WriteAtomic(path, content, 0o644); err != nil {
-			return err
+		if err := writeRooted(repo, rel, content, 0o644); err != nil {
+			return fmt.Errorf("%s: %w", rel, err)
 		}
 		receipt.Files[rel] = "wrote"
 		return nil
 	}
 	return fmt.Errorf("unknown mode %q", mode)
+}
+
+// writeRooted publishes `content` at `rel` inside `repo` atomically, through
+// the same exclusive no-follow create the uninstall path uses. The rename is
+// root-relative, so neither the temporary nor the final name can be redirected
+// by a link planted between the check and the write.
+func writeRooted(repo *os.Root, rel string, content []byte, perm os.FileMode) error {
+	tmp := rel + ".devcouncil-tmp-" + rand.Text()
+	if err := writeHookExclusive(repo, tmp, content, perm); err != nil {
+		return err
+	}
+	if err := repo.Rename(tmp, rel); err != nil {
+		return errors.Join(err, repo.Remove(tmp))
+	}
+	return nil
 }
 
 func refuseJSONComments(data []byte, path string) error {

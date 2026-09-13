@@ -1966,9 +1966,23 @@ fn extend_host_contract(
 /// `PATH` plus common host MCP configs (with version), so binary skew is a
 /// structured fact rather than a silent wrong hook.
 fn doctor_report(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
-    let schema_version = Store::stored_schema_version(db)?;
-    let binaries = inventory_devmap_binaries()?;
-    let skew = binaries_skew_warning(&binaries);
+    macro_rules! tm {
+        ($label:expr, $e:expr) => {{
+            let t = std::time::Instant::now();
+            let v = $e;
+            eprintln!("TIMING {:<34} {:?}", $label, t.elapsed());
+            v
+        }};
+    }
+    let schema_version = tm!("stored_schema_version", Store::stored_schema_version(db)?);
+    let binaries = tm!("inventory_devmap_binaries", inventory_devmap_binaries()?);
+    let skew = tm!("binaries_skew_warning", binaries_skew_warning(&binaries));
+    let missing = tm!("missing_binary_warning", missing_binary_warning(&binaries));
+    let dup = tm!("duplicate_mcp_registration_warning", duplicate_mcp_registration_warning());
+    let stray = tm!("stray_state_warning", stray_state_warning());
+    let plugin = tm!("plugin_warning", plugin_warning());
+    let stale = tm!("stale_server_warning", stale_server_warning());
+    let regs = tm!("mcp_registration_inventory", mcp_registration_inventory());
     Ok(serde_json::json!({
         "schema_version": schema_version,
         "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
@@ -1979,12 +1993,12 @@ fn doctor_report(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
         "build": build_identity_json(),
         "binaries": binaries,
         "binary_skew_warning": skew,
-        "missing_binary_warning": missing_binary_warning(&binaries),
-        "duplicate_mcp_registration_warning": duplicate_mcp_registration_warning(),
-        "stray_state_warning": stray_state_warning(),
-        "plugin_warning": plugin_warning(),
-        "stale_server_warning": stale_server_warning(),
-        "mcp_registrations": mcp_registration_inventory(),
+        "missing_binary_warning": missing,
+        "duplicate_mcp_registration_warning": dup,
+        "stray_state_warning": stray,
+        "plugin_warning": plugin,
+        "stale_server_warning": stale,
+        "mcp_registrations": regs,
     }))
 }
 
@@ -2987,8 +3001,20 @@ fn report_api_impact(impact: &serde_json::Value) {
 /// because every count above it is then a lower bound.
 fn report_scan(payload: &serde_json::Value) {
     let scan = &payload["scan"];
-    if scan["complete"].as_bool().unwrap_or(true) {
-        return;
+    match scan["complete"].as_bool() {
+        Some(true) => return,
+        Some(false) => {}
+        // Absent is not complete. The library reads this same field as
+        // `unwrap_or(false)`; defaulting the *human* output to "complete" is
+        // how an answer that never reported its coverage comes to read as one
+        // that covered everything.
+        None => {
+            outln!(
+                "  scan coverage not reported; the counts above are not a \
+completeness claim."
+            );
+            return;
+        }
     }
     outln!(
         "  scan incomplete: read {} of {} file(s); {} skipped for budget, \
@@ -4245,7 +4271,10 @@ async fn main() -> std::process::ExitCode {
 async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Build {
-            path,
+            // Read through `cli.root_hint()` below, which already falls back to
+            // this positional when `--root` is absent. Binding it here as well
+            // is what let the two disagree.
+            path: _,
             affected: affected_flag,
             deleted,
             full,
@@ -4258,6 +4287,20 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             stamps,
             inventory,
         } => {
+            // `--root` outranks the positional path, for the same reason it
+            // does in `paths`: `cli.db()` already resolves the store from
+            // `--root`, so reading the repository from `path` made one build
+            // name two repositories and abort with "DevMap store belongs to
+            // worktree X, not Y" before extracting anything.
+            //
+            // The hook is the caller that breaks on it. `detach_build` spawns
+            // `devmap --root <project> build` from whatever directory the agent
+            // happens to be in, with stdout and stderr on /dev/null — so on
+            // every edit outside the repository root the rebuild exited 1 into
+            // nothing, the lock was taken and released, and the index silently
+            // stopped following the tree while every hook still reported
+            // success.
+            let path = &cli.root_hint();
             let progress = progress.expect("main supplies a build reporter");
             let build_started = std::time::Instant::now();
             progress.stage(
@@ -5690,16 +5733,44 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 }),
             )?;
         }
-        Commands::Paths { path } => {
+        Commands::Paths { .. } => {
             // Absolute, so a caller in another directory can use every field
             // as given; `validate_root` has already checked the directory exists.
-            let root = path.canonicalize()?;
+            //
+            // Resolved through `root_hint`, not the positional `path`, because
+            // `--root` outranks it and `cli.db()` already honours that. Reading
+            // the positional argument here made one answer describe two
+            // repositories: `devmap --root A paths` reported A's `db_path`
+            // beside the *working directory's* `root`, `state_dir` and
+            // `repo_map`. Hooks are the case that breaks on — they pass
+            // `--root <project>` precisely because the agent's working
+            // directory is not the repository the index belongs to — and
+            // `paths` is the first command the generated agent guide tells an
+            // agent to run, so the mixed answer pointed it at another
+            // checkout's map.
+            let root = cli.root_hint();
+            let root = root
+                .canonicalize()
+                .with_context(|| format!("repository root {}", root.display()))?;
             let state_dir = devmap_extract::paths::state_dir(&root);
             // Both explicit --db and relative roots are invocation-relative.
             // Joining this to root again duplicates the repository directory.
             let db_path = std::path::absolute(cli.db())?;
-            let binaries = inventory_devmap_binaries()?;
-            let skew = binaries_skew_warning(&binaries);
+            macro_rules! tm2 {
+                ($label:expr, $e:expr) => {{
+                    let t = std::time::Instant::now();
+                    let v = $e;
+                    eprintln!("TIMING {:<34} {:?}", $label, t.elapsed());
+                    v
+                }};
+            }
+            let binaries = tm2!("inventory_devmap_binaries", inventory_devmap_binaries()?);
+            let skew = tm2!("binaries_skew_warning", binaries_skew_warning(&binaries));
+            let m_missing = tm2!("missing_binary_warning", missing_binary_warning(&binaries));
+            let m_dup = tm2!("duplicate_mcp_registration", duplicate_mcp_registration_warning());
+            let m_stray = tm2!("stray_state_warning", stray_state_warning());
+            let m_plugin = tm2!("plugin_warning", plugin_warning());
+            let m_stale = tm2!("stale_server_warning", stale_server_warning());
             let payload = serde_json::json!({
                 "root": root,
                 "state_dir": state_dir,
@@ -5712,11 +5783,11 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 "plugin_dir": devmap_extract::paths::plugin_dir(&root),
                 "binaries": binaries,
                 "binary_skew_warning": skew,
-                "missing_binary_warning": missing_binary_warning(&binaries),
-                "duplicate_mcp_registration_warning": duplicate_mcp_registration_warning(),
-                "stray_state_warning": stray_state_warning(),
-                "plugin_warning": plugin_warning(),
-                "stale_server_warning": stale_server_warning(),
+                "missing_binary_warning": m_missing,
+                "duplicate_mcp_registration_warning": m_dup,
+                "stray_state_warning": m_stray,
+                "plugin_warning": m_plugin,
+                "stale_server_warning": m_stale,
                 "version": env!("CARGO_PKG_VERSION"),
                 "build": build_identity_json(),
             });
@@ -6837,9 +6908,27 @@ fn run_integrate(
     Ok(())
 }
 
+/// Write one hook diagnostic straight to stderr.
+///
+/// Not through [`diagnostic`]. That path hands the line to an asynchronous
+/// writer, and a failing hook ends in `std::process::exit`, which runs no
+/// destructors and waits for nothing — so the message was dropped on exactly
+/// the paths that had something to report. Measured 2026-09-12:
+/// `devmap hook bogus-event` exited 1 with completely empty stdout and stderr,
+/// while every exit-0 path printed its note normally.
+///
+/// A hook has one bounded line to say and no progress display to share it
+/// with, so it writes and flushes that line itself.
+fn hook_diagnostic(message: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "{message}");
+    let _ = err.flush();
+}
+
 fn run_hook_command(cli: &Cli, event_name: &str) -> anyhow::Result<i32> {
     let Some(event) = hook::HookEvent::parse(event_name) else {
-        diagnostic(format_args!(
+        hook_diagnostic(format_args!(
             "devmap hook: unknown event {event_name:?}; expected session-start, \
              post-tool-use, or session-end"
         ));
@@ -6849,7 +6938,7 @@ fn run_hook_command(cli: &Cli, event_name: &str) -> anyhow::Result<i32> {
     let executable = std::env::current_exe()?;
     let outcome = hook::run_hook(event, &stdin, &executable, cli.root.as_deref());
     if let Some(line) = &outcome.stderr_line {
-        diagnostic(format_args!("{line}"));
+        hook_diagnostic(format_args!("{line}"));
     }
     if let Some(stdout) = &outcome.stdout {
         if cli.json {

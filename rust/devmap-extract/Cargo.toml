@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Tree-sitter extraction frontend for the DevCouncil code-intelligence kernel"
 
 [dependencies]
+dc-proc = { path = "../dc-proc" }
 serde.workspace = true
 serde_json.workspace = true
 rayon.workspace = true

@@ -299,6 +299,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc-proc"
+version = "0.2.1"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "dc-store"
 version = "0.2.1"
 dependencies = [
@@ -311,6 +318,7 @@ version = "0.2.1"
 dependencies = [
  "dc-evidence",
  "dc-glob",
+ "dc-proc",
  "serde_json",
 ]
 
@@ -343,6 +351,7 @@ dependencies = [
  "rayon",
  "rusqlite",
  "serde_json",
+ "sha2",
  "tokio",
  "toml",
  "tracing",
@@ -355,6 +364,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "cc",
+ "dc-proc",
  "ignore",
  "libc",
  "rayon",

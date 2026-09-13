@@ -98,51 +98,80 @@ remove language limitations or make unresolved dynamic calls deterministic.
 
 ## Benchmark comparison
 
-The [2026-09-12 competitor report](../../benchmarks/results/competition/20260912-expanded/REPORT.md)
-records **261 timing samples** against Graphify, Gortex, GitNexus, CodeGraph,
-codebase-memory-mcp, and a ripgrep text baseline. All graph tools received the
-same 1,186-file DevCouncil snapshot. The report is the canonical source for
-per-tool positives and negatives, query timings, memory/storage, correctness,
-warnings, methodology, and raw evidence.
+The [DevMap v0.2.1 report, 2026-09-13 UTC](../../benchmarks/results/competition/20260913-v0.2.1/REPORT.md)
+records **261 fresh competitive timing samples** against Graphify, Gortex,
+GitNexus, CodeGraph, codebase-memory-mcp, and a ripgrep text baseline. It also
+includes **82 supplemental samples** alternating the preserved v0.2.0 and
+v0.2.1 binaries. All graph tools used the same original 1,186-file DevCouncil
+snapshot. The [previous report](../../benchmarks/results/competition/20260912-expanded/REPORT.md)
+and its measurements remain unchanged.
 
-**Verified medians for that run:**
+**Verified medians in the v0.2.1 competitor campaign:**
 
 | Tool | Cold index | Unchanged refresh | Single-file edit | Inspected caller pairs |
 |---|---:|---:|---:|---:|
-| DevMap | 1.971 s | 74.2 ms | 817.4 ms | 5/5 |
-| CodeGraph | 2.900 s | 211.2 ms | 376.5 ms | 3/5 |
-| codebase-memory-mcp | 7.790 s | 5.907 s | 8.898 s | 5/5 |
-| Graphify | 21.674 s | 3.804 s | 3.764 s | 3/5 |
-| Gortex | 29.526 s | 299.8 ms | 3.923 s | 4/5 default; 5/5 with name-only inclusion |
-| GitNexus | 30.051 s | 508.6 ms | 31.792 s | 3/5 |
+| DevMap 0.2.1 | 2.244 s | 137.8 ms | 1.190 s | 5/5 |
+| CodeGraph | 3.267 s | 226.2 ms | 691.9 ms | 3/5 |
+| codebase-memory-mcp | 8.453 s | 6.015 s | 9.259 s | 5/5 |
+| Graphify | 17.530 s | 4.183 s | 4.499 s | 3/5 |
+| Gortex | 33.982 s | 746.6 ms | 4.910 s | 4/5 default; 5/5 with name-only inclusion |
+| GitNexus | 35.103 s | 636.6 ms | 33.760 s | 3/5 |
 
-**DevMap positives:** the lowest cold-index, unchanged-refresh, and measured
-query medians; the lowest sampled cold process-tree RSS (611.5 MiB); all five
-inspected caller pairs; and successful update/deletion checks.
+**DevMap speed factors** (each cell compares DevMap with the named tool):
+
+| Compared with | Cold index | Unchanged refresh | Single-file edit |
+|---|---:|---:|---:|
+| CodeGraph | 1.46× faster | 1.64× faster | 1.72× slower |
+| codebase-memory-mcp | 3.77× faster | 43.64× faster | 7.78× faster |
+| Graphify | 7.81× faster | 30.35× faster | 3.78× faster |
+| Gortex | 15.14× faster | 5.42× faster | 4.13× faster |
+| GitNexus | 15.64× faster | 4.62× faster | 28.38× faster |
+
+Ratios use unrounded medians. “X× faster” means the competitor took X times
+DevMap’s elapsed time; “X× slower” means DevMap took X times the competitor’s
+elapsed time. The full report also gives ratios for all six query cells per
+competitor and the separate ripgrep text baseline. Native pipelines and
+output scopes differ; these factors do not imply equal analysis.
+
+**DevMap positives:** lowest cold-index, unchanged-refresh, and measured
+query medians; lowest sampled cold process-tree RSS (608.0 MiB); all five
+inspected caller pairs; and successful update/removal controls. The preserved
+0.2.1 binary reports clean-build source commit `506a617498a5`.
 
 **DevMap negatives:** CodeGraph had lower edit latency and a smaller store.
-DevMap's 138.8 MiB store also exceeded Graphify's 42.5 MiB and CBM's 67.1 MiB.
-Its query envelopes still reported 91,784 remaining unresolved attribution
-sites, eight SQL import-extractor gaps, and a PowerShell pattern fallback.
-Five selected caller pairs do not establish complete graph accuracy.
+DevMap's 138.9 MiB store also exceeded Graphify's 42.5 MiB and CBM's 67.1 MiB.
+It left 96,233 unexplained attribution sites, compared with 91,784 in the old
+run, while resolved symbol/edge totals stayed the same. This classification
+difference has not been shown to be a loss of caller accuracy. Eight SQL
+import-extractor gaps and a PowerShell pattern fallback remain.
 
-**Competitor findings:** CBM matched the five caller pairs; Graphify had the
-smallest measured index/cache directory; Gortex recovered its fifth pair with
-an explicit lower-confidence setting and verified deletion through exact-ID
-lookups. GitNexus retained a deleted probe across two ordinary refreshes; a
-forced rebuild cleared it. Graphify, GitNexus, and CodeGraph missed the two
-inspected Rust test callers. The report preserves these failures and the
-successful controls together.
+**Competitors:** CBM also returned all five inspected caller pairs. Graphify
+had the smallest measured store. Gortex returned four pairs by default and
+five with explicit lower-confidence inclusion; exact-ID lookups proved
+deletion after capped fuzzy searches were inconclusive. GitNexus again kept
+a deleted probe across two ordinary refreshes; a forced rebuild cleared it.
+Graphify, GitNexus, and CodeGraph missed both inspected Rust test callers.
 
-These are different native pipelines: Graphify used AST-only extraction with
-clustering disabled, and Gortex's cold time includes enrichment (query-ready
-median: 12.072 s). Gortex queries used a resident daemon; the other measured
-interfaces were standalone CLIs. CBM's roughly four-second CLI queries do not
-measure its persistent MCP engine. Index formats and sampled RSS also differ.
-The binary was a preserved `0.2.0` dirty build, not a reproducible clean release
-or necessarily the currently installed binary. Read the report's ranges,
-provenance, unverified scenarios, and inferred follow-up priorities before
-using these results to choose a tool or claim a performance improvement.
+**Version comparison:** the separate alternating control measured v0.2.1 at
+2.450 s cold (**1.09× slower**, +8.6%), 76.0 ms unchanged (**1.17× faster**,
+-14.3%), and 836.3 ms edited (**1.02× faster**, -2.3%) against the preserved
+v0.2.0 executable. All three ranges overlap; these small
+samples do not establish a general regression or improvement. Both versions
+passed the selected definitions, caller pairs, and edit/removal controls.
+Keep these control samples separate from the competitor medians above.
+
+Graphify used AST-only extraction with clustering disabled. Gortex cold time
+includes enrichment (query-ready median: 14.591 s), and its queries use a
+resident daemon; the other measured interfaces were standalone CLIs. CBM's
+roughly four-second CLI queries do not measure its persistent MCP engine.
+Native filters, output scope, index formats, and sampled RSS differ.
+
+The report retains per-tool positives and negatives, complete timing ranges,
+raw outputs, memory/storage, coverage warnings, and inferred follow-up work.
+No product test suite, hosted inference, UI, persistent-MCP parity, or broad
+language-accuracy qualification was run for this benchmark follow-up. The old
+dirty binary lacks its exact source patch; the new binary was hash-verified
+but not rebuilt during this run.
 
 ## Install
 

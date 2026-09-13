@@ -1,0 +1,26 @@
+{
+  "task_id": "52d63a1a-266d-4a5a-8a09-9b8458a98334",
+  "repo": "/Users/bharath/Code/devtools/DevCouncil",
+  "corpus_commit": "ee07c183b127e7291c38f993f4d71ca75f1121dc",
+  "devmap_source_commit": "506a617498a5f1dae8a89519f91b4ee67031e352",
+  "devmap_build": {
+    "dirty": false,
+    "git": "506a617498a5",
+    "id": "506a617498a5",
+    "time": "1789262603"
+  },
+  "devmap_version": "devmap 0.2.1 (store schema 20, code graph schema 2, build 506a617498a5)",
+  "devmap_binary": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-v0.2.1/devmap",
+  "devmap_sha256": "0cf3428a85de9099d6ae30172d4f149b57c3135bcaaaaaad9ec5f73d5a72541f",
+  "source_status_before": "M backend/go_orchestrator/devcouncil/integrate/integrate.go\n M backend/go_orchestrator/devcouncil/integrate/uninstall_test.go\n M backend/go_orchestrator/internal/mapcli/discover.go\n M rust/devmap-cli/src/hook.rs\n M rust/devmap-cli/src/integrate.rs\n?? backend/go_orchestrator/devcouncil/integrate/integrate_write_security_test.go\n?? backend/go_orchestrator/proc/lookpath.go\n?? backend/go_orchestrator/proc/lookpath_test.go\n?? benchmarks/results/competition/20260913-v0.2.1/",
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "machine": "Apple M5 Pro",
+  "memory_bytes": 68719476736,
+  "cpu_count": 18,
+  "corpus_files": 1186,
+  "corpus_bytes": 46940219,
+  "gitnexus_version": "1.6.9",
+  "rg_version": "ripgrep 15.1.0",
+  "prepared_utc": "2026-09-13T01:27:00.858327+00:00",
+  "tool_setup": "Reused verified prior local competitor installations; all index/config/corpus state is new."
+}

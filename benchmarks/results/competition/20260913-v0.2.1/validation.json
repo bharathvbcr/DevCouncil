@@ -1,0 +1,77 @@
+{
+  "completed_utc": "2026-09-13T02:32:21.598984+00:00",
+  "competitive_timing_samples": 261,
+  "groups": 57,
+  "total_timed_records": 405,
+  "alternating_version_control_samples": 82,
+  "failed_invocations": [],
+  "control_failures": [
+    "negative-gitnexus-devmap_competition_revision_3"
+  ],
+  "initially_inconclusive_controls": [
+    "negative-gortex-devmap_competition_revision_3",
+    "negative-gortex-devmap_competition_nonexistent_52d63a1a"
+  ],
+  "corpora": [
+    {
+      "tool": "devmap",
+      "files": 1186,
+      "mismatches": []
+    },
+    {
+      "tool": "graphify",
+      "files": 1186,
+      "mismatches": []
+    },
+    {
+      "tool": "gitnexus",
+      "files": 1186,
+      "mismatches": []
+    },
+    {
+      "tool": "codegraph",
+      "files": 1186,
+      "mismatches": []
+    },
+    {
+      "tool": "cbm",
+      "files": 1186,
+      "mismatches": []
+    },
+    {
+      "tool": "gortex",
+      "files": 1186,
+      "mismatches": []
+    }
+  ],
+  "source_snippets_match": true,
+  "preserved_binary_hashes_match": true,
+  "baseline_files_unchanged": 744,
+  "daemon_checks": [
+    {
+      "pid": 18665,
+      "owned_daemon_alive": false,
+      "pid_exists": false
+    },
+    {
+      "pid": 31113,
+      "owned_daemon_alive": false,
+      "pid_exists": false
+    },
+    {
+      "pid": 38930,
+      "owned_daemon_alive": false,
+      "pid_exists": false
+    },
+    {
+      "pid": 20446,
+      "owned_daemon_alive": false,
+      "pid_exists": false
+    }
+  ],
+  "socket_removed": true,
+  "report_regeneration_identical": true,
+  "local_links_checked": 93,
+  "external_links_not_rechecked": 5,
+  "product_tests_not_run": "Benchmark artifacts and documentation only; no product source changes or v0.2.1 product-test qualification claimed."
+}

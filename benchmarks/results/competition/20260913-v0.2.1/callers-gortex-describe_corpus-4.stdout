@@ -1,0 +1,47 @@
+{
+  "edges": [
+    {
+      "confidence_label": "EXTRACTED",
+      "file_path": "devcouncil-bench/benchmarks/map_bench.py",
+      "from": "devcouncil-bench/benchmarks/map_bench.py::main",
+      "kind": "calls",
+      "line": 1086,
+      "origin": "lsp_resolved",
+      "tier": "lsp",
+      "to": "devcouncil-bench/benchmarks/map_bench.py::describe_corpus"
+    }
+  ],
+  "nodes": [
+    {
+      "absolute_file_path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-v0.2.1/gortex-corpus/benchmarks/map_bench.py",
+      "end_line": 271,
+      "fetched_at": "0001-01-01T00:00:00Z",
+      "file_path": "devcouncil-bench/benchmarks/map_bench.py",
+      "id": "devcouncil-bench/benchmarks/map_bench.py::describe_corpus",
+      "kind": "function",
+      "language": "python",
+      "name": "describe_corpus",
+      "project_id": "devcouncil-bench",
+      "repo_prefix": "devcouncil-bench",
+      "start_line": 240,
+      "workspace_id": "devcouncil-bench"
+    },
+    {
+      "absolute_file_path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260913-v0.2.1/gortex-corpus/benchmarks/map_bench.py",
+      "end_line": 1139,
+      "fetched_at": "0001-01-01T00:00:00Z",
+      "file_path": "devcouncil-bench/benchmarks/map_bench.py",
+      "id": "devcouncil-bench/benchmarks/map_bench.py::main",
+      "kind": "function",
+      "language": "python",
+      "name": "main",
+      "project_id": "devcouncil-bench",
+      "repo_prefix": "devcouncil-bench",
+      "start_line": 1022,
+      "workspace_id": "devcouncil-bench"
+    }
+  ],
+  "total_edges": 1,
+  "total_nodes": 2,
+  "truncated": false
+}

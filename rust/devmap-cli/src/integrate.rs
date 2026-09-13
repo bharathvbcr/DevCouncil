@@ -8,6 +8,7 @@
 //!   insufficient for multi-tab Cursor — callers must still pass `repo_path`)
 
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
@@ -102,7 +103,7 @@ pub fn integrate(
             devmap_query::guides::agent_guide_text(map, map_rel, graph_rel, store_rel) + "\n";
         for name in devmap_query::guides::GUIDE_FILENAMES {
             let path = root.join(name);
-            let disposition = match fs::read_to_string(&path) {
+            let disposition = match read_host_config(&path) {
                 Ok(existing)
                     if existing.contains(devmap_query::guides::AGENT_GUIDE_MARKER)
                         || existing.contains(devmap_query::guides::LEGACY_AGENT_GUIDE_MARKER) =>
@@ -129,7 +130,7 @@ pub fn integrate(
         }
         let rule_path = root.join(devmap_query::guides::CURSOR_RULE_REL);
         let rule_text = devmap_query::guides::cursor_rule_text(map_rel);
-        let rule_differs = fs::read_to_string(&rule_path)
+        let rule_differs = read_host_config(&rule_path)
             .map(|existing| existing != rule_text)
             .unwrap_or(true);
         if rule_differs {
@@ -430,11 +431,58 @@ fn entry_has_db_arg(entry: &Value) -> bool {
         .is_some_and(|args| args.iter().any(|a| a.as_str() == Some("--db")))
 }
 
+/// The most a host config this module inspects may weigh.
+///
+/// Matches the Go host's `maxHostConfigBytes`: these are settings files, and a
+/// file that large is a wedged or hostile one, not a config to merge into.
+const MAX_HOST_CONFIG_BYTES: u64 = 1 << 20;
+
+/// Read one host config with a bound and a file-type check.
+///
+/// Every read of an existing config in this module goes through here. A plain
+/// `read_to_string` had no ceiling and no notion of what it opened, so a
+/// character device or an oversized file at a known config name was read until
+/// it stopped or the process did.
+fn read_host_config(path: &Path) -> io::Result<String> {
+    let file = fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: not a regular file", path.display()),
+        ));
+    }
+    if meta.len() > MAX_HOST_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: {} bytes exceeds the {MAX_HOST_CONFIG_BYTES}-byte host config bound",
+                path.display(),
+                meta.len()
+            ),
+        ));
+    }
+    let mut text = String::new();
+    // Bounded independently of the stat above: the file can grow between them.
+    file.take(MAX_HOST_CONFIG_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_HOST_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: grew past the {MAX_HOST_CONFIG_BYTES}-byte host config bound",
+                path.display()
+            ),
+        ));
+    }
+    Ok(text)
+}
+
 fn read_json_object(path: &Path) -> anyhow::Result<Value> {
     if !path.exists() {
         return Ok(json!({"mcpServers": {}}));
     }
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = read_host_config(path).with_context(|| format!("reading {}", path.display()))?;
     let value: Value = serde_json::from_str(&text).map_err(|err| {
         anyhow!(
             "{}: not strict JSON ({err}); JSON-with-comments is refused rather than rewritten",
@@ -477,7 +525,7 @@ pub fn merge_cursor_hooks(
 ) -> anyhow::Result<McpMergeOutcome> {
     let expected = claude::cursor_hooks_document(executable)?;
     if path.is_file() {
-        let existing_text = fs::read_to_string(path)?;
+        let existing_text = read_host_config(path)?;
         let existing: Value = serde_json::from_str(&existing_text).map_err(|err| {
             anyhow!(
                 "{}: not JSON ({err}); refuse to overwrite a broken hooks file",
@@ -528,7 +576,7 @@ pub fn merge_codex_mcp(
         .ok_or_else(|| anyhow!("executable path is not UTF-8"))?;
 
     let existing = if path.is_file() {
-        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+        read_host_config(path).with_context(|| format!("reading {}", path.display()))?
     } else {
         String::new()
     };
@@ -572,7 +620,11 @@ pub fn merge_codex_mcp(
         }
         let text = toml::to_string_pretty(&toml::Value::Table(table))
             .map_err(|err| anyhow!("serialize Codex config: {err}"))?;
-        fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        // The JSON configs next door publish through safe_fs; a plain
+        // `fs::write` here truncated whatever the name resolved to, link or
+        // not, and left a half-written config behind on a failed write.
+        devmap_query::write_atomic(path, text.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
     }
 
     Ok(McpMergeOutcome {
@@ -606,7 +658,7 @@ pub fn write_codex_plugin_assets(
         (&hooks_path, &hooks, "wrote .codex-plugin/hooks/hooks.json"),
     ] {
         let changed = if path.is_file() {
-            let existing = fs::read_to_string(path).unwrap_or_default();
+            let existing = read_host_config(path).unwrap_or_default();
             let pretty = {
                 let mut text = serde_json::to_string_pretty(value)?;
                 text.push('\n');
