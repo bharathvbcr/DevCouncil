@@ -283,9 +283,20 @@ fn live_rows_adapt_after_a_real_terminal_resize() {
         &root,
         &["--progress", "always"],
         "xterm",
-        |rendered, fd, _| {
-            rendered.recv_timeout(Duration::from_secs(5)).unwrap();
-            for width in [24, 120] {
+        |transcript, fd, _| {
+            assert!(
+                transcript.wait(Duration::from_secs(5), |shown| !shown.is_empty()),
+                "no first frame"
+            );
+            // The held writer lock parks the build in stage one, so each width
+            // stays applied until a frame drawn at that width appears. That
+            // wait is the whole point: the renderer reads the window size when
+            // it repaints, and a machine under load starves the repaint well
+            // past the fixed sleep this loop used to take.
+            for (width, drawn, described) in [
+                (24, narrow_frame as fn(&str) -> bool, "narrow"),
+                (120, expanded_frame as fn(&str) -> bool, "expanded"),
+            ] {
                 let size = libc::winsize {
                     ws_row: 24,
                     ws_col: width,
@@ -293,31 +304,43 @@ fn live_rows_adapt_after_a_real_terminal_resize() {
                     ws_ypixel: 0,
                 };
                 assert_eq!(unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size) }, 0);
-                std::thread::sleep(Duration::from_millis(240));
+                assert!(
+                    transcript.wait(Duration::from_secs(5), |shown| drawn_rows(shown)
+                        .into_iter()
+                        .any(drawn)),
+                    "no {described} frame within 5s of resizing to {width} columns"
+                );
             }
             drop(lock);
         },
     );
     assert!(output.status.success(), "{terminal}");
-    let rows: Vec<_> = terminal
-        .split("\x1b[2K")
-        .filter_map(|row| {
-            let row = row.split(['\r', '\n', '\x1b']).next().unwrap_or("");
-            row.contains("1/5").then_some(row)
-        })
+    let rows = drawn_rows(&terminal);
+    let narrow: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|row| narrow_frame(row))
         .collect();
-    let cells = |row: &&str| {
-        row.chars()
-            .map(|c| if c.is_ascii() { 1 } else { 2 })
-            .sum::<usize>()
-    };
+    let expanded: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|row| expanded_frame(row))
+        .collect();
+    // Each window must both select its own layout and be spent without
+    // overflowing the last usable column.
+    assert!(!narrow.is_empty(), "no narrow frame: {terminal}");
     assert!(
-        rows.iter().any(|row| cells(row) <= 23),
-        "no narrow frame: {terminal}"
+        narrow.iter().all(|row| cells(row) <= 23),
+        "a 24-column frame overran the window: {terminal}"
+    );
+    assert!(!expanded.is_empty(), "no expanded frame: {terminal}");
+    assert!(
+        expanded.iter().all(|row| cells(row) <= 119),
+        "a 120-column frame overran the window: {terminal}"
     );
     assert!(
-        rows.iter().any(|row| cells(row) > 80),
-        "no expanded frame: {terminal}"
+        expanded.iter().all(|row| cells(row) > 23),
+        "the expanded rows are no wider than the narrow window: {terminal}"
     );
     assert!(
         !terminal.contains("\x1b[?25l"),
@@ -339,8 +362,11 @@ fn interrupting_an_animated_lock_wait_preserves_terminal_and_store_recovery() {
             &root,
             &["--progress", "always"],
             "xterm",
-            |rendered, _, pid| {
-                rendered.recv_timeout(Duration::from_secs(5)).unwrap();
+            |transcript, _, pid| {
+                assert!(
+                    transcript.wait(Duration::from_secs(5), |shown| !shown.is_empty()),
+                    "no first frame"
+                );
                 assert_eq!(
                     unsafe { libc::kill(i32::try_from(pid).unwrap(), signal) },
                     0
@@ -562,6 +588,110 @@ fn a_disconnected_terminal_does_not_panic_or_destroy_the_json_result() {
     assert_eq!(payload["progress_output"]["incomplete"], true);
 }
 
+/// What the terminal has been shown so far, appended to by the drain thread
+/// while the child runs.
+///
+/// A test that changes something the renderer observes — the window size, say —
+/// has to wait for the frame that change produced. It cannot wait for a number
+/// of animation ticks: the renderer redraws on a timer it owns, and a loaded
+/// machine starves that timer past any sleep a test could pick. So the wait is
+/// on the frame itself, bounded by a deadline.
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct Transcript(std::sync::Arc<(std::sync::Mutex<Vec<u8>>, std::sync::Condvar)>);
+
+#[cfg(unix)]
+impl Transcript {
+    fn append(&self, bytes: &[u8]) {
+        self.0
+             .0
+            .lock()
+            .expect("transcript lock")
+            .extend_from_slice(bytes);
+        self.0 .1.notify_all();
+    }
+
+    fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.0 .0.lock().expect("transcript lock"))
+    }
+
+    /// Block until `ready` accepts the transcript, or `within` elapses. Returns
+    /// whether the condition was met. Decoding is lossy only here; the value
+    /// the helper finally returns is still decoded strictly, so a child that
+    /// emits invalid UTF-8 still fails the test.
+    fn wait(&self, within: std::time::Duration, ready: impl Fn(&str) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        let mut buffer = self.0 .0.lock().expect("transcript lock");
+        loop {
+            if ready(&String::from_utf8_lossy(&buffer)) {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            buffer = self
+                .0
+                 .1
+                .wait_timeout(buffer, remaining)
+                .expect("transcript lock")
+                .0;
+        }
+    }
+}
+
+/// The live rows the renderer has finished drawing.
+///
+/// Each redraw is one clear sequence followed by the row, so the text after the
+/// *last* clear is still being written and is not a row yet — counting it would
+/// let a half-flushed wide frame pass for a narrow one.
+#[cfg(unix)]
+fn drawn_rows(terminal: &str) -> Vec<&str> {
+    let pieces: Vec<&str> = terminal.split("\x1b[2K").collect();
+    pieces
+        .get(1..pieces.len().saturating_sub(1))
+        .unwrap_or_default()
+        .iter()
+        .map(|piece| piece.split(['\r', '\n', '\x1b']).next().unwrap_or(""))
+        .collect()
+}
+
+/// Terminal cells, counting the renderer's box-drawing and braille glyphs as
+/// the two columns they occupy. Mirrors `progress::cells`.
+#[cfg(unix)]
+fn cells(row: &str) -> usize {
+    row.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
+/// A live stage-one frame in the layout tier below 48 columns, whose prefix is
+/// the spinner and the stage number alone.
+///
+/// Matched by the shape the renderer builds, not by the absence of the product
+/// name: the fixture's own scan path is `devmap-progress-…`, so an absence test
+/// would misread any row wide enough to show that path.
+#[cfg(unix)]
+fn narrow_frame(row: &str) -> bool {
+    row.char_indices()
+        .nth(2)
+        .is_some_and(|(after_spinner, _)| row[after_spinner..].starts_with("1/5 "))
+}
+
+/// A live stage-one frame in the widest tier: the stage trail returns at 72
+/// columns and the label becomes `title / detail` at 110, so neither the
+/// 80-column window the pty opens with nor the 24-column step can build one.
+///
+/// These are the renderer's own width breakpoints, which is the whole of what a
+/// resize changes. A row's *length* is not: rows are sized to their content —
+/// `fit` truncates and nothing pads — so asserting an absolute cell count
+/// measures whichever phase label happened to be current when a frame landed.
+/// The only label long enough to pass `> 80` is the absolute scan path, shown
+/// for the few milliseconds after the writer lock drops, which is a race no
+/// wait can win.
+#[cfg(unix)]
+fn expanded_frame(row: &str) -> bool {
+    row.contains("─·─·─·─·") && row.contains("1/5 Reading the terrain / ")
+}
+
 /// Exercise the binary with a real terminal on stderr and a separate JSON
 /// pipe on stdout. Both the child and terminal drain have bounded waits.
 #[cfg(unix)]
@@ -569,7 +699,7 @@ fn terminal_build(
     root: &std::path::Path,
     args: &[&str],
     term: &str,
-    after_spawn: impl FnOnce(&std::sync::mpsc::Receiver<()>, i32, u32),
+    after_spawn: impl FnOnce(&Transcript, i32, u32),
 ) -> (std::process::Output, String) {
     terminal_build_output(root, args, term, true, after_spawn)
 }
@@ -580,7 +710,7 @@ fn terminal_build_output(
     args: &[&str],
     term: &str,
     json: bool,
-    after_spawn: impl FnOnce(&std::sync::mpsc::Receiver<()>, i32, u32),
+    after_spawn: impl FnOnce(&Transcript, i32, u32),
 ) -> (std::process::Output, String) {
     use std::io::Read;
     use std::os::fd::AsRawFd;
@@ -621,10 +751,13 @@ fn terminal_build_output(
         .stderr(slave);
     let mut child = command.spawn().unwrap();
     drop(command); // Drop the parent's slave before waiting for terminal EOF.
-    let (first_frame, rendered) = std::sync::mpsc::sync_channel(1);
+    let transcript = Transcript::default();
+    let drain = transcript.clone();
+    // The drain must outlast the longest bounded wait a callback can take, or
+    // it would close the transcript out from under a test that is still
+    // waiting for a frame and report the wrong failure.
     let reader = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut bytes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(45);
         let mut buffer = [0u8; 4096];
         loop {
             assert!(Instant::now() < deadline, "terminal output did not close");
@@ -647,21 +780,16 @@ fn terminal_build_output(
             }
             match master.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(n) => {
-                    if bytes.is_empty() {
-                        first_frame.send(()).unwrap();
-                    }
-                    bytes.extend_from_slice(&buffer[..n]);
-                }
+                Ok(n) => drain.append(&buffer[..n]),
                 // Linux reports EIO rather than EOF when the slave closes.
                 Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => panic!("terminal read failed: {e}"),
             }
         }
-        String::from_utf8(bytes).unwrap()
+        String::from_utf8(drain.take()).unwrap()
     });
-    after_spawn(&rendered, control.as_raw_fd(), child.id());
+    after_spawn(&transcript, control.as_raw_fd(), child.id());
     assert_eq!(termios(), before, "progress changed terminal modes");
     drop(control);
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -759,12 +887,13 @@ fn a_real_terminal_animates_during_work_and_stops_before_the_result() {
         &root,
         &["--progress", "always"],
         "xterm-256color",
-        |rendered, _, _| {
+        |transcript, _, _| {
             // A held writer lock makes a slow stage deterministic without a large
             // repository, a mocked reporter or performance assumptions.
-            rendered
-                .recv_timeout(Duration::from_secs(5))
-                .expect("first live frame");
+            assert!(
+                transcript.wait(Duration::from_secs(5), |shown| !shown.is_empty()),
+                "first live frame"
+            );
             std::thread::sleep(Duration::from_millis(350));
             drop(lock);
         },
@@ -841,8 +970,11 @@ fn a_real_terminal_animates_during_work_and_stops_before_the_result() {
             invalid_output.to_str().unwrap(),
         ],
         "xterm-256color",
-        |rendered, _, _| {
-            rendered.recv_timeout(Duration::from_secs(5)).unwrap();
+        |transcript, _, _| {
+            assert!(
+                transcript.wait(Duration::from_secs(5), |shown| !shown.is_empty()),
+                "no first frame"
+            );
             drop(lock);
         },
     );
