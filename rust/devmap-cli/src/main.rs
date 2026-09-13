@@ -1356,8 +1356,12 @@ enum Commands {
     /// registration serves every repository. Stale per-project `--db` entries
     /// this installer owns are rewritten. Unrelated MCP servers are preserved.
     Integrate {
-        /// Host to integrate: `cursor`, `claude`, or `codex`.
-        host: String,
+        /// Host to integrate.
+        // The accepted names are clap's own, read off `integrate::Host`, so
+        // this help cannot advertise a set the integrator does not accept —
+        // which is what a hand-written list here did, naming three of six.
+        #[arg(value_enum)]
+        host: integrate::Host,
         /// Repository root (defaults to the current worktree).
         #[arg(long, default_value_os_t = default_root_hint())]
         project_root: PathBuf,
@@ -6914,7 +6918,14 @@ raise --max-nodes to widen"
             dry_run,
             check,
             binary,
-        } => run_integrate(cli, host, project_root, *dry_run, *check, binary.as_deref())?,
+        } => run_integrate(
+            cli,
+            *host,
+            project_root,
+            *dry_run,
+            *check,
+            binary.as_deref(),
+        )?,
     }
 
     Ok(())
@@ -6984,13 +6995,12 @@ fn run_skills(cli: &Cli, action: &SkillsAction) -> anyhow::Result<()> {
 
 fn run_integrate(
     cli: &Cli,
-    host_name: &str,
+    host: integrate::Host,
     project_root: &Path,
     dry_run: bool,
     check: bool,
     binary: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let host = integrate::Host::parse(host_name)?;
     let executable = claude::plugin_command(&std::env::current_exe()?, binary);
     let db = cli.db();
     let (map, map_rel, graph_rel, store_rel) = integrate_map_context(project_root, &db)?;
@@ -7411,6 +7421,53 @@ const RESOLUTION_RATE_LANGUAGES_SHOWN: usize = 8;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `devmap integrate --help` offers exactly the hosts the integrator takes.
+    ///
+    /// The help used to be a doc comment reading "`cursor`, `claude`, or
+    /// `codex`" over a bare `String`, while `Host::parse` had accepted six for
+    /// some time: the text was a claim about another file that nothing checked,
+    /// and it told users that half the supported hosts were unsupported. Typing
+    /// the positional moved the list into clap's hands; this asserts it stayed
+    /// there, and fails if anyone reintroduces a hand-written set.
+    #[test]
+    fn integrate_advertises_every_host_the_integrator_accepts() {
+        let command = Cli::command();
+        let integrate = command
+            .get_subcommands()
+            .find(|candidate| candidate.get_name() == "integrate")
+            .expect("`integrate` is a subcommand");
+        let host = integrate
+            .get_arguments()
+            .find(|argument| argument.get_id() == "host")
+            .expect("`integrate` takes a host");
+
+        let advertised: Vec<String> = host
+            .get_possible_values()
+            .iter()
+            .map(|value| value.get_name().to_string())
+            .collect();
+        let accepted: Vec<String> = <integrate::Host as ValueEnum>::value_variants()
+            .iter()
+            .map(|value| value.as_str().to_string())
+            .collect();
+
+        // Not `is_empty`-tolerant on purpose: an untyped positional advertises
+        // nothing, which is the state this replaced.
+        assert_eq!(
+            advertised, accepted,
+            "the help offers a different set of hosts than `Host` accepts"
+        );
+
+        // The name each is offered under is the name that parses, so a user can
+        // copy one out of `--help` and have it work.
+        for name in &advertised {
+            assert!(
+                integrate::Host::parse(name).is_ok(),
+                "`--help` offers {name:?}, which the integrator refuses"
+            );
+        }
+    }
 
     /// `ps` elapsed time, in the three shapes it actually prints.
     ///
