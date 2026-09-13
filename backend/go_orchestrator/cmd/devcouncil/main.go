@@ -84,7 +84,7 @@ Usage:
   devcouncil disable NAME [--prefix DIR]
   devcouncil enable NAME [--prefix DIR]
   devcouncil gate status [--json] [--project-root DIR]
-  devcouncil gate set --mode off|advisory|enforce [--hook off|contain]
+  devcouncil gate set --mode off|advisory|enforce
   devcouncil hook <event>     Retired lifecycle compatibility (silent no-op)
   devcouncil hook status|disable [--project-root DIR] [--client HOST]
   devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR]
@@ -354,7 +354,10 @@ func resolveDevmap() (string, error) {
 
 func runIntegrate(args []string) int {
 	if len(args) < 1 {
-		console.Errorln("integrate requires a host")
+		// Name them here: this is where a caller who does not know the set
+		// arrives, and the list is now the same one `devmap integrate` takes.
+		console.Errorf("integrate requires a host; expected one of: %s\n",
+			strings.Join(integrate.Hosts, ", "))
 		return 2
 	}
 	if args[0] == "uninstall" {
@@ -370,7 +373,15 @@ func runIntegrate(args []string) int {
 		case "--dry-run":
 			opts.Mode = integrate.ModeDryRun
 		case "--write-gate":
-			opts.WriteGate = true
+			// Retired, not merely unsupported. Answered by name rather than
+			// left to "unknown flag" because it appears in existing scripts
+			// and release notes, and the reason it went away is the part a
+			// caller needs: nothing here ever gated a write.
+			console.Errorln("--write-gate was removed: DevCouncil lifecycle hooks are " +
+				"retired, so no host hook can gate a write. Nothing enforced it before " +
+				"this flag was removed either — it was refused. Use the devcouncil_* MCP " +
+				"policy tools and verification explicitly.")
+			return 2
 		case "--project-root":
 			i++
 			if i >= len(args) {
@@ -390,8 +401,13 @@ func runIntegrate(args []string) int {
 	receipt, err := integrate.Run(opts)
 	if err != nil {
 		console.Errorf("integrate: %v\n", err)
-		if writeErr := console.JSON(receipt); writeErr != nil {
-			console.Errorln(writeErr)
+		// A partial failure still carries what was written before it stopped,
+		// and that receipt is the only record of it. A refusal carries no
+		// receipt at all, and emitting `null` there reads as a result.
+		if receipt != nil {
+			if writeErr := console.JSON(receipt); writeErr != nil {
+				console.Errorln(writeErr)
+			}
 		}
 		return 1
 	}

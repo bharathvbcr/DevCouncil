@@ -18,6 +18,14 @@ allows an operator to choose a local build. PATH discovery rejects candidates
 whose canonical location is inside the repository, including aliases and
 relative PATH entries.
 
+That rejection has one owner, `proc.LookPathOutside`, shared by the navigation
+adapter and by `devcouncil integrate`. Integration separates the two questions
+it used to conflate: the name written into a host config is resolved later by
+the host, while the program this process spawns must come from outside the
+repository. When no such program is found, DevMap asset composition is skipped
+with a note instead of falling back to a bare name. Composed invocations run
+under a bounded deadline in their own process group.
+
 Required verification commands use process outcomes. Text such as `no tests
 ran`, `SyntaxError`, or `command not found` cannot change a failed process into
 a skipped check. A required command that was skipped, could not launch, or had
@@ -68,6 +76,20 @@ read policy, preserves native filenames, and refuses links, special files,
 secret paths, or a collection exceeding 4096 files / 8 MiB. A refusal is an
 explicit diff failure, not an empty successful diff.
 
+`devcouncil integrate` reads and writes host configs (`.mcp.json`,
+`.cursor/`, `.codex/`) by repository-relative name inside an `os.Root`, using
+the same no-follow reader and exclusive writer as `integrate uninstall`: a
+symlink at any component is refused rather than followed, and the read is
+bounded at 1 MiB. A link at one of those names is left as found, so an outside
+file's contents can no longer be merged into a repository config.
+`safefile.WriteAtomic` is not a containment boundary: it resolves its parent
+through the operating system and guarantees no-follow for the leaf only, so
+callers whose path
+components come from repository content validate ancestors themselves or hold a
+root. The DevMap CLI bounds every host config it inspects at 1 MiB and requires
+a regular file, and publishes the Codex `config.toml` through the same atomic
+`safe_fs` writer as its JSON siblings.
+
 These checks protect against hostile repository paths and files. They are not
 an operating-system sandbox against a privileged actor or another process
 already running with the same user's authority. Cross-platform runtime
@@ -84,10 +106,24 @@ qualification must be recorded separately from compilation or macOS tests.
 | Resolver ambiguity | Defaults: 4,000,000 candidate visits, 32 MiB retained candidate bytes, 128 MiB conservative repeated JSON evidence bytes |
 | Cache directory marker | Only the required 43-byte signature is read; trailing comments remain valid; unreadable/special markers report unexamined coverage |
 | Nested parsing | Heritage names, unary callee unwrapping and enclosing callable names use iterative walks that honor the extraction deadline |
+| Hook root selection | At most 8 acted-on roots from at most 256 examined payload candidates; reaching either is reported, not trimmed silently |
+| Hook SessionStart | 10 s total across every child, each run through the kernel's bounded process boundary with a 64 KiB output cap; a partial pass names how far it got |
+| `dcjsoncheck` | Manifest stdin capped at 1 MiB; per-invocation stdout/stderr capture capped at 8 MiB, and exceeding it fails that invocation rather than truncating its evidence; each invocation runs under a wall-clock deadline (default 120 s, `--deadline-secs N`) and a command still alive at it is killed and reported as failed |
 
 The session append size check is not a global reservation across concurrent
 writers. The source and resolver limits describe accounted bytes, not a precise
-whole-process RSS ceiling.
+whole-process RSS ceiling. `dcjsoncheck`'s manifest and commands are the
+operator's, not repository content.
+
+One bounded runner serves every process boundary in the Rust workspace, and it
+lives in `dc-proc` so the analysis plane can use it without compiling
+tree-sitter grammars — `devmap_extract::subprocess` is a re-export of that one
+implementation, not a second copy. Its properties are the ones a caller cannot
+reliably assemble by hand: a wall-clock deadline, a kill that reaches the
+child's whole process group, and both pipes drained concurrently on their own
+threads. That last one is load-bearing rather than tidy: a reader that takes
+stdout to EOF before touching stderr deadlocks the moment a child fills the
+stderr pipe, so hand-rolled capture is not a supported substitute.
 
 Route scan results carry attempted/read/skipped/unreadable counts and source
 bytes. `scan.complete` is false after unreadable, oversized, budget-skipped or
@@ -108,14 +144,22 @@ whole result instead of sampling candidates and publishing a partial graph.
 
 Compact graph readers reject repeated structural keys instead of decoding an
 ambiguous layout. Both graph HTML renderers escape the composed tooltip label
-before handing it to the browser's HTML renderer.
+before handing it to the browser's HTML renderer. `escape::html_escape` is the
+single escape sink for generated artifacts; the graph renderer no longer keeps
+a private copy that omitted the apostrophe. The flag-filter control is built
+from DOM nodes rather than composed markup, so its element id and the id read
+back by `getElementById` cannot disagree.
+
+The human-readable CLI reports absent scan coverage as unreported rather than
+as complete, matching how the library reads the same field.
 
 ## Verification
 
 The project gate is `npm run ci:local`; `rust/verify.sh` adds release worker,
 determinism and resource checks beyond its quick mode. Security regressions
 live beside their owners (`*_security` tests, `renewal_identity`,
-`complete_secret_spans`, `ambiguity_budget`, and `nested_source_limits`). Browser
+`complete_secret_spans`, `ambiguity_budget`, and `nested_source_limits`), and
+in Go beside `integrate_write_security_test.go` and `proc/lookpath_test.go`. Browser
 tooltip tests require the explicit browser environment documented in
 `rust/devmap-query/tests/tooltip_security.rs`. Child-process tests marked
 ignored are invoked by bounded parent tests; running the children alone does

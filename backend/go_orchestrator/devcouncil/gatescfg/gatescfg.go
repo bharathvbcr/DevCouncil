@@ -28,8 +28,6 @@ const (
 type Snapshot struct {
 	VerificationMode   string `json:"verification_mode"`
 	VerificationOrigin string `json:"verification_origin"`
-	HookGate           string `json:"hook_gate"`
-	WriteGate          bool   `json:"write_gate"`
 	ConfigPath         string `json:"config_path"`
 	ConfigPresent      bool   `json:"config_present"`
 }
@@ -74,8 +72,6 @@ func Load(root string) Snapshot {
 	snap := Snapshot{
 		VerificationMode:   ModeOff,
 		VerificationOrigin: OriginDefault,
-		HookGate:           ModeOff,
-		WriteGate:          false,
 		ConfigPath:         path,
 	}
 	f, err := os.Open(path)
@@ -96,16 +92,20 @@ func Load(root string) Snapshot {
 		return snap
 	}
 	snap.VerificationMode, snap.VerificationOrigin = Normalize(values["gates.mode"])
-	if hook := strings.TrimSpace(strings.ToLower(values["execution.hook_gate.mode"])); hook != "" {
-		if hook == "contain" {
-			snap.HookGate = "contain"
-		} else {
-			mode, _ := Normalize(hook)
-			snap.HookGate = mode
-		}
-	}
-	wg := strings.TrimSpace(strings.ToLower(values["integrations.cursor.write_gate"]))
-	snap.WriteGate = wg == "true" || wg == "1" || wg == "yes"
+	// Neither `execution.hook_gate.mode` nor `integrations.<host>.write_gate`
+	// is read. Both named pre-tool-use containment that only DevCouncil's
+	// retired lifecycle hooks ever installed, and `contain` was a mode that
+	// contained nothing — a status line reading `hook_gate: contain` or
+	// `write_gate: true` reported enforcement that did not exist, which is
+	// worse than reporting none. Copies left in an existing config.yaml are
+	// inert and need no migration.
+	//
+	// Detail on the removed keys. It named a
+	// pre-tool-use write gate that DevCouncil's retired lifecycle hooks used to
+	// install; nothing enforces it now. Publishing it in this snapshot let
+	// `gate status` print a knob that did nothing, which is the shape of a
+	// setting that reads as enforcement without being any. A key left in an
+	// existing config.yaml is inert and needs no migration.
 	return snap
 }
 
@@ -128,30 +128,6 @@ func SetVerificationMode(path, mode string) error {
 		return writeAtomicFile(path, []byte(body), 0o644)
 	}
 	updated, err := patchYAMLKey(string(data), "gates", "mode", canonical)
-	if err != nil {
-		return err
-	}
-	return writeAtomicFile(path, []byte(updated), 0o644)
-}
-
-// SetHookGate writes execution.hook_gate.mode (off or contain).
-func SetHookGate(path, mode string) error {
-	s := strings.TrimSpace(strings.ToLower(mode))
-	if s != ModeOff && s != "contain" {
-		return fmt.Errorf("unknown hook-gate mode %q (want off or contain)", mode)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return err
-		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return err
-		}
-		body := "gates:\n  mode: off\nexecution:\n  hook_gate:\n    mode: " + s + "\n"
-		return writeAtomicFile(path, []byte(body), 0o644)
-	}
-	updated, err := patchNestedYAML(string(data), []string{"execution", "hook_gate"}, "mode", s)
 	if err != nil {
 		return err
 	}

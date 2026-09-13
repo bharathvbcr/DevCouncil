@@ -84,15 +84,15 @@ Runs the Model Context Protocol (MCP) stdio server. Eight tools: checkout / rene
 ### Agent Host Integrations
 
 ```bash
-devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR] [--write-gate]
+devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR]
 ```
 
-`Hosts` lists `cursor`, `claude`, `codex`, `gemini`, `opencode`, `warp`, `aider`, `antigravity`. Only **cursor / claude / codex** have adapters (TASK-P7-8). The rest write a stub receipt; `devmap integrate` then refuses those names.
+`Hosts` lists `cursor`, `claude`, `codex`, `opencode`, `warp`, `antigravity` — the same six `devmap integrate` accepts, and all six now have adapters. Cursor, Claude and Codex write their own documents; Antigravity, OpenCode and Warp register the `devcouncil` server in `.agents/mcp_config.json`, `opencode.json` and `.devcouncil/integrations/warp-mcp.json`. `devmap integrate` registers the `devmap` entry in those same files, and both preserve every other server and key. `gemini` and `aider` are refused with a pointer to their replacement: Gemini CLI was replaced upstream by Antigravity, and Aider exposes no MCP server to register. Any other name is refused rather than stubbed.
 
 - `--apply`: Write configuration files (or a stub receipt) to the target repository.
 - `--check`: Read-only verification that integration files match expected content.
 - `--dry-run`: Print planned actions without modifying files.
-- `--write-gate`: Refused before writes. Retired host hooks cannot provide containment; use MCP policy and verification explicitly.
+- `--write-gate`: **Removed.** It named a pre-tool-use gate that only DevCouncil's retired lifecycle hooks installed; nothing enforced it. Passing it exits 2 with that explanation rather than "unknown flag". `execution.hook_gate.mode` and its `contain` mode are gone for the same reason, along with `gate set --hook`. A copy left in an existing `config.yaml` is inert. Use `gates.mode` for verification and the `devcouncil_*` MCP policy tools for write scope.
 - `--project-root DIR`: Specify target project directory (defaults to `$DEVCOUNCIL_PROJECT_ROOT` or `pwd`).
 
 ```bash

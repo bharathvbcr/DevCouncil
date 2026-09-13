@@ -1237,7 +1237,7 @@ pub fn event_coverage() -> Vec<(&'static str, Option<&'static DevmapHook>, &'sta
 /// a plausible-looking path naming a file that does not exist. A hook whose
 /// `command` was mangled that way fails on every fire, into a debug log, while
 /// the writer that produced it reported success.
-fn utf8_path(label: &str, path: &Path) -> anyhow::Result<String> {
+pub(crate) fn utf8_path(label: &str, path: &Path) -> anyhow::Result<String> {
     path.to_str().map(str::to_string).ok_or_else(|| {
         anyhow::anyhow!(
             "{label} is not valid UTF-8 ({}), and JSON cannot carry it without corrupting \
