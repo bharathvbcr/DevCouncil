@@ -18,27 +18,44 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
-// AllowedNextToolsForVerify mirrors Python integrations/mcp/util.allowed_next_tools
-// for a planned/in-progress task. Duplicated here to avoid an import cycle with
-// package devcouncil (which calls into verify).
+// AllowedNextToolsForVerify names the tools an agent may call after a verify.
+//
+// These are the eight this host actually serves — the set devcouncil.Registry
+// advertises through Specs() and tools/list. The list is spelled here rather
+// than read from the registry because package devcouncil imports verify, so
+// reading it back would be an import cycle. devcouncil's
+// allowed_next_tools_test.go holds the two lists to each other in both
+// directions, which is the seam a second copy needs to be safe.
+//
+// It previously carried the Python surface's names — devcouncil_read_file,
+// devcouncil_write_file, devcouncil_apply_patch, devcouncil_run_command,
+// devcouncil_get_evidence, devcouncil_update_task_scope — of which six of eight
+// are served by nothing here (GAP-P7-NEXT-TOOLS-DRIFT). An agent that followed
+// them called into a tool the host does not have and got an error in place of
+// the repair step the verifier had just told it to take.
 func AllowedNextToolsForVerify() []string {
 	return []string{
-		"devcouncil_read_file",
-		"devcouncil_get_evidence",
 		"devcouncil_get_diff",
-		"devcouncil_run_command",
-		"devcouncil_apply_patch",
-		"devcouncil_write_file",
-		"devcouncil_update_task_scope",
+		"devcouncil_checkout_task",
+		"devcouncil_renew_lease",
+		"devcouncil_release_task",
+		"devcouncil_next_task",
 		"devcouncil_verify_task",
+		"devcouncil_get_gaps",
+		"devcouncil_policy_check_write",
 	}
 }
 
 // Run executes the Phase-5 verification gates for one task and returns gaps.
 //
 // Coverage that cannot run is recorded as CoverageSkippedReason — never as a
-// measured pass. Commands that cannot run become skipped/invalid gaps.
-func Run(in Input) (gaps []Gap, meta runMeta) {
+// measured pass. Commands that cannot run become skipped/invalid gaps. The
+// same rule governs the rigor gates: RigorApplied names what ran, and
+// RigorSkippedReason says why when nothing did.
+//
+// ctx bounds the subprocess work — the rigor gates are a dcverify child — so a
+// cancelled verify does not leave one running.
+func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 	meta.Sandbox = in.Sandbox
 	if meta.Sandbox == "" {
 		meta.Sandbox = "local"
@@ -55,7 +72,6 @@ func Run(in Input) (gaps []Gap, meta runMeta) {
 		meta.Difficulty = "easy"
 	}
 	meta.DiffEmpty = in.DiffEmpty
-	meta.RigorApplied = []string{}
 
 	taskID := ""
 	var planned []dc.PlannedFile
@@ -81,15 +97,16 @@ func Run(in Input) (gaps []Gap, meta runMeta) {
 	}
 	gaps = append(gaps, RunVerificationCommands(taskID, commands, in.RunCommand)...)
 
-	// Diff∩coverage: when there is no diff, skip with an explicit reason.
-	// Never report coverage_measured=true / pass for "could not measure".
-	if in.DiffEmpty || strings.TrimSpace(in.DiffContent) == "" {
-		meta.CoverageMeasured = false
-		meta.CoverageSkippedReason = "no diff to measure"
-	} else {
-		meta.CoverageMeasured = false
-		meta.CoverageSkippedReason = "coverage profile not supplied"
-	}
+	// Stub detection, secret scanning and diff∩coverage, all of which live in
+	// dcverify. The outcome carries its own account of what ran: never
+	// coverage_measured=true for "could not measure", and never an empty
+	// RigorApplied that a reader could take for "no findings".
+	rigor := runRigorGates(ctx, in, taskID, plannedExpectingChange(planned))
+	gaps = append(gaps, rigor.gaps...)
+	meta.RigorApplied = rigor.applied
+	meta.RigorSkippedReason = rigor.skippedReason
+	meta.CoverageMeasured = rigor.coverageMeasured
+	meta.CoverageSkippedReason = rigor.coverageSkippedReason
 
 	meta.CompilerActive = false
 	meta.VerificationMode = "coarse"
@@ -106,7 +123,12 @@ type runMeta struct {
 	CoverageSkippedReason string
 	CompilerActive        bool
 	VerificationMode      string
-	RigorApplied          []string
+	// RigorApplied names the rigor gates that ran; RigorSkippedReason says why
+	// when none did. Exactly one is populated — see verify/rigor.go, where an
+	// empty RigorApplied with no reason beside it is the ambiguity this pair
+	// was introduced to remove.
+	RigorApplied       []string
+	RigorSkippedReason string
 }
 
 // StatusFromGaps maps gaps to blocked/verified under gate_mode.
@@ -175,6 +197,7 @@ func ToMCP(taskID string, gaps []Gap, meta runMeta) MCPResult {
 		VerificationSkipped:   skipped,
 		Sandbox:               meta.Sandbox,
 		RigorApplied:          rigor,
+		RigorSkippedReason:    meta.RigorSkippedReason,
 		BlockingGaps:          blockingGaps,
 		NextActions:           blocking,
 		AdvisoryActions:       advisory,
@@ -212,6 +235,7 @@ func ToCLITask(taskID string, gaps []Gap, meta runMeta) TaskCLIResult {
 		VerificationMode:      meta.VerificationMode,
 		VerificationSkipped:   skipped,
 		RigorApplied:          rigor,
+		RigorSkippedReason:    meta.RigorSkippedReason,
 		GapCount:              len(gaps),
 		BlockingGapCount:      blockingCount,
 		Gaps:                  gaps,
@@ -343,7 +367,14 @@ func shortHash(s string) string {
 }
 
 // VerifyTask is the high-level entry used by MCP and CLI.
-func VerifyTask(ctx context.Context, root string, client *store.Client, taskID, gateMode, sandbox string) (MCPResult, []Gap, error) {
+//
+// coveragePath is an optional coverage profile for the same change; empty means
+// the diff∩coverage gate does not run, which is reported as
+// CoverageSkippedReason rather than as a measured pass. MCP passes empty — its
+// tool schema has no field for a path, and inventing one would be a protocol
+// change — so today that gate is reachable from `devcouncil verify --coverage`
+// and from a library caller that runs its own tests under coverage.
+func VerifyTask(ctx context.Context, root string, client *store.Client, taskID, gateMode, sandbox, coveragePath string) (MCPResult, []Gap, error) {
 	if client == nil {
 		return MCPResult{}, nil, fmt.Errorf("store unavailable")
 	}
@@ -371,8 +402,10 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID, 
 		DiffEmpty:    empty,
 		WorkPresent:  !empty,
 		RunCommand:   DefaultRunCommand(root),
+		Rigor:        RigorClient(root),
+		CoveragePath: coveragePath,
 	}
-	gaps, meta := Run(in)
+	gaps, meta := Run(ctx, in)
 	result := ToMCP(taskID, gaps, meta)
 	_ = Persist(ctx, client, taskID, gaps, meta, result.Status)
 	writeBlockedCorrection(root, taskID, &result, gaps)

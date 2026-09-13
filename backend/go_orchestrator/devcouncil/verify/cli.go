@@ -7,8 +7,13 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 )
 
-// RunCLI implements `devcouncil verify [TASK_ID] [--json] [--sandbox local]`.
-func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gateMode, sandbox string, jsonOut bool) int {
+// RunCLI implements
+// `devcouncil verify [TASK_ID] [--json] [--sandbox local] [--coverage PATH]`.
+//
+// coveragePath is empty unless the operator names a profile. The rigor gates
+// that read added lines run regardless; only the diff∩coverage gate needs one,
+// and without it the report says so rather than reporting a diff as exercised.
+func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gateMode, sandbox, coveragePath string, jsonOut bool) int {
 	if client == nil {
 		payload := map[string]any{"ok": false, "error": "DevCouncil state is unavailable in this directory."}
 		writeJSON(payload)
@@ -50,7 +55,7 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gate
 		Tasks:                        []TaskCLIResult{},
 	}
 	for _, id := range taskIDs {
-		mcp, gaps, err := VerifyTask(ctx, root, client, id, gateMode, sandbox)
+		mcp, gaps, err := VerifyTask(ctx, root, client, id, gateMode, sandbox, coveragePath)
 		if err != nil {
 			cli.OK = false
 			cli.Error = err.Error()
@@ -67,6 +72,12 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gate
 			CompilerActive:        mcp.CompilerActive,
 			VerificationMode:      mcp.VerificationMode,
 			RigorApplied:          mcp.RigorApplied,
+			// Carried across with RigorApplied, never separately. A CLI entry
+			// rebuilt with the gate list but not the reason reports an empty
+			// rigor_applied with nothing to explain it — which is the reading
+			// the pair exists to make impossible, reintroduced one surface
+			// down from where it was fixed.
+			RigorSkippedReason: mcp.RigorSkippedReason,
 		}
 		entry := ToCLITask(id, gaps, meta)
 		cli.Tasks = append(cli.Tasks, entry)

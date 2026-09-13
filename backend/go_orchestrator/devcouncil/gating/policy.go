@@ -14,6 +14,12 @@ var HardSafetyGapTypes = map[string]struct{}{
 	"stub_detected":                {},
 	"invalid_verification_command": {},
 	"skipped_verification_command": {}, // required evidence was not produced
+	// The credential scanner and stub detector were configured and could not
+	// run. Demoting this to advisory would let an unscanned diff pass under the
+	// same gate mode that demotes a failing test — and the two are not alike: a
+	// failing test is evidence, while this is the absence of evidence about
+	// whether a credential is in the change.
+	"rigor_check_unavailable": {},
 }
 
 // IsHardSafetyGap reports whether a gap type is in the hard-safety set.

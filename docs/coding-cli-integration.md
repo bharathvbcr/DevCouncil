@@ -68,9 +68,9 @@ The primary orchestration server. Configured automatically by `devcouncil integr
 - **Task leases:** `devcouncil_checkout_task`, `devcouncil_renew_lease`, `devcouncil_release_task`, `devcouncil_next_task`
 - **Diff & gaps:** `devcouncil_get_diff`, `devcouncil_get_gaps`
 - **Write policy:** `devcouncil_policy_check_write` — planned-file scope before writing
-- **Verification:** `devcouncil_verify_task` — Go `verify.Run()` (planned-file, orphan-diff, dependency-risk, expected-test commands). It does **not** spawn `dcverify`. Stub / secret / coverage rigor is in that binary; **Manvi** `runRigor` is the path that execs it today.
+- **Verification:** `devcouncil_verify_task` — Go `verify.Run()` (planned-file, orphan-diff, dependency-risk, expected-test commands) plus `dcverify` for stub and secret rigor. Diff↔coverage needs a profile this tool has no field for; `devcouncil verify --coverage PATH` supplies one. A missing `dcverify` is reported in `rigor_skipped_reason`, and one that fails blocks on `rigor_check_unavailable`.
 
-Filesystem, patch, and shell tools (`devcouncil_read_file`, `apply_patch`, `write_file`, `run_command`, …) are **not** on this server. They live on Manvi. `AllowedNextToolsForVerify` still names several of those Python-era tools; that list is stale (TASK-P7-1).
+Filesystem, patch, and shell tools (`devcouncil_read_file`, `apply_patch`, `write_file`, `run_command`, …) are **not** on this server. They live on Manvi. `allowed_next_tools` names only the eight tools this server serves, so a repair contract never points an agent at a tool it cannot call.
 
 ### 2. DevMap Code Intelligence MCP Server (`devmap mcp`)
 

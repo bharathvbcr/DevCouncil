@@ -92,7 +92,7 @@ The agent executes the certified **Hero Loop**:
    - **Scope enforcement:** Unauthorized file edits outside planned boundaries.
    - **Orphan diffs / dependency-risk:** Files changed that were not planned.
    - **Expected tests:** Task command list via `/bin/sh -c` in the project root.
-   Stub, secret, and coverage rigor live in `dcverify`; Manvi `runRigor` spawns it, this MCP tool currently does not (TASK-P7-1).
+   - **Rigor gates:** Stub detection, secret scanning, and diff↔coverage, which live in `dcverify`. This MCP tool spawns it. When it is not installed, `rigor_applied` is empty and `rigor_skipped_reason` names what is missing; when it is installed and fails, verification blocks on `rigor_check_unavailable`. Diff↔coverage needs a profile, which the MCP tool does not supply — use `devcouncil verify --coverage PATH` for that gate.
 4. **Self-Repair:** If verification fails, DevCouncil emits structured, typed `next_actions`. The agent iterates on repairs until the gates pass.
 5. **Release:** Once verified, calls `devcouncil_release_task` to complete the task and record evidence.
 
