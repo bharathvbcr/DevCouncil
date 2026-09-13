@@ -69,6 +69,17 @@ func TestRetiredHostsAreNotOffered(t *testing.T) {
 			t.Fatalf("%s was dropped without an explanation for callers", host)
 		}
 	}
+	// The pair above is the drift that happened; this is the shape of it. Any
+	// name in both tables is accepted by `checkHost`, because it tests `Hosts`
+	// before it reaches `retiredHosts` — so the successor its retirement points
+	// at can never be printed, and the host is quietly configured instead. The
+	// two named above cannot catch a third name reappearing, so the rule is
+	// stated over the table rather than over the two instances of it.
+	for host := range retiredHosts {
+		if slices.Contains(Hosts, host) {
+			t.Fatalf("%s is both advertised and retired; its explanation is unreachable", host)
+		}
+	}
 }
 
 // Dropping a host from installation says nothing about removal. A
