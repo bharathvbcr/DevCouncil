@@ -15,6 +15,7 @@ import {
   npmPublishSkipsExistingVersion,
   packageIsDistable,
   parseCargoLockVersion,
+  parseDistWorkspaceTargets,
   parseGoVersion,
   parseTag,
   parseTomlSectionVersion,
@@ -85,6 +86,22 @@ function scratchTree(prefix, versions = {}) {
     writeFileSync(path.join(dir, "docs", "releases", `v${v.pkg}.md`), `# DevCouncil v${v.pkg}\n\nNative host.\n`);
   }
   writeFileSync(
+    path.join(dir, "dist-workspace.toml"),
+    [
+      "[workspace]",
+      'members = ["cargo:./rust"]',
+      "",
+      "[dist]",
+      "targets = [",
+      '    "x86_64-unknown-linux-gnu",',
+      '    "aarch64-apple-darwin",',
+      '    "x86_64-apple-darwin",',
+      '    "x86_64-pc-windows-msvc",',
+      "]",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(
     path.join(dir, ".github", "workflows", "npm-publish.yml"),
     [
       "name: npm",
@@ -142,6 +159,14 @@ describe("parsers", () => {
     assert.equal(packageIsDistable("[package]\nname = \"x\"\n"), true);
     assert.equal(packageIsDistable("[package.metadata.dist]\ndist = false\n"), false);
     assert.equal(packageIsDistable("[package.metadata.dist]\ndist = true\n"), true);
+  });
+
+  it("parses targets from dist-workspace.toml", () => {
+    const source = `[workspace]\nmembers = ["cargo:./rust"]\n\n[dist]\ntargets = [\n    "x86_64-unknown-linux-gnu",\n    "aarch64-apple-darwin",\n]\n`;
+    assert.deepEqual(parseDistWorkspaceTargets(source), [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-apple-darwin",
+    ]);
   });
 });
 
@@ -203,6 +228,18 @@ describe("inspectRelease", () => {
     assert.ok(extras.some((pkg) => pkg.name === "devmap-store"));
     const result = inspectRelease(defaultSources(root));
     assert.ok(result.errors.some((e) => e.includes("devmap-store")));
+  });
+
+  it("fails when dist-workspace.toml misses a required target", () => {
+    const root = scratchTree("dist-target-missing");
+    writeFileSync(
+      path.join(root, "dist-workspace.toml"),
+      '[workspace]\nmembers = ["cargo:./rust"]\n\n[dist]\ntargets = ["x86_64-unknown-linux-gnu"]\n',
+    );
+    const result = inspectRelease(defaultSources(root));
+    assert.ok(
+      result.errors.some((e) => e.includes("REQUIRED_ARCHIVES entry") && e.includes("not declared")),
+    );
   });
 });
 

@@ -79,17 +79,17 @@ jobs:
       # job does not compile tgrep-core; they are gated by analysis-plane.yml.
       - name: Clippy
         if: ${{ !cancelled() }}
-        run: cargo clippy --workspace --exclude dc-glob --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --all-targets --keep-going -- -D warnings
+        run: cargo clippy --workspace --exclude dc-glob --exclude dc-proc --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --all-targets --keep-going -- -D warnings
 
       # 22 tree-sitter grammars compile C. A build failure here is a real
       # portability failure, not a test failure, so it is a separate step.
       - name: Build
         if: ${{ !cancelled() }}
-        run: cargo build --workspace --exclude dc-glob --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --all-targets --keep-going
+        run: cargo build --workspace --exclude dc-glob --exclude dc-proc --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --all-targets --keep-going
 
       - name: Test
         if: ${{ !cancelled() }}
-        run: cargo test --workspace --exclude dc-glob --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --no-fail-fast
+        run: cargo test --workspace --exclude dc-glob --exclude dc-proc --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --no-fail-fast
 
       # cargo test --release still forces unwinding. This executable must use
       # the shipped profile or an aborting worker can pass every Rust test.

@@ -101,6 +101,15 @@ export function parseNpmVersion(source) {
   return payload.version;
 }
 
+/** @param {string} source */
+export function parseDistWorkspaceTargets(source) {
+  const match = /targets\s*=\s*\[([\s\S]*?)\]/.exec(source);
+  if (!match) return [];
+  const inside = match[1];
+  const stringMatches = inside.matchAll(/"([^"]+)"/g);
+  return Array.from(stringMatches, (m) => m[1]);
+}
+
 /**
  * cargo-dist treats a binary package as dist-able unless it sets
  * `[package.metadata.dist] dist = false`. Default is true.
@@ -226,6 +235,7 @@ export function defaultSources(root) {
     cargoLockPath: path.join(root, "rust", "Cargo.lock"),
     goVersionPath: path.join(root, "backend", "go_orchestrator", "cmd", "devcouncil", "version.go"),
     rustRoot: path.join(root, "rust"),
+    distWorkspacePath: path.join(root, "dist-workspace.toml"),
     npmPublishPath: path.join(root, ".github", "workflows", "npm-publish.yml"),
     releaseWorkflowPath: path.join(root, ".github", "workflows", "release.yml"),
     notesDir: path.join(root, "docs", "releases"),
@@ -318,6 +328,36 @@ export function inspectRelease(sources, opts = {}) {
       errors.push(`binary package ${DIST_PACKAGE} was not found under rust/`);
     } else if (!distPkg.distable) {
       errors.push(`${DIST_PACKAGE} has dist = false; GitHub Releases would have no archives`);
+    }
+  }
+
+  if (sources.distWorkspacePath && existsSync(sources.distWorkspacePath)) {
+    const distToml = readFileSync(sources.distWorkspacePath, "utf8");
+    const targets = parseDistWorkspaceTargets(distToml);
+    if (targets.length === 0) {
+      errors.push("dist-workspace.toml declares no targets");
+    } else {
+      for (const target of targets) {
+        const expectedArchive = target.includes("windows")
+          ? `${DIST_PACKAGE}-${target}.zip`
+          : `${DIST_PACKAGE}-${target}.tar.xz`;
+        if (!REQUIRED_ARCHIVES.includes(expectedArchive)) {
+          errors.push(
+            `dist-workspace.toml target ${target} (${expectedArchive}) is missing from REQUIRED_ARCHIVES`,
+          );
+        }
+      }
+      for (const req of REQUIRED_ARCHIVES) {
+        const hasTarget = targets.some((t) => {
+          const expected = t.includes("windows")
+            ? `${DIST_PACKAGE}-${t}.zip`
+            : `${DIST_PACKAGE}-${t}.tar.xz`;
+          return expected === req;
+        });
+        if (!hasTarget) {
+          errors.push(`REQUIRED_ARCHIVES entry ${req} is not declared in dist-workspace.toml`);
+        }
+      }
     }
   }
 
