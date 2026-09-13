@@ -69,7 +69,7 @@ exclude `rust/target/`, which holds generated sources from build scripts.
 | `rust/dc-verify` | 1,793 / 2,554 | Unified-diff parsing, scope classification, rigor gates, diff↔coverage |
 | **Rust total** | **6,437 / 8,144** | |
 | `backend/go_orchestrator/dc/{store,dcgrep,devmap}` | — / 8,376 | Go IPC clients across the process boundary |
-| `backend/go_orchestrator/internal/{proc,testsupport}` | — / 806 | Process-group control; build/locate real binaries for tests |
+| `backend/go_orchestrator/{proc,testsupport}` | — / 806 | Process-group control; build/locate real binaries for tests |
 | `backend/go_orchestrator/repomap` | 584 / 946 | Code-graph artifact loader (client-side schema check) |
 | **Go total** | **3,930 / 10,128** | |
 
@@ -118,8 +118,8 @@ on the same file.
 
 **Go — verified.** `go test ./...` in `backend/go_orchestrator`: **862 test and
 subtest executions, 862 passed, 0 skipped, 0 failed.** These are not mock-only:
-`internal/testsupport` builds the real `dcstore` / `dcverify` / `dcgrep` binaries
-out of `rust/` and the tests exec them.
+`testsupport` builds the real `dcstore` / `dcverify` / `dcgrep` binaries out of
+`rust/` and the tests exec them.
 
 **The live devmap contract — verified.** `dc/devmap`'s three `TestTheLive*` tests
 build a fixture repository and drive the **real** `devmap` binary
@@ -162,12 +162,14 @@ Four, all forced by the move. Everything else is byte-identical to MANVI.
    machine. `DC_STORE_REQUIRE_INTEROP=1` turns the skip into a failure so CI can
    demand the evidence; unset, the behaviour is unchanged.
 4. **`testsupport` workspace location.** MANVI's Rust workspace is `crates/`;
-   DevCouncil's is `rust/`. The literal was spelled in five places, so it is now
-   one exported helper, `testsupport.RustWorkspace(t)` — a func, not a constant,
-   because it stats the candidate before returning it. The marker names
-   themselves are the package-level `workspaceDirs`, read by nothing but
-   `findWorkspace`; a test asserting where the workspace lives restates them
-   independently rather than importing the list it is checking.
+   DevCouncil's is `rust/`. The literal was spelled in five places; the package now
+   discovers which of the two holds `Cargo.toml` instead of hard-coding either.
+   The entry point is `testsupport.RustWorkspace(t)` — a func, not a constant,
+   because it stats the candidate before returning it. The marker names are the
+   package-level `workspaceDirs`, read by nothing but `findWorkspace`, which
+   returns the repository root and the workspace from one walk; a test asserting
+   where the workspace lives restates the markers independently rather than
+   importing the list it is checking.
 
 **Not changed, and deliberately flagged:** `testsupport.AllowSkipEnv` is still
 `MANVI_TEST_ALLOW_SKIP` and the build lock is still `.manvi-testbin.lock`.
