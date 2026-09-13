@@ -110,10 +110,24 @@ fn the_directory_cap_stops_the_walk_and_reports_both_numbers() {
 
     let scanned = inventory::scan(&root);
     assert!(scanned.computed);
-    assert_eq!(
+    // `<=`, not `==`. The walk ends on the directory cap *or* `WALK_DEADLINE`,
+    // whichever comes first, and opening 20,000 directories does not fit in 5
+    // seconds on a loaded machine: measured 2026-09-13 at load ~360 this
+    // stopped at 15,126-18,823 and was red 3/3 — and equally red 3/3 at
+    // pristine HEAD, so it was reporting the machine, not the code.
+    //
+    // What must hold either way is that the walk stopped short and said so.
+    // That the cap *specifically* stops at exactly the number it promises is
+    // already pinned deterministically by
+    // `inventory::tests::fallback_entry_frontier_and_deadline_limits_are_honest`,
+    // which drives the same walk over 128 directories with a cap of 9 and the
+    // deadline far out of the way, and asserts the count exactly. Nothing is
+    // lost here; the exact check simply lives where it cannot race a clock.
+    assert!(
+        scanned.directories_visited <= inventory::WALK_DIR_CAP,
+        "the walk opened {} directories, more than the {} it promises to",
         scanned.directories_visited,
-        inventory::WALK_DIR_CAP,
-        "the walk opened more directories than it promises to"
+        inventory::WALK_DIR_CAP
     );
     assert!(
         scanned.walk_truncated,

@@ -311,13 +311,49 @@ fn live_rows_adapt_after_a_real_terminal_resize() {
             .map(|c| if c.is_ascii() { 1 } else { 2 })
             .sum::<usize>()
     };
+    // Layout breakpoints, not cell counts.
+    //
+    // The expanded check used to ask for "some row wider than 80 cells". Rows
+    // are content-sized — `fit` truncates and nothing pads — so at 120 columns
+    // a row is only as wide as whichever phase label happened to be current
+    // when the resize landed. Measured 2026-09-13 the expanded frame rendered
+    // perfectly at ~60 cells (`devmap  ◎─·─·─·─·  1/5 Reading the terrain /
+    // writer:wait`) and the assertion failed anyway. It was measuring the
+    // label, not the layout.
+    //
+    // What width actually changes is the *shape*, at two breakpoints
+    // `progress.rs` states outright:
+    //
+    //   >= 72   `{spinner} devmap  {trail}  {stage}`  — brand, then TWO spaces
+    //   48..72  `{spinner} devmap {stage}`            — brand, then ONE space
+    //   < 48    `{spinner} {stage}`                   — no brand at all
+    //   >= 110  label becomes `{title} / {detail}`
+    //
+    // So "devmap" plus two spaces is an exact, content-independent marker for
+    // the >= 72 layout, and it does not depend on the ascii/unicode trail
+    // glyphs either. The narrow frame is the absence of the brand.
     assert!(
-        rows.iter().any(|row| cells(row) <= 23),
-        "no narrow frame: {terminal}"
+        rows.iter().any(|row| !row.contains("devmap")),
+        "no narrow frame: the brand appears below 48 columns: {terminal}"
     );
     assert!(
-        rows.iter().any(|row| cells(row) > 80),
-        "no expanded frame: {terminal}"
+        rows.iter().any(|row| cells(row) <= 23),
+        "no narrow frame: nothing was truncated to the 24-column terminal: {terminal}"
+    );
+    let branded: Vec<_> = rows.iter().filter(|row| row.contains("devmap  ")).collect();
+    // Necessary but not sufficient on its own: the very first frame is drawn
+    // at the PTY's inherited width, which is already past 72, so this holds
+    // even when the resize never lands. Verified by pinning both resizes to 24
+    // — this stayed green and the `/` check below is what went red. Kept
+    // because it names the >= 72 breakpoint specifically.
+    assert!(
+        !branded.is_empty(),
+        "no expanded frame: the brand and phase trail never appeared: {terminal}"
+    );
+    assert!(
+        branded.iter().any(|row| row.contains(" / ")),
+        "no expanded frame: the wide `title / detail` label never appeared at \
+         120 columns: {terminal}"
     );
     assert!(
         !terminal.contains("\x1b[?25l"),

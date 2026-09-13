@@ -108,9 +108,23 @@ fn churn_past_the_cap_costs_its_bytes_not_the_deadline() {
             > 0,
         "the bytes before the cap still count"
     );
+    // Against the deadline this test is named for, not an unrelated constant.
+    //
+    // It read `< 3s` against a `CHURN_DEADLINE` of 10s, so on a loaded machine
+    // it failed at 6.5s while the property it names — "costs its bytes, not the
+    // deadline" — was perfectly intact. A test that is red on a healthy tree
+    // catches nothing; it only teaches the reader to skip it.
+    //
+    // The weight here is carried by the two assertions above, not by the clock:
+    // `computed` is false whenever `run_bounded` kills the child on the
+    // deadline, and `truncated` is true only when the *cap* ended the read. The
+    // timing check remains as a backstop, so raising `CHURN_DEADLINE` without
+    // revisiting this cannot pass unnoticed.
     assert!(
-        elapsed < Duration::from_secs(3),
-        "a flood past the cap must not cost the deadline: {elapsed:?}"
+        elapsed < inventory::CHURN_DEADLINE,
+        "a flood past the cap must not cost the deadline \
+         ({:?}): {elapsed:?}",
+        inventory::CHURN_DEADLINE
     );
     let _ = std::fs::remove_dir_all(dir);
 }
