@@ -303,21 +303,70 @@ fn live_rows_adapt_after_a_real_terminal_resize() {
         .split("\x1b[2K")
         .filter_map(|row| {
             let row = row.split(['\r', '\n', '\x1b']).next().unwrap_or("");
-            row.contains("1/5").then_some(row)
+            // The completed-stage trail lines carry "1/5" too, but bracketed.
+            // Only the redrawn live frames are laid out against the window.
+            (row.contains("1/5 ") && !row.contains("[1/5]")).then_some(row)
         })
         .collect();
-    let cells = |row: &&str| {
+    let cells = |row: &str| {
         row.chars()
             .map(|c| if c.is_ascii() { 1 } else { 2 })
             .sum::<usize>()
     };
+    // The live row is sized to its content: `fit` truncates and nothing pads,
+    // so a resize shows up as a change of layout, never as a row that fills
+    // the window. What adapts is the renderer's width breakpoints — the brand
+    // and the phase trail return at >= 72 columns, and the label becomes
+    // "title / detail" at >= 110. Asserting an absolute cell count instead
+    // measures whichever phase label happened to be current when a frame
+    // landed, which is a race rather than a promise.
+    //
+    // Below 48 columns the prefix is only the spinner and the stage. Matching
+    // that shape beats testing for a missing brand: the fixture's own scan path
+    // contains "devmap", so absence would misclassify a row the moment one got
+    // wide enough to show it.
+    fn after_spinner(row: &str) -> &str {
+        row.char_indices().nth(2).map_or("", |(at, _)| &row[at..])
+    }
+    let narrow: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|row| after_spinner(row).starts_with("1/5 "))
+        .collect();
+    let wide: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|row| row.contains("1/5 Reading the terrain / "))
+        .collect();
     assert!(
-        rows.iter().any(|row| cells(row) <= 23),
-        "no narrow frame: {terminal}"
+        !narrow.is_empty() && narrow.iter().all(|&row| cells(row) <= 23),
+        "24 columns did not shrink the row to the bare prefix: {terminal}"
+    );
+    // Only a window of at least 110 columns composes "title / detail", so this
+    // row cannot have been drawn against the 80-column window the pty opened
+    // with, nor against the 24-column one.
+    assert!(
+        !wide.is_empty(),
+        "120 columns did not restore the wide layout: {terminal}"
     );
     assert!(
-        rows.iter().any(|row| cells(row) > 80),
-        "no expanded frame: {terminal}"
+        wide.iter()
+            .all(|&row| row.contains("─·─·─·─·") && cells(row) <= 119),
+        "120 columns lost the phase trail or overflowed the window: {terminal}"
+    );
+    // The extra width also carries a label the narrow window had to cut: a row
+    // of at most 23 cells cannot hold this 33-cell one. Frames drawn once the
+    // writer lock drops name an absolute scan path and still truncate — which
+    // is the renderer fitting its window, not a defect — so this is `any`.
+    assert!(
+        wide.iter()
+            .any(|&row| row.contains("Reading the terrain / writer:wait") && !row.contains('~')),
+        "120 columns did not show the lock-wait label whole: {terminal}"
+    );
+    let widest_narrow = narrow.iter().map(|&row| cells(row)).max().unwrap_or(0);
+    assert!(
+        wide.iter().all(|&row| cells(row) > widest_narrow),
+        "the expanded rows are no wider than the narrow ones: {terminal}"
     );
     assert!(
         !terminal.contains("\x1b[?25l"),
