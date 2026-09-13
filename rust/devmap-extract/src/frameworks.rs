@@ -297,27 +297,37 @@ fn python_route_methods(verb: &str, arguments: Option<&str>) -> Vec<String> {
     declared
 }
 
-/// Name of the function a Python route decorator is attached to.
+/// Name of the definition a Python route decorator is attached to.
 ///
 /// `@app.get("/items")` carries no handler name of its own — the handler is the
-/// `def` the decorator is applied to, which may sit several stacked decorators
-/// later. Scanning forward for it is what makes a FastAPI or Flask route
-/// resolvable at all; without it the route names nothing and its handler has no
-/// incoming edge, so an endpoint reachable only over HTTP reads as dead.
+/// definition the decorator is applied to, which may sit several stacked
+/// decorators later. Scanning forward for it is what makes a FastAPI or Flask
+/// route resolvable at all; without it the route names nothing and its handler
+/// has no incoming edge, so an endpoint reachable only over HTTP reads as dead.
 ///
-/// Returns `None` when the decorator is not attached to a function, rather than
-/// guessing: a route bound to the wrong symbol is worse than one bound to none.
+/// The three prefixes below are the whole of what a decorator may target:
+/// Python's grammar is `decorated: decorators (classdef | funcdef |
+/// async_funcdef)`. `class` belongs here because a class-based view — Flask's
+/// `MethodView`, or any callable class — is as much a handler as a `def`, and
+/// reading only the two function forms made the third resolve to `""`, which
+/// `resolver.rs` cannot tell from an Express arrow function that has no name by
+/// design and so skips without a ledger entry.
+///
+/// Returns `None` when the decorator is not attached to a definition, rather
+/// than guessing: a route bound to the wrong symbol is worse than one bound to
+/// none.
 fn python_decorated_handler(source: &str, after: usize) -> Option<String> {
     for line in source.get(after..)?.lines().skip(1) {
         let trimmed = line.trim();
         // Blank lines, comments and further stacked decorators sit between the
-        // route decorator and its function.
+        // route decorator and its definition.
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('@') {
             continue;
         }
         let definition = trimmed
             .strip_prefix("async def ")
-            .or_else(|| trimmed.strip_prefix("def "))?;
+            .or_else(|| trimmed.strip_prefix("def "))
+            .or_else(|| trimmed.strip_prefix("class "))?;
         let name: String = definition
             .chars()
             .take_while(|character| character.is_alphanumeric() || *character == '_')
@@ -1229,6 +1239,41 @@ def get_user(uid):
             .len(),
             4,
             "every route in a mixed module is extracted, not only the `app` one"
+        );
+    }
+
+    /// A Python decorator may target a class, and the handler is then the class.
+    ///
+    /// Python's grammar is `decorated: decorators (classdef | funcdef |
+    /// async_funcdef)`, so `class` is one of exactly three things a decorator
+    /// can be applied to. Reading only `def` and `async def` left the third
+    /// resolving to `""`, which `resolver.rs`'s route arm treats as a
+    /// deliberately anonymous Express arrow function and skips without a
+    /// ledger entry — a handler that could not be extracted reporting the same
+    /// outcome as one that has no name by design.
+    ///
+    /// Measured against seven `site-packages` trees: 103 route-decorator
+    /// matches, none of them over a class, so this is a latent shape rather
+    /// than an observed loss. It is fixed because the omission is a missing
+    /// grammar case and not a judgement call, and because the silence is the
+    /// expensive part.
+    #[test]
+    fn a_route_decorator_over_a_class_names_the_class_as_its_handler() {
+        assert_eq!(
+            python_routes(
+                "@app.route(\"/users\")\nclass UserView(MethodView):\n    \
+                 def get(self):\n        return []\n"
+            ),
+            [("ANY".into(), "/users".into(), "UserView".into())],
+            "a class-based view is the route's handler, not an empty name"
+        );
+        assert_eq!(
+            python_routes(
+                "@bp.post(\"/items\")\n@login_required\nclass Create(MethodView):\n    \
+                 pass\n"
+            ),
+            [("POST".into(), "/items".into(), "Create".into())],
+            "stacked decorators above a class are skipped the same as above a def"
         );
     }
 
