@@ -69,6 +69,11 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "git_is_bounded_on_the_artifact_path",
             "guide_write_security",
             "host_artifact_provider",
+            // `stat_key` and `read_bounded` are std plus one `O_NONBLOCK`
+            // flag; nothing in this target reaches a grammar. Verified with
+            // `cargo check -p devmap-query --no-default-features
+            // --all-targets`, which is this test's own instruction.
+            "stat_memo_spawns_are_test_only",
             "subsystem_handoff_paths_are_computed",
             "subsystem_roles_and_file_kinds_are_computed",
             "the_repository_inventory_bounds_are_honest",

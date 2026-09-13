@@ -15,6 +15,10 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 regex.workspace = true
+# For `O_NONBLOCK` on the memo read: opening a fifo without it blocks in
+# `open(2)` forever. Already a workspace dependency, linked by dc-grep and
+# devmap-cli, so nothing new enters the tree.
+libc.workspace = true
 
 [features]
 default = ["parse"]

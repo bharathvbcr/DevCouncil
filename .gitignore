@@ -176,6 +176,14 @@ t.jsonl
 # DevCouncil local state
 !.devcouncil/
 
+# The standalone spelling of the same directory. `devmap_extract::paths` picks
+# `.devmap/` for any repository that does not already have a `.devcouncil/`,
+# and writes the store, `repo_map.json`, `graph/code_graph.json` and the
+# `cache/` memos into it — all generated, none of it checked in anywhere
+# (`git ls-files .devmap` is empty). Only the store was ignored here, and only
+# by accident, through the global `*.sqlite` rule.
+.devmap/
+
 # Environment, dependency, and cache directories
 .env.local
 

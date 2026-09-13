@@ -47,6 +47,7 @@ macro_rules! outln {
 }
 
 mod claude;
+mod digest_cache;
 mod hook;
 mod integrate;
 mod presentation;
@@ -1965,9 +1966,17 @@ fn extend_host_contract(
 /// linked into this build, the resolved store path, and every `devmap` found on
 /// `PATH` plus common host MCP configs (with version), so binary skew is a
 /// structured fact rather than a silent wrong hook.
-fn doctor_report(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+fn doctor_report(
+    db: &std::path::Path,
+    root: &std::path::Path,
+) -> anyhow::Result<serde_json::Value> {
     let schema_version = Store::stored_schema_version(db)?;
-    let binaries = inventory_devmap_binaries()?;
+    let state_dir = devmap_extract::paths::state_dir(root);
+    // Read-only: this handler already refuses to create a store, on the
+    // grounds that a usability probe must not write into a tree it may not
+    // own. Leaving a memo behind would be the same write by another name.
+    let mut digests = crate::digest_cache::BinaryDigests::open_read_only(Some(&state_dir));
+    let binaries = inventory_devmap_binaries(&mut digests)?;
     let skew = binaries_skew_warning(&binaries);
     Ok(serde_json::json!({
         "schema_version": schema_version,
@@ -1989,7 +1998,19 @@ fn doctor_report(db: &std::path::Path) -> anyhow::Result<serde_json::Value> {
 }
 
 /// Every `devmap` on `PATH` and referenced from common host MCP configs.
-fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
+///
+/// The digests are the expensive part of this inventory — tens to hundreds of
+/// megabytes of SHA-256 — and they change only when a binary is rebuilt, so
+/// they are memoised on `(path, size, mtime, ctime)`. See
+/// [`crate::digest_cache`]; a memo that cannot be read or written costs a
+/// rehash and never an answer.
+///
+/// `digests` is passed in rather than opened here because the two callers
+/// differ on one point: `paths` may leave a memo behind and `doctor` may not.
+/// Stating that at the call site keeps the policy where the contract is.
+fn inventory_devmap_binaries(
+    digests: &mut crate::digest_cache::BinaryDigests,
+) -> anyhow::Result<Vec<serde_json::Value>> {
     let mut rows = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     if let Some(path_var) = std::env::var_os("PATH") {
@@ -2013,7 +2034,7 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
                 "build_id": probe.build_id,
                 "probe_error": probe.error,
                 "probe_status": probe.status,
-                "sha256": if resolved.is_file() { sha256::sha256_file(&resolved) } else { None },
+                "sha256": digests.digest(&resolved),
                 "exists": true,
             }));
         }
@@ -2029,7 +2050,7 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
                     "probe_error": serde_json::Value::Null,
                     "version": Some(env!("CARGO_PKG_VERSION")),
                     "build_id": Some(env!("DEVMAP_BUILD_ID")),
-                    "sha256": if resolved.is_file() { sha256::sha256_file(&resolved) } else { None },
+                    "sha256": digests.digest(&resolved),
                     "exists": true,
                 }));
             }
@@ -2048,7 +2069,7 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
                     "build_id": probe.build_id,
                 "probe_error": probe.error,
                 "probe_status": probe.status,
-                    "sha256": if resolved.is_file() { sha256::sha256_file(&resolved) } else { None },
+                    "sha256": digests.digest(&resolved),
                     "exists": resolved.is_file(),
                 }));
             } else if let Some(existing) = rows.iter_mut().find(|r| r["path"] == key) {
@@ -2057,6 +2078,10 @@ fn inventory_devmap_binaries() -> anyhow::Result<Vec<serde_json::Value>> {
             }
         }
     }
+    // Once, after the whole pass: the same binary is routinely reached through
+    // `PATH`, `current_exe` and several MCP configs, and one write per row
+    // would publish the memo repeatedly for a single answer.
+    digests.save();
     Ok(rows)
 }
 
@@ -2495,6 +2520,41 @@ fn plugin_warning() -> Option<String> {
     }
 }
 
+/// Parse `ps` elapsed time — `[[dd-]hh:]mm:ss` — into a duration.
+///
+/// In-process on purpose: the caller runs this once per matching line, and the
+/// previous spelling spawned `date` there instead. `None` for anything that is
+/// not that shape, which the caller skips rather than guessing at.
+fn parse_etime(text: &str) -> Option<std::time::Duration> {
+    let (days, rest) = match text.split_once('-') {
+        Some((days, rest)) => (days.parse::<u64>().ok()?, rest),
+        None => (0, text),
+    };
+    let mut fields = [0u64; 3];
+    let mut count = 0usize;
+    for piece in rest.split(':') {
+        if count == 3 || piece.is_empty() {
+            return None;
+        }
+        fields[count] = piece.parse::<u64>().ok()?;
+        count += 1;
+    }
+    let (hours, minutes, seconds) = match count {
+        3 => (fields[0], fields[1], fields[2]),
+        2 => (0, fields[0], fields[1]),
+        _ => return None,
+    };
+    // `ps` never reports 60+ here; a value that does is a format this parser
+    // does not understand, and inventing a duration from it would silently
+    // mis-age a process.
+    if minutes > 59 || seconds > 59 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(
+        days * 86_400 + hours * 3_600 + minutes * 60 + seconds,
+    ))
+}
+
 fn stale_server_warning() -> Option<String> {
     #[cfg(not(unix))]
     {
@@ -2512,9 +2572,42 @@ fn stale_server_warning() -> Option<String> {
             return None;
         };
         let mut command = std::process::Command::new("ps");
-        command.args(["-axo", "pid=,lstart=,command="]);
+        // `etime=` (elapsed), not `lstart=` (a local-time wall clock). Two
+        // reasons, both load-bearing:
+        //
+        // 1. `lstart` had to be turned into an instant, and that was done by
+        //    spawning `date -j -f ...` **once per matching line**. The line
+        //    count is the number of running DevMap MCP servers, which is
+        //    unbounded and grows with exactly the thing this tool is for:
+        //    measured 2026-09-12 on this machine, 67 matches meant 67 child
+        //    processes and 2.3-2.8 s inside a function whose own `ps` call is
+        //    budgeted at 500 ms. Each spawn was individually bounded and the
+        //    fan-out was not, so `devmap paths` got slower the more DevMap
+        //    sessions were open.
+        // 2. `date -j -f` is BSD-only. On Linux that child failed, and the
+        //    whole check returned "unavailable" — so it never worked in CI or
+        //    on any Linux host, and said so in a way nothing asserted.
+        //
+        // Elapsed time needs no timezone and no subprocess.
+        command.args(["-axo", "pid=,etime=,command="]);
+        // A deadline is a ceiling, not a cost: `run_bounded` returns the moment
+        // the child exits, so a wider bound is free in the common case and only
+        // widens the worst one.
+        //
+        // 500 ms was not a ceiling here, it was a coin flip. Measured
+        // 2026-09-12 on a developer machine running several agent sessions:
+        // `ps -axo` costs 0.40-0.52 s against 1,900 processes, so the check
+        // lost its own race about a third of the time on a release build and
+        // every time on a debug one — reporting "unavailable" while a genuinely
+        // stale MCP server went unmentioned. A check that usually cannot run is
+        // worse than no check, because its answer reads the same as a clean one
+        // to anything that only looks for a warning string.
+        //
+        // 4 s is ~8x the measured worst case, in the same spirit as the
+        // wall-clock budgets in verify.sh, which are set at ~2.5x measured and
+        // documented as catching a real regression rather than a busy machine.
         let output = match devmap_extract::subprocess::run_bounded(&mut command,
-            devmap_extract::subprocess::Bounds { deadline: std::time::Duration::from_millis(500), stdout_cap: 1024 * 1024, stderr_cap: 4096 }) {
+            devmap_extract::subprocess::Bounds { deadline: std::time::Duration::from_secs(4), stdout_cap: 4 * 1024 * 1024, stderr_cap: 4096 }) {
             Ok(output) if !output.stdout_truncated && !output.stderr_truncated => output,
             _ => return Some("stale-server check unavailable: process inventory did not complete within its time/output bounds".into()),
         };
@@ -2528,38 +2621,20 @@ fn stale_server_warning() -> Option<String> {
             if !line.contains("devmap") || !line.contains("mcp") {
                 continue;
             }
-            // `ps -axo pid=,lstart=,command=` — lstart is 24 chars like
-            // `Fri Sep 11 07:40:12 2026`.
+            // `ps -axo pid=,etime=,command=` — `1-02:03:04`, `02:03:04`, `03:04`.
             let mut parts = line.split_whitespace();
             let Some(pid) = parts.next() else {
                 continue;
             };
-            let lstart: String = parts.by_ref().take(5).collect::<Vec<_>>().join(" ");
-            let mut command = std::process::Command::new("date");
-            command.args(["-j", "-f", "%a %b %d %T %Y", &lstart, "+%s"]);
-            let Ok(started) = devmap_extract::subprocess::run_bounded(
-                &mut command,
-                devmap_extract::subprocess::Bounds {
-                    deadline: std::time::Duration::from_millis(100),
-                    stdout_cap: 4096,
-                    stderr_cap: 4096,
-                },
-            ) else {
-                return Some(
-                    "stale-server check unavailable: process timestamp probe did not complete"
-                        .into(),
-                );
-            };
-            if !started.status.success() || started.stdout_truncated || started.stderr_truncated {
-                return Some("stale-server check unavailable: process timestamp could not be read completely on this platform".into());
-            }
-            let Ok(secs) = String::from_utf8_lossy(&started.stdout)
-                .trim()
-                .parse::<i64>()
-            else {
+            let Some(etime) = parts.next() else {
                 continue;
             };
-            let started_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64);
+            let Some(elapsed) = parse_etime(etime) else {
+                continue;
+            };
+            let Some(started_at) = std::time::SystemTime::now().checked_sub(elapsed) else {
+                continue;
+            };
             if started_at < bin_mtime {
                 stale.push(pid.to_string());
             }
@@ -2987,8 +3062,20 @@ fn report_api_impact(impact: &serde_json::Value) {
 /// because every count above it is then a lower bound.
 fn report_scan(payload: &serde_json::Value) {
     let scan = &payload["scan"];
-    if scan["complete"].as_bool().unwrap_or(true) {
-        return;
+    match scan["complete"].as_bool() {
+        Some(true) => return,
+        Some(false) => {}
+        // Absent is not complete. The library reads this same field as
+        // `unwrap_or(false)`; defaulting the *human* output to "complete" is
+        // how an answer that never reported its coverage comes to read as one
+        // that covered everything.
+        None => {
+            outln!(
+                "  scan coverage not reported; the counts above are not a \
+completeness claim."
+            );
+            return;
+        }
     }
     outln!(
         "  scan incomplete: read {} of {} file(s); {} skipped for budget, \
@@ -4245,7 +4332,10 @@ async fn main() -> std::process::ExitCode {
 async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<()> {
     match &cli.command {
         Commands::Build {
-            path,
+            // Read through `cli.root_hint()` below, which already falls back to
+            // this positional when `--root` is absent. Binding it here as well
+            // is what let the two disagree.
+            path: _,
             affected: affected_flag,
             deleted,
             full,
@@ -4258,6 +4348,20 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             stamps,
             inventory,
         } => {
+            // `--root` outranks the positional path, for the same reason it
+            // does in `paths`: `cli.db()` already resolves the store from
+            // `--root`, so reading the repository from `path` made one build
+            // name two repositories and abort with "DevMap store belongs to
+            // worktree X, not Y" before extracting anything.
+            //
+            // The hook is the caller that breaks on it. `detach_build` spawns
+            // `devmap --root <project> build` from whatever directory the agent
+            // happens to be in, with stdout and stderr on /dev/null — so on
+            // every edit outside the repository root the rebuild exited 1 into
+            // nothing, the lock was taken and released, and the index silently
+            // stopped following the tree while every hook still reported
+            // success.
+            let path = &cli.root_hint();
             let progress = progress.expect("main supplies a build reporter");
             let build_started = std::time::Instant::now();
             progress.stage(
@@ -5690,15 +5794,31 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 }),
             )?;
         }
-        Commands::Paths { path } => {
+        Commands::Paths { .. } => {
             // Absolute, so a caller in another directory can use every field
             // as given; `validate_root` has already checked the directory exists.
-            let root = path.canonicalize()?;
+            //
+            // Resolved through `root_hint`, not the positional `path`, because
+            // `--root` outranks it and `cli.db()` already honours that. Reading
+            // the positional argument here made one answer describe two
+            // repositories: `devmap --root A paths` reported A's `db_path`
+            // beside the *working directory's* `root`, `state_dir` and
+            // `repo_map`. Hooks are the case that breaks on — they pass
+            // `--root <project>` precisely because the agent's working
+            // directory is not the repository the index belongs to — and
+            // `paths` is the first command the generated agent guide tells an
+            // agent to run, so the mixed answer pointed it at another
+            // checkout's map.
+            let root = cli.root_hint();
+            let root = root
+                .canonicalize()
+                .with_context(|| format!("repository root {}", root.display()))?;
             let state_dir = devmap_extract::paths::state_dir(&root);
             // Both explicit --db and relative roots are invocation-relative.
             // Joining this to root again duplicates the repository directory.
             let db_path = std::path::absolute(cli.db())?;
-            let binaries = inventory_devmap_binaries()?;
+            let mut digests = crate::digest_cache::BinaryDigests::open(Some(&state_dir));
+            let binaries = inventory_devmap_binaries(&mut digests)?;
             let skew = binaries_skew_warning(&binaries);
             let payload = serde_json::json!({
                 "root": root,
@@ -5936,7 +6056,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             // Never creates a store. The probe is what a host runs *before* it
             // trusts this binary against a tree it may not own; creating one
             // here would turn "is this binary usable?" into a write.
-            let payload = doctor_report(&cli.db())?;
+            let payload = doctor_report(&cli.db(), &cli.root_hint())?;
             emit_json(cli, &payload)?;
         }
         Commands::SessionReport { last, session_id } => {
@@ -6837,9 +6957,27 @@ fn run_integrate(
     Ok(())
 }
 
+/// Write one hook diagnostic straight to stderr.
+///
+/// Not through [`diagnostic`]. That path hands the line to an asynchronous
+/// writer, and a failing hook ends in `std::process::exit`, which runs no
+/// destructors and waits for nothing — so the message was dropped on exactly
+/// the paths that had something to report. Measured 2026-09-12:
+/// `devmap hook bogus-event` exited 1 with completely empty stdout and stderr,
+/// while every exit-0 path printed its note normally.
+///
+/// A hook has one bounded line to say and no progress display to share it
+/// with, so it writes and flushes that line itself.
+fn hook_diagnostic(message: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "{message}");
+    let _ = err.flush();
+}
+
 fn run_hook_command(cli: &Cli, event_name: &str) -> anyhow::Result<i32> {
     let Some(event) = hook::HookEvent::parse(event_name) else {
-        diagnostic(format_args!(
+        hook_diagnostic(format_args!(
             "devmap hook: unknown event {event_name:?}; expected session-start, \
              post-tool-use, or session-end"
         ));
@@ -6849,7 +6987,7 @@ fn run_hook_command(cli: &Cli, event_name: &str) -> anyhow::Result<i32> {
     let executable = std::env::current_exe()?;
     let outcome = hook::run_hook(event, &stdin, &executable, cli.root.as_deref());
     if let Some(line) = &outcome.stderr_line {
-        diagnostic(format_args!("{line}"));
+        hook_diagnostic(format_args!("{line}"));
     }
     if let Some(stdout) = &outcome.stdout {
         if cli.json {
@@ -7145,6 +7283,53 @@ const RESOLUTION_RATE_LANGUAGES_SHOWN: usize = 8;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ps` elapsed time, in the three shapes it actually prints.
+    ///
+    /// This replaced a `date` subprocess spawned once per matching line, so it
+    /// is now the only thing standing between a process's age and a wrong
+    /// stale-server verdict.
+    #[test]
+    fn etime_parses_every_shape_ps_prints() {
+        use std::time::Duration;
+        assert_eq!(parse_etime("03:04"), Some(Duration::from_secs(184)));
+        assert_eq!(parse_etime("02:03:04"), Some(Duration::from_secs(7384)));
+        assert_eq!(parse_etime("1-02:03:04"), Some(Duration::from_secs(93_784)));
+        assert_eq!(
+            parse_etime("10-00:00:00"),
+            Some(Duration::from_secs(864_000))
+        );
+        assert_eq!(parse_etime("00:00"), Some(Duration::ZERO));
+    }
+
+    /// Anything that is not that shape yields `None`, never a guessed age.
+    ///
+    /// The caller skips a `None` line. Returning some plausible duration for
+    /// unparseable input would silently mis-age a process and could report a
+    /// live MCP server as stale — or hide one that is.
+    #[test]
+    fn etime_refuses_what_it_does_not_understand() {
+        for bad in [
+            "",
+            ":",
+            "::",
+            "1:2:3:4",
+            "abc",
+            "-",
+            "1-",
+            "-01:02",
+            "01:60",
+            "60:00",
+            "1--02:03:04",
+            "0x10:00",
+            "01:02:",
+            ":01:02",
+            " 01:02",
+            "99999999999999999999:00",
+        ] {
+            assert_eq!(parse_etime(bad), None, "parse_etime({bad:?}) must refuse");
+        }
+    }
 
     /// Class E (PLAN.md §3.1): a measurement is attributed to what incurred it.
     ///

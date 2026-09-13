@@ -26,6 +26,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 libc.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 # Retention tests assert that pruned generations leave no rows in any

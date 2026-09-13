@@ -31,6 +31,20 @@ codegen-units = 1
 # worker_recovery_probe as an executable under the release profile.
 panic = "unwind"
 
+# The digest is the only CPU-bound work in `devmap paths`, and an unoptimised
+# build runs it over the debug `devmap` binary itself — 105 MiB. At dev
+# opt-level that took 29 s, past the 20 s bound
+# `diagnostics_never_execute_discovered_commands` puts on the same call, so the
+# gate failed on the size of its own build artefact rather than on any
+# behaviour it was written to check.
+#
+# Optimising one leaf dependency, not the workspace: everything the tests
+# actually exercise stays unoptimised and debuggable. This is only expressible
+# because the hash is a crate now — a hand-rolled module cannot be given its
+# own profile without optimising the crate that contains it.
+[profile.dev.package.sha2]
+opt-level = 3
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
@@ -53,6 +67,11 @@ unsafe_code = "forbid"
 all = "warn"
 
 [workspace.dependencies]
+# One SHA-256 for the workspace. Three hand-rolled copies of FIPS 180-4 lived
+# here before — `devmap-cli/src/sha256.rs`, a second inside
+# `devmap-cli/src/skills.rs`, and this crate — each written to avoid a
+# dependency that `dc-evidence` had already taken.
+sha2 = "0.10.9"
 # "rc" lets Arc<T> derive Serialize/Deserialize. ResolvedEdge shares one
 # Resolution across every edge fanned out from the same ambiguous call site;
 # Arc<T> serializes as the inner T, so the wire form is unchanged.
