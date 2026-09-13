@@ -3174,11 +3174,11 @@ impl Store {
     }
 
     fn repair_sidecar_modes(db_path: &Path) -> Result<()> {
-        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
-        let sidecars = Self::checked_sidecars(db_path)?;
         #[cfg(unix)]
         {
+            use devmap_extract::safe_fs::{Access, Creation, SafeFile};
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let sidecars = Self::checked_sidecars(db_path)?;
             const OWNER_WRITE: u32 = 0o200;
             let database = match SafeFile::open(db_path, Access::Read, Creation::Never) {
                 Ok(file) => file,
@@ -3262,6 +3262,10 @@ impl Store {
                 file.set_permissions(permissions)
                     .map_err(|error| refusal(error.to_string()))?;
             }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = db_path;
         }
         Ok(())
     }
@@ -3449,8 +3453,8 @@ impl Store {
         #[cfg(windows)]
         let owner_path = lock_path.with_extension("lock.owner");
         #[cfg(not(windows))]
-        let owner_path = lock_path;
-        SafeFile::open(owner_path, Access::Read, Creation::Never)
+        let owner_path = lock_path.to_path_buf();
+        SafeFile::open(&owner_path, Access::Read, Creation::Never)
             .and_then(|mut handle| handle.read_text(64))
             .ok()
             .map(|holder| holder.trim().to_string())
