@@ -98,34 +98,38 @@ remove language limitations or make unresolved dynamic calls deterministic.
 
 ## Benchmark comparison
 
-The [DevMap v0.2.1 report, 2026-09-13 UTC](../../benchmarks/results/competition/20260913-v0.2.1/REPORT.md)
+For a head-to-head, per-tool breakdown, see
+[DevMap vs GitNexus, CodeGraph, Graphify, Gortex, and codebase-memory-mcp](comparison.md).
+
+The [DevMap build 48cd3c7 report, 2026-09-13 UTC](../../benchmarks/results/competition/20260913-48cd3c7/REPORT.md)
 records **261 fresh competitive timing samples** against Graphify, Gortex,
 GitNexus, CodeGraph, codebase-memory-mcp, and a ripgrep text baseline. It also
-includes **82 supplemental samples** alternating the preserved v0.2.0 and
-v0.2.1 binaries. All graph tools used the same original 1,186-file DevCouncil
-snapshot. The [previous report](../../benchmarks/results/competition/20260912-expanded/REPORT.md)
-and its measurements remain unchanged.
+includes **82 supplemental samples** alternating the preserved `506a617` and
+`48cd3c7` binaries — both version 0.2.1, 49 commits apart. All graph tools used
+the same original 1,186-file DevCouncil snapshot. The
+[previous report](../../benchmarks/results/competition/20260913-v0.2.1/REPORT.md)
+measured build `506a617` and its measurements remain unchanged.
 
-**Verified medians in the v0.2.1 competitor campaign:**
+**Verified medians in the build-48cd3c7 competitor campaign:**
 
 | Tool | Cold index | Unchanged refresh | Single-file edit | Inspected caller pairs |
 |---|---:|---:|---:|---:|
-| DevMap 0.2.1 | 2.244 s | 137.8 ms | 1.190 s | 5/5 |
-| CodeGraph | 3.267 s | 226.2 ms | 691.9 ms | 3/5 |
-| codebase-memory-mcp | 8.453 s | 6.015 s | 9.259 s | 5/5 |
-| Graphify | 17.530 s | 4.183 s | 4.499 s | 3/5 |
-| Gortex | 33.982 s | 746.6 ms | 4.910 s | 4/5 default; 5/5 with name-only inclusion |
-| GitNexus | 35.103 s | 636.6 ms | 33.760 s | 3/5 |
+| DevMap 0.2.1 (48cd3c7) | 2.031 s | 107.1 ms | 957.8 ms | 5/5 |
+| CodeGraph | 2.912 s | 241.9 ms | 417.2 ms | 3/5 |
+| codebase-memory-mcp | 8.019 s | 6.160 s | 9.347 s | 5/5 |
+| Graphify | 16.456 s | 4.327 s | 3.945 s | 3/5 |
+| Gortex | 38.835 s | 967.5 ms | 5.754 s | 4/5 default; 5/5 with name-only inclusion |
+| GitNexus | 34.102 s | 567.5 ms | 33.417 s | 3/5 |
 
 **DevMap speed factors** (each cell compares DevMap with the named tool):
 
 | Compared with | Cold index | Unchanged refresh | Single-file edit |
 |---|---:|---:|---:|
-| CodeGraph | 1.46× faster | 1.64× faster | 1.72× slower |
-| codebase-memory-mcp | 3.77× faster | 43.64× faster | 7.78× faster |
-| Graphify | 7.81× faster | 30.35× faster | 3.78× faster |
-| Gortex | 15.14× faster | 5.42× faster | 4.13× faster |
-| GitNexus | 15.64× faster | 4.62× faster | 28.38× faster |
+| CodeGraph | 1.43× faster | 2.26× faster | 2.30× slower |
+| codebase-memory-mcp | 3.95× faster | 57.49× faster | 9.76× faster |
+| Graphify | 8.10× faster | 40.39× faster | 4.12× faster |
+| Gortex | 19.12× faster | 9.03× faster | 6.01× faster |
+| GitNexus | 16.79× faster | 5.30× faster | 34.89× faster |
 
 Ratios use unrounded medians. “X× faster” means the competitor took X times
 DevMap’s elapsed time; “X× slower” means DevMap took X times the competitor’s
@@ -134,16 +138,15 @@ competitor and the separate ripgrep text baseline. Native pipelines and
 output scopes differ; these factors do not imply equal analysis.
 
 **DevMap positives:** lowest cold-index, unchanged-refresh, and measured
-query medians; lowest sampled cold process-tree RSS (608.0 MiB); all five
+query medians; lowest sampled cold process-tree RSS (610.3 MiB); all five
 inspected caller pairs; and successful update/removal controls. The preserved
-0.2.1 binary reports clean-build source commit `506a617498a5`.
+binary reports clean-build source commit `48cd3c7c5a84`.
 
-**DevMap negatives:** CodeGraph had lower edit latency and a smaller store.
-DevMap's 138.9 MiB store also exceeded Graphify's 42.5 MiB and CBM's 67.1 MiB.
-It left 96,233 unexplained attribution sites, compared with 91,784 in the old
-run, while resolved symbol/edge totals stayed the same. This classification
-difference has not been shown to be a loss of caller accuracy. Eight SQL
-import-extractor gaps and a PowerShell pattern fallback remain.
+**DevMap negatives:** CodeGraph had lower edit latency (417.2 ms versus
+957.8 ms) and a smaller store. DevMap's 138.9 MiB store also exceeded
+Graphify's 42.5 MiB and CBM's 67.1 MiB. It left 96,233 unexplained attribution
+sites. Eight SQL import-extractor gaps and a PowerShell pattern fallback
+remain.
 
 **Competitors:** CBM also returned all five inspected caller pairs. Graphify
 had the smallest measured store. Gortex returned four pairs by default and
@@ -152,12 +155,16 @@ deletion after capped fuzzy searches were inconclusive. GitNexus again kept
 a deleted probe across two ordinary refreshes; a forced rebuild cleared it.
 Graphify, GitNexus, and CodeGraph missed both inspected Rust test callers.
 
-**Version comparison:** the separate alternating control measured v0.2.1 at
-2.450 s cold (**1.09× slower**, +8.6%), 76.0 ms unchanged (**1.17× faster**,
--14.3%), and 836.3 ms edited (**1.02× faster**, -2.3%) against the preserved
-v0.2.0 executable. All three ranges overlap; these small
-samples do not establish a general regression or improvement. Both versions
-passed the selected definitions, caller pairs, and edit/removal controls.
+**Build comparison:** the separate alternating control measured `48cd3c7` at
+1.918 s cold (**1.05× faster**, -5.0%), 78.8 ms unchanged (**1.05× faster**,
+-4.8%), and 784.3 ms edited (**1.002× faster**, -0.2%) against the preserved
+`506a617` executable. All three ranges overlap; these small samples do not
+establish a general regression or improvement. Both builds passed the selected
+definitions, caller pairs, and edit/removal controls, and produced an
+**identical** cold graph on this corpus — 857 files, 10,193 symbols, 33,789
+edges, and the same per-language resolution breakdown — so the 49 intervening
+commits did not change what was extracted from this workload. That is a
+statement about this corpus, not about the changed extractors in general.
 Keep these control samples separate from the competitor medians above.
 
 Graphify used AST-only extraction with clustering disabled. Gortex cold time

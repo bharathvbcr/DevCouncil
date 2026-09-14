@@ -39,6 +39,8 @@ pub enum Host {
     /// OpenCode. Reads `opencode.json` at the repository root — a *user-owned*
     /// file, not a dot-directory this tool owns — under an `mcp` key whose
     /// entries name the program as an argv array rather than command+args.
+    // clap's default rename would spell this `open-code`; the host is one word.
+    #[value(name = "opencode")]
     OpenCode,
     /// Warp / Oz. Reads `.devcouncil/integrations/warp-mcp.json`, a file
     /// DevCouncil writes and passes explicitly via `oz agent run --mcp`, so
@@ -59,17 +61,27 @@ impl Host {
     /// a blanket allow hide a later unwiring.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn parse(name: &str) -> anyhow::Result<Self> {
-        match name {
-            "cursor" => Ok(Self::Cursor),
-            "claude" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
-            "antigravity" => Ok(Self::Antigravity),
-            "opencode" => Ok(Self::OpenCode),
-            "warp" => Ok(Self::Warp),
-            other => bail!(
-                "unsupported host {other:?}; expected cursor, claude, codex, \
-                 antigravity, opencode, or warp"
-            ),
+        <Self as clap::ValueEnum>::from_str(name, false).map_err(|_| {
+            anyhow!(
+                "unsupported host {name:?}; expected {}",
+                Self::accepted_names()
+            )
+        })
+    }
+
+    /// The accepted names as prose: `a, b, or c`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn accepted_names() -> String {
+        let names: Vec<&str> = <Self as clap::ValueEnum>::value_variants()
+            .iter()
+            .map(|host| host.as_str())
+            .collect();
+        match names.as_slice() {
+            // Unreachable while the enum has variants, but a refusal that had
+            // nothing to name must say so rather than trail off after "expected".
+            [] => "no host: this build accepts none".to_string(),
+            [only] => (*only).to_string(),
+            [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
         }
     }
 
