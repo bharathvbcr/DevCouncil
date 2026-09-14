@@ -3,9 +3,11 @@
 //! `lease.revalidate()` names a method on whatever `lease` is, and a typed
 //! field declaration is the file's own written answer. Two grammars produced
 //! that evidence and twenty-nine did not, so a method reached only through a
-//! typed field stayed callerless everywhere else — 57% of this workspace's
-//! remaining unexplained receivers and 60% of an independent Swift corpus's are
-//! a bare identifier of exactly that shape.
+//! typed field stayed callerless everywhere else.
+//!
+//! The 57% of `UninferredReceiver` rows with a bare identifier receiver is an
+//! opportunity size, not a reduction this delivers — see the `langfields` module
+//! doc, which says what to measure instead and why the raw count can rise.
 //!
 //! These tests are the registry for `langfields`. Every case was written from a
 //! dumped parse tree rather than from memory: six grammars spell a field

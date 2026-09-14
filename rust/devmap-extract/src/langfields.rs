@@ -3,9 +3,28 @@
 //! `h.engine.tick()` and `lease.revalidate()` name a method on whatever
 //! `engine` and `lease` are, and a typed field declaration is the file's own
 //! written answer. Without it the resolver reaches `UninferredReceiver` and the
-//! method reads as callerless — 57% of this workspace's remaining unexplained
-//! receivers and 60% of an independent Swift corpus's are a bare identifier of
-//! exactly this shape (`directory`, `lock`, `workspace`).
+//! method reads as callerless.
+//!
+//! # What the 57% is, and is not
+//!
+//! 57% of this workspace's `UninferredReceiver` rows, and 60% of an independent
+//! Swift corpus's, have a bare lowercase identifier for a receiver —
+//! `directory`, `lock`, `workspace`. That is the **opportunity size**: the share
+//! of rows shaped like something a field declaration *could* answer. It is not
+//! a predicted reduction, and this module does not deliver one anywhere near it,
+//! because most of those receivers are locals, or fields whose type the author
+//! never wrote, or fields typed by a collection this module refuses on purpose.
+//!
+//! Nor is `unresolved_uninferred_receiver` the number to read it against. Every
+//! `Type` reference this module emits is itself an attribution site, so reading
+//! more declarations *adds* rows to the denominator while resolving others: on a
+//! 306-file Swift corpus the total unresolved count rose from 47,217 to 48,748
+//! in the same build where unexplained sites fell by 218 and the dead-symbol
+//! list returned to its untouched baseline. Judge it on edges and on explained
+//! share, and only against a corpus held identical across the two builds —
+//! measured that way here, `uninferred_receiver` fell 66,083 to 66,017 and edges
+//! rose 35,476 to 35,530. A run that indexes this module's own new files is
+//! comparing two different corpora and will show the count going up.
 //!
 //! The evidence was already consumed: [`Resolver::field_type_on`] reads
 //! `declared_types["{file}:{name}@type"]`, written from any `Type` reference
