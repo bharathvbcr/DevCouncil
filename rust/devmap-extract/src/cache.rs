@@ -388,7 +388,13 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `*path` and `!Self`, whose leftmost *segment* is an operator, so the binding
 /// that would have typed the receiver is invisible to both the classifier and
 /// the receiver-type rung.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "53";
+///
+/// v54 reads a declared field's type in every grammar that declares one, not
+/// just Rust and Go — see `langfields`. A v53 generation holds no `Type`
+/// reference for a Swift, Kotlin, TypeScript, Java, C#, Python, PHP, Scala,
+/// Dart, Objective-C, C, C++, Solidity or Pascal field, so every receiver typed
+/// only by one stays `UninferredReceiver` until the file is re-extracted.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "54";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

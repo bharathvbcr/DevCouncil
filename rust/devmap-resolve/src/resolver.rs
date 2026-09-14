@@ -478,7 +478,20 @@ impl Resolver {
             let root_binding = binding.filter(|b| b.name == root);
             let owner = self
                 .receiver_type_for(file, scope, root, root_binding)
-                .or_else(|| self.lookup_declared_type_name(file, scope, root))?;
+                .or_else(|| self.lookup_declared_type_name(file, scope, root))
+                .or_else(|| {
+                    // `self.lease.run()`. No map records a type under the
+                    // keyword, because `self` is not a binding any declaration
+                    // wrote — it is the type the call is written inside, which
+                    // is what X42 already reads it as one rung down. Without
+                    // this the explicit spelling resolved nothing while the bare
+                    // `lease.run()` beside it resolved, which is the wrong way
+                    // round: the explicit one says strictly more.
+                    Self::receiver_is_self(root)
+                        .then(|| scope.and_then(|scope| self.declaring_type_of(file, scope)))
+                        .flatten()
+                        .map(str::to_string)
+                })?;
             return self.field_type_on(file, &owner, field);
         }
 
@@ -504,6 +517,14 @@ impl Resolver {
             }
             if self.scope_declares_local(file, scope, name) {
                 return None;
+            }
+            // An implicit `self`: a bare name inside a method can be the
+            // enclosing type's own member. Asked after the scope's own bindings
+            // — a local named `lease` shadows the field `lease`, in every
+            // language that allows both — and before the file-wide map, which
+            // knows nothing about which type a name belongs to.
+            if let Some(member) = self.member_declared_type(file, Some(scope), name) {
+                return Some(member);
             }
         }
         self.receiver_types
@@ -603,6 +624,27 @@ impl Resolver {
         }
         self.declared_types
             .get(&format!("{file}:{name}@type"))
+            .and_then(|typed| Self::admissible_nominal_type(typed))
+    }
+
+    /// The declared type of a member named `name` on the type `scope` sits in.
+    ///
+    /// What a bare receiver means in a language with an implicit `self`:
+    /// `lease.revalidate()` written inside `Holder.run` is `self.lease`, and
+    /// `Holder`'s own declaration of `lease` is the file's written answer.
+    ///
+    /// Reads the *owner-scoped* key, which is the only one a member writes, so
+    /// a namesake member on a sibling type in the same file cannot answer here.
+    /// Swift, Kotlin, Scala, C#, Java, Python, Ruby and PHP all spell field
+    /// access this way; Rust and Go cannot, and reach fields through
+    /// [`Self::field_type_on`] instead.
+    fn member_declared_type(&self, file: &str, scope: Option<&str>, name: &str) -> Option<String> {
+        let enclosing = self.declaring_type_of(file, scope?)?;
+        // `declaring_type_of` reduces to the bare name; the key is written with
+        // the qualified spelling the extractor recorded.
+        let qualified = format!("{file}::{enclosing}");
+        self.declared_types
+            .get(&format!("{file}:{qualified}:{name}@type"))
             .and_then(|typed| Self::admissible_nominal_type(typed))
     }
 
@@ -1712,7 +1754,8 @@ impl Resolver {
                     } else {
                         "@type"
                     };
-                    if let Some(scope) = reference.enclosing_symbol.as_deref() {
+                    let scope = reference.enclosing_symbol.as_deref();
+                    if let Some(scope) = scope {
                         Self::bind_receiver(
                             &mut self.declared_types,
                             &mut self.poisoned_receiver_keys,
