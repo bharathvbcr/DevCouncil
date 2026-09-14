@@ -147,6 +147,18 @@ name = "capped_reads_say_so"
 required-features = ["parse"]
 
 [[test]]
+name = "a_call_is_one_site_hardening"
+required-features = ["parse"]
+
+[[test]]
+name = "a_receiver_is_not_its_operator"
+required-features = ["parse"]
+
+[[test]]
+name = "a_call_is_one_site_not_two"
+required-features = ["parse"]
+
+[[test]]
 name = "cprobe"
 required-features = ["parse"]
 

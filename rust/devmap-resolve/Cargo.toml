@@ -40,6 +40,10 @@ name = "audit_regressions"
 required-features = ["parse"]
 
 [[test]]
+name = "a_prelude_type_receiver_is_not_a_value"
+required-features = ["parse"]
+
+[[test]]
 name = "embedded_script_families"
 required-features = ["parse"]
 
@@ -125,4 +129,8 @@ required-features = ["parse"]
 
 [[test]]
 name = "captured_receiver_attribution"
+required-features = ["parse"]
+
+[[test]]
+name = "self_in_a_type_is_that_type"
 required-features = ["parse"]

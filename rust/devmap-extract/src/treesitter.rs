@@ -712,6 +712,10 @@ fn extract_treesitter_before_deadline(
                     lang,
                     deadline,
                 );
+                // After the merge, so an embedded `<script>`'s references are
+                // deduplicated against its own calls too, and once for the
+                // whole file rather than per language arm.
+                drop_duplicate_callee_names(&mut extraction.references);
                 #[cfg(test)]
                 EXTRACTION_FINISH_HOOK.with(|hook| {
                     if let Some(finish) = hook.take() {
@@ -1831,6 +1835,120 @@ fn callable_binding_name(node: Node, source: &str) -> Option<String> {
 /// that `except Exception as e` cannot bind to an unrelated `def e`; without
 /// the distinction that refusal swallowed every property read and every
 /// callback passed by attribute along with it.
+/// Drop the `Name` reference that a call's own callee already accounts for.
+///
+/// Every call extractor records a `Call` (or `Constructor`) reference naming
+/// the callee and spanning the callee *expression* — `r.mm` for `r.mm()`,
+/// `Z::pp` for `Z::pp()`. The generic identifier walker then visits the same
+/// method identifier and, unless [`is_call_callee`] recognises the grammar's
+/// spelling for it, records a **second** reference for it as an ordinary `Name`
+/// use of a symbol.
+///
+/// That suppression had drifted out of step with the very facts it depends on.
+/// Three functions each carry their own copy of "which grammars spell a name
+/// reached through something else, and in which fields":
+/// [`member_access_fields`] lists four spellings, [`member_access_receiver`]
+/// five, and `is_call_callee` three. The reference the walker emits is recorded
+/// by the resolver exactly when `member_access_receiver` gives it a receiver —
+/// so every spelling in the five-entry list and not in the three-entry one
+/// produced a duplicate row, and the two missing entries are Rust's and Scala's
+/// `field_expression` and Rust's `scoped_identifier`.
+///
+/// **Eleven** languages were measured emitting the duplicate — C, C++, Java,
+/// Kotlin, Lua, R, Ruby, Rust, Scala, Solidity, Swift — by running
+/// `a_call_is_one_site_not_two`'s matrix against the code this replaces; CUDA
+/// and Luau share the C++ and Lua grammars and the shapes that produced it.
+/// Seven were already correct: Go, Python, JS/TS, C#, PHP, Dart, Objective-C.
+///
+/// On this repository it cost Rust **49,989** of its 150,163 attribution sites
+/// — 27% of the corpus total of 182,181, every one of them a call already
+/// counted once. And the second copy was filed as a *failure* even where the
+/// first resolved: a `Widget::omegafn()` that produced a `Calls` edge at full
+/// confidence also produced an `uninferred_receiver` row claiming it had not.
+/// 1,937 resolved `References` edges duplicated a `Calls` edge to the same
+/// pair, and four more bound a C function-pointer field (`lexer->advance`) to
+/// the file's own same-named `static` function at confidence 1.0.
+///
+/// The test is structural and needs no grammar table, which is why it is here
+/// rather than a fourteenth arm in `is_call_callee`: a callee's name is the
+/// **last** token of the callee expression in every grammar that spells a call
+/// as `<receiver> <separator> <name>`, so a `Name` reference is the callee's
+/// own second copy exactly when a `Call`/`Constructor` reference of the same
+/// name ends at the same byte and starts at or before it.
+///
+/// The suffix requirement is what keeps the receiver, which is the property the
+/// three-entry list was written to protect (see `is_call_callee`, and
+/// `member_use_liveness`): in `mm::mm()` both halves are spelled `mm` and both
+/// lie inside the callee span, and only the right-hand one ends where the
+/// call's does. Requiring the *name* to match as well keeps a whole-expression
+/// callee span — an Objective-C `message_expression`, a C `Type` reference over
+/// a declarator — from swallowing an unrelated identifier that happens to end
+/// where it does.
+///
+/// # What this deliberately leaves behind
+///
+/// A callee reference whose span is *wider than the callee expression* keeps
+/// its duplicate. Two shapes have one: a Rust turbofish, where `::<_, String>`
+/// follows the name inside the `generic_function` the call records; and a call
+/// recovered from a Rust macro body, which is stamped with the whole
+/// `macro_invocation`'s span because the re-parsed tree has no coordinates in
+/// this file. `assert_eq!(calls_of(src), 3)` is the common one.
+///
+/// A second tier — "the callee is the only mention of its own name inside the
+/// span" — takes those, and was built and measured rather than reasoned about.
+/// A/B over one snapshot of this repository, 1,101 files: it removes **1,164**
+/// edges, of which **1,150** are genuine duplicates of a `Calls` edge to the
+/// same pair and **14** are the only edge that pair has. All 14 are a call
+/// inside a Rust macro whose *macro-borne call* did not resolve while the
+/// identifier did — `RpcError::new -> codes::is_reserved_and_undefined` in
+/// `devmap-serve`, where the receiver is a module path — so the identifier is
+/// the whole of the evidence that the target is reached.
+///
+/// Extraction cannot tell the 1,150 from the 14: they are the same syntax, and
+/// what separates them is what the *resolver* later makes of each. A duplicate
+/// edge costs a row; a dropped reference can report a live symbol dead. So this
+/// abstains, and the residue is stated rather than hidden —
+/// `a_turbofish_keeps_its_duplicate_and_that_is_known` pins it, and
+/// `a_macro_borne_calls_argument_keeps_its_reference` pins why.
+fn drop_duplicate_callee_names(references: &mut Vec<ExtractedReference>) {
+    // Keyed on the byte the callee's name ends at, which is a position in one
+    // file and therefore unique; the value is the leftmost byte a callee
+    // expression of that name reaches back to.
+    let mut callee_ends: HashMap<(&str, usize), usize> = HashMap::new();
+    for reference in references.iter() {
+        if matches!(
+            reference.kind,
+            ReferenceKind::Call | ReferenceKind::Constructor
+        ) {
+            let start = callee_ends
+                .entry((reference.name.as_str(), reference.span.end_byte))
+                .or_insert(reference.span.start_byte);
+            *start = (*start).min(reference.span.start_byte);
+        }
+    }
+    if callee_ends.is_empty() {
+        return;
+    }
+    // Two passes rather than one `retain` closure, because the map borrows the
+    // names it is keyed by.
+    let mut keep = Vec::with_capacity(references.len());
+    for reference in references.iter() {
+        keep.push(
+            reference.kind != ReferenceKind::Name
+                || !callee_ends
+                    .get(&(reference.name.as_str(), reference.span.end_byte))
+                    .is_some_and(|start| *start <= reference.span.start_byte),
+        );
+    }
+    drop(callee_ends);
+    let mut index = 0;
+    references.retain(|_| {
+        let keep_this = keep[index];
+        index += 1;
+        keep_this
+    });
+}
+
 fn member_access_receiver(node: Node, source: &str) -> Option<String> {
     let parent = bounded_parent(node)?;
     // The grammars spell the same shape several ways: `attribute` in Python,
@@ -4832,12 +4950,85 @@ const MAX_RECEIVER_CHARS: usize = 64;
 /// whose job is to name a value.
 fn bound_receiver_text(text: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = strip_prefix_operators(&flat);
     if flat.chars().count() <= MAX_RECEIVER_CHARS {
-        return flat;
+        return flat.to_string();
     }
     let mut out: String = flat.chars().take(MAX_RECEIVER_CHARS).collect();
     out.push('\u{2026}');
     out
+}
+
+/// Strip a leading `&` / `*` / `!` from a receiver that is otherwise a plain
+/// path of names.
+///
+/// `(*path).to_string()` records the receiver `*path`, `(&x).use()` records
+/// `&x`, and Swift's `!Self.check(v)` records `!Self` — tree-sitter-swift makes
+/// `!Self` the navigation target rather than negating the call's result. The
+/// classifier and the receiver-type rung both read a receiver's **leftmost
+/// segment**, and `*` is not a segment: every one of these rows reached
+/// `UninferredReceiver` with the binding that would have typed it sitting one
+/// character to the right. Measured: 370 rows on this repository (`*path`,
+/// `*name`, `&…`) and 107 on a 306-file Swift corpus, where `!Self.containsNul`
+/// is a call to the enclosing type's own static method that the `self` rung
+/// could not see.
+///
+/// **Only when the remainder is a plain path**, and that restriction is the
+/// whole of the argument. A reference or a dereference denotes the *same value*
+/// as its operand, so the operand's declared type is the receiver's and reading
+/// it is not a guess. `!name.is_empty()` does not: it denotes a `bool` computed
+/// from a call, and rooting it at `name` would claim the method belongs to
+/// whatever `name` is. Requiring what follows to be an identifier or a dotted
+/// path — no parentheses, no brackets, no further operators — separates them
+/// exactly, and it is why `!Self` is taken and `!a.ok()` is left alone.
+///
+/// Arithmetic is deliberately absent. `-x` is a different value of a possibly
+/// different type, and the reduction has no way to know; it costs a row and
+/// invents nothing.
+pub(crate) fn strip_prefix_operators(text: &str) -> &str {
+    let mut rest = text;
+    let mut stripped_any = false;
+    // Bounded: `&&x` and `&mut *p` are real, a thousand leading `&` is not.
+    for _ in 0..4 {
+        let Some(next) = rest
+            .strip_prefix('&')
+            .or_else(|| rest.strip_prefix('*'))
+            .or_else(|| rest.strip_prefix('!'))
+            .map(|after| after.strip_prefix("mut ").unwrap_or(after))
+            .map(str::trim_start)
+            .filter(|next| !next.is_empty())
+        else {
+            break;
+        };
+        rest = next;
+        stripped_any = true;
+    }
+    if !stripped_any {
+        return text;
+    }
+    // What is left must be a path of names and nothing else: a parenthesis, a
+    // bracket, a quote or a second operator means the operand was an
+    // expression, not a binding, and its type is not the receiver's.
+    //
+    // `$` and `#` are names here for the reason `is_callee_identity` admits
+    // them: Swift spells a closure's parameter `$0`, PHP spells every variable
+    // `$r`, and a JavaScript private member is `#name`. Refusing them would
+    // leave `!$0` and `&$row` rooted at an operator in the two languages whose
+    // ordinary bindings look like that.
+    let is_name_char =
+        |character: char| character.is_alphanumeric() || matches!(character, '_' | '$' | '#');
+    let is_plain_path = rest
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || matches!(first, '_' | '$' | '#'))
+        && rest
+            .split(['.', ':'])
+            .all(|segment| segment.chars().all(is_name_char));
+    if is_plain_path {
+        rest
+    } else {
+        text
+    }
 }
 
 /// Grammar keys for a call, across the languages this crate splits receivers
