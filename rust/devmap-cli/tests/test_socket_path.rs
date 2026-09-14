@@ -78,14 +78,24 @@ async fn the_printed_socket_path_is_the_one_the_daemon_binds() {
         .with_store_path(db.clone())
         .with_idle_poll(Duration::from_millis(20));
     let running = daemon.clone();
-    let task = tokio::spawn(async move { running.run_loop().await });
+    let mut task = tokio::spawn(async move { running.run_loop().await });
 
-    for _ in 0..300 {
-        if announced.exists() {
-            break;
+    // Not a stat-poll: waiting for the path to appear cannot tell a daemon that
+    // is still starting from one that already returned an error saying why it
+    // never will, and reports the same "did not bind" for both after spending
+    // its whole budget. The daemon's own endpoint signal, raced against the
+    // task, distinguishes them — and only then does asking about the *path*
+    // mean anything, because the claim under test is that the path the daemon
+    // bound is the path it printed.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::select! {
+            biased;
+            () = daemon.wait_until_serving() => {}
+            ended = &mut task => panic!("the daemon stopped before binding: {ended:?}"),
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await
+    .expect("`run_loop` neither bound its endpoint nor returned: it is hung, not slow");
     assert!(
         announced.exists(),
         "the daemon did not bind the announced endpoint {}",

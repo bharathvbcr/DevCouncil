@@ -1501,17 +1501,23 @@ impl Drop for UnixIpcServer {
     }
 }
 
+/// `on_listening` is called once, the moment the first pipe instance exists and
+/// a client could connect — the named-pipe counterpart of `UnixIpcServer::bind`
+/// returning. It is a callback rather than a return value because this function
+/// never returns while the endpoint is up.
 #[cfg(windows)]
 pub async fn run_named_pipe(
     store: Arc<Store>,
     name: &str,
     state: Arc<ServeState>,
+    on_listening: impl FnOnce(),
 ) -> anyhow::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
         .create(name)?;
+    on_listening();
     let admission = crate::admission::Admission::new(MAX_CONCURRENT_CONNECTIONS);
     let mut consecutive_connect_errors: u32 = 0;
     loop {

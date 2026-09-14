@@ -238,6 +238,16 @@ pub struct Daemon {
     /// Tripped by [`Daemon::request_shutdown`], and by SIGTERM/SIGINT, to end
     /// [`Daemon::run_loop`] through its orderly-release path.
     shutdown: Arc<tokio::sync::Notify>,
+    /// Latched by [`Daemon::run_loop`] the moment its IPC endpoint is live, and
+    /// awaited through [`Daemon::wait_until_serving`].
+    ///
+    /// Latched rather than levelled, and never cleared: the endpoint's *release*
+    /// is an ordinary part of this daemon's life — every retirement path unlinks
+    /// the socket — so a signal that fell back to false would be unobservable
+    /// exactly when the daemon is short-lived. What a caller needs to know is
+    /// that startup got as far as a live endpoint, which is a fact about the
+    /// past and cannot stop being true.
+    serving: Arc<tokio::sync::watch::Sender<bool>>,
     /// The store file this daemon serves, when it has one on disk.
     ///
     /// `None` means "not stated" — an in-memory store, or a caller that did not
@@ -353,6 +363,13 @@ impl Daemon {
             ipc_path,
             max_idle: None,
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            // `channel`, not `Sender::new`: the workspace declares tokio 1.38
+            // as its floor and this half of the API is older than either, so
+            // nothing here depends on the lockfile happening to resolve newer.
+            // The receiver is dropped immediately — `send_replace` does not
+            // care whether anyone is listening, and `subscribe` works either
+            // way.
+            serving: Arc::new(tokio::sync::watch::channel(false).0),
             store_path: None,
             #[cfg(test)]
             connect_time_probe: None,
@@ -382,6 +399,56 @@ impl Daemon {
         // `notify_one` stores a permit if nobody is waiting yet, so a shutdown
         // requested before the loop reaches its select is not lost.
         self.shutdown.notify_one();
+    }
+
+    /// Resolve once [`Self::run_loop`] has brought this daemon's IPC endpoint
+    /// up — the moment a client could connect to it.
+    ///
+    /// This is the answer to "is the daemon up yet?", and it exists because the
+    /// obvious substitute is wrong in two ways that cost a gate its
+    /// credibility. Polling for the socket path cannot see a daemon that
+    /// *stopped* — a `run_loop` that returned an error, or panicked, before
+    /// binding leaves the path missing for exactly the same reason a slow
+    /// startup does, so a waiter attributes the failure to the clock and
+    /// reports "it did not bind in time" about a daemon that said precisely why
+    /// it would never bind. Measured on an idle machine, a stat-poll bounded at
+    /// 500 x 20 ms turned `devmap IPC endpoint is already active` into 11.5 s of
+    /// waiting and then a timeout message. It also cannot see an endpoint that
+    /// came up and was released again between two polls, which every short-idle
+    /// daemon in this crate's tests does by design.
+    ///
+    /// Awaiting this signal answers the first question honestly and the second
+    /// by construction — it is latched, so it is answered whether the caller
+    /// arrives before the endpoint exists or after it is gone. It is not a
+    /// substitute for watching the task: a caller that wants a *bound* wait
+    /// still has to race this against the handle `run_loop` is running on,
+    /// because a daemon that died before binding never reaches this signal at
+    /// all. `serving_or_dead` — in this file's test module for the unit tests,
+    /// and in `tests/support/mod.rs` for the integration tests, which cannot
+    /// see inside the library — is that race written out.
+    pub async fn wait_until_serving(&self) {
+        let mut receiver = self.serving.subscribe();
+        // Latched, so this exits without waiting when the endpoint already came
+        // up — including after it has been released again.
+        //
+        // `changed` fails only once every sender has dropped, which `&self`
+        // holds one against for the whole call. It is stated rather than
+        // swallowed because returning as though the endpoint were live is the
+        // one answer this must never give.
+        while !*receiver.borrow_and_update() {
+            receiver
+                .changed()
+                .await
+                .expect("the daemon holding this signal is borrowed for the whole wait");
+        }
+    }
+
+    /// Latch [`Self::wait_until_serving`]. Called once the endpoint is live.
+    fn announce_serving(&self) {
+        // `send_replace`, not `send`: `send` reports an error when there are no
+        // receivers yet, and "nobody is waiting" is the ordinary case for a
+        // daemon nothing is synchronising on.
+        self.serving.send_replace(true);
     }
 
     pub fn with_batch_limit(mut self, batch_limit: usize) -> Self {
@@ -1276,10 +1343,11 @@ impl Daemon {
         // restarts the tooling that spawns this daemon.
         //
         // It also makes the check testable. A test can synchronise on the
-        // socket appearing; it has no way to observe a capture that happens
-        // afterwards, so `daemon_binary_retirement.rs` was failing whenever a
-        // cold binary made startup slow enough for its `advance_modification_time`
-        // to land inside the window.
+        // endpoint coming up — see [`Self::wait_until_serving`] — and has no
+        // way to observe a capture that happens after that, so
+        // `daemon_binary_retirement.rs` was failing whenever a cold binary made
+        // startup slow enough for its `advance_modification_time` to land
+        // inside the window.
         let started_as = executable_identity();
         info!(
             "DevMap daemon started for {:?} (batch_limit={})",
@@ -1345,6 +1413,10 @@ impl Daemon {
         #[cfg(unix)]
         let mut ipc_task = AbortTaskOnDrop({
             let server = crate::protocol::UnixIpcServer::bind(&self.ipc_path)?;
+            // The socket is on disk and listening the instant `bind` returns,
+            // so this is where the endpoint is live — before the accept loop is
+            // even spawned, exactly as a connecting client sees it.
+            self.announce_serving();
             let store = Arc::clone(&self.store);
             tokio::spawn(server.run(store, Arc::clone(&state)))
         });
@@ -1354,7 +1426,15 @@ impl Daemon {
             let store = Arc::clone(&self.store);
             let state = Arc::clone(&state);
             let name = self.ipc_path.to_string_lossy().into_owned();
-            tokio::spawn(async move { crate::protocol::run_named_pipe(store, &name, state).await })
+            // The named pipe's first instance is created inside the loop rather
+            // than before it, so the signal is handed down to the one place
+            // that knows the endpoint exists. Latching it out here instead
+            // would announce a spawned task, not a live endpoint.
+            let serving = self.clone();
+            tokio::spawn(async move {
+                crate::protocol::run_named_pipe(store, &name, state, || serving.announce_serving())
+                    .await
+            })
         });
 
         // Reconcile after the endpoint is live: a failure here is logged and
@@ -1883,6 +1963,45 @@ mod tests {
     // assembled. The drain itself must never use it.
     use devmap_analyze::analyze;
     use devmap_analyze::model::AnalysisStatus;
+
+    /// Wait until `daemon`'s IPC endpoint is live, or until the task running it
+    /// stops trying — and say which.
+    ///
+    /// Five tests below opened with the same two hundred stats of the socket
+    /// path at 10 ms, then `assert!(socket.exists(), "daemon IPC socket did not
+    /// start")`. That message was the only thing any of them could say, and it
+    /// was equally true of a slow start, of a `run_loop` that returned an error
+    /// naming its own cause, of one that panicked, and of an endpoint that came
+    /// up and was released again between two stats. Racing the daemon's own
+    /// endpoint signal against its task tells those apart, and costs no wall
+    /// clock on the path that works.
+    ///
+    /// `tests/support/mod.rs` carries the same helper for this crate's
+    /// integration tests, which cannot see inside the library; the semantics
+    /// both of them rest on have one owner, [`Daemon::wait_until_serving`].
+    async fn serving_or_dead(
+        daemon: &Daemon,
+        running: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let raced = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::select! {
+                // Biased, endpoint first: the signal is latched, so this arm is
+                // ready whenever the endpoint ever came up — including when the
+                // daemon has since retired and both arms are ready together.
+                biased;
+                () = daemon.wait_until_serving() => {}
+                ended = running => {
+                    panic!("the daemon stopped before binding its endpoint: {ended:?}")
+                }
+            }
+        })
+        .await;
+        assert!(
+            raced.is_ok(),
+            "`run_loop` neither brought its endpoint up nor returned within 60s: \
+             it is hung, not slow"
+        );
+    }
 
     #[test]
     fn agentic_drain_takes_the_writer_lock_before_reading_its_base() {
@@ -3016,6 +3135,115 @@ mod tests {
         dir
     }
 
+    /// A daemon that cannot bind says so, and says it without spending a clock.
+    ///
+    /// This is the failure the endpoint signal exists for. The endpoint is
+    /// occupied by a live listener, so `UnixIpcServer::bind` refuses at once
+    /// and the socket the old wait was stat-polling for will never appear —
+    /// which that wait could only render as "it did not bind in time", after
+    /// its full 500 x 20 ms. Measured at the time: `run_loop` answered in
+    /// milliseconds and the poll reported a timeout 11.5 s later, the same
+    /// shape and within 2% the same runtime as the flake that prompted this.
+    ///
+    /// Two things are pinned. The signal must *not* latch for a start that
+    /// failed — a readiness flag that fires on the attempt would be worse than
+    /// the stat-poll, since it would report a live endpoint where there is
+    /// none. And the answer must arrive well inside the budget the old shape
+    /// needed, so a return to stat-polling fails here rather than passing
+    /// slowly: the 5 s below is half of that budget, against a measured cost of
+    /// a few milliseconds, and it is a real bound because this fixture cannot
+    /// succeed — nothing here is racing a healthy daemon against a deadline.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_daemon_that_cannot_bind_reports_why_instead_of_timing_out() {
+        let root = short_unix_fixture_dir("occupied");
+        fs::write(root.join("main.py"), "def main(): pass\n").unwrap();
+        let socket = root.join("taken.sock");
+
+        // A live endpoint on the path, answering, so `bind`'s liveness probe
+        // refuses to reclaim it rather than treating it as a stale socket.
+        let squatter = tokio::net::UnixListener::bind(&socket).unwrap();
+        let accepting = tokio::spawn(async move {
+            loop {
+                let _ = squatter.accept().await;
+            }
+        });
+
+        let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone())
+            .with_ipc_path(socket.clone())
+            .with_idle_poll(Duration::from_millis(20))
+            .with_max_idle(None);
+        let watching = daemon.clone();
+        let mut task = tokio::spawn(async move { daemon.run_loop().await });
+
+        let reported = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                biased;
+                () = watching.wait_until_serving() => None,
+                ended = &mut task => Some(ended),
+            }
+        })
+        .await
+        .expect("a daemon whose endpoint is occupied must not leave the caller waiting");
+
+        let ended = reported.expect(
+            "the endpoint signal latched for a daemon that never bound: it must \
+             mean a live endpoint, not an attempted one",
+        );
+        let error = ended
+            .expect("the run loop must fail, not panic")
+            .expect_err("binding an occupied endpoint must not report success");
+        assert!(
+            error.to_string().contains("already active"),
+            "the failure must name the cause a caller can act on, not the clock: {error}"
+        );
+
+        accepting.abort();
+        let _ = accepting.await;
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The endpoint signal outlives the endpoint.
+    ///
+    /// A daemon's socket existing is a fact with a short and unpredictable
+    /// life: every retirement path unlinks it, and the short-idle daemons this
+    /// crate tests with can be gone before the first stat. Anything that waits
+    /// on the *path* therefore has a window it can miss, and missing it is
+    /// indistinguishable from a daemon that never started. The signal is
+    /// latched precisely so that window does not exist, and this pins it —
+    /// asked after the daemon has retired and taken its socket with it, it
+    /// still answers.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_endpoint_signal_is_still_answerable_after_the_endpoint_is_gone() {
+        let root = short_unix_fixture_dir("latched");
+        fs::write(root.join("main.py"), "def main(): pass\n").unwrap();
+        let socket = root.join("brief.sock");
+
+        let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone())
+            .with_ipc_path(socket.clone())
+            .with_idle_poll(Duration::from_millis(10))
+            .with_max_idle(Some(Duration::from_millis(20)));
+
+        // Run to completion in this task: the daemon binds and retires with
+        // nobody watching, which is the case a poll cannot cover.
+        let outcome = tokio::time::timeout(Duration::from_secs(30), daemon.run_loop())
+            .await
+            .expect("a daemon with a 20 ms idle bound must retire");
+        assert!(outcome.is_ok(), "idle retirement reported: {outcome:?}");
+        assert!(
+            !socket.exists(),
+            "precondition: the endpoint must already be released, so the only \
+             thing left to ask is the signal"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), daemon.wait_until_serving())
+            .await
+            .expect("the signal must still report that the endpoint came up");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     /// A rebuilt binary retires the daemon; an unchanged one does not.
     ///
     /// The hazard is specific: `PROTOCOL_VERSION` does not move when the kernel
@@ -3163,21 +3391,18 @@ mod tests {
             .with_ipc_path(socket.clone())
             .with_idle_poll(Duration::from_millis(20))
             .with_max_idle(Some(Duration::from_millis(100)));
-        let task = tokio::spawn(async move { daemon.run_loop().await });
+        let watching = daemon.clone();
+        let mut task = tokio::spawn(async move { daemon.run_loop().await });
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !socket.exists() && tokio::time::Instant::now() < deadline {
-            if task.is_finished() {
-                let joined = task.await;
-                let inner = joined.expect("join");
-                panic!(
-                    "run_loop exited before binding IPC: {inner:?}",
-                    inner = inner.map_err(|error| error.to_string())
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(socket.exists(), "daemon IPC socket did not start");
+        // This one always did ask whether the task had died — it is where the
+        // question came from — but it asked between stats, so a daemon that
+        // died in the same window its socket would have appeared in still
+        // reported the socket's absence. Racing the endpoint signal asks it
+        // continuously. The 100 ms idle bound also means this daemon may have
+        // retired before the first stat: the latched signal answers anyway,
+        // which the `socket.exists()` that followed could not, so the
+        // assertion itself has to be on the signal rather than on the path.
+        serving_or_dead(&watching, &mut task).await;
 
         let result = tokio::time::timeout(Duration::from_secs(5), task)
             .await
@@ -3486,15 +3711,14 @@ mod tests {
             .with_ipc_path(socket.clone())
             .with_idle_poll(Duration::from_millis(20));
         let running = daemon.clone();
-        let task = tokio::spawn(async move { running.run_loop().await });
+        let mut task = tokio::spawn(async move { running.run_loop().await });
 
-        for _ in 0..200 {
-            if socket.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(socket.exists(), "daemon IPC socket did not start");
+        serving_or_dead(&daemon, &mut task).await;
+        assert!(
+            socket.exists(),
+            "the endpoint came up, so a missing socket means it is not at the \
+             configured path"
+        );
         assert!(lock.exists(), "daemon IPC lock was never taken");
 
         daemon.request_shutdown();
@@ -3553,15 +3777,15 @@ mod tests {
             // `None` disables idle retirement, so nothing but the vanished
             // repository can end this loop.
             .with_max_idle(None);
-        let task = tokio::spawn(async move { daemon.run_loop().await });
+        let watching = daemon.clone();
+        let mut task = tokio::spawn(async move { daemon.run_loop().await });
 
-        for _ in 0..200 {
-            if socket.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(socket.exists(), "daemon IPC socket did not start");
+        serving_or_dead(&watching, &mut task).await;
+        assert!(
+            socket.exists(),
+            "the endpoint came up, so a missing socket means it is not at the \
+             configured path"
+        );
 
         // Still serving while the tree is there: this must be the deletion that
         // ends it, not merely elapsed time.
@@ -3612,15 +3836,15 @@ mod tests {
             // `None` disables idle retirement, so nothing but the vanished
             // repository can end this loop.
             .with_max_idle(None);
-        let task = tokio::spawn(async move { daemon.run_loop().await });
+        let watching = daemon.clone();
+        let mut task = tokio::spawn(async move { daemon.run_loop().await });
 
-        for _ in 0..200 {
-            if socket.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(socket.exists(), "daemon IPC socket did not start");
+        serving_or_dead(&watching, &mut task).await;
+        assert!(
+            socket.exists(),
+            "the endpoint came up, so a missing socket means it is not at the \
+             configured path"
+        );
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
             !task.is_finished(),
@@ -3711,15 +3935,15 @@ mod tests {
         let _ = fs::remove_file(&socket);
         let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone())
             .with_ipc_path(socket.clone());
-        let task = tokio::spawn(async move { daemon.run_loop().await });
+        let watching = daemon.clone();
+        let mut task = tokio::spawn(async move { daemon.run_loop().await });
 
-        for _ in 0..100 {
-            if socket.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(socket.exists(), "daemon IPC socket did not start");
+        serving_or_dead(&watching, &mut task).await;
+        assert!(
+            socket.exists(),
+            "the endpoint came up, so a missing socket means it is not at the \
+             configured path"
+        );
         task.abort();
         let _ = task.await;
         for _ in 0..100 {
@@ -3759,14 +3983,14 @@ mod tests {
         let daemon = Daemon::new(store, root.clone())
             .with_idle_poll(Duration::from_millis(50))
             .with_ipc_path(socket.clone());
-        let task = tokio::spawn(async move { daemon.run_loop().await });
-        for _ in 0..200 {
-            if socket.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(socket.exists(), "daemon IPC socket did not start");
+        let watching = daemon.clone();
+        let mut task = tokio::spawn(async move { daemon.run_loop().await });
+        serving_or_dead(&watching, &mut task).await;
+        assert!(
+            socket.exists(),
+            "the endpoint came up, so a missing socket means it is not at the \
+             configured path"
+        );
 
         // Rewrite each round, then stay quiet longer than the watcher's
         // debounce before rewriting again.

@@ -23,6 +23,9 @@ use std::time::Duration;
 use devmap_serve::Daemon;
 use devmap_store::Store;
 
+mod support;
+use support::serving_or_dead;
+
 /// Move a file's modification time forward, the way a rebuild does.
 ///
 /// Opened read-only: a running executable cannot be opened for write
@@ -42,16 +45,6 @@ fn advance_modification_time(path: &Path) {
         .expect("the test process owns its own executable");
 }
 
-async fn wait_for(path: &Path, exists: bool) -> bool {
-    for _ in 0..500 {
-        if path.exists() == exists {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    path.exists() == exists
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replaced_binary_retires_the_daemon_and_releases_its_endpoint() {
     let root =
@@ -68,13 +61,15 @@ async fn a_replaced_binary_retires_the_daemon_and_releases_its_endpoint() {
         .with_ipc_path(socket.clone())
         .with_idle_poll(Duration::from_millis(20))
         .with_max_idle(None);
-    let serving = tokio::spawn(async move { daemon.run_loop().await });
+    // A clone to hold the endpoint signal: `run_loop` is moved into the task,
+    // and both halves share one `Arc`, so this is the same daemon's signal.
+    let watching = daemon.clone();
+    let mut serving = tokio::spawn(async move { daemon.run_loop().await });
 
-    assert!(
-        wait_for(&socket, true).await,
-        "the daemon must bind its endpoint at {} before the binary changes",
-        socket.display()
-    );
+    // The binary must not change until the endpoint is genuinely up, or the
+    // retirement under test is racing startup rather than exercising a running
+    // daemon.
+    serving_or_dead(&watching, &mut serving).await;
 
     advance_modification_time(&std::env::current_exe().unwrap());
 
@@ -114,9 +109,16 @@ async fn a_replaced_binary_retires_the_daemon_and_releases_its_endpoint() {
         second.is_ok(),
         "the released endpoint must be immediately rebindable: {second:?}"
     );
+    // Asserted directly, for the reason spelled out above: `run_loop` has
+    // already resolved, and the whole claim is that the release happens before
+    // it does. Waiting here — this polled for ten seconds — would have let a
+    // merely-scheduled cleanup pass, which is the defect this file exists to
+    // catch, and would have spent that ten seconds proving nothing whenever it
+    // did fail.
     assert!(
-        wait_for(&socket, false).await,
-        "and the successor's own orderly exit must release it again"
+        !socket.exists(),
+        "the successor's own orderly exit left {} behind",
+        socket.display()
     );
 
     let _ = std::fs::remove_dir_all(&root);
