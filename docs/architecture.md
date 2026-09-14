@@ -1,150 +1,112 @@
-# DevCouncil Architecture
+# Architecture
 
-DevCouncil is **components and modules** for AI-assisted software development. It provides the deterministic substrate — code intelligence, leases, verification, search — that makes AI-generated work verifiable, scoped, and traceable back to requirements. Manvi wraps those modules into a harness; host apps such as GitPulse take Manvi and selected DevCouncil components for their respective jobs.
+DevCouncil supplies native components for AI-assisted development. The Go host
+connects task tooling; Rust owns code intelligence, state, search and rigor
+checks. A consumer can use a single binary or selected library crates.
+[Documentation index](README.md)
 
----
+## Components and ownership
 
-## 1. System Architecture
-
-DevCouncil is built as independently installable native modules. Rather than linking large runtimes together via complex FFI or Python bindings, components communicate across process and protocol boundaries, and a host may also link a selected crate when that is the right seam:
+| Component | Source owner | Responsibility |
+|---|---|---|
+| `devcouncil` / `dev` | `backend/go_orchestrator/cmd/devcouncil/` | Host CLI, task MCP, integration, skills, verification orchestration and DevMap forwarding |
+| `devmap` | `rust/devmap-cli/` and `rust/devmap-*` | Extraction, resolution, graph storage, analysis, queries, watching and navigation MCP |
+| `dcstore` | `rust/dc-store/` | SQLite task and workbench state, leases, verification records and gaps |
+| `dcverify` | `rust/dc-verify/` | Structured diff analysis, scope classification, stub/secret checks and diff–coverage intersection |
+| `dcgrep` | `rust/dc-grep/` | Ignore-aware text search with optional trigram indexing |
 
 ```mermaid
 flowchart TD
-    subgraph Upstream["Harnesses and host apps"]
-        Manvi["Manvi (wraps the components)"]
-        GitPulse["GitPulse (selects Manvi + DevCouncil modules)"]
-        ExternalAgents["Coding Agents (Claude Code, Cursor, Codex, Antigravity)"]
-    end
-
-    subgraph Host["Go Host Orchestrator (devcouncil / dev)"]
-        HostCLI["CLI Entrypoint
-cmd/devcouncil"]
-        HostMCP["Host MCP Server
-devcouncil mcp"]
-        HostInteg["Integrations Engine
-devcouncil integrate"]
-        HostSkills["Skills Scaffolder
-devcouncil skills"]
-        HostVerify["Verify Gateway
-devcouncil verify"]
-    end
-
-    subgraph Analysis["Rust Analysis & State Suite"]
-        DevMap["devmap
-Code Graph & 36+ Language Extractors"]
-        DCStore["dcstore
-Atomic Task Leases & SQLite Store"]
-        DCVerify["dcverify
-Unified Diff Parser & Rigor Gates"]
-        DCGrep["dcgrep
-Ripgrep Engine & Trigram Index"]
-    end
-
-    ExternalAgents <-->|MCP Protocol| HostMCP
-    Manvi -->|Imports Go packages| Host
-    Manvi -->|Spawns selected binaries| Analysis
-    GitPulse -->|Vendors selected crates| DevMap
-    GitPulse -->|manvi serve| Manvi
-
-    HostCLI -->|Execs| DevMap
-    HostCLI -->|Integrates| HostInteg
-    HostCLI -->|Scaffolds| HostSkills
-    HostVerify -->|Scope, orphan, expected tests| DCStore
-    Manvi -->|Spawns dcverify rigor| DCVerify
-
-    HostMCP -->|Lease and task storage| DCStore
-    HostMCP -->|verify_task → Go Run| HostVerify
+    Agent[Editor or coding agent] -->|code navigation MCP| Map[devmap]
+    Agent -->|task MCP| Host[Go host: devcouncil]
+    Host -->|map / graph / ast forwarding| Map
+    Host -->|task and lease operations| State[dcstore]
+    Host --> Verify[Go verification orchestration]
+    Verify -->|rigor request| Rigor[dcverify]
+    Verify -->|expected commands| Shell[Local shell in project root]
+    Verify -->|runs and gaps| State
+    Map --> Graph[(Canonical graph SQLite store)]
+    Map --> Exports[Repository map / graph exports / managed guides]
+    Harness[Consuming harness or app] -->|selected modules| Map
+    Harness --> State
+    Harness --> Rigor
+    Harness --> Search[dcgrep]
 ```
 
----
+The diagram describes implemented interfaces, not a claim that every consumer
+uses every edge. Manvi owns its agent loop and provider orchestration. GitPulse
+composes Manvi with selected DevCouncil components; those consumers have their
+own versions and qualification requirements.
 
-## 2. Core Components
+## Two MCP servers
 
-### A. Go Host Orchestrator (`devcouncil` / `dev`)
+`devmap mcp` serves code navigation. Its repository-aware envelopes let one
+server serve multiple workspaces: clients send `repo_path` and verify the
+returned `repository.root` before using the answer.
 
-Located in `backend/go_orchestrator/`. Compiled as a single static native binary.
-- **Host MCP Server (`mcp`):** Provides stdio MCP tools for task checkout, leases, diff analysis, and verification gates.
-- **Agent Integration (`integrate`):** Cursor writes `.cursor/mcp.json` + a rule. Claude writes `.mcp.json`. Codex writes a comment-only toml. Antigravity writes `.agents/mcp_config.json`, OpenCode `opencode.json` (plus an ES-module hook listed in `plugin`), Warp `.devcouncil/integrations/warp-mcp.json`. Each merges only the `devcouncil` entry; `devmap integrate` adds `devmap` to the same files. Gemini and Aider are refused. `--write-gate` is refused before writes (TASK-P7-8).
-- **Skills Distribution (`skills`):** Scaffolds embedded engineering and code intelligence skills into agent directories (`.agents/skills`, `.claude/skills`, `.cursor/skills`).
-- **Verification Gateway (`verify`):** Checks leases in `dcstore` and runs Go `verify.Run()` (no-work, planned-file, orphan-diff, dependency-risk, expected-test commands). It spawns **`dcverify`** through `dc/dcverify` for the rigor gates — stub, secret, and diff↔coverage — so `devcouncil verify`, MCP `devcouncil_verify_task`, and Manvi `runRigor` now share one verifier. Scope classification is *not* read back from it: `DetectOrphanDiffGaps` owns that question on this side, and two producers of one finding is how two answers come to disagree. `rigor_applied` names the gates that ran and `rigor_skipped_reason` says why when none did; a configured verifier that fails is a blocking `rigor_check_unavailable` gap, never a skip. `--sandbox` is recorded on the report; only local `/bin/sh -c` in the project root is implemented.
-- **DevMap Forwarding (`map`, `graph`, `ast`):** Dispatches directly to `devmap`.
+`devcouncil mcp` serves eight task/policy tools from
+[`Registry.Specs`](../backend/go_orchestrator/devcouncil/registry.go): diff,
+checkout, renew lease, release, next task, verify task, get gaps and check write
+policy. It binds to the project root resolved by the Go host. It is not an
+arbitrary shell/file-edit server. Ordinary editor writes are not intercepted
+by the retired DevCouncil lifecycle hooks.
 
-### B. Code Intelligence Engine (`devmap`)
+## Code graph pipeline
 
-Multi-crate workspace providing compiler-grade code intelligence without calling an LLM.
-- **Extract (`devmap-extract`):** 36+ tree-sitter grammars extracting definitions, imports, calls, exports, and language fixtures.
-- **Resolve (`devmap-resolve`):** High-speed cross-file symbol resolution and import binding.
-- **Analyze (`devmap-analyze`):** Blast radius, reverse dependents, circular dependency detection, and dead code classification.
-- **Store (`devmap-store`):** SQLite WAL-mode canonical code graph store (`.devcouncil/codeintel/devmap.sqlite`).
-- **Query & Serve (`devmap-query`, `devmap-serve`):** CLI (`search`, `explore`, `trace`, `impact`, `dead`, `cypher`) and `devmap mcp` / `devmap serve`. There is no `devmap query` command.
+1. `devmap-extract` discovers files and extracts definitions, imports, calls and
+   language-specific evidence. Parsing and discovery gaps remain visible.
+2. `devmap-resolve` resolves symbols and relationships, preserving ambiguity and
+   unresolved sites rather than upgrading a name match into certainty.
+3. `devmap-analyze` computes graph analysis and liveness candidates.
+4. `devmap-store` owns persistence; `devmap-query` reads and composes results.
+5. `devmap-serve` watches and updates state; `devmap-cli` exposes CLI/MCP and
+   integration surfaces.
 
-### C. State & Lease Repository (`dcstore`)
+Supported parsing is not complete semantic coverage. Read
+[code graph interpretation](code-graph.md) before making completeness claims.
 
-Provides safe concurrent agent building through atomic SQLite leases:
-- Manages tasks, requirements, leases, evidence, and verification runs.
-- Mutual-exclusion task locking prevents multi-agent write collisions on shared files.
-- Communicates with the Go host via JSON over stdio.
+## Verification pipeline
 
-### D. Deterministic Verification Engine (`dcverify`)
+The CLI and host MCP converge on
+[`VerifyTask` / `Run`](../backend/go_orchestrator/devcouncil/verify/orchestrate.go).
+The Go layer collects task and diff context, checks no-work/planned-file/orphan/
+dependency conditions, and executes expected commands. It invokes `dcverify`
+through [`runRigorGates`](../backend/go_orchestrator/devcouncil/verify/rigor.go)
+for stub, secret and optional coverage checks.
 
-Evaluates task diffs against strict engineering invariants:
-- **Scope Classification:** Rejects diffs that touch files outside the task's declared `planned_files`.
-- **Rigor Gates:** Anti-laziness stub detection, empty diff rejection, secret scanning.
-- **Coverage Intersection:** Intersects modified line ranges with test execution coverage.
-- **Typed Next Actions:** Emits machine-readable repair instructions (`next_actions`) when verification fails.
+Go scope findings retain their existing owner; the rigor adapter does not
+report a second independent scope verdict. Result metadata names applied gates
+and skipped reasons. CLI `--coverage PATH` supplies a profile; the host MCP
+verify tool does not expose that field. Missing `dcverify` is reported as a
+skip; a configured verifier that fails produces an unavailable-check gap.
 
----
+The gate mode governs the verdict. Default `off` reports verification skipped;
+`advisory` and `enforce` have different blocking policies. A success-shaped
+response or process exit alone does not establish that all checks ran.
+Expected commands run in a local shell. The sandbox selector does not implement
+Docker or Nix isolation. See the [task loop contract](hero-loop.md).
 
-## 3. Separation of Concerns: DevCouncil vs. Manvi vs. GitPulse
+## State and artifacts
 
-DevCouncil is the **components and modules**. Manvi **wraps** them. GitPulse **selects** both for their respective jobs. Each module can be updated on its own, and an app is not required to take the whole suite.
-
-- **DevCouncil owns:**
-  - Standalone compiled binaries and libraries (`devcouncil`, `devmap`, `dcstore`, `dcverify`, `dcgrep`).
-  - Code graph extraction, symbol resolution, and workspace navigation.
-  - Task state, atomic leases, write containment policy, and deterministic verification gates.
-  - MCP servers for agent tooling.
-- **Manvi wraps those modules and owns:**
-  - The agent turn loop, LLM provider routing, and policy ladder.
-  - Prompt construction, agent personas, and debate councils.
-  - Multi-agent campaign coordination, TUI, and `manvi serve` for embedding.
-- **GitPulse uses:**
-  - Manvi for policy, workbench, and agent hosting.
-  - Selected DevCouncil components (`devmap` CLI and crates, verification reads) for code intelligence and related analysis.
-
----
-
-## 4. The Artifact Graph
-
-The durable source of truth for every task. Every modified line of code traces back to a requirement and acceptance criterion:
-
-```mermaid
-erDiagram
-    Requirement ||--o{ AcceptanceCriterion : "has"
-    Requirement ||--o{ Task : "triggers"
-    AcceptanceCriterion ||--o{ Task : "verified_by"
-    Task ||--o{ PlannedFile : "affects"
-    Task ||--o{ ChangedFile : "produces"
-    Task ||--o{ Evidence : "generates"
-    Evidence ||--o{ Gap : "may_reveal"
-    Gap }o--|| Task : "becomes_repair_task"
-```
-
-| Entity | Description |
+| Artifact | Location / resolution |
 |---|---|
-| **Requirement** | Discrete functionality or constraint from project goals. |
-| **Acceptance Criterion** | Falsifiable condition required to satisfy a requirement. |
-| **Task** | Scoped unit of work linked to requirements, carrying declared planned files. |
-| **Evidence** | Deterministic artifacts (test output, diff coverage, verification logs). |
-| **Gap** | Blocking or advisory issue identified during verification. |
+| Code graph database | `db_path` from `devmap paths --json`; canonical query source |
+| Repository map | `repo_map` from `paths`; file/subsystem navigation |
+| Graph export | `code_graph` from `paths`; may be capped |
+| Agent guides | Project `AGENTS.md` / `CLAUDE.md`, written when requested and managed |
+| Task state | `.devcouncil/state.sqlite`, opened by the Go host |
 
----
+[`devmap-extract/src/paths.rs`](../rust/devmap-extract/src/paths.rs) owns state
+resolution: configured state home, then existing `.devmap/`, then existing
+`.devcouncil/`, otherwise new `.devmap/`. An explicit `--db` selects a database.
+Do not confuse the task store with the graph store, or copy generated state
+between worktrees.
 
-## 5. Storage Layout
+## Build and compatibility
 
-State is kept locally inside the target repository:
-- `.devcouncil/repo_map.json`: High-level inventory, entry points, and subsystem groupings.
-- `.devcouncil/graph/code_graph.json`: Exported symbol-level knowledge graph.
-- `.devcouncil/codeintel/devmap.sqlite`: Canonical SQLite store for code intelligence.
-- `.devcouncil/state.sqlite`: Canonical SQLite store for tasks, leases, and verification records.
-- `.devcouncil/logs/`: Redacted execution and verification logs.
+Use [source installers](quickstart.md) and the repository toolchain manifests.
+The npm package is a launcher, separately versioned from native components.
+Changing one component need not require installing all others, but wire
+contracts and store schemas still need compatible readers and writers.
+[Project status](project-status.md) separates current interfaces, implementation
+limits and historical material.

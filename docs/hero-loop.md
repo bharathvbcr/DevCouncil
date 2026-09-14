@@ -1,266 +1,99 @@
-# The Claude Code Hero Loop
+# MCP task loop and verification contract
 
-This is an opt-in strict workflow. It describes `gates.mode=enforce` and does
-not make tasks, leases, or verification mandatory for ordinary work when the
-project uses `advisory` or `off`.
+DevCouncil supplies an opt-in task loop over the Go host’s eight MCP tools.
+The agent drives checkout → implement → verify → repair → release. DevCouncil
+supplies state and verification; it does not run the agent’s model loop.
+[Documentation index](README.md)
 
-DevCouncil's flagship integration is an **autonomous closed loop** with Claude Code over
-MCP: the agent checks out a task, implements it, asks DevCouncil to verify, receives a
-typed list of next actions, repairs, and re-verifies — **without a human pasting prompts
-or test output back and forth.** Evidence, not model confidence, decides when the work is
-done. These are **modules** (lease, verify, MCP). **Manvi** wraps the same components for
-multi-agent campaigns. A host can take this loop without Manvi, or take Manvi without
-this loop.
+## Prerequisites
 
-Cursor and Claude can run this loop over the eight-tool host MCP. It is **Preview**, not a certified slash/hook/subagent install. Other names in `integrate.Hosts` are stub receipts (see
-[coding-cli-integration.md](coding-cli-integration.md)).
+- Native `devcouncil`, `dcstore` and `dcverify` binaries on the consumer’s PATH.
+- A project `.devcouncil/state.sqlite` initialized by a store client or consuming
+  application, with a real task, planned files and expected commands.
+- Host MCP registration pointing at the intended project.
+- An explicit choice of gate mode. Default `off` is not a verification pass.
 
-## Certified path (Preview)
+Mapping a repository or installing the binaries does not create a task. The
+Go host does not supply the retired `dev plan`, `dev go` or `dev e2e` commands.
+See [integration setup](coding-cli-integration.md).
 
-| Agent | OS | Transport | Status |
-| --- | --- | --- | --- |
-| **Claude Code** | macOS, Linux | MCP via `.mcp.json` (`devcouncil_*` eight-tool host) | **Preview** — integrate writes MCP only |
-| **Cursor** | macOS, Linux | MCP via `.cursor/mcp.json` + `.cursor/rules/devcouncil.mdc` | **Preview** — no hooks.json |
-| **Codex** | macOS, Linux | comment-only `.codex/config.toml` | **Stub** |
+## Live tool surface
 
-`devcouncil integrate claude` does **not** install slash commands, a plugin, PreToolUse hooks, a statusline, or a `devcouncil-implementer` subagent. Those were the Python installer. Coverage: Go MCP tests (`backend/go_orchestrator/devcouncil/mcp`) and `dcverify` golden fixtures. Those `dcverify` fixtures cover the Rust binary; host MCP `devcouncil_verify_task` currently runs Go `verify.Run()` and does not spawn `dcverify` (TASK-P7-1). Manvi `runRigor` is the path that execs it.
+The authority is
+[`backend/go_orchestrator/devcouncil/registry.go`](../backend/go_orchestrator/devcouncil/registry.go),
+which both advertises and dispatches these names:
 
-### Deterministic self-repair
-
-Stable repair contract (no LLM required): correction manifest from blocking gaps + typed `next_actions`; bounded re-runs; stop on unchanged blocking-gap fingerprint.
-
-### Lease contract (long runs)
-
-| Failure | Code | Recovery |
-| --- | --- | --- |
-| TTL not yet expired | — | `devcouncil_renew_lease` before `expires_at` |
-| TTL expired | `lease_expired` | `devcouncil_checkout_task` again |
-| Wrong token / no lease | `invalid_lease` | Checkout with correct `client_id` |
-| Another agent holds task | `lease_held_by_other` | `devcouncil_next_task` or wait |
-
-### Best-effort adapters (Preview)
-
-Cursor Agent, Codex, and other CLIs can still *call* the same eight host MCP tools if you point them at `devcouncil mcp` by hand. `integrate` does not configure Antigravity / OpenCode / Warp / Aider / Gemini (stub receipt). Prefer Cursor or Claude MCP for the loop; confirm wiring with `devcouncil integrate cursor|claude --check`.
-
-Large multi-agent goals with dependency DAGs are orchestrated by **Manvi**, which wraps these same DevCouncil components rather than replacing them.
-
-## The loop
-
-```
-checkout_task ─▶ (agent implements) ─▶ verify_task ─▶ passed? ─▶ release_task
-      ▲                                     │
-      │                                     ▼ blocking gaps
-      └──────────── self-repair ◀──── next_actions (typed)
-```
-
-1. **`devcouncil_checkout_task`** — the agent acquires a task lease and gets back the
-   scoped prompt, planned files, allowed commands, expected tests, and (when present)
-   semantic context. One agent owns the task at a time.
-2. **The agent implements** the change inside the declared file scope.
-3. **`devcouncil_verify_task`** — DevCouncil runs the *deterministic* verifier: planned-file
-   compliance, orphan-diff detection, dependency/secret scanning, acceptance evidence, and
-   the **diff↔coverage gate** (below). It returns `passed`, `blocking_gaps`, and
-   `next_actions`.
-4. **`next_actions`** — a typed, machine-routable contract the agent acts on directly.
-   No prose parsing:
-
-   ```json
-   {
-     "gap_id": "GAP-TASK-001-DIFFCOV-ab12-001",
-     "gap_type": "diff_not_exercised",
-     "category": "add_test",
-     "severity": "high",
-     "blocking": true,
-     "action": "Add or extend a test that executes the changed lines (src/calc.py:42), then re-verify.",
-     "file": "src/calc.py",
-     "line": 42,
-     "missing_evidence": "Verification commands passed but exercised 1/6 changed line(s).",
-     "suggested_command": "python -m pytest tests/test_calc.py -q"
-   }
-   ```
-
-   Categories the agent can branch on: `fix_code`, `add_test`, `fix_verification`, `scope`,
-   `security`, `review`, `plan`.
-5. **Self-repair and re-verify** — the agent resolves each action and calls
-   `devcouncil_verify_task` again. The loop continues until `passed` is true.
-6. **`devcouncil_release_task`** — the lease is released.
-
-The agent never needs a human in the inner loop. A human reviews the final evidence (`devcouncil verify TASK_ID --json` / MCP `devcouncil_get_gaps`) — not the chat history. There is no `dev report` command (unknown, exit 2).
-
-## The diff↔coverage gate
-
-This gate lives in **`dcverify`**, which Go `verify.Run()`, MCP `devcouncil_verify_task`, and Manvi `runRigor` all exec. It measures only when a coverage profile is supplied: `devcouncil verify --coverage PATH` (Go `-coverprofile` output or LCOV), or `verify.Input.CoveragePath` for a library caller that runs its own tests under coverage. MCP `devcouncil_verify_task` supplies none — its tool schema has no field for a path — so over MCP this gate records `"coverage profile not supplied"` and the stub and secret gates still run.
-
-A green test suite is only acceptance evidence if it actually ran the lines the diff
-changed. The verifier runs the task's test command under coverage and intersects the
-executed lines with the diff hunks. A passing suite that never imports the changed module,
-never calls the new function, or only exercises an unrelated branch is reported as
-`diff_not_exercised` — the new logic was not proven.
-
-This is deliberately **false-positive-safe** (see [security.md](security.md) for the wider
-discipline):
-
-- It only produces a signal when it has reliable data: a parseable diff, the target repo's
-  own coverage tooling, and changed *executable* lines to measure. Otherwise it degrades
-  silently and the verifier behaves as before — it never blocks correct work for lack of
-  measurement.
-- It is **signal-first**: the gap is non-blocking and informational.
-
-**There is no way to opt into blocking today.** The `verification.diff_coverage.enforce`,
-`min_ratio`, and `verification.rigor.enforce_coverage_on_hard` keys that earlier revisions
-of this page described belonged to the retired Python verifier. No component in this tree
-reads them: since TASK-P7-1 `verify.Run()` does spawn `dcverify`, but `dcverify` takes no
-enforcement setting and the host raises the coverage gap (`diff_not_exercised`) as
-non-blocking unconditionally — see `Blocking: false` in `verify/rigor.go`. Setting them in
-`.devcouncil/config.yaml` is inert — the file still accepts them, because `verification.*`
-is DevCouncil core config shared with Manvi, but nothing here acts on them.
-
-The matching harness flags `verify.diff_coverage.enforce` and `verify.rigor.enabled` were
-declared and read by nothing, and have been **removed** from the catalogue rather than left
-to imply a switch existed. `manvi flags` no longer lists them, and a config file or
-`MANVI_*` variable that still sets them is refused by name.
-
-Promoting an unexercised diff to a blocking gap is still unbuilt, but it is no longer
-waiting on the wiring: since TASK-P7-1 there *is* a gap to promote. What is missing is a
-setting to promote it by, and the two deleted flags were not one — they were read by
-nothing.
-
-It currently measures **Python** (via the target repo's `coverage.py`), including inline
-`python -c "..."` acceptance checks. It assumes tests run against the **source tree**
-(the normal setup for a repo under active development — editable install or `src` on the
-path); a suite that exercises an installed *copy* of the package instead may under-report.
-That under-reporting is one more reason enforcement should stay opt-in when it is built.
-
-## Anti-laziness rigor
-
-Coding agents routinely stub, undersize diffs, or claim "done" before tests actually prove
-the work. DevCouncil's **rigor layer** catches those patterns deterministically (no extra
-LLM calls for stub/effort detection) and scales strictness by **task difficulty**:
-
-| Difficulty | Default behavior |
+| Tool | Purpose |
 |---|---|
-| `easy` / `normal` | Stub/effort/coarse-proof findings are **advisory** — surfaced in gaps and `next_actions` but non-blocking |
-| `hard` | Same gates **block** verification; repair budget widens |
+| `devcouncil_get_diff` | Read repository diff, optionally scoped to a task |
+| `devcouncil_checkout_task` | Acquire a task lease for a client |
+| `devcouncil_renew_lease` | Renew an existing lease |
+| `devcouncil_release_task` | Release the lease; not proof of successful verification |
+| `devcouncil_next_task` | Select available task work |
+| `devcouncil_verify_task` | Evaluate task changes and return verification metadata/gaps |
+| `devcouncil_get_gaps` | Read the recorded task gaps |
+| `devcouncil_policy_check_write` | Ask the host policy whether a write is permitted |
 
-Tasks are classified as `easy` / `normal` / `hard` by a deterministic scorer
-(`devcouncil.verification.difficulty`) from planned scope, acceptance-criteria count, and
-keywords. Planners and humans can override with `Task.difficulty`.
+Use the tool’s advertised input schema. The host does not offer arbitrary
+`read_file`, `write_file`, `run_command`, scope-update or rollback MCP tools.
+Implement edits through the agent’s own tools. A policy-check result protects
+only consumers that honor it; ordinary external writes are not intercepted.
 
-**Verifier gates (on added diff lines only):**
+## Read the result, not just the verdict
 
-- **Stub/TODO detection** (`stub_detected`): placeholders, `NotImplementedError`, skipped
-  tests, assert-free tests, TODO/FIXME markers. Intentional scaffolding requires the task
-  description to mention "scaffolding" and the line to carry `devcouncil: allow-stub`.
-- **Effort heuristics** (`suspicious_effort`): undersized diff vs planned scope,
-  comment-only diffs, net test deletion in files referenced by `expected_tests`.
-- **Coarse acceptance proof** (`coarse_acceptance_proof`): a criterion "proven" only because
-  a generic passing command ran, not a per-criterion check — blocking on hard tasks.
+CLI and MCP share Go verification orchestration. It checks work presence,
+planned files, orphan diffs, dependency changes and expected commands. The
+`dcverify` adapter adds stub and secret checks and optional diff–coverage
+intersection. No model key is needed for these deterministic checks; an
+operator-provided test command can still access the network.
 
-**Hard-task escalation** also injects a compact **Rigor** section into the executor prompt,
-adds `extra_repair_attempts_on_hard` to the `dev go` repair budget, and (opt-in) lets a
-**critical** implementation-reviewer finding block when
-`reviewer_required_on_hard: true`.
-
-```yaml
-# .devcouncil/config.yaml
-verification:
-  rigor:
-    enabled: true
-    stub_detection: hard           # never | hard | always
-    effort_heuristics: hard
-    coarse_acceptance_proof: hard  # block coarse AC proof on hard tasks
-    enforce_coverage_on_hard: true
-    reviewer_required_on_hard: false  # opt-in: critical review findings block
-    extra_repair_attempts_on_hard: 1
-    min_added_lines_per_planned_file: 5
-    acceptance_samples_on_hard: 2   # self-consistency voting on hard tasks
-```
-
-> **Not read in this tree.** The block above is the retired Python verifier's settings
-> surface, kept here because `.devcouncil/config.yaml` is shared with Manvi. Nothing in
-> this repository consults these keys — the gates they configure live in `dcverify`, which
-> this host spawns since TASK-P7-1, but `dcverify` takes no enforcement setting and the host
-> maps its findings to fixed severities. `enabled` and `enforce_coverage_on_hard` in
-> particular promise nothing here: task difficulty is never sent to `dcverify` (the request
-> carries the diff, the planned paths and an optional coverage profile), so it cannot change
-> what blocks. The rest of this section describes the rigor layer's intended behaviour, not
-> what `verify.Run()` does today.
-
-Repair runs carry a **correction manifest** with prior diff, failing output, attempt
-history, stub findings, and non-negotiable **repair rules** (never weaken tests, never
-stub around a gap). There is no `dev report rigor` command.
-
-## Setup
-
-```bash
-# Writes .mcp.json (devcouncil + devmap). No slash commands, hooks, or statusline.
-devcouncil integrate claude --apply
-
-# Confirm the wiring.
-devcouncil integrate claude --check
-```
-
-Then, inside Claude Code, drive the loop with the `devcouncil_*` MCP tools, or let an
-automated executor run it:
-
-```bash
-dev e2e "Describe the implementation goal" --executor claude
-```
-
-## Anthropic advisor tool (Claude Code only)
-
-Pair a faster main model with a stronger advisor that Claude consults mid-task (planning,
-stuck loops, completion checks). This is **not** live review, the planning council, or
-`opusplan` — it is Anthropic's server-side advisor tool on Claude Code / the Anthropic API.
-
-**Requirements:** Claude Code ≥ 2.1.98 (Fable main/advisor needs ≥ 2.1.170), Anthropic API
-(not Bedrock/Vertex/Foundry), compatible main/advisor pairing. Recommended: `sonnet` main +
-`opus` advisor. DevCouncil soft-filters clear mismatches only; Claude Code validates the
-full versioned pairing matrix at launch.
-
-**When not to use:** skip advisor for mechanical one-line fixes, pure lookup/grep turns, or
-when you are on Bedrock/Vertex/Foundry (Claude Code ignores `--advisor` there — DevCouncil
-soft-skips attach). Prefer live review / verification for evidence gates, not the advisor.
-
-Enable via profile config:
-
-```yaml
-# .devcouncil/config.yaml
-integrations:
-  cli_agents:
-    profiles:
-      default:
-        model: sonnet
-        advisor_model: opus
-```
-
-| Path | How advisor enables |
+| Field | Interpretation |
 |---|---|
-| `dev run/go/e2e --executor claude` | `--advisor` on every spawn (including `--resume` repairs) |
-| `dev run --executor claude-sdk` | SDK `extra_args={"advisor": ...}` |
-| Interactive MCP hero loop | `advisorModel` written by `dev integrate claude` when the default profile sets a pairing-safe `advisor_model` |
+| `gate_mode`, `status`, `verification_skipped` | Whether the verdict represents enforcement, advisory handling or skipped verification |
+| `rigor_applied` | Rigor gates actually applied |
+| `rigor_skipped_reason` | Why rigor did not run; missing evidence is not a clean finding |
+| `coverage_measured`, `coverage_skipped_reason` | Whether changed-line coverage was evaluated |
+| `next_actions`, `advisory_actions` | Concrete gaps for the agent to address or review |
+| `allowed_next_tools` | Names the host actually serves; not a grant of permission to arbitrary tools |
 
-Repair/`--resume` runs treat the correction manifest as authoritative over prior session
-or prior advisor advice. Soft pairing preflight skips clearly bad pairs so Claude does
-not hard-exit and burn the repair budget. Set `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1` to
-disable the tool entirely (Claude still accepts `--advisor` / `advisorModel` but ignores them).
-
-See [coding-cli-integration.md](coding-cli-integration.md) for more detail, including the
-unified **stop gate** (claim checks + optional active-task verify on Claude/Codex Stop hooks).
-
-## CLI Verification Gateway
-
-You can run the same deterministic evidence gate against current changes via the CLI — no LLM or external provider keys needed:
+The MCP verify tool has no coverage-profile input. Use the CLI when that gate
+is required:
 
 ```bash
-# Verify the task diff against planned scope and rigor gates
-devcouncil verify TASK-001
-
-# Emit structured JSON for scripting and CI pipelines
-devcouncil verify TASK-001 --json
-
-# --sandbox is recorded on the report; docker/nix do not isolate today
-devcouncil verify TASK-001 --sandbox local
+# Run inside the project; TASK-001 must already exist.
+devcouncil verify TASK-001 --mode enforce --json
+devcouncil verify TASK-001 --mode enforce --coverage /path/to/coverage-profile --json
 ```
 
-`devcouncil verify` runs Go `verify.Run()` (planned-file / orphan / expected tests) and prints the verdict along with typed `next_actions`. It also spawns `dcverify` for the stub and secret gates; add `--coverage PATH` to include diff↔coverage. When `dcverify` is not installed, `rigor_applied` is empty and `rigor_skipped_reason` names what is missing — never a silent pass.
+If `dcverify` is missing, the result names the skipped rigor. If a configured
+verifier fails, it produces a `rigor_check_unavailable` gap. A consumer requiring
+complete rigor should reject missing/skipped evidence in addition to checking
+the verdict. The result describes the supplied scope and commands; it is not a
+certificate of complete functional correctness.
+
+## Modes and isolation
+
+`off` is the default and reports skipped verification. `advisory` preserves
+findings with a different blocking policy; `enforce` blocks blocking gaps.
+Use `devcouncil gate status --json` to inspect project configuration and the
+result’s own mode to interpret a run. Do not infer mode from an old README or
+from an agent’s claimed posture.
+
+Expected commands execute through the local shell in the project root.
+`--sandbox local|docker|nix` records the selection but the gateway does not
+implement Docker or Nix isolation. A task lease is also not a filesystem lock
+against arbitrary editors. [Repository boundaries](SECURITY_BOUNDARIES.md)
+provide the detailed implementation limits.
+
+## Repair and completion
+
+The agent reads gaps, modifies the implementation and reruns verification.
+The consuming harness must bound attempts, time and cost; this host is not an
+autonomous repair scheduler. Preserve failing tests and evidence rather than
+weakening expectations to reach a green verdict. Only claim checks that ran.
+Release leases when the participating workflow is finished; preserve any
+remaining gaps in the handoff.
+
+Historical Python slash commands, advisor configuration, stop gates, executor
+adapters and certification tables are not the current native contract.
+[Project status](project-status.md) tracks that migration boundary.

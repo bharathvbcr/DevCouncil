@@ -1,4 +1,6 @@
-# DevCouncil: Components and Modules for AI Development
+# DevCouncil
+
+Code intelligence and verification components for AI development.
 
 [![Website](https://img.shields.io/badge/website-devcouncil.vbcr.dev-10B981?style=flat&logo=safari&logoColor=white)](https://devcouncil.vbcr.dev/)
 [![CI](https://github.com/bharathvbcr/DevCouncil/actions/workflows/ci.yml/badge.svg)](https://github.com/bharathvbcr/DevCouncil/actions/workflows/ci.yml)
@@ -29,7 +31,7 @@ DevCouncil's core runtime is a set of standalone, compiled native modules. Each 
 | Binary | Language | Role & Ownership |
 |--------|----------|------------------|
 | `devcouncil` / `dev` | **Go** | Host orchestrator: Stdio MCP server (`mcp`), multi-host agent integration (`integrate`), engineering skills distribution (`skills`), task verification (`verify`), and devmap forwarding (`map`, `graph`, `ast`). |
-| `devmap` | **Rust** | Code intelligence engine: 35 named tree-sitter language extractors plus a generic tree-sitter fallback, symbol resolution, blast-radius calculation, dead-code analysis, workspace guides (`AGENTS.md`), and DevMap MCP server (`devmap mcp`). |
+| `devmap` | **Rust** | Code intelligence engine: Language-aware tree-sitter extraction and explicit fallback/coverage reporting, symbol resolution, blast-radius calculation, dead-code analysis, workspace guides (`AGENTS.md`), and DevMap MCP server (`devmap mcp`). |
 | `dcstore` | **Rust** | State & lease store: SQLite-backed task repository, mutual-exclusion leases for concurrent agent building, evidence records, and gap tracking. |
 | `dcverify` | **Rust** | Deterministic verification: Unified-diff parsing, planned file scope classification, anti-laziness/stub gates, test coverage evaluation, and typed `next_actions` repair signals. |
 | `dcgrep` | **Rust** | Code search: Ripgrep-powered ignore-aware search engine with optional trigram indexing (`tgrep-core`). |
@@ -47,7 +49,9 @@ DevCouncil's core runtime is a set of standalone, compiled native modules. Each 
 
 ## Benchmarks: DevMap vs Graphify, Gortex, GitNexus, CodeGraph, and codebase-memory-mcp
 
-Every number below is a measured median from a reproducible run with the raw
+The table below records historical DevMap 0.2.1 build `48cd3c7` measurements,
+not a fresh benchmark of the current native source. Each timing is a median
+from a reproducible run with the raw
 evidence committed beside it — not a marketing estimate. Six code-graph tools
 plus a ripgrep text baseline indexed the **same frozen 1,186-file / 46.9 MB
 repository** on one Apple M5 Pro, with 261 timed samples and per-tool
@@ -87,241 +91,82 @@ rebuild.
 
 ---
 
-## Installation
+## Get started
 
-DevCouncil supports macOS, Linux, and Windows. Requires a Go toolchain (`>=1.22`), Rust/`cargo`, and Git.
-
-### 1. Build and Install Native Binaries
-
-From a clone of this repository:
+Build just DevMap from source, then map a project:
 
 ```bash
-# macOS & Linux: builds Go host and all Rust analysis binaries into ~/.local/bin
-bash scripts/install.sh
-
-# Standalone DevMap (no Go host)
+git clone https://github.com/bharathvbcr/DevCouncil.git
+cd DevCouncil
 bash scripts/install.sh --only=devmap
-
-# Analysis suite only (devmap dcstore dcverify dcgrep)
-bash scripts/install.sh analysis
-
-# Windows (PowerShell):
-.\scripts\install.ps1
-.\scripts\install.ps1 -Components devmap
-```
-
-To build and install the analysis components (`devmap`, `dcstore`, `dcverify`, `dcgrep`):
-
-```bash
-# Build & install all analysis components to ~/.local/bin
-bash scripts/install-components.sh
-
-# Or install specific components
-bash scripts/install-components.sh devmap
-bash scripts/install-components.sh dcstore dcverify dcgrep
-
-# Build the Go host binary
-go -C backend/go_orchestrator build -o ~/.local/bin/devcouncil ./cmd/devcouncil
-ln -sf devcouncil ~/.local/bin/dev
-```
-
-Ensure `~/.local/bin` is in your `PATH`:
-
-```bash
 export PATH="$HOME/.local/bin:$PATH"
+
+cd /path/to/your/project
+devmap build --manifest --guides
+devmap paths --json
+devmap status --json
+devmap explore MyFunction --json
 ```
 
-### 2. Optional Global npm Shim
+Git and Rust/Cargo are required. To include the Go host and full analysis suite,
+run `bash scripts/install.sh`; the host needs the toolchain declared in
+[`go.mod`](backend/go_orchestrator/go.mod), currently Go 1.26.6. On Windows use
+`.\scripts\install.ps1 -Components devmap`, or omit `-Components` for the suite.
+The npm package is a lightweight launcher for native binaries, not a bundled
+runtime. [Complete installation guide](docs/quickstart.md).
 
-If you prefer to dispatch through npm, install the lightweight Node.js wrapper (Node 18+). The npm package ships a shim that resolves and executes the native binaries:
+Use the paths returned by `devmap paths`: new repositories default to `.devmap`,
+existing `.devcouncil` layouts remain supported, and explicit configuration can
+override either. `--guides` requests managed workspace guides separately from
+the map export. Check freshness, coverage gaps and result truncation before
+using graph answers as evidence. If first-time guide creation leaves status
+stale, run `devmap build --manifest` once more to index the new guides.
+
+## Connect an agent
 
 ```bash
-npm install -g devcouncil
+devmap integrate cursor --dry-run
+devmap integrate cursor
+devmap integrate cursor --check
 ```
 
-### 3. Verify Environment
+Substitute `claude`, `codex`, `antigravity`, `opencode` or `warp` for `cursor`.
+Integration can update user-level MCP settings as well as project assets.
+Inspect the receipt and complete host reload/trust steps. For task tooling,
+add the Go-host integration described in
+[coding CLI integration](docs/coding-cli-integration.md).
+
+## Verification is opt-in
+
+For an existing task in an initialized `.devcouncil/state.sqlite`:
 
 ```bash
-devcouncil --help
-dev --help
-devmap --version
-dcverify health
-dcstore --db .devcouncil/state.sqlite health
-dcgrep health
+devcouncil verify TASK-001 --mode enforce --json
 ```
 
----
-
-## Core Capabilities & Workflows
-
-### 1. Coding Agent Integration (`devcouncil integrate`)
-
-Connect DevCouncil's MCP server to Cursor or Claude Code. `--write-gate` has been removed: it named a pre-tool-use gate that only the retired lifecycle hooks installed, and nothing enforced it. Use `dev hook status` to inspect old registrations and `dev hook disable --dry-run` to preview cleanup.
-
-```bash
-devcouncil integrate cursor --apply
-devcouncil integrate claude --apply
-
-# Stub receipt only — not a working installer:
-# devcouncil integrate antigravity --apply
-
-# Verify existing integration configuration
-devcouncil integrate cursor --check
-```
-
-### 2. Engineering Skills Delivery (`devcouncil skills`)
-
-Deliver verified engineering practices and code-intelligence skills directly into agent skill folders (`.agents/skills`, `.claude/skills`, `.cursor/skills`):
-
-```bash
-# List available skills embedded in the binary
-devcouncil skills list
-
-# Scaffold all applicable skills into the repository
-devcouncil skills scaffold
-
-# Scaffold a specific skill (e.g. core-engineering or devmap)
-devcouncil skills scaffold --skill core-engineering
-devcouncil skills scaffold --skill devmap
-```
-
-### 3. Repository Mapping & Code Intelligence (`devmap` / `dev map`)
-
-Build and query deep semantic relationships across your codebase without an LLM:
-
-```bash
-# Build the repository map (.devcouncil/repo_map.json) and code graph
-devmap build --manifest
-
-# Shorthand via the Go host:
-dev map
-
-# Query symbol blast radius & reverse dependents before editing
-devmap impact path/to/file.go
-
-# Trace dependency paths between two symbols
-devmap trace SymbolA SymbolB
-
-# Find dead code with confidence tiers (extracted | inferred | ambiguous)
-devmap dead
-
-# Launch the interactive HTML visualizer
-devmap view
-```
-
-### 4. Task Leases & Gated Verification (`devcouncil verify`)
-
-Prevent multi-agent file trampling and verify diff correctness against deterministic criteria:
-
-```bash
-# Run deterministic verification against a task's diff
-devcouncil verify TASK-001
-
-# Machine-readable output for agent loops
-devcouncil verify TASK-001 --json
-
-# Sandbox flag is recorded only; docker/nix do not isolate (TASK-P7-2)
-devcouncil verify TASK-001 --sandbox local
-```
-
-Verification today (Go `verify.Run()`) enforces:
-- **Planned file scope:** Rejects unauthorized edits outside declared task boundaries.
-- **Orphan diffs / dependency-risk:** Flags files changed that were not planned.
-- **Expected tests / allowed commands:** Runs the task's command list via `/bin/sh -c` in the project root.
-- **Typed `next_actions`:** Structured repair instructions when those gates fail.
-
-Stub detection, secret scanning, and coverage intersection live in the **`dcverify`** binary. `devcouncil verify`, MCP `devcouncil_verify_task`, and **Manvi** `runRigor` all spawn it. When `dcverify` is not installed the report carries an empty `rigor_applied` **and** a `rigor_skipped_reason` naming what to install — never a silent clean pass. Diff↔coverage runs only when a profile is supplied (`devcouncil verify --coverage PATH`); otherwise `coverage_skipped_reason` says so.
-
-### 5. MCP Servers for AI Agents
-
-DevCouncil provides two complementary Model Context Protocol (MCP) servers:
-
-- **Host MCP Server (`devcouncil mcp`)**: Eight tools — checkout / renew / release / next_task / get_diff / verify_task / get_gaps / policy_check_write. `verify_task` runs Go `verify.Run()`, which spawns `dcverify` for the stub and secret gates; diff↔coverage needs a profile this tool has no field for, so use `devcouncil verify --coverage PATH`.
-- **DevMap MCP Server (`devmap mcp`)**: Eleven query tools (status, search, dependencies, impact, trace, neighbors, dead_symbols, clones, preview, explore, affected_tests). Always pass `repo_path`.
-
----
-
-## Architecture Flow
-
-```mermaid
-flowchart TD
-    subgraph Agents["Harnesses, hosts, and coding agents"]
-        Claude["Claude Code"]
-        Cursor["Cursor"]
-        Codex["Codex"]
-        AGY["Antigravity"]
-        Warp["Warp"]
-        Manvi["Manvi (wraps these components)"]
-        GitPulse["GitPulse (selects modules)"]
-    end
-
-    subgraph Host["Go Host Orchestrator (devcouncil / dev)"]
-        CLI["Host CLI\ncmd/devcouncil"]
-        MCP["Host MCP Server\ndevcouncil mcp"]
-        Integ["Integrator\ndevcouncil integrate"]
-        Skills["Skills Engine\ndevcouncil skills"]
-        VerifyCmd["Verify Command\ndevcouncil verify"]
-    end
-
-    subgraph RustAnalysis["Rust Analysis & State Suite"]
-        DevMap["devmap\nCode Graph & 35 Language ASTs"]
-        DCStore["dcstore\nAtomic Task Leases & SQLite Store"]
-        DCVerify["dcverify\nUnified Diff Parser & Rigor Gates"]
-        DCGrep["dcgrep\nRipgrep Engine & Trigram Index"]
-    end
-
-    Agents <-->|MCP Protocol| MCP
-    Agents <-->|Direct / Tool Calls| CLI
-    Manvi -->|Wraps: imports Go, spawns binaries| Host
-    Manvi -->|Spawns selected modules| RustAnalysis
-    GitPulse -->|Vendors selected crates| DevMap
-    GitPulse -->|manvi serve| Manvi
-
-    CLI -->|Execs| DevMap
-    CLI -->|Integrates| Integ
-    CLI -->|Scaffolds| Skills
-    VerifyCmd -->|Scope, orphan, expected tests| DCStore
-    Manvi -->|Spawns dcverify rigor| DCVerify
-
-    MCP -->|Leases and tasks| DCStore
-    MCP -->|verify_task → Go Run| VerifyCmd
-```
-
----
-
-## Repository Layout
-
-```
-DevCouncil/
-├── backend/go_orchestrator/     # Go host orchestrator binary and packages
-│   ├── cmd/devcouncil/          # Main entrypoint for devcouncil and dev
-│   ├── devcouncil/              # MCP server, integrate, skills, verify implementations
-│   ├── dc/store/                # Interop client for dcstore binary
-│   └── policy/                  # File-write containment & security policies
-├── rust/                        # Analysis and verification engine crates (dcstore, dcverify, dcgrep, devmap)
-├── bin/                         # Node.js npm shim (bin/devcouncil.js)
-├── scripts/                     # Platform installers (install.sh, install-components.sh)
-└── docs/                        # Architecture, releases, and integration guides
-```
-
----
+Read gate mode, skipped reasons and coverage metadata. The Go host invokes
+`dcverify` for rigor checks; changed-line coverage requires a profile supplied
+through `--coverage PATH`. The default gate mode is `off`. Task leases and MCP
+policy results coordinate participating clients; retired lifecycle hooks do
+not intercept arbitrary shell commands or editor writes. The sandbox selector
+does not implement Docker/Nix isolation. See the
+[task loop contract](docs/hero-loop.md).
 
 ## Documentation
 
-- [Release Notes (v0.2.0)](docs/releases/v0.2.0.md): Native orchestration and analysis migration.
-- [Native cutover follow-ups](docs/TODO.md): Open wiring and honesty work after Phase 7.
-- [Architecture Decisions & Python Retirement](docs/PHASE7_LONG_TAIL.md): Background on the transition to native Go and Rust binaries.
-- [Archived ledgers](docs/archive/README.md): Pre-cutover DevMap plans, audits, and qualification dumps.
-- [Code Graph & DevMap Guide](docs/code-graph.md): Symbol resolution, dead code, and blast radius.
-- [DevMap vs other code-graph tools](docs/devmap/comparison.md): Head-to-head comparison written for the "which code intelligence tool should my agent use" question, with per-tool sections and the limits stated.
-- [DevMap competitor benchmark report](benchmarks/results/competition/20260913-48cd3c7/REPORT.md): Full measured comparison against Graphify, Gortex, GitNexus, CodeGraph, codebase-memory-mcp, and ripgrep — indexing and query latency, memory, storage, caller accuracy, stale-index recovery, scope limits, and committed raw evidence. The [DevMap guide](docs/devmap/README.md#benchmark-comparison) carries the shorter summary and the [competition index](benchmarks/results/competition/README.md) links every prior run.
-- [Hero Loop (MCP Closed Loop)](docs/hero-loop.md): Autonomous task loop with deterministic gates.
-- [Coding CLI Integration](docs/coding-cli-integration.md): Configuring Claude, Codex, Cursor, Warp, and Antigravity.
-- [Security Model](docs/security.md): Redaction, write isolation, and containment rules.
-- [Project Status](docs/project-status.md): Subsystem maturity ledger.
+Start at the **[documentation index](docs/README.md)**.
 
----
+| Topic | Guide |
+|---|---|
+| Installation and first query | [Quickstart](docs/quickstart.md) |
+| Components and state ownership | [Architecture](docs/architecture.md) |
+| Symbols, impact and evidence limits | [Code graph](docs/code-graph.md) |
+| Editor setup and hooks | [Integration](docs/coding-cli-integration.md) |
+| Commands and flags | [CLI reference](docs/cli-reference.md) |
+| Task workflow | [Workflow](docs/workflow.md) and [MCP loop](docs/hero-loop.md) |
+| Implementation and migration limits | [Project status](docs/project-status.md) |
+| Native development | [Rust workspace](rust/README.md) |
 
-## License
-
-Licensed under the **Apache License, Version 2.0**. See [LICENSE](LICENSE) for details.
+[Apache 2.0](LICENSE). The Python CLI, its release lineage and its historical
+workflow certifications are retired; current native source and installed
+binary identities must be checked separately.

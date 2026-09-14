@@ -1,5 +1,13 @@
 # CLI Command Reference
 
+[Documentation index](README.md) · [Quickstart](quickstart.md)
+
+Task verification defaults to `off`; for an existing task use explicit
+`--mode enforce` when a strict verdict is required. Read skipped reasons and
+coverage metadata. Installed `devmap COMMAND --help` and `devcouncil --help` are flag authorities.
+The JSON analysis components do not expose conventional `--help`; their native
+command parsers and [Rust guide](../rust/README.md) document those contracts.
+
 This is the comprehensive reference for DevCouncil's native binaries: the Go host orchestrator (`devcouncil` / `dev`) and the Rust analysis components (`devmap`, `dcstore`, `dcverify`, `dcgrep`).
 
 **Platforms:** macOS, Linux, Windows.  
@@ -79,7 +87,7 @@ devcouncil mcp
 # or: devcouncil mcp-server
 ```
 
-Runs the Model Context Protocol (MCP) stdio server. Eight tools: checkout / renew / release / next_task / get_diff / verify_task / get_gaps / policy_check_write. What `integrate` installs into Cursor/Claude. Filesystem, grep, git, and `dcverify` rigor live on **Manvi**, not here.
+Runs the Model Context Protocol (MCP) stdio server. Eight tools: checkout / renew / release / next_task / get_diff / verify_task / get_gaps / policy_check_write. What `integrate` installs into Cursor/Claude. Arbitrary filesystem/patch/shell tools are not exposed by this host. Its verification gateway does invoke `dcverify` for rigor; see [the task loop contract](hero-loop.md).
 
 ### Agent Host Integrations
 
@@ -87,9 +95,15 @@ Runs the Model Context Protocol (MCP) stdio server. Eight tools: checkout / rene
 devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR]
 ```
 
-`Hosts` lists `cursor`, `claude`, `codex`, `opencode`, `warp`, `antigravity` — the same six `devmap integrate` accepts, and all six now have adapters. Cursor, Claude and Codex write their own documents; Antigravity, OpenCode and Warp register the `devcouncil` server in `.agents/mcp_config.json`, `opencode.json` and `.devcouncil/integrations/warp-mcp.json`. `devmap integrate` registers the `devmap` entry in those same files, and both preserve every other server and key. `gemini` and `aider` are refused with a pointer to their replacement: Gemini CLI was replaced upstream by Antigravity, and Aider exposes no MCP server to register. Any other name is refused rather than stubbed.
+`Hosts` lists `cursor`, `claude`, `codex`, `opencode`, `warp` and
+`antigravity`, matching DevMap's accepted names. Outputs differ by host. The
+Go Codex adapter remains comment-only; the Rust integrator installs DevMap's
+user-level Codex MCP registration. Other adapters merge their owned entries
+into host documents. See the [integration matrix](coding-cli-integration.md)
+for the separate Go/Rust surfaces, hooks and user-level changes. Legacy
+`gemini` and `aider` targets are refused by these adapters.
 
-- `--apply`: Write configuration files (or a stub receipt) to the target repository.
+- `--apply`: Write configuration files to the target repository.
 - `--check`: Read-only verification that integration files match expected content.
 - `--dry-run`: Print planned actions without modifying files.
 - `--write-gate`: **Removed.** It named a pre-tool-use gate that only DevCouncil's retired lifecycle hooks installed; nothing enforced it. Passing it exits 2 with that explanation rather than "unknown flag". `execution.hook_gate.mode` and its `contain` mode are gone for the same reason, along with `gate set --hook`. A copy left in an existing `config.yaml` is inert. Use `gates.mode` for verification and the `devcouncil_*` MCP policy tools for write scope.
@@ -222,8 +236,8 @@ dcstore --db <PATH> health
 dcstore --db <PATH> acquire --task <ID> --owner <OWNER> --client-id <CLIENT> --ttl-seconds <N>
 dcstore --db <PATH> renew --task <ID> --token <TOKEN> --ttl-seconds <N>
 dcstore --db <PATH> release --task <ID> --token <TOKEN>
-dcstore --db <PATH> status --task <ID>
-dcstore --db <PATH> next-task
+dcstore --db <PATH> task --task <ID>
+dcstore --db <PATH> ready
 ```
 
 ### Deterministic Verifier (`dcverify`)
@@ -232,7 +246,8 @@ Diff parser, scope classifier, and rigor gate evaluator:
 
 ```bash
 dcverify health
-dcverify check [--planned <FILE>] [--coverage <LCOV>] [--root <DIR>] < unified.diff
+dcverify check --planned "src/service.go" --root /path/to/repo < unified.diff
+# Optional: --coverage /path/to/profile (Go coverprofile or LCOV)
 dcverify evidence-check --contract <PATH> --bundle <PATH> [options]
 ```
 
@@ -260,9 +275,9 @@ With Phase 7 and the transition to native Go and Rust binaries, legacy Python CL
 | `dev run` / `dev e2e` / `dev go` | Python subprocess coding agent runner | Run agents natively via MCP (**Hero Loop**) or via **Manvi**. |
 | `dev prompt` / `dev handoff` | Formatted text prompt generation | Handled over MCP via task checkout contexts and skills. |
 | `dev status` / `dev checkout` / `dev tasks` / `dev doctor` | Python orientation and lease bootstrap | Go unknown command (exit 2). Policy `NoTaskAllowedCommands` still allowlists them (TASK-P7-9). Use `devcouncil mcp` tools / `devmap status` / `devmap doctor`. |
-| `dev check` / `dev check --verify` | Python LLM audit / demo check | Use `devcouncil verify TASK_ID` or `dcverify`. |
-| `dev wiki` / `dev okf` / `dev design` | Markdown wiki & OKF bundle generator | Replaced by `devmap build --guides` (`AGENTS.md`, `CLAUDE.md`). |
-| `dev dashboard` | Textual dashboard UI | Replaced by DevMap visualizers (`devmap view`) and Manvi TUI. |
+| `dev check` / `dev check --verify` | Python LLM audit / demo check | Use `devcouncil verify TASK_ID --mode enforce --json` for an existing task, or `dcverify`. |
+| `dev wiki` / `dev okf` / `dev design` | Markdown wiki & OKF bundle generator | Managed guides are available with `devmap build --manifest --guides`; they do not replace the full wiki/OKF feature set. |
+| `dev dashboard` | Textual dashboard UI | Use DevMap HTML exports (`devmap html`, `devmap map-html`) or the consuming harness UI. |
 | `dev cost` / `dev doctor` | Python model pricing ledger & env checks | Health checks via `devmap doctor` and binary health flags. |
 
 For detailed rationale on the retirement decisions, see [PHASE7_LONG_TAIL.md](PHASE7_LONG_TAIL.md). Open follow-ups: [TODO.md](TODO.md).

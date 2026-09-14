@@ -1,16 +1,30 @@
-# Security Model
+# Security and execution boundaries
 
-DevCouncil is designed to minimize unsafe agent behavior:
+DevCouncil provides local code analysis, task policy and verification evidence.
+The implementation-level reference is
+[repository input and verification boundaries](SECURITY_BOUNDARIES.md).
+[Documentation index](README.md)
 
-- **Redaction:** strips secrets and API keys before sending context to LLMs.
-- **Permission guard:** prevents agents from accessing `.git`, `.env`, or sensitive credentials.
-- **Allowlist enforcement:** restricts writes to task-approved files and commands to a safe subset.
-- **Local sovereignty:** stores project state, logs, and artifacts locally in `.devcouncil/`.
+## What a consumer must distinguish
 
-DevCouncil provides gates and evidence to make risky changes easier to detect. It does not replace human security review.
+- Code analysis does not require sending source to a model. A consuming agent
+  or harness has its own provider and data-handling policy.
+- Task leases and write-policy results apply to participating clients. Retired
+  DevCouncil hooks do not intercept every shell command or editor write.
+- Rigor includes a secret check over the supplied diff. That is not a guarantee
+  that every repository file, log or provider payload is free of secrets.
+- Missing and unavailable checks need explicit handling. Read gate mode,
+  skipped reasons and coverage metadata in addition to the verdict.
 
 ## Verification commands run on the host
 
-`devcouncil verify --sandbox` records the flag on the report. Only local execution is implemented: expected-test and allowed-command lines are passed to `/bin/sh -c` with `Dir` set to the project root (`DefaultRunCommand`). Values `docker` and `nix` do not start a container or Nix sandbox (TASK-P7-2). There is no `verification.sandbox.docker_setup_commands` reader in the Go host.
+The Go gateway executes task commands through a local shell in the project
+root. The `--sandbox` flag records the selection; `docker` and `nix` do not
+start isolation. Review task command lists and project configuration before
+running verification, as you would review CI workflow changes.
 
-Treat `.devcouncil/config.yaml` as trusted input: anything that can write that file can influence which commands verification will run on the host. Review config changes in pull requests the same way you would review CI workflow changes, and do not run `devcouncil verify` against configs from untrusted sources.
+Installing MCP configuration does not grant universal scope enforcement.
+[Integration](coding-cli-integration.md) documents which settings and hooks
+are written; the [task loop](hero-loop.md) describes the verification contract.
+These tools assist review and do not replace a security assessment of the
+application under development.
