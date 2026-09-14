@@ -21,6 +21,9 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+mod support;
+use support::serving_or_dead;
+
 fn corpus_store() -> Arc<Store> {
     let files = [
         ("core.py", "def helper(rows):\n    return sum(rows)\n"),
@@ -563,19 +566,6 @@ async fn ipc_exchange(socket: &std::path::Path, frame: &str) -> std::io::Result<
     })
 }
 
-async fn wait_for_socket(socket: &std::path::Path) {
-    for _ in 0..500 {
-        if ipc_exchange(socket, r#"{"version":1,"cmd":"status"}"#)
-            .await
-            .is_ok()
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("the daemon never bound {}", socket.display());
-}
-
 /// 128 clients against the daemon's socket while its queue holds ten thousand
 /// paths.
 ///
@@ -607,8 +597,9 @@ async fn the_ipc_daemon_answers_every_client_while_its_queue_drains() {
         .with_store_path(db.clone())
         .with_idle_poll(Duration::from_millis(20))
         .with_max_idle(None);
-    let serving = tokio::spawn(async move { daemon.run_loop().await });
-    wait_for_socket(&socket).await;
+    let watching = daemon.clone();
+    let mut serving = tokio::spawn(async move { daemon.run_loop().await });
+    serving_or_dead(&watching, &mut serving).await;
 
     let started = Instant::now();
     let clients: Vec<_> = (0..128u32)
@@ -733,16 +724,20 @@ async fn fifty_spawn_retire_cycles_and_a_kill_mid_drain_leave_the_store_usable()
         assert_eq!(store.get_pending_paths().unwrap().len(), 1);
     }
 
-    let killed = {
+    let (watching, mut killed) = {
         let store = Store::open(&db).expect("store");
         let daemon = devmap_serve::Daemon::new(store, root.clone())
             .with_ipc_path(socket.clone())
             .with_store_path(db.clone())
             .with_idle_poll(Duration::from_millis(10))
             .with_max_idle(None);
-        tokio::spawn(async move { daemon.run_loop().await })
+        let watching = daemon.clone();
+        (
+            watching,
+            tokio::spawn(async move { daemon.run_loop().await }),
+        )
     };
-    wait_for_socket(&socket).await;
+    serving_or_dead(&watching, &mut killed).await;
     killed.abort();
     let _ = killed.await;
     // The abort drops the daemon's store handle; the socket may survive it,

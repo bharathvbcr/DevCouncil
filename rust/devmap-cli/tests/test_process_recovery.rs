@@ -22,8 +22,22 @@ fn temp_root() -> std::path::PathBuf {
     root
 }
 
-fn wait_for_path(path: &std::path::Path) {
+/// Wait for a spawned daemon's endpoint to answer, or for the daemon to exit
+/// without one.
+///
+/// `child` is not decoration. These daemons are separate processes, so the
+/// in-process endpoint signal `devmap-serve`'s own tests use cannot reach them
+/// and a poll is the only instrument available — but a poll that never asks
+/// whether the process is still there reports "timed out waiting for the
+/// socket" about a daemon that exited immediately and said why, which is the
+/// clock taking the blame for a cause that was already known.
+/// `daemon_storm_soak.rs::wait_until_bound` asks the same question; this is the
+/// call site that did not.
+fn wait_for_path(path: &std::path::Path, child: &mut std::process::Child) {
     for _ in 0..200 {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("the daemon exited {status} instead of binding {path:?}");
+        }
         #[cfg(unix)]
         let ready = std::os::unix::net::UnixStream::connect(path).is_ok();
         #[cfg(windows)]
@@ -65,7 +79,7 @@ fn process_death_restart_replays_durable_pending_work_and_reclaims_the_endpoint(
         .stderr(Stdio::null())
         .spawn()
         .expect("start first daemon");
-    wait_for_path(&socket);
+    wait_for_path(&socket, &mut first);
     std::thread::sleep(Duration::from_millis(250));
     first.kill().expect("kill first daemon");
     first.wait().expect("reap first daemon");
@@ -109,7 +123,7 @@ fn process_death_restart_replays_durable_pending_work_and_reclaims_the_endpoint(
         .stderr(Stdio::null())
         .spawn()
         .expect("restart daemon");
-    wait_for_path(&socket);
+    wait_for_path(&socket, &mut second);
 
     let observer = Store::open(&db).unwrap();
     let mut replayed = false;
