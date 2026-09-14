@@ -22,6 +22,7 @@ import {
   releaseIsIdempotent,
   releasePutsAnnouncementBodyInEnv,
   releaseUsesNotesFile,
+  tagNamesHead,
 } from "./check-release.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -134,6 +135,33 @@ describe("parseTag", () => {
     assert.deepEqual(parseTag("v0.2.0"), { ok: true, version: "0.2.0" });
     assert.equal(parseTag("0.2.0").ok, false);
     assert.equal(parseTag("v0.2.0-rc.1").ok, false);
+  });
+});
+
+describe("tagNamesHead", () => {
+  const head = "bc26de4a1b2c3d4e5f60718293a4b5c6d7e8f901";
+  const older = "1d680487a6b5c4d3e2f10918273645a5b4c3d2e1";
+
+  it("passes when the tag names HEAD", () => {
+    assert.deepEqual(tagNamesHead({ tag: "v0.2.2", tagSha: head, headSha: head }), {
+      ok: true,
+    });
+  });
+
+  it("passes when the tag does not exist yet — the push creates it at HEAD", () => {
+    assert.deepEqual(tagNamesHead({ tag: "v0.2.2", tagSha: null, headSha: head }), {
+      ok: true,
+    });
+  });
+
+  it("fails when the tag is behind HEAD, naming both commits and the notes file", () => {
+    const verdict = tagNamesHead({ tag: "v0.2.2", tagSha: older, headSha: head });
+    assert.equal(verdict.ok, false);
+    // The operator has to be told which notes would actually ship, because
+    // every other gate passes on the stale ones.
+    assert.match(verdict.reason, /1d680487a6b5/);
+    assert.match(verdict.reason, /bc26de4a1b2c/);
+    assert.match(verdict.reason, /docs\/releases\/v0\.2\.2\.md/);
   });
 });
 

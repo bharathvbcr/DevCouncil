@@ -51,6 +51,37 @@ export function parseTag(tag) {
 }
 
 /**
+ * Whether a release tag names the commit whose notes would actually ship.
+ *
+ * `release.yml` checks out the *tagged* commit and publishes
+ * `docs/releases/<tag>.md` from it. So notes edited after the tag was cut are
+ * invisible to the release, and **no CI gate can see the discrepancy**: at the
+ * tagged commit the old notes are internally consistent, mention the version,
+ * and sit under the size cap, so every check passes while the wrong text ships.
+ * Measured 2026-09-14 — `v0.2.2` named a commit whose notes were 277 lines
+ * against 653 at `HEAD`.
+ *
+ * This is therefore a pre-push check by construction, not an oversight that it
+ * runs only locally. A tag that does not exist yet is fine: pushing creates it
+ * at `HEAD`.
+ *
+ * @param {{ tag: string, tagSha: string | null, headSha: string }} input
+ * @returns {{ ok: true } | { ok: false, reason: string }}
+ */
+export function tagNamesHead({ tag, tagSha, headSha }) {
+  if (!tagSha) return { ok: true };
+  if (tagSha === headSha) return { ok: true };
+  const short = (/** @type {string} */ sha) => sha.slice(0, 12);
+  return {
+    ok: false,
+    reason:
+      `tag ${tag} names ${short(tagSha)} but HEAD is ${short(headSha)}; ` +
+      `the release would publish docs/releases/${tag}.md as it was at ` +
+      `${short(tagSha)}. Retag at HEAD, or push a different tag.`,
+  };
+}
+
+/**
  * @param {string} source
  * @param {string} section  e.g. "[workspace.package]" or "[package]"
  */
