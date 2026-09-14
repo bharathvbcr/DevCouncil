@@ -226,6 +226,54 @@ fn symlink_artifacts_and_directories_are_unavailable_without_following_them() {
 }
 
 #[cfg(unix)]
+#[test]
+fn a_symlinked_directory_on_the_contract_path_is_refused_before_it_is_read() {
+    // The one case the component walk in `reject_symlinks` catches alone. A
+    // symlinked *final* component is already refused by the regular-file check,
+    // and a symlinked artifact directory by the escapes-root check — so with
+    // that walk disabled outright, every other test in this file still passes
+    // and the guard looks covered when it is not. `--contract` takes an
+    // arbitrary path under no root, so here the walk is the only thing between
+    // a symlinked parent directory and the read.
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new();
+    let real = fixture.0.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("contract.json"), CONTRACT).unwrap();
+    symlink(&real, fixture.0.join("link")).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dcverify"))
+        .arg("evidence-check")
+        .arg("--contract")
+        .arg(fixture.0.join("link").join("contract.json"))
+        .arg("--bundle")
+        .arg(fixture.0.join("bundle.json"))
+        .arg("--artifacts-root")
+        .arg(&fixture.0)
+        .arg("--expected-contract-sha256")
+        .arg(dc_evidence::sha256(CONTRACT))
+        .arg("--expected-capability-sha256")
+        .arg("1a4bf7dac3b78318718a5047937473da4898acfb53cbbc9afdbe0c7fa9f3eec2")
+        .args([
+            "--expected-run-id",
+            "run-1",
+            "--expected-session-id",
+            "desktop-1",
+            "--expected-epoch",
+            "1",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(
+        decoded(&output)["error"],
+        "symlink input paths are refused",
+        "the symlinked parent must be refused by name, not by some later guard"
+    );
+}
+
+#[cfg(unix)]
 fn rewrite_artifact_path(root: &Path, path: &str) {
     let mut bundle: Value = serde_json::from_slice(BUNDLE).unwrap();
     bundle["artifacts"][0]["path"] = path.into();
