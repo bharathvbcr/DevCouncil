@@ -1,0 +1,21 @@
+
+  GitNexus Analyzer
+
+[2K
+  Skipped 1 large files (>512KB, likely generated/vendored)
+[2K
+  - benchmarks/results/competition/20260912-expanded/gortex-source-tree.json
+[2K
+  Set GITNEXUS_MAX_FILE_SIZE=<KB> to include files above the default cap.
+[2K
+Incremental: changed=1, added=0, deleted=0 (skipping wipe + 4249 unchanged file rows preserved)
+[2K
+Incremental: +4 importer(s) added to writable set (BFS depth ≤ 4)
+[2K
+Parse cache: pruned 1 stale chunk entries
+
+  Repository indexed successfully (30.2s)
+
+  21,328 nodes | 56,127 edges | 929 clusters | 300 flows
+  /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/sem/gitnexus-DevCouncil
+

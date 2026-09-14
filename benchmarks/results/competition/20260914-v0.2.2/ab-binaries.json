@@ -1,0 +1,22 @@
+{
+  "note": "Binaries for ab_control.py. The v0.2.1 arm was built for this run from the v0.2.1 tag into a scratch worktree, because the prior run's preserved binaries were deleted by the 2026-09-13 cleanup pass. The path below is session-scratch and will not survive; rebuild with the command in `build` and check `sha256` before trusting a rerun's comparability.",
+  "binaries": {
+    "v0.2.1": {
+      "path": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/8aef7e52-66bf-445f-af67-d8ff23d20183/scratchpad/v021-target/release/devmap",
+      "version": "devmap 0.2.1 (store schema 20, code graph schema 2, build bde133a97077)",
+      "commit": "bde133a97077",
+      "tag": "v0.2.1",
+      "sha256": "75f3876ca276a74148f0",
+      "sha256_note": "first 20 hex chars as recorded at build time",
+      "build": "git worktree add --detach <dir> v0.2.1 && CARGO_TARGET_DIR=<target> cargo build --release -p devmap-cli --manifest-path <dir>/rust/Cargo.toml"
+    },
+    "v0.2.2": {
+      "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/devmap",
+      "version": "devmap 0.2.2 (store schema 22, code graph schema 2, build 1d680486869d)",
+      "commit": "1d680486869d",
+      "tag": "v0.2.2",
+      "sha256": "e989668ca23650f52ddc45746872dc01c0219981956d3f720d0488f920340ac8",
+      "build": "the installed ~/.local/bin/devmap at the time of the run, copied into scratch and pinned"
+    }
+  }
+}

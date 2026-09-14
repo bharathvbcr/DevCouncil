@@ -1,0 +1,21 @@
+  warning: 1 source file(s) produced zero nodes and are absent from the graph: Cargo.toml. A re-run will retry them (empties are no longer cached); if it persists, please report the file(s) (#1666).
+  warning: 9 .sql file(s) contributed nothing to the graph because a dependency is missing: tree_sitter_sql not installed. Install it with: pip install "graphifyy[sql]" (#1745)
+  warning: 2 .tf file(s) contributed nothing to the graph because a dependency is missing: tree_sitter_hcl not installed. Install it with: pip install "graphifyy[terraform]" (#1745)
+        5.14 real         6.40 user         2.00 sys
+           196132864  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              106820  page reclaims
+                 892  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  21  voluntary context switches
+               36087  involuntary context switches
+         95361294459  instructions retired
+         21001056046  cycles elapsed
+           184763232  peak memory footprint

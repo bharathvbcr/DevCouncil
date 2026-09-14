@@ -187,6 +187,38 @@ Output: a `results/<timestamp>.json` (raw per-run data, including the
 
 See `tasks.py` for the task suite and each task's hidden checks.
 
+## DevMap v0.2.2 competitor comparison: 2026-09-14 UTC
+
+The [v0.2.2 report](results/competition/20260914-v0.2.2/REPORT.md) is the
+current competitor comparison and the first to carry both halves in one run:
+the four-repository indexing/memory/store matrix **and** the correctness-and-query
+campaign (definitions, callers, edit visibility, index staleness, query latency,
+coverage inventories). It measures DevPrism, DevCouncil, GitPulse and scholarlm
+— 595 to 4,335 files — against CodeGraph, codebase-memory-mcp, Graphify,
+GitNexus, Gortex and a ripgrep text baseline. All 180 matrix measurements
+succeeded.
+
+DevMap 0.2.2 had the lowest cold and unchanged-refresh times on **all four**
+corpora, the lowest median in **all six** query cells, and **5/5** inspected
+caller pairs (matched only by CBM). CodeGraph had the lowest one-file-edit time
+on all four. Graphify had the smallest store everywhere and lower sampled memory
+than DevMap on scholarlm.
+
+It adds two **controlled A/Bs** between v0.2.1 and v0.2.2, alternating both
+binaries on the same corpora in one session: cold indexing 1.14–1.40× faster,
+the largest corpus's edit 1.37× faster, the store 16–19% smaller — for a
+byte-identical graph — while **query latency and caller accuracy did not
+change**. That second A/B exists because reading the raw query numbers across
+reports suggests a 3× speedup that the controlled measurement does not support;
+the difference is campaign conditions.
+
+Its competitor executables were deleted by a 2026-09-13 cleanup pass and
+reinstalled from their pinned releases, each verified byte-for-byte against the
+digest the build-48cd3c7 run recorded, so the tool builds are unchanged. Its
+corpora sit at newer HEADs, so only the A/B sections are controlled version
+comparisons. `verify_report.py` asserts the published tables still match the raw
+measurements.
+
 ## DevMap build 48cd3c7 competitor comparison: 2026-09-13 UTC
 
 The [build-48cd3c7 competitor report](results/competition/20260913-48cd3c7/REPORT.md)

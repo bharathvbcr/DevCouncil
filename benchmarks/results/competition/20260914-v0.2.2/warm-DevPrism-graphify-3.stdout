@@ -1,0 +1,8 @@
+[graphify extract] incremental scan of /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/graphify-DevPrism
+[graphify extract] re-queuing 6 manifest-stamped code file(s) with no nodes in graph.json (prior failed extraction, #2543)
+[graphify extract] --code-only: skipping 146 non-code file(s) (60 docs, 14 papers, 72 images) — no LLM extraction
+[graphify extract] 6 code, 0 docs, 0 papers, 0 images changed; 559 unchanged; 0 deleted
+[graphify extract] 139 file(s) not classified (no supported extension or shebang), skipped: .env.example, .gitattributes, .gitignore, Entitlements.plist, LICENSE, abstract.tex (+133 more)
+[graphify extract] 1 file(s) skipped as potentially sensitive (rename or move if wrongly flagged): .npmrc
+[graphify extract] AST extraction on 6 code files...
+[graphify extract] wrote /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/graphify-DevPrism/graphify-out/graph.json — 7498 nodes, 22998 edges (no clustering)

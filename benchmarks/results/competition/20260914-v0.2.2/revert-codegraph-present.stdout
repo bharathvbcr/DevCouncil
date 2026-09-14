@@ -1,0 +1,24 @@
+[
+  {
+    "node": {
+      "id": "function:06e895a8507f09fcaa66f50452863a52",
+      "kind": "function",
+      "name": "devmap_competition_revert_probe",
+      "qualifiedName": "devmap_competition_revert_probe",
+      "filePath": "benchmarks/tasks.py",
+      "language": "python",
+      "startLine": 266,
+      "endLine": 268,
+      "startColumn": 0,
+      "endColumn": 16,
+      "signature": "(value)",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false,
+      "isAbstract": false,
+      "updatedAt": 1789389665001
+    },
+    "score": 94.91358725736517
+  }
+]

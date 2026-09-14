@@ -1,0 +1,43 @@
+[
+ {
+  "tool": "devmap",
+  "present_after_add": true,
+  "present_after_1_refresh": false,
+  "present_after_2_refreshes": false,
+  "probe_was_indexed": true,
+  "stale": false
+ },
+ {
+  "tool": "codegraph",
+  "present_after_add": true,
+  "present_after_1_refresh": false,
+  "present_after_2_refreshes": false,
+  "probe_was_indexed": true,
+  "stale": false
+ },
+ {
+  "tool": "cbm",
+  "present_after_add": true,
+  "present_after_1_refresh": false,
+  "present_after_2_refreshes": false,
+  "probe_was_indexed": true,
+  "stale": false
+ },
+ {
+  "tool": "gitnexus",
+  "present_after_add": true,
+  "present_after_1_refresh": true,
+  "present_after_2_refreshes": true,
+  "probe_was_indexed": true,
+  "stale": true,
+  "present_after_forced_rebuild": false
+ },
+ {
+  "tool": "graphify",
+  "present_after_add": true,
+  "present_after_1_refresh": false,
+  "present_after_2_refreshes": false,
+  "probe_was_indexed": true,
+  "stale": false
+ }
+]

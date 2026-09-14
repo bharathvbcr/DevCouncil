@@ -1,0 +1,19 @@
+  warning: 7 .sql file(s) contributed nothing to the graph because a dependency is missing: tree_sitter_sql not installed. Install it with: pip install "graphifyy[sql]" (#1745)
+        7.47 real         7.54 user         2.61 sys
+           383139840  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              128139  page reclaims
+                 844  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  21  voluntary context switches
+               54664  involuntary context switches
+        130756406990  instructions retired
+         30308936375  cycles elapsed
+           371901424  peak memory footprint

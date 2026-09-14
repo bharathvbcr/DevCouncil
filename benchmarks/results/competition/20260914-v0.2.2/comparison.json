@@ -1,0 +1,668 @@
+{
+ "benchmark": "DevMap v0.2.2 vs five code-graph tools, four repositories",
+ "generated_utc": "20260914T070350Z",
+ "devmap_version": "devmap 0.2.2 (store schema 22, code graph schema 2, build 1d680486869d)",
+ "prior_run": "20260913-multirepo",
+ "method": {
+  "repeats": 3,
+  "statistic": "minimum of 3 interleaved repeats; median and max in summary",
+  "interleaving": "repeat is the outermost loop, so a cell's samples land in different load windows",
+  "corpora": "each tool indexes its own APFS clone of a snapshot pinned at the repository's HEAD; no working checkout is touched",
+  "cold_integrity": "index state a tool keeps outside the corpus (DevMap's --db store, GitNexus's GITNEXUS_HOME) is deleted before every cold run",
+  "gortex": "resident daemon, measured at its own log gates with a files_reindexed>0 assertion; n=1, not CLI-comparable",
+  "tool_provenance": "the five competitor executables were deleted by a 2026-09-13 cleanup pass and reinstalled from their pinned releases; each was verified byte-for-byte against the sha256 recorded by 20260913-48cd3c7.",
+  "host": "Mac17,8 18"
+ },
+ "caveats": {
+  "not_an_accuracy_ranking": "these tools do not do the same work. Timings are descriptive of each tool's own native command, never a quality or accuracy score.",
+  "cbm_no_index_size": "CBM ran with --persistence false and leaves no on-disk index to measure.",
+  "cbm_memory_carried_forward": "the 20260913-multirepo run measured CBM's sampled peak RSS varying -75% to -96% between two passes, because its workers are too short-lived for the 50ms sampler. This run did ONE pass and so cannot confirm or refute that; cbm_cold_peak_rss_mb records what it caught.",
+  "cbm_cold_peak_rss_mb": {
+   "DevPrism": 170,
+   "DevCouncil": 1589,
+   "GitPulse": 1777,
+   "scholarlm": 3930
+  },
+  "machine_shared": "this is an interactive machine. Minimums are the defensible statistic; per-sample load_average is in measurements.jsonl.",
+  "matrix_load_average_1min": {
+   "min": 5.8,
+   "max": 11.2,
+   "samples": 180
+  },
+  "gortex_load_average_1min": {
+   "DevCouncil": 7.9,
+   "DevPrism": 7.3,
+   "GitPulse": 6.6,
+   "scholarlm": 5.4
+  },
+  "competitor_corpora_moved": "three of the four repositories advanced past the commits 20260913-multirepo measured, so competitor timings are NOT a controlled A/B against that report. DevPrism did not move.",
+  "edit_stage_appends_a_hash_comment": "the touch stage appends '# devmap-bench edit' to a .rs/.tsx/.go file, where '#' does not start a comment. Every tool sees the same edit, and it is the same edit the prior runs made, but it is a content change that may not parse."
+ },
+ "corpus_commits": {
+  "DevCouncil": "1d680486869d922933146725cfe8b07f5c20ae92",
+  "GitPulse": "e9322f5361a7e4c5bb4518c17f2ea88438b98fa0",
+  "DevPrism": "feaef2ffd27fe6d77f897ebc9ba6f0db0b5dd458",
+  "scholarlm": "5b5454c88cc16578c6ca24bb3e248374729acd5d"
+ },
+ "tool_identities": {
+  "gortex": {
+   "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/tools/gortex/x/gortex",
+   "exists": true,
+   "sha256": "62813625fa4d121322cab6f1bced00397713a59688af0297882812da2ab912bf"
+  },
+  "cbm": {
+   "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/tools/cbm/x/codebase-memory-mcp",
+   "exists": true,
+   "sha256": "2412e017268bef8f847f38d1b0f79f63185b38c27fe6fba637067bfc87c0eedf"
+  },
+  "codegraph": {
+   "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/tools/codegraph/x/codegraph-darwin-arm64/bin/codegraph",
+   "exists": true,
+   "sha256": "3184bbf582b5db7cffd07373017631fdc4392842860c2e3991be3f23b6fb3559"
+  },
+  "graphify": {
+   "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/tools/graphify-venv/bin/graphify",
+   "exists": true,
+   "sha256": "64fce780e77bbdfc52f6c6e3eb21cad5affffa38228e279763f01edd9fd6260d"
+  },
+  "gitnexus": {
+   "path": "/opt/homebrew/bin/gitnexus",
+   "exists": true,
+   "sha256": "233ece3066020a9098aa7fa448e04beff8452169497248cb1e5c316e508bfbbc"
+  },
+  "devmap": {
+   "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/devmap",
+   "exists": true,
+   "sha256": "e989668ca23650f52ddc45746872dc01c0219981956d3f720d0488f920340ac8"
+  }
+ },
+ "devmap_graph": {
+  "DevPrism": {
+   "devmap_files_indexed": 595,
+   "devmap_symbols": 6290,
+   "devmap_edges": 18534
+  },
+  "DevCouncil": {
+   "devmap_files_indexed": 1098,
+   "devmap_symbols": 11473,
+   "devmap_edges": 37326
+  },
+  "GitPulse": {
+   "devmap_files_indexed": 1999,
+   "devmap_symbols": 27918,
+   "devmap_edges": 91292
+  },
+  "scholarlm": {
+   "devmap_files_indexed": 4335,
+   "devmap_symbols": 41995,
+   "devmap_edges": 146115
+  }
+ },
+ "timings": {
+  "DevCouncil": {
+   "devmap": {
+    "cold": {
+     "n": 3,
+     "min": 2.012013957981253,
+     "median": 2.0497177910001483,
+     "max": 2.0498713329725433,
+     "peak_rss_bytes": 710836224
+    },
+    "warm": {
+     "n": 3,
+     "min": 0.08909749999293126,
+     "median": 0.09994037498836406,
+     "max": 0.10153270798036829,
+     "peak_rss_bytes": 5029888
+    },
+    "touch": {
+     "n": 3,
+     "min": 0.8162512079870794,
+     "median": 0.8683000000019092,
+     "max": 0.8751207919849548,
+     "peak_rss_bytes": 541704192
+    }
+   },
+   "codegraph": {
+    "cold": {
+     "n": 3,
+     "min": 3.2941770420002285,
+     "median": 3.74819587499951,
+     "max": 4.017973707988858,
+     "peak_rss_bytes": 2547744768
+    },
+    "warm": {
+     "n": 3,
+     "min": 0.23473191700759344,
+     "median": 0.24734291702043265,
+     "max": 0.34476587499375455,
+     "peak_rss_bytes": 111099904
+    },
+    "touch": {
+     "n": 3,
+     "min": 0.5123436670110095,
+     "median": 0.5304146250127815,
+     "max": 0.5756702079961542,
+     "peak_rss_bytes": 170147840
+    }
+   },
+   "cbm": {
+    "cold": {
+     "n": 3,
+     "min": 9.35746804100927,
+     "median": 9.365007665997837,
+     "max": 9.941780875000404,
+     "peak_rss_bytes": 1665974272
+    },
+    "warm": {
+     "n": 3,
+     "min": 5.72632233297918,
+     "median": 5.85493516700808,
+     "max": 5.872422249987721,
+     "peak_rss_bytes": 58736640
+    },
+    "touch": {
+     "n": 3,
+     "min": 8.894444124976872,
+     "median": 8.954477208986646,
+     "max": 9.31413841599715,
+     "peak_rss_bytes": 423477248
+    }
+   },
+   "gitnexus": {
+    "cold": {
+     "n": 3,
+     "min": 33.6890600839979,
+     "median": 34.24196012498578,
+     "max": 34.86878679099027,
+     "peak_rss_bytes": 3517988864
+    },
+    "warm": {
+     "n": 3,
+     "min": 0.6987082080158871,
+     "median": 0.7306212089897599,
+     "max": 0.7340785840060562,
+     "peak_rss_bytes": 276021248
+    },
+    "touch": {
+     "n": 3,
+     "min": 31.841292666998925,
+     "median": 32.459859124996,
+     "max": 33.35536466698977,
+     "peak_rss_bytes": 3614916608
+    }
+   },
+   "graphify": {
+    "cold": {
+     "n": 3,
+     "min": 14.989104290987598,
+     "median": 15.554501125006936,
+     "max": 16.21942174999276,
+     "peak_rss_bytes": 3583098880
+    },
+    "warm": {
+     "n": 3,
+     "min": 5.080028124997625,
+     "median": 5.162049874983495,
+     "max": 5.573201249993872,
+     "peak_rss_bytes": 925433856
+    },
+    "touch": {
+     "n": 3,
+     "min": 4.882611542008817,
+     "median": 5.230720666993875,
+     "max": 5.244568166002864,
+     "peak_rss_bytes": 909000704
+    }
+   }
+  },
+  "DevPrism": {
+   "devmap": {
+    "cold": {
+     "n": 3,
+     "min": 0.7571878340095282,
+     "median": 0.8363483329885639,
+     "max": 0.8606539589818567,
+     "peak_rss_bytes": 434061312
+    },
+    "warm": {
+     "n": 3,
+     "min": 0.053098499978659675,
+     "median": 0.057911334006348625,
+     "max": 0.061673875025007874,
+     "peak_rss_bytes": 4587520
+    },
+    "touch": {
+     "n": 3,
+     "min": 0.3893742079962976,
+     "median": 0.4043411250167992,
+     "max": 0.4170004589832388,
+     "peak_rss_bytes": 284246016
+    }
+   },
+   "codegraph": {
+    "cold": {
+     "n": 3,
+     "min": 2.0851735830074176,
+     "median": 2.3989611249999143,
+     "max": 2.404734500014456,
+     "peak_rss_bytes": 985726976
+    },
+    "warm": {
+     "n": 3,
+     "min": 0.19448808298329823,
+     "median": 0.19953379200887866,
+     "max": 0.20959387498442084,
+     "peak_rss_bytes": 108052480
+    },
+    "touch": {
+     "n": 3,
+     "min": 0.3597236669738777,
+     "median": 0.3714622500119731,
+     "max": 0.376070250000339,
+     "peak_rss_bytes": 134905856
+    }
+   },
+   "cbm": {
+    "cold": {
+     "n": 3,
+     "min": 5.702704708004603,
+     "median": 6.06950162499561,
+     "max": 6.1396319170016795,
+     "peak_rss_bytes": 178307072
+    },
+    "warm": {
+     "n": 3,
+     "min": 5.657202875008807,
+     "median": 5.675627040996915,
+     "max": 5.724985500011826,
+     "peak_rss_bytes": 41943040
+    },
+    "touch": {
+     "n": 3,
+     "min": 6.001504208979895,
+     "median": 6.030296499986434,
+     "max": 6.17166870800429,
+     "peak_rss_bytes": 180699136
+    }
+   },
+   "gitnexus": {
+    "cold": {
+     "n": 3,
+     "min": 15.927805499988608,
+     "median": 16.181818249984644,
+     "max": 16.37112774999696,
+     "peak_rss_bytes": 3073310720
+    },
+    "warm": {
+     "n": 3,
+     "min": 0.5282216250197962,
+     "median": 0.5585679590003565,
+     "max": 0.5671224999823608,
+     "peak_rss_bytes": 242827264
+    },
+    "touch": {
+     "n": 3,
+     "min": 18.599686499976087,
+     "median": 18.777642750006635,
+     "max": 19.00972537501366,
+     "peak_rss_bytes": 3230466048
+    }
+   },
+   "graphify": {
+    "cold": {
+     "n": 3,
+     "min": 5.081414874992333,
+     "median": 5.1066852920048404,
+     "max": 5.241915999999037,
+     "peak_rss_bytes": 1153220608
+    },
+    "warm": {
+     "n": 3,
+     "min": 2.1050935839884914,
+     "median": 2.114680667000357,
+     "max": 2.162640750000719,
+     "peak_rss_bytes": 138084352
+    },
+    "touch": {
+     "n": 3,
+     "min": 2.1356491670012474,
+     "median": 2.157653542002663,
+     "max": 2.1915120409976225,
+     "peak_rss_bytes": 139689984
+    }
+   }
+  },
+  "GitPulse": {
+   "devmap": {
+    "cold": {
+     "n": 3,
+     "min": 2.8202099589980207,
+     "median": 2.9796026659896597,
+     "max": 3.1334008749981876,
+     "peak_rss_bytes": 1170636800
+    },
+    "warm": {
+     "n": 3,
+     "min": 0.10234283399768174,
+     "median": 0.10347875001025386,
+     "max": 0.10652870801277459,
+     "peak_rss_bytes": 81068032
+    },
+    "touch": {
+     "n": 3,
+     "min": 1.519290208001621,
+     "median": 1.5195712499844376,
+     "max": 1.546568624995416,
+     "peak_rss_bytes": 1028931584
+    }
+   },
+   "codegraph": {
+    "cold": {
+     "n": 3,
+     "min": 6.372137541999109,
+     "median": 6.48917379201157,
+     "max": 6.765145916986512,
+     "peak_rss_bytes": 2478325760
+    },
+    "warm": {
+     "n": 3,
+     "min": 0.2220900829997845,
+     "median": 0.22393737500533462,
+     "max": 0.22681441600434482,
+     "peak_rss_bytes": 114835456
+    },
+    "touch": {
+     "n": 3,
+     "min": 0.42097241699229926,
+     "median": 0.4319430830073543,
+     "max": 0.5083992499858141,
+     "peak_rss_bytes": 179617792
+    }
+   },
+   "cbm": {
+    "cold": {
+     "n": 3,
+     "min": 5.6900785410252865,
+     "median": 5.86844837499666,
+     "max": 8.95519062501262,
+     "peak_rss_bytes": 1862975488
+    },
+    "warm": {
+     "n": 3,
+     "min": 5.692012209008681,
+     "median": 5.7076137920084875,
+     "max": 5.729864750028355,
+     "peak_rss_bytes": 72499200
+    },
+    "touch": {
+     "n": 3,
+     "min": 5.673804082995048,
+     "median": 5.675253708992386,
+     "max": 5.966918458987493,
+     "peak_rss_bytes": 72368128
+    }
+   },
+   "gitnexus": {
+    "cold": {
+     "n": 3,
+     "min": 43.65359137498308,
+     "median": 44.32845837500645,
+     "max": 48.32281562499702,
+     "peak_rss_bytes": 4999692288
+    },
+    "warm": {
+     "n": 3,
+     "min": 0.7649674590211362,
+     "median": 0.7961120840045623,
+     "max": 1.0890159170085099,
+     "peak_rss_bytes": 261750784
+    },
+    "touch": {
+     "n": 3,
+     "min": 40.32674299998325,
+     "median": 42.14616879200912,
+     "max": 43.38626275002025,
+     "peak_rss_bytes": 5003788288
+    }
+   },
+   "graphify": {
+    "cold": {
+     "n": 3,
+     "min": 12.043943917000433,
+     "median": 14.427295415982371,
+     "max": 14.975434249994578,
+     "peak_rss_bytes": 1474379776
+    },
+    "warm": {
+     "n": 3,
+     "min": 6.889792790985666,
+     "median": 7.403332124988083,
+     "max": 7.494718166999519,
+     "peak_rss_bytes": 1014120448
+    },
+    "touch": {
+     "n": 3,
+     "min": 6.695874582976103,
+     "median": 7.152153083006851,
+     "max": 7.410602833988378,
+     "peak_rss_bytes": 990494720
+    }
+   }
+  },
+  "scholarlm": {
+   "devmap": {
+    "cold": {
+     "n": 3,
+     "min": 4.61103916700813,
+     "median": 4.840018750022864,
+     "max": 5.182923374988604,
+     "peak_rss_bytes": 1808891904
+    },
+    "warm": {
+     "n": 3,
+     "min": 0.1407319580030162,
+     "median": 0.1618204999831505,
+     "max": 0.24073683298774995,
+     "peak_rss_bytes": 126435328
+    },
+    "touch": {
+     "n": 3,
+     "min": 2.4491652500000782,
+     "median": 2.6031516249931883,
+     "max": 2.628249165980378,
+     "peak_rss_bytes": 1611284480
+    }
+   },
+   "codegraph": {
+    "cold": {
+     "n": 3,
+     "min": 9.035624417010695,
+     "median": 9.77856520799105,
+     "max": 9.847722000005888,
+     "peak_rss_bytes": 3023765504
+    },
+    "warm": {
+     "n": 3,
+     "min": 0.42536762499366887,
+     "median": 0.43752341700019315,
+     "max": 0.47477012500166893,
+     "peak_rss_bytes": 125304832
+    },
+    "touch": {
+     "n": 3,
+     "min": 0.8669766250241082,
+     "median": 0.8678927500150166,
+     "max": 0.9205424999818206,
+     "peak_rss_bytes": 208027648
+    }
+   },
+   "cbm": {
+    "cold": {
+     "n": 3,
+     "min": 7.3665584579866845,
+     "median": 7.595064416993409,
+     "max": 12.960046833992237,
+     "peak_rss_bytes": 4121165824
+    },
+    "warm": {
+     "n": 3,
+     "min": 5.863412000006065,
+     "median": 6.3181251660280395,
+     "max": 6.3390946660074405,
+     "peak_rss_bytes": 72450048
+    },
+    "touch": {
+     "n": 3,
+     "min": 7.292129042005399,
+     "median": 7.6234091670194175,
+     "max": 7.674306791013805,
+     "peak_rss_bytes": 557203456
+    }
+   },
+   "gitnexus": {
+    "cold": {
+     "n": 3,
+     "min": 42.94826404098421,
+     "median": 43.347215916990535,
+     "max": 47.62178899999708,
+     "peak_rss_bytes": 5047812096
+    },
+    "warm": {
+     "n": 3,
+     "min": 1.2074739999952726,
+     "median": 1.2251380420057103,
+     "max": 1.358132666995516,
+     "peak_rss_bytes": 296681472
+    },
+    "touch": {
+     "n": 3,
+     "min": 77.16086641600123,
+     "median": 80.0260278750211,
+     "max": 85.57487725000829,
+     "peak_rss_bytes": 4852056064
+    }
+   },
+   "graphify": {
+    "cold": {
+     "n": 3,
+     "min": 26.788203540985705,
+     "median": 28.72316779202083,
+     "max": 29.091020791005576,
+     "peak_rss_bytes": 1529102336
+    },
+    "warm": {
+     "n": 3,
+     "min": 14.043880167009775,
+     "median": 14.137920832989039,
+     "max": 15.776586583000608,
+     "peak_rss_bytes": 1233584128
+    },
+    "touch": {
+     "n": 3,
+     "min": 14.274998417007737,
+     "median": 15.576074624987086,
+     "max": 15.720575957995607,
+     "peak_rss_bytes": 1232470016
+    }
+   }
+  }
+ },
+ "failures": [],
+ "gortex_gates": [
+  {
+   "repo": "DevCouncil",
+   "iteration": 1,
+   "tool": "gortex",
+   "query_ready_seconds": 16.513275958015583,
+   "enriched_seconds": 36.880052041000454,
+   "files_reindexed": 1366,
+   "daemon_total_seconds": 33.941024959,
+   "database_bytes": 416862208,
+   "load_average": [
+    7.91015625,
+    8.3486328125,
+    8.5087890625
+   ],
+   "log": "gortex-DevCouncil-1.log"
+  },
+  {
+   "repo": "DevPrism",
+   "iteration": 1,
+   "tool": "gortex",
+   "query_ready_seconds": 7.362857500003884,
+   "enriched_seconds": 13.977810417010915,
+   "files_reindexed": 758,
+   "daemon_total_seconds": 13.573005458,
+   "database_bytes": 194957312,
+   "load_average": [
+    7.27099609375,
+    8.18408203125,
+    8.44677734375
+   ],
+   "log": "gortex-DevPrism-1.log"
+  },
+  {
+   "repo": "GitPulse",
+   "iteration": 1,
+   "tool": "gortex",
+   "query_ready_seconds": 29.25498954099021,
+   "enriched_seconds": 82.70188204100123,
+   "files_reindexed": 2068,
+   "daemon_total_seconds": 82.343462042,
+   "database_bytes": 734031872,
+   "load_average": [
+    6.59423828125,
+    7.84716796875,
+    8.2998046875
+   ],
+   "log": "gortex-GitPulse-1.log"
+  },
+  {
+   "repo": "scholarlm",
+   "iteration": 1,
+   "tool": "gortex",
+   "query_ready_seconds": 107.95296170798247,
+   "enriched_seconds": 269.3689532080025,
+   "files_reindexed": 4425,
+   "daemon_total_seconds": 268.994164334,
+   "database_bytes": 2446848000,
+   "load_average": [
+    5.41064453125,
+    6.544921875,
+    7.6044921875
+   ],
+   "log": "gortex-scholarlm-1.log"
+  }
+ ],
+ "index_bytes": {
+  "DevPrism": {
+   "devmap": 87359488,
+   "codegraph": 51326976,
+   "graphify": 18751488,
+   "gitnexus": 266006528,
+   "gortex": 197566464
+  },
+  "DevCouncil": {
+   "devmap": 151060480,
+   "codegraph": 76308480,
+   "graphify": 51269632,
+   "gitnexus": 492773376,
+   "gortex": 416940032
+  },
+  "GitPulse": {
+   "devmap": 285278208,
+   "codegraph": 175902720,
+   "graphify": 88932352,
+   "gitnexus": 679768064,
+   "gortex": 734662656
+  },
+  "scholarlm": {
+   "devmap": 486604800,
+   "codegraph": 309805056,
+   "graphify": 175583232,
+   "gitnexus": 778817536,
+   "gortex": 2446880768
+  }
+ }
+}

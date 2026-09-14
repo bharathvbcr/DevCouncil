@@ -1,0 +1,13 @@
+[graphify extract] scanning /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/graphify-DevPrism
+[graphify extract] --code-only: skipping 146 non-code file(s) (60 docs, 14 papers, 72 images) — no LLM extraction
+[graphify extract] found 559 code, 0 docs, 0 papers, 0 images
+[graphify extract] 139 file(s) not classified (no supported extension or shebang), skipped: .env.example, .gitattributes, .gitignore, Entitlements.plist, LICENSE, abstract.tex (+133 more)
+[graphify extract] 1 file(s) skipped as potentially sensitive (rename or move if wrongly flagged): .npmrc
+[graphify extract] AST extraction on 559 code files...
+  AST extraction: 100/559 uncached files (17%) [18 workers]
+  AST extraction: 200/559 uncached files (35%) [18 workers]
+  AST extraction: 300/559 uncached files (53%) [18 workers]
+  AST extraction: 400/559 uncached files (71%) [18 workers]
+  AST extraction: 500/559 uncached files (89%) [18 workers]
+  AST extraction: 559/559 uncached files (100%) [18 workers]
+[graphify extract] wrote /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/graphify-DevPrism/graphify-out/graph.json — 7505 nodes, 22998 edges (no clustering)

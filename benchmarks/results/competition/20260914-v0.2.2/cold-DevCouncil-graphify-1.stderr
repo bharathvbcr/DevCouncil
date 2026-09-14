@@ -1,0 +1,23 @@
+  warning: 1 source file(s) produced zero nodes and are absent from the graph: Cargo.toml. A re-run will retry them (empties are no longer cached); if it persists, please report the file(s) (#1666).
+  warning: 4 file(s) are classified as code but graphify has no AST extractor for their language, so they contributed nothing to the graph: .ets (2), .r (2). Please open an issue to request support for these (#1689).
+  warning: 9 .sql file(s) contributed nothing to the graph because a dependency is missing: tree_sitter_sql not installed. Install it with: pip install "graphifyy[sql]" (#1745)
+  warning: 2 .tf file(s) contributed nothing to the graph because a dependency is missing: tree_sitter_hcl not installed. Install it with: pip install "graphifyy[terraform]" (#1745)
+  warning: 7 file(s) had syntax errors and may be partially extracted: rust/testdata/capabilities/probe.svelte (first error at line 1, 1 symbol(s) extracted), rust/testdata/fixtures/dead_hardening/svelte_runes/Counter.svelte (first error at line 1, no symbols extracted), rust/testdata/fixtures/languages/svelte/Main.svelte (first error at line 3, no symbols extracted), rust/testdata/fixtures/tier_a/invalid/broken.ts (first error at line 1, no symbols extracted), rust/vendor/grammars/cobol/tree_sitter/parser.h (first error at line 226, no symbols extracted) (+2 more)
+       15.53 real        18.29 user         4.92 sys
+          2307522560  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              279730  page reclaims
+                1353  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                2536  voluntary context switches
+               76124  involuntary context switches
+        112851934478  instructions retired
+         27025055796  cycles elapsed
+           262292104  peak memory footprint

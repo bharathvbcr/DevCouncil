@@ -1,0 +1,7 @@
+[graphify extract] incremental scan of /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/graphify-GitPulse
+[graphify extract] re-queuing 26 manifest-stamped code file(s) with no nodes in graph.json (prior failed extraction, #2543)
+[graphify extract] --code-only: skipping 185 non-code file(s) (169 docs, 0 papers, 16 images) — no LLM extraction
+[graphify extract] 33 code, 0 docs, 0 papers, 0 images changed; 1859 unchanged; 0 deleted
+[graphify extract] 64 file(s) not classified (no supported extension or shebang), skipped: .all-contributorsrc, .gitattributes, .gitignore, .gitmodules, .license_template, AndroidManifest.xml (+58 more)
+[graphify extract] AST extraction on 33 code files...
+[graphify extract] wrote /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/graphify-GitPulse/graphify-out/graph.json — 35154 nodes, 90603 edges (no clustering)

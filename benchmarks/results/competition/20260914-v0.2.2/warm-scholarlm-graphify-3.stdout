@@ -1,0 +1,9 @@
+[graphify extract] incremental scan of /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/graphify-scholarlm
+[graphify extract] re-queuing 66 manifest-stamped code file(s) with no nodes in graph.json (prior failed extraction, #2543)
+[graphify extract] --code-only: skipping 364 non-code file(s) (328 docs, 9 papers, 27 images) — no LLM extraction
+[graphify extract] 105 code, 0 docs, 0 papers, 0 images changed; 4001 unchanged; 0 deleted
+[graphify extract] 191 file(s) not classified (no supported extension or shebang), skipped: .coveragerc, .dockerignore, .env.example, .firebaserc, .gcloudignore, .gitattributes (+185 more)
+[graphify extract] AST extraction on 105 code files...
+  AST extraction: 100/105 uncached files (95%) [18 workers]
+  AST extraction: 105/105 uncached files (100%) [18 workers]
+[graphify extract] wrote /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/graphify-scholarlm/graphify-out/graph.json — 44129 nodes, 139325 edges (no clustering)

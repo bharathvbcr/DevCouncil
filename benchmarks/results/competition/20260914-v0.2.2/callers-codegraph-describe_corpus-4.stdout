@@ -1,0 +1,11 @@
+{
+  "symbol": "describe_corpus",
+  "callers": [
+    {
+      "name": "main",
+      "kind": "function",
+      "filePath": "benchmarks/map_bench.py",
+      "startLine": 1004
+    }
+  ]
+}

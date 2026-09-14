@@ -1,0 +1,68 @@
+[
+  {
+    "node": {
+      "id": "function:5d6de4c9ea1dc746c6688437d73c5d8e",
+      "kind": "function",
+      "name": "describe_corpus",
+      "qualifiedName": "describe_corpus",
+      "filePath": "benchmarks/map_bench.py",
+      "language": "python",
+      "startLine": 240,
+      "endLine": 271,
+      "startColumn": 0,
+      "endColumn": 5,
+      "signature": "(repo: Path) -> Dict[str, object]",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false,
+      "isAbstract": false,
+      "updatedAt": 1789389384199
+    },
+    "score": 93.10038494170021
+  },
+  {
+    "node": {
+      "id": "variable:6a6ee086c8f7a9d0ed57f2c3250add85",
+      "kind": "variable",
+      "name": "TARGETS",
+      "qualifiedName": "TARGETS",
+      "filePath": "benchmarks/results/competition/20260913-48cd3c7/write_report.py",
+      "language": "python",
+      "startLine": 14,
+      "endLine": 14,
+      "startColumn": 0,
+      "endColumn": 66,
+      "signature": "= ['db_size_gate_bytes', 'loadBounded', 'describe_corpus']",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false,
+      "isAbstract": false,
+      "updatedAt": 1789389384207
+    },
+    "score": 0.7534548161548784
+  },
+  {
+    "node": {
+      "id": "variable:9cd76518c8155994a1d717f9a1af6a9d",
+      "kind": "variable",
+      "name": "TARGETS",
+      "qualifiedName": "TARGETS",
+      "filePath": "benchmarks/results/competition/20260913-v0.2.1/write_report.py",
+      "language": "python",
+      "startLine": 13,
+      "endLine": 13,
+      "startColumn": 0,
+      "endColumn": 66,
+      "signature": "= ['db_size_gate_bytes', 'loadBounded', 'describe_corpus']",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false,
+      "isAbstract": false,
+      "updatedAt": 1789389384212
+    },
+    "score": 0.7534548161548784
+  }
+]
