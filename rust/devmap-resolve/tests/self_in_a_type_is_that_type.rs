@@ -270,6 +270,32 @@ fn a_file_level_function_is_not_an_enclosing_type() {
     );
 }
 
+/// A function named like a type **somewhere else** must not borrow its methods.
+///
+/// The sharp version of the test above, and the one that has teeth. There, a
+/// widened kind check let the free function through but the walk found nothing
+/// to reach, so the call abstained anyway and the widening was invisible. Here
+/// `b.swift` declares a real `Helper` type owning `zzcheck`, and
+/// `type_methods`/`supertypes` are both flat by **bare** type name — so the
+/// moment `a.swift`'s *function* `Helper` is accepted as an enclosing type, the
+/// walk reaches across the file boundary and emits an edge to a method the
+/// caller has nothing to do with.
+///
+/// cargo-mutants found this: widening either `&&` in the kind check survived
+/// every other test in this file.
+#[test]
+fn a_function_named_like_a_type_elsewhere_borrows_nothing() {
+    let owner = "struct Helper {\n\
+         \x20   static func zzcheck(_ v: Int) -> Bool { v > 0 }\n\
+         }\n";
+    let impostor = "func Helper() -> Bool { return Self.zzcheck(1) }\n";
+    let files = [("b.swift", owner), ("a.swift", impostor)];
+    assert!(
+        calls_from(&files, "a.swift::Helper").is_empty(),
+        "a free function is not a type, however its name reads"
+    );
+}
+
 /// A caller that is a type declaring nothing by that name still abstains.
 #[test]
 fn a_type_without_the_method_resolves_to_nothing() {
