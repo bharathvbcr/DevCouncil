@@ -1,0 +1,25 @@
+# Git must not rewrite the bytes of anything in this repository.
+#
+# `dc-evidence` binds a bundle to its contract by digesting the contract's
+# exact bytes — `lib.rs`: "SHA-256 of exact bytes; never hash independently
+# reserialized JSON" — and `fixtures/v1/bundle*.json` record those digests as
+# literals. `include_bytes!` then hands the test binary whatever the checkout
+# wrote to disk. So a checkout that converts LF to CRLF changes the digest of
+# `contract.json` and `contract-not-found.json` and nothing else visible: the
+# JSON still parses, the semantics are unchanged, and eleven verdicts in
+# `dc-evidence/tests/evidence.rs` flip to `Failed` while naming no cause.
+#
+# That is not hypothetical. Git for Windows installs with `core.autocrlf=true`
+# in its system config and `actions/checkout` does not override it, so with no
+# `.gitattributes` here the `components (windows-latest)` job was red on every
+# push from 2026-09-10 onward. It also took `cargo test` down with it before
+# dc-glob, dc-proc, dc-grep, dc-store or dc-verify ever ran, which is most of
+# what that job exists to answer.
+#
+# `-text` rather than `text=auto eol=lf`: some committed files are recorded
+# evidence that genuinely contains CRLF — `benchmarks/results/**` captures
+# competitor stdout verbatim — and normalising would silently rewrite the
+# record. Nothing in this tree wants end-of-line translation, so nothing is
+# exempted below. Keep it that way: a `text` entry added here re-arms the bug
+# for whatever it covers.
+* -text
