@@ -2735,3 +2735,224 @@ fn every_migration_step_is_re_entrant_from_every_version() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Every SQL statement the gate scripts hand-write must parse against the
+/// schema this binary creates.
+///
+/// `verify.sh` and `tools/*.sh` query the store with `sqlite3` and literal SQL.
+/// Nothing compiles that SQL and, until this test, nothing ran it outside a
+/// full gate pass -- so a schema change could leave a gate script naming a
+/// column that no longer existed and the tree would still be green through
+/// `cargo test`, `cargo clippy` and every crate suite.
+///
+/// The scripts are discovered rather than listed, so one added later is
+/// covered without anyone remembering this test exists.
+///
+/// That is not hypothetical. Schema v22 interned the unresolved ledger's
+/// `reason` into `unresolved_texts`, and
+/// `tools/memory_model_probe.sh` kept counting
+/// `unresolved_rows WHERE reason LIKE 'AmbiguousGlobal%'`. The whole workspace
+/// suite -- 303 binaries -- passed; the breakage surfaced only as a step-6
+/// failure several release builds into a gate run. It surfaced *at all* only
+/// because that script checks `sqlite3`'s exit status. A probe that had
+/// swallowed the error would have counted zero rows and reported a gate that
+/// never examined anything as a gate that passed.
+///
+/// Preparing is the whole check and it is enough: SQLite resolves every
+/// relation and column name at prepare time, which is exactly this class of
+/// breakage, and it does so without needing a populated store.
+#[test]
+fn every_sql_statement_the_gate_scripts_embed_parses_against_the_current_schema() {
+    // `CARGO_MANIFEST_DIR` is `<workspace>/devmap-store`.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the crate lives one level below the workspace root")
+        .to_path_buf();
+
+    // Globbed, then pinned. Both directions of drift are real and they want
+    // opposite things: a named list stops covering a gate script added
+    // tomorrow, and a bare glob stops covering one that is renamed or moved
+    // out of `tools/` without anyone noticing the set shrank. So the set is
+    // discovered -- `verify.sh` plus every `.sh` under `tools/` -- and then
+    // checked against the files known to carry SQL today.
+    let mut scripts: Vec<std::path::PathBuf> = vec![root.join("verify.sh")];
+    let tools = root.join("tools");
+    let listing = fs::read_dir(&tools)
+        .unwrap_or_else(|error| panic!("{} is unreadable: {error}", tools.display()));
+    for entry in listing {
+        let path = entry.expect("a readable directory entry").path();
+        if path.extension().is_some_and(|extension| extension == "sh") {
+            scripts.push(path);
+        }
+    }
+    scripts.sort();
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for path in &scripts {
+        let relative = path
+            .strip_prefix(&root)
+            .expect("every script was joined onto root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = fs::read_to_string(path).unwrap_or_else(|error| {
+            panic!("gate script {} is unreadable: {error}", path.display())
+        });
+        sources.push((relative, text));
+    }
+
+    // The files that carry SQL today. Not the whole expected set -- new
+    // scripts are meant to be picked up without editing this -- but a rename
+    // that moved one of these out of the glob's reach would otherwise take its
+    // coverage with it and leave every assertion below still passing.
+    for required in ["verify.sh", "tools/memory_model_probe.sh", "tools/soak.sh"] {
+        assert!(
+            sources.iter().any(|(name, _)| name == required),
+            "{required} is no longer among the discovered gate scripts {:?}; if it \
+             moved, the glob above has to follow it",
+            sources.iter().map(|(name, _)| name).collect::<Vec<_>>()
+        );
+    }
+
+    // Shell double-quoted SQL, so the statement runs to the next `"`. None of
+    // these embed an escaped double quote -- SQL string literals in them are
+    // single-quoted -- and the count assertion below is what notices if one
+    // ever does.
+    let mut found: Vec<(String, String)> = Vec::new();
+    for (name, text) in &sources {
+        let mut rest = text.as_str();
+        while let Some(open) = rest.find("\"SELECT").or_else(|| rest.find("\"WITH")) {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('"') else {
+                panic!("{name}: an embedded SQL string is never closed");
+            };
+            found.push((name.clone(), after[..close].to_string()));
+            rest = &after[close + 1..];
+        }
+    }
+
+    // Non-vacuity, proved against the tree rather than against a constant: the
+    // extractor must account for every statement opener in the sources. An
+    // extractor that quietly matched nothing would make this test pass while
+    // checking no SQL at all, which is the failure it exists to prevent.
+    let openers: usize = sources
+        .iter()
+        .map(|(_, text)| text.matches("\"SELECT").count() + text.matches("\"WITH").count())
+        .sum();
+    assert!(
+        openers > 0,
+        "no embedded SQL found in the gate scripts at all; the extractor or the scripts moved"
+    );
+    assert_eq!(
+        found.len(),
+        openers,
+        "the extractor found {} of {openers} embedded statements, so it is dropping some",
+        found.len()
+    );
+    // The specific coupling that broke, pinned so a future change that stops
+    // reading the ledger from a gate script has to say so here.
+    assert!(
+        found.iter().any(|(_, sql)| sql.contains("unresolved_rows")),
+        "no gate script reads the unresolved ledger any more; this test was added \
+         because tools/memory_model_probe.sh does, so confirm that on purpose"
+    );
+
+    let dir = tmp_dir("gate-script-sql");
+    let db_path = dir.join("index.sqlite");
+    Store::open(&db_path).expect("a freshly created store must open");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    for (name, sql) in &found {
+        conn.prepare(sql).unwrap_or_else(|error| {
+            panic!("{name} embeds SQL the current schema cannot parse: {error}\n{sql}")
+        });
+    }
+
+    // `fanout.sql` is a whole file rather than a quoted string, and it builds
+    // scratch relations its later statements read, so it is checked by running
+    // it: preparing its statements one at a time would fail on the scratch
+    // relations the earlier ones create. The store is a throwaway.
+    let fanout_path = root.join("tools/fanout.sql");
+    let fanout = fs::read_to_string(&fanout_path)
+        .unwrap_or_else(|error| panic!("{} is unreadable: {error}", fanout_path.display()));
+    conn.execute_batch(&fanout).unwrap_or_else(|error| {
+        panic!("tools/fanout.sql does not run against the current schema: {error}")
+    });
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An id these two tables hand out must never be handed out again.
+///
+/// `generation_file_digests` folds a per-file digest of the edge rows and the
+/// ledger rows, and since v22 the ledger tuple that digest is taken over
+/// carries `source_file_id`, `reason_id` and `classification_id` — ids into
+/// `paths` and `unresolved_texts` — rather than the path and the two texts.
+/// That is only sound while an id means one thing forever. SQLite's default
+/// rowid is `max(rowid) + 1`, so deleting the highest row hands its id to the
+/// next insert; `AUTOINCREMENT` is what stops that, and both tables declare it.
+///
+/// If either lost it, the failure would be silent and would not look like a
+/// schema fault. `prune_generations_except_latest` retires unreferenced pool
+/// texts and unreferenced paths, so ids *are* freed in normal operation. A
+/// reused id lets a digest taken generations apart compare equal to a digest
+/// taken over different text, which puts the file on the
+/// `unchanged_unresolved_files` fast path and leaves its stale ledger rows
+/// live. The store would answer confidently and wrongly.
+///
+/// Nothing else in the workspace asserts this. `REQUIRED_SCHEMA` checks column
+/// names, not column constraints; `a_migrated_store_carries_the_same_schema_as_a_fresh_one`
+/// compares a migrated store's DDL against a fresh store's, which still agree
+/// if both lost the keyword. So this asserts the *behaviour* rather than the
+/// spelling: a keyword can be renamed or a table rebuilt by some future rung,
+/// and the property that has to survive is that the second insert does not get
+/// the first one's id.
+#[test]
+fn an_id_these_tables_hand_out_is_never_handed_out_again() {
+    let dir = tmp_dir("id-reuse");
+    let db_path = dir.join("index.sqlite");
+    drop(Store::open(&db_path).expect("a fresh store must open"));
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+    for (table, column) in [("paths", "path"), ("unresolved_texts", "text")] {
+        // A fresh store has both tables empty, so the row inserted here is the
+        // highest -- which is the only case where a default rowid would be
+        // reused, and therefore the case that tells the two schemes apart.
+        let empty: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            empty, 0,
+            "{table} must start empty or this test cannot distinguish a reused id"
+        );
+
+        conn.execute(
+            &format!("INSERT INTO {table} ({column}) VALUES ('id-reuse-probe-first')"),
+            [],
+        )
+        .unwrap();
+        let first = conn.last_insert_rowid();
+        conn.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [first])
+            .unwrap();
+        conn.execute(
+            &format!("INSERT INTO {table} ({column}) VALUES ('id-reuse-probe-second')"),
+            [],
+        )
+        .unwrap();
+        let second = conn.last_insert_rowid();
+
+        assert!(
+            second > first,
+            "{table} reused id {first} for a second, different row: without \
+             AUTOINCREMENT an id stops being an identity, and a per-file digest \
+             taken over these ids can then compare equal across two generations \
+             that hold different text"
+        );
+
+        conn.execute(&format!("DELETE FROM {table} WHERE id = ?1"), [second])
+            .unwrap();
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -108,9 +108,9 @@ use crate::schema::{
     MIGRATION_V16_TO_V17, MIGRATION_V17_TO_V18_BACKFILL_EDGES,
     MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED, MIGRATION_V17_TO_V18_RENAME_EDGES,
     MIGRATION_V17_TO_V18_RENAME_UNRESOLVED, MIGRATION_V18_TO_V19, MIGRATION_V19_TO_V20,
-    MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6,
-    MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10,
-    PYTHON_INDEX_SCHEMA_VERSION, VALIDITY_RANGE_TABLES,
+    MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5,
+    MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8,
+    MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, PYTHON_INDEX_SCHEMA_VERSION, VALIDITY_RANGE_TABLES,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -1347,14 +1347,24 @@ fn edge_tuple<'a>(
 }
 
 /// The same identity for one row of the unresolved-call ledger.
+///
+/// Three of the six fields are ids since v22, which is what the row stores.
+/// The two long ones went that way — a reason averages 130 bytes and a path 40
+/// — so a live row read back for comparison costs three integers instead of
+/// three strings, and the digest folded into `generation_file_digests` hashes
+/// twenty-odd bytes a row instead of two hundred and seventy.
+///
+/// The ids are only an identity because `unresolved_texts` and `paths` are both
+/// `AUTOINCREMENT`: an id never comes back meaning different text, so two
+/// digests taken generations apart are comparable.
 #[cfg(feature = "parse")]
 #[derive(PartialEq, Eq, Hash)]
 struct UnresolvedTuple<'a> {
-    source_file: std::borrow::Cow<'a, str>,
+    source_file_id: u32,
     source_symbol: std::borrow::Cow<'a, str>,
     callee_name: std::borrow::Cow<'a, str>,
-    reason: std::borrow::Cow<'a, str>,
-    classification: std::borrow::Cow<'a, str>,
+    reason_id: i64,
+    classification_id: i64,
     receiver: Option<std::borrow::Cow<'a, str>>,
 }
 
@@ -1460,6 +1470,32 @@ pub struct WriteBreakdown {
     pub history: f64,
     /// `tx.commit()` -- the durability the whole write is waiting for.
     pub commit: f64,
+    /// Everything the ten spans above do not bracket, as a residual.
+    ///
+    /// Set once by [`Self::attribute_residual`] at the end of the write, as
+    /// `total - (the ten named spans)`, so the split adds up to the write by
+    /// construction rather than by anyone remembering to bracket a new
+    /// statement.
+    ///
+    /// This is not a rounding term. It was 16% of a cold `persist:write` when
+    /// it was first computed -- larger than every named span but two -- and it
+    /// is 25% now, because the named spans got faster and this did not.
+    ///
+    /// What is in it, by reading the write rather than by measuring inside it:
+    /// the `serde_json` of the `AnalysisSummary` and the `generations` insert
+    /// that carries the ~1.09 MB of JSON it produces, the duplicate-path scan
+    /// over every extraction, the transaction and `pending_state` setup, and --
+    /// on an incremental write only -- the carry-forward decision, which reads
+    /// the previous generation's file rows to choose what to reuse. The one
+    /// part of that with a measurement is the `AnalysisSummary` *clone* that
+    /// used to precede the serialization: removing it moved `persist:write`
+    /// 0.671 s to 0.623 s. The rest is unmeasured and named here as unmeasured.
+    ///
+    /// A span cannot cover work nobody thought to bracket; subtraction covers
+    /// exactly that work and nothing else. Attribute a piece of it properly and
+    /// this number should fall by that much -- which is the check that the
+    /// residual is real rather than a bucket that absorbs mistakes.
+    pub other: f64,
 }
 
 impl WriteBreakdown {
@@ -1480,6 +1516,7 @@ impl WriteBreakdown {
             dead,
             history,
             commit,
+            other,
         } = *self;
         vec![
             ("file_rows", file_rows),
@@ -1492,7 +1529,36 @@ impl WriteBreakdown {
             ("dead", dead),
             ("history", history),
             ("commit", commit),
+            ("other", other),
         ]
+    }
+
+    /// The ten bracketed spans, without the residual.
+    ///
+    /// Separate from [`Self::parts`] because the residual is *defined* as the
+    /// total minus this, and a sum that included it would define `other` in
+    /// terms of itself.
+    fn charged_spans(&self) -> f64 {
+        self.parts()
+            .iter()
+            .filter(|(label, _)| *label != "other")
+            .map(|(_, secs)| secs)
+            .sum()
+    }
+
+    /// Close the split against the write it describes.
+    ///
+    /// Called once, at the end of the write, with the wall time of the whole
+    /// call. After it, `parts()` sums to `total` -- which is the property that
+    /// makes the breakdown safe to optimise from: anything the named spans do
+    /// not cover appears as `other` instead of vanishing.
+    ///
+    /// Saturating at zero. The spans are measured strictly inside the total, so
+    /// a negative residual is not a slow write but a clock that went backwards,
+    /// and reporting `0.0` for a span that cannot be believed is better than
+    /// reporting a negative duration a caller will render.
+    pub fn attribute_residual(&mut self, total: f64) {
+        self.other = (total - self.charged_spans()).max(0.0);
     }
 }
 
@@ -1910,16 +1976,22 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
         "unresolved_rows",
         &[
             "unresolved_id",
-            "source_file",
+            "source_file_id",
             "source_symbol",
             "callee_name",
-            "reason",
-            "classification",
+            "reason_id",
+            "classification_id",
             "receiver",
             "valid_from",
             "valid_to",
         ],
     ),
+    // v22's interning pool. Listed for the reason v17's and v18's base tables
+    // are: the `generation_unresolved` view joins it, and `PRAGMA table_info`
+    // on a view says nothing about what the view is *over*, so a migration that
+    // built the pool with the wrong columns would pass the gate and fail at the
+    // first write.
+    ("unresolved_texts", &["id", "text"]),
     (
         "generation_coverage_gaps",
         &["generation_id", "gap", "path", "reason"],
@@ -2590,6 +2662,20 @@ impl Store {
             tx.execute_batch(COVERAGE_GAPS_TABLE)?;
             tx.execute_batch(MIGRATION_V18_TO_V19)?;
             tx.execute_batch(MIGRATION_V19_TO_V20)?;
+            // A fresh store never creates the two indexes v21 drops, so this is
+            // a no-op here. Applied anyway, because the fresh path and the
+            // ladder must land on the same schema: the one thing this batch
+            // list exists to guarantee is that a store built from scratch and a
+            // store migrated up are indistinguishable, and a rung skipped here
+            // "because it cannot matter" is how that stops being true.
+            tx.execute_batch(MIGRATION_V20_TO_V21)?;
+            // Applied on the fresh path too, over the empty v18 shape
+            // `VALIDITY_RANGE_TABLES` just created. Its backfill copies nothing
+            // and its `DROP TABLE`/`RENAME` land the same columns a migrated
+            // store gets, which is the property `FRESH_SCHEMA_BATCHES` exists
+            // to hold: a store built from scratch and one walked up the ladder
+            // are indistinguishable.
+            tx.execute_batch(MIGRATION_V21_TO_V22)?;
             Self::validate_schema(tx)?;
             tx.execute(
                 &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION),
@@ -2894,6 +2980,64 @@ impl Store {
             // A re-entered migration must preserve an already established epoch
             // and counter, including claims held by another process.
             conn.execute("PRAGMA user_version = 20", [])?;
+            // 20, not `CURRENT_SCHEMA_VERSION`. This rung leaves the store at
+            // exactly the version it just stamped, and the next `if` decides
+            // what follows; assigning the constant here would have made every
+            // future rung unreachable for a store arriving at v19, which is the
+            // silent kind of migration bug — the store reports current and is
+            // missing the work.
+            version = 20;
+        }
+        if version == 20 {
+            // Idempotent (`DROP INDEX IF EXISTS`) and outside a transaction of
+            // its own for the same reason the rungs above are: `run_migrations`
+            // is already called inside one.
+            conn.execute_batch(MIGRATION_V20_TO_V21)?;
+            conn.execute("PRAGMA user_version = 21", [])?;
+            version = 21;
+        }
+        if version == 21 {
+            // The ledger's three interned columns. Unlike every rung above it
+            // this one *moves rows*, so it counts them.
+            //
+            // The backfill is three joins — path, reason text, classification
+            // text — and a join drops the rows it cannot match rather than
+            // failing. Every value was inserted into its pool one statement
+            // earlier so none can miss, but "cannot miss" is an argument and a
+            // silently shorter ledger is the failure it would be making: the
+            // store would open clean, and the missing rows would read as calls
+            // that resolved. Counted before and after, and refused loudly on
+            // any difference, inside the same transaction that did the move.
+            // Guarded on the shape, not on the stamp, the way the v19 rung is.
+            //
+            // A rung reached with its work already done is not hypothetical
+            // here: two processes opening one mid-chain store race through this
+            // ladder, and the loser arrives with `version` read before the
+            // winner committed. This batch reads `unresolved_rows.reason`, a
+            // column the winner has just removed, so unguarded it fails the
+            // whole open with `no such column: reason` — which is exactly what
+            // `concurrent_openers_of_a_mid_chain_store_converge_on_one_schema`
+            // and `the_extraction_cache_fallback_uses_an_index_rather_than_
+            // scanning` caught, the latter by re-stamping a current store to
+            // v12 and walking it up.
+            //
+            // The stamp still advances in both arms. A store that already has
+            // the interned shape *is* a v22 store; refusing to say so would
+            // leave it walking this rung on every open forever.
+            if Self::has_column(conn, "unresolved_rows", "reason")? {
+                let before: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM unresolved_rows", [], |row| row.get(0))?;
+                conn.execute_batch(MIGRATION_V21_TO_V22)?;
+                let after: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM unresolved_rows", [], |row| row.get(0))?;
+                if before != after {
+                    return Err(refusal(format!(
+                        "interning the unresolved-call ledger lost rows: {before} before, \
+                         {after} after; the store has been left unmigrated"
+                    )));
+                }
+            }
+            conn.execute("PRAGMA user_version = 22", [])?;
             version = CURRENT_SCHEMA_VERSION;
         }
         if version != CURRENT_SCHEMA_VERSION {
@@ -4233,6 +4377,10 @@ impl Store {
         head_sha: &str,
     ) -> Result<(u32, WriteBreakdown)> {
         let mut spent = WriteBreakdown::default();
+        // Started before the first thing the write does, so the residual
+        // `attribute_residual` computes below covers the whole call and not
+        // just the part after some later landmark.
+        let write_started = std::time::Instant::now();
         self.refuse_if_read_only()?;
         validate_head_sha(head_sha)?;
         let mut unique_paths = std::collections::BTreeSet::new();
@@ -4262,11 +4410,17 @@ impl Store {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        let durable_analysis = analysis.clone();
         // Keep the summary semantically complete even though dead rows also
         // have a normalized table. An authoritative-looking empty list makes
         // latest_analysis() disagree with latest_dead_symbols().
-        let analysis_json = serde_json::to_string(&durable_analysis)
+        //
+        // Serialized straight from the borrow. This used to clone the summary
+        // first and serialize the clone, for no reason the three readers
+        // needed: the clone was only ever read — once here and twice for the
+        // `dead_confident`/`dead_ambiguous` counts far below — and a summary of
+        // this repository carries 4,927 dead-symbol rows, so the copy was
+        // several thousand string allocations that existed to be dropped.
+        let analysis_json = serde_json::to_string(analysis)
             .map_err(|error| refusal(format!("analysis serialization failed: {error}")))?;
 
         tx.execute(
@@ -4677,33 +4831,35 @@ impl Store {
         let scope_by_digest = !opts.verify_every_row && !full_rewrite && prev_gen.is_some();
         let mut stored_edge_digests: std::collections::HashMap<u32, RowSetDigest> =
             std::collections::HashMap::new();
-        let mut stored_unresolved_digests: std::collections::HashMap<String, RowSetDigest> =
+        let mut stored_unresolved_digests: std::collections::HashMap<u32, RowSetDigest> =
             std::collections::HashMap::new();
         if let (true, Some(prev)) = (scope_by_digest, prev_gen) {
             let _charge = charge(&mut spent.digests);
-            // The edge side is keyed by `paths.id` and the ledger side by the
-            // path text, because that is what each relation's own rows carry:
-            // `edge_rows.source_file_id` is an id and `unresolved_rows`'
-            // `source_file` is a path. Joining `paths` here is what lets each
-            // scan compare against its own key without translating per row.
+            // Both sides keyed by `paths.id`, and the join to `paths` gone with
+            // the reason for it.
+            //
+            // Until v22 the ledger stored `source_file` as text while
+            // `edge_rows` stored an id, so this statement had to fetch the path
+            // as well and the two scans below compared against different keys
+            // for the same file. The ledger stores `source_file_id` now, so
+            // there is one key, one column, and no per-row translation on
+            // either side.
             let mut stmt = tx.prepare(
-                "SELECT d.file_id, p.path, d.edge_rows, d.edge_lo, d.edge_hi,
-                        d.unresolved_rows, d.unresolved_lo, d.unresolved_hi
-                   FROM generation_file_digests d
-                   JOIN paths p ON p.id = d.file_id
-                  WHERE d.generation_id = ?1",
+                "SELECT file_id, edge_rows, edge_lo, edge_hi,
+                        unresolved_rows, unresolved_lo, unresolved_hi
+                   FROM generation_file_digests
+                  WHERE generation_id = ?1",
             )?;
             let mut rows = stmt.query(params![prev])?;
             while let Some(row) = rows.next()? {
                 let file_id: u32 = row.get(0)?;
-                let path: String = row.get(1)?;
                 stored_edge_digests.insert(
                     file_id,
-                    RowSetDigest::from_columns(row.get(2)?, row.get(3)?, row.get(4)?),
+                    RowSetDigest::from_columns(row.get(1)?, row.get(2)?, row.get(3)?),
                 );
                 stored_unresolved_digests.insert(
-                    path,
-                    RowSetDigest::from_columns(row.get(5)?, row.get(6)?, row.get(7)?),
+                    file_id,
+                    RowSetDigest::from_columns(row.get(4)?, row.get(5)?, row.get(6)?),
                 );
             }
         }
@@ -5145,7 +5301,7 @@ impl Store {
         // that had not changed at all and was rewritten in full every time.
         // Declared out here because the digest write below reads it, and the
         // block it is filled in is scoped to the charge it belongs to.
-        let mut fresh_unresolved_digests: std::collections::HashMap<&str, RowSetDigest> =
+        let mut fresh_unresolved_digests: std::collections::HashMap<u32, RowSetDigest> =
             std::collections::HashMap::new();
         {
             let _charge = charge(&mut spent.unresolved);
@@ -5153,32 +5309,202 @@ impl Store {
             // one generation (36,600 rows), so this is a multiset too — and
             // `matched`, one bit a row, is what makes it one.
             //
-            // The reason text is formatted on demand rather than kept in a
-            // parallel `Vec<String>`: 89,743 owned strings held for the length
-            // of the write is memory `verify.sh` gate 6 charges against the
-            // kernel's model, and the three passes below need it only while a
-            // comparison is in flight.
+            // The row's identity, as ids.
+            //
+            // Three of its six columns are interned since v22 — the path into
+            // `paths`, the reason and the classification into
+            // `unresolved_texts` — so this resolves each distinct text to its
+            // id once, here, and everything downstream compares integers.
+            //
+            // The reason is formatted once per row rather than three times.
+            // It used to be formatted on demand, which read as the frugal
+            // choice: a parallel `Vec<String>` holds 181,163 owned strings for
+            // the length of the write, and that is memory `verify.sh` gate 6
+            // charges against the kernel's model. But "on demand" was three
+            // demands — the digest pass, the bucket pass and the insert pass
+            // each rebuilt every row's `format!("{:?}", …)` — so the write paid
+            // half a million allocations to avoid holding 181,163.
+            //
+            // Interning against the *persisted* pool, not a fresh one per
+            // write: the id has to mean the same text as it did in the stored
+            // rows this write is about to compare against, so the pool is read
+            // in once and only genuinely new texts are inserted. On this
+            // repository that is 46,978 rows read and, on an incremental build,
+            // a handful written.
+            let mut text_ids: std::collections::HashMap<std::rc::Rc<str>, i64> = {
+                let mut stmt = tx.prepare("SELECT id, text FROM unresolved_texts")?;
+                let mut rows = stmt.query([])?;
+                let mut pool = std::collections::HashMap::new();
+                while let Some(row) = rows.next()? {
+                    let id: i64 = row.get(0)?;
+                    let text: String = row.get(1)?;
+                    pool.insert(std::rc::Rc::from(text.as_str()), id);
+                }
+                pool
+            };
+
+            // Per-row ids, in `resolution.unresolved` order.
+            //
+            // Two passes, not one. The obvious shape — resolve each row's text
+            // to an id as the row is reached, inserting on a miss — makes the
+            // pool's inserts arrive in the order the rows happen to mention
+            // them, which for a `UNIQUE(text)` index is random order. Measured
+            // on the cold self-build, where every one of 46,978 reasons is a
+            // miss, that cost 1.55 us an insert against 0.54 us for a ledger
+            // row: the index is over 130-byte text, so a random insertion order
+            // pays a page split and a string comparison at every level.
+            //
+            // The first pass therefore only *slots* each row against a distinct
+            // text; the second inserts the genuinely new slots in sorted order,
+            // which is the order the index wants. Per-row cost is unchanged —
+            // one hash of the text either way — and the insert becomes
+            // append-mostly.
+            //
+            // `Rc<str>` so a distinct text is stored once and the map's key is a
+            // refcount bump rather than a second copy.
+            let mut slot_of_text: std::collections::HashMap<std::rc::Rc<str>, u32> =
+                std::collections::HashMap::new();
+            let mut slot_text: Vec<std::rc::Rc<str>> = Vec::new();
+            let mut reason_slots: Vec<u32> = Vec::with_capacity(resolution.unresolved.len());
+            let mut class_slots: Vec<u32> = Vec::with_capacity(resolution.unresolved.len());
+            let mut source_ids: Vec<u32> = Vec::with_capacity(resolution.unresolved.len());
+            {
+                let mut scratch = String::new();
+                let slot_for =
+                    |text: &str,
+                     slot_of_text: &mut std::collections::HashMap<std::rc::Rc<str>, u32>,
+                     slot_text: &mut Vec<std::rc::Rc<str>>|
+                     -> Result<u32> {
+                        if let Some(slot) = slot_of_text.get(text) {
+                            return Ok(*slot);
+                        }
+                        let slot = u32::try_from(slot_text.len()).map_err(|_| {
+                            refusal("unresolved ledger text count exceeds u32 slot capacity")
+                        })?;
+                        let owned: std::rc::Rc<str> = std::rc::Rc::from(text);
+                        slot_text.push(std::rc::Rc::clone(&owned));
+                        slot_of_text.insert(owned, slot);
+                        Ok(slot)
+                    };
+                // `class.label()` is a `&'static str` over a handful of
+                // variants, so its slot is memoised on the identity of the
+                // static the enum hands back rather than re-hashed 181,163
+                // times. A linear scan of at most a dozen keys beats hashing
+                // even a short string.
+                //
+                // The key is (pointer, length) and not the pointer alone. A
+                // pointer alone is only a unique key for these labels while no
+                // label is a prefix of another: `&'static str` carries no
+                // terminator, so nothing stops a toolchain from placing
+                // `"external"` at the same address as the start of a longer
+                // `"external_module"`, and then two classes would share a
+                // memo entry and every row of one would be stored with the
+                // other's text. That is not a bug today — the eight labels are
+                // pairwise non-prefix, and no rustc release is known to merge
+                // string literals this way — but it is an assumption about a
+                // toolchain, held by a `match` arm in another crate, that
+                // nothing would restate if a ninth label were added.
+                // Comparing the length too costs one `usize` compare and owes
+                // the assumption nothing.
+                //
+                // Both halves were classified by mutation rather than argued.
+                // Reverting this key to the pointer alone leaves the suite
+                // green, so the length is defensive and not load-bearing today.
+                // Making the memo return one slot for every class -- what a
+                // pointer collision would actually do -- fails exactly one test
+                // in the crate, `every_unresolved_class_keeps_its_own_label` in
+                // `tests/ledger_write.rs`, and the other six in that file pass
+                // with all eight classes stored as `builtin`. That test is the
+                // behavioural half of this comment, and it is load-bearing.
+                let mut class_memo: Vec<((*const u8, usize), u32)> = Vec::new();
+                // Consecutive rows overwhelmingly share a source file — the
+                // resolver emits per file — so one remembered path answers
+                // almost every lookup without hashing forty bytes again.
+                let mut last_path: Option<(&str, u32)> = None;
+
+                for unresolved in &resolution.unresolved {
+                    use std::fmt::Write as _;
+                    scratch.clear();
+                    let _ = write!(scratch, "{:?}", unresolved.resolution);
+                    reason_slots.push(slot_for(&scratch, &mut slot_of_text, &mut slot_text)?);
+
+                    let label = unresolved.class.label();
+                    let key = (label.as_ptr(), label.len());
+                    let class_slot = match class_memo.iter().find(|(seen, _)| *seen == key) {
+                        Some((_, slot)) => *slot,
+                        None => {
+                            let slot = slot_for(label, &mut slot_of_text, &mut slot_text)?;
+                            class_memo.push((key, slot));
+                            slot
+                        }
+                    };
+                    class_slots.push(class_slot);
+
+                    let path = unresolved.source_file.as_str();
+                    let file_id = match last_path {
+                        Some((seen, id)) if seen == path => id,
+                        _ => {
+                            let id = Self::ensure_path_id_cached(&tx, &mut path_ids, path)?;
+                            last_path = Some((path, id));
+                            id
+                        }
+                    };
+                    source_ids.push(file_id);
+                }
+            }
+
+            // The slots the pool does not hold yet, inserted in sorted order.
+            let mut slot_ids: Vec<i64> = vec![0; slot_text.len()];
+            {
+                let mut fresh: Vec<u32> = (0..slot_text.len() as u32)
+                    .filter(|slot| !text_ids.contains_key(&slot_text[*slot as usize]))
+                    .collect();
+                fresh.sort_unstable_by(|left, right| {
+                    slot_text[*left as usize].cmp(&slot_text[*right as usize])
+                });
+                let mut insert =
+                    tx.prepare_cached("INSERT INTO unresolved_texts (text) VALUES (?1)")?;
+                for slot in fresh {
+                    let text = std::rc::Rc::clone(&slot_text[slot as usize]);
+                    insert.execute(params![text.as_ref()])?;
+                    text_ids.insert(text, tx.last_insert_rowid());
+                }
+            }
+            for (slot, text) in slot_text.iter().enumerate() {
+                slot_ids[slot] = *text_ids.get(text).ok_or_else(|| {
+                    refusal("an interned ledger text has no id after its own insert")
+                })?;
+            }
+            let reason_ids: Vec<i64> = reason_slots
+                .iter()
+                .map(|slot| slot_ids[*slot as usize])
+                .collect();
+            let class_ids: Vec<i64> = class_slots
+                .iter()
+                .map(|slot| slot_ids[*slot as usize])
+                .collect();
+
             let unresolved_tuple = |index: usize| -> UnresolvedTuple<'_> {
                 let unresolved = &resolution.unresolved[index];
                 UnresolvedTuple {
-                    source_file: std::borrow::Cow::Borrowed(unresolved.source_file.as_str()),
+                    source_file_id: source_ids[index],
                     source_symbol: std::borrow::Cow::Borrowed(unresolved.source_symbol.as_str()),
                     callee_name: std::borrow::Cow::Borrowed(unresolved.callee_name.as_str()),
-                    reason: std::borrow::Cow::Owned(format!("{:?}", unresolved.resolution)),
-                    classification: std::borrow::Cow::Borrowed(unresolved.class.label()),
+                    reason_id: reason_ids[index],
+                    classification_id: class_ids[index],
                     receiver: unresolved
                         .receiver
                         .as_deref()
                         .map(std::borrow::Cow::Borrowed),
                 }
             };
-            // The same per-file digest the edges get, keyed by the path
-            // `unresolved_rows` itself stores rather than by a `paths` id: the
-            // scan below reads that column, and translating 91,703 of them per
-            // build to look each one up would cost more than the lookup saves.
-            for (index, unresolved) in resolution.unresolved.iter().enumerate() {
+            // The same per-file digest the edges get, and keyed the same way
+            // since v22. Before it, this relation stored its path as text and
+            // keyed by that, so the two halves of one digest row were reached
+            // by two different keys.
+            for (index, file_id) in source_ids.iter().enumerate() {
                 fresh_unresolved_digests
-                    .entry(unresolved.source_file.as_str())
+                    .entry(*file_id)
                     .or_default()
                     .absorb(&unresolved_tuple(index));
             }
@@ -5186,32 +5512,33 @@ impl Store {
             // are asked how many of them there are, so a row deleted behind the
             // write path is never mistaken for a row still stored.
             //
-            // The map is seeded from the fresh paths and only ever incremented
-            // through `get_mut`, so a borrowed `&str` off the row answers it and
-            // 91,703 lookups allocate nothing.
-            let mut live_unresolved_rows: std::collections::HashMap<&str, u64> =
+            // The map is seeded from the fresh file ids and only ever
+            // incremented through `get_mut`, so the `u32` off the row answers it
+            // and nothing allocates. Since v22 the row carries the id, so this
+            // no longer reads a path out of every live row to look it up.
+            let mut live_unresolved_rows: std::collections::HashMap<u32, u64> =
                 fresh_unresolved_digests
                     .keys()
-                    .map(|path| (*path, 0))
+                    .map(|file_id| (*file_id, 0))
                     .collect();
             if scope_by_digest {
-                let mut stmt =
-                    tx.prepare("SELECT source_file FROM unresolved_rows WHERE valid_to IS NULL")?;
+                let mut stmt = tx
+                    .prepare("SELECT source_file_id FROM unresolved_rows WHERE valid_to IS NULL")?;
                 let mut rows = stmt.query([])?;
                 while let Some(row) = rows.next()? {
-                    if let Some(count) = live_unresolved_rows.get_mut(row.get_ref(0)?.as_str()?) {
+                    if let Some(count) = live_unresolved_rows.get_mut(&row.get::<_, u32>(0)?) {
                         *count += 1;
                     }
                 }
             }
-            let unchanged_unresolved_files: std::collections::HashSet<&str> = if scope_by_digest {
+            let unchanged_unresolved_files: std::collections::HashSet<u32> = if scope_by_digest {
                 fresh_unresolved_digests
                     .iter()
-                    .filter(|(path, fresh)| {
-                        stored_unresolved_digests.get(**path) == Some(*fresh)
-                            && live_unresolved_rows.get(**path) == Some(&fresh.rows)
+                    .filter(|(file_id, fresh)| {
+                        stored_unresolved_digests.get(*file_id) == Some(*fresh)
+                            && live_unresolved_rows.get(*file_id) == Some(&fresh.rows)
                     })
-                    .map(|(path, _)| *path)
+                    .map(|(file_id, _)| *file_id)
                     .collect()
             } else {
                 std::collections::HashSet::new()
@@ -5221,57 +5548,71 @@ impl Store {
             // edge pass names: the two must agree about which indexes are
             // offered, not only about what an identity is.
             let ledger_identity = |index: usize| -> Option<UnresolvedTuple<'_>> {
-                if unchanged_unresolved_files
-                    .contains(resolution.unresolved[index].source_file.as_str())
-                {
+                if unchanged_unresolved_files.contains(&source_ids[index]) {
                     return None;
                 }
                 Some(unresolved_tuple(index))
             };
-            let (ledger_buckets, ledger_chain) =
-                bucket_identities(resolution.unresolved.len(), ledger_identity);
-            let mut ledger_matched: Vec<bool> = resolution
-                .unresolved
+            // Built on the first live row that reaches the comparison, not
+            // ahead of it.
+            //
+            // The index exists only to answer "is this stored row still one of
+            // ours", so a write with no live row to ask about never needs it —
+            // and that is exactly the cold build, where the table is empty and
+            // every one of this repository's 180,679 identities was formatted,
+            // hashed and chained into a structure nothing then queried. Measured
+            // at 93 ms of a 505 ms ledger write, on the path that is already the
+            // slowest one.
+            //
+            // Lazy rather than a `SELECT EXISTS` guard: the emptiness that
+            // matters is not "are there live rows" but "does any live row
+            // survive the `unchanged_unresolved_files` filter below", which a
+            // count cannot answer without doing the scan twice.
+            let mut ledger_index: Option<(std::collections::HashMap<u64, u32>, Vec<u32>)> = None;
+            let mut ledger_matched: Vec<bool> = source_ids
                 .iter()
-                .map(|unresolved| {
-                    unchanged_unresolved_files.contains(unresolved.source_file.as_str())
-                })
+                .map(|file_id| unchanged_unresolved_files.contains(file_id))
                 .collect();
 
             let mut close_rows: Vec<i64> = Vec::new();
             {
                 let mut stmt = tx.prepare(
-                    "SELECT unresolved_id, source_file, source_symbol, callee_name, reason,
-                            classification, receiver
+                    "SELECT unresolved_id, source_file_id, source_symbol, callee_name, reason_id,
+                            classification_id, receiver
                      FROM unresolved_rows WHERE valid_to IS NULL",
                 )?;
                 let mut rows = stmt.query([])?;
                 while let Some(row) = rows.next()? {
-                    // `get_ref` rather than `get`, and only for the membership
-                    // test: the partition column is consulted for every live
-                    // row and owned for almost none of them, so the borrowed
-                    // `&str` answers the question and the `String` is allocated
-                    // only for a row that is going to be compared. It does not
-                    // outlive the condition — a `ValueRef` borrows the
-                    // statement, not the row, and holding one across
-                    // `rows.next()` is a borrow the loop cannot have.
-                    if unchanged_unresolved_files.contains(row.get_ref(1)?.as_str()?) {
+                    // The partition column is an integer since v22, so the
+                    // membership test is a `u32` compare. It used to read the
+                    // path text out of every live row and hash it — 181,163
+                    // string reads to decide which rows were even in scope —
+                    // and needed `get_ref` to avoid owning a `String` for each.
+                    let source_file_id: u32 = row.get(1)?;
+                    if unchanged_unresolved_files.contains(&source_file_id) {
                         continue;
                     }
                     let unresolved_id: i64 = row.get(0)?;
+                    // Two of the three remaining owned `String`s went with the
+                    // same change: `reason` averaged 130 bytes a row and is now
+                    // an id. What is left is the symbol and callee, which are
+                    // this row's own text and belong in it.
                     let live = UnresolvedTuple {
-                        source_file: std::borrow::Cow::Owned(row.get(1)?),
+                        source_file_id,
                         source_symbol: std::borrow::Cow::Owned(row.get(2)?),
                         callee_name: std::borrow::Cow::Owned(row.get(3)?),
-                        reason: std::borrow::Cow::Owned(row.get(4)?),
-                        classification: std::borrow::Cow::Owned(row.get(5)?),
+                        reason_id: row.get(4)?,
+                        classification_id: row.get(5)?,
                         receiver: row
                             .get::<_, Option<String>>(6)?
                             .map(std::borrow::Cow::Owned),
                     };
+                    let (ledger_buckets, ledger_chain) = ledger_index.get_or_insert_with(|| {
+                        bucket_identities(resolution.unresolved.len(), ledger_identity)
+                    });
                     let still_valid = claim_matching_candidate(
-                        &ledger_buckets,
-                        &ledger_chain,
+                        ledger_buckets,
+                        ledger_chain,
                         &mut ledger_matched,
                         &live,
                         ledger_identity,
@@ -5293,10 +5634,30 @@ impl Store {
             // generation, and re-preparing the INSERT for each one cost seconds
             // of the build — the self-build gate caught it as a regression the
             // moment this table landed.
+            //
+            // One row per execute, deliberately, after multi-row batching was
+            // tried here and removed.
+            //
+            // The theory was that 180,679 executes of a cached statement pay
+            // 180,679 VDBE step/reset cycles that batches of 128 would amortise.
+            // Measured, in isolation, on the cold self-build: `persist:write`
+            // 0.4576 s at one row per statement against 0.4568 s at 128
+            // (min-of-4, interleaved) — no difference, with the ledger pass
+            // itself marginally worse batched. The insert's cost is b-tree page
+            // writes, not statement dispatch, which is also why dropping the
+            // two unread indexes on this table moved it 2.3x and batching moved
+            // it nothing.
+            //
+            // Not kept "in case it helps later". A batch has to build its SQL
+            // for a varying arity and bind positionally by hand, so a
+            // miscounted chunk or a transposed bind writes a wrong ledger with
+            // no error — and the varying-arity remainder statement is a new
+            // cache key every build, evicting one of the sixteen slots
+            // rusqlite's LRU has and this write already fills eleven of.
             let mut insert = tx.prepare_cached(
                 "INSERT INTO unresolved_rows
-                 (source_file, source_symbol, callee_name, reason, classification, receiver,
-                  valid_from, valid_to)
+                 (source_file_id, source_symbol, callee_name, reason_id, classification_id,
+                  receiver, valid_from, valid_to)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
             )?;
             for (index, still_valid) in ledger_matched.iter().enumerate() {
@@ -5305,11 +5666,11 @@ impl Store {
                 }
                 let tuple = unresolved_tuple(index);
                 insert.execute(params![
-                    tuple.source_file.as_ref(),
+                    tuple.source_file_id,
                     tuple.source_symbol.as_ref(),
                     tuple.callee_name.as_ref(),
-                    tuple.reason.as_ref(),
-                    tuple.classification.as_ref(),
+                    tuple.reason_id,
+                    tuple.classification_id,
                     tuple.receiver.as_deref(),
                     gen_id,
                 ])?;
@@ -5341,13 +5702,13 @@ impl Store {
             for (file_id, digest) in &fresh_edge_digests {
                 digests.entry(*file_id).or_default().0 = *digest;
             }
-            for (path, digest) in &fresh_unresolved_digests {
-                // Interned here rather than in the per-row loop above: this is
-                // one lookup per *file*, and every one of these paths already
-                // has an id — a file with unresolved calls was extracted, and
-                // extraction is what put it in `paths`.
-                let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, path)?;
-                digests.entry(file_id).or_default().1 = *digest;
+            // No interning left to do here. This used to translate each
+            // unresolved digest's path to an id, because the ledger keyed its
+            // digests by text while the edges keyed theirs by id; since v22
+            // both arrive keyed the same way and the two loops are the same
+            // loop over different maps.
+            for (file_id, digest) in &fresh_unresolved_digests {
+                digests.entry(*file_id).or_default().1 = *digest;
             }
             let mut insert = tx.prepare_cached(
                 "INSERT INTO generation_file_digests
@@ -5399,12 +5760,12 @@ impl Store {
         // and coverage-capped findings sit below 0.9 too. Counting anything
         // under the extracted floor as `dead_confident` inflated the history
         // trend with unconfirmed rows.
-        let dead_confident = durable_analysis
+        let dead_confident = analysis
             .dead_symbols
             .iter()
             .filter(|dead| !dead.is_exempt && dead.confidence >= 0.9)
             .count() as i64;
-        let dead_ambiguous = durable_analysis
+        let dead_ambiguous = analysis
             .dead_symbols
             .iter()
             .filter(|dead| !dead.is_exempt && dead.confidence < 0.9)
@@ -5496,6 +5857,7 @@ impl Store {
             let _charge = charge(&mut spent.commit);
             tx.commit()?;
         }
+        spent.attribute_residual(write_started.elapsed().as_secs_f64());
         Ok((gen_id, spent))
     }
 
@@ -8088,6 +8450,30 @@ generation {latest}; run `devmap status` to re-verify",
                 UNION SELECT file_id FROM generation_file_digests
                 UNION SELECT source_file_id FROM edge_rows
                 UNION SELECT target_file_id FROM edge_rows
+                UNION SELECT source_file_id FROM unresolved_rows
+             )",
+            [],
+        )?;
+
+        // The ledger's interning pool, retired the same way and for the same
+        // reason. Since v22 `reason` and `classification` are ids into
+        // `unresolved_texts`, and a reason text names the file and symbol it is
+        // about — so the pool churns as the tree does and would grow for the
+        // life of the store if nothing retired it.
+        //
+        // `NOT IN` over the two id columns, not a probe per candidate: SQLite
+        // materialises each subquery once, so this is two scans of
+        // `unresolved_rows` and one of the pool, and it needs no index on
+        // `reason_id`. An index there would put back exactly the per-row write
+        // amplification v21 removed, to serve a statement that runs once a
+        // prune.
+        //
+        // After the deletes above, so the rows whose texts this is deciding
+        // about are already gone.
+        tx.execute(
+            "DELETE FROM unresolved_texts WHERE id NOT IN (
+                SELECT reason_id FROM unresolved_rows
+                UNION SELECT classification_id FROM unresolved_rows
              )",
             [],
         )?;

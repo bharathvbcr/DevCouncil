@@ -1275,6 +1275,12 @@ fn the_persist_write_phase_reports_what_each_relation_cost() {
             "dead",
             "history",
             "commit",
+            // The residual: `persist:write` minus the ten relations above.
+            // Reported alongside them rather than left implicit, because the
+            // ten covered 84% of a cold write and the missing 16% — the
+            // `AnalysisSummary` serialization, third-largest thing the write
+            // does — reached this JSON as nothing at all.
+            "other",
         ],
         "the split names every relation the write touches: {write}"
     );
@@ -1287,6 +1293,15 @@ fn the_persist_write_phase_reports_what_each_relation_cost() {
     assert!(
         charged <= whole + 1e-6,
         "the parts of a phase cannot outlast it: {charged}s charged of {whole}s: {write}"
+    );
+    // And it accounts for it. This direction is the one the residual exists to
+    // make assertable: without `other` the parts could cover any fraction of
+    // the phase and this test would still pass, which is how a sixth of the
+    // write went unattributed in the `--json` timings a reader profiles from.
+    assert!(
+        charged >= whole * 0.95,
+        "the split must account for the phase, not part of it: \
+         {charged}s charged of {whole}s: {write}"
     );
 
     fs::remove_dir_all(root).expect("remove fixture tree");
