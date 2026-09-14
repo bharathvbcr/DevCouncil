@@ -3192,6 +3192,66 @@ impl Resolver {
             .filter(|type_name| !type_name.is_empty())
     }
 
+    /// What `self` / `Self` denotes at a call attributed to `caller_symbol`.
+    ///
+    /// Usually the caller is a *member* of a type and the answer is its parent,
+    /// which is all `declaring_type_of` gives. But a call can be attributed to
+    /// the type itself — a Swift `private static func` body, a property
+    /// initializer, a Python class-body statement — and then the parent is the
+    /// file, `declaring_type_of` abstains, and X42 never runs even though the
+    /// enclosing type is sitting in the caller's own name.
+    ///
+    /// Measured: 9 Swift targets on a 306-file corpus lost their last
+    /// non-structural inbound edge to exactly this, every one a
+    /// `Self.staticMethod()` whose caller symbol was the `struct`. The rung
+    /// could not see the type because it only ever looked one level *up*.
+    ///
+    /// The caller must be a type **declared in this file**: the answer is the
+    /// key `type_methods` is built with, so an unqualified match elsewhere
+    /// would dispatch `self.m()` onto a namesake in another file. Ambiguity
+    /// inside the file is left to the caller's own `local.len() > 1` guard,
+    /// which already abstains when one name declares the method twice.
+    ///
+    /// `Module` is in the list because Ruby's `module M; def self.m` is this
+    /// exact shape and `self` there *is* `M`. The kind is shared with Go
+    /// packages, TypeScript namespaces, C# namespaces and Terraform blocks, so
+    /// it was admitted only after checking each: none of them ever reaches here,
+    /// because a namespace-level call arrives with no caller symbol at all and
+    /// the others have no `self` keyword to spell.
+    fn self_type_at(&self, file: &str, family: LangFamily, caller_symbol: &str) -> Option<String> {
+        if let Some(parent) = self.declaring_type_of(file, caller_symbol) {
+            return Some(parent.to_string());
+        }
+        let declares_a_type_here = self
+            .symbol_index
+            .get(caller_symbol)
+            .into_iter()
+            .flatten()
+            .any(|(path, kind, candidate_family, _)| {
+                path == file
+                    && family.admits(*candidate_family)
+                    && matches!(
+                        kind,
+                        SymbolKind::Class
+                            | SymbolKind::Struct
+                            | SymbolKind::Enum
+                            | SymbolKind::Interface
+                            | SymbolKind::Trait
+                            | SymbolKind::Module
+                    )
+            });
+        if !declares_a_type_here {
+            return None;
+        }
+        // Reduced exactly as `declaring_type_of` reduces a parent, so a caller
+        // that *is* a type and a caller that is *inside* one key identically.
+        caller_symbol
+            .rsplit("::")
+            .next()
+            .filter(|type_name| !type_name.is_empty())
+            .map(str::to_string)
+    }
+
     /// Whether exactly one indexed file declares a type of this name.
     ///
     /// The identifiability test for the supertype walk. `type_methods` and
@@ -3240,7 +3300,7 @@ impl Resolver {
         caller_symbol: &str,
         method: &str,
     ) -> Option<(String, String, String)> {
-        let enclosing = self.declaring_type_of(file, caller_symbol)?.to_string();
+        let enclosing = self.self_type_at(file, family, caller_symbol)?;
         // The caller's declaring type is an exact identity even when another
         // file declares a namesake. Only inherited lookup needs a global name.
         if let Some(hits) = self

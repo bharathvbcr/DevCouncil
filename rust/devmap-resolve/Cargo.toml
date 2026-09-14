@@ -130,3 +130,7 @@ required-features = ["parse"]
 [[test]]
 name = "captured_receiver_attribution"
 required-features = ["parse"]
+
+[[test]]
+name = "self_in_a_type_is_that_type"
+required-features = ["parse"]
