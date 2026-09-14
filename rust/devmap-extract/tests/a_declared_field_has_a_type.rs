@@ -109,6 +109,12 @@ fn every_grammar_states_the_type_of_a_declared_field() {
 }
 
 /// The owner is the declaring type, so the key is scoped to it.
+///
+/// Objective-C is in the list for a reason cargo-mutants found: its interface
+/// names itself with a bare `identifier` child rather than a `name:` field, so
+/// the walk picks the *first* identifier — and inverting that comparison yields
+/// the brace block's whole source text as the owner instead of `S`. Nothing
+/// else in this file looked at an Objective-C owner.
 #[test]
 fn a_field_is_recorded_against_the_type_that_declares_it() {
     for (path, source) in [
@@ -116,6 +122,10 @@ fn a_field_is_recorded_against_the_type_that_declares_it() {
         ("a.rs", "struct Holder {\n    lease: Lease,\n}\n"),
         ("a.java", "class Holder {\n    private Lease lease;\n}\n"),
         ("a.py", "class Holder:\n    lease: Lease\n"),
+        (
+            "a.m",
+            "@interface Holder : NSObject {\n    Lease *lease;\n}\n@end\n",
+        ),
     ] {
         let owner = field_types(path, source)
             .into_iter()
@@ -316,6 +326,89 @@ fn go_records_the_package_a_field_type_comes_from() {
         sliced.is_empty(),
         "a qualifier without a type beside it says where a field came from \
          without saying what it is, got {sliced:?}"
+    );
+}
+
+/// A grammar with nothing to read is **refused**, not merely unlisted.
+///
+/// Without this, a dispatcher stubbed to say "yes" to everything satisfies both
+/// the list check and the coverage sweep below — each only ever asks whether a
+/// key is *in*. cargo-mutants found exactly that stub surviving.
+#[test]
+fn a_grammar_with_no_typed_field_is_refused() {
+    for lang in [
+        "javascript",
+        "ruby",
+        "lua",
+        "luau",
+        "shell",
+        "erlang",
+        "hcl",
+        "nix",
+        "r",
+        "cobol",
+        "sql",
+    ] {
+        assert!(
+            !extracts_field_types(lang),
+            "{lang} declares no typed field, so the dispatcher must refuse it"
+        );
+    }
+    assert!(
+        !extracts_field_types("vb"),
+        "VB.NET has no linked grammar at all, so no tree-sitter walk can serve it"
+    );
+    assert!(!extracts_field_types(""), "an empty key names no language");
+}
+
+/// A pathological type expression terminates, and abstains rather than guessing.
+///
+/// Both reducers are depth-bounded, and the bound is the whole defence against
+/// a generated or adversarial file: unbounded recursion here is a stack
+/// overflow in the extractor, not a wrong answer. The cases sit either side of
+/// each bound so that widening it, narrowing it, or failing to advance the
+/// counter at all are three distinguishable failures rather than one.
+#[test]
+fn a_pathological_type_expression_is_bounded() {
+    // `nominal_type_name`: one `reference_type` per `&`.
+    let refs = |count: usize| format!("struct S {{\n    r: {}Lease,\n}}\n", "&".repeat(count));
+    assert_eq!(
+        names_a_field("a.rs", &refs(16), "r").as_deref(),
+        Some("Lease"),
+        "sixteen references is inside the bound and must still reduce"
+    );
+    assert_eq!(
+        names_a_field("a.rs", &refs(17), "r"),
+        None,
+        "seventeen is past it, and past it the answer is no answer"
+    );
+    assert_eq!(
+        names_a_field("a.rs", &refs(400), "r"),
+        None,
+        "four hundred must terminate, not recurse to exhaustion"
+    );
+
+    // `declarator_name`: one `pointer_declarator` per `*`.
+    let stars = |count: usize| {
+        format!(
+            "struct S {{\n    struct Lease {}lease;\n}};\n",
+            "*".repeat(count)
+        )
+    };
+    assert_eq!(
+        names_a_field("a.c", &stars(8), "lease").as_deref(),
+        Some("Lease"),
+        "eight pointers is inside the bound"
+    );
+    assert_eq!(
+        names_a_field("a.c", &stars(9), "lease"),
+        None,
+        "nine is past it"
+    );
+    assert_eq!(
+        names_a_field("a.c", &stars(400), "lease"),
+        None,
+        "four hundred must terminate"
     );
 }
 

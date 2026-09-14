@@ -321,6 +321,14 @@ fn field_of(lang: &str, node: Node, source: &str) -> Option<FieldType> {
 ///
 /// Objective-C states a field's type and declarator as bare siblings with no
 /// field names, so the type has to be recognised by its own kind.
+///
+/// Not observable on the shapes tree-sitter-objc produces: the type is always
+/// the first named child, so a stub returning `true` gives the same answer for
+/// a plain field, a qualified one, a struct tag and a two-field interface —
+/// all four measured. Kept rather than reduced to `named_child(0)` because the
+/// predicate is what makes an attribute-first shape skip to the type instead of
+/// reading the attribute as one; that the current grammar never produces such a
+/// shape is a fact about this grammar, not a licence to drop the check.
 fn is_type_bearing(kind: &str) -> bool {
     matches!(
         kind,
@@ -365,6 +373,12 @@ fn nominal_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
     match node.kind() {
         // A collection is not its element. Answering here would type
         // `many.first()` as a call on `Lease` when it is a call on `Array`.
+        //
+        // Redundant with `_ => None` *today*, and deliberately kept: deleting
+        // it is an equivalent mutation, which is exactly what makes it worth
+        // writing down. The refusal is the module's headline claim, and a later
+        // edit that adds `array_type` to the wrapper arm above would otherwise
+        // reverse it with nothing on the page saying it had been decided.
         "array_type" | "slice_type" | "map_type" | "dictionary_type" | "tuple_type"
         | "function_type" | "lambda_type" | "channel_type" => None,
         // Wrappers denoting the same value as their operand.
