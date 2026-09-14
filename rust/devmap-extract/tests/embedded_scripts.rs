@@ -755,8 +755,12 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // measured emitting one, so a warm v51 row still counts a Rust method call
     // as two attribution sites — and files the second as a failure even where
     // the first resolved.
+    // v53 reduces a receiver past a leading `&`, `*` or `!` when what follows
+    // is a plain path. A v52 row records `*path` and `!Self`, whose leftmost
+    // segment is an operator, so the binding that would have typed the
+    // receiver is invisible to the rung that needs it.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "52",
+        EXTRACTION_SCHEMA_VERSION, "53",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

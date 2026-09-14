@@ -4950,12 +4950,85 @@ const MAX_RECEIVER_CHARS: usize = 64;
 /// whose job is to name a value.
 fn bound_receiver_text(text: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = strip_prefix_operators(&flat);
     if flat.chars().count() <= MAX_RECEIVER_CHARS {
-        return flat;
+        return flat.to_string();
     }
     let mut out: String = flat.chars().take(MAX_RECEIVER_CHARS).collect();
     out.push('\u{2026}');
     out
+}
+
+/// Strip a leading `&` / `*` / `!` from a receiver that is otherwise a plain
+/// path of names.
+///
+/// `(*path).to_string()` records the receiver `*path`, `(&x).use()` records
+/// `&x`, and Swift's `!Self.check(v)` records `!Self` — tree-sitter-swift makes
+/// `!Self` the navigation target rather than negating the call's result. The
+/// classifier and the receiver-type rung both read a receiver's **leftmost
+/// segment**, and `*` is not a segment: every one of these rows reached
+/// `UninferredReceiver` with the binding that would have typed it sitting one
+/// character to the right. Measured: 370 rows on this repository (`*path`,
+/// `*name`, `&…`) and 107 on a 306-file Swift corpus, where `!Self.containsNul`
+/// is a call to the enclosing type's own static method that the `self` rung
+/// could not see.
+///
+/// **Only when the remainder is a plain path**, and that restriction is the
+/// whole of the argument. A reference or a dereference denotes the *same value*
+/// as its operand, so the operand's declared type is the receiver's and reading
+/// it is not a guess. `!name.is_empty()` does not: it denotes a `bool` computed
+/// from a call, and rooting it at `name` would claim the method belongs to
+/// whatever `name` is. Requiring what follows to be an identifier or a dotted
+/// path — no parentheses, no brackets, no further operators — separates them
+/// exactly, and it is why `!Self` is taken and `!a.ok()` is left alone.
+///
+/// Arithmetic is deliberately absent. `-x` is a different value of a possibly
+/// different type, and the reduction has no way to know; it costs a row and
+/// invents nothing.
+pub(crate) fn strip_prefix_operators(text: &str) -> &str {
+    let mut rest = text;
+    let mut stripped_any = false;
+    // Bounded: `&&x` and `&mut *p` are real, a thousand leading `&` is not.
+    for _ in 0..4 {
+        let Some(next) = rest
+            .strip_prefix('&')
+            .or_else(|| rest.strip_prefix('*'))
+            .or_else(|| rest.strip_prefix('!'))
+            .map(|after| after.strip_prefix("mut ").unwrap_or(after))
+            .map(str::trim_start)
+            .filter(|next| !next.is_empty())
+        else {
+            break;
+        };
+        rest = next;
+        stripped_any = true;
+    }
+    if !stripped_any {
+        return text;
+    }
+    // What is left must be a path of names and nothing else: a parenthesis, a
+    // bracket, a quote or a second operator means the operand was an
+    // expression, not a binding, and its type is not the receiver's.
+    //
+    // `$` and `#` are names here for the reason `is_callee_identity` admits
+    // them: Swift spells a closure's parameter `$0`, PHP spells every variable
+    // `$r`, and a JavaScript private member is `#name`. Refusing them would
+    // leave `!$0` and `&$row` rooted at an operator in the two languages whose
+    // ordinary bindings look like that.
+    let is_name_char =
+        |character: char| character.is_alphanumeric() || matches!(character, '_' | '$' | '#');
+    let is_plain_path = rest
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || matches!(first, '_' | '$' | '#'))
+        && rest
+            .split(['.', ':'])
+            .all(|segment| segment.chars().all(is_name_char));
+    if is_plain_path {
+        rest
+    } else {
+        text
+    }
 }
 
 /// Grammar keys for a call, across the languages this crate splits receivers

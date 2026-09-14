@@ -382,7 +382,13 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// uninferred, and an unchanged v51 generation keeps the older tier even
 /// though no extraction byte moved — the same reason v50 gates the
 /// unchanged-source shortcut ahead of resolution.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "52";
+///
+/// v53 reduces a receiver past a leading `&`, `*` or `!` when what follows is a
+/// plain path — see `treesitter::strip_prefix_operators`. A v52 row records
+/// `*path` and `!Self`, whose leftmost *segment* is an operator, so the binding
+/// that would have typed the receiver is invisible to both the classifier and
+/// the receiver-type rung.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "53";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
