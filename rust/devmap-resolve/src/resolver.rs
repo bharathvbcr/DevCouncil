@@ -126,6 +126,26 @@ impl<'a> UsePosition<'a> {
 pub struct Resolver {
     symbol_index: BTreeMap<String, Vec<IndexedSymbol>>,
     file_symbols: BTreeMap<String, Vec<String>>, // file_path -> symbol_names
+    /// Every indexed file, grouped by its parent directory, each group sorted.
+    ///
+    /// Three call sites answered "which files sit directly in this directory"
+    /// by scanning *every* key of `file_symbols` and calling `parent_dir` on
+    /// each: `go_files_in_dir`, the package-suffix fallback in
+    /// `resolve_go_import`, and `files_in_dir_with_extensions`. Go import
+    /// resolution calls the first up to four times per import, so the cost was
+    /// O(imports x files in the repository) — and `parent_dir` allocates twice
+    /// per call, through `Path::parent` and `to_string_lossy().replace()`.
+    ///
+    /// Measured on scholarlm (1,942 Go files) with `sample`: 500 of the 825
+    /// samples inside `index_extractions` were this scan, 267 of them in
+    /// `parent_dir` alone.
+    ///
+    /// Grouping once costs one `parent_dir` per file per build and turns each
+    /// of those scans into a lookup. Built from `file_symbols` rather than from
+    /// the extractions so it holds exactly the population the scans walked —
+    /// `file_symbols` takes an entry per extraction unconditionally, including
+    /// files that declare no symbol.
+    files_by_dir: BTreeMap<String, Vec<String>>,
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
     reexport_chains: BTreeMap<String, String>,
@@ -323,6 +343,7 @@ impl Resolver {
         Self {
             symbol_index: BTreeMap::new(),
             file_symbols: BTreeMap::new(),
+            files_by_dir: BTreeMap::new(),
             reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
@@ -1172,6 +1193,7 @@ impl Resolver {
         // for a rebuild.
         self.symbol_index.clear();
         self.file_symbols.clear();
+        self.files_by_dir.clear();
         self.reexport_chains.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
@@ -1345,6 +1367,27 @@ impl Resolver {
                 }
             }
         }
+
+        // Group the indexed files by directory once, now that `file_symbols`
+        // holds the complete set and before pass two asks the first "what is in
+        // this directory" question. Built into a local because the loop borrows
+        // `file_symbols` for the whole walk.
+        //
+        // Each group comes out ascending — `BTreeMap::keys` yields sorted keys
+        // and the push preserves that — but the sort is explicit rather than
+        // inherited, so the ordering `go_files_in_dir` and
+        // `files_in_dir_with_extensions` promise survives a change of source.
+        let mut files_by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for path in self.file_symbols.keys() {
+            files_by_dir
+                .entry(Self::parent_dir(path))
+                .or_default()
+                .push(path.clone());
+        }
+        for files in files_by_dir.values_mut() {
+            files.sort();
+        }
+        self.files_by_dir = files_by_dir;
 
         // Between the passes, and necessarily so: following a barrel needs the
         // complete symbol universe pass one builds, and pass two's import
@@ -3492,20 +3535,40 @@ impl Resolver {
         nodes.into_iter().collect()
     }
 
+    /// A `.go` file that is part of the importable package.
+    ///
+    /// `_test.go` files are compiled only for the package's own test binary, so
+    /// an importer never sees them. One owner for the predicate because
+    /// `go_files_in_dir` and the package-suffix fallback below must agree on
+    /// what a package contains — they answer the same import.
+    fn is_go_package_file(path: &str) -> bool {
+        path.ends_with(".go") && !path.ends_with("_test.go")
+    }
+
+    /// Every directory holding at least one importable Go file, ascending.
+    ///
+    /// The keys of `files_by_dir` are parent directories already, so this is
+    /// the same set the previous `parent_dir`-per-file scan collected, without
+    /// the scan.
+    fn go_package_dirs(&self) -> impl Iterator<Item = String> + '_ {
+        self.files_by_dir
+            .iter()
+            .filter(|(_, files)| files.iter().any(|path| Self::is_go_package_file(path)))
+            .map(|(dir, _)| dir.clone())
+    }
+
     fn go_files_in_dir(&self, dir: &str) -> Vec<String> {
         let dir = dir.trim_end_matches('/');
-        let mut files: Vec<String> = self
-            .file_symbols
-            .keys()
-            .filter(|path| {
-                path.ends_with(".go")
-                    && !path.ends_with("_test.go")
-                    && Self::parent_dir(path) == dir
+        self.files_by_dir
+            .get(dir)
+            .map(|files| {
+                files
+                    .iter()
+                    .filter(|path| Self::is_go_package_file(path))
+                    .cloned()
+                    .collect()
             })
-            .cloned()
-            .collect();
-        files.sort();
-        files
+            .unwrap_or_default()
     }
 
     fn apply_go_replace(&self, spec: &str) -> Option<(String, Option<String>)> {
@@ -3594,12 +3657,7 @@ impl Resolver {
             return Vec::new();
         }
         let mut matches: Vec<(usize, String)> = self
-            .file_symbols
-            .keys()
-            .filter(|path| path.ends_with(".go") && !path.ends_with("_test.go"))
-            .map(|path| Self::parent_dir(path))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
+            .go_package_dirs()
             .filter(|dir| {
                 let components = dir.split('/').filter(|part| !part.is_empty()).count();
                 components >= 2
@@ -3715,19 +3773,20 @@ impl Resolver {
     /// `extensions`. Sorted, so an expansion is deterministic across runs.
     fn files_in_dir_with_extensions(&self, dir: &str, extensions: &[&str]) -> Vec<String> {
         let dir = dir.trim_end_matches('/');
-        let mut files: Vec<String> = self
-            .file_symbols
-            .keys()
-            .filter(|path| {
-                Self::parent_dir(path) == dir
-                    && extensions
-                        .iter()
-                        .any(|extension| !extension.is_empty() && path.ends_with(extension))
+        self.files_by_dir
+            .get(dir)
+            .map(|files| {
+                files
+                    .iter()
+                    .filter(|path| {
+                        extensions
+                            .iter()
+                            .any(|extension| !extension.is_empty() && path.ends_with(extension))
+                    })
+                    .cloned()
+                    .collect()
             })
-            .cloned()
-            .collect();
-        files.sort();
-        files
+            .unwrap_or_default()
     }
 
     /// A member reference resolved through its receiver.
@@ -5167,6 +5226,178 @@ mod import_resolution_tests {
             "a parent directory holds no files of its own here"
         );
         assert!(resolver.go_files_in_dir("").is_empty());
+    }
+
+    /// The directory index carries the current snapshot and nothing older.
+    ///
+    /// `index_extractions` resets every other map for exactly this reason: a
+    /// caller may reuse the object for a rebuild. An index that accumulated
+    /// would answer a Go import with a file the snapshot no longer contains,
+    /// and the resulting edge is stamped with the same confidence as a real
+    /// one — a deleted file reappearing as a live import target.
+    ///
+    /// Fails against an index that is built but never cleared.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn the_directory_index_holds_only_the_current_snapshot() {
+        use devmap_extract::extract_file;
+        let mut resolver = Resolver::new();
+
+        let first = [extract_file(
+            "internal/svc/a.go",
+            "package svc\nfunc A() {}\n",
+        )];
+        resolver.index_extractions(&first);
+        assert_eq!(
+            resolver.go_files_in_dir("internal/svc"),
+            ["internal/svc/a.go"]
+        );
+
+        let second = [extract_file(
+            "internal/other/b.go",
+            "package other\nfunc B() {}\n",
+        )];
+        resolver.index_extractions(&second);
+        assert!(
+            resolver.go_files_in_dir("internal/svc").is_empty(),
+            "a directory absent from the new snapshot must not survive the rebuild"
+        );
+        assert_eq!(
+            resolver.go_files_in_dir("internal/other"),
+            ["internal/other/b.go"]
+        );
+    }
+
+    /// Grouping *every* indexed file by directory moves the `.go` filter from
+    /// the scan to the reader, so the reader has to still apply it.
+    ///
+    /// A real package directory holds a README, a generated `.json` and often a
+    /// helper script. Returning those as package files makes each one an import
+    /// target for `example.com/svc`, and the first of them wins the edge.
+    ///
+    /// Fails against a reader that returns the directory's files unfiltered.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn go_files_in_dir_returns_no_non_go_sibling() {
+        use devmap_extract::extract_file;
+        let files = [
+            ("pkg/svc/a.go", "package svc\nfunc A() {}\n"),
+            ("pkg/svc/README.md", "# svc\n"),
+            ("pkg/svc/helper.py", "def helper():\n    pass\n"),
+            ("pkg/svc/a_test.go", "package svc\nfunc T() {}\n"),
+        ];
+        let extractions: Vec<_> = files
+            .iter()
+            .map(|(path, source)| extract_file(path, source))
+            .collect();
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+
+        assert_eq!(
+            resolver.go_files_in_dir("pkg/svc"),
+            ["pkg/svc/a.go"],
+            "only the importable Go file belongs to the package"
+        );
+    }
+
+    /// The suffix fallback ranks directories that hold importable Go.
+    ///
+    /// The index holds every directory, including ones with no Go in them at
+    /// all. Handing that set to the fallback unfiltered lets `docs/api` claim
+    /// an `example.com/api` import, and a directory holding only `_test.go`
+    /// claim its package — both resolve to an empty file set, so the import
+    /// binds to nothing while reporting that it matched.
+    ///
+    /// Fails against a fallback that walks the index keys directly.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn go_package_dirs_names_only_directories_holding_importable_go() {
+        use devmap_extract::extract_file;
+        let files = [
+            ("pkg/real/a.go", "package real\nfunc A() {}\n"),
+            ("pkg/testonly/a_test.go", "package testonly\nfunc T() {}\n"),
+            ("docs/api/guide.md", "# guide\n"),
+        ];
+        let extractions: Vec<_> = files
+            .iter()
+            .map(|(path, source)| extract_file(path, source))
+            .collect();
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+
+        assert_eq!(
+            resolver.go_package_dirs().collect::<Vec<_>>(),
+            ["pkg/real"],
+            "a test-only directory and a docs directory are not Go packages"
+        );
+    }
+
+    /// A `doc.go` carrying only a package clause is still a package file, and
+    /// answers come back sorted.
+    ///
+    /// This pins membership and ordering, not a symbol-free path. The extractor
+    /// gives every file a file-level symbol named after its basename — measured,
+    /// including for an empty `.go` and for a `.txt` — so `file_symbols` never
+    /// holds an empty entry, and no mutation of the index's *population* can be
+    /// caught here. It is a contract test, and the mutation harness records it
+    /// as one rather than counting it as mutation-covered.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn a_package_file_that_declares_nothing_is_still_in_the_package() {
+        use devmap_extract::extract_file;
+        let files = [
+            ("pkg/svc/z.go", "package svc\nfunc Z() {}\n"),
+            ("pkg/svc/doc.go", "package svc\n"),
+            ("pkg/svc/a.go", "package svc\nfunc A() {}\n"),
+        ];
+        let extractions: Vec<_> = files
+            .iter()
+            .map(|(path, source)| extract_file(path, source))
+            .collect();
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+
+        assert_eq!(
+            resolver.go_files_in_dir("pkg/svc"),
+            ["pkg/svc/a.go", "pkg/svc/doc.go", "pkg/svc/z.go"],
+            "a symbol-free file belongs to the package, and answers are sorted"
+        );
+    }
+
+    /// An empty extension matches every path through `ends_with`.
+    ///
+    /// The guard refusing it is what stops a rule that names no extension from
+    /// claiming every file in the directory.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn an_empty_extension_claims_no_file() {
+        use devmap_extract::extract_file;
+        let files = [
+            ("infra/main.tf", "resource \"null_resource\" \"a\" {}\n"),
+            ("infra/notes.md", "# notes\n"),
+        ];
+        let extractions: Vec<_> = files
+            .iter()
+            .map(|(path, source)| extract_file(path, source))
+            .collect();
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+
+        assert!(
+            resolver
+                .files_in_dir_with_extensions("infra", &[""])
+                .is_empty(),
+            "an empty extension must not match by `ends_with`"
+        );
+        assert_eq!(
+            resolver.files_in_dir_with_extensions("infra", &[".tf"]),
+            ["infra/main.tf"]
+        );
+        // A trailing slash names the same directory here too.
+        assert_eq!(
+            resolver.files_in_dir_with_extensions("infra/", &[".tf"]),
+            resolver.files_in_dir_with_extensions("infra", &[".tf"])
+        );
     }
 
     /// An import edge points at the package node, except for `package main`.

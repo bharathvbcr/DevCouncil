@@ -379,6 +379,26 @@ Ranked by measured share of wall time when found:
   `--indexed-hash` and `--content-fingerprint` and writes them itself; the
   read-modify-write survives only as the fallback for a kernel too old for the
   flags, because an unstamped map reads permanently stale to `map_is_stale`.
+- **Go import resolution rescanned every file in the repository** — 623 of the
+  825 samples in `resolver:index`, and 29% of an incremental build, on a
+  1,942-Go-file tree. `go_files_in_dir` answered "which files sit directly in
+  this directory" by walking every key of `file_symbols` and calling
+  `parent_dir` on each — which allocates twice, through `Path::parent` and
+  `to_string_lossy().replace()` — and `resolve_go_import` calls it up to four
+  times per import, so the cost was O(imports x files in the repository). The
+  suffix fallback and `files_in_dir_with_extensions` had the same shape. One
+  `files_by_dir` index, grouped once per pass where `file_symbols` is already
+  complete, turns all three scans into lookups: `resolver:index` 1.058s ->
+  0.212s (5.0x), touch build -29%, cold -13%, with `code_graph.json` and
+  `repo_map.json` byte-identical across five corpora. The remaining
+  `go_package_dirs` walk is O(files) but reached only by the suffix tier, and
+  measures 1.4% of the build — left alone deliberately rather than traded for a
+  second structure to keep in sync.
+
+  Found with `sample(1)` after two hand-instrumented hypotheses had each blamed
+  the wrong loop; the second was wrong because the timer's span silently
+  included the import loop it was supposed to exclude.
+
 - **A full `VACUUM` ran on nearly every build** — 937ms, 28% of an incremental
   build, to reclaim a few percent of the file. Now `PRAGMA incremental_vacuum`
   (2ms). Legacy `auto_vacuum=NONE` stores convert on the vacuum they were
