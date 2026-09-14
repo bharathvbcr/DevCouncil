@@ -1,0 +1,15 @@
+Node: loadBounded()
+  ID:        backend_go_orchestrator_repomap_repomap_loadbounded
+  Source:    backend/go_orchestrator/repomap/repomap.go L331
+  Type:      code
+  Community: 
+  Degree:    7
+
+Connections (7):
+  <-- Load() [calls] [EXTRACTED] backend/go_orchestrator/repomap/repomap.go:L327
+  --> Map [references] [EXTRACTED] backend/go_orchestrator/repomap/repomap.go:L331
+  <-- repomap.go [contains] [EXTRACTED] backend/go_orchestrator/repomap/repomap.go:L331
+  --> decodeGraph() [calls] [INFERRED] backend/go_orchestrator/repomap/repomap.go:L342
+  --> build() [calls] [EXTRACTED] backend/go_orchestrator/repomap/repomap.go:L356
+  <-- TestAnInternedGraphIsHeldToTheSameBound() [calls] [INFERRED] backend/go_orchestrator/repomap/compact_test.go:L547
+  --> readBounded() [calls] [EXTRACTED] backend/go_orchestrator/repomap/repomap.go:L338

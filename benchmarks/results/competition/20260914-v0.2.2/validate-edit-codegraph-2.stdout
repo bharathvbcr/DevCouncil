@@ -1,0 +1,24 @@
+[
+  {
+    "node": {
+      "id": "function:d10236aaa06b192ba3751c8a081dbd0e",
+      "kind": "function",
+      "name": "devmap_competition_revision_2",
+      "qualifiedName": "devmap_competition_revision_2",
+      "filePath": "benchmarks/tasks.py",
+      "language": "python",
+      "startLine": 271,
+      "endLine": 273,
+      "startColumn": 0,
+      "endColumn": 16,
+      "signature": "(value)",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false,
+      "isAbstract": false,
+      "updatedAt": 1789389391056
+    },
+    "score": 94.91370624523091
+  }
+]

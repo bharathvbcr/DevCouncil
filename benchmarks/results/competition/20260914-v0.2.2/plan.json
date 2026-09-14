@@ -1,0 +1,68 @@
+{
+  "benchmark": "devmap v0.2.2 cross-repository competitor comparison",
+  "scratch": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2",
+  "devmap_binary": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/devmap",
+  "devmap_version": "devmap 0.2.2 (store schema 22, code graph schema 2, build 1d680486869d)",
+  "snapshots": {
+    "DevCouncil": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/8aef7e52-66bf-445f-af67-d8ff23d20183/scratchpad/corpus/DevCouncil",
+    "GitPulse": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/8aef7e52-66bf-445f-af67-d8ff23d20183/scratchpad/corpus/GitPulse",
+    "DevPrism": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/8aef7e52-66bf-445f-af67-d8ff23d20183/scratchpad/corpus/DevPrism",
+    "scholarlm": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/8aef7e52-66bf-445f-af67-d8ff23d20183/scratchpad/corpus/scholarlm"
+  },
+  "corpus_commits": {
+    "DevCouncil": "1d680486869d922933146725cfe8b07f5c20ae92",
+    "GitPulse": "e9322f5361a7e4c5bb4518c17f2ea88438b98fa0",
+    "DevPrism": "feaef2ffd27fe6d77f897ebc9ba6f0db0b5dd458",
+    "scholarlm": "5b5454c88cc16578c6ca24bb3e248374729acd5d"
+  },
+  "edit_targets": {
+    "DevCouncil": "rust/devmap-cli/tests/file_liveness_reaches_every_artifact.rs",
+    "DevPrism": "apps/desktop/src/components/settings-toggle-row.tsx",
+    "GitPulse": "src-tauri/vendored/devmap-extract/src/langdecl/kotlin.rs",
+    "scholarlm": "backend/go_orchestrator/internal/wisdev/temporal_activities.go"
+  },
+  "sources": {
+    "DevCouncil": "/Users/bharath/Code/devtools/DevCouncil",
+    "GitPulse": "/Users/bharath/Code/devtools/GitPulse",
+    "DevPrism": "/Users/bharath/Code/devtools/DevPrism",
+    "scholarlm": "/Users/bharath/Code/scholarlm"
+  },
+  "tool_identities": {
+    "gortex": {
+      "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/tools/gortex/x/gortex",
+      "exists": true,
+      "sha256": "62813625fa4d121322cab6f1bced00397713a59688af0297882812da2ab912bf"
+    },
+    "cbm": {
+      "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/tools/cbm/x/codebase-memory-mcp",
+      "exists": true,
+      "sha256": "2412e017268bef8f847f38d1b0f79f63185b38c27fe6fba637067bfc87c0eedf"
+    },
+    "codegraph": {
+      "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/tools/codegraph/x/codegraph-darwin-arm64/bin/codegraph",
+      "exists": true,
+      "sha256": "3184bbf582b5db7cffd07373017631fdc4392842860c2e3991be3f23b6fb3559"
+    },
+    "graphify": {
+      "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/tools/graphify-venv/bin/graphify",
+      "exists": true,
+      "sha256": "64fce780e77bbdfc52f6c6e3eb21cad5affffa38228e279763f01edd9fd6260d"
+    },
+    "gitnexus": {
+      "path": "/opt/homebrew/bin/gitnexus",
+      "exists": true,
+      "sha256": "233ece3066020a9098aa7fa448e04beff8452169497248cb1e5c316e508bfbbc"
+    },
+    "devmap": {
+      "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/devmap",
+      "exists": true,
+      "sha256": "e989668ca23650f52ddc45746872dc01c0219981956d3f720d0488f920340ac8"
+    }
+  },
+  "prior_run": "20260913-multirepo",
+  "host": [
+    "Mac17,8",
+    "18"
+  ],
+  "note": "Each tool indexes its own APFS clone of the pinned snapshot. No working checkout and no live product index is read or written."
+}

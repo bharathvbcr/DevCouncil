@@ -1,0 +1,1 @@
+{"level":40,"time":1789389278119,"name":"gitnexus","msg":"Skipping 1 cobol file(s) — cobol parser not available (native binding may not have built). Try: npm rebuild tree-sitter-cobol"}

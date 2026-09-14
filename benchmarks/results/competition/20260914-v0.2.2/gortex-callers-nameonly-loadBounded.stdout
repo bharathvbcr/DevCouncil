@@ -1,0 +1,81 @@
+{
+  "edges": [
+    {
+      "confidence_label": "EXTRACTED",
+      "file_path": "devcouncil-bench/backend/go_orchestrator/repomap/compact_test.go",
+      "from": "devcouncil-bench/backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "kind": "calls",
+      "line": 547,
+      "origin": "lsp_resolved",
+      "tier": "lsp",
+      "to": "devcouncil-bench/backend/go_orchestrator/repomap/repomap.go::loadBounded"
+    },
+    {
+      "confidence_label": "EXTRACTED",
+      "file_path": "devcouncil-bench/backend/go_orchestrator/repomap/compact_test.go",
+      "from": "devcouncil-bench/backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "kind": "calls",
+      "line": 550,
+      "origin": "lsp_resolved",
+      "tier": "lsp",
+      "to": "devcouncil-bench/backend/go_orchestrator/repomap/repomap.go::loadBounded"
+    },
+    {
+      "confidence_label": "EXTRACTED",
+      "file_path": "devcouncil-bench/backend/go_orchestrator/repomap/repomap.go",
+      "from": "devcouncil-bench/backend/go_orchestrator/repomap/repomap.go::Load",
+      "kind": "calls",
+      "line": 327,
+      "origin": "lsp_resolved",
+      "tier": "lsp",
+      "to": "devcouncil-bench/backend/go_orchestrator/repomap/repomap.go::loadBounded"
+    }
+  ],
+  "nodes": [
+    {
+      "absolute_file_path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/sem/gortex-DevCouncil/backend/go_orchestrator/repomap/repomap.go",
+      "end_line": 357,
+      "fetched_at": "0001-01-01T00:00:00Z",
+      "file_path": "devcouncil-bench/backend/go_orchestrator/repomap/repomap.go",
+      "id": "devcouncil-bench/backend/go_orchestrator/repomap/repomap.go::loadBounded",
+      "kind": "function",
+      "language": "go",
+      "name": "loadBounded",
+      "project_id": "devcouncil-bench",
+      "repo_prefix": "devcouncil-bench",
+      "start_line": 331,
+      "workspace_id": "devcouncil-bench"
+    },
+    {
+      "absolute_file_path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/sem/gortex-DevCouncil/backend/go_orchestrator/repomap/compact_test.go",
+      "end_line": 559,
+      "fetched_at": "0001-01-01T00:00:00Z",
+      "file_path": "devcouncil-bench/backend/go_orchestrator/repomap/compact_test.go",
+      "id": "devcouncil-bench/backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "kind": "function",
+      "language": "go",
+      "name": "TestAnInternedGraphIsHeldToTheSameBound",
+      "project_id": "devcouncil-bench",
+      "repo_prefix": "devcouncil-bench",
+      "start_line": 544,
+      "workspace_id": "devcouncil-bench"
+    },
+    {
+      "absolute_file_path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/sem/gortex-DevCouncil/backend/go_orchestrator/repomap/repomap.go",
+      "end_line": 327,
+      "fetched_at": "0001-01-01T00:00:00Z",
+      "file_path": "devcouncil-bench/backend/go_orchestrator/repomap/repomap.go",
+      "id": "devcouncil-bench/backend/go_orchestrator/repomap/repomap.go::Load",
+      "kind": "function",
+      "language": "go",
+      "name": "Load",
+      "project_id": "devcouncil-bench",
+      "repo_prefix": "devcouncil-bench",
+      "start_line": 327,
+      "workspace_id": "devcouncil-bench"
+    }
+  ],
+  "total_edges": 3,
+  "total_nodes": 3,
+  "truncated": false
+}

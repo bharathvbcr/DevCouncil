@@ -1,0 +1,30 @@
+ daemon    v0.64.3+56a1c29                                                                                                                       
+ pid       64624                                                                                                                                 
+ socket    /tmp/dmbench-v022.sock                                                                                                                
+ uptime    33s                                                                                                                                   
+ state     ready (warmup 33s)                                                                                                                    
+ sessions  1                                                                                                                                     
+ memory    19.1 MiB                                                                                                                              
+ search    sqlite-fts5  docs=26283  disk-resident (indexed in the graph store)                                                                   
+ trigram   live=0/3  heap=0 B/256.0 MiB  idle_ttl=10m0s                                                                                          
+ runtime   alloc=19.1 MiB  sys=1.0 GiB  heap_inuse=47.2 MiB  heap_idle=986.4 MiB  heap_released=956.9 MiB  stacks=2.5 MiB  gc=146  goroutines=31 
+
+workspaces: 1 (one per repo, default — every repo is its own workspace)
+  Group repos into a shared workspace with `gortex workspace set <repo> <slug> --global`
+  or `gortex workspace set-all <slug> --root <path> --global`. See `gortex workspace --help`.
+
+tracked repos:
+┌──────────────────┬──────────┬───────┬───────┬────────┬─────────┬─────────┬──────────┬───────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ repo             │ total    │ files │ nodes │  edges │ nodes_b │ edges_b │ search_b │ vectors_b │ path                                                                                                 │
+├──────────────────┼──────────┼───────┼───────┼────────┼─────────┼─────────┼──────────┼───────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ devcouncil-bench │      0 B │  1366 │ 41364 │ 280962 │     0 B │     0 B │      0 B │       0 B │ /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/sem/gortex-DevCouncil │
+├──────────────────┼──────────┼───────┼───────┼────────┼─────────┼─────────┼──────────┼───────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ other            │ 19.1 MiB │       │       │        │         │         │          │           │ embedder + runtime + caches (not attributed)                                                         │
+└──────────────────┴──────────┴───────┴───────┴────────┴─────────┴─────────┴──────────┴───────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+MCP sessions:
+┌───────────────────────┬────────┬─────────┬───────────┬─────┐
+│ id                    │ client │ version │ connected │ cwd │
+├───────────────────────┼────────┼─────────┼───────────┼─────┤
+│ sess_a71450bed8e02282 │ cli    │         │        0s │     │
+└───────────────────────┴────────┴─────────┴───────────┴─────┘

@@ -4,7 +4,7 @@ Paste-ready copy for the marketing site. Nothing here is deployed by this
 repository — `devcouncil.vbcr.dev` is hosted separately.
 
 Every number traces to
-[the committed benchmark report](benchmarks/results/competition/20260913-48cd3c7/REPORT.md).
+[the committed benchmark report](benchmarks/results/competition/20260914-v0.2.2/REPORT.md).
 If you re-run the benchmark, update this file and the site together, or the
 site becomes a stale claim.
 
@@ -17,12 +17,12 @@ server*, *devmap vs gitnexus*, *codebase context for Claude Code*.
 
 ```html
 <title>DevMap — Fast Code Intelligence &amp; Code Graph for AI Coding Agents</title>
-<meta name="description" content="Symbol-level code graph, blast radius, and dead-code analysis for AI coding agents. Benchmarked against GitNexus, CodeGraph, Graphify, Gortex, and codebase-memory-mcp: 2.0s cold index, 30ms symbol queries, 610MiB peak memory.">
+<meta name="description" content="Symbol-level code graph, blast radius, and dead-code analysis for AI coding agents. Benchmarked against GitNexus, CodeGraph, Graphify, Gortex, and codebase-memory-mcp across four repositories: fastest cold index and refresh on all four, 10ms symbol queries.">
 <link rel="canonical" href="https://devcouncil.vbcr.dev/">
 
 <meta property="og:type" content="website">
 <meta property="og:title" content="DevMap — Code Intelligence for AI Coding Agents">
-<meta property="og:description" content="2.0s cold index, 30ms symbol queries, lowest memory of six code-graph tools. Measured, with the raw evidence published.">
+<meta property="og:description" content="Fastest cold index and refresh on all four benchmarked repositories, 10ms symbol queries, 5/5 caller pairs. Measured, with the raw evidence published.">
 <meta property="og:url" content="https://devcouncil.vbcr.dev/">
 <meta name="twitter:card" content="summary_large_image">
 ```
@@ -37,15 +37,16 @@ version above is deliberately fact-dense rather than adjective-dense.
 > ### Your AI agent is guessing about your codebase.
 >
 > DevMap gives it a symbol-level map instead — every definition, caller, and
-> blast radius, in milliseconds. Six code-graph tools indexed the same
-> repository. DevMap was fastest on cold indexing, refresh, and every symbol
-> query we measured, using a quarter of the memory.
+> blast radius, in milliseconds. Six code-graph tools indexed the same four
+> repositories. DevMap was fastest on cold indexing and refresh on **every one
+> of them**, fastest on every symbol query we measured, and the only tool
+> besides one to find all five hand-inspected caller pairs.
 >
 > **[See the benchmark →]** &nbsp; **[Install →]**
 
 Alternate, more specific headline if you want the keyword up front:
 
-> ### Code intelligence for AI coding agents — 2 seconds cold, 30 ms per query.
+> ### Code intelligence for AI coding agents — 2 seconds cold, 10 ms per query.
 
 ---
 
@@ -53,26 +54,39 @@ Alternate, more specific headline if you want the keyword up front:
 
 > ## Measured against five other code-graph tools
 >
-> Not an estimate. Six tools indexed the identical frozen 1,186-file repository
-> on one machine — 261 timed samples, corpus hash-verified before and after,
-> every command's raw output published.
+> Not an estimate. Six tools indexed the same **four repositories** — 595 to
+> 4,335 files across Rust, Go, TypeScript, Python and Swift — on one machine.
+> Every corpus pinned to a commit, every competitor binary hash-verified, every
+> command's raw output published.
+
+**Fastest on all four repositories:**
+
+| Stage | DevMap 0.2.2 | Next fastest |
+|---|---|---|
+| Cold index | 0.76 s – 4.61 s | 1.6× to 21× slower |
+| Unchanged refresh | 0.05 s – 0.14 s | 2.2× to 107× slower |
+
+Detailed, on the 1,098-file corpus where correctness was also checked:
 
 | Tool | Cold index | Refresh | Edit | Symbol query | Peak RSS | Callers found |
 |---|---:|---:|---:|---:|---:|---:|
-| **DevMap 0.2.1** | **2.03 s** | **107 ms** | 958 ms | **30–33 ms** | **610 MiB** | **5/5** |
-| CodeGraph 1.6.0 | 2.91 s | 242 ms | **417 ms** | 144–166 ms | 2438 MiB | 3/5 |
-| codebase-memory-mcp 0.10.8 | 8.02 s | 6.16 s | 9.35 s | ~4.4 s | 1208 MiB | **5/5** |
-| Graphify 0.9.59 | 16.46 s | 4.33 s | 3.95 s | 567–615 ms | 3293 MiB | 3/5 |
-| GitNexus 1.6.9 | 34.10 s | 568 ms | 33.42 s | ~1.0 s | 3095 MiB | 3/5 |
-| Gortex 0.64.3 | 38.84 s | 968 ms | 5.75 s | 92–115 ms | 2206 MiB | 4/5 |
+| **DevMap 0.2.2** | **2.01 s** | **89 ms** | 816 ms | **9.7 ms** | **678 MiB** | **5/5** |
+| CodeGraph 1.6.0 | 3.29 s | 235 ms | **512 ms** | 101–106 ms | 2430 MiB | 3/5 |
+| codebase-memory-mcp 0.10.8 | 9.36 s | 5.73 s | 8.89 s | ~3.9 s | — | **5/5** |
+| Graphify 0.9.59 | 14.99 s | 5.08 s | 4.88 s | 557–572 ms | 3417 MiB | 3/5 |
+| GitNexus 1.6.9 | 33.69 s | 699 ms | 31.84 s | ~800 ms | 3355 MiB | 3/5 |
+| Gortex 0.64.3 | 16.5 s to query-ready | — | — | 92–104 ms | — | 4/5 |
 
-> **Where we lose.** CodeGraph re-indexes a single edited file in 417 ms to our
-> 958 ms, and Graphify's index is a third the size of ours. Both are in the
-> report, because a comparison that only lists wins isn't a comparison.
+> **Where we lose.** CodeGraph re-indexes a single edited file faster than we do
+> on **every** repository — 512 ms to our 816 ms here, and 3.6× faster on the
+> largest gap. Graphify's index is a third the size of ours and it used less
+> memory than we did on the biggest repository. All of it is in the report,
+> because a comparison that only lists wins isn't a comparison.
 >
-> **What it doesn't prove.** One repository, one machine, five hand-inspected
+> **What it doesn't prove.** Four repositories, one machine, five hand-inspected
 > caller pairs. It measures speed and a small correctness sample — not general
-> graph accuracy, and not whether your agent ships better code.
+> graph accuracy, and not whether your agent ships better code. DevMap itself
+> reports 106,217 call sites it could not attribute on this corpus.
 >
 > **[Read the full report, including the failures →]**
 
@@ -96,11 +110,12 @@ Codex.
 Grep finds text; embeddings find things that look similar. DevMap resolves
 actual symbol relationships, so "who calls this function" returns callers
 rather than lines that mention the name. For reference, ripgrep searched the
-same corpus in ~36 ms — DevMap's resolved symbol lookup was 30–33 ms.
+same corpus in ~45 ms — DevMap's resolved symbol lookup was 9.7 ms.
 
 **Is it faster than GitNexus / CodeGraph / Graphify?**
-On the benchmarked corpus: faster than all five on cold indexing, refresh, and
-symbol queries. CodeGraph is faster at re-indexing a single edited file.
+On the four benchmarked repositories: faster than all five on cold indexing and
+unchanged refresh on every one, and faster on every symbol query measured.
+CodeGraph is faster at re-indexing a single edited file, on every repository.
 
 **Which languages are supported?**
 35 named tree-sitter extractors plus a generic fallback, including TypeScript,
@@ -131,7 +146,7 @@ user-submitted ratings — fabricated review markup is a manual-action risk.
   "codeRepository": "https://github.com/bharathvbcr/DevCouncil",
   "programmingLanguage": ["Rust", "Go"],
   "license": "https://www.apache.org/licenses/LICENSE-2.0",
-  "softwareVersion": "0.2.1",
+  "softwareVersion": "0.2.2",
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
 }
 </script>
@@ -156,7 +171,7 @@ user-submitted ratings — fabricated review markup is a manual-action risk.
       "name": "Is DevMap faster than GitNexus or CodeGraph?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "On a benchmarked 1,186-file repository, DevMap indexed cold in 2.03 seconds against CodeGraph's 2.91 and GitNexus's 34.10, and answered symbol queries in 30-33 ms. CodeGraph was faster at re-indexing a single edited file, at 417 ms against DevMap's 958 ms."
+        "text": "Across four benchmarked repositories, DevMap was fastest at cold indexing and unchanged refresh on all four. On the 1,098-file corpus it indexed cold in 2.01 seconds against CodeGraph's 3.29 and GitNexus's 33.69, and answered symbol queries in 9.7 ms against 101-106 ms and ~800 ms respectively. CodeGraph was faster at re-indexing a single edited file on every repository, at 512 ms against DevMap's 816 ms on this corpus."
       }
     },
     {

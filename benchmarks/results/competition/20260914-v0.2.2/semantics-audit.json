@@ -1,0 +1,1965 @@
+{
+ "answers": [
+  {
+   "tool": "devmap",
+   "target": "db_size_gate_bytes",
+   "language": "Rust",
+   "expected": [
+    "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+    "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "devmap",
+   "target": "loadBounded",
+   "language": "Go",
+   "expected": [
+    "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+    "backend/go_orchestrator/repomap/repomap.go::Load"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "devmap",
+   "target": "describe_corpus",
+   "language": "Python",
+   "expected": [
+    "benchmarks/map_bench.py::main"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "codegraph",
+   "target": "db_size_gate_bytes",
+   "language": "Rust",
+   "expected": [
+    "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+    "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "codegraph",
+   "target": "loadBounded",
+   "language": "Go",
+   "expected": [
+    "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+    "backend/go_orchestrator/repomap/repomap.go::Load"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "codegraph",
+   "target": "describe_corpus",
+   "language": "Python",
+   "expected": [
+    "benchmarks/map_bench.py::main"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "cbm",
+   "target": "db_size_gate_bytes",
+   "language": "Rust",
+   "expected": [
+    "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+    "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "cbm",
+   "target": "loadBounded",
+   "language": "Go",
+   "expected": [
+    "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+    "backend/go_orchestrator/repomap/repomap.go::Load"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "cbm",
+   "target": "describe_corpus",
+   "language": "Python",
+   "expected": [
+    "benchmarks/map_bench.py::main"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "gitnexus",
+   "target": "db_size_gate_bytes",
+   "language": "Rust",
+   "expected": [
+    "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+    "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "gitnexus",
+   "target": "loadBounded",
+   "language": "Go",
+   "expected": [
+    "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+    "backend/go_orchestrator/repomap/repomap.go::Load"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "gitnexus",
+   "target": "describe_corpus",
+   "language": "Python",
+   "expected": [
+    "benchmarks/map_bench.py::main"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "graphify",
+   "target": "db_size_gate_bytes",
+   "language": "Rust",
+   "expected": [
+    "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+    "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [],
+     "matched": [],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "graphify",
+   "target": "loadBounded",
+   "language": "Go",
+   "expected": [
+    "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+    "backend/go_orchestrator/repomap/repomap.go::Load"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "graphify",
+   "target": "describe_corpus",
+   "language": "Python",
+   "expected": [
+    "benchmarks/map_bench.py::main"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "gortex",
+   "target": "db_size_gate_bytes",
+   "language": "Rust",
+   "expected": [
+    "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor",
+    "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor"
+     ],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "matched": [
+      "rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes"
+     ],
+     "missing": [
+      "rust/devmap-cli/tests/test_scholarlm_findings.rs::db_size_gate_scales_with_file_count_and_keeps_a_floor"
+     ],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "gortex",
+   "target": "loadBounded",
+   "language": "Go",
+   "expected": [
+    "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+    "backend/go_orchestrator/repomap/repomap.go::Load"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "matched": [
+      "backend/go_orchestrator/repomap/compact_test.go::TestAnInternedGraphIsHeldToTheSameBound",
+      "backend/go_orchestrator/repomap/repomap.go::Load"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  },
+  {
+   "tool": "gortex",
+   "target": "describe_corpus",
+   "language": "Python",
+   "expected": [
+    "benchmarks/map_bench.py::main"
+   ],
+   "scored_samples": 5,
+   "consistent": true,
+   "samples": [
+    {
+     "iteration": 1,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 2,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 3,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 4,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    },
+    {
+     "iteration": 5,
+     "command_ok": true,
+     "exact_definition": true,
+     "returned": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "matched": [
+      "benchmarks/map_bench.py::main"
+     ],
+     "missing": [],
+     "additional_unjudged": []
+    }
+   ]
+  }
+ ],
+ "controls": [
+  {
+   "tool": "devmap",
+   "label": "validate-edit-devmap-1",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "devmap",
+   "label": "validate-edit-devmap-2",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "devmap",
+   "label": "validate-edit-devmap-3",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "devmap",
+   "label": "negative-devmap-devmap_competition_revision_3",
+   "expected": "absent",
+   "passed": true
+  },
+  {
+   "tool": "devmap",
+   "label": "negative-devmap-devmap_competition_nonexistent_8aef7e52",
+   "expected": "absent",
+   "passed": true
+  },
+  {
+   "tool": "codegraph",
+   "label": "validate-edit-codegraph-1",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "codegraph",
+   "label": "validate-edit-codegraph-2",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "codegraph",
+   "label": "validate-edit-codegraph-3",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "codegraph",
+   "label": "negative-codegraph-devmap_competition_revision_3",
+   "expected": "absent",
+   "passed": true
+  },
+  {
+   "tool": "codegraph",
+   "label": "negative-codegraph-devmap_competition_nonexistent_8aef7e52",
+   "expected": "absent",
+   "passed": true
+  },
+  {
+   "tool": "cbm",
+   "label": "validate-edit-cbm-1",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "cbm",
+   "label": "validate-edit-cbm-2",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "cbm",
+   "label": "validate-edit-cbm-3",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "cbm",
+   "label": "negative-cbm-devmap_competition_revision_3",
+   "expected": "absent",
+   "passed": true
+  },
+  {
+   "tool": "cbm",
+   "label": "negative-cbm-devmap_competition_nonexistent_8aef7e52",
+   "expected": "absent",
+   "passed": true
+  },
+  {
+   "tool": "gitnexus",
+   "label": "validate-edit-gitnexus-1",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "gitnexus",
+   "label": "validate-edit-gitnexus-2",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "gitnexus",
+   "label": "validate-edit-gitnexus-3",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "gitnexus",
+   "label": "negative-gitnexus-devmap_competition_revision_3",
+   "expected": "absent",
+   "passed": true
+  },
+  {
+   "tool": "gitnexus",
+   "label": "negative-gitnexus-devmap_competition_nonexistent_8aef7e52",
+   "expected": "absent",
+   "passed": true
+  },
+  {
+   "tool": "graphify",
+   "label": "validate-edit-graphify-1",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "graphify",
+   "label": "validate-edit-graphify-2",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "graphify",
+   "label": "validate-edit-graphify-3",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "graphify",
+   "label": "negative-graphify-devmap_competition_revision_3",
+   "expected": "absent",
+   "passed": true
+  },
+  {
+   "tool": "graphify",
+   "label": "negative-graphify-devmap_competition_nonexistent_8aef7e52",
+   "expected": "absent",
+   "passed": true
+  },
+  {
+   "tool": "gortex",
+   "label": "validate-edit-gortex-1",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "gortex",
+   "label": "validate-edit-gortex-2",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "gortex",
+   "label": "validate-edit-gortex-3",
+   "expected": "present",
+   "passed": true
+  },
+  {
+   "tool": "gortex",
+   "label": "negative-gortex-devmap_competition_revision_3",
+   "expected": "absent",
+   "passed": true
+  },
+  {
+   "tool": "gortex",
+   "label": "negative-gortex-devmap_competition_nonexistent_8aef7e52",
+   "expected": "absent",
+   "passed": true
+  }
+ ],
+ "coverage_flags": [
+  {
+   "label": "callers-devmap-db_size_gate_bytes-1",
+   "path": ".blast_radius.layers.items[1].nodes_omitted",
+   "value": 7
+  },
+  {
+   "label": "callers-devmap-db_size_gate_bytes-1",
+   "path": ".blast_radius.layers.walk_incomplete",
+   "value": "106217 of 182181 unresolved attribution site(s) have no indexed target after excluding 75964 site(s) classified as builtin, runtime-global, external-import, no-namesake, or module-path; classification does not prove complete source coverage; these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it"
+  },
+  {
+   "label": "callers-devmap-db_size_gate_bytes-1",
+   "path": ".definitions.items[0].callees.walk_incomplete",
+   "value": "106217 of 182181 unresolved attribution site(s) have no indexed target after excluding 75964 site(s) classified as builtin, runtime-global, external-import, no-namesake, or module-path; classification does not prove complete source coverage; these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it"
+  },
+  {
+   "label": "callers-devmap-db_size_gate_bytes-1",
+   "path": ".definitions.items[0].callers.walk_incomplete",
+   "value": "106217 of 182181 unresolved attribution site(s) have no indexed target after excluding 75964 site(s) classified as builtin, runtime-global, external-import, no-namesake, or module-path; classification does not prove complete source coverage; these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it"
+  },
+  {
+   "label": "callers-devmap-loadBounded-1",
+   "path": ".blast_radius.layers.walk_incomplete",
+   "value": "the walk did not complete: stopped at depth 3; the result is a lower bound, not the full blast radius; 106217 of 182181 unresolved attribution site(s) have no indexed target after excluding 75964 site(s) classified as builtin, runtime-global, external-import, no-namesake, or module-path; classification does not prove complete source coverage; these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it"
+  },
+  {
+   "label": "callers-devmap-loadBounded-1",
+   "path": ".definitions.items[0].callees.walk_incomplete",
+   "value": "the walk did not complete: stopped at depth 1; the result is a lower bound, not the full blast radius; 106217 of 182181 unresolved attribution site(s) have no indexed target after excluding 75964 site(s) classified as builtin, runtime-global, external-import, no-namesake, or module-path; classification does not prove complete source coverage; these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it"
+  },
+  {
+   "label": "callers-devmap-loadBounded-1",
+   "path": ".definitions.items[0].callers.walk_incomplete",
+   "value": "the walk did not complete: stopped at depth 1; the result is a lower bound, not the full blast radius; 106217 of 182181 unresolved attribution site(s) have no indexed target after excluding 75964 site(s) classified as builtin, runtime-global, external-import, no-namesake, or module-path; classification does not prove complete source coverage; these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it"
+  },
+  {
+   "label": "callers-devmap-describe_corpus-1",
+   "path": ".blast_radius.layers.walk_incomplete",
+   "value": "106217 of 182181 unresolved attribution site(s) have no indexed target after excluding 75964 site(s) classified as builtin, runtime-global, external-import, no-namesake, or module-path; classification does not prove complete source coverage; these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it"
+  },
+  {
+   "label": "callers-devmap-describe_corpus-1",
+   "path": ".definitions.items[0].callees.walk_incomplete",
+   "value": "106217 of 182181 unresolved attribution site(s) have no indexed target after excluding 75964 site(s) classified as builtin, runtime-global, external-import, no-namesake, or module-path; classification does not prove complete source coverage; these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it"
+  },
+  {
+   "label": "callers-devmap-describe_corpus-1",
+   "path": ".definitions.items[0].callers.walk_incomplete",
+   "value": "the walk did not complete: stopped at depth 1; the result is a lower bound, not the full blast radius; 106217 of 182181 unresolved attribution site(s) have no indexed target after excluding 75964 site(s) classified as builtin, runtime-global, external-import, no-namesake, or module-path; classification does not prove complete source coverage; these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies that name it"
+  },
+  {
+   "label": "callers-gortex-db_size_gate_bytes-1",
+   "path": ".text_matched_suppressed",
+   "value": 5
+  }
+ ],
+ "unparsed": [],
+ "gitnexus_recovery": {
+  "gitnexus-repeat-stale-query": false,
+  "gitnexus-after-force-query": false
+ },
+ "query_latency_seconds": {
+  "devmap": {
+   "search/Rust": {
+    "median": 0.009690959006547928,
+    "min": 0.009307208005338907,
+    "max": 0.009878957993350923,
+    "n": 5
+   },
+   "search/Go": {
+    "median": 0.009699874994112179,
+    "min": 0.009441249974770471,
+    "max": 0.010157792014069855,
+    "n": 5
+   },
+   "search/Python": {
+    "median": 0.009668208978837356,
+    "min": 0.009402583993505687,
+    "max": 0.010337790998164564,
+    "n": 5
+   },
+   "callers/Rust": {
+    "median": 0.027791332977358252,
+    "min": 0.027548667014343664,
+    "max": 0.02815966701018624,
+    "n": 5
+   },
+   "callers/Go": {
+    "median": 0.02841075000469573,
+    "min": 0.027585458010435104,
+    "max": 0.02938920899759978,
+    "n": 5
+   },
+   "callers/Python": {
+    "median": 0.027748833992518485,
+    "min": 0.027400874998420477,
+    "max": 0.032118083006935194,
+    "n": 5
+   }
+  },
+  "codegraph": {
+   "search/Rust": {
+    "median": 0.10580354099511169,
+    "min": 0.09943320800084621,
+    "max": 0.11494354100432247,
+    "n": 5
+   },
+   "search/Go": {
+    "median": 0.10232941701542586,
+    "min": 0.09884054202120751,
+    "max": 0.1060658750066068,
+    "n": 5
+   },
+   "search/Python": {
+    "median": 0.10099237502436154,
+    "min": 0.09871583300991915,
+    "max": 0.10468445799779147,
+    "n": 5
+   },
+   "callers/Rust": {
+    "median": 0.10162087497883476,
+    "min": 0.09904083298170008,
+    "max": 0.10545283299870789,
+    "n": 5
+   },
+   "callers/Go": {
+    "median": 0.10498479101806879,
+    "min": 0.09985304201836698,
+    "max": 0.11670004099141806,
+    "n": 5
+   },
+   "callers/Python": {
+    "median": 0.10524875001283363,
+    "min": 0.09885241702431813,
+    "max": 0.11460125001030974,
+    "n": 5
+   }
+  },
+  "cbm": {
+   "search/Rust": {
+    "median": 3.937573125003837,
+    "min": 3.9193185420008376,
+    "max": 3.9416782500047702,
+    "n": 5
+   },
+   "search/Go": {
+    "median": 3.948498124984326,
+    "min": 3.9275666250032373,
+    "max": 4.04001141700428,
+    "n": 5
+   },
+   "search/Python": {
+    "median": 3.9482560830074362,
+    "min": 3.9334314999869093,
+    "max": 3.9542508749873377,
+    "n": 5
+   },
+   "callers/Rust": {
+    "median": 3.9313938750128727,
+    "min": 3.9207199159718584,
+    "max": 3.957082667009672,
+    "n": 5
+   },
+   "callers/Go": {
+    "median": 3.9377258750027977,
+    "min": 3.926652166992426,
+    "max": 3.9519953340059146,
+    "n": 5
+   },
+   "callers/Python": {
+    "median": 3.93518229102483,
+    "min": 3.9251758749887813,
+    "max": 3.9516186249966267,
+    "n": 5
+   }
+  },
+  "gitnexus": {
+   "search/Rust": {
+    "median": 0.8080452079884708,
+    "min": 0.794336499995552,
+    "max": 0.8156534169975203,
+    "n": 5
+   },
+   "search/Go": {
+    "median": 0.802031083003385,
+    "min": 0.7904770830064081,
+    "max": 0.8157027080014814,
+    "n": 5
+   },
+   "search/Python": {
+    "median": 0.791498959006276,
+    "min": 0.7893321659939829,
+    "max": 0.8036987500090618,
+    "n": 5
+   },
+   "callers/Rust": {
+    "median": 0.7998828339914326,
+    "min": 0.7890120829979423,
+    "max": 0.8039652080042288,
+    "n": 5
+   },
+   "callers/Go": {
+    "median": 0.7966842500027269,
+    "min": 0.7924895840114914,
+    "max": 0.8164380000089295,
+    "n": 5
+   },
+   "callers/Python": {
+    "median": 0.8001321670017205,
+    "min": 0.7856379580043722,
+    "max": 0.8231785410025623,
+    "n": 5
+   }
+  },
+  "graphify": {
+   "search/Rust": {
+    "median": 0.5716817920038011,
+    "min": 0.539675583015196,
+    "max": 0.5783179170102812,
+    "n": 5
+   },
+   "search/Go": {
+    "median": 0.5569604999909643,
+    "min": 0.5483504580042791,
+    "max": 0.5701633749995381,
+    "n": 5
+   },
+   "search/Python": {
+    "median": 0.5672480409848504,
+    "min": 0.5495645409973804,
+    "max": 0.5692502910096664,
+    "n": 5
+   },
+   "callers/Rust": {
+    "median": 0.26724270900012925,
+    "min": 0.25397783299558796,
+    "max": 0.2790015419886913,
+    "n": 5
+   },
+   "callers/Go": {
+    "median": 0.2613951670064125,
+    "min": 0.25258579198271036,
+    "max": 0.2728884999814909,
+    "n": 5
+   },
+   "callers/Python": {
+    "median": 0.25479587499285117,
+    "min": 0.2508284579962492,
+    "max": 0.26548433300922625,
+    "n": 5
+   }
+  },
+  "gortex": {
+   "search/Rust": {
+    "median": 0.10352395800873637,
+    "min": 0.10224283402203582,
+    "max": 0.17139687499729916,
+    "n": 5
+   },
+   "search/Go": {
+    "median": 0.10056629197788425,
+    "min": 0.0952478339895606,
+    "max": 0.10321979102445766,
+    "n": 5
+   },
+   "search/Python": {
+    "median": 0.09161083400249481,
+    "min": 0.08706045799772255,
+    "max": 0.1004014170030132,
+    "n": 5
+   },
+   "callers/Rust": {
+    "median": 0.09270341601222754,
+    "min": 0.08766858300077729,
+    "max": 0.3047690420062281,
+    "n": 5
+   },
+   "callers/Go": {
+    "median": 0.08156487499945797,
+    "min": 0.07907312500174157,
+    "max": 0.43068675001268275,
+    "n": 5
+   },
+   "callers/Python": {
+    "median": 0.07532766700023785,
+    "min": 0.07204408300458454,
+    "max": 0.6899532919924241,
+    "n": 5
+   }
+  }
+ },
+ "ripgrep_seconds": {
+  "Rust": {
+   "median": 0.04579716600710526,
+   "n": 5
+  },
+  "Go": {
+   "median": 0.04380420799134299,
+   "n": 5
+  },
+  "Python": {
+   "median": 0.04480208398308605,
+   "n": 5
+  }
+ }
+}

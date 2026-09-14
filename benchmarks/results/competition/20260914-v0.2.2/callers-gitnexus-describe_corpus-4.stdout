@@ -1,0 +1,32 @@
+{
+  "status": "found",
+  "symbol": {
+    "uid": "Function:benchmarks/map_bench.py:describe_corpus",
+    "name": "describe_corpus",
+    "kind": "Function",
+    "filePath": "benchmarks/map_bench.py",
+    "startLine": 239,
+    "endLine": 270,
+    "content": " def describe_corpus(repo: Path) -> Dict[str, object]:     \"\"\"Count tracked files and code files so throughput has a denominator.     Falls back to a filesystem walk outside a git repository — the engine     indexes trees, not just checkouts, and a benchmark that only runs on git     repos cannot measure the case it is most often asked about.     \"\"\"     try:         out = subprocess.run(             [\"git\", \"ls-files\"], cwd=str(repo), capture_output=True, text=True, timeout=120         )         files = [f for f in out.stdout.splitlines() if f] if out.returncode == 0 else []     except (OSError, subprocess.SubprocessError):         files = []     if not files:         files = [             str(p.relative_to(repo))             for p in repo.rglob(\"*\")             if p.is_file() and \".git\" not in p.parts         ]     code = [f for f in files if Path(f).suffix.lower() in _CODE_SUFFIXES]     total_bytes = 0     for rel in code:         try:             total_bytes += (repo / rel).stat().st_size         except OSError:             pass     return {         \"tracked_files\": len(files),         \"code_files\": len(code),         \"code_bytes\": total_bytes,     } "
+  },
+  "epistemic": "exact",
+  "incoming": {
+    "calls": [
+      {
+        "uid": "Function:benchmarks/map_bench.py:main",
+        "name": "main",
+        "filePath": "benchmarks/map_bench.py"
+      }
+    ]
+  },
+  "outgoing": {
+    "calls": [
+      {
+        "uid": "Function:benchmarks/map_bench.py:run",
+        "name": "run",
+        "filePath": "benchmarks/map_bench.py"
+      }
+    ]
+  },
+  "processes": []
+}

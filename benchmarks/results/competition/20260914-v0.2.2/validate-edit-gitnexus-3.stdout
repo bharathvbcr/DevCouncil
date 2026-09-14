@@ -1,0 +1,16 @@
+{
+  "status": "found",
+  "symbol": {
+    "uid": "Function:benchmarks/tasks.py:devmap_competition_revision_3",
+    "name": "devmap_competition_revision_3",
+    "kind": "Function",
+    "filePath": "benchmarks/tasks.py",
+    "startLine": 275,
+    "endLine": 277,
+    "content": " def devmap_competition_revision_3(value):     \"\"\"Benchmark probe appended by semantics.py.\"\"\"     return value "
+  },
+  "epistemic": "exact",
+  "incoming": {},
+  "outgoing": {},
+  "processes": []
+}

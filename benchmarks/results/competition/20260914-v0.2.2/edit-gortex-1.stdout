@@ -1,0 +1,27 @@
+{
+  "duration_ms": 457,
+  "edge_count": 278301,
+  "file_count": 1436,
+  "full_retrack": false,
+  "node_count": 40688,
+  "result": {
+    "derived_invalidation": {
+      "files": [
+        "devcouncil-bench/benchmarks/tasks.py"
+      ],
+      "flags": 15,
+      "legacy_fallback": true,
+      "type_ids": [
+        "devcouncil-bench/annotation::python::dataclass",
+        "devcouncil-bench/benchmarks/tasks.py::Task"
+      ]
+    },
+    "duration_ms": 457,
+    "edge_count": 278301,
+    "file_count": 1436,
+    "node_count": 40688,
+    "stale_file_count": 1
+  },
+  "scope": "repository",
+  "stale_file_count": 1
+}

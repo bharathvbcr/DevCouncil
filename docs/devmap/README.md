@@ -101,52 +101,67 @@ remove language limitations or make unresolved dynamic calls deterministic.
 For a head-to-head, per-tool breakdown, see
 [DevMap vs GitNexus, CodeGraph, Graphify, Gortex, and codebase-memory-mcp](comparison.md).
 
-The [DevMap build 48cd3c7 report, 2026-09-13 UTC](../../benchmarks/results/competition/20260913-48cd3c7/REPORT.md)
-records **261 fresh competitive timing samples** against Graphify, Gortex,
-GitNexus, CodeGraph, codebase-memory-mcp, and a ripgrep text baseline. It also
-includes **82 supplemental samples** alternating the preserved `506a617` and
-`48cd3c7` binaries — both version 0.2.1, 49 commits apart. All graph tools used
-the same original 1,186-file DevCouncil snapshot. The
-[previous report](../../benchmarks/results/competition/20260913-v0.2.1/REPORT.md)
-measured build `506a617` and its measurements remain unchanged.
+The [DevMap v0.2.2 report, 2026-09-14 UTC](../../benchmarks/results/competition/20260914-v0.2.2/REPORT.md)
+is the current source. It measures **four repositories** (595 to 4,335 files)
+against Graphify, Gortex, GitNexus, CodeGraph, codebase-memory-mcp, and a
+ripgrep text baseline, and carries both halves of the earlier reports: the
+indexing/memory/store matrix *and* the correctness-and-query campaign. It adds
+two controlled A/Bs between v0.2.1 and v0.2.2 on the same corpora in one
+session. Earlier reports remain published with their own measurements —
+[build 48cd3c7](../../benchmarks/results/competition/20260913-48cd3c7/REPORT.md)
+and [the four-repository v0.2.1 run](../../benchmarks/results/competition/20260913-multirepo/REPORT.md).
 
-**Verified medians in the build-48cd3c7 competitor campaign:**
+**DevMap 0.2.2 led cold indexing and unchanged refresh on all four
+repositories, and all six symbol-query cells.** It lost the one-file edit to
+CodeGraph on all four.
 
-| Tool | Cold index | Unchanged refresh | Single-file edit | Inspected caller pairs |
+Detailed figures on the 1,098-file DevCouncil corpus (cold/refresh/edit are
+minimums of three interleaved repeats; queries are medians of five):
+
+| Tool | Cold index | Unchanged refresh | Single-file edit | Definition lookup | Inspected caller pairs |
+|---|---:|---:|---:|---:|---:|
+| DevMap 0.2.2 (1d680486) | 2.012 s | 0.089 s | 0.816 s | 9.7 ms | 5/5 |
+| CodeGraph | 3.294 s | 0.235 s | 0.512 s | 101–106 ms | 3/5 |
+| codebase-memory-mcp | 9.357 s | 5.726 s | 8.894 s | ~3.94 s | 5/5 |
+| Graphify | 14.989 s | 5.080 s | 4.883 s | 557–572 ms | 3/5 |
+| Gortex | 16.5 s to query-ready | — | — | 92–104 ms | 4/5 default; 5/5 with name-only inclusion |
+| GitNexus | 33.689 s | 0.699 s | 31.841 s | 792–808 ms | 3/5 |
+
+**DevMap speed factors** (each cell compares DevMap with the named tool, on the
+DevCouncil corpus):
+
+| Compared with | Cold index | Unchanged refresh | Single-file edit | Definition lookup |
 |---|---:|---:|---:|---:|
-| DevMap 0.2.1 (48cd3c7) | 2.031 s | 107.1 ms | 957.8 ms | 5/5 |
-| CodeGraph | 2.912 s | 241.9 ms | 417.2 ms | 3/5 |
-| codebase-memory-mcp | 8.019 s | 6.160 s | 9.347 s | 5/5 |
-| Graphify | 16.456 s | 4.327 s | 3.945 s | 3/5 |
-| Gortex | 38.835 s | 967.5 ms | 5.754 s | 4/5 default; 5/5 with name-only inclusion |
-| GitNexus | 34.102 s | 567.5 ms | 33.417 s | 3/5 |
+| CodeGraph | 1.64× faster | 2.63× faster | 1.59× slower | 10.4–10.9× faster |
+| codebase-memory-mcp | 4.65× faster | 64.27× faster | 10.90× faster | ~407× faster |
+| Graphify | 7.45× faster | 57.02× faster | 5.98× faster | 57–59× faster |
+| Gortex | — (daemon, not comparable) | — | — | 9.5–10.7× faster |
+| GitNexus | 16.74× faster | 7.84× faster | 39.01× faster | 82–83× faster |
 
-**DevMap speed factors** (each cell compares DevMap with the named tool):
+Ratios use unrounded values. “X× faster” means the competitor took X times
+DevMap’s elapsed time; “X× slower” means DevMap took X times the competitor’s.
+Native pipelines and output scopes differ; these factors do not imply equal
+analysis, and a missing caller is a correctness miss rather than fast traversal.
 
-| Compared with | Cold index | Unchanged refresh | Single-file edit |
-|---|---:|---:|---:|
-| CodeGraph | 1.43× faster | 2.26× faster | 2.30× slower |
-| codebase-memory-mcp | 3.95× faster | 57.49× faster | 9.76× faster |
-| Graphify | 8.10× faster | 40.39× faster | 4.12× faster |
-| Gortex | 19.12× faster | 9.03× faster | 6.01× faster |
-| GitNexus | 16.79× faster | 5.30× faster | 34.89× faster |
+**DevMap positives:** fastest cold index and unchanged refresh on all four
+corpora; lowest median in all six query cells; all five inspected caller pairs
+(matched only by codebase-memory-mcp); lowest sampled cold RSS on three of four
+corpora; clean on both index-staleness probes, including the revert-to-original
+case that GitNexus fails.
 
-Ratios use unrounded medians. “X× faster” means the competitor took X times
-DevMap’s elapsed time; “X× slower” means DevMap took X times the competitor’s
-elapsed time. The full report also gives ratios for all six query cells per
-competitor and the separate ripgrep text baseline. Native pipelines and
-output scopes differ; these factors do not imply equal analysis.
+**DevMap negatives:** CodeGraph has lower edit latency on **every** corpus —
+DevMap takes 1.08× its time on the smallest and 3.61× on GitPulse — and a
+smaller store (1.6–2.0× smaller; Graphify 2.8–4.7× smaller). Graphify used less
+memory than DevMap on the largest corpus (1,458 MB vs 1,725 MB). DevMap reports
+**106,217 unexplained call-attribution sites** on this corpus. Against v0.2.1,
+unchanged refresh regressed ~12% (~5 ms) on the smallest corpus.
 
-**DevMap positives:** lowest cold-index, unchanged-refresh, and measured
-query medians; lowest sampled cold process-tree RSS (610.3 MiB); all five
-inspected caller pairs; and successful update/removal controls. The preserved
-binary reports clean-build source commit `48cd3c7c5a84`.
-
-**DevMap negatives:** CodeGraph had lower edit latency (417.2 ms versus
-957.8 ms) and a smaller store. DevMap's 138.9 MiB store also exceeded
-Graphify's 42.5 MiB and CBM's 67.1 MiB. It left 96,233 unexplained attribution
-sites. Eight SQL import-extractor gaps and a PowerShell pattern fallback
-remain.
+**What v0.2.2 changed**, from the controlled A/B: cold indexing 1.14–1.40×
+faster and the store 16–19% smaller on all four corpora, the largest corpus's
+one-file edit 1.37× faster — for a graph identical to v0.2.1's, with **query
+latency and caller accuracy unchanged**. Read across reports the raw query
+numbers appear to show a 3× speedup; the controlled measurement shows none, and
+attributes the difference to campaign conditions.
 
 **Competitors:** CBM also returned all five inspected caller pairs. Graphify
 had the smallest measured store. Gortex returned four pairs by default and

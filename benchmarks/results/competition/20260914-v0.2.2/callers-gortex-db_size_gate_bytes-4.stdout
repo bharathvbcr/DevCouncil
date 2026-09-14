@@ -1,0 +1,78 @@
+{
+  "edges": [
+    {
+      "confidence_label": "EXTRACTED",
+      "file_path": "devcouncil-bench/rust/devmap-extract/src/model.rs",
+      "from": "devcouncil-bench/rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes",
+      "kind": "calls",
+      "line": 1634,
+      "origin": "ast_resolved",
+      "tier": "ast",
+      "to": "devcouncil-bench/rust/devmap-extract/src/model.rs::db_size_gate_bytes"
+    },
+    {
+      "confidence_label": "EXTRACTED",
+      "file_path": "devcouncil-bench/rust/devmap-extract/src/model.rs",
+      "from": "devcouncil-bench/rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes",
+      "kind": "calls",
+      "line": 1639,
+      "origin": "ast_resolved",
+      "tier": "ast",
+      "to": "devcouncil-bench/rust/devmap-extract/src/model.rs::db_size_gate_bytes"
+    },
+    {
+      "confidence_label": "EXTRACTED",
+      "file_path": "devcouncil-bench/rust/devmap-extract/src/model.rs",
+      "from": "devcouncil-bench/rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes",
+      "kind": "calls",
+      "line": 1644,
+      "origin": "ast_resolved",
+      "tier": "ast",
+      "to": "devcouncil-bench/rust/devmap-extract/src/model.rs::db_size_gate_bytes"
+    },
+    {
+      "confidence_label": "EXTRACTED",
+      "file_path": "devcouncil-bench/rust/devmap-extract/src/model.rs",
+      "from": "devcouncil-bench/rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes",
+      "kind": "calls",
+      "line": 1649,
+      "origin": "ast_resolved",
+      "tier": "ast",
+      "to": "devcouncil-bench/rust/devmap-extract/src/model.rs::db_size_gate_bytes"
+    }
+  ],
+  "nodes": [
+    {
+      "absolute_file_path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/sem/gortex-DevCouncil/rust/devmap-extract/src/model.rs",
+      "end_line": 227,
+      "fetched_at": "0001-01-01T00:00:00Z",
+      "file_path": "devcouncil-bench/rust/devmap-extract/src/model.rs",
+      "id": "devcouncil-bench/rust/devmap-extract/src/model.rs::db_size_gate_bytes",
+      "kind": "function",
+      "language": "rust",
+      "name": "db_size_gate_bytes",
+      "project_id": "devcouncil-bench",
+      "repo_prefix": "devcouncil-bench",
+      "start_line": 225,
+      "workspace_id": "devcouncil-bench"
+    },
+    {
+      "absolute_file_path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/sem/gortex-DevCouncil/rust/devmap-extract/src/model.rs",
+      "end_line": 1653,
+      "fetched_at": "0001-01-01T00:00:00Z",
+      "file_path": "devcouncil-bench/rust/devmap-extract/src/model.rs",
+      "id": "devcouncil-bench/rust/devmap-extract/src/model.rs::size_gate_constants_are_their_declared_magnitudes",
+      "kind": "function",
+      "language": "rust",
+      "name": "size_gate_constants_are_their_declared_magnitudes",
+      "project_id": "devcouncil-bench",
+      "repo_prefix": "devcouncil-bench",
+      "start_line": 1620,
+      "workspace_id": "devcouncil-bench"
+    }
+  ],
+  "text_matched_suppressed": 5,
+  "total_edges": 9,
+  "total_nodes": 3,
+  "truncated": false
+}

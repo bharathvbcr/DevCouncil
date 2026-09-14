@@ -1,0 +1,1 @@
+{"total":1,"count":1,"cols":["name","label","lines","in","out"],"groups":[{"qn_prefix":"devcouncil-bench.backend.go_orchestrator.repomap","file":"backend/go_orchestrator/repomap/repomap.go","rows":[["loadBounded","Function","331-357",2,12]]}],"has_more":false}

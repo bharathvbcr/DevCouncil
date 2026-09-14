@@ -1,0 +1,1 @@
+{"function":"describe_corpus","direction":"inbound","callers_total":1,"callers":{"cols":["name","hop"],"groups":[{"qn_prefix":"devcouncil-bench.benchmarks.map_bench","rows":[["main",1]]}]}}

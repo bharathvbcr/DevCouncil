@@ -1,0 +1,20 @@
+[graphify extract] scanning /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/sem/graphify-DevCouncil
+[graphify extract] --code-only: skipping 232 non-code file(s) (229 docs, 1 papers, 2 images) — no LLM extraction
+[graphify extract] found 1204 code, 0 docs, 0 papers, 0 images
+[graphify extract] 2928 file(s) not classified (no supported extension or shebang), skipped: .gitignore, 2e6bc46761a01ee2, 7878b58459359f84, 82bd359c89570b5e, CHECKSUMS, Contract.sol (+2922 more)
+[graphify extract] 1 file(s) skipped as potentially sensitive (rename or move if wrongly flagged): secrets.env.example
+[graphify extract] AST extraction on 1204 code files...
+  AST extraction: 100/1200 uncached files (8%) [18 workers]
+  AST extraction: 200/1200 uncached files (16%) [18 workers]
+  AST extraction: 300/1200 uncached files (25%) [18 workers]
+  AST extraction: 400/1200 uncached files (33%) [18 workers]
+  AST extraction: 500/1200 uncached files (41%) [18 workers]
+  AST extraction: 600/1200 uncached files (50%) [18 workers]
+  AST extraction: 700/1200 uncached files (58%) [18 workers]
+  AST extraction: 800/1200 uncached files (66%) [18 workers]
+  AST extraction: 900/1200 uncached files (75%) [18 workers]
+  AST extraction: 1000/1200 uncached files (83%) [18 workers]
+  AST extraction: 1100/1200 uncached files (91%) [18 workers]
+  AST extraction: 1200/1200 uncached files (100%) [18 workers]
+  AST extraction: 1200/1200 uncached files (100%) [18 workers]
+[graphify extract] wrote /Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/sem/graphify-DevCouncil/graphify-out/graph.json — 14204 nodes, 38495 edges (no clustering)

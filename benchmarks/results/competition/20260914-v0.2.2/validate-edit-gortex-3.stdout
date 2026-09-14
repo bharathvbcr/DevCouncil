@@ -1,0 +1,20 @@
+{
+  "query_class": "symbol",
+  "results": [
+    {
+      "absolute_file_path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/sem/gortex-DevCouncil/benchmarks/tasks.py",
+      "doc": "Benchmark probe appended by semantics.py.",
+      "file_path": "devcouncil-bench/benchmarks/tasks.py",
+      "id": "devcouncil-bench/benchmarks/tasks.py::devmap_competition_revision_3",
+      "kind": "function",
+      "name": "devmap_competition_revision_3",
+      "project_id": "devcouncil-bench",
+      "repo_prefix": "devcouncil-bench",
+      "start_line": 276,
+      "visibility": "public",
+      "workspace_id": "devcouncil-bench"
+    }
+  ],
+  "total": 1,
+  "truncated": false
+}

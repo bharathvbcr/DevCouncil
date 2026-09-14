@@ -1,0 +1,90 @@
+[
+  {
+    "node": {
+      "id": "function:38c8432fa41682c88a8344d66dc2f2bd",
+      "kind": "function",
+      "name": "devmap_competition_revision_3",
+      "qualifiedName": "devmap_competition_revision_3",
+      "filePath": "benchmarks/tasks.py",
+      "language": "python",
+      "startLine": 276,
+      "endLine": 278,
+      "startColumn": 0,
+      "endColumn": 16,
+      "signature": "(value)",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false,
+      "isAbstract": false,
+      "updatedAt": 1789389391604
+    },
+    "score": 92.56291990247317
+  },
+  {
+    "node": {
+      "id": "variable:a7c48305687cdd03a46211c8af314838",
+      "kind": "variable",
+      "name": "argv",
+      "qualifiedName": "argv",
+      "filePath": "benchmarks/results/competition/20260912-expanded/final_checks.py",
+      "language": "python",
+      "startLine": 18,
+      "endLine": 18,
+      "startColumn": 0,
+      "endColumn": 117,
+      "signature": "= [B['gitnexus'],'context','devmap_competition_revision_3','-r',str(roots['gitnexus']),'-f','benchmark...",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false,
+      "isAbstract": false,
+      "updatedAt": 1789389384195
+    },
+    "score": 4.334312271310175
+  },
+  {
+    "node": {
+      "id": "variable:49f3de0761ad6afe1b22c413fcbd98f7",
+      "kind": "variable",
+      "name": "argv",
+      "qualifiedName": "argv",
+      "filePath": "benchmarks/results/competition/20260913-48cd3c7/final_checks.py",
+      "language": "python",
+      "startLine": 18,
+      "endLine": 18,
+      "startColumn": 0,
+      "endColumn": 117,
+      "signature": "= [B['gitnexus'],'context','devmap_competition_revision_3','-r',str(roots['gitnexus']),'-f','benchmark...",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false,
+      "isAbstract": false,
+      "updatedAt": 1789389384202
+    },
+    "score": 4.334312271310175
+  },
+  {
+    "node": {
+      "id": "variable:d2b598a012b504161fbb85a233fcf370",
+      "kind": "variable",
+      "name": "argv",
+      "qualifiedName": "argv",
+      "filePath": "benchmarks/results/competition/20260913-v0.2.1/final_checks.py",
+      "language": "python",
+      "startLine": 18,
+      "endLine": 18,
+      "startColumn": 0,
+      "endColumn": 117,
+      "signature": "= [B['gitnexus'],'context','devmap_competition_revision_3','-r',str(roots['gitnexus']),'-f','benchmark...",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false,
+      "isAbstract": false,
+      "updatedAt": 1789389384206
+    },
+    "score": 4.334312271310175
+  }
+]

@@ -49,44 +49,54 @@ DevCouncil's core runtime is a set of standalone, compiled native modules. Each 
 
 ## Benchmarks: DevMap vs Graphify, Gortex, GitNexus, CodeGraph, and codebase-memory-mcp
 
-The table below records historical DevMap 0.2.1 build `48cd3c7` measurements,
-not a fresh benchmark of the current native source. Each timing is a median
-from a reproducible run with the raw
-evidence committed beside it — not a marketing estimate. Six code-graph tools
-plus a ripgrep text baseline indexed the **same frozen 1,186-file / 46.9 MB
-repository** on one Apple M5 Pro, with 261 timed samples and per-tool
-correctness checks. Head-to-head breakdown:
+Six code-graph tools plus a ripgrep text baseline, measured on **four
+repositories** (595 to 4,335 files, mixing Rust, Go, TypeScript, Python and
+Swift) on one Apple M5 Pro. Every timing is a minimum or median from a
+reproducible run with the raw evidence committed beside it — not a marketing
+estimate. Head-to-head breakdown:
 **[DevMap vs GitNexus, CodeGraph, Graphify, Gortex, and codebase-memory-mcp](docs/devmap/comparison.md)**.
 Full method, caveats, and raw output:
-**[benchmark report](benchmarks/results/competition/20260913-48cd3c7/REPORT.md)**.
+**[benchmark report](benchmarks/results/competition/20260914-v0.2.2/REPORT.md)**.
 
-| Tool | Cold index | Unchanged refresh | Single-file edit | Peak RSS | Caller pairs found |
-|---|---:|---:|---:|---:|---:|
-| **DevMap 0.2.1** | **2.031 s** | **107.1 ms** | 957.8 ms | **610 MiB** | **5/5** |
-| CodeGraph 1.6.0 | 2.912 s | 241.9 ms | **417.2 ms** | 2438 MiB | 3/5 |
-| codebase-memory-mcp 0.10.8 | 8.019 s | 6.160 s | 9.347 s | 1208 MiB | **5/5** |
-| Graphify 0.9.59 | 16.456 s | 4.327 s | 3.945 s | 3293 MiB | 3/5 |
-| GitNexus 1.6.9 | 34.102 s | 567.5 ms | 33.417 s | 3095 MiB | 3/5 |
-| Gortex 0.64.3 | 38.835 s | 967.5 ms | 5.754 s | 2206 MiB | 4/5 |
+**DevMap 0.2.2 was fastest on most of what was measured:** cold indexing and
+unchanged refresh on **all four repositories**, the lowest median in **all six
+symbol-query cells**, and **5/5** source-inspected caller pairs — matched only
+by codebase-memory-mcp.
 
-**Where DevMap won.** Lowest cold-index median (**1.4× faster than CodeGraph**,
-**16.8× faster than GitNexus**), lowest unchanged-refresh median, the lowest
-median in **all six symbol-query cells** — definition lookups ran 30–33 ms,
-**4.8–5.2× faster than CodeGraph** and **31–33× faster than GitNexus** — the
-lowest sampled peak memory of any graph tool, and all five source-inspected
-caller pairs.
+Detailed table on the 1,098-file DevCouncil corpus, where the correctness and
+query campaign also ran:
 
-**Where DevMap lost.** CodeGraph re-indexed a single edited file in 417 ms
-against DevMap's 958 ms — **2.3× faster**, the one stage where a competitor is
-consistently ahead. DevMap's 139 MiB store is also larger than Graphify's
-42 MiB, CodeGraph's 63 MiB, and codebase-memory-mcp's 67 MiB.
+| Tool | Cold index | Unchanged refresh | Single-file edit | Definition lookup | Peak RSS | Caller pairs found |
+|---|---:|---:|---:|---:|---:|---:|
+| **DevMap 0.2.2** | **2.012 s** | **0.089 s** | 0.816 s | **9.7 ms** | **678 MiB** | **5/5** |
+| CodeGraph 1.6.0 | 3.294 s | 0.235 s | **0.512 s** | 101–106 ms | 2430 MiB | 3/5 |
+| codebase-memory-mcp 0.10.8 | 9.357 s | 5.726 s | 8.894 s | ~3.94 s | — | **5/5** |
+| Graphify 0.9.59 | 14.989 s | 5.080 s | 4.883 s | 557–572 ms | 3417 MiB | 3/5 |
+| GitNexus 1.6.9 | 33.689 s | 0.699 s | 31.841 s | 792–808 ms | 3355 MiB | 3/5 |
+| Gortex 0.64.3 | 16.5 s to query-ready | — | — | 92–104 ms | — | 4/5 |
 
-**What these numbers are not.** One corpus, one machine, three-to-five
+**Where DevMap won.** Fastest cold index on all four corpora (**1.6–21×** the
+competitors' time) and fastest unchanged refresh on all four (**2.2–107×**).
+Lowest median in all six query cells — definition lookups at 9.7 ms, **~10×
+faster than CodeGraph** and **~82× faster than GitNexus**. Lowest sampled peak
+memory on three of four corpora. All five source-inspected caller pairs, and a
+clean result on both index-staleness probes.
+
+**Where DevMap lost.** CodeGraph re-indexes a single edited file faster **on
+every corpus** — DevMap takes 1.08× its time on the smallest and **3.61×** on
+GitPulse. That is the one stage where a competitor is consistently ahead.
+DevMap's store is 1.6–2.0× CodeGraph's and 2.8–4.7× Graphify's, and Graphify
+used **less memory than DevMap on the largest repository** (1,458 MB vs
+1,725 MB). Against v0.2.1, unchanged refresh regressed ~12% on the smallest
+corpus.
+
+**What these numbers are not.** Four repositories, one machine, three-to-five
 repetitions, three symbols, and five inspected caller pairs. They do not
 establish general graph accuracy, persistent-MCP latency, or coding-agent task
 success. Tool output scopes differ, so equal latency is not equal analysis.
+DevMap itself reports 106,217 unexplained call-attribution sites on this corpus.
 The report states every limit explicitly and keeps the failures in — including
-GitNexus retaining a deleted symbol through ordinary refreshes until a forced
+GitNexus serving a deleted symbol through two ordinary refreshes until a forced
 rebuild.
 
 ---
