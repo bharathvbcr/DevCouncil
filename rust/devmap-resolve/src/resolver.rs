@@ -1070,6 +1070,34 @@ impl Resolver {
                     module: root.to_string(),
                 };
             }
+            // The receiver is a **prelude type**, not a module and not a value:
+            // `Vec::new()`, `String::from(s)`, `Default::default()`,
+            // `Option::Some`. These reached `UninferredReceiver`, the tier that
+            // means "the receiver is a value whose type we could not infer",
+            // and `Vec` is not a value at all — the language's own standard
+            // library declares it, so no indexed file can ever own the method.
+            // Measured on this repository: 1,532 rows, led by `Vec` (777),
+            // `String` (514) and `Default` (169).
+            //
+            // The same sentence the Swift rung two blocks above already makes
+            // for `s.count` where `s` is a `String`, in the language whose
+            // spelling for it is a path rather than a value. It carries the
+            // same veto, and the veto is the point: a repository that declares
+            // its own `Vec` keeps `Vec::new` in the attribution gaps, because
+            // there the corpus — not the prelude — is the authority.
+            //
+            // Placed after the module-root rungs on purpose. A `use
+            // other::Vec` made this file's `Vec` something else, and that
+            // import is file-specific evidence that outranks a name table —
+            // the rule the bare-name ladder states where it checks imports
+            // before `is_builtin`.
+            if !root_is_a_value_here
+                && receiver == root
+                && crate::builtins::is_prelude_type(family, root)
+                && !self.family_declares(family, root)
+            {
+                return UnresolvedClass::Builtin;
+            }
         }
 
         // X48. The receiver is rooted at a **host global object**.

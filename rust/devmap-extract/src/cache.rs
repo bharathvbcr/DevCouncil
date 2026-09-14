@@ -371,7 +371,18 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// v51 invalidates classifications that omitted exact receiver-binding facts
 /// for captured values. An unchanged v50 generation may still explain a local
 /// parameter named `Math` as a runtime global, even after the resolver is fixed.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "51";
+///
+/// v52 drops the second `Name` reference a call's own callee already accounts
+/// for — see `treesitter::drop_duplicate_callee_names`. Eleven of the twenty
+/// languages with a call extractor were measured emitting one, and a v51 row
+/// still carries it, so a warm cache would keep reporting a Rust method call as two
+/// attribution sites and filing the second as a failure even where the first
+/// resolved. It also invalidates the classification of a **prelude-type
+/// receiver**: `Vec::new()` is a language type, not a value whose type went
+/// uninferred, and an unchanged v51 generation keeps the older tier even
+/// though no extraction byte moved — the same reason v50 gates the
+/// unchanged-source shortcut ahead of resolution.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "52";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

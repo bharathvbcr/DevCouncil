@@ -750,8 +750,13 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // and a bare self value no longer supplies Rust module-path evidence.
     // v51 rebuilds the classification of captured receivers using their exact
     // binding facts; unchanged v50 generations otherwise keep stale globals.
+    // v52 drops the second `Name` reference a call's own callee already
+    // accounts for. Eleven of the twenty languages with a call extractor were
+    // measured emitting one, so a warm v51 row still counts a Rust method call
+    // as two attribution sites — and files the second as a failure even where
+    // the first resolved.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "51",
+        EXTRACTION_SCHEMA_VERSION, "52",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

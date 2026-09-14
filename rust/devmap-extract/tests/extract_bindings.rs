@@ -12,8 +12,8 @@ use devmap_extract::model::{LocalBinding, ReferenceKind};
 fn extraction_schema_version_tracks_binding_and_ruleguard() {
     assert_eq!(
         devmap_extract::cache::EXTRACTION_SCHEMA_VERSION,
-        "51",
-        "v51 rebuilds captured-receiver classifications while retaining v48 bindings, v49 ruleguard wiring, and v50 attribution fixes"
+        "52",
+        "v52 drops the duplicate callee Name reference while retaining v48 bindings, v49 ruleguard wiring, v50 attribution fixes and v51 captured-receiver classifications"
     );
 }
 
