@@ -816,10 +816,28 @@ fn assert_unchanged_attribution_upgrade(
             [format!("0.2.0:extract-v{old_version}")],
         )
         .unwrap();
-        let changed = conn.execute(
-            "UPDATE unresolved_rows SET classification = ?1 WHERE callee_name = ?2 AND source_file = ?3 AND valid_to IS NULL",
-            [old_class, callee, relative_path],
-        ).unwrap();
+        // Schema v22 interns both halves of the ledger row: the row carries a
+        // `classification_id` into `unresolved_texts` and a `source_file_id`
+        // into `paths`, not the two texts. Planting an old classification
+        // therefore means interning its text first and pointing the row at it,
+        // and matching the file through its path id. The fixture is unchanged
+        // in intent -- it still writes one wrong live classification and still
+        // requires the rebuild to recompute it.
+        conn.execute(
+            "INSERT OR IGNORE INTO unresolved_texts (text) VALUES (?1)",
+            [old_class],
+        )
+        .unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE unresolved_rows \
+             SET classification_id = (SELECT id FROM unresolved_texts WHERE text = ?1) \
+             WHERE callee_name = ?2 \
+               AND source_file_id = (SELECT id FROM paths WHERE path = ?3) \
+               AND valid_to IS NULL",
+                [old_class, callee, relative_path],
+            )
+            .unwrap();
         assert!(
             changed > 0,
             "fixture must preserve an old incorrectly explained call"

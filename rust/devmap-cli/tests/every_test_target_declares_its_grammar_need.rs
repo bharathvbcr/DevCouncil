@@ -100,6 +100,12 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             // test's own failure message.
             "head_stamp",
             "kernel_defects",
+            // The unresolved-call ledger's write path. Compiles feature-off for
+            // the reason the neighbours here do: `devmap-store` depends on
+            // `devmap-extract`/`devmap-analyze` without turning their defaults
+            // off, so `extract_file` and `analyze` are present whether or not
+            // `devmap-store/parse` is.
+            "ledger_write",
             "managed_write_security",
             "migration_ladder",
             "one_symlink_rule",

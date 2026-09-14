@@ -110,10 +110,18 @@ fn seed_current_store(db_path: &Path) {
              edge_kind, confidence, resolution, candidate_total, valid_from, valid_to)
         VALUES (3, 1, 'b.py::main', 'a.py::helper', 'Calls', 0.9, 'Exact', NULL, 1, NULL);
 
+        -- The ledger's three interned columns, seeded as v22 stores them. The
+        -- reason and the classification go into the pool the same statement
+        -- reads them back out of, so the reduction down to v21 has real text to
+        -- materialise rather than a dangling id.
+        INSERT INTO unresolved_texts (text) VALUES ('no candidate'), ('unresolved');
         INSERT INTO unresolved_rows
-            (source_file, source_symbol, callee_name, reason, classification, receiver,
+            (source_file_id, source_symbol, callee_name, reason_id, classification_id, receiver,
              valid_from, valid_to)
-        VALUES ('b.py', 'b.py::main', 'mystery', 'no candidate', 'unresolved', 'obj', 1, NULL);
+        VALUES (3, 'b.py::main', 'mystery',
+                (SELECT id FROM unresolved_texts WHERE text = 'no candidate'),
+                (SELECT id FROM unresolved_texts WHERE text = 'unresolved'),
+                'obj', 1, NULL);
 
         INSERT INTO generation_dead_symbols
             (generation_id, ordinal, file_path, symbol_name, confidence,
@@ -149,6 +157,67 @@ fn seed_current_store(db_path: &Path) {
 /// traceable to a line of `schema.rs`.
 fn reduce_one_rung(conn: &Connection, from_version: i32) {
     let sql: &str = match from_version {
+        // MIGRATION_V21_TO_V22: the ledger's interned columns. Materialise the
+        // three ids back into the text they stand for, drop the pool, and put
+        // the v18 view back over the flat table.
+        //
+        // `paths` is *not* reduced with them: it long predates v22 and the rows
+        // the ledger referenced were already there for the nodes and edges. The
+        // pool is v22's own and goes.
+        22 => {
+            "CREATE TABLE unresolved_rows_v21 (
+                 unresolved_id  INTEGER PRIMARY KEY,
+                 source_file    TEXT NOT NULL,
+                 source_symbol  TEXT NOT NULL,
+                 callee_name    TEXT NOT NULL,
+                 reason         TEXT NOT NULL,
+                 classification TEXT NOT NULL DEFAULT 'unresolved',
+                 receiver       TEXT,
+                 valid_from     INTEGER NOT NULL,
+                 valid_to       INTEGER,
+                 CHECK (valid_to IS NULL OR valid_to > valid_from)
+             );
+             INSERT INTO unresolved_rows_v21
+                 (unresolved_id, source_file, source_symbol, callee_name,
+                  reason, classification, receiver, valid_from, valid_to)
+             SELECT u.unresolved_id, p.path, u.source_symbol, u.callee_name,
+                    r.text, c.text, u.receiver, u.valid_from, u.valid_to
+               FROM unresolved_rows u
+               JOIN paths p            ON p.id = u.source_file_id
+               JOIN unresolved_texts r ON r.id = u.reason_id
+               JOIN unresolved_texts c ON c.id = u.classification_id;
+             DROP VIEW IF EXISTS generation_unresolved;
+             DROP TABLE unresolved_rows;
+             DROP TABLE unresolved_texts;
+             ALTER TABLE unresolved_rows_v21 RENAME TO unresolved_rows;
+             CREATE INDEX idx_unresolved_rows_closed
+                 ON unresolved_rows(valid_to) WHERE valid_to IS NOT NULL;
+             CREATE VIEW generation_unresolved AS
+             SELECT g.id             AS generation_id,
+                    u.unresolved_id  AS ordinal,
+                    u.source_file    AS source_file,
+                    u.source_symbol  AS source_symbol,
+                    u.callee_name    AS callee_name,
+                    u.reason         AS reason,
+                    u.classification AS classification,
+                    u.receiver       AS receiver
+               FROM unresolved_rows u
+               JOIN generations g
+                 ON g.id >= u.valid_from
+                AND (u.valid_to IS NULL OR g.id < u.valid_to);"
+        }
+        // MIGRATION_V20_TO_V21: the two unread ledger indexes. The reduction
+        // puts them back, so a "v20 store" reduced from current really does
+        // carry what a v20 binary would have left behind — which is the whole
+        // point of reducing rather than hand-building a legacy store, and the
+        // only way `a_migrated_store_carries_the_same_schema_as_a_fresh_one`
+        // can prove the rung actually drops them.
+        21 => {
+            "CREATE INDEX idx_unresolved_rows_callee
+                 ON unresolved_rows(callee_name);
+             CREATE INDEX idx_unresolved_rows_class
+                 ON unresolved_rows(classification);"
+        }
         20 => "DROP TABLE pending_state; ALTER TABLE pending_paths DROP COLUMN revision;",
         // MIGRATION_V18_TO_V19: the per-file row digests. Purely additive, so
         // the reduction is the table and nothing else — there is no backfill to
@@ -1104,4 +1173,317 @@ fn concurrent_v19_openers_keep_pending_work_and_one_durable_identity() {
     assert_eq!(reopened.clear_claimed_pending_paths(&claim).unwrap(), 0);
     drop(reopened);
     fs::remove_dir_all(dir).unwrap();
+}
+
+/// One ledger row as the fixture below seeds it: file id, symbol, callee,
+/// reason, classification, receiver, and the validity range.
+type SeededRow = (
+    i64,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    i64,
+    Option<i64>,
+);
+
+/// One ledger row as the view projects it, for comparison across a migration.
+type LedgerRow = (
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+);
+
+/// Every row `generation_unresolved` returns, in a fixed order.
+///
+/// Ordered by `(generation_id, ordinal)` and compared as a sequence rather than
+/// as a set, deliberately. The fixture below contains two rows that are each
+/// other's transposition, so a migration that swapped a pair of columns would
+/// leave the *set* of rows untouched and only a per-row comparison can see it.
+fn ledger_view(conn: &Connection) -> Vec<LedgerRow> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT generation_id, ordinal, source_file, source_symbol,
+                    callee_name, reason, classification, receiver
+               FROM generation_unresolved
+              ORDER BY generation_id, ordinal",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+        ))
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+/// **R16.** A migration must preserve what the view *returns*, not only how
+/// many rows it returns.
+///
+/// v22's backfill joins `unresolved_texts` twice — once for `reason`, once for
+/// `classification` — and both columns are `TEXT NOT NULL`:
+///
+/// ```sql
+/// JOIN unresolved_texts r ON r.text = u.reason
+/// JOIN unresolved_texts c ON c.text = u.classification
+/// ```
+///
+/// Transpose those two and every row survives and every count matches, so
+/// `migrating_from_any_rung_keeps_every_row` cannot see it. `source_symbol` and
+/// `callee_name` are the same hazard one column over.
+///
+/// # What this adds, measured rather than assumed
+///
+/// Transposing `r.id`/`c.id` in the backfill and running this file was tried.
+/// Three results, and the middle one corrects the obvious motivation for this
+/// test:
+///
+/// * `migrating_from_any_rung_keeps_every_row` — **passed**. Counting is blind,
+///   as expected.
+/// * `a_v17_store_with_two_generations_carries_both_onto_ranges` — **failed**.
+///   It compares `unresolved_by_generation` across the whole chain, so a plain
+///   transposition was *already* caught. This test is not closing an open hole;
+///   it is narrowing an incidental catch into a direct one.
+/// * this test — **failed**, at the view comparison.
+///
+/// So the value here is the fixture, not the comparison. The v17 test inherits
+/// `seed_current_store`'s single ledger row: one file, no closed rows, ASCII
+/// text, and a `reason` and `classification` that no other row uses. This one
+/// is built to be hostile on the axes that row cannot reach — rows 1 and 2
+/// carry each other's `reason`/`classification` *and* each other's
+/// `source_symbol`/`callee_name`, so both texts are in the pool either way and
+/// a transposed join still finds a match, which isolates "transposed" from
+/// "failed to look up"; row 3 carries bytes hostile to string handling; row 4
+/// shares row 1's reason so two rows must resolve to one pool entry; and row 5
+/// closes at generation 2, so the view's range scoping is exercised rather
+/// than assumed. Rows are compared as an ordered sequence keyed by ordinal,
+/// which is what lets the transposition twins be a fixture rather than a
+/// blind spot.
+#[test]
+fn migrating_the_ledger_preserves_every_column_and_not_only_the_count() {
+    let dir = tmp_dir("v22-content-parity");
+    let db_path = dir.join("index.sqlite");
+    drop(Store::open(&db_path).expect("a fresh store must open"));
+
+    let hostile =
+        "quote\" backslash\\ newline\n tab\t unicode \u{00e9}\u{4e2d} emoji \u{1f600} \u{1}\u{7f}";
+
+    // (file_id, source_symbol, callee_name, reason, classification, receiver, valid_from, valid_to)
+    let seeded: Vec<SeededRow> = vec![
+        (
+            1,
+            "sym-one",
+            "callee-one",
+            "reason-A",
+            "class-B",
+            Some("recv"),
+            1,
+            None,
+        ),
+        // The transposition twin of row 1.
+        (
+            2,
+            "callee-one",
+            "sym-one",
+            "class-B",
+            "reason-A",
+            None,
+            1,
+            None,
+        ),
+        (
+            1,
+            hostile,
+            "callee-hostile",
+            hostile,
+            "class-B",
+            Some(hostile),
+            1,
+            None,
+        ),
+        // Shares row 1's reason, so the pool must hold one entry for two rows.
+        (
+            2,
+            "sym-four",
+            "callee-four",
+            "reason-A",
+            "class-four",
+            None,
+            1,
+            None,
+        ),
+        // Closed at generation 2: visible from generation 1 only.
+        (
+            1,
+            "sym-five",
+            "callee-five",
+            "reason-five",
+            "class-five",
+            Some(""),
+            1,
+            Some(2),
+        ),
+    ];
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            INSERT INTO paths (id, path) VALUES (1, 'alpha.py'), (2, 'beta.py');
+            INSERT INTO generations (id, created_at, head_sha, repo_root, analysis_json)
+            VALUES (1, 1.0, 'deadbeef', '/tmp/probe',
+                    '{"total_files":2,"total_symbols":0,"total_edges":0,
+                      "dead_symbols":[],"communities":[],"status":"Ok"}'),
+                   (2, 2.0, 'cafebabe', '/tmp/probe',
+                    '{"total_files":2,"total_symbols":0,"total_edges":0,
+                      "dead_symbols":[],"communities":[],"status":"Ok"}');
+            "#,
+        )
+        .unwrap();
+
+        let intern = |text: &str| -> i64 {
+            conn.execute(
+                "INSERT OR IGNORE INTO unresolved_texts (text) VALUES (?1)",
+                [text],
+            )
+            .unwrap();
+            conn.query_row(
+                "SELECT id FROM unresolved_texts WHERE text = ?1",
+                [text],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        for (ordinal, (file, symbol, callee, reason, class, receiver, from, to)) in
+            seeded.iter().enumerate()
+        {
+            conn.execute(
+                "INSERT INTO unresolved_rows
+                     (unresolved_id, source_file_id, source_symbol, callee_name,
+                      reason_id, classification_id, receiver, valid_from, valid_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    ordinal as i64 + 1,
+                    file,
+                    symbol,
+                    callee,
+                    intern(reason),
+                    intern(class),
+                    receiver,
+                    from,
+                    to
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    let (before, pool_before) = {
+        let conn = Connection::open(&db_path).unwrap();
+        let pool: i64 = conn
+            .query_row("SELECT COUNT(*) FROM unresolved_texts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        (ledger_view(&conn), pool)
+    };
+
+    // The fixture has to actually reach the view, or every assertion below is
+    // satisfied by two empty vectors. Rows 1-4 are live and so appear under
+    // both generations; row 5 closes at 2 and appears under generation 1 only.
+    assert_eq!(
+        before.len(),
+        9,
+        "the fixture must reach the view before anything is migrated: {before:#?}"
+    );
+    let distinct_texts: BTreeSet<&str> = seeded
+        .iter()
+        .flat_map(|(_, _, _, reason, class, _, _, _)| [*reason, *class])
+        .collect();
+    assert_eq!(
+        pool_before,
+        distinct_texts.len() as i64,
+        "the fixture's own pool must already be deduped"
+    );
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        reduce_one_rung(&conn, CURRENT_SCHEMA_VERSION);
+        let stamped: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stamped, CURRENT_SCHEMA_VERSION - 1);
+        // The reduction must really have produced the flat pre-v22 shape,
+        // otherwise the reopen below migrates nothing and this test compares a
+        // store with itself.
+        let flat: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('unresolved_rows') WHERE name = 'reason'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(flat, 1, "the reduction must leave a flat `reason` column");
+    }
+
+    // Opening walks the v21 rung, which is the statement under test.
+    drop(Store::open(&db_path).expect("a reduced store must migrate and open"));
+
+    let conn = Connection::open(&db_path).unwrap();
+    let interned: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('unresolved_rows') WHERE name = 'reason_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(interned, 1, "the reopen must have run the v22 rung");
+
+    assert_eq!(
+        ledger_view(&conn),
+        before,
+        "the v22 backfill changed what the ledger says"
+    );
+
+    // Defensive, and not load-bearing today -- said plainly because the
+    // comment that first stood here claimed otherwise.
+    //
+    // `unresolved_texts.text` is `NOT NULL UNIQUE`, so the pool cannot hold a
+    // duplicate however the backfill is written, and this assertion is
+    // satisfied for free. Dropping the `UNIQUE` together with the backfill's
+    // `DISTINCT`/`OR IGNORE` was tried: this test does fail, but at the
+    // fixture's own pool guard above rather than here, because the fixture
+    // interns through the same constraint.
+    //
+    // It stays because it is the only statement in the suite that says the
+    // pool is one row per distinct text, and the day the `UNIQUE` is relaxed
+    // for some other reason it becomes the thing that notices.
+    let pool_after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM unresolved_texts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        pool_after, pool_before,
+        "the migrated pool must hold one row per distinct text"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
 }

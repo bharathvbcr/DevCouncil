@@ -106,8 +106,24 @@ const EDGE_COLUMNS: &str = "sp.path, tp.path, e.source_symbol, e.target_symbol, 
      printf('%.17g', e.confidence), COALESCE(e.resolution, '<none>'),
      COALESCE(CAST(e.candidate_total AS TEXT), '<none>')";
 
+/// As `generation_unresolved` exposes them. The view's column names are the
+/// contract readers hold and v22 did not change them.
 const UNRESOLVED_COLUMNS: &str = "source_file, source_symbol, callee_name, reason, classification,
      COALESCE(receiver, '<none>')";
+
+/// The same six values as `unresolved_rows` actually stores them.
+///
+/// Three are ids since v22, so this probe resolves them the way the view does.
+/// It reads the base table rather than the view on purpose: the view is scoped
+/// to a generation, and what these tests compare is every stored row including
+/// the closed ones no generation can see.
+const UNRESOLVED_ROW_COLUMNS: &str = "up.path, u.source_symbol, u.callee_name, ur.text, uc.text,
+     COALESCE(u.receiver, '<none>')";
+
+const UNRESOLVED_ROW_SOURCE: &str = "FROM unresolved_rows u
+       JOIN paths up            ON up.id = u.source_file_id
+       JOIN unresolved_texts ur ON ur.id = u.reason_id
+       JOIN unresolved_texts uc ON uc.id = u.classification_id";
 
 fn render(row: &rusqlite::Row, columns: usize) -> rusqlite::Result<String> {
     let mut parts: Vec<String> = Vec::with_capacity(columns);
@@ -150,9 +166,9 @@ fn ranged_rows(db: &Path) -> Vec<String> {
     );
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT {UNRESOLVED_COLUMNS}, valid_from,
-                    COALESCE(CAST(valid_to AS TEXT), '<open>')
-               FROM unresolved_rows"
+            "SELECT {UNRESOLVED_ROW_COLUMNS}, u.valid_from,
+                    COALESCE(CAST(u.valid_to AS TEXT), '<open>')
+               {UNRESOLVED_ROW_SOURCE}"
         ))
         .unwrap();
     out.extend(
@@ -658,7 +674,7 @@ fn every_identity_column_moves_the_digest() {
             }),
         ),
         (
-            "unresolved_rows.reason",
+            "unresolved_rows.reason_id",
             unchanged(),
             Box::new(|_: &mut ResolvedEdge, row: &mut UnresolvedReference| {
                 row.resolution = Resolution::Unresolved {
@@ -667,7 +683,7 @@ fn every_identity_column_moves_the_digest() {
             }),
         ),
         (
-            "unresolved_rows.classification",
+            "unresolved_rows.classification_id",
             unchanged(),
             Box::new(|_: &mut ResolvedEdge, row: &mut UnresolvedReference| {
                 row.class = UnresolvedClass::Builtin;
@@ -1007,8 +1023,9 @@ fn rows_deleted_behind_the_write_path_are_written_again() {
         let ledger = conn
             .execute(
                 "DELETE FROM unresolved_rows WHERE unresolved_id IN (
-                   SELECT unresolved_id FROM unresolved_rows
-                    WHERE valid_to IS NULL AND source_file <> 'mod_1.py' LIMIT 2)",
+                   SELECT u.unresolved_id FROM unresolved_rows u
+                     JOIN paths p ON p.id = u.source_file_id
+                    WHERE u.valid_to IS NULL AND p.path <> 'mod_1.py' LIMIT 2)",
                 [],
             )
             .unwrap();

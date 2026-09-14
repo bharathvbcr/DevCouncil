@@ -195,7 +195,9 @@ echo "probe: ${AT_MILLI} milli-bytes/candidate at-cap (cap ${CANDIDATE_CAP_MILLI
 
 # Ledger must record every above-cap call site (resolution AmbiguousGlobal).
 LEDGER=$(sqlite3 -readonly "$TMP/abovcap.amb.sqlite" \
-  "SELECT COUNT(*) FROM unresolved_rows WHERE reason LIKE 'AmbiguousGlobal%' AND valid_to IS NULL;") || {
+  "SELECT COUNT(*) FROM unresolved_rows u
+     JOIN unresolved_texts r ON r.id = u.reason_id
+    WHERE r.text LIKE 'AmbiguousGlobal%' AND u.valid_to IS NULL;") || {
   echo "PROBE FAIL: could not count AmbiguousGlobal ledger rows"; exit 1; }
 [ "$LEDGER" -eq "$SITES" ] || {
   echo "PROBE FAIL: above-cap ledger has $LEDGER AmbiguousGlobal rows, corpus has $SITES call sites"; FAIL=1; }
