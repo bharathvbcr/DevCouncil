@@ -432,6 +432,12 @@ fn nominal_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
             get_child_text(node, "name", source).filter(|name| !name.is_empty())
         }
         // Go's `pkg.Lease`.
+        //
+        // Dropping the emptiness check is an equivalent mutation: a name that
+        // fails it falls to `bare_leaf`, which reduces the whole `pkg.Lease`
+        // text past its dot to the same answer the `name` child would have
+        // given. It is kept so an absent or empty `name` reaches the fallback
+        // by intent rather than by that coincidence continuing to hold.
         "qualified_type" => get_child_text(node, "name", source)
             .filter(|name| !name.is_empty())
             .or_else(|| bare_leaf(node, source)),
@@ -443,6 +449,11 @@ fn nominal_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
         // Measured: admitting them added 696 rows on this repository alone, all
         // of them `bool`, `u32` and `u64`, and the Rust arm this module
         // replaces had always refused them by simply not matching the kind.
+        //
+        // Redundant with `_ => None` *today*, and kept for the reason the
+        // collection arm above is: deleting it is an equivalent mutation, so
+        // nothing fails when a later edit moves these kinds into the leaf arm
+        // instead — and that edit is the one that costs 696 wrong rows.
         "primitive_type" | "predefined_type" | "sized_type_specifier" => None,
         "type_identifier" | "identifier" | "simple_identifier" | "name" | "field_identifier" => {
             bare_leaf(node, source)

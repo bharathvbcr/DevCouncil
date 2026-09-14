@@ -13,6 +13,13 @@
 //! dumped parse tree rather than from memory: six grammars spell a field
 //! `field_declaration` and mean six different interiors, and three spell a
 //! property `property_declaration` and likewise.
+//!
+//! Every viable mutant of `langfields` dies here. `cargo mutants -f
+//! devmap-extract/src/langfields.rs --test-package devmap-extract` reports 99
+//! mutants, 1 unviable, 94 caught, and exactly 4 survivors — each one an
+//! equivalent mutation argued at its own site in the module, not a gap. A
+//! fifth survivor is a missing case in this file, and the four are named there
+//! so a reader can tell the difference without re-deriving it.
 
 use devmap_extract::langfields::{extracts_field_types, FIELD_TYPE_LANGUAGES};
 use devmap_extract::languages::LANGUAGE_SPECS;
