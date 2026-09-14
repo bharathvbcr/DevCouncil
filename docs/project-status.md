@@ -19,7 +19,7 @@ availability; it does not certify every platform, editor session or release.
 | Sandbox selector | Accepted by Go verification | Records selection; Docker/Nix isolation is not implemented |
 
 Native source versions are declared independently: currently 0.2.2 in the
-Rust workspace and Go host, with the npm launcher at 0.2.1. These are source
+Rust workspace, the Go host and the npm launcher. These are source
 values, not proof of publication. Inspect `devmap --version`,
 `devcouncil --version` and `devmap paths --json` for installed identity.
 Old Python 0.4.x release notes belong to a different runtime lineage.
