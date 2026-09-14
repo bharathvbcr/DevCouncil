@@ -194,6 +194,26 @@ fn absolute_lcov_paths_reduce_against_the_supplied_root() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[test]
+fn an_sf_line_naming_the_root_itself_does_not_reduce_to_an_empty_path() {
+    // Reducing a path that *is* the root leaves nothing behind. An empty path
+    // would collect that record's lines under "" and read as coverage for some
+    // other file; verbatim reports it unmeasured, which is the safe answer and
+    // the same one every other unreducible path gets.
+    let repo = std::env::temp_dir().join(format!("dcv-selfroot-{}", std::process::id()));
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let profile = format!("SF:{}\nDA:1,1\nend_of_record\n", repo.display());
+    let parsed = dc_verify::coverage::parse_with_root(&profile, Some(&repo)).expect("must parse");
+    assert_eq!(parsed.len(), 1);
+    assert_ne!(
+        parsed[0].path, "",
+        "an SF: line naming the root must not reduce to an empty path"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
 /// MAX_COVERED_SPAN bounds one block; nothing bounded their sum, and the sum is
 /// what the allocation follows. Overlapping blocks of a million lines each cost
 /// a million entries *apiece*: 601 bytes of profile took 19.7 s and 85 MB, and
