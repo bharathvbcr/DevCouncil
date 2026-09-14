@@ -1,47 +1,98 @@
-# Coding CLI Integration
+# Coding CLI integration
 
-DevCouncil's components integrate with leading coding agents and IDEs: task scoping, mutual-exclusion leases, and deterministic verification. A host can take this integration alone, wrap the same modules through Manvi, or select individual binaries (`devmap`, `dcverify`, `dcstore`) without the rest of the suite.
+Choose code navigation (`devmap`) and optionally task tooling (`devcouncil`).
+These are separate MCP servers. Integration writes configuration and project
+assets; successful file validation does not prove that a running editor has
+reloaded or trusted them. [Documentation index](README.md)
 
----
+## Standalone DevMap
 
-## Supported Hosts
+Both native installers accept `cursor`, `claude`, `codex`, `antigravity`,
+`opencode` and `warp`. The source authority is the Rust `Host` enum and Go
+`integrate.Hosts`; unknown names and the legacy `gemini` / `aider` targets are
+refused by these adapters. This is the repository's adapter set, not a claim
+about every host's current capabilities.
 
-`devcouncil integrate` and `devmap integrate` are **not** the Python installer. Go `Hosts` lists six names and all six have adapters. `--write-gate` has been removed: it named a pre-tool-use gate that only the retired lifecycle hooks installed, and nothing enforced it. `devmap integrate` accepts only `cursor|claude|codex`.
-
-| Host | What `--apply` actually writes | Hooks | Setup command |
-|---|---|---|---|
-| **Cursor** | `.cursor/mcp.json` (devcouncil + devmap stdio) and `.cursor/rules/devcouncil.mdc`. Then `devmap integrate cursor` writes DevMap guides/skills. | No `.cursor/hooks.json`. | `devcouncil integrate cursor --apply` |
-| **Claude Code** | `.mcp.json` (devcouncil + devmap). No slash commands, plugin, subagents, or statusline. | None. | `devcouncil integrate claude --apply` |
-| **Codex CLI** | `.codex/config.toml` containing only `# Managed by devcouncil integrate codex`. | None. | `devcouncil integrate codex --apply` |
-| **Antigravity** | `.agents/mcp_config.json` — the `devcouncil` server, merged into any `mcpServers` already there. Skills land in `.agents/skills`, shared with Codex. | None documented. | `devcouncil integrate antigravity --apply` |
-| **OpenCode** | `opencode.json` — the `devcouncil` server under `mcp`, plus every unrelated key preserved. | `<state>/integrations/opencode_devmap_plugin.mjs`, listed in `plugin`. Registers `tool.execute.after` only. | `devcouncil integrate opencode --apply` |
-| **Warp / Oz** | `.devcouncil/integrations/warp-mcp.json` — a bare server map, passed to `oz agent run --mcp <path>`. | None documented. | `devcouncil integrate warp --apply` |
-| **Gemini, Aider** | Refused, exit 1. Gemini CLI was replaced upstream by Antigravity; Aider exposes no MCP server and is a launch-command executor. Existing `.gemini/settings.json` hooks are still removable. | None. | `integrate antigravity` / run Aider directly (it uses the `devmap` CLI, not MCP) |
-
-Python's golden `integrate claude --apply` receipt (43 files, slash commands, `claude-plugin`) is leftover testdata, not current behaviour.
-
----
-
-## Quick Configuration
-
-To configure an agent host, run `devcouncil integrate` from your project root:
+From the target repository:
 
 ```bash
-# 1. Configure Cursor
-devcouncil integrate cursor --apply
-
-# 2. Configure Claude Code (writes .mcp.json)
-devcouncil integrate claude --apply
-
-# 3. Codex is a comment-only toml today — see TASK-P7-8
-devcouncil integrate cursor --check
-devcouncil integrate claude --check
-
-# 5. Dry-run to inspect proposed changes without writing
-devcouncil integrate codex --dry-run
+devmap integrate cursor --dry-run
+devmap integrate cursor
+devmap integrate cursor --check
 ```
 
-To inspect and selectively remove legacy hooks:
+There is no `--apply` on `devmap integrate`: an invocation without `--dry-run`
+or `--check` applies changes. Read the JSON receipt with `--json` when scripting.
+
+| Host | DevMap configuration surfaces |
+|---|---|
+| Cursor | Global MCP registration, owned project entries, managed guides/rule, `.cursor/skills` and `.cursor/hooks.json` |
+| Claude | Global MCP registration, owned project entries, managed guides and `.claude/skills`; separate `devmap claude plugin` generates a plugin bundle |
+| Codex | User `~/.codex/config.toml` MCP registration, `.agents/skills`, project plugin/hook assets; host trust may need renewal |
+| Antigravity | `.agents/mcp_config.json` and `.agents/skills` |
+| OpenCode | `opencode.json`, its project skills layout and a DevMap post-tool plugin |
+| Warp | `.devcouncil/integrations/warp-mcp.json`; no project skill destination is installed by this adapter |
+
+All adapters also use the managed guide-writing path. Inspect the receipt for
+exact files and changes: global settings may be touched. Existing unrelated
+server entries are preserved. Do not assume a project-only dry run previews
+only project-local effects.
+
+Every DevMap MCP call should include absolute `repo_path`; verify
+`repository.root` in the answer. One global registration can serve multiple
+repositories. Hard-coded database paths and duplicate server registrations can
+otherwise route a query to the wrong index. `devmap paths --json` reports
+binary/configuration diagnostics.
+
+## Optional Go-host task tools
+
+Install the full native suite first, then preview/apply the Go host:
+
+```bash
+devcouncil integrate cursor --dry-run
+devcouncil integrate cursor --apply
+devcouncil integrate cursor --check
+```
+
+The Go adapter merges the `devcouncil` server and invokes DevMap integration
+when a usable binary is found. Inspect `spawned` and `notes`; a Go receipt alone
+is not proof that every DevMap asset is installed.
+
+| Host | Go-owned configuration |
+|---|---|
+| Cursor | `.cursor/mcp.json` and `.cursor/rules/devcouncil.mdc` |
+| Claude | `.mcp.json` with host and DevMap entries |
+| Codex | A comment-only project `.codex/config.toml` adapter; this does not register the Go host's task server |
+| Antigravity | `.agents/mcp_config.json` |
+| OpenCode | `opencode.json` |
+| Warp | `.devcouncil/integrations/warp-mcp.json` |
+
+Codex's DevMap registration is implemented in the Rust integrator. Do not
+confuse that with complete Go-host task MCP setup for Codex. Use the host's
+current documented MCP setup for any additional manual registration.
+
+The Go host serves checkout, renew/release lease, next task, diff, gaps,
+verification and write-policy checks. It does not serve arbitrary file-edit
+or shell tools. Tasks require initialized state and a consuming agent that
+honors policy/results. See [MCP task loop](hero-loop.md).
+
+## Hooks, skills and enforcement
+
+DevMap navigation hooks maintain code context. DevCouncil's old lifecycle
+write/stop gates are retired. Installing either server does not intercept all
+ordinary editor writes, and `--write-gate` is no longer supported.
+
+Use `devcouncil skills list` and `devcouncil skills scaffold --dry-run` to inspect
+the Go host's engineering skills. Embedded instructions can retain migration
+limits; they are guidance, not a permissions mechanism. DevMap integration
+installs its own navigation skills through the existing managed installer.
+
+Reload the host after updating a binary or configuration. For Codex hook
+assets, the generated receipt calls out the host trust step; changing a hook
+can require renewed trust. File checks and physical host execution are
+separate verification steps.
+
+## Remove retired DevCouncil hooks
 
 ```bash
 dev hook status --project-root /path/to/project
@@ -49,65 +100,11 @@ dev hook disable --project-root /path/to/project --client claude --dry-run
 dev hook disable --project-root /path/to/project --client claude
 ```
 
-Cleanup preserves other tools and creates recoverable backups. Status exits 1
-when registrations remain or inspection fails; its receipt distinguishes them.
-Old event commands now exit 0 silently, even before a host reloads its cached
-configuration. No verification is performed by retired hooks. MCP policy and
-host permissions are unchanged. See [cleanup details](cli-reference.md#retired-hook-compatibility-and-cleanup).
+Status can be nonzero because registrations remain or inspection failed; read
+its receipt to distinguish them. Cleanup preserves unrelated tools and records
+recoverable backups. Old event invocations are silent no-ops, not verification.
+See [CLI cleanup details](cli-reference.md#retired-hook-compatibility-and-cleanup).
 
----
-
-## MCP Servers for Coding Agents
-
-DevCouncil provides two complementary Model Context Protocol (MCP) servers:
-
-### 1. Host MCP Server (`devcouncil mcp`)
-
-The primary orchestration server. Configured automatically by `devcouncil integrate`. The Go host advertises **eight** tools (`Registry.Specs()`), not the Python host's 78:
-
-- **Task leases:** `devcouncil_checkout_task`, `devcouncil_renew_lease`, `devcouncil_release_task`, `devcouncil_next_task`
-- **Diff & gaps:** `devcouncil_get_diff`, `devcouncil_get_gaps`
-- **Write policy:** `devcouncil_policy_check_write` — planned-file scope before writing
-- **Verification:** `devcouncil_verify_task` — Go `verify.Run()` (planned-file, orphan-diff, dependency-risk, expected-test commands) plus `dcverify` for stub and secret rigor. Diff↔coverage needs a profile this tool has no field for; `devcouncil verify --coverage PATH` supplies one. A missing `dcverify` is reported in `rigor_skipped_reason`, and one that fails blocks on `rigor_check_unavailable`.
-
-Filesystem, patch, and shell tools (`devcouncil_read_file`, `apply_patch`, `write_file`, `run_command`, …) are **not** on this server. They live on Manvi. `allowed_next_tools` names only the eight tools this server serves, so a repair contract never points an agent at a tool it cannot call.
-
-### 2. DevMap Code Intelligence MCP Server (`devmap mcp`)
-
-Eleven query tools: `status`, `search`, `dependencies`, `impact`, `trace`, `neighbors`, `dead_symbols`, `clones`, `preview`, `explore`, `affected_tests`. Always pass this repository's absolute `repo_path` and check `repository.root` in the envelope.
-
-CLI-only (named in `devmap-cli` `MISSING_CAPABILITIES`, not on kernel MCP): `cypher`, `pdg_query`, `taint_explain`, `route_map`, plus `detect_changes` / `rename` / `clusters_processes`. PDG construction in the CLI is Python-source only.
-
----
-
-## Host-Specific Setup Details
-
-### Cursor
-
-`devcouncil integrate cursor --apply` writes `.cursor/mcp.json` and `.cursor/rules/devcouncil.mdc`, then runs `devmap integrate cursor` (guides + DevMap skills). It does **not** write `.cursor/hooks.json`. `--write-gate` no longer exists; passing it exits 2 with the reason.
-
-### Claude Code
-
-`devcouncil integrate claude --apply` writes `.mcp.json` (devcouncil + devmap stdio) and runs `devmap integrate claude`. It does **not** install slash commands, a plugin, PreToolUse hooks, or a statusline. `--write-gate` no longer exists; passing it exits 2 with the reason.
-
-### Codex
-
-`devcouncil integrate codex --apply` writes a one-line comment into `.codex/config.toml`. That is the whole Go adapter.
-
-### Other hosts
-
-`antigravity`, `opencode` and `warp` have adapters here: this binary writes the `devcouncil` server into each host's document and `devmap integrate` writes the `devmap` entry into the same file. Each merges only its own entry, so the two commands compose in either order and neither disturbs a server the user added. `gemini` and `aider` are no longer accepted.
-
-Domain skills still need `devcouncil skills scaffold` (or the `devmap skills install` spawn on cursor/claude). The packaged `devcouncil.md` / hero-loop skills currently describe Python-era tools (TASK-P7-9).
-
----
-
-## Execution Modes
-
-Coding agents interact with DevCouncil in two primary ways:
-
-1. **The Autonomous MCP Loop (Hero Loop):**  
-   The agent checks out a task, performs edits, calls `devcouncil_verify_task`, and repairs any issues until the gates pass. See [Hero Loop](hero-loop.md).
-
-2. **Manvi (wraps the components):**  
-   When running end-to-end multi-agent campaigns, **Manvi** wraps DevCouncil's components: it owns LLM provider routing and agent personas, and it reaches leases, write containment, and verification across the process boundary. GitPulse uses that wrap for policy and workbench, and selected DevCouncil modules directly for code intelligence.
+Source owners:
+[`rust/devmap-cli/src/integrate.rs`](../rust/devmap-cli/src/integrate.rs),
+[`backend/go_orchestrator/devcouncil/integrate/integrate.go`](../backend/go_orchestrator/devcouncil/integrate/integrate.go).
