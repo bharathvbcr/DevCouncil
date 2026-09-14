@@ -180,12 +180,24 @@ fn absolute_lcov_paths_reduce_against_the_supplied_root() {
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0].path, "crates/x/src/lib.rs");
 
+    // The producer's own separator reduces too. llvm-cov emits the native one
+    // on Windows, and the root it is reduced against need not agree with it.
+    let native = repo.join("crates").join("y").join("src").join("lib.rs");
+    let profile = format!("SF:{}\nDA:7,1\nend_of_record\n", native.display());
+    let parsed = dc_verify::coverage::parse_with_root(&profile, Some(&repo)).expect("must parse");
+    assert_eq!(parsed[0].path, "crates/y/src/lib.rs");
+
     // The symlinked-ancestor spelling reduces too (macOS /tmp → /private/tmp).
+    //
+    // Joined rather than concatenated with a literal `/`: on Windows
+    // `canonicalize` returns a verbatim `\\?\C:\...` path, and a verbatim path
+    // suppresses separator translation, so an appended `/src/main.rs` is one
+    // literal filename rather than two components and names no file at all.
+    // The expectation below is unchanged; only the input is now a path on both
+    // platforms instead of just on Unix.
     if let Ok(canonical) = repo.canonicalize() {
-        let profile = format!(
-            "SF:{}/src/main.rs\nDA:2,1\nend_of_record\n",
-            canonical.display()
-        );
+        let sf = canonical.join("src").join("main.rs");
+        let profile = format!("SF:{}\nDA:2,1\nend_of_record\n", sf.display());
         let parsed =
             dc_verify::coverage::parse_with_root(&profile, Some(&repo)).expect("must parse");
         assert_eq!(parsed[0].path, "src/main.rs");
