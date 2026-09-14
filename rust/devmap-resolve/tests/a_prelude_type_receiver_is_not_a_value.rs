@@ -105,16 +105,60 @@ fn a_corpus_declared_type_of_the_same_name_vetoes_the_prelude() {
 }
 
 /// ...and a local bound to that spelling is a value, not the prelude type.
+///
+/// This is the `root_is_a_value_here` veto, and it is the one this rung leans
+/// on hardest: without it, any repository that happens to name a value `Vec` or
+/// `Default` would have its own method calls explained away as the language's.
+/// Written with a **path** receiver (`Default::whatever()`) because that is the
+/// shape the rung sees — `Default.whatever()` is a field access on a value and
+/// never reaches it, so a fixture using the dot form asserts over an empty set
+/// and passes whatever the rung does.
 #[test]
 fn a_local_named_like_a_prelude_type_is_not_the_prelude_type() {
     let resolution = resolve(&[(
         "a.rs",
-        "fn drive() { let Default = make(); Default.whatever(); }\n",
+        "fn drive() { let Default = make(); Default::whatever(); }\n",
     )]);
-    for class in classes_for(&resolution, "whatever", "Default") {
+    let classes = classes_for(&resolution, "whatever", "Default");
+    assert!(
+        !classes.is_empty(),
+        "no unresolved row for Default::whatever — the fixture asserts over \
+         nothing and would pass however the rung behaves"
+    );
+    for class in classes {
         assert!(
             !matches!(class, UnresolvedClass::Builtin),
             "a scope that binds `Default` as a value states what it is; got {class:?}"
+        );
+    }
+}
+
+/// ...and so does a value whose type the file states by assignment.
+///
+/// The `root_is_a_value_here` test has four clauses and this is the fourth:
+/// `receiver_types`, filled where an assignment names a unique indexed type
+/// (`Vec = Holder::make()`). Separated from the local-binding case above
+/// because they are different evidence, and a conjunction of the four would
+/// still pass a test that only ever exercises one.
+#[test]
+fn an_assignment_that_types_the_spelling_is_also_a_value() {
+    let resolution = resolve(&[
+        ("holder.rs", "pub struct Holder;\n"),
+        (
+            "a.rs",
+            "fn drive() { let Vec: Holder = Holder::make(); Vec::whatever(); }\n",
+        ),
+    ]);
+    let classes = classes_for(&resolution, "whatever", "Vec");
+    assert!(
+        !classes.is_empty(),
+        "no unresolved row for Vec::whatever — the fixture asserts over nothing"
+    );
+    for class in classes {
+        assert!(
+            !matches!(class, UnresolvedClass::Builtin),
+            "the file states what its `Vec` is; the prelude does not get to \
+             answer for it. got {class:?}"
         );
     }
 }
@@ -127,7 +171,12 @@ fn an_import_of_the_spelling_outranks_the_prelude_table() {
         "a.rs",
         "use other_crate::Vec;\nfn drive() { let v = Vec::new(); }\n",
     )]);
-    for class in classes_for(&resolution, "new", "Vec") {
+    let classes = classes_for(&resolution, "new", "Vec");
+    assert!(
+        !classes.is_empty(),
+        "no unresolved row for Vec::new — the fixture asserts over nothing"
+    );
+    for class in classes {
         assert!(
             matches!(class, UnresolvedClass::External { .. }),
             "`use other_crate::Vec` says where this file's `Vec` comes from; \
@@ -147,7 +196,13 @@ fn the_prelude_table_is_keyed_by_language() {
         "def drive():\n    v = Vec.new()\n    s = String.from_parts()\n",
     )]);
     for (callee, receiver) in [("new", "Vec"), ("from_parts", "String")] {
-        for class in classes_for(&resolution, callee, receiver) {
+        let classes = classes_for(&resolution, callee, receiver);
+        assert!(
+            !classes.is_empty(),
+            "no unresolved row for {receiver}.{callee} — the fixture asserts \
+             over nothing"
+        );
+        for class in classes {
             assert!(
                 !matches!(class, UnresolvedClass::Builtin),
                 "Python has no Rust prelude; {receiver}.{callee} got {class:?}"
