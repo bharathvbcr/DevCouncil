@@ -12,8 +12,8 @@ use devmap_extract::model::{LocalBinding, ReferenceKind};
 fn extraction_schema_version_tracks_binding_and_ruleguard() {
     assert_eq!(
         devmap_extract::cache::EXTRACTION_SCHEMA_VERSION,
-        "53",
-        "v53 reduces a receiver past its `&`/`*`/`!` prefix, on top of v52's duplicate-callee drop, while retaining v48 bindings, v49 ruleguard wiring, v50 attribution fixes and v51 captured-receiver classifications"
+        "54",
+        "v54 reads a declared field's type in every grammar that declares one, on top of v53's receiver-prefix reduction and v52's duplicate-callee drop, while retaining v48 bindings, v49 ruleguard wiring, v50 attribution fixes and v51 captured-receiver classifications"
     );
 }
 

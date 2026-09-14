@@ -134,3 +134,9 @@ required-features = ["parse"]
 [[test]]
 name = "self_in_a_type_is_that_type"
 required-features = ["parse"]
+
+
+
+[[test]]
+name = "a_field_types_its_receiver"
+required-features = ["parse"]

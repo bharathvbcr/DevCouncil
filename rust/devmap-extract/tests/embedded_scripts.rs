@@ -759,8 +759,11 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // is a plain path. A v52 row records `*path` and `!Self`, whose leftmost
     // segment is an operator, so the binding that would have typed the
     // receiver is invisible to the rung that needs it.
+    // v54 reads a declared field's type in every grammar that declares one. A
+    // v53 row holds none for a `<script lang="ts">` class field, so a receiver
+    // typed only by one stays uninferred until the file is re-extracted.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "53",
+        EXTRACTION_SCHEMA_VERSION, "54",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

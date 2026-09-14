@@ -2182,37 +2182,6 @@ fn rust_string_literal_content(node: Node, source: &str) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-/// The struct/enum/union that owns a field declaration.
-fn rust_type_item_name(node: Node, source: &str) -> Option<String> {
-    let mut ancestor = bounded_parent(node);
-    while let Some(parent) = ancestor {
-        if matches!(parent.kind(), "struct_item" | "enum_item" | "union_item") {
-            return get_child_text(parent, "name", source);
-        }
-        if is_callable_node(parent) {
-            return None;
-        }
-        ancestor = bounded_parent(parent);
-    }
-    None
-}
-
-/// The Go type that owns a `field_declaration` — walked up through
-/// `field_declaration_list` / `struct_type` to the enclosing `type_spec`.
-fn go_field_owner_name(node: Node, source: &str) -> Option<String> {
-    let mut ancestor = bounded_parent(node);
-    while let Some(parent) = ancestor {
-        if parent.kind() == "type_spec" {
-            return get_child_text(parent, "name", source).filter(|name| !name.is_empty());
-        }
-        if is_callable_node(parent) {
-            return None;
-        }
-        ancestor = bounded_parent(parent);
-    }
-    None
-}
-
 /// Why a Rust `fn` can never be observed as `pub` regardless of its liveness.
 ///
 /// A trait-impl method and a defaulted trait method both reject `pub`, so
@@ -3543,30 +3512,6 @@ fn extract_node(
             "use_declaration" => {
                 rust_use_imports(node, source, span, imports);
             }
-            "field_declaration" => {
-                // Struct field types are the evidence `let x = self.field`
-                // needs to type `x`. Without them a field used only as a
-                // receiver (`adjacency.run()`) left its method callerless.
-                if let Some(field_name) = get_child_text(node, "name", source) {
-                    if let Some(type_name) = node
-                        .child_by_field_name("type")
-                        .and_then(|ty| rust_type_name(ty, source, 0))
-                    {
-                        if let Some(owner) = rust_type_item_name(node, source) {
-                            if !field_name.is_empty() && !type_name.is_empty() {
-                                references.push(ExtractedReference {
-                                    name: type_name,
-                                    kind: ReferenceKind::Type,
-                                    span: span.clone(),
-                                    enclosing_symbol: Some(format!("{file_symbol_name}::{owner}")),
-                                    assigned_to: Some(field_name),
-                                    receiver_expr: None,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
             "attribute_item" => {
                 rust_attribute_callback_refs(node, source, file_symbol_name, references);
             }
@@ -3804,45 +3749,6 @@ fn extract_node(
                     });
                 }
             }
-            // Struct field types are the evidence `w.Priority.valid()` needs to
-            // type the field receiver. Rust already emits this; Go did not, so
-            // every method reached only through a typed field stayed untyped.
-            "field_declaration" => {
-                if let Some(field_name) = get_child_text(node, "name", source) {
-                    if let Some(type_name) = node
-                        .child_by_field_name("type")
-                        .and_then(|ty| go_type_name(ty, source, 0))
-                    {
-                        if let Some(owner) = go_field_owner_name(node, source) {
-                            if !field_name.is_empty() && !type_name.is_empty() {
-                                let qualifier = node
-                                    .child_by_field_name("type")
-                                    .and_then(|ty| go_type_qualifier(ty, source, 0));
-                                if let Some(qualifier) = qualifier {
-                                    references.push(ExtractedReference {
-                                        name: qualifier,
-                                        kind: ReferenceKind::TypeQualifier,
-                                        span: span.clone(),
-                                        enclosing_symbol: Some(format!(
-                                            "{file_symbol_name}::{owner}"
-                                        )),
-                                        assigned_to: Some(field_name.clone()),
-                                        receiver_expr: None,
-                                    });
-                                }
-                                references.push(ExtractedReference {
-                                    name: type_name,
-                                    kind: ReferenceKind::Type,
-                                    span: span.clone(),
-                                    enclosing_symbol: Some(format!("{file_symbol_name}::{owner}")),
-                                    assigned_to: Some(field_name),
-                                    receiver_expr: None,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
             "call_expression" | "composite_literal" => {
                 let callee_node = if kind == "call_expression" {
                     node.child_by_field_name("function")
@@ -4062,6 +3968,11 @@ fn extract_node(
     // Languages whose arm already pushes imports — Python, JS/TS, Rust, Go —
     // are absent from the dispatcher's match, so nothing is counted twice.
     crate::langimports::extract_imports(lang, node, source, imports);
+    // A declared field's type, for the same reason and from the same position:
+    // Rust, Go, Python and HCL take specialised arms above and the C family
+    // takes `c_family`, so the one position that serves every grammar — and
+    // keeps serving one that gains a specialised arm later — is this one.
+    let _ = crate::langfields::extract_field_type(lang, node, source, file_symbol_name, references);
     maybe_push_name_reference(node, source, lang, file_symbol_name, references);
 }
 
@@ -6089,7 +6000,7 @@ fn c_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
 /// Separate from `go_type_name` for the SC17 reason — that function answers
 /// "what type is this value, for dispatch", and must keep returning the bare
 /// name. Bounded depth so a pathological nesting cannot recurse without end.
-fn go_type_qualifier(node: Node, source: &str, depth: usize) -> Option<String> {
+pub(crate) fn go_type_qualifier(node: Node, source: &str, depth: usize) -> Option<String> {
     if depth > 16 {
         return None;
     }
@@ -6864,7 +6775,7 @@ fn scope_locals_len() -> usize {
     SCOPE_LOCALS.with(|cache| cache.borrow().len())
 }
 
-fn is_callable_node(node: Node) -> bool {
+pub(crate) fn is_callable_node(node: Node) -> bool {
     matches!(
         node.kind(),
         "function_definition"

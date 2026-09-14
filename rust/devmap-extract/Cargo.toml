@@ -290,3 +290,10 @@ required-features = ["parse"]
 [[test]]
 name = "nested_source_limits"
 required-features = ["parse"]
+
+
+
+[[test]]
+name = "a_declared_field_has_a_type"
+required-features = ["parse"]
+
