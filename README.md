@@ -22,6 +22,8 @@ difference between unavailable evidence and a passing check.
 
 **Manvi wraps these components** into a coding-agent harness (turn loop, providers, policy, TUI, `manvi serve`). **GitPulse** uses Manvi for policy, workbench, and agent hosting, and DevCouncil components for code intelligence and related analysis. DevCouncil does not replace coding agents; it sits beside Claude Code, Codex, Cursor, and others as selectable modules.
 
+![DevMap interactive dependency map and symbol graph in GitPulse](docs/assets/DevMap.png)
+
 ---
 
 ## Architecture & Components

@@ -35,6 +35,8 @@ devmap affected src/api.py   # the tests a change here reaches
 devmap dead                  # confident vs unconfirmed dead candidates (not one flat list)
 ```
 
+![DevMap interactive dependency map and symbol graph in GitPulse](../assets/DevMap.png)
+
 ## Why not grep
 
 Grep finds strings. This resolves *edges*, and — more to the point — it tells
