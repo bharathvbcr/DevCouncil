@@ -44,9 +44,70 @@ pub const SESSION_START_BUDGET: Duration = Duration::from_secs(10);
 /// rest is drained and dropped rather than buffered whole.
 const CHILD_OUTPUT_CAP: usize = 64 * 1024;
 
+/// Total wall clock a synchronous PreToolUse may spend in child processes.
+///
+/// Two orders of magnitude tighter than [`SESSION_START_BUDGET`] because the
+/// host blocks on this hook *inside* a tool call rather than once at startup.
+/// Only the first navigation tool call of a session ever reaches a child at
+/// all — see [`claim_once`] — so this budget is paid once, not per call.
+pub const PRE_TOOL_USE_BUDGET: Duration = Duration::from_millis(1500);
+
+/// How many per-session markers one repository keeps before the oldest are
+/// dropped.
+///
+/// Markers are one empty file per session, so the cost is inodes rather than
+/// bytes, but "small forever" is not a bound. Pruning keeps the newest and
+/// discards the rest, which at worst re-nudges a session whose marker aged out
+/// of a very busy repository — a duplicate line, not a wrong one.
+pub const MAX_PRE_TOOL_MARKERS: usize = 64;
+
+/// How many directory entries pruning will examine. A marker directory that
+/// somehow grew past this is trimmed over several invocations instead of
+/// stalling one tool call on an unbounded readdir.
+pub const MAX_PRUNE_SCAN: usize = 512;
+
+/// Longest session identifier accepted from the payload before it is folded to
+/// a digest. Hosts send UUIDs; this bounds a hostile or pathological one.
+const MAX_SESSION_ID_BYTES: usize = 512;
+
+/// Longest prefix of a shell command inspected for a search verb. A command is
+/// classified by how it starts, so reading further buys nothing.
+const MAX_COMMAND_SNIFF_BYTES: usize = 256;
+
+/// Tool names, lowercased, whose use means the agent is navigating source.
+///
+/// Host-neutral on purpose: the matcher in a host's config already narrows
+/// this, but a hook that trusts the matcher alone fires on everything under a
+/// host that has no matcher (Codex) or spells the tools differently (Cursor).
+const NAVIGATION_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "glob",
+    "search",
+    "read_file",
+    "grep_search",
+    "file_search",
+    "codebase_search",
+    "searchfiles",
+    "readfile",
+];
+
+/// Shell verbs that make a terminal call a file scan rather than a build step.
+///
+/// Deliberately only true search verbs. `ls`, `cat` and `head` appear in almost
+/// every shell call, so including them would move the nudge from "the first
+/// time the agent looks for code" to "the first Bash call", which is usually
+/// `git status` and tells the agent nothing about navigation.
+const NAVIGATION_COMMANDS: &[&str] =
+    &["rg", "grep", "egrep", "fgrep", "ugrep", "ag", "ack", "find"];
+
+/// Shell tool names whose payload carries a command to sniff.
+const SHELL_TOOLS: &[&str] = &["bash", "shell", "run_terminal_cmd", "terminal"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
     SessionStart,
+    PreToolUse,
     PostToolUse,
     SessionEnd,
 }
@@ -55,6 +116,7 @@ impl HookEvent {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SessionStart => "session-start",
+            Self::PreToolUse => "pre-tool-use",
             Self::PostToolUse => "post-tool-use",
             Self::SessionEnd => "session-end",
         }
@@ -63,10 +125,72 @@ impl HookEvent {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "session-start" => Some(Self::SessionStart),
+            "pre-tool-use" => Some(Self::PreToolUse),
             "post-tool-use" => Some(Self::PostToolUse),
             "session-end" => Some(Self::SessionEnd),
             _ => None,
         }
+    }
+}
+
+/// Whether this payload came from Cursor's native hook runner.
+///
+/// Cursor documents `cursor_version` on every event. Claude and Codex do not
+/// send it. Event-name casing is not a signal: both hosts have used both
+/// spellings.
+pub fn is_cursor_payload(payload: &Value) -> bool {
+    payload
+        .get("cursor_version")
+        .is_some_and(|value| !value.is_null())
+}
+
+/// Cursor events whose stdout is a permission decision.
+///
+/// Invalid JSON or a schema mismatch on these **blocks the tool**. Dev Map
+/// never installs on them; if a user wires the binary there anyway, we emit
+/// nothing so the call fails open rather than blocking a Read.
+fn is_cursor_permission_event(payload: &Value) -> bool {
+    const EVENTS: &[&str] = &[
+        "pretooluse",
+        "beforereadfile",
+        "beforeshellexecution",
+        "beforemcpexecution",
+        "beforetabfileread",
+        "subagentstart",
+    ];
+    payload_str(payload, &["hook_event_name", "hookEventName"])
+        .map(|name| name.trim().to_ascii_lowercase())
+        .is_some_and(|name| EVENTS.contains(&name.as_str()))
+}
+
+/// Host-specific stdout for one hook result.
+///
+/// Cursor native `sessionStart` / `postToolUse` require JSON with snake_case
+/// `additional_context`. Claude pastes exit-0 stdout into the model, so the
+/// briefing must stay plaintext. `--json` bypasses this and emits the internal
+/// document. Returns `None` when the host should see an empty body.
+pub fn render_host_stdout(event: HookEvent, payload: &Value, stdout: &Value) -> Option<String> {
+    let additional = stdout
+        .pointer("/hookSpecificOutput/additionalContext")
+        .and_then(Value::as_str);
+
+    if is_cursor_payload(payload) {
+        if is_cursor_permission_event(payload) {
+            return None;
+        }
+        return match event {
+            HookEvent::SessionStart | HookEvent::PreToolUse => {
+                Some(json!({ "additional_context": additional.unwrap_or("") }).to_string())
+            }
+            HookEvent::PostToolUse | HookEvent::SessionEnd => {
+                additional.map(|ctx| json!({ "additional_context": ctx }).to_string())
+            }
+        };
+    }
+    if let Some(ctx) = additional {
+        Some(ctx.to_string())
+    } else {
+        Some(stdout.to_string())
     }
 }
 
@@ -152,6 +276,19 @@ fn run_hook_inner(
         }
     };
 
+    // Cheapest possible rejection, taken before `select_roots` does any
+    // filesystem work. PreToolUse fires on every matching tool call for the
+    // life of the session, so the overwhelmingly common outcome — "not a
+    // navigation tool" — must cost a string compare and nothing else.
+    if event == HookEvent::PreToolUse && !is_navigation_payload(&payload) {
+        return Ok(HookOutcome {
+            exit_code: 0,
+            stdout: None,
+            stderr_line: None,
+            roots: Vec::new(),
+        });
+    }
+
     let selection = select_roots(&payload, pinned_root)?;
     if selection.is_empty() {
         return Ok(HookOutcome {
@@ -175,6 +312,18 @@ fn run_hook_inner(
                 exit_code: 0,
                 stdout: Some(stdout),
                 stderr_line: capped_note,
+                roots: selection.roots,
+            })
+        }
+        HookEvent::PreToolUse => {
+            let stdout = pre_tool_use_sync(executable, &selection, &payload)?;
+            Ok(HookOutcome {
+                exit_code: 0,
+                stdout,
+                // No `capped_note`: this hook acts on one root by construction,
+                // so "the payload named more" is the normal case, not a partial
+                // result worth reporting on every tool call.
+                stderr_line: None,
                 roots: selection.roots,
             })
         }
@@ -657,12 +806,19 @@ fn session_start_sync(executable: &Path, selection: &RootSelection) -> anyhow::R
             root,
             &["--json", "status", "--auto-rebuild"],
             started,
+            SESSION_START_BUDGET,
         )?
         else {
             ran_out_of_time = true;
             break;
         };
-        let Some(last_text) = probe(executable, root, &["session-report", "--last"], started)?
+        let Some(last_text) = probe(
+            executable,
+            root,
+            &["session-report", "--last"],
+            started,
+            SESSION_START_BUDGET,
+        )?
         else {
             ran_out_of_time = true;
             break;
@@ -691,6 +847,326 @@ fn session_start_sync(executable: &Path, selection: &RootSelection) -> anyhow::R
             "additionalContext": additional,
         }
     }))
+}
+
+/// Longest PreToolUse context line. Smaller than a SessionStart summary on
+/// purpose: this one lands mid-tool-call, and a paragraph there costs the
+/// agent more attention than it returns.
+const PRE_TOOL_CONTEXT_CAP: usize = 400;
+
+/// Restate the directive at the moment the agent is about to bypass the index.
+///
+/// SessionStart already carries [`DEVMAP_DIRECTIVE`], and the comment there
+/// calls that "the only reliable moment". Measurement says it is reliable but
+/// not sufficient: across the 37 session reports this repository had recorded
+/// by 2026-09-14, 36 showed `query_count: 0` — every one of them had been told
+/// about the index at startup and none of them asked it anything. A directive
+/// competes with the whole session for attention; a directive attached to the
+/// first `Read` competes with nothing.
+///
+/// Fires at most once per session per repository, spends at most one
+/// subprocess doing it, and says nothing at all unless the index can actually
+/// answer. Never blocks: the caller maps every outcome to exit 0.
+fn pre_tool_use_sync(
+    executable: &Path,
+    selection: &RootSelection,
+    payload: &Value,
+) -> anyhow::Result<Option<Value>> {
+    // One root by construction. The directive is about the index the agent is
+    // about to bypass; probing eight repositories to say it once would put
+    // eight subprocesses inside a single `Read`.
+    let Some(root) = selection.roots.first() else {
+        return Ok(None);
+    };
+    if claim_once(&marker_dir(root), &session_marker_name(payload)) == Claim::Skip {
+        return Ok(None);
+    }
+
+    let started = Instant::now();
+    // No `--auto-rebuild` here, unlike SessionStart: a rebuild triggered by a
+    // `Read` is a surprise the agent did not ask for, and the cost lands inside
+    // a tool call the host is blocking on.
+    let Some(status_text) = probe(
+        executable,
+        root,
+        &["--json", "status"],
+        started,
+        PRE_TOOL_USE_BUDGET,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(context) = compose_pre_tool_use(&status_text, root) else {
+        return Ok(None);
+    };
+    Ok(Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": context,
+        }
+    })))
+}
+
+/// The directive, or nothing when the index cannot back it.
+///
+/// Silence is the correct output for an unbuilt, empty or degraded index.
+/// Pointing an agent at `devmap_search` when the store cannot answer earns one
+/// empty result and a durable conclusion that the tool does not work — which
+/// is not hypothetical here: a sibling MCP server pinned to an older store
+/// schema answers `available: false`, and the sessions that read it stopped
+/// asking. A hook that oversells the index does more damage than one that
+/// stays quiet.
+fn compose_pre_tool_use(status_text: &str, root: &Path) -> Option<String> {
+    let status: Value = serde_json::from_str(status_text).ok()?;
+    if !status
+        .get("query_ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    if status
+        .get("degraded_reason")
+        .is_some_and(|reason| !reason.is_null())
+    {
+        return None;
+    }
+    let nodes = status
+        .get("node_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    // A store that is query-ready but holds nothing answers every question
+    // "absent", which is the single most expensive wrong answer it can give.
+    if nodes == 0 {
+        return None;
+    }
+    let edges = status
+        .get("edge_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let generation = status
+        .get("generation_id")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let fresh = status
+        .get("is_fresh")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("this repository");
+    let freshness = if fresh {
+        "current"
+    } else {
+        "behind the working tree, so its answers are a lower bound"
+    };
+    Some(truncate(
+        &format!(
+            "DevMap has {name} indexed: {nodes} symbols, {edges} edges, \
+             generation {generation}, {freshness}. {DEVMAP_DIRECTIVE}"
+        ),
+        PRE_TOOL_CONTEXT_CAP,
+    ))
+}
+
+/// Whether this payload describes the agent about to look through source.
+///
+/// Two shapes count: a navigation tool by name, and a shell tool whose command
+/// runs a search verb. Everything else — writes, edits, fetches, MCP calls, and
+/// the `git status` that opens most sessions — is not a moment where the index
+/// has anything to add.
+fn is_navigation_payload(payload: &Value) -> bool {
+    let Some(tool) = payload_str(payload, &["tool_name", "toolName", "tool"]) else {
+        return false;
+    };
+    let tool = tool.trim().to_ascii_lowercase();
+    if NAVIGATION_TOOLS.contains(&tool.as_str()) {
+        return true;
+    }
+    if !SHELL_TOOLS.contains(&tool.as_str()) {
+        return false;
+    }
+    payload
+        .pointer("/tool_input/command")
+        .or_else(|| payload.pointer("/toolInput/command"))
+        .or_else(|| payload.pointer("/tool_input/cmd"))
+        .or_else(|| payload.pointer("/command"))
+        .and_then(Value::as_str)
+        .is_some_and(command_is_search)
+}
+
+/// First string present under any of `keys`, at the payload's top level.
+fn payload_str<'a>(payload: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_str))
+}
+
+/// Whether a shell command line runs a search verb.
+///
+/// Splits on pipeline and list separators because `cat x | rg y` is still a
+/// scan, skips leading `VAR=value` assignments, and compares the verb's file
+/// name so `/usr/bin/grep` matches `grep`. Only the first
+/// [`MAX_COMMAND_SNIFF_BYTES`] are read: a command is classified by how it
+/// starts, so a megabyte-long heredoc buys nothing.
+fn command_is_search(command: &str) -> bool {
+    let head: String = command
+        .chars()
+        .take(MAX_COMMAND_SNIFF_BYTES)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    head.split(['|', ';', '&', '(', ')', '\n']).any(|segment| {
+        let Some(verb) = segment.split_whitespace().find(|word| !word.contains('=')) else {
+            return false;
+        };
+        let verb = verb.rsplit('/').next().unwrap_or(verb);
+        NAVIGATION_COMMANDS.contains(&verb)
+    })
+}
+
+/// Where a repository keeps hook bookkeeping.
+///
+/// Shared with [`coalesce_lock_dir`] so the two never disagree about which
+/// layout a repository uses; the choice is a property of the repository.
+fn state_dir(root: &Path) -> PathBuf {
+    if root.join(".devmap").is_dir() {
+        root.join(".devmap")
+    } else {
+        root.join(".devcouncil")
+    }
+}
+
+fn marker_dir(root: &Path) -> PathBuf {
+    state_dir(root).join("codeintel").join("hooks")
+}
+
+/// Prefix every marker carries. Pruning removes only names that start with it,
+/// so a marker directory shared with anything else cannot lose the other thing.
+const MARKER_PREFIX: &str = "nav.";
+
+/// Filesystem-safe, collision-free marker name for this session.
+///
+/// The readable prefix keeps the directory debuggable by eye; the FNV-1a suffix
+/// is what makes two sessions sharing a 48-character prefix distinct, so a
+/// truncated name can never silence a different session. A payload with no
+/// session identifier falls back to the process id, which nudges once per hook
+/// process — wrong in the harmless direction, where a host that omits the field
+/// gets a few extra lines rather than none at all.
+fn session_marker_name(payload: &Value) -> String {
+    let raw = payload_str(
+        payload,
+        &[
+            "conversation_id",
+            "conversationId",
+            "session_id",
+            "sessionId",
+            "session",
+        ],
+    )
+    .map(str::trim)
+    .filter(|id| !id.is_empty())
+    .map(|id| id.chars().take(MAX_SESSION_ID_BYTES).collect::<String>())
+    .unwrap_or_else(|| format!("anon-{}", std::process::id()));
+
+    let digest = fnv1a64(raw.as_bytes());
+    let readable: String = raw
+        .chars()
+        .take(48)
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{MARKER_PREFIX}{readable}.{digest:016x}")
+}
+
+/// FNV-1a, written out rather than taken from `DefaultHasher`.
+///
+/// The marker has to mean the same thing across separate processes, and
+/// `DefaultHasher`'s output is explicitly not guaranteed stable across Rust
+/// releases. A rebuilt binary that hashed a session differently would re-nudge
+/// every live session once — small, but silently version-dependent.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Outcome of trying to be the first navigation hook of a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// This call created the marker and owes the session a directive.
+    First,
+    /// Another call already claimed it, or the filesystem refused. Either way
+    /// this call says nothing: a duplicate directive costs context, and a hook
+    /// that cannot write must never cost the agent its tool call.
+    Skip,
+}
+
+/// Claim the session's one directive, atomically.
+///
+/// `create_new` is the whole mechanism: it is a single atomic syscall, so
+/// exactly one member of a concurrent burst wins. A parallel fan-out of reads
+/// emits one directive rather than one per call, without a lock to reclaim or
+/// a pid to interpret.
+fn claim_once(dir: &Path, name: &str) -> Claim {
+    if fs::create_dir_all(dir).is_err() {
+        return Claim::Skip;
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join(name))
+    {
+        Ok(_) => {
+            prune_markers(dir, MAX_PRE_TOOL_MARKERS);
+            Claim::First
+        }
+        Err(_) => Claim::Skip,
+    }
+}
+
+/// Keep the newest `cap` markers and drop the rest.
+///
+/// Bounded twice: at most [`MAX_PRUNE_SCAN`] entries are examined, so a
+/// directory that somehow grew far past the cap is trimmed over several
+/// invocations instead of stalling one tool call on an unbounded readdir; and
+/// only names carrying [`MARKER_PREFIX`] are eligible, so nothing else that
+/// shares the directory can be removed. Every error is swallowed — pruning is
+/// housekeeping, and housekeeping must never fail a tool call.
+fn prune_markers(dir: &Path, cap: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut markers: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.take(MAX_PRUNE_SCAN).flatten() {
+        let path = entry.path();
+        let is_marker = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(MARKER_PREFIX));
+        if !is_marker {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        markers.push((modified, path));
+    }
+    if markers.len() <= cap {
+        return;
+    }
+    markers.sort_by_key(|left| std::cmp::Reverse(left.0));
+    for (_, path) in markers.into_iter().skip(cap) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// Assemble the context block from already-summarized repository clauses.
@@ -758,8 +1234,9 @@ fn probe(
     root: &Path,
     args: &[&str],
     started: Instant,
+    budget: Duration,
 ) -> anyhow::Result<Option<String>> {
-    let remaining = SESSION_START_BUDGET.saturating_sub(started.elapsed());
+    let remaining = budget.saturating_sub(started.elapsed());
     if remaining.is_zero() {
         return Ok(None);
     }
@@ -865,12 +1342,9 @@ fn detach_session_report(executable: &Path, root: &Path) -> anyhow::Result<()> {
 }
 
 fn coalesce_lock_dir(root: &Path, kind: &str) -> PathBuf {
-    let state = if root.join(".devmap").is_dir() {
-        root.join(".devmap")
-    } else {
-        root.join(".devcouncil")
-    };
-    state.join("codeintel").join(format!("hook-{kind}.running"))
+    state_dir(root)
+        .join("codeintel")
+        .join(format!("hook-{kind}.running"))
 }
 
 /// How many times one call may reclaim a stale lock before giving up.
@@ -1089,6 +1563,7 @@ pub fn shell_command(executable: &Path, event: HookEvent) -> anyhow::Result<Stri
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     // ---- SessionStart context: what the agent actually reads ----------------
@@ -1410,6 +1885,646 @@ mod tests {
         let bad = run_hook(HookEvent::PostToolUse, b"{not-json", &exe, None);
         assert_eq!(bad.exit_code, 0);
         assert!(bad.stderr_line.unwrap().contains("malformed"));
+    }
+
+    /// A fake `devmap` that prints `stdout_json` for any arguments.
+    ///
+    /// The hook shells out to itself for status; a stub lets these tests drive
+    /// the real emission path without building an index. Gated with its callers
+    /// so a Windows build does not carry an unused POSIX-script helper.
+    #[cfg(unix)]
+    fn fake_devmap(dir: &Path, stdout_json: &str) -> PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        let script = dir.join("fake-devmap.sh");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\ncat <<'EOF'\n{stdout_json}\nEOF\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        script
+    }
+
+    fn healthy_status() -> &'static str {
+        r#"{"query_ready":true,"degraded_reason":null,"node_count":11714,
+            "edge_count":35951,"generation_id":2582,"is_fresh":true}"#
+    }
+
+    /// Recursively collect every object key in a JSON document.
+    #[cfg(unix)]
+    fn all_keys(value: &Value, into: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    into.push(key.clone());
+                    all_keys(child, into);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| all_keys(item, into)),
+            _ => {}
+        }
+    }
+
+    /// The security invariant, asserted against real emitted output.
+    ///
+    /// `claude::PERMISSION_DECIDING_EVENTS` keeps Dev Map's *emitted hook table*
+    /// off PreToolUse, and `hooks_block` bails if that is ever edited. This
+    /// covers the other half: the handler a user wires up themselves must not be
+    /// able to influence an authorization outcome either. A code index has
+    /// nothing to contribute to a permission decision, so the only key this
+    /// event may carry is `additionalContext`.
+    ///
+    /// Falsifiable by construction: it scans the document the hook actually
+    /// produced rather than restating the literal the emitter uses, so adding a
+    /// decision field anywhere in the payload turns it red.
+    ///
+    /// Unix-only because the stub is a `#!/bin/sh` script. The property it
+    /// guards is not platform-specific, and the conformance suite covers the
+    /// same event everywhere; gating this keeps a Windows runner from failing
+    /// on the fixture rather than on the behaviour.
+    #[cfg(unix)]
+    #[test]
+    fn pre_tool_use_never_emits_a_permission_decision() {
+        let root = scratch("pretool-nopermission");
+        store_bearing(&root);
+        let exe = fake_devmap(&root.join("bin"), healthy_status());
+
+        let payload = json!({
+            "session_id": "sec-1",
+            "cwd": root.to_string_lossy(),
+            "tool_name": "Read",
+            "tool_input": {"file_path": root.join("a.rs").to_string_lossy()},
+        });
+        let outcome = run_hook(
+            HookEvent::PreToolUse,
+            serde_json::to_string(&payload).unwrap().as_bytes(),
+            &exe,
+            None,
+        );
+        assert_eq!(outcome.exit_code, 0, "{:?}", outcome.stderr_line);
+        let stdout = outcome
+            .stdout
+            .expect("a healthy index emits the directive; the rest of this test needs it");
+
+        let mut keys = Vec::new();
+        all_keys(&stdout, &mut keys);
+        for forbidden in [
+            "permissionDecision",
+            "permissionDecisionReason",
+            "permission",
+            "decision",
+            "continue",
+            "stopReason",
+            "suppressOutput",
+            "systemMessage",
+        ] {
+            assert!(
+                !keys.iter().any(|key| key == forbidden),
+                "PreToolUse emitted {forbidden:?}; this event decides authorization \
+                 outcomes and a code index must not reach one. Keys: {keys:?}"
+            );
+        }
+        assert_eq!(
+            keys.iter()
+                .filter(|key| *key == "additionalContext")
+                .count(),
+            1,
+            "expected exactly one additionalContext, got keys {keys:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The common case must cost a string compare, not a filesystem walk.
+    ///
+    /// Asserted by behaviour rather than by timing: a payload naming a root that
+    /// does not exist would make `select_roots` work and fail, so a non-
+    /// navigation tool returning cleanly proves the short circuit ran first.
+    #[test]
+    fn pre_tool_use_ignores_non_navigation_tools() {
+        let exe = PathBuf::from("/bin/true");
+        for tool in ["Write", "Edit", "WebFetch", "TodoWrite", "NotebookEdit"] {
+            let payload = json!({
+                "session_id": "skip",
+                "cwd": "/nonexistent/devmap/probe/root",
+                "tool_name": tool,
+            });
+            let outcome = run_hook(
+                HookEvent::PreToolUse,
+                serde_json::to_string(&payload).unwrap().as_bytes(),
+                &exe,
+                None,
+            );
+            assert_eq!(outcome.exit_code, 0, "{tool}");
+            assert!(outcome.stdout.is_none(), "{tool} produced stdout");
+            assert!(
+                outcome.stderr_line.is_none(),
+                "{tool} produced a diagnostic"
+            );
+            assert!(outcome.roots.is_empty(), "{tool} resolved roots");
+        }
+    }
+
+    /// A shell tool is navigation only when it actually searches.
+    #[test]
+    fn bash_counts_as_navigation_only_for_search_verbs() {
+        for (command, expected) in [
+            ("rg TODO src/", true),
+            ("grep -rn foo .", true),
+            ("/usr/bin/grep foo bar", true),
+            ("RIPGREP_CONFIG_PATH= rg foo", true),
+            ("cat notes.md | rg foo", true),
+            ("find . -name '*.rs'", true),
+            ("git status", false),
+            ("cargo build --release", false),
+            ("ls -la", false),
+            ("echo grep", false),
+        ] {
+            let payload = json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            });
+            assert_eq!(
+                is_navigation_payload(&payload),
+                expected,
+                "classifying {command:?}"
+            );
+        }
+    }
+
+    /// `echo grep` must not count: the verb is `echo`, and only the first word
+    /// of a segment is the verb.
+    #[test]
+    fn only_the_first_word_of_a_segment_is_the_verb() {
+        let buried = format!("{} rg foo", "echo ".repeat(64));
+        assert!(
+            !command_is_search(&buried),
+            "a search verb used as an argument is not a scan"
+        );
+    }
+
+    /// The sniff bound is a real bound, not a comment.
+    ///
+    /// Needs a search verb that *starts a segment* past the cap, because a verb
+    /// buried mid-segment is already rejected by the verb rule. An earlier
+    /// version of this test used the mid-segment shape and so asserted nothing
+    /// about the bound: removing `.take(MAX_COMMAND_SNIFF_BYTES)` left it green.
+    #[test]
+    fn command_sniffing_stops_at_the_bound() {
+        let huge = format!("rg {}", "x".repeat(MAX_COMMAND_SNIFF_BYTES * 4));
+        assert!(command_is_search(&huge), "a long argv still starts with rg");
+
+        let filler = "echo x; ".repeat(MAX_COMMAND_SNIFF_BYTES);
+        let past_bound = format!("{filler}rg foo");
+        assert!(
+            past_bound.len() > MAX_COMMAND_SNIFF_BYTES,
+            "the fixture must actually exceed the bound"
+        );
+        assert!(
+            !command_is_search(&past_bound),
+            "a segment beginning past the sniff bound must not be read"
+        );
+
+        // The same shape inside the bound is found, so the test above is about
+        // the bound rather than about segment splitting being broken.
+        assert!(
+            command_is_search("echo x; rg foo"),
+            "a search verb starting a later segment within the bound is a scan"
+        );
+    }
+
+    /// One directive per session, even when the reads arrive in parallel.
+    ///
+    /// `create_new` is the whole mechanism, so this is the test that would catch
+    /// a future rewrite to read-then-write, which races.
+    #[test]
+    fn concurrent_first_reads_claim_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let root = scratch("pretool-race");
+        store_bearing(&root);
+        let dir = Arc::new(marker_dir(&root));
+        let name = Arc::new(session_marker_name(&json!({"session_id": "race-1"})));
+        let firsts = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..24 {
+            let dir = Arc::clone(&dir);
+            let name = Arc::clone(&name);
+            let firsts = Arc::clone(&firsts);
+            handles.push(thread::spawn(move || {
+                if claim_once(&dir, &name) == Claim::First {
+                    firsts.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            firsts.load(Ordering::Relaxed),
+            1,
+            "a 24-way burst claimed the session's one directive more than once"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two sessions are two directives; one session is one.
+    #[test]
+    fn claims_are_scoped_to_the_session() {
+        let root = scratch("pretool-scope");
+        store_bearing(&root);
+        let dir = marker_dir(&root);
+
+        let first = session_marker_name(&json!({"session_id": "alpha"}));
+        let second = session_marker_name(&json!({"session_id": "beta"}));
+        assert_eq!(claim_once(&dir, &first), Claim::First);
+        assert_eq!(claim_once(&dir, &first), Claim::Skip);
+        assert_eq!(claim_once(&dir, &second), Claim::First);
+        assert_eq!(claim_once(&dir, &second), Claim::Skip);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Truncation must not silence a different session.
+    #[test]
+    fn long_session_ids_sharing_a_prefix_stay_distinct() {
+        let shared = "s".repeat(120);
+        let left = session_marker_name(&json!({"session_id": format!("{shared}-left")}));
+        let right = session_marker_name(&json!({"session_id": format!("{shared}-right")}));
+        assert_ne!(
+            left, right,
+            "two sessions sharing a 120-character prefix collapsed to one marker"
+        );
+        for name in [&left, &right] {
+            assert!(name.starts_with(MARKER_PREFIX));
+            assert!(
+                !name.contains('/') && !name.contains(".."),
+                "marker name is not a safe file name: {name}"
+            );
+        }
+    }
+
+    /// A payload with no session id still nudges, scoped to the process.
+    #[test]
+    fn missing_session_id_falls_back_to_process_scope() {
+        let name = session_marker_name(&json!({"tool_name": "Read"}));
+        assert!(
+            name.contains(&format!("anon-{}", std::process::id())),
+            "{name}"
+        );
+    }
+
+    /// Cursor's common schema names the conversation `conversation_id`.
+    /// Falling back to the process id would re-nudge on every Read, because
+    /// each hook is a new process.
+    #[test]
+    fn conversation_id_identifies_the_session() {
+        let named = session_marker_name(&json!({"conversation_id": "conv-stable"}));
+        let again = session_marker_name(&json!({"conversation_id": "conv-stable"}));
+        assert_eq!(named, again);
+        assert!(
+            !named.contains(&format!("anon-{}", std::process::id())),
+            "conversation_id must not fall through to the process id: {named}"
+        );
+        let different = session_marker_name(&json!({"conversation_id": "conv-other"}));
+        assert_ne!(named, different);
+    }
+
+    fn briefing_document() -> Value {
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": "Ask DevMap before reading files: devmap_search.\nrepo \"quotes\"",
+            }
+        })
+    }
+
+    /// Cursor native sessionStart is JSON `additional_context`. A plaintext
+    /// unwrap is the live 3.20 failure: "Failed to parse hook stdout as JSON".
+    #[test]
+    fn cursor_session_start_renders_json_additional_context() {
+        let payload = json!({
+            "cursor_version": "3.20.7",
+            "hook_event_name": "sessionStart",
+        });
+        let rendered = render_host_stdout(HookEvent::SessionStart, &payload, &briefing_document())
+            .expect("Cursor sessionStart must emit a body");
+        let value: Value = serde_json::from_str(&rendered).expect("parseable JSON");
+        let ctx = value["additional_context"].as_str().expect("context");
+        assert!(ctx.contains("Ask DevMap"), "{ctx}");
+        assert!(ctx.contains("quotes"), "quotes must survive JSON encoding");
+        assert!(value.get("permission").is_none());
+        assert!(value.get("hookSpecificOutput").is_none());
+    }
+
+    /// Claude pastes exit-0 stdout. A JSON object there is a briefing the
+    /// model never reads as prose.
+    #[test]
+    fn claude_session_start_renders_plaintext() {
+        let payload = json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-1",
+        });
+        let rendered = render_host_stdout(HookEvent::SessionStart, &payload, &briefing_document())
+            .expect("Claude sessionStart must emit a body");
+        assert!(
+            !rendered.trim_start().starts_with('{'),
+            "Claude must stay plaintext, got {rendered}"
+        );
+        assert!(rendered.contains("Ask DevMap"), "{rendered}");
+    }
+
+    /// Cursor `preToolUse` blocks the tool on a schema mismatch. Emitting
+    /// `additional_context` without `permission` is that mismatch.
+    #[test]
+    fn cursor_permission_events_render_nothing() {
+        let stdout = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": "Ask DevMap before reading files.",
+            }
+        });
+        for event_name in [
+            "preToolUse",
+            "beforeReadFile",
+            "beforeShellExecution",
+            "beforeMCPExecution",
+            "beforeTabFileRead",
+            "subagentStart",
+        ] {
+            let payload = json!({
+                "cursor_version": "3.20.7",
+                "hook_event_name": event_name,
+            });
+            assert_eq!(
+                render_host_stdout(HookEvent::PreToolUse, &payload, &stdout),
+                None,
+                "{event_name} must fail open"
+            );
+        }
+    }
+
+    /// The installer wires first-nav as Cursor `postToolUse`. That event
+    /// documents `additional_context` and is not a permission hook.
+    #[test]
+    fn cursor_post_tool_use_navigation_renders_additional_context() {
+        let payload = json!({
+            "cursor_version": "3.20.7",
+            "hook_event_name": "postToolUse",
+            "tool_name": "Read",
+        });
+        let stdout = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": "Ask DevMap before reading files.",
+            }
+        });
+        let rendered = render_host_stdout(HookEvent::PreToolUse, &payload, &stdout)
+            .expect("postToolUse nav must emit");
+        let value: Value = serde_json::from_str(&rendered).expect("JSON");
+        assert_eq!(
+            value["additional_context"],
+            "Ask DevMap before reading files."
+        );
+        assert!(value.get("permission").is_none());
+    }
+
+    /// A missing `cursor_version` must not be treated as Cursor just because
+    /// the event name is camelCase.
+    #[test]
+    fn camel_case_event_name_alone_is_not_cursor() {
+        let payload = json!({ "hook_event_name": "sessionStart" });
+        let rendered = render_host_stdout(HookEvent::SessionStart, &payload, &briefing_document())
+            .expect("body");
+        assert!(
+            !rendered.trim_start().starts_with('{'),
+            "casing is not a host signal: {rendered}"
+        );
+    }
+
+    /// A path-shaped session id must not escape the marker directory.
+    #[test]
+    fn hostile_session_ids_cannot_escape_the_marker_directory() {
+        for hostile in ["../../etc/passwd", "a/b/c", "..", "."] {
+            let name = session_marker_name(&json!({"session_id": hostile}));
+            assert!(
+                !name.contains('/'),
+                "{hostile:?} produced a name with a separator: {name}"
+            );
+            let joined = Path::new("/base/hooks").join(&name);
+            assert_eq!(
+                joined.parent(),
+                Some(Path::new("/base/hooks")),
+                "{hostile:?} escaped its directory as {name}"
+            );
+        }
+    }
+
+    /// Pruning bounds the marker directory and touches nothing else.
+    #[test]
+    fn pruning_keeps_newest_markers_and_spares_foreign_files() {
+        let root = scratch("pretool-prune");
+        let dir = root.join("hooks");
+        fs::create_dir_all(&dir).unwrap();
+
+        let keeper = dir.join("hook-build.running");
+        fs::write(&keeper, b"not a marker").unwrap();
+        for index in 0..10 {
+            fs::write(
+                dir.join(format!("{MARKER_PREFIX}s{index}.{index:016x}")),
+                b"",
+            )
+            .unwrap();
+            // Distinct mtimes: the newest-first ordering is what is under test.
+            thread::sleep(Duration::from_millis(6));
+        }
+
+        prune_markers(&dir, 4);
+        let remaining: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        let markers = remaining
+            .iter()
+            .filter(|name| name.starts_with(MARKER_PREFIX))
+            .count();
+        assert_eq!(markers, 4, "pruning kept {markers} markers, expected 4");
+        assert!(
+            keeper.exists(),
+            "pruning removed a file that is not a marker: {remaining:?}"
+        );
+        // Newest-first: the survivors are the highest-numbered.
+        for index in 6..10 {
+            assert!(
+                remaining
+                    .iter()
+                    .any(|name| name.starts_with(&format!("{MARKER_PREFIX}s{index}."))),
+                "pruning dropped a newer marker s{index}: {remaining:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An index that cannot answer must produce silence, not a directive.
+    #[test]
+    fn unusable_indexes_produce_no_directive() {
+        let root = Path::new("/repo/Demo");
+        for (label, status) in [
+            (
+                "not query ready",
+                r#"{"query_ready":false,"node_count":10}"#,
+            ),
+            (
+                "degraded",
+                r#"{"query_ready":true,"degraded_reason":"schema","node_count":10}"#,
+            ),
+            ("empty", r#"{"query_ready":true,"node_count":0}"#),
+            // Absent `query_ready` with a populated store. Without this case
+            // the gate's default is redundant with the `nodes == 0` guard, and
+            // a mutation flipping it to `unwrap_or(true)` survives — it did.
+            (
+                "query_ready absent on a populated store",
+                r#"{"node_count":10,"edge_count":20,"generation_id":3}"#,
+            ),
+            ("missing fields", r#"{}"#),
+            ("not json", "devmap: command not found"),
+            ("empty output", ""),
+        ] {
+            assert!(
+                compose_pre_tool_use(status, root).is_none(),
+                "{label} produced a directive"
+            );
+        }
+    }
+
+    /// A healthy index names itself and carries the tool list.
+    #[test]
+    fn healthy_index_directive_names_the_tools_and_the_caveat() {
+        let text = compose_pre_tool_use(healthy_status(), Path::new("/repo/DevCouncil"))
+            .expect("a healthy index emits a directive");
+        assert!(text.contains("DevCouncil"), "{text}");
+        assert!(text.contains("11714"), "{text}");
+        assert!(text.contains("devmap_search"), "{text}");
+        assert!(text.contains("walk_incomplete"), "{text}");
+        assert!(
+            text.chars().count() <= PRE_TOOL_CONTEXT_CAP,
+            "directive is {} chars, cap is {PRE_TOOL_CONTEXT_CAP}",
+            text.chars().count()
+        );
+    }
+
+    /// A stale index is still worth naming, but must say it is a lower bound.
+    #[test]
+    fn stale_index_directive_says_its_answers_are_a_lower_bound() {
+        let stale = r#"{"query_ready":true,"degraded_reason":null,"node_count":5,
+                        "edge_count":6,"generation_id":1,"is_fresh":false}"#;
+        let text = compose_pre_tool_use(stale, Path::new("/repo/Demo"))
+            .expect("a stale but queryable index still emits");
+        assert!(text.contains("lower bound"), "{text}");
+    }
+
+    /// The whole point of the event: a second navigation call stays silent.
+    ///
+    /// Unix-only for the same reason as
+    /// [`pre_tool_use_never_emits_a_permission_decision`]: the fixture execs a
+    /// `#!/bin/sh` stub. `pre_tool_use_speaks_once_for_each_distinct_session`
+    /// in the conformance suite covers once-per-session on every platform.
+    #[cfg(unix)]
+    #[test]
+    fn second_navigation_call_in_a_session_is_silent() {
+        let root = scratch("pretool-once");
+        store_bearing(&root);
+        let exe = fake_devmap(&root.join("bin"), healthy_status());
+        let payload = json!({
+            "session_id": "once-1",
+            "cwd": root.to_string_lossy(),
+            "tool_name": "Grep",
+        });
+        let bytes = serde_json::to_string(&payload).unwrap();
+
+        let first = run_hook(HookEvent::PreToolUse, bytes.as_bytes(), &exe, None);
+        assert!(
+            first.stdout.is_some(),
+            "the first navigation call must speak"
+        );
+        let second = run_hook(HookEvent::PreToolUse, bytes.as_bytes(), &exe, None);
+        assert!(
+            second.stdout.is_none(),
+            "the second call repeated the directive: {:?}",
+            second.stdout
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A hook whose work genuinely fails exits 1, never 2.
+    ///
+    /// Exit 2 means "block the agent" on Cursor and Codex, so this is the one
+    /// number the failure path may never produce. The CLI cannot reach this arm
+    /// — `--root` is resolved in `main` before `run_hook` is called, and with no
+    /// pin `select_roots` has no failing branch — so the conformance suite
+    /// exercises `main`'s handler instead and a mutation changing *this* arm to
+    /// 2 survived there. Reaching it needs an in-process call with a pin.
+    #[test]
+    fn a_failed_hook_exits_one_never_two() {
+        let missing = PathBuf::from("/nonexistent/devmap/pinned-root");
+        let payload = json!({"session_id": "fail-1", "tool_name": "Read"});
+        for event in [
+            HookEvent::PreToolUse,
+            HookEvent::PostToolUse,
+            HookEvent::SessionStart,
+            HookEvent::SessionEnd,
+        ] {
+            let outcome = run_hook(
+                event,
+                serde_json::to_string(&payload).unwrap().as_bytes(),
+                Path::new("/bin/true"),
+                Some(&missing),
+            );
+            assert_ne!(
+                outcome.exit_code,
+                2,
+                "{} exited 2, which blocks the agent's tool call",
+                event.as_str()
+            );
+            assert_eq!(
+                outcome.exit_code,
+                1,
+                "{} should report a genuine failure as exit 1",
+                event.as_str()
+            );
+            assert!(
+                outcome.stdout.is_none(),
+                "{} emitted stdout on a failure",
+                event.as_str()
+            );
+            assert!(
+                outcome
+                    .stderr_line
+                    .as_deref()
+                    .is_some_and(|line| line.contains(event.as_str())),
+                "{} failure must name the event: {:?}",
+                event.as_str(),
+                outcome.stderr_line
+            );
+        }
+    }
+
+    /// A hook that cannot write its marker must still not break the tool call.
+    #[test]
+    fn an_unwritable_marker_directory_fails_open_and_silent() {
+        let root = scratch("pretool-readonly");
+        store_bearing(&root);
+        let blocked = root.join("blocked");
+        // A regular file where the marker directory belongs: `create_dir_all`
+        // fails, which is the branch under test.
+        fs::write(&blocked, b"x").unwrap();
+        assert_eq!(claim_once(&blocked, "nav.x.0"), Claim::Skip);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

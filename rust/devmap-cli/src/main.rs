@@ -1321,7 +1321,26 @@ enum Commands {
     /// Reads one JSON object from stdin (bounded to 1 MiB). Exit 0 on success
     /// or no-op, 1 on failure — never 2 (hosts treat exit 2 as "block").
     Hook {
-        /// `session-start`, `post-tool-use`, or `session-end`.
+        /// `session-start`, `pre-tool-use`, `post-tool-use`, or `session-end`.
+        ///
+        /// `pre-tool-use` is the one event `devmap integrate` will not install
+        /// for you. On Claude Code and Cursor that event decides an
+        /// authorization outcome, and `claude::hooks_block` refuses to emit a
+        /// handler onto any such event: a code index has nothing to contribute
+        /// to a permission decision, and a table that could place one there is
+        /// one edit away from widening what this tool can approve.
+        ///
+        /// The handler itself only ever emits `additionalContext` — never a
+        /// decision field, which `pre_tool_use_never_emits_a_permission_decision`
+        /// asserts against the document it actually produces. So it is safe to
+        /// wire by hand, deliberately, in your own host configuration:
+        ///
+        ///   "PreToolUse": [{ "matcher": "Read|Grep|Glob", "hooks": [
+        ///     { "type": "command", "timeout": 5,
+        ///       "command": "\"/abs/path/to/devmap\" hook pre-tool-use" }]}]
+        ///
+        /// It restates the DevMap directive once per session, at the first
+        /// navigation tool call, and stays silent when the index cannot answer.
         event: String,
     },
 
@@ -7117,7 +7136,7 @@ fn run_hook_command(cli: &Cli, event_name: &str) -> anyhow::Result<i32> {
     let Some(event) = hook::HookEvent::parse(event_name) else {
         hook_diagnostic(format_args!(
             "devmap hook: unknown event {event_name:?}; expected session-start, \
-             post-tool-use, or session-end"
+             pre-tool-use, post-tool-use, or session-end"
         ));
         return Ok(1);
     };
@@ -7130,13 +7149,12 @@ fn run_hook_command(cli: &Cli, event_name: &str) -> anyhow::Result<i32> {
     if let Some(stdout) = &outcome.stdout {
         if cli.json {
             emit_json(cli, stdout)?;
-        } else if let Some(ctx) = stdout
-            .pointer("/hookSpecificOutput/additionalContext")
-            .and_then(|v| v.as_str())
-        {
-            outln!("{ctx}");
         } else {
-            outln!("{stdout}");
+            let payload: serde_json::Value =
+                serde_json::from_slice(&stdin).unwrap_or(serde_json::Value::Null);
+            if let Some(rendered) = hook::render_host_stdout(event, &payload, stdout) {
+                outln!("{rendered}");
+            }
         }
     }
     Ok(outcome.exit_code)

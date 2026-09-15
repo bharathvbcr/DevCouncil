@@ -1469,6 +1469,9 @@ pub fn codex_plugin_manifest(version: Option<&str>) -> anyhow::Result<Value> {
 ///
 /// Marker-owned via `generatedBy: "devmap"`. `afterFileEdit` covers Write (Tab
 /// completions excluded — they are not repository edits Dev Map should index).
+/// `postToolUse` with matcher `Read|Grep` is the first-nav nudge: Cursor's
+/// `preToolUse` is a permission hook, and a schema mismatch there blocks the
+/// tool, so the directive is injected after the first read instead.
 pub fn cursor_hooks_document(executable: &Path) -> anyhow::Result<Value> {
     let exe = utf8_path("the devmap executable path", &hook_executable(executable))?;
     let cmd = |event: &str| format!("\"{exe}\" hook {event}");
@@ -1478,6 +1481,10 @@ pub fn cursor_hooks_document(executable: &Path) -> anyhow::Result<Value> {
         "hooks": {
             "sessionStart": [{ "command": cmd("session-start") }],
             "afterFileEdit": [{ "command": cmd("post-tool-use") }],
+            "postToolUse": [{
+                "command": cmd("pre-tool-use"),
+                "matcher": "Read|Grep",
+            }],
             "sessionEnd": [{
                 "command": cmd("session-end"),
                 "timeout": SESSION_END_MAX_TIMEOUT_SECS,

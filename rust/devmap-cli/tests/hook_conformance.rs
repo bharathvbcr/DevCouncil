@@ -32,6 +32,22 @@ fn seed_store(root: &Path) {
     std::fs::write(root.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
 }
 
+/// A store `status` will call `query_ready`. Required for PreToolUse, which
+/// stays silent unless the index can actually answer.
+fn seed_queryable(root: &Path) {
+    std::fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+    let build = Command::new(DEVMAP)
+        .args(["--json", "build", "."])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "tiny build must succeed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
 struct HookRun {
     code: Option<i32>,
     #[allow(dead_code)]
@@ -528,4 +544,664 @@ fn pinned_root_disables_discovery() {
 
     let _ = std::fs::remove_dir_all(&pinned);
     let _ = std::fs::remove_dir_all(&other);
+}
+
+/// Cursor native sessionStart is fire-and-forget JSON. Plaintext briefing is
+/// logged as "Failed to parse hook stdout as JSON" and never reaches the agent.
+///
+/// The live Cursor 3.20 payload has `cursor_version` + `workspace_roots` and
+/// no `cwd`. The unwrap in `run_hook_command` that pastes Claude's
+/// `additionalContext` as raw text is the defect this names.
+#[test]
+fn cursor_session_start_stdout_is_json_additional_context() {
+    let root = scratch("cursor-start");
+    seed_store(&root);
+    let payload = json!({
+        "conversation_id": "conv-cursor-1",
+        "generation_id": "gen-1",
+        "session_id": "conv-cursor-1",
+        "hook_event_name": "sessionStart",
+        "cursor_version": "3.20.7",
+        "composer_mode": "agent",
+        "workspace_roots": [root.to_string_lossy()],
+    });
+    let run = run_hook(
+        "session-start",
+        serde_json::to_string(&payload).unwrap().as_bytes(),
+        &[],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let value: serde_json::Value = serde_json::from_str(run.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "Cursor sessionStart stdout must be JSON, not plaintext ({err}):\n{}",
+            run.stdout
+        )
+    });
+    let ctx = value["additional_context"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing additional_context: {value}"));
+    assert!(
+        ctx.contains("Ask DevMap") || ctx.contains("devmap_search"),
+        "the briefing the agent reads is missing: {ctx}"
+    );
+    assert!(
+        value.get("permission").is_none(),
+        "sessionStart must not emit a permission decision: {value}"
+    );
+    assert!(
+        value.get("hookSpecificOutput").is_none(),
+        "Cursor native schema is snake_case additional_context, not Claude nested JSON: {value}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Claude pastes exit-0 stdout into the model. A JSON blob there is the
+/// briefing the agent never reads as prose.
+#[test]
+fn claude_session_start_stdout_is_plaintext_briefing() {
+    let root = scratch("claude-start");
+    seed_store(&root);
+    let payload = json!({
+        "session_id": "claude-1",
+        "hook_event_name": "SessionStart",
+        "cwd": root.to_string_lossy(),
+        "source": "startup",
+    });
+    let run = run_hook(
+        "session-start",
+        serde_json::to_string(&payload).unwrap().as_bytes(),
+        &[],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let text = run.stdout.trim();
+    assert!(
+        !text.starts_with('{'),
+        "Claude SessionStart must stay plaintext, got {text}"
+    );
+    assert!(
+        text.contains("Ask DevMap") || text.contains("devmap_search"),
+        "Claude must still receive the briefing: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Quotes, newlines, and non-ASCII in the briefing must still be a document
+/// Cursor's parser accepts. A hand-built string would break on the first
+/// repository whose status line contained a quote.
+#[test]
+fn cursor_session_start_stdout_survives_hostile_briefing_characters() {
+    let root = scratch("cursor-quotes");
+    seed_store(&root);
+    // The repository *name* is interpolated into the briefing.
+    let named = root.join("repo \"quotes\" and 日本語");
+    std::fs::create_dir_all(&named).unwrap();
+    seed_store(&named);
+    let payload = json!({
+        "cursor_version": "3.20.7",
+        "hook_event_name": "sessionStart",
+        "session_id": "s-quotes",
+        "workspace_roots": [named.to_string_lossy()],
+    });
+    let run = run_hook(
+        "session-start",
+        serde_json::to_string(&payload).unwrap().as_bytes(),
+        &[],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let value: serde_json::Value =
+        serde_json::from_str(run.stdout.trim()).expect("hostile briefing must still be JSON");
+    let ctx = value["additional_context"].as_str().expect("context");
+    assert!(!ctx.is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Cursor `preToolUse` is a permission hook: invalid JSON or a schema mismatch
+/// **blocks the tool**. Dev Map must never sit there, and if a user wires the
+/// binary there anyway, stdout must be empty so the call fails open.
+#[test]
+fn cursor_pre_tool_use_on_a_permission_event_emits_no_stdout() {
+    let root = scratch("cursor-perm");
+    seed_queryable(&root);
+    let payload = json!({
+        "cursor_version": "3.20.7",
+        "hook_event_name": "preToolUse",
+        "session_id": "perm-1",
+        "workspace_roots": [root.to_string_lossy()],
+        "tool_name": "Read",
+        "tool_input": {"file_path": root.join("a.rs").to_string_lossy()},
+    });
+    let run = run_hook(
+        "pre-tool-use",
+        serde_json::to_string(&payload).unwrap().as_bytes(),
+        &[],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        run.stdout.trim().is_empty(),
+        "permission-hook stdout must be empty (fail open), got {:?}",
+        run.stdout
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The first-nav nudge on Cursor is `postToolUse` (additional_context is
+/// documented there). Matcher `Read|Grep` is what the installer emits; this
+/// is the binary contract that handler must satisfy.
+#[test]
+fn cursor_post_tool_use_navigation_emits_additional_context_json() {
+    let root = scratch("cursor-post-nav");
+    seed_queryable(&root);
+    let payload = json!({
+        "cursor_version": "3.20.7",
+        "hook_event_name": "postToolUse",
+        "session_id": "post-nav-1",
+        "workspace_roots": [root.to_string_lossy()],
+        "tool_name": "Read",
+        "tool_input": {"file_path": root.join("a.rs").to_string_lossy()},
+    });
+    let run = run_hook(
+        "pre-tool-use",
+        serde_json::to_string(&payload).unwrap().as_bytes(),
+        &[],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let value: serde_json::Value = serde_json::from_str(run.stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "Cursor postToolUse stdout must be JSON ({err}):\n{}",
+            run.stdout
+        )
+    });
+    let ctx = value["additional_context"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing additional_context: {value}"));
+    assert!(
+        ctx.contains("Ask DevMap") || ctx.contains("devmap"),
+        "first-nav directive missing: {ctx}"
+    );
+    assert!(value.get("permission").is_none(), "{value}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `--json` is the debug/CI shape: Claude nested document, even when stdin
+/// looks like Cursor. Hosts never pass `--json`.
+#[test]
+fn json_flag_keeps_claude_nested_shape_for_a_cursor_payload() {
+    let root = scratch("cursor-json-flag");
+    seed_store(&root);
+    let payload = json!({
+        "cursor_version": "3.20.7",
+        "hook_event_name": "sessionStart",
+        "workspace_roots": [root.to_string_lossy()],
+    });
+    let run = run_hook(
+        "session-start",
+        serde_json::to_string(&payload).unwrap().as_bytes(),
+        &["--json"],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let value: serde_json::Value = serde_json::from_str(run.stdout.trim()).expect("JSON flag");
+    assert!(
+        value
+            .pointer("/hookSpecificOutput/additionalContext")
+            .is_some(),
+        " --json must keep the internal Claude document: {value}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A Cursor payload naming more roots than the cap still has to be a document
+/// the host can parse, not a panic or a truncated fragment.
+#[test]
+fn cursor_session_start_caps_workspace_roots_and_stays_json() {
+    let base = scratch("cursor-cap");
+    let mut roots = Vec::new();
+    for i in 0..10 {
+        let root = base.join(format!("r{i}"));
+        seed_store(&root);
+        roots.push(root.to_string_lossy().into_owned());
+    }
+    let payload = json!({
+        "cursor_version": "3.20.7",
+        "hook_event_name": "sessionStart",
+        "session_id": "cap-1",
+        "workspace_roots": roots,
+    });
+    let run = run_hook(
+        "session-start",
+        serde_json::to_string(&payload).unwrap().as_bytes(),
+        &[],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let value: serde_json::Value =
+        serde_json::from_str(run.stdout.trim()).expect("capped sessionStart must still be JSON");
+    assert!(value["additional_context"].as_str().is_some());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Every Cursor permission event name must fail open at the process boundary,
+/// not only in the unit that wraps stdout. One queryable store, because
+/// PreToolUse stays silent when the index cannot answer — that silence is
+/// not the fail-open this names.
+#[test]
+fn cursor_permission_events_emit_no_stdout() {
+    let root = scratch("cursor-perm-all");
+    seed_queryable(&root);
+    for event_name in [
+        "preToolUse",
+        "beforeReadFile",
+        "beforeShellExecution",
+        "beforeMCPExecution",
+        "beforeTabFileRead",
+        "subagentStart",
+    ] {
+        let payload = json!({
+            "cursor_version": "3.20.7",
+            "hook_event_name": event_name,
+            "session_id": format!("perm-{event_name}"),
+            "workspace_roots": [root.to_string_lossy()],
+            "tool_name": "Read",
+            "tool_input": {"file_path": root.join("a.py").to_string_lossy()},
+        });
+        let run = run_hook(
+            "pre-tool-use",
+            serde_json::to_string(&payload).unwrap().as_bytes(),
+            &[],
+        );
+        assert_eq!(run.code, Some(0), "{event_name}: {}", run.stderr);
+        assert!(
+            run.stdout.trim().is_empty(),
+            "{event_name} must fail open, got {:?}",
+            run.stdout
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Concurrent Cursor sessionStarts must each be one JSON document, not a
+/// torn or interleaved write.
+#[test]
+fn concurrent_cursor_session_start_stdout_is_each_one_json_document() {
+    let root = Arc::new(scratch("cursor-fanout"));
+    seed_store(root.as_path());
+    let payload = serde_json::to_string(&json!({
+        "cursor_version": "3.20.7",
+        "hook_event_name": "sessionStart",
+        "workspace_roots": [root.to_string_lossy()],
+    }))
+    .unwrap();
+    let payload = Arc::new(payload);
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let payload = Arc::clone(&payload);
+        handles.push(thread::spawn(move || {
+            let run = run_hook("session-start", payload.as_bytes(), &[]);
+            (i, run)
+        }));
+    }
+    for handle in handles {
+        let (i, run) = handle.join().unwrap();
+        assert_eq!(run.code, Some(0), "hook {i}: {}", run.stderr);
+        let value: serde_json::Value =
+            serde_json::from_str(run.stdout.trim()).unwrap_or_else(|err| {
+                panic!(
+                    "hook {i} stdout must be one JSON document ({err}): {:?}",
+                    run.stdout
+                )
+            });
+        assert!(
+            value["additional_context"].as_str().is_some(),
+            "hook {i}: {value}"
+        );
+        assert!(value.get("permission").is_none(), "hook {i}: {value}");
+    }
+    let _ = std::fs::remove_dir_all(root.as_path());
+}
+
+// ---- pre-tool-use under load -------------------------------------------
+//
+// The properties below were first established with throwaway shell scripts
+// driving the release binary. That proved them once, on one machine, and then
+// the evidence was deleted. They belong here, against `DEVMAP`, where a
+// regression fails the build instead of going unnoticed.
+
+/// Where a repository keeps its per-session hook markers.
+///
+/// Resolved, never assumed: a repository built by `devmap build` may use either
+/// layout, and a test that hard-codes `.devcouncil` looks in an empty directory
+/// and reports "0 markers" as a pass. That exact mistake made the first version
+/// of this check pass while proving nothing.
+fn hook_marker_dir(root: &Path) -> PathBuf {
+    let state = if root.join(".devmap").is_dir() {
+        root.join(".devmap")
+    } else {
+        root.join(".devcouncil")
+    };
+    state.join("codeintel").join("hooks")
+}
+
+fn claude_nav_payload(root: &Path, session: &str) -> String {
+    serde_json::to_string(&json!({
+        "session_id": session,
+        "cwd": root.to_string_lossy(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": root.join("a.py").to_string_lossy()},
+    }))
+    .unwrap()
+}
+
+/// A parallel fan-out of first reads must produce one directive, not N.
+///
+/// The claim is a single `create_new`, which is atomic, so exactly one member of
+/// the burst wins. This is the test that catches a future rewrite to
+/// read-then-write: that races, and under load would paste the directive into
+/// the session several times over.
+#[test]
+fn pre_tool_use_first_navigation_emits_exactly_once_under_concurrency() {
+    let root = Arc::new(scratch("pretool-burst"));
+    seed_queryable(root.as_path());
+    let payload = Arc::new(claude_nav_payload(root.as_path(), "burst-session"));
+
+    let mut handles = Vec::new();
+    for _ in 0..32 {
+        let payload = Arc::clone(&payload);
+        handles.push(thread::spawn(move || {
+            run_hook("pre-tool-use", payload.as_bytes(), &[])
+        }));
+    }
+    let mut spoke = 0;
+    for handle in handles {
+        let run = handle.join().unwrap();
+        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        if !run.stdout.trim().is_empty() {
+            spoke += 1;
+        }
+    }
+    assert_eq!(
+        spoke, 1,
+        "a 32-way burst emitted the session's directive {spoke} times"
+    );
+    let _ = std::fs::remove_dir_all(root.as_path());
+}
+
+/// Markers are bounded, and the check that says so actually ran.
+///
+/// Asserting only `<= cap` passes when nothing was written at all, which is the
+/// same answer a broken hook gives. Both bounds are required.
+#[test]
+fn pre_tool_use_markers_stay_bounded_across_many_sessions() {
+    let root = scratch("pretool-bound");
+    seed_queryable(&root);
+    let markers = hook_marker_dir(&root);
+    let _ = std::fs::remove_dir_all(&markers);
+
+    for session in 0..150 {
+        let run = run_hook(
+            "pre-tool-use",
+            claude_nav_payload(&root, &format!("sess-{session}")).as_bytes(),
+            &[],
+        );
+        assert_eq!(run.code, Some(0), "session {session}: {}", run.stderr);
+    }
+
+    let count = std::fs::read_dir(&markers)
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0);
+    assert!(
+        count > 0,
+        "no marker was written at all, so this check proved nothing about the bound"
+    );
+    assert!(
+        count <= devmap_cli_max_markers(),
+        "{count} markers survived 150 sessions; the cap is {}",
+        devmap_cli_max_markers()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The cap the hook enforces. Kept beside the test that asserts it rather than
+/// imported: this suite drives the binary as a subprocess and has no access to
+/// the crate's internals, so the number is part of the observable contract.
+fn devmap_cli_max_markers() -> usize {
+    64
+}
+
+/// Exit 2 blocks the agent's tool call. Nothing this hook can be fed may reach
+/// it — not malformed input, not a hostile session id, not stdin past the 1 MiB
+/// bound.
+#[test]
+fn pre_tool_use_never_blocks_a_tool_call() {
+    let root = scratch("pretool-hostile");
+    seed_queryable(&root);
+
+    let oversized = {
+        let mut payload = String::from("{\"tool_name\":\"Read\",\"pad\":\"");
+        payload.push_str(&"x".repeat(1024 * 1024 + 4096));
+        payload.push_str("\"}");
+        payload
+    };
+
+    let cases: Vec<(&str, String)> = vec![
+        ("empty", String::new()),
+        ("truncated json", "{".into()),
+        ("json null", "null".into()),
+        ("json array", "[]".into()),
+        ("null tool name", json!({"tool_name": null}).to_string()),
+        (
+            "path-escaping session id",
+            json!({
+                "session_id": "../../etc/passwd",
+                "cwd": root.to_string_lossy(),
+                "tool_name": "Read",
+            })
+            .to_string(),
+        ),
+        (
+            "nonexistent cwd",
+            json!({"tool_name": "Read", "cwd": "/nonexistent/devmap/probe"}).to_string(),
+        ),
+        (
+            "shell search verb",
+            json!({
+                "session_id": "shell-1",
+                "cwd": root.to_string_lossy(),
+                "tool_name": "Bash",
+                "tool_input": {"command": "rg TODO src/"},
+            })
+            .to_string(),
+        ),
+        ("oversized stdin", oversized),
+    ];
+
+    for (label, payload) in cases {
+        let run = run_hook("pre-tool-use", payload.as_bytes(), &[]);
+        assert_ne!(
+            run.code,
+            Some(2),
+            "{label}: exit 2 blocks the tool call; stderr: {}",
+            run.stderr
+        );
+        assert_eq!(
+            run.code,
+            Some(0),
+            "{label}: expected a clean no-op; stderr: {}",
+            run.stderr
+        );
+    }
+
+    // Every case above takes a no-op path, so none of them reach the error
+    // branch — which is how a mutation turning that branch's exit code into 2
+    // survived this test. `--root` at a path that does not exist is the one
+    // input that makes root selection genuinely fail, so this is the case that
+    // proves a *failure* still refuses to block.
+    let failing = run_hook(
+        "pre-tool-use",
+        claude_nav_payload(&root, "forced-failure").as_bytes(),
+        &["--root", "/nonexistent/devmap/pinned"],
+    );
+    assert_ne!(
+        failing.code,
+        Some(2),
+        "a hook failure must never exit 2: it would block the tool call. stderr: {}",
+        failing.stderr
+    );
+    assert_eq!(
+        failing.code,
+        Some(1),
+        "a genuine failure is exit 1; stderr: {}",
+        failing.stderr
+    );
+    assert!(
+        failing.stdout.trim().is_empty(),
+        "a failed hook must emit nothing, got {:?}",
+        failing.stdout
+    );
+
+    // A hostile session id must not have escaped the marker directory.
+    let markers = hook_marker_dir(&root);
+    if let Ok(entries) = std::fs::read_dir(&markers) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.contains("..") && !name.contains('/'),
+                "marker name escaped its directory: {name}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A tool that is not navigation must cost nothing and say nothing.
+///
+/// The root here is real and queryable **on purpose**. An earlier version of
+/// this test pointed at a nonexistent directory, reasoning that a silent no-op
+/// proved the short circuit had run first — but a payload naming no indexed
+/// repository is silent anyway, so deleting the short circuit left the test
+/// green. Against a root the hook *would* happily advertise, silence can only
+/// mean the tool name was rejected before any of that.
+#[test]
+fn pre_tool_use_skips_non_navigation_tools() {
+    let root = scratch("pretool-skip");
+    seed_queryable(&root);
+
+    // Control: this root does speak, so the assertions below mean something.
+    let control = run_hook(
+        "pre-tool-use",
+        claude_nav_payload(&root, "skip-control").as_bytes(),
+        &[],
+    );
+    assert_eq!(control.code, Some(0), "{}", control.stderr);
+    assert!(
+        !control.stdout.trim().is_empty(),
+        "the control read must emit, or this test cannot detect a regression"
+    );
+
+    for tool in ["Write", "Edit", "NotebookEdit", "WebFetch", "TodoWrite"] {
+        let payload = json!({
+            "session_id": format!("skip-{tool}"),
+            "cwd": root.to_string_lossy(),
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+        });
+        let run = run_hook(
+            "pre-tool-use",
+            serde_json::to_string(&payload).unwrap().as_bytes(),
+            &[],
+        );
+        assert_eq!(run.code, Some(0), "{tool}: {}", run.stderr);
+        assert!(
+            run.stdout.trim().is_empty(),
+            "{tool} produced stdout: {:?}",
+            run.stdout
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Two sessions are two directives; the marker is scoped, not global.
+#[test]
+fn pre_tool_use_speaks_once_for_each_distinct_session() {
+    let root = scratch("pretool-two-sessions");
+    seed_queryable(&root);
+
+    let mut spoke = 0;
+    for session in ["alpha", "beta"] {
+        for attempt in 0..2 {
+            let run = run_hook(
+                "pre-tool-use",
+                claude_nav_payload(&root, session).as_bytes(),
+                &[],
+            );
+            assert_eq!(run.code, Some(0), "{session}/{attempt}: {}", run.stderr);
+            if !run.stdout.trim().is_empty() {
+                spoke += 1;
+            }
+        }
+    }
+    assert_eq!(
+        spoke, 2,
+        "two sessions reading twice each must yield exactly two directives"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An index that is queryable but holds nothing must produce silence.
+///
+/// The store here is **built**, not a stub: this repository indexes cleanly to
+/// `query_ready: true, node_count: 0`, and would answer every question
+/// "absent" — the single most expensive wrong answer it can give. An earlier
+/// version seeded a fake sqlite file instead, so the probe failed outright and
+/// the emptiness guard was never the thing under test; deleting that guard left
+/// it green.
+///
+/// The fixture is a `.txt` file specifically. A `README.md` does *not* work:
+/// markdown headings are indexed, so it yields one symbol and the hook
+/// correctly advertises it — measured, after that fixture failed this test.
+#[test]
+fn pre_tool_use_is_silent_when_the_index_is_empty() {
+    let root = scratch("pretool-empty-index");
+    std::fs::write(root.join("notes.txt"), "prose, no code and no headings\n").unwrap();
+    let build = Command::new(DEVMAP)
+        .args(["--json", "build", "."])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "building an empty repository must still succeed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = run_hook(
+        "pre-tool-use",
+        claude_nav_payload(&root, "empty-1").as_bytes(),
+        &[],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        run.stdout.trim().is_empty(),
+        "an index holding no symbols must not be advertised, got {:?}",
+        run.stdout
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A store file that is not a usable index must also stay silent.
+#[test]
+fn pre_tool_use_is_silent_when_the_store_cannot_be_read() {
+    let root = scratch("pretool-unreadable");
+    seed_store(&root);
+    let run = run_hook(
+        "pre-tool-use",
+        claude_nav_payload(&root, "unreadable-1").as_bytes(),
+        &[],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        run.stdout.trim().is_empty(),
+        "an unreadable store must not be advertised, got {:?}",
+        run.stdout
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }

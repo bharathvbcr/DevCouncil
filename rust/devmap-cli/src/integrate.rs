@@ -1041,7 +1041,7 @@ pub fn merge_cursor_hooks(
         path: path.to_path_buf(),
         changed: true,
         removed_stale_db: false,
-        note: "wrote marker-owned .cursor/hooks.json (sessionStart, afterFileEdit, sessionEnd)"
+        note: "wrote marker-owned .cursor/hooks.json (sessionStart, postToolUse, afterFileEdit, sessionEnd)"
             .into(),
     })
 }
@@ -1819,6 +1819,42 @@ mod tests {
         // Second merge is a no-op.
         let again = merge_cursor_hooks(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
         assert!(!again.changed);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Cursor `preToolUse` / `beforeReadFile` are permission hooks: a schema
+    /// mismatch blocks the tool. The first-nav nudge therefore lives on
+    /// `postToolUse`, whose documented output is `additional_context`.
+    #[test]
+    fn cursor_hooks_inject_first_navigation_on_post_tool_use_never_on_permission_events() {
+        let dir = scratch("cursor-nav-hooks");
+        let path = dir.join(".cursor").join("hooks.json");
+        merge_cursor_hooks(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for forbidden in [
+            "preToolUse",
+            "beforeReadFile",
+            "beforeShellExecution",
+            "beforeMCPExecution",
+            "beforeTabFileRead",
+            "subagentStart",
+        ] {
+            assert!(
+                value["hooks"].get(forbidden).is_none(),
+                "{forbidden} is a permission hook; installing there can block the agent"
+            );
+        }
+        let nav = &value["hooks"]["postToolUse"][0];
+        let cmd = nav["command"].as_str().unwrap();
+        assert!(
+            cmd.contains("hook pre-tool-use"),
+            "first-nav must run the existing pre-tool-use handler: {cmd}"
+        );
+        assert_eq!(nav["matcher"], "Read|Grep");
+        assert!(
+            value.get("failClosed").is_none() && nav.get("failClosed").is_none(),
+            "failClosed would turn a crash into a blocked Read: {value}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
