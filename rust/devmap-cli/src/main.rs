@@ -2656,6 +2656,11 @@ fn plugin_warning() -> Option<String> {
 /// In-process on purpose: the caller runs this once per matching line, and the
 /// previous spelling spawned `date` there instead. `None` for anything that is
 /// not that shape, which the caller skips rather than guessing at.
+///
+/// `cfg(unix)` because its only caller is `stale_server_warning`'s unix arm:
+/// there is no `ps` to parse on Windows, so compiling it there left dead code
+/// that `-D warnings` rejected. The tests below carry the same gate.
+#[cfg(unix)]
 fn parse_etime(text: &str) -> Option<std::time::Duration> {
     let (days, rest) = match text.split_once('-') {
         Some((days, rest)) => (days.parse::<u64>().ok()?, rest),
@@ -2687,9 +2692,14 @@ fn parse_etime(text: &str) -> Option<std::time::Duration> {
 }
 
 fn stale_server_warning() -> Option<String> {
+    // A tail expression, not `return None`: on Windows this arm *is* the whole
+    // body, so the `return` was `clippy::needless_return` on the one platform
+    // that compiles it — and `-D warnings` failed the build there on a line no
+    // other target ever sees. `None` here means "not measured" rather than
+    // "nothing is stale"; the check reads `ps`, which Windows does not have.
     #[cfg(not(unix))]
     {
-        return None;
+        None
     }
     #[cfg(unix)]
     {
@@ -7493,6 +7503,7 @@ mod tests {
     /// is now the only thing standing between a process's age and a wrong
     /// stale-server verdict.
     #[test]
+    #[cfg(unix)]
     fn etime_parses_every_shape_ps_prints() {
         use std::time::Duration;
         assert_eq!(parse_etime("03:04"), Some(Duration::from_secs(184)));
@@ -7511,6 +7522,7 @@ mod tests {
     /// unparseable input would silently mis-age a process and could report a
     /// live MCP server as stale — or hide one that is.
     #[test]
+    #[cfg(unix)]
     fn etime_refuses_what_it_does_not_understand() {
         for bad in [
             "",

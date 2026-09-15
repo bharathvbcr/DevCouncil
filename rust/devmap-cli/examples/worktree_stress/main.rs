@@ -14,7 +14,10 @@ mod support;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+// `Write` is imported by `ipc_unix` alone, beside the `UnixStream` it writes
+// to: at this scope it is unused on Windows, where the named-pipe path does
+// the exchange instead, and `-D warnings` makes that a build failure.
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1170,6 +1173,7 @@ fn ipc(
 
 #[cfg(unix)]
 fn ipc_unix(endpoint: &Path, command: &Value) -> Result<Value> {
+    use std::io::Write;
     use std::os::unix::net::UnixStream;
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut stream = UnixStream::connect(endpoint)?;

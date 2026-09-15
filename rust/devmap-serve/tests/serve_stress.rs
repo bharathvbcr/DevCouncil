@@ -768,31 +768,58 @@ async fn fifty_spawn_retire_cycles_and_a_kill_mid_drain_leave_the_store_usable()
         "the work queued before the kill was neither replayable nor done"
     );
 
-    let daemon = devmap_serve::Daemon::new(store, root.clone()).with_store_path(db.clone());
-    let _drained = tokio::task::spawn_blocking(move || daemon.drain_pending_batch())
-        .await
-        .expect("drain task")
-        .expect("the next drain must complete the interrupted work");
-    // Aborting a Tokio task does not terminate its spawn_blocking drain. That
-    // worker may finish after `still_queued` was read and before this drain
-    // obtains writer ownership. The final state below proves recovery whichever
-    // worker completed it; the real SIGKILL case lives in test_process_recovery.
+    drop(store);
 
-    let store = Store::open(&db).expect("store");
-    assert!(
-        store
+    // Drain until the queue is empty, rather than exactly once.
+    //
+    // Aborting a Tokio task does not terminate the killed daemon's own
+    // `spawn_blocking` drain, so two drains are live here. When the surviving
+    // one touches a row this one has already claimed, that row's revision
+    // moves, and `clear_claimed_pending_paths` deletes `WHERE path = ?1 AND
+    // revision = ?2` — so the acknowledgement matches nothing and the row
+    // stays. That is the store working as designed: it is the same rule
+    // `equal_clock_ticks_cannot_acknowledge_a_new_edit` pins, and it exists so
+    // a drain cannot retire an edit that arrived after it looked. The work is
+    // in the generation; the row is simply not retired yet, and only another
+    // drain retires it. A daemon does that on its next idle tick — this test
+    // has no daemon left running, so it has to drain again itself.
+    //
+    // Sleeping cannot substitute: with nothing draining, an unretired row stays
+    // unretired. Measured under `verify.sh`'s whole-workspace load, a wait of
+    // 60 s reported `late.py indexed=true, still queued=["late.py"]` unchanged
+    // — which is also the shape this failed in on CI (run 34904461297 attempt
+    // 1, green on attempt 2 of the same commit). It passes locally under light
+    // load because the two drains do not interleave there.
+    //
+    // The property is unchanged and still fails closed: `late.py` ends up in
+    // the generation and out of the queue, or the bound expires and the message
+    // names what it saw, so the next failure is diagnosable instead of a rerun.
+    let settled_by = Instant::now() + Duration::from_secs(60);
+    loop {
+        let store = Store::open(&db).expect("the store must reopen after an abrupt exit");
+        // Indexed: the file queued before the kill reached the generation.
+        // Not queued: work completed once is not work to redo.
+        let indexed = store
             .latest_extractions()
             .unwrap()
             .iter()
-            .any(|extraction| extraction.file_path == "late.py"),
-        "the file queued before the kill must be in the generation after recovery"
-    );
-    assert!(
-        store.get_pending_paths().unwrap().is_empty(),
-        "and it must not still be queued: work completed once is not work to redo"
-    );
+            .any(|extraction| extraction.file_path == "late.py");
+        let queued = store.get_pending_paths().unwrap();
+        if indexed && queued.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < settled_by,
+            "60s of drains after recovery left the interrupted work unsettled: \
+             late.py indexed={indexed}, still queued={queued:?}"
+        );
+        let daemon = devmap_serve::Daemon::new(store, root.clone()).with_store_path(db.clone());
+        tokio::task::spawn_blocking(move || daemon.drain_pending_batch())
+            .await
+            .expect("drain task")
+            .expect("a drain after an abrupt exit must complete rather than error");
+    }
 
-    drop(store);
     let _ = std::fs::remove_dir_all(&root);
 }
 

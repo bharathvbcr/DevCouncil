@@ -1818,6 +1818,122 @@ fn an_unexamined_cache_marker_keeps_previously_queued_work() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// A control token is not a path, and admission must not apply path semantics
+/// to it.
+///
+/// `canonical_pending_entry` already short-circuits control tokens — a leading
+/// NUL cannot begin a real filesystem path, which is what makes the namespace
+/// safe — but the K7 build-cache check then ran on the result anyway. The OS
+/// cannot be handed `root.join("\0devmap:git-head-changed")` at all, because a
+/// path string cannot carry an interior NUL, so `is_cache_directory` returned
+/// `Err`, the verdict was `Unreadable`, and the token was refused at the door:
+///
+/// ```text
+/// watcher emitted a path outside the tree: "\0devmap:git-head-changed"
+///   (cannot examine \u{0}devmap:git-head-changed/CACHEDIR.TAG:
+///    file name contained an unexpected NUL byte)
+/// enqueued 0 changed path(s)
+/// ```
+///
+/// That token is the daemon's only signal that the checkout moved. Dropping it
+/// leaves a commit, branch switch or rebase invisible: the index goes on
+/// describing a tree that no longer exists and `status` still answers fresh.
+/// It reached CI as `rust.yml`'s `Native worktree capacity and process
+/// recovery` step failing on macOS and Ubuntu alike, the harness waiting out
+/// its full 90 s deadline for a stored HEAD that could never move.
+///
+/// Every existing test of the sentinel called `enqueue_pending_paths`, which
+/// has no cache check, while the daemon calls
+/// `enqueue_pending_paths_under_root`, which does — so the whole suite was
+/// green against a producer the daemon does not use.
+/// `reconcile_pending_paths_with` already guards with `is_control_token`
+/// before applying path semantics; this asserts the same guard at the other
+/// producer, and the two positive controls below keep the K7 refusal and the
+/// unreadable-marker refusal intact for entries that really are paths.
+#[test]
+fn a_control_token_is_admitted_without_being_walked_as_a_path() {
+    const GIT_HEAD_SENTINEL: &str = "\u{0}devmap:git-head-changed";
+
+    let dir = tmp_dir("control-token-admission");
+    let root = dir.join("repo");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.py"), "def f(): pass\n").unwrap();
+    // A real tagged build cache, and a marker that cannot be examined.
+    fs::create_dir_all(root.join("build/CACHEDIR.TAG")).unwrap();
+    fs::write(root.join("build/artifact.py"), "def g(): pass\n").unwrap();
+    fs::create_dir_all(root.join("cache")).unwrap();
+    fs::write(
+        root.join("cache/CACHEDIR.TAG"),
+        devmap_extract::CACHEDIR_TAG_SIGNATURE,
+    )
+    .unwrap();
+    fs::write(root.join("cache/artifact.py"), "def h(): pass\n").unwrap();
+
+    let store = Store::open(dir.join("devmap.sqlite")).unwrap();
+    let admission = store
+        .enqueue_pending_paths_under_root(
+            &root,
+            &[
+                GIT_HEAD_SENTINEL.to_string(),
+                "src/main.py".to_string(),
+                "cache/artifact.py".to_string(),
+                "build/artifact.py".to_string(),
+            ],
+        )
+        .unwrap();
+
+    assert!(
+        admission.enqueued.contains(&GIT_HEAD_SENTINEL.to_string()),
+        "the git-HEAD sentinel must reach the queue; refused: {:?}",
+        admission.refused
+    );
+    assert!(
+        admission.enqueued.contains(&"src/main.py".to_string()),
+        "ordinary source must still be admitted: {:?}",
+        admission.enqueued
+    );
+    // Positive control: the guard must exempt control tokens, not disable K7.
+    let refused_for = |raw: &str| -> String {
+        admission
+            .refused
+            .iter()
+            .find(|(path, _)| path == raw)
+            .unwrap_or_else(|| panic!("{raw} must be refused: {:?}", admission.refused))
+            .1
+            .clone()
+    };
+    assert!(
+        refused_for("cache/artifact.py").contains("CACHEDIR.TAG"),
+        "a tagged build cache is still refused"
+    );
+    // Positive control: an unreadable marker is still not a cleared path.
+    assert!(
+        refused_for("build/artifact.py").contains("CACHEDIR.TAG"),
+        "a marker that could not be examined is still refused"
+    );
+
+    // The token survives the reconcile sweep too, so the daemon can still see
+    // it after a connect-time repair.
+    let outcome = store.reconcile_pending_paths(&root).unwrap();
+    assert!(
+        outcome
+            .dropped
+            .iter()
+            .all(|(path, _)| path != GIT_HEAD_SENTINEL),
+        "reconcile must retain the sentinel: {outcome:?}"
+    );
+    assert!(
+        store
+            .get_pending_paths()
+            .unwrap()
+            .contains(&GIT_HEAD_SENTINEL.to_string()),
+        "the sentinel must still be queued after reconcile"
+    );
+
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 /// S-3, one level up: a `canonicalize` that could not run is not "outside the
 /// repository root".
 ///
