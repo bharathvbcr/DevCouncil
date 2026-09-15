@@ -21,6 +21,48 @@ fn edit_bundle(edit: impl FnOnce(&mut Value)) -> Vec<u8> {
     serde_json::to_vec(&bundle).unwrap()
 }
 
+/// The precondition every verdict below rests on: the fixtures reached this
+/// binary as committed.
+///
+/// The contracts are bound to the bundles by a digest over their exact bytes,
+/// so a checkout that rewrites line endings changes that digest without
+/// changing anything a reader would notice — the JSON still parses and still
+/// means the same thing. Eleven tests in this file then fail with nothing but
+/// `left: Failed`, which is how `components (windows-latest)` stayed red for
+/// ten runs. The root `.gitattributes` (`* -text`) is what prevents it; this
+/// test is what says so when it stops working.
+///
+/// The directory is walked rather than the consts above because `dc-verify`
+/// embeds these same files and has no equivalent guard of its own.
+#[test]
+fn fixtures_reach_the_test_binary_byte_for_byte() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/v1");
+    let mut checked = 0usize;
+    for entry in std::fs::read_dir(dir).expect("fixtures/v1 is unreadable") {
+        let path = entry.unwrap().path();
+        assert!(
+            !std::fs::read(&path).unwrap().contains(&b'\r'),
+            "{} holds CR bytes, so this checkout rewrote its line endings. The \
+             contract digests recorded in bundle*.json are taken over exact \
+             bytes and no longer match. Check that the root .gitattributes \
+             (`* -text`) is still present and still covers this path.",
+            path.display()
+        );
+        checked += 1;
+    }
+    // A directory that failed to enumerate would make this pass by checking
+    // nothing.
+    assert!(checked >= 8, "only {checked} fixtures were read from {dir}");
+    // Catches byte drift that inserts no CR — a BOM, a stray edit — against the
+    // digest the evidence actually binds.
+    assert_eq!(
+        sha256(CONTRACT),
+        expected().contract_sha256,
+        "fixtures/v1/contract.json no longer hashes to the digest recorded in \
+         expected.json"
+    );
+}
+
 #[test]
 fn immutable_fixture_passes_and_report_binds_exact_input_bytes() {
     let report = verify(CONTRACT, BUNDLE, &expected(), &inputs()).unwrap();
