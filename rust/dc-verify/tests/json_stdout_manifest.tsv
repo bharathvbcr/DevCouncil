@@ -1,66 +1,90 @@
-# DevCouncil `--json` invocations whose stdout must hold exactly one JSON object.
+# DevCouncil `--json` invocations whose stdout must hold exactly one JSON value.
 #
 # Fields are TAB-separated. The first is the mode; the rest are argv, passed to
-# the process directly — there is no shell here, so nothing needs quoting.
+# the process directly — there is no shell here, so nothing needs quoting. The
+# format is `dcjsoncheck`'s, which is what runs this file.
 #
-# `{PY}` is replaced with the interpreter the harness resolved and `{ROOT}` with
-# the throwaway project it initialised, so every entry runs against a real,
-# freshly-scaffolded repository rather than the developer's own checkout.
+# `{DEVCOUNCIL}` is replaced with the host binary the harness resolved and
+# `{ROOT}` with the throwaway git repository it created, so every entry runs
+# against a real, freshly-scaffolded project rather than the developer's own
+# checkout.
 #
-# Every entry here reproduced a failure against the pre-fix CLI, except where a
-# comment says otherwise. Both outcomes are covered on purpose: a command that
-# succeeds and a command that rejects its arguments owe stdout the same one
-# object, and it was the rejecting paths that were emitting zero.
+# This list named `{PY} -m devcouncil.cli.main …` until 2026-09-14. That module
+# was deleted in 3286db5 when the orchestrator moved to Go, so every invocation
+# here had been unrunnable — and the harness skipped instead of failing, which
+# is how a gate that ran nothing kept reporting the green of a gate that ran.
+# The surviving `--json` CLIs are the Go host and `devmap`; `devmap`'s own
+# contract is owned by `rust/devmap-cli/tests/cli_json_contract.rs`, in the
+# crate that builds it, so this file is the host's half and does not duplicate
+# it.
+#
+# Both outcomes are covered on purpose: a command that succeeds and a command
+# that rejects its arguments owe stdout the same one object. The host keeps
+# that promise in one place — `console.Session.Finish` emits
+# `{"ok":false,"diagnostics":[…]}` when `--json` was asked for and no handler
+# wrote a payload — so a rejecting path that prints only to stderr is a real
+# regression, not an accepted shape. Every entry below was run against
+# dea408e; the `hook status --client` pair failed there and is the reason this
+# pass also changed `presentationArgs`.
+#
+# Nothing here may write to the project or the developer's machine: `install`
+# only ever appears with `--dry-run` (or a name that fails to resolve), and
+# `integrate`, `skills` and `hook` only with `--check` or `--dry-run`.
 
-# --- dev cost: the confirmed leak, both shapes ---------------------------------
-mode=json	{PY}	-m	devcouncil.cli.main	cost	show	--json	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	cost	budget	--json	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	cost	budget	--json	--set	5.00	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	cost	budget	--json	--clear	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	cost	budget	--json	--set	5	--clear	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	cost	budget	--json	--set	-1	--project-root	{ROOT}
+# --- gate: the smallest read, and the presentation seam around it --------------
+# `--progress always` forces the live renderer on while `--json` is set; it
+# must still render to stderr. That interaction is the one this file exists to
+# hold, and it is invisible to any in-process test of the handler.
+mode=json	{DEVCOUNCIL}	gate	status	--json	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	gate	status	--json	--progress	always	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	gate	status	--json	--progress	never	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	gate	status	--json	--project-root	{ROOT}/no-such-dir
+mode=json	{DEVCOUNCIL}	gate	status	--json	--nonsense	--project-root	{ROOT}
+# `gate set` has no --json of its own, so this is the unknown-flag refusal on a
+# --json argv: the envelope owes stdout an object even for a flag nobody parsed.
+mode=json	{DEVCOUNCIL}	gate	set	--mode	nonsense	--json	--project-root	{ROOT}
 
-# --- dev report: five branches that did their work and returned ----------------
-mode=json	{PY}	-m	devcouncil.cli.main	report	--json	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	report	--json	--evidence-json	{ROOT}/evidence.json	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	report	--json	--evidence-html	{ROOT}/evidence.html	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	report	--json	--github	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	report	--json	--gitlab-pr-comment	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	report	rigor	--json	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	report	release-health	--json	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	report	release-health	--json	--write-baseline	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	report	release-health	--json	--output	{ROOT}/release-health.json	--project-root	{ROOT}
+# --- install: the receipt, the dry-run plan, and the refusals ------------------
+mode=json	{DEVCOUNCIL}	install	--list	--json
+mode=json	{DEVCOUNCIL}	install	--list	--json	--progress	always
+mode=json	{DEVCOUNCIL}	install	--list	--json	--nonsense
+mode=json	{DEVCOUNCIL}	install	--dry-run	--json	--prefix	{ROOT}/prefix
+mode=json	{DEVCOUNCIL}	install	--dry-run	--json	--prefix	{ROOT}/prefix	devmap
+mode=json	{DEVCOUNCIL}	install	--json	--prefix	{ROOT}/prefix	nosuchcomponent
 
-# --- dev go: the orchestrator, whose whole console output was narration --------
-# The second reaches plan.py, which was writing a provider error onto stdout
-# ahead of the payload; the first is rejected before planning starts.
-mode=json	{PY}	-m	devcouncil.cli.main	go	a goal	--json	--executor	nosuchagent	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	go	a goal	--json	--project-root	{ROOT}
+# --- skills -------------------------------------------------------------------
+mode=json	{DEVCOUNCIL}	skills	list	--json
+mode=json	{DEVCOUNCIL}	skills	list	--json	--nonsense
+mode=json	{DEVCOUNCIL}	skills	scaffold	--check	--json	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	skills	scaffold	--dry-run	--json	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	skills	scaffold	--check	--json	--skill	nosuchskill	--project-root	{ROOT}
 
-# --- dev boot: the whole setup phase used to run onto the payload stream --------
-# `{ROOT}` is already initialised by the harness, so this exercises boot's
-# re-init path plus the doctor table, both of which were writing to stdout.
-# --skip-api-key keeps it non-interactive; boot would force that anyway off a TTY.
-mode=json	{PY}	-m	devcouncil.cli.main	boot	a goal	--json	--skip-map	--skip-skills	--skip-integrations	--skip-api-key	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	boot	a goal	--json	--gemini-scope	nonsense	--project-root	{ROOT}
+# --- integrate: the receipt path, and the two refusals that carry none ---------
+# `--write-gate` is refused by name rather than as an unknown flag, and that
+# branch returns before `integrate.Run`, so nothing writes a receipt.
+mode=json	{DEVCOUNCIL}	integrate	claude	--check	--json	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	integrate	claude	--dry-run	--json	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	integrate	nosuchhost	--check	--json	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	integrate	claude	--write-gate	--json	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	integrate	uninstall	--target	hooks	--dry-run	--json	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	integrate	uninstall	--target	nonsense	--dry-run	--json	--project-root	{ROOT}
 
-# --- the small commands' pre-flight guards -------------------------------------
-mode=json	{PY}	-m	devcouncil.cli.main	tasks	--json	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	semantic	snapshot	TASK-001	--json	--stage	sideways	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	apply-patch	--json	--unified-diff	 	--project-root	{ROOT}
+# --- hook: the retired lifecycle surface's two management subcommands ----------
+# `--client nosuchhost` is refused inside `integrate.Uninstall`, which returns
+# no receipt. Both of these left stdout empty at dea408e, because `hook` took
+# the protocol path and so never reached the envelope in `Finish`. They are the
+# entries that fail against the pre-fix host.
+mode=json	{DEVCOUNCIL}	hook	status	--json	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	hook	status	--json	--client	nosuchhost	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	hook	disable	--dry-run	--json	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	hook	disable	--dry-run	--json	--client	nosuchhost	--project-root	{ROOT}
 
-# --- streaming commands, whose progress ran around the payload -----------------
-mode=json	{PY}	-m	devcouncil.cli.main	runs	list	--json	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	runs	timeline	no-such-run	--json	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	runs	supervise	no-such-run	--json	--no-llm	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	watch	fs	--task	TASK-001	--once	--json	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	trace	tail	--json	--project-root	{ROOT}
-
-# `--jsonl` is the sibling contract: stdout is a newline-delimited JSON stream,
-# and the cursor line was the last, unparseable thing a consumer read.
-mode=jsonl	{PY}	-m	devcouncil.cli.main	trace	tail	--since	0	--jsonl	--project-root	{ROOT}
-
-# --- commands that already honoured the contract, kept as the control ----------
-# If these ever fail, the harness itself is wrong rather than the CLI.
-mode=json	{PY}	-m	devcouncil.cli.main	verify	--json	--project-root	{ROOT}
-mode=json	{PY}	-m	devcouncil.cli.main	status	--json	--project-root	{ROOT}
+# --- verify: every exit the gate mode can produce, plus the pre-flight guards --
+mode=json	{DEVCOUNCIL}	verify	TASK-001	--json	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	verify	TASK-001	--json	--mode	off	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	verify	TASK-001	--json	--mode	advisory	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	verify	TASK-001	--json	--mode	enforce	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	verify	TASK-001	--json	--mode	nonsense	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	verify	TASK-001	--json	--sandbox	nonsense	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	verify	TASK-001	--json	--coverage	{ROOT}/no-such.lcov	--project-root	{ROOT}
+mode=json	{DEVCOUNCIL}	verify	--json	--project-root	{ROOT}

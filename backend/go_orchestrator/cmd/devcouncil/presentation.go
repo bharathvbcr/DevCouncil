@@ -24,10 +24,24 @@ func runCLI(args []string) int {
 	return console.Run(policy, ctx, func() int { return dispatch(rest) })
 }
 
+// hookIsManagement separates `dev hook status|disable` from the retired
+// lifecycle events that share the word.
+//
+// An event call must stay inert: no render session, no goroutine, nothing on
+// either stream. The two management subcommands are ordinary commands a person
+// or a script runs, and `--json` owes them one JSON value on stdout like any
+// other command. Only the session can keep that promise on the paths where the
+// handler has no receipt to write — `integrate.Uninstall` returns none for an
+// unsupported `--client`, and with the protocol bypass that left stdout empty
+// while a caller was parsing it.
+func hookIsManagement(args []string) bool {
+	return len(args) > 1 && (args[1] == "status" || args[1] == "disable")
+}
+
 func presentationArgs(args []string) ([]string, console.Policy, error) {
 	policy := console.Policy{Title: "Command", Activity: "Checking the request", Progress: "auto"}
 	// Delegated commands own their presentation and complete argv grammar.
-	if len(args) > 0 && (args[0] == "map" || args[0] == "graph" || args[0] == "ast" || args[0] == "hook" || args[0] == "mcp" || args[0] == "mcp-server") {
+	if len(args) > 0 && (args[0] == "map" || args[0] == "graph" || args[0] == "ast" || (args[0] == "hook" && !hookIsManagement(args)) || args[0] == "mcp" || args[0] == "mcp-server") {
 		policy.Protocol = true
 		return args, policy, nil
 	}
@@ -96,7 +110,11 @@ func presentationArgs(args []string) ([]string, console.Policy, error) {
 		// Progress flags before the alias belong to the child too.
 		rest = append(rest, "--progress", policy.Progress)
 		policy.Protocol = true
-	case "hook", "mcp", "mcp-server", "version", "help":
+	case "hook":
+		// Reached only for the management subcommands; the event path took the
+		// protocol return above.
+		policy.Title, policy.Activity = "Hooks", "Checking host registrations"
+	case "mcp", "mcp-server", "version", "help":
 		policy.Protocol = true
 	default:
 		policy.Title, policy.Activity = "Command", "Checking the request"
