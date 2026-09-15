@@ -1,0 +1,2 @@
+reference=classify_scope@017da09 candidate=classify_scope@working
+cases=2000 mismatches=0 seed=4711

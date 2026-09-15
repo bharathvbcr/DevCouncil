@@ -159,7 +159,56 @@ func runRigorGates(ctx context.Context, in Input, taskID string, planned []strin
 	} else {
 		out.coverageSkippedReason = coverageReason
 	}
+	if gap, ok := gapFromSubstance(taskID, result.Substance); ok {
+		out.gaps = append(out.gaps, gap)
+	}
 	return out
+}
+
+// gapFromSubstance reports a diff that passed every gate while containing
+// little new work.
+//
+// Non-blocking, and that is not timidity. A pure refactor is almost entirely
+// relocated lines and *should* measure low; so should a lockfile refresh. The
+// measurement is not evidence that anything is wrong — it is the answer to a
+// question no other gate asks, which is whether there is anything in the change
+// at all. A reviewer who knows a diff is 90% relocation reads it as a
+// relocation, and that is the whole value.
+//
+// Blocking on it would be the mistake every gate in this layer is written to
+// avoid: a check with a high false-positive rate gets switched off, and this
+// one has a legitimate false-positive class by construction.
+//
+// The false return is "nothing to say", which covers both a substantive diff
+// and one too small to judge. Those are different facts, but neither is a gap,
+// and inventing a gap for "too small to measure" would put a row in the report
+// for almost every small change.
+func gapFromSubstance(taskID string, s dcverify.Substance) (Gap, bool) {
+	if !s.Judged || !s.Low {
+		return Gap{}, false
+	}
+	return Gap{
+		ID:       StableGapID(taskID, "SUBSTANCE"),
+		Severity: "low",
+		GapType:  "low_substance",
+		TaskID:   taskID,
+		Description: itoa(s.SubstantiveLines) + " of " + itoa(s.AddedLines) +
+			" added lines are new work; the rest is structure, relocation, " +
+			"repetition or generated output.",
+		Evidence: []string{
+			"added " + itoa(s.AddedLines) +
+				": substantive " + itoa(s.SubstantiveLines) +
+				", trivial " + itoa(s.Trivial) +
+				", moved " + itoa(s.Moved) +
+				", repeated " + itoa(s.Repeated) +
+				", generated " + itoa(s.Generated),
+		},
+		RecommendedFix: "Check that the change does what the task asked. This is the " +
+			"expected shape for a refactor, a file move or a dependency refresh — " +
+			"if that is what this is, the measurement is describing it correctly " +
+			"and there is nothing to fix.",
+		Blocking: false,
+	}, true
 }
 
 // gapsFromFindings translates dcverify's findings into the gap vocabulary.

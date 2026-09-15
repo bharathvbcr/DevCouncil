@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "id": "refactor-preserves-behavior",
+  "criteria": [
+    {
+      "id": "no-mismatch",
+      "fact": "differential.mismatches",
+      "required": true,
+      "predicate": {
+        "op": "equals",
+        "value": 0
+      }
+    },
+    {
+      "id": "enough-cases",
+      "fact": "differential.cases_run",
+      "required": true,
+      "predicate": {
+        "op": "minimum",
+        "value": 1000
+      }
+    },
+    {
+      "id": "compared-against-the-pinned-reference",
+      "fact": "differential.reference_rev",
+      "required": true,
+      "predicate": {
+        "op": "equals",
+        "value": "017da09"
+      }
+    },
+    {
+      "id": "the-run-succeeded",
+      "fact": "outcome.kind",
+      "required": true,
+      "predicate": {
+        "op": "equals",
+        "value": "success"
+      }
+    }
+  ]
+}

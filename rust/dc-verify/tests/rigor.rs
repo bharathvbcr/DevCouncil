@@ -13,7 +13,7 @@ fn diff_of(path: &str, lines: &[(u32, &str)]) -> FileDiff {
         old_path: None,
         status: ChangeStatus::Modified,
         added_lines: lines.iter().map(|(n, s)| (*n, s.to_string())).collect(),
-        removed_count: 0,
+        removed_lines: Vec::new(),
     }
 }
 
@@ -93,8 +93,13 @@ fn ordinary_code_is_not_flagged_as_a_secret() {
 #[test]
 fn removed_lines_are_not_scanned() {
     // Deleting a secret is the fix, not the offence.
+    //
+    // The removed line is now the credential itself rather than a bare count.
+    // With a count the assertion held for the wrong reason — there was no text
+    // to scan — so it would have passed just as well against a scanner that
+    // read removed lines eagerly.
     let mut file = diff_of("src/a.go", &[]);
-    file.removed_count = 1;
+    file.removed_lines = vec!["const key = \"sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAA\"".into()];
     assert!(scan_secrets(&[file]).is_empty());
 }
 
@@ -190,7 +195,7 @@ fn documentation_and_tests_are_not_coverage_questions() {
 fn a_deleted_file_is_not_a_coverage_gap() {
     let mut file = diff_of("src/gone.go", &[]);
     file.status = ChangeStatus::Deleted;
-    file.removed_count = 40;
+    file.removed_lines = (0..40).map(|n| format!("line {n}")).collect();
     let report = intersect_coverage(&[file], &[]);
     assert!(report.is_clean());
 }

@@ -103,10 +103,15 @@ type response struct {
 	// contract has been checked. Execution-lease commands never populate it.
 	Workbench  json.RawMessage `json:"-"`
 	EvidenceID int64           `json:"id"`
-	Evidence   []EvidenceRow   `json:"evidence"`
-	Gaps       []GapRow        `json:"gaps"`
-	Truncated  bool            `json:"truncated"`
-	Shown      int             `json:"shown"`
+	// GapID is gap-upsert's answer. It is a separate key from EvidenceID
+	// rather than sharing `id`: one envelope decodes every reply on this
+	// boundary, and a string and an integer cannot occupy one field.
+	GapID     string          `json:"gap_id"`
+	Evidence  []EvidenceRow   `json:"evidence"`
+	Gaps      []GapRow        `json:"gaps"`
+	History   []GapHistoryRow `json:"history"`
+	Truncated bool            `json:"truncated"`
+	Shown     int             `json:"shown"`
 }
 
 // Conflict reports that another agent holds the task. It is a distinct type
@@ -631,6 +636,26 @@ type GapRow struct {
 	EvidenceJSON   json.RawMessage `json:"evidence_json"`
 }
 
+// GapHistoryRow is what became of one gap across a task's verification runs.
+//
+// The `gaps` table is current-state: it is cleared and rewritten every run, so
+// a gap that was raised, reported fixed, and raised again is indistinguishable
+// there from one nobody has touched. This is the part that survives, and
+// Resurfaces is the reason it exists.
+type GapHistoryRow struct {
+	TaskID       string `json:"task_id"`
+	GapID        string `json:"gap_id"`
+	GapType      string `json:"gap_type"`
+	FirstSeenRun int    `json:"first_seen_run"`
+	LastSeenRun  int    `json:"last_seen_run"`
+	Occurrences  int    `json:"occurrences"`
+	// Resurfaces counts how many times this gap was absent for at least one
+	// run and came back. Nonzero means something reported it fixed and a later
+	// run disagreed — a statement about the reports, not about the code, since
+	// a run that could not measure the gap also makes it disappear.
+	Resurfaces int `json:"resurfaces"`
+}
+
 // VerificationRun is one persisted verification run.
 type VerificationRun struct {
 	ID              string `json:"id"`
@@ -707,6 +732,23 @@ func (c *Client) Gaps(ctx context.Context, taskID string) ([]GapRow, bool, error
 		return nil, false, fmt.Errorf("gaps refused: %s", out.Error)
 	}
 	return out.Gaps, out.Truncated, nil
+}
+
+// GapHistory returns the recurrence record for a task's gaps, or for every
+// task when taskID is empty.
+func (c *Client) GapHistory(ctx context.Context, taskID string) ([]GapHistoryRow, bool, error) {
+	args := []string{"gap-history"}
+	if taskID != "" {
+		args = append(args, "--task", taskID)
+	}
+	out, err := c.run(ctx, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	if !out.OK {
+		return nil, false, fmt.Errorf("gap-history refused: %s", out.Error)
+	}
+	return out.History, out.Truncated, nil
 }
 
 // GapsReplace clears a task's gaps then upserts the replacement set.

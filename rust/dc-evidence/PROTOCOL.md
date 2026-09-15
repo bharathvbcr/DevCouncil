@@ -36,6 +36,26 @@ with process exit 2. Evaluated `failed` and `incomplete` return exit 0: exit sta
 reports whether evaluation ran, not acceptance. Consumers must inspect `verdict`.
 Diagnostics contain identifiers/codes rather than the actual fact values.
 
+## Worked example: differential testing without an execution surface
+
+`fixtures/v1/differential-contract.json` with `differential-bundle.json` and
+`differential-bundle-mismatch.json` is a complete acceptance contract for a
+behaviour-equivalence run — a reference and a candidate implementation compared
+over shared inputs, which is the strongest evidence available for a refactor.
+
+It is here rather than in `dcverify` deliberately. Running a candidate
+implementation means executing repository code, and this crate executes nothing;
+the analysis plane has no sandbox to contain it. A differential result is an
+*observation*, so the host runs the comparison and records what it saw, and this
+protocol decides whether that satisfies a contract pinned before the run. The
+contract asserts the mismatch count, a floor on cases run, the reference
+revision compared against, and the outcome kind — and because it is admitted
+independently, the thing under test cannot choose which of those get checked.
+
+`dc-verify/tests/differential_contract.rs` runs both bundles through the real
+binary: the agreeing one passes, the three-mismatch one fails on exactly the
+mismatch criterion while the unrelated clauses still pass.
+
 ## Canonical wire
 
 The complete byte-exact example is in `fixtures/v1/`: `contract.json`,

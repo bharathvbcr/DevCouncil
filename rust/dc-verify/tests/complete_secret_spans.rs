@@ -59,7 +59,7 @@ fn invalid_first_prefix_cannot_leak_a_later_value_through_evidence() {
         old_path: None,
         status: ChangeStatus::Modified,
         added_lines: vec![(1, format!("// TODO ghp_short '{secret}'"))],
-        removed_count: 0,
+        removed_lines: Vec::new(),
     };
     assert_eq!(scan_secrets(std::slice::from_ref(&file)).len(), 1);
     let stubs = detect_stubs(&[file]);

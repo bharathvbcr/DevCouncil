@@ -147,7 +147,7 @@ func TestAReplyThatSaysOKButCannotBeBelievedIsRefused(t *testing.T) {
 			json: `{"ok":true,"files":1,"in_scope":["src/a.go"],"orphans":[],"untouched_planned":[],` +
 				`"findings":[{"gate":"licence_scan","severity":"blocking","path":"src/a.go","line":4,` +
 				`"evidence":"x","message":"y"}],"coverage_unmeasured":[],"coverage_gaps":[],` +
-				`"coverage_skipped_by_type":[]}`,
+				`"coverage_skipped_by_type":[],"substance":{"added_lines":0,"substantive_lines":0,"trivial":0,"moved":0,"repeated":0,"generated":0,"judged":false,"low":false,"files":[]}}`,
 			want: "cannot map to a gap",
 		},
 		{
@@ -155,36 +155,78 @@ func TestAReplyThatSaysOKButCannotBeBelievedIsRefused(t *testing.T) {
 			json: `{"ok":true,"files":1,"in_scope":["src/a.go"],"orphans":[],"untouched_planned":[],` +
 				`"findings":[{"gate":"secret_scan","severity":"informational","path":"src/a.go","line":4,` +
 				`"evidence":"x","message":"y"}],"coverage_unmeasured":[],"coverage_gaps":[],` +
-				`"coverage_skipped_by_type":[]}`,
+				`"coverage_skipped_by_type":[],"substance":{"added_lines":0,"substantive_lines":0,"trivial":0,"moved":0,"repeated":0,"generated":0,"judged":false,"low":false,"files":[]}}`,
 			want: "severity",
 		},
 		{
 			name: "a finding on line zero, which names no line",
 			json: `{"ok":true,"files":1,"in_scope":["src/a.go"],"orphans":[],"untouched_planned":[],` +
-				`"findings":[{"gate":"stub_detection","severity":"advisory","path":"src/a.go","line":0,` +
+				`"findings":[{"gate":"stub_detection","severity":"advisory","strength":"derived","path":"src/a.go","line":0,` +
 				`"evidence":"x","message":"y"}],"coverage_unmeasured":[],"coverage_gaps":[],` +
-				`"coverage_skipped_by_type":[]}`,
+				`"coverage_skipped_by_type":[],"substance":{"added_lines":0,"substantive_lines":0,"trivial":0,"moved":0,"repeated":0,"generated":0,"judged":false,"low":false,"files":[]}}`,
 			want: "names no line",
 		},
 		{
 			name: "a finding against an absolute path",
 			json: `{"ok":true,"files":1,"in_scope":["src/a.go"],"orphans":[],"untouched_planned":[],` +
-				`"findings":[{"gate":"secret_scan","severity":"blocking","path":"/etc/passwd","line":1,` +
+				`"findings":[{"gate":"secret_scan","severity":"blocking","strength":"derived","path":"/etc/passwd","line":1,` +
 				`"evidence":"x","message":"y"}],"coverage_unmeasured":[],"coverage_gaps":[],` +
-				`"coverage_skipped_by_type":[]}`,
+				`"coverage_skipped_by_type":[],"substance":{"added_lines":0,"substantive_lines":0,"trivial":0,"moved":0,"repeated":0,"generated":0,"judged":false,"low":false,"files":[]}}`,
 			want: "absolute",
+		},
+		{
+			name: "a finding carrying a strength this client does not know",
+			json: `{"ok":true,"files":1,"in_scope":["src/a.go"],"orphans":[],"untouched_planned":[],` +
+				`"findings":[{"gate":"secret_scan","severity":"blocking","strength":"probably",` +
+				`"path":"src/a.go","line":1,"evidence":"x","message":"y"}],` +
+				`"coverage_unmeasured":[],"coverage_gaps":[],"coverage_skipped_by_type":[],` +
+				`"substance":{"added_lines":0,"substantive_lines":0,"trivial":0,"moved":0,` +
+				`"repeated":0,"generated":0,"judged":false,"low":false,"files":[]}}`,
+			want: "strength",
+		},
+		{
+			// The shape an older verifier produces: every field this client
+			// used to read, and no substance key. Decoding it as a zero value
+			// would report "nought added lines, not judged", which is what a
+			// real measurement of a tiny diff looks like.
+			name: "a reply from a verifier that predates the substance gate",
+			json: `{"ok":true,"files":1,"in_scope":["src/a.go"],"orphans":[],"untouched_planned":[],` +
+				`"findings":[],"coverage_unmeasured":[],"coverage_gaps":[],` +
+				`"coverage_skipped_by_type":[]}`,
+			want: "predates the substance gate",
+		},
+		{
+			// A producer whose classifier gained a class this client cannot
+			// see: the parts no longer add up to the whole, so every ratio
+			// derived from them is wrong by an unknown amount.
+			name: "substance classes that do not sum to the added lines",
+			json: `{"ok":true,"files":1,"in_scope":["src/a.go"],"orphans":[],"untouched_planned":[],` +
+				`"findings":[],"coverage_unmeasured":[],"coverage_gaps":[],` +
+				`"coverage_skipped_by_type":[],` +
+				`"substance":{"added_lines":40,"substantive_lines":5,"trivial":5,"moved":0,` +
+				`"repeated":0,"generated":0,"judged":true,"low":true,"files":[]}}`,
+			want: "must fall in exactly one class",
+		},
+		{
+			name: "substance reporting low on a diff it never judged",
+			json: `{"ok":true,"files":1,"in_scope":["src/a.go"],"orphans":[],"untouched_planned":[],` +
+				`"findings":[],"coverage_unmeasured":[],"coverage_gaps":[],` +
+				`"coverage_skipped_by_type":[],` +
+				`"substance":{"added_lines":4,"substantive_lines":1,"trivial":3,"moved":0,` +
+				`"repeated":0,"generated":0,"judged":false,"low":true,"files":[]}}`,
+			want: "no ratio to be under a threshold",
 		},
 		{
 			name: "a scope classification that climbs out of the repository",
 			json: `{"ok":true,"files":1,"in_scope":["../elsewhere/a.go"],"orphans":[],` +
 				`"untouched_planned":[],"findings":[],"coverage_unmeasured":[],"coverage_gaps":[],` +
-				`"coverage_skipped_by_type":[]}`,
+				`"coverage_skipped_by_type":[],"substance":{"added_lines":0,"substantive_lines":0,"trivial":0,"moved":0,"repeated":0,"generated":0,"judged":false,"low":false,"files":[]}}`,
 			want: "climbs out",
 		},
 		{
 			name: "more files counted than classified",
 			json: `{"ok":true,"files":9,"in_scope":["src/a.go"],"orphans":[],"untouched_planned":[],` +
-				`"findings":[],"coverage_unmeasured":[],"coverage_gaps":[],"coverage_skipped_by_type":[]}`,
+				`"findings":[],"coverage_unmeasured":[],"coverage_gaps":[],"coverage_skipped_by_type":[],"substance":{"added_lines":0,"substantive_lines":0,"trivial":0,"moved":0,"repeated":0,"generated":0,"judged":false,"low":false,"files":[]}}`,
 			want: "classified",
 		},
 		{
@@ -194,14 +236,14 @@ func TestAReplyThatSaysOKButCannotBeBelievedIsRefused(t *testing.T) {
 			name: "coverage gaps with no coverage profile supplied",
 			json: `{"ok":true,"files":1,"in_scope":["src/a.go"],"orphans":[],"untouched_planned":[],` +
 				`"findings":[],"coverage_unmeasured":[],"coverage_gaps":[{"path":"src/a.go",` +
-				`"added_lines":3,"uncovered_lines":[1,2]}],"coverage_skipped_by_type":[]}`,
+				`"added_lines":3,"uncovered_lines":[1,2]}],"coverage_skipped_by_type":[],"substance":{"added_lines":0,"substantive_lines":0,"trivial":0,"moved":0,"repeated":0,"generated":0,"judged":false,"low":false,"files":[]}}`,
 			want: "without a coverage profile",
 		},
 		{
 			name: "a coverage gap naming no uncovered line",
 			json: `{"ok":true,"files":1,"in_scope":["src/a.go"],"orphans":[],"untouched_planned":[],` +
 				`"findings":[],"coverage_unmeasured":[],"coverage_gaps":[{"path":"src/a.go",` +
-				`"added_lines":3,"uncovered_lines":[]}],"coverage_skipped_by_type":[]}`,
+				`"added_lines":3,"uncovered_lines":[]}],"coverage_skipped_by_type":[],"substance":{"added_lines":0,"substantive_lines":0,"trivial":0,"moved":0,"repeated":0,"generated":0,"judged":false,"low":false,"files":[]}}`,
 			want:    "not a gap",
 			profile: true,
 		},
@@ -209,7 +251,7 @@ func TestAReplyThatSaysOKButCannotBeBelievedIsRefused(t *testing.T) {
 			name: "more lines uncovered than the diff added",
 			json: `{"ok":true,"files":1,"in_scope":["src/a.go"],"orphans":[],"untouched_planned":[],` +
 				`"findings":[],"coverage_unmeasured":[],"coverage_gaps":[{"path":"src/a.go",` +
-				`"added_lines":1,"uncovered_lines":[1,2,3]}],"coverage_skipped_by_type":[]}`,
+				`"added_lines":1,"uncovered_lines":[1,2,3]}],"coverage_skipped_by_type":[],"substance":{"added_lines":0,"substantive_lines":0,"trivial":0,"moved":0,"repeated":0,"generated":0,"judged":false,"low":false,"files":[]}}`,
 			want:    "above one is not a measurement",
 			profile: true,
 		},
@@ -217,14 +259,14 @@ func TestAReplyThatSaysOKButCannotBeBelievedIsRefused(t *testing.T) {
 			name: "a coverage gap reporting no added lines to cover",
 			json: `{"ok":true,"files":1,"in_scope":["src/a.go"],"orphans":[],"untouched_planned":[],` +
 				`"findings":[],"coverage_unmeasured":[],"coverage_gaps":[{"path":"src/a.go",` +
-				`"added_lines":0,"uncovered_lines":[1]}],"coverage_skipped_by_type":[]}`,
+				`"added_lines":0,"uncovered_lines":[1]}],"coverage_skipped_by_type":[],"substance":{"added_lines":0,"substantive_lines":0,"trivial":0,"moved":0,"repeated":0,"generated":0,"judged":false,"low":false,"files":[]}}`,
 			want:    "nothing to cover",
 			profile: true,
 		},
 		{
 			name: "a negative file count",
 			json: `{"ok":true,"files":-1,"in_scope":[],"orphans":[],"untouched_planned":[],` +
-				`"findings":[],"coverage_unmeasured":[],"coverage_gaps":[],"coverage_skipped_by_type":[]}`,
+				`"findings":[],"coverage_unmeasured":[],"coverage_gaps":[],"coverage_skipped_by_type":[],"substance":{"added_lines":0,"substantive_lines":0,"trivial":0,"moved":0,"repeated":0,"generated":0,"judged":false,"low":false,"files":[]}}`,
 			want: "not a count",
 		},
 	}
@@ -254,7 +296,7 @@ func TestAReplyThatSaysOKButCannotBeBelievedIsRefused(t *testing.T) {
 // they ask is what a *clean* report is allowed to claim.
 const cleanReply = `{"ok":true,"files":1,"in_scope":["src/a.go"],"orphans":[],` +
 	`"untouched_planned":[],"findings":[],"coverage_unmeasured":["src/a.go"],` +
-	`"coverage_gaps":[],"coverage_skipped_by_type":[]}`
+	`"coverage_gaps":[],"coverage_skipped_by_type":[],"substance":{"added_lines":0,"substantive_lines":0,"trivial":0,"moved":0,"repeated":0,"generated":0,"judged":false,"low":false,"files":[]}}`
 
 // TestACleanReportWithNoProfileNeverClaimsCoverageRan is the honesty property
 // the whole package exists for.
@@ -289,11 +331,22 @@ func TestACleanReportWithNoProfileNeverClaimsCoverageRan(t *testing.T) {
 				"a caller records that list as the rigor it applied", gates)
 		}
 	}
-	// The two findings gates are unconditional, so a clean report does attest
-	// to them having run. Losing that would be the opposite error — refusing to
-	// take credit for work that was done.
-	if len(gates) != 2 {
-		t.Fatalf("GatesRun()=%v, want exactly the two unconditional findings gates", gates)
+	// The gates that need nothing from the caller are unconditional, so a clean
+	// report does attest to them having run. Losing that would be the opposite
+	// error — refusing to take credit for work that was done.
+	//
+	// Named rather than counted. A count was a proxy for "the unconditional
+	// ones", and a proxy stops tracking what it stood for the moment the set
+	// changes: adding the substance measurement made this assertion fail while
+	// the property it was written to hold was still true.
+	want := []string{GateSecretScan, GateStubDetection, GateSubstance}
+	if len(gates) != len(want) {
+		t.Fatalf("GatesRun()=%v, want exactly %v", gates, want)
+	}
+	for i, gate := range want {
+		if gates[i] != gate {
+			t.Fatalf("GatesRun()=%v, want exactly %v", gates, want)
+		}
 	}
 }
 

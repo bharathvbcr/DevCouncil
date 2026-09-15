@@ -1,0 +1,465 @@
+### The false-accept corpus.
+###
+### Every gate in this crate is a classifier, and until this file existed none
+### of them had a measured error rate. The suites beside it prove that a gate
+### fires on the input it was written for; none of them could say how often it
+### fires on input it was not, or how often it stays quiet on input it should
+### catch. "dcverify passed" was therefore a claim with no denominator.
+###
+### This is reverify's move, aimed at a diff instead of a binary: known-true and
+### known-false cases on the same corpus, a confusion matrix, and a build that
+### fails on a single false accept. `tests/false_accept.rs` runs it.
+###
+### FORMAT
+###
+### A case begins at a line starting `### case:` and runs to the next one. The
+### header lines that follow declare what EVERY gate must say about it, not only
+### the gate the case was written for — so a fixture aimed at `secret_scan` is
+### also a standing negative control for `stub_detection`, and a gate that
+### starts firing everywhere is caught by the cases it has nothing to do with.
+### A diff body line never starts at column 0 with `###`, so the separator is
+### unambiguous.
+###
+###   secret_scan, stub_detection:  blocking | advisory | clean
+###     blocking  at least one blocking finding from that gate
+###     advisory  at least one advisory finding and no blocking one
+###     clean     no finding at all, at any severity
+###
+###   substance:  low | substantive | unjudged
+###     low          judged, and under the informativeness threshold
+###     substantive  judged, and over it
+###     unjudged     fewer added lines than MIN_LINES_TO_JUDGE
+###
+### Every credential below is a published example, a documented placeholder, or
+### a literal run of `A`. None has ever authenticated anything. A case needs the
+### SHAPE of a credential, and a real one would make this file the leak the gate
+### exists to prevent.
+
+### case: secret-anthropic-key
+### secret_scan: blocking
+### stub_detection: clean
+### substance: unjudged
+### note: The plain shape the gate exists for.
+diff --git a/src/client.go b/src/client.go
+--- a/src/client.go
++++ b/src/client.go
+@@ -0,0 +1 @@
++const key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+### case: secret-github-pat
+### secret_scan: blocking
+### stub_detection: clean
+### substance: unjudged
+### note: A different vendor family, to catch a table edit that drops one.
+diff --git a/scripts/push.sh b/scripts/push.sh
+--- a/scripts/push.sh
++++ b/scripts/push.sh
+@@ -0,0 +1 @@
++TOKEN=ghp_0123456789abcdefghijklmnopqrstuvwxyzA
+
+### case: secret-aws-access-key
+### secret_scan: blocking
+### stub_detection: clean
+### substance: unjudged
+### note: AWS's own published example key, and exactly at the 20-character
+###   floor — one character of drift in min_len turns this into a false accept.
+diff --git a/deploy/env.tf b/deploy/env.tf
+--- a/deploy/env.tf
++++ b/deploy/env.tf
+@@ -0,0 +1 @@
++  access_key = "AKIAIOSFODNN7EXAMPLE"
+
+### case: secret-private-key-header
+### secret_scan: blocking
+### stub_detection: clean
+### substance: unjudged
+### note: The one pattern with its own parsing branch.
+diff --git a/certs/server.pem b/certs/server.pem
+--- a/certs/server.pem
++++ b/certs/server.pem
+@@ -0,0 +1 @@
++-----BEGIN RSA PRIVATE KEY-----
+
+### case: secret-slack-bot-token
+### secret_scan: blocking
+### stub_detection: clean
+### substance: unjudged
+### note: Hyphens in the body; this family must not require an alphanumeric one.
+diff --git a/config/slack.yaml b/config/slack.yaml
+--- a/config/slack.yaml
++++ b/config/slack.yaml
+@@ -0,0 +1 @@
++bot_token: xoxb-fixture-hyphenated-placeholder-token
+
+### case: secret-in-a-json-fixture
+### secret_scan: blocking
+### stub_detection: clean
+### substance: unjudged
+### note: Under testdata/. A credential in a fixture is still a credential in
+###   the history; no path may exempt it.
+diff --git a/testdata/fixture.json b/testdata/fixture.json
+--- a/testdata/fixture.json
++++ b/testdata/fixture.json
+@@ -0,0 +1 @@
++  "api_key": "ghp_0123456789abcdefghijklmnopqrstuvwxyzA"
+
+### case: secret-beside-a-todo-marker
+### secret_scan: blocking
+### stub_detection: advisory
+### substance: unjudged
+### note: One line, two gates. This is the case safe_evidence was written for:
+###   the stub gate quotes the line it fires on, and quoting this one verbatim
+###   would copy the key into the report that the secret gate beside it is
+###   carefully redacting. Both verdicts are asserted so neither can regress
+###   alone.
+diff --git a/src/retry.go b/src/retry.go
+--- a/src/retry.go
++++ b/src/retry.go
+@@ -0,0 +1 @@
++// TODO remove before merge: sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAA
+
+### case: clean-sk-prefix-in-a-kebab-identifier
+### secret_scan: clean
+### stub_detection: clean
+### substance: unjudged
+### note: The strongest negative here. It starts a token with `sk-` and is 51
+###   characters, so it clears the 45-character floor: only the alphanumeric
+###   body rule rejects it. Relax that rule and this becomes a false accept on
+###   an ordinary identifier.
+diff --git a/src/cache.go b/src/cache.go
+--- a/src/cache.go
++++ b/src/cache.go
+@@ -0,0 +1 @@
++const policy = sk-cache-eviction-policy-manager-service-names-extra
+
+### case: clean-sk-inside-a-word
+### secret_scan: clean
+### stub_detection: clean
+### substance: unjudged
+### note: `disk-` contains `sk-` but does not start a token with it.
+diff --git a/src/disk.go b/src/disk.go
+--- a/src/disk.go
++++ b/src/disk.go
+@@ -0,0 +1 @@
++var diskCacheEvictionPolicyManagerName = "disk-cache-eviction-policy"
+
+### case: clean-begin-certificate
+### secret_scan: clean
+### stub_detection: clean
+### substance: unjudged
+### note: `-----BEGIN` without "private key". A certificate is public.
+diff --git a/certs/ca.pem b/certs/ca.pem
+--- a/certs/ca.pem
++++ b/certs/ca.pem
+@@ -0,0 +1 @@
++-----BEGIN CERTIFICATE-----
+
+### case: clean-short-vendor-prefix
+### secret_scan: clean
+### stub_detection: clean
+### substance: unjudged
+### note: The right prefix, under the length floor. Every pattern literal in
+###   rigor.rs itself is this shape, which is why the floors exist.
+diff --git a/docs/auth.md b/docs/auth.md
+--- a/docs/auth.md
++++ b/docs/auth.md
+@@ -0,0 +1 @@
++Set the variable to your key, which begins sk-ant- followed by the body.
+
+### case: clean-aiza-in-an-identifier
+### secret_scan: clean
+### stub_detection: clean
+### substance: unjudged
+### note: `AIza` at a token start, 21 characters, under the 30-character floor.
+diff --git a/src/render.ts b/src/render.ts
+--- a/src/render.ts
++++ b/src/render.ts
+@@ -0,0 +1 @@
++import AIzaSyntaxHighlighter from "./highlight";
+
+### case: clean-secret-only-on-a-removed-line
+### secret_scan: clean
+### stub_detection: clean
+### substance: unjudged
+### note: Deleting a credential is the fix, not the offence. A scanner that read
+###   removed lines would block the commit that repairs the leak.
+diff --git a/src/client.go b/src/client.go
+--- a/src/client.go
++++ b/src/client.go
+@@ -1 +0,0 @@
+-const key = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+### case: stub-rust-todo-macro
+### secret_scan: clean
+### stub_detection: blocking
+### substance: unjudged
+### note: A body that is the macro. Shipping this is what the gate is for.
+diff --git a/src/resolve.rs b/src/resolve.rs
+--- a/src/resolve.rs
++++ b/src/resolve.rs
+@@ -0,0 +1,3 @@
++fn resolve(&self, name: &str) -> Option<Symbol> {
++    todo!()
++}
+
+### case: stub-rust-unimplemented-macro
+### secret_scan: clean
+### stub_detection: blocking
+### substance: unjudged
+diff --git a/src/resolve.rs b/src/resolve.rs
+--- a/src/resolve.rs
++++ b/src/resolve.rs
+@@ -0,0 +1,3 @@
++fn callers(&self, id: NodeId) -> Vec<NodeId> {
++    unimplemented!()
++}
+
+### case: stub-python-not-implemented-error
+### secret_scan: clean
+### stub_detection: blocking
+### substance: unjudged
+diff --git a/src/store.py b/src/store.py
+--- a/src/store.py
++++ b/src/store.py
+@@ -0,0 +1,2 @@
++def flush(self):
++    raise NotImplementedError
+
+### case: stub-todo-comment-is-advisory-only
+### secret_scan: clean
+### stub_detection: advisory
+### substance: unjudged
+### note: A note about future work is not an unimplemented task. Making this
+###   blocking is what turns the gate into something people route around, so
+###   the severity is pinned here rather than left to the implementation.
+diff --git a/src/retry.go b/src/retry.go
+--- a/src/retry.go
++++ b/src/retry.go
+@@ -0,0 +1 @@
++// TODO: wire the retry budget once the transport lands
+
+### case: clean-todo-inside-an-identifier
+### secret_scan: clean
+### stub_detection: clean
+### substance: unjudged
+### note: `todoItems` is a name, not a marker. A gate that fires on ordinary
+###   identifiers is a gate that gets disabled.
+diff --git a/src/tasks.go b/src/tasks.go
+--- a/src/tasks.go
++++ b/src/tasks.go
+@@ -0,0 +1 @@
++	todoItems := []Task{}
+
+### case: clean-stub-and-placeholder-as-identifiers
+### secret_scan: clean
+### stub_detection: clean
+### substance: unjudged
+### note: Two more markers appearing as ordinary code. `stubServer` is what
+###   every Go test in this repository calls its fake.
+diff --git a/src/server_test.go b/src/server_test.go
+--- a/src/server_test.go
++++ b/src/server_test.go
+@@ -0,0 +1,2 @@
++	stubServer := httptest.NewServer(handler)
++	placeholderText := input.Placeholder
+
+### case: substance-lockfile-regeneration
+### secret_scan: clean
+### stub_detection: clean
+### substance: low
+### note: The shape the substance gate exists for, and the one commit in this
+###   repository's last 200 that falls under the threshold. Twenty-five added
+###   lines, every one of them regenerated, no other gate has anything to say.
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -0,0 +1,25 @@
++[[package]]
++name = "anyhow"
++version = "1.0.100"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
++
++[[package]]
++name = "bitflags"
++version = "2.9.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
++
++[[package]]
++name = "cfg-if"
++version = "1.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
++
++[[package]]
++name = "libc"
++version = "0.2.189"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
++
++[[package]]
+
+### case: substance-relocated-block
+### secret_scan: clean
+### stub_detection: clean
+### substance: low
+### note: A function moved between files. Twenty-two added lines, none of them
+###   written. Every other gate reports a clean pass — correctly, because
+###   nothing is wrong with it — and only this measurement says it is a
+###   relocation, which is how a reviewer knows to read it as one.
+###
+###   This is also the case that needs the removed-line CONTENT: with only a
+###   count, all twenty-two would score as new work.
+diff --git a/src/old_home.rs b/src/old_home.rs
+--- a/src/old_home.rs
++++ b/src/old_home.rs
+@@ -1,23 +0,0 @@
+-pub fn classify_scope(files: &[FileDiff], planned: &[String]) -> Scope {
+-    let mut scope = Scope::default();
+-    for file in files {
+-        if planned.iter().any(|p| p == &file.path) {
+-            scope.in_scope.push(file.path.clone());
+-        } else {
+-            scope.orphans.push(file.path.clone());
+-        }
+-    }
+-    for plan in planned {
+-        if !files.iter().any(|f| &f.path == plan) {
+-            scope.untouched_planned.push(plan.clone());
+-        }
+-    }
+-    scope.in_scope.sort();
+-    scope.orphans.sort();
+-    scope.untouched_planned.sort();
+-    scope
+-}
+-
+-fn unrelated_helper(value: u32) -> u32 {
+-    value.saturating_add(1)
+-}
+diff --git a/src/new_home.rs b/src/new_home.rs
+--- a/src/new_home.rs
++++ b/src/new_home.rs
+@@ -0,0 +1,23 @@
++pub fn classify_scope(files: &[FileDiff], planned: &[String]) -> Scope {
++    let mut scope = Scope::default();
++    for file in files {
++        if planned.iter().any(|p| p == &file.path) {
++            scope.in_scope.push(file.path.clone());
++        } else {
++            scope.orphans.push(file.path.clone());
++        }
++    }
++    for plan in planned {
++        if !files.iter().any(|f| &f.path == plan) {
++            scope.untouched_planned.push(plan.clone());
++        }
++    }
++    scope.in_scope.sort();
++    scope.orphans.sort();
++    scope.untouched_planned.sort();
++    scope
++}
++
++fn unrelated_helper(value: u32) -> u32 {
++    value.saturating_add(1)
++}
+
+### case: substance-copy-pasted-across-files
+### secret_scan: clean
+### stub_detection: clean
+### substance: low
+### note: One six-line block pasted into five files. Written once, added thirty
+###   times. The repeat test is deliberately diff-wide rather than per file —
+###   a per-file measurement would score all five copies as new work, which is
+###   the answer that makes duplication invisible.
+diff --git a/src/a.go b/src/a.go
+--- a/src/a.go
++++ b/src/a.go
+@@ -0,0 +1,6 @@
++func validate(cfg Config) error {
++	if cfg.Timeout <= 0 {
++		return fmt.Errorf("timeout must be positive, got %v", cfg.Timeout)
++	}
++	return nil
++}
+diff --git a/src/b.go b/src/b.go
+--- a/src/b.go
++++ b/src/b.go
+@@ -0,0 +1,6 @@
++func validate(cfg Config) error {
++	if cfg.Timeout <= 0 {
++		return fmt.Errorf("timeout must be positive, got %v", cfg.Timeout)
++	}
++	return nil
++}
+diff --git a/src/c.go b/src/c.go
+--- a/src/c.go
++++ b/src/c.go
+@@ -0,0 +1,6 @@
++func validate(cfg Config) error {
++	if cfg.Timeout <= 0 {
++		return fmt.Errorf("timeout must be positive, got %v", cfg.Timeout)
++	}
++	return nil
++}
+diff --git a/src/d.go b/src/d.go
+--- a/src/d.go
++++ b/src/d.go
+@@ -0,0 +1,6 @@
++func validate(cfg Config) error {
++	if cfg.Timeout <= 0 {
++		return fmt.Errorf("timeout must be positive, got %v", cfg.Timeout)
++	}
++	return nil
++}
+diff --git a/src/e.go b/src/e.go
+--- a/src/e.go
++++ b/src/e.go
+@@ -0,0 +1,6 @@
++func validate(cfg Config) error {
++	if cfg.Timeout <= 0 {
++		return fmt.Errorf("timeout must be positive, got %v", cfg.Timeout)
++	}
++	return nil
++}
+
+### case: substance-real-implementation
+### secret_scan: clean
+### stub_detection: clean
+### substance: substantive
+### note: The control. Twenty-four lines of ordinary new code, and the gate must
+###   stay quiet on it — a substance measurement that fired here would be worse
+###   than none, because it would train a reader to ignore the one above.
+diff --git a/src/budget.rs b/src/budget.rs
+--- a/src/budget.rs
++++ b/src/budget.rs
+@@ -0,0 +1,27 @@
++/// Bounds how long one verification pass may run.
++pub struct Budget {
++    deadline: Instant,
++    spent: Duration,
++}
++
++impl Budget {
++    pub fn starting_now(limit: Duration) -> Self {
++        Budget { deadline: Instant::now() + limit, spent: Duration::ZERO }
++    }
++
++    pub fn remaining(&self) -> Duration {
++        self.deadline.saturating_duration_since(Instant::now())
++    }
++
++    pub fn charge(&mut self, cost: Duration) -> Result<(), Exhausted> {
++        self.spent += cost;
++        if self.remaining().is_zero() {
++            return Err(Exhausted { spent: self.spent });
++        }
++        Ok(())
++    }
++}
++
++pub struct Exhausted {
++    pub spent: Duration,
++}

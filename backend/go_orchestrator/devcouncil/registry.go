@@ -256,13 +256,34 @@ func (r *Registry) callGetGaps(ctx context.Context, args map[string]any) any {
 	if err != nil {
 		return ErrorPayload{OK: false, Code: "store_error", Error: err.Error()}
 	}
+	// Recurrence rides along with the gap rather than sitting behind a tool of
+	// its own. "You have reported this fixed before" is only useful at the
+	// moment something is deciding what to do about the gap, and a separate
+	// tool is one an agent has to know to call — which the ones that most need
+	// this signal are the least likely to do.
+	//
+	// A history read that fails is not fatal here: the gaps are the answer to
+	// this call and withholding them because an annotation could not be
+	// gathered would be the worse failure. The absence is reported instead, so
+	// a caller can tell "no gap has ever recurred" from "recurrence was not
+	// available" — the two are opposite facts and must not share a rendering.
+	history := map[string]store.GapHistoryRow{}
+	historyAvailable := true
+	if rows, _, err := r.Store.GapHistory(ctx, taskID); err == nil {
+		for _, h := range rows {
+			history[h.GapID] = h
+		}
+	} else {
+		historyAvailable = false
+	}
+
 	blocking := 0
 	gaps := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
 		if row.Blocking {
 			blocking++
 		}
-		gaps = append(gaps, map[string]any{
+		gap := map[string]any{
 			"id":              row.ID,
 			"severity":        row.Severity,
 			"gap_type":        row.GapType,
@@ -271,14 +292,23 @@ func (r *Registry) callGetGaps(ctx context.Context, args map[string]any) any {
 			"recommended_fix": row.RecommendedFix,
 			"blocking":        row.Blocking,
 			"evidence_json":   row.EvidenceJSON,
-		})
+		}
+		if h, ok := history[row.ID]; ok {
+			gap["occurrences"] = h.Occurrences
+			gap["resurfaces"] = h.Resurfaces
+			gap["first_seen_run"] = h.FirstSeenRun
+		}
+		gaps = append(gaps, gap)
 	}
 	return map[string]any{
-		"ok":        true,
-		"task_id":   taskID,
-		"gaps":      gaps,
-		"blocking":  blocking,
-		"truncated": truncated,
+		"ok":       true,
+		"task_id":  taskID,
+		"gaps":     gaps,
+		"blocking": blocking,
+		// False means the recurrence annotation is missing from every gap
+		// above, not that nothing has ever recurred.
+		"recurrence_available": historyAvailable,
+		"truncated":            truncated,
 	}
 }
 
