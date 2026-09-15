@@ -1205,3 +1205,479 @@ fn pre_tool_use_is_silent_when_the_store_cannot_be_read() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Run one git command in `dir` with the ambient environment neutralised.
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.hooksPath=",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A linked worktree must not be briefed with its parent checkout's index.
+///
+/// The layout is the one agents actually get: the worktree lives *inside* the
+/// checkout it was made from, at `.claude/worktrees/<lane>`, so an upward walk
+/// for a store reaches the parent's. That store describes a different commit,
+/// and the lane's own `status` answers `query_ready:false` — so a brief saying
+/// "ready, N symbols" is a check that could not run reporting what a check
+/// that ran and passed reports. The CLI is already held to this by
+/// `a_new_linked_worktree_is_truthfully_missing_until_bootstrapped_locally`;
+/// the hook is the surface every agent actually reads.
+///
+/// The parent leg is a positive control: without it, a hook that had gone
+/// silent for every repository would satisfy the negative assertions.
+#[test]
+fn a_nested_linked_worktree_is_not_briefed_with_the_parent_index() {
+    let base = scratch("worktree-escape");
+    let main = base.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+
+    git(&main, &["init", "-q"]);
+    std::fs::write(
+        main.join("alpha.py"),
+        "def alpha_only_in_main():\n    return 1\n",
+    )
+    .unwrap();
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-qm", "fixture"]);
+
+    let build = Command::new(DEVMAP)
+        .args(["--json", "build", "."])
+        .current_dir(&main)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "parent build must succeed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let brief = |cwd: &Path| -> String {
+        let payload = json!({
+            "session_id": "worktree-escape",
+            "hook_event_name": "SessionStart",
+            "cwd": cwd.to_string_lossy(),
+            "source": "startup",
+        });
+        let run = run_hook(
+            "session-start",
+            serde_json::to_string(&payload).unwrap().as_bytes(),
+            &[],
+        );
+        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        run.stdout
+    };
+
+    // Positive control: the parent really is indexed, and is briefed as ready.
+    let parent_brief = brief(&main);
+    assert!(
+        parent_brief.contains("ready,"),
+        "the indexed parent must still be briefed as ready, got {parent_brief:?}"
+    );
+
+    std::fs::create_dir_all(main.join(".claude/worktrees")).unwrap();
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            ".claude/worktrees/lane",
+        ],
+    );
+    let lane = main.join(".claude/worktrees/lane");
+    assert!(
+        lane.join(".git").is_file(),
+        "lane must be a linked worktree"
+    );
+
+    // Ground truth the brief has to agree with.
+    let status = Command::new(DEVMAP)
+        .args(["--json", "status"])
+        .current_dir(&lane)
+        .output()
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status["query_ready"], false,
+        "fixture invalid: the lane was already indexed"
+    );
+
+    let lane_brief = brief(&lane);
+    assert!(
+        !lane_brief.contains("ready,"),
+        "an unindexed worktree was briefed as ready: {lane_brief:?}"
+    );
+    assert!(
+        !lane_brief.contains("main:"),
+        "the brief named the enclosing checkout: {lane_brief:?}"
+    );
+
+    // The bound must withhold the *parent's* index, not disable discovery:
+    // once the lane is built, its own index is what the brief reports. Without
+    // this leg, making the hook permanently silent inside every worktree would
+    // pass every assertion above.
+    let build_lane = Command::new(DEVMAP)
+        .args(["--json", "build", "."])
+        .current_dir(&lane)
+        .output()
+        .unwrap();
+    assert!(
+        build_lane.status.success(),
+        "lane build must succeed: {}",
+        String::from_utf8_lossy(&build_lane.stderr)
+    );
+    let built = brief(&lane);
+    assert!(
+        built.contains("lane: ready,"),
+        "a locally built worktree must be briefed with its own index: {built:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The walk stops at the nearest gitlink, at any depth, and fails closed.
+///
+/// Two ways the bound could be wrong in opposite directions: a nested
+/// subdirectory of the worktree could escape by being examined before the
+/// boundary is recognised, and a directory carrying a `.git` file that is not
+/// a worktree at all (a submodule, or a stray gitlink) could be walked past.
+/// Both must stop, because in both cases the enclosing store describes code
+/// this directory does not contain. Being wrong in the closed direction costs
+/// a "run devmap build"; being wrong in the open direction is a false "ready".
+#[test]
+fn the_store_walk_stops_at_the_nearest_gitlink_however_deep() {
+    let base = scratch("gitlink-bound");
+    let main = base.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+
+    git(&main, &["init", "-q"]);
+    std::fs::write(main.join("alpha.py"), "def alpha():\n    return 1\n").unwrap();
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-qm", "fixture"]);
+    assert!(Command::new(DEVMAP)
+        .args(["--json", "build", "."])
+        .current_dir(&main)
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let brief_of = |cwd: &Path| -> String {
+        let payload = json!({
+            "session_id": "gitlink-bound",
+            "hook_event_name": "SessionStart",
+            "cwd": cwd.to_string_lossy(),
+            "source": "startup",
+        });
+        let run = run_hook(
+            "session-start",
+            serde_json::to_string(&payload).unwrap().as_bytes(),
+            &[],
+        );
+        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        run.stdout
+    };
+
+    // A subdirectory of the *main* checkout still reaches the root store:
+    // there is no boundary between them, and bounding that would be a
+    // regression, not a fix.
+    let inner = main.join("pkg/deep");
+    std::fs::create_dir_all(&inner).unwrap();
+    assert!(
+        brief_of(&inner).contains("ready,"),
+        "a plain subdirectory must still find its own repository's store"
+    );
+
+    // Several levels below a linked worktree, the boundary still holds.
+    std::fs::create_dir_all(main.join(".claude/worktrees")).unwrap();
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            ".claude/worktrees/lane",
+        ],
+    );
+    let deep = main.join(".claude/worktrees/lane/a/b/c");
+    std::fs::create_dir_all(&deep).unwrap();
+    let deep_brief = brief_of(&deep);
+    assert!(
+        !deep_brief.contains("ready,"),
+        "depth defeated the worktree boundary: {deep_brief:?}"
+    );
+
+    // A bare gitlink that is not a registered worktree — a submodule, or a
+    // leftover file. `.git` existing is the boundary; its validity is git's
+    // business, and treating an unreadable one as "no boundary" is the open
+    // direction.
+    let sub = main.join("vendor/sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join(".git"), "gitdir: ../../.git/modules/sub\n").unwrap();
+    let sub_brief = brief_of(&sub);
+    assert!(
+        !sub_brief.contains("ready,"),
+        "a gitlinked subdirectory inherited the superproject's index: {sub_brief:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Under concurrency, across many worktrees, the brief agrees with `status`.
+///
+/// This is the invariant the bound exists to protect, stated as a property
+/// instead of a case: for every working tree, what the SessionStart brief says
+/// about readiness must match what that tree's own `devmap status` says. The
+/// escape was exactly a disagreement between those two answers, so asserting
+/// agreement catches the whole class rather than the one layout that exposed
+/// it — including any future tier that resolves roots differently.
+///
+/// Lanes alternate built and bare so both verdicts are exercised, each built
+/// lane carries a different number of symbols so a brief carrying another
+/// tree's counts is visible rather than merely plausible, and every lane is
+/// briefed from several threads at once because the hook coalesces work
+/// through lock directories keyed on the resolved root — a root resolved to
+/// the parent would collide there too.
+#[test]
+fn briefs_agree_with_status_across_many_worktrees_under_concurrency() {
+    const LANES: usize = 6;
+    const THREADS_PER_LANE: usize = 3;
+
+    let base = scratch("worktree-storm");
+    let main = base.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+
+    git(&main, &["init", "-q"]);
+    std::fs::write(main.join("alpha.py"), "def alpha():\n    return 1\n").unwrap();
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-qm", "fixture"]);
+    assert!(Command::new(DEVMAP)
+        .args(["--json", "build", "."])
+        .current_dir(&main)
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    std::fs::create_dir_all(main.join(".claude/worktrees")).unwrap();
+    let mut lanes = Vec::new();
+    for n in 0..LANES {
+        let rel = format!(".claude/worktrees/lane{n}");
+        git(&main, &["worktree", "add", "-q", "--detach", &rel]);
+        let lane = main.join(&rel);
+        let built = n % 2 == 0;
+        if built {
+            // A distinct symbol count per lane: a brief that quoted a
+            // different tree's index would name a number that is not this
+            // lane's.
+            let mut body = String::new();
+            for f in 0..=n {
+                body.push_str(&format!("def lane{n}_fn{f}():\n    return {f}\n"));
+            }
+            std::fs::write(lane.join("lane.py"), body).unwrap();
+            assert!(Command::new(DEVMAP)
+                .args(["--json", "build", "."])
+                .current_dir(&lane)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        }
+        lanes.push((lane, built));
+    }
+
+    // Ground truth, read once per lane before the storm.
+    let mut truth = Vec::new();
+    for (lane, built) in &lanes {
+        let out = Command::new(DEVMAP)
+            .args(["--json", "status"])
+            .current_dir(lane)
+            .output()
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let ready = status["query_ready"].as_bool().unwrap();
+        assert_eq!(
+            ready,
+            *built,
+            "fixture invalid for {}: query_ready={ready}, expected {built}",
+            lane.display()
+        );
+        let nodes = status["node_count"].as_u64().unwrap();
+        truth.push((lane.clone(), ready, nodes));
+    }
+
+    let truth = Arc::new(truth);
+    let mut handles = Vec::new();
+    for slot in 0..truth.len() {
+        for attempt in 0..THREADS_PER_LANE {
+            let truth = Arc::clone(&truth);
+            handles.push(thread::spawn(move || {
+                let (lane, ready, nodes) = &truth[slot];
+                let payload = json!({
+                    "session_id": format!("storm-{slot}-{attempt}"),
+                    "hook_event_name": "SessionStart",
+                    "cwd": lane.to_string_lossy(),
+                    "source": "startup",
+                });
+                let run = run_hook(
+                    "session-start",
+                    serde_json::to_string(&payload).unwrap().as_bytes(),
+                    &[],
+                );
+                assert_eq!(run.code, Some(0), "{}", run.stderr);
+                let text = run.stdout;
+                if *ready {
+                    let expected = format!("{nodes} symbols");
+                    assert!(
+                        text.contains(&expected),
+                        "{} was briefed with counts that are not its own: wanted {expected:?}, got {text:?}",
+                        lane.display()
+                    );
+                } else {
+                    assert!(
+                        !text.contains("ready,"),
+                        "{} is not indexed but was briefed as ready: {text:?}",
+                        lane.display()
+                    );
+                }
+                assert!(
+                    !text.contains("main:"),
+                    "{} was briefed with the enclosing checkout: {text:?}",
+                    lane.display()
+                );
+            }));
+        }
+    }
+    for handle in handles {
+        handle.join().expect("a concurrent brief panicked");
+    }
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// An unindexed working tree is told so, and told how to fix it — on
+/// SessionStart, and nowhere else.
+///
+/// Withholding the parent's index leaves a second failure behind if the hook
+/// simply goes quiet: the agent cannot distinguish "DevMap has nothing to
+/// say" from "DevMap is not here", and reads an empty `devmap_search` as
+/// proof of absence. So the brief names the tree, names `devmap build`, and
+/// carries the caveat.
+///
+/// The PreToolUse leg is the fence, not a nicety. That event decides an
+/// authorization outcome; its handler is contracted to stay silent when the
+/// index cannot answer, and `devmap integrate` refuses to install onto it at
+/// all. Emitting the notice there would be a code index volunteering context
+/// into a permission decision. This asserts the emitted document is empty.
+#[test]
+fn an_unindexed_worktree_is_told_how_to_index_itself_on_session_start_only() {
+    let base = scratch("unindexed-notice");
+    let main = base.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+
+    git(&main, &["init", "-q"]);
+    std::fs::write(main.join("alpha.py"), "def alpha():\n    return 1\n").unwrap();
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-qm", "fixture"]);
+    assert!(Command::new(DEVMAP)
+        .args(["--json", "build", "."])
+        .current_dir(&main)
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    std::fs::create_dir_all(main.join(".claude/worktrees")).unwrap();
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            ".claude/worktrees/lane",
+        ],
+    );
+    let lane = main.join(".claude/worktrees/lane");
+
+    let start = run_hook(
+        "session-start",
+        serde_json::to_string(&json!({
+            "session_id": "unindexed-notice",
+            "hook_event_name": "SessionStart",
+            "cwd": lane.to_string_lossy(),
+            "source": "startup",
+        }))
+        .unwrap()
+        .as_bytes(),
+        &[],
+    );
+    assert_eq!(start.code, Some(0), "{}", start.stderr);
+    assert!(
+        start
+            .stdout
+            .contains("no DevMap index in this working tree"),
+        "an unindexed worktree must say so: {:?}",
+        start.stdout
+    );
+    assert!(
+        start.stdout.contains("devmap build"),
+        "the notice must name the remedy: {:?}",
+        start.stdout
+    );
+    assert!(
+        start.stdout.contains("lane"),
+        "the notice must name the tree it is about: {:?}",
+        start.stdout
+    );
+    assert!(
+        !start.stdout.contains("ready,"),
+        "the notice must not read as readiness: {:?}",
+        start.stdout
+    );
+
+    // Same tree, same absent index, on the event that decides authorization.
+    let pre = run_hook(
+        "pre-tool-use",
+        serde_json::to_string(&json!({
+            "session_id": "unindexed-notice",
+            "hook_event_name": "PreToolUse",
+            "cwd": lane.to_string_lossy(),
+            "tool_name": "Read",
+            "tool_input": {"file_path": lane.join("alpha.py").to_string_lossy()},
+        }))
+        .unwrap()
+        .as_bytes(),
+        &[],
+    );
+    assert_eq!(pre.code, Some(0), "{}", pre.stderr);
+    assert!(
+        pre.stdout.trim().is_empty(),
+        "PreToolUse must emit nothing for an unindexed tree, got {:?}",
+        pre.stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}

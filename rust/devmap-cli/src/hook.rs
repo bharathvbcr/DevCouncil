@@ -291,9 +291,23 @@ fn run_hook_inner(
 
     let selection = select_roots(&payload, pinned_root)?;
     if selection.is_empty() {
+        // SessionStart only. Bounding the walk at the working tree turned a
+        // false "ready" into silence, and silence is its own failure: the
+        // agent cannot tell "DevMap has nothing to say" from "DevMap is not
+        // here", so it reads an empty `devmap_search` as proof a symbol does
+        // not exist. Name the tree and the one command that fixes it.
+        //
+        // Deliberately not on PreToolUse: that event decides an authorization
+        // outcome, its handler is contracted to stay silent when the index
+        // cannot answer, and `pre_tool_use_never_emits_a_permission_decision`
+        // guards what it may emit. This says nothing there.
+        let stdout = match event {
+            HookEvent::SessionStart => unindexed_worktree_notice(&payload),
+            _ => None,
+        };
         return Ok(HookOutcome {
             exit_code: 0,
-            stdout: None,
+            stdout,
             stderr_line: Some("devmap hook: no indexed repository found; no-op".into()),
             roots: selection.roots,
         });
@@ -553,6 +567,37 @@ fn string_path(payload: &Value, key: &str) -> Option<PathBuf> {
     payload.get(key).and_then(Value::as_str).map(PathBuf::from)
 }
 
+/// What to say when this working tree is a repository with no index.
+///
+/// Only that case. A directory outside git, an unsafe root, or a tree that
+/// does have a store are all `None`: there is either nothing true to say or
+/// another branch already says it. The caveat at the end is the load-bearing
+/// half — without it an agent reads an empty answer from a dead index as
+/// proof of absence, which is the same confusion the false "ready" caused,
+/// arrived at from the other side.
+fn unindexed_worktree_notice(payload: &Value) -> Option<Value> {
+    let cwd = canonicalize_existing(&string_path(payload, "cwd")?).ok()?;
+    let root = devmap_extract::git_worktree_root(&cwd)?;
+    if is_unsafe_root(&root) || store_exists(&root) {
+        return None;
+    }
+    let name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
+    let text = format!(
+        "{name}: no DevMap index in this working tree. Run `devmap build` here to enable \
+         devmap_* queries; until then they cannot answer, and an empty result is not \
+         evidence that a symbol is absent."
+    );
+    Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": text,
+        }
+    }))
+}
+
 fn push_unique(out: &mut Vec<PathBuf>, path: Option<PathBuf>) {
     let Some(path) = path else {
         return;
@@ -573,9 +618,24 @@ fn resolve_repo_root(path: &Path) -> anyhow::Result<PathBuf> {
     };
     // Walk up until a store is found, else canonicalize the path itself.
     let mut cursor = canonicalize_existing(&path).unwrap_or(path);
+    // ...but never out of this working tree. A linked worktree nested inside
+    // its parent checkout (`.claude/worktrees/<lane>`) has no store until it
+    // is built locally, and the parent's store describes a different commit.
+    // Without this bound the walk reaches the parent and the session brief
+    // reports that index as this session's: `status` says `query_ready:false`
+    // while the hook says "ready, 11789 symbols", which is the one thing a
+    // check that could not run must never do. `state_discovery_contract`
+    // already holds the CLI to the same rule
+    // (`a_new_linked_worktree_is_truthfully_missing_until_bootstrapped_locally`);
+    // this is the hook honouring it. Outside git there is no repository
+    // identity to cross, so discovery there is left unbounded.
+    let boundary = devmap_extract::git_worktree_root(&cursor);
     loop {
         if store_exists(&cursor) {
             return Ok(cursor);
+        }
+        if boundary.as_deref() == Some(cursor.as_path()) {
+            break;
         }
         match cursor.parent() {
             Some(parent) if parent != cursor => cursor = parent.to_path_buf(),

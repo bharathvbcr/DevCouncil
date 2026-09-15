@@ -7277,7 +7277,7 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
                     Some(version),
                     &subcommands,
                 )?;
-                let files: serde_json::Map<String, serde_json::Value> = rendered
+                let mut files: serde_json::Map<String, serde_json::Value> = rendered
                     .into_iter()
                     .map(|(path, body)| {
                         let key = path
@@ -7294,6 +7294,17 @@ fn run_claude(cli: &Cli, action: &ClaudeAction) -> anyhow::Result<()> {
                         Ok((key, value))
                     })
                     .collect::<anyhow::Result<_>>()?;
+                // Binary assets are described, not inlined: a dry run that
+                // omitted them entirely would report a bundle the writer does
+                // not produce, and one that inlined the bytes would be a PNG
+                // in a terminal.
+                for (path, bytes) in claude::plugin_binary_assets() {
+                    let key = path
+                        .to_str()
+                        .ok_or_else(|| anyhow::anyhow!("asset path is not valid UTF-8: {path:?}"))?
+                        .to_string();
+                    files.insert(key, serde_json::json!({ "bytes": bytes.len() }));
+                }
                 return emit_json(cli, &serde_json::Value::Object(files));
             }
             let written = claude::write_plugin_bundle(
