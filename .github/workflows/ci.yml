@@ -51,6 +51,24 @@ jobs:
           test -z "$(gofmt -l cmd/devcouncil)"
           go test ./cmd/devcouncil -count=1
 
+      # tests/unit/ holds two harness tests for rust/tools/soak.sh. They slice
+      # blocks out of the script and run them, so they only prove anything when
+      # something runs them — an earlier orphan in that directory imported a
+      # package deleted in 3286db5 and went unnoticed for months because no
+      # workflow collected it. See tests/unit/README.md.
+      #
+      # The three prerequisites are checked rather than assumed: a soak test
+      # that silently skips reports the same result as one that passed.
+      - name: Soak harness tests
+        run: |
+          set -euo pipefail
+          for tool in bash perl; do
+            command -v "$tool" || { echo "::error::$tool is required by rust/tools/soak.sh"; exit 1; }
+          done
+          test -x /usr/bin/time || { echo "::error::/usr/bin/time is required by rust/tools/soak.sh; install the 'time' package"; exit 1; }
+          python3 tests/unit/test_soak_query_check.py
+          python3 tests/unit/test_soak_shutdown.py
+
       - name: Package smoke
         run: |
           npm pack --dry-run

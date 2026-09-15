@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/skills"
 )
@@ -80,13 +81,21 @@ func TestScaffoldRefusesUnowned(t *testing.T) {
 	}
 }
 
-func TestScaffoldLockTimeout(t *testing.T) {
+// A held lock must not block a read-only plan: --dry-run and --check answer
+// questions about the tree and write nothing, so waiting on another installer
+// would make them useless exactly while one is running.
+//
+// The lock's own timeout contract is TestBusyLockHasBoundedWaitAndIsNotStolen
+// in delivery_test.go; this test deliberately takes the path that skips it.
+func TestDryRunDoesNotWaitOnAHeldLock(t *testing.T) {
 	root := t.TempDir()
-	lock := filepath.Join(root, ".devcouncil-skills.lock")
-	if err := os.Mkdir(lock, 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(root, ".devcouncil-skills.lock"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	all, _ := skills.Embedded.Load()
+	all, err := skills.Embedded.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
 	var core skills.Skill
 	for _, s := range all {
 		if s.Name == "core-engineering" {
@@ -94,17 +103,21 @@ func TestScaffoldLockTimeout(t *testing.T) {
 			break
 		}
 	}
-	// Shrink wait via holding the lock; Scaffold uses 5s — we just assert busy error shape.
-	// Holding the lock forever would make the test slow; remove lock after starting...
-	// Instead: leave lock and use a short test by checking error contains "busy" with a
-	// pre-held lock — but 5s is long. Create lock then immediately call with DryRun which
-	// skips the lock.
-	_, err := skills.Scaffold(skills.Options{
+	start := time.Now()
+	result, err := skills.Scaffold(skills.Options{
 		Root: root, Skills: []skills.Skill{core}, DryRun: true,
 		Destinations: []string{".cursor/skills"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = lock
+	if elapsed := time.Since(start); elapsed >= skills.LockWait {
+		t.Fatalf("a dry run waited %s on a lock it never needed", elapsed)
+	}
+	if len(result.Files) != 1 {
+		t.Fatalf("dry run should name the one missing file, got %v", result.Files)
+	}
+	if entries, err := os.ReadDir(root); err != nil || len(entries) != 1 {
+		t.Fatalf("dry run changed the tree: %v (%v)", entries, err)
+	}
 }
