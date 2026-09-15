@@ -9,9 +9,14 @@ name: analysis components (rust/ + go clients)
 #   rust — the dc-* components themselves, on three platforms.
 #   go   — the clients, driving real component binaries rather than fakes.
 #
-# The Python TaskLeaseRepository / CLI stdout-contract jobs were removed with
-# the Python package. `dc-store` interop and `dc-verify` json_contract tests
-# skip when there is no `.venv`; they are not required here.
+# The Python TaskLeaseRepository jobs were removed with the Python package.
+# `dc-store`'s interop tests still skip when there is no `.venv`.
+#
+# `dc-verify`'s json_contract does not skip. It drives the Go host binary as a
+# real process — the only way to tell a banner on stdout from one on stderr —
+# and fails when that binary is absent, so the rust job builds it. It named the
+# deleted Python CLI until 2026-09-14 and skipped its way to green for four
+# days; the build step below is what keeps that from recurring silently.
 
 on:
   push:
@@ -67,6 +72,17 @@ jobs:
       # compile the kernel's tree-sitter grammars.
       - name: Build
         run: cargo build -p dc-glob -p dc-proc -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets
+
+      # dc-verify's json_contract runs the host's `--json` commands as real
+      # processes and fails if it cannot find the binary. Go only: the module
+      # has no third-party dependencies and links in about a second, so this
+      # job still does not compile a single tree-sitter grammar.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go_orchestrator/go.mod
+      - name: Build the DevCouncil host
+        working-directory: backend/go_orchestrator
+        run: go build -o bin/ ./cmd/devcouncil
 
       - name: Test
         run: cargo test -p dc-glob -p dc-proc -p dc-grep -p dc-store -p dc-verify -p dc-evidence

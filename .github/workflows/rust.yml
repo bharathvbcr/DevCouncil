@@ -147,6 +147,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      # `dc-verify` is in the loop below, and its json_contract test drives the
+      # Go host binary as a real process rather than skipping when it is
+      # missing. Feature-off is still the thing under test here; the host is
+      # just a fixture the loop needs, and it links in about a second.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go_orchestrator/go.mod
+      - name: Build the DevCouncil host
+        working-directory: backend/go_orchestrator
+        run: go build -o bin/ ./cmd/devcouncil
       - name: Per-crate feature-off build and test
         run: |
           set -euo pipefail
