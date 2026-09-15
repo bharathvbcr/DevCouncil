@@ -622,7 +622,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `cfg(unix)`: a read-only *directory* is the situation under test, and
+    /// `Permissions::from_mode` is the only way to create one. Windows denies
+    /// writes through ACLs, which `std::fs` cannot set, so there is no Windows
+    /// spelling of this fixture — not merely one nobody has written yet.
     #[test]
+    #[cfg(unix)]
     fn a_memo_that_cannot_be_written_costs_nothing() {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("readonly");
@@ -746,16 +751,23 @@ mod adversarial {
         assert!(BinaryDigests::open(Some(&state)).entries.is_empty());
         std::fs::remove_dir(&memo).expect("rmdir");
 
-        // A symlink to a character device: `File::open` succeeds and
-        // `read_to_string` would block forever on /dev/zero without the
-        // is_file() guard.
-        std::os::unix::fs::symlink("/dev/zero", &memo).expect("symlink");
-        assert!(BinaryDigests::open(Some(&state)).entries.is_empty());
-        std::fs::remove_file(&memo).expect("unlink");
+        // The symlink shapes are unix-only — `std::os::unix::fs::symlink` does
+        // not exist on Windows, and creating one there needs a privilege CI
+        // does not have. The directory case above still runs on every platform,
+        // so this narrows what Windows checks rather than skipping the test.
+        #[cfg(unix)]
+        {
+            // A symlink to a character device: `File::open` succeeds and
+            // `read_to_string` would block forever on /dev/zero without the
+            // is_file() guard.
+            std::os::unix::fs::symlink("/dev/zero", &memo).expect("symlink");
+            assert!(BinaryDigests::open(Some(&state)).entries.is_empty());
+            std::fs::remove_file(&memo).expect("unlink");
 
-        // A dangling symlink.
-        std::os::unix::fs::symlink(dir.join("nowhere"), &memo).expect("symlink");
-        assert!(BinaryDigests::open(Some(&state)).entries.is_empty());
+            // A dangling symlink.
+            std::os::unix::fs::symlink(dir.join("nowhere"), &memo).expect("symlink");
+            assert!(BinaryDigests::open(Some(&state)).entries.is_empty());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1979,6 +1979,11 @@ mod tests {
     /// `tests/support/mod.rs` carries the same helper for this crate's
     /// integration tests, which cannot see inside the library; the semantics
     /// both of them rest on have one owner, [`Daemon::wait_until_serving`].
+    ///
+    /// `cfg(unix)` to match its callers: every test that races the endpoint
+    /// signal binds a Unix socket and is gated the same way, so on Windows this
+    /// helper had no callers left and `-D warnings` failed the build on it.
+    #[cfg(unix)]
     async fn serving_or_dead(
         daemon: &Daemon,
         running: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
