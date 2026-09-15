@@ -944,8 +944,57 @@ fn check_path_field(at: &str, key: &str, value: &Value, out: &mut Vec<Diagnostic
     }
 }
 
+/// Which host's `plugin.json` dialect a document is written in.
+///
+/// The bundle emits the same manifest shape three times, and they are not the
+/// same schema. Only Cursor reads `logo`; Claude Code documents no field for
+/// one and ignores it. Validating every file against the Claude key set means
+/// the emitter's own Cursor manifest is reported as wrong — a warning that is
+/// correct about Claude and false about the file it is aimed at, which is how
+/// a warning list stops being read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestDialect {
+    Claude,
+    Cursor,
+}
+
+impl ManifestDialect {
+    /// Keys this host reads that the Claude key set does not list.
+    fn extra_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::Claude => &[],
+            Self::Cursor => &["logo"],
+        }
+    }
+
+    /// Named in the diagnostic, so the reader knows which host is ignoring it.
+    fn host(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Cursor => "Cursor",
+        }
+    }
+
+    /// The dialect a path is written in, from the directory that holds it.
+    ///
+    /// `.cursor-plugin/plugin.json` is Cursor's; anything else is treated as
+    /// Claude's, which is the stricter of the two and so the safe default for
+    /// a file whose provenance is unknown.
+    pub fn of_path(path: &Path) -> Self {
+        match path.parent().and_then(Path::file_name) {
+            Some(dir) if dir == ".cursor-plugin" => Self::Cursor,
+            _ => Self::Claude,
+        }
+    }
+}
+
 /// Validate a `plugin.json` document against the documented manifest schema.
 pub fn validate_plugin_manifest(document: &Value) -> Vec<Diagnostic> {
+    validate_plugin_manifest_in(document, ManifestDialect::Claude)
+}
+
+/// Validate a `plugin.json` written in one host's dialect.
+pub fn validate_plugin_manifest_in(document: &Value, dialect: ManifestDialect) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let Some(root) = document.as_object() else {
         out.push(Diagnostic::error("<root>", "plugin.json must be an object"));
@@ -962,10 +1011,13 @@ pub fn validate_plugin_manifest(document: &Value) -> Vec<Diagnostic> {
         }
     }
     for (key, value) in root {
-        if !MANIFEST_KEYS.contains(&key.as_str()) {
+        if !MANIFEST_KEYS.contains(&key.as_str()) && !dialect.extra_keys().contains(&key.as_str()) {
             out.push(Diagnostic::warning(
                 key,
-                format!("{key:?} is not a recognized manifest field; Claude Code ignores it"),
+                format!(
+                    "{key:?} is not a recognized manifest field; {} ignores it",
+                    dialect.host()
+                ),
             ));
             continue;
         }
@@ -1098,11 +1150,25 @@ pub fn validate_marketplace(document: &Value) -> Vec<Diagnostic> {
 // ---------------------------------------------------------------------------
 
 pub const PLUGIN_NAME: &str = "devmap";
+/// The product's name, for the one manifest field hosts render as a name.
+///
+/// Separate from [`PLUGIN_NAME`] on purpose: that is the install identifier
+/// and must stay a kebab-case slug, so the two can never be the same string.
+pub const PLUGIN_DISPLAY_NAME: &str = "Dev Map";
 pub const MARKETPLACE_NAME: &str = "devmap-local";
 pub const MCP_SERVER_NAME: &str = "devmap";
 const PLUGIN_HOMEPAGE: &str = "https://github.com/bharathvbcr/DevCouncil";
 const PLUGIN_REPOSITORY: &str = "https://github.com/bharathvbcr/DevCouncil.git";
 const PLUGIN_LICENSE: &str = "Apache-2.0";
+
+/// Bundle-relative path of the plugin mark, and the bytes themselves.
+///
+/// `include_bytes!` for the same reason the skills use `include_str!`: a
+/// `cargo install` binary carries no repository beside it, and a bundle whose
+/// manifest names a logo that was never written is worse than one with no
+/// logo — it parses, renders nothing, and no other check looks.
+pub const PLUGIN_LOGO_PATH: &str = "assets/logo.png";
+const PLUGIN_LOGO: &[u8] = include_bytes!("../assets/logo.png");
 
 /// Legacy host placeholder. Emitted hooks no longer carry it — root discovery
 /// happens inside `devmap hook` from stdin (`cwd`, `file_path`, `workspace_roots`,
@@ -1414,6 +1480,12 @@ pub fn hooks_block(executable: &Path, subcommands: &[String]) -> anyhow::Result<
 pub fn plugin_manifest(version: Option<&str>) -> anyhow::Result<Value> {
     let mut manifest = Map::new();
     manifest.insert("name".into(), json!(PLUGIN_NAME));
+    // `name` is the install identifier and must stay the kebab-case slug;
+    // `displayName` is the only field Claude Code renders as a human name, so
+    // without it the plugin list shows "devmap" beside products that show
+    // theirs. Claude has no field for a logo at all — see
+    // `cursor_plugin_manifest`, which is where the mark can actually live.
+    manifest.insert("displayName".into(), json!(PLUGIN_DISPLAY_NAME));
     manifest.insert(
         "description".into(),
         json!(
@@ -1463,6 +1535,52 @@ pub fn codex_plugin_manifest(version: Option<&str>) -> anyhow::Result<Value> {
     }
     manifest.insert("hooks".into(), json!("./hooks/hooks.json"));
     Ok(Value::Object(manifest))
+}
+
+/// Cursor plugin manifest, written beside the Claude bundle under
+/// `.cursor-plugin/`.
+///
+/// Cursor is the only one of the three hosts that renders a plugin logo.
+/// Claude Code documents no field for one — not in `plugin.json`, not in
+/// `hooks.json`, not in `.mcp.json` — and the Agent Plugins 1.0.0 schema sets
+/// `additionalProperties: false`, so the same key in the portable manifest
+/// makes a conformant client reject the package. The logo therefore lives
+/// here and nowhere else, which is why this manifest exists at all.
+pub fn cursor_plugin_manifest(version: Option<&str>) -> anyhow::Result<Value> {
+    let mut manifest = Map::new();
+    manifest.insert("name".into(), json!(PLUGIN_NAME));
+    manifest.insert("displayName".into(), json!(PLUGIN_DISPLAY_NAME));
+    manifest.insert(
+        "description".into(),
+        json!(
+            "Dev Map: symbol-level code intelligence — search, callers, blast radius, \
+               dead code — over a local index."
+        ),
+    );
+    if let Some(version) = version {
+        manifest.insert("version".into(), json!(version));
+    }
+    manifest.insert(
+        "author".into(),
+        json!({"name": "DevCouncil", "url": PLUGIN_HOMEPAGE}),
+    );
+    manifest.insert("homepage".into(), json!(PLUGIN_HOMEPAGE));
+    manifest.insert("repository".into(), json!(PLUGIN_REPOSITORY));
+    manifest.insert("license".into(), json!(PLUGIN_LICENSE));
+    manifest.insert("logo".into(), json!(PLUGIN_LOGO_PATH));
+    Ok(Value::Object(manifest))
+}
+
+/// Bundle files that are bytes rather than text.
+///
+/// Kept apart from [`render_plugin_bundle`] rather than widening its tuple:
+/// every other emitted file is a document a reader can diff, and collapsing
+/// the two would make `--dry-run` print a PNG. The writer emits both.
+pub fn plugin_binary_assets() -> Vec<(PathBuf, &'static [u8])> {
+    vec![(
+        PathBuf::from(PLUGIN_NAME).join(PLUGIN_LOGO_PATH),
+        PLUGIN_LOGO,
+    )]
 }
 
 /// Cursor native `.cursor/hooks.json` (version 1, camelCase, flat shell commands).
@@ -1524,6 +1642,10 @@ pub const PLUGIN_SKILLS: &[(&str, &str)] = &[
 pub fn marketplace_manifest(version: Option<&str>) -> anyhow::Result<Value> {
     let mut entry = Map::new();
     entry.insert("name".into(), json!(PLUGIN_NAME));
+    // The marketplace entry is what the plugin browser lists, and it carries
+    // its own `displayName` rather than reading the plugin manifest's — so
+    // setting one there and not here leaves the browser showing the slug.
+    entry.insert("displayName".into(), json!(PLUGIN_DISPLAY_NAME));
     entry.insert("source".into(), json!(format!("./{PLUGIN_NAME}")));
     entry.insert(
         "description".into(),
@@ -1672,6 +1794,10 @@ pub fn render_plugin_bundle(
             pretty(&codex_plugin_manifest(version)?),
         ),
         (
+            plugin.join(".cursor-plugin").join("plugin.json"),
+            pretty(&cursor_plugin_manifest(version)?),
+        ),
+        (
             plugin
                 .join(".codex-plugin")
                 .join("hooks")
@@ -1706,10 +1832,20 @@ pub fn write_plugin_bundle(
     // Rendering first means a validation failure or a non-UTF-8 path costs no
     // partial write: nothing is created until every file is known good.
     let rendered = render_plugin_bundle(executable, db, version, subcommands)?;
-    let mut written = Vec::with_capacity(rendered.len());
+    let assets = plugin_binary_assets();
+    let mut written = Vec::with_capacity(rendered.len() + assets.len());
     for (relative, json) in rendered {
         let path = out_dir.join(&relative);
         let changed = devmap_query::write_atomic(&path, json.as_bytes())
+            .map_err(|err| anyhow::anyhow!("could not write {}: {err}", path.display()))?;
+        written.push(EmittedFile { path, changed });
+    }
+    // Written through the same atomic path as the documents, and reported in
+    // the same list: a manifest naming a logo is only true if the logo is
+    // emitted with it, so the two must not be able to ship apart.
+    for (relative, bytes) in assets {
+        let path = out_dir.join(&relative);
+        let changed = devmap_query::write_atomic(&path, bytes)
             .map_err(|err| anyhow::anyhow!("could not write {}: {err}", path.display()))?;
         written.push(EmittedFile { path, changed });
     }
@@ -1733,11 +1869,14 @@ pub fn validate_file(path: &Path, strict: bool) -> anyhow::Result<Report> {
         // plugin manifest field, not a hooks document — handled below.
         let mut out = validate_hooks(&value);
         if value.get("name").is_some() {
-            out.extend(validate_plugin_manifest(&value));
+            out.extend(validate_plugin_manifest_in(
+                &value,
+                ManifestDialect::of_path(path),
+            ));
         }
         out
     } else if value.get("name").is_some() {
-        validate_plugin_manifest(&value)
+        validate_plugin_manifest_in(&value, ManifestDialect::of_path(path))
     } else {
         vec![Diagnostic::error(
             "<root>",

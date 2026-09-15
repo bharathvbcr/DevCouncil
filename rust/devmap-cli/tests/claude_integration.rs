@@ -384,11 +384,24 @@ fn the_bundle_is_written_atomically_and_re_running_changes_nothing() {
         .iter()
         .filter(|f| f["path"].as_str().unwrap().ends_with("SKILL.md"))
         .collect();
-    assert_eq!(json_files.len(), 6, "json files: {first}");
+    assert_eq!(json_files.len(), 7, "json files: {first}");
     assert_eq!(
         skill_files.len(),
         5,
         "the plugin must ship the DevMap agent skills, not only hooks: {first}"
+    );
+    // The mark is emitted with the manifest that names it. A bundle whose
+    // `logo` points at a file the writer never wrote still parses and still
+    // installs; it just shows nothing, and no manifest check would notice.
+    let logo = files
+        .iter()
+        .find(|f| f["path"].as_str().unwrap().ends_with("assets/logo.png"))
+        .unwrap_or_else(|| panic!("the bundle must ship the plugin mark: {first}"));
+    let bytes = std::fs::read(logo["path"].as_str().unwrap()).expect("read logo");
+    assert_eq!(
+        &bytes[..8],
+        b"\x89PNG\r\n\x1a\n",
+        "the emitted mark must really be a PNG"
     );
     assert_eq!(
         first["changed"],
@@ -398,18 +411,23 @@ fn the_bundle_is_written_atomically_and_re_running_changes_nothing() {
 
     for file in files {
         let path = PathBuf::from(file["path"].as_str().unwrap());
-        let text = std::fs::read_to_string(&path).expect("emitted file is readable");
-        if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            serde_json::from_str::<Value>(&text)
-                .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()));
-        } else {
-            assert!(
-                text.contains("name:"),
-                "{} is not a skill file: {text}",
-                path.display()
-            );
+        // Binary assets take the same atomic write as the documents, so the
+        // temp-file check below still applies to them — only the text-shape
+        // assertions do not.
+        if path.extension().and_then(|e| e.to_str()) != Some("png") {
+            let text = std::fs::read_to_string(&path).expect("emitted file is readable");
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                serde_json::from_str::<Value>(&text)
+                    .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()));
+            } else {
+                assert!(
+                    text.contains("name:"),
+                    "{} is not a skill file: {text}",
+                    path.display()
+                );
+            }
+            assert!(text.ends_with('\n'), "{}", path.display());
         }
-        assert!(text.ends_with('\n'), "{}", path.display());
         // No temp file survived the write.
         assert!(
             !path.with_extension("tmp").exists(),
@@ -670,10 +688,20 @@ fn every_emitted_file_passes_our_own_validator_in_strict_mode() {
     let emitted = devmap(&["--json", "claude", "plugin", "--out", out.to_str().unwrap()])
         .ok()
         .json();
+    let mut skipped_assets = 0usize;
     for file in emitted["files"].as_array().unwrap() {
         let path = file["path"].as_str().unwrap();
         if path.ends_with(".mcp.json") || path.ends_with("SKILL.md") {
             continue; // MCP config and skills are not hook/manifest/marketplace JSON
+        }
+        if path.ends_with(".png") {
+            // Not JSON, so the validator has nothing to say — but "skipped"
+            // must not read the same as "passed". Check what can be checked:
+            // that the bytes are the image the manifest promises.
+            let bytes = std::fs::read(path).expect("read asset");
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "{path} is not a PNG");
+            skipped_assets += 1;
+            continue;
         }
         let run = devmap(&["claude", "validate", path, "--strict"]);
         assert_eq!(
@@ -684,6 +712,78 @@ fn every_emitted_file_passes_our_own_validator_in_strict_mode() {
             run.stderr
         );
     }
+    assert_eq!(
+        skipped_assets, 1,
+        "the loop must have actually reached the mark; a bundle that stopped \
+         emitting it would otherwise pass this test by having nothing to skip"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The product's name and mark land in the manifests that read them — and
+/// only those.
+///
+/// Three hosts, three dialects, and they disagree about branding. Claude Code
+/// renders `displayName` and documents no logo field at all; Cursor reads
+/// both. The Agent Plugins schema that the portable manifest declares sets
+/// `additionalProperties: false`, so a `logo` copied there does not degrade
+/// to "ignored" — it makes a conformant client reject the package. Pinning
+/// where each key may appear is the only thing that keeps a later edit from
+/// "helpfully" adding the logo everywhere.
+#[test]
+fn the_plugin_is_branded_in_the_manifests_that_render_branding() {
+    let dir = scratch("branding");
+    let out = dir.join("claude-plugin");
+    devmap(&["--json", "claude", "plugin", "--out", out.to_str().unwrap()]).ok();
+
+    let read = |rel: &str| -> Value {
+        let text =
+            std::fs::read_to_string(out.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}"))
+    };
+
+    // The browser lists the marketplace entry, which carries its own
+    // displayName rather than reading the plugin manifest's — so branding one
+    // and not the other still shows the slug where users actually look.
+    let marketplace = read(".claude-plugin/marketplace.json");
+    let entry = &marketplace["plugins"][0];
+    assert_eq!(entry["name"], "devmap");
+    assert_eq!(
+        entry["displayName"], "Dev Map",
+        "the marketplace entry is what the plugin browser lists: {marketplace}"
+    );
+
+    let claude = read("devmap/.claude-plugin/plugin.json");
+    assert_eq!(
+        claude["name"], "devmap",
+        "the install identifier must stay the slug"
+    );
+    assert_eq!(
+        claude["displayName"], "Dev Map",
+        "Claude Code renders displayName; without it the plugin list shows the slug"
+    );
+    assert!(
+        claude.get("logo").is_none(),
+        "Claude Code documents no logo field: {claude}"
+    );
+
+    let cursor = read("devmap/.cursor-plugin/plugin.json");
+    assert_eq!(cursor["name"], "devmap");
+    assert_eq!(cursor["displayName"], "Dev Map");
+    let logo = cursor["logo"]
+        .as_str()
+        .expect("cursor manifest names a logo");
+
+    // The path is only a promise until it resolves to bytes inside the bundle.
+    assert!(
+        !logo.starts_with('/') && !logo.contains(".."),
+        "logo must be package-relative and stay inside it: {logo:?}"
+    );
+    let resolved = out.join("devmap").join(logo);
+    let bytes = std::fs::read(&resolved)
+        .unwrap_or_else(|e| panic!("the manifest names {logo}, which is not there: {e}"));
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "{logo} is not a PNG");
+
     std::fs::remove_dir_all(&dir).ok();
 }
 
