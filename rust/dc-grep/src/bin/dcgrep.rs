@@ -50,6 +50,17 @@ fn main() -> ExitCode {
 fn run() -> Result<String, String> {
     let args = collect_args()?;
     match args.first().map(String::as_str) {
+        // `CARGO_PKG_VERSION` and never a literal: every crate in this
+        // workspace takes `version.workspace = true`, so the one number in
+        // `rust/Cargo.toml` reaches here and a release has no second place to
+        // forget. Until this arm existed the binary answered `--version` with
+        // `unknown command "--version"`, so a deployed searcher's version was
+        // not observable at all — the package said 0.2.3 and the program could
+        // not be asked.
+        Some("--version") => Ok(format!(
+            "{{\"ok\":true,\"component\":\"{IDENTITY}\",\"version\":\"{}\"}}",
+            env!("CARGO_PKG_VERSION")
+        )),
         Some("health") => Ok(format!(
             "{{\"ok\":true,\"searcher\":\"{IDENTITY}\",\"schema_version\":{SCHEMA_VERSION},\"engine\":\"ripgrep\",\"index_engine\":\"tgrep-core\"}}"
         )),
@@ -57,7 +68,7 @@ fn run() -> Result<String, String> {
         Some("files") => list(),
         Some("index") => index(),
         Some(other) => Err(format!(
-            "unknown command {other:?} (search, files, index, health)"
+            "unknown command {other:?} (search, files, index, health, --version)"
         )),
     }
 }

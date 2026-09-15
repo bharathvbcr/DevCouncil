@@ -164,6 +164,61 @@ export function packageIsDistable(source) {
 }
 
 /**
+ * The `[workspace] members` list, in declaration order.
+ *
+ * @param {string} source
+ * @returns {string[]}
+ */
+export function parseWorkspaceMembers(source) {
+  const match = /^\[workspace\]([\s\S]*?)(?=^\[)/m.exec(source);
+  if (!match) return [];
+  const members = /members\s*=\s*\[([\s\S]*?)\]/.exec(match[1]);
+  if (!members) return [];
+  return Array.from(members[1].matchAll(/"([^"]+)"/g), (m) => m[1]);
+}
+
+/**
+ * Workspace members that do not take `version.workspace = true`.
+ *
+ * Every per-binary version check compares a program's answer against its own
+ * `CARGO_PKG_VERSION`, so a crate that swapped inheritance for a literal would
+ * keep passing all of them while shipping a different number than the product.
+ * Inheritance is what makes `[workspace.package] version` the single owner, so
+ * it is asserted here rather than assumed: this is the only place that sees
+ * every crate at once.
+ *
+ * A member whose manifest is missing is reported too — an unbuildable
+ * workspace must not read as "every crate inherits".
+ *
+ * @param {string} rustRoot
+ * @param {readonly string[]} members
+ * @returns {string[]} one human-readable reason per offending member
+ */
+export function membersNotInheritingVersion(rustRoot, members) {
+  /** @type {string[]} */
+  const offenders = [];
+  for (const member of members) {
+    const manifestPath = path.join(rustRoot, member, "Cargo.toml");
+    if (!existsSync(manifestPath)) {
+      offenders.push(`${member} is a workspace member with no Cargo.toml`);
+      continue;
+    }
+    const source = readFileSync(manifestPath, "utf8");
+    const own = parseTomlSectionVersion(source, "[package]");
+    if (own != null) {
+      offenders.push(
+        `${member} declares its own version ${JSON.stringify(own)} instead of version.workspace = true`,
+      );
+      continue;
+    }
+    if (!/^\s*version\.workspace\s*=\s*true\s*$/m.test(source)) {
+      offenders.push(`${member} sets no version: it must take version.workspace = true`);
+    }
+  }
+  return offenders;
+}
+
+/**
  * Packages under `rustRoot` that cargo would build a binary for: they have
  * `src/main.rs` or at least one `src/bin/*.rs`. A library crate with no
  * binary is not dist-able even when `dist` is left at the default.
@@ -264,7 +319,10 @@ export function defaultSources(root) {
     packageLockPath: path.join(root, "package-lock.json"),
     cargoTomlPath: path.join(root, "rust", "Cargo.toml"),
     cargoLockPath: path.join(root, "rust", "Cargo.lock"),
-    goVersionPath: path.join(root, "backend", "go_orchestrator", "cmd", "devcouncil", "version.go"),
+    // `devcouncil/version`, not `cmd/devcouncil`: the constant moved into a
+    // library so `devcouncil/mcp` could import it, and this gate must read
+    // the owner rather than the alias that `package main` keeps for printing.
+    goVersionPath: path.join(root, "backend", "go_orchestrator", "devcouncil", "version", "version.go"),
     rustRoot: path.join(root, "rust"),
     distWorkspacePath: path.join(root, "dist-workspace.toml"),
     npmPublishPath: path.join(root, ".github", "workflows", "npm-publish.yml"),
@@ -341,6 +399,17 @@ export function inspectRelease(sources, opts = {}) {
         // GitHub's release-body limit is 1 MB; stay well under it so notes
         // never have to travel through GITHUB_ENV (48 KB cap).
         errors.push(`release notes exceed 100000 characters: ${notesPath}`);
+      }
+    }
+  }
+
+  if (cargoToml) {
+    const members = parseWorkspaceMembers(cargoToml);
+    if (members.length === 0) {
+      errors.push("rust/Cargo.toml declares no workspace members");
+    } else {
+      for (const reason of membersNotInheritingVersion(sources.rustRoot, members)) {
+        errors.push(reason);
       }
     }
   }

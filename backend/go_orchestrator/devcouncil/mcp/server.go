@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/version"
 )
 
 const (
@@ -225,7 +226,10 @@ func (s *Server) handle(req rpcRequest) rpcResponse {
 		return okResult(req.ID, map[string]any{
 			"protocolVersion": "2024-11-05",
 			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]any{"name": "devcouncil", "version": "0.1.0"},
+			// `version.Version`, never a literal: this field is how a host
+			// reports which DevCouncil answered it, and a literal here held
+			// 0.1.0 from the first release through 0.2.3.
+			"serverInfo": map[string]any{"name": "devcouncil", "version": version.Version},
 		})
 	case "ping":
 		return okResult(req.ID, map[string]any{})

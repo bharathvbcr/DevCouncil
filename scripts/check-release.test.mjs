@@ -10,6 +10,7 @@ import {
   binaryPackages,
   defaultSources,
   inspectRelease,
+  membersNotInheritingVersion,
   missingArchives,
   npmPublishCreatesGitHubRelease,
   npmPublishSkipsExistingVersion,
@@ -19,6 +20,7 @@ import {
   parseGoVersion,
   parseTag,
   parseTomlSectionVersion,
+  parseWorkspaceMembers,
   releaseIsIdempotent,
   releasePutsAnnouncementBodyInEnv,
   releaseUsesNotesFile,
@@ -48,7 +50,7 @@ function scratchTree(prefix, versions = {}) {
   };
   const dir = mkdtempSync(path.join(tmpdir(), `devcouncil-rel-${prefix}-`));
   tempDirs.push(dir);
-  mkdirSync(path.join(dir, "backend", "go_orchestrator", "cmd", "devcouncil"), { recursive: true });
+  mkdirSync(path.join(dir, "backend", "go_orchestrator", "devcouncil", "version"), { recursive: true });
   mkdirSync(path.join(dir, "rust", "devmap-cli", "src"), { recursive: true });
   mkdirSync(path.join(dir, "rust", "devmap-store", "src", "bin"), { recursive: true });
   mkdirSync(path.join(dir, "docs", "releases"), { recursive: true });
@@ -68,8 +70,8 @@ function scratchTree(prefix, versions = {}) {
     `[[package]]\nname = "${DIST_PACKAGE}"\nversion = "${v.rust}"\n`,
   );
   writeFileSync(
-    path.join(dir, "backend", "go_orchestrator", "cmd", "devcouncil", "version.go"),
-    `package main\n\nconst Version = "${v.go}"\n`,
+    path.join(dir, "backend", "go_orchestrator", "devcouncil", "version", "version.go"),
+    `package version\n\nconst Version = "${v.go}"\n`,
   );
   writeFileSync(
     path.join(dir, "rust", "devmap-cli", "Cargo.toml"),
@@ -296,6 +298,65 @@ describe("this repository's workflows", () => {
     assert.equal(existsSync(path.join(REPO_ROOT, "docs", "judge-release-notes.md")), false);
     assert.equal(npmYaml.includes("judge-release-notes"), false);
     assert.equal(relYaml.includes("judge-release-notes"), false);
+  });
+});
+
+describe("workspace version inheritance", () => {
+  it("reads the members list and not a dependency array", () => {
+    const source =
+      '[workspace]\nresolver = "3"\nmembers = ["dc-store", "dc-verify"]\n\n' +
+      '[workspace.dependencies]\nserde = { version = "1.0", features = ["derive"] }\n';
+    assert.deepEqual(parseWorkspaceMembers(source), ["dc-store", "dc-verify"]);
+  });
+
+  it("passes when every member inherits", () => {
+    const root = scratchTree("inherit-ok");
+    assert.deepEqual(
+      membersNotInheritingVersion(path.join(root, "rust"), ["devmap-cli", "devmap-store"]),
+      [],
+    );
+  });
+
+  it("fails a member that declares its own version, naming the number it would ship", () => {
+    const root = scratchTree("inherit-literal");
+    writeFileSync(
+      path.join(root, "rust", "devmap-store", "Cargo.toml"),
+      '[package]\nname = "devmap-store"\nversion = "0.1.0"\n[package.metadata.dist]\ndist = false\n',
+    );
+    const offenders = membersNotInheritingVersion(path.join(root, "rust"), [
+      "devmap-cli",
+      "devmap-store",
+    ]);
+    assert.equal(offenders.length, 1);
+    assert.ok(offenders[0].includes("devmap-store") && offenders[0].includes("0.1.0"));
+    // …and it reaches the gate, not just the helper.
+    const result = inspectRelease(defaultSources(root));
+    assert.ok(result.errors.some((e) => e.includes("devmap-store") && e.includes("0.1.0")));
+  });
+
+  it("fails a member that sets no version at all", () => {
+    const root = scratchTree("inherit-absent");
+    writeFileSync(
+      path.join(root, "rust", "devmap-store", "Cargo.toml"),
+      '[package]\nname = "devmap-store"\n[package.metadata.dist]\ndist = false\n',
+    );
+    const offenders = membersNotInheritingVersion(path.join(root, "rust"), ["devmap-store"]);
+    assert.equal(offenders.length, 1);
+    assert.ok(offenders[0].includes("version.workspace = true"));
+  });
+
+  it("reports a member with no manifest rather than reading it as inheriting", () => {
+    const root = scratchTree("inherit-missing");
+    const offenders = membersNotInheritingVersion(path.join(root, "rust"), ["dc-nonexistent"]);
+    assert.equal(offenders.length, 1);
+    assert.ok(offenders[0].includes("no Cargo.toml"));
+  });
+
+  it("holds for this repository: all 13 crates inherit the one workspace version", () => {
+    const rustRoot = path.join(REPO_ROOT, "rust");
+    const members = parseWorkspaceMembers(readFileSync(path.join(rustRoot, "Cargo.toml"), "utf8"));
+    assert.ok(members.length >= 13, `members=${members.length}`);
+    assert.deepEqual(membersNotInheritingVersion(rustRoot, members), []);
   });
 });
 
