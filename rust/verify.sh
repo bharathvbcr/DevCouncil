@@ -35,6 +35,34 @@ cargo fmt --all -- --check
 step "2/9 clippy (-D warnings)"
 cargo clippy --workspace --all-targets -- -D warnings
 
+# The host binary gate 3 needs, built the way the workflows build it.
+#
+# `dc-verify`'s json_contract drives `devcouncil --json` as a real process —
+# two real file descriptors are the only way to tell a banner on stdout from
+# one on stderr — and since 2026-09-14 it fails rather than skips when the
+# binary is absent, because a gate that ran nothing must not report what a gate
+# that ran and passed reports. That makes the host a fixture of `cargo test
+# --workspace`, so this pipeline builds it, exactly as `analysis-plane.yml` and
+# `rust.yml` do. The module has no third-party dependencies and links in about
+# a second, so this compiles no tree-sitter grammar and costs gate 3 nothing.
+#
+# Without this the chain was red by construction on any clean checkout: the
+# workflows gained the build step and this file did not, so every local run
+# failed two tests with a message about a path. A missing toolchain is named
+# here rather than left to surface as that message, because the cause is the
+# toolchain and naming it is the difference between one command and a hunt.
+step "3/9 tests — host fixture"
+if [ -n "${DEVCOUNCIL_BIN:-}" ]; then
+  echo "DEVCOUNCIL_BIN is set ($DEVCOUNCIL_BIN); not building the host"
+elif command -v go >/dev/null 2>&1; then
+  go -C ../backend/go_orchestrator build -o bin/ ./cmd/devcouncil
+else
+  echo "GATE FAIL: no \`go\` on PATH, and gate 3 needs the DevCouncil host binary —" >&2
+  echo "dc-verify's json_contract runs it as a real process and fails when it is absent." >&2
+  echo "Install Go, or point DEVCOUNCIL_BIN at a host built from this tree." >&2
+  exit 1
+fi
+
 step "3/9 tests"
 cargo test --workspace
 
