@@ -1,3 +1,9 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "devcouncil": {
+      "type": "stdio",
+      "command": "devcouncil",
+      "args": ["mcp"]
+    }
+  }
 }
