@@ -92,6 +92,7 @@ Usage:
   devcouncil integrate uninstall --target hooks [--dry-run] [--project-root DIR]
   devcouncil skills list
   devcouncil skills scaffold [--skill NAME] [--project-root DIR] [--dry-run] [--check]
+                                   --check writes nothing and exits 1 if any file is missing or differs
   devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local|docker|nix] [--coverage PATH]
   devcouncil map [devmap args…]   Exec `+"`devmap`"+` (bare invocation: build --manifest)
   devcouncil graph …              Alias of map
@@ -563,19 +564,25 @@ func runSkillsScaffold(args []string) int {
 	}
 	selected := all
 	if len(filter) > 0 {
-		want := map[string]struct{}{}
-		for _, n := range filter {
-			want[n] = struct{}{}
-		}
-		selected = nil
+		have := map[string]skills.Skill{}
 		for _, s := range all {
-			if _, ok := want[s.Name]; ok {
-				selected = append(selected, s)
-			}
+			have[s.Name] = s
 		}
-		if len(selected) == 0 {
-			console.Errorf("no matching skills for %v\n", filter)
-			return 1
+		// Every requested name must exist. Installing the subset that happened
+		// to match and exiting 0 reports a typo as a completed install.
+		selected = nil
+		seen := map[string]struct{}{}
+		for _, name := range filter {
+			s, ok := have[name]
+			if !ok {
+				console.Errorf("Unknown skill: %s\n", name)
+				return 1
+			}
+			if _, repeat := seen[name]; repeat {
+				continue
+			}
+			seen[name] = struct{}{}
+			selected = append(selected, s)
 		}
 	}
 	result, err := skills.Scaffold(skills.Options{
@@ -588,6 +595,11 @@ func runSkillsScaffold(args []string) int {
 	if dryRun || checkOnly {
 		if err := console.JSON(result); err != nil {
 			console.Errorln(err)
+			return 1
+		}
+		// --check answers a question, so it must be able to say no: a tree that
+		// still needs files exits non-zero, an installed one exits 0.
+		if checkOnly && len(result.Files) > 0 {
 			return 1
 		}
 		return 0

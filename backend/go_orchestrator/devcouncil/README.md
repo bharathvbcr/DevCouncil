@@ -11,7 +11,7 @@ Install: `go build -o ~/.local/bin/devcouncil ./cmd/devcouncil` (from `backend/g
 | `devcouncil uninstall / disable / enable` | Remove or skip a catalog binary |
 | `devcouncil gate status \| set` | Verification-gate mode (off / advisory / enforce) |
 | `devcouncil integrate <host> [--apply\|--check\|--dry-run]` | Host MCP/rules/hooks; spawns `devmap integrate` / `skills install` |
-| `devcouncil skills scaffold [--skill NAME]` | Embed.FS domain skills (17) with Python registry bounds |
+| `devcouncil skills scaffold [--skill NAME]` | Embed.FS domain skills (17) with Python registry bounds; `--check` exits 1 when anything is missing or differs |
 
 Manvi must not be imported from this module tree. Shared get_diff/lease live in
 `devcouncil/`; Manvi keeps `manvi/devcouncil` for harness-coupled tools.

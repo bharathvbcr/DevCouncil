@@ -387,6 +387,79 @@ mod tests {
         dir
     }
 
+    /// The corpus contract, ported from the retired
+    /// `tests/unit/test_devmap_skill_delivery.py`.
+    ///
+    /// That test compared two distributions of these five skills — the DevMap
+    /// crate's own copy and DevCouncil's Python skill library — and asserted
+    /// they were byte-identical. The Python library was deleted in 3286db5 and
+    /// its Go replacement carries the 17 domain skills, not these, so there is
+    /// now one distribution and the parity half is retired. What survives is
+    /// what the parity check was protecting: that each shipped skill is
+    /// addressable under the name a host is told to look for, and that its body
+    /// still points at the command an agent runs first.
+    #[test]
+    fn every_shipped_skill_is_named_and_points_at_a_real_command() {
+        let names: Vec<&str> = PLUGIN_SKILLS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            [
+                "devmap",
+                "devmap-exploring",
+                "devmap-debugging",
+                "devmap-impact",
+                "devmap-refactoring"
+            ],
+            "the shipped skill set changed; hosts are configured for these names"
+        );
+
+        for (name, body) in PLUGIN_SKILLS {
+            validate_skill_name(name).unwrap_or_else(|err| panic!("{name}: {err}"));
+
+            let front = body
+                .strip_prefix("---\n")
+                .and_then(|rest| rest.split_once("\n---\n"))
+                .unwrap_or_else(|| panic!("{name}: SKILL.md has no terminated frontmatter"))
+                .0;
+            let declared = front
+                .lines()
+                .find_map(|line| line.strip_prefix("name:"))
+                .map(str::trim)
+                .unwrap_or_else(|| panic!("{name}: frontmatter declares no name"));
+            assert_eq!(
+                declared, *name,
+                "a skill installed as {name}/SKILL.md that calls itself {declared} is \
+                 invisible to a host asking for either"
+            );
+            let description = front
+                .lines()
+                .find_map(|line| line.strip_prefix("description:"))
+                .map(str::trim)
+                .unwrap_or_else(|| panic!("{name}: frontmatter declares no description"));
+            assert!(
+                !description.is_empty(),
+                "{name}: the description is what a host matches on"
+            );
+
+            // `devmap paths --json` is the first command generated guidance
+            // tells an agent to run; a skill that omits it sends the agent
+            // straight to the fallback it exists to avoid.
+            assert!(
+                body.contains("devmap paths --json"),
+                "{name}: no `devmap paths --json`"
+            );
+            // Two phrasings retired on purpose: guidance that forbids another
+            // tool outright, and guidance that predicts breakage it cannot
+            // observe. Both were removed from the corpus; neither may return.
+            for banned in ["Do not use GitNexus", "will break"] {
+                assert!(
+                    !body.contains(banned),
+                    "{name}: retired phrasing {banned:?} is back in the shipped skill"
+                );
+            }
+        }
+    }
+
     #[test]
     fn sha256_matches_known_vector() {
         assert_eq!(
