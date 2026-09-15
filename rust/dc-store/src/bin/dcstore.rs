@@ -146,6 +146,31 @@ const KNOWN_FLAGS: &[&str] = &[
     "started-at",
     "finished-at",
     "created-at",
+    // `gap-upsert`'s own vocabulary. Its handler has always read all ten of
+    // these, and none of them was listed here — so the parser refused the argv
+    // before the handler could run, and the command failed on its first flag
+    // with "unknown flag --severity". Two of them (`gap-type`, `description`)
+    // are `required`, so there was no argument vector that reached it at all.
+    //
+    // `dc/store.GapsReplace` spells a replacement as `gaps-clear` plus one
+    // `gap-upsert` per gap, and `verify/orchestrate.go` calls it after every
+    // verification, so persisting a task's gaps has been failing for as long as
+    // both have existed. Nothing caught it because the Go tests that exercise
+    // GapsReplace pass an empty list, which never reaches the upsert loop.
+    //
+    // This is the comment above KNOWN_FLAGS made good on: adding a flag without
+    // listing it must fail loudly at first use. It did fail — the failure was
+    // just being returned to a caller that logged it and continued.
+    "severity",
+    "gap-type",
+    "description",
+    "recommended-fix",
+    "evidence",
+    "blocking",
+    "file",
+    "line",
+    "suggested-command",
+    "expected-verification-method",
 ];
 
 /// The identity a caller checks to confirm it is talking to this store and not
@@ -658,6 +683,36 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
             ]))
         }
 
+        // The negative memory `gaps` cannot hold. `gaps` answers "what blocks
+        // me now" and is replaced wholesale each run; this answers "what has
+        // been reported before, and what came back after being reported
+        // fixed".
+        "gap-history" => {
+            let (rows, truncated) = store
+                .gap_history_list(flag("task"))
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            let items: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    object(&[
+                        ("task_id", &quote(&r.task_id)),
+                        ("gap_id", &quote(&r.gap_id)),
+                        ("gap_type", &quote(&r.gap_type)),
+                        ("first_seen_run", &r.first_seen_run.to_string()),
+                        ("last_seen_run", &r.last_seen_run.to_string()),
+                        ("occurrences", &r.occurrences.to_string()),
+                        ("resurfaces", &r.resurfaces.to_string()),
+                    ])
+                })
+                .collect();
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                ("history", &format!("[{}]", items.join(","))),
+                ("truncated", &json_bool(truncated)),
+                ("shown", &rows.len().to_string()),
+            ]))
+        }
+
         "gaps-clear" => {
             let task = required("task")?.to_string();
             store
@@ -696,7 +751,17 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
             store
                 .gap_upsert(&gap)
                 .map_err(|e| Failure::Fatal(e.to_string()))?;
-            Ok(object(&[("ok", &json_bool(true)), ("id", &quote(&gap.id))]))
+            // `gap_id`, not `id`. The Go client decodes every reply on this
+            // boundary through one envelope, where `id` is already
+            // `evidence-append`'s new row number — an integer. Answering with a
+            // string under the same key made the reply unparseable for the
+            // caller, which is the second half of why this command has never
+            // completed: the flags were refused first, and anything that got
+            // past them died here.
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                ("gap_id", &quote(&gap.id)),
+            ]))
         }
 
         "run-record" => {
@@ -737,7 +802,7 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
         }
 
         other => Err(Failure::Fatal(format!(
-            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, evidence-append, evidence-list, gaps, gaps-clear, gap-upsert, run-record, handoff, work)"
+            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, evidence-append, evidence-list, gaps, gaps-clear, gap-history, gap-upsert, run-record, handoff, work)"
         ))),
     }
 }

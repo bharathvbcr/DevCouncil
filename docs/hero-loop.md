@@ -54,6 +54,9 @@ operator-provided test command can still access the network.
 | `rigor_skipped_reason` | Why rigor did not run; missing evidence is not a clean finding |
 | `coverage_measured`, `coverage_skipped_reason` | Whether changed-line coverage was evaluated |
 | `next_actions`, `advisory_actions` | Concrete gaps for the agent to address or review |
+| finding `strength` | How the gate knows: `proven` (from the parsed diff), `observed` (from an execution artifact), `derived` (a text pattern, which can match something else). Both findings gates report `derived` today. |
+| `low_substance` gap | How much of the diff is new work rather than structure, relocation, repetition or generated output. Never blocking — a refactor measures low by construction. Absent means either substantive or too small to judge. |
+| gap `occurrences`, `resurfaces` | From `devcouncil_get_gaps`. `resurfaces > 0` means this gap was reported, went away, and came back — something reported it fixed and a later run disagreed. `recurrence_available: false` means the annotation is missing from every gap, not that nothing has recurred. |
 | `allowed_next_tools` | Names the host actually serves; not a grant of permission to arbitrary tools |
 
 The MCP verify tool has no coverage-profile input. Use the CLI when that gate

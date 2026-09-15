@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "run_id": "run-diff-1",
+  "session_id": "ci-1",
+  "epoch": 1,
+  "contract_sha256": "12d85fa1ac1ef6ee2a5fd834858a56e3a81da163eeefc025c9d102d1254b49a5",
+  "capability_sha256": "1a4bf7dac3b78318718a5047937473da4898acfb53cbbc9afdbe0c7fa9f3eec2",
+  "outcome": {
+    "id": "agreed",
+    "kind": "success"
+  },
+  "journal_complete": true,
+  "degraded": [],
+  "actions": [
+    {
+      "id": "run-differential",
+      "sequence": 1,
+      "disposition": "succeeded"
+    }
+  ],
+  "observations": [
+    {
+      "sequence": 2,
+      "run_id": "run-diff-1",
+      "session_id": "ci-1",
+      "epoch": 1,
+      "after_action_id": "run-differential",
+      "facts": {
+        "differential.mismatches": 0,
+        "differential.cases_run": 2000,
+        "differential.reference_rev": "017da09"
+      },
+      "artifact_ids": [
+        "differential-report"
+      ]
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "differential-report",
+      "path": "differential-report.txt",
+      "sha256": "84d3fef4b12ea83df3f718073d20daf8ba93937e4c1579834fab671e258a00d7",
+      "size_bytes": 100
+    }
+  ],
+  "interventions": [],
+  "human_actions": [],
+  "recoveries": [],
+  "locator_hits": []
+}

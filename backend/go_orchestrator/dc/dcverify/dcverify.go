@@ -79,6 +79,12 @@ const (
 // compared against a finding's gate field.
 const GateDiffCoverage = "diff_coverage"
 
+// GateSubstance names the informativeness measurement. Like GateDiffCoverage it
+// is not a findings gate — it arrives as its own object — so it is spelled here
+// for the caller that reports which gates ran, and never compared against a
+// finding's gate field.
+const GateSubstance = "substance"
+
 // The severities a finding may carry, spelled by dc-verify's Severity enum.
 // Anything else is refused: Go would decode an unknown string without
 // complaint, and the caller's "is this blocking" test would then answer false
@@ -86,6 +92,29 @@ const GateDiffCoverage = "diff_coverage"
 const (
 	SeverityBlocking = "blocking"
 	SeverityAdvisory = "advisory"
+)
+
+// The strengths a finding may carry, spelled by dc-verify's Strength enum.
+//
+// Severity says how much a finding matters; strength says how much it can be
+// trusted. Both are refused when unrecognised, and for the same reason: Go
+// would decode an unknown string without complaint, and a consumer weighing a
+// blocking finding would then read an unrecognised strength as the empty
+// string rather than learning that the verifier speaks a vocabulary this
+// client does not.
+//
+// StrengthDerived is the one every findings gate currently reports —
+// `secret_scan` matches a credential's shape and `stub_detection` matches text,
+// and neither is a measurement. That is a true and slightly uncomfortable
+// description of the rigor layer, which is the point of putting it on the wire.
+const (
+	// StrengthProven follows from the parsed structure of the diff.
+	StrengthProven = "proven"
+	// StrengthObserved is read from an execution artifact the caller supplied.
+	StrengthObserved = "observed"
+	// StrengthDerived is a textual pattern that correlates with the thing
+	// being looked for, and can match something else.
+	StrengthDerived = "derived"
 )
 
 const (
@@ -156,6 +185,11 @@ type Request struct {
 type Finding struct {
 	Gate     string `json:"gate"`
 	Severity string `json:"severity"`
+	// Strength is how the gate knows: see the Strength* constants. A verifier
+	// predating the field leaves it empty, which validate refuses — an
+	// unlabelled finding would otherwise be indistinguishable from a proven
+	// one to any caller that reads the field at all.
+	Strength string `json:"strength"`
 	Path     string `json:"path"`
 	Line     int    `json:"line"`
 	// Evidence is what triggered the finding, already truncated by the verifier
@@ -205,6 +239,49 @@ type Coverage struct {
 	SkippedByType []string
 }
 
+// FileSubstance is one file's share of the substance measurement.
+type FileSubstance struct {
+	Path             string `json:"path"`
+	AddedLines       int    `json:"added_lines"`
+	SubstantiveLines int    `json:"substantive_lines"`
+}
+
+// Substance is how much of the diff is new work.
+//
+// Every other answer here is about something being *wrong* with a change. This
+// one is about there being anything in it: a diff of relocated functions, brace
+// lines and a regenerated lockfile trips no gate, produces no coverage gap
+// because moved code carries its moved tests, and arrives as `findings: []` —
+// which a caller reasonably reads as work having been done.
+//
+// It is a measurement and never a finding, and it has no Measured flag beside
+// it because there is no state in which it could not run: it needs only the
+// diff every other gate already read. Judged is the analogous distinction and a
+// weaker one — not "the gate did not run" but "the diff is too small for the
+// ratio to say anything", which is a fact about the input rather than about the
+// verifier.
+//
+// Low is decided by dc-verify, not here. The threshold is calibrated against
+// real history in the crate that owns the classification, and a second copy of
+// it on this side would be a second policy that disagrees the first time either
+// moves.
+type Substance struct {
+	AddedLines       int `json:"added_lines"`
+	SubstantiveLines int `json:"substantive_lines"`
+	Trivial          int `json:"trivial"`
+	Moved            int `json:"moved"`
+	Repeated         int `json:"repeated"`
+	Generated        int `json:"generated"`
+	// Judged reports whether the diff had enough added lines for the ratio to
+	// carry information. False means this measurement has nothing to say, which
+	// is not the same as saying the change is fine.
+	Judged bool `json:"judged"`
+	// Low reports whether a judged diff fell under the verifier's threshold.
+	// Always false when Judged is false.
+	Low   bool            `json:"low"`
+	Files []FileSubstance `json:"files"`
+}
+
 // Result is what the verifier returned.
 type Result struct {
 	OK    bool   `json:"ok"`
@@ -219,6 +296,12 @@ type Result struct {
 	UntouchedPlanned []string `json:"untouched_planned"`
 
 	Findings []Finding `json:"findings"`
+
+	// Substance is the informativeness measurement. Unlike the coverage
+	// arrays it is safe to read straight off the wire: it carries its own
+	// Judged flag, so there is no "supplied by the caller" fact this client
+	// has to attach before it can be acted on.
+	Substance Substance `json:"substance"`
 
 	// The coverage arrays as they arrive. Callers read Coverage instead, which
 	// carries the same data with the measured/unmeasured distinction that makes
@@ -245,6 +328,19 @@ type wireResult struct {
 	CoverageUnmeasured    []string      `json:"coverage_unmeasured"`
 	CoverageGaps          []CoverageGap `json:"coverage_gaps"`
 	CoverageSkippedByType []string      `json:"coverage_skipped_by_type"`
+	// A pointer so its ABSENCE is detectable. A verifier built before the
+	// substance gate existed emits no `substance` key, which decodes into a
+	// zero value — nought added lines, judged false — and that is
+	// indistinguishable from a real measurement of a diff too small to judge.
+	// A measurement that never ran must not read as one that ran and declined
+	// to conclude, so nil is refused in validate rather than defaulted.
+	//
+	// This is why the schema version does not move. A version bump would
+	// refuse an old binary too, but it would equally refuse a *new* binary
+	// paired with an older host for a field that host never reads, which is a
+	// cost the additive rule exists to avoid. Detecting the absent key is
+	// exact, and it fails in only the direction that is actually unsafe.
+	Substance *Substance `json:"substance"`
 }
 
 // Coverage returns the coverage answer together with whether it was measured.
@@ -270,7 +366,12 @@ func (r *Result) Coverage() Coverage {
 // named here that did not run is a gate reported as passed without examining
 // anything.
 func (r *Result) GatesRun() []string {
-	gates := []string{GateSecretScan, GateStubDetection}
+	// Substance is unconditional: it reads the diff the other gates already
+	// read and needs nothing from the caller, so unlike coverage there is no
+	// state in which it was configured away. It is named here so a report that
+	// lists the gates it applied does not leave out the one measurement that
+	// ran on every pass.
+	gates := []string{GateSecretScan, GateStubDetection, GateSubstance}
 	if r.coverageMeasured {
 		gates = append(gates, GateDiffCoverage)
 	}
@@ -323,6 +424,15 @@ func (c *Client) Check(ctx context.Context, req Request) (*Result, error) {
 		coverageSkippedByType: wire.CoverageSkippedByType,
 		coverageMeasured:      req.CoveragePath != "",
 	}
+	if wire.Substance == nil {
+		return nil, fmt.Errorf(
+			"the verifier at %s returned no substance measurement; it predates the "+
+				"substance gate. Rebuild it from this tree (`cargo build -p dc-verify "+
+				"--bin dcverify`) or point %s at one that has it — an absent "+
+				"measurement must not be read as a diff too small to measure",
+			c.Binary, BinaryEnv)
+	}
+	out.Substance = *wire.Substance
 	if err := validate(out); err != nil {
 		return nil, err
 	}
@@ -448,6 +558,16 @@ func validate(out *Result) error {
 			return fmt.Errorf("finding from %s carries severity %q, which is neither %q nor %q",
 				finding.Gate, finding.Severity, SeverityBlocking, SeverityAdvisory)
 		}
+		switch finding.Strength {
+		case StrengthProven, StrengthObserved, StrengthDerived:
+		default:
+			return fmt.Errorf(
+				"finding from %s carries strength %q, which is none of %q, %q, %q; "+
+					"an unlabelled finding reads as a measurement to any caller that "+
+					"weighs the field",
+				finding.Gate, finding.Strength,
+				StrengthProven, StrengthObserved, StrengthDerived)
+		}
 		if err := validPath(finding.Path); err != nil {
 			return fmt.Errorf("finding path: %w", err)
 		}
@@ -459,6 +579,39 @@ func validate(out *Result) error {
 
 	if out.Files < 0 {
 		return fmt.Errorf("verifier reported %d files, which is not a count", out.Files)
+	}
+
+	// The substance classes must partition the added lines. Checked here as
+	// well as in the crate that computes them, because this is the boundary
+	// between two processes: a verifier from a different build, or one whose
+	// classifier gained a class this client does not know about, would
+	// otherwise hand over a ratio whose denominator does not match its parts
+	// and every number derived from it would be quietly wrong.
+	s := out.Substance
+	if s.AddedLines < 0 || s.SubstantiveLines < 0 {
+		return fmt.Errorf("substance reports %d added and %d substantive lines, which are not counts",
+			s.AddedLines, s.SubstantiveLines)
+	}
+	if sum := s.SubstantiveLines + s.Trivial + s.Moved + s.Repeated + s.Generated; sum != s.AddedLines {
+		return fmt.Errorf(
+			"substance classes sum to %d but the diff added %d lines "+
+				"(substantive %d, trivial %d, moved %d, repeated %d, generated %d); "+
+				"every added line must fall in exactly one class or the ratio means nothing",
+			sum, s.AddedLines, s.SubstantiveLines, s.Trivial, s.Moved, s.Repeated, s.Generated)
+	}
+	if s.Low && !s.Judged {
+		return fmt.Errorf(
+			"substance reports low on an unjudged diff; a diff too small to judge " +
+				"has no ratio to be under a threshold")
+	}
+	for _, f := range s.Files {
+		if err := validPath(f.Path); err != nil {
+			return fmt.Errorf("substance path: %w", err)
+		}
+		if f.SubstantiveLines > f.AddedLines {
+			return fmt.Errorf("substance reports %d substantive of %d added lines in %s",
+				f.SubstantiveLines, f.AddedLines, f.Path)
+		}
 	}
 	if total := len(out.InScope) + len(out.Orphans); total != out.Files {
 		return fmt.Errorf(

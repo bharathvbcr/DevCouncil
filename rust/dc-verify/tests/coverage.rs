@@ -102,7 +102,7 @@ fn real_coverage_closes_the_unmeasured_gap() {
             (11, "b := 2".into()),
             (17, "unreached()".into()),
         ],
-        removed_count: 0,
+        removed_lines: Vec::new(),
     }];
 
     let blind = intersect_coverage(&files, &[]);
@@ -126,7 +126,7 @@ fn a_fully_covered_diff_is_clean() {
         old_path: None,
         status: ChangeStatus::Modified,
         added_lines: vec![(10, "a := 1".into()), (12, "c := 3".into())],
-        removed_count: 0,
+        removed_lines: Vec::new(),
     }];
     let report = intersect_coverage(&files, &parse(GO_PROFILE).unwrap());
     assert!(report.is_clean(), "{report:#?}");
@@ -139,7 +139,7 @@ fn coverage_for_a_file_the_diff_never_touched_is_ignored() {
         old_path: None,
         status: ChangeStatus::Modified,
         added_lines: vec![(10, "a := 1".into())],
-        removed_count: 0,
+        removed_lines: Vec::new(),
     }];
     let mut measurements = parse(GO_PROFILE).unwrap();
     measurements.push(FileCoverage {

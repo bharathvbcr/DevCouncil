@@ -24,7 +24,7 @@ The analysis-plane crates:
 | Crate | Binary | Answers |
 |---|---|---|
 | `dc-store` | `dcstore` | Which tasks exist, and who holds the lease on one |
-| `dc-verify` | `dcverify` | What a diff changed, whether it stayed in scope, whether it is honest, whether tests reached it |
+| `dc-verify` | `dcverify` | What a diff changed, whether it stayed in scope, whether it is honest, whether tests reached it, and how much of it is new work |
 | `dc-grep` | `dcgrep` | What is in this repository, honouring its ignore rules |
 | `dc-glob` | *(library)* | Whether a path matches a pattern, with CPython `fnmatch` semantics |
 | `dc-evidence` | *(library, via `dcverify evidence-check`)* | Whether an independently admitted acceptance contract is satisfied by a bound execution-evidence bundle |
@@ -60,6 +60,41 @@ dcgrep     search, files, index, health
 ```
 
 `dcstore` additionally requires `--db`.
+
+### Two axes on a finding, and a measurement beside them
+
+`dcverify check` answers on two axes rather than one. **Severity** (`blocking` /
+`advisory`) says how much a finding matters. **Strength** (`proven` /
+`observed` / `derived`) says how much it can be trusted — whether the gate read
+the parsed structure of the diff, read an execution artifact, or matched a
+pattern. Both findings gates currently report `derived`: `secret_scan` matches
+a credential's *shape* and `stub_detection` matches text. That is an accurate
+and slightly uncomfortable description of the rigor layer, which is why it is
+on the wire. The rule is the existing one carried one step further — a check
+that could not run must not look like one that ran, and a guess must not look
+like a measurement.
+
+The reply also carries a **`substance`** object: how many added lines are new
+work, against how many are structure, relocation, repetition, or generated
+output. It exists because every other gate answers "is something *wrong* with
+this change" and none answers "is there anything *in* it" — a diff of moved
+functions, closing braces and a refreshed lockfile trips nothing and arrives as
+`findings: []`. It never blocks: a pure refactor measures low by construction,
+and that is the correct reading of a pure refactor. The threshold is calibrated
+against this repository's own history; reproduce it with
+`tools/substance_calibration.sh`.
+
+### The gates are measured as classifiers
+
+`dc-verify/tests/corpus/cases.txt` is a corpus of diffs, each declaring what
+*every* gate must say about it — so a fixture written for `secret_scan` is also
+a standing negative control for `stub_detection`. `tests/false_accept.rs` runs
+it, prints a confusion matrix, and fails the build on a single **false accept**
+(a case a gate should have caught and passed) or **false positive** (a clean
+case a gate flagged). Both are gated at zero, and the run prints `0 of N` so the
+number can be cited rather than assumed.
+
+Adding a case is a five-line edit to that file. The header documents the format.
 
 The [acceptance evidence protocol](dc-evidence/PROTOCOL.md) extends `dcverify`
 without changing the existing diff contract. It validates exact input/artifact

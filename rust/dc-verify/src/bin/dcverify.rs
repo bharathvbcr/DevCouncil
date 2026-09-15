@@ -213,11 +213,15 @@ fn check(
         }
     };
     let coverage = intersect_coverage(&files, &measurements);
+    // Unconditional, and never skipped: the measurement needs nothing but the
+    // diff every other gate already read, so there is no state in which it
+    // could not run and therefore no `substance_skipped_reason` to invent.
+    let substance = dc_verify::substance::measure(&files);
 
     Ok(format!(
         "{{\"ok\":true,\"files\":{},\"in_scope\":{},\"orphans\":{},\"untouched_planned\":{},\
          \"findings\":{},\"coverage_unmeasured\":{},\"coverage_gaps\":{},\
-         \"coverage_skipped_by_type\":{}}}",
+         \"coverage_skipped_by_type\":{},\"substance\":{}}}",
         files.len(),
         string_array(&scope.in_scope),
         string_array(&scope.orphans),
@@ -229,20 +233,67 @@ fn check(
         // ask about used to leave the reply with no trace, which reads exactly
         // like a file that was measured and clean.
         string_array(&coverage.skipped_by_type),
+        substance_object(&substance),
     ))
 }
 
+/// Renders the substance measurement.
+///
+/// `judged` is on the wire beside the counts rather than left for the caller to
+/// re-derive from `added_lines`. The threshold that decides it is this crate's
+/// to own — a second copy in the Go host would be a second policy, and the two
+/// would answer differently the first time either moved.
+///
+/// No ratio: see `SubstanceReport`. The five class counts sum to `added_lines`,
+/// which is what lets a reader check the arithmetic rather than trust it.
+fn substance_object(report: &dc_verify::substance::SubstanceReport) -> String {
+    let files: Vec<String> = report
+        .files
+        .iter()
+        .map(|f| {
+            format!(
+                "{{\"path\":{},\"added_lines\":{},\"substantive_lines\":{}}}",
+                quote(&f.path),
+                f.added_lines,
+                f.substantive_lines
+            )
+        })
+        .collect();
+    format!(
+        "{{\"added_lines\":{},\"substantive_lines\":{},\"trivial\":{},\"moved\":{},\
+         \"repeated\":{},\"generated\":{},\"judged\":{},\"low\":{},\"files\":[{}]}}",
+        report.added_lines,
+        report.substantive_lines,
+        report.trivial,
+        report.moved,
+        report.repeated,
+        report.generated,
+        report.judged(),
+        report.is_low(),
+        files.join(","),
+    )
+}
+
+/// Renders findings, each carrying both axes: how much it matters and how the
+/// gate knows.
+///
+/// `strength` is additive, so `schema_version` stays 1 — the same rule dcgrep's
+/// `index` object followed. A client that does not read the field sees exactly
+/// what it saw before; one that does can stop treating a prefix match and an
+/// executed profile as the same kind of evidence.
 fn findings_array(findings: &[Finding]) -> String {
     let items: Vec<String> = findings
         .iter()
         .map(|f| {
             format!(
-                "{{\"gate\":{},\"severity\":{},\"path\":{},\"line\":{},\"evidence\":{},\"message\":{}}}",
+                "{{\"gate\":{},\"severity\":{},\"strength\":{},\"path\":{},\"line\":{},\
+                 \"evidence\":{},\"message\":{}}}",
                 quote(f.gate),
                 quote(match f.severity {
                     Severity::Blocking => "blocking",
                     Severity::Advisory => "advisory",
                 }),
+                quote(f.strength.as_str()),
                 quote(&f.path),
                 f.line,
                 quote(&f.evidence),
