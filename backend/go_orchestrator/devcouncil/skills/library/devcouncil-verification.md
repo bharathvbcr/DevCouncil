@@ -33,10 +33,15 @@ Read persisted state without re-verifying:
 
 ```
 devcouncil_get_gaps           # gap list (blocking_only filter available)
-devcouncil_get_next_actions   # blocking + advisory actions, allowed_next_tools
-devcouncil_get_evidence       # command results, test evidence
-devcouncil_get_task_provenance  # audit trail: writes, verify runs, diff coverage
+devcouncil_get_diff           # working-tree diff, optionally scoped to the task
 ```
+
+Those two are the whole persisted-state surface this host serves.
+`devcouncil_get_next_actions`, `devcouncil_get_evidence` and
+`devcouncil_get_task_provenance` belonged to the retired Python host. The typed
+actions and `allowed_next_tools` ride on the `devcouncil_verify_task` result;
+evidence and the audit trail come from `dev verify TASK-ID --json` and the
+persisted state under `.devcouncil/`.
 
 ## Next-actions contract
 
@@ -95,9 +100,10 @@ non-negotiable rules: never weaken tests, never stub around a gap.
 
 ## Repair workflow (`enforce`, or when explicitly requested)
 
-1. `devcouncil_get_next_actions` — list blocking items
+1. Read `next_actions` from the `devcouncil_verify_task` result, or
+   `devcouncil_get_gaps` for the persisted list — list blocking items
 2. Fix each gap (smallest change that closes it)
-3. Re-run suggested tests via `devcouncil_run_command`
+3. Re-run the suggested tests with your host's own command tool
 4. `devcouncil_verify_task` — repeat until `passed`
 5. `/devcouncil:repair [TASK-ID]` or `dev repair [TASK-ID]` for CLI-guided repair
 

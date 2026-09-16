@@ -36,24 +36,28 @@ checkout_task ─▶ (agent implements) ─▶ verify_task ─▶ passed? ─▶
 devcouncil_next_task          # highest-priority unblocked task (or a known TASK-ID)
 devcouncil_checkout_task      # acquire lease — required before writes or verify when
                               # write-gates / contain mode are active
-devcouncil_get_task           # scope, planned files, acceptance criteria
-devcouncil_get_prompt           # full executor prompt with rigor + context
 ```
+
+Checkout returns the scope with the lease: planned files, allowed commands,
+expected tests and gate mode all ride on its result. `devcouncil_get_task` and
+`devcouncil_get_prompt` belonged to the retired Python host and are not served.
 
 One agent owns the task at a time. If checkout fails (lease held), do not bypass — pick
 another task or wait for release.
 
 ### 2. Implement inside scope
 
-- Read with `devcouncil_read_file`; inspect changes with `devcouncil_get_diff`.
-- Prefer policy-gated writes: `devcouncil_write_file` / `devcouncil_apply_patch`.
-  When write-gates / contain mode are active, direct editor writes to out-of-scope or
-  protected paths are rejected.
-- Run tests with `devcouncil_run_command` or `devcouncil_record_command`.
-- Preflight questionable paths with `devcouncil_policy_check_write`.
+- Read and edit files, and run tests, with your host's own tools. This host serves
+  no `devcouncil_read_file`, `devcouncil_write_file`, `devcouncil_apply_patch`,
+  `devcouncil_run_command` or `devcouncil_record_command` — they belonged to the
+  retired Python host, and nothing gates a write as it happens.
+- Inspect changes with `devcouncil_get_diff`.
+- Preflight questionable paths with `devcouncil_policy_check_write`, the one policy
+  tool that survived. It answers the scope question; it does not perform the write.
 
 Stay inside the task's **planned files** and **allowed commands**. Do not expand scope
-silently — use `devcouncil_update_task_scope` only when the task genuinely requires it.
+silently: there is no `devcouncil_update_task_scope` here, so a task that genuinely
+needs a wider scope is a question for the human, not a tool call.
 
 When the advisor tool is available, consult it before committing to an approach, when
 stuck on a recurring error, and before declaring the task complete.
@@ -70,10 +74,11 @@ coverage, stub detection, and more.
 
 ### 4. Self-repair from next_actions
 
-When `passed` is false:
+When `passed` is false, the typed actions are already in the verify result. To
+re-read the persisted gaps later without verifying again:
 
 ```
-devcouncil_get_next_actions   # cheap read of persisted gaps — no re-verify
+devcouncil_get_gaps           # cheap read of persisted gaps — no re-verify
 ```
 
 Each action is typed (`category`: `fix_code`, `add_test`, `fix_verification`, `scope`,

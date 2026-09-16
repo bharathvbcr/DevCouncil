@@ -13,22 +13,29 @@ import (
 
 const DefaultLeaseTTL = 15 * time.Minute
 
-// AllowedNextTools mirrors Python integrations/mcp/util.allowed_next_tools for
-// a freshly checked-out planned task (no blocking gaps).
+// AllowedNextTools names the tools an agent may call next for a task in the
+// given status. A task that is already checked out may reach for any served
+// tool; one that is not must check out first.
+//
+// The list is derived from the registry rather than spelled again here. It used
+// to mirror Python integrations/mcp/util.allowed_next_tools, and it still named
+// that host's surface — devcouncil_read_file, devcouncil_get_evidence,
+// devcouncil_run_command, devcouncil_apply_patch, devcouncil_write_file,
+// devcouncil_update_task_scope — so six of the eight tools handed to an agent on
+// every successful checkout were served by nothing. That is the same
+// GAP-P7-NEXT-TOOLS-DRIFT the verify path was corrected for; this path kept its
+// copy because, unlike verify's, nothing held it to the registry.
+//
+// Which eight is not an arbitrary choice restated here: it is the set
+// ServedToolNames reports, on the rationale already written down in
+// allowed_next_tools_test.go — every tool this host serves is one an agent may
+// legitimately reach for, so withholding one would be a restriction the next
+// person to add a tool has to rediscover.
 func AllowedNextTools(status string, hasBlockingGaps bool) []string {
 	_ = hasBlockingGaps
 	switch status {
 	case "planned", "in_progress", "blocked", "verified", "done":
-		return []string{
-			"devcouncil_read_file",
-			"devcouncil_get_evidence",
-			"devcouncil_get_diff",
-			"devcouncil_run_command",
-			"devcouncil_apply_patch",
-			"devcouncil_write_file",
-			"devcouncil_update_task_scope",
-			"devcouncil_verify_task",
-		}
+		return ServedToolNames()
 	default:
 		return []string{"devcouncil_checkout_task"}
 	}

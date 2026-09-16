@@ -42,6 +42,46 @@ func TestAllowedNextToolsAreAllServedByThisHost(t *testing.T) {
 	}
 }
 
+// TestCheckoutAllowedNextToolsAreAllServedByThisHost covers the other producer
+// of an allowed_next_tools list: the one a successful checkout returns.
+//
+// It is the same seam and the same failure. verify's list was corrected for
+// GAP-P7-NEXT-TOOLS-DRIFT and pinned by the two tests around this one; the
+// checkout list was not, and went on naming the retired Python host's
+// devcouncil_read_file, devcouncil_get_evidence, devcouncil_run_command,
+// devcouncil_apply_patch, devcouncil_write_file and devcouncil_update_task_scope
+// to every agent that checked a task out. The stored envelopes under
+// testdata/golden/{cli,mcp}/lease/ recorded that list without contradicting it,
+// because nothing replays them.
+//
+// The statuses are enumerated rather than sampled: each one is a separate branch
+// of the switch, and a branch that is never asked cannot be said to have passed.
+func TestCheckoutAllowedNextToolsAreAllServedByThisHost(t *testing.T) {
+	served := map[string]bool{}
+	for _, spec := range devcouncil.NewRegistry(t.TempDir(), nil, nil).Specs() {
+		served[spec.Name] = true
+	}
+
+	for _, status := range []string{
+		"planned", "in_progress", "blocked", "verified", "done",
+		"", "unknown", "archived",
+	} {
+		for _, gaps := range []bool{false, true} {
+			allowed := devcouncil.AllowedNextTools(status, gaps)
+			if len(allowed) == 0 {
+				t.Errorf("status %q names no next tool, leaving the agent nothing to call", status)
+			}
+			for _, name := range allowed {
+				if !served[name] {
+					t.Errorf("checkout of a %q task names %s as an allowed next tool, but this "+
+						"host serves no such tool; the agent's first step after checkout would "+
+						"call into nothing", status, name)
+				}
+			}
+		}
+	}
+}
+
 // TestEveryServedToolIsAnAllowedNextTool is the other direction, and it is an
 // assertion about this host specifically rather than a general principle.
 //

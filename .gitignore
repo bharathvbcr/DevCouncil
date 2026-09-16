@@ -176,6 +176,43 @@ t.jsonl
 # DevCouncil local state
 !.devcouncil/
 
+# =============================================================================
+# Agent definitions: generated, and tracked so the check has something to read
+# =============================================================================
+# scripts/sync-agent-defs.mjs renders the Codex role and the plugin copy from
+# .claude/agents/<name>.md. `npm run agents:check` compares the three, and on a
+# clean clone it can only do that if all three are tracked: an untracked file
+# reads as "missing", and a check that could not run must never report the same
+# result as one that ran and passed.
+#
+# They were local state until three hand-maintained copies drifted apart — two of
+# them telling agents to call `devcouncil_write_file`, `devcouncil_apply_patch`
+# and `devcouncil_run_command`, which this host has not served since the Python
+# host was retired.
+#
+# A pattern that excludes a directory stops git descending into it, so each level
+# has to be re-included before the file itself can be. Same shape as the
+# .devcouncil/knowledge rules above. Everything else under these directories —
+# settings.local.json, commands/, worktrees/, the rest of the plugin — stays
+# ignored.
+!.claude/
+.claude/*
+!.claude/agents/
+.claude/agents/*
+!.claude/agents/devcouncil-*.md
+!.codex/
+.codex/*
+!.codex/agents/
+.codex/agents/*
+!.codex/agents/devcouncil-*.toml
+!.devcouncil/claude-plugin/
+.devcouncil/claude-plugin/*
+!.devcouncil/claude-plugin/devcouncil/
+.devcouncil/claude-plugin/devcouncil/*
+!.devcouncil/claude-plugin/devcouncil/agents/
+.devcouncil/claude-plugin/devcouncil/agents/*
+!.devcouncil/claude-plugin/devcouncil/agents/devcouncil-*.md
+
 # The standalone spelling of the same directory. `devmap_extract::paths` picks
 # `.devmap/` for any repository that does not already have a `.devcouncil/`,
 # and writes the store, `repo_map.json`, `graph/code_graph.json` and the
