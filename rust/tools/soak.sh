@@ -140,7 +140,8 @@ BASE_DIGEST=$(digest) || { echo "SOAK FAIL: baseline graph could not be measured
 [ -n "$BASE_DIGEST" ] || { echo "SOAK FAIL: the baseline digest is empty — the store has no edges to compare"; exit 1; }
 BASE_DB=$(db_bytes)
 echo "soak baseline: mode=$MODE digest=${BASE_DIGEST:0:12} db=${BASE_DB} tolerance=${TOLERANCE_PCT}%"
-echo "cycle,rss_bytes,db_bytes" > "$CSV"
+echo "cycle,rss_bytes,db_bytes" > "$CSV" || {
+  echo "SOAK FAIL: cannot write CSV $CSV" >&2; exit 1; }
 
 FAILS=0
 TIMEOUT_LOG="$ROOT/.soak_time.$$"
@@ -316,7 +317,8 @@ if [ "$MODE" = "--daemon" ]; then
     await_symbol "_soak_$i" absent || { echo "SOAK FAIL: removed symbol cycle $i"; FAILS=1; break; }
     RSS=$(ps -o rss= -p "$SERVE_PID" 2>/dev/null | tr -d ' ')
     [ -n "$RSS" ] || { echo "SOAK FAIL: the daemon died at cycle $i"; FAILS=1; break; }
-    echo "$i,$(( RSS * 1024 )),$(db_bytes)" >> "$CSV"
+    echo "$i,$(( RSS * 1024 )),$(db_bytes)" >> "$CSV" || {
+      echo "SOAK FAIL: cannot append CSV $CSV at cycle $i" >&2; FAILS=1; break; }
     if [ $((i % 10)) -eq 0 ]; then echo "  cycle $i ok rss=$(( RSS * 1024 )) db=$(db_bytes)"; fi
   done
   if [ "$FAILS" -eq 0 ]; then
@@ -378,7 +380,8 @@ else
     if [ "$D" != "$BASE_DIGEST" ]; then
       echo "SOAK FAIL: digest drift at cycle $i (${D:0:12} != ${BASE_DIGEST:0:12})"; FAILS=1; break
     fi
-    echo "$i,$RSS,$(db_bytes)" >> "$CSV"
+    echo "$i,$RSS,$(db_bytes)" >> "$CSV" || {
+      echo "SOAK FAIL: cannot append CSV $CSV at cycle $i" >&2; FAILS=1; break; }
     if [ $((i % 10)) -eq 0 ]; then echo "  cycle $i ok rss=$RSS db=$(db_bytes)"; fi
   done
 fi

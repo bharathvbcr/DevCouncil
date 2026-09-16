@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -112,6 +113,39 @@ await_symbol '_soak_1' present
     def test_freshness_must_be_verified(self):
         self.check('fresh', {'is_fresh': False}, 2)
         self.check('fresh', {'is_fresh': True}, 0)
+
+
+class SoakCsvAdmission(unittest.TestCase):
+    def test_all_csv_writes_propagate_failure(self):
+        source = (ROOT / 'rust/tools/soak.sh').read_text()
+        header_start = source.index('echo "cycle,rss_bytes,db_bytes"')
+        header_end = source.index('\nFAILS=0', header_start)
+        blocks = [('header', source[header_start:header_end])]
+        for name, marker in [('daemon', '    echo "$i,$(( RSS * 1024 )),'),
+                             ('build', '    echo "$i,$RSS,')]:
+            start = source.index(marker)
+            end = source.index('\n    if [ $((i % 10))', start)
+            blocks.append((name, source[start:end]))
+        for name, block in blocks:
+            for invalid in [False, True]:
+                with self.subTest(write=name, directory=invalid):
+                    with tempfile.TemporaryDirectory(prefix='soak-csv-') as directory:
+                        csv = Path(directory) if invalid else Path(directory) / 'samples.csv'
+                        process = subprocess.run(
+                            ['bash', '-c', 'FAILS=0; RSS=123; db_bytes() { echo 456; }; '
+                             'for i in 1; do\n' + block + '\ndone\nexit "$FAILS"'],
+                            env={**os.environ, 'CSV': str(csv)},
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        self.assertEqual(process.returncode, int(invalid),
+                                         process.stdout + process.stderr)
+                        if invalid:
+                            self.assertIn('SOAK FAIL:', process.stdout + process.stderr)
+                        else:
+                            expected = {'header': 'cycle,rss_bytes,db_bytes\n',
+                                        'daemon': '1,125952,456\n',
+                                        'build': '1,123,456\n'}[name]
+                            self.assertEqual(csv.read_text(), expected)
 
 
 if __name__ == '__main__':
