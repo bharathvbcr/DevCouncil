@@ -167,12 +167,12 @@ func diffCandidate(prefixIdx, sepIdx, payloadIdx int) string {
 
 func differentialGate() (CommandGate, *dc.Task) {
 	return CommandGate{
-			GlobalAllowedCommands: []string{"echo", "echo *", "cat *", "true", ":"},
-			HardRules:             true,
-		}, &dc.Task{
-			ID:              "TASK-001",
-			AllowedCommands: []string{"echo *", "cat *"},
-		}
+		GlobalAllowedCommands: []string{"echo", "echo *", "cat *", "true", ":"},
+		HardRules:             true,
+	}, &dc.Task{
+		ID:              "TASK-001",
+		AllowedCommands: []string{"echo *", "cat *"},
+	}
 }
 
 // runDifferentialCase executes one candidate under a real sh in its own
