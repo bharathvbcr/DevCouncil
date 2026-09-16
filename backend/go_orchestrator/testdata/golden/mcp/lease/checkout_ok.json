@@ -12,14 +12,14 @@
       "*"
     ],
     "allowed_next_tools": [
-      "devcouncil_read_file",
-      "devcouncil_get_evidence",
       "devcouncil_get_diff",
-      "devcouncil_run_command",
-      "devcouncil_apply_patch",
-      "devcouncil_write_file",
-      "devcouncil_update_task_scope",
-      "devcouncil_verify_task"
+      "devcouncil_checkout_task",
+      "devcouncil_renew_lease",
+      "devcouncil_release_task",
+      "devcouncil_next_task",
+      "devcouncil_verify_task",
+      "devcouncil_get_gaps",
+      "devcouncil_policy_check_write"
     ],
     "applied_skills": [
       "core-engineering",

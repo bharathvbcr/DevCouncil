@@ -63,7 +63,29 @@ func NewRegistry(root string, storeClient *store.Client, g *gate.Gate) *Registry
 
 // Specs returns every advertised tool. tools/list is generated from this so
 // schema drift between list and call is impossible.
-func (r *Registry) Specs() []ToolSpec {
+func (r *Registry) Specs() []ToolSpec { return toolSpecs() }
+
+// ServedToolNames names every tool this host advertises.
+//
+// Anything inside this package that needs to name the served surface reads it
+// from here instead of spelling a second list. A hand-written copy is precisely
+// how the checkout path came to hand every agent six tool names this host does
+// not have (GAP-P7-NEXT-TOOLS-DRIFT). verify.AllowedNextToolsForVerify still
+// keeps a copy because package devcouncil imports verify and reading back would
+// cycle — that copy is safe only because allowed_next_tools_test.go holds it to
+// this list in both directions. Callers that can reach this function have no
+// such excuse.
+func ServedToolNames() []string {
+	specs := toolSpecs()
+	names := make([]string, len(specs))
+	for i, spec := range specs {
+		names[i] = spec.Name
+	}
+	return names
+}
+
+// toolSpecs is the one literal list of advertised tools.
+func toolSpecs() []ToolSpec {
 	return []ToolSpec{
 		{
 			Name:        "devcouncil_get_diff",

@@ -66,24 +66,30 @@ Install with `dev integrate claude --apply`. Commands live under `/devcouncil:*`
 
 ## Key MCP tools (by role)
 
-**Orientation:** `devcouncil_status`, `devcouncil_report`, `devcouncil_integration_status`,
-`devcouncil_wiki_page`, `devcouncil_graph_context`
+This host serves exactly eight tools; `tools/list` is generated from
+`devcouncil/registry.go`'s `toolSpecs()`, so it can report no others.
 
-**Task loop:** `devcouncil_next_task`, `devcouncil_checkout_task`, `devcouncil_get_task`,
-`devcouncil_get_prompt`, `devcouncil_release_task`, `devcouncil_renew_lease`
+**Task loop:** `devcouncil_next_task`, `devcouncil_checkout_task`,
+`devcouncil_renew_lease`, `devcouncil_release_task`
 
-**Policy-gated writes:** `devcouncil_write_file`, `devcouncil_apply_patch`,
-`devcouncil_policy_check_write` (preflight), `devcouncil_run_command`,
-`devcouncil_record_command`
+**Inspection:** `devcouncil_get_diff`, `devcouncil_get_gaps`
 
-**Read-only inspection:** `devcouncil_read_file`, `devcouncil_get_diff`,
-`devcouncil_get_gaps`, `devcouncil_get_next_actions`, `devcouncil_get_evidence`,
-`devcouncil_get_task_provenance`
+**Policy:** `devcouncil_policy_check_write` — a preflight that answers whether a
+write would be in scope; it does not perform the write
 
 **Verification:** `devcouncil_verify_task` (a lease is required in `enforce` mode)
 
-**Live review:** `devcouncil_live_review`, `devcouncil_live_cards`,
-`devcouncil_live_repair_prompt`
+**Retired with the Python host — not served, and calling one fails:**
+`devcouncil_status`, `devcouncil_report`, `devcouncil_integration_status`,
+`devcouncil_wiki_page`, `devcouncil_graph_context`, `devcouncil_get_task`,
+`devcouncil_get_prompt`, `devcouncil_read_file`, `devcouncil_write_file`,
+`devcouncil_apply_patch`, `devcouncil_run_command`, `devcouncil_record_command`,
+`devcouncil_update_task_scope`, `devcouncil_get_next_actions`,
+`devcouncil_get_evidence`, `devcouncil_get_task_provenance`,
+`devcouncil_live_review`, `devcouncil_live_cards`, `devcouncil_live_repair_prompt`.
+Read files and run commands with your host's own tools; read persisted state from
+`.devcouncil/` or the `dev` CLI; take `next_actions` from the
+`devcouncil_verify_task` result.
 
 ## Subagents
 
@@ -91,7 +97,7 @@ When delegated, use the bundled subagents:
 
 - **devcouncil-implementer** — checkout → scoped edits → verify → release
 - **devcouncil-verifier** — read-only verification and gap reporting
-- **devcouncil-reviewer** — policy-aware diff review via live critique cards
+- **devcouncil-reviewer** — policy-aware diff review, with structure from DevMap
 
 ## Rules of engagement
 
@@ -105,8 +111,9 @@ When delegated, use the bundled subagents:
   Cursor/Claude Shell does **not** need a lease — do not block on checkout for ad-hoc commands.
 - **Leases:** one agent owns a task at a time; checkout before MCP gated writes or
   verification (or when running the hero loop), then release.
-- **Repairs:** in `enforce`, read `devcouncil_get_next_actions` and close effective
-  blocking gaps. Outside enforce, stored quality gaps are advisory history, not a
+- **Repairs:** in `enforce`, read the typed `next_actions` out of the
+  `devcouncil_verify_task` result — or `devcouncil_get_gaps` for the persisted
+  list without re-verifying — and close effective blocking gaps. Outside enforce, stored quality gaps are advisory history, not a
   reason to block ordinary work.
 
 For the full autonomous loop, follow the **devcouncil-hero-loop** skill. For verifier
