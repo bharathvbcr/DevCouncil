@@ -10,16 +10,49 @@ import (
 )
 
 func TestVersionCommandPrintsTheProductVersion(t *testing.T) {
-	stdout, restore := swapStdout(t)
-	code := dispatch([]string{"--version"})
-	restore()
-	if code != 0 {
-		t.Fatalf("exit %d, want 0", code)
+	for _, flag := range []string{"--version", "-V", "-v", "version"} {
+		stdout, restore := swapStdout(t)
+		code := dispatch([]string{flag})
+		restore()
+		if code != 0 {
+			t.Fatalf("%s exit %d, want 0", flag, code)
+		}
+		got := strings.TrimSpace(stdout.String())
+		want := "devcouncil " + Version
+		if got != want {
+			t.Fatalf("%s stdout = %q, want %q", flag, got, want)
+		}
 	}
-	got := strings.TrimSpace(stdout.String())
-	want := "devcouncil " + Version
-	if got != want {
-		t.Fatalf("stdout = %q, want %q", got, want)
+}
+
+func TestVersionCommandJSONOutput(t *testing.T) {
+	cases := [][]string{
+		{"version", "--json"},
+		{"--version", "--json"},
+		{"-V", "--json"},
+		{"-v", "--json"},
+		{"--json", "version"},
+		{"--json", "--version"},
+	}
+	for _, args := range cases {
+		stdout, restore := swapStdout(t)
+		code := dispatch(args)
+		restore()
+		if code != 0 {
+			t.Fatalf("%v exit %d, want 0", args, code)
+		}
+		var payload struct {
+			OK        bool   `json:"ok"`
+			ID        string `json:"id"`
+			Component string `json:"component"`
+			Version   string `json:"version"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(stdout.String())), &payload); err != nil {
+			t.Fatalf("%v returned non-JSON: %v (%s)", args, err, stdout.String())
+		}
+		if !payload.OK || payload.ID != "host" || payload.Component != "devcouncil" || payload.Version != Version {
+			t.Fatalf("%v returned unexpected payload: %+v", args, payload)
+		}
 	}
 }
 

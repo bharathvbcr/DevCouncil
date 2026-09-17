@@ -304,6 +304,11 @@ for name in "${requested[@]}"; do
 
   case "$name" in
     dcstore)
+      ver="$("$built" --version)"
+      case "$ver" in
+        *'"id":"dcstore"'*|*'"version":'*) ;;
+        *) echo "dcstore --version did not report id and version: $ver" >&2; exit 1 ;;
+      esac
       "$built" --db "$tmp/state.sqlite" ready >/dev/null
       reply="$("$built" --db "$tmp/state.sqlite" health)"
       # The exclusion index is the lease's mutual exclusion. A store that will
@@ -313,23 +318,51 @@ for name in "${requested[@]}"; do
         *'"exclusion_index":"verified"'*) ;;
         *) echo "dcstore health did not verify the exclusion index: $reply" >&2; exit 1 ;;
       esac
+      case "$reply" in
+        *'"id":"dcstore"'*) ;;
+        *) echo "dcstore health did not report id: $reply" >&2; exit 1 ;;
+      esac
       ;;
     dcverify)
+      ver="$("$built" --version)"
+      case "$ver" in
+        *'"id":"dcverify"'*|*'"version":'*) ;;
+        *) echo "dcverify --version did not report id and version: $ver" >&2; exit 1 ;;
+      esac
       reply="$("$built" health)"
       case "$reply" in
         *'"verifier":"dc-verify"'*) ;;
         *) echo "dcverify did not identify itself: $reply" >&2; exit 1 ;;
       esac
+      case "$reply" in
+        *'"id":"dcverify"'*) ;;
+        *) echo "dcverify health did not report id: $reply" >&2; exit 1 ;;
+      esac
       ;;
     dcgrep)
+      ver="$("$built" --version)"
+      case "$ver" in
+        *'"id":"dcgrep"'*|*'"version":'*) ;;
+        *) echo "dcgrep --version did not report id and version: $ver" >&2; exit 1 ;;
+      esac
       reply="$("$built" health 2>&1)"
       case "$reply" in
         *'"ok":true'*) ;;
         *) echo "dcgrep health failed: $reply" >&2; exit 1 ;;
       esac
+      case "$reply" in
+        *'"id":"dcgrep"'*) ;;
+        *) echo "dcgrep health did not report id: $reply" >&2; exit 1 ;;
+      esac
       ;;
     devmap)
       "$built" --version >/dev/null
+      "$built" version >/dev/null
+      ver="$("$built" version --json)"
+      case "$ver" in
+        *'"id":"devmap"'*|*'"version":'*) ;;
+        *) echo "devmap version --json did not report id and version: $ver" >&2; exit 1 ;;
+      esac
       ;;
   esac
   echo "  $name: healthy"

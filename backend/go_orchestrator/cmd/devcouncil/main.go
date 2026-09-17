@@ -29,10 +29,18 @@ func main() {
 	os.Exit(runCLI(os.Args[1:]))
 }
 
+func isVersionArg(arg string) bool {
+	return arg == "version" || arg == "--version" || arg == "-V" || arg == "-v"
+}
+
 func dispatch(args []string) int {
 	if len(args) < 1 {
 		usage()
 		return 2
+	}
+	if args[0] == "--json" && len(args) > 1 && isVersionArg(args[1]) {
+		console.Println(`{"ok":true,"id":"host","component":"devcouncil","version":"` + Version + `"}`)
+		return 0
 	}
 	switch args[0] {
 	case "mcp", "mcp-server":
@@ -59,7 +67,13 @@ func dispatch(args []string) int {
 		return runDevmap(mapArgs(args[1:]))
 	case "ast":
 		return runDevmap(astArgs(args[1:]))
-	case "version", "--version", "-V":
+	case "version", "--version", "-V", "-v":
+		for _, arg := range args[1:] {
+			if arg == "--json" {
+				console.Println(`{"ok":true,"id":"host","component":"devcouncil","version":"` + Version + `"}`)
+				return 0
+			}
+		}
 		console.Println("devcouncil " + Version)
 		return 0
 	case "help", "-h", "--help":
@@ -280,7 +294,7 @@ func helpOrVersion(args []string) bool {
 			name = a[:i]
 		}
 		switch name {
-		case "--help", "-h", "--version", "-V":
+		case "--help", "-h", "--version", "-V", "-v":
 			return true
 		}
 	}

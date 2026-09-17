@@ -101,8 +101,10 @@ type response struct {
 	CurrentAppended json.RawMessage `json:"current_appended"`
 	// Workbench retains the bounded profile result after its separate envelope
 	// contract has been checked. Execution-lease commands never populate it.
-	Workbench  json.RawMessage `json:"-"`
-	EvidenceID int64           `json:"id"`
+	Workbench   json.RawMessage `json:"-"`
+	EvidenceID  int64           `json:"-"`
+	ComponentID string          `json:"-"`
+	Version     string          `json:"version"`
 	// GapID is gap-upsert's answer. It is a separate key from EvidenceID
 	// rather than sharing `id`: one envelope decodes every reply on this
 	// boundary, and a string and an integer cannot occupy one field.
@@ -112,6 +114,30 @@ type response struct {
 	History   []GapHistoryRow `json:"history"`
 	Truncated bool            `json:"truncated"`
 	Shown     int             `json:"shown"`
+}
+
+func (r *response) UnmarshalJSON(data []byte) error {
+	type alias response
+	var raw struct {
+		alias
+		RawID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*r = response(raw.alias)
+	if len(raw.RawID) > 0 {
+		var intID int64
+		if err := json.Unmarshal(raw.RawID, &intID); err == nil {
+			r.EvidenceID = intID
+		} else {
+			var strID string
+			if err := json.Unmarshal(raw.RawID, &strID); err == nil {
+				r.ComponentID = strID
+			}
+		}
+	}
+	return nil
 }
 
 // Conflict reports that another agent holds the task. It is a distinct type

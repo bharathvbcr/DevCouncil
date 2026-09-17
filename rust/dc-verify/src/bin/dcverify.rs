@@ -73,7 +73,12 @@ fn collect_args() -> Result<Vec<String>, String> {
 
 const KNOWN_FLAGS: &[&str] = &["planned", "coverage", "root"];
 const IDENTITY: &str = "dc-verify";
+const COMPONENT_ID: &str = "dcverify";
 const SCHEMA_VERSION: u32 = 1;
+
+fn is_version_arg(arg: &str) -> bool {
+    matches!(arg, "--version" | "-V" | "-v" | "version")
+}
 
 /// What `--version` answers.
 ///
@@ -88,14 +93,15 @@ const SCHEMA_VERSION: u32 = 1;
 /// line must not have to special-case this one.
 fn version_object() -> String {
     format!(
-        "{{\"ok\":true,\"component\":{},\"version\":{}}}",
+        "{{\"ok\":true,\"id\":{},\"component\":{},\"version\":{}}}",
+        quote(COMPONENT_ID),
         quote(IDENTITY),
         quote(env!("CARGO_PKG_VERSION"))
     )
 }
 
 fn run(args: &[String]) -> Result<String, String> {
-    if args.first().is_some_and(|arg| arg == "--version") {
+    if args.iter().any(|arg| is_version_arg(arg)) {
         return Ok(version_object());
     }
     if args.first().is_some_and(|arg| arg == "evidence-check") {
@@ -145,7 +151,10 @@ fn run(args: &[String]) -> Result<String, String> {
 
     match positional.first().copied() {
         Some("health") => Ok(format!(
-            "{{\"ok\":true,\"verifier\":{},\"schema_version\":{},\"evidence_schema_versions\":[1]}}",
+            "{{\"ok\":true,\"id\":{},\"component\":{},\"version\":{},\"verifier\":{},\"schema_version\":{},\"evidence_schema_versions\":[1]}}",
+            quote(COMPONENT_ID),
+            quote(IDENTITY),
+            quote(env!("CARGO_PKG_VERSION")),
             quote(IDENTITY),
             SCHEMA_VERSION
         )),
@@ -155,7 +164,7 @@ fn run(args: &[String]) -> Result<String, String> {
             root.as_deref().map(std::path::Path::new),
         ),
         Some(other) => Err(format!(
-            "unknown command {other:?} (check, health, evidence-check)"
+            "unknown command {other:?} (check, health, evidence-check, --version, -V, -v, version)"
         )),
     }
 }

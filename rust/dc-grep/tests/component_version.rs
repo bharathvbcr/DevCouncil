@@ -15,31 +15,33 @@ use std::process::Command;
 
 #[test]
 fn version_flag_reports_this_build() {
-    let output = Command::new(env!("CARGO_BIN_EXE_dcgrep"))
-        .arg("--version")
-        .output()
-        .expect("dcgrep must run");
-
-    assert!(
-        output.status.success(),
-        "--version must exit 0, got {:?}; stderr: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
     let want = format!(
-        "{{\"ok\":true,\"component\":\"dc-grep\",\"version\":\"{}\"}}",
+        "{{\"ok\":true,\"id\":\"dcgrep\",\"component\":\"dc-grep\",\"version\":\"{}\"}}",
         env!("CARGO_PKG_VERSION")
     );
-    assert_eq!(
-        stdout.trim(),
-        want,
-        "every outcome on this boundary is one JSON object, --version included"
-    );
+    for flag in ["--version", "-V", "-v", "version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dcgrep"))
+            .arg(flag)
+            .output()
+            .expect("dcgrep must run");
+
+        assert!(
+            output.status.success(),
+            "{flag} must exit 0, got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
+        assert_eq!(
+            stdout.trim(),
+            want,
+            "every outcome on this boundary is one JSON object, {flag} included"
+        );
+    }
 }
 
-/// `--version` must not read a request from stdin.
+/// Version flags must not read a request from stdin.
 ///
 /// With no leading command this binary searches, and searching blocks on stdin
 /// until EOF. A `--version` that fell through to that arm would hang for any
@@ -50,20 +52,26 @@ fn version_flag_reports_this_build() {
 /// is what distinguishes a right answer from a lucky one.
 #[test]
 fn version_flag_does_not_wait_for_a_request() {
-    let output = Command::new(env!("CARGO_BIN_EXE_dcgrep"))
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .expect("dcgrep must run");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        !stdout.contains("no request on stdin"),
-        "--version fell through to the search path: {stdout}"
-    );
-    assert!(
-        stdout.contains("\"version\""),
-        "--version must answer with the build identity: {stdout}"
-    );
+    for flag in ["--version", "-V", "-v", "version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dcgrep"))
+            .arg(flag)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("dcgrep must run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("no request on stdin"),
+            "{flag} fell through to the search path: {stdout}"
+        );
+        assert!(
+            stdout.contains("\"id\":\"dcgrep\""),
+            "{flag} must answer with component id: {stdout}"
+        );
+        assert!(
+            stdout.contains("\"version\""),
+            "{flag} must answer with the build identity: {stdout}"
+        );
+    }
 }
 
 /// The unknown-command help must name every command it accepts.
@@ -82,4 +90,20 @@ fn the_command_list_names_the_version_flag() {
         stdout.contains("--version"),
         "the command list omits an accepted command: {stdout}"
     );
+}
+
+#[test]
+fn health_reports_version_and_id() {
+    let output = Command::new(env!("CARGO_BIN_EXE_dcgrep"))
+        .arg("health")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("dcgrep must run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"id\":\"dcgrep\""), "health missing id: {stdout}");
+    assert!(stdout.contains("\"component\":\"dc-grep\""), "health missing component: {stdout}");
+    assert!(stdout.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))), "health missing version: {stdout}");
+    assert!(stdout.contains("\"searcher\":\"dc-grep\""), "health missing searcher: {stdout}");
+    assert!(stdout.contains("\"schema_version\":1"), "health missing schema_version: {stdout}");
 }

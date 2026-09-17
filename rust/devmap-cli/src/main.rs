@@ -1394,6 +1394,13 @@ enum Commands {
         #[arg(long)]
         binary: Option<PathBuf>,
     },
+
+    /// Report build and schema versions.
+    Version {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4278,6 +4285,7 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         | Commands::Claude { .. }
         | Commands::Skills { .. }
         | Commands::Integrate { .. }
+        | Commands::Version { .. }
         | Commands::Hook { .. } => Ok(()),
     }
 }
@@ -6955,6 +6963,19 @@ raise --max-nodes to widen"
             *check,
             binary.as_deref(),
         )?,
+        Commands::Version { json } => {
+            if *json || cli.json {
+                outln!(
+                    "{{\"ok\":true,\"id\":\"devmap\",\"component\":\"devmap\",\"version\":\"{}\",\"store_schema\":{},\"code_graph_schema\":{},\"build\":\"{}\"}}",
+                    env!("CARGO_PKG_VERSION"),
+                    devmap_store::CURRENT_SCHEMA_VERSION,
+                    devmap_query::CODE_GRAPH_SCHEMA_VERSION,
+                    env!("DEVMAP_BUILD_ID")
+                );
+            } else {
+                outln!("{}", version_line());
+            }
+        }
     }
 
     Ok(())

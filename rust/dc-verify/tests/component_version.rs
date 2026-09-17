@@ -15,28 +15,30 @@ use std::process::Command;
 
 #[test]
 fn version_flag_reports_this_build() {
-    let output = Command::new(env!("CARGO_BIN_EXE_dcverify"))
-        .arg("--version")
-        .output()
-        .expect("dcverify must run");
-
-    assert!(
-        output.status.success(),
-        "--version must exit 0, got {:?}; stderr: {}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
     let want = format!(
-        "{{\"ok\":true,\"component\":\"dc-verify\",\"version\":\"{}\"}}",
+        "{{\"ok\":true,\"id\":\"dcverify\",\"component\":\"dc-verify\",\"version\":\"{}\"}}",
         env!("CARGO_PKG_VERSION")
     );
-    assert_eq!(
-        stdout.trim(),
-        want,
-        "every outcome on this boundary is one JSON object, --version included"
-    );
+    for flag in ["--version", "-V", "-v", "version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dcverify"))
+            .arg(flag)
+            .output()
+            .expect("dcverify must run");
+
+        assert!(
+            output.status.success(),
+            "{flag} must exit 0, got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
+        assert_eq!(
+            stdout.trim(),
+            want,
+            "every outcome on this boundary is one JSON object, {flag} included"
+        );
+    }
 }
 
 /// Asking for the version must not be mistaken for an empty verification.
@@ -48,17 +50,38 @@ fn version_flag_reports_this_build() {
 /// successful.
 #[test]
 fn version_flag_is_not_an_empty_verdict() {
+    for flag in ["--version", "-V", "-v", "version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dcverify"))
+            .arg(flag)
+            .output()
+            .expect("dcverify must run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("\"findings\""),
+            "{flag} answered with a verification result: {stdout}"
+        );
+        assert!(
+            stdout.contains("\"id\":\"dcverify\""),
+            "{flag} must answer with component id: {stdout}"
+        );
+        assert!(
+            stdout.contains("\"version\""),
+            "{flag} must answer with the build identity: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn health_reports_version_and_id() {
     let output = Command::new(env!("CARGO_BIN_EXE_dcverify"))
-        .arg("--version")
+        .arg("health")
         .output()
         .expect("dcverify must run");
+    assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        !stdout.contains("\"findings\""),
-        "--version answered with a verification result: {stdout}"
-    );
-    assert!(
-        stdout.contains("\"version\""),
-        "--version must answer with the build identity: {stdout}"
-    );
+    assert!(stdout.contains("\"id\":\"dcverify\""), "health missing id: {stdout}");
+    assert!(stdout.contains("\"component\":\"dc-verify\""), "health missing component: {stdout}");
+    assert!(stdout.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))), "health missing version: {stdout}");
+    assert!(stdout.contains("\"verifier\":\"dc-verify\""), "health missing verifier: {stdout}");
+    assert!(stdout.contains("\"schema_version\":1"), "health missing schema_version: {stdout}");
 }

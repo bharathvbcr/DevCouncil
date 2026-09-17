@@ -176,6 +176,11 @@ const KNOWN_FLAGS: &[&str] = &[
 /// The identity a caller checks to confirm it is talking to this store and not
 /// to some other program that happens to print JSON.
 const STORE_IDENTITY: &str = "dc-store";
+const COMPONENT_ID: &str = "dcstore";
+
+fn is_version_arg(arg: &str) -> bool {
+    matches!(arg, "--version" | "-V" | "-v" | "version")
+}
 
 /// What `--version` answers.
 ///
@@ -191,7 +196,8 @@ const STORE_IDENTITY: &str = "dc-store";
 /// must not have to special-case this one.
 fn version_object() -> String {
     format!(
-        "{{\"ok\":true,\"component\":{},\"version\":{}}}",
+        "{{\"ok\":true,\"id\":{},\"component\":{},\"version\":{}}}",
+        quote(COMPONENT_ID),
         quote(STORE_IDENTITY),
         quote(env!("CARGO_PKG_VERSION"))
     )
@@ -288,7 +294,7 @@ fn open_for(command: &str, db: &str) -> Result<Store, Failure> {
 }
 
 fn run(args: &[String]) -> Result<String, Failure> {
-    if args.first().is_some_and(|arg| arg == "--version") {
+    if args.iter().any(|arg| is_version_arg(arg)) {
         return Ok(version_object());
     }
     let parsed = parse(args)?;
@@ -312,6 +318,9 @@ fn run(args: &[String]) -> Result<String, Failure> {
 /// mechanics — argv, the database path, whether opening may create the file —
 /// and everything a caller acts on is decided here.
 fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<String, Failure> {
+    if is_version_arg(command) {
+        return Ok(version_object());
+    }
     let flag = |name: &str| -> Option<&str> {
         flags
             .iter()
@@ -587,7 +596,10 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                 .map_err(|e| Failure::Fatal(e.to_string()))?;
             Ok(object(&[
                 ("ok", &json_bool(true)),
+                ("id", &quote(COMPONENT_ID)),
+                ("component", &quote(STORE_IDENTITY)),
                 ("store", &quote(STORE_IDENTITY)),
+                ("version", &quote(env!("CARGO_PKG_VERSION"))),
                 ("schema_version", &dc_store::SCHEMA_VERSION.to_string()),
                 ("exclusion_index", &quote(EXCLUSION_INDEX_VERIFIED)),
                 ("active_leases", &leases.len().to_string()),

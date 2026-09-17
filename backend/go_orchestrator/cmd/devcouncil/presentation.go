@@ -77,7 +77,7 @@ func presentationArgs(args []string) ([]string, console.Policy, error) {
 		if arg == "--json" {
 			policy.JSON = true
 		}
-		if arg == "--help" || arg == "-h" || arg == "--version" || arg == "-V" {
+		if arg == "--help" || arg == "-h" || arg == "--version" || arg == "-V" || arg == "-v" {
 			policy.Protocol = true
 		}
 	}
@@ -114,7 +114,7 @@ func presentationArgs(args []string) ([]string, console.Policy, error) {
 		// Reached only for the management subcommands; the event path took the
 		// protocol return above.
 		policy.Title, policy.Activity = "Hooks", "Checking host registrations"
-	case "mcp", "mcp-server", "version", "help":
+	case "mcp", "mcp-server", "version", "--version", "-V", "-v", "help", "--help", "-h":
 		policy.Protocol = true
 	default:
 		policy.Title, policy.Activity = "Command", "Checking the request"

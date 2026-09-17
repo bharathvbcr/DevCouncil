@@ -47,29 +47,31 @@ fn main() -> ExitCode {
     }
 }
 
+const COMPONENT_ID: &str = "dcgrep";
+
+fn is_version_arg(arg: &str) -> bool {
+    matches!(arg, "--version" | "-V" | "-v" | "version")
+}
+
 fn run() -> Result<String, String> {
     let args = collect_args()?;
-    match args.first().map(String::as_str) {
-        // `CARGO_PKG_VERSION` and never a literal: every crate in this
-        // workspace takes `version.workspace = true`, so the one number in
-        // `rust/Cargo.toml` reaches here and a release has no second place to
-        // forget. Until this arm existed the binary answered `--version` with
-        // `unknown command "--version"`, so a deployed searcher's version was
-        // not observable at all — the package said 0.2.3 and the program could
-        // not be asked.
-        Some("--version") => Ok(format!(
-            "{{\"ok\":true,\"component\":\"{IDENTITY}\",\"version\":\"{}\"}}",
+    if args.iter().any(|arg| is_version_arg(arg)) {
+        return Ok(format!(
+            "{{\"ok\":true,\"id\":\"{COMPONENT_ID}\",\"component\":\"{IDENTITY}\",\"version\":\"{}\"}}",
             env!("CARGO_PKG_VERSION")
-        )),
+        ));
+    }
+    match args.first().map(String::as_str) {
         // The ranked fields are what this build *can* read, taken from the one
         // list next to the enum rather than written out here. They were single
         // literals saying "bm25" and "code-v1", which stopped being true the
         // moment a learned index could be published: health would have denied
         // a capability the same binary was exercising.
         Some("health") => Ok(format!(
-            "{{\"ok\":true,\"searcher\":\"{IDENTITY}\",\"schema_version\":{SCHEMA_VERSION},\
+            "{{\"ok\":true,\"id\":\"{COMPONENT_ID}\",\"component\":\"{IDENTITY}\",\"version\":\"{}\",\"searcher\":\"{IDENTITY}\",\"schema_version\":{SCHEMA_VERSION},\
              \"engine\":\"ripgrep\",\"index_engine\":\"tgrep-core\",\
              \"ranked_engines\":{},\"ranked_vocabularies\":{}}}",
+            env!("CARGO_PKG_VERSION"),
             render(&dc_grep::ranked_engines())?,
             render(&dc_grep::ranked_vocabularies())?,
         )),
@@ -78,7 +80,7 @@ fn run() -> Result<String, String> {
         Some("index") => index(),
         Some("rank") => rank(),
         Some(other) => Err(format!(
-            "unknown command {other:?} (search, files, index, rank, health, --version)"
+            "unknown command {other:?} (search, files, index, rank, health, --version, -V, -v, version)"
         )),
     }
 }

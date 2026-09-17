@@ -69,6 +69,7 @@ fn profile(command: &Commands) -> Option<(&'static str, &'static str)> {
         Commands::Build { .. }
         | Commands::Serve { .. }
         | Commands::Mcp { .. }
+        | Commands::Version { .. }
         | Commands::Hook { .. } => return None,
         Commands::Export { out, .. } if out.as_deref() == Some(std::path::Path::new("-")) => {
             return None
