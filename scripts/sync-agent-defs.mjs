@@ -82,8 +82,123 @@ When the MCP tools are not loaded, the \`devmap\` CLI answers the same questions
 CLI, so when it is unavailable, report the situation as unestablished rather than
 guessing at it.`;
 
+/**
+ * Every host tool-ID prefix the same MCP server is served under.
+ *
+ * A `tools:` entry is a string, and a string the host does not serve is not an
+ * error the host reports — the agent is simply never handed that tool. The only
+ * symptom is an agent that looks like it is ignoring the instruction telling it
+ * to navigate with DevMap. Measured 2026-09-17: all ten grants named
+ * `mcp__plugin_devmap_devmap__*` and nothing else, and that prefix is absent
+ * from any session where Claude Code resolves the user-scope `devmap` server
+ * instead, so those agents were granted zero DevMap tools. Transcripts show all
+ * three prefixes in live use across sessions.
+ *
+ * The duplication is real: one `devmap mcp` server is registered three times —
+ * user scope in `~/.claude.json`, the `devmap` plugin's own `.mcp.json`, and the
+ * `gitpulse` plugin, which serves the same eleven `devmap_*` tools beside its
+ * own. Which prefix a session exposes is not a property of the agent, so a grant
+ * must name all of them. Listing a prefix the session does not serve is inert;
+ * omitting the one it does serve is silent failure.
+ *
+ * Declared rather than probed so the check runs on a clean clone with no host
+ * config and no servers running. `scripts/mcp-served-tools.mjs` probes the live
+ * hosts and fails when this declaration has gone stale, so it cannot rot
+ * unnoticed.
+ */
+export const MCP_TOOL_PREFIXES = {
+  devmap: [
+    "mcp__devmap__",
+    "mcp__plugin_devmap_devmap__",
+    "mcp__plugin_gitpulse_gitpulse__",
+  ],
+  gitpulse: ["mcp__plugin_gitpulse_gitpulse__"],
+  devcouncil: ["mcp__devcouncil__"],
+};
+
 /** Thrown for every rejected input, so callers can fail closed on one type. */
 export class AgentDefError extends Error {}
+
+/**
+ * Splits `mcp__<prefix>__<tool>` into its prefix and bare tool name.
+ *
+ * Returns null for a built-in tool name, which carries no prefix. The split is
+ * on the LAST `__` because a plugin prefix contains one of its own
+ * (`mcp__plugin_gitpulse_gitpulse__`), so splitting on the first would report
+ * `plugin` as the server.
+ */
+export function splitToolId(entry) {
+  if (!entry.startsWith("mcp__")) return null;
+  const cut = entry.lastIndexOf("__");
+  if (cut <= 4) return null;
+  return { prefix: entry.slice(0, cut + 2), tool: entry.slice(cut + 2) };
+}
+
+/** The `MCP_TOOL_PREFIXES` family a bare tool name belongs to, or null. */
+export function familyOf(tool) {
+  const family = tool.split("_", 1)[0];
+  return Object.hasOwn(MCP_TOOL_PREFIXES, family) ? family : null;
+}
+
+/**
+ * Expands every MCP grant to all prefixes its server is served under.
+ *
+ * Built-ins keep their position and order. MCP entries are grouped by bare tool
+ * name so the expansion of one tool stays together and the result is stable
+ * regardless of how the input was ordered — a grant that reorders on every sync
+ * would show up as drift forever.
+ *
+ * An MCP entry whose bare name belongs to no known family is passed through
+ * untouched rather than dropped: this function widens grants, and silently
+ * removing a tool an agent was given would be the opposite of that.
+ */
+export function expandTools(tools) {
+  const builtins = [];
+  const byTool = new Map();
+  const passthrough = [];
+  for (const entry of tools) {
+    const split = splitToolId(entry);
+    if (split === null) {
+      if (!builtins.includes(entry)) builtins.push(entry);
+      continue;
+    }
+    if (familyOf(split.tool) === null) {
+      if (!passthrough.includes(entry)) passthrough.push(entry);
+      continue;
+    }
+    if (!byTool.has(split.tool)) byTool.set(split.tool, true);
+  }
+  const expanded = [];
+  for (const tool of byTool.keys()) {
+    for (const prefix of MCP_TOOL_PREFIXES[familyOf(tool)]) {
+      const id = prefix + tool;
+      if (!expanded.includes(id)) expanded.push(id);
+    }
+  }
+  return [...builtins, ...passthrough, ...expanded];
+}
+
+/**
+ * Grant entries that are pinned to a subset of their server's prefixes.
+ *
+ * Returned per bare tool name so the message can say which prefix is missing,
+ * rather than only that the list is wrong.
+ */
+export function pinnedGrants(tools) {
+  const seen = new Map();
+  for (const entry of tools) {
+    const split = splitToolId(entry);
+    if (split === null || familyOf(split.tool) === null) continue;
+    if (!seen.has(split.tool)) seen.set(split.tool, new Set());
+    seen.get(split.tool).add(split.prefix);
+  }
+  const pinned = [];
+  for (const [tool, prefixes] of seen) {
+    const missing = MCP_TOOL_PREFIXES[familyOf(tool)].filter((p) => !prefixes.has(p));
+    if (missing.length > 0) pinned.push({ tool, missing });
+  }
+  return pinned;
+}
 
 /**
  * Splits `---\n...\n---\n` frontmatter from the markdown body.
@@ -198,6 +313,66 @@ export function renderPluginMarkdown(source) {
   return source;
 }
 
+/** Column the `tools:` block wraps at, chosen to match the existing files. */
+const TOOLS_WRAP_COLUMN = 100;
+
+/**
+ * Rewrites only the `tools:` block of a definition's frontmatter.
+ *
+ * Deliberately a targeted splice rather than re-rendering the frontmatter: the
+ * `description` field is also a folded multi-line scalar, and round-tripping it
+ * would reflow three correct files and make every future diff unreadable. Every
+ * byte outside the `tools:` block is preserved.
+ *
+ * Returns the source unchanged when the block already holds exactly this list,
+ * so a no-op sync does not churn mtimes for every watcher on the tree.
+ */
+export function rewriteToolsBlock(source, expanded, label = "<source>") {
+  const normalized = source.replace(/\r\n/g, "\n");
+  if (!normalized.startsWith("---\n")) {
+    throw new AgentDefError(`${label}: must begin with '---' YAML frontmatter`);
+  }
+  const closing = normalized.indexOf("\n---\n", 3);
+  if (closing === -1) {
+    throw new AgentDefError(`${label}: frontmatter is never closed by a '---' line`);
+  }
+  const head = normalized.slice(0, 4);
+  const frontmatter = normalized.slice(4, closing + 1);
+  const tail = normalized.slice(closing + 1);
+
+  const lines = frontmatter.split("\n");
+  const start = lines.findIndex((l) => /^tools:/.test(l));
+  if (start === -1) {
+    throw new AgentDefError(`${label}: no 'tools:' key to rewrite`);
+  }
+  let end = start + 1;
+  while (end < lines.length && /^\s+\S/.test(lines[end])) end += 1;
+
+  // Two spaces, matching the folded `description` above it. Any leading
+  // whitespace folds, but a file whose two multi-line scalars indent differently
+  // reads like one of them is a mistake.
+  const CONTINUATION = "  ";
+  const rendered = [];
+  let current = "tools:";
+  for (const entry of expanded) {
+    const piece = ` ${entry},`;
+    if (current.length + piece.length > TOOLS_WRAP_COLUMN && current !== "tools:") {
+      rendered.push(current);
+      current = `${CONTINUATION}${entry},`;
+    } else {
+      current += piece;
+    }
+  }
+  // The last entry carries no trailing comma: a dangling one folds into the
+  // joined scalar and parses back as an empty final tool name.
+  current = current.replace(/,$/, "");
+  rendered.push(current);
+
+  const rebuilt = [...lines.slice(0, start), ...rendered, ...lines.slice(end)].join("\n");
+  const result = head + rebuilt + tail;
+  return result === normalized ? source : result;
+}
+
 /** Definition basenames present in the source directory, sorted. */
 export function agentNames(directory) {
   if (!existsSync(directory)) return [];
@@ -222,11 +397,38 @@ export function plan(root = repoRoot) {
   const outputs = [];
   for (const name of names) {
     const sourceRelative = path.join(CLAUDE_AGENTS_DIR, `${name}.md`);
-    const source = readFileSync(path.join(root, sourceRelative), "utf8");
-    const def = parseAgentMarkdown(source, sourceRelative);
-    if (def.name !== name) {
-      throw new AgentDefError(`${sourceRelative}: frontmatter name '${def.name}' != filename`);
+    const onDisk = readFileSync(path.join(root, sourceRelative), "utf8");
+    const parsed = parseAgentMarkdown(onDisk, sourceRelative);
+    if (parsed.name !== name) {
+      throw new AgentDefError(`${sourceRelative}: frontmatter name '${parsed.name}' != filename`);
     }
+
+    // The source is a target too. Claude Code reads `.claude/agents/<name>.md`
+    // directly, so a grant pinned to one of a server's prefixes has to be
+    // widened in THIS file — normalizing only the generated copies would fix
+    // the two hosts nobody reported the problem on and leave the one they did.
+    let source = onDisk;
+    if (parsed.tools.length > 0) {
+      source = rewriteToolsBlock(onDisk, expandTools(parsed.tools), sourceRelative);
+      if (source !== onDisk) {
+        outputs.push({ relative: sourceRelative, contents: source });
+      }
+    }
+    // Re-parse so the copies are rendered from the widened grant, not the
+    // pinned one: three files that agree on a broken list are still broken.
+    const def = source === onDisk ? parsed : parseAgentMarkdown(source, sourceRelative);
+
+    const stillPinned = pinnedGrants(def.tools);
+    if (stillPinned.length > 0) {
+      const detail = stillPinned
+        .map(({ tool, missing }) => `${tool} missing ${missing.join(", ")}`)
+        .join("; ");
+      throw new AgentDefError(
+        `${sourceRelative}: grant is still prefix-pinned after expansion (${detail}); ` +
+          `MCP_TOOL_PREFIXES and expandTools disagree`,
+      );
+    }
+
     outputs.push({
       relative: path.join(CODEX_AGENTS_DIR, `${name}.toml`),
       contents: renderCodexToml(def, sourceRelative),

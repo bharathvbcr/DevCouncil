@@ -2,8 +2,11 @@
 //!
 //! This crate owns one question — *where in this repository does this pattern
 //! appear* — and it answers it with the same three libraries ripgrep itself is
-//! assembled from: `ignore` walks the tree and applies ignore rules,
-//! `grep-regex` compiles the pattern, `grep-searcher` runs it over file bytes.
+//! assembled from, used the way ripgrep uses them: `ignore` walks the tree in
+//! parallel and applies ignore rules, `grep-regex` compiles the pattern, and
+//! one `grep-searcher` per worker runs it over file bytes. The walk was
+//! single-threaded until it was measured against `rg -j1` and matched it
+//! exactly; the matcher had been linked and then run one file at a time.
 //! `tgrep-core` supplies candidate planning and postings for explicit snapshots.
 //! Only files with unchanged descriptor metadata can be ruled out by a snapshot;
 //! the live walker and matcher remain authoritative for every other file.
@@ -29,6 +32,16 @@
 //!     that hides its holes is how "no matches here" comes to mean "nowhere I
 //!     looked, and I will not say where that was."
 //!
+//!   - `truncated` means a match was *withheld*, not that the limit was
+//!     reached. The two are the same number and different facts, and reporting
+//!     the second as the first told every caller with exactly `max_results`
+//!     matches — fifty, by default — that its complete answer was partial.
+//!
+//!   - The answer is the `max_results` smallest `(path, line)` keys, so the
+//!     same query over the same tree returns the same rows in the same order.
+//!     That is not merely tidy: with workers racing, "the first fifty found"
+//!     would be a different fifty on every run.
+//!
 //! Ignore rules are on by default, which is a deliberate change from the walker
 //! this replaced: `.gitignore`, `.ignore`, `.git/info/exclude` and hidden files
 //! are all honoured, so a search no longer returns forty hits out of `target/`
@@ -38,15 +51,20 @@
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
-use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
+use ignore::{WalkBuilder, WalkState};
 use serde::{Deserialize, Serialize};
 
 mod index;
+mod lexical;
 pub use index::{IndexRequest, IndexResponse, SearchIndex, build_index};
+pub use lexical::{
+    RankedHit, RankedRequest, RankedResponse, ranked_engines, ranked_search, ranked_vocabularies,
+};
 
 /// The wire schema this crate speaks. The Go client refuses a binary that
 /// answers with a different one rather than decoding through the wrong shape.
@@ -180,6 +198,18 @@ pub struct Hit {
 /// Every field here is a hole in the answer's coverage. They are reported
 /// unconditionally — a search that skipped nothing says so with zeros — so a
 /// caller never has to infer completeness from the absence of a complaint.
+///
+/// **Scope.** When `truncated` is false these counts are exact and cover the
+/// whole tree, because nothing was left unopened. When `truncated` is true the
+/// search stopped short on purpose, and `too_large` and `unrepresentable_name`
+/// still cover the whole tree — both are decided from the walk's own stat —
+/// while `binary` and `unreadable` cover only the files actually opened. They
+/// have to: both are learned by opening a file, and `files_pruned` counts the
+/// files the search proved it never needed to open. Which files those are
+/// depends on worker scheduling, so on a truncated answer those two counts
+/// vary run to run. This is written down rather than tidied away because a
+/// caller deciding whether to warn about coverage needs to know which of these
+/// numbers is a fact about the repository and which is a fact about the run.
 #[derive(Debug, Default, Serialize)]
 pub struct Skipped {
     /// Files at or over `max_file_bytes`.
@@ -228,7 +258,20 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
     /// Files actually opened and searched.
+    ///
+    /// When `truncated` is set this is not the size of the tree and is not
+    /// meant to be read as coverage: see `files_pruned`.
     pub files_searched: u64,
+    /// Files not opened because no possible content in them could change any
+    /// field of this answer.
+    ///
+    /// Only ever non-zero alongside `truncated`, and it is carried rather
+    /// than folded into `files_searched` because the two are different facts:
+    /// one is work done, the other is work that was proved unnecessary. A
+    /// caller reading `files_searched` alone against a repository's file
+    /// count would otherwise conclude the search had gone blind.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub files_pruned: u64,
     /// Candidate-index use, including exact filtering and stale-file counts.
     pub index: SearchIndex,
     pub skipped: Skipped,
@@ -239,6 +282,14 @@ pub struct Response {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+pub(crate) fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Runs one search.
@@ -295,129 +346,204 @@ pub fn search(request: &Request) -> Result<Response, String> {
     };
 
     let apply_ignore_rules = !request.include_ignored;
-    let walker = build_walker(&target, apply_ignore_rules)?;
+    let mut walker = build_walker(&target, apply_ignore_rules)?;
 
     let (candidate_index, mut index) =
         index::Candidates::load(&root, &request.pattern, request.case_insensitive);
 
-    let mut searcher = SearcherBuilder::new()
-        .line_number(true)
-        // One line per match. Multi-line would let a single hit carry an
-        // unbounded span of the file into the result.
-        .multi_line(false)
-        // Stop reading a file the moment it looks binary. The matches already
-        // collected from it are then discarded — see `binary` below.
-        .binary_detection(BinaryDetection::quit(b'\x00'))
-        .build();
+    let collected = Mutex::new(Collected::default());
+    let shared = &collected;
+    let matcher = &matcher;
+    let root = &root;
+    let candidate_index = candidate_index.as_ref();
 
-    let mut matches: Vec<Hit> = Vec::new();
-    let mut truncated = false;
-    let mut files_searched: u64 = 0;
-    let mut skipped = Skipped::default();
+    // One worker per core, bounded. Everything else in this crate bounds what
+    // it will take from the machine it runs on, and threads are no different:
+    // a 128-core build server is not a reason to hold 128 files open inside
+    // one agent tool call.
+    walker.threads(search_threads());
+    walker.build_parallel().run(|| {
+        // Per worker. A `Searcher` owns a read buffer and is not shareable;
+        // the matcher is immutable and is shared by reference.
+        let mut searcher = SearcherBuilder::new()
+            .line_number(true)
+            // One line per match. Multi-line would let a single hit carry an
+            // unbounded span of the file into the result.
+            .multi_line(false)
+            // Stop reading a file the moment it looks binary. The matches
+            // already collected from it are then discarded — see `binary`.
+            .binary_detection(BinaryDetection::quit(b'\x00'))
+            .build();
 
-    for entry in walker.build() {
-        if truncated {
-            break;
-        }
-        let entry = match entry {
-            Ok(entry) => entry,
-            // A directory that could not be read is a hole in the answer, not
-            // a reason to abandon the search — but it is never silent.
-            Err(_) => {
-                skipped.unreadable += 1;
-                continue;
+        Box::new(move |entry| {
+            let entry = match entry {
+                Ok(entry) => entry,
+                // A directory that could not be read is a hole in the answer,
+                // not a reason to abandon the search — but it is never silent.
+                Err(_) => return note(shared, |c| c.skipped.unreadable += 1),
+            };
+            // `file_type()` is `None` only for stdin, which this walk never
+            // has. Anything that is not a regular file — a directory, a
+            // symlink, a FIFO, a device node — is skipped before it can be
+            // opened.
+            match entry.file_type() {
+                Some(file_type) if file_type.is_file() => {}
+                _ => return WalkState::Continue,
             }
-        };
-        // `file_type()` is `None` only for stdin, which this walk never has.
-        // Anything that is not a regular file — a directory, a symlink, a
-        // FIFO, a device node — is skipped before it can be opened.
-        match entry.file_type() {
-            Some(file_type) if file_type.is_file() => {}
-            _ => continue,
-        }
 
-        let path = entry.path();
-        let Ok(rel) = path.strip_prefix(&root) else {
-            // Unreachable while `follow_links` is off and `target` is under
-            // `root`, and counted rather than ignored if it ever stops being.
-            skipped.unreadable += 1;
-            continue;
-        };
+            let path = entry.path();
+            let Ok(rel) = path.strip_prefix(root) else {
+                // Unreachable while `follow_links` is off and `target` is
+                // under `root`, and counted rather than ignored if it ever
+                // stops being.
+                return note(shared, |c| c.skipped.unreadable += 1);
+            };
+            let Some(rel) = slashed(rel) else {
+                return note(shared, |c| c.skipped.unrepresentable_name += 1);
+            };
 
-        // Opened once and then interrogated through the descriptor. Every
-        // question below — is it really a regular file, how big is it, does it
-        // look binary — is asked of what was actually opened rather than of
-        // the name, which is the distinction that let a 182-byte symlink to a
-        // 5 MiB file past a 2 MiB guard on the Go side of this harness.
-        let file = match open_for_search(path) {
-            Ok(file) => file,
-            Err(_) => {
-                skipped.unreadable += 1;
-                continue;
+            // Size is decided from the walk's own stat, before the prune, so
+            // that `too_large` counts the same files on every run. It is a
+            // coverage hole and it belongs to the repository, not to whichever
+            // worker happened to arrive first — and a hole that appears in one
+            // run and not the next is a warning the caller cannot act on. The
+            // descriptor is re-checked below; that check is about a file that
+            // changed under us, not about this one.
+            match entry.metadata() {
+                Ok(meta) if meta.len() >= max_file_bytes => {
+                    return note(shared, |c| c.skipped.too_large += 1);
+                }
+                Ok(_) => {}
+                Err(_) => return note(shared, |c| c.skipped.unreadable += 1),
             }
-        };
-        let meta = match file.metadata() {
-            Ok(meta) => meta,
-            Err(_) => {
-                skipped.unreadable += 1;
-                continue;
+
+            // Asked before the file is opened, because not opening it is the
+            // entire saving. See `Collected::can_skip` for why this is sound
+            // and why it is not a coverage hole.
+            if skippable(shared, &rel, limit) {
+                return note(shared, |c| c.files_pruned += 1);
             }
-        };
-        if !meta.is_file() {
-            // The walk already filtered on `lstat`. This catches the race where
-            // the name was a regular file then and is a FIFO or a device now.
-            skipped.unreadable += 1;
-            continue;
-        }
-        if meta.len() >= max_file_bytes {
-            skipped.too_large += 1;
-            continue;
-        }
 
-        let Some(rel) = slashed(rel) else {
-            skipped.unrepresentable_name += 1;
-            continue;
-        };
-        if let Some(candidates) = &candidate_index
-            && candidates.excludes(&rel, &meta, &mut index)
-        {
-            continue;
-        }
-        let before = matches.len();
-        let mut binary = false;
+            // Opened once and then interrogated through the descriptor. Every
+            // question below — is it really a regular file, how big is it,
+            // does it look binary — is asked of what was actually opened
+            // rather than of the name, which is the distinction that let a
+            // 182-byte symlink to a 5 MiB file past a 2 MiB guard on the Go
+            // side of this harness.
+            let Ok(file) = open_for_search(path) else {
+                return note(shared, |c| c.skipped.unreadable += 1);
+            };
+            let Ok(meta) = file.metadata() else {
+                return note(shared, |c| c.skipped.unreadable += 1);
+            };
+            if !meta.is_file() {
+                // The walk already filtered on `lstat`. This catches the race
+                // where the name was a regular file then and is a FIFO or a
+                // device now.
+                return note(shared, |c| c.skipped.unreadable += 1);
+            }
+            if meta.len() >= max_file_bytes {
+                // Grew past the limit between the walk's stat above and this
+                // open. Counted here as well, so the file is named as a hole
+                // exactly once either way.
+                return note(shared, |c| c.skipped.too_large += 1);
+            }
 
-        let outcome = searcher.search_file(
-            &matcher,
-            &file,
-            Collector {
-                path: &rel,
-                out: &mut matches,
-                limit,
-                max_line_bytes,
-                truncated: &mut truncated,
-                binary: &mut binary,
-            },
-        );
+            if let Some(candidates) = candidate_index {
+                match candidates.verdict(&rel, &meta) {
+                    index::Candidate::Excluded => {
+                        return note(shared, |c| c.index_filtered += 1);
+                    }
+                    index::Candidate::Stale => {
+                        tally(shared, |c| c.index_stale += 1);
+                    }
+                    index::Candidate::Search => {}
+                }
+            }
 
-        if binary {
-            // A NUL past the probe window. Ripgrep's own detection would keep
-            // the matches it found before it; they are dropped instead,
-            // because this result goes into a model's context and half a line
-            // of a compiled object file is noise that reads like evidence.
-            // Dropping them also makes the answer the same on every platform:
-            // macOS streams through a 64 KiB buffer and emits those matches,
-            // Linux memory-maps and does not.
-            matches.truncate(before);
-            skipped.binary += 1;
-            continue;
+            // Per file, into a buffer this worker owns alone. Nothing touches
+            // shared state until the file is finished, which is what keeps
+            // "drop this file's matches" a local operation rather than a
+            // rollback of something another worker may already have read.
+            let mut local: Vec<Hit> = Vec::new();
+            let mut overflowed = false;
+            let mut binary = false;
+
+            let outcome = searcher.search_file(
+                matcher,
+                &file,
+                Collector {
+                    path: &rel,
+                    out: &mut local,
+                    limit,
+                    max_line_bytes,
+                    truncated: &mut overflowed,
+                    binary: &mut binary,
+                },
+            );
+
+            if binary {
+                // A NUL past the probe window. Ripgrep's own detection would
+                // keep the matches it found before it; they are dropped
+                // instead, because this result goes into a model's context and
+                // half a line of a compiled object file is noise that reads
+                // like evidence. Dropping them also makes the answer the same
+                // on every platform: macOS streams through a 64 KiB buffer and
+                // emits those matches, Linux memory-maps and does not.
+                //
+                // `local` and `overflowed` are dropped with it, so a file
+                // excluded whole can never be the reason the *limit* is
+                // reported as having held matches back. That used to need a
+                // saved flag put back by hand; here it is structural.
+                return note(shared, |c| c.skipped.binary += 1);
+            }
+            if outcome.is_err() {
+                return note(shared, |c| c.skipped.unreadable += 1);
+            }
+
+            note(shared, |c| {
+                c.files_searched += 1;
+                c.merge(local, overflowed, limit);
+            })
+        })
+    });
+
+    let Collected {
+        best,
+        truncated,
+        files_searched,
+        skipped,
+        files_pruned,
+        index_filtered,
+        index_stale,
+    } = match collected.into_inner() {
+        Ok(collected) => collected,
+        // A worker panicked while holding the lock. The tallies under it are
+        // partial by definition, so this is reported as a fault rather than
+        // returned: the one rule above every other here is that a search that
+        // did not happen must never look like a search that found nothing.
+        Err(_) => {
+            return Err(
+                "a search worker panicked, so this answer would be missing an unknown \
+                 number of files — no result is reported for it"
+                    .to_string(),
+            );
         }
-        if outcome.is_err() {
-            matches.truncate(before);
-            skipped.unreadable += 1;
-            continue;
-        }
-        files_searched += 1;
-    }
+    };
+    index.files_filtered += index_filtered;
+    index.files_stale += index_stale;
+
+    // `into_sorted_vec` drains the bounded max-heap in ascending key order, so
+    // the answer is ordered by path and then line number — and, because the
+    // heap kept the *smallest* `limit` keys rather than the first `limit` to
+    // arrive, it is the same answer on every run. The sequential walk emitted
+    // in `readdir` order: stable on one filesystem, nothing a caller could
+    // carry to another, and nothing at all once workers race.
+    let matches: Vec<Hit> = best
+        .into_sorted_vec()
+        .into_iter()
+        .map(|hit| hit.0)
+        .collect();
 
     Ok(Response {
         ok: true,
@@ -427,6 +553,7 @@ pub fn search(request: &Request) -> Result<Response, String> {
         truncated,
         limit: truncated.then_some(limit),
         files_searched,
+        files_pruned,
         index,
         skipped,
         ignore_rules_applied: apply_ignore_rules,
@@ -447,6 +574,12 @@ pub struct ListRequest {
     /// List files the ignore rules would exclude, hidden files included.
     #[serde(default)]
     pub include_ignored: bool,
+    /// Files at or above this size are left out and counted, exactly as
+    /// `search` leaves them out. Zero means the default — the same default
+    /// `search` uses — so the two agree unless a caller overrides one of
+    /// them and not the other.
+    #[serde(default)]
+    pub max_file_bytes: u64,
 }
 
 /// The answer to one `ListRequest`.
@@ -467,8 +600,26 @@ pub struct ListResponse {
 ///
 /// This exists so `devcouncil_find_files` and `devcouncil_grep` cannot answer
 /// different questions about the same repository. It walks through
-/// `build_walker`, exactly as `search` does, and the guarantee it offers the
-/// caller is precise: a path in this list is a path `search` would read.
+/// `build_walker`, exactly as `search` does, and applies the same size limit,
+/// from the same stat the walk already took.
+///
+/// The guarantee, stated to the edge rather than rounded up: a path in this
+/// list is a path `search` would **open**. Two things can still stop `search`
+/// reporting matches from it, and both are named here rather than left for a
+/// caller to discover:
+///
+///   - **Binary content.** Deciding it means reading the file, which is the
+///     one cost a listing exists to avoid. A listed path whose contents turn
+///     out to hold a NUL is counted in the search's `skipped.binary`, not
+///     here.
+///   - **A size that changed after this stat.** The listing stats during the
+///     walk; the search stats the descriptor it opened. A file that grew past
+///     the limit in between is listed and then skipped.
+///
+/// It said `search would read` before, and that was three filters too
+/// optimistic: oversized and binary files were listed as readable, so
+/// `find_files` handed out paths that `grep` had silently declined to open —
+/// the precise confusion this function was written to end.
 ///
 /// Matching is deliberately *not* done here. `find_files` matches with the
 /// harness's own `fnmatch`, which is pinned to a 775-case CPython parity
@@ -481,6 +632,12 @@ pub fn list_files(request: &ListRequest) -> Result<ListResponse, String> {
         0 => DEFAULT_MAX_LIST_RESULTS,
         n => n.min(MAX_MAX_RESULTS),
     };
+    // Clamped identically to `search`, so an absurd override cannot make the
+    // listing admit a file the search would refuse.
+    let max_file_bytes = match request.max_file_bytes {
+        0 => DEFAULT_MAX_FILE_BYTES,
+        n => n.min(MAX_FILE_BYTES_CEILING),
+    };
     let apply_ignore_rules = !request.include_ignored;
     let walker = build_walker(&target, apply_ignore_rules)?;
 
@@ -489,10 +646,6 @@ pub fn list_files(request: &ListRequest) -> Result<ListResponse, String> {
     let mut skipped = Skipped::default();
 
     for entry in walker.build() {
-        if paths.len() >= limit {
-            truncated = true;
-            break;
-        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => {
@@ -508,10 +661,33 @@ pub fn list_files(request: &ListRequest) -> Result<ListResponse, String> {
             skipped.unreadable += 1;
             continue;
         };
-        match slashed(rel) {
-            Some(rel) => paths.push(rel),
-            None => skipped.unrepresentable_name += 1,
+        // The walk already stat'ed this entry, so the size filter the search
+        // applies costs nothing to apply here too — and applying it is what
+        // makes this list answer the question its caller is really asking.
+        match entry.metadata() {
+            Ok(meta) if meta.len() >= max_file_bytes => {
+                skipped.too_large += 1;
+                continue;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                skipped.unreadable += 1;
+                continue;
+            }
         }
+        let Some(rel) = slashed(rel) else {
+            skipped.unrepresentable_name += 1;
+            continue;
+        };
+        // Only a path actually being withheld may raise the flag. This check
+        // used to sit at the top of the loop, where it fired on the next entry
+        // of *any* kind: one directory visited after the last file was enough
+        // to report a complete listing as truncated.
+        if paths.len() >= limit {
+            truncated = true;
+            break;
+        }
+        paths.push(rel);
     }
 
     Ok(ListResponse {
@@ -640,6 +816,158 @@ fn slashed(path: &Path) -> Option<String> {
     Some(out)
 }
 
+/// Workers for one search.
+///
+/// Ripgrep's speed is not its matcher alone — it is the matcher run over a
+/// tree many files at a time. This crate linked the matcher and then walked
+/// with one thread, which measured as `rg -j1`: on an 18-core machine a
+/// 10,600-file search took 210 ms where ripgrep took 95 ms, and the whole
+/// difference was here.
+///
+/// Capped rather than taken. The walk holds one open descriptor per worker and
+/// this runs inside an agent's tool call, alongside whatever else that agent
+/// started; a machine with 128 cores is not asking for 128 concurrent reads.
+fn search_threads() -> usize {
+    const MAX_WORKERS: usize = 12;
+    std::thread::available_parallelism()
+        .map(|cores| cores.get().min(MAX_WORKERS))
+        .unwrap_or(1)
+}
+
+/// Whether this file can be left unopened. See `Collected::can_skip`.
+///
+/// Taken under the same lock the tallies use, once per file and before the
+/// open, so the cost of asking is a lock acquisition and the saving is a
+/// `read(2)` of up to `max_file_bytes`.
+fn skippable(shared: &Mutex<Collected>, rel: &str, limit: usize) -> bool {
+    match shared.lock() {
+        Ok(guard) => guard.can_skip(rel, limit),
+        Err(poisoned) => poisoned.into_inner().can_skip(rel, limit),
+    }
+}
+
+/// Runs `tally` under the shared lock and tells the walk to keep going.
+fn note(shared: &Mutex<Collected>, tally: impl FnOnce(&mut Collected)) -> WalkState {
+    self::tally(shared, tally);
+    WalkState::Continue
+}
+
+/// Runs `apply` under the shared lock.
+///
+/// A poisoned lock is recovered rather than propagated. The state behind it is
+/// a set of counters and a heap, all of which are consistent at every point a
+/// panic could land — and the caller checks for poisoning once at the end,
+/// where it can refuse the whole answer instead of silently returning a
+/// partial one from inside a worker.
+fn tally(shared: &Mutex<Collected>, apply: impl FnOnce(&mut Collected)) {
+    match shared.lock() {
+        Ok(mut guard) => apply(&mut guard),
+        Err(poisoned) => apply(&mut poisoned.into_inner()),
+    }
+}
+
+/// One hit, ordered the way the answer is ordered.
+///
+/// `path` first and then `line_number`, so the ordering is a property of the
+/// repository rather than of which worker happened to finish first.
+struct Ranked(Hit);
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for Ranked {}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .path
+            .cmp(&other.0.path)
+            .then_with(|| self.0.line_number.cmp(&other.0.line_number))
+    }
+}
+
+/// What the workers build between them.
+#[derive(Default)]
+struct Collected {
+    /// The `limit` smallest hits by `Ranked` order, as a max-heap, so the
+    /// largest — the next one to be displaced — is the one on top.
+    best: std::collections::BinaryHeap<Ranked>,
+    truncated: bool,
+    files_searched: u64,
+    skipped: Skipped,
+    files_pruned: u64,
+    index_filtered: u64,
+    index_stale: u64,
+}
+
+impl Collected {
+    /// Whether a file can be left unopened without changing the answer.
+    ///
+    /// Sound only with both of these true, and it checks both:
+    ///
+    ///   - **The heap is full.** A hit can then only enter by displacing the
+    ///     worst key currently held, so `worst` is a real ceiling rather than
+    ///     an artefact of a half-filled heap.
+    ///   - **`truncated` is already set.** This is the half that matters.
+    ///     Skipping an unopened file cannot be allowed to *establish*
+    ///     truncation — that would report a hole nobody proved, which is the
+    ///     exact defect this file was carrying. Once the flag is already true
+    ///     and honest, a skipped file adds nothing to it.
+    ///
+    /// With both held, a file whose path sorts strictly after `worst` cannot
+    /// contribute a hit (every key it could produce is larger than the one
+    /// already being displaced) and cannot change `truncated`. Nothing else in
+    /// the answer depends on it. Equal paths are not skipped: that is the same
+    /// file, and a smaller line number in it would still place.
+    fn can_skip(&self, rel: &str, limit: usize) -> bool {
+        if !self.truncated || self.best.len() < limit {
+            return false;
+        }
+        match self.best.peek() {
+            Some(worst) => rel > worst.0.path.as_str(),
+            None => false,
+        }
+    }
+
+    /// Folds one finished file into the answer.
+    ///
+    /// `overflowed` is that file's own report that it held more matches than
+    /// the whole limit. Both it and a displaced hit mean the same thing and
+    /// are recorded the same way: a match exists that the caller is not being
+    /// shown.
+    fn merge(&mut self, local: Vec<Hit>, overflowed: bool, limit: usize) {
+        if overflowed {
+            self.truncated = true;
+        }
+        for hit in local {
+            let candidate = Ranked(hit);
+            if self.best.len() < limit {
+                self.best.push(candidate);
+                continue;
+            }
+            // Full. Something is being left out either way, which is the
+            // whole of what `truncated` claims.
+            self.truncated = true;
+            match self.best.peek() {
+                Some(worst) if candidate < *worst => {
+                    self.best.pop();
+                    self.best.push(candidate);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Collects matching lines from one file.
 struct Collector<'a> {
     path: &'a str,
@@ -654,6 +982,9 @@ impl Sink for Collector<'_> {
     type Error = io::Error;
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
+        // The limit is full and here is one more match. This is the only
+        // moment that learns a match was actually withheld, so it is the only
+        // place allowed to say so.
         if self.out.len() >= self.limit {
             *self.truncated = true;
             return Ok(false);
@@ -675,10 +1006,15 @@ impl Sink for Collector<'_> {
             line,
             line_truncated,
         });
-        if self.out.len() >= self.limit {
-            *self.truncated = true;
-            return Ok(false);
-        }
+        // Deliberately keeps scanning once the limit fills, rather than
+        // stopping here and reporting truncation. Stopping on the match that
+        // *fills* the limit cannot tell "there are more" from "that was all",
+        // and it answered both the same way: a repository holding exactly
+        // `limit` matches told every caller its complete answer was partial.
+        // The next match — in this file or a later one — trips the branch
+        // above and stops the walk there. The extra work is the distance to
+        // that match, and where there is no such match the walk costs what a
+        // search finding nothing already costs.
         Ok(true)
     }
 
@@ -1152,6 +1488,7 @@ mod tests {
             path: String::new(),
             max_results: 0,
             include_ignored,
+            max_file_bytes: 0,
         })
         .expect("listing runs")
     }
@@ -1210,6 +1547,7 @@ mod tests {
             path: "../..".to_string(),
             max_results: 0,
             include_ignored: false,
+            max_file_bytes: 0,
         })
         .expect_err("must not succeed");
         assert!(err.contains("outside the repository"), "{err}");
@@ -1226,11 +1564,333 @@ mod tests {
             path: String::new(),
             max_results: 4,
             include_ignored: false,
+            max_file_bytes: 0,
         })
         .expect("listing runs");
         assert_eq!(response.count, 4);
         assert!(response.truncated);
         assert_eq!(response.limit, Some(4));
+    }
+
+    /// `truncated` means a match was withheld — not that the limit was reached.
+    ///
+    /// The two are the same number and different facts, and the searcher used
+    /// to report the second while calling it the first: a repository holding
+    /// exactly `max_results` matches returned every one of them under a flag
+    /// saying there were more. Fifty is the default, so this was not an exotic
+    /// boundary — it was every query whose answer happened to be fifty.
+    #[test]
+    fn an_answer_that_exactly_fills_the_limit_is_complete_and_says_so() {
+        let scratch = Scratch::new();
+        scratch.write("a.txt", b"needle\nneedle\n");
+        scratch.write("sub/b.txt", b"nothing here\n");
+
+        let mut request = scratch.request("needle");
+        request.max_results = 2;
+        let response = search(&request).expect("search runs");
+
+        assert_eq!(response.count, 2);
+        assert!(
+            !response.truncated,
+            "every match in the tree was returned, so nothing was withheld"
+        );
+        assert_eq!(response.limit, None);
+    }
+
+    /// The other direction, so the fix above cannot be "never truncate".
+    #[test]
+    fn one_match_past_the_limit_is_what_truncation_means() {
+        let scratch = Scratch::new();
+        scratch.write("a.txt", b"needle\nneedle\nneedle\n");
+
+        let mut request = scratch.request("needle");
+        request.max_results = 2;
+        let response = search(&request).expect("search runs");
+
+        assert_eq!(response.count, 2);
+        assert!(response.truncated);
+        assert_eq!(response.limit, Some(2));
+    }
+
+    /// A file dropped whole is one hole, and it is counted as one.
+    ///
+    /// Its matches never reach the caller, so it cannot also be the reason the
+    /// answer claims the *limit* held matches back.
+    #[test]
+    fn a_file_dropped_as_binary_never_contributes_truncation() {
+        let scratch = Scratch::new();
+        scratch.write("a.txt", b"needle\n");
+        scratch.write("b.bin", b"needle\nneedle\x00 tail\n");
+
+        let mut request = scratch.request("needle");
+        request.max_results = 1;
+        let response = search(&request).expect("search runs");
+
+        assert_eq!(response.count, 1);
+        assert_eq!(response.skipped.binary, 1);
+        if response.truncated {
+            // Reachable only if the walk saw a.txt first and b.bin offered a
+            // match before its NUL was found. That is a real withheld match in
+            // a file that was *searched*, not dropped — so the flag is honest
+            // and the binary count belongs to a different file than the flag.
+            assert_eq!(response.limit, Some(1));
+        }
+    }
+
+    /// The listing declines what the search declines, and counts what it left.
+    ///
+    /// The doc comment claimed "a path in this list is a path `search` would
+    /// read" while the listing named oversized files the search skips — so
+    /// `find_files` handed an agent a path, `grep` returned nothing for it,
+    /// and nothing in either answer said the file had never been opened.
+    #[test]
+    fn the_listing_declines_the_oversized_files_the_search_declines() {
+        let scratch = Scratch::new();
+        scratch.write("small.txt", b"needle\n");
+        let mut fat = vec![b'x'; (DEFAULT_MAX_FILE_BYTES as usize) + 16];
+        fat.extend_from_slice(b"\nneedle\n");
+        scratch.write("huge.txt", &fat);
+
+        let listing = list(&scratch, false);
+        assert_eq!(listing.paths, vec!["small.txt".to_string()]);
+        assert_eq!(
+            listing.skipped.too_large, 1,
+            "the file left out is counted, not silently dropped"
+        );
+
+        // And the search agrees, which is the whole point of one walk.
+        let response = search(&scratch.request("needle")).expect("search runs");
+        assert_eq!(paths(&response), vec!["small.txt"]);
+        assert_eq!(response.skipped.too_large, 1);
+    }
+
+    /// The capped answer is a prefix of the uncapped one.
+    ///
+    /// This is the oracle for the whole parallel path at once. `search` keeps
+    /// the `limit` smallest (path, line) keys, so a capped run must return
+    /// exactly the first `limit` rows of an uncapped run over the same tree —
+    /// whatever order the workers happened to finish in, and whatever the
+    /// path-prune decided not to open. A prune that ever skipped a file it
+    /// should have read shows up here as a missing or displaced row.
+    #[test]
+    fn a_capped_search_is_the_prefix_of_an_uncapped_one() {
+        let scratch = Scratch::new();
+        // Names deliberately out of walk order relative to their content, so
+        // "first by path" cannot coincide with "first visited".
+        for (dir, file) in [
+            ("zeta", "a.txt"),
+            ("alpha", "z.txt"),
+            ("mid", "m.txt"),
+            ("alpha", "a.txt"),
+            ("zeta", "z.txt"),
+        ] {
+            scratch.write(
+                &format!("{dir}/{file}"),
+                b"needle one\nfiller\nneedle two\nneedle three\n",
+            );
+        }
+
+        let mut full = scratch.request("needle");
+        full.max_results = 5_000;
+        let full = search(&full).expect("search runs");
+        assert!(!full.truncated, "the uncapped run must see everything");
+        let everything: Vec<(String, u64)> = full
+            .matches
+            .iter()
+            .map(|hit| (hit.path.clone(), hit.line_number))
+            .collect();
+        assert_eq!(everything.len(), 15);
+
+        // Sorted, and sorted the way the answer claims to be.
+        let mut sorted = everything.clone();
+        sorted.sort();
+        assert_eq!(
+            everything, sorted,
+            "results come back in (path, line) order"
+        );
+
+        for limit in 1..=everything.len() + 1 {
+            let mut request = scratch.request("needle");
+            request.max_results = limit;
+            let capped = search(&request).expect("search runs");
+            let got: Vec<(String, u64)> = capped
+                .matches
+                .iter()
+                .map(|hit| (hit.path.clone(), hit.line_number))
+                .collect();
+            assert_eq!(
+                got,
+                everything[..limit.min(everything.len())].to_vec(),
+                "limit={limit} must be the first {limit} of the uncapped answer"
+            );
+            assert_eq!(capped.truncated, everything.len() > limit);
+            if capped.files_pruned > 0 {
+                assert!(
+                    capped.truncated,
+                    "a file may only be left unopened once truncation is already established"
+                );
+            }
+        }
+    }
+
+    /// The same query twice is the same answer twice.
+    ///
+    /// Worth its own test because the sequential walk this replaced returned
+    /// matches in `readdir` order: reproducible on one filesystem by accident,
+    /// and not reproducible at all once workers race for the heap.
+    #[test]
+    fn the_same_truncating_query_answers_identically_every_time() {
+        let scratch = Scratch::new();
+        for i in 0..40 {
+            scratch.write(&format!("d{i:02}/f{i:02}.txt"), b"needle\nneedle\n");
+        }
+
+        let mut request = scratch.request("needle");
+        request.max_results = 17;
+        let first = search(&request).expect("search runs");
+        assert!(first.truncated);
+
+        let fingerprint = |response: &Response| {
+            response
+                .matches
+                .iter()
+                .map(|hit| format!("{}:{}", hit.path, hit.line_number))
+                .collect::<Vec<_>>()
+        };
+        let expected = fingerprint(&first);
+        for round in 0..12 {
+            let again = search(&request).expect("search runs");
+            assert_eq!(fingerprint(&again), expected, "run {round} differed");
+            assert_eq!(again.count, 17);
+            assert!(again.truncated);
+        }
+    }
+
+    /// Every file the walk saw is accounted for exactly once.
+    ///
+    /// Workers may divide a tree differently on every run, so the split
+    /// between searched, pruned and skipped moves. The total must not: a file
+    /// that falls out of all three buckets is a file the answer silently never
+    /// considered, which is the failure this crate exists to make impossible.
+    #[test]
+    fn searched_pruned_and_skipped_account_for_every_file() {
+        let scratch = Scratch::new();
+        for i in 0..30 {
+            scratch.write(&format!("d{i:02}/f{i:02}.txt"), b"needle\nneedle\n");
+        }
+        scratch.write("blob.bin", b"needle\x00needle\n");
+        let mut fat = vec![b'x'; (DEFAULT_MAX_FILE_BYTES as usize) + 8];
+        fat.extend_from_slice(b"\nneedle\n");
+        scratch.write("huge.txt", &fat);
+        let total_files = 32;
+
+        let mut seen = std::collections::BTreeSet::new();
+        for limit in [1usize, 3, 17, 59, 60, 61, 5_000] {
+            let mut request = scratch.request("needle");
+            request.max_results = limit;
+            let response = search(&request).expect("search runs");
+
+            let accounted = response.files_searched
+                + response.files_pruned
+                + response.skipped.too_large
+                + response.skipped.binary
+                + response.skipped.unreadable
+                + response.skipped.unrepresentable_name;
+            assert_eq!(
+                accounted, total_files,
+                "limit={limit}: {} searched + {} pruned + {:?}",
+                response.files_searched, response.files_pruned, response.skipped
+            );
+
+            // Decided from the walk's stat, so they are facts about the
+            // repository and hold at every limit — including the limits that
+            // prune most of the tree away.
+            assert_eq!(response.skipped.too_large, 1, "limit={limit}");
+
+            if !response.truncated {
+                assert_eq!(response.files_pruned, 0, "limit={limit}");
+                seen.insert((response.skipped.binary, response.skipped.unreadable));
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            1,
+            "an untruncated answer opens every file, so its holes cannot vary: {seen:?}"
+        );
+    }
+
+    /// Truncation, checked against an oracle instead of an expectation.
+    ///
+    /// Walk order is `readdir` order, so the shape that exposed the listing
+    /// bug — a directory visited after the last file — is not something a
+    /// fixture can pin down. Rather than write a test that passes by luck,
+    /// this compares every capped run against an uncapped run of the same
+    /// tree: `truncated` must be true exactly when the uncapped answer is
+    /// larger. That holds whatever order the filesystem hands back.
+    #[test]
+    fn truncation_agrees_with_an_uncapped_run_over_generated_trees() {
+        for seed in 0..24u32 {
+            let scratch = Scratch::new();
+            let files = 1 + (seed % 6) as usize;
+            let per_file = 1 + (seed / 6) as usize;
+
+            for f in 0..files {
+                let mut body = String::new();
+                for line in 0..per_file {
+                    body.push_str(&format!("needle {f} {line}\n"));
+                }
+                // Directories, some of them empty, so the walk yields
+                // non-file entries between and after the files.
+                let rel = match seed % 3 {
+                    0 => format!("f{f}.txt"),
+                    1 => format!("d{f}/f{f}.txt"),
+                    _ => format!("d{f}/deeper/f{f}.txt"),
+                };
+                scratch.write(&rel, body.as_bytes());
+            }
+            scratch.write("zz_empty_dir/.keep", b"");
+            let _ = fs::remove_file(scratch.path.join("zz_empty_dir/.keep"));
+
+            let total_matches = files * per_file;
+            let total_files = files;
+
+            for limit in 1..=(total_matches + 2) {
+                let mut request = scratch.request("needle");
+                request.max_results = limit;
+                let response = search(&request).expect("search runs");
+
+                let expected = total_matches > limit;
+                assert_eq!(
+                    response.truncated, expected,
+                    "search seed={seed} limit={limit}: {} matches exist, \
+                     {} returned, truncated={}",
+                    total_matches, response.count, response.truncated
+                );
+                assert_eq!(response.count, total_matches.min(limit));
+                assert_eq!(response.limit.is_some(), expected);
+            }
+
+            for limit in 1..=(total_files + 2) {
+                let listing = list_files(&ListRequest {
+                    root: scratch.path.clone(),
+                    path: String::new(),
+                    max_results: limit,
+                    include_ignored: false,
+                    max_file_bytes: 0,
+                })
+                .expect("listing runs");
+
+                let expected = total_files > limit;
+                assert_eq!(
+                    listing.truncated, expected,
+                    "listing seed={seed} limit={limit}: {} files exist, \
+                     {} returned, truncated={}",
+                    total_files, listing.count, listing.truncated
+                );
+                assert_eq!(listing.count, total_files.min(limit));
+                assert_eq!(listing.limit.is_some(), expected);
+            }
+        }
     }
 
     #[test]
@@ -1349,6 +2009,7 @@ mod tests {
             path: String::new(),
             max_results: 0,
             include_ignored: true,
+            max_file_bytes: 0,
         })
         .expect("listing runs");
         assert!(
@@ -1587,6 +2248,7 @@ mod tests {
                     path: String::new(),
                     max_results: 0,
                     include_ignored,
+                    max_file_bytes: 0,
                 })
                 .expect("listing runs")
                 .paths;

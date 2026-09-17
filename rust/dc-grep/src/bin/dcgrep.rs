@@ -13,7 +13,7 @@
 use std::io::Read;
 use std::process::ExitCode;
 
-use dc_grep::{IDENTITY, IndexRequest, ListRequest, Request, SCHEMA_VERSION};
+use dc_grep::{IDENTITY, IndexRequest, ListRequest, RankedRequest, Request, SCHEMA_VERSION};
 
 // A disconnected consumer is a transport failure, not a Rust panic. Keep
 // diagnostics off this JSON protocol, including the error response path.
@@ -61,14 +61,24 @@ fn run() -> Result<String, String> {
             "{{\"ok\":true,\"component\":\"{IDENTITY}\",\"version\":\"{}\"}}",
             env!("CARGO_PKG_VERSION")
         )),
+        // The ranked fields are what this build *can* read, taken from the one
+        // list next to the enum rather than written out here. They were single
+        // literals saying "bm25" and "code-v1", which stopped being true the
+        // moment a learned index could be published: health would have denied
+        // a capability the same binary was exercising.
         Some("health") => Ok(format!(
-            "{{\"ok\":true,\"searcher\":\"{IDENTITY}\",\"schema_version\":{SCHEMA_VERSION},\"engine\":\"ripgrep\",\"index_engine\":\"tgrep-core\"}}"
+            "{{\"ok\":true,\"searcher\":\"{IDENTITY}\",\"schema_version\":{SCHEMA_VERSION},\
+             \"engine\":\"ripgrep\",\"index_engine\":\"tgrep-core\",\
+             \"ranked_engines\":{},\"ranked_vocabularies\":{}}}",
+            render(&dc_grep::ranked_engines())?,
+            render(&dc_grep::ranked_vocabularies())?,
         )),
         Some("search") | None => search(),
         Some("files") => list(),
         Some("index") => index(),
+        Some("rank") => rank(),
         Some(other) => Err(format!(
-            "unknown command {other:?} (search, files, index, health, --version)"
+            "unknown command {other:?} (search, files, index, rank, health, --version)"
         )),
     }
 }
@@ -122,6 +132,32 @@ fn list() -> Result<String, String> {
         .map_err(|err| format!("request is not valid JSON for this schema: {err}"))?;
     let response = dc_grep::list_files(&request)?;
     serde_json::to_string(&response)
+        .map_err(|err| format!("result could not be rendered as JSON: {err}"))
+}
+
+/// Ranks files by how much they are about the query, rather than by whether
+/// they contain it.
+///
+/// A separate command from `search` and not a mode of it, because the two
+/// answer different questions and return different shapes: `search` returns
+/// lines that definitely contain something, `rank` returns files that are
+/// probably about something. Folding them into one reply would give every
+/// caller a field that is meaningful in one mode and absent in the other,
+/// which is the shape a caller eventually reads without checking which mode
+/// produced it.
+fn rank() -> Result<String, String> {
+    let raw = read_request()?;
+    let request: RankedRequest = serde_json::from_str(&raw)
+        .map_err(|err| format!("request is not valid JSON for this schema: {err}"))?;
+    let response = dc_grep::ranked_search(&request)?;
+    serde_json::to_string(&response)
+        .map_err(|err| format!("result could not be rendered as JSON: {err}"))
+}
+
+/// Renders a value as JSON, so the health line's lists are escaped by the same
+/// serialiser every other response goes through rather than by concatenation.
+fn render<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    serde_json::to_string(value)
         .map_err(|err| format!("result could not be rendered as JSON: {err}"))
 }
 

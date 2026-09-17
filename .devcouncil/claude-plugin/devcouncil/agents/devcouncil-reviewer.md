@@ -2,12 +2,20 @@
 name: devcouncil-reviewer
 description: Reviews the working-tree diff against DevCouncil policy and the code
   graph. Use for a structural, policy-aware code review before merge.
-tools: Read, Grep, Glob, Bash, mcp__devcouncil__devcouncil_get_diff, mcp__devcouncil__devcouncil_policy_check_write,
-  mcp__plugin_devmap_devmap__devmap_impact, mcp__plugin_devmap_devmap__devmap_explore,
-  mcp__plugin_devmap_devmap__devmap_search, mcp__plugin_devmap_devmap__devmap_affected_tests,
-  mcp__plugin_devmap_devmap__devmap_status, mcp__plugin_gitpulse_gitpulse__gitpulse_insights,
-  mcp__plugin_gitpulse_gitpulse__gitpulse_collision_risk, mcp__plugin_gitpulse_gitpulse__gitpulse_active_changes,
-  mcp__plugin_gitpulse_gitpulse__gitpulse_change_context, mcp__plugin_gitpulse_gitpulse__gitpulse_provenance,
+tools: Read, Grep, Glob, Bash, mcp__devcouncil__devcouncil_get_diff,
+  mcp__devcouncil__devcouncil_policy_check_write, mcp__devmap__devmap_impact,
+  mcp__plugin_devmap_devmap__devmap_impact, mcp__plugin_gitpulse_gitpulse__devmap_impact,
+  mcp__devmap__devmap_explore, mcp__plugin_devmap_devmap__devmap_explore,
+  mcp__plugin_gitpulse_gitpulse__devmap_explore, mcp__devmap__devmap_search,
+  mcp__plugin_devmap_devmap__devmap_search, mcp__plugin_gitpulse_gitpulse__devmap_search,
+  mcp__devmap__devmap_affected_tests, mcp__plugin_devmap_devmap__devmap_affected_tests,
+  mcp__plugin_gitpulse_gitpulse__devmap_affected_tests, mcp__devmap__devmap_status,
+  mcp__plugin_devmap_devmap__devmap_status, mcp__plugin_gitpulse_gitpulse__devmap_status,
+  mcp__plugin_gitpulse_gitpulse__gitpulse_insights,
+  mcp__plugin_gitpulse_gitpulse__gitpulse_collision_risk,
+  mcp__plugin_gitpulse_gitpulse__gitpulse_active_changes,
+  mcp__plugin_gitpulse_gitpulse__gitpulse_change_context,
+  mcp__plugin_gitpulse_gitpulse__gitpulse_provenance,
   mcp__plugin_gitpulse_gitpulse__gitpulse_ledger_events
 ---
 

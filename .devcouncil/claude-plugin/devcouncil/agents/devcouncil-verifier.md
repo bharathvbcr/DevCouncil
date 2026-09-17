@@ -2,13 +2,22 @@
 name: devcouncil-verifier
 description: Runs DevCouncil verification and reports blocking gaps and next actions
   without modifying code. Use to confirm whether a task actually meets its requirements.
-tools: Read, Grep, Glob, Bash, mcp__devcouncil__devcouncil_get_gaps, mcp__devcouncil__devcouncil_verify_task,
-  mcp__devcouncil__devcouncil_get_diff, mcp__plugin_devmap_devmap__devmap_search,
-  mcp__plugin_devmap_devmap__devmap_explore, mcp__plugin_devmap_devmap__devmap_impact,
-  mcp__plugin_devmap_devmap__devmap_affected_tests, mcp__plugin_devmap_devmap__devmap_status,
-  mcp__plugin_gitpulse_gitpulse__gitpulse_insights, mcp__plugin_gitpulse_gitpulse__gitpulse_collision_risk,
-  mcp__plugin_gitpulse_gitpulse__gitpulse_active_changes, mcp__plugin_gitpulse_gitpulse__gitpulse_change_context,
-  mcp__plugin_gitpulse_gitpulse__gitpulse_provenance, mcp__plugin_gitpulse_gitpulse__gitpulse_ledger_events
+tools: Read, Grep, Glob, Bash, mcp__devcouncil__devcouncil_get_gaps,
+  mcp__devcouncil__devcouncil_verify_task, mcp__devcouncil__devcouncil_get_diff,
+  mcp__devmap__devmap_search, mcp__plugin_devmap_devmap__devmap_search,
+  mcp__plugin_gitpulse_gitpulse__devmap_search, mcp__devmap__devmap_explore,
+  mcp__plugin_devmap_devmap__devmap_explore, mcp__plugin_gitpulse_gitpulse__devmap_explore,
+  mcp__devmap__devmap_impact, mcp__plugin_devmap_devmap__devmap_impact,
+  mcp__plugin_gitpulse_gitpulse__devmap_impact, mcp__devmap__devmap_affected_tests,
+  mcp__plugin_devmap_devmap__devmap_affected_tests,
+  mcp__plugin_gitpulse_gitpulse__devmap_affected_tests, mcp__devmap__devmap_status,
+  mcp__plugin_devmap_devmap__devmap_status, mcp__plugin_gitpulse_gitpulse__devmap_status,
+  mcp__plugin_gitpulse_gitpulse__gitpulse_insights,
+  mcp__plugin_gitpulse_gitpulse__gitpulse_collision_risk,
+  mcp__plugin_gitpulse_gitpulse__gitpulse_active_changes,
+  mcp__plugin_gitpulse_gitpulse__gitpulse_change_context,
+  mcp__plugin_gitpulse_gitpulse__gitpulse_provenance,
+  mcp__plugin_gitpulse_gitpulse__gitpulse_ledger_events
 ---
 
 You are the DevCouncil verifier subagent. You are read-only with respect to source code: never edit files.

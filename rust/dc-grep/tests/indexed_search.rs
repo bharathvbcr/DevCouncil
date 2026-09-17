@@ -1,10 +1,33 @@
 use std::fs;
-use std::io::Write;
+use std::fs::TryLockError;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+
+mod support;
+
+/// How long a `dcgrep` call may take while the cache lock is held against it.
+///
+/// Not a speed limit. The writer-contention test below holds the lock across
+/// the call and releases it only after the call returns, so an implementation
+/// that waited for the lock would be waiting for something that never
+/// arrives: the choice is between returning in milliseconds and never
+/// returning at all. Measured worst case for both calls together, on a machine
+/// with all 18 cores saturated, was 28ms — so this is roughly a thousandfold
+/// margin over the fast branch, and still finite over the hung one.
+const UNBLOCKED: Duration = Duration::from_secs(30);
+
+/// How long the fixture will wait to take a lock that is held by nobody.
+///
+/// An flock belongs to the open file description, so any process that holds
+/// one and then spawns a child leaks a duplicate into it until it execs — and
+/// this process spawns `dcgrep` children from eight threads throughout. The
+/// product side of this is `WRITER_LOCK_SETTLES` in `index.rs`, which is what
+/// keeps `dcgrep index` from reporting a phantom lock as "busy". This constant
+/// covers the half `build_index` cannot: the fixture taking the lock itself.
+const LOCK_SETTLES: Duration = Duration::from_secs(5);
 
 struct Repo(PathBuf);
 
@@ -26,26 +49,29 @@ impl Repo {
         fs::write(path, contents).unwrap();
     }
 
-    fn call(&self, command: &str, mut request: Value) -> (bool, Value) {
-        request["root"] = json!(self.0);
-        let mut child = Command::new(env!("CARGO_BIN_EXE_dcgrep"))
-            .arg(command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(request.to_string().as_bytes())
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
-        let reply = serde_json::from_slice(&output.stdout).expect("one JSON reply");
-        (output.status.success(), reply)
+    fn call(&self, command: &str, request: Value) -> (bool, Value) {
+        self.call_within(command, request, support::CALL_BOUND)
     }
 
+    /// `call`, but refusing to wait past `within`.
+    ///
+    /// A test that asserts a call did not block cannot do it after the fact: a
+    /// check placed below an unbounded wait only runs once that wait has
+    /// already returned, which is the one case it does not need to check. The
+    /// bound has to sit on the wait itself, and that is what turns "hangs the
+    /// suite" into "fails this test, with a reason".
+    fn call_within(&self, command: &str, mut request: Value, within: Duration) -> (bool, Value) {
+        request["root"] = json!(self.0);
+        let (ok, stdout) = support::run(command, request.to_string().as_bytes(), within);
+        let reply = serde_json::from_slice(&stdout).expect("one JSON reply");
+        (ok, reply)
+    }
+
+    // `track_caller` on both helpers because every test reaches the searcher
+    // and the indexer through them: without it each of the ~40 call sites
+    // reports the same two lines in here, and a failure says which assertion
+    // broke but not which call broke it.
+    #[track_caller]
     fn index(&self) -> Value {
         let (ok, reply) = self.call("index", json!({}));
         assert!(ok, "index command must succeed: {reply}");
@@ -53,6 +79,7 @@ impl Repo {
         reply
     }
 
+    #[track_caller]
     fn search(&self, pattern: &str) -> Value {
         let (ok, reply) = self.call("search", json!({"pattern": pattern}));
         assert!(ok, "search must succeed: {reply}");
@@ -229,16 +256,51 @@ fn writer_contention_falls_back_without_blocking_or_publishing() {
         .write(true)
         .open(repo.0.join(".devcouncil/dcgrep/cache.lock"))
         .unwrap();
-    lock.try_lock().unwrap();
-    let started = std::time::Instant::now();
-    let result = repo.search("needle");
+    // The fixture taking the lock is exposed to the same phantom hold as
+    // everything else here, and is the one half `build_index` cannot cover:
+    // a sibling test's fork may still hold a duplicate of a descriptor this
+    // process already closed. I never saw this fire in ~900 runs, unlike the
+    // release side; it is retried because it is the same race, not because
+    // it was observed.
+    //
+    // Only `WouldBlock` is waited out, for the same reason `build_index` only
+    // waits that one out: an I/O error means the lock is unusable here and no
+    // amount of waiting changes it, so spinning on one would spend the whole
+    // budget and then blame contention for something else entirely.
+    let acquired = Instant::now() + LOCK_SETTLES;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::Error(err)) => {
+                panic!("the fixture's cache lock is unusable: {err}")
+            }
+            Err(TryLockError::WouldBlock) => {
+                assert!(
+                    Instant::now() < acquired,
+                    "the fixture could not take the cache lock it needs in order \
+                     to create contention in the first place"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    // Both calls run against a lock that is held until after they return, so
+    // each one is bounded rather than timed: see `UNBLOCKED`. The elapsed-time
+    // assertion this replaces could not fail for the blocking it was named
+    // for -- an indexer that waited for the lock would have hung inside the
+    // unbounded `wait_with_output`, and the check below it would never run.
+    let (searched, result) = repo.call_within("search", json!({"pattern": "needle"}), UNBLOCKED);
+    assert!(searched, "search must succeed: {result}");
     assert_eq!(result["count"], 1);
     assert_eq!(result["index"]["status"], "scan");
-    let (ok, failure) = repo.call("index", json!({}));
+    let (ok, failure) = repo.call_within("index", json!({}), UNBLOCKED);
     assert!(!ok);
     assert!(failure["error"].as_str().unwrap().contains("busy"));
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
     drop(lock);
+    // Plain `index()` on purpose. Absorbing the phantom lock is the
+    // product's job now (`WRITER_LOCK_SETTLES`), so this asserts the
+    // contract instead of working around it: if that retry ever regresses,
+    // this line fails with the refusal rather than hiding it.
     repo.index();
 }
 

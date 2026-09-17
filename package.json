@@ -50,6 +50,7 @@
     "check:workflows": "node scripts/check-workflows.mjs",
     "agents:sync": "node scripts/sync-agent-defs.mjs",
     "agents:check": "node scripts/sync-agent-defs.mjs --check",
+    "agents:prefixes": "node scripts/mcp-served-tools.mjs",
     "test:scripts": "node --test scripts/check-release.test.mjs scripts/check-workflows.test.mjs scripts/sync-agent-defs.test.mjs",
     "ci:local": "node scripts/ci-local.mjs"
   },

@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -156,8 +157,17 @@ type Result struct {
 	// Truncated reports that the match limit stopped the walk early.
 	Truncated bool `json:"truncated"`
 	// Limit is the bound that did the stopping, present when Truncated is.
-	Limit              int     `json:"limit"`
-	FilesSearched      int     `json:"files_searched"`
+	Limit         int `json:"limit"`
+	FilesSearched int `json:"files_searched"`
+	// FilesPruned counts files the searcher proved could not change the
+	// answer and so never opened. It is only ever set alongside Truncated.
+	//
+	// Carried separately from FilesSearched, and deliberately not added into
+	// Skipped.Total: a pruned file is not a hole in the coverage. Folding it
+	// into either number would make a caller report missing coverage that was
+	// proved absent, and leaving it out entirely would make FilesSearched look
+	// like the searcher had gone blind over most of the tree.
+	FilesPruned        int     `json:"files_pruned"`
 	Skipped            Skipped `json:"skipped"`
 	IgnoreRulesApplied bool    `json:"ignore_rules_applied"`
 }
@@ -202,8 +212,9 @@ func (c *Client) run(ctx context.Context, command string, req any, out any) erro
 	defer cancel()
 
 	// #nosec G204 -- c.Binary is the searcher this harness configured and
-	// command is one of the two literals this file passes ("search", "files").
-	// Neither reaches here from a caller, let alone from a model.
+	// command is one of the four literals this file passes ("search", "files",
+	// "index", "rank"). Neither reaches here from a caller, let alone from a
+	// model.
 	cmd := exec.CommandContext(ctx, c.Binary, command)
 	// See proc.ConfigureGroup. The searcher spawns nothing today, which is
 	// exactly the argument that was made at the boundaries where a grandchild
@@ -288,6 +299,92 @@ func validate(out any) error {
 			return errors.New("searcher reported truncation without the limit that caused it")
 		}
 		return validSkipped(reply.Skipped, reply.FilesSearched)
+	case *RankedResult:
+		if reply.Count != len(reply.Files) {
+			return fmt.Errorf("searcher reported %d ranked files and sent %d",
+				reply.Count, len(reply.Files))
+		}
+		last := math.Inf(1)
+		for _, file := range reply.Files {
+			if err := validPath(file.Path); err != nil {
+				return fmt.Errorf("ranked path: %w", err)
+			}
+			// A score that is not a number compares false against every
+			// threshold, so a caller filtering by relevance would silently
+			// drop the file rather than see a bad value.
+			if math.IsNaN(file.Score) || math.IsInf(file.Score, 0) {
+				return fmt.Errorf("ranked file %s carries score %v, which is not a number",
+					file.Path, file.Score)
+			}
+			if file.Score <= 0 {
+				return fmt.Errorf("ranked file %s scored %v, so it is not an answer",
+					file.Path, file.Score)
+			}
+			// The order is the answer. A list that is not descending has
+			// either been reordered in transit or ranked by something other
+			// than the score it reports, and a caller reading the first row
+			// as "best" would be wrong either way.
+			if file.Score > last {
+				return fmt.Errorf("ranked files are not in descending order at %s (%v after %v)",
+					file.Path, file.Score, last)
+			}
+			last = file.Score
+			if file.TermsPresent < 0 {
+				return fmt.Errorf("ranked file %s holds %d terms, which is not a count",
+					file.Path, file.TermsPresent)
+			}
+		}
+		if reply.Truncated && reply.Limit < 1 {
+			return errors.New("searcher reported truncation without the limit that caused it")
+		}
+		if reply.Vocabulary == "" {
+			return errors.New("searcher ranked without naming the vocabulary it ranked in")
+		}
+		if reply.StaleFiles > len(reply.Files) {
+			return fmt.Errorf("searcher reported %d stale files out of %d returned",
+				reply.StaleFiles, len(reply.Files))
+		}
+		return nil
+	case *IndexResult:
+		if reply.FilesIndexed > reply.FilesSeen {
+			return fmt.Errorf("index reported %d files indexed of %d seen",
+				reply.FilesIndexed, reply.FilesSeen)
+		}
+		if reply.LexicalFiles > reply.FilesIndexed {
+			return fmt.Errorf("index ranked %d files but only read %d",
+				reply.LexicalFiles, reply.FilesIndexed)
+		}
+		// A model name without a model vocabulary, or the reverse, means the
+		// two halves of the report disagree about what was published — and a
+		// caller deciding whether to trust a ranking reads exactly these.
+		if (reply.LexicalModel != "") != (reply.LexicalVocabulary != "" &&
+			reply.LexicalVocabulary != "code-v1") {
+			return fmt.Errorf("index names model %q in vocabulary %q",
+				reply.LexicalModel, reply.LexicalVocabulary)
+		}
+		// A build that stopped short must say so. `traversal_complete` is
+		// what a caller reads to decide whether an empty search result means
+		// anything, so it may not be true while a limit is named.
+		if reply.TraversalComplete && reply.LimitReason != "" {
+			return fmt.Errorf("index claims a complete traversal and names limit %q",
+				reply.LimitReason)
+		}
+		for name, count := range map[string]int{
+			"files_seen":        reply.FilesSeen,
+			"files_indexed":     reply.FilesIndexed,
+			"files_unindexed":   reply.FilesUnindexed,
+			"walk_errors":       reply.WalkErrors,
+			"postings":          reply.Postings,
+			"lexical_files":     reply.LexicalFiles,
+			"lexical_postings":  reply.LexicalPostings,
+			"lexical_unindexed": reply.LexicalUnindexed,
+			"lexical_unmatched": reply.LexicalUnmatched,
+		} {
+			if count < 0 {
+				return fmt.Errorf("index reported %s = %d, which is not a count", name, count)
+			}
+		}
+		return nil
 	case *ListResult:
 		if reply.Count != len(reply.Paths) {
 			return fmt.Errorf("searcher reported %d paths and sent %d", reply.Count, len(reply.Paths))
@@ -364,6 +461,10 @@ func okOf(out any) (bool, string) {
 		return reply.OK, reply.Error
 	case *ListResult:
 		return reply.OK, reply.Error
+	case *RankedResult:
+		return reply.OK, reply.Error
+	case *IndexResult:
+		return reply.OK, reply.Error
 	default:
 		return false, "the client decoded a reply shape it does not know how to check"
 	}
@@ -416,6 +517,139 @@ func (c *Client) List(ctx context.Context, req ListRequest) (*ListResult, error)
 	req.Root = c.Root
 	var out ListResult
 	if err := c.run(ctx, "files", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// IndexRequest builds the cached indexes for a repository.
+//
+// One request builds both: the trigram index the exact searcher uses to skip
+// files, and the ranked index Rank scores against. They are one artifact in
+// one published slot, so there is no way to hold a fresh one and a stale one.
+type IndexRequest struct {
+	// Root is the repository. Set by Index from the client.
+	Root string `json:"root"`
+	// MaxFiles bounds the build. Zero means the searcher's ceiling.
+	MaxFiles int `json:"max_files,omitempty"`
+	// Sparse is the output of a learned sparse encoder run offline against
+	// this repository — scripts/encode-sparse.py writes it. Empty means the
+	// ranked index is built from the searcher's own tokeniser and BM25, which
+	// needs no model.
+	//
+	// The searcher never loads a model either way: a learned index carries
+	// the token and weight tables a query is scored against, so this path is
+	// read at build time and never again.
+	Sparse string `json:"sparse,omitempty"`
+}
+
+// IndexResult is what one index build did, including what it could not do.
+type IndexResult struct {
+	OK                 bool   `json:"ok"`
+	Error              string `json:"error"`
+	Engine             string `json:"engine"`
+	FilesSeen          int    `json:"files_seen"`
+	FilesIndexed       int    `json:"files_indexed"`
+	FilesUnindexed     int    `json:"files_unindexed"`
+	WalkErrors         int    `json:"walk_errors"`
+	TraversalComplete  bool   `json:"traversal_complete"`
+	LimitReason        string `json:"limit_reason"`
+	InputBytes         int64  `json:"input_bytes"`
+	Postings           int    `json:"postings"`
+	CacheWarning       string `json:"cache_warning"`
+	LexicalFiles       int    `json:"lexical_files"`
+	LexicalPostings    int    `json:"lexical_postings"`
+	LexicalUnindexed   int    `json:"lexical_unindexed"`
+	LexicalLimitReason string `json:"lexical_limit_reason"`
+	LexicalVocabulary  string `json:"lexical_vocabulary"`
+	// LexicalModel names the encoder whose weights were imported, and is
+	// empty when the searcher computed them itself.
+	LexicalModel string `json:"lexical_model"`
+	// LexicalUnmatched counts documents the encoding described that the walk
+	// never reached — deleted, ignored, or never in this repository. They are
+	// dropped rather than indexed, so a large number means the encoding is
+	// stale and the ranking covers less than the caller expects.
+	LexicalUnmatched int `json:"lexical_unmatched"`
+}
+
+// RankedRequest asks which files are about something.
+type RankedRequest struct {
+	// Query is words, not a regular expression.
+	Query string `json:"query"`
+	// Root is the repository. Set by Rank from the client.
+	Root string `json:"root"`
+	// Path scopes the ranking under Root.
+	Path string `json:"path,omitempty"`
+	// MaxResults bounds the file list. Zero means the searcher's default.
+	MaxResults int `json:"max_results,omitempty"`
+}
+
+// RankedFile is one file and how much it is about the query.
+type RankedFile struct {
+	Path  string  `json:"path"`
+	Score float64 `json:"score"`
+	// TermsPresent is how many of the query's terms this file holds.
+	TermsPresent int `json:"terms_present"`
+	// Stale marks a file whose indexed copy is no longer what is on disk.
+	// The file is still ranked — it was about the query when it was read —
+	// but quoting it without reading it first quotes history.
+	Stale bool `json:"stale"`
+}
+
+// RankedResult is one ranking.
+type RankedResult struct {
+	OK        bool         `json:"ok"`
+	Error     string       `json:"error"`
+	Query     string       `json:"query"`
+	Count     int          `json:"count"`
+	Files     []RankedFile `json:"files"`
+	Truncated bool         `json:"truncated"`
+	Limit     int          `json:"limit"`
+	// Vocabulary names the term space the ranking used, so a caller can tell
+	// a BM25 ranking from a learned one without asking a second question.
+	Vocabulary   string `json:"vocabulary"`
+	FilesIndexed int    `json:"files_indexed"`
+	TermsUnknown int    `json:"terms_unknown"`
+	TermsTotal   int    `json:"terms_total"`
+	TermsDropped int    `json:"terms_dropped"`
+	StaleFiles   int    `json:"stale_files"`
+}
+
+// Index builds the cached indexes for the repository.
+//
+// The searcher works without them — every search falls back to a live walk —
+// so this is acceleration and ranking, never correctness. A build that fails
+// is reported; it does not make the repository unsearchable.
+func (c *Client) Index(ctx context.Context, req IndexRequest) (*IndexResult, error) {
+	if c == nil || c.Binary == "" {
+		return nil, ErrNoBinary
+	}
+	req.Root = c.Root
+	var out IndexResult
+	if err := c.run(ctx, "index", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Rank returns the files most about a query, in rank order.
+//
+// This is the question Search cannot answer. Search takes a pattern and finds
+// the lines that contain it; a reader asking about "json response parsing" is
+// not naming a substring, and for that question every file is a better or
+// worse answer rather than a hit or a miss.
+//
+// An error here includes "this repository has no index", which is deliberately
+// not an empty list: a repository nobody has indexed and a repository where
+// nothing is about the query are different facts, and a caller that cannot
+// tell them apart will report the second when it means the first.
+func (c *Client) Rank(ctx context.Context, req RankedRequest) (*RankedResult, error) {
+	if c == nil || c.Binary == "" {
+		return nil, ErrNoBinary
+	}
+	req.Root = c.Root
+	var out RankedResult
+	if err := c.run(ctx, "rank", req, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

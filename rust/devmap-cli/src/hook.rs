@@ -101,6 +101,23 @@ const NAVIGATION_TOOLS: &[&str] = &[
 const NAVIGATION_COMMANDS: &[&str] =
     &["rg", "grep", "egrep", "fgrep", "ugrep", "ag", "ack", "find"];
 
+/// Shell verbs that read a file's contents rather than searching for one.
+///
+/// Kept apart from [`NAVIGATION_COMMANDS`] because a search verb is navigation
+/// whatever its target, while a read verb is navigation only when it is aimed at
+/// source. The distinction is not hypothetical: over 160,960 Bash calls measured
+/// on 2026-09-17, 25.8% ended in a bare `| tail -25` or `| head -60` closing a
+/// build or test run. Treating the verb alone as navigation would fire the nudge
+/// on the tail of every `npm test`, which is the same mistake as counting the
+/// session's first `git status`.
+///
+/// `ls` is deliberately absent: it names a directory, not a file to read, and it
+/// is the most common leading verb in a shell session that is not looking for
+/// code at all.
+const READ_COMMANDS: &[&str] = &[
+    "cat", "head", "tail", "sed", "awk", "bat", "nl", "less", "more",
+];
+
 /// Shell tool names whose payload carries a command to sniff.
 const SHELL_TOOLS: &[&str] = &["bash", "shell", "run_terminal_cmd", "terminal"];
 
@@ -1080,7 +1097,46 @@ fn command_is_search(command: &str) -> bool {
             return false;
         };
         let verb = verb.rsplit('/').next().unwrap_or(verb);
-        NAVIGATION_COMMANDS.contains(&verb)
+        if NAVIGATION_COMMANDS.contains(&verb) {
+            return true;
+        }
+        // A read verb is navigation only when *this* segment names source. The
+        // segment, not the whole line: `npm test foo.rs | tail -25` must not be
+        // navigation because of a filename that belongs to another segment.
+        READ_COMMANDS.contains(&verb) && segment_reads_source(segment)
+    })
+}
+
+/// Whether a shell segment names a file some language spec claims.
+///
+/// The extension table is [`devmap_extract::languages`], the same one the
+/// indexer uses to decide what it will parse. A hand-kept list here would answer
+/// "is this code" differently from the thing that indexes code, and the first
+/// language added to one and not the other would make the nudge silently
+/// language-specific.
+///
+/// A redirection target is skipped: `sed -n 1,5p x.rs > out.rs` is still a read
+/// of `x.rs`, but `cat /dev/null > main.rs` names source only as a destination
+/// and is not navigation.
+fn segment_reads_source(segment: &str) -> bool {
+    // Everything from the first redirection onward names a destination, not
+    // something being read. Truncating there is simpler than tracking which
+    // operator takes a following word, and it cannot mistake a write target for
+    // a read: `cat /dev/null > main.rs` reads no source.
+    let read_part = segment.split_once('>').map_or(segment, |(before, _)| before);
+    let mut words = read_part.split_whitespace();
+    let _ = words.next(); // the verb
+    words.any(|word| {
+        let stem = word.trim_matches(|c: char| c == '"' || c == '\'' || c == ';');
+        if stem.starts_with('-') {
+            return false;
+        }
+        stem.rsplit_once('.').is_some_and(|(name, ext)| {
+            !name.is_empty()
+                && !ext.is_empty()
+                && !ext.contains('/')
+                && devmap_extract::languages::find_spec_by_extension(ext).is_some()
+        })
     })
 }
 
@@ -2113,6 +2169,101 @@ mod tests {
                 "classifying {command:?}"
             );
         }
+    }
+
+    /// A read verb is navigation only when it is aimed at source.
+    ///
+    /// The false-accept half of this table is the point. Of 160,960 Bash calls
+    /// measured on 2026-09-17, 25.8% ended in a bare `| tail -N` or `| head -N`
+    /// closing a build or test run; classifying the verb alone would fire the
+    /// nudge on the tail of every `npm test`. Each `false` row below is a shape
+    /// that actually occurs in that corpus.
+    #[test]
+    fn a_read_verb_is_navigation_only_when_it_names_source() {
+        for (command, expected) in [
+            // Aimed at source: this is an agent reading code.
+            ("sed -n '1,60p' scripts/run-vitest.js", true),
+            ("cat rust/devmap-cli/src/hook.rs", true),
+            ("head -40 main.go", true),
+            ("sed -n '80,200p' manuscript_citation_verification.go", true),
+            ("cat foo.rs 2>/dev/null", true),
+            ("sed -n '1,5p' x.rs > /tmp/out", true),
+            ("cat a.py | rg TODO", true),
+            // Not source, or not a read of anything.
+            ("npx vitest run scripts/__tests__/ 2>&1 | tail -25", false),
+            ("cargo test 2>&1 | head -60", false),
+            ("npm test -- scripts/ 2>&1 | tail -25", false),
+            ("cat package.json", false),
+            ("cat Cargo.lock", false),
+            ("sed -n '155,200p' cloudbuild.yaml", false),
+            ("cat .env", false),
+            ("ls -la src/", false),
+            ("git status", false),
+            // A write target is not a read, even when it names source.
+            ("cat /dev/null > main.rs", false),
+            ("cat > lib.rs", false),
+            // A bare read with no file argument names nothing to read.
+            ("tail -25", false),
+            ("cat", false),
+        ] {
+            let payload = json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            });
+            assert_eq!(
+                is_navigation_payload(&payload),
+                expected,
+                "classifying {command:?}"
+            );
+        }
+    }
+
+    /// The extension table is the indexer's, not a second copy.
+    ///
+    /// A hand-kept list here would answer "is this code" differently from the
+    /// thing that indexes code. This asserts the shared table is actually
+    /// consulted, by checking a language no local list would have thought to
+    /// include.
+    #[test]
+    fn source_detection_uses_the_shared_language_table() {
+        // Languages no list written from memory here would have covered. The
+        // first draft of this test asserted `.zig` and `.ex`, which the table
+        // does not carry — the table is the authority, not recollection.
+        for ext in ["rs", "go", "py", "ts", "swift", "kt", "scala", "dart", "vue", "nix", "sol"] {
+            let command = format!("cat thing.{ext}");
+            assert!(
+                command_is_search(&command),
+                "`{command}` should be navigation; {ext} is in the language table"
+            );
+        }
+        // Data, config and — most importantly — secrets. `.env` and `.lock`
+        // appear elsewhere in `languages.rs`, in its ignore helpers rather than
+        // in any spec's extensions, so the lookup must not claim them. Reading a
+        // secrets file is never something to nudge an agent towards.
+        for ext in ["json", "lock", "yaml", "yml", "toml", "md", "txt", "env", "csv"] {
+            let command = format!("cat thing.{ext}");
+            assert!(
+                !command_is_search(&command),
+                "`{command}` must not be navigation; {ext} is not code"
+            );
+        }
+        assert!(
+            !command_is_search("cat .env"),
+            "a bare secrets file has no name before its extension and is not source"
+        );
+    }
+
+    /// A filename in one segment must not make another segment navigation.
+    #[test]
+    fn source_is_looked_for_in_the_reading_segment_only() {
+        assert!(
+            !command_is_search("cargo build lib.rs | tail -5"),
+            "`tail -5` reads no file; the .rs belongs to the cargo segment"
+        );
+        assert!(
+            command_is_search("cargo build | sed -n '1,5p' lib.rs"),
+            "the sed segment does name source"
+        );
     }
 
     /// `echo grep` must not count: the verb is `echo`, and only the first word

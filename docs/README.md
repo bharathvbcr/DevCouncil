@@ -12,6 +12,7 @@ CLI. [Project overview](../README.md) · [Website](https://devcouncil.vbcr.dev/)
 | Install and map my first repository | [Quickstart](quickstart.md) |
 | Connect an editor or coding agent | [Coding CLI integration](coding-cli-integration.md) |
 | Find symbols, callers, impact and candidate tests | [Code graph guide](code-graph.md) |
+| Search text exactly, or rank files by what they are about | [Ranked search](lexical-search.md) |
 | Choose a binary, library or host boundary | [Architecture](architecture.md) |
 | Use tasks, leases and verification | [Task workflow](workflow.md) and [MCP task loop](hero-loop.md) |
 | Look up commands and flags | [CLI reference](cli-reference.md) |

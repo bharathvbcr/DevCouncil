@@ -155,6 +155,89 @@ func TestTheListingAndTheSearchAgreeAcrossTheBoundary(t *testing.T) {
 	}
 }
 
+// TestTheLearnedTierWorksEndToEndAcrossTheBoundary drives the whole learned
+// path with both halves real: a hand-written encoding standing in for a model
+// run, the Rust binary importing it, and this client reading the ranking back.
+//
+// Hand-written on purpose. If a fixture a test can type is enough to produce a
+// learned ranking, then nothing on the search path loads a model — which is
+// the property that keeps this boundary one fork/exec of a static binary
+// rather than a Python runtime the orchestrator has to own.
+func TestTheLearnedTierWorksEndToEndAcrossTheBoundary(t *testing.T) {
+	root := scratchRepo(t, map[string]string{
+		"src/alpha.go": "package alpha\n",
+		"src/beta.go":  "package beta\n",
+	})
+	// The encoding lives outside the repository, where a producer writes it
+	// and where the walk cannot index it into the thing it describes.
+	encoding := filepath.Join(t.TempDir(), "sparse.jsonl")
+	// Ids are positions in `vocab`. The parity pairs are what the searcher
+	// replays through its own tokeniser before it will publish anything; these
+	// are the ids it genuinely produces, so the build is expected to succeed.
+	body := strings.Join([]string{
+		`{"schema":1,"model":"interop-fixture","vocabulary":"wordpiece-30522",` +
+			`"vocab":["[UNK]","parse","json","server"],` +
+			`"query_weights":[0.0,2.0,3.0,1.0],` +
+			`"parity":[{"text":"parse","ids":[1]},{"text":"json","ids":[2]}]}`,
+		`{"path":"src/alpha.go","total_terms":12,"terms":[[2,0.90]]}`,
+		`{"path":"src/beta.go","total_terms":12,"terms":[[2,0.10]]}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(encoding, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client := realClient(t, root)
+	built, err := client.Index(context.Background(), IndexRequest{Sparse: encoding})
+	if err != nil {
+		t.Fatalf("the learned build must succeed: %v", err)
+	}
+	if built.LexicalVocabulary != "wordpiece-30522" {
+		t.Fatalf("the build did not publish a learned index: %+v", built)
+	}
+	if built.LexicalModel != "interop-fixture" {
+		t.Fatalf("the build did not attribute the weights: %+v", built)
+	}
+
+	ranked, err := client.Rank(context.Background(), RankedRequest{Query: "json"})
+	if err != nil {
+		t.Fatalf("rank: %v", err)
+	}
+	if ranked.Vocabulary != "wordpiece-30522" {
+		t.Fatalf("the ranking came from the wrong term space: %+v", ranked)
+	}
+	// alpha outweighs beta nine to one in the encoding and nowhere else — the
+	// two files' text is the same length and shares no word with the query.
+	if len(ranked.Files) != 2 || ranked.Files[0].Path != "src/alpha.go" {
+		t.Fatalf("the encoder's weights did not decide the order: %+v", ranked.Files)
+	}
+
+	// And a tokeniser that disagrees must refuse rather than publish. The
+	// claim below is false: this build resolves "parse" to 1, not 3.
+	bad := strings.Replace(body, `{"text":"parse","ids":[1]}`, `{"text":"parse","ids":[3]}`, 1)
+	if err := os.WriteFile(encoding, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.Index(context.Background(), IndexRequest{Sparse: encoding})
+	if err == nil {
+		t.Fatalf("a tokeniser disagreement must refuse the build, got %+v", result)
+	}
+	if !strings.Contains(err.Error(), "disagrees with the model") {
+		t.Fatalf("the refusal must name the cause: %v", err)
+	}
+
+	// The refused build published nothing, so the previous index is still the
+	// one that answers. A half-published slot would show up here as a ranking
+	// that changed without a successful build.
+	again, err := client.Rank(context.Background(), RankedRequest{Query: "json"})
+	if err != nil {
+		t.Fatalf("the previous index must still answer: %v", err)
+	}
+	if len(again.Files) != 2 || again.Files[0].Path != "src/alpha.go" {
+		t.Fatalf("a refused build disturbed the published index: %+v", again.Files)
+	}
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"
