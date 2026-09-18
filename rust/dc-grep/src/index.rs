@@ -22,7 +22,36 @@ use crate::{DEFAULT_MAX_FILE_BYTES, build_walker, open_for_search, resolve_roots
 // a file missing from its integrity set — the check that would otherwise fail
 // with "lexical.bin changed after publication" about a file that was never
 // written.
-const CACHE_SCHEMA: u32 = 2;
+//
+// Bumped to 3 with `lexical::store::SCHEMA`, and it has to move whenever that
+// does. The two numbers guard the same slot at different depths, and only this
+// one is checked early enough to say something useful: an operator who upgrades
+// the binary over an existing cache otherwise reaches `Reader::open` and is
+// told "lexical index is schema 2, this build reads 3" in the middle of a
+// query, where the answer they need is "rebuild with dcgrep index" — which is
+// exactly what refusing here says.
+const CACHE_SCHEMA: u32 = 3;
+
+// The slot's number must never fall behind the ranked index's.
+//
+// They guard the same published slot at different depths, and only
+// `CACHE_SCHEMA` is read early enough to answer "rebuild with dcgrep index".
+// If `lexical::store::SCHEMA` moves alone, an operator who upgrades over an
+// existing cache gets `Reader::open`'s raw complaint in the middle of a query
+// instead — a correct refusal that tells them nothing they can act on.
+//
+// Not equality: `CACHE_SCHEMA` has its own reasons to move, such as a seventh
+// file joining `INDEX_FILES`. Only the direction that loses a usable error
+// message is a fault.
+//
+// Checked at compile time rather than by a test, because a test can only fail
+// after a binary with the wrong pairing has already been built.
+const _: () = assert!(
+    CACHE_SCHEMA >= crate::lexical::store::SCHEMA,
+    "lexical::store::SCHEMA is ahead of CACHE_SCHEMA; bump CACHE_SCHEMA so a \
+     stale slot is refused where the message is useful"
+);
+
 const MAX_INDEX_FILES: usize = 50_000;
 const MAX_INDEX_POSTINGS: usize = 2_000_000;
 const MAX_INDEX_INPUT_BYTES: u64 = 128 * 1024 * 1024;
@@ -150,6 +179,30 @@ pub(crate) struct Candidates {
 /// established in one of them, which meant the other either repeated them or
 /// trusted them. Repeating them is how two readers come to disagree about
 /// whether a cache is valid.
+/// Why a published index could not be opened.
+///
+/// The two variants have opposite remedies, and collapsing them into one
+/// string is how `rank` came to tell callers that a repository holding a
+/// complete index had none — advising a build while a build was the thing
+/// holding the lock. Typed rather than sniffed from the message, because the
+/// caller that has to tell them apart is the one that phrases them.
+pub(crate) enum OpenFault {
+    /// A builder holds the lock. Nothing is wrong and nothing needs doing; the
+    /// condition clears when that build publishes.
+    Busy(String),
+    /// No index, a schema that this build cannot read, or an artifact that
+    /// failed its integrity check. None of these clear on their own.
+    Unusable(String),
+}
+
+impl OpenFault {
+    pub(crate) fn message(self) -> String {
+        match self {
+            OpenFault::Busy(message) | OpenFault::Unusable(message) => message,
+        }
+    }
+}
+
 pub(crate) struct Published {
     /// Held for as long as the caller reads. Dropping it republishes nothing;
     /// it only stops a build from recycling the slot mid-read.
@@ -159,31 +212,37 @@ pub(crate) struct Published {
 }
 
 impl Published {
-    pub(crate) fn open(root: &Path) -> Result<Self, String> {
-        let cache = cache_directory(root, false)?;
-        let lock = open_for_search(&cache.join("cache.lock")).map_err(error)?;
-        lock.try_lock_shared().map_err(error)?;
-        let current: Current = read_json(&cache.join("current.json"), 4096)?;
+    pub(crate) fn open(root: &Path) -> Result<Self, OpenFault> {
+        let cache = cache_directory(root, false).map_err(OpenFault::Unusable)?;
+        let lock = open_for_search(&cache.join("cache.lock"))
+            .map_err(|err| OpenFault::Unusable(error(err)))?;
+        acquire_reader_lock(&lock)?;
+        let current: Current =
+            read_json(&cache.join("current.json"), 4096).map_err(OpenFault::Unusable)?;
         if current.schema != CACHE_SCHEMA
             || current.root != root
             || !matches!(current.slot.as_str(), "slot-a" | "slot-b")
         {
-            return Err("cache identity or schema differs; rebuild with dcgrep index".into());
+            return Err(OpenFault::Unusable(
+                "cache identity or schema differs; rebuild with dcgrep index".into(),
+            ));
         }
         let slot = cache.join(&current.slot);
-        require_directory(&slot)?;
-        require_directory(&slot.join("integrity"))?;
-        bounded_regular_file(&slot.join("integrity/filestamps.json"), 16 * 1024)?;
-        let integrity =
-            tgrep_core::meta::read_file_evidence(&slot.join("integrity")).map_err(error)?;
+        require_directory(&slot).map_err(OpenFault::Unusable)?;
+        require_directory(&slot.join("integrity")).map_err(OpenFault::Unusable)?;
+        bounded_regular_file(&slot.join("integrity/filestamps.json"), 16 * 1024)
+            .map_err(OpenFault::Unusable)?;
+        let integrity = tgrep_core::meta::read_file_evidence(&slot.join("integrity"))
+            .map_err(|err| OpenFault::Unusable(error(err)))?;
         // Detect replaced, truncated, or edited artifacts before interpreting
         // their postings. The snapshots themselves are immutable while locked.
         for name in INDEX_FILES {
-            let metadata = bounded_regular_file(&slot.join(name), MAX_CACHE_FILE_BYTES)?;
+            let metadata = bounded_regular_file(&slot.join(name), MAX_CACHE_FILE_BYTES)
+                .map_err(OpenFault::Unusable)?;
             if integrity.version(name) != Some(&file_version(&metadata)) {
-                return Err(format!(
+                return Err(OpenFault::Unusable(format!(
                     "{name} changed after publication; rebuild with dcgrep index"
-                ));
+                )));
             }
         }
         Ok(Published {
@@ -235,7 +294,7 @@ impl Candidates {
             lock,
             slot,
             files_indexed,
-        } = Published::open(root)?;
+        } = Published::open(root).map_err(OpenFault::message)?;
         let reader = IndexReader::open(&slot).map_err(error)?;
         reader.validate_lookup()?;
         if reader.num_files() != files_indexed {
@@ -697,6 +756,42 @@ fn acquire_writer_lock(lock: &File) -> Result<(), String> {
     }
 }
 
+/// Takes the shared read lock, distinguishing a running build from a broken
+/// lock — and waiting briefly, because most contention is the publish itself.
+///
+/// A build holds this lock for the whole build, so waiting cannot outlast a
+/// real one; what it does outlast is the slot flip, which is the window a
+/// reader is overwhelmingly likely to land in. Stressing `rank` against
+/// repeated republishes, 29% of reads were refused without this wait.
+///
+/// `WouldBlock` is the only thing retried. An I/O error means locking is
+/// unavailable here and no amount of waiting changes it — and it must not be
+/// reported as a running build, because that would tell a caller to wait for
+/// something that is never going to happen.
+fn acquire_reader_lock(lock: &File) -> Result<(), OpenFault> {
+    let deadline = Instant::now() + WRITER_LOCK_SETTLES;
+    loop {
+        match lock.try_lock_shared() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::Error(err)) => {
+                return Err(OpenFault::Unusable(format!(
+                    "the index lock could not be taken: {err}"
+                )));
+            }
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(OpenFault::Busy(
+                        "a build is publishing this repository's index; \
+                         retry the query in a moment"
+                            .into(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
+
 fn error(err: impl std::fmt::Display) -> String {
     err.to_string()
 }
@@ -778,6 +873,10 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{IndexRequest, MAX_INDEX_DURATION, build_with_limits};
+
+    // The CACHE_SCHEMA/store::SCHEMA ordering was asserted here. It is a fact
+    // about two constants, so it now sits beside them as a `const` assertion
+    // and fails the build rather than a test run.
     use std::fs;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

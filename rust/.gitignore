@@ -10,6 +10,8 @@
 *.sqlite-wal
 *.sqlite-shm
 *.db
+*.db-wal
+*.db-shm
 
 # Mutation testing run output (regenerate with cargo mutants)
 mutants.out/
@@ -17,6 +19,11 @@ mutants.out.old/
 
 # Generated coverage dump. Not source; paths go stale the moment the tree moves.
 lcov.info
+*.profraw
+*.profdata
+
+# rustfmt backup files
+*.rs.bk
 
 # testdata is extractor *input*, not build output.
 #

@@ -310,6 +310,59 @@ func TestAClientBuiltWithoutNewIsStillBounded(t *testing.T) {
 		t.Fatalf("a zero-valued client must fall back to the package bounds, got %d/%d",
 			bare.outputBound(), bare.stderrBound())
 	}
+	if bare.listOutputBound() != maxListOutput {
+		t.Fatalf("a zero-valued client must bound a listing too, got %d",
+			bare.listOutputBound())
+	}
+}
+
+// TestAnOversizedListingIsRefusedToo covers the bound the listing does not
+// share with the search.
+//
+// A listing carries paths rather than lines, so it is bounded by a larger
+// number — and a larger number is still a number. The risk in giving it its
+// own bound is that it ends up with none: the search path would keep its
+// refusal while a runaway listing was decoded from whatever arrived.
+func TestAnOversizedListingIsRefusedToo(t *testing.T) {
+	client := New(fake(t, "biglist.sh",
+		"#!/bin/sh\necho '{\"ok\":true,\"count\":1,\"paths\":[\"a.txt\"]}'\n"),
+		t.TempDir())
+	client.maxListOutput = 8 // smaller than any well-formed listing
+
+	_, err := client.List(context.Background(), ListRequest{MaxResults: MaxListResults})
+	if err == nil {
+		t.Fatal("a listing over the cap must be refused")
+	}
+	if !strings.Contains(err.Error(), "more than 8 bytes") {
+		t.Fatalf("the error must name the bound it exceeded, got %v", err)
+	}
+}
+
+// TestTheListingBoundIsLargerThanTheSearchBound states the relationship the
+// two constants exist to have.
+//
+// They were one constant. A listing of MaxListResults paths does not fit in
+// the search's bound, so sharing it would have meant raising the listing
+// ceiling and then overflowing the transport instead — the same truncation one
+// layer down, reported as a different error.
+func TestTheListingBoundIsLargerThanTheSearchBound(t *testing.T) {
+	if maxListOutput <= maxOutput {
+		t.Fatalf("the listing bound (%d) must exceed the search bound (%d)",
+			maxListOutput, maxOutput)
+	}
+	// Enough room for the ceiling this package asks for, at a measured cost
+	// per path rather than a guessed one.
+	//
+	// This was 64, called "generous". Listing a real 200,000-file tree of
+	// deeply nested paths produced 25.4 MB, or 127 bytes per path including
+	// the JSON quoting — twice the guess. The bound held anyway, with 2.6x to
+	// spare, but the arithmetic that justified it did not, and a bound whose
+	// justification is wrong is a bound nobody can safely change.
+	const measuredPathBytes = 128
+	if need := MaxListResults * measuredPathBytes; maxListOutput < need {
+		t.Fatalf("a full listing of %d paths at %d bytes needs %d, the bound is %d",
+			MaxListResults, measuredPathBytes, need, maxListOutput)
+	}
 }
 
 // TestSkippedTotalCountsEveryReason decides whether the caller reports the

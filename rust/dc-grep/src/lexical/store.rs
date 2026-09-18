@@ -26,6 +26,7 @@
 //! postings     postings   x (u32 file_id, f32 weight)
 //! vocab        vocab_size x (u32 length, that many UTF-8 bytes)
 //! query_weights vocab_size x f32
+//! vocab_order  vocab_size x u32       token ids, sorted by token text
 //! ```
 //!
 //! The last two sections are what make a learned index self-contained, and
@@ -76,7 +77,15 @@ pub(crate) const MAGIC: [u8; 8] = *b"DCLEX\0\0\x01";
 /// section and is refused rather than read with the section assumed empty:
 /// "empty" and "absent" would score identically for `code-v1` and differently
 /// for a model, which is the kind of agreement that holds until it does not.
-pub(crate) const SCHEMA: u32 = 2;
+///
+/// Went to 3 when `vocab_order` joined it. The reader used to build a
+/// `HashMap<String, u32>` of the whole vocabulary at open — thirty thousand
+/// string allocations, on every query, to serve about ten lookups. Measured by
+/// holding the documents and postings fixed and varying only the vocabulary,
+/// that cost 1.0 ms per query at 30522 tokens and 3.4 ms at the 100000
+/// ceiling. The sorted index is four bytes per token on disk and turns a
+/// lookup into a binary search over bytes already in memory.
+pub(crate) const SCHEMA: u32 = 3;
 
 /// Postings kept in one index.
 ///
@@ -396,6 +405,15 @@ impl Builder {
         for weight in &self.query_weights {
             out.extend_from_slice(&weight.to_le_bytes());
         }
+        // Token ids in the order their text sorts. Written here rather than
+        // derived at open because deriving it is the cost this exists to
+        // remove, and because a sort proved once by the writer can be *checked*
+        // by the reader in one pass without allocating anything.
+        let mut order: Vec<u32> = (0..self.vocab.len() as u32).collect();
+        order.sort_unstable_by(|a, b| self.vocab[*a as usize].cmp(&self.vocab[*b as usize]));
+        for id in &order {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
         out
     }
 }
@@ -422,14 +440,16 @@ pub(crate) struct Reader {
     term_table_at: usize,
     postings_at: usize,
     path_offsets: Vec<(usize, usize)>,
-    /// Token text to token id, built once at open so a query pays a hash
-    /// lookup rather than a scan of thirty thousand strings per token.
+    /// Where each token's length prefix starts, indexed by token id.
     ///
-    /// This is the only copy of the vocabulary a loaded index keeps. A second
-    /// one indexed the other way would be thirty thousand more allocations to
-    /// answer a question this map already answers, and two structures that
-    /// have to be kept agreeing.
-    vocab_index: std::collections::HashMap<String, u32>,
+    /// One bulk allocation, not one per token. This replaced a
+    /// `HashMap<String, u32>`, which cost thirty thousand string allocations
+    /// at every open to answer about ten lookups — 1.0 ms per query at BERT's
+    /// vocabulary size, 3.4 ms at the format's ceiling.
+    vocab_starts: Vec<u32>,
+    /// Offset of `vocab_order`: token ids sorted by their text, which
+    /// `token_id` binary-searches without allocating.
+    vocab_order_at: usize,
     query_weights: Vec<f32>,
 }
 
@@ -444,7 +464,7 @@ impl fmt::Debug for Reader {
             .field("files", &self.files)
             .field("terms", &self.terms)
             .field("postings", &self.postings)
-            .field("vocab", &self.vocab_index.len())
+            .field("vocab", &self.vocab_starts.len())
             .field("bytes", &self.bytes.len())
             .finish()
     }
@@ -580,13 +600,16 @@ impl Reader {
         // Variable-length again, so the extent is discovered — and discovering
         // it is what proves every length prefix lands inside the file.
         let mut cursor = vocab_at;
-        let mut vocab_index = std::collections::HashMap::with_capacity(vocab_size);
+        let mut vocab_starts: Vec<u32> = Vec::with_capacity(vocab_size);
         for id in 0..vocab_size {
             if cursor + 4 > bytes.len() {
                 return Err(format!(
                     "lexical index is truncated before the length of vocabulary token {id}"
                 ));
             }
+            vocab_starts.push(u32::try_from(cursor).map_err(|_| {
+                "lexical index vocabulary is larger than an offset can address".to_string()
+            })?);
             let len = u32_at(&bytes, cursor) as usize;
             cursor += 4;
             if len == 0 || len > MAX_VOCAB_TOKEN_BYTES {
@@ -602,16 +625,11 @@ impl Reader {
                     "lexical index is truncated inside vocabulary token {id}"
                 ));
             }
-            let token = std::str::from_utf8(&bytes[cursor..end])
+            // Validated here and nowhere else, so the accessors below can hand
+            // out `&str` without re-checking. No `String` is built: the bytes
+            // are already in memory and stay there.
+            std::str::from_utf8(&bytes[cursor..end])
                 .map_err(|_| format!("lexical index vocabulary token {id} is not valid UTF-8"))?;
-            // A duplicate token would make one id unreachable and give the
-            // other its weight — the exact silent mis-scoring this format
-            // exists to prevent.
-            if vocab_index.insert(token.to_string(), id as u32).is_some() {
-                return Err(format!(
-                    "lexical index vocabulary repeats the token {token:?} at id {id}"
-                ));
-            }
             cursor = end;
         }
         let end = cursor
@@ -637,6 +655,21 @@ impl Reader {
             }
             query_weights.push(weight);
         }
+        let vocab_order_at = end;
+        let order_end = vocab_order_at
+            .checked_add(
+                vocab_size
+                    .checked_mul(4)
+                    .ok_or("lexical index order count overflows")?,
+            )
+            .ok_or("lexical index order table overflows")?;
+        if order_end > bytes.len() {
+            return Err(format!(
+                "lexical index is truncated inside its vocabulary order table: \
+                 needs {order_end} bytes, has {}",
+                bytes.len()
+            ));
+        }
 
         let reader = Reader {
             bytes,
@@ -647,9 +680,50 @@ impl Reader {
             term_table_at,
             postings_at,
             path_offsets,
-            vocab_index,
+            vocab_starts,
+            vocab_order_at,
             query_weights,
         };
+
+        // The order table is what `token_id` binary-searches, so an unsorted or
+        // repeating one does not fail loudly — it makes a token that is present
+        // resolve to nothing, and the query then scores against ids no document
+        // carries. Proved in one pass here: every id in range, and every token
+        // strictly greater than the one before, which is also what rules out a
+        // duplicate token and a repeated id.
+        let mut previous: Option<&str> = None;
+        for slot in 0..vocab_size {
+            let id = u32_at(&reader.bytes, reader.vocab_order_at + slot * 4);
+            if id as usize >= vocab_size {
+                return Err(format!(
+                    "lexical index vocabulary order names token {id}, outside the \
+                     {vocab_size}-token vocabulary"
+                ));
+            }
+            let token = reader
+                .token_text(id)
+                .ok_or("lexical index vocabulary order points outside the vocabulary")?;
+            // Equal and out-of-order are both fatal and are reported apart,
+            // because they are different mistakes: a repeat means one id is
+            // unreachable and takes the other's weight, and a mis-sort means
+            // the binary search misses tokens that are present. An operator
+            // reading one message should not have to guess which happened.
+            match previous {
+                Some(last) if last == token => {
+                    return Err(format!(
+                        "lexical index vocabulary repeats the token {token:?} at slot {slot}"
+                    ));
+                }
+                Some(last) if last > token => {
+                    return Err(format!(
+                        "lexical index vocabulary order is not ascending at slot {slot}: \
+                         {token:?} follows {last:?}"
+                    ));
+                }
+                _ => {}
+            }
+            previous = Some(token);
+        }
 
         // Proven, not assumed. An unsorted table makes the binary search in
         // `postings_for` miss terms that are present, and the symptom is an
@@ -717,9 +791,38 @@ impl Reader {
         )
     }
 
+    /// The text of one token, by id.
+    ///
+    /// Borrowed straight out of the index's own bytes. Both the length and the
+    /// UTF-8 were proved at open, so this cannot fail for an id in range and
+    /// costs nothing but two reads.
+    fn token_text(&self, id: u32) -> Option<&str> {
+        let start = *self.vocab_starts.get(id as usize)? as usize;
+        let len = u32_at(&self.bytes, start) as usize;
+        let from = start + 4;
+        // Checked at open; `from_utf8` here only to get a `&str` back.
+        std::str::from_utf8(self.bytes.get(from..from + len)?).ok()
+    }
+
     /// The id of one token, if the stored vocabulary holds it.
+    ///
+    /// A binary search over the stored order, not a hash lookup. The map this
+    /// replaced had to be built from thirty thousand freshly allocated strings
+    /// before the first query term could be resolved; this touches about
+    /// fifteen tokens and allocates nothing.
     pub(crate) fn token_id(&self, token: &str) -> Option<u32> {
-        self.vocab_index.get(token).copied()
+        let count = self.vocab_starts.len();
+        let (mut lo, mut hi) = (0usize, count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let id = u32_at(&self.bytes, self.vocab_order_at + mid * 4);
+            match self.token_text(id)?.cmp(token) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(id),
+            }
+        }
+        None
     }
 
     /// What one token contributes when it appears in a query.
@@ -1064,6 +1167,58 @@ mod tests {
     }
 
     #[test]
+    fn a_vocabulary_order_that_would_mislead_the_search_is_refused() {
+        // `token_id` binary-searches this table, so a corrupted one does not
+        // fail loudly: it makes a token that is present resolve to nothing,
+        // and the query then scores against ids no document carries. Every
+        // corruption below is therefore a refusal, not a degraded answer.
+        let good = || {
+            let mut builder = Builder::new(Vocabulary::WordPiece30522);
+            builder
+                .set_query_side(model_vocab(), vec![1.0; 6])
+                .expect("query side");
+            builder.add("a.rs".into(), 2, &[(0, 1.0)]);
+            builder.finish()
+        };
+        let bytes = good();
+        let reader = Reader::open(bytes.clone()).expect("the unmodified index opens");
+        for (id, token) in model_vocab().iter().enumerate() {
+            assert_eq!(reader.token_id(token), Some(id as u32), "{token:?}");
+        }
+        assert_eq!(reader.token_id("absent"), None);
+
+        // The order table is the last section, four bytes per token.
+        let order_at = bytes.len() - model_vocab().len() * 4;
+
+        // An id outside the vocabulary.
+        let mut wrong = bytes.clone();
+        wrong[order_at..order_at + 4].copy_from_slice(&999u32.to_le_bytes());
+        let err = Reader::open(wrong).expect_err("must refuse");
+        assert!(err.contains("outside the"), "{err}");
+
+        // Two slots naming the same token: one id becomes unreachable and
+        // takes the other's weight.
+        let mut repeated = bytes.clone();
+        let first = u32_at(&repeated, order_at);
+        repeated[order_at + 4..order_at + 8].copy_from_slice(&first.to_le_bytes());
+        let err = Reader::open(repeated).expect_err("must refuse");
+        assert!(err.contains("repeats the token"), "{err}");
+
+        // Out of order, which makes the binary search miss present tokens.
+        let mut swapped = bytes.clone();
+        let a = u32_at(&swapped, order_at);
+        let b = u32_at(&swapped, order_at + 4);
+        swapped[order_at..order_at + 4].copy_from_slice(&b.to_le_bytes());
+        swapped[order_at + 4..order_at + 8].copy_from_slice(&a.to_le_bytes());
+        let err = Reader::open(swapped).expect_err("must refuse");
+        assert!(err.contains("not ascending"), "{err}");
+
+        // And a file that simply stops before the table.
+        let err = Reader::open(bytes[..bytes.len() - 4].to_vec()).expect_err("must refuse");
+        assert!(err.contains("order table"), "{err}");
+    }
+
+    #[test]
     fn a_model_vocabulary_passes_its_weights_through_untouched() {
         let mut builder = Builder::new(Vocabulary::WordPiece30522);
         builder
@@ -1076,5 +1231,177 @@ mod tests {
         // No BM25 length normalisation: the encoder already decided.
         assert_eq!(postings[0].weight, 0.25);
         assert_eq!(postings[1].weight, 0.25);
+    }
+
+    /// Every accessor a query reaches, driven past its edges.
+    ///
+    /// A reader that opened has asserted its own consistency, so this asserts
+    /// the same properties from outside: if `open` let something through, the
+    /// symptom is here rather than in a ranking nobody is checking.
+    fn exercise(reader: &Reader) {
+        // Paths: in range, past the end, and at the u32 boundary.
+        for file_id in 0..reader.files as u32 {
+            let path = reader.path(file_id).expect("an indexed file has a path");
+            assert!(!path.is_empty(), "file {file_id} opened with an empty path");
+        }
+        assert!(reader.path(reader.files as u32).is_none());
+        assert!(reader.path(u32::MAX).is_none());
+
+        // The vocabulary side, including ids nothing was published under.
+        for id in 0..reader.vocab_starts.len() as u32 {
+            let weight = reader.query_weight(id);
+            assert!(
+                weight.is_finite() && weight >= 0.0,
+                "token {id} carries query weight {weight}"
+            );
+        }
+        assert_eq!(reader.query_weight(u32::MAX), 0.0);
+        for token in ["parse", "", "\u{0}", "quetzal", "\u{10FFFF}", "zzzzzzzz"] {
+            if let Some(id) = reader.token_id(token) {
+                assert!(
+                    (id as usize) < reader.vocab_starts.len(),
+                    "token {token:?} resolved to {id}, outside the vocabulary"
+                );
+            }
+        }
+
+        // Every posting reachable by a term lookup must name a real file and
+        // carry a weight that can participate in a sum.
+        //
+        // Deliberately *not* asserted: that the term slices tile the posting
+        // table exactly. A corrupted table can leave postings no term reaches,
+        // or point two terms at the same ones, and the first draft of this
+        // called both a fault. They are not. Every index read is still inside
+        // the table — `open` proves `first + count <= postings` per entry — so
+        // the worst case is a posting nobody scores or one scored twice, in a
+        // file whose weights are already arbitrary because it was corrupted.
+        // Requiring exact tiling would buy no safety and would fail on inputs
+        // the format permits.
+        for slot in 0..reader.terms {
+            let (term, _, _) = reader.term_entry(slot);
+            let (postings, df) = reader
+                .postings_for(term)
+                .expect("a term in the table must be findable by the search that reads it");
+            assert_eq!(
+                df as usize,
+                postings.len(),
+                "term {term} reports df {df} and returned {} postings",
+                postings.len()
+            );
+            for posting in &postings {
+                assert!(
+                    (posting.file_id as usize) < reader.files,
+                    "term {term} names file {} of {}",
+                    posting.file_id,
+                    reader.files
+                );
+                assert!(posting.weight.is_finite());
+            }
+            assert!(reader.idf(df).is_finite());
+        }
+    }
+
+    /// No single-byte change to a published index produces a reader that
+    /// panics or hands out something outside itself.
+    ///
+    /// `every_truncation_is_refused_by_name` covers prefixes and
+    /// `a_corrupt_header_is_refused_rather_than_read` covers five header
+    /// fields. Neither covers the tables, which is where most of the file is
+    /// and where a wrong offset stops being a length check and starts being an
+    /// index into a slice. Exhaustive over every byte and every value it could
+    /// take, because "we tried some corruptions" is not the same claim.
+    ///
+    /// Refusing is always a correct outcome. Opening is only correct if the
+    /// reader that comes back is internally consistent, which `exercise`
+    /// is what decides.
+    #[test]
+    fn no_single_byte_change_makes_a_reader_that_panics_or_escapes_itself() {
+        let mut model = Builder::new(Vocabulary::WordPiece30522);
+        model
+            .set_query_side(model_vocab(), vec![0.0, 1.5, 0.5, 0.25, 2.0, 0.75])
+            .expect("accepted");
+        model.add("a.rs".into(), 4, &[(1, 1.0), (2, 1.0)]);
+        model.add("b.rs".into(), 9, &[(2, 0.5), (4, 2.0)]);
+
+        let mut opened = 0usize;
+        for original in [built(), model.finish()] {
+            for position in 0..original.len() {
+                for value in 0u16..=255 {
+                    let mut bytes = original.clone();
+                    if bytes[position] == value as u8 {
+                        continue;
+                    }
+                    bytes[position] = value as u8;
+                    if let Ok(reader) = Reader::open(bytes) {
+                        exercise(&reader);
+                        opened += 1;
+                    }
+                }
+            }
+        }
+        // Not an assertion about how many survive — that number is allowed to
+        // move. It asserts the test is doing work: if a change made every
+        // mutation refuse, this would pass while proving nothing.
+        // Not an upper bound — more survivors is fine, and the number moves
+        // with the fixtures. It guards the case that would make this test pass
+        // while proving nothing: a change that makes every mutation refuse at
+        // the header, so `exercise` never runs. It was 27,610 when written.
+        assert!(
+            opened > 10_000,
+            "only {opened} mutations opened; this test proves nothing if they \
+             are all refused before a reader exists"
+        );
+    }
+
+    /// The same property under many bytes changing at once.
+    ///
+    /// Single-byte coverage is exhaustive but cannot reach a state that needs
+    /// two fields to agree — a length and the offset that follows it, say.
+    /// Seeded so a failure reproduces exactly.
+    #[test]
+    fn no_multi_byte_corruption_makes_a_reader_that_panics_or_escapes_itself() {
+        let mut state = 0x2026_0917u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut model = Builder::new(Vocabulary::WordPiece30522);
+        model
+            .set_query_side(model_vocab(), vec![0.0, 1.5, 0.5, 0.25, 2.0, 0.75])
+            .expect("accepted");
+        model.add("src/a.rs".into(), 40, &[(1, 1.0), (2, 1.0), (5, 0.5)]);
+        model.add("src/b.rs".into(), 90, &[(2, 0.5), (4, 2.0)]);
+        model.add("c.rs".into(), 7, &[(1, 3.0)]);
+        let corpora = [built(), model.finish()];
+
+        let mut opened = 0usize;
+        for round in 0..20_000 {
+            let original = &corpora[round % corpora.len()];
+            let mut bytes = original.clone();
+            let changes = 1 + (next() as usize % 8);
+            for _ in 0..changes {
+                let at = next() as usize % bytes.len();
+                bytes[at] = next() as u8;
+            }
+            // Also exercise lengths the writer would never produce.
+            match next() % 8 {
+                0 => bytes.truncate(next() as usize % original.len().max(1)),
+                1 => bytes.extend(std::iter::repeat_n(next() as u8, next() as usize % 64)),
+                _ => {}
+            }
+            if let Ok(reader) = Reader::open(bytes) {
+                exercise(&reader);
+                opened += 1;
+            }
+        }
+        // See the single-byte test: a floor, not a target. It was 897.
+        assert!(
+            opened > 200,
+            "only {opened} corruptions opened; this test proves nothing if they \
+             are all refused before a reader exists"
+        );
     }
 }

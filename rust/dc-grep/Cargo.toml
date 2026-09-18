@@ -39,6 +39,27 @@ tgrep-core = { git = "https://github.com/microsoft/tgrep", rev = "241128bd197618
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# The query side of a learned ranking has to split a query exactly the way the
+# model's Python tokeniser split the documents, and BERT's uncased pipeline is
+# defined in terms of Unicode operations rather than approximations of them:
+# NFC, then per word NFD with every `Mn` mark dropped, with control/format
+# (`C*`), space-separator (`Zs`) and punctuation (`P*`) decided by general
+# category. Rust's standard library carries none of that.
+#
+# This was a hand-written transliteration table and a list of punctuation
+# ranges, which is a different algorithm wearing the same name: it turned `ł`
+# into `l` and `ß` into `s` where the reference keeps both, and did not treat
+# `§` as punctuation. Measured against the real tokeniser over a sweep of every
+# plausible codepoint, 1754 of 7904 cases disagreed — 22%, and over 95% inside
+# Latin Extended Additional. ASCII and CJK ideographs were already exact, which
+# is why a curated corpus had reported 0.3%.
+#
+# Both crates are from the Rust Unicode working group, Apache-2.0/MIT.
+# `unicode-properties` has no dependencies; `unicode-normalization` adds
+# `tinyvec` alone. Three crates on a binary that already links 86.
+unicode-normalization = "0.1"
+unicode-properties = "0.1"
+
 [lints]
 workspace = true
 

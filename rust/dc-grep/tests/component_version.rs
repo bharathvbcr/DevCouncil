@@ -101,9 +101,24 @@ fn health_reports_version_and_id() {
         .expect("dcgrep must run");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"id\":\"dcgrep\""), "health missing id: {stdout}");
-    assert!(stdout.contains("\"component\":\"dc-grep\""), "health missing component: {stdout}");
-    assert!(stdout.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))), "health missing version: {stdout}");
-    assert!(stdout.contains("\"searcher\":\"dc-grep\""), "health missing searcher: {stdout}");
-    assert!(stdout.contains("\"schema_version\":1"), "health missing schema_version: {stdout}");
+    assert!(
+        stdout.contains("\"id\":\"dcgrep\""),
+        "health missing id: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"component\":\"dc-grep\""),
+        "health missing component: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))),
+        "health missing version: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"searcher\":\"dc-grep\""),
+        "health missing searcher: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"schema_version\":1"),
+        "health missing schema_version: {stdout}"
+    );
 }

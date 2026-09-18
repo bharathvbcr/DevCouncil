@@ -51,6 +51,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
+import subprocess
 import sys
 from pathlib import Path
 
@@ -79,15 +81,50 @@ SKIP_DIRS = {
 }
 
 # Sent through the tokenizer and recorded so dcgrep can prove its own tokenizer
-# agrees. Chosen for the decisions that actually differ between
-# implementations: camelCase, digits, a compound that must split, punctuation,
-# an accent, CJK, and a word no vocabulary has.
+# agrees. Every entry is a decision two implementations can differ on, and most
+# of them are here because they *did* differ: the Rust side used a hand-written
+# transliteration table where the reference does canonical decomposition, which
+# disagreed on 22% of a codepoint sweep while a curated list like this one had
+# reported 0.3%. A sample set that only contains what its author thought to
+# doubt is not a gate.
+#
+# One thing not to put here. dcgrep's Unicode tables are newer than this
+# tokenizer's, and on 98 codepoints — Arabic Extended-A/B marks, Indic marks,
+# Supplemental Punctuation, listed as TABLE_SKEW in
+# rust/dc-grep/src/lexical/wordpiece.rs — the two genuinely disagree. Adding one
+# of them below makes *every* build refuse, with a parity-gate message that is
+# accurate but reads like a regression in code nobody touched. The divergence is
+# a miss on rare marks, not a wrong answer, and it is asserted where it can be
+# described; a sample here would only convert it into an outage.
 PARITY_TEXTS = [
+    # Identifier shapes: camel, snake, acronym runs, digits.
     "parse", "json", "parseJson", "parseJSONResponse", "HTTPServer",
     "http_server", "server2", "v2", "read_file", "readFile", "FILE",
-    "unwrap_or_default", "Böse", "naïve", "日本語", "снег",
-    "a.b.c", "foo::bar", "x-=+", "  spaced  out  ", "",
-    "supercalifragilisticexpialidocious", "zzqqxx", "tokenize",
+    "unwrap_or_default", "tokenize", "zzqqxx", "sha256sum", "utf8",
+    "supercalifragilisticexpialidocious",
+    # Letters that decompose to themselves and must NOT be folded to ASCII.
+    "ß", "ẞ", "ø", "Ø", "æ", "Æ", "ð", "þ", "đ", "ı", "ł", "Łódź", "œ",
+    # Letters that are a base plus a mark, which is dropped.
+    "Böse", "naïve", "café", "École", "Ångström", "žluťoučký",
+    "Việt", "Tiếng", "ﬁle",
+    # The same text with the mark typed separately rather than precomposed.
+    "e\u0301cole", "n\u0303ino",
+    # Turkish dotted capital I, which lowercases to two characters.
+    "İstanbul",
+    # Scripts that reach the vocabulary one character at a time.
+    "日本語", "中文字符", "한국어", "снег", "Ελληνικά", "עברית",
+    "العربية", "ไทย", "हिन्दी",
+    # Characters that are discarded, and characters that are not.
+    "a\u200bb", "a\ufeffb", "a\u00a0b", "a\u0000b", "a\u000bb",
+    "🎉", "a🎉b", "→", "±", "§", "§8", "audit §e", "€", "℃",
+    # Punctuation, including the fullwidth and CJK forms.
+    "a.b.c", "foo::bar", "x-=+", "don't", "e.g.", "U.S.A.",
+    "path/to/file.rs", "https://example.com/a?b=c", "user@example.com",
+    "#[derive(Debug)]", "{\"k\":[1,2]}", "// line", "全角。句点",
+    # Whitespace and emptiness.
+    "", " ", "   ", "\t\n", "  spaced  out  ",
+    # The per-word ceiling, on both sides of it.
+    "a" * 99, "a" * 100, "a" * 101,
 ]
 
 
@@ -189,8 +226,56 @@ def special_ids(tokenizer) -> set[int]:
     return ids
 
 
+def files_from_dcgrep(
+    dcgrep: str, root: Path, max_files: int
+) -> tuple[list[Path], bool] | None:
+    """Ask the indexer which files it would index, rather than guessing.
+
+    `dcgrep files` is the same walk `dcgrep index` performs: the same ignore
+    rules, the same hidden-file and size decisions, the same `.gitignore`. A
+    document encoded for a path the walk will not admit is work thrown away —
+    over this repository the local walk below produced 498 of them, a third of
+    the run — and, worse, a file the walk *does* admit that this misses is a
+    hole in the ranking that nothing reports.
+
+    Two implementations of "which files are in this repository" drift. This one
+    has no second implementation to drift from.
+
+    Returns None when dcgrep cannot be reached, so the caller can fall back and
+    say so rather than silently encoding nothing. Otherwise returns the paths
+    and whether the listing was complete — a truncated listing is a prefix of
+    the corpus, and encoding a prefix produces an index that is learned for the
+    files it reached and BM25 for the rest, which is not what "learned" claims.
+    """
+    request = json.dumps({
+        "root": str(root),
+        "max_results": max_files,
+        # The producer reads every file whole; the searcher's own ceiling is
+        # what decides which are indexable, so it is left at its default.
+    })
+    try:
+        proc = subprocess.run([dcgrep, "files"], input=request.encode(),
+                              capture_output=True, timeout=300)
+        reply = json.loads(proc.stdout or b"{}")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as err:
+        eprint(f"note: could not ask {dcgrep} for the file list ({err.__class__.__name__}).")
+        return None
+    if not reply.get("ok"):
+        eprint(f"note: {dcgrep} files refused: {str(reply.get('error'))[:200]}")
+        return None
+    # Only the extensions this script can read as text. The walk admits more
+    # than the encoder should encode.
+    paths = [root / rel for rel in reply.get("paths", [])]
+    kept = [p for p in paths if p.suffix.lower() in SOURCE_SUFFIXES]
+    return kept, not reply.get("truncated")
+
+
 def walk(root: Path, max_files: int) -> list[Path]:
-    """Files worth encoding, in a stable order.
+    """Files worth encoding, in a stable order — without asking the indexer.
+
+    The fallback for when `dcgrep` is not on the path. It does not read
+    `.gitignore`, so it will encode files the index will then decline; the
+    build reports the difference as `lexical_unmatched`.
 
     Sorted, so two runs over an unchanged tree produce byte-identical output
     and a diff of two encodings shows what the model did rather than what the
@@ -325,6 +410,112 @@ def write_encoding(out: Path, root: Path, files: list[Path], header: dict,
             eprint(f"  {done}/{len(files)}")
     staging.replace(out)
     return written
+
+
+# Ranges the conformance corpus sweeps, one codepoint at a time. Chosen to
+# cover every class the tokenizer treats differently — not a sample of what
+# looked interesting.
+RECORD_RANGES = [
+    (0x0020, 0x024F, "ASCII + Latin-1 + Latin Ext-A/B"),
+    (0x0250, 0x02FF, "IPA + modifiers"),
+    (0x0300, 0x036F, "combining marks"),
+    (0x0370, 0x03FF, "Greek"),
+    (0x0400, 0x04FF, "Cyrillic"),
+    (0x0530, 0x058F, "Armenian"),
+    (0x0590, 0x05FF, "Hebrew"),
+    # Through 08FF rather than 06FF: Arabic Extended-A holds marks assigned
+    # after the model tokenizer's Unicode tables were built, and stopping at
+    # 06FF is what kept 23 of them out of this fixture.
+    (0x0600, 0x08FF, "Arabic + Syriac + Thaana + NKo + Arabic Ext-A"),
+    # Every Indic block, not Devanagari alone. Bengali, Gujarati, Oriya,
+    # Telugu, Kannada, Malayalam and Sinhala each contributed skewed marks.
+    (0x0900, 0x0DFF, "Devanagari through Sinhala"),
+    (0x0E00, 0x0FFF, "Thai + Lao + Tibetan"),
+    (0x1000, 0x109F, "Myanmar"),
+    (0x1600, 0x169F, "Canadian Syllabics tail + Ogham"),
+    (0x1800, 0x18AF, "Mongolian"),
+    (0x1B00, 0x1B7F, "Balinese"),
+    (0x1DC0, 0x1DFF, "combining marks supplement"),
+    (0x1E00, 0x1EFF, "Latin Extended Additional"),
+    (0x2000, 0x206F, "punctuation + spaces"),
+    # Supplemental Punctuation: U+2E43..U+2E5D are the largest single group of
+    # characters this build splits as punctuation and the model's tokeniser
+    # does not.
+    (0x2E00, 0x2E7F, "supplemental punctuation"),
+    (0x20A0, 0x20CF, "currency"),
+    (0x2100, 0x21FF, "letterlike + arrows"),
+    (0x2200, 0x22FF, "math operators"),
+    (0x2500, 0x257F, "box drawing"),
+    (0x2600, 0x26FF, "misc symbols"),
+    (0x3000, 0x303F, "CJK punctuation"),
+    (0x4E00, 0x4E7F, "CJK ideographs (sample)"),
+    (0xAC00, 0xAC7F, "Hangul syllables (sample)"),
+    (0xFE00, 0xFEFF, "variation selectors + BOM"),
+    (0xFF00, 0xFF6F, "fullwidth forms"),
+    (0x1F600, 0x1F64F, "emoji"),
+]
+
+
+def record(model: str, out_dir: Path, root: Path) -> int:
+    """Re-record rust/dc-grep/tests/fixtures/wordpiece-* from the real tokenizer.
+
+    The Rust conformance test judges this crate's WordPiece against these
+    files. They are committed so that check runs on an ordinary `cargo test`,
+    with no PyTorch and no download — a check that needs a model to run is a
+    check that stops running. Re-record when the model or its tokenizer
+    changes, and read the diff: a change here is a change in what queries mean.
+    """
+    _, tokenizer, _ = load_model(model, "cpu")
+    tokens = vocabulary(tokenizer)
+
+    def ids_of(text: str) -> list[int]:
+        return tokenizer(text, add_special_tokens=False)["input_ids"]
+
+    cases: list[str] = []
+    for lo, hi, _label in RECORD_RANGES:
+        for cp in range(lo, hi + 1):
+            cases.append(chr(cp))
+            cases.append(f"x{chr(cp)}y")
+    cases.extend(PARITY_TEXTS)
+
+    # Real lines out of the repository, which cover multi-word behaviour a
+    # single-codepoint sweep cannot reach.
+    rng = random.Random(20260917)
+    harvested: list[str] = []
+    for path in walk(root, 4000):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        lines = [ln.strip() for ln in text.splitlines() if 3 < len(ln.strip()) < 160]
+        if lines:
+            harvested.extend(rng.sample(lines, min(4, len(lines))))
+    rng.shuffle(harvested)
+    cases.extend(harvested[:900])
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "wordpiece-vocab.txt", "w", encoding="utf-8") as fh:
+        for token in tokens:
+            if "\n" in token:
+                eprint(f"vocabulary token {token!r} contains a newline")
+                return 1
+            fh.write(token + "\n")
+
+    with open(out_dir / "wordpiece-conformance.jsonl", "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "model": model,
+            "note": ("Recorded from the model's own HuggingFace tokenizer. "
+                     "Regenerate with scripts/encode-sparse.py --record."),
+            "pairs": len(cases),
+        }, ensure_ascii=False) + "\n")
+        for text in cases:
+            fh.write(json.dumps({"text": text, "ids": ids_of(text)},
+                                ensure_ascii=False) + "\n")
+
+    for name in ("wordpiece-vocab.txt", "wordpiece-conformance.jsonl"):
+        eprint(f"  {name}: {(out_dir / name).stat().st_size:,} bytes")
+    eprint(f"recorded {len(cases)} cases from {model}")
+    return 0
 
 
 def self_test(dcgrep: str) -> int:
@@ -483,11 +674,20 @@ def main() -> int:
     parser.add_argument("--device", default="cpu", help="cpu, cuda, or mps")
     parser.add_argument("--self-test", action="store_true",
                         help="check this script against the real dcgrep, without a model")
-    parser.add_argument("--dcgrep", default="dcgrep", help="the binary --self-test drives")
+    parser.add_argument("--dcgrep", default="dcgrep",
+                        help="the binary that supplies the file list, and that --self-test drives")
+    parser.add_argument("--walk", action="store_true",
+                        help="use this script's own walk instead of asking dcgrep")
+    parser.add_argument("--record", action="store_true",
+                        help="re-record the Rust tokenizer conformance fixture")
+    parser.add_argument("--fixtures", default="rust/dc-grep/tests/fixtures",
+                        help="where --record writes")
     args = parser.parse_args()
 
     if args.self_test:
         return self_test(args.dcgrep)
+    if args.record:
+        return record(args.model, Path(args.fixtures), Path(args.root).resolve())
     if not args.out:
         eprint("--out is required")
         return 2
@@ -503,15 +703,50 @@ def main() -> int:
         eprint("--max-files must be at least 1")
         return 2
 
+    # Which files to encode is settled before the model is loaded. Both
+    # answers that end the run — "the listing is a prefix" and "there is
+    # nothing here to encode" — are known without a tokenizer, and finding
+    # them out after a multi-hundred-megabyte download is a worse way to learn
+    # them.
+    listed = None
+    if not args.walk:
+        listed = files_from_dcgrep(args.dcgrep, root, args.max_files)
+    if listed is None:
+        eprint("falling back to this script's own walk, which does not read "
+               ".gitignore; expect lexical_unmatched to be non-zero.")
+        files = walk(root, args.max_files)
+    else:
+        files, complete = listed
+        if not complete:
+            # A prefix is not the corpus. The files past the cut reach the
+            # index through the walk and rank by BM25, inside a build that
+            # reports itself as learned — visible only as lexical_unindexed,
+            # which nobody reads when the build says ok.
+            #
+            # Refused rather than warned, unless the operator chose the bound
+            # themselves: the default is "encode this repository", and a
+            # partial answer to that is wrong rather than smaller.
+            asked = args.max_files
+            if asked == parser.get_default("max_files"):
+                eprint(f"{args.dcgrep} truncated the file list at {asked}. "
+                       "This encoding would cover a prefix of the repository "
+                       "and leave the rest ranking by BM25. Raise the "
+                       "searcher's MAX_LIST_RESULTS, or pass --max-files "
+                       "explicitly to encode a prefix on purpose.")
+                return 1
+            eprint(f"warning: encoding a prefix — the file list was truncated "
+                   f"at the --max-files you passed ({asked}). Files past it "
+                   "will be searchable but ranked by BM25, and the build will "
+                   "count them in lexical_unindexed.")
+    if not files:
+        eprint(f"no encodable files under {root}")
+        return 1
+
     torch, tokenizer, model = load_model(args.model, args.device)
     tokens = vocabulary(tokenizer)
     weights = query_weights(tokenizer, len(tokens))
     drop = special_ids(tokenizer)
 
-    files = walk(root, args.max_files)
-    if not files:
-        eprint(f"no encodable files under {root}")
-        return 1
     eprint(f"encoding {len(files)} files with {args.model} on {args.device}")
 
     header = build_header(

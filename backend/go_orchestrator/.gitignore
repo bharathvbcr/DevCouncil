@@ -1,3 +1,9 @@
 bin/
 .gocache/
 .gopath/
+coverage.out
+coverage.html
+coverage.tmp
+*.cov
+*.test
+*.prof

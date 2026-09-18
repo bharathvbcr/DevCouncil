@@ -105,6 +105,53 @@ fn corpus(repo: &Repo) {
     );
 }
 
+/// A build holding the lock must not be reported as a repository with no index.
+///
+/// These are opposite facts with opposite remedies. "No index" is permanent
+/// until someone runs `dcgrep index`; a held lock is transient and clears on
+/// its own, and the one thing a caller must not do is start a second build
+/// because the first is still running.
+///
+/// Found by stressing `rank` against concurrent rebuilds: 29% of reads during
+/// a republish came back saying the repository had no ranked index, advising a
+/// build, while a complete and valid index sat in the published slot.
+#[test]
+fn a_build_holding_the_lock_is_not_reported_as_a_missing_index() {
+    let repo = Repo::new();
+    corpus(&repo);
+    let (ok, reply) = repo.call("index", json!({}));
+    assert!(ok, "the index must build: {reply}");
+
+    // Exactly what a running build holds, for as long as it runs.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(repo.0.join(".devcouncil/dcgrep/cache.lock"))
+        .expect("the lock file exists once an index is published");
+    lock.lock().expect("take the writer lock");
+
+    let (ok, reply) = repo.call("rank", json!({"query": "json response"}));
+    let error = reply["error"].as_str().unwrap_or("").to_string();
+    drop(lock);
+
+    assert!(
+        !ok,
+        "a locked index must refuse rather than answer: {reply}"
+    );
+    assert!(
+        !error.contains("no ranked index"),
+        "an index that exists must not be reported missing: {error}"
+    );
+    assert!(
+        !error.contains("build one with"),
+        "advising a build while a build holds the lock is the wrong remedy: {error}"
+    );
+    assert!(
+        error.contains("retry") || error.contains("again"),
+        "the refusal must say the condition clears on its own: {error}"
+    );
+}
+
 #[test]
 fn a_repository_with_no_index_is_refused_rather_than_answered_empty() {
     let repo = Repo::new();

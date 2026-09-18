@@ -195,8 +195,18 @@ pub fn ranked_search(request: &RankedRequest) -> Result<RankedResponse, String> 
         n => n.min(MAX_MAX_RANKED),
     };
 
-    let published = Published::open(&root).map_err(|err| {
-        format!("no ranked index for this repository ({err}); build one with `dcgrep index`")
+    // A missing index and a busy one are opposite facts with opposite
+    // remedies, so only one of them is phrased as "build one". Telling a
+    // caller to start a build while a build holds the lock is advice that
+    // makes the situation worse, and an agent reading it concludes the
+    // repository has no ranked index at all.
+    let published = Published::open(&root).map_err(|fault| match fault {
+        crate::index::OpenFault::Busy(message) => message,
+        crate::index::OpenFault::Unusable(message) => {
+            format!(
+                "no ranked index for this repository ({message}); build one with `dcgrep index`"
+            )
+        }
     })?;
     let bytes =
         crate::index::read_bounded(&published.slot.join("lexical.bin"), store::MAX_FILE_BYTES)?;

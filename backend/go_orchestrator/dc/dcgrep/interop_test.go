@@ -2,7 +2,9 @@ package dcgrep
 
 import (
 	"context"
+	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -76,16 +78,38 @@ func TestMaxListResultsIsNotSilentlyClampedByTheSearcher(t *testing.T) {
 		t.Fatalf("a %d-file tree must not truncate at %d: %+v", count, MaxListResults, listing)
 	}
 
-	// And the ceiling is real: asking for more than the searcher allows must
-	// still report the searcher's number, so the two constants are proven equal
-	// rather than assumed.
-	over, err := client.List(context.Background(), ListRequest{MaxResults: MaxListResults + 1000})
+	// And the ceiling is real. This used to ask for MaxListResults+1000 over a
+	// twelve-file tree and check the reported limit "if over.Truncated" — which
+	// a twelve-file tree never is, so the check the comment called proof never
+	// executed. Detecting a clamp behaviourally needs a tree larger than the
+	// ceiling, and the ceiling is now 200,000. So the searcher reports it
+	// instead, and the two constants are compared directly.
+	raw, err := exec.Command(testsupport.DCGrep(t), "health").Output()
 	if err != nil {
-		t.Fatalf("list: %v", err)
+		t.Fatalf("health: %v", err)
 	}
-	if over.Truncated && over.Limit != MaxListResults {
-		t.Fatalf("the searcher clamped to %d while this side believes the ceiling is %d",
-			over.Limit, MaxListResults)
+	var health struct {
+		Limits struct {
+			MaxResults     int `json:"max_results"`
+			MaxListResults int `json:"max_list_results"`
+		} `json:"limits"`
+	}
+	if err := json.Unmarshal(raw, &health); err != nil {
+		t.Fatalf("unparseable health reply: %v", err)
+	}
+	if health.Limits.MaxListResults != MaxListResults {
+		t.Fatalf("the searcher lists up to %d while this side asks for %d; a "+
+			"caller wanting every candidate would receive %d of them and be told nothing",
+			health.Limits.MaxListResults, MaxListResults,
+			min(health.Limits.MaxListResults, MaxListResults))
+	}
+	// The listing ceiling must stay above the search ceiling. If they were
+	// merged again, this test would still pass on the constant above while the
+	// enumeration silently became a sample.
+	if health.Limits.MaxListResults <= health.Limits.MaxResults {
+		t.Fatalf("the searcher's listing ceiling (%d) is not above its search "+
+			"ceiling (%d); enumeration has been clamped to sampling again",
+			health.Limits.MaxListResults, health.Limits.MaxResults)
 	}
 }
 

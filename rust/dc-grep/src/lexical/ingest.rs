@@ -70,10 +70,38 @@ const MAX_HEADER_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Documents accepted from one file.
-const MAX_DOCUMENTS: usize = 200_000;
+///
+/// `crate::MAX_LIST_RESULTS` is defined as this, so the listing a producer uses
+/// to decide what to encode can always name at least as many files as this will
+/// accept back.
+pub(crate) const MAX_DOCUMENTS: usize = 200_000;
 
 /// Terms accepted from one document.
 const MAX_TERMS_PER_DOCUMENT: usize = 20_000;
+
+/// Postings accepted from one encoding, across every document in it.
+///
+/// The two bounds above are each modest and their product is not: 200,000
+/// documents of 20,000 terms is four billion postings, all of them parsed and
+/// held before the index keeps the first [`store::MAX_POSTINGS`] and drops the
+/// rest. Measured at roughly 7 bytes per posting held — 36 million cost 246 MB
+/// resident — the declared ceilings come to about 29 GB for an index that can
+/// use a thousandth of it. Per-item bounds are not a bound on the fan-out.
+///
+/// Eight times what the store can hold. A document the walk does not admit
+/// still costs memory here, so the budget has to cover a stale encoding whose
+/// documents have mostly moved or been deleted; eight times covers an encoding
+/// where seven of every eight documents are gone, at about 230 MB. This
+/// repository's own encoding is 334,000 postings, two orders of magnitude
+/// inside it.
+pub(crate) const MAX_INGEST_POSTINGS: usize = 8 * super::store::MAX_POSTINGS;
+
+// A budget below what the store can hold would trade an out-of-memory for an
+// outage: encodings the index could have used in full would be refused.
+// Compile-time, because a test can only fail after a binary carrying the wrong
+// budget has been built.
+const _: () = assert!(MAX_INGEST_POSTINGS >= 8 * super::store::MAX_POSTINGS);
+const _: () = assert!(MAX_INGEST_POSTINGS > MAX_TERMS_PER_DOCUMENT);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -142,6 +170,18 @@ impl std::fmt::Debug for Encoded {
 /// nothing in it are different facts, and a build that confused them would
 /// publish an empty ranked index over a repository full of code.
 pub(crate) fn read(path: &Path) -> Result<Encoded, String> {
+    read_with_budget(path, MAX_INGEST_POSTINGS)
+}
+
+/// `read`, with the posting budget injectable.
+///
+/// The seam exists for the same reason `index::build_with_limits` does: proving
+/// a ceiling refuses requires an input that exceeds it, and building 32 million
+/// postings of JSON to prove that takes seven seconds and 400 MB. A test drives
+/// a small budget through the same code; a separate test asserts the real
+/// constant is the one `read` passes and that it stays above what the store can
+/// hold.
+fn read_with_budget(path: &Path, max_postings: usize) -> Result<Encoded, String> {
     // `File::open`, not the walk's hardened `open_for_search`. This path is an
     // argument the operator typed, not a name discovered inside a tree under
     // search, and the encoder's output legitimately lives behind a symlink into
@@ -233,6 +273,7 @@ pub(crate) fn read(path: &Path) -> Result<Encoded, String> {
     let vocab_size = header.vocab.len() as u32;
     let mut documents = HashMap::new();
     let mut line_number = 1usize;
+    let mut postings = 0usize;
     while let Some(line) = read_line(&mut reader, "document", MAX_DOCUMENT_BYTES)? {
         line_number += 1;
         if line.trim().is_empty() {
@@ -252,6 +293,19 @@ pub(crate) fn read(path: &Path) -> Result<Encoded, String> {
                  {MAX_TERMS_PER_DOCUMENT} ceiling",
                 document.terms.len(),
                 document.path
+            ));
+        }
+        // Checked while reading rather than after, so an encoding past the
+        // budget is refused before the memory it would need is allocated. A
+        // bound enforced after the allocation is not a bound.
+        postings = postings.saturating_add(document.terms.len());
+        if postings > max_postings {
+            return Err(format!(
+                "sparse encoding carries more than {max_postings} postings, \
+                 reached at line {line_number}; the ranked index holds at most {} of \
+                 them, so this encoding describes far more than any index built from \
+                 it could use",
+                super::store::MAX_POSTINGS
             ));
         }
         for (id, weight) in &document.terms {
@@ -455,6 +509,75 @@ mod tests {
         assert!(err.contains("document"), "{err}");
         let _ = fs::remove_file(path);
     }
+
+    /// Per-item bounds do not bound their product.
+    ///
+    /// `MAX_DOCUMENTS` and `MAX_TERMS_PER_DOCUMENT` each look modest and
+    /// multiply to four billion postings, every one of which is parsed and
+    /// held in memory before the index that can hold four *million* of them
+    /// discards the rest. Measured at about 7 bytes per posting held, the
+    /// declared ceilings come to roughly 29 GB of resident memory for an index
+    /// that cannot use a thousandth of it.
+    ///
+    /// Not a security bound — the encoding path is operator-typed — but a
+    /// robustness one: a monorepo encoding that is merely large should be
+    /// refused by name rather than by the machine running out of memory.
+    #[test]
+    fn an_encoding_whose_postings_exceed_the_ingest_budget_is_refused() {
+        // Documents each well inside every per-item bound, so only the total
+        // can refuse this. Driven through a small budget rather than the real
+        // one: the behaviour is identical and the fixture is 300 bytes instead
+        // of 400 MB.
+        let budget = 20usize;
+        let terms: String = (0..8)
+            .map(|i| format!("[{},0.5]", i % 4))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut text = format!("{}\n", header(r#"{"text":"parse","ids":[1]}"#));
+        for i in 0..4 {
+            text.push_str(&format!(
+                "{{\"path\":\"src/f{i}.rs\",\"total_terms\":10,\"terms\":[{terms}]}}\n"
+            ));
+        }
+        let path = scratch(&text);
+        let err = read_with_budget(&path, budget).expect_err("must refuse");
+        assert!(
+            err.contains("postings") && err.contains(&budget.to_string()),
+            "the refusal must name the budget and what exceeded it: {err}"
+        );
+        // The same file inside the budget reads, so it is the total that
+        // refused and not the shape of the documents.
+        let ok = read_with_budget(&path, 1_000).expect("inside the budget it reads");
+        assert_eq!(ok.documents.len(), 4);
+        let _ = fs::remove_file(path);
+    }
+
+    /// `read` must pass the real constant, not a smaller one.
+    ///
+    /// The seam above makes the budget injectable, which is also how a seam
+    /// becomes a way for production to run unbounded while the tests all pass.
+    #[test]
+    fn the_budget_read_enforces_is_the_declared_one() {
+        let terms: String = (0..8)
+            .map(|i| format!("[{},0.5]", i % 4))
+            .collect::<Vec<_>>()
+            .join(",");
+        let path = scratch(&format!(
+            "{}\n{{\"path\":\"src/a.rs\",\"total_terms\":10,\"terms\":[{terms}]}}\n",
+            header(r#"{"text":"parse","ids":[1]}"#)
+        ));
+        // Eight postings: refused by a budget of four, accepted by the real
+        // one. If `read` had been left on a token budget this would refuse.
+        assert!(read_with_budget(&path, 4).is_err());
+        assert!(read(&path).is_ok());
+        let _ = fs::remove_file(path);
+    }
+
+    // The budget's relationship to what the store can hold is a fact about two
+    // constants, so it sits beside them as a `const` assertion and fails the
+    // build rather than a test run. What remains a test is the behaviour:
+    // `an_encoding_whose_postings_exceed_the_ingest_budget_is_refused` and
+    // `the_budget_read_enforces_is_the_declared_one`.
 
     #[test]
     fn a_key_this_schema_does_not_know_refuses_rather_than_being_ignored() {

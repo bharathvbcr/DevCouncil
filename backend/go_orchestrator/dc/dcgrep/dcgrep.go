@@ -62,7 +62,24 @@ const (
 	// legitimate result is kilobytes; this is the bound on a child gone wrong,
 	// applied during the copy rather than checked after it so a runaway cannot
 	// allocate the whole thing before anyone looks.
+	//
+	// It is load-bearing rather than nominal: 5,000 matches at the searcher's
+	// 64 KiB line ceiling is 320 MiB, so this is what stands between a
+	// pathological repository and that allocation.
 	maxOutput = 16 << 20
+
+	// maxListOutput bounds a *listing's* reply, which is legitimately larger.
+	// A match carries a line; a path carries a path. Raising the listing
+	// ceiling without raising this would have moved the truncation rather than
+	// removed it.
+	//
+	// Measured, not estimated: listing a 200,000-file tree of deeply nested
+	// paths produced 25.4 MB, 127 bytes per path including JSON quoting, in
+	// 689 ms and 39 MB of child RSS. That is well over the 16 MiB above and
+	// leaves 2.6x headroom here, which is what a bound on a child gone wrong
+	// should look like — comfortably above every legitimate reply and nowhere
+	// near the heap.
+	maxListOutput = 64 << 20
 
 	// maxStderr bounds the diagnostic half. It exists to make a failure
 	// reportable, not to capture a log.
@@ -87,15 +104,16 @@ type Client struct {
 	// can drive the bound without generating megabytes to reach it — the same
 	// reason the devmap boundary carries them as fields. Nothing outside this
 	// package sets them.
-	maxOutput int
-	maxStderr int
+	maxOutput     int
+	maxListOutput int
+	maxStderr     int
 }
 
 // New builds a client with defaults.
 func New(binary, root string) *Client {
 	return &Client{
 		Binary: binary, Root: root, Timeout: defaultTimeout,
-		maxOutput: maxOutput, maxStderr: maxStderr,
+		maxOutput: maxOutput, maxListOutput: maxListOutput, maxStderr: maxStderr,
 	}
 }
 
@@ -221,7 +239,13 @@ func (c *Client) run(ctx context.Context, command string, req any, out any) erro
 	// later appeared and held the pipe open past the deadline.
 	proc.ConfigureGroup(cmd)
 	cmd.Stdin = bytes.NewReader(body)
-	stdout := &cappedBuffer{limit: c.outputBound()}
+	// A listing answers a different question and is bounded by a different
+	// number; see maxListOutput.
+	replyBound := c.outputBound()
+	if command == "files" {
+		replyBound = c.listOutputBound()
+	}
+	stdout := &cappedBuffer{limit: replyBound}
 	stderr := &cappedBuffer{limit: c.stderrBound()}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
@@ -237,7 +261,7 @@ func (c *Client) run(ctx context.Context, command string, req any, out any) erro
 		// Refused rather than decoded from the prefix. A truncated reply can
 		// still be valid JSON — the match array simply ends early — and
 		// accepting it would report a capped sample as the whole result.
-		return fmt.Errorf("searcher produced more than %d bytes", c.outputBound())
+		return fmt.Errorf("searcher produced more than %d bytes", replyBound)
 	}
 
 	if err := json.Unmarshal(bytes.TrimSpace(stdout.buf.Bytes()), out); err != nil {
@@ -474,10 +498,18 @@ func okOf(out any) (bool, string) {
 // here so a caller that needs every candidate can ask for all of them by name
 // rather than by guessing a large number.
 //
-// It must not exceed the searcher's own MAX_MAX_RESULTS; asking for more is
+// It must not exceed the searcher's own MAX_LIST_RESULTS; asking for more is
 // clamped silently on that side, and a caller that believed the larger number
 // would think it had the whole tree.
-const MaxListResults = 5000
+//
+// This was 5000 — the searcher's *search* ceiling, which a listing used to
+// share. That is the right bound on match lines a model reads and the wrong
+// one on file names: the repository this package lives in crossed it at 5,408
+// files, so "give me every candidate" had been returning a prefix. The
+// searcher now reports both ceilings from `health`, and
+// TestMaxListResultsIsNotSilentlyClampedByTheSearcher reads them rather than
+// inferring one from a tree it would have to be enormous to detect.
+const MaxListResults = 200000
 
 // ListRequest is one file listing.
 type ListRequest struct {
@@ -694,14 +726,22 @@ func (c *Client) Available(ctx context.Context) error {
 	return nil
 }
 
-// outputBound and stderrBound resolve the per-invocation caps, so a zero-valued
-// Client built by a caller that did not go through New is bounded rather than
-// unbounded. A cap that defaults to "none" is the failure the cap exists for.
+// outputBound, listOutputBound and stderrBound resolve the per-invocation
+// caps, so a zero-valued Client built by a caller that did not go through New
+// is bounded rather than unbounded. A cap that defaults to "none" is the
+// failure the cap exists for.
 func (c *Client) outputBound() int {
 	if c.maxOutput <= 0 {
 		return maxOutput
 	}
 	return c.maxOutput
+}
+
+func (c *Client) listOutputBound() int {
+	if c.maxListOutput <= 0 {
+		return maxListOutput
+	}
+	return c.maxListOutput
 }
 
 func (c *Client) stderrBound() int {

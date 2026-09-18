@@ -87,6 +87,32 @@ pub const DEFAULT_MAX_LIST_RESULTS: usize = 100;
 /// read; the cap is reported rather than silently applied.
 pub const MAX_MAX_RESULTS: usize = 5_000;
 
+/// The ceiling on a *listing's* `max_results`, which is not the search's.
+///
+/// Searching sample: 5,000 match lines is already more than anything reads.
+/// Listing enumerates: it answers "which files are in this repository", and a
+/// repository with more than 5,000 files is ordinary — this one crossed it at
+/// 5,408. Sharing the sampling ceiling made the enumeration return a prefix
+/// flagged `truncated`, which is honest but unhelpful, because the clamp left
+/// no larger number to ask for.
+///
+/// It is `lexical::ingest::MAX_DOCUMENTS`, so the enumeration is never the
+/// constraint that binds first: a caller can always list at least as many
+/// files as the encoder downstream is willing to accept. Listing beyond that
+/// would be listing files nothing can consume.
+pub const MAX_LIST_RESULTS: usize = lexical::ingest::MAX_DOCUMENTS;
+
+// Enumerating must never be the constraint that binds before ingesting.
+//
+// If the listing ceiling fell below what the encoder accepts, a producer could
+// be told "that is all the files there are" for a corpus the consumer would
+// have taken in full — and the shortfall would surface only as documents
+// ranking by the wrong tier. Compile-time, because a test can only fail after
+// a binary carrying the wrong ceiling has been built.
+const _: () = assert!(MAX_LIST_RESULTS >= lexical::ingest::MAX_DOCUMENTS);
+const _: () = assert!(MAX_LIST_RESULTS > MAX_MAX_RESULTS);
+const _: () = assert!(DEFAULT_MAX_LIST_RESULTS < MAX_LIST_RESULTS);
+
 /// Files larger than this are not searched. It is the same 2 MiB the Go read
 /// tools bound themselves by, because `read_file` and this face the same
 /// repository and two different ceilings would only mean one of them was wrong.
@@ -630,7 +656,7 @@ pub fn list_files(request: &ListRequest) -> Result<ListResponse, String> {
 
     let limit = match request.max_results {
         0 => DEFAULT_MAX_LIST_RESULTS,
-        n => n.min(MAX_MAX_RESULTS),
+        n => n.min(MAX_LIST_RESULTS),
     };
     // Clamped identically to `search`, so an absurd override cannot make the
     // listing admit a file the search would refuse.
@@ -1572,6 +1598,47 @@ mod tests {
         assert_eq!(response.limit, Some(4));
     }
 
+    /// A listing is used to enumerate, so its ceiling cannot be the search's.
+    ///
+    /// `MAX_MAX_RESULTS` bounds a *sample* a model reads, and 5,000 match lines
+    /// is more than anything downstream wants. A listing answers "which files
+    /// are in this repository", and for that question 5,000 is not a large
+    /// number — this repository passed it during the writing of this test, at
+    /// 5,408 files. Clamping the enumeration to the sampling ceiling made
+    /// `dcgrep files` return a prefix under a flag no caller was obliged to
+    /// read, and the callers that did read it were told to "pass a larger
+    /// max_results" — advice that could not work, because the clamp was the
+    /// thing refusing them.
+    ///
+    /// What made it costly rather than merely wrong: `scripts/encode-sparse.py`
+    /// asks this question to decide which files to encode. A prefix meant the
+    /// files past the cut got no model weights and silently fell back to BM25
+    /// inside an index reported as learned.
+    #[test]
+    fn a_listing_asked_for_everything_is_not_clamped_to_the_search_ceiling() {
+        let scratch = Scratch::new();
+        let count = MAX_MAX_RESULTS + 200;
+        for i in 0..count {
+            scratch.write(&format!("d{:03}/f{:05}.txt", i / 100, i), b"x\n");
+        }
+        let response = list_files(&ListRequest {
+            root: scratch.path.clone(),
+            path: String::new(),
+            max_results: MAX_MAX_RESULTS + 1_000,
+            include_ignored: false,
+            max_file_bytes: 0,
+        })
+        .expect("listing runs");
+        assert!(
+            !response.truncated,
+            "a tree of {count} files truncated at {:?} although the caller \
+             asked for {}",
+            response.limit,
+            MAX_MAX_RESULTS + 1_000
+        );
+        assert_eq!(response.count, count);
+    }
+
     /// `truncated` means a match was withheld — not that the limit was reached.
     ///
     /// The two are the same number and different facts, and the searcher used
@@ -2044,12 +2111,23 @@ mod tests {
 
     #[test]
     fn max_max_results_is_the_number_the_go_plane_mirrors() {
-        // manvi/dc/dcgrep declares MaxListResults against this constant so a
-        // caller asking for "everything" is not silently clamped to less than
-        // it believes it asked for. The two are asserted equal across the
-        // boundary in the Go tests; this pins the value they agree on.
+        // manvi/dc/dcgrep declares MaxListResults against the *listing*
+        // ceiling so a caller asking for "everything" is not silently clamped
+        // to less than it believes it asked for. The two are asserted equal
+        // across the boundary in the Go tests; this pins the values they agree
+        // on. MaxListResults mirrored MAX_MAX_RESULTS until a listing stopped
+        // being a sample: 5,000 is the right bound on match lines and the
+        // wrong one on file names.
         assert_eq!(MAX_MAX_RESULTS, 5_000);
+        assert_eq!(MAX_LIST_RESULTS, 200_000);
     }
+
+    // The three relationships between the listing ceiling, the search ceiling
+    // and the ingest bound were asserted here. They are facts about constants,
+    // so they now sit beside `MAX_LIST_RESULTS` as `const` assertions and fail
+    // the build rather than a test run. What remains a test is the behaviour:
+    // `a_listing_asked_for_everything_is_not_clamped_to_the_search_ceiling`
+    // proves the walk honours them.
 
     /// A tiny deterministic generator, so the randomized tests below reproduce
     /// exactly on a failure and add no dependency to a crate whose dependency

@@ -67,13 +67,21 @@ fn run() -> Result<String, String> {
         // literals saying "bm25" and "code-v1", which stopped being true the
         // moment a learned index could be published: health would have denied
         // a capability the same binary was exercising.
+        // `limits` is reported because the other side of this boundary keeps
+        // its own copies of these numbers, and a copy that drifts low is
+        // invisible: the caller asks for everything, receives a prefix under a
+        // flag it is not obliged to read, and believes it has the whole tree.
+        // Reporting them lets that be asserted rather than assumed.
         Some("health") => Ok(format!(
             "{{\"ok\":true,\"id\":\"{COMPONENT_ID}\",\"component\":\"{IDENTITY}\",\"version\":\"{}\",\"searcher\":\"{IDENTITY}\",\"schema_version\":{SCHEMA_VERSION},\
              \"engine\":\"ripgrep\",\"index_engine\":\"tgrep-core\",\
-             \"ranked_engines\":{},\"ranked_vocabularies\":{}}}",
+             \"ranked_engines\":{},\"ranked_vocabularies\":{},\
+             \"limits\":{{\"max_results\":{},\"max_list_results\":{}}}}}",
             env!("CARGO_PKG_VERSION"),
             render(&dc_grep::ranked_engines())?,
             render(&dc_grep::ranked_vocabularies())?,
+            dc_grep::MAX_MAX_RESULTS,
+            dc_grep::MAX_LIST_RESULTS,
         )),
         Some("search") | None => search(),
         Some("files") => list(),
