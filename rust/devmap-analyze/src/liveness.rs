@@ -8,6 +8,30 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// reconstructs the graph id exactly. A method must report as `MyClass.execute`
 /// rather than `execute`; the bare form cannot be joined back to a node and
 /// collides with any same-named method on a different type in the same file.
+/// Kinds that are never dead-code candidates, whatever the graph says about
+/// them.
+///
+/// `File` is here because file reachability is a different analysis with its own
+/// edges. The two markup kinds are here because **this index can prove a DOM or
+/// stylesheet identity is used and cannot prove one is not.** A class reaches an
+/// element through `class:{expr}`, through `classList.add(name)` where `name` is
+/// computed, through a `:global()` rule another component relies on, or through a
+/// template string — and `crate::markup` deliberately reads none of those, on the
+/// grounds that guessing at them would invent edges. Reporting `.card` dead on
+/// that evidence would be the exact error the honesty rules in this crate exist
+/// to prevent: a check that *could not run* returning the same answer as a check
+/// that ran and found nothing.
+///
+/// The consequence is stated rather than hidden: DevMap does not report unused
+/// CSS. Svelte's own compiler does, from inside the compilation that knows the
+/// answer, and that is the tool for it.
+fn is_never_dead_candidate(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::File | SymbolKind::MarkupAnchor | SymbolKind::StyleRule
+    )
+}
+
 fn dead_symbol_identity(symbol: &ExtractedSymbol, file_path: &str) -> String {
     symbol
         .qualified_name
@@ -1481,7 +1505,7 @@ fn symbol_exemption_index(
         };
 
         for sym in &ext.symbols {
-            if sym.kind == SymbolKind::File || sym.name.starts_with('_') {
+            if is_never_dead_candidate(sym.kind) || sym.name.starts_with('_') {
                 continue;
             }
             let identity = dead_symbol_identity(sym, &ext.file_path);
@@ -1758,8 +1782,8 @@ pub fn analyze_liveness_with_coverage(
         for sym in &ext.symbols {
             // `starts_with("__")` was also tested here and is subsumed by the
             // single-underscore check — dead code that no mutant could kill.
-            if sym.kind == SymbolKind::File || sym.name.starts_with('_') {
-                continue; // File nodes and underscore-private symbols are exempt
+            if is_never_dead_candidate(sym.kind) || sym.name.starts_with('_') {
+                continue; // See `is_never_dead_candidate`; plus underscore-private
             }
 
             let is_called = called_symbols.contains(&(ext.file_path.clone(), sym.name.clone()))

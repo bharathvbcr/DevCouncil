@@ -123,9 +123,59 @@ impl<'a> UsePosition<'a> {
     }
 }
 
+/// Whether a file's stylesheet applies to the whole document.
+///
+/// True for a standalone stylesheet and for a plain page; false for every
+/// template language, because Svelte, Vue and Astro each scope a component's
+/// `<style>` to that component's own elements. Keyed on the language rather than
+/// the extension so the one place that decides it is the same place
+/// `detect_language` already answered.
+///
+/// `:global(.x)` in a component is deliberately **not** detected. It is the one
+/// way a component legitimately declares a document-wide class, and honouring it
+/// would need the extractor to mark the declaration — a field on the payload. So
+/// a `:global` class answers its own file and nothing else: a missing edge, which
+/// a reader can see, rather than a wrong one, which they cannot.
+fn is_global_stylesheet(language: &str) -> bool {
+    matches!(language, "css" | "html")
+}
+
+/// One file's declaration of a markup or stylesheet identity.
+///
+/// The flag is what makes cross-file resolution decidable. A component's
+/// `<style>` is **scoped**: Svelte, Vue and Astro each compile it to rules that
+/// match only that component's own elements, so a `.selected` declared in
+/// `TaskBoard.svelte` cannot style `BranchList.svelte`'s markup, and an edge
+/// saying otherwise is false however unique the name is. A standalone
+/// stylesheet, and a `<style>` in a plain page, are global and can.
+///
+/// Measured on GitPulse before this flag existed: 672 cross-file selector edges,
+/// 668 of them into the global `src/app.css` and correct, and three of the
+/// remaining four into another component's scoped stylesheet and wrong.
+#[derive(Debug, Clone)]
+struct SelectorDeclaration {
+    file: String,
+    /// Whether the declaring file's stylesheet is document-wide: a `.css`,
+    /// `.scss` or `.less` file, or an `.html` page.
+    in_global_sheet: bool,
+}
+
 pub struct Resolver {
     symbol_index: BTreeMap<String, Vec<IndexedSymbol>>,
     file_symbols: BTreeMap<String, Vec<String>>, // file_path -> symbol_names
+    /// Markup and stylesheet declarations, by their selector-form name:
+    /// `[data-add-repo]`, `.nav-heading`, `#repo-heading`, `--gap-x` -> the
+    /// files that declare them, deduplicated and sorted.
+    ///
+    /// **A second namespace, on purpose.** These names do not live in the same
+    /// space as identifiers, and `symbol_index` is keyed by qualified name for
+    /// rungs that reason about imports, receivers and packages — none of which a
+    /// CSS class has. Putting them in one index would let the code ladder's
+    /// unique-global rung answer a class with a function: a class called `menu`
+    /// is not `fn menu`, and an edge between them is a fabrication, not a
+    /// coarser answer. Kept apart, the only thing that can answer a selector is
+    /// a markup or stylesheet declaration.
+    selector_symbols: BTreeMap<String, Vec<SelectorDeclaration>>,
     /// Every indexed file, grouped by its parent directory, each group sorted.
     ///
     /// Three call sites answered "which files sit directly in this directory"
@@ -343,6 +393,7 @@ impl Resolver {
         Self {
             symbol_index: BTreeMap::new(),
             file_symbols: BTreeMap::new(),
+            selector_symbols: BTreeMap::new(),
             files_by_dir: BTreeMap::new(),
             reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
@@ -1263,6 +1314,7 @@ impl Resolver {
         // for a rebuild.
         self.symbol_index.clear();
         self.file_symbols.clear();
+        self.selector_symbols.clear();
         self.files_by_dir.clear();
         self.reexport_chains.clear();
         self.receiver_types.clear();
@@ -1377,6 +1429,16 @@ impl Resolver {
                             .clone()
                             .unwrap_or_else(|| ext.file_path.clone())
                     });
+                // The markup/stylesheet namespace, kept out of the rungs above.
+                if matches!(sym.kind, SymbolKind::MarkupAnchor | SymbolKind::StyleRule) {
+                    let declaring = self.selector_symbols.entry(sym.name.clone()).or_default();
+                    if !declaring.iter().any(|known| known.file == ext.file_path) {
+                        declaring.push(SelectorDeclaration {
+                            file: ext.file_path.clone(),
+                            in_global_sheet: is_global_stylesheet(&ext.language),
+                        });
+                    }
+                }
                 file_syms.push(sym.name.clone());
             }
             self.file_symbols.insert(ext.file_path.clone(), file_syms);
@@ -2624,6 +2686,22 @@ impl Resolver {
                         reference.kind,
                         ReferenceKind::Call | ReferenceKind::Constructor | ReferenceKind::JsxTag
                     ) {
+                        continue;
+                    }
+                    // A DOM or stylesheet identity, answered by its own two-rung
+                    // ladder and by nothing else. It never reaches the code
+                    // rungs below, and a name they cannot find is not recorded
+                    // as an unresolved *code* reference: a class this index never
+                    // saw declared is the ordinary case — it lives in a global
+                    // stylesheet outside the tree, in a framework, or behind a
+                    // CDN — and filing 40,000 of those as failed attributions
+                    // would bury the tier whose whole purpose is to name
+                    // defects. The limit is stated in `markup`'s documentation
+                    // instead of implied by an empty ledger.
+                    if reference.kind == ReferenceKind::Selector {
+                        if let Some(edge) = self.resolve_selector_reference(ext, reference) {
+                            edges.push(edge);
+                        }
                         continue;
                     }
                     if let Some(edge) = self.resolve_name_reference(ext, family, reference) {
@@ -4393,6 +4471,103 @@ impl Resolver {
             let first = *file_hits.first()?;
             file_hits.iter().all(|kind| *kind == first).then_some(first)
         })
+    }
+
+    /// Resolve one [`ReferenceKind::Selector`] against markup and stylesheet
+    /// declarations only.
+    ///
+    /// Two rungs, and deliberately no third:
+    ///
+    /// 1. **This file.** A component's `<style>` is scoped to it by every
+    ///    framework that has one, and a `data-*` hook is queried by the script
+    ///    beside it, so a declaration in the same file is the answer whenever
+    ///    there is one — deterministic, exactly as `SameFile` is for code.
+    /// 2. **Exactly one file in the repository.** A global stylesheet declares
+    ///    `.btn` once and every component that writes `class="btn"` means that
+    ///    one. Rated `UniqueGlobal`, the same rung and the same confidence the
+    ///    code ladder gives a name with one declaration.
+    ///
+    /// Several files and no same-file match is **no edge**. Two components that
+    /// each scope a `.card` are two different `.card`s, and picking one would
+    /// assert a relationship between unrelated components; the honest answer is
+    /// that this index cannot say which, and `AmbiguousGlobal` would still put a
+    /// speculative edge in the graph.
+    fn resolve_selector_reference(
+        &self,
+        ext: &Extraction,
+        reference: &ExtractedReference,
+    ) -> Option<ResolvedEdge> {
+        let declaring = self.selector_symbols.get(&reference.name)?;
+        let (target_file, resolution) = if declaring
+            .iter()
+            .any(|declaration| declaration.file == ext.file_path)
+        {
+            (
+                ext.file_path.clone(),
+                Resolution::SameFile {
+                    target_symbol: reference.name.clone(),
+                    target_file: ext.file_path.clone(),
+                },
+            )
+        } else if declaring.len() == 1 && self.may_cross_files(reference, &declaring[0]) {
+            let target = declaring[0].file.clone();
+            (
+                target.clone(),
+                Resolution::UniqueSelector {
+                    target_symbol: reference.name.clone(),
+                    target_file: target,
+                },
+            )
+        } else {
+            return None;
+        };
+        Some(self.reference_edge(ext, &target_file, &reference.name, reference, resolution))
+    }
+
+    /// Whether a selector may reach a declaration in *another* file at all.
+    ///
+    /// Uniqueness is not sufficient here, which is what separates this rung from
+    /// the code ladder's. A name declared exactly once is still unreachable when
+    /// the two ends are scoped to different components, and an edge between them
+    /// is false rather than uncertain. Two ways for it to be reachable, and
+    /// nothing else:
+    ///
+    /// 1. **The declaration is global.** A `.css`/`.scss`/`.less` file, or a
+    ///    `<style>` in a plain `.html` page, applies to the whole document, so
+    ///    every component that names one of its classes means that one.
+    /// 2. **The name is an `id`.** An id is unique *per document*, not per
+    ///    component, so one component's `aria-controls="task-archive-dock"`
+    ///    naming another's `id` is the ordinary correct case — it is how an ARIA
+    ///    relationship is written across a page.
+    ///
+    /// Everything else abstains. Measured on GitPulse, this is the difference
+    /// between 672 cross-file edges with three wrong ones and 669 with none: the
+    /// three were `.selected`, `.sheet-body` and `.status`, each declared in one
+    /// component's scoped `<style>` and named by a different component's markup,
+    /// where the real declaration is either global CSS this index never saw or
+    /// absent altogether.
+    ///
+    /// **A third clause was considered and removed**, which is worth recording
+    /// because it reads as obviously right: *the reference is global*, on the
+    /// grounds that a rule in a global stylesheet selects across the whole
+    /// document. It has no correct producer. A stylesheet's selectors are read as
+    /// *declarations*, not uses, so a global sheet emits almost no references to
+    /// admit — and the one shape the clause did admit was wrong: a plain page's
+    /// `class="x"` reaching a `.x` that only a component scopes, which that
+    /// component's compiled CSS cannot match.
+    ///
+    /// The residual, stated rather than implied: clause 2 assumes the two
+    /// components render into the same document, which is true of a single-page
+    /// application and is not something this index proves. Two separately-mounted
+    /// pages could each carry an element with that id and the edge would join the
+    /// wrong pair. That is why an id crossing files is rated `HIGH` and never
+    /// `DETERMINISTIC`.
+    fn may_cross_files(
+        &self,
+        reference: &ExtractedReference,
+        declaration: &SelectorDeclaration,
+    ) -> bool {
+        declaration.in_global_sheet || reference.name.starts_with('#')
     }
 
     fn reference_edge(

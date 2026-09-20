@@ -54,7 +54,9 @@ fn entitled(resolution: &Resolution) -> Confidence {
         | Resolution::ImportScoped { .. }
         | Resolution::ReceiverType { .. }
         | Resolution::Structural { .. } => Confidence::DETERMINISTIC,
-        Resolution::UniqueGlobal { .. } => Confidence::HIGH,
+        // One declaration of the name and nothing tying it to this file:
+        // the same rung whether the name is an identifier or a selector.
+        Resolution::UniqueGlobal { .. } | Resolution::UniqueSelector { .. } => Confidence::HIGH,
         Resolution::AmbiguousGlobal { .. } | Resolution::Unresolved { .. } => {
             Confidence::SPECULATIVE
         }

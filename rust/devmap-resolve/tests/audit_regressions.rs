@@ -57,6 +57,10 @@ fn entitled_confidence(resolution: &Resolution) -> Confidence {
         // One match across the whole family, with nothing tying it to this
         // file. Strong, not certain.
         Resolution::UniqueGlobal { .. } => Confidence::HIGH,
+        // A markup or stylesheet identity declared in exactly one file, reached
+        // from another. Same evidence, same tier: one declaration of the name,
+        // nothing tying it to this file.
+        Resolution::UniqueSelector { .. } => Confidence::HIGH,
         Resolution::AmbiguousGlobal { .. } => Confidence::SPECULATIVE,
         Resolution::Unresolved { .. } => Confidence::SPECULATIVE,
     }
@@ -177,6 +181,7 @@ fn every_edge_confidence_matches_the_evidence_it_names() {
             Resolution::ImportScoped { .. } => "ImportScoped",
             Resolution::ReceiverType { .. } => "ReceiverType",
             Resolution::UniqueGlobal { .. } => "UniqueGlobal",
+            Resolution::UniqueSelector { .. } => "UniqueSelector",
             Resolution::AmbiguousGlobal { .. } => "AmbiguousGlobal",
             Resolution::Unresolved { .. } => "Unresolved",
             Resolution::Structural { .. } => "Structural",

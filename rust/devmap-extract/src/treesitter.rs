@@ -716,6 +716,15 @@ fn extract_treesitter_before_deadline(
                 // deduplicated against its own calls too, and once for the
                 // whole file rather than per language arm.
                 drop_duplicate_callee_names(&mut extraction.references);
+                // The other half of a template file: its markup, and its
+                // `<style>` block. After the script merge because a selector
+                // string is attributed to the function it sits inside, and that
+                // function only exists in `symbols` once the merge above has
+                // run; after the dedup because a `ReferenceKind::Selector` is
+                // not in the callee-name namespace that pass is about. Returns
+                // after one registry lookup for every language whose entry
+                // permits neither `css` nor `html` inside it.
+                crate::markup::merge_markup(&mut extraction, root, source, lang);
                 #[cfg(test)]
                 EXTRACTION_FINISH_HOOK.with(|hook| {
                     if let Some(finish) = hook.take() {
@@ -1408,18 +1417,36 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
     // parse failures, all prose and data, hiding the 16 real ones.
     let declarative = crate::fallback::applies_to(lang);
     let scan = if declarative {
-        crate::fallback::scan_declarations(path, source)
+        // The language, not just the path: two of the languages this tier serves
+        // — `css` and `html` — are read by `crate::markup` rather than by the
+        // line scanner, and the dispatch belongs to the tier, not here.
+        crate::fallback::scan_declarations_in(lang, path, source)
     } else {
         // Prose and data formats declare nothing; see
         // `fallback::NON_DECLARATIVE_LANGUAGES` for what scanning them produced.
         crate::fallback::FallbackScan {
             symbols: Vec::new(),
+            references: Vec::new(),
             truncated: 0,
             skipped_long_lines: 0,
+            unread_bytes: 0,
         }
     };
     let recovered_count = scan.symbols.len();
-    let recovered = recovered_count > 0;
+    // A reader ran over this file and produced an answer — either because it
+    // found declarations, or because the language has a reader of its own and
+    // that reader found none.
+    //
+    // The second half is load-bearing and was not here at first. `html` and `css`
+    // moved out of `NON_DECLARATIVE_LANGUAGES` when `crate::markup` gave them a
+    // reader, and a page with no ids then landed in the `(false, true)` arm —
+    // "a grammar was wanted for this language and was not there" — so every
+    // `.html` and `.css` file without an anchor or a rule counted as a parse
+    // failure. That is the K5 defect exactly, and the store's
+    // `k5_prose_formats_are_not_parse_failures_but_broken_files_still_are`
+    // caught it. Finding nothing in a file that declares nothing is a completed
+    // read, and it must not report what a failed one reports.
+    let recovered = recovered_count > 0 || crate::fallback::has_dedicated_reader(lang);
 
     // The `File` node, which this path used to omit entirely.
     //
@@ -1519,6 +1546,18 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
                             crate::fallback::MAX_LINE_BYTES
                         ));
                     }
+                    // A third way to lose a declaration, and the only one the
+                    // markup and stylesheet readers can hit: a byte cap stopped
+                    // the reader partway through the file. Like a skipped line
+                    // and unlike the scan cap, what those bytes held was never
+                    // counted, so the total is a lower bound.
+                    if scan.unread_bytes > 0 {
+                        caveats.push(format!(
+                            "{} byte(s) never read at a reader's byte cap, so the total is a \
+                             lower bound",
+                            scan.unread_bytes
+                        ));
+                    }
                     // The "X of Y" form is used only when Y is genuinely
                     // known — that is, when every declaration was counted and
                     // some were dropped afterwards. If a line was never
@@ -1558,7 +1597,11 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         imports: Vec::new(),
         calls: Vec::new(),
         exports: Vec::new(),
-        references: Vec::new(),
+        // Empty for the line scanner, which recovers declarations only. The
+        // markup and stylesheet readers behind this same tier do read uses — a
+        // `class` attribute, a `var(--x)` — and dropping them here would index
+        // one half of a contract that only means anything as a pair.
+        references: scan.references,
         diagnostics,
         routes: Vec::new(),
         wiring: extract_wiring_annotations(path, source),

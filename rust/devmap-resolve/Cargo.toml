@@ -48,6 +48,10 @@ name = "embedded_script_families"
 required-features = ["parse"]
 
 [[test]]
+name = "markup_selectors_resolve"
+required-features = ["parse"]
+
+[[test]]
 name = "parallel_determinism"
 required-features = ["parse"]
 
