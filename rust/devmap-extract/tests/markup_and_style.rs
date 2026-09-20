@@ -13,9 +13,7 @@
 //! case.
 
 use devmap_extract::extract_file;
-use devmap_extract::model::{
-    Extraction, ParseOutcome, ReferenceKind, SymbolKind,
-};
+use devmap_extract::model::{Extraction, ParseOutcome, ReferenceKind, SymbolKind};
 
 /// The reported file, reduced to the three things it proved were missing: a
 /// valueless `data-*` hook, a selector string in the script that targets it,
@@ -159,8 +157,9 @@ fn a_selector_string_is_attributed_to_the_function_it_sits_in() {
         })
         .collect();
     assert!(
-        attributed.iter().any(|(name, owner)| name == ".nav-heading"
-            && owner.ends_with("::toggleAddMenu")),
+        attributed
+            .iter()
+            .any(|(name, owner)| name == ".nav-heading" && owner.ends_with("::toggleAddMenu")),
         "the querySelector call inside toggleAddMenu belongs to it: {attributed:?}"
     );
     assert!(

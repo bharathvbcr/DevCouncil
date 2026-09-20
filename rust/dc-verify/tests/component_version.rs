@@ -79,9 +79,24 @@ fn health_reports_version_and_id() {
         .expect("dcverify must run");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"id\":\"dcverify\""), "health missing id: {stdout}");
-    assert!(stdout.contains("\"component\":\"dc-verify\""), "health missing component: {stdout}");
-    assert!(stdout.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))), "health missing version: {stdout}");
-    assert!(stdout.contains("\"verifier\":\"dc-verify\""), "health missing verifier: {stdout}");
-    assert!(stdout.contains("\"schema_version\":1"), "health missing schema_version: {stdout}");
+    assert!(
+        stdout.contains("\"id\":\"dcverify\""),
+        "health missing id: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"component\":\"dc-verify\""),
+        "health missing component: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))),
+        "health missing version: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"verifier\":\"dc-verify\""),
+        "health missing verifier: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"schema_version\":1"),
+        "health missing schema_version: {stdout}"
+    );
 }

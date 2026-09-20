@@ -263,7 +263,13 @@ pub fn has_dedicated_reader(language: &str) -> bool {
 
 pub fn scan_declarations_in(language: &str, file_path: &str, source: &str) -> FallbackScan {
     match language {
-        "css" => return from_markup(crate::markup::scan_stylesheet(file_path, source), file_path, source),
+        "css" => {
+            return from_markup(
+                crate::markup::scan_stylesheet(file_path, source),
+                file_path,
+                source,
+            )
+        }
         "html" => {
             let scan = crate::markup::scan_markup_text(file_path, source);
             // A page's inline `<script>` is not parsed here — no grammar is
@@ -272,8 +278,7 @@ pub fn scan_declarations_in(language: &str, file_path: &str, source: &str) -> Fa
             // parser. The gap that remains is the script's *code*, and it is
             // named in that module's documentation rather than left implied.
             let declared = scan.declared_names();
-            let budget =
-                crate::markup::MAX_MARKUP_REFERENCES.saturating_sub(scan.references.len());
+            let budget = crate::markup::MAX_MARKUP_REFERENCES.saturating_sub(scan.references.len());
             let (script_uses, truncated) =
                 crate::markup::selector_references(source, &scan.script_regions, &declared, budget);
             let mut scan = scan;
@@ -365,11 +370,7 @@ pub fn scan_declarations_in(language: &str, file_path: &str, source: &str) -> Fa
 /// The two shapes report the same three facts under different names, and this is
 /// the one place they are translated, so the caller that builds the `Extraction`
 /// needs to know about only one of them.
-fn from_markup(
-    scan: crate::markup::MarkupScan,
-    file_path: &str,
-    source: &str,
-) -> FallbackScan {
+fn from_markup(scan: crate::markup::MarkupScan, file_path: &str, source: &str) -> FallbackScan {
     let unread_bytes = scan
         .unread
         .iter()
@@ -537,7 +538,9 @@ mod applicability_tests {
     /// graph that do not exist anywhere.
     #[test]
     fn prose_and_data_formats_are_not_scanned() {
-        for language in ["markdown", "json", "yaml", "toml", "config", "text", "notebook"] {
+        for language in [
+            "markdown", "json", "yaml", "toml", "config", "text", "notebook",
+        ] {
             assert!(
                 !applies_to(language),
                 "{language} declares nothing; scanning it can only invent symbols"

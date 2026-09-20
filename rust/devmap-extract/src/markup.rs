@@ -363,7 +363,12 @@ fn read_stylesheet(css: &str, base: usize, collector: &mut Collector) {
                 // The last declaration in a block needs no `;`, so the text
                 // before the closing brace is one.
                 let in_rule = innermost_is_rule(depth, &blocks);
-                read_declaration(&css[chunk_start..at], base + chunk_start, in_rule, collector);
+                read_declaration(
+                    &css[chunk_start..at],
+                    base + chunk_start,
+                    in_rule,
+                    collector,
+                );
                 if depth == blocks.len() {
                     blocks.pop();
                 }
@@ -372,7 +377,12 @@ fn read_stylesheet(css: &str, base: usize, collector: &mut Collector) {
             }
             b';' => {
                 let in_rule = innermost_is_rule(depth, &blocks);
-                read_declaration(&css[chunk_start..at], base + chunk_start, in_rule, collector);
+                read_declaration(
+                    &css[chunk_start..at],
+                    base + chunk_start,
+                    in_rule,
+                    collector,
+                );
                 chunk_start = at + 1;
             }
             _ => {}
@@ -547,11 +557,7 @@ fn selector_components(selector: &str, base: usize) -> Vec<(String, Span)> {
                 }
                 if cursor > name_start {
                     found.push((
-                        format!(
-                            "{}{}",
-                            sigil as char,
-                            &selector[name_start..cursor]
-                        ),
+                        format!("{}{}", sigil as char, &selector[name_start..cursor]),
                         Span {
                             start_byte: base + at,
                             end_byte: base + cursor,
@@ -661,11 +667,7 @@ fn read_attribute(
         return;
     }
     if lowered.starts_with("data-") {
-        collector.add_symbol(
-            &format!("[{lowered}]"),
-            SymbolKind::MarkupAnchor,
-            name_span,
-        );
+        collector.add_symbol(&format!("[{lowered}]"), SymbolKind::MarkupAnchor, name_span);
         return;
     }
     let Some(value) = value else { return };
@@ -735,7 +737,8 @@ fn read_markup_text(text: &str, base: usize, collector: &mut Collector) {
         let name_start = at + 1;
         let mut cursor = name_start;
         while cursor < bytes.len()
-            && (bytes[cursor].is_ascii_alphanumeric() || matches!(bytes[cursor], b'-' | b'_' | b':'))
+            && (bytes[cursor].is_ascii_alphanumeric()
+                || matches!(bytes[cursor], b'-' | b'_' | b':'))
         {
             cursor += 1;
         }
@@ -1292,7 +1295,11 @@ fn enclosing_symbol_for(span: &Span, symbols: &[ExtractedSymbol], file_path: &st
         let width = symbol.span.end_byte.saturating_sub(symbol.span.start_byte);
         match best {
             Some(current)
-                if current.span.end_byte.saturating_sub(current.span.start_byte) <= width => {}
+                if current
+                    .span
+                    .end_byte
+                    .saturating_sub(current.span.start_byte)
+                    <= width => {}
             _ => best = Some(symbol),
         }
     }

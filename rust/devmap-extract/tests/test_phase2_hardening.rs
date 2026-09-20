@@ -431,11 +431,27 @@ fn a_computed_module_binding_is_not_an_alias() {
     let dropped = [
         // The measured shape, and the four other ways to compute a value whose
         // outermost node looks like a name.
-        ("out.py", "from pathlib import Path\nOUT=Path(__file__).resolve().parent\n", "OUT"),
-        ("made.py", "from x import factory\nMADE = factory()\n", "MADE"),
-        ("item.py", "from x import things\nITEM = things[0]\n", "ITEM"),
+        (
+            "out.py",
+            "from pathlib import Path\nOUT=Path(__file__).resolve().parent\n",
+            "OUT",
+        ),
+        (
+            "made.py",
+            "from x import factory\nMADE = factory()\n",
+            "MADE",
+        ),
+        (
+            "item.py",
+            "from x import things\nITEM = things[0]\n",
+            "ITEM",
+        ),
         ("sum.py", "from x import a, b\nTOTAL = a + b\n", "TOTAL"),
-        ("call.py", "from x import mod\nVALUE = mod.make().field\n", "VALUE"),
+        (
+            "call.py",
+            "from x import mod\nVALUE = mod.make().field\n",
+            "VALUE",
+        ),
     ];
     for (path, source, name) in dropped {
         let ext = extract_file(path, source);
@@ -453,7 +469,11 @@ fn a_computed_module_binding_is_not_an_alias() {
     // dropping one deletes a name other modules import.
     let kept = [
         ("bare.py", "from x import Other\nAlias = Other\n", "Alias"),
-        ("dotted.py", "import widgets\nWidget = widgets.Widget\n", "Widget"),
+        (
+            "dotted.py",
+            "import widgets\nWidget = widgets.Widget\n",
+            "Widget",
+        ),
         ("deep.py", "import pkg\nThing = pkg.mod.Thing\n", "Thing"),
     ];
     for (path, source, name) in kept {

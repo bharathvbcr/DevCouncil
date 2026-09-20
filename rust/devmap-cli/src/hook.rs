@@ -1123,7 +1123,9 @@ fn segment_reads_source(segment: &str) -> bool {
     // something being read. Truncating there is simpler than tracking which
     // operator takes a following word, and it cannot mistake a write target for
     // a read: `cat /dev/null > main.rs` reads no source.
-    let read_part = segment.split_once('>').map_or(segment, |(before, _)| before);
+    let read_part = segment
+        .split_once('>')
+        .map_or(segment, |(before, _)| before);
     let mut words = read_part.split_whitespace();
     let _ = words.next(); // the verb
     words.any(|word| {
@@ -2229,7 +2231,9 @@ mod tests {
         // Languages no list written from memory here would have covered. The
         // first draft of this test asserted `.zig` and `.ex`, which the table
         // does not carry — the table is the authority, not recollection.
-        for ext in ["rs", "go", "py", "ts", "swift", "kt", "scala", "dart", "vue", "nix", "sol"] {
+        for ext in [
+            "rs", "go", "py", "ts", "swift", "kt", "scala", "dart", "vue", "nix", "sol",
+        ] {
             let command = format!("cat thing.{ext}");
             assert!(
                 command_is_search(&command),
@@ -2240,7 +2244,9 @@ mod tests {
         // appear elsewhere in `languages.rs`, in its ignore helpers rather than
         // in any spec's extensions, so the lookup must not claim them. Reading a
         // secrets file is never something to nudge an agent towards.
-        for ext in ["json", "lock", "yaml", "yml", "toml", "md", "txt", "env", "csv"] {
+        for ext in [
+            "json", "lock", "yaml", "yml", "toml", "md", "txt", "env", "csv",
+        ] {
             let command = format!("cat thing.{ext}");
             assert!(
                 !command_is_search(&command),

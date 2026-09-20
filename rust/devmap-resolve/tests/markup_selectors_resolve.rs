@@ -51,13 +51,13 @@ fn is_selector_name(qualified: &str) -> bool {
 /// that same file, so a `find` over both kinds silently answers questions about
 /// *use* with the containment edge — which is how the first draft of this file
 /// "passed" an assertion about which function owns a use.
-fn selector_uses(
-    resolution: &ResolutionResult,
-) -> Vec<&devmap_resolve::model::ResolvedEdge> {
+fn selector_uses(resolution: &ResolutionResult) -> Vec<&devmap_resolve::model::ResolvedEdge> {
     resolution
         .edges
         .iter()
-        .filter(|edge| edge.edge_kind == EdgeKind::References && is_selector_name(&edge.target_symbol))
+        .filter(|edge| {
+            edge.edge_kind == EdgeKind::References && is_selector_name(&edge.target_symbol)
+        })
         .collect()
 }
 
@@ -68,10 +68,15 @@ fn a_declaration_is_contained_by_its_file() {
     let contained: Vec<&str> = resolution
         .edges
         .iter()
-        .filter(|edge| edge.edge_kind == EdgeKind::Contains && is_selector_name(&edge.target_symbol))
+        .filter(|edge| {
+            edge.edge_kind == EdgeKind::Contains && is_selector_name(&edge.target_symbol)
+        })
         .map(|edge| edge.target_symbol.as_str())
         .collect();
-    for expected in ["src/Board.svelte::[data-hook]", "src/Board.svelte::.nav-heading"] {
+    for expected in [
+        "src/Board.svelte::[data-hook]",
+        "src/Board.svelte::.nav-heading",
+    ] {
         assert!(
             contained.contains(&expected),
             "{expected} must be contained by its file, or nothing can navigate to it: \
@@ -80,7 +85,8 @@ fn a_declaration_is_contained_by_its_file() {
     }
 }
 
-const COMPONENT: &str = "<script>\n  function toggle() { document.querySelector(\"[data-hook]\"); }\n\
+const COMPONENT: &str =
+    "<script>\n  function toggle() { document.querySelector(\"[data-hook]\"); }\n\
                          </script>\n\
                          <div class=\"nav-heading\" data-hook>x</div>\n\
                          <style>\n  .nav-heading { color: red; }\n</style>\n";
@@ -135,10 +141,7 @@ fn a_selector_string_reaches_the_hook_the_markup_declares() {
 fn a_global_stylesheet_rule_answers_a_component_that_names_it() {
     let (_, resolution) = resolve(&[
         ("src/app.css", ".btn { padding: 2px; }\n"),
-        (
-            "src/Save.svelte",
-            "<button class=\"btn\">Save</button>\n",
-        ),
+        ("src/Save.svelte", "<button class=\"btn\">Save</button>\n"),
     ]);
     let edge = selector_uses(&resolution)
         .into_iter()
@@ -330,10 +333,7 @@ fn a_selector_never_resolves_to_a_code_symbol() {
             "src/menu.ts",
             "export function menu(): number { return 1; }\n",
         ),
-        (
-            "src/Nav.svelte",
-            "<div class=\"menu\" data-menu>x</div>\n",
-        ),
+        ("src/Nav.svelte", "<div class=\"menu\" data-menu>x</div>\n"),
     ]);
     for edge in &resolution.edges {
         let target = edge.target_symbol.rsplit("::").next().unwrap_or("");
@@ -381,8 +381,14 @@ fn an_unresolvable_selector_is_not_an_unresolved_code_reference() {
 #[test]
 fn resolving_the_same_corpus_twice_gives_the_same_edges() {
     let corpus: &[(&str, &str)] = &[
-        ("src/app.css", ".btn { padding: 2px; }\n.card { margin: 0; }\n"),
-        ("src/Save.svelte", "<button class=\"btn card\">Save</button>\n"),
+        (
+            "src/app.css",
+            ".btn { padding: 2px; }\n.card { margin: 0; }\n",
+        ),
+        (
+            "src/Save.svelte",
+            "<button class=\"btn card\">Save</button>\n",
+        ),
         ("src/Board.svelte", COMPONENT),
     ];
     let fingerprint = |resolution: &ResolutionResult| {

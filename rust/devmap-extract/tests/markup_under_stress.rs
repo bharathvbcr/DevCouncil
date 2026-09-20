@@ -182,7 +182,8 @@ fn assert_invariants(label: &str, path: &str, source: &str, extraction: &Extract
 
 /// Hand-written hostile inputs, each naming the loop or slice it attacks.
 fn adversarial_cases() -> Vec<(&'static str, String)> {
-    let mut cases: Vec<(&'static str, String)> = vec![
+    let mut cases: Vec<(&'static str, String)> =
+        vec![
         ("empty", String::new()),
         ("only a style element", "<style></style>".to_string()),
         (
@@ -335,9 +336,7 @@ fn adversarial_cases() -> Vec<(&'static str, String)> {
         "one enormous selector list",
         format!(
             "<style>{} {{ x: 1 }}</style>",
-            (0..50_000)
-                .map(|n| format!(".s{n},"))
-                .collect::<String>()
+            (0..50_000).map(|n| format!(".s{n},")).collect::<String>()
         ),
     ));
     cases
@@ -438,10 +437,53 @@ fn random_structural_bytes_are_read_without_panicking() {
     // Every byte the scanners dispatch on, plus the pieces of a real tag and a
     // real rule, plus two multi-byte characters.
     const ALPHABET: &[&str] = &[
-        "<", ">", "/", "\"", "'", "`", "{", "}", "[", "]", "(", ")", ";", ":", ",", ".", "#", "-",
-        "_", "=", "*", "&", "@", "\\", " ", "\n", "\t", "a", "Z", "0", "é", "日", "<div", "<style",
-        "</style", "<script", "</script", "<!--", "-->", "class=", "id=", "data-x", "var(--y)",
-        "@media", "@keyframes", ":global(", "raw_text",
+        "<",
+        ">",
+        "/",
+        "\"",
+        "'",
+        "`",
+        "{",
+        "}",
+        "[",
+        "]",
+        "(",
+        ")",
+        ";",
+        ":",
+        ",",
+        ".",
+        "#",
+        "-",
+        "_",
+        "=",
+        "*",
+        "&",
+        "@",
+        "\\",
+        " ",
+        "\n",
+        "\t",
+        "a",
+        "Z",
+        "0",
+        "é",
+        "日",
+        "<div",
+        "<style",
+        "</style",
+        "<script",
+        "</script",
+        "<!--",
+        "-->",
+        "class=",
+        "id=",
+        "data-x",
+        "var(--y)",
+        "@media",
+        "@keyframes",
+        ":global(",
+        "raw_text",
     ];
     for round in 0..ROUNDS {
         let pieces = 1 + rng.below(60);
@@ -449,7 +491,9 @@ fn random_structural_bytes_are_read_without_panicking() {
         for _ in 0..pieces {
             source.push_str(rng.pick(ALPHABET));
         }
-        let path = rng.pick(&["a.svelte", "a.vue", "a.astro", "a.liquid", "a.html", "a.css"]);
+        let path = rng.pick(&[
+            "a.svelte", "a.vue", "a.astro", "a.liquid", "a.html", "a.css",
+        ]);
         let label = format!("seed {seed} round {round} source {source:?}");
         let started = Instant::now();
         let extraction = extract_file(path, &source);
@@ -587,10 +631,11 @@ fn a_class_named_like_a_function_is_not_that_function() {
     let source = "<script>\n  export function menu() { return 1; }\n</script>\n\
                   <div class=\"menu\">x</div>\n<style>.menu { color: red; }</style>\n";
     let extraction = extract_file("a.svelte", source);
-    let class_declarations: Vec<&devmap_extract::model::ExtractedSymbol> = markup_symbols(&extraction)
-        .into_iter()
-        .filter(|symbol| symbol.name == ".menu")
-        .collect();
+    let class_declarations: Vec<&devmap_extract::model::ExtractedSymbol> =
+        markup_symbols(&extraction)
+            .into_iter()
+            .filter(|symbol| symbol.name == ".menu")
+            .collect();
     assert_eq!(
         class_declarations.len(),
         1,
@@ -635,7 +680,10 @@ fn the_code_half_is_untouched_by_the_markup_pass() {
         extraction.imports
     );
     assert!(
-        extraction.calls.iter().any(|call| call.callee_name == "helper"),
+        extraction
+            .calls
+            .iter()
+            .any(|call| call.callee_name == "helper"),
         "the call is still read: {:?}",
         extraction.calls
     );

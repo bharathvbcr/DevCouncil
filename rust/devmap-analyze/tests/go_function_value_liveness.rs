@@ -368,8 +368,8 @@ fn a_composite_literal_field_key_also_spares_a_namesake_function() {
             ),
         ),
     ]);
-    let report = report_for(&out, "run")
-        .unwrap_or_else(|| panic!("`run` must be reported at all: {out:?}"));
+    let report =
+        report_for(&out, "run").unwrap_or_else(|| panic!("`run` must be reported at all: {out:?}"));
     assert!(
         report.is_exempt,
         "recorded behaviour: the field key spares the namesake function: {report:?}"
