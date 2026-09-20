@@ -640,6 +640,33 @@ fn preparation_limits_and_pagination_preserve_counts_without_copying_source_bodi
 }
 
 #[test]
+fn grok_and_antigravity_are_supported_terminal_providers() {
+    let (store, _) = fixture();
+    for provider in ["grok", "agy"] {
+        let input = PREPARE
+            .replace(r#""id":"run""#, &format!(r#""id":"run-{provider}""#))
+            .replace(
+                r#""request_id":"prepare""#,
+                &format!(r#""request_id":"prepare-{provider}""#),
+            )
+            .replace(
+                r#""provider":"codex""#,
+                &format!(r#""provider":"{provider}""#),
+            );
+        let raw = call(&store, "runs.prepare", &input);
+        assert_eq!(text(&store, &raw, "$.item.provider"), provider);
+        assert_eq!(text(&store, &raw, "$.item.kind"), "external_terminal");
+        call(
+            &store,
+            "runs.cancel",
+            &format!(
+                r#"{{"id":"run-{provider}","request_id":"cancel-{provider}","expected_revision":1}}"#
+            ),
+        );
+    }
+}
+
+#[test]
 fn malformed_or_unrelated_launch_inputs_never_reserve_a_slot() {
     let (store, _) = fixture();
     for input in [
