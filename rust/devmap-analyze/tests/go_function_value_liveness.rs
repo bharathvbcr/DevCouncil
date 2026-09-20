@@ -234,7 +234,7 @@ fn a_file_with_no_package_clause_cannot_key_the_join() {
     let out = reports(&[
         (
             "cmd/mapcli/fragment.go",
-            concat!("func orphanHandler(args []string) {}\n"),
+            "func orphanHandler(args []string) {}\n",
         ),
         (
             "cmd/mapcli/other_fragment.go",
