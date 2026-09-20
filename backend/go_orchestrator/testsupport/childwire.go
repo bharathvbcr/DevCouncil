@@ -1,3 +1,7 @@
+// devcouncil: allow-unwired
+//
+// Test-only by design, and shared with Manvi. See the package doc in
+// testsupport.go for why this is a declaration rather than a finding.
 package testsupport
 
 import (

@@ -21,6 +21,21 @@
 //     unlinks and rewrites its output on every build — so the binary a test is
 //     exec'ing can vanish because a *different* package rebuilt it. cargoBin
 //     hands out a stable copy instead. See its comment for the measurements.
+//
+// devcouncil: allow-unwired
+//
+// Every importer of this package is a `_test.go` file, and `unwired_candidates`
+// discounts test importers on purpose — a test importing a module says nothing
+// about whether production wired it. That rule is right, and this package is
+// the case it cannot judge: being imported only by tests is not a symptom
+// here, it is the entire job.
+//
+// The declaration is also the only way to state the half no single-repository
+// analyzer can see. Manvi keeps symlinks to these crates and drives the same
+// helpers from its own tree — `TestRepoRootFindsTheManviLayout` in this
+// package's tests exists because a change that stayed green here once failed
+// every test in Manvi. So "nothing in DevCouncil depends on this" is true and
+// is not evidence that the package is stranded.
 package testsupport
 
 import (
