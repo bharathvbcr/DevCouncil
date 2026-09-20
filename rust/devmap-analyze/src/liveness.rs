@@ -156,6 +156,71 @@ fn c_header_exported_names(extractions: &[Extraction]) -> HashSet<&str> {
 pub const GO_BUILD_VARIANT_REASON: &str =
     "Go build-constrained variant — the call reaches whichever variant this build selects";
 
+/// Why a Go function named as a value is exempt rather than reported.
+///
+/// Worded as a statement about the evidence, not about the function. This
+/// exemption does not claim the function runs — it says the index holds a
+/// value-position mention of it that the reference ladder declines to attribute,
+/// so the index cannot show that nothing uses it.
+pub const GO_VALUE_MENTION_REASON: &str =
+    "Named as a value in its own Go package — the mention is a bare identifier the ladder declines";
+
+/// Bare value-position identifiers named in a Go package, keyed by
+/// `(directory, package clause, name)` and carrying the files that named them.
+///
+/// `Command{Run: runStatus}` is the shape. The mention is a
+/// `ReferenceKind::Name`, and `resolve_reference` returns `None` for a bare
+/// `Name` rather than continuing down the ladder — deliberately, because the
+/// unique-global rung would bind `except Exception as e` to some unrelated
+/// `def e`. The Go package rung is written *below* that refusal and its comment
+/// says so in as many words: a bare identifier mention is the one shape that
+/// function declines rather than fails, and a package-scope rung must not be the
+/// thing that widens it. So the edge does not exist, and liveness sees a function
+/// nothing calls.
+///
+/// The declaring file is excluded at the use site, not here, because it is only
+/// knowable per candidate. That exclusion is what keeps this exemption from
+/// claiming credit for the same-file rung's work — and, in the same stroke, stops
+/// a function's own body from being the evidence that spares it.
+///
+/// Scoping to the package is exact rather than merely conservative, by the same
+/// rule as [`go_interface_specs_by_package`]: an unexported Go name resolves only
+/// within its own directory, and an exported one reports `is_exported` and is
+/// spared earlier without ever reaching this branch.
+///
+/// **Known over-approximation, tested and named.** Go spells a composite-literal
+/// field key as a bare identifier with no receiver, so `Command{run: nil}` is
+/// indistinguishable here from naming a package-level `func run`. An unexported
+/// function colliding with a field key is therefore exempted although nothing
+/// uses it. That is the direction an exemption may be wrong in — withholding a
+/// finding it cannot prove, never asserting one it cannot support. Narrowing it
+/// belongs in the extractor, where a field key could carry its composite type as
+/// a receiver; at this layer the only available answer would be to guess from the
+/// spelling.
+fn go_value_mentioned_names(
+    extractions: &[Extraction],
+) -> HashMap<(&str, &str, &str), HashSet<&str>> {
+    let mut mentions: HashMap<(&str, &str, &str), HashSet<&str>> = HashMap::new();
+    for ext in extractions {
+        let Some((dir, package)) = go_package_key(ext) else {
+            continue;
+        };
+        for reference in &ext.references {
+            // A receiver makes this a member reference — `cfg.runDoctor` names a
+            // struct field, and the member rungs run for it in full, so its
+            // failure is already recorded as a failure rather than declined.
+            if reference.kind != ReferenceKind::Name || reference.receiver_expr.is_some() {
+                continue;
+            }
+            mentions
+                .entry((dir, package, reference.name.as_str()))
+                .or_default()
+                .insert(ext.file_path.as_str());
+        }
+    }
+    mentions
+}
+
 /// Symbol identities that exist in a Go package only as mutually exclusive
 /// build variants, keyed by `(package, identity)`.
 ///
@@ -1427,6 +1492,7 @@ fn symbol_exemption_index(
     let go_interface_specs = go_interface_specs_by_package(extractions);
     let c_header_exports = c_header_exported_names(extractions);
     let go_build_variants = go_build_variant_identities(extractions);
+    let go_value_mentions = go_value_mentioned_names(extractions);
 
     // The one annotation kind whose target lives in a *different* file from the
     // one that carries it: `[project.scripts] cli = "pkg.mod:func"` is written
@@ -1577,6 +1643,33 @@ fn symbol_exemption_index(
                             })
                             .unwrap_or(false))
                     .then(|| GO_BUILD_VARIANT_REASON.to_string())
+                })
+                // A Go function used as a value rather than called. Appended
+                // last, so no reason string above it changes: the arms are
+                // machine tokens in the tests that pin them.
+                //
+                // `SymbolKind::Function` only. A method is reported under
+                // `Type.Method`, so matching a bare mention against it would mean
+                // deliberately stripping the type — and that over-exempts every
+                // same-named method of every type in the package. The
+                // `identity == name` check says the same thing structurally for
+                // any other nested shape.
+                .or_else(|| {
+                    (sym.kind == SymbolKind::Function
+                        && identity == sym.name
+                        && go_package_key(ext)
+                            .and_then(|(dir, package)| {
+                                go_value_mentions.get(&(dir, package, sym.name.as_str()))
+                            })
+                            .is_some_and(|files| {
+                                // A mention in the declaring file is not
+                                // declined — the same-file rung answers it and
+                                // the symbol is live by an edge. Only a mention
+                                // from elsewhere in the package is evidence this
+                                // index cannot attribute.
+                                files.iter().any(|file| *file != ext.file_path.as_str())
+                            }))
+                    .then(|| GO_VALUE_MENTION_REASON.to_string())
                 });
 
             if let Some(reason) = reason {
