@@ -273,6 +273,73 @@ fn a_non_code_suffix_is_not_scanned() {
     .is_empty());
 }
 
+/// A Cargo build script's declared inputs are wiring evidence.
+///
+/// `cargo:rerun-if-changed=` is the one place a crate states that a file no
+/// `use` can reach is part of its build. GitPulse's Swift bridge is the
+/// measured case: `build.rs` compiles `swift/AppleIntelligence.swift` with
+/// `swiftc` and declares it here, and the only other edge to it is an argument
+/// to a subprocess — so without this it was reported as a file nothing
+/// depends on.
+#[test]
+fn a_build_script_declares_the_files_it_compiles() {
+    let source = "\
+fn main() {
+    println!(\"cargo:rerun-if-changed=swift/AppleIntelligence.swift\");
+    println!(\"cargo::rerun-if-changed=proto/api.proto\");
+}
+";
+    let forms = dynamic_reference_forms("src-tauri/build.rs", source);
+    // Joined to the manifest directory, which is what the declaration is
+    // relative to — this is the form `reached_dynamically` matches a repository
+    // path against.
+    assert!(
+        forms.contains(&"src-tauri/swift/AppleIntelligence.swift".to_string()),
+        "expected the manifest-relative path among {forms:?}"
+    );
+    // And the bare form, for a repository whose root is the crate itself.
+    assert!(forms.contains(&"swift/AppleIntelligence.swift".to_string()));
+    // The `cargo::` spelling Cargo 1.77 introduced is the same declaration.
+    assert!(forms.contains(&"src-tauri/proto/api.proto".to_string()));
+}
+
+/// An interpolated path is refused rather than guessed at.
+#[test]
+fn a_computed_build_script_input_is_not_invented() {
+    let source = "\
+fn main() {
+    println!(\"cargo:rerun-if-changed={}\", dir.display());
+    println!(\"cargo:rerun-if-changed={SRC}\");
+}
+";
+    let forms = dynamic_reference_forms("src-tauri/build.rs", source);
+    assert!(
+        forms.is_empty(),
+        "a format placeholder names no file; emitting one would invent a \
+         specifier the author never wrote — got {forms:?}"
+    );
+}
+
+/// The build-script rule must not turn every Rust file into a wiring source.
+///
+/// `rs` is deliberately absent from `CODE_CONFIG_SUFFIXES`, and reaching the
+/// build-script case must not have smuggled the Python and JS pattern sweeps
+/// in with it.
+#[test]
+fn an_ordinary_rust_file_is_still_not_scanned_for_dynamic_forms() {
+    let source = "\
+fn main() {
+    println!(\"cargo:rerun-if-changed=swift/Bridge.swift\");
+    let _ = import_module(\"pkg.mod\");
+}
+";
+    assert!(
+        dynamic_reference_forms("src/lib.rs", source).is_empty(),
+        "only `build.rs` declares build inputs; an ordinary module saying the \
+         same words does not"
+    );
+}
+
 #[test]
 fn the_annotation_records_the_target_not_the_referrer() {
     let annotations =

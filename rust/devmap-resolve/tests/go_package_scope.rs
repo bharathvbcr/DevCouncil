@@ -421,3 +421,98 @@ func check(t *testing.T) {
             .collect::<Vec<_>>()
     );
 }
+
+/// A package-level **constant** read as a bare name is in the package block too.
+///
+/// The rung above was reached by type references and by calls, but not by a
+/// plain identifier mention: the ladder refuses `ReferenceKind::Name` before
+/// the package rung is offered the question, so `Version` in one file of
+/// `package main` produced **no edge at all** to the `const Version` its
+/// sibling declares. Measured on this repository: it is why
+/// `cmd/devcouncil/version.go` — whose constant `main.go` prints on three
+/// lines — was reported by `unwired_candidates` as a file nothing depends on.
+///
+/// The refusal itself is right for the tier it was written for. A bare name is
+/// weak evidence *across the family*, where the global rungs match on the name
+/// alone and two packages can each declare `Version`. It is not weak evidence
+/// inside one package, where Go's own scope rule decides the answer and
+/// `same_package_target` abstains whenever the package declares the name twice.
+/// Same-file and import-scoped rungs run above this point, so a local variable
+/// or an imported name has already bound by the time the package block is
+/// asked.
+#[test]
+fn a_package_level_constant_is_readable_unqualified_from_a_sibling_file() {
+    const DECL: &str = "\
+package main
+
+const Version = \"0.2.3\"
+";
+    const USE: &str = "\
+package main
+
+func banner() string {
+\treturn \"devcouncil \" + Version
+}
+";
+    let result = resolve(&[
+        ("cmd/devcouncil/version.go", DECL),
+        ("cmd/devcouncil/main.go", USE),
+    ]);
+
+    let edges = edges_from(&result, "cmd/devcouncil/main.go::banner", "Version");
+    assert_eq!(
+        edges.len(),
+        1,
+        "`banner` reads the package's own `Version`; expected exactly one edge \
+         to the sibling that declares it — got {:?}",
+        edges
+            .iter()
+            .map(|edge| (&edge.target_file, &edge.target_symbol, kind_of(edge)))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(edges[0].target_file, "cmd/devcouncil/version.go");
+    assert_eq!(
+        kind_of(edges[0]),
+        ResolutionKind::SamePackage,
+        "the package block is what decides this, so the evidence recorded must \
+         be the scope rule and not a name count across the family"
+    );
+    assert_eq!(edges[0].confidence, Confidence::DETERMINISTIC);
+}
+
+/// And the refusal it sits behind is still refused: two packages declaring the
+/// same constant must not bind by name across the family.
+///
+/// Without this, moving the package rung above the `Name` refusal would be
+/// indistinguishable from deleting the refusal — the bare mention would reach
+/// the global tier and pick one of them.
+#[test]
+fn a_bare_name_still_does_not_reach_another_package() {
+    const OTHER: &str = "\
+package other
+
+const Marker = \"other\"
+";
+    const USER: &str = "\
+package api
+
+func emit() string {
+\treturn Marker
+}
+";
+    let result = resolve(&[
+        ("internal/other/other.go", OTHER),
+        ("internal/api/emit.go", USER),
+    ]);
+
+    let edges = edges_from(&result, "internal/api/emit.go::emit", "Marker");
+    assert!(
+        edges.is_empty(),
+        "`api` declares no `Marker`; a bare mention must not reach `other`'s \
+         constant on the strength of the name alone — got {:?}",
+        edges
+            .iter()
+            .map(|edge| (&edge.target_file, &edge.target_symbol, kind_of(edge)))
+            .collect::<Vec<_>>()
+    );
+}

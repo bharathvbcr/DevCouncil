@@ -3,14 +3,28 @@
 //! `Command{Run: runStatus}` never writes `runStatus(...)`. The extractor records
 //! the mention as a bare `ReferenceKind::Name`, which the reference ladder
 //! declines by design — binding a bare identifier through the unique-global rung
-//! would attach `except Exception as e` to some unrelated `def e`, so
-//! `resolve_reference` returns `None` for it and the Go package rung written
-//! below that refusal never runs. The consequence is not a missing edge in the
-//! abstract: liveness then sees a function with no callers at all and reports it
-//! **confidently** dead. Measured on this repository, `runStatus` and `runDoctor`
-//! — both registered as `Run:` handlers in `mapcli.go` — were the only two
-//! confident non-exempt dead findings left after the Python alias fix, and both
-//! are on a live command path.
+//! would attach `except Exception as e` to some unrelated `def e`.
+//!
+//! This file used to say that the refusal also meant "the Go package rung
+//! written below it never runs", and treated that as the fixed constraint the
+//! exemption below had to work around. It was not fixed, it was an ordering
+//! accident: the refusal guards the **global** tier, where a bare name really is
+//! weak evidence across the corpus, and it caught the two scope rungs only by
+//! sitting above them. Moved below them, `Run: runStatus` resolves to its
+//! declaring sibling at `SamePackage`/DETERMINISTIC and the function is live by
+//! an edge — which refutes a dead finding rather than withholding one.
+//!
+//! Measured on this repository before that: `runStatus` and `runDoctor` — both
+//! registered as `Run:` handlers in `mapcli.go` — were the only two confident
+//! non-exempt dead findings left after the Python alias fix, and both are on a
+//! live command path.
+//!
+//! The exemption is still here and still reachable, on the narrower case the
+//! rung cannot answer: a package that declares the name twice, where
+//! `same_package_target` abstains rather than choosing.
+//! `the_exemption_still_covers_what_the_package_rung_abstains_on` is what keeps
+//! this file honest about that, instead of leaving a spared-by branch nothing
+//! can trigger.
 //!
 //! The condition is narrower than "some file names this function", because a
 //! mention in the *declaring* file is not declined at all: the same-file rung
@@ -62,16 +76,67 @@ const REGISTRY: &str = concat!(
 );
 
 #[test]
-fn a_go_function_named_as_a_value_is_exempt_not_confidently_dead() {
+fn a_go_function_named_as_a_value_is_live_by_an_edge() {
+    // Superseded, and by the cause rather than the symptom. The module doc
+    // above recorded that the package rung "never runs" for a bare `Name`
+    // because the ladder's refusal sat above it; that refusal now sits *below*
+    // the two scope rungs, so `Run: runStatus` resolves to the sibling file at
+    // `SamePackage`/DETERMINISTIC and the function has a caller.
+    //
+    // The property this test was written to protect — a function named as a
+    // `Run:` value must not be a confident dead finding — is unchanged, and is
+    // now met the way `a_same_file_mention_needs_no_exemption` describes as the
+    // stronger form: not reported at all, because an edge answers it. An
+    // exemption withholds a finding; an edge refutes it.
     let out = reports(&[
         ("cmd/mapcli/commands.go", COMMANDS),
+        ("cmd/mapcli/mapcli.go", REGISTRY),
+    ]);
+    assert!(
+        report_for(&out, "runStatus").is_none(),
+        "`Run: runStatus` resolves to the declaring sibling; nothing should be \
+         reported for it: {out:?}"
+    );
+}
+
+/// The exemption is still reachable, and this is the case that reaches it.
+///
+/// With the package rung answering the ordinary case, the question "does
+/// `GO_VALUE_MENTION_REASON` still do anything" has to be answered rather than
+/// assumed — a spared-by branch nothing can trigger is dead code wearing a
+/// justification. It can: `same_package_target` **abstains** when the package
+/// declares the name twice (`a_name_the_package_declares_twice_is_an_abstention_not_a_choice`
+/// in the resolver's own suite pins that), so the rung returns nothing, the
+/// value mention resolves to no edge, and the function would be confidently
+/// dead on evidence that does not support it. That is where the exemption
+/// still earns its place.
+#[test]
+fn the_exemption_still_covers_what_the_package_rung_abstains_on() {
+    let out = reports(&[
+        (
+            "cmd/mapcli/commands.go",
+            concat!(
+                "package mapcli\n",
+                "type Command struct {\n",
+                "\tRun func(args []string)\n",
+                "}\n",
+                "func runStatus(args []string) {}\n",
+            ),
+        ),
+        (
+            // A second declaration of the same name in the same package: the
+            // rung cannot say which is meant, so it says nothing.
+            "cmd/mapcli/legacy.go",
+            concat!("package mapcli\n", "func runStatus(args []string) {}\n"),
+        ),
         ("cmd/mapcli/mapcli.go", REGISTRY),
     ]);
     let status = report_for(&out, "runStatus")
         .unwrap_or_else(|| panic!("`runStatus` must be reported at all: {out:?}"));
     assert!(
         status.is_exempt,
-        "a function named as a `Run:` value must not be a confident dead finding: {status:?}"
+        "the rung abstained, so the mention is all the evidence there is — and \
+         withholding the finding is what to do with it: {status:?}"
     );
     assert_eq!(
         status.exemption_reason.as_deref(),
@@ -317,12 +382,16 @@ fn the_verdict_does_not_depend_on_the_order_files_arrive_in() {
         fingerprint(&reversed),
         "the dead list must not depend on file order"
     );
-    let status = report_for(&forward, "runStatus")
-        .unwrap_or_else(|| panic!("`runStatus` must still be reported: {forward:?}"));
-    assert_eq!(
-        status.exemption_reason.as_deref(),
-        Some(GO_VALUE_MENTION_REASON),
-        "and the subject must still be the one this test is about: {status:?}"
+    // The subject resolves now rather than being exempted, so the assertion
+    // that keeps this test about something is that it stays resolved — under
+    // both orders, with 64 hash-order-shuffling fillers in the corpus.
+    assert!(
+        report_for(&forward, "runStatus").is_none(),
+        "`Run: runStatus` must resolve to its declaring sibling: {forward:?}"
+    );
+    assert!(
+        report_for(&reversed, "runStatus").is_none(),
+        "and must still resolve when the files arrive the other way round: {reversed:?}"
     );
     for index in 0..64 {
         assert!(
@@ -333,20 +402,24 @@ fn the_verdict_does_not_depend_on_the_order_files_arrive_in() {
 }
 
 #[test]
-fn a_composite_literal_field_key_also_spares_a_namesake_function() {
-    // The known over-approximation, recorded rather than discovered later. Go
-    // spells a composite-literal field key as a bare identifier with no
-    // receiver — `Use` and `Run` in `Command{Use: …, Run: …}` are
-    // indistinguishable, at this layer, from naming a package-level function of
-    // that name. So an *unexported* function whose name collides with a field
-    // key written in another file of the same package is exempted although
-    // nothing uses it.
+fn a_composite_literal_field_key_does_not_name_a_namesake_function() {
+    // The over-approximation this test recorded is gone, and it was closed
+    // where its own comment said it belonged — in the extractor. Go spells a
+    // struct literal's field key as a bare identifier with no receiver, so
+    // `run` in `Command{run: nil}` used to be indistinguishable from naming a
+    // package-level `func run`, and an unexported function whose name collided
+    // with a field key was spared although nothing used it.
     //
-    // This is the direction an exemption is allowed to be wrong in: it withholds
-    // a finding it cannot prove, rather than asserting one it cannot support.
-    // Narrowing it belongs in the extractor — a field key is a member reference
-    // and should carry its composite type as a receiver — not here, where the
-    // only available answer would be to guess from the spelling.
+    // `go_struct_literal_field_key` now refuses the key outright: it names a
+    // field of the literal's own type, not a symbol. A **map** literal's key is
+    // left alone, because there the key really is an expression — the two are
+    // separated by the literal's declared type, not by position.
+    //
+    // Closing it became urgent rather than optional. While the ladder declined
+    // every bare `Name` the misreading only withheld a finding; with the Go
+    // package rung answering them it would have produced a `SamePackage` edge
+    // at DETERMINISTIC instead — a fabricated caller, which is the opposite of
+    // the direction an approximation is allowed to be wrong in.
     let out = reports(&[
         (
             "cmd/mapcli/kinds.go",
@@ -371,12 +444,42 @@ fn a_composite_literal_field_key_also_spares_a_namesake_function() {
     let report =
         report_for(&out, "run").unwrap_or_else(|| panic!("`run` must be reported at all: {out:?}"));
     assert!(
-        report.is_exempt,
-        "recorded behaviour: the field key spares the namesake function: {report:?}"
+        !report.is_exempt,
+        "nothing names this function: a field key is not a mention of it: {report:?}"
     );
-    assert_eq!(
-        report.exemption_reason.as_deref(),
-        Some(GO_VALUE_MENTION_REASON),
-        "and it is spared by this exemption, not some other one: {report:?}"
+    assert!(
+        report.confidence > 0.5,
+        "and with no mention to withhold on, the finding keeps its confidence: {report:?}"
+    );
+}
+
+/// A map literal's key is a real expression and must still be one.
+///
+/// The boundary `go_struct_literal_field_key` is defined against: narrowing the
+/// struct case must not take map keys with it, or `map[string]int{limit: 1}`
+/// stops naming `limit` and a live constant starts looking dead.
+#[test]
+fn a_map_literal_key_still_names_what_it_mentions() {
+    let out = reports(&[
+        (
+            "cmd/mapcli/limits.go",
+            concat!(
+                "package mapcli\n",
+                "func limitFor(n int) int { return n }\n"
+            ),
+        ),
+        (
+            "cmd/mapcli/table.go",
+            concat!(
+                "package mapcli\n",
+                "func Table() map[int]string {\n",
+                "\treturn map[int]string{limitFor(1): \"one\"}\n",
+                "}\n",
+            ),
+        ),
+    ]);
+    assert!(
+        report_for(&out, "limitFor").is_none(),
+        "a call in map-key position is still a call: {out:?}"
     );
 }

@@ -762,8 +762,27 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v54 reads a declared field's type in every grammar that declares one. A
     // v53 row holds none for a `<script lang="ts">` class field, so a receiver
     // typed only by one stays uninferred until the file is re-extracted.
+    // v55 resolves a Rust call receiver of exactly `super` against the inline
+    // module it is written inside, in both the call and macro-argument arms. A
+    // v54 row records `super` for `mod tests { super::f() }` and for a
+    // file-level `super::f()` alike, so the resolver could only refuse both and
+    // every function reached that way looked uncalled.
+    // v56 records a Rust `pub use` as an **export** and not only as an import.
+    // A v55 row carries no export for it at all, so the re-export chain has no
+    // Rust input and a crate root's republished surface stays invisible —
+    // which is every `pub use` in every `lib.rs` in this workspace.
+    // v57 exempts a method declared in an object literal handed to a call. A
+    // v56 row has no wiring for it, so every callback interface outside the two
+    // name allowlists — xterm's `ILinkProvider` is the measured case — stays
+    // confidently dead at the tier whose contract is "safe to act on".
+    //
+    // v58 records two wiring surfaces that were not in the payload at all — a
+    // shell `source` now carries the glob marker, and a `build.rs` emits a
+    // dynamic-reference form per `cargo:rerun-if-changed=` — and drops one
+    // reference that should never have been there, a Go struct-literal field
+    // key. A v57 row has neither addition and keeps the spurious reference.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "54",
+        EXTRACTION_SCHEMA_VERSION, "58",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );
