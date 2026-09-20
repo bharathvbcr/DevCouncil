@@ -1,6 +1,13 @@
 <!doctype html>
+<!-- Declares an id and a data-* hook, and uses a class and an IDREF, so the
+     `REFERENCES` bit this language declares is exercised rather than asserted
+     vacuously. -->
 <html>
   <body>
-    <p>Probe</p>
+    <label for="probe-field">Probe</label>
+    <p id="probe-field" class="probe" data-probe-hook>Probe</p>
+    <style>
+      .probe { color: red; }
+    </style>
   </body>
 </html>

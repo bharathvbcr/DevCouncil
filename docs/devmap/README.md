@@ -638,8 +638,44 @@ than larger.
 > Pascal/Delphi, Python, R, Ruby, Rust, Scala, Solidity, Svelte, Swift, TSX,
 > Terraform/OpenTofu, TypeScript, VB.NET, Vue
 
-Shell, SQL, Protobuf, PowerShell and Jupyter notebooks are discovered by
-extension and recovered by a pattern tier rather than a full spec.
+Shell, SQL, Protobuf, PowerShell, HTML, CSS and Jupyter notebooks are discovered
+by extension and recovered by a pattern tier rather than a full spec.
+
+### The markup half of a component
+
+A template file has two halves. The `<script>` half is routed back through a real
+grammar under the outer file's own path, so its functions, imports and calls are
+indexed as code. The **markup and `<style>` halves** are read by a scanner, and
+contribute two declaration kinds and one reference kind:
+
+| kind | what it is | named as |
+|------|-----------|----------|
+| `MarkupAnchor` | an identity markup declares: `id`, or a `data-*` hook | `#repo-heading`, `[data-add-repo]` |
+| `StyleRule` | a name a stylesheet declares: a selector, `@keyframes`, a custom property | `.nav-heading`, `@keyframes pulse`, `--gap-x` |
+| `Selector` reference | a *use*: a `class` attribute, a Svelte `class:` directive, an IDREF attribute (`for`, `aria-controls`, …), a `var(--x)` read, or a selector string in a script | — |
+
+Named in CSS-selector form because that is the form everything targeting the
+identity is written in, so it is the form a search for it uses:
+`devmap search data-add-repo` finds the element that declares it and
+`devmap explore` names the script that queries it. The same reader serves
+`.svelte`, `.vue`, `.astro`, `.liquid`, standalone `.html`, and
+`.css`/`.scss`/`.less`.
+
+Three limits, stated because each is a place the reader abstains rather than
+guesses:
+
+- **A selector string in a script counts only when the file it sits in declares
+  what it names.** Otherwise the only thing it could join to is a same-named
+  class in an unrelated component.
+- **A component's `<style>` is scoped**, so a class it declares never answers
+  another file. Only a standalone stylesheet, a page, or an `id` — which is
+  unique per *document* — crosses files. A `:global(.x)` class is not detected
+  and answers its own file only.
+- **Unused CSS is not reported.** A class reaches an element through
+  `class={expr}`, `classList.add(name)` or a template string, none of which this
+  reader follows, so it can prove a name is used and cannot prove one is not.
+  Both kinds are therefore exempt from dead-symbol analysis; Svelte's own
+  compiler reports unused selectors from inside the compilation that knows.
 
 A file whose language has no grammar still contributes a node, plus any symbols
 that tier can recover — labelled `RegexFallback` and never mixed in with parsed

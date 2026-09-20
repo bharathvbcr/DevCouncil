@@ -409,6 +409,78 @@ fn python_dunder_all_requires_a_real_assignment() {
         .any(|symbol| symbol.name == "ghost" && symbol.is_exported));
 }
 
+/// An alias is a second *name*, not a computed value.
+///
+/// A Python module-level binding survives the `__all__` filter only when it is
+/// named there or when it is an alias — "a second name for something already
+/// referenceable" — because emitting the rest would add a symbol for every
+/// private module constant in the repository, whose only graph effect is
+/// dead-code noise. The alias test asked whether the right-hand side's
+/// *outermost* node was an `identifier` or an `attribute`, which every dotted
+/// expression satisfies however it was computed:
+/// `OUT = Path(__file__).resolve().parent` is an `attribute` whose object is a
+/// `call`, and it names nothing another module can import.
+///
+/// Measured on this repository, that admitted 54 of 54 Python `Variable`
+/// symbols — every one a path constant of exactly that shape — and six of them
+/// were then reported dead at 0.9, in the tier documented as the only one that
+/// indicates a defect. The noise the filter exists to prevent arrived through
+/// the exemption in the filter.
+#[test]
+fn a_computed_module_binding_is_not_an_alias() {
+    let dropped = [
+        // The measured shape, and the four other ways to compute a value whose
+        // outermost node looks like a name.
+        ("out.py", "from pathlib import Path\nOUT=Path(__file__).resolve().parent\n", "OUT"),
+        ("made.py", "from x import factory\nMADE = factory()\n", "MADE"),
+        ("item.py", "from x import things\nITEM = things[0]\n", "ITEM"),
+        ("sum.py", "from x import a, b\nTOTAL = a + b\n", "TOTAL"),
+        ("call.py", "from x import mod\nVALUE = mod.make().field\n", "VALUE"),
+    ];
+    for (path, source, name) in dropped {
+        let ext = extract_file(path, source);
+        assert!(
+            !ext.symbols.iter().any(|symbol| symbol.name == name),
+            "{path}: {name} is a computed constant, not an alias, and must not be a symbol: {:?}",
+            ext.symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // A genuine alias is still a second name for something importable, and
+    // dropping one deletes a name other modules import.
+    let kept = [
+        ("bare.py", "from x import Other\nAlias = Other\n", "Alias"),
+        ("dotted.py", "import widgets\nWidget = widgets.Widget\n", "Widget"),
+        ("deep.py", "import pkg\nThing = pkg.mod.Thing\n", "Thing"),
+    ];
+    for (path, source, name) in kept {
+        let ext = extract_file(path, source);
+        assert!(
+            ext.symbols.iter().any(|symbol| symbol.name == name),
+            "{path}: {name} is an alias for an importable name and must survive: {:?}",
+            ext.symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // And `__all__` still outranks the alias rule in both directions.
+    let ext = extract_file(
+        "declared.py",
+        "from pathlib import Path\n__all__ = [\"OUT\"]\nOUT = Path(__file__).parent\n",
+    );
+    assert!(
+        ext.symbols
+            .iter()
+            .any(|symbol| symbol.name == "OUT" && symbol.is_exported),
+        "a binding the module names in __all__ is published surface whatever computed it"
+    );
+}
+
 /// SC6a: the two halves of the Go interface-satisfaction join must both travel
 /// on the `Extraction`, because the interface and its implementation routinely
 /// live in different files of the same package and extraction is per file.

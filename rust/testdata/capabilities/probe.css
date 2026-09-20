@@ -1,3 +1,7 @@
+/* Declares a rule and a custom property, and *uses* the property, so the
+   `REFERENCES` bit this language declares is exercised rather than asserted
+   vacuously. `crate::markup` reads all three. */
 .probe {
-  color: red;
+  --probe-ink: red;
+  color: var(--probe-ink);
 }
