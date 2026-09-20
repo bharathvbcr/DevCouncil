@@ -818,6 +818,31 @@ enum Commands {
         #[arg(short, long, default_value_t = 2000)]
         budget: u32,
     },
+    /// Which commits since `--since` could have caused a symptom.
+    ///
+    /// Runs the graph first and git second: the symptom names a symbol, the
+    /// code graph names everything that symbol transitively *depends on*, and
+    /// only the byte spans of those symbols are blamed. A file's other lines
+    /// cannot have caused this failure, so blaming them is noise — which is
+    /// what a blame-first tool spends most of its output on.
+    ///
+    /// The direction is deliberate: a symptom is caused by its own body or by
+    /// something it calls. Its callers sit downstream of the failure.
+    ///
+    /// The answer distinguishes "nothing in the window touched the cone" from
+    /// "something could not be examined": an empty list with `complete: true`
+    /// is a finding, an empty list with `complete: false` is not.
+    Suspects {
+        /// A symbol name, a `file::symbol` node id, or anything `search` can
+        /// resolve to one.
+        symptom: String,
+        /// The last known-good revision. Commits after it are the candidates.
+        #[arg(long)]
+        since: String,
+        /// How far to walk inbound edges from the symptom.
+        #[arg(long, default_value_t = dc_regress::DEFAULT_CONE_DEPTH)]
+        depth: u32,
+    },
     /// Definitions matching a query, with source, callers, callees and a
     /// layered blast radius — the whole neighbourhood in one invocation.
     ///
@@ -1050,6 +1075,34 @@ enum Commands {
         /// Host session id, when the hook has one.
         #[arg(long)]
         session_id: Option<String>,
+    },
+    /// Record a DevMap gap — a question the index could not answer — in the
+    /// ledger `session-report` reads.
+    ///
+    /// The agent guide has told every agent to write
+    /// `.devcouncil/codeintel/sessions/gaps.jsonl` since it was written, and
+    /// nothing could: the kernel named and read that file but never appended to
+    /// it, and a harness that protects the state directory refuses the shell
+    /// redirect an agent reaches for instead — correctly, since the store
+    /// beside it is what every later answer comes from. This is the writer that
+    /// was missing, so the instruction is one a tool carries out rather than one
+    /// an agent works around.
+    GapRecord {
+        /// The tool whose answer fell short (`devmap_dead_symbols`, …).
+        #[arg(long)]
+        tool: String,
+        /// Stable id for this gap, so a later session can resolve it.
+        #[arg(long = "gap-id")]
+        gap_id: String,
+        /// What was asked, what came back, and why that is a gap.
+        #[arg(long)]
+        reason: String,
+        /// The repository the gap was observed in, when it is not this one.
+        #[arg(long)]
+        repo_path: Option<String>,
+        /// Mark a previously recorded gap as closed.
+        #[arg(long)]
+        resolved: bool,
     },
     /// Where this repository's state lives — the state directory, the store, the
     /// artifacts, the workspace registry — resolved exactly as every other
@@ -3564,6 +3617,64 @@ fn emit_affected(report: &devmap_query::AffectedTestsReport) {
     emit_blast_radius(&report.blast_radius);
 }
 
+/// Render a suspect report.
+///
+/// The refusals print *before* the suspects and are never omitted, because the
+/// question a reader brings to this output is "is this the whole story". A list
+/// that was cut short and a list that is complete look identical otherwise, and
+/// the one thing this report must not do is let the first read as the second.
+fn emit_suspects(report: &dc_regress::SuspectReport) {
+    if !report.unavailable.is_empty() {
+        outln!("could not examine everything:");
+        for reason in &report.unavailable {
+            outln!("  - {}", reason.describe());
+        }
+        outln!("");
+    }
+    if report.suspects.is_empty() {
+        if report.complete {
+            outln!(
+                "no commit in the window touched any of the {} symbol(s) that reach {}",
+                report.cone_size,
+                report.symptom
+            );
+        } else {
+            outln!(
+                "no suspects found — but the analysis was incomplete, so this is not \
+                 evidence that none exist"
+            );
+        }
+        return;
+    }
+    outln!(
+        "{} suspect(s) over {} cone symbol(s), {} blamed:",
+        report.suspects.len(),
+        report.cone_size,
+        report.blamed_symbols
+    );
+    for suspect in &report.suspects {
+        let short: String = suspect.commit.chars().take(12).collect();
+        outln!(
+            "  {short}  {:?}  score {}  nearest {}  {}",
+            suspect.evidence,
+            suspect.score,
+            suspect.nearest_distance,
+            suspect.author
+        );
+        for touch in suspect.touched.iter().take(5) {
+            outln!(
+                "      d{} {} ({} line(s))",
+                touch.distance,
+                touch.qualified_name,
+                touch.lines
+            );
+        }
+        if suspect.touched.len() > 5 {
+            outln!("      … {} more", suspect.touched.len() - 5);
+        }
+    }
+}
+
 fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
     if let ResolutionAvailability::Unavailable { reason } = &resp.resolution {
         emit_unavailable(reason);
@@ -4157,6 +4268,19 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         | Commands::Snapshots { budget, .. }
         | Commands::Savings { budget, .. } => check_budget(*budget),
         Commands::Dead { budget } => check_budget(*budget),
+        Commands::Suspects { since, depth, .. } => {
+            // A blank revision would make the window `..HEAD`, which git reads
+            // as every commit ever — the opposite of the bounded question this
+            // command exists to ask.
+            if since.trim().is_empty() {
+                return Err(
+                    "--since must name a revision: it is the last known-good point, and \
+                     an empty one asks about the whole history rather than a window"
+                        .to_string(),
+                );
+            }
+            check_depth(*depth as usize)
+        }
         Commands::Deps {
             budget,
             min_confidence,
@@ -4266,6 +4390,11 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         | Commands::Status { .. }
         | Commands::Doctor
         | Commands::SessionReport { .. }
+        // Its arguments are validated by `session::record_gap`, which refuses
+        // before it writes. Checking them here as well would put the same rule
+        // in two places, and the one that has to hold is the one guarding the
+        // write — the MCP surface can reach it without passing through here.
+        | Commands::GapRecord { .. }
         | Commands::Paths { .. }
         | Commands::Manifest { .. }
         | Commands::MapHtml { .. }
@@ -5431,6 +5560,34 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 emit_dead(&payload);
             }
         }
+        Commands::Suspects {
+            symptom,
+            since,
+            depth,
+        } => {
+            let store = open_for_read(cli)?;
+            let root = std::path::absolute(cli.root_hint())
+                .unwrap_or_else(|_| cli.root_hint().to_path_buf());
+            let graph = dc_regress_store::StoreGraph::new(&store, &root)?;
+            // The analysis runs against the commit the index was built at, not
+            // against HEAD. Anything else compares spans taken from one
+            // revision with lines from another — which the join refuses, so
+            // the alternative is not a wrong answer but a report of nothing
+            // but refusals.
+            let until = graph.indexed_head().map(str::to_string).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "this store recorded no head commit, so there is no revision whose \
+                     content its spans are known to describe — run `devmap build` in a \
+                     git repository first"
+                )
+            })?;
+            let report = dc_regress::suspects(&root, &graph, symptom, since, &until, *depth);
+            if cli.json {
+                emit_json(cli, &serde_json::to_value(&report)?)?;
+            } else {
+                emit_suspects(&report);
+            }
+        }
         Commands::Explore {
             query,
             limit,
@@ -6232,6 +6389,27 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             let payload = session::run(&cli.db(), *last, session_id.as_deref(), cli.json)?;
             if cli.json {
                 emit_json(cli, &payload)?;
+            }
+        }
+        Commands::GapRecord {
+            tool,
+            gap_id,
+            reason,
+            repo_path,
+            resolved,
+        } => {
+            let payload = session::record_gap(
+                &cli.db(),
+                tool,
+                gap_id,
+                reason,
+                repo_path.as_deref(),
+                *resolved,
+            )?;
+            if cli.json {
+                emit_json(cli, &payload)?;
+            } else {
+                println!("recorded gap {gap_id} for {tool}");
             }
         }
         Commands::History { last } => {

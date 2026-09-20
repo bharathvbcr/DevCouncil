@@ -1,0 +1,22 @@
+[package]
+name = "dc-regress-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Presents a persisted devmap generation through dc-regress's CodeGraph trait, so every host asks the same question of the same graph"
+
+[dependencies]
+# The trait and the analysis. This crate is the adapter between them and a
+# store; it adds no analysis of its own.
+dc-regress = { path = "../dc-regress" }
+# `default-features = false` keeps the parsing frontend out. Nothing here
+# builds a graph — it reads one — so the grammars would be linked and never
+# called. A host that wants them turns them on itself; `devmap-cli` does,
+# GitPulse does not.
+devmap-query = { path = "../devmap-query", default-features = false }
+devmap-store = { path = "../devmap-store", default-features = false }
+anyhow.workspace = true
+
+[lints]
+workspace = true

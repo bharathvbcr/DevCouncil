@@ -7,6 +7,8 @@ members = [
     "dc-store",
     "dc-verify",
     "dc-evidence",
+    "dc-regress",
+    "dc-regress-store",
     "devmap-extract",
     "devmap-resolve",
     "devmap-analyze",

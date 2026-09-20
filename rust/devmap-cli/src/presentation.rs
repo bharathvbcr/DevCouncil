@@ -77,6 +77,7 @@ fn profile(command: &Commands) -> Option<(&'static str, &'static str)> {
         Commands::Claude {
             action: ClaudeAction::Hooks { .. } | ClaudeAction::Plugin { dry_run: true, .. },
         } => return None,
+        Commands::Suspects { .. } => ("Suspects", "Asking what could have caused this"),
         Commands::Search { .. } => ("Search", "Looking for the right thread"),
         Commands::Deps { .. } => ("Dependencies", "Following the connections"),
         Commands::Impact { .. } => ("Impact", "Tracing the ripples"),
@@ -97,6 +98,7 @@ fn profile(command: &Commands) -> Option<(&'static str, &'static str)> {
         Commands::Status { .. } => ("Status", "Taking the pulse"),
         Commands::Doctor => ("Diagnostics", "Checking the moving parts"),
         Commands::SessionReport { .. } => ("Session report", "Retracing the session"),
+        Commands::GapRecord { .. } => ("Gap recorded", "Writing down what could not be answered"),
         Commands::Paths { .. } => ("Paths", "Getting our bearings"),
         Commands::History { .. } => ("Build history", "Turning back the pages"),
         Commands::Repair { .. } => ("Store repair", "Mending the map"),

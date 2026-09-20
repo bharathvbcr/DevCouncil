@@ -51,6 +51,18 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
     ),
     ("devmap-resolve", &["resolution_kind_is_one_owner"]),
     (
+        // `dc-regress` has no `parse` feature to gate on: it answers from a
+        // graph it is handed and from git, and never builds one. Listing it
+        // here is what brings it under this check at all — the crate list is
+        // this constant, so a crate absent from it is a crate whose targets
+        // nobody has classified and nobody would notice.
+        //
+        // Verified with `cargo check -p dc-regress --no-default-features
+        // --all-targets`, which is this test's own instruction.
+        "dc-regress",
+        &["against_a_real_repository", "hostile_input"],
+    ),
+    (
         "devmap-analyze",
         &[
             "adversarial_analyze",
@@ -230,9 +242,10 @@ fn every_integration_test_is_classified_against_the_parse_feature() {
 
     assert!(
         total_files > 90,
-        "only {total_files} test files were found across five crates — the walk \
-         or the manifest parse is broken, and a check that could not run must \
-         not report the same green as one that ran"
+        "only {total_files} test files were found across the {} crates named in \
+         FEATURE_OFF_SAFE — the walk or the manifest parse is broken, and a \
+         check that could not run must not report the same green as one that ran",
+        FEATURE_OFF_SAFE.len()
     );
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }

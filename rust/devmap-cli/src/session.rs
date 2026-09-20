@@ -48,6 +48,99 @@ pub fn gaps_path(db: &Path) -> PathBuf {
     session_log::sessions_dir(db).join("gaps.jsonl")
 }
 
+/// Most bytes one gap entry may occupy.
+///
+/// A gap's `reason` is prose an agent writes, so it is the field with no
+/// natural bound. Capped here rather than at the caller because this is the
+/// only writer, and a ledger one entry can fill is a ledger the next agent
+/// cannot append to.
+const MAX_GAP_BYTES: usize = 8 * 1024;
+
+/// Append one gap to the ledger the agent guide tells every agent to keep.
+///
+/// **The instruction had no writer behind it.** `CLAUDE.md` has said "record a
+/// gap in `.devcouncil/codeintel/sessions/gaps.jsonl`" for as long as it has
+/// existed; [`gaps_path`] names the file and `read_gaps` reads it, and nothing
+/// in the kernel, the CLI or the MCP surface ever appended to it. An agent
+/// following the guide reached for a shell redirect, and the harness refuses
+/// `.devcouncil/` as a protected path — correctly, because the store beside it
+/// is what every later answer is read from. So the documented process could not
+/// be carried out at all: the gaps it asks for went into session scratch files
+/// that nothing reads, and `session-report` kept reporting a ledger that only
+/// ever grew by hand.
+///
+/// Written through the owner instead. The kernel already owns this directory,
+/// and a tool writing its own state is the arrangement that protection exists
+/// to preserve rather than the one it exists to stop.
+///
+/// Appends rather than rewrites, so two agents recording at once interleave
+/// whole lines instead of truncating each other — the same reason the query log
+/// is opened [`Access::Append`](devmap_extract::safe_fs::Access::Append).
+pub fn record_gap(
+    db: &Path,
+    tool: &str,
+    gap_id: &str,
+    reason: &str,
+    repo_path: Option<&str>,
+    resolved: bool,
+) -> anyhow::Result<Value> {
+    use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+
+    // Each field is what a reader keys on, so an empty one is a row that names
+    // nothing. Refused rather than written, because a ledger of blanks reads
+    // exactly like a ledger nobody kept.
+    for (label, value) in [("--tool", tool), ("--gap-id", gap_id), ("--reason", reason)] {
+        if value.trim().is_empty() {
+            anyhow::bail!("{label} must not be empty: a gap that names nothing records nothing");
+        }
+    }
+
+    let mut entry = Map::new();
+    entry.insert(
+        "ts_ms".into(),
+        json!(SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)),
+    );
+    entry.insert("tool".into(), json!(tool.trim()));
+    entry.insert("gap_id".into(), json!(gap_id.trim()));
+    entry.insert("reason".into(), json!(reason.trim()));
+    if let Some(repo_path) = repo_path.filter(|path| !path.trim().is_empty()) {
+        entry.insert("repo_path".into(), json!(repo_path.trim()));
+    }
+    if resolved {
+        entry.insert("resolved".into(), json!(true));
+    }
+    let value = Value::Object(entry);
+
+    let line = serde_json::to_string(&value)?;
+    if line.len() > MAX_GAP_BYTES {
+        anyhow::bail!(
+            "gap entry is {} bytes, over the {MAX_GAP_BYTES}-byte limit; \
+             shorten --reason or link the detail from it",
+            line.len()
+        );
+    }
+
+    let path = gaps_path(db);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = SafeFile::open(&path, Access::Append, Creation::IfMissing)?;
+    if file.metadata()?.len().saturating_add(line.len() as u64 + 1) > session_log::MAX_SESSION_BYTES
+    {
+        anyhow::bail!(
+            "gap ledger is at its {} byte limit; rotate {} before recording more",
+            session_log::MAX_SESSION_BYTES,
+            path.display()
+        );
+    }
+    writeln!(file, "{line}")?;
+    file.flush()?;
+    Ok(json!({ "recorded": value, "path": path.display().to_string() }))
+}
+
 /// Write a report from the live log (or print the previous one).
 pub fn run(
     db: &Path,
@@ -372,6 +465,133 @@ fn render_markdown(report: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A store path in its own directory, so parallel tests cannot collide.
+    fn scratch_db(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQUENCE: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "devmap-gap-record-{label}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root.join("store.sqlite")
+    }
+
+    fn ledger_lines(db: &Path) -> Vec<Value> {
+        fs::read_to_string(gaps_path(db))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("each line is one JSON object"))
+            .collect()
+    }
+
+    /// The writer exists and what it writes is what `read_gaps` reads back.
+    ///
+    /// The ledger had a reader and no writer for as long as the guide has asked
+    /// agents to keep it, so this is the first test that the two halves agree
+    /// on a format at all.
+    #[test]
+    fn a_recorded_gap_is_one_line_the_reader_accepts() {
+        let db = scratch_db("roundtrip");
+        record_gap(
+            &db,
+            "devmap_dead_symbols",
+            "GAP-X",
+            "nothing came back",
+            None,
+            false,
+        )
+        .unwrap();
+        let rows = read_gaps(&db).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["gap_id"], json!("GAP-X"));
+        assert_eq!(rows[0]["tool"], json!("devmap_dead_symbols"));
+        assert_eq!(rows[0]["reason"], json!("nothing came back"));
+        assert!(
+            rows[0]["ts_ms"].as_u64().is_some_and(|ms| ms > 0),
+            "an entry carries when it was recorded: {rows:?}"
+        );
+        assert!(
+            rows[0].get("resolved").is_none(),
+            "an open gap says nothing about being resolved: {rows:?}"
+        );
+        let _ = fs::remove_dir_all(gaps_path(&db).parent().unwrap().parent().unwrap());
+    }
+
+    /// Appending, not rewriting: the second entry must not cost the first.
+    #[test]
+    fn recording_twice_keeps_both() {
+        let db = scratch_db("append");
+        record_gap(&db, "t", "GAP-1", "first", None, false).unwrap();
+        record_gap(&db, "t", "GAP-2", "second", Some("/elsewhere"), true).unwrap();
+        let rows = ledger_lines(&db);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["gap_id"], json!("GAP-1"));
+        assert_eq!(rows[1]["gap_id"], json!("GAP-2"));
+        assert_eq!(rows[1]["repo_path"], json!("/elsewhere"));
+        assert_eq!(rows[1]["resolved"], json!(true));
+        let _ = fs::remove_dir_all(gaps_path(&db).parent().unwrap().parent().unwrap());
+    }
+
+    /// A row whose key fields are blank records nothing, and reads exactly like
+    /// a ledger nobody kept — so it is refused before the file is touched.
+    #[test]
+    fn a_gap_naming_nothing_is_refused_and_writes_no_line() {
+        let db = scratch_db("blank");
+        for (tool, id, reason) in [("", "GAP", "why"), ("t", "   ", "why"), ("t", "GAP", "\t")] {
+            assert!(
+                record_gap(&db, tool, id, reason, None, false).is_err(),
+                "({tool:?}, {id:?}, {reason:?}) was accepted"
+            );
+        }
+        assert!(
+            !gaps_path(&db).exists(),
+            "a refused entry must not leave a ledger behind"
+        );
+        let _ = fs::remove_dir_all(gaps_path(&db).parent().unwrap().parent().unwrap());
+    }
+
+    /// One oversized entry must not be able to fill the ledger the next agent
+    /// has to append to.
+    #[test]
+    fn an_oversized_gap_is_refused_and_the_ledger_stays_appendable() {
+        let db = scratch_db("oversized");
+        record_gap(&db, "t", "GAP-SMALL", "fits", None, false).unwrap();
+        let huge = "x".repeat(MAX_GAP_BYTES + 1);
+        assert!(record_gap(&db, "t", "GAP-HUGE", &huge, None, false).is_err());
+        record_gap(&db, "t", "GAP-AFTER", "still works", None, false).unwrap();
+        let rows = ledger_lines(&db);
+        assert_eq!(
+            rows.iter().map(|r| r["gap_id"].clone()).collect::<Vec<_>>(),
+            vec![json!("GAP-SMALL"), json!("GAP-AFTER")],
+            "the refused entry left no partial line: {rows:?}"
+        );
+        let _ = fs::remove_dir_all(gaps_path(&db).parent().unwrap().parent().unwrap());
+    }
+
+    /// A reason spanning lines would otherwise split one entry into several,
+    /// and every line after the first would fail to parse as JSON.
+    #[test]
+    fn a_multi_line_reason_stays_one_entry() {
+        let db = scratch_db("newlines");
+        record_gap(
+            &db,
+            "t",
+            "GAP-NL",
+            "line one\nline two\r\nline three",
+            None,
+            false,
+        )
+        .unwrap();
+        let rows = ledger_lines(&db);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["reason"], json!("line one\nline two\r\nline three"));
+        let _ = fs::remove_dir_all(gaps_path(&db).parent().unwrap().parent().unwrap());
+    }
 
     #[test]
     #[cfg(unix)]

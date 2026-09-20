@@ -308,6 +308,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc-regress"
+version = "0.2.3"
+dependencies = [
+ "dc-proc",
+ "devmap-extract",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dc-regress-store"
+version = "0.2.3"
+dependencies = [
+ "anyhow",
+ "dc-regress",
+ "devmap-query",
+ "devmap-store",
+]
+
+[[package]]
 name = "dc-store"
 version = "0.2.3"
 dependencies = [
@@ -343,6 +363,8 @@ version = "0.2.3"
 dependencies = [
  "anyhow",
  "clap",
+ "dc-regress",
+ "dc-regress-store",
  "devmap-analyze",
  "devmap-extract",
  "devmap-query",

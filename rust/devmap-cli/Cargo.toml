@@ -26,6 +26,8 @@ devmap-resolve = { path = "../devmap-resolve" }
 devmap-analyze = { path = "../devmap-analyze" }
 devmap-store = { path = "../devmap-store" }
 devmap-query = { path = "../devmap-query" }
+dc-regress = { path = "../dc-regress" }
+dc-regress-store = { path = "../dc-regress-store" }
 devmap-serve = { path = "../devmap-serve" }
 toml = { workspace = true, features = ["display"] }
 clap.workspace = true
