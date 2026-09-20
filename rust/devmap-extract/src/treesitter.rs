@@ -1239,6 +1239,40 @@ fn python_all_exports(source: &str) -> std::collections::BTreeSet<String> {
     exported
 }
 
+/// Whether `node` is a **pure dotted name** — `Other`, `widgets.Widget`,
+/// `pkg.mod.Thing` — and not an expression that merely ends in one.
+///
+/// The distinction is the whole of the alias rule. An alias is a second *name*
+/// for something another module can already import, which is why dropping one
+/// would delete a name other modules use. A computed value is not that, however
+/// dotted it looks.
+///
+/// Asking only whether the outermost node was an `identifier` or an `attribute`
+/// admitted every computed value whose last step happened to be an attribute
+/// access. `OUT = Path(__file__).resolve().parent` is an `attribute` whose
+/// object is a `call`: it passed, survived the `__all__` filter as an "alias",
+/// and became a symbol nothing can reference — because nothing can import it —
+/// and was therefore reported dead at 0.9. Measured on this repository that was
+/// 54 of 54 Python `Variable` symbols and six of the eight findings in the
+/// confident tier.
+///
+/// Iterative rather than recursive, for the reason every walk in this file is:
+/// `a.b.c.…` nested adversarially deep must not overflow the stack. The loop
+/// strictly descends the `object` chain, so it terminates.
+fn is_python_dotted_name(node: Node) -> bool {
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" => return true,
+            "attribute" => match current.child_by_field_name("object") {
+                Some(object) => current = object,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+}
+
 /// Module-level names a Python file declares as another name for something
 /// already referenceable — `TestEvidence = VerificationEvidence`.
 ///
@@ -1277,7 +1311,7 @@ fn python_module_aliases(root: Node, source: &str) -> std::collections::BTreeSet
         ) else {
             continue;
         };
-        if left.kind() != "identifier" || !matches!(right.kind(), "identifier" | "attribute") {
+        if left.kind() != "identifier" || !is_python_dotted_name(right) {
             continue;
         }
         let name = get_node_text(left, source);
