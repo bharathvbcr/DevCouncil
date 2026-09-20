@@ -207,6 +207,42 @@ fn many_empty_commits_leave_a_matching_tree_fresh() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// The two head accessors answer identically, and this target is the guard
+/// that they are both reachable without the parsing frontend.
+///
+/// They were separate implementations of one read, and had drifted the way two
+/// copies do: `latest_generation_head_sha` carried a stray
+/// `#[cfg(feature = "parse")]` — debris on a pure SQL read — so an embedder
+/// linking `devmap-store` with `default-features = false` could reach the head
+/// through one name and not the other. That is not hypothetical: it is exactly
+/// how it surfaced, as `dc-regress-store` failing to compile for GitPulse,
+/// which links the store without grammars.
+///
+/// `head_stamp` is listed in `FEATURE_OFF_SAFE`, so this test is compiled by
+/// `cargo check -p devmap-store --no-default-features --all-targets`. Naming
+/// the gated method here is what makes that check fail if the gate returns.
+#[test]
+fn both_head_accessors_answer_the_same_and_need_no_grammar() {
+    let (root, store, head, _generation) = indexed_git_repo("head-accessors");
+    assert_eq!(
+        store.latest_generation_head().unwrap(),
+        store.latest_generation_head_sha().unwrap(),
+        "one read, two names: they must not drift apart again"
+    );
+    assert_eq!(
+        store.latest_generation_head_sha().unwrap().as_deref(),
+        Some(head.as_str())
+    );
+
+    store.restamp_latest_head(&head).unwrap();
+    assert_eq!(
+        store.latest_generation_head().unwrap(),
+        store.latest_generation_head_sha().unwrap(),
+        "and they still agree after a write"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn restamp_updates_head_without_a_new_generation() {
     let (root, store, first_head, generation) = indexed_git_repo("restamp");
