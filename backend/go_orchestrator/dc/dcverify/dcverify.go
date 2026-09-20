@@ -40,12 +40,11 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 // BinaryEnv overrides binary discovery, so an operator who names a path means
@@ -669,25 +668,12 @@ func validate(out *Result) error {
 // The rule is the same one the search boundary applies, asserted again here
 // because this is where bytes from another process become a path a caller will
 // open, quote in a gap, or hand to a repair loop.
+//
+// A thin adapter over safefile.ValidRepoPath, which owns the rule — see the
+// twin of this comment in dc/dcgrep. "The same rule as the search boundary" is
+// now true by construction rather than by two copies happening to agree.
 func validPath(path string) error {
-	if path == "" {
-		return errors.New("is empty, so it names no file")
-	}
-	if strings.HasPrefix(path, "/") || strings.HasPrefix(path, `\`) {
-		return fmt.Errorf("%q is absolute, and every path here is relative to the repository", path)
-	}
-	if vol := filepath.VolumeName(filepath.FromSlash(path)); vol != "" {
-		return fmt.Errorf("%q names a volume, so it is not inside the repository", path)
-	}
-	for _, element := range strings.Split(path, "/") {
-		if element == ".." {
-			return fmt.Errorf("%q climbs out of the repository", path)
-		}
-	}
-	if !utf8.ValidString(path) {
-		return fmt.Errorf("%q is not valid UTF-8, so it names no file that can be reopened", path)
-	}
-	return nil
+	return safefile.ValidRepoPath(path)
 }
 
 // okOf reads the ok flag and error text off whichever reply shape was decoded.

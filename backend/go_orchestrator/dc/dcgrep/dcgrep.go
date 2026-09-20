@@ -30,12 +30,10 @@ import (
 	"fmt"
 	"math"
 	"os/exec"
-	"path/filepath"
-	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 // BinaryEnv overrides binary discovery, so an operator who names a path means
@@ -432,25 +430,15 @@ func validate(out any) error {
 // The rule is the same one containedRelOf applies on the tool side, asserted
 // again here because this is where bytes from another process become a path a
 // caller will open.
+//
+// A thin adapter over safefile.ValidRepoPath, which owns the rule. This used
+// to be a second full implementation of it, byte-identical to the one in
+// dc/dcverify — two containment checks at two subprocess boundaries, either of
+// which could be tightened without the other. Delegating keeps the local name
+// the call sites already use while leaving exactly one place where the rule
+// can change.
 func validPath(path string) error {
-	if path == "" {
-		return errors.New("is empty, so it names no file")
-	}
-	if strings.HasPrefix(path, "/") || strings.HasPrefix(path, `\`) {
-		return fmt.Errorf("%q is absolute, and every path here is relative to the repository", path)
-	}
-	if vol := filepath.VolumeName(filepath.FromSlash(path)); vol != "" {
-		return fmt.Errorf("%q names a volume, so it is not inside the repository", path)
-	}
-	for _, element := range strings.Split(path, "/") {
-		if element == ".." {
-			return fmt.Errorf("%q climbs out of the repository", path)
-		}
-	}
-	if !utf8.ValidString(path) {
-		return fmt.Errorf("%q is not valid UTF-8, so it names no file that can be reopened", path)
-	}
-	return nil
+	return safefile.ValidRepoPath(path)
 }
 
 // validSkipped refuses counts that cannot be counts.
