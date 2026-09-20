@@ -294,8 +294,12 @@ Always pass `repo_path` (the absolute repository path) on every `devmap_*` call,
 check `repository.root` in the envelope before trusting the answer — Cursor shares one \
 MCP process across workspace tabs. \
 Read `truncated` and `total` on every envelope before treating a list as complete. \
-When DevMap cannot answer, record a gap in `.devcouncil/codeintel/sessions/gaps.jsonl` \
-— do not switch indexes."
+When DevMap cannot answer, record a gap with \
+`devmap gap-record --tool <tool> --gap-id <id> --reason <why>` — do not switch \
+indexes. Give `--reason` what you asked, what came back, and why that is a gap. \
+It appends to `.devcouncil/codeintel/sessions/gaps.jsonl`, which \
+`devmap session-report` reads; go through the command rather than writing that \
+file, because the state directory is protected and a redirect at it is refused."
             .to_string(),
         format!(
             "9. The store (`{store_rel}`) is canonical — prefer `devmap` commands when \

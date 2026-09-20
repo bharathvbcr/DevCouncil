@@ -315,11 +315,24 @@ fn every_flag_the_guide_names_is_accepted_by_the_parser() {
         let Some(invocation) = rest.split('`').next() else {
             continue;
         };
-        // Only the flags: a placeholder like `<name>` is prose, not an argument
-        // the parser could resolve.
-        let args: Vec<&str> = invocation
+        // A placeholder like `<name>` stands for a value, so it is *replaced*
+        // rather than dropped.
+        //
+        // Dropping it left a value-taking flag bare — `--tool <tool>` became
+        // `--tool`, which clap rejects for the missing value rather than for
+        // anything the guide got wrong. So the check could not cover a flag
+        // that takes a value at all, which is most of them, and the first one
+        // documented failed the test for the wrong reason. Substituting keeps
+        // the invocation shaped the way the guide writes it.
+        let args: Vec<String> = invocation
             .split_whitespace()
-            .filter(|token| !token.starts_with('<'))
+            .map(|token| {
+                if token.starts_with('<') {
+                    "placeholder".to_string()
+                } else {
+                    token.to_string()
+                }
+            })
             .collect();
         if args.len() < 2 || !args[1..].iter().any(|t| t.starts_with("--")) {
             continue;
