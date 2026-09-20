@@ -37,7 +37,16 @@ type verdictSchema struct {
 
 func contractsDir(t *testing.T) string {
 	t.Helper()
-	// contracts/ sits at the repository root; this package is manvi/policy.
+	// `backend/contracts/`, reached from `backend/go_orchestrator/policy`.
+	//
+	// The comment this replaces said the directory sits at the repository root
+	// and that this package is `manvi/policy`, both true when it was written
+	// and neither true since the move to `backend/go_orchestrator`. The two
+	// errors cancelled — `../../` still lands on a real `contracts/` — so the
+	// test kept passing while describing a layout that no longer existed, and
+	// a *second* `contracts/` survived at the root for exactly as long,
+	// unreferenced, missing the `rust-port` -> `rust` rename and two rule IDs
+	// this package emits. A path that is right by accident documents nothing.
 	dir, err := filepath.Abs(filepath.Join("..", "..", "contracts"))
 	if err != nil {
 		t.Fatalf("resolving contracts dir: %v", err)

@@ -1531,7 +1531,7 @@ had outgrown. The sixth turned out to close a real fail-open, described below.
    purpose, because a hook-synthesised verdict ("hook_gate mode=off allows this") fired no
    rule, and `PolicyDecision` derives `severity` from `rule` with an unknown rule failing
    closed to "hard" — so giving such a verdict a `PolicyDecision` would put a fabricated
-   severity into the vocabulary `contracts/verdict.schema.json` shares with Manvi. The seam is
+   severity into the vocabulary `backend/contracts/verdict.schema.json` shares with Manvi. The seam is
    named instead: `policy_engine.Decision`, a protocol of the three members a gate reads, and
    `PolicyDecision` gains the `allowed` property `HookDecision` already had.
    `is_command_allowed` keeps its asymmetry (`action == "allow"` on one branch, `.allowed` on
