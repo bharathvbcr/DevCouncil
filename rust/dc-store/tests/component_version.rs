@@ -84,11 +84,26 @@ fn health_reports_version_and_id() {
         .expect("health must run");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"id\":\"dcstore\""), "health missing id: {stdout}");
-    assert!(stdout.contains("\"component\":\"dc-store\""), "health missing component: {stdout}");
-    assert!(stdout.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))), "health missing version: {stdout}");
-    assert!(stdout.contains("\"store\":\"dc-store\""), "health missing store: {stdout}");
-    assert!(stdout.contains("\"exclusion_index\":\"verified\""), "health missing exclusion_index: {stdout}");
+    assert!(
+        stdout.contains("\"id\":\"dcstore\""),
+        "health missing id: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"component\":\"dc-store\""),
+        "health missing component: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))),
+        "health missing version: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"store\":\"dc-store\""),
+        "health missing store: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"exclusion_index\":\"verified\""),
+        "health missing exclusion_index: {stdout}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
