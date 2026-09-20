@@ -51,6 +51,8 @@ func dispatch(args []string) int {
 		return runSkills(args[1:])
 	case "verify":
 		return runVerify(args[1:])
+	case "grep":
+		return runGrep(args[1:])
 	case "install":
 		return runInstall(args[1:])
 	case "uninstall":
@@ -108,6 +110,8 @@ Usage:
   devcouncil skills scaffold [--skill NAME] [--project-root DIR] [--dry-run] [--check]
                                    --check writes nothing and exits 1 if any file is missing or differs
   devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local|docker|nix] [--coverage PATH]
+  devcouncil grep PATTERN [--json] [--path DIR] [--max N] [--ignore-case]
+                                   Search via the `+"`dcgrep`"+` client (missing binary is an error, never an empty match list)
   devcouncil map [devmap args…]   Exec `+"`devmap`"+` (bare invocation: build --manifest)
   devcouncil graph …              Alias of map
   devcouncil ast …                Exec `+"`devmap ast`"+`
