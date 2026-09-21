@@ -839,8 +839,52 @@ enum Commands {
         /// The last known-good revision. Commits after it are the candidates.
         #[arg(long)]
         since: String,
-        /// How far to walk inbound edges from the symptom.
+        /// How far to walk **outbound** call edges from the symptom — its
+        /// transitive dependencies, which are what could have caused it.
+        ///
+        /// Outbound, not inbound. The symptom's callers sit downstream of the
+        /// failure and cannot have caused it; walking towards them returns the
+        /// symptom alone and reads as "no commit touched anything relevant".
+        /// For the inbound direction — what a change *affects* — see `blast`.
         #[arg(long, default_value_t = dc_regress::DEFAULT_CONE_DEPTH)]
+        depth: u32,
+    },
+    /// What a change affects: the symbols, files, modules and tests downstream
+    /// of the lines it touched.
+    ///
+    /// The mirror of `suspects`. That command runs from a symptom back to the
+    /// commits that could have caused it, walking outbound call edges. This
+    /// runs from a change forward to what depends on it, walking **inbound**
+    /// ones — a change breaks what calls it, never what it calls.
+    ///
+    /// The post-image is always the revision the index was built at, because
+    /// that is the only content the graph's byte offsets describe. A diff
+    /// against any other revision would pair spans from one revision with
+    /// lines from another, which the join refuses rather than clamping past.
+    ///
+    /// Changed lines that land in no symbol — imports, top-level constants,
+    /// attributes, macro invocations — are reported as unattributed rather
+    /// than dropped, and make the report incomplete. A change to a module's
+    /// central constant must never read as a change that affects nothing.
+    ///
+    /// For an *uncommitted* buffer, use `preview`: it diffs candidate content
+    /// against the index and reports what a removal or re-declaration would
+    /// break. This command needs a committed post-image so the basis is a real
+    /// blob rather than a worktree read that nothing can be compared against.
+    Blast {
+        /// The revision the change is measured from. The change is everything
+        /// between it and the indexed head.
+        #[arg(long, conflicts_with = "at")]
+        since: Option<String>,
+        /// An explicit location instead of a diff: `path:start-end`, or
+        /// `path:line` for one line. Read at the indexed head.
+        ///
+        /// For "what depends on the line I am looking at", which has no
+        /// revision range to speak of.
+        #[arg(long, conflicts_with = "since")]
+        at: Option<String>,
+        /// How far to walk inbound call edges from the changed symbols.
+        #[arg(long, default_value_t = dc_regress::DEFAULT_BLAST_DEPTH)]
         depth: u32,
     },
     /// Definitions matching a query, with source, callers, callees and a
@@ -3675,6 +3719,142 @@ fn emit_suspects(report: &dc_regress::SuspectReport) {
     }
 }
 
+/// Render a blast report.
+///
+/// The refusals and the unattributed lines print *first*, for the same reason
+/// they do in `emit_suspects`: a reader's question is "is this the whole
+/// story", and an impact list computed from half the change looks exactly like
+/// one computed from all of it.
+fn emit_blast(report: &dc_regress::BlastReport) {
+    if !report.unavailable.is_empty() {
+        outln!("could not examine everything:");
+        for reason in &report.unavailable {
+            outln!("  - {}", reason.describe());
+        }
+        outln!("");
+    }
+
+    if report.changed_files.is_empty() {
+        // The distinction this whole command is built on, applied to its own
+        // summary line. An empty change set after a refusal is not a finding
+        // that nothing changed — it is the absence of a finding, and printing
+        // "changed no files" under a banner explaining that the diff could not
+        // be read invites a reader to take the first sentence and leave.
+        if report.complete {
+            outln!("{} changed no files", report.change);
+        } else {
+            outln!(
+                "{}: what changed could not be determined — see above. This is not a \
+                 finding that nothing changed.",
+                report.change
+            );
+        }
+        return;
+    }
+
+    outln!(
+        "{}: {} file(s) changed, {} symbol(s) touched",
+        report.change,
+        report.changed_files.len(),
+        report.seeds.len()
+    );
+    for seed in report.seeds.iter().take(10) {
+        outln!(
+            "  changed  {} ({}-{}, {} line(s){})",
+            seed.qualified_name,
+            seed.start_line,
+            seed.end_line,
+            seed.changed_lines,
+            if seed.deletion_only {
+                ", deletions only"
+            } else {
+                ""
+            }
+        );
+    }
+    if report.seeds.len() > 10 {
+        outln!("  … {} more changed symbol(s)", report.seeds.len() - 10);
+    }
+
+    // Printed even when empty is *not* the rule here — an empty list with
+    // nothing in `unavailable` means the change really did land entirely in
+    // symbols, which is worth not saying. A non-empty one is always shown in
+    // full up to its own cap, because each entry is a place the walk could not
+    // start.
+    if !report.unattributed.is_empty() {
+        outln!("");
+        outln!(
+            "{} range(s) landed in no symbol — the impact below cannot account for them:",
+            report.unattributed.len()
+        );
+        for entry in report.unattributed.iter().take(10) {
+            if entry.start_line == 0 {
+                outln!("  {}: {}", entry.path, entry.reason.describe());
+            } else {
+                outln!(
+                    "  {}:{}-{}: {}",
+                    entry.path,
+                    entry.start_line,
+                    entry.end_line,
+                    entry.reason.describe()
+                );
+            }
+        }
+        if report.unattributed.len() > 10 {
+            outln!("  … {} more", report.unattributed.len() - 10);
+        }
+    }
+
+    outln!("");
+    if report.impacted.is_empty() {
+        if report.complete {
+            outln!("nothing outside the changed symbols depends on them");
+        } else {
+            outln!(
+                "no dependents found — but the analysis was incomplete, so this is not \
+                 evidence that none exist"
+            );
+        }
+    } else {
+        outln!("{} symbol(s) affected:", report.impacted.len());
+        for symbol in report.impacted.iter().take(15) {
+            outln!("  d{} {}", symbol.distance, symbol.qualified_name);
+        }
+        if report.impacted.len() > 15 {
+            outln!("  … {} more", report.impacted.len() - 15);
+        }
+    }
+
+    if !report.modules.is_empty() {
+        outln!("");
+        outln!("{} module(s) affected:", report.modules.len());
+        for module in report.modules.iter().take(15) {
+            outln!(
+                "  d{} {} ({} file(s), {} symbol(s){})",
+                module.nearest_distance,
+                module.path,
+                module.files,
+                module.symbols,
+                if module.changed { ", changed" } else { "" }
+            );
+        }
+        if report.modules.len() > 15 {
+            outln!("  … {} more", report.modules.len() - 15);
+        }
+    }
+
+    if !report.tests.is_empty() {
+        outln!("");
+        outln!("{} test file(s) to run:", report.tests.len());
+        for test in report.tests.iter().take(20) {
+            outln!("  d{} {}", test.distance, test.path);
+        }
+        if report.tests.len() > 20 {
+            outln!("  … {} more", report.tests.len() - 20);
+        }
+    }
+}
+
 fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
     if let ResolutionAvailability::Unavailable { reason } = &resp.resolution {
         emit_unavailable(reason);
@@ -4278,6 +4458,41 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
                      an empty one asks about the whole history rather than a window"
                         .to_string(),
                 );
+            }
+            check_depth(*depth as usize)
+        }
+        Commands::Blast { since, at, depth } => {
+            match (since.as_deref(), at.as_deref()) {
+                (None, None) => {
+                    return Err(
+                        "blast needs a starting point: --since <rev> for what a range of \
+                         commits affects, or --at <path>:<start>-<end> for what a specific \
+                         range of lines affects"
+                            .to_string(),
+                    )
+                }
+                (Some(since), None) if since.trim().is_empty() => {
+                    return Err(
+                        "--since must name a revision: an empty one asks about the whole \
+                         history rather than a change"
+                            .to_string(),
+                    )
+                }
+                // `conflicts_with` already refuses both; this arm exists so the
+                // match is exhaustive over what clap can hand back rather than
+                // relying on a guarantee stated elsewhere.
+                (Some(_), Some(_)) => {
+                    return Err("--since and --at are alternatives; pass one".to_string())
+                }
+                (None, Some(at)) => {
+                    // Parsed twice — here for the message, and again at
+                    // dispatch. The duplication buys a refusal the user sees
+                    // before any store is opened, and the parser is one
+                    // function in `dc-regress` so the two calls, and the
+                    // daemon's, cannot disagree about what is valid.
+                    dc_regress::change::parse_location(at)?;
+                }
+                (Some(_), None) => {}
             }
             check_depth(*depth as usize)
         }
@@ -5586,6 +5801,47 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 emit_json(cli, &serde_json::to_value(&report)?)?;
             } else {
                 emit_suspects(&report);
+            }
+        }
+        Commands::Blast { since, at, depth } => {
+            let store = open_for_read(cli)?;
+            let root = std::path::absolute(cli.root_hint())
+                .unwrap_or_else(|_| cli.root_hint().to_path_buf());
+            let graph = dc_regress_store::StoreGraph::new(&store, &root)?;
+            // Pinned to the indexed head for the same reason `suspects` is:
+            // the graph's byte offsets describe that revision's content and
+            // no other, so any other post-image makes every file's basis check
+            // refuse — a report of nothing but refusals rather than a wrong
+            // answer, but still not an answer.
+            let until = graph.indexed_head().map(str::to_string).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "this store recorded no head commit, so there is no revision whose \
+                     content its spans are known to describe — run `devmap build` in a \
+                     git repository first"
+                )
+            })?;
+            let report = match (since.as_deref(), at.as_deref()) {
+                (Some(since), _) => dc_regress::blast(&root, &graph, since, &until, *depth),
+                (None, Some(at)) => {
+                    let (path, start, end) = dc_regress::change::parse_location(at)
+                        .map_err(|error| anyhow::anyhow!(error))?;
+                    dc_regress::blast::blast_change_with_program(
+                        std::ffi::OsStr::new("git"),
+                        &root,
+                        &graph,
+                        &dc_regress::ChangeSet::at(&path, start, end),
+                        at,
+                        &until,
+                        *depth,
+                    )
+                }
+                // Refused in `validate` before the store was opened.
+                (None, None) => unreachable!("blast requires --since or --at"),
+            };
+            if cli.json {
+                emit_json(cli, &serde_json::to_value(&report)?)?;
+            } else {
+                emit_blast(&report);
             }
         }
         Commands::Explore {

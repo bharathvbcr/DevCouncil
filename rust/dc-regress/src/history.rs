@@ -113,7 +113,15 @@ fn bounds(stdout_cap: usize) -> Bounds {
     }
 }
 
-fn run(
+/// Run one bounded git command, refusing a capped read rather than returning
+/// its prefix.
+///
+/// `pub(crate)` rather than private because [`crate::change`] runs `git diff`
+/// under exactly these bounds and exactly this refusal order. A second copy
+/// there would be a second place for the truncation-before-status rule to be
+/// got wrong, and that rule is the one that decides whether a partial read is
+/// presented as a whole answer.
+pub(crate) fn run_git(
     program: &std::ffi::OsStr,
     repo: &Path,
     args: &[&str],
@@ -174,7 +182,7 @@ pub fn commit_window_with_program(
     // tell "the range is this long" from "the range is longer".
     let max_count = format!("--max-count={}", COMMIT_CAP + 1);
     let range = format!("{since}..{until}");
-    let captured = run(
+    let captured = run_git(
         program,
         repo,
         &["log", &max_count, "--format=%H", "--no-merges", &range],
@@ -210,7 +218,7 @@ pub fn resolve_blob_with_program(
     path: &str,
 ) -> Result<ResolvedBlob, HistoryRefusal> {
     let spec = format!("{rev}:{path}");
-    let id = run(
+    let id = run_git(
         program,
         repo,
         &["rev-parse", &spec],
@@ -218,7 +226,7 @@ pub fn resolve_blob_with_program(
         4 * 1024,
     )?;
     let oid = id.stdout_lossy().trim().to_string();
-    let shown = run(program, repo, &["show", &spec], "git show", CONTENT_CAP)?;
+    let shown = run_git(program, repo, &["show", &spec], "git show", CONTENT_CAP)?;
     let content = match String::from_utf8(shown.stdout.clone()) {
         Ok(content) => content,
         Err(_) => {
@@ -244,7 +252,7 @@ pub fn files_changed_with_program(
     repo: &Path,
     commit: &str,
 ) -> Result<Vec<String>, HistoryRefusal> {
-    let captured = run(
+    let captured = run_git(
         program,
         repo,
         &[

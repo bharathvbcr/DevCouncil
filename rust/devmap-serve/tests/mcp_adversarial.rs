@@ -345,6 +345,17 @@ async fn every_published_default_is_the_default_that_is_applied() {
             }
             "devmap_explore" => json!({"query": "helper"}),
             "devmap_affected_tests" => json!({"targets": ["helper"]}),
+            // These two join the graph to git, and this corpus is an in-memory
+            // store with no repository behind it — so both arms refuse, and
+            // what this gate proves for them is that the refusals match, not
+            // that `depth` was applied. Said plainly rather than left for a
+            // reader to infer from a passing test: the substantive coverage is
+            // `blast_names_what_a_change_reaches` in `devmap-cli`, which runs
+            // them over a real checkout, and
+            // `the_git_joined_tools_reach_their_own_commands` below, which
+            // proves the MCP wiring routes to them at all.
+            "devmap_suspects" => json!({"symptom": "helper", "since": "HEAD~1"}),
+            "devmap_blast" => json!({"since": "HEAD~1"}),
             other => panic!("tool {other} has no fixture in this gate"),
         };
 
@@ -727,6 +738,79 @@ async fn unbroken_a_store_that_appears_mid_session_is_picked_up() {
 /// the `CallToolRequest` schema, is a protocol error — the model cannot fix a
 /// name it was never offered, and a model handed "unknown tool" inside a tool
 /// *result* sees a tool that ran and retries the same non-existent name.
+/// The two git-joined tools are reachable and route to their own commands.
+///
+/// `every_published_default_is_the_default_that_is_applied` compares two
+/// answers for equality, which a pair of identical refusals satisfies — so on
+/// this repository-less corpus it would pass just as happily if
+/// `devmap_blast` were wired to `status`, or to nothing. This asserts the
+/// facts that equality cannot: that each tool is published, that a call
+/// reaches the command's own argument handling, and that its refusal names the
+/// reason this corpus cannot answer rather than "unknown tool".
+#[tokio::test]
+async fn the_git_joined_tools_reach_their_own_commands() {
+    let published: Vec<String> = tool_specs()
+        .iter()
+        .filter_map(|spec| spec["name"].as_str().map(str::to_string))
+        .collect();
+    for tool in ["devmap_suspects", "devmap_blast"] {
+        assert!(
+            published.iter().any(|name| name == tool),
+            "{tool} is not in tools/list: {published:?}"
+        );
+    }
+
+    // Selector handling is the command's own, and it runs before anything
+    // touches git — so these refusals prove the call arrived at the `Blast`
+    // arm specifically.
+    let store = corpus();
+    let neither = call(&store, "devmap_blast", json!({})).await;
+    assert_eq!(neither["result"]["isError"], json!(true));
+    let text = neither["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        text.contains("starting point") || text.contains("since"),
+        "blast with no selector must say what to pass, not fail generically: {text}"
+    );
+
+    let both = call(
+        &store,
+        "devmap_blast",
+        json!({"since": "HEAD~1", "at": "core.py:1-2"}),
+    )
+    .await;
+    assert_eq!(
+        both["result"]["isError"],
+        json!(true),
+        "two selectors ask two different questions; answering either one \
+         answers a question the caller did not ask"
+    );
+
+    // A blank revision must not be read as all of history, on this transport
+    // as on the CLI.
+    let blank = call(
+        &store,
+        "devmap_suspects",
+        json!({"symptom": "helper", "since": "  "}),
+    )
+    .await;
+    assert_eq!(blank["result"]["isError"], json!(true));
+
+    // And a well-formed call gets this corpus's real limitation named, rather
+    // than an empty answer that would read as "nothing is affected".
+    let real = call(&store, "devmap_blast", json!({"since": "HEAD~1"})).await;
+    let text = real["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        text.contains("repository root") || text.contains("devmap build"),
+        "an in-memory store has no checkout to diff; the refusal must say so: {text}"
+    );
+}
+
 #[tokio::test]
 async fn unbroken_a_tool_cannot_be_steered_at_another_command() {
     /// How a refusal must reach the caller.

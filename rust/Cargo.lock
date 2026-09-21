@@ -459,6 +459,8 @@ name = "devmap-serve"
 version = "0.2.3"
 dependencies = [
  "anyhow",
+ "dc-regress",
+ "dc-regress-store",
  "devmap-analyze",
  "devmap-extract",
  "devmap-query",

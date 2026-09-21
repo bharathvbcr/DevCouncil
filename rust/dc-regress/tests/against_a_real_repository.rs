@@ -91,6 +91,21 @@ impl CodeGraph for FakeGraph {
     fn cone(&self, _symbol: &str, _depth: u32) -> (Vec<ConeEntry>, bool) {
         (self.cone.clone(), false)
     }
+    /// The inbound direction, which these tests do not exercise: they are
+    /// about `suspects`, which never calls it. Empty and *complete* rather
+    /// than empty and incomplete, because this fake genuinely holds nothing
+    /// inbound — an "incomplete" here would mark every suspect report in this
+    /// file as a lower bound for a walk it never ran.
+    fn impacted(&self, _seeds: &[String], _depth: u32) -> (Vec<ConeEntry>, bool) {
+        (Vec::new(), false)
+    }
+    fn affected_tests(
+        &self,
+        _seeds: &[String],
+        _depth: u32,
+    ) -> (Vec<dc_regress::AffectedTestFile>, bool) {
+        (Vec::new(), false)
+    }
     fn resolve_symptom(&self, _symptom: &str) -> Vec<String> {
         self.resolves_to.clone()
     }

@@ -50,6 +50,136 @@ fn corpus() -> Arc<StoreSlot> {
     Arc::new(StoreSlot::ready("in-memory", Arc::new(store)))
 }
 
+/// The same corpus, behind a real git checkout.
+///
+/// `devmap_suspects` and `devmap_blast` join the graph to git, so an in-memory
+/// store with no repository cannot exercise them at all. Exempting them from
+/// the conformance gate below was the alternative, and it is the worse one:
+/// the gate's entire claim is that every *declared* tool's result was checked
+/// against its declared schema, and a gate that skips two tools while
+/// reporting a pass is the "capped sample presented as complete coverage"
+/// this repository refuses everywhere else.
+///
+/// Returns the store and the base revision, so a caller can ask what the
+/// second commit changed. The generation is built from the **post-image**
+/// sources and stamped with that commit, which is what makes the spans and the
+/// blobs describe the same bytes.
+///
+/// `None` when git is unavailable or refuses — reported by the caller as a
+/// skipped check rather than folded into a pass.
+fn git_corpus() -> Option<(Arc<StoreSlot>, String, tempdir::Dir)> {
+    let dir = tempdir::Dir::new("mcp-git-corpus")?;
+    let root = dir.path().to_path_buf();
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Ada")
+            .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_NAME", "Ada")
+            .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    git(&["init", "--initial-branch=main"])?;
+    git(&["config", "user.name", "Ada"])?;
+    git(&["config", "user.email", "ada@example.com"])?;
+
+    // Two revisions of the same two files, so there is a change to ask about.
+    let before = [
+        ("core.py", "def helper(rows):\n    return sum(rows)\n"),
+        (
+            "caller.py",
+            "from core import helper\n\n\ndef run(rows):\n    return helper(rows)\n",
+        ),
+    ];
+    let after = [
+        ("core.py", "def helper(rows):\n    return sum(rows) + 1\n"),
+        (
+            "caller.py",
+            "from core import helper\n\n\ndef run(rows):\n    return helper(rows)\n",
+        ),
+    ];
+    for (path, source) in before {
+        std::fs::write(root.join(path), source).ok()?;
+    }
+    git(&["add", "-A"])?;
+    git(&["commit", "-m", "base", "--no-gpg-sign"])?;
+    let base = git(&["rev-parse", "HEAD"])?;
+
+    for (path, source) in after {
+        std::fs::write(root.join(path), source).ok()?;
+    }
+    git(&["add", "-A"])?;
+    git(&["commit", "-m", "change", "--no-gpg-sign"])?;
+    let head = git(&["rev-parse", "HEAD"])?;
+
+    let extractions: Vec<_> = after
+        .iter()
+        .map(|(path, source)| devmap_extract::extract_file(path, source))
+        .collect();
+    let mut resolver = devmap_resolve::Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).ok()?;
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().ok()?;
+    store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            devmap_store::GenerationWriteOpts {
+                repo_root: Some(root.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        )
+        .ok()?;
+    // The commit the spans describe. Without it every basis is `Unknown` and
+    // every file refuses — loudly, but still without answering.
+    store.restamp_latest_head(&head).ok()?;
+    Some((
+        Arc::new(StoreSlot::ready("git-corpus", Arc::new(store))),
+        base,
+        dir,
+    ))
+}
+
+/// A temp directory that removes itself.
+mod tempdir {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static SEQUENCE: AtomicU32 = AtomicU32::new(0);
+
+    pub struct Dir(PathBuf);
+
+    impl Dir {
+        pub fn new(label: &str) -> Option<Self> {
+            // Pid *and* a counter: `cargo test` runs these on several threads
+            // of one process, and a pid-only name collides between them.
+            let seq = SEQUENCE.fetch_add(1, Ordering::SeqCst);
+            let path =
+                std::env::temp_dir().join(format!("devmap-{label}-{}-{seq}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).ok()?;
+            Some(Self(path))
+        }
+        pub fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
 /// A request body carrying the modern era's required `_meta`.
 fn modern(method: &str, params: Value) -> String {
     let mut params = params;
@@ -437,22 +567,46 @@ async fn every_tool_result_conforms_to_the_output_schema_it_declared() {
         ("devmap_explore", json!({"query": "helper"})),
         ("devmap_affected_tests", json!({"targets": ["helper"]})),
     ];
+
+    // The two git-joined tools need a checkout, so they run against the git
+    // corpus and are listed separately. Both lists are summed against
+    // `TOOL_NAMES` below: splitting the fixture must not become a way to drop
+    // a tool from the count.
+    let git = git_corpus();
+    let git_arguments: Vec<(&str, Value)> = match &git {
+        Some((_, base, _)) => vec![
+            ("devmap_suspects", json!({"symptom": "run", "since": base})),
+            ("devmap_blast", json!({"since": base})),
+        ],
+        None => Vec::new(),
+    };
+    assert!(
+        git.is_some(),
+        "the git-joined tools cannot be validated without a checkout, and a gate \
+         that reports a pass having skipped two of its tools is not a coverage claim"
+    );
+
     assert_eq!(
-        arguments.len(),
+        arguments.len() + git_arguments.len(),
         TOOL_NAMES.len(),
         "this test must exercise every declared tool; {} declared, {} exercised",
         TOOL_NAMES.len(),
-        arguments.len()
+        arguments.len() + git_arguments.len()
     );
 
+    let git_store = git.as_ref().map(|(store, _, _)| store);
     let mut checked = 0usize;
-    for (tool, args) in arguments {
+    for (tool, args) in arguments.iter().chain(git_arguments.iter()) {
+        let target = match git_store {
+            Some(git_store) if matches!(*tool, "devmap_suspects" | "devmap_blast") => git_store,
+            _ => &store,
+        };
         let frame = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": tool, "arguments": args},
         })
         .to_string();
-        let response = handle_line(&store, &frame).await.expect("answered");
+        let response = handle_line(target, &frame).await.expect("answered");
         let result = &response["result"];
         assert_eq!(
             result["isError"],

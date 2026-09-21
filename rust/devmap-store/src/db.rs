@@ -6046,6 +6046,29 @@ impl Store {
         Ok(sha)
     }
 
+    /// The repository root the latest generation was built from.
+    ///
+    /// The pair to [`Self::latest_generation_head_sha`], and needed by the
+    /// same callers for the same reason: an analysis that joins these spans to
+    /// git has to run against *the* repository they were taken from, and a
+    /// root supplied by the caller is a second opinion that can disagree.
+    /// Where the two differ the generation's own root is the correct one,
+    /// because it is the one the byte offsets describe.
+    ///
+    /// `None` when the generation recorded no root — an older store, or one
+    /// built outside a repository. Never an empty string dressed as a path.
+    pub fn latest_generation_repo_root(&self) -> Result<Option<String>> {
+        let conn = lock_conn(&self.conn)?;
+        let root: Option<Option<String>> = conn
+            .query_row(
+                "SELECT repo_root FROM generations WHERE id = (SELECT max(id) FROM generations)",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(root.flatten().filter(|root| !root.is_empty()))
+    }
+
     /// Rewrite the latest generation's git identity without writing a new graph.
     ///
     /// Callers that have already proved the working tree matches this

@@ -250,6 +250,102 @@ fn default_depth() -> usize {
     3
 }
 
+/// Walk depth for the two git-joined directions.
+///
+/// Read from `dc-regress` rather than restated, so the daemon and the CLI
+/// cannot answer the same question over different horizons.
+fn default_cone_depth() -> u32 {
+    dc_regress::DEFAULT_CONE_DEPTH
+}
+
+/// The graph both git-joined commands read, rooted at the indexed checkout.
+///
+/// `dispatch` receives a `&Store` and no root, so the generation's own
+/// recorded root is the only one available here. That is weaker than a
+/// caller-supplied root against a store copied between checkouts — see
+/// [`dc_regress_store::StoreGraph::for_indexed_repo`] — and the CLI, which
+/// does have a root, passes its own rather than using this.
+fn git_joined_graph(store: &Store) -> anyhow::Result<dc_regress_store::StoreGraph<'_>> {
+    dc_regress_store::StoreGraph::for_indexed_repo(store)
+}
+
+/// Which of `blast`'s two selectors was given, refusing neither and both.
+///
+/// One function, called from `validate_request` and again from `dispatch`, so
+/// the transport that validates up front and the one that does not cannot
+/// disagree about which requests are well formed.
+enum BlastSelector<'a> {
+    Since(&'a str),
+    At(&'a str),
+}
+
+fn blast_selector<'a>(
+    since: Option<&'a str>,
+    at: Option<&'a str>,
+) -> Result<BlastSelector<'a>, String> {
+    match (since, at) {
+        (Some(_), Some(_)) => Err(
+            "`since` and `at` are alternatives: one measures a revision range, the other \
+             names a line range, and answering either when both were asked answers a \
+             question the caller did not ask"
+                .to_string(),
+        ),
+        (None, None) => Err(
+            "blast needs a starting point: `since` for what a range of commits affects, or \
+             `at` as `path:start-end` for what a range of lines affects"
+                .to_string(),
+        ),
+        (Some(since), None) => {
+            if since.trim().is_empty() {
+                return Err(
+                    "`since` must name a revision: an empty one asks about the whole history \
+                     rather than a change"
+                        .to_string(),
+                );
+            }
+            Ok(BlastSelector::Since(since))
+        }
+        (None, Some(at)) => {
+            // Parsed here as well as at dispatch, so a malformed location is
+            // refused before the store is opened. One parser, so the two
+            // cannot disagree about what is valid.
+            dc_regress::change::parse_location(at)?;
+            Ok(BlastSelector::At(at))
+        }
+    }
+}
+
+/// The depth bounds every traversal shares, for the commands that carry no
+/// token budget and so return before the shared tail of `validate_request`.
+///
+/// Shares the two limits with that tail rather than restating them: a depth
+/// that one transport accepts and the other refuses is the same question
+/// answered over two different horizons.
+fn check_walk_depth(depth: u32) -> Result<(), String> {
+    if depth == 0 {
+        return Err("traversal depth must be at least 1: depth 0 walks nothing".to_string());
+    }
+    if depth as usize > MAX_TRAVERSAL_DEPTH {
+        return Err(format!("traversal depth exceeds {MAX_TRAVERSAL_DEPTH}"));
+    }
+    Ok(())
+}
+
+/// The revision both git-joined directions must run against.
+///
+/// Not `HEAD`. The graph's byte offsets describe the content of the commit the
+/// index was built at, so blaming or diffing any other revision pairs spans
+/// from one revision with lines from another — which the join refuses, making
+/// the whole answer a list of refusals. Refusing here instead says why once.
+fn indexed_head_of(graph: &dc_regress_store::StoreGraph<'_>) -> anyhow::Result<String> {
+    graph.indexed_head().map(str::to_string).ok_or_else(|| {
+        anyhow::anyhow!(
+            "this store recorded no head commit, so there is no revision whose content its \
+             spans are known to describe — run `devmap build` in a git repository first"
+        )
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct IpcRequest {
     pub version: u32,
@@ -372,6 +468,32 @@ pub enum IpcCommand {
         depth: usize,
         #[serde(default)]
         min_confidence: f32,
+    },
+    /// Which commits since `since` could have caused a symptom.
+    ///
+    /// Walks **outbound** call edges: a symptom is caused by its own body or
+    /// by what it calls, never by its callers. The mirror of [`Self::Blast`].
+    Suspects {
+        symptom: String,
+        since: String,
+        #[serde(default = "default_cone_depth")]
+        depth: u32,
+    },
+    /// What a change affects: the symbols, files, modules and tests
+    /// downstream of the lines it touched.
+    ///
+    /// Walks **inbound** call edges. Exactly one of `since` and `at` is given:
+    /// `since` measures a revision range against the indexed head, `at` names
+    /// an explicit `path:start-end` at that head. Both is refused rather than
+    /// one being preferred, because they are two different questions and a
+    /// silent preference answers the one the caller did not ask.
+    Blast {
+        #[serde(default)]
+        since: Option<String>,
+        #[serde(default)]
+        at: Option<String>,
+        #[serde(default = "default_cone_depth")]
+        depth: u32,
     },
     Preview {
         /// Repository-relative path the buffer would be written to.
@@ -535,6 +657,40 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
 
     let (text, budget, depth, min_confidence) = match &request.command {
         IpcCommand::Status => return Ok(()),
+        // The two git-joined directions take a revision or a location rather
+        // than a graph query, and carry no token budget or confidence floor.
+        // They are checked here and returned, rather than being given a
+        // placeholder budget to carry through the shared tail below — a
+        // placeholder that satisfies a check is a check that stopped running.
+        IpcCommand::Suspects {
+            symptom,
+            since,
+            depth,
+        } => {
+            if symptom.len() > MAX_QUERY_BYTES {
+                return Err(format!("symptom exceeds {MAX_QUERY_BYTES} bytes"));
+            }
+            if since.len() > MAX_QUERY_BYTES {
+                return Err(format!("since exceeds {MAX_QUERY_BYTES} bytes"));
+            }
+            return check_walk_depth(*depth);
+        }
+        IpcCommand::Blast { since, at, depth } => {
+            for (name, value) in [("since", since), ("at", at)] {
+                if value.as_ref().is_some_and(|v| v.len() > MAX_QUERY_BYTES) {
+                    return Err(format!("blast {name} exceeds {MAX_QUERY_BYTES} bytes"));
+                }
+            }
+            // Here, not in `dispatch`, because this runs before the store is
+            // touched. Checked there first, a caller who passed neither
+            // selector was told "this store recorded no repository root" — a
+            // condition they cannot fix, standing in for an argument they
+            // can. Cheap caller-fixable checks come before expensive
+            // environment-dependent ones, or the environment's problems mask
+            // the caller's.
+            blast_selector(since.as_deref(), at.as_deref())?;
+            return check_walk_depth(*depth);
+        }
         IpcCommand::Search { query, budget, .. } => (query.as_str(), *budget, 1, None),
         IpcCommand::Deps {
             target,
@@ -980,6 +1136,54 @@ pub(crate) fn dispatch(
             min_confidence,
             depth,
         )?)?),
+        IpcCommand::Suspects {
+            symptom,
+            since,
+            depth,
+        } => {
+            // Before the store, for the same reason as `Blast` above.
+            if since.trim().is_empty() {
+                anyhow::bail!(
+                    "`since` must name a revision: it is the last known-good point, and an \
+                     empty one asks about the whole history rather than a window"
+                );
+            }
+            let graph = git_joined_graph(store)?;
+            let root = graph.indexed_repo().to_path_buf();
+            let until = indexed_head_of(&graph)?;
+            Ok(serde_json::to_value(dc_regress::suspects(
+                &root, &graph, &symptom, &since, &until, depth,
+            ))?)
+        }
+        IpcCommand::Blast { since, at, depth } => {
+            // The selector first, before the store is touched: an argument the
+            // caller can fix must not be masked by an environment problem they
+            // cannot.
+            let selector = blast_selector(since.as_deref(), at.as_deref())
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let graph = git_joined_graph(store)?;
+            let root = graph.indexed_repo().to_path_buf();
+            let until = indexed_head_of(&graph)?;
+            let report = match selector {
+                BlastSelector::Since(since) => {
+                    dc_regress::blast(&root, &graph, since, &until, depth)
+                }
+                BlastSelector::At(at) => {
+                    let (path, start, end) = dc_regress::change::parse_location(at)
+                        .map_err(|error| anyhow::anyhow!(error))?;
+                    dc_regress::blast::blast_change_with_program(
+                        std::ffi::OsStr::new("git"),
+                        &root,
+                        &graph,
+                        &dc_regress::change::ChangeSet::at(&path, start, end),
+                        at,
+                        &until,
+                        depth,
+                    )
+                }
+            };
+            Ok(serde_json::to_value(report)?)
+        }
         IpcCommand::Preview {
             file,
             content,

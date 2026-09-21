@@ -12,6 +12,12 @@ devmap-resolve = { path = "../devmap-resolve" }
 devmap-analyze = { path = "../devmap-analyze" }
 devmap-store = { path = "../devmap-store" }
 devmap-query = { path = "../devmap-query" }
+# The two git-joined directions. Both are served over IPC and MCP, so the
+# daemon links the analysis and its store adapter — the same two crates the CLI
+# links, rather than a second implementation that could disagree with it about
+# the walk direction or the basis.
+dc-regress = { path = "../dc-regress" }
+dc-regress-store = { path = "../dc-regress-store" }
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true

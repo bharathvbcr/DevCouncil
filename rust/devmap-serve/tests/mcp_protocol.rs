@@ -75,7 +75,7 @@ fn every_declared_tool_maps_to_a_command() {
     let specs = tool_specs();
     assert_eq!(
         specs.len(),
-        11,
+        13,
         "the tool surface changed; update this count"
     );
     for spec in &specs {
@@ -92,6 +92,12 @@ fn every_declared_tool_maps_to_a_command() {
             "devmap_preview" => json!({"file": "core.py", "content": "def helper():\n    pass\n"}),
             "devmap_explore" => json!({"query": "helper"}),
             "devmap_affected_tests" => json!({"targets": ["helper"]}),
+            "devmap_suspects" => json!({"symptom": "helper", "since": "HEAD~1"}),
+            // `since` rather than no arguments: this test proves a declared
+            // tool *deserializes* into a command, and blast's two selectors
+            // are alternatives — one of them has to be present for the
+            // argument set to be a valid call at all.
+            "devmap_blast" => json!({"since": "HEAD~1"}),
             other => panic!("tool {other} has no argument fixture in this test"),
         };
         to_ipc_command(name, Some(&arguments))

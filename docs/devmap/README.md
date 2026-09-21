@@ -531,11 +531,26 @@ devmap serve .    # index over IPC, watching the tree for changes
 devmap mcp        # speak MCP on stdin/stdout, for an agent host
 ```
 
-`devmap mcp` publishes eleven read-only tools: `devmap_status`, `devmap_search`,
+`devmap mcp` publishes thirteen read-only tools: `devmap_status`, `devmap_search`,
 `devmap_dependencies`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`,
-`devmap_dead_symbols`, `devmap_clones`, `devmap_preview`, `devmap_explore` and
-`devmap_affected_tests`. Every one declares an `outputSchema`, and the server
-validates its own answers against the schema it published before emitting them.
+`devmap_dead_symbols`, `devmap_clones`, `devmap_preview`, `devmap_explore`,
+`devmap_affected_tests`, `devmap_blast` and `devmap_suspects`. Every one declares an
+`outputSchema`, and the server validates its own answers against the schema it
+published before emitting them.
+
+The last two join the graph to git and run in opposite directions.
+`devmap_blast` goes **forward** — these lines changed, what depends on them —
+walking inbound call edges to the symbols, files, modules and tests downstream
+of a change. `devmap_suspects` goes **backward** — this is broken, which commit
+did it — walking outbound edges, because a symptom is caused by its own body or
+by what it calls and never by its callers. Both pin their post-image to the
+revision the index was built at, since that is the only content the graph's byte
+offsets describe; any other revision would pair spans from one revision with
+lines from another, which the join refuses rather than clamping past. A `blast`
+report's `unattributed` list is read before its `impacted` one: changed lines
+that land inside no symbol — imports, top-level constants, attributes, macro
+invocations — have no inbound edges to walk, so the impact is a lower bound and
+`complete` is false.
 
 ### Claude Code
 

@@ -838,6 +838,8 @@ const TOOLS: &[(&str, &str)] = &[
     ("devmap_preview", "preview"),
     ("devmap_explore", "explore"),
     ("devmap_affected_tests", "affected"),
+    ("devmap_suspects", "suspects"),
+    ("devmap_blast", "blast"),
 ];
 
 /// The declared tool names, in published order.
@@ -1153,6 +1155,44 @@ maximum is refused, never silently trimmed."
                 "additionalProperties": false
             }),
         ),
+        "suspects" => (
+            "Which commits since a known-good revision could have caused a symptom. Runs the graph first and git second: the symptom names a symbol, the graph names everything that symbol transitively *depends on*, and only the byte spans of those symbols are blamed — a file's other lines cannot have caused this failure. The direction is deliberate and is the opposite of `devmap_blast`: a symptom is caused by its own body or by what it calls, never by its callers. An empty `suspects` with `complete: true` is a finding; with `complete: false` it is not, and `unavailable` says what could not be examined.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "symptom": {"type": "string", "maxLength": 4096,
+                        "description": "A symbol name, a `file::symbol` node id, or a file path."},
+                    "since": {"type": "string", "maxLength": 4096,
+                        "description": "The last known-good revision. Commits after it are the \
+candidates. An empty value is refused rather than read as all of history."},
+                    "depth": depth_prop(dc_regress::DEFAULT_CONE_DEPTH)
+                },
+                "required": ["symptom", "since"],
+                "additionalProperties": false
+            }),
+        ),
+        "blast" => (
+            "What a change affects: the symbols, files, modules and test files downstream of the lines it touched. The mirror of `devmap_suspects` — this walks **inbound** call edges, because a change breaks what calls it, never what it calls. The post-image is always the revision the index was built at, since that is the only content the graph's byte offsets describe. Changed lines that land in no symbol — imports, top-level constants, attributes, macro invocations — are reported in `unattributed` and make `complete` false: a change to a module's central constant must never read as a change that affects nothing. For an uncommitted buffer use `devmap_preview` instead.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "since": {"type": "string", "maxLength": 4096,
+                        "description": "The revision the change is measured from; the change is \
+everything between it and the indexed head. Give this or `at`, never both."},
+                    "at": {"type": "string", "maxLength": 4096,
+                        "description": "An explicit location instead of a diff: `path:start-end`, \
+`path:line`, or a bare `path` for the whole file, read at the indexed head. For \"what depends on \
+the line I am looking at\". Give this or `since`, never both."},
+                    "depth": depth_prop(dc_regress::DEFAULT_BLAST_DEPTH)
+                },
+                // Neither is required by the schema because exactly one is:
+                // JSON Schema can express that with `oneOf`, but a client that
+                // does not evaluate `oneOf` would then send both and get a
+                // server refusal it could not have predicted. The refusal is
+                // stated in both descriptions and enforced in `dispatch`.
+                "additionalProperties": false
+            }),
+        ),
         other => unreachable!("command tag {other} has no schema"),
     };
     (description, with_repo_scope_args(schema))
@@ -1399,6 +1439,75 @@ a partial corpus is a lower bound, not a clean bill. Candidate list to verify, n
                     "description": "The inbound walk the test list was derived from."}
             },
             "required": ["targets", "tests", "blast_radius"],
+            "additionalProperties": true
+        }),
+        // Fields transcribed from `dc_regress::SuspectReport`.
+        "suspects" => json!({
+            "type": "object",
+            "properties": {
+                "symptom": {"type": "string",
+                    "description": "The symptom as asked."},
+                "suspects": {"type": "array",
+                    "description": "Ranked most-suspect first. `evidence` is the primary key and \
+        is a class, not a weight: `body_changed` beats `unknown` beats `moved_only`, and no \
+        amount of churn promotes a pure move above a proven behaviour change. `score` is a \
+        scaled integer comparable only within this report."},
+                "cone_size": {"type": "integer",
+                    "description": "Symbols the symptom transitively depends on."},
+                "blamed_symbols": {"type": "integer",
+                    "description": "How many of them were actually blamed."},
+                "unavailable": {"type": "array",
+                    "description": "Everything that could not be done, each naming what was \
+        attempted and why it stopped. Non-empty means the suspect list is a lower bound."},
+                "complete": {"type": "boolean",
+                    "description": "False whenever anything at all could not be done. An empty \
+        `suspects` with `complete: true` means nothing in the window touched the cone; with \
+        `complete: false` it means something was not examined. Read this before concluding \
+        that no commit is responsible."}
+            },
+            "required": ["symptom", "suspects", "cone_size", "blamed_symbols", "unavailable",
+                         "complete"],
+            "additionalProperties": true
+        }),
+        // Fields transcribed from `dc_regress::BlastReport`.
+        "blast" => json!({
+            "type": "object",
+            "properties": {
+                "change": {"type": "string",
+                    "description": "The revision range or location as asked."},
+                "changed_files": {"type": "array",
+                    "description": "Files the change touched, with their post-image line ranges \
+        and how each participated (modified, added, deleted, binary)."},
+                "seeds": {"type": "array",
+                    "description": "Symbols the change landed inside, most-changed first. These \
+        are what the inbound walk started from. `deletion_only` marks a symbol whose evidence \
+        is what was removed — the post-image shows nothing unusual there."},
+                "unattributed": {"type": "array",
+                    "description": "Changed lines that reached no symbol, each with its reason. \
+        Module-level code — imports, top-level constants, attributes, macro invocations — has \
+        no inbound edges to walk, so anything here means the impact below is a lower bound. \
+        `nearest_symbol` is diagnosis, not attribution: a doc comment sits in the same position \
+        as a top-level constant and guessing between them would fabricate an edge."},
+                "impacted": {"type": "array",
+                    "description": "Symbols the inbound walk reached, nearest first, excluding \
+        the seeds themselves."},
+                "files": {"type": "array",
+                    "description": "Rolled up per file, including the changed files at distance \
+        zero — the file you edited is affected."},
+                "modules": {"type": "array",
+                    "description": "Rolled up per directory."},
+                "tests": {"type": "array",
+                    "description": "Test files the inbound walk reached — which tests to run."},
+                "unavailable": {"type": "array",
+                    "description": "Everything that could not be done. Non-empty means every \
+        list above is a lower bound."},
+                "complete": {"type": "boolean",
+                    "description": "False whenever anything at all could not be done, including \
+        when any changed line landed in no symbol. An empty `impacted` with `complete: false` \
+        is not evidence that nothing depends on the change."}
+            },
+            "required": ["change", "changed_files", "seeds", "unattributed", "impacted", "files",
+                         "modules", "tests", "unavailable", "complete"],
             "additionalProperties": true
         }),
         other => unreachable!("command tag {other} has no output schema"),

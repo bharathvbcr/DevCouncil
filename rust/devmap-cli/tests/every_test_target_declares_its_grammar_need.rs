@@ -60,7 +60,12 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         // Verified with `cargo check -p dc-regress --no-default-features
         // --all-targets`, which is this test's own instruction.
         "dc-regress",
-        &["against_a_real_repository", "hostile_input"],
+        &[
+            "against_a_real_repository",
+            "change_to_impact",
+            "hostile_change",
+            "hostile_input",
+        ],
     ),
     (
         "devmap-analyze",
