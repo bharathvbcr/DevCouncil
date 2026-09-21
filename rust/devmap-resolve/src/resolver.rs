@@ -665,6 +665,23 @@ impl Resolver {
                 None => break,
             }
         }
+        // A deref-transparent wrapper is not a generic this needs to refuse:
+        // `shared_ptr<Service>` *is* a `Service` as far as member access goes.
+        //
+        // This is the second of the two places that rule is enforced, and it is
+        // not redundant with the extractor's. The extractor unwraps a parse
+        // *node*, which covers a parameter's written type; a C++ local binding
+        // reaches here as the raw text `shared_ptr<Service>` from a different
+        // producer, and hit the `contains('<')` refusal below. Measured: the
+        // type reference `probe -> Service` resolved while the call
+        // `probe -> Service.wait_tick` did not, because the two facts came down
+        // different paths and only one had been taught the rule.
+        //
+        // The *list* is shared — `crate::deref` is the single owner — so the
+        // two enforcement points cannot come to disagree about which wrappers
+        // are transparent. `Vec<Service>` is still refused here, exactly as
+        // before, because `Vec` is not in that list.
+        s = devmap_extract::deref::strip_deref_transparent(s);
         if s.is_empty()
             || s.contains('<')
             || s.contains('>')

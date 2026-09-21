@@ -156,3 +156,7 @@ required-features = ["parse"]
 [[test]]
 name = "shell_source_resolves"
 required-features = ["parse"]
+
+[[test]]
+name = "deref_transparent_receivers"
+required-features = ["parse"]
