@@ -162,13 +162,19 @@ impl<'a> StoreQueryEngine<'a> {
         // `None` whenever every match was ranked, which on any ordinary query
         // is every time.
         let ranked_over_a_sample = ranking_coverage_gap(total, pool);
-        // Two independent qualifications, composed rather than ranked — the
+        // Three independent qualifications, composed rather than ranked — the
         // same shape `dependencies` and the traversals use. One is about the
-        // *ordering* of what was found; the other is about whether the corpus
-        // searched was the whole repository, and it is the one that decides
-        // whether `total: 0` may be read as "no such symbol".
-        response.walk_incomplete =
-            devmap_analyze::combine_reasons(ranked_over_a_sample, coverage_gap);
+        // *ordering* of what was found; one is about whether the corpus
+        // searched was the whole repository; and the third is about what an
+        // empty answer is entitled to mean. The second was documented here as
+        // "the one that decides whether `total: 0` may be read as 'no such
+        // symbol'" — but it is `None` on every healthy index, which left the
+        // most confident-looking answer this API produces as the one carrying
+        // the least justification. See [`empty_result_gap`].
+        response.walk_incomplete = devmap_analyze::combine_reasons(
+            ranked_over_a_sample,
+            devmap_analyze::combine_reasons(coverage_gap, empty_result_gap(total, &req.query)),
+        );
         Ok(self.finish(response))
     }
 
@@ -1549,7 +1555,15 @@ impl<'a> StoreQueryEngine<'a> {
         response.total = total;
         response.hidden = total.saturating_sub(response.shown);
         response.truncated = response.hidden > 0;
-        response.walk_incomplete = coverage_gap;
+        // The same disclosure the keyword surface makes, for the same reason.
+        // This function's own doc says "'Nothing matched' is an answer" — it
+        // is, and it is also an answer whose scope the caller cannot see, since
+        // the texts scored here are `name` and `qualified_name` and nothing
+        // else. See [`SEARCH_SCOPE_NOTE`].
+        response.walk_incomplete = devmap_analyze::combine_reasons(
+            coverage_gap,
+            empty_semantic_gap(response.total, query),
+        );
         Ok(self.finish(response))
     }
 
@@ -2858,8 +2872,17 @@ impl<'a> QueryEngine<'a> {
         // page was cut.
         response.walk_incomplete = devmap_analyze::combine_reasons(
             response.walk_incomplete.take(),
-            search_coverage_gap(
-                devmap_analyze::extraction_coverage(self.extractions).degraded_reason(),
+            devmap_analyze::combine_reasons(
+                search_coverage_gap(
+                    devmap_analyze::extraction_coverage(self.extractions).degraded_reason(),
+                ),
+                // Same owner, same sentence: an empty answer from this engine
+                // means exactly what an empty answer from the store-backed one
+                // means, and must say so identically. This engine matches by
+                // substring over names rather than through FTS, so its zero has
+                // a different *cause* — but the same thing is true of it, which
+                // is that it never read a file body.
+                empty_result_gap(response.total, &req.query),
             ),
         );
         response
@@ -4030,6 +4053,84 @@ fn search_coverage_gap(corpus_gap: Option<String>) -> Option<String> {
              name that matches nothing here may still be declared in a file that was never \
              indexed: {gap}"
         )
+    })
+}
+
+/// What an empty search result does *not* mean.
+///
+/// `total: 0, hidden: 0, truncated: false` on a fresh, undegraded index is the
+/// most confident shape this API can produce, and for a keyword search it is
+/// also the least informative: it is returned both when the repository has no
+/// such symbol and when the caller asked a question this index does not answer.
+///
+/// Measured, and the reason this exists: an agent asked "where is the optimizer
+/// constructed in this repository?", DevMap returned zero items, `devmap_status`
+/// reported `is_fresh: true` with no coverage gaps and nothing quarantined, and
+/// ripgrep then found **eight** construction sites. None of them is a symbol —
+/// `self.optimizer = torch.optim.AdamW(...)` is an attribute assignment to an
+/// externally-owned class — so the store was not stale and not degraded. It
+/// simply does not index that shape, and it had no way to say so.
+///
+/// The comment on `search` already named this as the qualification "that
+/// decides whether `total: 0` may be read as 'no such symbol'". It only ever
+/// fired on a *partial* analysis, so on a complete one — the overwhelmingly
+/// common case — zero carried no qualification at all.
+///
+/// **Only for a multi-term query**, and that restriction is the whole design.
+///
+/// The first version of this fired on every miss, and
+/// `search_over_a_complete_corpus_claims_nothing` rejected it — correctly. A
+/// one-word miss over a fully read corpus is a *completed check*: "no symbol is
+/// named `no_such_symbol_anywhere`" is a whole, correct answer, and hanging a
+/// caveat on it claims an incompleteness that does not exist. Worse, it would
+/// fire on the overwhelmingly common case, which is how a qualification becomes
+/// noise a caller learns to skip — and `walk_incomplete` is the field that has
+/// to be believed when a corpus really does have holes in it.
+///
+/// A multi-term query is different, and not because the conjunction is
+/// incomplete — it ran fully. It is different because the caller has almost
+/// certainly *described* a symbol rather than named one, so the check that ran
+/// is not the check they think they asked for. That is the same kind of note
+/// `ranking_coverage_gap` carries: not "the corpus had holes" but "this answer
+/// means less than its shape suggests". The audit's query,
+/// `optimizer AdamW step`, is exactly that shape.
+fn empty_result_gap(total: u32, query: &str) -> Option<String> {
+    let terms = query.split_whitespace().count();
+    (total == 0 && terms > 1).then(|| {
+        format!(
+            "no symbol matched all {terms} terms — every term must appear in one symbol's \
+             name, qualified name or path, so a phrase describing a symbol will not match it; \
+             {SEARCH_SCOPE_NOTE}"
+        )
+    })
+}
+
+/// The boundary both search surfaces share, written once.
+///
+/// Keyword search and semantic search reach zero by different mechanisms — a
+/// conjunction that filtered everything out, or a score that never rose above
+/// nothing — but the thing a caller most needs to know about either zero is the
+/// same, and it is not about the mechanism: **no file body was read.** Two
+/// copies of this sentence would let one surface be fixed and the other left to
+/// answer in the old shape, which is the failure this whole pass is about.
+const SEARCH_SCOPE_NOTE: &str =
+    "this search matches symbol names, qualified names and file paths, and does not read file \
+     contents — so \"where is X constructed\", \"where is X assigned\" and any other question \
+     about what a body contains is outside what it can answer, and zero here is not evidence \
+     of absence";
+
+/// [`empty_result_gap`] for the semantic surface.
+///
+/// Separate because the conjunction sentence would be a lie here: semantic
+/// search scores term overlap and has no all-terms-must-match rule to explain.
+/// The scope sentence is shared, and is the half that matters.
+///
+/// Gated on the same multi-term condition, for the same reason: a one-word miss
+/// is a completed check on either surface, and the two must not disagree about
+/// when an empty answer is worth qualifying.
+fn empty_semantic_gap(total: u32, query: &str) -> Option<String> {
+    (total == 0 && query.split_whitespace().count() > 1).then(|| {
+        format!("no symbol name or qualified name scored against this query; {SEARCH_SCOPE_NOTE}")
     })
 }
 

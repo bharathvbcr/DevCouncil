@@ -1842,7 +1842,41 @@ fn fts_match_query(query: &str) -> Result<String> {
              can carry one through"
         )));
     }
-    Ok(format!("\"{}\"*", query.replace('"', "\"\"")))
+    // Each *word* is its own quoted prefix term, joined by AND — not the whole
+    // input as one quoted phrase.
+    //
+    // A quoted FTS5 phrase requires its tokens to appear **adjacently and in
+    // order** inside a single indexed column, and the indexed columns are
+    // `name`, `qualified_name` and `path`. So `"optimizer AdamW step"*` asked
+    // for a symbol literally *named* `optimizer AdamW step…`, which nothing is,
+    // and the store answered `total: 0, truncated: false, hidden: 0` — a shape
+    // indistinguishable from "this repository contains no such thing".
+    //
+    // Measured on this repository: `devmap_search "dead_symbols"` returned 8
+    // rows and `devmap_search "dead symbols"` returned 0. Same corpus, same
+    // generation, one space.
+    //
+    // A single-word query still produces exactly `"word"*`, byte for byte, so
+    // every query that worked before produces the identical MATCH expression
+    // and the identical rows.
+    //
+    // The quoting rule this function exists to enforce is untouched: each term
+    // is quoted individually, so FTS5 operators, column filters, parentheses,
+    // wildcards and hyphens inside a term stay data rather than becoming
+    // syntax. `AND` is the only thing this function adds as syntax, and it adds
+    // it *between* quoted terms where no user text can reach.
+    let mut terms = query
+        .split_whitespace()
+        .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
+        .peekable();
+    if terms.peek().is_none() {
+        // Whitespace-only (or empty). No term to join, and an empty MATCH
+        // expression is a syntax error rather than an empty result — so this
+        // keeps the exact expression the single-phrase form produced, and with
+        // it whatever SQLite already did about it.
+        return Ok(format!("\"{}\"*", query.replace('"', "\"\"")));
+    }
+    Ok(terms.collect::<Vec<_>>().join(" AND "))
 }
 
 pub fn checked_min_confidence(value: f32) -> Result<f32> {
