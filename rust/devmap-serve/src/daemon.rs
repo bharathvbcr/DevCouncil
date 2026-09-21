@@ -3155,22 +3155,58 @@ mod tests {
     /// the stat-poll, since it would report a live endpoint where there is
     /// none. And the answer must arrive well inside the budget the old shape
     /// needed, so a return to stat-polling fails here rather than passing
-    /// slowly: the 5 s below is half of that budget, against a measured cost of
-    /// a few milliseconds, and it is a real bound because this fixture cannot
-    /// succeed — nothing here is racing a healthy daemon against a deadline.
+    /// slowly.
+    ///
+    /// That second bound is timed from the daemon's own liveness probe, not
+    /// from the spawn. `run_loop` binds the store, captures the executable
+    /// identity, installs the signal handlers and starts a recursive file
+    /// watcher before `bind` is ever reached, and none of that is under test
+    /// here. Measured on this machine by timing a *control* daemon that binds
+    /// successfully: that prologue costs 41 ms idle and 0.79 s to 5.06 s under
+    /// eight concurrent copies of this module — a 120x spread that a flat
+    /// deadline from the spawn charges to the code. The answer itself stayed
+    /// within 0.25 s to 1.50 s across the same runs. So the prologue alone
+    /// reached the 5 s this test used to allow for both, which is why it failed
+    /// 3 times in 24 runs at that load and passes 48 of 48 anchored below.
+    ///
+    /// The probe is what separates them. `UnixIpcServer::bind` decides whether
+    /// an existing socket is live by *connecting* to it, so the squatter
+    /// accepting a connection is the observable instant at which startup is
+    /// behind the daemon and `bind` has reached its decision. Everything before
+    /// it belongs to the machine; everything after it belongs to the code, and
+    /// only the second is bounded — at 2 s, which is tighter than the 5 s it
+    /// replaces and cannot be spent by a loaded host. The outer limits below
+    /// are hang guards, deliberately far out of reach: a bound that fires on
+    /// load is the failure being fixed here.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_daemon_that_cannot_bind_reports_why_instead_of_timing_out() {
+        use std::time::Instant;
+
+        /// How long the answer may take once `bind` has reached its decision.
+        const ANSWER_BUDGET: Duration = Duration::from_secs(2);
+        /// Not a bound — only a guard so a wedged fixture fails instead of
+        /// hanging the suite. Startup is whatever the host makes it.
+        const HANG_GUARD: Duration = Duration::from_secs(120);
+
         let root = short_unix_fixture_dir("occupied");
         fs::write(root.join("main.py"), "def main(): pass\n").unwrap();
         let socket = root.join("taken.sock");
 
         // A live endpoint on the path, answering, so `bind`'s liveness probe
-        // refuses to reclaim it rather than treating it as a stale socket.
+        // refuses to reclaim it rather than treating it as a stale socket. The
+        // first connection it accepts is that probe, and its arrival is what
+        // the budget above is measured from.
         let squatter = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (probed_tx, probed) = tokio::sync::oneshot::channel();
         let accepting = tokio::spawn(async move {
+            let mut probed_tx = Some(probed_tx);
             loop {
-                let _ = squatter.accept().await;
+                if squatter.accept().await.is_ok() {
+                    if let Some(sender) = probed_tx.take() {
+                        let _ = sender.send(Instant::now());
+                    }
+                }
             }
         });
 
@@ -3181,7 +3217,14 @@ mod tests {
         let watching = daemon.clone();
         let mut task = tokio::spawn(async move { daemon.run_loop().await });
 
-        let reported = tokio::time::timeout(Duration::from_secs(5), async {
+        // Stated, not inferred: a probe that was never observed means the
+        // budget below was never applied to anything, which must not read the
+        // same as a budget that was applied and held.
+        let probed = tokio::time::timeout(HANG_GUARD, probed)
+            .await
+            .expect("the daemon must reach its bind attempt")
+            .expect("the accept loop must outlive the probe it reports");
+        let reported = tokio::time::timeout(HANG_GUARD, async {
             tokio::select! {
                 biased;
                 () = watching.wait_until_serving() => None,
@@ -3190,6 +3233,7 @@ mod tests {
         })
         .await
         .expect("a daemon whose endpoint is occupied must not leave the caller waiting");
+        let answered = Instant::now().saturating_duration_since(probed);
 
         let ended = reported.expect(
             "the endpoint signal latched for a daemon that never bound: it must \
@@ -3201,6 +3245,12 @@ mod tests {
         assert!(
             error.to_string().contains("already active"),
             "the failure must name the cause a caller can act on, not the clock: {error}"
+        );
+        assert!(
+            answered <= ANSWER_BUDGET,
+            "the refusal was already decided; reporting it took {answered:?}, \
+             past the {ANSWER_BUDGET:?} budget, which is the shape of a caller \
+             waiting out a poll instead of being told"
         );
 
         accepting.abort();

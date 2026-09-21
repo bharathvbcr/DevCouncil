@@ -478,16 +478,88 @@ fn ordinary_build_has_one_compact_summary_and_verbose_retains_details() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// A stderr pipe whose read end is gone *everywhere*, proven rather than assumed.
+///
+/// `std::io::pipe` sets CLOEXEC on both ends, so no sibling test keeps the read
+/// end past its own `exec`. It holds a copy for the whole fork-to-exec window
+/// though, and this binary runs its tests in parallel, most of which spawn.
+/// A fork landing between `pipe()` and `drop(reader)` hands that child a live
+/// reader, and under load its `exec` is far enough away that every progress
+/// write in the child under test *succeeds*. The receipt then reports
+/// `incomplete: false` — correctly, about a pipe that really did have a reader
+/// — and the assertion below reads as an indexing regression.
+///
+/// Measured here: with one live holder of the read end the same build reports
+/// `failed_writes: 0, error: null, incomplete: false`, against
+/// `failed_writes: 9, error: "progress output disconnected"` when the read end
+/// is truly gone. Nine writes are attempted either way, so the flake is not a
+/// build that outran the renderer; it is a premise that did not hold.
+///
+/// So the premise is established with the same operation the child will
+/// perform: a write that must be refused as a broken pipe. A pipe that still
+/// accepts bytes is discarded rather than waited on — the sibling holding it
+/// execs on its own schedule, while a *fresh* pipe cannot be inherited by a
+/// fork that has already happened, so one retry is normally enough. Exhausting
+/// the retries fails as a fixture that could not set itself up, which is not
+/// the same answer as a product that did not disclose its lost output.
+fn reader_less_pipe() -> std::io::PipeWriter {
+    use std::io::Write;
+    for _ in 0..64 {
+        let (reader, mut writer) = std::io::pipe().expect("create the fixture pipe");
+        drop(reader);
+        match writer.write(&[0]) {
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return writer,
+            // Nothing was written in the refusing case; this pipe is dropped.
+            Ok(_) => continue,
+            Err(error) => panic!("probing the fixture pipe failed unexpectedly: {error}"),
+        }
+    }
+    panic!("no pipe stayed reader-less long enough to hand to the child");
+}
+
+/// The probe [`reader_less_pipe`] retries on has to tell the two states apart.
+///
+/// This is the whole load-bearing claim of that helper: if a pipe that still
+/// has a reader could not be distinguished from one that does not, it would
+/// hand the child a writable stderr and the closed-pipe test below would be
+/// back to asserting against whatever the rest of this binary happened to be
+/// doing. Measured directly rather than argued, in both directions.
+#[test]
+fn the_fixture_probe_tells_a_live_reader_from_a_closed_one() {
+    use std::io::Write;
+    let (reader, mut writer) = std::io::pipe().expect("create the probe pipe");
+    assert!(
+        writer.write(&[0]).is_ok(),
+        "a pipe someone still holds the read end of must accept the probe, or \
+         the retry in reader_less_pipe never fires"
+    );
+    drop(reader);
+    assert_eq!(
+        writer
+            .write(&[0])
+            .expect_err("a reader-less pipe must refuse the probe")
+            .kind(),
+        std::io::ErrorKind::BrokenPipe,
+        "the hangup the closed-pipe test depends on must be visible here"
+    );
+    // And what the helper actually returns is only ever the second state.
+    assert_eq!(
+        reader_less_pipe()
+            .write(&[0])
+            .expect_err("the helper must only return a pipe with no reader")
+            .kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+}
+
 #[test]
 fn a_closed_progress_pipe_does_not_signal_the_indexing_process() {
     let root = temp_root();
-    let (reader, writer) = std::io::pipe().unwrap();
-    drop(reader);
     let output = Command::new(env!("CARGO_BIN_EXE_devmap"))
         .args(["build", "--json", "--progress", "always", "--db"])
         .arg(root.join("index.sqlite"))
         .arg(&root)
-        .stderr(writer)
+        .stderr(reader_less_pipe())
         .output()
         .unwrap();
     fs::remove_dir_all(root).unwrap();
@@ -498,7 +570,15 @@ fn a_closed_progress_pipe_does_not_signal_the_indexing_process() {
     );
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["files_indexed"], 1);
-    assert_eq!(payload["progress_output"]["incomplete"], true);
+    let receipt = &payload["progress_output"];
+    assert_eq!(receipt["incomplete"], true, "{payload}");
+    // The disclosure has to come from the hangup this test creates, not from
+    // some other term of `incomplete`. Without this, a fixture that stopped
+    // producing a broken pipe could still pass on a dropped update.
+    assert!(
+        receipt["failed_writes"].as_u64().unwrap() > 0,
+        "the loss must be the refused writes, not another cause: {payload}"
+    );
 }
 
 #[cfg(unix)]
@@ -579,18 +659,57 @@ fn a_paused_terminal_cannot_hold_the_build_or_change_parent_descriptor_flags() {
     );
 }
 
+/// A terminal whose master is gone *everywhere*, proven rather than assumed.
+///
+/// The same hazard as [`reader_less_pipe`], one layer up. `open_terminal` takes
+/// both handles through std, so CLOEXEC is set atomically and no sibling keeps
+/// the master past its own `exec` — the comment there says as much. A fork
+/// landing between that open and `drop(master)` still holds a copy for the
+/// whole fork-to-exec window, and while any copy is open the slave is *not*
+/// hung up: every progress write succeeds and the receipt reports
+/// `incomplete: false`, correctly, about a terminal that was never
+/// disconnected. Measured here: `failed_writes: 0, error: null` with one live
+/// holder of the master, against `failed_writes: 1, dropped_updates: 40,
+/// error: "progress output disconnected"` when it is truly gone.
+///
+/// The hangup is therefore polled for, with the same question the renderer
+/// asks, and a terminal that has not hung up is discarded rather than waited
+/// on — the sibling holding it execs on its own schedule, while a fresh pair
+/// cannot be inherited by a fork that has already happened.
+#[cfg(unix)]
+fn hung_up_terminal() -> fs::File {
+    use std::os::fd::AsRawFd;
+    for _ in 0..64 {
+        let (master, slave) = open_terminal();
+        drop(master);
+        let mut poll = libc::pollfd {
+            fd: slave.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one valid, live, owned descriptor; the timeout is zero.
+        assert!(
+            unsafe { libc::poll(&mut poll, 1, 0) } >= 0,
+            "polling the fixture terminal failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if poll.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return slave;
+        }
+    }
+    panic!("no terminal stayed master-less long enough to hand to the child");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_disconnected_terminal_does_not_panic_or_destroy_the_json_result() {
     let root = temp_root();
-    let (master, slave) = open_terminal();
-    drop(master);
     let output = Command::new(env!("CARGO_BIN_EXE_devmap"))
         .args(["build", "--json", "--progress", "always", "--db"])
         .arg(root.join("index.sqlite"))
         .arg(&root)
         .env("TERM", "xterm-256color")
-        .stderr(slave)
+        .stderr(hung_up_terminal())
         .output()
         .unwrap();
     fs::remove_dir_all(root).unwrap();
@@ -601,7 +720,13 @@ fn a_disconnected_terminal_does_not_panic_or_destroy_the_json_result() {
     );
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["files_indexed"], 1);
-    assert_eq!(payload["progress_output"]["incomplete"], true);
+    let receipt = &payload["progress_output"];
+    assert_eq!(receipt["incomplete"], true, "{payload}");
+    // As above: the disclosure has to come from the hangup this test creates.
+    assert!(
+        receipt["failed_writes"].as_u64().unwrap() > 0,
+        "the loss must be the refused writes, not another cause: {payload}"
+    );
 }
 
 /// What the terminal has been shown so far, appended to by the drain thread
