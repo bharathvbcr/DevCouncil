@@ -136,8 +136,7 @@ pub fn record_gap(
             path.display()
         );
     }
-    writeln!(file, "{line}")?;
-    file.flush()?;
+    session_log::append_line(&mut file, &line)?;
     Ok(json!({ "recorded": value, "path": path.display().to_string() }))
 }
 
@@ -151,7 +150,30 @@ pub fn run(
     if last {
         return print_last(db, json_out);
     }
-    let report = build_report(db, session_id)?;
+    // Rotation is the recovery, so it must not sit behind the thing that
+    // failed. A log that cannot be summarised — because it is over the read
+    // limit, or not UTF-8 — would otherwise stay live forever: the appender
+    // refuses to add to it past the cap and the reader refuses to read it, so
+    // nothing retires it and telemetry stops for good. Retiring it still costs
+    // nothing: rotation is a rename, and the bytes keep their own file.
+    let report = match build_report(db, session_id) {
+        Ok(report) => report,
+        Err(error) => {
+            let stamp = stamp_now();
+            match session_log::rotate_live(db, &stamp) {
+                Ok(true) => {
+                    return Err(error.context(format!(
+                        "live log could not be summarised; it was rotated to {stamp}.jsonl so the \
+                         next session starts clean"
+                    )))
+                }
+                Ok(false) => return Err(error),
+                Err(rotate_error) => {
+                    return Err(error.context(format!("and rotation failed too: {rotate_error}")))
+                }
+            }
+        }
+    };
     let stamp = report
         .get("stamp")
         .and_then(Value::as_str)
@@ -232,8 +254,13 @@ fn newest_report(db: &Path) -> anyhow::Result<Option<Value>> {
 }
 
 fn build_report(db: &Path, session_id: Option<&str>) -> anyhow::Result<Value> {
-    let queries = session_log::read_live(db)?;
-    let gaps = read_gaps(db)?;
+    let live = session_log::read_live(db)?;
+    let gap_ledger = read_gaps(db)?;
+    let queries = live.records;
+    let gaps = gap_ledger.records;
+    // Records that were written but cannot be read back. Reported next to the
+    // counts they are missing from, so a degraded report is visibly degraded.
+    let unreadable = live.malformed.saturating_add(gap_ledger.malformed);
     let stamp = stamp_now();
     let mut truncated = 0u64;
     let mut walk_incomplete = 0u64;
@@ -284,6 +311,9 @@ fn build_report(db: &Path, session_id: Option<&str>) -> anyhow::Result<Value> {
         "session_id": session_id,
         "store": db.display().to_string(),
         "query_count": queries.len(),
+        "unreadable_lines": unreadable,
+        "unreadable_query_lines": live.malformed,
+        "unreadable_gap_lines": gap_ledger.malformed,
         "truncated": truncated,
         "walk_incomplete": walk_incomplete,
         "empty": empty,
@@ -314,18 +344,22 @@ fn notable_queries(queries: &[Map<String, Value>]) -> Vec<Value> {
         .collect()
 }
 
-fn read_gaps(db: &Path) -> anyhow::Result<Vec<Value>> {
+/// Read the gap ledger, counting rather than failing on an unreadable line.
+///
+/// Several agents append here concurrently, so this ledger can tear the same
+/// way the live log did; one bad line must not cost the report the other
+/// entries. See [`session_log::parse_jsonl`].
+fn read_gaps(db: &Path) -> anyhow::Result<session_log::Ledger<Value>> {
     use devmap_extract::safe_fs::{Access, Creation, SafeFile};
     let mut file = match SafeFile::open(&gaps_path(db), Access::Read, Creation::Never) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(session_log::Ledger::default())
+        }
         Err(error) => return Err(error.into()),
     };
-    file.read_text(session_log::MAX_SESSION_BYTES)?
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).map_err(Into::into))
-        .collect()
+    let text = file.read_text_prefix(session_log::MAX_SESSION_BYTES)?;
+    Ok(session_log::parse_jsonl(&text))
 }
 
 fn bump(obj: &mut Map<String, Value>, key: &str) {
@@ -358,13 +392,30 @@ fn brief(report: &Value) -> String {
         .and_then(Value::as_array)
         .map(|a| a.len())
         .unwrap_or(0);
+    let unreadable = report
+        .get("unreadable_lines")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    // Stays inside the first sentence: the SessionStart hook keeps only that
+    // much, and a report that dropped records has to say so where it is read.
+    let lost = if unreadable == 0 {
+        String::new()
+    } else {
+        format!(", {unreadable} unreadable lines")
+    };
     if queries == 0 && gaps == 0 {
+        if unreadable > 0 {
+            return format!(
+                "DevMap session: 0 readable queries{lost}. The log was written but could not be \
+parsed back; it rotates with this report, so the next session starts clean."
+            );
+        }
         return "DevMap session: no queries logged. Prefer `devmap_*` MCP tools over GitNexus."
             .to_string();
     }
     format!(
         "DevMap session: {queries} queries, {truncated} truncated, {incomplete} walk_incomplete, \
-{empty} empty, {errors} errors, {gaps} recorded gaps. Read truncated/walk_incomplete before \
+{empty} empty, {errors} errors, {gaps} recorded gaps{lost}. Read truncated/walk_incomplete before \
 treating an empty list as 'does not exist'. Do not fall back to GitNexus — record a gap instead."
     )
 }
@@ -506,8 +557,10 @@ mod tests {
             false,
         )
         .unwrap();
-        let rows = read_gaps(&db).unwrap();
+        let ledger = read_gaps(&db).unwrap();
+        let rows = &ledger.records;
         assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(ledger.malformed, 0, "a fresh entry is readable: {rows:?}");
         assert_eq!(rows[0]["gap_id"], json!("GAP-X"));
         assert_eq!(rows[0]["tool"], json!("devmap_dead_symbols"));
         assert_eq!(rows[0]["reason"], json!("nothing came back"));

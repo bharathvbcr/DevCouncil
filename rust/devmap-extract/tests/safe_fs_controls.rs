@@ -137,3 +137,63 @@ fn runtime_permissions_are_changed_only_for_our_own_directory() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+/// The append-only read tolerates growth and nothing else.
+///
+/// `read_text_prefix` exists because a ledger several daemons append to grows
+/// under its reader as a matter of course. That relaxation must buy exactly
+/// one thing: growth. A file swapped for another inode, or truncated under the
+/// reader, is still tampering and must still be refused — otherwise the looser
+/// read becomes a way around the checks `read_text` makes.
+#[test]
+fn appended_only_reads_accept_growth_and_refuse_everything_else() {
+    let root = root("append-prefix");
+    let path = root.join("ledger.jsonl");
+    fs::write(&path, "one\ntwo\n").unwrap();
+
+    // Growth after open is invisible to this read, not an error: the prefix
+    // that existed at open is what comes back.
+    let mut reader = SafeFile::open(&path, Access::Read, Creation::Never).unwrap();
+    let mut appender = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    appender.write_all(b"three\n").unwrap();
+    appender.flush().unwrap();
+    assert_eq!(reader.read_text_prefix(4096).unwrap(), "one\ntwo\n");
+
+    // A later reader sees the appended record, so nothing was lost.
+    assert_eq!(
+        SafeFile::open(&path, Access::Read, Creation::Never)
+            .unwrap()
+            .read_text_prefix(4096)
+            .unwrap(),
+        "one\ntwo\nthree\n"
+    );
+
+    // Replacement by a different inode is still refused.
+    let mut stale = SafeFile::open(&path, Access::Read, Creation::Never).unwrap();
+    fs::rename(&path, root.join("rotated")).unwrap();
+    fs::write(&path, "impostor\n").unwrap();
+    assert!(
+        stale.read_text_prefix(4096).is_err(),
+        "a swapped file must be refused"
+    );
+
+    // Truncation under the reader is still refused.
+    let truncated = root.join("shrinker.jsonl");
+    fs::write(&truncated, "aaaa\nbbbb\ncccc\n").unwrap();
+    let mut shrink_reader = SafeFile::open(&truncated, Access::Read, Creation::Never).unwrap();
+    fs::write(&truncated, "a\n").unwrap();
+    assert!(
+        shrink_reader.read_text_prefix(4096).is_err(),
+        "a truncated file must be refused"
+    );
+
+    // The read limit still binds.
+    assert!(
+        SafeFile::open(&root.join("rotated"), Access::Read, Creation::Never)
+            .unwrap()
+            .read_text_prefix(4)
+            .is_err()
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}

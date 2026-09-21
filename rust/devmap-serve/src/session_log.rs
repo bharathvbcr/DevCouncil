@@ -13,6 +13,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use devmap_extract::safe_fs::SafeFile;
+use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 
 /// Directory that holds the live log and the rotated session reports.
@@ -98,12 +100,79 @@ pub fn append_query(
                 "session log limit reached; finish or rotate the session",
             ));
         }
-        writeln!(file, "{line}")?;
-        file.flush()
+        append_line(&mut file, &line)
     })();
     if let Err(error) = result {
         tracing::warn!("MCP query logging skipped: {error}");
     }
+}
+
+/// Append one record and its terminator in a single write.
+///
+/// `writeln!` sends the body and the newline as two writes, and `SafeFile`
+/// derefs to an unbuffered `File`, so those are two `write` calls. `O_APPEND`
+/// makes each one atomic against other appenders but says nothing about the
+/// pair, so a second process lands in the gap and the two records share a
+/// line. That is not theoretical: eight concurrent writers tore hundreds of
+/// 2000 records, and the logs this machine had accumulated held sixteen such
+/// lines across two repositories.
+///
+/// One `write_all` of body-plus-newline closes that window. A short write on a
+/// full disk could still split a record, which is why the reader counts what
+/// it cannot parse instead of trusting this to be perfect.
+pub fn append_line(file: &mut SafeFile, line: &str) -> std::io::Result<()> {
+    let mut bytes = Vec::with_capacity(line.len() + 1);
+    bytes.extend_from_slice(line.as_bytes());
+    bytes.push(b'\n');
+    file.write_all(&bytes)
+}
+
+/// One ledger read: the records that parsed, and how many lines did not.
+#[derive(Debug, Clone)]
+pub struct Ledger<T> {
+    pub records: Vec<T>,
+    /// Lines that were present but did not parse.
+    ///
+    /// Carried rather than folded away because a read that lost records must
+    /// never look like a read that found none. The count is what lets a report
+    /// say "93 records, 4 unreadable" instead of quietly reporting 93.
+    pub malformed: u64,
+}
+
+// Hand-written so an empty read needs nothing of `T`: `derive(Default)` would
+// bound it on `T: Default` for no reason, since the empty ledger holds no `T`.
+impl<T> Default for Ledger<T> {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            malformed: 0,
+        }
+    }
+}
+
+/// Parse a JSON-lines ledger, skipping and counting what will not parse.
+///
+/// Failing closed on the first bad line is what made one torn record fatal:
+/// `session-report` returned `Err`, so the rotation that would have retired
+/// the bad line never ran, the live log grew instead, and at
+/// [`MAX_SESSION_BYTES`] logging would have stopped altogether. The ledger
+/// could not recover from a single tear without a human deleting the file.
+///
+/// Skipping is therefore the recovering choice. Counting is what keeps it
+/// honest.
+pub fn parse_jsonl<T: DeserializeOwned>(text: &str) -> Ledger<T> {
+    let mut records = Vec::new();
+    let mut malformed = 0u64;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<T>(line) {
+            Ok(record) => records.push(record),
+            Err(_) => malformed = malformed.saturating_add(1),
+        }
+    }
+    Ledger { records, malformed }
 }
 
 fn now_ms() -> u64 {
@@ -202,21 +271,19 @@ fn find_flag(value: &Value, key: &str, depth: u8) -> Option<Value> {
 }
 
 /// Load the live log as parsed records. Missing file is an empty session.
-pub fn read_live(db_path: &Path) -> std::io::Result<Vec<Map<String, Value>>> {
-    use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+///
+/// Unreadable lines are reported in [`Ledger::malformed`], not returned as an
+/// error: see [`parse_jsonl`] for why one torn record must not cost the whole
+/// session.
+pub fn read_live(db_path: &Path) -> std::io::Result<Ledger<Map<String, Value>>> {
+    use devmap_extract::safe_fs::{Access, Creation};
     let mut file = match SafeFile::open(&live_log_path(db_path), Access::Read, Creation::Never) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Ledger::default()),
         Err(error) => return Err(error),
     };
-    let text = file.read_text(MAX_SESSION_BYTES)?;
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str::<Map<String, Value>>(line)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-        })
-        .collect()
+    let text = file.read_text_prefix(MAX_SESSION_BYTES)?;
+    Ok(parse_jsonl(&text))
 }
 
 /// Rotate within the checked session directory. Only a missing log is a no-op.
@@ -292,8 +359,10 @@ mod tests {
             None,
             4,
         );
-        let rows = read_live(&db).unwrap();
+        let ledger = read_live(&db).unwrap();
+        let rows = &ledger.records;
         assert_eq!(rows.len(), 1);
+        assert_eq!(ledger.malformed, 0);
         assert_eq!(rows[0]["tool"], "devmap_search");
         assert_eq!(rows[0]["empty"], true);
         assert_eq!(rows[0]["ok"], true);

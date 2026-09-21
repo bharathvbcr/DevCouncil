@@ -11,7 +11,7 @@ fn session_rotation_checks_both_names_and_preserves_normal_records() {
     let db = root.join("store.sqlite");
     fs::write(&db, "store").unwrap();
     append_query(&db, "devmap_status", None, None, None, 1);
-    assert_eq!(read_live(&db).unwrap().len(), 1);
+    assert_eq!(read_live(&db).unwrap().records.len(), 1);
     assert!(rotate_live(&db, "../outside").is_err());
     fs::write(root.join("sentinel"), "outside sentinel").unwrap();
     symlink(root.join("sentinel"), root.join("sessions/linked.jsonl")).unwrap();
@@ -21,7 +21,7 @@ fn session_rotation_checks_both_names_and_preserves_normal_records() {
         "outside sentinel"
     );
     assert!(rotate_live(&db, "normal").unwrap());
-    assert!(read_live(&db).unwrap().is_empty());
+    assert!(read_live(&db).unwrap().records.is_empty());
     assert!(!rotate_live(&db, "again").unwrap());
     assert!(fs::read_to_string(root.join("sessions/normal.jsonl"))
         .unwrap()
