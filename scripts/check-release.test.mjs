@@ -22,6 +22,7 @@ import {
   parseTomlSectionVersion,
   parseWorkspaceMembers,
   releaseIsIdempotent,
+  releaseNotesPublishGaps,
   releasePutsAnnouncementBodyInEnv,
   releaseUsesNotesFile,
   tagNamesHead,
@@ -125,8 +126,8 @@ function scratchTree(prefix, versions = {}) {
       "    steps:",
       '      - run: NOTES_FILE="docs/releases/${RELEASE_TAG}.md"',
       "      - run: gh release view \"$RELEASE_TAG\"",
-      "      - run: gh release upload \"$RELEASE_TAG\" artifacts/* --clobber",
       "      - run: gh release edit \"$RELEASE_TAG\" --notes-file \"$NOTES_FILE\"",
+      "      - run: gh release upload \"$RELEASE_TAG\" artifacts/* --clobber",
     ].join("\n"),
   );
   return dir;
@@ -292,6 +293,20 @@ describe("this repository's workflows", () => {
   it("publishes docs/releases via --notes-file and is idempotent on an existing tag", () => {
     assert.equal(releaseUsesNotesFile(relYaml), true);
     assert.equal(releaseIsIdempotent(relYaml), true);
+    assert.deepEqual(releaseNotesPublishGaps(relYaml), []);
+  });
+
+  it("rejects an existing-release path that uploads before the notes edit", () => {
+    const yaml = `
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "\${files[@]}" --clobber
+            gh release edit "$RELEASE_TAG" --notes-file "$NOTES_FILE"
+          else
+            gh release create "$RELEASE_TAG" --notes-file "$NOTES_FILE" "\${files[@]}"
+          fi
+`;
+    const gaps = releaseNotesPublishGaps(yaml);
+    assert.ok(gaps.some((gap) => gap.includes("uploads before editing notes")));
   });
 
   it("does not keep or attach judge-release-notes", () => {

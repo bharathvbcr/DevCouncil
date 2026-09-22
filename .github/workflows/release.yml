@@ -312,9 +312,11 @@ jobs:
         run: node scripts/check-release.mjs --artifacts artifacts
       - name: Publish GitHub Release notes and archives
         # Notes come from docs/releases/vX.Y.Z.md via --notes-file. They must
-        # not travel through GITHUB_ENV (48 KB cap). `gh release create` is
-        # skipped when cargo-dist already opened the tag so a second create
-        # cannot fail the job after the artifacts are built.
+        # not travel through GITHUB_ENV (48 KB cap). cargo-dist's
+        # `host --steps=release` has already opened the tag, so this step
+        # edits the notes first. Upload is second, with --clobber: a failed
+        # upload must not skip the notes edit, and a retry must not die
+        # because the archives are already attached.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
@@ -338,9 +340,9 @@ jobs:
             extra+=(--prerelease)
           fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Release $RELEASE_TAG already exists; uploading artifacts and replacing notes."
-            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+            echo "Release $RELEASE_TAG already exists; replacing notes, then uploading artifacts."
             gh release edit "$RELEASE_TAG" --title "$title" --notes-file "$NOTES_FILE" --target "$RELEASE_COMMIT" "${extra[@]}"
+            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
           else
             gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" --title "$title" --notes-file "$NOTES_FILE" "${extra[@]}" "${files[@]}"
           fi

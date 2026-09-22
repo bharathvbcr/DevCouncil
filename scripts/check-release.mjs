@@ -287,6 +287,54 @@ export function releaseIsIdempotent(yaml) {
 }
 
 /**
+ * Gaps in the path that runs when cargo-dist has already opened the tag.
+ *
+ * `host --steps=release` creates the GitHub Release before this step, with
+ * cargo-dist's own changelog. The shell then uses `set -euo pipefail`. If
+ * `gh release upload` runs first and fails — the usual retry error is an
+ * asset that already exists — the notes edit never runs, and the release
+ * that users see is the changelog, not `docs/releases/<tag>.md`.
+ *
+ * The existing-release branch must edit the notes first, then re-upload
+ * with `--clobber`.
+ *
+ * @param {string} yaml
+ * @returns {string[]}
+ */
+export function releaseNotesPublishGaps(yaml) {
+  const marker = yaml.includes("if gh release view") ? "if gh release view" : "gh release view";
+  const afterView = yaml.split(marker)[1] ?? "";
+  const elseAt = afterView.search(/\n\s*else\b/);
+  const branch = elseAt >= 0 ? afterView.slice(0, elseAt) : afterView;
+  const editAt = branch.search(/gh release edit\b[^\n]*--notes-file/);
+  const uploadAt = branch.search(/gh release upload\b[^\n]*--clobber/);
+  /** @type {string[]} */
+  const errors = [];
+  if (!yaml.includes("gh release view")) {
+    errors.push(
+      "existing-release path must `gh release view` before editing notes; without it a second publish runs `gh release create` and fails after cargo-dist has already opened the tag",
+    );
+    return errors;
+  }
+  if (editAt < 0) {
+    errors.push(
+      "existing-release path must `gh release edit` with --notes-file; cargo-dist opens the release first, so this is the path that publishes docs/releases",
+    );
+  }
+  if (uploadAt < 0) {
+    errors.push(
+      "existing-release path must `gh release upload --clobber`; without --clobber a retry fails after cargo-dist has already attached the archives",
+    );
+  }
+  if (editAt >= 0 && uploadAt >= 0 && editAt > uploadAt) {
+    errors.push(
+      "existing-release path uploads before editing notes; a failed upload skips the notes edit and the release keeps cargo-dist's changelog",
+    );
+  }
+  return errors;
+}
+
+/**
  * @param {string} dir
  * @param {readonly string[]} required
  * @returns {string[]}
@@ -489,6 +537,9 @@ export function inspectRelease(sources, opts = {}) {
         errors.push(
           "release.yml is not idempotent (needs gh release view/edit/upload); a second create on an existing tag fails after the artifacts are built",
         );
+      }
+      for (const gap of releaseNotesPublishGaps(relYaml)) {
+        errors.push(gap);
       }
     }
   }
