@@ -44,7 +44,13 @@ SQL="$HERE/fanout.sql"
 [ -r "$SQL" ] || { echo "fanout: missing $SQL" >&2; exit 1; }
 command -v sqlite3 >/dev/null 2>&1 || { echo "fanout: sqlite3 is not on PATH" >&2; exit 1; }
 
-ROW=$(sqlite3 -readonly "$DB" < "$SQL") || {
+# Do not pass `-readonly`. Apple's /usr/bin/sqlite3 (3.54) rejects that flag
+# on a WAL store written by the newer SQLite this binary bundles, and reports
+# it as "Parse error near line 83: unable to open database file (14)" — the
+# first statement of fanout.sql — so the probe dies before it has a number.
+# The script never writes the main database: setup is TEMP tables and the
+# result is one SELECT. Measured: the store's checksum is unchanged.
+ROW=$(sqlite3 "$DB" < "$SQL") || {
   echo "fanout: query failed against $DB" >&2; exit 1; }
 
 IFS='|' read -r FILES EDGES SUM_N2 SITES MAX_N UNJOINED ALT_SUM_N2 ALT_SITES \
