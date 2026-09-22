@@ -1,0 +1,25 @@
+[package]
+name = "devcouncil-gusset-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Umbrella staticlib: Gusset plus the dc-glob engine. One archive per Go binary (R14)."
+publish = false
+
+[workspace]
+
+[lib]
+name = "gusset"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+gusset_core = { package = "gusset", path = "../../../gusset/crates/gusset" }
+dc-glob = { path = "../dc-glob" }
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+codegen-units = 1
+lto = "thin"

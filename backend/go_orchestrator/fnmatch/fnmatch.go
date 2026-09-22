@@ -12,9 +12,24 @@
 // that stops denying) and narrow planned-file matching (a gate that starts
 // denying legitimate writes). Both failures are silent.
 //
-// Match is case-sensitive, which is what Python does on POSIX, where
-// os.path.normcase is the identity function. DevCouncil's own patterns are
-// checked this way on macOS and Linux today, and the parity fixture pins it.
+// The matcher is the same backtracking algorithm as rust/dc-glob. The previous
+// Go copy translated patterns into RE2, and RE2 rejects character classes
+// CPython normalises (an out-of-order range such as [c-a-e] still matches "e"
+// and "-"). That translation matched nothing for the whole pattern, so the two
+// planes disagreed on exactly the paths a class named. One algorithm, pinned
+// by testdata/fnmatch-parity.tsv, which scripts/gen-fnmatch-parity.py
+// regenerates from CPython's fnmatchcase.
+//
+// Both languages still run the algorithm in-process. The write gate cannot
+// cross into the Rust crate: a transport failure has no honest bool, and
+// either choice (match, or not) is a wrong allow or a wrong deny. dc-verify
+// cannot call this package. The shared fixture is what keeps the two copies
+// from drifting.
+//
+// Match is case-sensitive, which is what Python's fnmatchcase does, and what
+// fnmatch does on POSIX where os.path.normcase is the identity. DevCouncil's
+// own patterns are checked this way on macOS and Linux today, and the parity
+// fixture pins it.
 //
 // MatchFold is the deliberate exception, and it is a divergence from the
 // incumbent rather than a port of it. Case-sensitive matching is a statement
@@ -27,28 +42,23 @@
 package fnmatch
 
 import (
-	"regexp"
 	"strings"
-	"sync"
+	"unicode"
+	"unicode/utf8"
 )
 
-var (
-	cacheMu sync.RWMutex
-	cache   = map[string]*regexp.Regexp{}
-	// foldCache is separate from cache so a pattern compiled for one matching
-	// mode can never be served to the other.
-	foldCache = map[string]*regexp.Regexp{}
-)
+// maxUnits is the longest pattern or name, in Unicode scalar values, that is
+// matched exactly. Past it the result is the fail-closed bool for that entry
+// point: Match returns false (an allow-list miss denies), MatchFold returns
+// true (a deny-rule miss would allow). A real repository path is far below
+// this. The bound also caps the backtrack, which is O(pattern × name).
+const maxUnits = 16384
 
 // Match reports whether name matches the shell-style pattern, using Python's
-// fnmatch rules. An unparseable pattern never matches; it cannot panic and it
-// cannot accidentally match everything.
+// fnmatchcase rules. A pattern that cannot be applied never matches; it cannot
+// panic and it cannot accidentally match everything.
 func Match(pattern, name string) bool {
-	re, err := compile(pattern)
-	if err != nil {
-		return false
-	}
-	return re.MatchString(name)
+	return decide(pattern, name, false)
 }
 
 // MatchAny reports whether name matches any of the patterns.
@@ -61,15 +71,15 @@ func MatchAny(patterns []string, name string) bool {
 	return false
 }
 
-// MatchFold reports whether name matches pattern ignoring ASCII and Unicode
-// case. Use it wherever a mismatch would let a write reach a file the pattern
-// was written to protect; see the package comment.
+// MatchFold reports whether name matches pattern ignoring case, using Unicode
+// simple case folding (one rune to one rune). Use it wherever a mismatch would
+// let a write reach a file the pattern was written to protect; see the package
+// comment.
 func MatchFold(pattern, name string) bool {
-	re, err := compileFold(pattern)
-	if err != nil {
-		return false
+	if oversized(pattern) || oversized(name) {
+		return true
 	}
-	return re.MatchString(name)
+	return decide(fold(pattern), fold(name), true)
 }
 
 // MatchAnyFold reports whether name matches any pattern, ignoring case.
@@ -107,116 +117,178 @@ func QuoteMeta(literal string) string {
 	return b.String()
 }
 
-func compile(pattern string) (*regexp.Regexp, error) {
-	return compileInto(cache, pattern, "")
-}
-
-func compileFold(pattern string) (*regexp.Regexp, error) {
-	return compileInto(foldCache, pattern, "(?i)")
-}
-
-func compileInto(store map[string]*regexp.Regexp, pattern, prefix string) (*regexp.Regexp, error) {
-	cacheMu.RLock()
-	re, ok := store[pattern]
-	cacheMu.RUnlock()
-	if ok {
-		return re, nil
+func decide(pattern, name string, oversizeIsMatch bool) bool {
+	if oversized(pattern) || oversized(name) {
+		return oversizeIsMatch
 	}
-	re, err := regexp.Compile(prefix + translate(pattern))
-	if err != nil {
-		return nil, err
+	pat := []rune(pattern)
+	text := []rune(name)
+	matched, completed := matchFrom(pat, text)
+	if !completed {
+		return oversizeIsMatch
 	}
-	cacheMu.Lock()
-	store[pattern] = re
-	cacheMu.Unlock()
-	return re, nil
+	return matched
 }
 
-// translate converts a Python fnmatch pattern into an anchored Go regexp,
-// following CPython's fnmatch.translate.
-func translate(pattern string) string {
-	var b strings.Builder
-	b.WriteString(`(?s)\A`)
+func oversized(s string) bool {
+	if len(s) > maxUnits*utf8.UTFMax {
+		return true
+	}
+	return utf8.RuneCountInString(s) > maxUnits
+}
 
-	runes := []rune(pattern)
-	for i := 0; i < len(runes); i++ {
-		c := runes[i]
-		switch c {
-		case '*':
-			// Consecutive stars collapse, so "**/x" is "*" then "/x" — which is
-			// why "**/.env" needs a separator before ".env" and does not match a
-			// bare ".env".
-			b.WriteString(".*")
-			for i+1 < len(runes) && runes[i+1] == '*' {
-				i++
-			}
-		case '?':
-			b.WriteString(".")
-		case '[':
-			if class, next, ok := charClass(runes, i); ok {
-				b.WriteString(class)
-				i = next
-			} else {
-				b.WriteString(regexp.QuoteMeta("["))
-			}
-		default:
-			b.WriteString(regexp.QuoteMeta(string(c)))
+func fold(s string) string {
+	rs := []rune(s)
+	changed := false
+	for i, r := range rs {
+		lower := unicode.ToLower(r)
+		if lower != r {
+			rs[i] = lower
+			changed = true
 		}
 	}
-
-	b.WriteString(`\z`)
-	return b.String()
+	if !changed {
+		return s
+	}
+	return string(rs)
 }
 
-// charClass parses a [...] set starting at runes[open], returning the regexp
-// equivalent and the index of the closing bracket.
+// matchFrom reports whether text matches pat, and whether the walk finished
+// inside its step budget. A false second result means the budget tripped; the
+// caller then applies its fail-closed bool instead of trusting a partial walk.
+func matchFrom(pat, text []rune) (matched, completed bool) {
+	pi, ti := 0, 0
+	starPi, starTi := -1, -1
+	// Each step either consumes one pattern unit or gives the latest star one
+	// more character. (len+1)² covers that; exceeding it is a loop bug.
+	steps := 0
+	// Four times the one-step-per-unit bound. The walk is O(pattern × name);
+	// the multiplier is slack for the star-collapse iterations inside a step,
+	// not a second algorithm.
+	limit := 4*((len(pat)+1)*(len(text)+1)) + 8
+
+	for {
+		steps++
+		if steps > limit {
+			return false, false
+		}
+		if pi < len(pat) {
+			switch pat[pi] {
+			case '*':
+				// Consecutive stars collapse, so "**/x" is "*" then "/x" —
+				// "**/.env" needs a separator before ".env" and does not match
+				// a bare ".env".
+				for pi < len(pat) && pat[pi] == '*' {
+					pi++
+				}
+				starPi, starTi = pi, ti
+				continue
+			case '?':
+				if ti < len(text) {
+					pi++
+					ti++
+					continue
+				}
+			case '[':
+				if class, next, ok := parseClass(pat, pi); ok {
+					if ti < len(text) && class.contains(text[ti]) {
+						pi = next + 1
+						ti++
+						continue
+					}
+				} else if ti < len(text) && text[ti] == '[' {
+					// Unterminated '[' is a literal, never a wildcard.
+					pi++
+					ti++
+					continue
+				}
+			default:
+				if ti < len(text) && text[ti] == pat[pi] {
+					pi++
+					ti++
+					continue
+				}
+			}
+		} else if ti == len(text) {
+			return true, true
+		}
+
+		if starPi >= 0 && starTi < len(text) {
+			starTi++
+			pi = starPi
+			ti = starTi
+			continue
+		}
+		return false, true
+	}
+}
+
+type charClass struct {
+	negated bool
+	singles []rune
+	ranges  [][2]rune
+}
+
+func (c charClass) contains(r rune) bool {
+	hit := false
+	for _, s := range c.singles {
+		if s == r {
+			hit = true
+			break
+		}
+	}
+	if !hit {
+		for _, rg := range c.ranges {
+			if r >= rg[0] && r <= rg[1] {
+				hit = true
+				break
+			}
+		}
+	}
+	return hit != c.negated
+}
+
+// parseClass parses the class starting at pat[open]. The returned index is the
+// closing bracket. An unterminated or empty class is not a class: the caller
+// treats '[' as a literal.
 //
-// Only a leading '!' negates. A leading '^' is an ordinary member of the set:
-// that is what CPython's fnmatch does — translate('[^a]') yields [\^a], a
-// literal set {^, a} — and these two planes are pinned to that behaviour, not
-// to shell intuition. Treating '^' as negation made the two halves of the
-// write gate disagree with the incumbent about exactly which paths a [^…]
-// pattern named, in opposite directions.
-func charClass(runes []rune, open int) (string, int, bool) {
+// Only a leading '!' negates. A leading '^' is an ordinary member of the set,
+// which is what CPython's fnmatch does. A range is recognised the same way the
+// Rust matcher does: three units "x-y" with room after the start. An
+// out-of-order range matches nothing and leaves the surrounding members, which
+// is how "[c-a-e]" still matches "e" and "-".
+func parseClass(pat []rune, open int) (charClass, int, bool) {
 	i := open + 1
-	if i < len(runes) && runes[i] == '!' {
-		i++
-	}
-	// A ']' immediately after the (negated) opening is a literal.
-	if i < len(runes) && runes[i] == ']' {
-		i++
-	}
-	for i < len(runes) && runes[i] != ']' {
-		i++
-	}
-	if i >= len(runes) {
-		return "", 0, false // unterminated: treat '[' as a literal
-	}
-
-	body := string(runes[open+1 : i])
-	negated := strings.HasPrefix(body, "!")
+	negated := i < len(pat) && pat[i] == '!'
 	if negated {
-		body = body[1:]
+		i++
 	}
-	if body == "" {
-		return "", 0, false
+	bodyStart := i
+	// A ']' immediately after the opening (or after the negation) is a literal.
+	if i < len(pat) && pat[i] == ']' {
+		i++
+	}
+	for i < len(pat) && pat[i] != ']' {
+		i++
+	}
+	if i >= len(pat) {
+		return charClass{}, 0, false
+	}
+	body := pat[bodyStart:i]
+	if len(body) == 0 {
+		return charClass{}, 0, false
 	}
 
-	// Escape the characters that mean something different inside a Go regexp
-	// class than they do inside an fnmatch set. Ranges (a-z) are preserved.
-	var esc strings.Builder
-	for _, r := range body {
-		switch r {
-		case '\\', '[', ']', '^':
-			esc.WriteRune('\\')
-			esc.WriteRune(r)
-		default:
-			esc.WriteRune(r)
+	var singles []rune
+	var ranges [][2]rune
+	for k := 0; k < len(body); {
+		if k+2 < len(body) && body[k+1] == '-' {
+			ranges = append(ranges, [2]rune{body[k], body[k+2]})
+			k += 3
+			continue
 		}
+		singles = append(singles, body[k])
+		k++
 	}
-
-	if negated {
-		return "[^" + esc.String() + "]", i, true
-	}
-	return "[" + esc.String() + "]", i, true
+	return charClass{negated: negated, singles: singles, ranges: ranges}, i, true
 }

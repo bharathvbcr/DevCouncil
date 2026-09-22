@@ -1,4 +1,4 @@
-# pattern	name	expected  — generated from CPython fnmatch; regenerate with scripts/gen-fnmatch-parity.py
+# pattern	name	expected  — generated from CPython fnmatchcase; regenerate with scripts/gen-fnmatch-parity.py
 *.py	src/foo.py	true
 *.py	foo.py	true
 *.py	a/b/.env	false
@@ -774,3 +774,28 @@ uv.lock		false
 *	p/secrets/k	true
 *	secrets/k	true
 *		true
+[c-a-e]	e	true
+[c-a-e]	-	true
+[c-a-e]	a	false
+[c-a-e]	c	false
+[a--c]	c	true
+[a--c]	a	false
+[a--c]	-	false
+[a--c]	b	false
+[z-a]	z	false
+[z-a]	a	false
+*[z-a]	hello	false
+[!]	[!]	true
+[!]	a	false
+[]	[]	true
+[]	a	false
+[a-c-e]	b	true
+[a-c-e]	d	false
+[a-c-e]	-	true
+[a-c-e]	e	true
+[a-c-e-g-i]	b	true
+[a-c-e-g-i]	d	false
+[a-c-e-g-i]	f	true
+[a-c-e-g-i]	h	false
+[a-c-e-g-i]	i	true
+[a-c-e-g-i]	-	true

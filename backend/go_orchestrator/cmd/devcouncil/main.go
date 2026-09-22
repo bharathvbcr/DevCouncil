@@ -69,6 +69,8 @@ func dispatch(args []string) int {
 		return runDevmap(mapArgs(args[1:]))
 	case "ast":
 		return runDevmap(astArgs(args[1:]))
+	case "gusset-check":
+		return runGussetCheck()
 	case "version", "--version", "-V", "-v":
 		for _, arg := range args[1:] {
 			if arg == "--json" {
@@ -115,6 +117,7 @@ Usage:
   devcouncil map [devmap args…]   Exec `+"`devmap`"+` (bare invocation: build --manifest)
   devcouncil graph …              Alias of map
   devcouncil ast …                Exec `+"`devmap ast`"+`
+  devcouncil gusset-check         Prove the linked Rust engine is dc-glob on Gusset
 
 Presentation: --progress auto|always|never (default: auto). JSON stays on stdout.
 NO_COLOR removes color; TERM=dumb and non-UTF-8 locales use simpler output.

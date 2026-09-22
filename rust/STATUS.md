@@ -32,8 +32,10 @@ significant case it is measurably less capable, and cutting over would weaken a 
 >
 > - `dc-store/tests/interop.rs` — this copy resolves DevCouncil as its own
 >   ancestor; MANVI's searches upward for a sibling checkout.
-> - `dc-glob/src/lib.rs` — one `include_str!` path, because the parity fixture
->   is at `rust/testdata/` here and at the repository root in MANVI.
+> - `dc-glob/src/lib.rs` — the parity fixture is the repository-root
+>   `testdata/fnmatch-parity.tsv` (one copy, shared with the Go matcher). The
+>   matcher itself has diverged from MANVI's: input caps, a step budget, and
+>   the inverted-range cases CPython keeps.
 >
 > Four paths exist only here and have no MANVI counterpart: `.gitignore`,
 > `README.md`, `STATUS.md`, and `testdata/` (MANVI keeps the parity fixture at
@@ -144,10 +146,11 @@ A passing test is not evidence until it has been shown it can fail.
 
 Four, all forced by the move. Everything else is byte-identical to MANVI.
 
-1. **`dc-glob` fixture path.** `include_str!("../../../testdata/…")` →
-   `("../../testdata/…")`; the 776-line CPython `fnmatch` parity fixture now lives
-   at `rust/testdata/fnmatch-parity.tsv`, inside the workspace, so the plane stays
-   self-contained.
+1. **`dc-glob` fixture path.** The CPython `fnmatch` parity fixture lives once,
+   at `testdata/fnmatch-parity.tsv` in the repository root. `dc-glob` and the Go
+   `fnmatch` package both read that file. Earlier copies under `rust/testdata/`
+   and `backend/testdata/` were byte-identical and could drift apart without a
+   test noticing.
 2. **`dc-store` interop root resolution.** It walked *three* levels up and re-entered
    by the literal name `DevCouncil`, which was right when the crate lived in a
    sibling repository. It now resolves the repository as its own ancestor
