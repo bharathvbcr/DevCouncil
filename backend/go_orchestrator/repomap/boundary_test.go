@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -453,50 +453,63 @@ func TestAnAreaIsFoundWithoutWalkingEveryIndexedFile(t *testing.T) {
 	// set lookup does not.
 	small, large := build(256), build(2048)
 	const probe = "elsewhere/entirely/deep/enough/x.go"
-	ratio := timeLookups(large, probe) / timeLookups(small, probe)
+	ratio := pairedLookupRatio(small, large, probe)
 	if ratio > 3 {
 		t.Fatalf("resolving one path took %.1fx longer against 8x the files; the lookup is "+
 			"walking the path table rather than consulting the set of areas", ratio)
 	}
 }
 
-// timeLookups reports the cost of one AreaForPath miss, in nanoseconds.
+// pairedLookupRatio is the median of back-to-back measurements.
 //
-// Each round runs for a fixed slice of time rather than a fixed number of
-// calls, so the measurement costs the same whether the lookup is a set probe or
-// a walk of the whole path table — a count tuned for the fast one takes seconds
-// against the slow one, and a count tuned for the slow one measures noise
-// against the fast one.
-//
-// The best of several rounds rather than one: the property under test is how the
-// work scales with the size of the map, and a single sample on a shared machine
-// measures the scheduler as much as the code. The minimum is the least
-// contaminated estimate available without a quiet machine.
-func timeLookups(m *Map, probe string) float64 {
-	const budget = 20 * time.Millisecond
-	// Batched so the clock is read once per batch rather than once per call,
-	// which would otherwise be most of what the fast path measures.
-	const batch = 64
-
-	best := math.MaxFloat64
-	for round := 0; round < 5; round++ {
-		start := time.Now()
-		calls := 0
-		var elapsed time.Duration
-		for {
-			for i := 0; i < batch; i++ {
-				m.AreaForPath(probe)
-			}
-			calls += batch
-			if elapsed = time.Since(start); elapsed >= budget {
-				break
-			}
+// Independent minima inflate the ratio. The small map's quietest slice
+// divided by the large map's least-bad slice are not the same moment, so a
+// pause looks like the large map scanning the path table. Pairing them
+// measures both under the same load, and alternating which runs first
+// cancels a drift across the pair. A real scan of 8x the files is still
+// about 8x on every pair, so the median stays over the bound.
+func pairedLookupRatio(small, large *Map, probe string) float64 {
+	const rounds = 9
+	ratios := make([]float64, 0, rounds)
+	for round := 0; round < rounds; round++ {
+		var s, l float64
+		if round%2 == 0 {
+			s, l = timeLookups(small, probe), timeLookups(large, probe)
+		} else {
+			l, s = timeLookups(large, probe), timeLookups(small, probe)
 		}
-		if ns := float64(elapsed.Nanoseconds()) / float64(calls); ns < best {
-			best = ns
+		if s > 0 {
+			ratios = append(ratios, l/s)
 		}
 	}
-	return best
+	sort.Float64s(ratios)
+	return ratios[len(ratios)/2]
+}
+
+// timeLookups reports the cost of one AreaForPath miss, in nanoseconds.
+//
+// The round runs for a fixed slice of time rather than a fixed number of
+// calls, so the measurement costs the same whether the lookup is a set probe
+// or a walk of the whole path table. Batched so the clock is read once per
+// batch rather than once per call, which would otherwise be most of what the
+// fast path measures.
+func timeLookups(m *Map, probe string) float64 {
+	const budget = 20 * time.Millisecond
+	const batch = 64
+
+	start := time.Now()
+	calls := 0
+	var elapsed time.Duration
+	for {
+		for i := 0; i < batch; i++ {
+			m.AreaForPath(probe)
+		}
+		calls += batch
+		if elapsed = time.Since(start); elapsed >= budget {
+			break
+		}
+	}
+	return float64(elapsed.Nanoseconds()) / float64(calls)
 }
 
 // TestAPartlyWrittenArtifactIsNeverReadAsAWholeOne.
