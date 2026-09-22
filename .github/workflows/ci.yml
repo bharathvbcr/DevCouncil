@@ -44,6 +44,11 @@ jobs:
       - name: Workflow lint
         run: npm run check:workflows
 
+      # go.mod replaces Gusset with a sibling checkout, and the host links
+      # rust/gusset-engine/target/release/libgusset.a. Neither is in this repo.
+      - name: Set up Gusset
+        uses: ./.github/actions/setup-gusset
+
       - name: Go host binary
         working-directory: backend/go_orchestrator
         run: |

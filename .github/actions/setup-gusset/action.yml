@@ -1,0 +1,104 @@
+name: Set up Gusset
+description: >-
+  Check out the Gusset revision the Go module replaces, and build the umbrella
+  staticlib the DevCouncil host links. backend/go_orchestrator/go.mod replaces
+  github.com/bharathvbcr/gusset with ../../../gusset, and rust/gusset-engine
+  depends on that same sibling. A GitHub checkout of DevCouncil alone does not
+  contain it.
+
+inputs:
+  build-engine:
+    description: >-
+      Build rust/gusset-engine in release. Required before any go build or
+      go test of the host. Set to false when a job only needs the sibling
+      sources on disk.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Check out Gusset
+      uses: actions/checkout@v5
+      with:
+        repository: bharathvbcr/gusset
+        # Pinned to the sibling revision this tree was linked against.
+        # Bump deliberately; tracking main would let a Gusset push fail a
+        # DevCouncil release without a DevCouncil commit.
+        ref: 7a56c3c98d026b4e445f687140c90d70755e8590
+        path: third_party/gusset
+        persist-credentials: false
+
+    - name: Link Gusset where the module replace looks
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${RUNNER_OS}" == "Windows" ]]; then
+          # GITHUB_WORKSPACE is a Windows path. Git Bash dirname does not
+          # treat backslash as a separator, so convert first.
+          workspace="$(cygpath -u "$GITHUB_WORKSPACE")"
+        else
+          workspace="$GITHUB_WORKSPACE"
+        fi
+        src="$workspace/third_party/gusset"
+        dest="$(dirname "$workspace")/gusset"
+        if [[ ! -f "$src/go.mod" || ! -f "$src/crates/gusset/Cargo.toml" ]]; then
+          echo "::error::Gusset checkout at $src is incomplete"
+          exit 1
+        fi
+        if [[ -e "$dest" || -L "$dest" ]]; then
+          echo "::error::$dest already exists; refusing to replace it"
+          exit 1
+        fi
+        if [[ "${RUNNER_OS}" == "Windows" ]]; then
+          # A junction, not a symlink: the runner can create one without
+          # Developer Mode, and both Go and Cargo follow it.
+          cmd.exe //c "mklink /J $(cygpath -w "$dest") $(cygpath -w "$src")"
+        else
+          ln -s "$src" "$dest"
+        fi
+        test -f "$dest/go.mod"
+        test -f "$dest/crates/gusset/Cargo.toml"
+
+    # Gusset's cgo line is -lgusset -lpthread -lm -ldl. That is a GNU link.
+    # windows-latest's Rust host is MSVC, which emits gusset.lib and has no
+    # libdl. The gnu target plus MinGW produces libgusset.a, which is what
+    # the #cgo -L path in gussetfn/engine.go already names.
+    - name: Install MinGW
+      if: ${{ runner.os == 'Windows' && inputs.build-engine == 'true' }}
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: false
+        install: mingw-w64-x86_64-gcc mingw-w64-x86_64-dlfcn
+        path-type: inherit
+
+    - name: Rust toolchain
+      if: ${{ runner.os != 'Windows' && inputs.build-engine == 'true' }}
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Rust toolchain (Windows gnu target)
+      if: ${{ runner.os == 'Windows' && inputs.build-engine == 'true' }}
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-pc-windows-gnu
+
+    - name: Build the umbrella staticlib
+      if: ${{ inputs.build-engine == 'true' }}
+      shell: bash
+      working-directory: rust/gusset-engine
+      run: |
+        set -euo pipefail
+        if [[ "${RUNNER_OS}" == "Windows" ]]; then
+          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=gcc
+          cargo build --release --locked --target x86_64-pc-windows-gnu
+          mkdir -p target/release
+          cp -f target/x86_64-pc-windows-gnu/release/libgusset.a target/release/libgusset.a
+          # Later `go build` steps in this job must use the same gcc. cgo
+          # will not use the MSVC linker for Gusset's -lpthread/-ldl line.
+          echo "CC=gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=gcc" >> "$GITHUB_ENV"
+        else
+          cargo build --release --locked
+        fi
+        test -f target/release/libgusset.a

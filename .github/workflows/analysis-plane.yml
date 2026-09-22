@@ -9,8 +9,8 @@ name: analysis components (rust/ + go clients)
 #   rust — the dc-* components themselves, on three platforms.
 #   go   — the clients, driving real component binaries rather than fakes.
 #
-# The Python TaskLeaseRepository jobs were removed with the Python package.
-# `dc-store`'s interop tests still skip when there is no `.venv`.
+# The Python package and its TaskLeaseRepository jobs are gone. dc-store's
+# interop test records that retirement; it does not look for a virtualenv.
 #
 # `dc-verify`'s json_contract does not skip. It drives the Go host binary as a
 # real process — the only way to tell a banner on stdout from one on stderr —
@@ -74,12 +74,14 @@ jobs:
         run: cargo build -p dc-glob -p dc-proc -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets
 
       # dc-verify's json_contract runs the host's `--json` commands as real
-      # processes and fails if it cannot find the binary. Go only: the module
-      # has no third-party dependencies and links in about a second, so this
-      # job still does not compile a single tree-sitter grammar.
+      # processes and fails if it cannot find the binary. The module's only
+      # dependency is the Gusset sibling plus the umbrella staticlib; building
+      # those does not compile a tree-sitter grammar.
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go_orchestrator/go.mod
+      - name: Set up Gusset
+        uses: ./.github/actions/setup-gusset
       - name: Build the DevCouncil host
         working-directory: backend/go_orchestrator
         run: go build -o bin/ ./cmd/devcouncil
@@ -142,6 +144,9 @@ jobs:
           if [ -n "$unformatted" ]; then
             echo "gofmt would rewrite:"; echo "$unformatted"; exit 1
           fi
+
+      - name: Set up Gusset
+        uses: ./.github/actions/setup-gusset
 
       - name: Vet
         working-directory: backend/go_orchestrator

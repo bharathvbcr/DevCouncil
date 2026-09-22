@@ -43,24 +43,41 @@ cargo clippy --workspace --all-targets -- -D warnings
 # binary is absent, because a gate that ran nothing must not report what a gate
 # that ran and passed reports. That makes the host a fixture of `cargo test
 # --workspace`, so this pipeline builds it, exactly as `analysis-plane.yml` and
-# `rust.yml` do. The module has no third-party dependencies and links in about
-# a second, so this compiles no tree-sitter grammar and costs gate 3 nothing.
+# `rust.yml` do.
 #
-# Without this the chain was red by construction on any clean checkout: the
-# workflows gained the build step and this file did not, so every local run
-# failed two tests with a message about a path. A missing toolchain is named
-# here rather than left to surface as that message, because the cause is the
-# toolchain and naming it is the difference between one command and a hunt.
+# The host is not a dependency-free Go build. go.mod replaces
+# github.com/bharathvbcr/gusset with the sibling checkout at <repo>/../gusset,
+# and cgo links rust/gusset-engine/target/release/libgusset.a. That archive is
+# gitignored. CI checks the sibling out in .github/actions/setup-gusset and
+# builds the archive there; locally this step builds the archive when the
+# sibling is already on disk. A missing sibling fails here, by name, rather
+# than as "replacement directory does not exist" after Go has started.
 step "3/9 tests — host fixture"
 if [ -n "${DEVCOUNCIL_BIN:-}" ]; then
   echo "DEVCOUNCIL_BIN is set ($DEVCOUNCIL_BIN); not building the host"
-elif command -v go >/dev/null 2>&1; then
-  go -C ../backend/go_orchestrator build -o bin/ ./cmd/devcouncil
-else
+elif ! command -v go >/dev/null 2>&1; then
   echo "GATE FAIL: no \`go\` on PATH, and gate 3 needs the DevCouncil host binary —" >&2
   echo "dc-verify's json_contract runs it as a real process and fails when it is absent." >&2
   echo "Install Go, or point DEVCOUNCIL_BIN at a host built from this tree." >&2
   exit 1
+else
+  repo_root="$(cd .. && pwd)"
+  gusset_dir="$(dirname "$repo_root")/gusset"
+  archive="gusset-engine/target/release/libgusset.a"
+  if [[ ! -f "$gusset_dir/go.mod" ]]; then
+    echo "GATE FAIL: the Go host replaces github.com/bharathvbcr/gusset with $gusset_dir, which is not a checkout." >&2
+    echo "Check out https://github.com/bharathvbcr/gusset there. CI does this in .github/actions/setup-gusset." >&2
+    exit 1
+  fi
+  if [[ ! -f "$archive" ]]; then
+    echo "building gusset-engine release staticlib (libgusset.a is not in git)"
+    cargo build --release --locked --manifest-path gusset-engine/Cargo.toml
+  fi
+  if [[ ! -f "$archive" ]]; then
+    echo "GATE FAIL: $archive is missing after cargo build --release --locked" >&2
+    exit 1
+  fi
+  go -C ../backend/go_orchestrator build -o bin/ ./cmd/devcouncil
 fi
 
 step "3/9 tests"

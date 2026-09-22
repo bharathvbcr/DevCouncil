@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import {
@@ -51,6 +52,20 @@ describe("check:workflows", () => {
 
     const dir = fileURLToPath(new URL("../.github/workflows", import.meta.url));
     assert.deepEqual(workflowsMissingPermissions(dir), []);
+  });
+
+  it("builds the Go host only after the Gusset sibling and staticlib exist", () => {
+    const root = fileURLToPath(new URL("../.github/workflows", import.meta.url));
+    const uses = (name) =>
+      readFileSync(path.join(root, name), "utf8")
+        .split("\n")
+        .filter((line) => line.includes("./.github/actions/setup-gusset")).length;
+    // One step per job that compiles the host. Dropping a call site puts
+    // `replacement directory ../../../gusset does not exist` back on the tag.
+    assert.equal(uses("ci.yml"), 1);
+    assert.equal(uses("analysis-plane.yml"), 2);
+    assert.equal(uses("rust.yml"), 2);
+    assert.equal(uses("codeql.yml"), 1);
   });
 
   it("invokes the archive gate before publishing, including the Windows zip", () => {

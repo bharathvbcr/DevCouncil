@@ -150,10 +150,13 @@ jobs:
       # `dc-verify` is in the loop below, and its json_contract test drives the
       # Go host binary as a real process rather than skipping when it is
       # missing. Feature-off is still the thing under test here; the host is
-      # just a fixture the loop needs, and it links in about a second.
+      # a fixture. It links the Gusset umbrella archive, so that sibling and
+      # staticlib have to exist before `go build`.
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go_orchestrator/go.mod
+      - name: Set up Gusset
+        uses: ./.github/actions/setup-gusset
       - name: Build the DevCouncil host
         working-directory: backend/go_orchestrator
         run: go build -o bin/ ./cmd/devcouncil
@@ -188,6 +191,15 @@ jobs:
           workspaces: rust
       - name: Install gate dependencies
         run: sudo apt-get update && sudo apt-get install -y sqlite3 rsync
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go_orchestrator/go.mod
+      # verify.sh builds the host. That link needs the sibling checkout and
+      # libgusset.a; the script builds the archive when the sibling is already
+      # on disk, and fails when it is not.
+      - name: Set up Gusset
+        uses: ./.github/actions/setup-gusset
 
       # Determinism, the measured memory ceiling, growth plateau, and the
       # incremental-vs-cold equivalence check that caught SC16.

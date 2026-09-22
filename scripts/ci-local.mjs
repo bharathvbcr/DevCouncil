@@ -5,7 +5,7 @@
  * as a pass.
  */
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { tagNamesHead } from "./check-release.mjs";
@@ -33,6 +33,35 @@ function run(label, command, args, opts = {}) {
   if (result.status !== 0) {
     console.error(`FAIL: ${label} (exit ${result.status})`);
     process.exit(result.status ?? 1);
+  }
+}
+
+/**
+ * The host links a sibling Gusset checkout and a gitignored staticlib.
+ * `go test` without either fails as a missing replace directory, which reads
+ * like a Go bug. Name the missing checkout, and build the archive when the
+ * checkout is already there.
+ */
+function ensureGussetEngine() {
+  const siblingMod = path.resolve(REPO_ROOT, "..", "gusset", "go.mod");
+  if (!existsSync(siblingMod)) {
+    console.error(
+      `FAIL: Go replace expects a Gusset checkout at ${path.dirname(siblingMod)}. ` +
+        "CI checks out https://github.com/bharathvbcr/gusset in .github/actions/setup-gusset.",
+    );
+    process.exit(2);
+  }
+  run("gusset engine", "cargo", [
+    "build",
+    "--release",
+    "--locked",
+    "--manifest-path",
+    "rust/gusset-engine/Cargo.toml",
+  ]);
+  const archive = path.join(REPO_ROOT, "rust", "gusset-engine", "target", "release", "libgusset.a");
+  if (!existsSync(archive)) {
+    console.error(`FAIL: ${archive} is missing after cargo build`);
+    process.exit(1);
   }
 }
 
@@ -126,6 +155,7 @@ function main() {
   run("npm pack", "npm", ["run", "pack:check"]);
   run("npm runtime smoke", process.execPath, ["scripts/npm-runtime-smoke.mjs"]);
   gofmtClean();
+  ensureGussetEngine();
   run("go host tests", "go", ["test", "./cmd/devcouncil", "-count=1"], {
     cwd: path.join(REPO_ROOT, "backend", "go_orchestrator"),
   });
