@@ -107,7 +107,12 @@ func TestAHungBinaryFailsFastWithinTheCooldown(t *testing.T) {
 		"#!/bin/sh\nprintf '%s\\n' \"$@\" >> "+argvLog+"\nprintf '\\036\\n' >> "+argvLog+"\n"+
 			"case \" $* \" in *\" --help \"*) sleep 60;; esac\necho '{}'\n")
 	c := New(bin, dir)
-	c.probeTimeout = 150 * time.Millisecond
+	// Long enough for /bin/sh to start and write the argv log, short of the
+	// fixture's sleep 60. 150ms lost that race under `go test ./...`: the
+	// probe correctly refused a hung producer, but the shell had not written
+	// the log yet, so the count was 0. The 5s bound below is what proves the
+	// probe did not wait out the sleep.
+	c.probeTimeout = 2 * time.Second
 
 	start := time.Now()
 	err := c.Probe(context.Background())
