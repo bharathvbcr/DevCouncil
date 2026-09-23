@@ -84,9 +84,62 @@ fn run_hook(event: &str, stdin: &[u8], extra: &[&str]) -> HookRun {
 fn empty_and_malformed_stdin_exit_zero() {
     let empty = run_hook("post-tool-use", b"", &[]);
     assert_eq!(empty.code, Some(0), "{}", empty.stderr);
+    assert!(
+        empty.stdout.trim().is_empty(),
+        "empty stdin must emit no permission-shaped stdout: {:?}",
+        empty.stdout
+    );
     let bad = run_hook("post-tool-use", b"{not-json", &[]);
     assert_eq!(bad.code, Some(0), "{}", bad.stderr);
     assert!(bad.stderr.contains("malformed") || bad.stderr.contains("no-op"));
+    assert!(bad.stdout.trim().is_empty(), "{:?}", bad.stdout);
+}
+
+/// Exit 2 blocks the agent. Hostile stdin that never names a repository — and
+/// bytes that are not UTF-8 at all — must stay exit 0 with an empty stdout.
+#[test]
+fn hostile_stdin_without_a_repo_emits_no_permission_decision() {
+    let oversized = {
+        let mut payload = String::from("{\"tool_name\":\"Read\",\"pad\":\"");
+        payload.push_str(&"x".repeat(1024 * 1024 + 64));
+        payload.push_str("\"}");
+        payload.into_bytes()
+    };
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("empty", Vec::new()),
+        ("non-utf8", b"{\"cwd\":\"\xff/nowhere\"}".to_vec()),
+        ("json null", b"null".to_vec()),
+        ("json array", b"[]".to_vec()),
+        ("json string", b"\"not-an-object\"".to_vec()),
+        ("no cwd", br#"{"tool_name":"Read"}"#.to_vec()),
+        (
+            "nonexistent cwd",
+            br#"{"tool_name":"Read","cwd":"/nonexistent/devmap/hostile"}"#.to_vec(),
+        ),
+        ("oversized", oversized),
+    ];
+    for (label, stdin) in cases {
+        for event in ["post-tool-use", "pre-tool-use", "session-start"] {
+            let run = run_hook(event, &stdin, &[]);
+            assert_ne!(
+                run.code,
+                Some(2),
+                "{label}/{event}: exit 2 blocks the tool call; stderr={}",
+                run.stderr
+            );
+            assert_eq!(
+                run.code,
+                Some(0),
+                "{label}/{event}: expected exit 0; stderr={}",
+                run.stderr
+            );
+            assert!(
+                run.stdout.trim().is_empty(),
+                "{label}/{event}: must emit no permission-shaped stdout, got {:?}",
+                run.stdout
+            );
+        }
+    }
 }
 
 #[test]
@@ -1680,4 +1733,167 @@ fn an_unindexed_worktree_is_told_how_to_index_itself_on_session_start_only() {
     );
 
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Thousands of symbols: the first-read hook cuts the list and says so.
+#[test]
+fn pre_tool_use_skeleton_cuts_a_huge_file_and_says_list_cut() {
+    let root = scratch("skeleton-huge");
+    let mut body = String::from("# huge\n");
+    for i in 0..2500 {
+        body.push_str(&format!("def f{i}():\n    return {i}\n"));
+    }
+    std::fs::write(root.join("huge.py"), &body).unwrap();
+    assert!(Command::new(DEVMAP)
+        .args(["--json", "build", "."])
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
+    let payload = json!({
+        "session_id": "skel-huge-1",
+        "cwd": root.to_string_lossy(),
+        "workspace_roots": [root.to_string_lossy()],
+        "tool_name": "Read",
+        "tool_input": {"file_path": root.join("huge.py").to_string_lossy()},
+    });
+    let run = run_hook(
+        "pre-tool-use",
+        serde_json::to_string(&payload).unwrap().as_bytes(),
+        &[],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_ne!(run.code, Some(2));
+    assert!(
+        run.stdout.contains("list cut:") || run.stdout.contains("definition"),
+        "expected a skeleton paste with a cut, got {}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.contains("\"permission\""),
+        "must not emit a permission decision: {}",
+        run.stdout
+    );
+    let second = run_hook(
+        "pre-tool-use",
+        serde_json::to_string(&payload).unwrap().as_bytes(),
+        &[],
+    );
+    assert_eq!(second.code, Some(0), "{}", second.stderr);
+    assert!(
+        second.stdout.trim().is_empty(),
+        "second nav must stay silent: {}",
+        second.stdout
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A notebook path the index does not hold is a distinct envelope.
+#[test]
+fn skeleton_cli_distinguishes_notebook_not_in_index() {
+    let root = scratch("skeleton-nb");
+    seed_queryable(&root);
+    let out = Command::new(DEVMAP)
+        .args(["--json", "skeleton", "analysis.ipynb"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["presence"], "not_in_index", "{value}");
+    assert_eq!(value["shown"], 0);
+    assert_eq!(value["total"], 0);
+    assert_eq!(value["truncated"], false);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn skeleton_cli_empty_file_is_not_not_in_index() {
+    let root = scratch("skeleton-empty");
+    std::fs::write(root.join("empty.py"), "# just a comment\n").unwrap();
+    assert!(Command::new(DEVMAP)
+        .args(["--json", "build", "."])
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
+    let out = Command::new(DEVMAP)
+        .args(["--json", "skeleton", "empty.py"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_ne!(value["presence"], "not_in_index", "{value}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Write-hook blast adversarial cases: never exit 2; name why the list is short.
+#[test]
+fn post_tool_use_blast_names_why_the_list_is_short() {
+    let root = scratch("write-blast");
+    std::fs::write(
+        root.join("mod.py"),
+        "import os\n\ndef alpha():\n    return 1\n\ndef beta():\n    return 2\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("other.py"), "def gamma():\n    return 3\n").unwrap();
+    assert!(Command::new(DEVMAP)
+        .args(["--json", "build", "."])
+        .current_dir(&root)
+        .status()
+        .unwrap()
+        .success());
+
+    let outside = run_hook(
+        "post-tool-use",
+        serde_json::to_string(&json!({
+            "cwd": root.to_string_lossy(),
+            "file_path": root.join("mod.py").to_string_lossy(),
+            "edits": [{"old_string": "import os", "new_string": "import sys"}],
+        }))
+        .unwrap()
+        .as_bytes(),
+        &[],
+    );
+    assert_eq!(outside.code, Some(0), "{}", outside.stderr);
+    assert_ne!(outside.code, Some(2));
+    if !outside.stdout.trim().is_empty() {
+        assert!(
+            outside.stdout.contains("unattributed")
+                || outside.stdout.contains("complete: false")
+                || outside.stdout.contains("pre-edit"),
+            "outside-span edit must name incompleteness: {}",
+            outside.stdout
+        );
+    }
+
+    let two = run_hook(
+        "post-tool-use",
+        serde_json::to_string(&json!({
+            "cwd": root.to_string_lossy(),
+            "tool_input": {
+                "command": format!(
+                    "*** Update File: {}\n*** Update File: {}\n",
+                    root.join("mod.py").display(),
+                    root.join("other.py").display()
+                )
+            },
+        }))
+        .unwrap()
+        .as_bytes(),
+        &[],
+    );
+    assert_eq!(two.code, Some(0), "{}", two.stderr);
+    assert_ne!(two.code, Some(2));
+
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -494,3 +494,93 @@ fn a_stored_confidence_that_contradicts_its_stored_kind_is_counted_not_trusted()
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An unknown stored spelling of `resolution` is not a reconstructed
+/// deterministic edge. `from_label` refuses it, the SQL CASE falls through to
+/// ELSE -1, and `edge_confidence_mismatches` counts the row. Quietly mapping
+/// the unknown label onto SameFile/UniqueGlobal would hide a store written by
+/// a newer binary that knows a tier this one does not.
+#[test]
+fn an_unknown_resolution_label_counts_as_a_confidence_mismatch() {
+    use devmap_store::{edge_resolution, resolution_kind_from_stored, StoredEdge};
+
+    assert!(
+        resolution_kind_from_stored("NotARealKind").is_err(),
+        "from_label must refuse an unknown spelling rather than neighbour it"
+    );
+    assert!(
+        edge_resolution(&StoredEdge {
+            source_file: "a.py".into(),
+            target_file: "b.py".into(),
+            source_symbol: "caller".into(),
+            target_symbol: "helper".into(),
+            edge_kind: "Calls".into(),
+            confidence: 0.9,
+            resolution: Some("NotARealKind".into()),
+        })
+        .is_err(),
+        "an unknown label must not reconstruct as UniqueGlobal/SameFile"
+    );
+
+    let dir = tmp_dir("unknown-resolution-label");
+    let db = dir.join("devmap.sqlite");
+    let store = Store::open(&db).unwrap();
+    let extractions = vec![
+        python("a.py", "def helper():\n    return 1\n"),
+        python(
+            "b.py",
+            "from a import helper\n\n\ndef caller():\n    return helper()\n",
+        ),
+    ];
+    let resolution = ResolutionResult {
+        edges: vec![ResolvedEdge::resolved(
+            "b.py".to_string(),
+            "a.py".to_string(),
+            "caller".to_string(),
+            "helper".to_string(),
+            EdgeKind::Calls,
+            Arc::new(Resolution::ImportScoped {
+                target_symbol: "helper".to_string(),
+                target_file: "a.py".to_string(),
+                imported_from: "a".to_string(),
+            }),
+            None,
+        )],
+        receiver_types: Default::default(),
+        reexport_chains: Default::default(),
+        unresolved: Vec::new(),
+    };
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
+    drop(store);
+
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE edge_rows SET resolution = 'NotARealKind'
+                 WHERE valid_to IS NULL AND edge_kind = 'Calls'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "fixture must hold one Calls edge to relabel");
+    }
+
+    let reread = Store::open(&db).unwrap();
+    assert_eq!(
+        reread.edge_confidence_mismatches().unwrap(),
+        Some(1),
+        "ELSE -1 must count an unknown resolution label as a mismatch, not \
+         as a reconstructed deterministic edge"
+    );
+    // Loading the index must refuse the unknown spelling rather than half-read
+    // it as UniqueGlobal.
+    let load = reread.generation_edges();
+    assert!(
+        load.is_err(),
+        "an unknown resolution label must refuse the generation load, got {load:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

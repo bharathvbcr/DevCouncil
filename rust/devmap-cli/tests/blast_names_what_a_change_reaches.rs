@@ -372,6 +372,25 @@ fn the_human_rendering_names_the_change_and_its_refusals() {
     );
 }
 
+/// Markdown is a presentation of the same report, not a second analysis.
+#[test]
+fn markdown_format_names_modules_tests_signal_and_owners() {
+    let (repo, base) = setup("markdown", CHANGED);
+    let (ok, text, err) = devmap(&repo, &["blast", "--since", &base, "--format", "markdown"]);
+    assert!(ok, "markdown rendering must not fail: {text}{err}");
+    assert!(text.contains("# Blast:"), "markdown title: {text}");
+    assert!(text.contains("## Modules"), "modules section: {text}");
+    assert!(
+        text.contains("tests:"),
+        "per-module test signal is rendered: {text}"
+    );
+    assert!(text.contains("## Owners"), "owners section: {text}");
+    assert!(
+        text.contains("ada@example.com") || text.contains("No owners"),
+        "owners are named or the gap is: {text}"
+    );
+}
+
 // ------------------------------------------------------------- what it refuses
 
 #[test]

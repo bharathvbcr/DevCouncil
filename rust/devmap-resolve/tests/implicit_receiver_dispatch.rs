@@ -254,9 +254,70 @@ fn an_explicit_rebinding_of_self_outranks_the_enclosing_type() {
     );
 }
 
+/// Virtual `self`: `Base.bar` calls `self.helper` while an indexed subtype
+/// overrides `helper`. Binding that call to `Base.helper` at `ReceiverType`
+/// (confidence 1.0) claims a unique runtime target the subtype can steal.
+/// Graf leaves this shape unresolved; DevMap must not store a deterministic
+/// `Calls` edge either — abstain into the unresolved ledger, or emit a
+/// speculative dispatch set. A unique, non-overridden method stays
+/// `ReceiverType` (see the other tests in this file).
+#[test]
+fn an_overridden_self_call_is_not_a_deterministic_receiver_type_edge() {
+    let (_, result) = resolve(&[(
+        "virt.py",
+        "class Base:\n    def helper(self):\n        return 1\n\n    \
+         def bar(self):\n        return self.helper()\n\n\n\
+         class Sub(Base):\n    def helper(self):\n        return 2\n",
+    )]);
+
+    let rows = calls_from(&result, "virt.py::Base.bar");
+    assert!(
+        !rows.iter().any(|(_, symbol, rung)| {
+            rung == "ReceiverType" && symbol == "virt.py::Base.helper"
+        }),
+        "`self.helper()` inside `Base.bar` can run `Sub.helper` when `self` is a \
+         `Sub`; a confidence-1.0 ReceiverType edge to `Base.helper` is a false \
+         unique target. got {rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|(_, _, rung)| rung == "SameFile" || rung == "UniqueGlobal"),
+        "falling through to another deterministic rung after the override \
+         abstention would reintroduce the same false certainty. got {rows:?}"
+    );
+    // Speculative fan-out is allowed; a deterministic single-target edge is not.
+    for (_, _, rung) in &rows {
+        assert!(
+            rung == "AmbiguousGlobal" || rung == "LanguageServerDispatch",
+            "only a speculative dispatch set may emit Calls for an overridden \
+             self call; got rung {rung} in {rows:?}"
+        );
+    }
+    let ledgered = result
+        .unresolved
+        .iter()
+        .any(|row| row.source_symbol == "virt.py::Base.bar" && row.callee_name == "helper");
+    assert!(
+        ledgered || !rows.is_empty(),
+        "an overridden self call must either land in the unresolved ledger or \
+         emit a speculative candidate set; got edges={rows:?}, unresolved={:?}",
+        result
+            .unresolved
+            .iter()
+            .filter(|row| row.source_symbol == "virt.py::Base.bar")
+            .collect::<Vec<_>>()
+    );
+}
+
 /// A class that declares the same method twice — the last one wins in Python,
 /// and the resolver has no business preferring either. The edge must still name
 /// the enclosing class rather than escaping to another file.
+///
+/// Picking `local[0]` and labelling it certain is the one answer this must not
+/// give: two same-file declarations of one method are an ambiguity inside the
+/// type, not a deterministic edge to whichever declaration the index listed
+/// first.
 #[test]
 fn a_class_that_declares_a_method_twice_stays_inside_its_own_type() {
     let (_, result) = resolve(&[
@@ -275,4 +336,28 @@ fn a_class_that_declares_a_method_twice_stays_inside_its_own_type() {
         "a duplicate declaration is an ambiguity inside one class, not a reason \
          to bind the call to an unrelated function in another file. got {rows:?}"
     );
+    for (file, symbol, rung) in &rows {
+        assert_ne!(
+            rung.as_str(),
+            "SameFile",
+            "an ambiguous same-file overload must not pick local[0] as Certain \
+             SameFile: {file}::{symbol} via {rung}"
+        );
+        // ReceiverType with exactly one hit is fine; with two declarations of
+        // `run` on Service the implicit-receiver rung abstains. A Certain
+        // ReceiverType edge here would mean local[0] won.
+        if symbol.ends_with(".run") || symbol.ends_with("::run") {
+            assert_ne!(
+                rung.as_str(),
+                "ReceiverType",
+                "two `run` methods on Service: picking one as ReceiverType is \
+                 local[0] certainty: {file}::{symbol}"
+            );
+            assert_ne!(
+                rung.as_str(),
+                "UniqueGlobal",
+                "an ambiguous overload must not become UniqueGlobal: {file}::{symbol}"
+            );
+        }
+    }
 }

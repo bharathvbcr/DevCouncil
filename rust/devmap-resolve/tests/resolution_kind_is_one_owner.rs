@@ -33,6 +33,12 @@ fn every_variant() -> Vec<Resolution> {
             target_file: file.clone(),
             receiver_type: "Shape".to_string(),
         },
+        Resolution::LanguageServer {
+            target_symbol: symbol.clone(),
+            target_file: file.clone(),
+            server: "rust-analyzer".to_string(),
+            server_version: "0.0.0".to_string(),
+        },
         Resolution::UniqueGlobal {
             target_symbol: symbol.clone(),
             target_file: file.clone(),
@@ -41,6 +47,11 @@ fn every_variant() -> Vec<Resolution> {
         Resolution::AmbiguousGlobal {
             candidates: vec![(file.clone(), symbol.clone())].into(),
             family: LangFamily::Python,
+        },
+        Resolution::LanguageServerDispatch {
+            candidates: vec![(file.clone(), symbol.clone())].into(),
+            server: "rust-analyzer".to_string(),
+            server_version: "0.0.0".to_string(),
         },
         Resolution::Unresolved {
             reason: "no declaration".to_string(),
@@ -95,7 +106,20 @@ fn a_resolution_scores_exactly_what_its_kind_scores() {
     );
     assert_eq!(ResolutionKind::UniqueGlobal.confidence(), Confidence::HIGH);
     assert_eq!(
+        ResolutionKind::LanguageServer.confidence(),
+        Confidence::HIGH
+    );
+    assert!(
+        ResolutionKind::LanguageServer.confidence().to_millis()
+            < ResolutionKind::ReceiverType.confidence().to_millis(),
+        "LanguageServer must sit below ReceiverType so a compiler claim never outranks a parse"
+    );
+    assert_eq!(
         ResolutionKind::AmbiguousGlobal.confidence(),
+        Confidence::SPECULATIVE
+    );
+    assert_eq!(
+        ResolutionKind::LanguageServerDispatch.confidence(),
         Confidence::SPECULATIVE
     );
     assert_eq!(
@@ -129,6 +153,18 @@ fn the_stored_spelling_round_trips_and_an_unknown_one_is_refused() {
     );
     assert_eq!(ResolutionKind::from_label("Structurally"), None);
     assert_eq!(ResolutionKind::from_label(""), None);
+    // Known opt-in compiler tiers round-trip. An unknown spelling still
+    // refuses rather than neighbouring UniqueGlobal — that fail-closed path
+    // is what makes the SQL CASE fall through to ELSE -1.
+    assert_eq!(
+        ResolutionKind::from_label("LanguageServer"),
+        Some(ResolutionKind::LanguageServer)
+    );
+    assert_eq!(
+        ResolutionKind::from_label("LanguageServerDispatch"),
+        Some(ResolutionKind::LanguageServerDispatch)
+    );
+    assert_eq!(ResolutionKind::from_label("NotARealKind"), None);
 }
 
 #[test]

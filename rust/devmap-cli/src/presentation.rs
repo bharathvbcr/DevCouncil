@@ -114,6 +114,8 @@ fn profile(command: &Commands) -> Option<(&'static str, &'static str)> {
         Commands::Claude { .. } => ("Claude integration", "Checking the connections"),
         Commands::Skills { .. } => ("Skills", "Packing your toolkit"),
         Commands::Integrate { .. } => ("Host integration", "Connecting your tools"),
+        Commands::Ask { .. } => ("Ask", "Finding symbols by what they do"),
+        Commands::Skeleton { .. } => ("Skeleton", "Listing signatures without bodies"),
     })
 }
 

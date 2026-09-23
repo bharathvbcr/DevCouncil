@@ -61,7 +61,9 @@ fn entitled_confidence(resolution: &Resolution) -> Confidence {
         // from another. Same evidence, same tier: one declaration of the name,
         // nothing tying it to this file.
         Resolution::UniqueSelector { .. } => Confidence::HIGH,
+        Resolution::LanguageServer { .. } => Confidence::HIGH,
         Resolution::AmbiguousGlobal { .. } => Confidence::SPECULATIVE,
+        Resolution::LanguageServerDispatch { .. } => Confidence::SPECULATIVE,
         Resolution::Unresolved { .. } => Confidence::SPECULATIVE,
     }
 }
@@ -180,9 +182,11 @@ fn every_edge_confidence_matches_the_evidence_it_names() {
             Resolution::SamePackage { .. } => "SamePackage",
             Resolution::ImportScoped { .. } => "ImportScoped",
             Resolution::ReceiverType { .. } => "ReceiverType",
+            Resolution::LanguageServer { .. } => "LanguageServer",
             Resolution::UniqueGlobal { .. } => "UniqueGlobal",
             Resolution::UniqueSelector { .. } => "UniqueSelector",
             Resolution::AmbiguousGlobal { .. } => "AmbiguousGlobal",
+            Resolution::LanguageServerDispatch { .. } => "LanguageServerDispatch",
             Resolution::Unresolved { .. } => "Unresolved",
             Resolution::Structural { .. } => "Structural",
         };

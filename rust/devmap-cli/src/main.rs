@@ -283,6 +283,14 @@ enum ProgressMode {
     Never,
 }
 
+/// How `devmap blast` renders when `--json` is not set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum BlastFormat {
+    #[default]
+    Text,
+    Markdown,
+}
+
 /// One completed span and the spans that ran inside it.
 ///
 /// Recursive, because the breakdown is. A stage contains sub-phases, and a
@@ -702,6 +710,16 @@ enum Commands {
         /// Replace a Python-schema or otherwise foreign repo map / code graph.
         #[arg(long, requires = "manifest", default_value_t = false)]
         force: bool,
+        /// Opt-in language-server edges for sites the syntax resolver left
+        /// unresolved. Off unless passed. Servers on PATH (rust-analyzer,
+        /// gopls, pyright, typescript-language-server) may add
+        /// `LanguageServer` / `LanguageServerDispatch` edges; a missing or
+        /// hung server is reported as did-not-run and never as zero edges
+        /// from a run. Unresolved sites stay in the ledger unless a server
+        /// actually names a target inside the repository — there is no
+        /// bare-name fallback.
+        #[arg(long)]
+        lsp: bool,
         #[command(flatten)]
         stamps: StampFlags,
         #[command(flatten)]
@@ -716,6 +734,21 @@ enum Commands {
         /// than ones that contain it.
         #[arg(long)]
         semantic: bool,
+    },
+    /// Plain-language find over names, docstrings, and the call graph.
+    ///
+    /// Seeds with TF-IDF over symbol names plus docstrings when present, then
+    /// re-ranks with personalized PageRank over stored call edges. Distinct
+    /// from `--semantic` search, which ranks names only.
+    Ask {
+        question: String,
+        #[arg(short, long, default_value_t = 2000)]
+        budget: u32,
+        /// Minimum call-edge confidence. Defaults to the deterministic rung
+        /// (1.0); edges below it are excluded. Lower this to include high or
+        /// speculative edges in the PageRank walk.
+        #[arg(long, default_value_t = devmap_query::ASK_DEFAULT_MIN_CONFIDENCE)]
+        min_confidence: f32,
     },
     Deps {
         file: String,
@@ -818,6 +851,18 @@ enum Commands {
         #[arg(short, long, default_value_t = 2000)]
         budget: u32,
     },
+    /// Definitions in one file as signature plus span — never the body.
+    ///
+    /// When a signature was not extracted the span is still returned and the
+    /// row says so. An empty file and a path the index does not contain are
+    /// different envelopes (`presence`), so "nothing here" is never confused
+    /// with "not examined".
+    Skeleton {
+        /// Repository-relative path, or an absolute path under the indexed root.
+        file: String,
+        #[arg(short, long, default_value_t = 2000)]
+        budget: u32,
+    },
     /// Which commits since `--since` could have caused a symptom.
     ///
     /// Runs the graph first and git second: the symptom names a symbol, the
@@ -886,6 +931,10 @@ enum Commands {
         /// How far to walk inbound call edges from the changed symbols.
         #[arg(long, default_value_t = dc_regress::DEFAULT_BLAST_DEPTH)]
         depth: u32,
+        /// How to render the report. `markdown` is for review notes; analysis
+        /// still runs in `dc-regress`. `--json` wins when both are set.
+        #[arg(long, value_enum, default_value_t = BlastFormat::Text)]
+        format: BlastFormat,
     },
     /// Definitions matching a query, with source, callers, callees and a
     /// layered blast radius — the whole neighbourhood in one invocation.
@@ -2993,6 +3042,10 @@ fn store_status_fields(
         // edge index for one number. `null` with no generation; 0 is a
         // measurement, never a default.
         "edge_confidence_mismatches": store.edge_confidence_mismatches()?,
+        // Same object `devmap build` prints: persisted on the generation, not
+        // recomputed. `null` when absent (no generation, or a summary written
+        // before the field existed) — unexplained is not zero.
+        "resolution_rate": store.latest_resolution_rate()?,
     }) else {
         unreachable!("json! of an object literal is an object")
     };
@@ -3830,12 +3883,13 @@ fn emit_blast(report: &dc_regress::BlastReport) {
         outln!("{} module(s) affected:", report.modules.len());
         for module in report.modules.iter().take(15) {
             outln!(
-                "  d{} {} ({} file(s), {} symbol(s){})",
+                "  d{} {} ({} file(s), {} symbol(s){}, tests: {})",
                 module.nearest_distance,
                 module.path,
                 module.files,
                 module.symbols,
-                if module.changed { ", changed" } else { "" }
+                if module.changed { ", changed" } else { "" },
+                test_signal_label(module.test_signal)
             );
         }
         if report.modules.len() > 15 {
@@ -3852,6 +3906,182 @@ fn emit_blast(report: &dc_regress::BlastReport) {
         if report.tests.len() > 20 {
             outln!("  … {} more", report.tests.len() - 20);
         }
+    }
+
+    if !report.owners.is_empty() {
+        outln!("");
+        outln!("{} owner(s):", report.owners.len());
+        for owner in report.owners.iter().take(15) {
+            outln!("  {} <{}>", owner.name, owner.email);
+        }
+        if report.owners.len() > 15 {
+            outln!("  … {} more", report.owners.len() - 15);
+        }
+    }
+}
+
+/// Markdown rendering of a blast report for review notes.
+///
+/// Analysis stays in `dc-regress`; this is only presentation. Refusals and
+/// unattributed ranges print first for the same reason as [`emit_blast`].
+fn emit_blast_markdown(report: &dc_regress::BlastReport) {
+    outln!("# Blast: {}", report.change);
+    outln!("");
+    outln!(
+        "Complete: **{}**",
+        if report.complete { "yes" } else { "no" }
+    );
+
+    if !report.unavailable.is_empty() {
+        outln!("");
+        outln!("## Could not examine everything");
+        for reason in &report.unavailable {
+            outln!("- {}", reason.describe());
+        }
+    }
+
+    if report.changed_files.is_empty() {
+        outln!("");
+        if report.complete {
+            outln!("Changed no files.");
+        } else {
+            outln!(
+                "What changed could not be determined — see above. This is not a finding \
+                 that nothing changed."
+            );
+        }
+        return;
+    }
+
+    outln!("");
+    outln!("## Change");
+    outln!(
+        "{} file(s) changed, {} symbol(s) touched.",
+        report.changed_files.len(),
+        report.seeds.len()
+    );
+    for seed in report.seeds.iter().take(20) {
+        outln!(
+            "- `{}` ({}–{}, {} line(s){})",
+            seed.qualified_name,
+            seed.start_line,
+            seed.end_line,
+            seed.changed_lines,
+            if seed.deletion_only {
+                ", deletions only"
+            } else {
+                ""
+            }
+        );
+    }
+    if report.seeds.len() > 20 {
+        outln!("- … {} more", report.seeds.len() - 20);
+    }
+
+    if !report.unattributed.is_empty() {
+        outln!("");
+        outln!("## Unattributed");
+        outln!(
+            "{} range(s) landed in no symbol — the impact below cannot account for them:",
+            report.unattributed.len()
+        );
+        for entry in report.unattributed.iter().take(20) {
+            if entry.start_line == 0 {
+                outln!("- `{}`: {}", entry.path, entry.reason.describe());
+            } else {
+                outln!(
+                    "- `{}:{}-{}`: {}",
+                    entry.path,
+                    entry.start_line,
+                    entry.end_line,
+                    entry.reason.describe()
+                );
+            }
+        }
+        if report.unattributed.len() > 20 {
+            outln!("- … {} more", report.unattributed.len() - 20);
+        }
+    }
+
+    outln!("");
+    outln!("## Impacted");
+    if report.impacted.is_empty() {
+        if report.complete {
+            outln!("Nothing outside the changed symbols depends on them.");
+        } else {
+            outln!(
+                "No dependents found — but the analysis was incomplete, so this is not \
+                 evidence that none exist."
+            );
+        }
+    } else {
+        for symbol in report.impacted.iter().take(30) {
+            outln!("- d{} `{}`", symbol.distance, symbol.qualified_name);
+        }
+        if report.impacted.len() > 30 {
+            outln!("- … {} more", report.impacted.len() - 30);
+        }
+    }
+
+    if !report.modules.is_empty() {
+        outln!("");
+        outln!("## Modules");
+        for module in report.modules.iter().take(30) {
+            outln!(
+                "- d{} `{}` ({} file(s), {} symbol(s){}, tests: {})",
+                module.nearest_distance,
+                module.path,
+                module.files,
+                module.symbols,
+                if module.changed { ", changed" } else { "" },
+                test_signal_label(module.test_signal)
+            );
+        }
+        if report.modules.len() > 30 {
+            outln!("- … {} more", report.modules.len() - 30);
+        }
+    }
+
+    if !report.tests.is_empty() {
+        outln!("");
+        outln!("## Tests");
+        for test in report.tests.iter().take(30) {
+            outln!("- d{} `{}`", test.distance, test.path);
+        }
+        if report.tests.len() > 30 {
+            outln!("- … {} more", report.tests.len() - 30);
+        }
+    }
+
+    outln!("");
+    outln!("## Owners");
+    if report.owners.is_empty() {
+        if report
+            .unavailable
+            .iter()
+            .any(|u| matches!(u, dc_regress::Unavailable::OwnersUnavailable { .. }))
+        {
+            outln!("Owners could not be read — see the refusals above.");
+        } else {
+            outln!("No owners recorded for the changed paths.");
+        }
+    } else {
+        for owner in report.owners.iter().take(30) {
+            outln!("- {} `<{}>`", owner.name, owner.email);
+        }
+        if report.owners.len() > 30 {
+            outln!("- … {} more", report.owners.len() - 30);
+        }
+    }
+}
+
+fn test_signal_label(signal: dc_regress::TestSignal) -> &'static str {
+    match signal {
+        dc_regress::TestSignal::Changed => "changed",
+        dc_regress::TestSignal::Stale => "stale",
+        dc_regress::TestSignal::None => "none",
+        dc_regress::TestSignal::Na => "n/a",
+        dc_regress::TestSignal::Unavailable => "unavailable",
     }
 }
 
@@ -3886,6 +4116,55 @@ fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
         outln!("\nwalk incomplete: {reason}");
     }
     emit_dead_clusters(resp);
+}
+
+/// File signatures without bodies.
+fn emit_skeleton(report: &devmap_query::SkeletonReport) {
+    use devmap_query::SkeletonPresence;
+    if let ResolutionAvailability::Unavailable { reason } = &report.resolution {
+        emit_unavailable(reason);
+        return;
+    }
+    match report.presence {
+        SkeletonPresence::NotInIndex => {
+            outln!("{}: not in the index", report.file);
+            return;
+        }
+        SkeletonPresence::Empty => {
+            outln!("{}: indexed, no definitions", report.file);
+            return;
+        }
+        SkeletonPresence::Indexed => {
+            outln!("{}: {} definition(s)", report.file, report.total);
+        }
+    }
+    for item in &report.items {
+        let sig = item
+            .signature
+            .as_deref()
+            .or(item.signature_note.as_deref())
+            .unwrap_or("not extracted");
+        // Collapse newlines in the signature so a multi-line declaration does
+        // not break the one-row-per-symbol layout the budget counts against.
+        let sig_one_line: String = sig
+            .chars()
+            .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
+            .collect();
+        outln!(
+            "  L{}-{}  {}  ({})  {}",
+            item.start_line,
+            item.end_line,
+            item.qualified_name,
+            item.kind,
+            sig_one_line
+        );
+    }
+    emit_truncation(
+        report.shown,
+        report.total.saturating_sub(report.shown),
+        report.total,
+        report.truncated,
+    );
 }
 
 fn emit_dead_row(row: &devmap_analyze::DeadSymbolReport) {
@@ -4447,7 +4726,16 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
         Commands::Search { budget, .. }
         | Commands::Snapshots { budget, .. }
         | Commands::Savings { budget, .. } => check_budget(*budget),
+        Commands::Ask {
+            budget,
+            min_confidence,
+            ..
+        } => {
+            check_budget(*budget)?;
+            check_confidence(*min_confidence)
+        }
         Commands::Dead { budget } => check_budget(*budget),
+        Commands::Skeleton { budget, .. } => check_budget(*budget),
         Commands::Suspects { since, depth, .. } => {
             // A blank revision would make the window `..HEAD`, which git reads
             // as every commit ever — the opposite of the bounded question this
@@ -4461,7 +4749,12 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
             }
             check_depth(*depth as usize)
         }
-        Commands::Blast { since, at, depth } => {
+        Commands::Blast {
+            since,
+            at,
+            depth,
+            format: _,
+        } => {
             match (since.as_deref(), at.as_deref()) {
                 (None, None) => {
                     return Err(
@@ -4858,6 +5151,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             graph_output,
             guides,
             force,
+            lsp,
             stamps,
             inventory,
         } => {
@@ -5255,6 +5549,10 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             // otherwise have added, and it is not hypothetical: measured A/B on
             // scholarlm (4,278 files), holding it cost 23 MiB of peak RSS.
             //
+            // `--lsp` is the exception: converting an unresolved call span into
+            // an LSP position needs the source bytes, so they are held through
+            // the opt-in pass and dropped immediately after.
+            //
             // The *report* has to outlive it — `discovery_refusals` below turns
             // it into the analysis disclosure — so this destructures rather
             // than dropping the pair, and only the source text goes.
@@ -5262,7 +5560,12 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 sources,
                 report: discovery,
             } = scanned;
-            drop(sources);
+            let lsp_sources = if *lsp {
+                Some(sources)
+            } else {
+                drop(sources);
+                None
+            };
 
             // B3/SC2: `affected` narrows what this generation *writes*. It no
             // longer narrows what is *resolved*.
@@ -5320,7 +5623,31 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 2,
                 format_args!("resolving {}", progress::count(extractions.len(), "file")),
             );
-            let resolution = resolver.resolve_all(&extractions)?;
+            let mut resolution = resolver.resolve_all(&extractions)?;
+            let mut lsp_report = None;
+            if *lsp {
+                progress.display.detail("language-server pass (opt-in)");
+                let cancel = std::sync::atomic::AtomicBool::new(false);
+                let sources_vec = lsp_sources.expect("--lsp retained the scanned sources");
+                let sources: std::collections::BTreeMap<String, String> =
+                    sources_vec.into_iter().collect();
+                let report = progress.timed("resolve:lsp", || {
+                    Ok::<_, anyhow::Error>(
+                        devmap_resolve::lsp::enrich_with_language_servers_with_sources(
+                            path,
+                            &extractions,
+                            &sources,
+                            &mut resolution,
+                            &cancel,
+                        ),
+                    )
+                })?;
+                for line in report.status_lines() {
+                    progress.display.diagnostic(format_args!("{line}"));
+                }
+                lsp_report = Some(report);
+                drop(sources);
+            }
             progress.stage(
                 3,
                 format_args!(
@@ -5550,7 +5877,27 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         // build reads it from the result rather than scraping
                         // the human progress lines off stderr.
                         "timings": progress.timings_json(),
-                                "progress_output": progress.display.output_json(),
+                        "progress_output": progress.display.output_json(),
+                        // `null` when `--lsp` was not asked for: a caller must
+                        // tell "not requested" from "ran and added zero edges".
+                        "lsp": lsp_report.as_ref().map(|report| {
+                            serde_json::json!({
+                                "edges_added": report.edges_added,
+                                "sites_resolved": report.sites_resolved,
+                                "sites_left_unresolved": report.sites_left_unresolved,
+                                "servers": report.servers.iter().map(|server| {
+                                    serde_json::json!({
+                                        "binary": server.binary,
+                                        "version": server.version,
+                                        "ran": server.ran,
+                                        "did_not_run": server.did_not_run.as_ref().map(|reason| reason.label()),
+                                        "files_considered": server.files_considered,
+                                        "files_finished": server.files_finished,
+                                        "edges_added": server.edges_added,
+                                    })
+                                }).collect::<Vec<_>>(),
+                            })
+                        }),
                         "manifest": manifest.as_ref().map(|manifest| &manifest.json),
                     }),
                 )?;
@@ -5623,6 +5970,20 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     max_depth: 1,
                 })?
             };
+            if cli.json {
+                emit_json(cli, &serde_json::to_value(&resp)?)?;
+            } else {
+                emit_search(&resp);
+            }
+        }
+        Commands::Ask {
+            question,
+            budget,
+            min_confidence,
+        } => {
+            let store = open_for_read(cli)?;
+            let engine = StoreQueryEngine::new(&store);
+            let resp = engine.ask(question, *budget, *min_confidence)?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&resp)?)?;
             } else {
@@ -5775,6 +6136,15 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 emit_dead(&payload);
             }
         }
+        Commands::Skeleton { file, budget } => {
+            let store = open_for_read(cli)?;
+            let payload = StoreQueryEngine::new(&store).skeleton(file, *budget)?;
+            if cli.json {
+                emit_json(cli, &serde_json::to_value(&payload)?)?;
+            } else {
+                emit_skeleton(&payload);
+            }
+        }
         Commands::Suspects {
             symptom,
             since,
@@ -5803,7 +6173,12 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 emit_suspects(&report);
             }
         }
-        Commands::Blast { since, at, depth } => {
+        Commands::Blast {
+            since,
+            at,
+            depth,
+            format,
+        } => {
             let store = open_for_read(cli)?;
             let root = std::path::absolute(cli.root_hint())
                 .unwrap_or_else(|_| cli.root_hint().to_path_buf());
@@ -5840,6 +6215,8 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             };
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&report)?)?;
+            } else if *format == BlastFormat::Markdown {
+                emit_blast_markdown(&report);
             } else {
                 emit_blast(&report);
             }
@@ -6478,6 +6855,8 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     "coverage_gaps": serde_json::Value::Null,
                     "edge_resolution_source": serde_json::Value::Null,
                     "edge_confidence_mismatches": serde_json::Value::Null,
+                    // Nothing was measured — same rule as coverage_gaps.
+                    "resolution_rate": serde_json::Value::Null,
                     "schema_outdated": false,
                     "schema_version": serde_json::Value::Null,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
@@ -6541,6 +6920,8 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     "coverage_gaps": serde_json::Value::Null,
                     "edge_resolution_source": serde_json::Value::Null,
                     "edge_confidence_mismatches": serde_json::Value::Null,
+                    // Store refused — nothing measured, not a zero rate.
+                    "resolution_rate": serde_json::Value::Null,
                     "schema_outdated": true,
                     "schema_version": version,
                     "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,

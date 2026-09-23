@@ -69,8 +69,8 @@ pub mod suspects;
 
 pub use blame::{BlameLine, BlameRefusal, FileBlame};
 pub use blast::{
-    blast, AffectedTestFile, BlastReport, ImpactedFile, ImpactedModule, ImpactedSymbol, SeedSymbol,
-    UnattributedChange, UnattributedReason, DEFAULT_BLAST_DEPTH,
+    blast, AffectedTestFile, BlastReport, ImpactedFile, ImpactedModule, ImpactedSymbol, Owner,
+    SeedSymbol, TestSignal, UnattributedChange, UnattributedReason, DEFAULT_BLAST_DEPTH,
 };
 pub use change::{ChangeRefusal, ChangeSet, ChangeStatus, ChangedRange, FileChange};
 pub use join::{attribute, Attribution, SymbolBlame};
@@ -204,6 +204,11 @@ pub enum Unavailable {
     ImpactIncomplete { depth: u32, reached: usize },
     /// The affected-test walk was trimmed, so the test list is a lower bound.
     AffectedTestsIncomplete { found: usize },
+    /// Recent owners of the changed paths could not be read — git missing,
+    /// not a repository, a deadline, a commit cap, or an empty author. The
+    /// owners list is then a lower bound (possibly empty), never evidence that
+    /// nobody owns the change.
+    OwnersUnavailable { reason: String },
 }
 
 impl Unavailable {
@@ -271,6 +276,9 @@ impl Unavailable {
                 "the affected-test walk was trimmed at {found} test file(s); the test list is \
                  a lower bound"
             ),
+            Unavailable::OwnersUnavailable { reason } => {
+                format!("owners of the changed paths could not be fully read: {reason}")
+            }
         }
     }
 }

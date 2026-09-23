@@ -75,7 +75,7 @@ fn every_declared_tool_maps_to_a_command() {
     let specs = tool_specs();
     assert_eq!(
         specs.len(),
-        13,
+        15,
         "the tool surface changed; update this count"
     );
     for spec in &specs {
@@ -86,6 +86,8 @@ fn every_declared_tool_maps_to_a_command() {
         let arguments = match name {
             "devmap_status" | "devmap_dead_symbols" | "devmap_clones" => json!({}),
             "devmap_search" => json!({"query": "helper"}),
+            "devmap_ask" => json!({"query": "cache freshness"}),
+            "devmap_skeleton" => json!({"file": "core.py"}),
             "devmap_dependencies" | "devmap_impact" => json!({"target": "core.py"}),
             "devmap_trace" => json!({"from": "helper"}),
             "devmap_neighbors" => json!({"targets": ["helper"]}),
@@ -430,6 +432,18 @@ async fn a_successful_call_carries_both_structured_and_text_content() {
     assert_eq!(
         &reparsed, structured,
         "the two encodings must carry the same answer"
+    );
+    // Build-time resolution_rate rides on status so agents can read coverage
+    // without re-running build. Absence would be null; a corpus with a
+    // generation must carry by_language.
+    let rate = &structured["resolution_rate"];
+    assert!(
+        rate.is_object(),
+        "MCP status must carry the persisted resolution_rate: {structured}"
+    );
+    assert!(
+        rate["by_language"]["python"].is_object(),
+        "by_language must name the fixture language: {structured}"
     );
 }
 

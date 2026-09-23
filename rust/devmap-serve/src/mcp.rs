@@ -829,11 +829,13 @@ one of the codes it defines"
 const TOOLS: &[(&str, &str)] = &[
     ("devmap_status", "status"),
     ("devmap_search", "search"),
+    ("devmap_ask", "ask"),
     ("devmap_dependencies", "deps"),
     ("devmap_impact", "impact"),
     ("devmap_trace", "trace"),
     ("devmap_neighbors", "neighbors"),
     ("devmap_dead_symbols", "dead"),
+    ("devmap_skeleton", "skeleton"),
     ("devmap_clones", "clones"),
     ("devmap_preview", "preview"),
     ("devmap_explore", "explore"),
@@ -946,9 +948,10 @@ fn describe(cmd: &str) -> (&'static str, Value) {
     let (description, schema) = match cmd {
         "status" => (
             "Index health for this repository: generation id, node and edge counts, how \
-many files are pending, and any degraded reason. Call this first when another tool returns an \
-empty or surprising answer — a zero node_count means the index is not built, which is a \
-different fact from 'the symbol does not exist'.",
+many files are pending, any degraded reason, and the build-time resolution_rate (per-language \
+attribution coverage). Call this first when another tool returns an empty or surprising answer — \
+a zero node_count means the index is not built, which is a different fact from 'the symbol does \
+not exist'. When resolution_rate is null the rate was not recorded; that is not a rate of zero.",
             json!({"type": "object", "properties": {}, "additionalProperties": false}),
         ),
         "search" => (
@@ -962,6 +965,26 @@ file and line, budgeted to a token cap.",
                     "budget": budget_prop(2000),
                     "semantic": {"type": "boolean", "default": false,
                         "description": "Rank by name similarity instead of FTS prefix matching."}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        ),
+        "ask" => (
+            "Plain-language find over the call graph. Seeds with TF-IDF over symbol names \
+plus docstrings when present, then re-ranks with personalized PageRank over stored call edges. \
+Use this for a question about behaviour; use `devmap_search` (optionally with `semantic`) for \
+a name. A query that shares no terms with any name or docstring returns nothing — not the whole \
+corpus at zero. Default `min_confidence` is the deterministic rung; lower it to include weaker \
+edges. When every edge among the seeds sits below the floor, the answer is empty with a line that \
+says the matches were withheld for confidence rather than absent.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "maxLength": 4096,
+                        "description": "A plain-language question or description of behaviour."},
+                    "budget": budget_prop(2000),
+                    "min_confidence": confidence_prop_defaulting(devmap_query::ASK_DEFAULT_MIN_CONFIDENCE)
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -1057,6 +1080,22 @@ corpus caps findings below the confident tier. Always pass `repo_path`.",
             json!({
                 "type": "object",
                 "properties": {"budget": budget_prop(2000)},
+                "additionalProperties": false
+            }),
+        ),
+        "skeleton" => (
+            "Definitions in one file as signature plus span — never the body. When a \
+signature was not extracted the span is still returned and the row says so. An empty file \
+and a path the index does not contain are different envelopes (`presence`: `indexed`, \
+`empty`, `not_in_index`). Always pass `repo_path`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "maxLength": 4096,
+                        "description": "Repository-relative path, or an absolute path under the indexed root."},
+                    "budget": budget_prop(2000)
+                },
+                "required": ["file"],
                 "additionalProperties": false
             }),
         ),
@@ -1325,6 +1364,10 @@ fn describe_output(cmd: &str) -> Value {
         each a capped listing with its own `total`, `shown` and `truncated`. A file named here \
         is absent from the graph or contributes no call edges, so an empty answer about it \
         means 'not examined'."},
+                "resolution_rate": {"type": ["object", "null"],
+                    "description": "The same per-language attribution rate `devmap build` \
+        prints, persisted on the generation. Includes `by_language`. Null when no generation \
+        exists or the summary predates the field — unexplained is not zero."},
                 "candidate_roots": {"type": "array",
                     "description": "MCP roots that currently hold a DevMap store. Present so a \
         shared process can name every repository it could have answered from."},
@@ -1337,6 +1380,10 @@ fn describe_output(cmd: &str) -> Value {
             "additionalProperties": true
         }),
         "search" => budgeted_envelope("Ranked symbol hits: name, file, kind, span and source."),
+        "ask" => budgeted_envelope(
+            "Symbols matching a plain-language question, seeded by name/docstring TF-IDF and \
+re-ranked by personalized PageRank over call edges. Read `truncated` and `walk_incomplete`.",
+        ),
         "deps" => budgeted_envelope("Outbound edges from the target."),
         "impact" => budgeted_envelope("Symbols that reach the target, walked in reverse."),
         "trace" => budgeted_envelope("Call paths from the origin, or between the two endpoints."),
@@ -1345,6 +1392,21 @@ fn describe_output(cmd: &str) -> Value {
 (`only_ambiguous_callers`, unresolved namesake, coverage-capped). Read `walk_incomplete` — \
 a partial corpus is a lower bound, not a clean bill. Candidate list to verify, not a delete list.",
         ),
+        "skeleton" => json!({
+            "type": "object",
+            "properties": {
+                "file": {"type": "string"},
+                "presence": {"type": "string",
+                    "description": "`indexed`, `empty`, or `not_in_index` — empty and not-in-index are different facts."},
+                "items": {"type": "array",
+                    "description": "Signature plus span per definition; `signature_note` is set when the signature was not extracted."},
+                "shown": {"type": "integer"},
+                "total": {"type": "integer"},
+                "truncated": {"type": "boolean"}
+            },
+            "required": ["file", "presence", "items", "shown", "total", "truncated"],
+            "additionalProperties": true
+        }),
         "neighbors" => json!({
             "type": "object",
             "properties": {

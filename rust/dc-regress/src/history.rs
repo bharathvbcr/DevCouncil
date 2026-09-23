@@ -105,9 +105,9 @@ pub struct ResolvedBlob {
     pub identity: BlobIdentity,
 }
 
-fn bounds(stdout_cap: usize) -> Bounds {
+fn bounds_with_deadline(stdout_cap: usize, deadline: Duration) -> Bounds {
     Bounds {
-        deadline: HISTORY_DEADLINE,
+        deadline,
         stdout_cap,
         stderr_cap: 8 * 1024,
     }
@@ -128,9 +128,23 @@ pub(crate) fn run_git(
     what: &str,
     stdout_cap: usize,
 ) -> Result<dc_proc::Captured, HistoryRefusal> {
+    run_git_with_deadline(program, repo, args, what, stdout_cap, HISTORY_DEADLINE)
+}
+
+/// [`run_git`] with an explicit wall-clock budget, so a caller walking several
+/// paths can spend the remainder of a shared deadline on each next path rather
+/// than resetting the clock.
+pub(crate) fn run_git_with_deadline(
+    program: &std::ffi::OsStr,
+    repo: &Path,
+    args: &[&str],
+    what: &str,
+    stdout_cap: usize,
+    deadline: Duration,
+) -> Result<dc_proc::Captured, HistoryRefusal> {
     let mut command = git_with_program(program, repo);
     command.args(args);
-    let captured = match run_bounded(&mut command, bounds(stdout_cap)) {
+    let captured = match run_bounded(&mut command, bounds_with_deadline(stdout_cap, deadline)) {
         Ok(captured) => captured,
         Err(Failure::Deadline { .. }) => {
             return Err(HistoryRefusal::Deadline {

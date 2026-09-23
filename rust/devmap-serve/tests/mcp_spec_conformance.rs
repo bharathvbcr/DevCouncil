@@ -554,11 +554,13 @@ async fn every_tool_result_conforms_to_the_output_schema_it_declared() {
     let arguments: &[(&str, Value)] = &[
         ("devmap_status", json!({})),
         ("devmap_search", json!({"query": "helper"})),
+        ("devmap_ask", json!({"query": "helper"})),
         ("devmap_dependencies", json!({"target": "run"})),
         ("devmap_impact", json!({"target": "helper"})),
         ("devmap_trace", json!({"from": "run"})),
         ("devmap_neighbors", json!({"targets": ["helper"]})),
         ("devmap_dead_symbols", json!({})),
+        ("devmap_skeleton", json!({"file": "core.py"})),
         ("devmap_clones", json!({})),
         (
             "devmap_preview",

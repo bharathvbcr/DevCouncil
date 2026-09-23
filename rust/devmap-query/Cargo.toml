@@ -220,3 +220,16 @@ required-features = ["parse"]
 [[test]]
 name = "search_hostile_queries"
 required-features = ["parse"]
+
+[[test]]
+name = "skeleton_envelopes"
+required-features = ["parse"]
+
+[[test]]
+name = "ask_ranking"
+required-features = ["parse"]
+
+[[test]]
+name = "ambiguous_impact_seeds"
+required-features = ["parse"]
+

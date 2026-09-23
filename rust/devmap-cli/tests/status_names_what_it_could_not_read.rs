@@ -206,6 +206,23 @@ fn a_corpus_with_nothing_to_report_reports_nothing_rather_than_saying_nothing() 
          layout: {status}"
     );
 
+    // Same object `devmap build` prints — persisted, with per-language rows.
+    // Absence would be `null` (not measured); a built generation must carry
+    // `by_language`, not invent a zero rate for an unexplained corpus.
+    let rate = &status["resolution_rate"];
+    assert!(
+        rate.is_object(),
+        "a generation that ran analyze must persist resolution_rate: {status}"
+    );
+    assert!(
+        rate["by_language"].is_object(),
+        "status must carry the build-time by_language breakdown: {status}"
+    );
+    assert!(
+        rate["by_language"]["python"].is_object(),
+        "python is in the fixture and must have a language row: {status}"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 

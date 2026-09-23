@@ -52,6 +52,20 @@ const CHILD_OUTPUT_CAP: usize = 64 * 1024;
 /// all — see [`claim_once`] — so this budget is paid once, not per call.
 pub const PRE_TOOL_USE_BUDGET: Duration = Duration::from_millis(1500);
 
+/// Wall clock the write hook may spend rendering a pre-edit blast after the
+/// detach is scheduled. The detach itself stays inside [`DETACH_BUDGET`]; this
+/// is the leftover for opening the on-disk generation and walking it. A miss
+/// emits that fact and still exits 0.
+pub const POST_TOOL_BLAST_BUDGET: Duration = Duration::from_millis(400);
+
+/// How many characters of blast text the write hook may paste into context.
+const POST_TOOL_BLAST_CONTEXT_CAP: usize = 1200;
+
+/// How many skeleton rows the first-read hook will paste before saying the
+/// list was cut. Independent of the query budget — the hook has a tighter
+/// context cap than a CLI answer.
+const PRE_TOOL_SKELETON_ROWS: usize = 40;
+
 /// How many per-session markers one repository keeps before the oldest are
 /// dropped.
 ///
@@ -359,11 +373,27 @@ fn run_hook_inner(
             })
         }
         HookEvent::PostToolUse => {
+            let started = Instant::now();
             let budget_note =
                 detach_roots(executable, &selection.roots, DETACH_BUDGET, detach_build)?;
+            // After the detach is scheduled: short blast from the generation
+            // already on disk. Never waits for the rebuild. Budget miss says
+            // so and still exits 0.
+            let leftover = POST_TOOL_BLAST_BUDGET.saturating_sub(started.elapsed());
+            let blast = selection
+                .roots
+                .first()
+                .and_then(|root| compose_write_blast(root, &payload, leftover));
             Ok(HookOutcome {
                 exit_code: 0,
-                stdout: None,
+                stdout: blast.map(|context| {
+                    json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PostToolUse",
+                            "additionalContext": context,
+                        }
+                    })
+                }),
                 stderr_line: join_notes(capped_note, budget_note),
                 roots: selection.roots,
             })
@@ -931,6 +961,10 @@ fn session_start_sync(executable: &Path, selection: &RootSelection) -> anyhow::R
 /// agent more attention than it returns.
 const PRE_TOOL_CONTEXT_CAP: usize = 400;
 
+/// Larger paste budget when the first-read hook carries a file's signature list
+/// instead of the short tool-name directive.
+const PRE_TOOL_SKELETON_CONTEXT_CAP: usize = 3500;
+
 /// Restate the directive at the moment the agent is about to bypass the index.
 ///
 /// SessionStart already carries [`DEVMAP_DIRECTIVE`], and the comment there
@@ -973,7 +1007,17 @@ fn pre_tool_use_sync(
     else {
         return Ok(None);
     };
-    let Some(context) = compose_pre_tool_use(&status_text, root) else {
+    // When the payload names a file and the index is query-ready, replace the
+    // tool-name directive with that file's signature list. Silence still wins
+    // for empty / degraded / not query-ready indexes.
+    let skeleton = file_path_from_payload(payload).and_then(|path| {
+        let leftover = PRE_TOOL_USE_BUDGET.saturating_sub(started.elapsed());
+        if leftover.is_zero() {
+            return None;
+        }
+        render_skeleton_context(root, &path, leftover)
+    });
+    let Some(context) = compose_pre_tool_use(&status_text, root, skeleton.as_deref()) else {
         return Ok(None);
     };
     Ok(Some(json!({
@@ -984,7 +1028,8 @@ fn pre_tool_use_sync(
     })))
 }
 
-/// The directive, or nothing when the index cannot back it.
+/// The directive — or a file's signature list — or nothing when the index
+/// cannot back it.
 ///
 /// Silence is the correct output for an unbuilt, empty or degraded index.
 /// Pointing an agent at `devmap_search` when the store cannot answer earns one
@@ -993,7 +1038,11 @@ fn pre_tool_use_sync(
 /// schema answers `available: false`, and the sessions that read it stopped
 /// asking. A hook that oversells the index does more damage than one that
 /// stays quiet.
-fn compose_pre_tool_use(status_text: &str, root: &Path) -> Option<String> {
+///
+/// `skeleton` replaces the tool-name directive when the payload named a file
+/// and the index answered. Truncation of that list ends with an explicit
+/// "list cut" line rather than a silently shorter paste.
+fn compose_pre_tool_use(status_text: &str, root: &Path, skeleton: Option<&str>) -> Option<String> {
     let status: Value = serde_json::from_str(status_text).ok()?;
     if !status
         .get("query_ready")
@@ -1038,13 +1087,375 @@ fn compose_pre_tool_use(status_text: &str, root: &Path) -> Option<String> {
     } else {
         "behind the working tree, so its answers are a lower bound"
     };
-    Some(truncate(
-        &format!(
-            "DevMap has {name} indexed: {nodes} symbols, {edges} edges, \
-             generation {generation}, {freshness}. {DEVMAP_DIRECTIVE}"
-        ),
-        PRE_TOOL_CONTEXT_CAP,
-    ))
+    let header = format!(
+        "DevMap has {name} indexed: {nodes} symbols, {edges} edges, \
+         generation {generation}, {freshness}."
+    );
+    let body = match skeleton {
+        Some(text) if !text.is_empty() => text.to_string(),
+        _ => DEVMAP_DIRECTIVE.to_string(),
+    };
+    let cap = if skeleton.is_some() {
+        PRE_TOOL_SKELETON_CONTEXT_CAP
+    } else {
+        PRE_TOOL_CONTEXT_CAP
+    };
+    Some(truncate(&format!("{header} {body}"), cap))
+}
+
+/// Open the on-disk store and render one file's signature list for the hook.
+///
+/// Returns `None` when the store cannot be opened or the budget is already
+/// spent — the caller then falls back to the tool-name directive. Truncation
+/// always ends with an explicit "list cut" line.
+fn render_skeleton_context(root: &Path, absolute: &Path, budget: Duration) -> Option<String> {
+    let started = Instant::now();
+    if budget.is_zero() {
+        return None;
+    }
+    let db = store_db_path(root)?;
+    let store = devmap_store::Store::open_read_only(&db).ok()?;
+    if started.elapsed() >= budget {
+        return None;
+    }
+    let relative = repo_relative_path(root, absolute)?;
+    let report = devmap_query::StoreQueryEngine::new(&store)
+        .skeleton(&relative, 4000)
+        .ok()?;
+    if started.elapsed() >= budget {
+        return None;
+    }
+    Some(format_skeleton_for_hook(&report))
+}
+
+fn format_skeleton_for_hook(report: &devmap_query::SkeletonReport) -> String {
+    use devmap_query::SkeletonPresence;
+    match report.presence {
+        SkeletonPresence::NotInIndex => {
+            return format!("{}: not in the DevMap index", report.file);
+        }
+        SkeletonPresence::Empty => {
+            return format!("{}: indexed, no definitions", report.file);
+        }
+        SkeletonPresence::Indexed => {}
+    }
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{} — {} definition(s) (signatures, no bodies):",
+        report.file, report.total
+    ));
+    let take = PRE_TOOL_SKELETON_ROWS.min(report.items.len());
+    for item in report.items.iter().take(take) {
+        let sig = item
+            .signature
+            .as_deref()
+            .or(item.signature_note.as_deref())
+            .unwrap_or("not extracted");
+        let sig_one: String = sig
+            .chars()
+            .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
+            .collect();
+        lines.push(format!(
+            "  L{}-{} {} ({}) {}",
+            item.start_line, item.end_line, item.qualified_name, item.kind, sig_one
+        ));
+    }
+    if report.truncated
+        || report.items.len() > PRE_TOOL_SKELETON_ROWS
+        || take < report.total as usize
+    {
+        lines.push(format!(
+            "list cut: showed {take} of {} definition(s)",
+            report.total
+        ));
+    }
+    lines.join("\n")
+}
+
+/// Short blast of the symbols whose current spans contain the edited range,
+/// from the generation already on disk. Labels the answer as pre-edit/stale
+/// when the index is not fresh. Budget miss names that fact.
+fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option<String> {
+    let started = Instant::now();
+    if budget.is_zero() {
+        return Some(
+            "DevMap blast skipped: the leftover budget was already spent before the report could be built."
+                .into(),
+        );
+    }
+    let locations = edited_locations(root, payload);
+    if locations.is_empty() {
+        return Some(
+            "DevMap blast: no edited file/range in the payload, so nothing to walk from.".into(),
+        );
+    }
+    let db = store_db_path(root)?;
+    let store = match devmap_store::Store::open_read_only(&db) {
+        Ok(store) => store,
+        Err(_) => {
+            return Some(
+                "DevMap blast: the on-disk index could not be opened; list is empty because the store was unavailable."
+                    .into(),
+            );
+        }
+    };
+    if started.elapsed() >= budget {
+        return Some("DevMap blast skipped: opening the store spent the leftover budget.".into());
+    }
+    let graph = match dc_regress_store::StoreGraph::new(&store, root) {
+        Ok(graph) => graph,
+        Err(err) => {
+            return Some(format!(
+                "DevMap blast: graph unavailable ({err}); list is empty because the walk could not start."
+            ));
+        }
+    };
+    let until = match graph.indexed_head() {
+        Some(head) => head.to_string(),
+        None => {
+            return Some(
+                "DevMap blast: the store recorded no head commit, so spans have no known post-image."
+                    .into(),
+            );
+        }
+    };
+    if started.elapsed() >= budget {
+        return Some("DevMap blast skipped: the leftover budget was spent before the walk.".into());
+    }
+
+    // Always label as pre-edit: PostToolUse detaches a rebuild and never waits
+    // for it, so the generation on disk is definitionally the pre-edit index.
+    // When source freshness already said the tree is behind, say that too.
+    let freshness = store.query_source_freshness();
+    let label = match freshness.fresh {
+        Some(false) => {
+            "pre-edit / stale index (not fresh; rebuild detached — answers are a lower bound)"
+        }
+        _ => "pre-edit index (rebuild detached; answers are a lower bound until it lands)",
+    };
+
+    // Cap how many locations we walk so two files / many hunks cannot blow the
+    // context or the budget.
+    const MAX_LOCATIONS: usize = 4;
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("DevMap blast from {label}:"));
+    for (examined, (path, start, end)) in locations.iter().take(MAX_LOCATIONS).enumerate() {
+        if started.elapsed() >= budget {
+            parts.push(format!(
+                "list short: leftover budget spent after {examined} location(s); remaining edits not walked."
+            ));
+            break;
+        }
+        let label_at = if *end == u32::MAX {
+            path.clone()
+        } else {
+            format!("{path}:{start}-{end}")
+        };
+        let report = dc_regress::blast::blast_change_with_program(
+            std::ffi::OsStr::new("git"),
+            root,
+            &graph,
+            &dc_regress::ChangeSet::at(path, *start, *end),
+            &label_at,
+            &until,
+            dc_regress::DEFAULT_BLAST_DEPTH,
+        );
+        parts.push(format_blast_for_hook(&report));
+    }
+    if locations.len() > MAX_LOCATIONS {
+        parts.push(format!(
+            "list short: walked {MAX_LOCATIONS} of {} edited location(s); the rest were capped for context."
+            , locations.len()
+        ));
+    }
+    Some(truncate(&parts.join("\n"), POST_TOOL_BLAST_CONTEXT_CAP))
+}
+
+fn format_blast_for_hook(report: &dc_regress::BlastReport) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{} — complete: {}; seeds: {}; impacted: {}; unattributed: {}",
+        report.change,
+        report.complete,
+        report.seeds.len(),
+        report.impacted.len(),
+        report.unattributed.len()
+    ));
+    if !report.unattributed.is_empty() {
+        let first = &report.unattributed[0];
+        lines.push(format!(
+            "  unattributed: {}:{}-{} ({})",
+            first.path,
+            first.start_line,
+            first.end_line,
+            first.reason.describe()
+        ));
+        if report.unattributed.len() > 1 {
+            lines.push(format!(
+                "  … {} more unattributed range(s)",
+                report.unattributed.len() - 1
+            ));
+        }
+    }
+    for seed in report.seeds.iter().take(6) {
+        lines.push(format!(
+            "  seed  {} (L{}-{})",
+            seed.qualified_name, seed.start_line, seed.end_line
+        ));
+    }
+    for hit in report.impacted.iter().take(8) {
+        lines.push(format!("  d{} {}", hit.distance, hit.qualified_name));
+    }
+    if report.impacted.len() > 8 {
+        lines.push(format!(
+            "  … {} more impacted (list short: context cap)",
+            report.impacted.len() - 8
+        ));
+    }
+    if !report.complete {
+        lines.push("  complete: false — see unattributed / unavailable above".into());
+    }
+    lines.join("\n")
+}
+
+/// Edited `(repo-relative path, start_line, end_line)` from a write payload.
+///
+/// Accepts Cursor `afterFileEdit` (`file_path` + `edits[]`), Claude Write/Edit
+/// (`tool_input`), and Codex `apply_patch` multi-file commands. `end_line ==
+/// u32::MAX` means the whole file.
+fn edited_locations(root: &Path, payload: &Value) -> Vec<(String, u32, u32)> {
+    let mut out = Vec::new();
+
+    // Cursor afterFileEdit: top-level file_path + edits.
+    if let Some(path) = file_path_from_payload(payload) {
+        if let Some(relative) = repo_relative_path(root, &path) {
+            let ranges = edit_ranges_from_payload(payload, root, &path);
+            if ranges.is_empty() {
+                out.push((relative, 1, u32::MAX));
+            } else {
+                for (start, end) in ranges {
+                    out.push((relative.clone(), start, end));
+                }
+            }
+        }
+    }
+
+    // Codex apply_patch: multiple files, no line ranges — whole file each.
+    for path in apply_patch_paths(payload) {
+        if let Some(relative) = repo_relative_path(root, &path) {
+            if !out.iter().any(|(p, _, _)| p == &relative) {
+                out.push((relative, 1, u32::MAX));
+            }
+        }
+    }
+
+    out
+}
+
+fn edit_ranges_from_payload(payload: &Value, root: &Path, absolute: &Path) -> Vec<(u32, u32)> {
+    let edits = payload
+        .get("edits")
+        .or_else(|| payload.pointer("/tool_input/edits"))
+        .and_then(Value::as_array);
+    let Some(edits) = edits else {
+        // Write with full contents, or Edit with old_string/new_string at top.
+        if let Some(old) = payload
+            .pointer("/tool_input/old_string")
+            .and_then(Value::as_str)
+        {
+            let new = payload
+                .pointer("/tool_input/new_string")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            return locate_edit_in_file(absolute, old, new)
+                .into_iter()
+                .collect();
+        }
+        return Vec::new();
+    };
+    let content = fs::read_to_string(absolute).ok();
+    let mut ranges = Vec::new();
+    for edit in edits {
+        if let Some(range) = edit.get("range") {
+            if let (Some(start), Some(end)) = (
+                range
+                    .get("start_line_number")
+                    .or_else(|| range.get("startLineNumber"))
+                    .and_then(Value::as_u64),
+                range
+                    .get("end_line_number")
+                    .or_else(|| range.get("endLineNumber"))
+                    .and_then(Value::as_u64),
+            ) {
+                let start = start.max(1) as u32;
+                let end = end.max(start as u64) as u32;
+                ranges.push((start, end));
+                continue;
+            }
+        }
+        let old = edit.get("old_string").and_then(Value::as_str).unwrap_or("");
+        let new = edit.get("new_string").and_then(Value::as_str).unwrap_or("");
+        if let Some(content) = content.as_deref() {
+            if let Some(found) = lines_covering(content, if new.is_empty() { old } else { new }) {
+                ranges.push(found);
+                continue;
+            }
+        }
+        if let Some(found) = locate_edit_in_file(absolute, old, new) {
+            ranges.push(found);
+        }
+    }
+    let _ = root;
+    ranges
+}
+
+fn locate_edit_in_file(path: &Path, old: &str, new: &str) -> Option<(u32, u32)> {
+    let content = fs::read_to_string(path).ok()?;
+    // Prefer new_string: afterFileEdit fires after the write.
+    if !new.is_empty() {
+        if let Some(range) = lines_covering(&content, new) {
+            return Some(range);
+        }
+    }
+    if !old.is_empty() {
+        return lines_covering(&content, old);
+    }
+    // Whole-file write with empty old_string.
+    let last = content.lines().count().max(1) as u32;
+    Some((1, last))
+}
+
+fn lines_covering(content: &str, needle: &str) -> Option<(u32, u32)> {
+    if needle.is_empty() {
+        return None;
+    }
+    let pos = content.find(needle)?;
+    let start = content[..pos].bytes().filter(|&b| b == b'\n').count() as u32 + 1;
+    let newlines = needle.bytes().filter(|&b| b == b'\n').count() as u32;
+    let end = start.saturating_add(newlines);
+    Some((start, end.max(start)))
+}
+
+fn store_db_path(root: &Path) -> Option<PathBuf> {
+    let candidates = [
+        root.join(".devcouncil/codeintel/devmap.sqlite"),
+        root.join(".devmap/codeintel/devmap.sqlite"),
+    ];
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn repo_relative_path(root: &Path, absolute: &Path) -> Option<String> {
+    let root = root.canonicalize().ok()?;
+    let abs = if absolute.is_absolute() {
+        absolute
+            .canonicalize()
+            .unwrap_or_else(|_| absolute.to_path_buf())
+    } else {
+        root.join(absolute).canonicalize().ok()?
+    };
+    abs.strip_prefix(&root)
+        .ok()
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
 }
 
 /// Whether this payload describes the agent about to look through source.
@@ -2000,9 +2411,59 @@ mod tests {
         let exe = PathBuf::from("/bin/true");
         let empty = run_hook(HookEvent::PostToolUse, b"", &exe, None);
         assert_eq!(empty.exit_code, 0);
+        assert!(empty.stdout.is_none(), "empty stdin must emit no stdout");
         let bad = run_hook(HookEvent::PostToolUse, b"{not-json", &exe, None);
         assert_eq!(bad.exit_code, 0);
+        assert!(bad.stdout.is_none());
         assert!(bad.stderr_line.unwrap().contains("malformed"));
+    }
+
+    /// Exit 2 is a Cursor/Claude permission block. Hostile stdin of every shape
+    /// the host can feed — empty, non-UTF-8, a JSON value that is not an
+    /// object, over the 1 MiB bound — must stay exit 0 with nothing on stdout
+    /// that could be read as a permission decision.
+    #[test]
+    fn hostile_stdin_shapes_exit_zero_with_no_permission_stdout() {
+        let exe = PathBuf::from("/bin/true");
+        let oversized = {
+            let mut bytes = b"{\"tool_name\":\"Read\",\"pad\":\"".to_vec();
+            bytes.extend(std::iter::repeat_n(b'x', MAX_STDIN_BYTES + 64));
+            bytes.extend_from_slice(b"\"}");
+            bytes
+        };
+        let cases: Vec<(&str, &[u8])> = vec![
+            ("empty", b""),
+            ("non-utf8", b"{\"cwd\":\"\xff\"}"),
+            ("json null", b"null"),
+            ("json array", b"[]"),
+            ("json string", b"\"hello\""),
+            ("truncated object", b"{"),
+            ("oversized", oversized.as_slice()),
+        ];
+        for (label, stdin) in cases {
+            for event in [
+                HookEvent::PostToolUse,
+                HookEvent::PreToolUse,
+                HookEvent::SessionStart,
+            ] {
+                let outcome = run_hook(event, stdin, &exe, None);
+                assert_ne!(
+                    outcome.exit_code, 2,
+                    "{label}/{event:?}: exit 2 would block the tool call"
+                );
+                assert_eq!(
+                    outcome.exit_code, 0,
+                    "{label}/{event:?}: expected a clean no-op; stderr={:?}",
+                    outcome.stderr_line
+                );
+                assert!(
+                    outcome.stdout.is_none(),
+                    "{label}/{event:?}: hostile stdin must emit no stdout that \
+                     could be read as a permission decision; got {:?}",
+                    outcome.stdout
+                );
+            }
+        }
     }
 
     /// A fake `devmap` that prints `stdout_json` for any arguments.
@@ -2613,7 +3074,7 @@ mod tests {
             ("empty output", ""),
         ] {
             assert!(
-                compose_pre_tool_use(status, root).is_none(),
+                compose_pre_tool_use(status, root, None).is_none(),
                 "{label} produced a directive"
             );
         }
@@ -2622,7 +3083,7 @@ mod tests {
     /// A healthy index names itself and carries the tool list.
     #[test]
     fn healthy_index_directive_names_the_tools_and_the_caveat() {
-        let text = compose_pre_tool_use(healthy_status(), Path::new("/repo/DevCouncil"))
+        let text = compose_pre_tool_use(healthy_status(), Path::new("/repo/DevCouncil"), None)
             .expect("a healthy index emits a directive");
         assert!(text.contains("DevCouncil"), "{text}");
         assert!(text.contains("11714"), "{text}");
@@ -2640,9 +3101,167 @@ mod tests {
     fn stale_index_directive_says_its_answers_are_a_lower_bound() {
         let stale = r#"{"query_ready":true,"degraded_reason":null,"node_count":5,
                         "edge_count":6,"generation_id":1,"is_fresh":false}"#;
-        let text = compose_pre_tool_use(stale, Path::new("/repo/Demo"))
+        let text = compose_pre_tool_use(stale, Path::new("/repo/Demo"), None)
             .expect("a stale but queryable index still emits");
         assert!(text.contains("lower bound"), "{text}");
+    }
+
+    /// A skeleton paste replaces the tool-name directive and ends with an
+    /// explicit cut line when the list is longer than the hook will show.
+    #[test]
+    fn skeleton_context_replaces_directive_and_names_a_list_cut() {
+        let report = devmap_query::SkeletonReport {
+            file: "pkg/mod.py".into(),
+            presence: devmap_query::SkeletonPresence::Indexed,
+            items: (0..80)
+                .map(|i| devmap_query::SkeletonSymbol {
+                    qualified_name: format!("pkg/mod.py::f{i}"),
+                    kind: "Function".into(),
+                    start_line: i + 1,
+                    end_line: i + 1,
+                    start_byte: i as usize * 10,
+                    end_byte: i as usize * 10 + 5,
+                    lines_from_bytes: false,
+                    signature: Some(format!("def f{i}():")),
+                    signature_note: None,
+                })
+                .collect(),
+            shown: 80,
+            total: 80,
+            truncated: false,
+            source_freshness: devmap_query::SourceFreshness::unverified("test"),
+            resolution: devmap_query::ResolutionAvailability::Available,
+        };
+        let text = format_skeleton_for_hook(&report);
+        assert!(text.contains("list cut:"), "{text}");
+        assert!(!text.contains("devmap_search"), "{text}");
+        let composed = compose_pre_tool_use(healthy_status(), Path::new("/repo/Demo"), Some(&text))
+            .expect("query-ready + skeleton");
+        assert!(composed.contains("list cut:"), "{composed}");
+        assert!(
+            !composed.contains("Ask DevMap before reading"),
+            "{composed}"
+        );
+    }
+
+    /// Newlines and quotes in a signature stay on one row; the note still says
+    /// when a signature was not extracted.
+    #[test]
+    fn skeleton_formats_newlines_quotes_and_missing_signatures() {
+        let report = devmap_query::SkeletonReport {
+            file: "a.py".into(),
+            presence: devmap_query::SkeletonPresence::Indexed,
+            items: vec![
+                devmap_query::SkeletonSymbol {
+                    qualified_name: "a.py::weird".into(),
+                    kind: "Function".into(),
+                    start_line: 1,
+                    end_line: 3,
+                    start_byte: 0,
+                    end_byte: 40,
+                    lines_from_bytes: false,
+                    signature: Some("def weird(a=\"x\\\"y\",\n  b=1):".into()),
+                    signature_note: None,
+                },
+                devmap_query::SkeletonSymbol {
+                    qualified_name: "a.py::bare".into(),
+                    kind: "Function".into(),
+                    start_line: 5,
+                    end_line: 5,
+                    start_byte: 50,
+                    end_byte: 60,
+                    lines_from_bytes: false,
+                    signature: None,
+                    signature_note: Some("not extracted".into()),
+                },
+            ],
+            shown: 2,
+            total: 2,
+            truncated: false,
+            source_freshness: devmap_query::SourceFreshness::unverified("test"),
+            resolution: devmap_query::ResolutionAvailability::Available,
+        };
+        let text = format_skeleton_for_hook(&report);
+        let rows: Vec<_> = text.lines().filter(|l| l.starts_with("  L")).collect();
+        assert_eq!(rows.len(), 2, "{text}");
+        assert!(rows[0].contains("def weird"), "{text}");
+        assert!(
+            rows[0].contains("x\\\"y") || rows[0].contains("x\\\"y") || rows[0].contains("weird"),
+            "{text}"
+        );
+        assert!(rows[1].contains("not extracted"), "{text}");
+    }
+
+    #[test]
+    fn empty_and_missing_skeleton_envelopes_differ() {
+        let missing = format_skeleton_for_hook(&devmap_query::SkeletonReport {
+            file: "gone.py".into(),
+            presence: devmap_query::SkeletonPresence::NotInIndex,
+            items: vec![],
+            shown: 0,
+            total: 0,
+            truncated: false,
+            source_freshness: devmap_query::SourceFreshness::unverified("test"),
+            resolution: devmap_query::ResolutionAvailability::Available,
+        });
+        let empty = format_skeleton_for_hook(&devmap_query::SkeletonReport {
+            file: "empty.py".into(),
+            presence: devmap_query::SkeletonPresence::Empty,
+            items: vec![],
+            shown: 0,
+            total: 0,
+            truncated: false,
+            source_freshness: devmap_query::SourceFreshness::unverified("test"),
+            resolution: devmap_query::ResolutionAvailability::Available,
+        });
+        assert!(missing.contains("not in the DevMap index"), "{missing}");
+        assert!(empty.contains("no definitions"), "{empty}");
+        assert_ne!(missing, empty);
+    }
+
+    #[test]
+    fn blast_hook_text_names_why_a_file_not_in_index_is_short() {
+        let report = dc_regress::BlastReport::new(
+            "missing.py:1-1".into(),
+            vec![],
+            vec![],
+            vec![dc_regress::UnattributedChange {
+                path: "missing.py".into(),
+                start_line: 1,
+                end_line: 1,
+                reason: dc_regress::UnattributedReason::FileNotIndexed,
+            }],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![dc_regress::Unavailable::ChangeUnattributed {
+                ranges: 1,
+                lines: 1,
+            }],
+        );
+        let text = format_blast_for_hook(&report);
+        assert!(text.contains("complete: false"), "{text}");
+        assert!(text.contains("unattributed"), "{text}");
+        assert!(
+            text.contains("holds no symbols")
+                || text.contains("not indexed")
+                || text.contains("graph holds no"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn write_blast_budget_zero_names_the_skip() {
+        let text = compose_write_blast(
+            Path::new("/tmp/does-not-exist-devmap-blast"),
+            &json!({}),
+            Duration::ZERO,
+        )
+        .expect("budget miss still speaks");
+        assert!(text.contains("budget"), "{text}");
+        assert!(text.contains("skipped") || text.contains("spent"), "{text}");
     }
 
     /// The whole point of the event: a second navigation call stays silent.

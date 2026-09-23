@@ -65,6 +65,10 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "change_to_impact",
             "hostile_change",
             "hostile_input",
+            // Compiles feature-off: `dc-regress` has no `parse` feature and
+            // answers from a handed graph. Verified with
+            // `cargo check -p dc-regress --no-default-features --all-targets`.
+            "owners_and_test_signal",
         ],
     ),
     (

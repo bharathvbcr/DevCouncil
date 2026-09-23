@@ -252,6 +252,44 @@ fn a_changed_import_is_reported_rather_than_dropped() {
     );
 }
 
+/// A top-level constant sits outside every function the same way an import
+/// does. Changing only that line must produce `unattributed` and `complete:
+/// false` — never an empty complete blast that reads as "affects nothing".
+#[test]
+fn a_changed_top_level_constant_is_unattributed_and_incomplete() {
+    const WITH_CONSTANT: &str = "const LIMIT: u32 = 10;\n\
+                                 \n\
+                                 pub fn helper() -> u32 {\n\
+                                 \x20   LIMIT\n\
+                                 }\n";
+    let repo = init_repo("constant");
+    write(&repo, "src/lib.rs", WITH_CONSTANT);
+    let head = commit(&repo, "base");
+    let helper_start = WITH_CONSTANT.find("pub fn helper").expect("helper");
+    let graph = FakeGraph {
+        symbols: vec![GraphSymbol {
+            qualified_name: "src/lib.rs::helper".into(),
+            file_path: "src/lib.rs".into(),
+            span_start: helper_start,
+            span_end: WITH_CONSTANT.len(),
+            body_exact: None,
+        }],
+        basis: Some(blob_of(&repo, &head, "src/lib.rs")),
+        ..Default::default()
+    };
+    let report = run(&repo, &graph, &change_of("src/lib.rs", &[(1, 1)]), &head);
+    assert!(report.seeds.is_empty(), "no function spans the constant");
+    assert_eq!(report.unattributed.len(), 1, "{report:#?}");
+    assert!(matches!(
+        report.unattributed[0].reason,
+        UnattributedReason::OutsideEverySymbol { .. }
+    ));
+    assert!(
+        !report.complete,
+        "a constant-only change must never read as a complete empty blast"
+    );
+}
+
 /// Diagnosis, not attribution. The nearest symbol is named so a reader can see
 /// at a glance that the range is a doc comment — but it must not become a
 /// seed, because a top-level constant sits in exactly the same position.
@@ -279,6 +317,10 @@ fn an_unplaced_range_names_its_nearest_symbol_without_seeding_it() {
 /// A hunk that removed lines and added none has a post-image count of zero.
 /// Read literally it touches nothing and the change disappears; it must seed
 /// the function the code was removed from.
+///
+/// The generation still contains that symbol. Reporting it as unaffected —
+/// empty seeds, or a complete answer that names nothing — is the lie this
+/// pins: the index still knows the span, so the deletion is a seed.
 #[test]
 fn a_pure_deletion_seeds_the_function_it_was_removed_from() {
     let (repo, head, graph) = fixture("deletion");
@@ -304,6 +346,14 @@ fn a_pure_deletion_seeds_the_function_it_was_removed_from() {
         report.seeds[0].deletion_only,
         "the report must say the evidence is what is no longer there, or a reader \
          looking at the post-image will find nothing and conclude the tool is wrong"
+    );
+    assert!(
+        report
+            .seeds
+            .iter()
+            .any(|seed| seed.qualified_name == "src/lib.rs::helper"),
+        "a deleted symbol the current generation still contains must be a seed, \
+         never read as unaffected: {report:#?}"
     );
 }
 

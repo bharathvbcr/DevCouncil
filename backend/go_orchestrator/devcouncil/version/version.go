@@ -18,4 +18,4 @@ package version
 
 // Version must match package.json, package-lock.json, rust/Cargo.toml
 // [workspace.package], and the release tag.
-const Version = "0.2.3"
+const Version = "1.3.5"

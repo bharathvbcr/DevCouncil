@@ -3089,6 +3089,14 @@ impl Store {
                 }
             }
             conn.execute("PRAGMA user_version = 22", [])?;
+            version = 22;
+        }
+        if version == 22 {
+            // Version-only rung: LanguageServer / LanguageServerDispatch kinds
+            // are free TEXT on the existing resolution column. Advancing the
+            // stamp makes an older binary refuse the store rather than
+            // reconstructing those rows as neighbouring tiers.
+            conn.execute("PRAGMA user_version = 23", [])?;
             version = CURRENT_SCHEMA_VERSION;
         }
         if version != CURRENT_SCHEMA_VERSION {
@@ -6748,6 +6756,45 @@ generation {latest}; run `devmap status` to re-verify",
             Some(_) => ResolutionSource::Stored,
             None => ResolutionSource::Reconstructed,
         }))
+    }
+
+    /// The build-time [`devmap_analyze::ResolutionRate`] persisted on the
+    /// latest generation, if any.
+    ///
+    /// Status and the MCP `devmap_status` tool carry this rather than
+    /// recomputing it: the unresolved ledger that forms the denominator is not
+    /// kept on the generation, so a later reader cannot reconstruct the rate
+    /// from edges alone. Extracted with `json_extract` so the dead-symbol and
+    /// community arrays never cross into this process.
+    ///
+    /// `None` when there is no generation, or when the summary was written
+    /// before `resolution_rate` existed. Absence is **not measured**, not a
+    /// rate of zero — the same rule `Permille = Option` and the build readout
+    /// already enforce. A malformed blob is an error, not an invented default.
+    pub fn latest_resolution_rate(&self) -> Result<Option<devmap_analyze::ResolutionRate>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let raw: Option<String> = snapshot
+            .query_row(
+                "SELECT json_extract(analysis_json, '$.resolution_rate')
+                 FROM generations WHERE id = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        serde_json::from_str::<devmap_analyze::ResolutionRate>(&raw)
+            .map(Some)
+            .map_err(|error| {
+                refusal(format!(
+                    "stored generation resolution_rate is invalid: {error}"
+                ))
+            })
     }
 
     /// Stored edges of the latest generation whose confidence contradicts the

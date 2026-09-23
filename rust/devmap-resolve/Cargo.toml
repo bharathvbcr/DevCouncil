@@ -12,6 +12,9 @@ description = "Call and import resolution into a defended edge graph"
 rayon.workspace = true
 devmap-extract = { path = "../devmap-extract", default-features = false }
 serde.workspace = true
+# Workspace dep already linked by the CLI and store — used here for the opt-in
+# language-server JSON-RPC client (`devmap build --lsp`), not a new crate.
+serde_json.workspace = true
 
 [features]
 default = ["parse"]
@@ -155,6 +158,10 @@ required-features = ["parse"]
 
 [[test]]
 name = "shell_source_resolves"
+required-features = ["parse"]
+
+[[test]]
+name = "language_server_edges"
 required-features = ["parse"]
 
 [[test]]

@@ -57,9 +57,10 @@ fn entitled(resolution: &Resolution) -> Confidence {
         // One declaration of the name and nothing tying it to this file:
         // the same rung whether the name is an identifier or a selector.
         Resolution::UniqueGlobal { .. } | Resolution::UniqueSelector { .. } => Confidence::HIGH,
-        Resolution::AmbiguousGlobal { .. } | Resolution::Unresolved { .. } => {
-            Confidence::SPECULATIVE
-        }
+        Resolution::LanguageServer { .. } => Confidence::HIGH,
+        Resolution::AmbiguousGlobal { .. }
+        | Resolution::LanguageServerDispatch { .. }
+        | Resolution::Unresolved { .. } => Confidence::SPECULATIVE,
     }
 }
 
@@ -326,6 +327,45 @@ fn ambiguity_never_picks_a_winner() {
             picks[0]
         );
     }
+}
+
+/// A bare name that exists only in another language family must not become a
+/// `UniqueGlobal` edge. That is the SC9 shape: a confidently wrong cross-family
+/// call that cannot exist at runtime.
+#[test]
+fn a_unique_bare_name_in_another_family_is_not_unique_global() {
+    let (_, result) = resolve(&[
+        (
+            "only.go",
+            "package only\n\nfunc process(x int) int { return x }\n",
+        ),
+        ("app.py", "def main():\n    return process(1)\n"),
+    ]);
+    let crossing: Vec<_> = result
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.edge_kind == EdgeKind::Calls
+                && edge.source_file.ends_with(".py")
+                && edge.target_file.ends_with(".go")
+        })
+        .collect();
+    assert!(
+        crossing.is_empty(),
+        "a Python bare call must not UniqueGlobal-bind to a Go function: {crossing:#?}"
+    );
+    assert!(
+        result
+            .unresolved
+            .iter()
+            .any(|site| site.callee_name == "process" && site.source_file.ends_with(".py")),
+        "the unresolvable call must stay in the ledger, not vanish: {:#?}",
+        result
+            .unresolved
+            .iter()
+            .map(|u| (&u.source_file, &u.callee_name))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// The import is a fact the author wrote, so a name that shadows a builtin

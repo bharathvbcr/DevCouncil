@@ -157,6 +157,8 @@ fn seed_current_store(db_path: &Path) {
 /// traceable to a line of `schema.rs`.
 fn reduce_one_rung(conn: &Connection, from_version: i32) {
     let sql: &str = match from_version {
+        // MIGRATION_V22_TO_V23: version stamp only. No DDL to undo.
+        23 => "",
         // MIGRATION_V21_TO_V22: the ledger's interned columns. Materialise the
         // three ids back into the text they stand for, drop the pool, and put
         // the v18 view back over the flat table.
@@ -299,8 +301,10 @@ fn reduce_one_rung(conn: &Connection, from_version: i32) {
         6 => "DROP TABLE build_history;",
         other => panic!("no reduction defined for schema version {other}"),
     };
-    conn.execute_batch(sql)
-        .unwrap_or_else(|error| panic!("reducing a v{from_version} store failed: {error}"));
+    if !sql.is_empty() {
+        conn.execute_batch(sql)
+            .unwrap_or_else(|error| panic!("reducing a v{from_version} store failed: {error}"));
+    }
     conn.execute_batch(&format!("PRAGMA user_version = {};", from_version - 1))
         .unwrap();
 }
@@ -1425,11 +1429,17 @@ fn migrating_the_ledger_preserves_every_column_and_not_only_the_count() {
     {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        reduce_one_rung(&conn, CURRENT_SCHEMA_VERSION);
+        // Walk back past the version-only v23 stamp and the v22 interning rung
+        // so the reopen actually re-runs the ledger backfill under test.
+        let mut version = CURRENT_SCHEMA_VERSION;
+        while version > 21 {
+            reduce_one_rung(&conn, version);
+            version -= 1;
+        }
         let stamped: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(stamped, CURRENT_SCHEMA_VERSION - 1);
+        assert_eq!(stamped, 21);
         // The reduction must really have produced the flat pre-v22 shape,
         // otherwise the reopen below migrates nothing and this test compares a
         // store with itself.

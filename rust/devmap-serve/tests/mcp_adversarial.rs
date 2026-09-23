@@ -345,6 +345,12 @@ async fn every_published_default_is_the_default_that_is_applied() {
             }
             "devmap_explore" => json!({"query": "helper"}),
             "devmap_affected_tests" => json!({"targets": ["helper"]}),
+            // Same base shapes as `mcp_protocol` / `mcp_spec_conformance`: ask
+            // needs a query; skeleton needs a path the corpus may or may not
+            // contain — either way both arms of the default gate get the same
+            // envelope so a mismatched published default still fails.
+            "devmap_ask" => json!({"query": "helper"}),
+            "devmap_skeleton" => json!({"file": "core.py"}),
             // These two join the graph to git, and this corpus is an in-memory
             // store with no repository behind it — so both arms refuse, and
             // what this gate proves for them is that the refusals match, not

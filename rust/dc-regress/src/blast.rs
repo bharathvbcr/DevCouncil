@@ -32,6 +32,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use devmap_extract::model::{LineIndex, Span};
 use serde::{Deserialize, Serialize};
@@ -39,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::change::{
     changes_between_with_program, ChangeSet, ChangeStatus, ChangedRange, FileChange,
 };
-use crate::history::resolve_blob_with_program;
+use crate::history::{self, resolve_blob_with_program};
 use crate::{CodeGraph, ConeEntry, GraphSymbol, Unavailable};
 
 /// How far the inbound walk goes by default.
@@ -57,6 +58,15 @@ pub const DEFAULT_BLAST_DEPTH: u32 = crate::DEFAULT_CONE_DEPTH;
 /// is decided by how much of each symbol changed, so a trimmed answer is made
 /// of the most-changed symbols rather than of whatever sorted first.
 pub const MAX_SEED_SYMBOLS: usize = 256;
+
+/// Most commits examined per path when collecting owners.
+pub const OWNER_COMMIT_CAP: usize = 32;
+
+/// Wall clock for the whole owner pass across every changed path.
+pub const OWNER_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Bytes of one path's `git log` kept while collecting owners.
+pub const OWNER_OUTPUT_CAP: usize = 256 * 1024;
 
 /// A symbol the change landed inside.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +216,35 @@ pub struct ImpactedModule {
     pub nearest_distance: u32,
     /// True when the change itself touched a file in this directory.
     pub changed: bool,
+    /// Whether tests covering this module moved with the change.
+    pub test_signal: TestSignal,
+}
+
+/// Whether the tests that reach an impacted module moved with the change.
+///
+/// `unavailable` is a separate state from `none`: a walk that could not finish
+/// must never read as "there are no tests".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestSignal {
+    /// A reached test file is in the diff.
+    Changed,
+    /// Tests reach the area and none of those files changed.
+    Stale,
+    /// No test file reached.
+    None,
+    /// No behavioral seed — nothing to ask tests about.
+    Na,
+    /// The test walk itself could not finish, or a renamed test could not be
+    /// reconciled with the reached list.
+    Unavailable,
+}
+
+/// A recent author of a changed path, name and email only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Owner {
+    pub name: String,
+    pub email: String,
 }
 
 /// A test file the inbound walk reached.
@@ -233,6 +272,11 @@ pub struct BlastReport {
     pub files: Vec<ImpactedFile>,
     pub modules: Vec<ImpactedModule>,
     pub tests: Vec<AffectedTestFile>,
+    /// Recent authors of the changed paths, name and email only. Empty when
+    /// there were no paths to ask about, or when every lookup failed — and in
+    /// the latter case [`Self::unavailable`] names why, so emptiness is not
+    /// read as "nobody owns this".
+    pub owners: Vec<Owner>,
     /// Everything that could not be done. Non-empty means every list above is
     /// a lower bound.
     pub unavailable: Vec<Unavailable>,
@@ -253,6 +297,7 @@ impl BlastReport {
         files: Vec<ImpactedFile>,
         modules: Vec<ImpactedModule>,
         tests: Vec<AffectedTestFile>,
+        owners: Vec<Owner>,
         unavailable: Vec<Unavailable>,
     ) -> Self {
         let complete = unavailable.is_empty();
@@ -265,6 +310,7 @@ impl BlastReport {
             files,
             modules,
             tests,
+            owners,
             unavailable,
             complete,
         }
@@ -274,6 +320,7 @@ impl BlastReport {
     pub fn refused(change: String, unavailable: Vec<Unavailable>) -> Self {
         Self::new(
             change,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -450,7 +497,7 @@ pub fn blast_change_with_program<G: CodeGraph>(
 
     let impacted = roll_up_symbols(reached, &seed_set);
     let files = roll_up_files(&impacted, &ordered, &changed_paths);
-    let modules = roll_up_modules(&files);
+    let mut modules = roll_up_modules(&files);
 
     let (tests, tests_incomplete) = if seed_names.is_empty() {
         (Vec::new(), false)
@@ -461,6 +508,23 @@ pub fn blast_change_with_program<G: CodeGraph>(
         unavailable.push(Unavailable::AffectedTestsIncomplete { found: tests.len() });
     }
 
+    annotate_test_signals(
+        &mut modules,
+        &ordered,
+        &tests,
+        &change.files,
+        tests_incomplete,
+    );
+
+    let (owners, owner_gaps) = owners_for_paths_with_program(
+        program,
+        repo,
+        &owner_paths(&change.files),
+        OWNER_COMMIT_CAP,
+        OWNER_DEADLINE,
+    );
+    unavailable.extend(owner_gaps);
+
     BlastReport::new(
         label.to_string(),
         change.files.clone(),
@@ -470,6 +534,7 @@ pub fn blast_change_with_program<G: CodeGraph>(
         files,
         modules,
         tests,
+        owners,
         unavailable,
     )
 }
@@ -793,6 +858,12 @@ fn roll_up_modules(files: &[ImpactedFile]) -> Vec<ImpactedModule> {
                 symbols,
                 nearest_distance: if distance == u32::MAX { 0 } else { distance },
                 changed,
+                // Filled by [`annotate_test_signals`] once the test walk has
+                // answered. Defaulting to `Na` here would collapse a missing
+                // annotation into "no behavioral seed"; `None` would collapse
+                // it into "no tests". The placeholder is overwritten before
+                // the report is built.
+                test_signal: TestSignal::Unavailable,
             },
         )
         .collect();
@@ -803,6 +874,192 @@ fn roll_up_modules(files: &[ImpactedFile]) -> Vec<ImpactedModule> {
             .then(a.path.cmp(&b.path))
     });
     out
+}
+
+/// Paths to ask `git log` about: every post-image path and every pre-image
+/// rename source. Asking only the new name after a rename would miss the
+/// authors who wrote under the old one.
+fn owner_paths(changed: &[FileChange]) -> Vec<String> {
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    for file in changed {
+        paths.insert(file.path.clone());
+        if let Some(from) = &file.renamed_from {
+            paths.insert(from.clone());
+        }
+    }
+    paths.into_iter().collect()
+}
+
+/// Per-module test signal from the reached tests and the change's files.
+///
+/// `unavailable` when the test walk itself could not finish — never collapsed
+/// into `none`. A renamed test file that the walk did not reconcile is also
+/// `unavailable`, not a silent "no tests".
+fn annotate_test_signals(
+    modules: &mut [ImpactedModule],
+    seeds: &[SeedSymbol],
+    tests: &[AffectedTestFile],
+    changed_files: &[FileChange],
+    tests_incomplete: bool,
+) {
+    for module in modules.iter_mut() {
+        module.test_signal =
+            test_signal_for_module(module, seeds, tests, changed_files, tests_incomplete);
+    }
+}
+
+fn test_signal_for_module(
+    module: &ImpactedModule,
+    seeds: &[SeedSymbol],
+    tests: &[AffectedTestFile],
+    changed_files: &[FileChange],
+    tests_incomplete: bool,
+) -> TestSignal {
+    let module_has_seed = seeds
+        .iter()
+        .any(|seed| module_of(&seed.file_path) == module.path);
+    // A module that holds neither a seed nor any reached symbol is present
+    // only because an unindexed or docs-only file changed there — there is
+    // nothing behavioral to ask tests about.
+    if seeds.is_empty() || (!module_has_seed && module.symbols == 0) {
+        return TestSignal::Na;
+    }
+    if tests_incomplete {
+        return TestSignal::Unavailable;
+    }
+
+    let change_touches_test = changed_files.iter().any(|file| {
+        looks_like_test_path(&file.path)
+            || file
+                .renamed_from
+                .as_deref()
+                .is_some_and(looks_like_test_path)
+    });
+
+    if tests.is_empty() {
+        // A renamed, deleted or added test in the diff with an empty reached
+        // list is not "no tests" — the walk and the change disagree.
+        if change_touches_test {
+            return TestSignal::Unavailable;
+        }
+        return TestSignal::None;
+    }
+
+    let test_in_diff = tests.iter().any(|test| {
+        changed_files.iter().any(|file| {
+            file.path == test.path || file.renamed_from.as_deref() == Some(test.path.as_str())
+        })
+    });
+    if test_in_diff {
+        TestSignal::Changed
+    } else {
+        TestSignal::Stale
+    }
+}
+
+fn looks_like_test_path(path: &str) -> bool {
+    // Same owner as the rest of the workspace's test-path rule, available
+    // without the parse frontend that this crate deliberately does not link.
+    devmap_extract::wiring::is_test_path(path)
+}
+
+/// Recent authors of `paths`, name and email only.
+///
+/// Paths are examined one at a time under a shared deadline so a timeout after
+/// the first of many still returns the owners already found and an
+/// [`Unavailable`] entry — never a silently short list.
+#[doc(hidden)]
+pub fn owners_for_paths_with_program(
+    program: &std::ffi::OsStr,
+    repo: &Path,
+    paths: &[String],
+    commit_cap: usize,
+    deadline: Duration,
+) -> (Vec<Owner>, Vec<Unavailable>) {
+    if paths.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let started = Instant::now();
+    let mut by_identity: BTreeMap<(String, String), ()> = BTreeMap::new();
+    let mut unavailable: Vec<Unavailable> = Vec::new();
+    let mut empty_author = false;
+    let mut examined = 0usize;
+
+    for path in paths {
+        let remaining = deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            unavailable.push(Unavailable::OwnersUnavailable {
+                reason: format!(
+                    "owner lookup exceeded {deadline:?} after {examined} of {} path(s)",
+                    paths.len()
+                ),
+            });
+            break;
+        }
+
+        let max_count = format!("--max-count={commit_cap}");
+        let what = format!("git log -- {path}");
+        match history::run_git_with_deadline(
+            program,
+            repo,
+            &["log", &max_count, "--format=%an%x00%ae", "--", path],
+            &what,
+            OWNER_OUTPUT_CAP,
+            remaining,
+        ) {
+            Ok(captured) => {
+                examined += 1;
+                for line in captured.stdout_lossy().lines() {
+                    let line = line.trim_end_matches('\r');
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let (name, email) = match line.split_once('\0') {
+                        Some((name, email)) => (name.trim(), email.trim()),
+                        None => (line.trim(), ""),
+                    };
+                    if name.is_empty() && email.is_empty() {
+                        empty_author = true;
+                        continue;
+                    }
+                    by_identity.insert((name.to_string(), email.to_string()), ());
+                }
+            }
+            Err(history::HistoryRefusal::Deadline { what }) => {
+                unavailable.push(Unavailable::OwnersUnavailable {
+                    reason: format!(
+                        "{what} exceeded the remaining owner budget after {examined} of {} path(s)",
+                        paths.len()
+                    ),
+                });
+                break;
+            }
+            Err(refusal) => {
+                unavailable.push(Unavailable::OwnersUnavailable {
+                    reason: refusal.describe(),
+                });
+                // A spawn failure means every later path will fail the same
+                // way; stop rather than fill the ledger with duplicates.
+                if matches!(refusal, history::HistoryRefusal::GitUnavailable { .. }) {
+                    break;
+                }
+                examined += 1;
+            }
+        }
+    }
+
+    if empty_author {
+        unavailable.push(Unavailable::OwnersUnavailable {
+            reason: "at least one commit has an empty author name and email".into(),
+        });
+    }
+
+    let owners = by_identity
+        .into_iter()
+        .map(|((name, email), _)| Owner { name, email })
+        .collect();
+    (owners, unavailable)
 }
 
 #[cfg(test)]
@@ -935,6 +1192,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert!(report.complete);
     }
@@ -949,5 +1207,141 @@ mod tests {
         );
         assert!(!report.complete);
         assert!(report.seeds.is_empty());
+        assert!(report.owners.is_empty());
+    }
+
+    fn module(path: &str, symbols: u32) -> ImpactedModule {
+        ImpactedModule {
+            path: path.into(),
+            files: 1,
+            symbols,
+            nearest_distance: 0,
+            changed: true,
+            test_signal: TestSignal::Unavailable,
+        }
+    }
+
+    /// An incomplete test walk must never collapse into `none`. That is how
+    /// "we stopped looking" comes to read as "there are no tests".
+    #[test]
+    fn an_incomplete_test_walk_is_unavailable_not_none() {
+        let mut modules = vec![module("src", 1)];
+        annotate_test_signals(
+            &mut modules,
+            &[seed("src/lib.rs::f", "src/lib.rs", 1)],
+            &[],
+            &[],
+            true,
+        );
+        assert_eq!(modules[0].test_signal, TestSignal::Unavailable);
+    }
+
+    #[test]
+    fn no_behavioral_seed_is_na() {
+        let mut modules = vec![module("docs", 0)];
+        annotate_test_signals(&mut modules, &[], &[], &[], false);
+        assert_eq!(modules[0].test_signal, TestSignal::Na);
+    }
+
+    #[test]
+    fn reached_tests_that_did_not_change_are_stale() {
+        let mut modules = vec![module("src", 1)];
+        annotate_test_signals(
+            &mut modules,
+            &[seed("src/lib.rs::f", "src/lib.rs", 1)],
+            &[AffectedTestFile {
+                path: "tests/f.rs".into(),
+                distance: 1,
+            }],
+            &[FileChange {
+                path: "src/lib.rs".into(),
+                renamed_from: None,
+                status: ChangeStatus::Modified,
+                ranges: vec![],
+            }],
+            false,
+        );
+        assert_eq!(modules[0].test_signal, TestSignal::Stale);
+    }
+
+    #[test]
+    fn a_reached_test_in_the_diff_is_changed() {
+        let mut modules = vec![module("src", 1)];
+        annotate_test_signals(
+            &mut modules,
+            &[seed("src/lib.rs::f", "src/lib.rs", 1)],
+            &[AffectedTestFile {
+                path: "tests/f.rs".into(),
+                distance: 1,
+            }],
+            &[FileChange {
+                path: "tests/f.rs".into(),
+                renamed_from: None,
+                status: ChangeStatus::Modified,
+                ranges: vec![],
+            }],
+            false,
+        );
+        assert_eq!(modules[0].test_signal, TestSignal::Changed);
+    }
+
+    /// A renamed test file that the walk did not reconcile must not read as
+    /// "no tests" — that is the silent wrong answer this signal exists to
+    /// refuse.
+    #[test]
+    fn a_renamed_test_with_no_reached_list_is_unavailable_not_none() {
+        let mut modules = vec![module("src", 1)];
+        annotate_test_signals(
+            &mut modules,
+            &[seed("src/lib.rs::f", "src/lib.rs", 1)],
+            &[],
+            &[FileChange {
+                path: "tests/new.rs".into(),
+                renamed_from: Some("tests/old.rs".into()),
+                status: ChangeStatus::Modified,
+                ranges: vec![],
+            }],
+            false,
+        );
+        assert_eq!(modules[0].test_signal, TestSignal::Unavailable);
+        assert_ne!(modules[0].test_signal, TestSignal::None);
+    }
+
+    #[test]
+    fn no_tests_reached_and_no_test_in_the_diff_is_none() {
+        let mut modules = vec![module("src", 1)];
+        annotate_test_signals(
+            &mut modules,
+            &[seed("src/lib.rs::f", "src/lib.rs", 1)],
+            &[],
+            &[FileChange {
+                path: "src/lib.rs".into(),
+                renamed_from: None,
+                status: ChangeStatus::Modified,
+                ranges: vec![],
+            }],
+            false,
+        );
+        assert_eq!(modules[0].test_signal, TestSignal::None);
+    }
+
+    #[test]
+    fn an_owners_unavailable_entry_makes_the_report_incomplete() {
+        let report = BlastReport::new(
+            "a..b".into(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![Unavailable::OwnersUnavailable {
+                reason: "not a git repository".into(),
+            }],
+        );
+        assert!(!report.complete);
+        assert!(report.owners.is_empty());
     }
 }

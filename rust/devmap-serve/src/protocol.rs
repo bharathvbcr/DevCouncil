@@ -367,6 +367,17 @@ pub enum IpcCommand {
         #[serde(default)]
         semantic: bool,
     },
+    /// Plain-language find: name+docstring TF-IDF seeds, re-ranked by
+    /// personalized PageRank over call edges. Distinct from `Search` with
+    /// `semantic: true`, which ranks names only.
+    Ask {
+        query: String,
+        #[serde(default = "default_budget")]
+        budget: u32,
+        /// Minimum call-edge confidence. Defaults to the deterministic rung.
+        #[serde(default = "default_ask_confidence")]
+        min_confidence: f32,
+    },
     Deps {
         target: String,
         #[serde(default = "default_budget")]
@@ -439,6 +450,12 @@ pub enum IpcCommand {
         min_rung: Option<String>,
     },
     Dead {
+        #[serde(default = "default_budget")]
+        budget: u32,
+    },
+    /// Definitions in one file as signature plus span — never the body.
+    Skeleton {
+        file: String,
         #[serde(default = "default_budget")]
         budget: u32,
     },
@@ -523,6 +540,10 @@ pub enum IpcCommand {
 
 fn default_preview_confidence() -> f32 {
     devmap_query::PREVIEW_CALLER_MIN_CONFIDENCE
+}
+
+fn default_ask_confidence() -> f32 {
+    devmap_query::ASK_DEFAULT_MIN_CONFIDENCE
 }
 
 fn default_explore_limit() -> usize {
@@ -692,6 +713,11 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
             return check_walk_depth(*depth);
         }
         IpcCommand::Search { query, budget, .. } => (query.as_str(), *budget, 1, None),
+        IpcCommand::Ask {
+            query,
+            budget,
+            min_confidence,
+        } => (query.as_str(), *budget, 1, Some(*min_confidence)),
         IpcCommand::Deps {
             target,
             budget,
@@ -748,6 +774,7 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
             ("", *budget, *depth, Some(*min_confidence))
         }
         IpcCommand::Dead { budget } => ("", *budget, 1, None),
+        IpcCommand::Skeleton { file, budget } => (file.as_str(), *budget, 1, None),
         IpcCommand::Explore {
             query,
             limit,
@@ -992,6 +1019,9 @@ pub(crate) fn dispatch(
                 // One owner with the CLI: SQL over stored edges, never the
                 // in-memory index's divergent recount. `null` with no generation.
                 "edge_confidence_mismatches": store.edge_confidence_mismatches()?,
+                // Same persisted object `devmap build` prints. `null` when
+                // absent — unexplained is not zero. Shared owner with the CLI.
+                "resolution_rate": store.latest_resolution_rate()?,
             }))
         }
         IpcCommand::Search {
@@ -1011,6 +1041,15 @@ pub(crate) fn dispatch(
             };
             Ok(serde_json::to_value(response)?)
         }
+        IpcCommand::Ask {
+            query,
+            budget,
+            min_confidence,
+        } => Ok(serde_json::to_value(engine.ask(
+            &query,
+            budget,
+            min_confidence,
+        )?)?),
         IpcCommand::Deps {
             target,
             budget,
@@ -1112,6 +1151,9 @@ pub(crate) fn dispatch(
             )?,
         })),
         IpcCommand::Dead { budget } => Ok(serde_json::to_value(engine.dead_symbols(budget)?)?),
+        IpcCommand::Skeleton { file, budget } => {
+            Ok(serde_json::to_value(engine.skeleton(&file, budget)?)?)
+        }
         IpcCommand::Explore {
             query,
             limit,
@@ -3360,6 +3402,85 @@ mod hardening_limit_tests {
             ipc["edge_confidence_mismatches"],
             serde_json::json!(sql),
             "IPC Status must report the SQL owner: {ipc}"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// IPC / MCP status carries the same persisted `resolution_rate` build
+    /// prints — including `by_language` — rather than inventing a zero rate
+    /// when the field is absent.
+    #[test]
+    fn ipc_status_carries_resolution_rate_by_language() {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-ipc-resolution-rate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.py"), "def helper():\n    return 42\n").unwrap();
+        std::fs::write(
+            root.join("app.py"),
+            "from lib import helper\n\n\ndef main():\n    return helper()\n",
+        )
+        .unwrap();
+        let lib = devmap_extract::extract_file(
+            "lib.py",
+            &std::fs::read_to_string(root.join("lib.py")).unwrap(),
+        );
+        let app = devmap_extract::extract_file(
+            "app.py",
+            &std::fs::read_to_string(root.join("app.py")).unwrap(),
+        );
+        let extractions = vec![lib, app];
+        let mut resolver = devmap_resolve::Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
+        let analysis = devmap_analyze::analyze(&extractions, &resolution);
+        let db = root.join("index.sqlite");
+        let store = Store::open(&db).unwrap();
+        store
+            .save_generation_with_opts(
+                &extractions,
+                &resolution,
+                &analysis,
+                devmap_store::GenerationWriteOpts {
+                    repo_root: Some(root.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let persisted = store
+            .latest_resolution_rate()
+            .unwrap()
+            .expect("analyze always records a rate");
+        assert!(
+            persisted.by_language.contains_key("python"),
+            "fixture must yield a python row: {:?}",
+            persisted.by_language.keys().collect::<Vec<_>>()
+        );
+        let ipc = dispatch(
+            &store,
+            IpcRequest {
+                version: PROTOCOL_VERSION,
+                command: IpcCommand::Status,
+            },
+            &devmap_query::Cancel::new(),
+            &UnappliedEdits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            ipc["resolution_rate"],
+            serde_json::to_value(&persisted).unwrap(),
+            "IPC Status must report the persisted rate, not a recomputed one: {ipc}"
+        );
+        assert!(
+            ipc["resolution_rate"]["by_language"]["python"].is_object(),
+            "by_language must be on the status payload: {ipc}"
         );
         drop(store);
         let _ = std::fs::remove_dir_all(&root);

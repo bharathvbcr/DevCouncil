@@ -121,3 +121,65 @@ fn symbol_snapshots_reject_corrupt_or_partial_attribution_metadata() {
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
+
+/// Status reads the persisted rate via `json_extract`. Absence must stay
+/// `None` — unexplained is not zero — and a present object must round-trip
+/// including `by_language`.
+#[test]
+fn latest_resolution_rate_treats_absence_as_unmeasured_not_zero() {
+    let (absent, path) = store_with_analysis(
+        "rate-absent",
+        r#"{"total_files":1,"total_symbols":1,"total_edges":0,"status":"Ok",
+            "dead_symbols":[],"communities":[]}"#,
+    );
+    assert_eq!(
+        absent.latest_resolution_rate().unwrap(),
+        None,
+        "a pre-rate summary must not invent a zero resolution_rate"
+    );
+    drop(absent);
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+    let rate = serde_json::json!({
+        "resolved_sites": 2,
+        "unresolved_sites": 1,
+        "explained_sites": 1,
+        "gross_permille": 666,
+        "net_permille": 1000,
+        "by_language": {
+            "python": {
+                "extracts_calls": true,
+                "resolved_sites": 2,
+                "unresolved_sites": 1,
+                "explained_sites": 1,
+                "gross_permille": 666,
+                "net_permille": 1000
+            }
+        }
+    });
+    let summary = format!(
+        r#"{{"total_files":1,"total_symbols":2,"total_edges":2,"status":"Ok",
+            "dead_symbols":[],"communities":[],"resolution_rate":{rate}}}"#
+    );
+    let (present, path) = store_with_analysis("rate-present", &summary);
+    let loaded = present
+        .latest_resolution_rate()
+        .unwrap()
+        .expect("a recorded rate must load");
+    assert_eq!(loaded.resolved_sites, 2);
+    assert_eq!(loaded.by_language["python"].net_permille, Some(1000));
+    drop(present);
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+    let (corrupt, path) = store_with_analysis(
+        "rate-corrupt",
+        r#"{"total_files":0,"total_symbols":0,"total_edges":0,"status":"Ok",
+            "dead_symbols":[],"communities":[],"resolution_rate":"not-an-object"}"#,
+    );
+    assert!(
+        corrupt.latest_resolution_rate().is_err(),
+        "a malformed rate must error, not read as unmeasured"
+    );
+    drop(corrupt);
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
