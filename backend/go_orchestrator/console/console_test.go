@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -135,6 +136,80 @@ func TestHumanOutputPreservesUnicodeAcrossWrites(t *testing.T) {
 	}
 	if out.String() != string(input) {
 		t.Fatalf("split writes corrupted Unicode: %q", out.String())
+	}
+}
+
+func TestChunkEndDoesNotWrapNearMaxInt(t *testing.T) {
+	start := math.MaxInt - 10
+	n := math.MaxInt
+	// start+humanChunkSize is the old window end. It wraps, so a slice
+	// expression using it panics instead of stopping at n.
+	wrapped := start + humanChunkSize
+	if wrapped >= 0 || wrapped >= start {
+		t.Fatal("start+humanChunkSize did not wrap; the overflow regression is gone")
+	}
+	end, ok := chunkEnd(start, n)
+	if !ok || end != n || end < start {
+		t.Fatalf("chunkEnd(%d, %d) = (%d, %v)", start, n, end, ok)
+	}
+
+	end, ok = chunkEnd(0, 100)
+	if !ok || end != 100 {
+		t.Fatalf("short buffer: (%d, %v)", end, ok)
+	}
+	end, ok = chunkEnd(0, humanChunkSize+50)
+	if !ok || end != humanChunkSize {
+		t.Fatalf("first window: (%d, %v)", end, ok)
+	}
+	end, ok = chunkEnd(humanChunkSize, humanChunkSize+50)
+	if !ok || end != humanChunkSize+50 {
+		t.Fatalf("tail window: (%d, %v)", end, ok)
+	}
+	if _, ok := chunkEnd(-1, 10); ok {
+		t.Fatal("negative start was accepted")
+	}
+	if _, ok := chunkEnd(11, 10); ok {
+		t.Fatal("start past n was accepted")
+	}
+}
+
+func TestHumanCarryStaysWithinOneRune(t *testing.T) {
+	var out bytes.Buffer
+	s := New(&out, io.Discard, Policy{}, context.Background())
+	s.clear()
+	close(s.stop)
+	<-s.done
+	s.human = true
+	// A full window plus the first byte of a 4-byte rune. The carry is that
+	// one byte, not the window.
+	input := append(bytes.Repeat([]byte{'x'}, humanChunkSize), 0xF0)
+	if _, err := (outputWriter{s}).Write(input); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.humanPending) != 1 || s.humanPending[0] != 0xF0 {
+		t.Fatalf("pending = %v", s.humanPending)
+	}
+	if out.String() != strings.Repeat("x", humanChunkSize) {
+		t.Fatalf("emitted %q", out.String())
+	}
+}
+
+func TestOversizedCarryIsEmittedBeforeTheNextWindow(t *testing.T) {
+	var out bytes.Buffer
+	s := New(&out, io.Discard, Policy{}, context.Background())
+	s.clear()
+	close(s.stop)
+	<-s.done
+	s.human = true
+	s.humanPending = bytes.Repeat([]byte{0x80}, 100)
+	if _, err := (outputWriter{s}).Write([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.humanPending) > maxUTF8Carry {
+		t.Fatalf("carried %d bytes", len(s.humanPending))
+	}
+	if !strings.Contains(out.String(), "ok") || !strings.Contains(out.String(), `\x80`) {
+		t.Fatalf("output = %q", out.String())
 	}
 }
 

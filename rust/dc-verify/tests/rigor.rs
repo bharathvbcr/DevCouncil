@@ -17,6 +17,42 @@ fn diff_of(path: &str, lines: &[(u32, &str)]) -> FileDiff {
     }
 }
 
+/// Failure text must say that a credential was quoted without repeating it.
+/// Interpolating `evidence` here would copy the secret into the test log at
+/// the moment the redaction check fails.
+fn assert_evidence_withholds(evidence: &str, marker: &str) {
+    assert!(
+        !evidence.contains(marker),
+        "the finding quoted the credential"
+    );
+}
+
+fn panic_payload(err: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = err.downcast_ref::<String>() {
+        return message.clone();
+    }
+    if let Some(message) = err.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    String::new()
+}
+
+#[test]
+fn a_failed_withhold_check_does_not_log_the_credential() {
+    let evidence = "sk-ant-SUPERSECRETVALUE";
+    let err = std::panic::catch_unwind(|| assert_evidence_withholds(evidence, "SUPERSECRET"))
+        .expect_err("the withhold check must fail when the marker is present");
+    let text = panic_payload(err.as_ref());
+    assert!(
+        !text.contains("SUPERSECRET"),
+        "the failure logged the credential"
+    );
+    assert!(
+        text.contains("the finding quoted the credential"),
+        "the failure omitted the reason"
+    );
+}
+
 // --- secret scanning ---
 
 #[test]
@@ -37,7 +73,7 @@ fn credential_shapes_in_added_lines_are_blocking() {
         ],
     )];
     let findings = scan_secrets(&files);
-    assert_eq!(findings.len(), 4, "findings: {findings:#?}");
+    assert_eq!(findings.len(), 4, "expected four credential shapes");
     for finding in &findings {
         assert_eq!(finding.severity, Severity::Blocking);
         assert_eq!(finding.gate, "secret_scan");
@@ -55,16 +91,11 @@ fn a_secret_finding_never_quotes_the_secret() {
     let findings = scan_secrets(&files);
     assert_eq!(findings.len(), 1);
     let finding = &findings[0];
-    assert!(
-        !finding.evidence.contains("SUPERSECRET"),
-        "the finding quoted the credential: {}",
-        finding.evidence
-    );
+    assert_evidence_withholds(&finding.evidence, "SUPERSECRET");
     assert!(!finding.message.contains("SUPERSECRET"));
     assert!(
         finding.evidence.starts_with("sk-ant-"),
-        "the finding must still identify the shape: {}",
-        finding.evidence
+        "the finding must still identify the credential shape"
     );
 }
 
@@ -87,7 +118,7 @@ fn ordinary_code_is_not_flagged_as_a_secret() {
         ],
     )];
     let findings = scan_secrets(&files);
-    assert!(findings.is_empty(), "false positives: {findings:#?}");
+    assert!(findings.is_empty(), "ordinary code was reported as a secret");
 }
 
 #[test]
@@ -225,7 +256,7 @@ fn the_gates_read_a_parsed_diff_end_to_end() {
     assert_eq!(files.len(), 1);
 
     let secrets = scan_secrets(&files);
-    assert_eq!(secrets.len(), 1, "{secrets:#?}");
+    assert_eq!(secrets.len(), 1, "the parsed diff should yield one secret finding");
     assert_eq!(secrets[0].path, "src/auth.go");
     assert!(
         secrets[0].line > 0,
@@ -271,11 +302,7 @@ diff --git a/src/notes.go b/src/notes.go
     let files = parse_unified(diff).expect("parse");
     let stubs = detect_stubs(&files);
     assert_eq!(stubs.len(), 1);
-    assert!(
-        !stubs[0].evidence.contains("AAAAAAAA"),
-        "stub evidence leaked the credential: {}",
-        stubs[0].evidence
-    );
+    assert_evidence_withholds(&stubs[0].evidence, "AAAAAAAA");
 }
 
 #[test]
@@ -413,17 +440,9 @@ fn sibling_prefixes_of_the_vendors_already_listed_are_detected() {
     for (name, line) in cases {
         let files = vec![diff_of("src/a.go", &[(1, line)])];
         let findings = scan_secrets(&files);
-        assert_eq!(
-            findings.len(),
-            1,
-            "{name} passed the secret gate clean: {line}"
-        );
+        assert_eq!(findings.len(), 1, "{name} passed the secret gate clean");
         assert_eq!(findings[0].severity, Severity::Blocking);
-        assert!(
-            !findings[0].evidence.contains("AAAAAAAAAA"),
-            "{name}: the finding quoted the credential: {}",
-            findings[0].evidence
-        );
+        assert_evidence_withholds(&findings[0].evidence, "AAAAAAAAAA");
     }
 }
 
@@ -450,7 +469,7 @@ fn ordinary_identifiers_containing_a_key_prefix_are_not_credentials() {
     let findings = scan_secrets(&files);
     assert!(
         findings.is_empty(),
-        "ordinary code was reported as credentials: {findings:#?}"
+        "ordinary code was reported as credentials"
     );
 }
 

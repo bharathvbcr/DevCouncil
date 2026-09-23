@@ -5,8 +5,10 @@ package console
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -168,6 +170,36 @@ func (w rawWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+const (
+	humanChunkSize = 4096
+	// An incomplete UTF-8 sequence is at most three bytes. A longer tail cannot
+	// still become a rune on a later write.
+	maxUTF8Carry = utf8.UTFMax - 1
+	humanBufCap  = humanChunkSize + maxUTF8Carry
+)
+
+var errChunkWindow = errors.New("console: chunk window overflow")
+
+// chunkEnd is the exclusive end of the next input window starting at start
+// within a slice of length n. The width is at most humanChunkSize.
+//
+// Adding the chunk size to start wraps when start > MaxInt-humanChunkSize,
+// and the wrapped negative index panics on the slice. The width is taken from
+// the remaining length instead, then checked against MaxInt-start.
+func chunkEnd(start, n int) (int, bool) {
+	if start < 0 || n < start {
+		return 0, false
+	}
+	remain := n - start
+	if remain > humanChunkSize {
+		remain = humanChunkSize
+	}
+	if remain > math.MaxInt-start {
+		return 0, false
+	}
+	return start + remain, true
+}
+
 type outputWriter struct{ s *Session }
 
 func (w outputWriter) Write(p []byte) (int, error) {
@@ -178,12 +210,24 @@ func (w outputWriter) Write(p []byte) (int, error) {
 	w.s.humanMu.Lock()
 	defer w.s.humanMu.Unlock()
 	// Child process writes may split a UTF-8 character anywhere. Carry at most
-	// three bytes between writes and keep all temporary chunks bounded.
+	// one incomplete rune between writes. The temporary buffer's capacity is a
+	// constant: sizing it from len(pending)+window wraps when either length is
+	// near MaxInt, and make then panics or allocates a short buffer.
 	pending := w.s.humanPending
 	w.s.humanPending = nil
+	if len(pending) > maxUTF8Carry {
+		cut := len(pending) - maxUTF8Carry
+		if _, err := (rawWriter{w.s}).Write([]byte(safe(string(pending[:cut]), w.s.ascii))); err != nil {
+			return 0, err
+		}
+		pending = append([]byte(nil), pending[cut:]...)
+	}
 	for start := 0; start < len(p); {
-		end := min(start+4096, len(p))
-		chunk := make([]byte, 0, len(pending)+end-start)
+		end, ok := chunkEnd(start, len(p))
+		if !ok {
+			return start, errChunkWindow
+		}
+		chunk := make([]byte, 0, humanBufCap)
 		chunk = append(chunk, pending...)
 		chunk = append(chunk, p[start:end]...)
 		valid := len(chunk)
@@ -196,6 +240,11 @@ func (w outputWriter) Write(p []byte) (int, error) {
 			valid = tail
 		} else {
 			valid = len(chunk)
+		}
+		// A run of bytes with no rune start is not a prefix that a later write
+		// can complete. Keep only the last incomplete sequence.
+		if len(chunk)-valid > maxUTF8Carry {
+			valid = len(chunk) - maxUTF8Carry
 		}
 		text := safe(string(chunk[:valid]), w.s.ascii)
 		if _, err := (rawWriter{w.s}).Write([]byte(text)); err != nil {

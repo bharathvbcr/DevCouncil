@@ -250,9 +250,8 @@ fn the_gates_accept_nothing_they_should_catch_and_flag_nothing_clean() {
             for finding in &mine {
                 assert!(
                     !dc_verify::rigor::contains_secret(&finding.evidence),
-                    "case {:?}: the {gate} gate quoted a credential in its evidence: {:?}",
-                    case.name,
-                    finding.evidence
+                    "case {:?}: the {gate} gate quoted a credential in its evidence",
+                    case.name
                 );
             }
         }
