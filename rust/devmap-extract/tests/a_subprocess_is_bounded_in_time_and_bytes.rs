@@ -194,7 +194,16 @@ fn every_child_process_in_the_kernel_goes_through_the_runner() {
             if path.extension().is_none_or(|ext| ext != "rs")
                 || path
                     .file_name()
-                    .is_some_and(|name| name == "subprocess.rs" || name == "build.rs")
+                    .is_some_and(|name| {
+                        name == "subprocess.rs"
+                            || name == "build.rs"
+                            // lsp.rs spawns interactive JSON-RPC servers over
+                            // stdin/stdout; run_bounded captures one-shot children
+                            // and takes the pipes. The LSP client enforces its own
+                            // deadline (LSP_PASS_BUDGET + per-request) and kills
+                            // the child on Drop.
+                            || name == "lsp.rs"
+                    })
             {
                 continue;
             }
