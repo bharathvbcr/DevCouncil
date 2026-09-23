@@ -51,6 +51,31 @@ policy. It binds to the project root resolved by the Go host. It is not an
 arbitrary shell/file-edit server. Ordinary editor writes are not intercepted
 by the retired DevCouncil lifecycle hooks.
 
+```mermaid
+flowchart TD
+    subgraph ClientLayer["Coding Agent / Editor Client"]
+        Agent["Agent Context / IDE"]
+    end
+
+    subgraph DevMapMCP["devmap mcp (Code Intelligence)"]
+        DM_Tools["13 Read-Only MCP Tools:<br/>- Inspection: status, search<br/>- Navigation: explore, dependencies, impact, trace, neighbors<br/>- Analysis: dead_symbols, clones, preview, affected_tests<br/>- Git-Graph: blast (forward), suspects (backward)"]
+        DM_Envelope["Multi-repo envelope check:<br/>Client sends repo_path<br/>Validates repository.root"]
+    end
+
+    subgraph DevCouncilMCP["devcouncil mcp (Task & Policy)"]
+        DC_Tools["8 Registry Tools:<br/>- devcouncil_next_task<br/>- devcouncil_checkout_task<br/>- devcouncil_renew_lease<br/>- devcouncil_policy_check_write<br/>- devcouncil_get_diff<br/>- devcouncil_verify_task<br/>- devcouncil_get_gaps<br/>- devcouncil_release_task"]
+        DC_Scope["Project-Root Bound:<br/>Task scope enforcement<br/>Lease mutual exclusion"]
+    end
+
+    Agent -->|"Code questions<br/>(repo_path, symbol)"| DM_Tools
+    DM_Tools --- DM_Envelope
+    DM_Tools --> GraphDB[(".devmap/devmap.sqlite")]
+
+    Agent -->|"Task lifecycle & policy<br/>(task_id, lease_id)"| DC_Tools
+    DC_Tools --- DC_Scope
+    DC_Tools --> TaskDB[(".devcouncil/state.sqlite")]
+```
+
 ## Code graph pipeline
 
 1. `devmap-extract` discovers files and extracts definitions, imports, calls and
@@ -86,6 +111,42 @@ response or process exit alone does not establish that all checks ran.
 Expected commands run in a local shell. The sandbox selector does not implement
 Docker or Nix isolation. See the [task loop contract](hero-loop.md).
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Agent as Coding Agent / CLI
+    participant Host as Go Host (devcouncil verify)
+    participant Git as Git Working Tree
+    participant DCVerify as dcverify (Rust Engine)
+    participant Shell as Local Shell (Project Root)
+    participant Store as dcstore (Task SQLite)
+
+    Agent->>Host: VerifyTask(task_id, mode, coverage_path)
+    Host->>Store: Load task record, planned files, expected commands
+    Host->>Git: Generate unified diff against base
+    Git-->>Host: Raw diff text
+    Host->>Host: Scope analysis (planned files, orphan diffs, dep changes)
+
+    rect rgb(240, 245, 255)
+        note over Host,DCVerify: Deterministic Rigor Verification
+        Host->>DCVerify: runRigorGates(diff, coverage_profile)
+        DCVerify->>DCVerify: Parse diff hunks & spans
+        DCVerify->>DCVerify: Check stubs, fake returns & secrets
+        DCVerify->>DCVerify: Intersect diff with coverage profile
+        DCVerify-->>Host: Rigor findings (stubs, secrets, uncovered lines)
+    end
+
+    rect rgb(245, 255, 245)
+        note over Host,Shell: Expected Command Execution
+        Host->>Shell: Execute task test / build commands
+        Shell-->>Host: Exit codes & command stdout/stderr
+    end
+
+    Host->>Host: Evaluate verdict against gate mode (off / advisory / enforce)
+    Host->>Store: Persist verification run, record gaps & update recurrence
+    Host-->>Agent: Verification result (status, gates applied, typed next_actions)
+```
+
 ## State and artifacts
 
 | Artifact | Location / resolution |
@@ -95,6 +156,29 @@ Docker or Nix isolation. See the [task loop contract](hero-loop.md).
 | Graph export | `code_graph` from `paths`; may be capped |
 | Agent guides | Project `AGENTS.md` / `CLAUDE.md`, written when requested and managed |
 | Task state | `.devcouncil/state.sqlite`, opened by the Go host |
+
+```mermaid
+flowchart TD
+    subgraph RepoRoot["Project Workspace"]
+        subgraph DevMapDir[".devmap/ (Code Intelligence State)"]
+            GraphDB[("devmap.sqlite<br/>(Canonical symbol graph,<br/>nodes, edges, evidence, gaps)")]
+            RepoMap["repo_map.json<br/>(Subsystem & file layout)"]
+            CodeGraphExport["code_graph.json<br/>(Exported graph snapshot)"]
+        end
+
+        subgraph DevCouncilDir[".devcouncil/ (Task & Lease State)"]
+            TaskDB[("state.sqlite<br/>(Task repository, active leases,<br/>verification runs, audit gaps)")]
+        end
+
+        subgraph ManagedGuides["Workspace Guides"]
+            AgentsMD["AGENTS.md / CLAUDE.md<br/>(Marker-managed agent context)"]
+        end
+    end
+
+    DevMapEngine["devmap (Rust)"] -->|"Writes canonical graph & exports"| DevMapDir
+    DevMapEngine -->|"Generates with --guides"| ManagedGuides
+    GoHost["devcouncil (Go Host)"] -->|"Reads/writes task & lease state"| DevCouncilDir
+```
 
 [`devmap-extract/src/paths.rs`](../rust/devmap-extract/src/paths.rs) owns state
 resolution: configured state home, then existing `.devmap/`, then existing

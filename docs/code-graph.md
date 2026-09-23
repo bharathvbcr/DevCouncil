@@ -38,8 +38,49 @@ Replace example names and paths with actual repository symbols:
 | Trace a relationship | `devmap trace EntryPoint TargetFunction --json` |
 | Find dead-code candidates | `devmap dead --json` |
 | Find candidate tests | `devmap affected src/service.go --json` |
+| Forward change impact | `devmap blast --since HEAD~1 --json` |
+| Backward root-cause commits | `devmap suspects MyFunction --since v0.2.0 --json` |
+| Preview unsaved edit impact | `devmap preview --file src/service.go --json` |
+| Find duplicate symbol bodies | `devmap clones --json` |
 | Keep the index warm | `devmap serve` |
 | Inspect installed identity | `devmap --version` |
+
+```mermaid
+flowchart TD
+    subgraph Target["Target Entity"]
+        Symbol["Target Symbol / File<br/>(e.g., src/service.go)"]
+    end
+
+    subgraph DirectNeighbors["Neighborhood Analysis (devmap explore)"]
+        InboundCallers["Inbound Callers<br/>(Who calls this)"]
+        OutboundCallees["Outbound Callees<br/>(Who this calls)"]
+        Imports["Import Dependencies"]
+    end
+
+    subgraph ForwardAnalysis["Forward Analysis (devmap blast / impact)"]
+        Subsystems["Affected Subsystems"]
+        APIRoutes["Affected Route Endpoints"]
+        DirectTests["Direct Unit Tests"]
+        IntegrationTests["Integration Tests (devmap affected)"]
+    end
+
+    subgraph BackwardAnalysis["Backward Analysis (devmap suspects)"]
+        DependencyCone["Transitive Outbound Cone<br/>(What this relies upon)"]
+        BlamedCommits["Blamed Historical Commits<br/>(Touching span lines)"]
+    end
+
+    InboundCallers -->|"calls"| Symbol
+    Symbol -->|"calls"| OutboundCallees
+    Symbol -->|"imports"| Imports
+
+    InboundCallers --> Subsystems
+    Subsystems --> APIRoutes
+    APIRoutes --> DirectTests
+    Subsystems --> IntegrationTests
+
+    Symbol -->|"walk outbound"| DependencyCone
+    DependencyCone -->|"intersect git window"| BlamedCommits
+```
 
 `devmap COMMAND --help` is the installed binary's flag authority. There is no
 `devmap query` command and no `build --watch`; use `serve` for watching.
@@ -81,6 +122,25 @@ and truncation metadata rather than equating an empty sample with full coverage.
 
 Confirm a deletion through independent source/caller evidence and relevant
 runtime tests. A graph match alone does not establish safety.
+
+```mermaid
+flowchart TD
+    Candidate["Symbol with 0 Inbound Edges"] --> FilterCheck{"Ambiguity or Coverage<br/>Limitations?"}
+
+    FilterCheck -->|"Has ambiguous namesake callers"| Unconfirmed1["Unconfirmed Candidate<br/>(reason: only_ambiguous_callers)"]
+    FilterCheck -->|"Unresolved namesake in repo"| Unconfirmed2["Unconfirmed Candidate<br/>(reason: unresolved_namesake)"]
+    FilterCheck -->|"Traversal budget/depth capped"| Unconfirmed3["Unconfirmed Candidate<br/>(reason: coverage_capped)"]
+    FilterCheck -->|"Clean graph, all callers parsed"| Confident["Confident Dead Candidate<br/>(High confidence: parsed, no inbound calls)"]
+
+    subgraph VerificationGate["Pre-Deletion Safety Gate"]
+        CheckSurfaces["Verify runtime entry roots, reflection,<br/>registries, and external consumers"]
+    end
+
+    Confident --> CheckSurfaces
+    Unconfirmed1 --> CheckSurfaces
+    Unconfirmed2 --> CheckSurfaces
+    Unconfirmed3 --> CheckSurfaces
+```
 
 ## MCP and host setup
 

@@ -206,18 +206,35 @@ devmap repair
 # Code Exploration & Navigation
 devmap search <QUERY> [--semantic]
 devmap explore <NAME>
+devmap deps <FILE> [--min-rung deterministic|high|speculative]
 devmap trace <SRC> <DST>
-devmap impact <TARGET>
+devmap impact <TARGET> [--layers]
+devmap neighbors <TARGETS…> [--depth N]
+devmap affected <TARGETS…>
 devmap dead [--json]
+devmap clones [--kind exact|structural]
+devmap preview --file <FILE> [--content <PATH|->]
+
+# Git + Code Graph Bidirectional Analysis
+devmap blast [--since <REV>] [--at <LOC>]   # Forward change impact (inbound edges)
+devmap suspects <SYMPTOM> --since <REV>     # Backward regression attribution (outbound edges)
+
+# Structural & Route Analysis
 devmap cypher '<QUERY>'
-devmap affected <TARGET>
 devmap pdg <FILE> [--taint]
-devmap ast …
+devmap routes [--filter <PATH>]
+devmap shape-check [--filter <PATH>]
+devmap api-impact <ROUTE>
+devmap ast <QUERY> [--kind <KIND>] [--language <LANG>]
+
+# Session Insights & Gaps
+devmap gap-record --tool <TOOL> --gap-id <ID> --reason <REASON>
+devmap session-report [--last]
 
 # Visualizers & Servers
-devmap map-html             # Subsystem map (.devcouncil/map.html)
+devmap map-html             # Subsystem map (.devmap/map.html or .devcouncil/map.html)
 devmap html                 # Symbol graph HTML
-devmap mcp                  # DevMap MCP stdio (not `serve --mcp`)
+devmap mcp                  # DevMap MCP stdio (13 read-only tools)
 devmap export               # GraphML
 ```
 

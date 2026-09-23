@@ -37,6 +37,59 @@ devmap dead                  # confident vs unconfirmed dead candidates (not one
 
 ![DevMap interactive dependency map and symbol graph in GitPulse](../assets/DevMap.png)
 
+```mermaid
+flowchart TD
+    subgraph Source["Source Repository"]
+        Files["Working Tree Files<br/>(Rust, Go, TS, Python, Swift, etc.)"]
+    end
+
+    subgraph Extraction["1. Extraction (devmap-extract)"]
+        Scanner["Ignore-Aware File Scanner"]
+        TreeSitter["Tree-Sitter Language Parsers"]
+        ExtractedData["AST Symbols, Imports, Calls & Spans"]
+        Scanner --> TreeSitter --> ExtractedData
+    end
+
+    subgraph Resolution["2. Symbol Resolution (devmap-resolve)"]
+        SymTable["Symbol & Scope Hierarchy"]
+        EdgeResolver["Call & Import Reference Resolver"]
+        EvidenceTiers["Evidence Tier Assignment<br/>(Proven / Observed / Derived / Gap)"]
+        SymTable --> EdgeResolver --> EvidenceTiers
+    end
+
+    subgraph Analysis["3. Graph Intelligence (devmap-analyze)"]
+        CallGraph["Call Graph & Transitive Traversal"]
+        BlastRadius["Blast Radius & Impact Modeling"]
+        DeadCode["Dead Code & Liveness Candidate Classification"]
+        TestReach["Affected Test Reachability Analysis"]
+        CallGraph --> BlastRadius
+        CallGraph --> DeadCode
+        CallGraph --> TestReach
+    end
+
+    subgraph Storage["4. Canonical Store (devmap-store)"]
+        SQLiteStore[("devmap.sqlite<br/>(Schema 22: Nodes, Edges, Evidence, Gaps)")]
+        ManifestExports["Artifact Exports<br/>(repo_map.json, code_graph.json, AGENTS.md)"]
+    end
+
+    subgraph Serving["5. Query & Consumer Interfaces"]
+        QueryEngine["devmap-query (Composed Graph Queries)"]
+        CLI["devmap CLI (explore, impact, affected, dead, blast, suspects)"]
+        Daemon["devmap serve (Warm Background Watcher)"]
+        MCP["devmap mcp (Repository-Aware Stdio MCP)"]
+    end
+
+    Files --> Scanner
+    ExtractedData --> SymTable
+    EvidenceTiers --> CallGraph
+    Analysis --> SQLiteStore
+    SQLiteStore --> ManifestExports
+    SQLiteStore --> QueryEngine
+    QueryEngine --> CLI
+    QueryEngine --> Daemon
+    QueryEngine --> MCP
+```
+
 ## Why not grep
 
 Grep finds strings. This resolves *edges*, and — more to the point — it tells
@@ -55,6 +108,29 @@ This is the whole design constraint: **a check that could not run must never
 report the same result as a check that ran and passed.** An agent acting on
 "no callers found" needs to know whether that means "nothing calls this" or
 "we stopped looking."
+
+```mermaid
+flowchart TD
+    Call["Call Site / Reference in Code"] --> RecCheck{"Receiver or Scope<br/>Resolved?"}
+
+    RecCheck -->|"Exact AST definition in scope"| Proven["Tier 1: Proven<br/>(High confidence, direct match)"]
+    RecCheck -->|"In-scope signature match"| Observed["Tier 2: Observed<br/>(Standard confidence, typed call)"]
+    RecCheck -->|"Unqualified namesake match"| Ambiguous["Tier 3: Ambiguous Global<br/>(Flagged candidate, unverified)"]
+    RecCheck -->|"External library / runtime global"| ExtGap["Explained Gap<br/>(Excluded external / std built-in)"]
+    RecCheck -->|"Dynamic dispatch / unknown receiver"| UnresolvedGap["Unresolved Gap<br/>(NoNamesake or attributed gap)"]
+
+    subgraph Envelopes["Query Result Envelope"]
+        Result["Symbol / Impact Result"]
+        Meta["Qualification Metadata:<br/>- confidence level<br/>- is_fresh (source + analyzer)<br/>- walk_incomplete (depth capped)<br/>- truncated / total (budget capped)<br/>- coverage_gaps count"]
+    end
+
+    Proven --> Result
+    Observed --> Result
+    Ambiguous --> Result
+    ExtGap --> Meta
+    UnresolvedGap --> Meta
+    Result --- Meta
+```
 
 `status` verifies current source bytes and analyzer identity before reporting
 freshness. Status reports nullable `source_freshness` and `analyzer_freshness`
@@ -264,6 +340,32 @@ Read-only discovery never creates or copies state from another worktree.
 See the [state-discovery audit](../archive/devmap/STATE_DISCOVERY_AUDIT_2026-09-09.md) for
 reproduced failures, regression evidence, and qualification limits.
 
+```mermaid
+flowchart LR
+    subgraph GitRepo["Git Repository"]
+        RootWorktree["Main Worktree (.git/)"]
+        AgentLaneA["Worktree / Agent Lane A"]
+        AgentLaneB["Worktree / Agent Lane B"]
+    end
+
+    subgraph StateA["Lane A State (.devmap/)"]
+        DB_A[("devmap.sqlite (Lane A)")]
+        Map_A["repo_map.json"]
+    end
+
+    subgraph StateB["Lane B State (.devmap/)"]
+        DB_B[("devmap.sqlite (Lane B)")]
+        Map_B["repo_map.json"]
+    end
+
+    AgentLaneA --> DB_A
+    AgentLaneA --> Map_A
+    AgentLaneB --> DB_B
+    AgentLaneB --> Map_B
+
+    DB_A -.->|"Independent builds<br/>No database sharing"| DB_B
+```
+
 Default discovery also skips `testdata/` directory segments, the
 `vendor/grammars/` prefix, and sources over the 1 MiB ceiling (they are not
 charged as coverage loss). Extend the skip list with
@@ -378,6 +480,33 @@ diagnostics with the panel state and its existing rotating logs.
 | `devmap api-impact <route>` | What changing one route reaches, with a risk band |
 | `devmap ast <query>` | Symbols by kind, language and name, with an exact total |
 | `devmap export` | The graph as GraphML, for Gephi, yEd, Cytoscape or networkx |
+| `devmap blast [--since <rev>] [--at <loc>]` | Forward change impact: downstream symbols, files, modules, and tests |
+| `devmap suspects <symptom> --since <rev>` | Backward regression: which commits caused this failure |
+
+```mermaid
+flowchart TD
+    Query["Target Symbol, File or Revision"] --> Dispatcher{"devmap Query Command"}
+
+    Dispatcher -->|"explore <sym>"| Explore["Explore Neighborhood<br/>- Definitions & Spans<br/>- Direct Callers & Callees<br/>- Immediate Blast Radius"]
+    Dispatcher -->|"impact <file>"| Impact["Impact Analysis<br/>- Downstream Dependencies<br/>- Transitive Inbound Callers<br/>- Structural Blast Radius"]
+    Dispatcher -->|"affected <file>"| Affected["Affected Tests<br/>- Reverse Graph Traversal<br/>- Nearest Test Files First<br/>- Candidate Verification Suite"]
+    Dispatcher -->|"blast --since <rev>"| Blast["Forward Change Impact<br/>- Inbound Call Edge Fan-Out<br/>- Downstream Symbols & Files<br/>- Affected Test Candidates"]
+    Dispatcher -->|"suspects <sym> --since <rev>"| Suspects["Backward Root Cause<br/>- Outbound Dependency Cone<br/>- Blamed Commits in Window<br/>- Byte Span Joining"]
+    Dispatcher -->|"trace <a> <b>"| Trace["Shortest Path Trace<br/>- Call & Import Chains<br/>- Directional Edge Steps"]
+    Dispatcher -->|"dead"| Dead["Liveness Candidates<br/>- Confident Dead (zero callers)<br/>- Unconfirmed (ambiguous callers)<br/>- Excludes NoNamesake Gaps"]
+
+    Explore --> GraphStore[("devmap.sqlite<br/>Canonical Graph")]
+    Impact --> GraphStore
+    Affected --> GraphStore
+    Blast --> GraphStore
+    Suspects --> GraphStore
+    Trace --> GraphStore
+    Dead --> GraphStore
+
+    GraphStore --> BoundsCheck{"Budget & Depth<br/>Limits Checked?"}
+    BoundsCheck -->|"Within depth & budget"| FullAnswer["Complete Query Answer<br/>(walk_incomplete: false)"]
+    BoundsCheck -->|"Hit budget / depth ceiling"| BoundedAnswer["Bounded Query Answer<br/>(truncated: true, walk_incomplete: true)"]
+```
 
 Add `--json` to any of them for a machine-readable answer — on either side of
 the subcommand.
@@ -551,6 +680,19 @@ report's `unattributed` list is read before its `impacted` one: changed lines
 that land inside no symbol — imports, top-level constants, attributes, macro
 invocations — have no inbound edges to walk, so the impact is a lower bound and
 `complete` is false.
+
+```mermaid
+flowchart LR
+    subgraph BlastZone["FORWARD ANALYSIS: devmap blast"]
+        GitCommit["Committed Lines / Revision Window"] --> WalkInbound["Walk INBOUND Call Edges<br/>(Who depends on these lines?)"]
+        WalkInbound --> Downstream["Impacted Symbols, Subsystems & Tests<br/>(Potential breakage downstream)"]
+    end
+
+    subgraph SuspectsZone["BACKWARD REGRESSION: devmap suspects"]
+        Symptom["Failing Symbol / Test Symptom"] --> WalkOutbound["Walk OUTBOUND Call Edges<br/>(Transitive dependency cone)"]
+        WalkOutbound --> BlamedCommits["Blamed Historical Commits<br/>(Touching spans of cone in git window)"]
+    end
+```
 
 ### Claude Code
 

@@ -38,6 +38,45 @@ DevCouncil's core runtime is a set of standalone, compiled native modules. Each 
 | `dcverify` | **Rust** | Deterministic verification: Unified-diff parsing, planned file scope classification, anti-laziness/stub gates, test coverage evaluation, and typed `next_actions` repair signals. |
 | `dcgrep` | **Rust** | Code search: Ripgrep-powered ignore-aware search engine with optional trigram indexing (`tgrep-core`). |
 
+```mermaid
+flowchart TD
+    subgraph Consumers["AI Agents & Host Harnesses"]
+        Agent["Coding Agents (Cursor / Claude / Codex / Antigravity / Warp)"]
+        Manvi["Manvi (Agent Loop & Policy Harness)"]
+        GitPulse["GitPulse (Workbench & Git Host)"]
+    end
+
+    subgraph Orchestration["Go Host Layer"]
+        DevCouncil["devcouncil / dev (Go Host CLI & Stdio MCP)"]
+    end
+
+    subgraph NativeModules["Native Rust Engines"]
+        DevMap["devmap (Code Intelligence & AST Graph)"]
+        DCStore["dcstore (Task & Lease SQLite Store)"]
+        DCVerify["dcverify (Rigor, Stubs & Diff Verification)"]
+        DCGrep["dcgrep (Ignore-Aware Ripgrep Engine)"]
+    end
+
+    subgraph Storage["Persistent State"]
+        GraphDB[(".devmap/devmap.sqlite (Code Graph)")]
+        TaskDB[(".devcouncil/state.sqlite (Tasks & Leases)")]
+    end
+
+    Agent -->|"Code Navigation MCP"| DevMap
+    Agent -->|"Task & Policy MCP"| DevCouncil
+    Manvi -->|"Stdio JSON IPC"| DevCouncil
+    Manvi -->|"Stdio JSON IPC"| DevMap
+    GitPulse -->|"In-process / CLI"| DevMap
+    GitPulse -->|"Workbench state"| DCStore
+
+    DevCouncil -->|"Forward map/graph/ast"| DevMap
+    DevCouncil -->|"Task lease coordination"| DCStore
+    DevCouncil -->|"Rigor gate execution"| DCVerify
+
+    DevMap --> GraphDB
+    DCStore --> TaskDB
+```
+
 ### How hosts consume the modules
 
 - **Manvi** wraps the components: it drives the agent loop, provider routing, policy ladder, and TUI, and reaches each binary over JSON on stdio. A host that wants a harness embeds Manvi rather than reimplementing it.
@@ -154,6 +193,16 @@ For an existing task in an initialized `.devcouncil/state.sqlite`:
 
 ```bash
 devcouncil verify TASK-001 --mode enforce --json
+```
+
+```mermaid
+flowchart LR
+    A["Acquire Task Lease<br/>(devcouncil_checkout_task)"] --> B["Implement Changes<br/>(Within Planned Scope)"]
+    B --> C["Verify Task<br/>(devcouncil verify / dcverify)"]
+    C --> D{"Rigor Gates<br/>& Scope Clean?"}
+    D -->|"Gaps Found"| E["Self-Repair<br/>(Typed next_actions)"]
+    E --> B
+    D -->|"All Gates Passed"| F["Release Task Lease<br/>(devcouncil_release_task)"]
 ```
 
 Read gate mode, skipped reasons and coverage metadata. The Go host invokes

@@ -39,6 +39,41 @@ Use the tool’s advertised input schema. The host does not offer arbitrary
 Implement edits through the agent’s own tools. A policy-check result protects
 only consumers that honor it; ordinary external writes are not intercepted.
 
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: Task created in store
+    Idle --> Leased: devcouncil_checkout_task
+    
+    state Leased {
+        [*] --> ScopedWork: Review planned files & diff
+        ScopedWork --> PolicyCheck: devcouncil_policy_check_write
+        PolicyCheck --> Editing: Tool edits in scope
+        Editing --> RenewLease: Lease timeout approaching
+        RenewLease --> Editing: devcouncil_renew_lease
+        Editing --> ScopeDiff: devcouncil_get_diff
+    }
+
+    Leased --> Verification: devcouncil_verify_task
+    
+    state Verification {
+        [*] --> ScopeGates: Check planned files & orphan diffs
+        ScopeGates --> RigorGates: dcverify (stubs, secrets, coverage)
+        RigorGates --> ExpectedCmds: Run test/build commands
+        ExpectedCmds --> EvaluateMode: Check mode (off / advisory / enforce)
+    }
+
+    Verification --> Repairing: Gaps detected (enforce blocks)
+    state Repairing {
+        [*] --> FetchGaps: devcouncil_get_gaps
+        FetchGaps --> ApplyNextActions: Execute typed next_actions
+    }
+    Repairing --> Leased: Apply fixes to diff
+
+    Verification --> VerifiedClean: All gates pass (status: pass)
+    VerifiedClean --> Released: devcouncil_release_task
+    Released --> [*]
+```
+
 ## Read the result, not just the verdict
 
 CLI and MCP share Go verification orchestration. It checks work presence,

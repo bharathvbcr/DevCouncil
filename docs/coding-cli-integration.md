@@ -33,6 +33,40 @@ or `--check` applies changes. Read the JSON receipt with `--json` when scripting
 | OpenCode | `opencode.json`, its project skills layout and a DevMap post-tool plugin |
 | Warp | `.devcouncil/integrations/warp-mcp.json`; no project skill destination is installed by this adapter |
 
+```mermaid
+flowchart TD
+    subgraph CLI["Integration Commands"]
+        DM_Int["devmap integrate &lt;host&gt;"]
+        DC_Int["devcouncil integrate &lt;host&gt;"]
+    end
+
+    subgraph Adapters["Supported Host Adapters"]
+        Cursor["Cursor"]
+        Claude["Claude Code"]
+        Codex["Codex"]
+        AGY["Antigravity"]
+        OpenCode["OpenCode"]
+        Warp["Warp"]
+    end
+
+    subgraph ConfigSurfaces["Target Configuration Surfaces"]
+        UserConfig["Global User Settings<br/>(Global MCP configs, ~/.codex)"]
+        ProjectConfig["Project Config<br/>(.cursor/mcp.json, .mcp.json, .agents/mcp_config.json, opencode.json)"]
+        Skills["Skills Libraries<br/>(.cursor/skills, .claude/skills, .agents/skills)"]
+        Guides["Managed Guides<br/>(AGENTS.md, CLAUDE.md)"]
+    end
+
+    DM_Int --> Cursor & Claude & Codex & AGY & OpenCode & Warp
+    DC_Int -->|"Merges task tools & delegates"| DM_Int
+
+    Cursor --> UserConfig & ProjectConfig & Skills & Guides
+    Claude --> UserConfig & ProjectConfig & Skills & Guides
+    Codex --> UserConfig & Skills & Guides
+    AGY --> ProjectConfig & Skills & Guides
+    OpenCode --> ProjectConfig & Skills & Guides
+    Warp --> ProjectConfig & Guides
+```
+
 All adapters also use the managed guide-writing path. Inspect the receipt for
 exact files and changes: global settings may be touched. Existing unrelated
 server entries are preserved. Do not assume a project-only dry run previews
