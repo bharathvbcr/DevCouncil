@@ -13,7 +13,7 @@ pub use coverage::{
 };
 pub use db::{
     checked_min_confidence, current_git_head, BuildHistoryRow, CallersPage, DeadPage, FileEdges,
-    GenerationWriteOpts, PageSizeConversion, PendingClaim, PendingEnqueueReport, PendingReconcile,
+    FileSymbolsPage, GenerationWriteOpts, PageSizeConversion, PendingClaim, PendingEnqueueReport, PendingReconcile,
     PendingSupersede, PendingWatermark, QuerySourceFreshness, SearchPage, SourceTreeDelta, Store,
     StoreStatus, StoredEdge, StoredFile, StoredSymbol, UnsupportedSchema, VacuumAction,
     VacuumOutcome, WalCheckpointMode, WalCheckpointResult, WriteBreakdown, WriterLock,
