@@ -37,6 +37,32 @@ function run(label, command, args, opts = {}) {
 }
 
 /**
+ * rust/gusset-engine/Cargo.lock records the Gusset version at the revision
+ * setup-gusset pins. A sibling at another revision with another version
+ * makes the `--locked` build below fail with "cannot update the lock file",
+ * which reads like a stale DevCouncil lock. Measured 2026-09-27: a sibling
+ * at Gusset v0.0.2 against the 0.0.1 pin. Say which it is before building.
+ *
+ * @param {string} sibling
+ */
+function warnIfGussetOffPin(sibling) {
+  const actionPath = path.join(REPO_ROOT, ".github", "actions", "setup-gusset", "action.yml");
+  const pin = existsSync(actionPath)
+    ? /^\s*ref:\s*([0-9a-f]{40})\s*$/m.exec(readFileSync(actionPath, "utf8"))?.[1]
+    : undefined;
+  const head = spawnSync("git", ["-C", sibling, "rev-parse", "HEAD"], { encoding: "utf8", shell: false });
+  const sha = head.status === 0 ? head.stdout.trim() : "";
+  if (pin && sha && sha !== pin) {
+    console.warn(
+      `WARN: Gusset checkout ${sibling} is at ${sha.slice(0, 12)}, but CI pins ${pin.slice(0, 12)} ` +
+        "(.github/actions/setup-gusset/action.yml). If the --locked build below fails on the " +
+        `gusset entry, check out the pin (git -C ${sibling} checkout ${pin.slice(0, 12)}); ` +
+        "the DevCouncil lock is not what moved.",
+    );
+  }
+}
+
+/**
  * The host links a sibling Gusset checkout and a gitignored staticlib.
  * `go test` without either fails as a missing replace directory, which reads
  * like a Go bug. Name the missing checkout, and build the archive when the
@@ -51,6 +77,7 @@ function ensureGussetEngine() {
     );
     process.exit(2);
   }
+  warnIfGussetOffPin(path.dirname(siblingMod));
   run("gusset engine", "cargo", [
     "build",
     "--release",
