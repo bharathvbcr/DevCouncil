@@ -311,6 +311,16 @@ export function staleWorkspaceLockEntries(rustRoot, members, identity) {
 export const WITHDRAWN_MARKER = "<!-- release: withdrawn -->";
 
 /**
+ * Whether notes are withdrawn: the marker on a line of its own. Notes that
+ * only *quote* it — v0.2.4.md explains the marker inline — are not.
+ *
+ * @param {string} notes
+ */
+export function notesAreWithdrawn(notes) {
+  return notes.split(/\r?\n/).some((line) => line.trim() === WITHDRAWN_MARKER);
+}
+
+/**
  * @param {string} version
  * @returns {[number, number, number] | null}
  */
@@ -350,7 +360,7 @@ export function successorVersions(prior) {
  * owns, so the product version must be the newest release in it or a single
  * step past it, and no release in it may be newer than the product.
  *
- * A notes file carrying {@link WITHDRAWN_MARKER} is history kept for its
+ * A notes file carrying {@link WITHDRAWN_MARKER} on its own line is history kept for its
  * readers but outside the line (a pre-unification number, a mistaken bump).
  *
  * @param {string} notesDir
@@ -370,7 +380,7 @@ export function releaseLineGaps(notesDir, identity) {
     if (!m) continue;
     const parts = semverParts(m[1]);
     if (!parts) continue;
-    if (readFileSync(path.join(notesDir, name), "utf8").includes(WITHDRAWN_MARKER)) {
+    if (notesAreWithdrawn(readFileSync(path.join(notesDir, name), "utf8"))) {
       if (m[1] === identity) {
         errors.push(`product version ${identity} is marked withdrawn in docs/releases/${name}`);
       }

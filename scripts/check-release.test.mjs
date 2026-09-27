@@ -12,6 +12,7 @@ import {
   inspectRelease,
   membersNotInheritingVersion,
   missingArchives,
+  notesAreWithdrawn,
   npmPublishCreatesGitHubRelease,
   npmPublishSkipsExistingVersion,
   packageIsDistable,
@@ -468,6 +469,11 @@ describe("release line", () => {
     assert.ok(releaseLineGaps(dir, "0.2.3").some((e) => e.includes("v1.3.5")));
     writeFileSync(path.join(dir, "v1.3.5.md"), `# 1.3.5\n\n${WITHDRAWN_MARKER}\n`);
     assert.deepEqual(releaseLineGaps(dir, "0.2.3"), []);
+  });
+
+  it("counts the marker only on a line of its own, not quoted in prose", () => {
+    assert.equal(notesAreWithdrawn(`# v1.3.5\n\n${WITHDRAWN_MARKER}\n> Withdrawn.\n`), true);
+    assert.equal(notesAreWithdrawn(`Notes outside the line carry \`${WITHDRAWN_MARKER}\`.\n`), false);
   });
 
   it("does not let the product version itself be a withdrawn one", () => {
