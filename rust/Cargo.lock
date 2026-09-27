@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "dc-evidence"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -283,11 +283,11 @@ dependencies = [
 
 [[package]]
 name = "dc-glob"
-version = "0.2.3"
+version = "0.2.4"
 
 [[package]]
 name = "dc-grep"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "grep-regex",
  "grep-searcher",
@@ -302,14 +302,14 @@ dependencies = [
 
 [[package]]
 name = "dc-proc"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "dc-regress"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "dc-proc",
  "devmap-extract",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "dc-regress-store"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "dc-regress",
@@ -329,14 +329,14 @@ dependencies = [
 
 [[package]]
 name = "dc-store"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "rusqlite",
 ]
 
 [[package]]
 name = "dc-verify"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "dc-evidence",
  "dc-glob",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-analyze"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "devmap-extract",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-cli"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-extract"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "cc",
@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-query"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "devmap-analyze",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-resolve"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "devmap-extract",
  "rayon",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-serve"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "dc-regress",
@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-store"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "devmap-analyze",
