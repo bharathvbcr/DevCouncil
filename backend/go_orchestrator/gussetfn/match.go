@@ -15,8 +15,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/fnmatch"
@@ -53,6 +55,9 @@ var (
 	engineMu sync.Mutex
 	current  atomic.Pointer[gusset.Handle]
 	closed   atomic.Bool
+	// opens counts handles opened, so tests can tell one replacement from a
+	// stampede of them.
+	opens atomic.Int64
 )
 
 // engine returns the shared handle, opening one if there is none.
@@ -78,6 +83,7 @@ func engine() (*gusset.Handle, error) {
 	if err != nil {
 		return nil, err
 	}
+	opens.Add(1)
 	current.Store(h)
 	return h, nil
 }
@@ -100,8 +106,9 @@ func poisoned(err error) bool {
 }
 
 // Close shuts the shared handle and refuses every later call with ErrClosed.
-// A long-running host calls it on shutdown, after gusset.Shutdown if it wants
-// the drain bounded.
+//
+// It joins the handle's workers without a time limit, so a host that must
+// not hang on a stuck engine calls Shutdown instead.
 func Close() error {
 	engineMu.Lock()
 	defer engineMu.Unlock()
@@ -111,6 +118,24 @@ func Close() error {
 		return nil
 	}
 	return h.Close()
+}
+
+// Shutdown is Close with a bound: it runs gusset.Shutdown(drain) first, which
+// refuses new work process-wide and cancels every job, then joins the handle.
+// When the drain expires with work still running (an engine that ignores its
+// JobContext) it returns that error without joining, because the join would
+// wait for exactly that work: the process is exiting and the OS reclaims the
+// threads. Process-wide and one-way, like gusset.Shutdown: for process exit
+// only.
+func Shutdown(drain time.Duration) error {
+	engineMu.Lock()
+	closed.Store(true)
+	engineMu.Unlock()
+	if err := gusset.Shutdown(drain); err != nil {
+		current.Store(nil)
+		return err
+	}
+	return Close()
 }
 
 // DrainLogs writes whatever Gusset's Rust side logged (worker respawns,
@@ -139,17 +164,45 @@ func DrainLogs(w io.Writer) (int, error) {
 	}
 }
 
+// handleGone reports an error that says h was closed under the call:
+// retired after another call's panic, or shut by Close. Gusset has no
+// sentinel for it; these are its two spellings.
+func handleGone(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "gusset: handle is closed") || strings.Contains(msg, "gusset: handle closed")
+}
+
 // call runs one frame on the shared handle and retires it on poison.
+//
+// A call that lands on a handle another call just poisoned or retired
+// retries once on the replacement: a match is idempotent, and the failure
+// was a sibling's, not this frame's. Before, those callers got ErrPoisoned or
+// an unclassified "handle is closed" while a healthy handle was one call
+// away. ErrPanic is never retried — this frame is what panicked, and a retry
+// would poison the replacement too. After Close the retry reaches engine(),
+// so a call racing Close answers ErrClosed, as Close promises.
 func call(ctx context.Context, payload []byte) ([]byte, error) {
-	h, err := engine()
-	if err != nil {
-		return nil, err
+	for attempt := 0; ; attempt++ {
+		h, err := engine()
+		if err != nil {
+			return nil, err
+		}
+		out, err := h.Call(ctx, payload)
+		if err == nil {
+			return out, nil
+		}
+		if poisoned(err) {
+			retire(h)
+		}
+		sibling := errors.Is(err, gusset.ErrPoisoned) || handleGone(err)
+		if !sibling {
+			return nil, err
+		}
+		// After Close the retry reaches engine(), which answers ErrClosed.
+		if attempt > 0 || ctx.Err() != nil {
+			return nil, err
+		}
 	}
-	out, err := h.Call(ctx, payload)
-	if err != nil && poisoned(err) {
-		retire(h)
-	}
-	return out, err
 }
 
 // decodeBool reads the engine's one-byte answer.
@@ -189,7 +242,11 @@ func Match(ctx context.Context, pattern, name string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	out, err := call(ctx, payload)
+	// Opcode 0, whatever the caller's context carries. gusset reads the
+	// opcode from ctx, so a ctx that had passed through MatchAny's opcode —
+	// or the self-test's — decoded this frame as a match-any frame, or
+	// panicked the shared handle.
+	out, err := call(gusset.ContextWithOpcode(ctx, 0), payload)
 	if err != nil {
 		return false, err
 	}
@@ -200,9 +257,10 @@ func Match(ctx context.Context, pattern, name string) (bool, error) {
 //
 // The list crosses the boundary in as few frames as fit Gusset's 4 KiB
 // inline copy, one call each, stopping at the first frame that matches. It
-// used to be one call per pattern. Every pattern in a frame is validated by
-// the engine before any is matched, so a malformed pattern is an error even
-// when an earlier one would have matched.
+// used to be one call per pattern. Every field is length- and UTF-8-checked
+// here before the first frame is sent, so a malformed pattern is an error
+// even when an earlier one, in this frame or an earlier frame, would have
+// matched; the engine re-validates each frame on its own side.
 func MatchAny(ctx context.Context, patterns []string, name string) (bool, error) {
 	if ctx == nil {
 		return false, errors.New("gusset: nil context")
@@ -210,9 +268,15 @@ func MatchAny(ctx context.Context, patterns []string, name string) (bool, error)
 	if len(name) > maxField {
 		return false, fmt.Errorf("gusset: name exceeds %d bytes", maxField)
 	}
+	if !utf8.ValidString(name) {
+		return false, errors.New("gusset: name is not valid UTF-8")
+	}
 	for _, p := range patterns {
 		if len(p) > maxField {
 			return false, fmt.Errorf("gusset: pattern exceeds %d bytes", maxField)
+		}
+		if !utf8.ValidString(p) {
+			return false, fmt.Errorf("gusset: pattern %q is not valid UTF-8", p)
 		}
 	}
 	if len(patterns) == 0 {

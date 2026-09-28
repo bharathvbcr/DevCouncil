@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -165,25 +167,42 @@ func TestPoisonedHandleIsReplaced(t *testing.T) {
 		t.Fatalf("self-test panic = %v", err)
 	}
 	prev := current.Swap(bad)
+	if prev != nil {
+		defer prev.Close()
+	}
 
-	if _, err := Match(ctx, "*.py", "a.py"); !errors.Is(err, gusset.ErrPoisoned) {
-		t.Fatalf("Match on the poisoned handle = %v, want ErrPoisoned", err)
-	}
-	if current.Load() == bad {
-		t.Fatal("the poisoned handle is still the shared handle")
-	}
+	// The poison was a sibling's, so the call retires the handle and answers
+	// from the replacement instead of returning ErrPoisoned.
 	got, err := Match(ctx, "*.py", "a.py")
 	if err != nil || !got {
-		t.Fatalf("Match after replacement = %v, %v", got, err)
+		t.Fatalf("Match on the poisoned handle = %v, %v; want a retried match", got, err)
 	}
-	if prev != nil {
-		_ = prev.Close()
+	if h := current.Load(); h == bad || h == nil {
+		t.Fatal("the poisoned handle was not replaced")
+	}
+}
+
+// This frame's own panic is not retried: the retry would poison the
+// replacement with the same input.
+func TestOwnPanicIsNotRetried(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	before := opens.Load()
+	_, err := call(gusset.ContextWithOpcode(ctx, opcodeSelfTestPanic), nil)
+	if !errors.Is(err, gusset.ErrPanic) {
+		t.Fatalf("call = %v, want ErrPanic", err)
+	}
+	if n := opens.Load() - before; n > 1 {
+		t.Fatalf("%d handles opened for one panicking frame", n)
+	}
+	if got, err := Match(ctx, "*.py", "a.py"); err != nil || !got {
+		t.Fatalf("Match after a panicking frame = %v, %v", got, err)
 	}
 }
 
 // Many goroutines hit a handle that becomes poisoned under them. Every call
-// returns (no hang), every error is a Gusset error, and exactly one new
-// handle serves afterwards.
+// must still succeed — the poison was another call's, and call retries once
+// on the replacement — and exactly one replacement is opened per poisoning.
 func TestPoisonUnderConcurrencyRecovers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -199,21 +218,21 @@ func TestPoisonUnderConcurrencyRecovers(t *testing.T) {
 		if prev := current.Swap(bad); prev != nil {
 			_ = prev.Close()
 		}
+		before := opens.Load()
 		var wg sync.WaitGroup
-		errs := make(chan error, 64)
+		errs := make(chan error, 64*10)
 		for g := 0; g < 64; g++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				for i := 0; i < 10; i++ {
 					got, err := Match(ctx, "*.py", "a.py")
-					if err == nil && !got {
-						errs <- errors.New("match returned false")
-						return
-					}
-					if err != nil && ctx.Err() != nil {
+					if err != nil {
 						errs <- err
-						return
+						continue
+					}
+					if !got {
+						errs <- errors.New("match returned false")
 					}
 				}
 			}()
@@ -221,11 +240,48 @@ func TestPoisonUnderConcurrencyRecovers(t *testing.T) {
 		wg.Wait()
 		close(errs)
 		for err := range errs {
-			t.Error(err)
+			t.Errorf("round %d: %v", round, err)
 		}
-		if got, err := Match(ctx, "*.py", "a.py"); err != nil || !got {
-			t.Fatalf("round %d: settled Match = %v, %v", round, got, err)
+		if n := opens.Load() - before; n != 1 {
+			t.Fatalf("round %d: %d handles opened to replace one poisoned handle", round, n)
 		}
+	}
+}
+
+// An opcode already on the caller's context must not reach Match's frame:
+// opcode 1 decoded it as a match-any frame, the self-test opcode panicked
+// the shared handle.
+func TestMatchIgnoresAnOpcodeOnTheContext(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, op := range []uint32{opcodeMatchAny, opcodeSelfTestPanic} {
+		got, err := Match(gusset.ContextWithOpcode(ctx, op), "*.py", "a.py")
+		if err != nil || !got {
+			t.Fatalf("Match under opcode %#x = %v, %v", op, got, err)
+		}
+	}
+	if h := current.Load(); h == nil {
+		t.Fatal("no shared handle")
+	}
+	if got, err := Match(ctx, "*.py", "a.py"); err != nil || !got {
+		t.Fatalf("shared handle after opcode contexts: %v, %v", got, err)
+	}
+}
+
+// A pattern in a later frame with bad UTF-8 is an error even when the first
+// frame matches: validation is over the whole list, not per frame.
+func TestMatchAnyValidatesAcrossFrames(t *testing.T) {
+	long := strings.Repeat("a", maxField)
+	list := []string{"*"}
+	for i := 0; i < 8; i++ {
+		list = append(list, long)
+	}
+	list = append(list, "\xff")
+	if _, n := encodeAny("x", list); n >= len(list) {
+		t.Fatal("the list fit one frame; the case is not exercised")
+	}
+	if _, err := MatchAny(context.Background(), list, "x"); err == nil || !strings.Contains(err.Error(), "UTF-8") {
+		t.Fatalf("got %v, want a UTF-8 error", err)
 	}
 }
 
@@ -245,12 +301,15 @@ func TestCancellationDoesNotPoison(t *testing.T) {
 	}
 }
 
-func TestDrainLogsWritesWhatRustLogged(t *testing.T) {
+// DrainLogs terminates on an idle ring and reports the bytes it wrote. It
+// does not prove anything was logged: gusset's ring receives no line for a
+// caught panic (that goes to FfiStatus), so there is nothing reliable to
+// drain here.
+func TestDrainLogsTerminatesAndCounts(t *testing.T) {
 	var buf bytes.Buffer
 	if _, err := DrainLogs(&buf); err != nil {
 		t.Fatal(err)
 	}
-	// A second drain of an idle ring is empty; the call must not block.
 	buf.Reset()
 	n, err := DrainLogs(&buf)
 	if err != nil || n != buf.Len() {
@@ -311,27 +370,29 @@ func FuzzMatchParity(f *testing.F) {
 	})
 }
 
-// Close is last: it shuts the process-wide engine. reopen restores it so a
-// -count>1 run still has an engine.
-func TestZZCloseRefusesLaterCalls(t *testing.T) {
-	defer func() { closed.Store(false) }()
-	if _, err := engine(); err != nil {
+// The umbrella installs gusset's Counting allocator. Gusset counts its own
+// buffers by hand whether or not Counting is installed, so buffer bytes prove
+// nothing about the allocator; AllocCount across plain Matches does — each
+// frame decode allocates a Vec that only a global Counting sees.
+func TestCountingIsTheGlobalAllocator(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := Match(ctx, "*", "a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	before := gusset.Stats().AllocCount
+	for i := 0; i < 50; i++ {
+		if _, err := Match(ctx, "*.py", "src/foo.py"); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if _, err := Match(context.Background(), "*", "a"); !errors.Is(err, ErrClosed) {
-		t.Fatalf("Match after Close = %v, want ErrClosed", err)
-	}
-	if err := Close(); err != nil {
-		t.Fatalf("second Close: %v", err)
+	if after := gusset.Stats().AllocCount; after < before+50 {
+		t.Fatalf("AllocCount %d -> %d over 50 Matches: Counting is not the global allocator", before, after)
 	}
 }
 
-// The umbrella installs gusset's Counting allocator. A Rust buffer is then
-// counted once — by Gusset's own buffer accounting or by the global
-// allocator, not both — and it is counted at all: before, Stats read zero.
+// A Rust buffer is counted once, not by both gusset's buffer accounting and
+// the global allocator.
 func TestStatsCountBuffersOnce(t *testing.T) {
 	if _, err := engine(); err != nil {
 		t.Fatal(err)
@@ -353,11 +414,77 @@ func TestStatsCountBuffersOnce(t *testing.T) {
 	}
 	after := gusset.Stats().LiveBytes
 	delta := int64(during) - int64(before)
-	// Other goroutines' Rust allocations are small next to 8 MiB.
 	if delta < n || delta > n+n/2 {
 		t.Fatalf("an %d-byte buffer moved LiveBytes by %d; want about %d once", n, delta, n)
 	}
 	if int64(after)-int64(before) > n/8 {
 		t.Fatalf("LiveBytes %d after Free, %d before", after, before)
+	}
+}
+
+// Calls racing Close return a result or ErrClosed, never an unclassified
+// "handle is closed". Named ZZ and reset by defer because Close is
+// process-wide; Go runs tests in source order, so this stays after the rest
+// of this file (match_test.go runs later and relies on the reset).
+func TestZZCloseRacingCallsSeeErrClosed(t *testing.T) {
+	defer func() { closed.Store(false) }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := engine(); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 32*50)
+	for g := 0; g < 32; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				if _, err := Match(ctx, "*.py", "a.py"); err != nil && !errors.Is(err, ErrClosed) {
+					errs <- err
+				}
+			}
+		}()
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("call racing Close: %v", err)
+	}
+	if _, err := Match(context.Background(), "*", "a"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Match after Close = %v, want ErrClosed", err)
+	}
+	if err := Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// Shutdown is process-wide and one-way, so it runs in a child process.
+func TestShutdownIsBoundedAndRefusesLaterCalls(t *testing.T) {
+	if os.Getenv("GUSSETFN_SHUTDOWN_CHILD") == "1" {
+		ctx := context.Background()
+		if _, err := Match(ctx, "*", "a"); err != nil {
+			fmt.Println("pre-shutdown match:", err)
+			os.Exit(3)
+		}
+		if err := Shutdown(time.Second); err != nil {
+			fmt.Println("shutdown:", err)
+			os.Exit(4)
+		}
+		if _, err := Match(ctx, "*", "a"); !errors.Is(err, ErrClosed) {
+			fmt.Println("post-shutdown match:", err)
+			os.Exit(5)
+		}
+		os.Exit(0)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestShutdownIsBoundedAndRefusesLaterCalls$")
+	cmd.Env = append(os.Environ(), "GUSSETFN_SHUTDOWN_CHILD=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("child: %v\n%s", err, out)
 	}
 }

@@ -74,10 +74,13 @@ else
   # caches on the archive's hash, without which a rebuilt archive is not
   # relinked and a cached test result is replayed against the old one.
   echo "building gusset-engine release staticlib (libgusset.a is not in git)"
-  eval "$(gusset-engine/cgo-env.sh --export)" || {
+  # Captured before eval: `eval "$(failing)" || …` evaluates the empty output,
+  # succeeds, and the build then links whatever archive is lying around.
+  engine_exports="$(gusset-engine/cgo-env.sh --export)" || {
     echo "GATE FAIL: gusset-engine/cgo-env.sh could not build $archive" >&2
     exit 1
   }
+  eval "$engine_exports"
   go -C ../backend/go_orchestrator build -o bin/ ./cmd/devcouncil
   go -C ../backend/go_orchestrator test -count=1 ./gussetfn
   ../backend/go_orchestrator/bin/devcouncil gusset-check

@@ -38,8 +38,10 @@ pub const MAX_PATTERNS: usize = 1024;
 /// (I2) against this archive rather than against Gusset's diagnostic engine.
 ///
 /// Reachable only through the call header, which Go sets; no payload byte
-/// selects it. `gussetfn.Check` sends it on a throwaway handle and requires
-/// ErrPanic, then ErrPoisoned, then a clean match on the shared handle.
+/// selects it. `gussetfn.SelfTest` sends it on a throwaway handle and requires
+/// ErrPanic, then ErrPoisoned, then a clean match on the shared handle;
+/// `gussetfn.Match` pins opcode 0 so a context carrying this one cannot
+/// reach the shared handle. `Check` never sends it.
 pub const OPCODE_SELF_TEST_PANIC: u32 = 0x7fff_0001;
 
 /// Registers the dc-glob engine on Gusset's global handler.

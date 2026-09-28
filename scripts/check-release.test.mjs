@@ -241,6 +241,18 @@ describe("inspectRelease", () => {
     assert.ok(result.errors.some((e) => e.includes("0.4.2") && e.includes("0.2.0")));
   });
 
+  it("fails when the Gusset umbrella's lock names another dc-glob version", () => {
+    const root = scratchTree("umbrella");
+    const dir = path.join(root, "rust", "gusset-engine");
+    mkdirSync(dir, { recursive: true });
+    const lock = (v) => `version = 4\n\n[[package]]\nname = "dc-glob"\nversion = "${v}"\n`;
+    writeFileSync(path.join(dir, "Cargo.lock"), lock("0.2.0"));
+    assert.deepEqual(inspectRelease(defaultSources(root)).errors, []);
+    writeFileSync(path.join(dir, "Cargo.lock"), lock("0.1.9"));
+    const result = inspectRelease(defaultSources(root));
+    assert.ok(result.errors.some((e) => e.includes("gusset-engine/Cargo.lock") && e.includes("0.1.9")));
+  });
+
   it("fails when the notes file for this version is missing", () => {
     const root = scratchTree("notes", { notes: false });
     const result = inspectRelease(defaultSources(root));
