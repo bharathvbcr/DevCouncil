@@ -64,7 +64,8 @@ describe("check:workflows", () => {
     // `replacement directory ../../../gusset does not exist` back on the tag.
     assert.equal(uses("ci.yml"), 1);
     assert.equal(uses("analysis-plane.yml"), 2);
-    assert.equal(uses("rust.yml"), 2);
+    // verify.sh gates, embedder shape, and the static musl host.
+    assert.equal(uses("rust.yml"), 3);
     assert.equal(uses("codeql.yml"), 1);
   });
 
