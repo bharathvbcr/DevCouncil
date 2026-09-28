@@ -620,8 +620,15 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// only kill.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A response must acquire its writer and reach the peer within this bound.
+/// A response must reach the peer within this bound once it holds the writer.
 /// A stopped reader must not retain every admission permit indefinitely.
+///
+/// The bound covers the write and flush, not the wait for the writer lock.
+/// Queueing behind other responses is not a stuck peer: a pipelined burst of
+/// ten thousand requests queued some responses past 5s on a busy machine while
+/// every write was instant, and the "timeout" ended a healthy session. A stuck
+/// peer is still bounded: the holder's write times out, leaves the stream
+/// marked failed, and every waiter then refuses at once.
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Requests one connection may have outstanding at once.
@@ -3590,9 +3597,10 @@ where
     let mut payload = serde_json::to_vec(frame)?;
     payload.push(b'\n');
     // The lock spans the write and the flush, so two concurrent responses cannot
-    // interleave their bytes into one unparseable line.
+    // interleave their bytes into one unparseable line. It is taken outside
+    // the deadline; see [`RESPONSE_WRITE_TIMEOUT`].
+    let mut writer = writer.lock().await;
     tokio::time::timeout(RESPONSE_WRITE_TIMEOUT, async {
-        let mut writer = writer.lock().await;
         anyhow::ensure!(
             !writer.failed,
             "MCP response stream failed on an earlier frame"

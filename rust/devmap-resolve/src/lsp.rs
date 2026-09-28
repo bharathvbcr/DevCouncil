@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use devmap_extract::model::{EdgeKind, ExtractedSymbol, Extraction, Span};
@@ -34,6 +34,15 @@ pub const LSP_PASS_BUDGET: Duration = Duration::from_secs(90);
 /// Per-request read deadline. A server that stops answering is killed and the
 /// files it had not finished are did-not-run.
 pub const LSP_REQUEST_BUDGET: Duration = Duration::from_secs(8);
+
+/// Longest header line accepted from a server. A header is `Content-Length`
+/// and perhaps `Content-Type`; a line past this is not one, and reading it
+/// unbounded would let a server that never sends a newline grow our memory
+/// until the deadline.
+pub const LSP_HEADER_LINE_CAP: usize = 8 * 1024;
+
+/// How long a server gets to exit after `exit` before its group is killed.
+pub const LSP_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 /// Maximum JSON-RPC frame this pass will accept. Larger responses are refused
 /// rather than parsed into edges.
@@ -603,8 +612,87 @@ fn which_binary(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Kills the server when an armed deadline passes.
+///
+/// The deadlines above were checked *between* reads, and every read is a
+/// blocking `read_line`/`read_exact` on the server's stdout: a server that
+/// stopped answering mid-request, or never answered, blocked the build forever
+/// with the deadline unread. This thread is what makes the deadline true — it
+/// kills the server's process group, the pipe reaches EOF, and the blocked read
+/// returns. It is armed around every write and read and disarmed after.
+struct Watchdog {
+    state: Arc<(Mutex<WatchState>, Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct WatchState {
+    armed: Option<Instant>,
+    stop: bool,
+    fired: bool,
+}
+
+impl Watchdog {
+    fn start(child: Arc<Mutex<Child>>) -> std::io::Result<Self> {
+        let state = Arc::new((Mutex::new(WatchState::default()), Condvar::new()));
+        let shared = Arc::clone(&state);
+        let thread = std::thread::Builder::new()
+            .name("devmap-lsp-watchdog".into())
+            .spawn(move || {
+                let (lock, wake) = &*shared;
+                let mut watch = lock.lock().unwrap_or_else(|p| p.into_inner());
+                loop {
+                    if watch.stop {
+                        return;
+                    }
+                    match watch.armed {
+                        Some(deadline) => {
+                            let now = Instant::now();
+                            if now >= deadline {
+                                watch.fired = true;
+                                drop(watch);
+                                let mut child = child.lock().unwrap_or_else(|p| p.into_inner());
+                                devmap_extract::subprocess::kill_group(&mut child);
+                                return;
+                            }
+                            watch = wake
+                                .wait_timeout(watch, deadline - now)
+                                .map(|(guard, _)| guard)
+                                .unwrap_or_else(|p| p.into_inner().0);
+                        }
+                        None => {
+                            watch = wake.wait(watch).unwrap_or_else(|p| p.into_inner());
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            state,
+            thread: Some(thread),
+        })
+    }
+
+    fn set(&self, update: impl FnOnce(&mut WatchState)) {
+        let (lock, wake) = &*self.state;
+        update(&mut lock.lock().unwrap_or_else(|p| p.into_inner()));
+        wake.notify_all();
+    }
+
+    fn fired(&self) -> bool {
+        self.state.0.lock().unwrap_or_else(|p| p.into_inner()).fired
+    }
+
+    fn stop(&mut self) {
+        self.set(|watch| watch.stop = true);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 struct LspClient {
-    child: Child,
+    child: Arc<Mutex<Child>>,
+    watchdog: Watchdog,
     reader: BufReader<std::process::ChildStdout>,
     writer: std::process::ChildStdin,
     next_id: u64,
@@ -621,6 +709,8 @@ impl LspClient {
         repo_root: &Path,
         deadline: Instant,
     ) -> Result<Self, LspDidNotRun> {
+        // Interactive, so not `run_bounded`: the child leads its own process
+        // group and the `Watchdog` below enforces the deadlines by killing it.
         let mut command = Command::new(binary);
         command
             .args(spec.args)
@@ -628,8 +718,7 @@ impl LspClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .current_dir(repo_root);
-        let mut child = command
-            .spawn()
+        let mut child = devmap_extract::subprocess::spawn_group(&mut command)
             .map_err(|error| LspDidNotRun::Protocol(format!("spawn {}: {error}", spec.binary)))?;
         let stdout = child
             .stdout
@@ -639,8 +728,22 @@ impl LspClient {
             .stdin
             .take()
             .ok_or_else(|| LspDidNotRun::Protocol("missing stdin".into()))?;
+        let child = Arc::new(Mutex::new(child));
+        let watchdog = match Watchdog::start(Arc::clone(&child)) {
+            Ok(watchdog) => watchdog,
+            Err(error) => {
+                // Without the watchdog nothing bounds a read; do not start.
+                devmap_extract::subprocess::kill_group(
+                    &mut child.lock().unwrap_or_else(|p| p.into_inner()),
+                );
+                return Err(LspDidNotRun::Protocol(format!(
+                    "could not start the deadline watchdog: {error}"
+                )));
+            }
+        };
         let mut client = Self {
             child,
+            watchdog,
             reader: BufReader::new(stdout),
             writer: stdin,
             next_id: 1,
@@ -715,8 +818,51 @@ impl LspClient {
     fn shutdown(&mut self) -> Result<(), LspDidNotRun> {
         let _ = self.request("shutdown", json!(null));
         let _ = self.notify("exit", json!(null));
-        let _ = self.child.wait();
+        // A server that ignores `exit` must not hold the build: poll for a
+        // short grace, then kill the group.
+        let grace = Instant::now() + LSP_EXIT_GRACE;
+        loop {
+            let exited = matches!(self.lock_child().try_wait(), Ok(Some(_)));
+            if exited || Instant::now() >= grace {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.kill();
         Ok(())
+    }
+
+    fn lock_child(&self) -> std::sync::MutexGuard<'_, Child> {
+        self.child.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Run one exchange with the watchdog armed at `deadline`.
+    ///
+    /// If the watchdog fired, whatever the exchange returned — usually a read
+    /// error from the pipe it closed — is reported as the timeout it was.
+    fn guarded<T>(
+        &mut self,
+        deadline: Instant,
+        exchange: impl FnOnce(&mut Self) -> Result<T, LspDidNotRun>,
+    ) -> Result<T, LspDidNotRun> {
+        if self.watchdog.fired() || Instant::now() >= deadline {
+            self.kill();
+            return Err(LspDidNotRun::TimedOut);
+        }
+        self.watchdog.set(|watch| watch.armed = Some(deadline));
+        let result = exchange(self);
+        self.watchdog.set(|watch| watch.armed = None);
+        if self.watchdog.fired() {
+            return Err(LspDidNotRun::TimedOut);
+        }
+        result
+    }
+
+    fn exchange_deadline(&self) -> Instant {
+        Instant::now()
+            .checked_add(LSP_REQUEST_BUDGET)
+            .unwrap_or(self.deadline)
+            .min(self.deadline)
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, LspDidNotRun> {
@@ -732,11 +878,14 @@ impl LspClient {
             "method": method,
             "params": params,
         });
-        self.write_message(&payload)?;
-        let request_deadline = Instant::now()
-            .checked_add(LSP_REQUEST_BUDGET)
-            .unwrap_or(self.deadline)
-            .min(self.deadline);
+        let request_deadline = self.exchange_deadline();
+        self.guarded(request_deadline, |client| {
+            client.write_message(&payload)?;
+            client.read_reply(id, request_deadline)
+        })
+    }
+
+    fn read_reply(&mut self, id: u64, request_deadline: Instant) -> Result<Value, LspDidNotRun> {
         loop {
             if Instant::now() >= request_deadline {
                 self.kill();
@@ -756,11 +905,14 @@ impl LspClient {
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), LspDidNotRun> {
-        self.write_message(&json!({
+        let payload = json!({
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
-        }))
+        });
+        // A write blocks too, once a server stops draining its stdin.
+        let deadline = self.exchange_deadline();
+        self.guarded(deadline, |client| client.write_message(&payload))
     }
 
     fn write_message(&mut self, payload: &Value) -> Result<(), LspDidNotRun> {
@@ -788,15 +940,21 @@ impl LspClient {
                 return Err(LspDidNotRun::TimedOut);
             }
             let mut line = String::new();
-            let read = self
-                .reader
+            let read = (&mut self.reader)
+                .take(LSP_HEADER_LINE_CAP as u64)
                 .read_line(&mut line)
                 .map_err(|error| LspDidNotRun::Protocol(format!("read header failed: {error}")))?;
             if read == 0 {
-                let status = self.child.try_wait().ok().flatten();
+                let status = self.lock_child().try_wait().ok().flatten();
                 return Err(LspDidNotRun::NonZeroExit {
                     code: status.and_then(|status| status.code()),
                 });
+            }
+            if !line.ends_with('\n') && read >= LSP_HEADER_LINE_CAP {
+                self.kill();
+                return Err(LspDidNotRun::Protocol(format!(
+                    "header line longer than {LSP_HEADER_LINE_CAP} bytes"
+                )));
             }
             let trimmed = line.trim_end();
             if trimmed.is_empty() {
@@ -821,15 +979,14 @@ impl LspClient {
     }
 
     fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        devmap_extract::subprocess::kill_group(&mut self.lock_child());
     }
 }
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.watchdog.stop();
+        self.kill();
     }
 }
 
@@ -905,4 +1062,126 @@ fn location_from_value(value: &Value, repo_root: &Path) -> Option<LspLocation> {
         line,
         character,
     })
+}
+
+#[cfg(all(test, unix))]
+mod deadline_tests {
+    //! Servers that misbehave in the ways a blocking read cannot see.
+    //!
+    //! Each is `sh -c` with a script. The pass deadline is set short, so a
+    //! client that honours it returns in about a second and one that does not
+    //! hangs the test — the failure this module exists to prevent.
+
+    use super::*;
+
+    fn spec(script: &'static str) -> LspServerSpec {
+        LspServerSpec {
+            binary: "sh",
+            args: Box::leak(Box::new(["-c", script])),
+            extensions: &[],
+        }
+    }
+
+    fn spawn_with(
+        script: &'static str,
+        budget: Duration,
+    ) -> (Result<LspClient, LspDidNotRun>, Duration) {
+        let started = Instant::now();
+        let root = std::env::temp_dir();
+        let result = LspClient::spawn(
+            &spec(script),
+            Path::new("/bin/sh"),
+            &root,
+            Instant::now() + budget,
+        );
+        (result, started.elapsed())
+    }
+
+    #[test]
+    fn a_server_that_never_answers_is_killed_at_the_deadline() {
+        let (result, elapsed) = spawn_with("cat > /dev/null", Duration::from_secs(1));
+        assert!(
+            matches!(result, Err(LspDidNotRun::TimedOut)),
+            "{:?}",
+            result.err()
+        );
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn a_server_that_stalls_mid_body_is_killed_at_the_deadline() {
+        let (result, elapsed) = spawn_with(
+            "printf 'Content-Length: 100\\r\\n\\r\\n{'; cat > /dev/null",
+            Duration::from_secs(1),
+        );
+        assert!(
+            matches!(result, Err(LspDidNotRun::TimedOut)),
+            "{:?}",
+            result.err()
+        );
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn a_header_line_without_an_end_is_refused_not_buffered() {
+        let (result, elapsed) = spawn_with(
+            "head -c 100000 /dev/zero | tr '\\000' x; cat > /dev/null",
+            Duration::from_secs(30),
+        );
+        match result {
+            Err(LspDidNotRun::Protocol(message)) => {
+                assert!(message.contains("header line"), "{message}")
+            }
+            other => panic!("expected a header refusal, got {:?}", other.err()),
+        }
+        assert!(elapsed < Duration::from_secs(10), "took {elapsed:?}");
+    }
+
+    /// Answers `initialize`, then ignores `shutdown` and `exit`, with a
+    /// background child holding its pipes. Shutdown must still return, and
+    /// the background child must die with the group.
+    #[test]
+    fn a_server_that_ignores_exit_is_killed_with_its_children() {
+        let pid_file =
+            std::env::temp_dir().join(format!("devmap-lsp-child-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+        let script: &'static str = Box::leak(
+            format!(
+                "sleep 300 & echo $! > '{}'; \
+                 printf 'Content-Length: 36\\r\\n\\r\\n{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}'; \
+                 cat > /dev/null",
+                pid_file.display()
+            )
+            .into_boxed_str(),
+        );
+        let (result, _) = spawn_with(script, Duration::from_secs(2));
+        let mut client = result.unwrap_or_else(|e| panic!("initialize was answered: {e:?}"));
+        let started = Instant::now();
+        client.shutdown().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "shutdown took {:?}",
+            started.elapsed()
+        );
+        drop(client);
+        let background: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the script recorded its child")
+            .trim()
+            .parse()
+            .unwrap();
+        // Reaped by init once the group is killed; allow it a moment.
+        let proc_entry = PathBuf::from(format!("/proc/{background}"));
+        let gone = (0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            !proc_entry.exists()
+                || std::fs::read_to_string(proc_entry.join("stat"))
+                    .map(|stat| stat.contains(") Z "))
+                    .unwrap_or(true)
+        });
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(
+            gone,
+            "the server's background child {background} outlived it"
+        );
+    }
 }

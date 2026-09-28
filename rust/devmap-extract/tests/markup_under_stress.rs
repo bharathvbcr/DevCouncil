@@ -489,7 +489,7 @@ fn random_structural_bytes_are_read_without_panicking() {
         let pieces = 1 + rng.below(60);
         let mut source = String::new();
         for _ in 0..pieces {
-            source.push_str(rng.pick(ALPHABET));
+            source.push_str(rng.pick::<&str>(ALPHABET));
         }
         let path = rng.pick(&[
             "a.svelte", "a.vue", "a.astro", "a.liquid", "a.html", "a.css",

@@ -162,6 +162,18 @@ fn a_missing_program_names_itself() {
 /// `dc-*` crates share this workspace but are not the kernel; `devmap-cli`
 /// re-execs itself for SessionStart auto-rebuild and stamps git from
 /// `build.rs`, which cannot link this runner.
+/// Production spawns that cannot go through `run_bounded`, each with the bound
+/// it carries instead. Keyed by the path under the workspace; an entry whose
+/// file no longer spawns anything fails the test, so the list cannot outlive
+/// the reason.
+const INTERACTIVE_CHILDREN: &[(&str, &str)] = &[(
+    "devmap-resolve/src/lsp.rs",
+    "a language server answers many requests over one session, which a \
+     run-to-completion runner cannot host; it is spawned with \
+     `subprocess::spawn_group` and a watchdog kills the group at each request \
+     deadline (`lsp::deadline_tests`)",
+)];
+
 #[test]
 fn every_child_process_in_the_kernel_goes_through_the_runner() {
     // `CARGO_MANIFEST_DIR` is `<workspace>/devmap-extract`.
@@ -178,6 +190,7 @@ fn every_child_process_in_the_kernel_goes_through_the_runner() {
     }
     let mut scanned = 0usize;
     let mut offenders = Vec::new();
+    let mut excepted = std::collections::BTreeSet::new();
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("read crates tree") {
             let path = entry.expect("dir entry").path();
@@ -200,9 +213,26 @@ fn every_child_process_in_the_kernel_goes_through_the_runner() {
             }
             scanned += 1;
             let text = std::fs::read_to_string(&path).expect("read source");
+            let relative = path
+                .strip_prefix(workspace)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let listed = INTERACTIVE_CHILDREN
+                .iter()
+                .any(|(listed, _)| *listed == relative);
             for (index, line) in text.lines().enumerate() {
                 if line.contains("Command::new(") {
-                    offenders.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+                    if listed {
+                        excepted.insert(relative.clone());
+                    } else {
+                        offenders.push(format!(
+                            "{}:{}: {}",
+                            path.display(),
+                            index + 1,
+                            line.trim()
+                        ));
+                    }
                 }
             }
         }
@@ -211,6 +241,12 @@ fn every_child_process_in_the_kernel_goes_through_the_runner() {
         scanned > 50,
         "the scan must have found the kernel's sources: {scanned} files"
     );
+    for (listed, _) in INTERACTIVE_CHILDREN {
+        assert!(
+            excepted.contains(*listed),
+            "{listed} is excepted but no longer spawns a child; remove the entry"
+        );
+    }
     assert!(
         offenders.is_empty(),
         "a child process spawned outside `devmap_extract::subprocess` has no deadline and no \
