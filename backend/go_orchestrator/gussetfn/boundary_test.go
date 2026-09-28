@@ -599,3 +599,67 @@ func TestShutdownIsBoundedAndRefusesLaterCalls(t *testing.T) {
 		t.Fatalf("child: %v\n%s", err, out)
 	}
 }
+
+// Large frames travel in Rust-owned buffers, and a sibling's panic retires
+// the handle that owns them. Every call must still come back with the right
+// answer: a copy racing the retire used to touch freed Rust memory, and a
+// result buffer freed under the call came back as a malformed answer
+// instead of ErrClosed, so it was denied rather than retried.
+func TestLargeFramesSurviveRetiresUnderThem(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	name := strings.Repeat("dir/", 3000) + "id_rsa"
+	want := fnmatch.Match("*id_rsa", name)
+	stop := make(chan struct{})
+	var poisoner sync.WaitGroup
+	poisoner.Add(1)
+	go func() {
+		defer poisoner.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := engine(); err != nil {
+				continue
+			}
+			bad, err := gusset.Open(gusset.WithPoolSize(1), gusset.WithOpcode(opcodeSelfTestPanic))
+			if err != nil {
+				continue
+			}
+			_, _ = bad.Call(ctx, nil)
+			if prev := current.Swap(bad); prev != nil {
+				go closeHandle(prev)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	var wg sync.WaitGroup
+	errs := make(chan error, 16*25)
+	for g := 0; g < 16; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 25; i++ {
+				got, err := Match(ctx, "*id_rsa", name)
+				switch {
+				case err != nil && !poisoned(err) && !errors.Is(err, gusset.ErrClosed):
+					errs <- err
+				case err == nil && got != want:
+					errs <- fmt.Errorf("got %v, want %v", got, want)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	poisoner.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if got, err := Match(ctx, "*id_rsa", name); err != nil || got != want {
+		t.Fatalf("after the storm: %v, %v", got, err)
+	}
+}

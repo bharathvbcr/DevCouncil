@@ -10,17 +10,38 @@ Decided 2026-09-28, with measurements from this repository.
 
 ## On Gusset: policy pattern matching
 
-Every pattern question the write, read and command ladders ask goes to dc-glob
-through `gussetfn.Matcher` (see `policy/matcher.go`). It qualifies on every
-count the others below fail:
+Every pattern question the write, read and command ladders ask inside a gate
+goes to dc-glob through `gussetfn.Matcher` (see `policy/matcher.go`), in any
+host built with the engine linked. The exceptions, all deliberate:
+
+- `policy.ReadRefused` and `MatchesPlannedPath` are bool APIs called outside
+  any gate entry point (search-result filtering, diff reporting), so an engine
+  error would have nowhere honest to go; they ask fnmatch.
+- Grant scope matching (`grants.Grant.Matches`) asks fnmatch: a grant only
+  widens, and a false there leaves the denial standing.
+- A build without the engine — non-unix, or `CGO_ENABLED=0` — decides with
+  fnmatch throughout.
+
+It qualifies where the others below do not:
 
 - **Hot.** Two or three questions per gate decision, and a decision per agent
   tool call. A process per question would cost more than the question.
-- **Bounded.** dc-glob's walk has a step budget and a 16384-rune cap, so a
-  question cannot run away; the missing kill switch does not matter.
 - **Pure.** No I/O, no child processes, no file descriptors.
-- **Honest failure.** A matcher error is a hard denial under
-  `path.engine_unavailable` / `command.engine_unavailable`, never a guess.
+- **Honest failure.** A broken engine (a panic, a poisoned or closed handle, a
+  malformed answer) is a hard denial under `path.engine_unavailable` /
+  `command.engine_unavailable`, never a guess.
+
+It is not unbounded-safe on its own, and the matcher says so. dc-glob's walk has
+a step budget and a 16384-rune cap, but inside those a pathological question
+still takes seconds (40 patterns of `*` + 8191 `a` + `b` against 16384 `a`:
+8.6 s in Go), cancellation is checked only between patterns, and the shared
+handle has four workers. So `gussetfn.Matcher` waits 250 ms for the engine and
+then answers with fnmatch — the reference the engine is held equal to — and
+counts it (`gussetfn.Fallbacks`). A slow question therefore gets the same
+answer and the same rule it would have got from Go, and questions queued behind
+slow ones wait at most the timeout. Before that fallback, a slow question came
+back as a Hard `engine_unavailable` where fnmatch gave a Soft, demotable
+denial, and a stream of slow questions could deny unrelated ones.
 
 Cost: about 20 µs per crossing, 63 µs against Go's 23 µs per write decision.
 
@@ -59,5 +80,6 @@ Considered and rejected.
 
 A candidate earns a Gusset opcode when it is called often enough that a spawn is
 a real fraction of each call, its work is bounded or checks its `JobContext`
-between bounded steps, and it has no I/O whose failure needs a process to
-contain. Add it to the one umbrella archive; never a second staticlib (R14).
+between bounded steps, it has no I/O whose failure needs a process to contain,
+and its caller has an answer for "the engine is busy" that is not a failure.
+Add it to the one umbrella archive; never a second staticlib (R14).

@@ -103,8 +103,22 @@ func engine() (*gusset.Handle, error) {
 // its deadline is not Close's business.
 func retire(h *gusset.Handle) {
 	if current.CompareAndSwap(h, nil) {
-		go func() { _ = h.Close() }()
+		go closeHandle(h)
 	}
+}
+
+// bufferMem orders touching a Rust-owned buffer's bytes against closing the
+// handle that owns them. Handle.Close frees every buffer of the handle, and
+// the slice Buffer.Bytes returned stays pointed at that memory: a copy into
+// it racing a retire from a sibling's panic wrote into freed Rust memory.
+// Readers hold it only for the copy, never across a call, so a close waits
+// microseconds, not for work.
+var bufferMem sync.RWMutex
+
+func closeHandle(h *gusset.Handle) error {
+	bufferMem.Lock()
+	defer bufferMem.Unlock()
+	return h.Close()
 }
 
 // poisoned reports an error after which h refuses all further work.
@@ -124,7 +138,7 @@ func Close() error {
 	if h == nil {
 		return nil
 	}
-	return h.Close()
+	return closeHandle(h)
 }
 
 // Shutdown is Close with a bound: it runs gusset.Shutdown(drain) first, which
@@ -257,19 +271,41 @@ func roundTrip(ctx context.Context, h *gusset.Handle, frame []byte) ([]byte, err
 		return nil, err
 	}
 	defer in.Free()
-	dst := in.Bytes()
-	if len(dst) != len(frame) {
+	if !withBuffer(in, func(dst []byte) bool {
+		if len(dst) != len(frame) {
+			return false
+		}
+		copy(dst, frame)
+		return true
+	}) {
 		// Bytes is nil once the handle is closed under us; classify it as
 		// that, so call retries on the replacement handle.
 		return nil, fmt.Errorf("gusset: input buffer unavailable: %w", gusset.ErrClosed)
 	}
-	copy(dst, frame)
 	out, err := h.CallBuffer(ctx, in)
 	if err != nil {
 		return nil, err
 	}
 	defer out.Free()
-	return append([]byte(nil), out.Bytes()...), nil
+	var result []byte
+	if !withBuffer(out, func(src []byte) bool {
+		result = append([]byte(nil), src...)
+		return src != nil
+	}) {
+		// The same close, after the call: every answer is one byte, so a nil
+		// result is a handle closed under us, not an empty answer. Before,
+		// it reached answer() as "engine returned \"\"", which is not
+		// ErrClosed, so the gate denied instead of retrying.
+		return nil, fmt.Errorf("gusset: result buffer unavailable: %w", gusset.ErrClosed)
+	}
+	return result, nil
+}
+
+// withBuffer runs f on b's bytes with the handle kept open for the duration.
+func withBuffer(b *gusset.Buffer, f func([]byte) bool) bool {
+	bufferMem.RLock()
+	defer bufferMem.RUnlock()
+	return f(b.Bytes())
 }
 
 // Match reports whether name matches pattern, exactly as fnmatch.Match does.

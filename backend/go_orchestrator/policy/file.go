@@ -168,7 +168,7 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 		taskID = task.ID
 	}
 	mt := matcherOf(g.Matcher)
-	defer failClosed(&d, RulePathEngineUnavailable, normalized, taskID)
+	defer failClosed(&d, RulePathEngineUnavailable, normalized, taskID, g.HardRules)
 
 	if g.HardRules {
 		// Checked on the raw input and again on the normalized result: a ".."
@@ -317,7 +317,7 @@ func (g FileGate) EvaluateRead(path string, task *dc.Task) (d Decision) {
 		taskID = task.ID
 	}
 	mt := matcherOf(g.Matcher)
-	defer failClosed(&d, RulePathEngineUnavailable, normalized, taskID)
+	defer failClosed(&d, RulePathEngineUnavailable, normalized, taskID, g.HardRules)
 	if !g.HardRules {
 		return g.noteHardRules(allow("Read is not gated when hard rules are off.", normalized, taskID))
 	}
@@ -921,9 +921,12 @@ func pathMatches(mt matching, pattern, path string) bool {
 	return path == p || mt.any([]string{p}, path)
 }
 
+// matchesAny backs MatchesPlannedPath, a bool API called outside any gate
+// entry point, so there is no failClosed to catch an engine error: it asks
+// fnmatch, never the configurable default.
 func matchesAny(patterns []string, path string) bool {
 	for _, raw := range patterns {
-		if pathMatches(matcherOf(nil), raw, path) {
+		if pathMatches(matching{m: GoMatcher}, raw, path) {
 			return true
 		}
 	}

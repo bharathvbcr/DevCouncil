@@ -32,4 +32,16 @@ func runGussetCheck() int {
 }
 
 // policyMatcher is the engine: this host always links it on unix.
-func policyMatcher() policy.Matcher { return gussetfn.Matcher{} }
+//
+// The engine is checked once here so a broken one is named at startup. The
+// matcher is installed either way: a gate that cannot ask it denies each
+// decision under path.engine_unavailable or command.engine_unavailable,
+// with the cause in the reason, rather than quietly deciding with fnmatch.
+func policyMatcher() policy.Matcher {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := gussetfn.Check(ctx); err != nil {
+		console.Errorf("devcouncil: the gusset policy engine failed its check (%v); policy decisions will be refused under path.engine_unavailable / command.engine_unavailable until it recovers\n", err)
+	}
+	return gussetfn.Matcher{}
+}

@@ -127,7 +127,7 @@ func (g CommandGate) EvaluateCommand(command string, task *dc.Task) (d Decision)
 	if task != nil {
 		taskID = task.ID
 	}
-	defer failClosed(&d, RuleCommandEngineUnavailable, command, taskID)
+	defer failClosed(&d, RuleCommandEngineUnavailable, command, taskID, g.HardRules)
 	// Length is checked once, here, before any rung reads the line. Every rung
 	// below is a scan and several recurse, so an unbounded line is an unbounded
 	// amount of work handed to the gate by whoever composed the string — and

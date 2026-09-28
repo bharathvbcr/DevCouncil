@@ -85,7 +85,13 @@ func (x matching) anyFold(patterns []string, name string) bool {
 
 // failClosed converts an engineFailure unwinding out of a gate into a denial
 // under rule. Any other panic is re-raised untouched.
-func failClosed(d *Decision, rule RuleID, target, taskID string) {
+//
+// The denial is Hard, so an operator's advisory or off mode does not demote
+// it. That is deliberate: without the matcher the gate cannot evaluate even
+// the rules no mode may relax (secret paths, protected writes), so it has no
+// allow to give. hardRules carries the gate's own setting so the record
+// notes, like every other decision, when hard rules were switched off.
+func failClosed(d *Decision, rule RuleID, target, taskID string, hardRules bool) {
 	r := recover()
 	if r == nil {
 		return
@@ -97,4 +103,7 @@ func failClosed(d *Decision, rule RuleID, target, taskID string) {
 	*d = deny(rule, fmt.Sprintf(
 		"The pattern engine could not answer (%v), so this is refused rather than guessed: "+
 			"a matcher that cannot answer has no safe allow.", f.err), target, taskID)
+	if !hardRules {
+		d.Degraded = append(d.Degraded, "policy.hard_rules.disabled")
+	}
 }

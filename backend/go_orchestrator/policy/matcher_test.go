@@ -79,6 +79,12 @@ func TestFailingMatcherDeniesUnderTheEngineRule(t *testing.T) {
 	if m.calls == 0 {
 		t.Fatal("the gates never asked the matcher")
 	}
+	// Like every other decision, the engine denial notes a gate whose hard
+	// rules were switched off, and stays Hard.
+	soft := FileGate{Root: root, Matcher: m}.EvaluateFileChange("src/a.go", task, dc.OpModify, false)
+	if soft.Severity != Hard || !reflect.DeepEqual(soft.Degraded, []string{"policy.hard_rules.disabled"}) {
+		t.Errorf("hard rules off: severity %s degraded %v", soft.Severity, soft.Degraded)
+	}
 	if !IsCommandRule(RuleCommandEngineUnavailable) || IsCommandRule(RulePathEngineUnavailable) {
 		t.Fatal("engine rules are filed under the wrong subject")
 	}
