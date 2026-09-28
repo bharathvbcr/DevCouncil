@@ -27,6 +27,19 @@ fn tmp_dir(label: &str) -> PathBuf {
     dir
 }
 
+/// Whether `text` names `path` as written or canonical (a `\\?\` verbatim
+/// path with long names on Windows, `/private/var` on macOS).
+fn names(text: &str, path: &std::path::Path) -> bool {
+    if text.contains(&path.display().to_string()) {
+        return true;
+    }
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    let shown = canonical.display().to_string();
+    text.contains(shown.strip_prefix(r"\\?\").unwrap_or(&shown))
+}
+
 /// K3: a store this binary cannot open must say what to do about it.
 ///
 /// The refusal was `unsupported future schema version 99` — no store path, no
@@ -48,7 +61,7 @@ fn k3_future_schema_refusal_names_the_store_the_versions_and_the_remedy() {
         .to_string();
 
     assert!(
-        error.contains(&db_path.display().to_string()),
+        names(&error, &db_path),
         "the refusal must name the store it refused: {error}"
     );
     assert!(
@@ -90,7 +103,7 @@ fn k3_outdated_schema_refusal_names_the_store_the_versions_and_the_remedy() {
         .to_string();
 
     assert!(
-        error.contains(&db_path.display().to_string()),
+        names(&error, &db_path),
         "the refusal must name the store it refused: {error}"
     );
     assert!(

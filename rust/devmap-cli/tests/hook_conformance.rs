@@ -520,17 +520,47 @@ fn unsafe_home_without_store_is_skipped() {
 /// and this file already relies on it for the sibling-union regression.
 fn make_undetachable(root: &Path) {
     let codeintel = root.join(".devcouncil/codeintel");
-    let mut perms = std::fs::metadata(&codeintel).unwrap().permissions();
-    perms.set_readonly(true);
-    std::fs::set_permissions(&codeintel, perms).unwrap();
+    #[cfg(windows)]
+    {
+        // Windows ignores the read-only attribute on a directory, so the hook
+        // still created its lock there and this helper disabled nothing. A
+        // deny ACE for Everyone (S-1-1-0) on writing is what refuses the
+        // lock's `mkdir`, administrators included.
+        icacls(&codeintel, &["/deny", "*S-1-1-0:(W)"]);
+    }
+    #[cfg(not(windows))]
+    {
+        let mut perms = std::fs::metadata(&codeintel).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&codeintel, perms).unwrap();
+    }
 }
 
 fn make_detachable(root: &Path) {
     let codeintel = root.join(".devcouncil/codeintel");
-    let mut perms = std::fs::metadata(&codeintel).unwrap().permissions();
-    #[allow(clippy::permissions_set_readonly_false)]
-    perms.set_readonly(false);
-    std::fs::set_permissions(&codeintel, perms).unwrap();
+    #[cfg(windows)]
+    icacls(&codeintel, &["/remove:d", "*S-1-1-0"]);
+    #[cfg(not(windows))]
+    {
+        let mut perms = std::fs::metadata(&codeintel).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&codeintel, perms).unwrap();
+    }
+}
+
+#[cfg(windows)]
+fn icacls(path: &Path, args: &[&str]) {
+    let out = Command::new("icacls")
+        .arg(path)
+        .args(args)
+        .output()
+        .expect("icacls runs");
+    assert!(
+        out.status.success(),
+        "icacls {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 /// `--root` must pin the repository, and the payload must not move it.
@@ -686,7 +716,13 @@ fn cursor_session_start_stdout_survives_hostile_briefing_characters() {
     let root = scratch("cursor-quotes");
     seed_store(&root);
     // The repository *name* is interpolated into the briefing.
+    // `"` cannot appear in a Windows file name, so no Windows repository can
+    // carry it; there the name keeps every other character that is hostile to
+    // a hand-built JSON string. Creating it failed with os error 123.
+    #[cfg(not(windows))]
     let named = root.join("repo \"quotes\" and 日本語");
+    #[cfg(windows)]
+    let named = root.join("repo 'quotes' {braces} and 日本語");
     std::fs::create_dir_all(&named).unwrap();
     seed_store(&named);
     let payload = json!({

@@ -5,6 +5,13 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// A path's text without a Windows `\\?\` verbatim prefix. `paths` reports
+/// `db_path` in plain form while the fixture root is canonical (verbatim on
+/// Windows); both name the same file, and elsewhere this is the identity.
+fn plain(path: Option<&str>) -> Option<&str> {
+    path.map(|p| p.strip_prefix(r"\\?\").unwrap_or(p))
+}
+
 struct Fixture(PathBuf);
 
 impl Fixture {
@@ -108,7 +115,7 @@ fn relative_repository_paths_do_not_duplicate_the_repository_directory() {
     fixture.run(&fixture.0, &["build", "repo", "--manifest"], None);
     let report = fixture.run(&fixture.0, &["paths", "repo"], None);
     let expected = fixture.repo().join(".devmap/codeintel/devmap.sqlite");
-    assert_eq!(report["db_path"].as_str(), expected.to_str());
+    assert_eq!(plain(report["db_path"].as_str()), plain(expected.to_str()));
     assert_eq!(report["store_exists"], true);
 }
 
@@ -126,8 +133,8 @@ fn explicit_relative_database_paths_stay_relative_to_the_invoking_directory() {
         None,
     );
     assert_eq!(
-        report["db_path"].as_str(),
-        fixture.0.join("custom.sqlite").to_str()
+        plain(report["db_path"].as_str()),
+        plain(fixture.0.join("custom.sqlite").to_str())
     );
     assert_eq!(report["store_exists"], true);
 }
@@ -174,11 +181,13 @@ fn relative_home_override_is_repository_relative_only_once() {
     fixture.run(&fixture.0, &["build", "repo", "--manifest"], Some(home));
     let report = fixture.run(&fixture.0, &["paths", "repo"], Some(home));
     assert_eq!(
-        report["db_path"].as_str(),
-        fixture
-            .repo()
-            .join("state/codeintel/devmap.sqlite")
-            .to_str()
+        plain(report["db_path"].as_str()),
+        plain(
+            fixture
+                .repo()
+                .join("state/codeintel/devmap.sqlite")
+                .to_str()
+        )
     );
     assert_eq!(report["store_exists"], true);
 }

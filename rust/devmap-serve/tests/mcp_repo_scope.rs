@@ -15,6 +15,34 @@ use devmap_serve::mcp::{
 use devmap_store::Store;
 use serde_json::{json, Value};
 
+/// Whether `text` names `path` in a spelling the platform gives it: as
+/// written, or canonical. Windows canonicalises to a `\\?\` verbatim path
+/// with long names where the temp dir used 8.3 short ones (`RUNNER~1`), and
+/// macOS to `/private/var` for `/var`; every one is the same directory.
+fn names(text: &str, path: &std::path::Path) -> bool {
+    if text.contains(&path.display().to_string()) {
+        return true;
+    }
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    let shown = canonical.display().to_string();
+    text.contains(shown.strip_prefix(r"\\?\").unwrap_or(&shown))
+}
+
+/// `path` as a `file://` URI in this platform's form: `file:///C:/…` on
+/// Windows. `format!("file://{}", path.display())` gives `file://C:\…` there,
+/// which is not a file URI at all.
+fn file_uri(path: &std::path::Path) -> String {
+    let shown = path.display().to_string();
+    if cfg!(windows) {
+        let bare = shown.strip_prefix(r"\\?\").unwrap_or(&shown);
+        format!("file:///{}", bare.replace('\\', "/"))
+    } else {
+        format!("file://{shown}")
+    }
+}
+
 fn scratch(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "devmap-mcp-scope-{name}-{}-{}",
@@ -333,8 +361,7 @@ async fn cwd_store_and_different_mcp_root_without_repo_path_is_refused() {
     let response = call(&slot, "devmap_status", json!({})).await;
     let text = tool_error_text(&response);
     assert!(
-        text.contains(&via_roots.display().to_string())
-            && text.contains(&via_cwd.display().to_string()),
+        names(&text, &via_roots) && names(&text, &via_cwd),
         "must name both the MCP root and the cwd/--root repository: {text}"
     );
 
@@ -447,7 +474,7 @@ async fn preview_without_repo_path_and_two_candidate_roots_is_refused() {
     .await;
     let text = tool_error_text(&response);
     assert!(
-        text.contains(&a.display().to_string()) && text.contains(&b.display().to_string()),
+        names(&text, &a) && names(&text, &b),
         "preview must name both candidate roots, not judge the first: {text}"
     );
 }
@@ -659,8 +686,7 @@ async fn mixed_calls_cannot_first_wins_across_cwd_and_mcp_root() {
             0 => {
                 let text = tool_error_text(&call(&slot, "devmap_status", json!({})).await);
                 assert!(
-                    text.contains(&via_roots.display().to_string())
-                        && text.contains(&via_cwd.display().to_string()),
+                    names(&text, &via_roots) && names(&text, &via_cwd),
                     "iteration {i}: empty args must stay ambiguous: {text}"
                 );
             }
@@ -809,12 +835,12 @@ async fn repo_path_against_a_foreign_root_pin_is_a_tool_error_naming_both() {
     .await;
     let text = tool_error_text(&response);
     assert!(
-        text.contains(&pinned.display().to_string())
+        names(&text, &pinned)
             || text.contains(&pinned.canonicalize().unwrap().display().to_string()),
         "error must name the --root pin: {text}"
     );
     assert!(
-        text.contains(&foreign.display().to_string())
+        names(&text, &foreign)
             || text.contains(&foreign.canonicalize().unwrap().display().to_string()),
         "error must name the refused repo_path: {text}"
     );
@@ -832,7 +858,7 @@ async fn late_devmap_roots_reply_is_ignored_after_a_newer_seq() {
         "jsonrpc": "2.0",
         "id": "devmap-roots-2",
         "result": {
-            "roots": [{"uri": format!("file://{}", newer.display())}]
+            "roots": [{"uri": file_uri(&newer)}]
         }
     });
     assert!(
@@ -844,7 +870,7 @@ async fn late_devmap_roots_reply_is_ignored_after_a_newer_seq() {
         "jsonrpc": "2.0",
         "id": "devmap-roots-1",
         "result": {
-            "roots": [{"uri": format!("file://{}", older.display())}]
+            "roots": [{"uri": file_uri(&older)}]
         }
     });
     assert!(handle_line(&slot, &apply_older.to_string()).await.is_none());

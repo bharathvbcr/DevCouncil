@@ -4988,6 +4988,9 @@ fn on_command_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // Held to the end of `main`: a detached hook build on Windows removes its
+    // coalescing lock when it finishes (see `hook::spawn_detached_with_cleanup`).
+    let _owned_lock = hook::OwnedLock::from_env();
     let started = Instant::now();
     let (cli, matches) = on_command_stack(|| {
         let matches = Cli::command().get_matches();

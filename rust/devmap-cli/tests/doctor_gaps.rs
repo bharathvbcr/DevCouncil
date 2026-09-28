@@ -50,20 +50,23 @@ fn pinned_registrations_are_not_counted_as_global_duplicates() {
     // One global (no --root) and one pinned project entry.
     fs::write(
         home.join(".cursor/mcp.json"),
-        format!(
-            r#"{{"mcpServers":{{"devmap":{{"type":"stdio","command":"{}","args":["mcp"]}}}}}}"#,
-            devmap_bin().display()
-        ),
+        // Built, not formatted: a Windows path in a JSON literal is an
+        // invalid escape, and an unparseable config registers nothing.
+        serde_json::json!({"mcpServers": {"devmap": {
+            "type": "stdio", "command": devmap_bin(), "args": ["mcp"]
+        }}})
+        .to_string(),
     )
     .unwrap();
     fs::create_dir_all(cwd.join(".cursor")).unwrap();
     fs::write(
         cwd.join(".cursor/mcp.json"),
-        format!(
-            r#"{{"mcpServers":{{"devmap":{{"type":"stdio","command":"{}","args":["--root","{}","mcp"]}}}}}}"#,
-            devmap_bin().display(),
-            cwd.display()
-        ),
+        serde_json::json!({"mcpServers": {"devmap": {
+            "type": "stdio",
+            "command": devmap_bin(),
+            "args": ["--root", cwd, "mcp"]
+        }}})
+        .to_string(),
     )
     .unwrap();
     let payload = doctor_with_home(&home, &cwd);
