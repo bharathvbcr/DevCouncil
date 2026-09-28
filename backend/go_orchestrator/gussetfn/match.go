@@ -158,9 +158,9 @@ func DrainLogs(w io.Writer) (int, error) {
 		if err != nil {
 			return total, err
 		}
-		if n < len(buf) {
-			return total, nil
-		}
+		// Not "a short read means empty": gusset drains whole lines and never
+		// splits a UTF-8 character, so a short read can leave more behind.
+		// Only 0 means the ring is empty.
 	}
 }
 
