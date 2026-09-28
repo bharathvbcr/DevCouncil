@@ -34,6 +34,11 @@ parse = ["devmap-extract/parse", "devmap-resolve/parse", "devmap-analyze/parse"]
 name = "retention_churn"
 required-features = ["parse"]
 
+# Builds its generations from extracted source.
+[[test]]
+name = "symbols_for_file"
+required-features = ["parse"]
+
 # The carry-forward guards these tests exercise only exist when an identity can
 # be computed: with `parse` off, `current_payload_identity` returns `None`, no
 # payload is ever carried, and the partial-extraction write is refused outright
