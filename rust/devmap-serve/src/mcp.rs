@@ -620,8 +620,18 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// only kill.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A response must acquire its writer and reach the peer within this bound.
-/// A stopped reader must not retain every admission permit indefinitely.
+/// A response's write and flush must reach the peer within this bound once it
+/// holds the writer. A stopped reader must not retain every admission permit
+/// indefinitely: the write that meets it fails here and marks the stream
+/// failed, and every response queued behind it then fails at once.
+///
+/// It does not cover the wait for the writer. It used to, and on a loaded
+/// machine a reply queued behind the other in-flight replies to a peer that
+/// was reading perfectly well ran out of its 5s before it was written, which
+/// ended the whole session (serve_stress's ten-thousand-request flood on
+/// macOS). Queueing behind a peer that is making progress is backpressure,
+/// already bounded by the admission ceiling; only a peer that has stopped
+/// reading is a failure.
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Requests one connection may have outstanding at once.
@@ -3529,29 +3539,161 @@ async fn write_frame<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    write_frame_within(writer, frame, RESPONSE_WRITE_TIMEOUT).await
+}
+
+async fn write_frame_within<W>(
+    writer: &tokio::sync::Mutex<ResponseWriter<W>>,
+    frame: &Value,
+    bound: Duration,
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut payload = serde_json::to_vec(frame)?;
     payload.push(b'\n');
     // The lock spans the write and the flush, so two concurrent responses cannot
     // interleave their bytes into one unparseable line.
-    tokio::time::timeout(RESPONSE_WRITE_TIMEOUT, async {
-        let mut writer = writer.lock().await;
-        anyhow::ensure!(
-            !writer.failed,
-            "MCP response stream failed on an earlier frame"
-        );
-        // Leave this set if writing fails or this future is cancelled. No
-        // concurrent handler may append another reply to a partial JSON frame.
-        writer.failed = true;
+    let mut writer = writer.lock().await;
+    anyhow::ensure!(
+        !writer.failed,
+        "MCP response stream failed on an earlier frame"
+    );
+    // Leave this set if writing fails or times out. No concurrent handler may
+    // append another reply to a partial JSON frame.
+    writer.failed = true;
+    tokio::time::timeout(bound, async {
         writer.stream.write_all(&payload).await?;
         // Buffered output can deadlock a request/response protocol, so flushing
         // shares the write deadline and mutex rather than extending either.
         writer.stream.flush().await?;
-        writer.failed = false;
-        Ok::<(), anyhow::Error>(())
+        Ok::<(), std::io::Error>(())
     })
     .await
-    .map_err(|_| anyhow::anyhow!("MCP response write exceeded {RESPONSE_WRITE_TIMEOUT:?}"))??;
+    .map_err(|_| anyhow::anyhow!("MCP response write exceeded {bound:?}"))??;
+    writer.failed = false;
     Ok(())
+}
+
+#[cfg(test)]
+mod response_write_bounds {
+    use super::{write_frame_within, ResponseWriter};
+    use serde_json::json;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWrite;
+
+    /// A peer that reads every byte, a little slowly: each write takes `delay`.
+    struct SlowSink {
+        delay: Duration,
+        sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl AsyncWrite for SlowSink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let delay = self.delay;
+            let sleep = self
+                .sleep
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
+            match sleep.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    self.sleep = None;
+                    Poll::Ready(Ok(buf.len()))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A peer that has stopped reading.
+    struct StoppedSink;
+
+    impl AsyncWrite for StoppedSink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    use std::future::Future;
+
+    /// Forty replies queued behind each other to a peer that reads every one
+    /// within the bound. The queue as a whole takes eight bounds; no reply may
+    /// fail for having waited its turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reading_peer_is_not_failed_for_the_length_of_the_queue() {
+        let bound = Duration::from_millis(200);
+        let writer = Arc::new(tokio::sync::Mutex::new(ResponseWriter {
+            stream: SlowSink {
+                delay: Duration::from_millis(40),
+                sleep: None,
+            },
+            failed: false,
+        }));
+        let replies: Vec<_> = (0..40)
+            .map(|id| {
+                let writer = Arc::clone(&writer);
+                tokio::spawn(async move {
+                    write_frame_within(&writer, &json!({ "id": id }), bound).await
+                })
+            })
+            .collect();
+        for reply in replies {
+            reply
+                .await
+                .expect("task")
+                .expect("a reading peer must get every reply");
+        }
+    }
+
+    /// A stopped peer still releases everyone promptly: the write that meets
+    /// it fails at the bound, and the rest fail at once behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stopped_peer_fails_every_queued_reply_within_about_one_bound() {
+        let bound = Duration::from_millis(200);
+        let writer = Arc::new(tokio::sync::Mutex::new(ResponseWriter {
+            stream: StoppedSink,
+            failed: false,
+        }));
+        let started = Instant::now();
+        let replies: Vec<_> = (0..32)
+            .map(|id| {
+                let writer = Arc::clone(&writer);
+                tokio::spawn(async move {
+                    write_frame_within(&writer, &json!({ "id": id }), bound).await
+                })
+            })
+            .collect();
+        for reply in replies {
+            assert!(reply.await.expect("task").is_err());
+        }
+        assert!(
+            started.elapsed() < bound * 4,
+            "queued replies to a stopped peer took {:?}",
+            started.elapsed()
+        );
+    }
 }
 
 #[cfg(test)]
