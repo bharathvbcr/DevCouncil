@@ -99,3 +99,29 @@ fn ordinary_code_outside_a_test_path_is_still_not_a_test() {
         .unwrap();
     assert!(answer.tests.items.is_empty(), "{answer:#?}");
 }
+
+/// The store's prefilter matches text, not structure: a file that merely
+/// *mentions* `RuntimeEntryPoint` passes it with no `wiring` at all, and must
+/// be skipped rather than refused or read as a test.
+#[test]
+fn a_file_that_only_mentions_an_entry_point_is_not_a_test() {
+    let store = store_of(&[
+        (
+            "ledger.py",
+            "def ledger_total(rows):\n    \"\"\"Not a RuntimeEntryPoint, just prose.\"\"\"\n    \
+             return sum(rows)\n",
+        ),
+        (
+            "report.py",
+            "from ledger import ledger_total\n\n\n\
+             def summary(rows):\n    \"\"\"RuntimeEntryPoint test harness invokes it\"\"\"\n    \
+             return ledger_total(rows)\n",
+        ),
+    ]);
+    let symbols = store.latest_test_entry_symbols().unwrap();
+    assert!(symbols.is_empty(), "{symbols:?}");
+    let answer = StoreQueryEngine::new(&store)
+        .affected_tests(&["ledger_total".into()], 8_000, 0.0, 3)
+        .unwrap();
+    assert!(answer.tests.items.is_empty(), "{answer:#?}");
+}

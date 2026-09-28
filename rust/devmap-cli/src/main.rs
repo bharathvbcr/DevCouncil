@@ -3631,6 +3631,19 @@ fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
                 );
                 continue;
             }
+            if unit.hit.source_span.is_empty() {
+                // A lead with no text: a whole file too large for the budget.
+                if let Some(omitted) = unit.hit.source_span_omitted_bytes {
+                    outln!(
+                        "Source {} lines {}-{} ({}): {omitted} bytes, too large to show; read the file",
+                        file.file_path,
+                        unit.hit.span.0,
+                        unit.hit.span.1,
+                        unit.qualified_name
+                    );
+                }
+                continue;
+            }
             outln!(
                 "Source {} lines {}-{} ({}):",
                 file.file_path,

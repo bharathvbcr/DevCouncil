@@ -30,9 +30,11 @@
 //!     inbound call edges, from the same walk `affected_tests` runs. Test files
 //!     already in `files` are not repeated.
 //!
-//! Nothing here reads a file or re-ranks. Order, scores and the counts are
-//! `ask`'s; `tokens_used` is recomputed after folding, so it describes what
-//! the pack actually carries.
+//! Nothing here reads a file or re-ranks: order and scores are `ask`'s. The
+//! page is budgeted by [`fold_aware_take`] rather than `ask`'s take, so a hit
+//! an earlier hit already prints costs only its lead and the same budget can
+//! hold more hits; `tokens_used` is recomputed after folding, so it describes
+//! what the pack actually carries.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -41,7 +43,7 @@ use devmap_store::GenerationEdges;
 use serde::{Deserialize, Serialize};
 
 use crate::cancel::{Cancel, QueryCancelled};
-use crate::engine::{is_test_path, search_hit_tokens};
+use crate::engine::{budget_take, is_test_path, search_hit_tokens, SEARCH_HIT_OVERHEAD_TOKENS};
 use crate::model::{AffectedTest, ResolutionAvailability, Response, SourceFreshness, SymbolHit};
 
 /// What a file is to the question, by path.
@@ -265,6 +267,92 @@ fn relate(
     Ok(())
 }
 
+/// Whether a hit prints its symbol's complete source, and so can stand in for
+/// any hit whose lines it contains.
+///
+/// One definition for both places that ask: [`fold_aware_take`], which charges
+/// a contained hit only its lead, and [`fold_nested`], which then drops that
+/// hit's text. If they disagreed, a hit charged as folded could print in full
+/// and the pack would exceed its budget.
+pub(crate) fn shows_whole(hit: &SymbolHit) -> bool {
+    hit.source_unavailable_reason.is_none()
+        && hit.source_span_omitted_bytes.is_none()
+        && !hit.source_span.is_empty()
+        && hit.span != (0, 0)
+}
+
+/// Whether `outer`'s lines contain `inner`'s, in the same file.
+pub(crate) fn encloses(outer: &SymbolHit, inner: &SymbolHit) -> bool {
+    inner.span != (0, 0)
+        && outer.file_path == inner.file_path
+        && outer.span.0 <= inner.span.0
+        && inner.span.1 <= outer.span.1
+}
+
+/// Budget a ranked page as the pack prints it.
+///
+/// `budget_take`'s rule — a prefix, stopping at the first hit that does not
+/// fit — with one change of price: a hit enclosed by an *earlier accepted* hit
+/// that [`shows_whole`] costs only [`SEARCH_HIT_OVERHEAD_TOKENS`], since
+/// [`fold_nested`] is certain to fold it (it finds a container whenever one
+/// qualifies, and an earlier one qualifies even when the spans are equal). A
+/// class's methods then cost their names, not a second copy of the class, and
+/// the budget buys more hits. Folding may still find containers accepted
+/// *after* a hit; that only makes the pack smaller than what was charged.
+///
+/// A whole-file hit whose text was capped becomes a lead first
+/// ([`file_hit_as_lead`]): its text is the file's first lines, and a capped
+/// span can stand in for nothing.
+pub fn fold_aware_take(hits: Vec<SymbolHit>, token_budget: u32) -> Response<SymbolHit> {
+    let mut accepted: Vec<SymbolHit> = Vec::new();
+    let mut used = 0u32;
+    let mut truncated = false;
+    for mut hit in hits {
+        file_hit_as_lead(&mut hit);
+        let folds = accepted
+            .iter()
+            .any(|outer| shows_whole(outer) && encloses(outer, &hit));
+        let cost = if folds {
+            SEARCH_HIT_OVERHEAD_TOKENS
+        } else {
+            search_hit_tokens(&hit)
+        };
+        if cost > token_budget.saturating_sub(used) {
+            truncated = true;
+            break;
+        }
+        used += cost;
+        accepted.push(hit);
+    }
+    let mut response = budget_take(accepted, u32::MAX, |_| 0);
+    response.tokens_used = used;
+    response.truncated = truncated;
+    response
+}
+
+/// Turn a capped whole-file hit into a lead: no text, every byte reported as
+/// not shown.
+///
+/// The cap keeps a file's first quarter-budget of bytes — imports and a module
+/// comment — which rarely answers anything and spent up to a quarter of the
+/// pack. The path stays, as the lead to read; `source_span_omitted_bytes` says
+/// the whole symbol was withheld, so an empty span is never mistaken for an
+/// empty file. An uncapped file hit keeps its text: it is complete, and it can
+/// fold every other hit in the file.
+fn file_hit_as_lead(hit: &mut SymbolHit) {
+    let Some(omitted) = hit.source_span_omitted_bytes else {
+        return;
+    };
+    if hit.kind != "File" {
+        return;
+    }
+    let whole = u32::try_from(hit.source_span.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(omitted);
+    hit.source_span.clear();
+    hit.source_span_omitted_bytes = Some(whole);
+}
+
 /// Drop the second copy of text a containing unit already shows.
 ///
 /// The container must have its complete source (available and not capped).
@@ -275,29 +363,17 @@ fn relate(
 /// the earlier, which keeps every chain acyclic: each step goes to a strictly
 /// larger span or to a strictly earlier unit.
 fn fold_nested(units: &mut [EvidenceUnit]) {
-    let shows_whole = |unit: &EvidenceUnit| {
-        unit.hit.source_unavailable_reason.is_none()
-            && unit.hit.source_span_omitted_bytes.is_none()
-            && !unit.hit.source_span.is_empty()
-            && unit.hit.span != (0, 0)
-    };
     let container: Vec<Option<usize>> = units
         .iter()
         .enumerate()
         .map(|(i, inner)| {
-            if inner.hit.span == (0, 0) {
-                return None;
-            }
-            let (start, end) = inner.hit.span;
             units
                 .iter()
                 .enumerate()
                 .filter(|&(j, outer)| {
                     j != i
-                        && outer.hit.file_path == inner.hit.file_path
-                        && shows_whole(outer)
-                        && outer.hit.span.0 <= start
-                        && end <= outer.hit.span.1
+                        && shows_whole(&outer.hit)
+                        && encloses(&outer.hit, &inner.hit)
                         && (outer.hit.span != inner.hit.span || j < i)
                 })
                 .min_by_key(|&(j, outer)| (outer.hit.span.1 - outer.hit.span.0, j))

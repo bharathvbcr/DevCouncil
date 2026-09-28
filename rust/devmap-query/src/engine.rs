@@ -1662,7 +1662,7 @@ impl<'a> StoreQueryEngine<'a> {
         // all of them. The ranking is already sorted, so the page bound is the
         // same one keyword search uses.
         let mut hits = Vec::new();
-        for (position, score) in scored.into_iter().take(budget_page_size(token_budget)) {
+        for (position, score) in scored.into_iter().take(search_page_size(token_budget)) {
             self.cancel.check()?;
             hits.push(hit_from_stored(
                 symbols[position].clone(),
@@ -1705,7 +1705,9 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         min_confidence: f32,
     ) -> anyhow::Result<Response<SymbolHit>> {
-        Ok(self.ask_ranked(query, token_budget, min_confidence)?.0)
+        Ok(self
+            .ask_ranked(query, token_budget, min_confidence, false)?
+            .0)
     }
 
     /// [`Self::ask`], answered as an evidence pack: hits grouped by file in
@@ -1725,7 +1727,7 @@ impl<'a> StoreQueryEngine<'a> {
     ) -> anyhow::Result<crate::evidence::EvidencePack> {
         let test_budget = token_budget / EVIDENCE_TEST_BUDGET_SHARE;
         let (response, qualified) =
-            self.ask_ranked(query, token_budget - test_budget, min_confidence)?;
+            self.ask_ranked(query, token_budget - test_budget, min_confidence, true)?;
         let (edges, test_symbols) = if response.items.is_empty() {
             (None, std::collections::HashSet::new())
         } else {
@@ -1823,11 +1825,17 @@ impl<'a> StoreQueryEngine<'a> {
     /// `SymbolHit` carries the bare name, and a bare name cannot be joined
     /// against call edges — two files can each define `run`. The second vector
     /// is index-aligned with `response.items` and exists for that join.
+    ///
+    /// `fold_aware` budgets the page as the evidence pack will print it: a hit
+    /// inside an earlier hit's whole source costs only its lead
+    /// ([`crate::evidence::fold_aware_take`]). Plain `ask` prints every hit's
+    /// source and budgets it so.
     fn ask_ranked(
         &self,
         query: &str,
         token_budget: u32,
         min_confidence: f32,
+        fold_aware: bool,
     ) -> anyhow::Result<(Response<SymbolHit>, Vec<String>)> {
         self.cancel.check()?;
         let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
@@ -1883,6 +1891,7 @@ impl<'a> StoreQueryEngine<'a> {
                 token_budget,
                 coverage_gap,
                 None,
+                fold_aware,
             );
         };
 
@@ -1953,9 +1962,11 @@ impl<'a> StoreQueryEngine<'a> {
             token_budget,
             coverage_gap,
             None,
+            fold_aware,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ask_hits_from_seeds(
         &self,
         symbols: &[StoredSymbol],
@@ -1964,11 +1975,12 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         coverage_gap: Option<String>,
         extra_gap: Option<String>,
+        fold_aware: bool,
     ) -> anyhow::Result<(Response<SymbolHit>, Vec<String>)> {
         let total = u32::try_from(ordered.len()).unwrap_or(u32::MAX);
         let mut hits = Vec::new();
         let mut qualified = Vec::new();
-        for &(position, score) in ordered.iter().take(budget_page_size(token_budget)) {
+        for &(position, score) in ordered.iter().take(search_page_size(token_budget)) {
             self.cancel.check()?;
             qualified.push(symbols[position].qualified_name.clone());
             hits.push(hit_from_stored(
@@ -1978,12 +1990,16 @@ impl<'a> StoreQueryEngine<'a> {
                 score,
             ));
         }
-        let mut response = budget_take(hits, token_budget, search_hit_tokens);
+        let mut response = if fold_aware {
+            crate::evidence::fold_aware_take(hits, token_budget)
+        } else {
+            budget_take(hits, token_budget, search_hit_tokens)
+        };
         response.total = total;
         response.hidden = total.saturating_sub(response.shown);
         response.truncated = response.hidden > 0;
         response.walk_incomplete = devmap_analyze::combine_reasons(coverage_gap, extra_gap);
-        // `budget_take` keeps a prefix, so the names stay aligned by truncation.
+        // Both takes keep a prefix, so the names stay aligned by truncation.
         qualified.truncate(response.items.len());
         Ok((self.finish(response), qualified))
     }
@@ -4154,7 +4170,7 @@ pub(crate) fn byte_span_to_line_range_in(
 /// Kept next to [`cap_source_span`] because the cap must invert the same
 /// arithmetic the packer uses, and a drift between the two reintroduces the
 /// oversized-hit bug in a form no test names.
-const SEARCH_HIT_OVERHEAD_TOKENS: u32 = 20;
+pub(crate) const SEARCH_HIT_OVERHEAD_TOKENS: u32 = 20;
 
 /// Bytes of source per token, matching the `len / 4` estimate in the search
 /// cost function.
@@ -4194,6 +4210,10 @@ fn budget_page_size(token_budget: u32) -> usize {
 /// `explore_reads_one_file_per_definition_it_returns_not_per_candidate` pins
 /// that — so capping its candidate page would cost ranking quality on a
 /// high-match query and buy no bounded-ness at all.
+///
+/// `search_semantic` and `ask` (and so the evidence pack) materialise their
+/// pages the same way — one verified file read per hit — and share the cap;
+/// `ask_and_semantic_search_share_the_page_ceiling` pins all three.
 ///
 /// The cap trims the page, never the count: `total` is still measured over the
 /// whole index and a trimmed page still reports `truncated` and `hidden`.
@@ -6306,6 +6326,62 @@ mod search_bounds_tests {
             response.total,
             response.hidden
         );
+    }
+    /// K-B1 again, for the other two surfaces that materialise a page of hits:
+    /// `ask` (and the evidence pack built on it) and `search_semantic`. Each
+    /// hit is a verified whole-file read, so the same page ceiling applies.
+    #[test]
+    fn ask_and_semantic_search_share_the_page_ceiling() {
+        const SYMBOLS: usize = 4_000;
+        let mut source = String::new();
+        for index in 0..SYMBOLS {
+            source.push_str(&format!("def widget_{index:05}():\n    return {index}\n"));
+        }
+        let store = store_of("things.py", &source);
+        let engine = StoreQueryEngine::new(&store);
+
+        // A surface under test: runs one query, reports its `total` and `truncated`.
+        type Probe<'a> = dyn Fn() -> (u32, bool) + 'a;
+        let reads_for = |run: &Probe| {
+            SOURCE_SPAN_READS.with(|reads| reads.set(0));
+            let (total, truncated) = run();
+            (
+                SOURCE_SPAN_READS.with(|reads| reads.get()),
+                total,
+                truncated,
+            )
+        };
+        let cases: [(&str, &Probe); 3] = [
+            ("ask", &|| {
+                let r = engine.ask("widget", 100_000, 0.0).expect("ask");
+                (r.total, r.truncated)
+            }),
+            ("ask_evidence", &|| {
+                let r = engine
+                    .ask_evidence("widget", 100_000, 0.0)
+                    .expect("ask_evidence");
+                (r.total, r.truncated)
+            }),
+            ("search_semantic", &|| {
+                let r = engine
+                    .search_semantic("widget", 100_000)
+                    .expect("search_semantic");
+                (r.total, r.truncated)
+            }),
+        ];
+        for (name, run) in cases {
+            let (reads, total, truncated) = reads_for(run);
+            assert!(
+                reads <= SEARCH_PAGE_MAX,
+                "{name}: a 100,000-token budget opened {reads} files; the page \
+                 ceiling is {SEARCH_PAGE_MAX}"
+            );
+            assert!(
+                total as usize >= SYMBOLS && truncated,
+                "{name}: the count stays index-wide and a capped page says so: \
+                 total={total} truncated={truncated}"
+            );
+        }
     }
 }
 

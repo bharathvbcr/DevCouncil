@@ -668,8 +668,11 @@ devmap mcp        # speak MCP on stdin/stdout, for an agent host
 server validates its own answers against the schema it published before emitting them.
 
 `devmap_ask_evidence` (CLI: `devmap ask --evidence`) is `devmap_ask` shaped for
-reading. Three quarters of the budget go to the hits — ranked and counted exactly as
-`devmap_ask` at that budget — grouped into files in rank order. Each hit carries its
+reading. Three quarters of the budget go to the hits, in `devmap_ask`'s order and
+grouped into files in rank order; a hit whose lines an earlier hit already prints
+costs only its lead, so the pack holds every hit `devmap_ask` would at that budget
+and sometimes more. Like `search`, it materialises at most 200 hits whatever the
+budget, since each one is a verified file read. Each hit carries its
 verbatim source, a `role` (`test` when its file is a test path or a test runner
 invokes it — `#[test]`, pytest `test_*`, JUnit `@Test` — else `implementation`), the
 other hits it `calls` or is `called_by` over admitted call edges, and `contained_in`

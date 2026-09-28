@@ -993,8 +993,9 @@ says the matches were withheld for confidence rather than absent.",
         ),
         "ask_evidence" => (
             "The `devmap_ask` answer shaped for reading, so the first reads are already done. \
-Three quarters of `budget` go to the hits — ranked and counted exactly as `devmap_ask` at that \
-budget — and a quarter to `related_tests`: test files that reach the implementation hits over \
+Three quarters of `budget` go to the hits, in `devmap_ask`'s order; a hit whose lines an earlier \
+hit already prints costs only its lead, so the pack holds every hit `devmap_ask` would at that \
+budget and sometimes more. A quarter goes to `related_tests`: test files that reach the implementation hits over \
 inbound call edges (depth 3), nearest first. The hits are grouped into `files` in rank \
 order. Each unit has a `role`: `test` when its file is a test path or a test runner invokes it (`#[test]`, \
 pytest `test_*`, JUnit `@Test`), else `implementation`; a file is `test` when its path is or all its \
