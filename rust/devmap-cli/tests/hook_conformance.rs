@@ -11,6 +11,19 @@ use serde_json::json;
 
 const DEVMAP: &str = env!("CARGO_BIN_EXE_devmap");
 
+/// Whether `text` names `path` as written or canonical (a `\\?\` verbatim
+/// path with long names on Windows, `/private/var` on macOS).
+fn names(text: &str, path: &Path) -> bool {
+    if text.contains(&path.display().to_string()) {
+        return true;
+    }
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    let shown = canonical.display().to_string();
+    text.contains(shown.strip_prefix(r"\\?\").unwrap_or(&shown))
+}
+
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "devmap-hook-conf-{tag}-{}-{}",
@@ -619,7 +632,7 @@ fn pinned_root_disables_discovery() {
         "the pinned repository was never acted on, so the pin proves nothing"
     );
     assert!(
-        run.stderr.contains(pinned.to_str().unwrap()),
+        names(&run.stderr, &pinned),
         "the failure must name the pinned root, not another repository: {}",
         run.stderr
     );
