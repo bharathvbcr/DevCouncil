@@ -108,6 +108,10 @@ fn a_repo_with_no_commits_marks_owners_unavailable() {
 
 /// An empty author is not invented into a placeholder owner. It is named as
 /// unavailable so completeness stays honest.
+// Drives a /bin/sh stub standing in for git; there is no shell to run it on
+// Windows. It was an early `return` there, which passed without testing
+// anything and tripped `unreachable_code` under -D warnings.
+#[cfg(unix)]
 #[test]
 fn an_empty_author_is_unavailable_not_invented() {
     let root = temp_root("empty-author");
@@ -150,7 +154,6 @@ fn an_empty_author_is_unavailable_not_invented() {
 
     // Drive the collector against a stub that emits one empty author line.
     let stub = root.join("empty-author-git");
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(
@@ -161,10 +164,6 @@ fn an_empty_author_is_unavailable_not_invented() {
         let mut perms = std::fs::metadata(&stub).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&stub, perms).unwrap();
-    }
-    #[cfg(not(unix))]
-    {
-        return;
     }
 
     let (owners, gaps) = owners_for_paths_with_program(
@@ -191,6 +190,10 @@ fn an_empty_author_is_unavailable_not_invented() {
 
 /// A timeout after the first of many paths keeps the owners already found and
 /// records unavailable — it does not discard them or pretend the pass finished.
+// Drives a /bin/sh stub standing in for git; there is no shell to run it on
+// Windows. It was an early `return` there, which passed without testing
+// anything and tripped `unreachable_code` under -D warnings.
+#[cfg(unix)]
 #[test]
 fn a_timeout_after_one_path_keeps_partial_owners_and_is_incomplete() {
     let root = temp_root("timeout");
@@ -205,7 +208,6 @@ fn a_timeout_after_one_path_keeps_partial_owners_and_is_incomplete() {
 
     let counter = root.join("log-count");
     let stub = root.join("slow-second-git");
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let script = format!(
@@ -216,10 +218,6 @@ fn a_timeout_after_one_path_keeps_partial_owners_and_is_incomplete() {
         let mut perms = std::fs::metadata(&stub).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&stub, perms).unwrap();
-    }
-    #[cfg(not(unix))]
-    {
-        return;
     }
 
     let (owners, gaps) = owners_for_paths_with_program(

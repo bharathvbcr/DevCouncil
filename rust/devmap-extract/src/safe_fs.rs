@@ -667,9 +667,9 @@ fn open_regular_child(
 /// noticed, and the name's metadata was computed and then dropped unused.
 #[cfg(unix)]
 fn same_identity(
-    _held: &File,
+    _held_file: &File,
     held: &std::fs::Metadata,
-    _named: &File,
+    _named_file: &File,
     named: &std::fs::Metadata,
 ) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
@@ -678,13 +678,13 @@ fn same_identity(
 
 #[cfg(windows)]
 fn same_identity(
-    held: &File,
+    held_file: &File,
     _held: &std::fs::Metadata,
-    named: &File,
+    named_file: &File,
     _named: &std::fs::Metadata,
 ) -> io::Result<bool> {
-    let a = windows_information(held)?;
-    let b = windows_information(named)?;
+    let a = windows_information(held_file)?;
+    let b = windows_information(named_file)?;
     Ok(a.volume == b.volume && a.index_high == b.index_high && a.index_low == b.index_low)
 }
 
