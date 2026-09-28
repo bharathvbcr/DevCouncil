@@ -17,7 +17,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -164,11 +163,10 @@ func DrainLogs(w io.Writer) (int, error) {
 }
 
 // handleGone reports an error that says h was closed under the call:
-// retired after another call's panic, or shut by Close. Gusset has no
-// sentinel for it; these are its two spellings.
+// retired after another call's panic, or shut by Close. gusset.ErrClosed
+// matches every such error; this used to match its two message texts.
 func handleGone(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, "gusset: handle is closed") || strings.Contains(msg, "gusset: handle closed")
+	return errors.Is(err, gusset.ErrClosed)
 }
 
 // call runs one frame on the shared handle and retires it on poison.
