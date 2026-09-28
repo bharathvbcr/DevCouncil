@@ -227,6 +227,10 @@ jobs:
   static-musl:
     name: static musl host (engine + panic firewall)
     runs-on: ubuntu-latest
+    # The workflow defaults run steps to rust/; these paths are repo-root.
+    defaults:
+      run:
+        working-directory: .
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
