@@ -668,11 +668,15 @@ devmap mcp        # speak MCP on stdin/stdout, for an agent host
 server validates its own answers against the schema it published before emitting them.
 
 `devmap_ask_evidence` (CLI: `devmap ask --evidence`) is `devmap_ask` shaped for
-reading: the same hits, ranking and budget, grouped into files in rank order. Each
-file carries a path-based `role` (`implementation` or `test`); each hit carries its
-verbatim source, the other hits it `calls` or is `called_by` over admitted call
-edges, and `contained_in` when an enclosing hit already shows its lines. It reads
-no file and re-ranks nothing beyond what `devmap_ask` does.
+reading. Three quarters of the budget go to the hits — ranked and counted exactly as
+`devmap_ask` at that budget — grouped into files in rank order. Each hit carries its
+verbatim source, a `role` (`test` when its file is a test path or a test runner
+invokes it — `#[test]`, pytest `test_*`, JUnit `@Test` — else `implementation`), the
+other hits it `calls` or is `called_by` over admitted call edges, and `contained_in`
+when an enclosing hit already prints its lines. The last quarter goes to
+`related_tests`: tests that reach the implementation hits over inbound call edges
+(depth 3), including `#[test]` functions beside the code, nearest first. It reads no
+file beyond what `devmap_ask` reads, and `tokens_used` never exceeds the budget.
 
 The last two join the graph to git and run in opposite directions.
 `devmap_blast` goes **forward** — these lines changed, what depends on them —

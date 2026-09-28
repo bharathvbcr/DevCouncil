@@ -993,8 +993,12 @@ says the matches were withheld for confidence rather than absent.",
         ),
         "ask_evidence" => (
             "The `devmap_ask` answer shaped for reading, so the first reads are already done. \
-Same ranking, budget and envelope counts as `devmap_ask`; the hits are grouped into `files` in rank \
-order. Each file has a `role` (`implementation` or `test`, by path) and its `units` in line order: \
+Three quarters of `budget` go to the hits — ranked and counted exactly as `devmap_ask` at that \
+budget — and a quarter to `related_tests`: test files that reach the implementation hits over \
+inbound call edges (depth 3), nearest first. The hits are grouped into `files` in rank \
+order. Each unit has a `role`: `test` when its file is a test path or a test runner invokes it (`#[test]`, \
+pytest `test_*`, JUnit `@Test`), else `implementation`; a file is `test` when its path is or all its \
+units are. Each file lists its `units` in line order: \
 the hit with its verbatim source, `qualified_name`, `calls` / `called_by` naming other hits joined \
 by admitted call edges at the same `min_confidence`, and `contained_in` when its lines are already \
 shown by an enclosing hit. Use it for a behaviour question in unfamiliar code; use `devmap_search` \
@@ -1411,21 +1415,28 @@ re-ranked by personalized PageRank over call edges. Read `truncated` and `walk_i
                 "files": {"type": "array",
                     "description": "Files in rank order. Each: `file_path`, `role` \
         (`implementation` | `test`), `score` (its best unit's), and `units` in line order. A unit is a \
-        `devmap_ask` hit plus `qualified_name`, optional `calls` / `called_by` (other hits, over admitted \
+        `devmap_ask` hit plus `qualified_name`, `role`, optional `calls` / `called_by` (other hits, over admitted \
         call edges) and optional `contained_in` (the enclosing unit that shows its source; its own \
         `source_span` is then empty)."},
+                "related_tests": {"type": "object",
+                    "description": "Test files reaching the implementation hits, as a budgeted \
+        envelope of its own (`items`, `shown`, `hidden`, `total`, `truncated`, `walk_incomplete`). Each \
+        item: `path`, `depth` (edges from the nearest hit), `symbols` reached (sampled) and \
+        `reached_symbols`. A reached symbol is a test by path or because a test runner invokes it; tests \
+        that are already hits are not repeated."},
                 "shown": {"type": "integer", "description": "Hits present across `files`."},
                 "hidden": {"type": "integer",
                     "description": "Hits the token budget withheld. Non-zero means this answer is a prefix."},
                 "total": {"type": "integer", "description": "shown + hidden."},
                 "truncated": {"type": "boolean"},
                 "tokens_used": {"type": "integer",
-                    "description": "`devmap_ask`'s count, before nested source was folded: an upper bound."},
+                    "description": "The whole pack, after folding and including `related_tests`; never over `budget`."},
                 "resolution": {"type": ["string", "object"]},
                 "walk_incomplete": {"type": ["string", "null"],
                     "description": "Present only when the producer stopped early; the answer is partial by an unknown amount."}
             },
-            "required": ["files", "shown", "hidden", "total", "truncated", "tokens_used", "resolution"],
+            "required": ["files", "related_tests", "shown", "hidden", "total", "truncated",
+                "tokens_used", "resolution"],
             "additionalProperties": true
         }),
         "deps" => budgeted_envelope("Outbound edges from the target."),

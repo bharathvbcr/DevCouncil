@@ -56,8 +56,9 @@ pub use code_graph::{
 pub use engine::{
     budget_take, clone_group_tokens, is_test_path, link_candidates, parse_clone_kind,
     resolved_edge_from_stored, traversal_starts, traversed_resolution_edges, workspace_search,
-    PathOutsideRepoRoot, QueryEngine, StoreQueryEngine, BYTES_PER_TOKEN, MAX_NEIGHBOR_TARGETS,
-    MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH, PREVIEW_CALLER_MIN_CONFIDENCE,
+    PathOutsideRepoRoot, QueryEngine, StoreQueryEngine, BYTES_PER_TOKEN,
+    EVIDENCE_TEST_BUDGET_SHARE, EVIDENCE_TEST_DEPTH, MAX_NEIGHBOR_TARGETS, MAX_TOKEN_BUDGET,
+    MAX_TRAVERSAL_DEPTH, PREVIEW_CALLER_MIN_CONFIDENCE,
 };
 pub use escape::{html_escape, render_symbol_label};
 pub use evidence::{EvidenceFile, EvidencePack, EvidenceRole, EvidenceUnit};

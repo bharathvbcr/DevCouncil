@@ -1701,31 +1701,121 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         min_confidence: f32,
     ) -> anyhow::Result<Response<SymbolHit>> {
-        Ok(self.ask_ranked(query, token_budget, min_confidence)?.0)
+        Ok(self
+            .ask_ranked(query, token_budget, min_confidence, None)?
+            .0)
     }
 
     /// [`Self::ask`], answered as an evidence pack: hits grouped by file in
     /// rank order, each file marked test or implementation, the call edges
-    /// that connect the hits, and a nested hit's source folded into the hit
-    /// that already shows it. See [`crate::evidence`].
+    /// that connect the hits, a nested hit's source folded into the hit that
+    /// already shows it, and the test files that reach the implementation
+    /// hits. See [`crate::evidence`].
+    ///
+    /// The budget is split: a [`EVIDENCE_TEST_BUDGET_SHARE`]th of it is held
+    /// for the related-test list and the rest goes to the hits, so the pack as
+    /// a whole never exceeds `token_budget`.
     pub fn ask_evidence(
         &self,
         query: &str,
         token_budget: u32,
         min_confidence: f32,
     ) -> anyhow::Result<crate::evidence::EvidencePack> {
-        let (response, qualified) = self.ask_ranked(query, token_budget, min_confidence)?;
+        let test_budget = token_budget / EVIDENCE_TEST_BUDGET_SHARE;
+        let mut test_symbols = std::collections::HashSet::new();
+        let (response, qualified) = self.ask_ranked(
+            query,
+            token_budget - test_budget,
+            min_confidence,
+            Some(&mut test_symbols),
+        )?;
         let edges = if response.items.is_empty() {
             None
         } else {
             self.generation_edges()?
+        };
+        let related_tests = match edges.as_deref() {
+            Some(edges) => self.evidence_related_tests(
+                edges,
+                &response,
+                &qualified,
+                &test_symbols,
+                test_budget,
+                min_confidence,
+            )?,
+            None => self.finish(budget_take(Vec::new(), test_budget, |_| 0)),
         };
         Ok(crate::evidence::assemble(
             response,
             &qualified,
             edges.as_deref(),
             min_confidence,
-        ))
+            &test_symbols,
+            related_tests,
+            &self.cancel,
+        )?)
+    }
+
+    /// Test files reaching the pack's implementation hits, nearest first.
+    ///
+    /// The same inbound walk as [`Self::affected_tests`], seeded with the
+    /// implementation hits' qualified names (at most [`MAX_NEIGHBOR_TARGETS`],
+    /// best-ranked first). A reached symbol is a test when its file is a test
+    /// path — `affected_tests`' rule — *or* a test runner invokes it, so a
+    /// `#[test] fn` beside the code it tests is found too. Tests that are
+    /// already hits are dropped *before* budgeting, so the counters describe
+    /// the list as returned.
+    fn evidence_related_tests(
+        &self,
+        edges: &GenerationEdges,
+        response: &Response<SymbolHit>,
+        qualified: &[String],
+        test_symbols: &std::collections::HashSet<String>,
+        token_budget: u32,
+        min_confidence: f32,
+    ) -> anyhow::Result<Response<AffectedTest>> {
+        let mut targets: Vec<String> = Vec::new();
+        let mut hits: BTreeSet<(&str, &str)> = BTreeSet::new();
+        for (hit, name) in response.items.iter().zip(qualified) {
+            hits.insert((hit.file_path.as_str(), name.as_str()));
+            let is_test = is_test_path(&hit.file_path) || test_symbols.contains(name);
+            if !is_test && targets.len() < MAX_NEIGHBOR_TARGETS && !targets.contains(name) {
+                targets.push(name.clone());
+            }
+        }
+        if targets.is_empty() {
+            return Ok(self.finish(budget_take(Vec::new(), token_budget, |_| 0)));
+        }
+        let walk = self.blast_walk(edges, &targets, EVIDENCE_TEST_DEPTH, min_confidence)?;
+        // Seeds are implementation hits by construction, so only the bands can
+        // hold a test.
+        let mut nearest: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
+        for band in &walk.bands {
+            for (symbol, file) in &band.members {
+                let is_test = is_test_path(file) || test_symbols.contains(symbol);
+                if !is_test || hits.contains(&(file.as_str(), symbol.as_str())) {
+                    continue;
+                }
+                let entry = nearest
+                    .entry(file.clone())
+                    .or_insert((band.depth, BTreeSet::new()));
+                entry.0 = entry.0.min(band.depth);
+                entry.1.insert(symbol.clone());
+            }
+        }
+        let mut tests: Vec<AffectedTest> = nearest
+            .into_iter()
+            .map(|(path, (depth, symbols))| AffectedTest {
+                path,
+                depth,
+                reached_symbols: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
+                symbols: symbols.into_iter().take(AFFECTED_SYMBOL_SAMPLE).collect(),
+            })
+            .collect();
+        tests.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.path.cmp(&b.path)));
+        let mut related = budget_take(tests, token_budget, affected_test_tokens);
+        related.walk_incomplete = walk.incomplete_reason();
+        Ok(self.finish(related))
     }
 
     /// The ask walk, with each shown hit's qualified name alongside it.
@@ -1733,11 +1823,16 @@ impl<'a> StoreQueryEngine<'a> {
     /// `SymbolHit` carries the bare name, and a bare name cannot be joined
     /// against call edges — two files can each define `run`. The second vector
     /// is index-aligned with `response.items` and exists for that join.
+    ///
+    /// `test_symbols`, when given, is filled with the qualified names a test
+    /// runner invokes ([`crate::ask::test_entry_symbols`]), read from the same
+    /// extractions the docstrings come from so the pack pays for one load.
     fn ask_ranked(
         &self,
         query: &str,
         token_budget: u32,
         min_confidence: f32,
+        test_symbols: Option<&mut std::collections::HashSet<String>>,
     ) -> anyhow::Result<(Response<SymbolHit>, Vec<String>)> {
         self.cancel.check()?;
         let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
@@ -1757,7 +1852,12 @@ impl<'a> StoreQueryEngine<'a> {
             return Ok((self.finish(response), Vec::new()));
         }
 
-        let docstrings = crate::ask::docstring_by_qualified_name(&self.store.latest_extractions()?);
+        let extractions = self.store.latest_extractions()?;
+        if let Some(test_symbols) = test_symbols {
+            *test_symbols = crate::ask::test_entry_symbols(&extractions);
+        }
+        let docstrings = crate::ask::docstring_by_qualified_name(&extractions);
+        drop(extractions);
         let texts: Vec<String> = symbols
             .iter()
             .map(|symbol| {
@@ -4554,7 +4654,15 @@ fn name_match_score(row: &devmap_store::StoredSymbol, query_lower: &str) -> f32 
 /// Shared by keyword and semantic search so the two spend the budget at the
 /// same rate; two copies of this arithmetic would let the same result cost
 /// different amounts depending on which command asked for it.
-fn search_hit_tokens(hit: &SymbolHit) -> u32 {
+/// Share of an evidence pack's budget held for its related-test list: a
+/// quarter, so the hits keep most of the budget and a few test files still
+/// fit beside them.
+pub const EVIDENCE_TEST_BUDGET_SHARE: u32 = 4;
+
+/// Inbound depth of the related-test walk: the `devmap affected` default.
+pub const EVIDENCE_TEST_DEPTH: usize = 3;
+
+pub(crate) fn search_hit_tokens(hit: &SymbolHit) -> u32 {
     u32::try_from(hit.source_span.len() / BYTES_PER_TOKEN as usize)
         .unwrap_or(u32::MAX)
         .saturating_add(SEARCH_HIT_OVERHEAD_TOKENS)

@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use devmap_extract::model::{EdgeKind, Extraction};
+use devmap_extract::model::{EdgeKind, Extraction, WiringKind};
 use devmap_store::GenerationEdges;
 
 use crate::cancel::{Cancel, QueryCancelled};
@@ -39,6 +39,24 @@ pub fn seed_text(name: &str, qualified_name: &str, docstring: Option<&str>) -> S
         Some(doc) => format!("{name} {qualified_name} {doc}"),
         None => format!("{name} {qualified_name}"),
     }
+}
+
+/// Qualified names a test runner invokes: `#[test]` functions, pytest's
+/// `test_*`, JUnit's `@Test` and the fixture hooks around them.
+///
+/// Read from the extraction's own `RuntimeEntryPoint` annotations through
+/// [`devmap_extract::wiring::is_test_harness_reason`], so a test inside a
+/// source file is recognised by what the extractor saw, not by its name.
+pub fn test_entry_symbols(extractions: &[Extraction]) -> HashSet<String> {
+    extractions
+        .iter()
+        .flat_map(|extraction| &extraction.wiring)
+        .filter(|annotation| {
+            annotation.kind == WiringKind::RuntimeEntryPoint
+                && devmap_extract::wiring::is_test_harness_reason(&annotation.details)
+        })
+        .map(|annotation| annotation.target_symbol.clone())
+        .collect()
 }
 
 /// Docstrings keyed by qualified name, only where the extraction carried one.

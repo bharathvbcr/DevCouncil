@@ -9,33 +9,40 @@
 //! This module rebuilds it from what the map already holds, and nothing else:
 //!
 //!   - **Files in rank order.** A file sits where its best hit sits.
-//!   - **Role.** `test` when the path is a test path ([`is_test_path`]),
-//!     otherwise `implementation`. A path rule, not a judgement about content —
-//!     a test fixture under `src/` is `implementation` here, and says so by
-//!     being wrong in a way anyone can check.
+//!   - **Role.** Per unit: `test` when its file is a test path
+//!     ([`is_test_path`]) or a test runner invokes it — a `#[test] fn`, a
+//!     pytest `test_*`, a JUnit `@Test`, as the extractor recorded them —
+//!     otherwise `implementation`. Per file: `test` when the path is a test
+//!     path or every unit in it is a test. Neither reads content: a helper
+//!     that only tests call is still `implementation`.
 //!   - **Relations.** The admitted call edges *between hits*, as `calls` and
 //!     `called_by` on each unit. Only edges at or above the same
 //!     `min_confidence` floor the ask walk used, so the pack never shows a
 //!     relation the ranking was not allowed to use.
 //!   - **Folding.** A hit whose lines sit inside another hit's complete source
 //!     keeps its lead and relations but not a second copy of the text;
-//!     `contained_in` names the unit that shows it. A container whose source
-//!     was capped does not fold anything — the inner text may be the part that
-//!     was cut.
+//!     `contained_in` names the unit that prints it — the outermost one, when
+//!     containers nest, since an intermediate container is folded too. Two hits
+//!     with identical lines fold the lower-ranked into the higher. A container
+//!     whose source was capped does not fold anything — the inner text may be
+//!     the part that was cut.
+//!   - **Related tests.** Test files that reach the implementation hits over
+//!     inbound call edges, from the same walk `affected_tests` runs. Test files
+//!     already in `files` are not repeated.
 //!
-//! Nothing here reads a file or re-ranks. Order, scores and budget accounting
-//! are `ask`'s; the envelope fields are carried over unchanged, so
-//! `tokens_used` still describes the answer before folding (an upper bound on
-//! what the pack prints).
+//! Nothing here reads a file or re-ranks. Order, scores and the counts are
+//! `ask`'s; `tokens_used` is recomputed after folding, so it describes what
+//! the pack actually carries.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use devmap_extract::model::EdgeKind;
 use devmap_store::GenerationEdges;
 use serde::{Deserialize, Serialize};
 
-use crate::engine::is_test_path;
-use crate::model::{ResolutionAvailability, Response, SourceFreshness, SymbolHit};
+use crate::cancel::{Cancel, QueryCancelled};
+use crate::engine::{is_test_path, search_hit_tokens};
+use crate::model::{AffectedTest, ResolutionAvailability, Response, SourceFreshness, SymbolHit};
 
 /// What a file is to the question, by path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +67,7 @@ pub struct EvidenceUnit {
     #[serde(flatten)]
     pub hit: SymbolHit,
     pub qualified_name: String,
+    pub role: EvidenceRole,
     /// Qualified names of other hits this one calls, over admitted edges.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<String>,
@@ -86,6 +94,10 @@ pub struct EvidenceFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidencePack {
     pub files: Vec<EvidenceFile>,
+    /// Test files reaching the implementation hits over inbound call edges,
+    /// nearest first, excluding test files already in `files`. Its own
+    /// counters and `walk_incomplete` describe it; they are not the hits'.
+    pub related_tests: Response<AffectedTest>,
     pub source_freshness: SourceFreshness,
     pub shown: u32,
     pub hidden: u32,
@@ -101,12 +113,16 @@ pub struct EvidencePack {
 ///
 /// `edges` is `None` when the generation has no edge index; the pack is then
 /// the same files and units with no relations, which is what the map knows.
+/// `related_tests` is attached as given; its tokens are added to the pack's.
 pub fn assemble(
     response: Response<SymbolHit>,
     qualified: &[String],
     edges: Option<&GenerationEdges>,
     min_confidence: f32,
-) -> EvidencePack {
+    test_symbols: &HashSet<String>,
+    related_tests: Response<AffectedTest>,
+    cancel: &Cancel,
+) -> Result<EvidencePack, QueryCancelled> {
     debug_assert_eq!(response.items.len(), qualified.len());
     let Response {
         source_freshness,
@@ -115,7 +131,6 @@ pub fn assemble(
         hidden,
         total,
         truncated,
-        tokens_used,
         resolution,
         walk_incomplete,
         ..
@@ -125,6 +140,11 @@ pub fn assemble(
         .into_iter()
         .zip(qualified.iter().cloned())
         .map(|(hit, qualified_name)| EvidenceUnit {
+            role: if is_test_path(&hit.file_path) || test_symbols.contains(&qualified_name) {
+                EvidenceRole::Test
+            } else {
+                EvidenceRole::Implementation
+            },
             hit,
             qualified_name,
             calls: Vec::new(),
@@ -134,9 +154,13 @@ pub fn assemble(
         .collect();
 
     if let Some(edges) = edges {
-        relate(&mut units, edges, min_confidence);
+        relate(&mut units, edges, min_confidence, cancel)?;
     }
     fold_nested(&mut units);
+    let tokens_used = units
+        .iter()
+        .map(|unit| search_hit_tokens(&unit.hit))
+        .fold(related_tests.tokens_used, u32::saturating_add);
 
     // Group in rank order: a file's position is its first (best) unit's.
     let mut order: Vec<String> = Vec::new();
@@ -164,7 +188,9 @@ pub fn assemble(
                     .then(b.hit.span.1.cmp(&a.hit.span.1))
                     .then(a.qualified_name.cmp(&b.qualified_name))
             });
-            let role = if is_test_path(&file_path) {
+            let role = if is_test_path(&file_path)
+                || units.iter().all(|unit| unit.role == EvidenceRole::Test)
+            {
                 EvidenceRole::Test
             } else {
                 EvidenceRole::Implementation
@@ -178,8 +204,9 @@ pub fn assemble(
         })
         .collect();
 
-    EvidencePack {
+    Ok(EvidencePack {
         files,
+        related_tests,
         source_freshness,
         shown,
         hidden,
@@ -188,7 +215,7 @@ pub fn assemble(
         tokens_used,
         resolution,
         walk_incomplete,
-    }
+    })
 }
 
 /// Attach the admitted call edges whose two ends are both hits.
@@ -196,7 +223,12 @@ pub fn assemble(
 /// Joined on `(file, qualified name)`, not the name alone: the same qualified
 /// name in two files is two symbols, and an edge between one pair must not be
 /// reported for the other.
-fn relate(units: &mut [EvidenceUnit], edges: &GenerationEdges, min_confidence: f32) {
+fn relate(
+    units: &mut [EvidenceUnit],
+    edges: &GenerationEdges,
+    min_confidence: f32,
+    cancel: &Cancel,
+) -> Result<(), QueryCancelled> {
     let index: HashMap<(&str, &str), usize> = units
         .iter()
         .enumerate()
@@ -210,6 +242,7 @@ fn relate(units: &mut [EvidenceUnit], edges: &GenerationEdges, min_confidence: f
     let mut calls: Vec<BTreeSet<String>> = vec![BTreeSet::new(); units.len()];
     let mut called_by: Vec<BTreeSet<String>> = vec![BTreeSet::new(); units.len()];
     for id in 0..edges.len() as u32 {
+        cancel.check_every(id as usize)?;
         if edges.kind(id) != EdgeKind::Calls || !edges.admits(id, min_confidence) {
             continue;
         }
@@ -229,13 +262,18 @@ fn relate(units: &mut [EvidenceUnit], edges: &GenerationEdges, min_confidence: f
         unit.calls = calls.into_iter().collect();
         unit.called_by = called_by.into_iter().collect();
     }
+    Ok(())
 }
 
 /// Drop the second copy of text a containing unit already shows.
 ///
-/// The container must have its complete source (available and not capped);
-/// among several candidates the tightest one is named. Two units with the
-/// same span do not fold into each other.
+/// The container must have its complete source (available and not capped).
+/// Among several candidates the tightest is chosen, then the chain is followed
+/// outward: when the class holding a method is itself inside a shown file, the
+/// class is folded too, and the method must point at the file — the block that
+/// is actually printed. Identical spans fold the later (lower-ranked) unit into
+/// the earlier, which keeps every chain acyclic: each step goes to a strictly
+/// larger span or to a strictly earlier unit.
 fn fold_nested(units: &mut [EvidenceUnit]) {
     let shows_whole = |unit: &EvidenceUnit| {
         unit.hit.source_unavailable_reason.is_none()
@@ -243,32 +281,40 @@ fn fold_nested(units: &mut [EvidenceUnit]) {
             && !unit.hit.source_span.is_empty()
             && unit.hit.span != (0, 0)
     };
-    let mut folds: Vec<(usize, String)> = Vec::new();
-    for (i, inner) in units.iter().enumerate() {
-        if inner.hit.span == (0, 0) {
+    let container: Vec<Option<usize>> = units
+        .iter()
+        .enumerate()
+        .map(|(i, inner)| {
+            if inner.hit.span == (0, 0) {
+                return None;
+            }
+            let (start, end) = inner.hit.span;
+            units
+                .iter()
+                .enumerate()
+                .filter(|&(j, outer)| {
+                    j != i
+                        && outer.hit.file_path == inner.hit.file_path
+                        && shows_whole(outer)
+                        && outer.hit.span.0 <= start
+                        && end <= outer.hit.span.1
+                        && (outer.hit.span != inner.hit.span || j < i)
+                })
+                .min_by_key(|&(j, outer)| (outer.hit.span.1 - outer.hit.span.0, j))
+                .map(|(j, _)| j)
+        })
+        .collect();
+    for i in 0..units.len() {
+        let Some(mut shown) = container[i] else {
             continue;
+        };
+        while let Some(next) = container[shown] {
+            shown = next;
         }
-        let (start, end) = inner.hit.span;
-        let container = units
-            .iter()
-            .enumerate()
-            .filter(|&(j, outer)| {
-                j != i
-                    && outer.hit.file_path == inner.hit.file_path
-                    && shows_whole(outer)
-                    && outer.hit.span.0 <= start
-                    && end <= outer.hit.span.1
-                    && outer.hit.span != inner.hit.span
-            })
-            .min_by_key(|(_, outer)| outer.hit.span.1 - outer.hit.span.0);
-        if let Some((_, outer)) = container {
-            folds.push((i, outer.qualified_name.clone()));
-        }
-    }
-    for (i, container) in folds {
+        let name = units[shown].qualified_name.clone();
         units[i].hit.source_span.clear();
         units[i].hit.source_span_omitted_bytes = None;
-        units[i].contained_in = Some(container);
+        units[i].contained_in = Some(name);
     }
 }
 
@@ -294,6 +340,7 @@ mod tests {
         EvidenceUnit {
             hit,
             qualified_name,
+            role: EvidenceRole::Implementation,
             calls: Vec::new(),
             called_by: Vec::new(),
             contained_in: None,
@@ -310,6 +357,34 @@ mod tests {
         assert_eq!(units[1].contained_in.as_deref(), Some("a.py::Cache"));
         assert!(units[1].hit.source_span.is_empty());
         assert!(units[0].contained_in.is_none());
+    }
+
+    #[test]
+    fn nested_containers_point_at_the_block_that_is_printed() {
+        let mut units = vec![
+            unit(hit("a.py", "a.py", (1, 40), "whole file", 0.9)),
+            unit(hit("a.py", "Cache", (5, 20), "class Cache: ...", 0.8)),
+            unit(hit("a.py", "get", (7, 9), "def get(self): ...", 0.7)),
+        ];
+        fold_nested(&mut units);
+        assert!(units[0].contained_in.is_none());
+        assert_eq!(units[1].contained_in.as_deref(), Some("a.py::a.py"));
+        assert_eq!(
+            units[2].contained_in.as_deref(),
+            Some("a.py::a.py"),
+            "the class is folded, so the method must name the file"
+        );
+    }
+
+    #[test]
+    fn identical_spans_fold_the_lower_ranked_into_the_higher() {
+        let mut units = vec![
+            unit(hit("a.py", "handler", (3, 5), "def handler(): ...", 0.9)),
+            unit(hit("a.py", "route", (3, 5), "def handler(): ...", 0.4)),
+        ];
+        fold_nested(&mut units);
+        assert!(units[0].contained_in.is_none());
+        assert_eq!(units[1].contained_in.as_deref(), Some("a.py::handler"));
     }
 
     #[test]
@@ -357,10 +432,25 @@ mod tests {
             "test_b.test_late".to_string(),
             "b.early".to_string(),
         ];
-        let pack = assemble(response, &qualified, None, 1.0);
+        let pack = assemble(
+            response,
+            &qualified,
+            None,
+            1.0,
+            &HashSet::from(["b.late".to_string()]),
+            crate::engine::budget_take(Vec::new(), 0, |_| 0),
+            &Cancel::default(),
+        )
+        .unwrap();
         let paths: Vec<&str> = pack.files.iter().map(|f| f.file_path.as_str()).collect();
         assert_eq!(paths, ["src/b.py", "tests/test_b.py"]);
         assert_eq!(pack.files[0].role, EvidenceRole::Implementation);
+        let roles: Vec<EvidenceRole> = pack.files[0].units.iter().map(|u| u.role).collect();
+        assert_eq!(
+            roles,
+            [EvidenceRole::Implementation, EvidenceRole::Test],
+            "a runner-invoked unit is a test beside the code it tests"
+        );
         assert_eq!(pack.files[1].role, EvidenceRole::Test);
         assert_eq!(pack.files[0].score, 0.9);
         let names: Vec<&str> = pack.files[0]
@@ -370,5 +460,12 @@ mod tests {
             .collect();
         assert_eq!(names, ["early", "late"]);
         assert_eq!(pack.shown, 3);
+        let expected: u32 = pack
+            .files
+            .iter()
+            .flat_map(|file| &file.units)
+            .map(|unit| search_hit_tokens(&unit.hit))
+            .sum();
+        assert_eq!(pack.tokens_used, expected, "tokens are the pack's own");
     }
 }

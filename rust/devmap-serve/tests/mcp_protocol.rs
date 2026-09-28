@@ -755,11 +755,17 @@ async fn tools_list_carries_its_cache_hint_on_the_shared_dispatcher() {
 #[tokio::test]
 async fn ask_evidence_groups_the_ask_hits_by_file_with_their_call_edges() {
     let store = corpus();
-    let ask = call(&store, "devmap_ask", json!({"query": "helper run rows"})).await;
+    // The pack holds a quarter of its budget for related tests.
+    let ask = call(
+        &store,
+        "devmap_ask",
+        json!({"query": "helper run rows", "budget": 1500}),
+    )
+    .await;
     let pack = call(
         &store,
         "devmap_ask_evidence",
-        json!({"query": "helper run rows"}),
+        json!({"query": "helper run rows", "budget": 2000}),
     )
     .await;
     assert_eq!(pack["result"]["isError"], json!(false), "{pack}");

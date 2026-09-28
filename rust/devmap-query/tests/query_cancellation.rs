@@ -146,6 +146,13 @@ fn a_cancelled_engine_refuses_instead_of_answering() {
         impacted.to_string().contains("cancelled"),
         "the refusal must say it was cancelled: {impacted}"
     );
+    let pack = engine
+        .ask_evidence("alpha beta", 2_000, 0.0)
+        .expect_err("a cancelled evidence pack must not answer");
+    assert!(
+        pack.to_string().contains("cancelled"),
+        "the refusal must say it was cancelled: {pack}"
+    );
 }
 
 /// An engine with no cancellation still answers: the flag must not become a

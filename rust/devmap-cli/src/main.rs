@@ -750,8 +750,9 @@ enum Commands {
         #[arg(long, default_value_t = devmap_query::ASK_DEFAULT_MIN_CONFIDENCE)]
         min_confidence: f32,
         /// Answer as an evidence pack: files in rank order with their role
-        /// (implementation or test), the call edges between hits, then each
-        /// hit's verbatim source with line numbers. Same ranking and budget.
+        /// (implementation or test), the call edges between hits, each hit's
+        /// verbatim source with line numbers, then the test files that reach
+        /// the hits. A quarter of the budget is held for the test list.
         #[arg(long)]
         evidence: bool,
     },
@@ -3603,6 +3604,9 @@ fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
                     shorten(&file.file_path, &unit.called_by)
                 ));
             }
+            if unit.role != file.role {
+                line.push_str(&format!("  [{}]", unit.role.as_str()));
+            }
             if let Some(container) = &unit.contained_in {
                 line.push_str(&format!(
                     "  (source shown in {})",
@@ -3646,6 +3650,42 @@ fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
     emit_truncation(pack.shown, pack.hidden, pack.total, pack.truncated);
     if let Some(reason) = &pack.walk_incomplete {
         outln!("warning: {reason}");
+    }
+    let tests = &pack.related_tests;
+    if !tests.items.is_empty() || tests.hidden > 0 || tests.walk_incomplete.is_some() {
+        outln!("");
+        outln!("Related tests (reach the hits over call edges; not run):");
+        for test in &tests.items {
+            // A symbol named after its file is the file's own top level.
+            let symbols: Vec<String> = test
+                .symbols
+                .iter()
+                .map(|symbol| {
+                    if symbol == &test.path {
+                        "(top level)".to_string()
+                    } else {
+                        short(&test.path, symbol)
+                    }
+                })
+                .collect();
+            let more =
+                test.reached_symbols as usize - symbols.len().min(test.reached_symbols as usize);
+            outln!(
+                "- {}  depth {}  {}{}",
+                test.path,
+                test.depth,
+                symbols.join(", "),
+                if more > 0 {
+                    format!(" (+{more} more)")
+                } else {
+                    String::new()
+                }
+            );
+        }
+        emit_truncation(tests.shown, tests.hidden, tests.total, tests.truncated);
+        if let Some(reason) = &tests.walk_incomplete {
+            outln!("warning: related tests: {reason}");
+        }
     }
 }
 
