@@ -660,12 +660,19 @@ devmap serve .    # index over IPC, watching the tree for changes
 devmap mcp        # speak MCP on stdin/stdout, for an agent host
 ```
 
-`devmap mcp` publishes thirteen read-only tools: `devmap_status`, `devmap_search`,
-`devmap_dependencies`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`,
-`devmap_dead_symbols`, `devmap_clones`, `devmap_preview`, `devmap_explore`,
-`devmap_affected_tests`, `devmap_blast` and `devmap_suspects`. Every one declares an
-`outputSchema`, and the server validates its own answers against the schema it
-published before emitting them.
+`devmap mcp` publishes sixteen read-only tools: `devmap_status`, `devmap_search`,
+`devmap_ask`, `devmap_ask_evidence`, `devmap_dependencies`, `devmap_impact`,
+`devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_skeleton`,
+`devmap_clones`, `devmap_preview`, `devmap_explore`, `devmap_affected_tests`,
+`devmap_blast` and `devmap_suspects`. Every one declares an `outputSchema`, and the
+server validates its own answers against the schema it published before emitting them.
+
+`devmap_ask_evidence` (CLI: `devmap ask --evidence`) is `devmap_ask` shaped for
+reading: the same hits, ranking and budget, grouped into files in rank order. Each
+file carries a path-based `role` (`implementation` or `test`); each hit carries its
+verbatim source, the other hits it `calls` or is `called_by` over admitted call
+edges, and `contained_in` when an enclosing hit already shows its lines. It reads
+no file and re-ranks nothing beyond what `devmap_ask` does.
 
 The last two join the graph to git and run in opposite directions.
 `devmap_blast` goes **forward** — these lines changed, what depends on them —

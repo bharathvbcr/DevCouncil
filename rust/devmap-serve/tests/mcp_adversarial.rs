@@ -349,7 +349,7 @@ async fn every_published_default_is_the_default_that_is_applied() {
             // needs a query; skeleton needs a path the corpus may or may not
             // contain — either way both arms of the default gate get the same
             // envelope so a mismatched published default still fails.
-            "devmap_ask" => json!({"query": "helper"}),
+            "devmap_ask" | "devmap_ask_evidence" => json!({"query": "helper"}),
             "devmap_skeleton" => json!({"file": "core.py"}),
             // These two join the graph to git, and this corpus is an in-memory
             // store with no repository behind it — so both arms refuse, and

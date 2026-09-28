@@ -830,6 +830,7 @@ const TOOLS: &[(&str, &str)] = &[
     ("devmap_status", "status"),
     ("devmap_search", "search"),
     ("devmap_ask", "ask"),
+    ("devmap_ask_evidence", "ask_evidence"),
     ("devmap_dependencies", "deps"),
     ("devmap_impact", "impact"),
     ("devmap_trace", "trace"),
@@ -978,6 +979,26 @@ a name. A query that shares no terms with any name or docstring returns nothing 
 corpus at zero. Default `min_confidence` is the deterministic rung; lower it to include weaker \
 edges. When every edge among the seeds sits below the floor, the answer is empty with a line that \
 says the matches were withheld for confidence rather than absent.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "maxLength": 4096,
+                        "description": "A plain-language question or description of behaviour."},
+                    "budget": budget_prop(2000),
+                    "min_confidence": confidence_prop_defaulting(devmap_query::ASK_DEFAULT_MIN_CONFIDENCE)
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        ),
+        "ask_evidence" => (
+            "The `devmap_ask` answer shaped for reading, so the first reads are already done. \
+Same ranking, budget and envelope counts as `devmap_ask`; the hits are grouped into `files` in rank \
+order. Each file has a `role` (`implementation` or `test`, by path) and its `units` in line order: \
+the hit with its verbatim source, `qualified_name`, `calls` / `called_by` naming other hits joined \
+by admitted call edges at the same `min_confidence`, and `contained_in` when its lines are already \
+shown by an enclosing hit. Use it for a behaviour question in unfamiliar code; use `devmap_search` \
+for a known name.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1384,6 +1405,29 @@ fn describe_output(cmd: &str) -> Value {
             "Symbols matching a plain-language question, seeded by name/docstring TF-IDF and \
 re-ranked by personalized PageRank over call edges. Read `truncated` and `walk_incomplete`.",
         ),
+        "ask_evidence" => json!({
+            "type": "object",
+            "properties": {
+                "files": {"type": "array",
+                    "description": "Files in rank order. Each: `file_path`, `role` \
+        (`implementation` | `test`), `score` (its best unit's), and `units` in line order. A unit is a \
+        `devmap_ask` hit plus `qualified_name`, optional `calls` / `called_by` (other hits, over admitted \
+        call edges) and optional `contained_in` (the enclosing unit that shows its source; its own \
+        `source_span` is then empty)."},
+                "shown": {"type": "integer", "description": "Hits present across `files`."},
+                "hidden": {"type": "integer",
+                    "description": "Hits the token budget withheld. Non-zero means this answer is a prefix."},
+                "total": {"type": "integer", "description": "shown + hidden."},
+                "truncated": {"type": "boolean"},
+                "tokens_used": {"type": "integer",
+                    "description": "`devmap_ask`'s count, before nested source was folded: an upper bound."},
+                "resolution": {"type": ["string", "object"]},
+                "walk_incomplete": {"type": ["string", "null"],
+                    "description": "Present only when the producer stopped early; the answer is partial by an unknown amount."}
+            },
+            "required": ["files", "shown", "hidden", "total", "truncated", "tokens_used", "resolution"],
+            "additionalProperties": true
+        }),
         "deps" => budgeted_envelope("Outbound edges from the target."),
         "impact" => budgeted_envelope("Symbols that reach the target, walked in reverse."),
         "trace" => budgeted_envelope("Call paths from the origin, or between the two endpoints."),
