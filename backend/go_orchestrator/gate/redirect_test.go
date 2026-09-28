@@ -232,7 +232,10 @@ func runInThrowawayTree(t *testing.T, command string) []string {
 		t.Fatal(err)
 	}
 	before := treeSnapshot(root)
-	cmd := exec.Command("sh", "-c", command)
+	// `wait` on its own line: an entry that backgrounds its write (`... &`)
+	// otherwise lets sh exit first, so the write lands after the snapshot
+	// (unobserved) and races t.TempDir's cleanup ("directory not empty").
+	cmd := exec.Command("sh", "-c", command+"\nwait")
 	cmd.Dir = root
 	// A corpus entry that hangs would wedge the suite; nothing here reads
 	// stdin, and closing it turns any that starts to into an immediate EOF.
