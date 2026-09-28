@@ -20,6 +20,9 @@ on:
       - "rust/Cargo.lock"
       - "rust/.gitignore"
       - ".github/workflows/rust.yml"
+      - ".github/actions/setup-gusset/**"
+      - "rust/gusset-engine/**"
+      - "backend/go_orchestrator/gussetfn/**"
   pull_request:
     paths:
       - "rust/devmap-*/**"
@@ -31,6 +34,9 @@ on:
       - "rust/Cargo.lock"
       - "rust/.gitignore"
       - ".github/workflows/rust.yml"
+      - ".github/actions/setup-gusset/**"
+      - "rust/gusset-engine/**"
+      - "backend/go_orchestrator/gussetfn/**"
   workflow_dispatch:
 
 permissions:

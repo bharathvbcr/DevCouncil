@@ -60,47 +60,22 @@ runs:
         test -f "$dest/go.mod"
         test -f "$dest/crates/gusset/Cargo.toml"
 
-    # Gusset's cgo line is -lgusset -lpthread -lm -ldl. That is a GNU link.
-    # windows-latest's Rust host is MSVC, which emits gusset.lib and has no
-    # libdl. The gnu target plus MinGW produces libgusset.a, which is what
-    # the #cgo -L path in gussetfn/engine.go already names.
-    - name: Install MinGW
-      if: ${{ runner.os == 'Windows' && inputs.build-engine == 'true' }}
-      uses: msys2/setup-msys2@v2
-      with:
-        msystem: MINGW64
-        update: false
-        install: mingw-w64-x86_64-gcc mingw-w64-x86_64-dlfcn
-        path-type: inherit
-
+    # gusset is unix-only: its crate refuses other targets with compile_error!,
+    # so no Windows toolchain can build the archive. On Windows the sibling is
+    # still checked out (go.mod's replace must resolve) and the host builds
+    # without it — gussetfn is build-tagged unix and answers ErrUnsupported
+    # elsewhere. The MinGW/gnu-target path this replaced could never succeed.
     - name: Rust toolchain
       if: ${{ runner.os != 'Windows' && inputs.build-engine == 'true' }}
       uses: dtolnay/rust-toolchain@stable
 
-    - name: Rust toolchain (Windows gnu target)
-      if: ${{ runner.os == 'Windows' && inputs.build-engine == 'true' }}
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: x86_64-pc-windows-gnu
-
     - name: Build the umbrella staticlib
-      if: ${{ inputs.build-engine == 'true' }}
+      if: ${{ runner.os != 'Windows' && inputs.build-engine == 'true' }}
       shell: bash
       working-directory: rust/gusset-engine
       run: |
         set -euo pipefail
-        if [[ "${RUNNER_OS}" == "Windows" ]]; then
-          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=gcc
-          cargo build --release --locked --target x86_64-pc-windows-gnu
-          mkdir -p target/release
-          cp -f target/x86_64-pc-windows-gnu/release/libgusset.a target/release/libgusset.a
-          # Later `go build` steps in this job must use the same gcc. cgo
-          # will not use the MSVC linker for Gusset's -lpthread/-ldl line.
-          echo "CC=gcc" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=gcc" >> "$GITHUB_ENV"
-        else
-          cargo build --release --locked
-        fi
+        cargo build --release --locked
         test -f target/release/libgusset.a
         # Key Go's build and test caches on the archive (see cgo-env.sh):
         # setup-go restores GOCACHE, and without this a cached link or a

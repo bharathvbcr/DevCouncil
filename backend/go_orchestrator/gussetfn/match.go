@@ -1,3 +1,5 @@
+//go:build unix
+
 // Package gussetfn matches paths through dc-glob on the Gusset runtime.
 //
 // The write gate does not call this. fnmatch.Match returns a bool, and a
@@ -45,9 +47,6 @@ const maxPatterns = 1024
 
 // poolSize is the shared handle's worker count.
 const poolSize = 4
-
-// ErrClosed is returned after Close: the engine is shut for this process.
-var ErrClosed = errors.New("gusset: engine is closed")
 
 var (
 	registerOnce sync.Once
