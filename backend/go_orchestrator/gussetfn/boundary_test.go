@@ -5,6 +5,7 @@ package gussetfn
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -15,7 +16,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/fnmatch"
 	"github.com/bharathvbcr/gusset"
@@ -72,59 +72,95 @@ func TestParityFixtureAcrossTheBoundary(t *testing.T) {
 }
 
 // MatchAny over the fixture's patterns agrees with the Go reference for each
-// name, including lists that must be split over several frames.
+// name, case-sensitive and folded, including lists split over several frames.
 func TestMatchAnyAgreesWithGoAcrossFrames(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	rows := parityRows(t)
-	patterns := make([]string, 0, len(rows))
-	for _, r := range rows {
-		patterns = append(patterns, r[0])
+	patterns := make([]string, 0, 3*len(rows))
+	for i := 0; i < 3; i++ {
+		for _, r := range rows {
+			patterns = append(patterns, r[0])
+		}
+	}
+	if _, n := encodeAny("x", patterns); n >= len(patterns) {
+		t.Fatal("the full list fit one frame; the split path is not exercised")
 	}
 	for _, list := range [][]string{patterns[:1], patterns[:40], patterns} {
-		if _, n := encodeAny("x", list); len(list) == len(patterns) && n >= len(list) {
-			t.Fatal("the full list fit one frame; the split path is not exercised")
-		}
 		for _, r := range rows[:200] {
-			got, err := MatchAny(ctx, list, r[1])
-			if err != nil {
-				t.Fatalf("MatchAny(%d patterns, %q): %v", len(list), r[1], err)
-			}
-			if want := fnmatch.MatchAny(list, r[1]); got != want {
-				t.Errorf("MatchAny(%d patterns, %q) = %v, Go says %v", len(list), r[1], got, want)
+			for _, name := range []string{r[1], strings.ToUpper(r[1])} {
+				got, err := MatchAny(ctx, list, name)
+				if err != nil {
+					t.Fatalf("MatchAny(%d patterns, %q): %v", len(list), name, err)
+				}
+				if want := fnmatch.MatchAny(list, name); got != want {
+					t.Errorf("MatchAny(%d patterns, %q) = %v, Go says %v", len(list), name, got, want)
+				}
+				got, err = MatchAnyFold(ctx, list, name)
+				if err != nil {
+					t.Fatalf("MatchAnyFold(%d patterns, %q): %v", len(list), name, err)
+				}
+				if want := fnmatch.MatchAnyFold(list, name); got != want {
+					t.Errorf("MatchAnyFold(%d patterns, %q) = %v, Go says %v", len(list), name, got, want)
+				}
 			}
 		}
 	}
 }
 
-func TestEncodeAnyStaysUnderTheInlineLimit(t *testing.T) {
-	long := strings.Repeat("a", maxField)
-	list := []string{long, long, long, long, long}
-	name := strings.Repeat("b", maxField)
+func TestEncodeAnyBoundsEachFrame(t *testing.T) {
+	long := strings.Repeat("a", maxField/4)
+	list := make([]string, 200)
+	for i := range list {
+		list[i] = long
+	}
 	for rest := list; len(rest) > 0; {
-		frame, n := encodeAny(name, rest)
+		frame, n := encodeAny(long, rest)
 		if n == 0 {
 			t.Fatal("encodeAny made no progress")
 		}
-		if len(frame) > maxFrame {
-			t.Fatalf("frame of %d bytes exceeds %d", len(frame), maxFrame)
+		if n > 1 && len(frame) > maxFrameBytes {
+			t.Fatalf("frame of %d bytes and %d patterns exceeds %d", len(frame), n, maxFrameBytes)
 		}
 		rest = rest[n:]
 	}
 	many := make([]string, maxPatterns+10)
-	if _, n := encodeAny("", many); n > maxPatterns {
+	if _, n := encodeAny("", many); n != maxPatterns {
 		t.Fatalf("frame carries %d patterns, cap is %d", n, maxPatterns)
 	}
 }
 
-func TestMatchAnyRefusesBeforeTheCall(t *testing.T) {
+// Inputs past fnmatch's cap get fnmatch's answer, decided in Go: no match
+// case-sensitively, a match folded. The old engine path made them an error,
+// which a policy gate would have turned into a denial Go never gave.
+func TestOversizedInputsGetGosAnswer(t *testing.T) {
 	ctx := context.Background()
-	long := strings.Repeat("a", maxField+1)
-	if _, err := MatchAny(ctx, []string{"*", long}, "a"); err == nil {
-		t.Fatal("an overlong pattern late in the list was accepted")
+	over := strings.Repeat("a", 16_385)
+	cases := []struct {
+		patterns []string
+		name     string
+	}{
+		{[]string{"*", over}, "a"},
+		{[]string{over}, "a"},
+		{[]string{"*"}, over},
+		{[]string{"b*"}, strings.Repeat("é", 16_385)},
+		{[]string{"*"}, strings.Repeat("a", 16_384)},
 	}
-	if _, err := MatchAny(ctx, []string{"*"}, long); err == nil {
-		t.Fatal("an overlong name was accepted")
+	for _, c := range cases {
+		got, err := MatchAny(ctx, c.patterns, c.name)
+		if err != nil {
+			t.Fatalf("MatchAny: %v", err)
+		}
+		if want := fnmatch.MatchAny(c.patterns, c.name); got != want {
+			t.Errorf("MatchAny(%d patterns, %d-byte name) = %v, Go %v", len(c.patterns), len(c.name), got, want)
+		}
+		got, err = MatchAnyFold(ctx, c.patterns, c.name)
+		if err != nil {
+			t.Fatalf("MatchAnyFold: %v", err)
+		}
+		if want := fnmatch.MatchAnyFold(c.patterns, c.name); got != want {
+			t.Errorf("MatchAnyFold(%d patterns, %d-byte name) = %v, Go %v", len(c.patterns), len(c.name), got, want)
+		}
 	}
 	if _, err := MatchAny(nil, []string{"*"}, "a"); err == nil {
 		t.Fatal("a nil context was accepted")
@@ -134,22 +170,117 @@ func TestMatchAnyRefusesBeforeTheCall(t *testing.T) {
 	if _, err := MatchAny(cctx, nil, "a"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("empty list on a cancelled context = %v", err)
 	}
+	if _, err := MatchAny(cctx, []string{over}, "a"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a Go-decided answer on a cancelled context = %v", err)
+	}
 }
 
-// A malformed pattern after a matching one is still an error: the engine
-// validates the frame before matching, so the answer cannot depend on order.
-func TestMatchAnyInvalidUTF8IsAnErrorNotAPoison(t *testing.T) {
+// A frame over Gusset's 4 KiB inline copy travels in a Rust buffer and gets
+// Go's answer: a long command or path is an ordinary policy input.
+func TestLargeFramesTravelInABuffer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := MatchAny(ctx, []string{"*.py", "\xff"}, "a.py")
-	if err == nil || !strings.Contains(err.Error(), "UTF-8") {
-		t.Fatalf("got %v, want a UTF-8 error", err)
+	name := strings.Repeat("dir/", 3000) + "id_rsa"
+	if fnmatch.Oversized(name) {
+		t.Fatal("the name is past fnmatch's cap; Go would answer without a crossing")
 	}
-	if poisoned(err) {
-		t.Fatalf("invalid UTF-8 poisoned the handle: %v", err)
+	if frame, _ := encodeAny(name, []string{"*id_rsa"}); len(frame) <= maxFrame {
+		t.Fatalf("frame of %d bytes fits inline; the buffer path is not exercised", len(frame))
+	}
+	for _, p := range []string{"*id_rsa", "*.pem", "dir/*", "*/ID_RSA"} {
+		got, err := Match(ctx, p, name)
+		if err != nil {
+			t.Fatalf("Match(%q): %v", p, err)
+		}
+		if want := fnmatch.Match(p, name); got != want {
+			t.Errorf("Match(%q) = %v, Go %v", p, got, want)
+		}
+		got, err = MatchFold(ctx, p, name)
+		if err != nil {
+			t.Fatalf("MatchFold(%q): %v", p, err)
+		}
+		if want := fnmatch.MatchFold(p, name); got != want {
+			t.Errorf("MatchFold(%q) = %v, Go %v", p, got, want)
+		}
+	}
+}
+
+// Invalid UTF-8 is matched the way fnmatch reads it, one U+FFFD per invalid
+// byte. strings.ToValidUTF8 collapses a run into one, which would shift every
+// '?' after it.
+func TestInvalidUTF8GetsGosAnswer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, c := range [][2]string{
+		{"???", "\xff\xfe\xfd"}, {"?", "\xff\xfe"}, {"*\xff", "a\xfe"}, {"[\xff]", "\xfe"},
+		{"a?b", "a\xc3b"}, {"\xff*", "\xffX"},
+	} {
+		got, err := Match(ctx, c[0], c[1])
+		if err != nil {
+			t.Fatalf("Match(%q, %q): %v", c[0], c[1], err)
+		}
+		if want := fnmatch.Match(c[0], c[1]); got != want {
+			t.Errorf("Match(%q, %q) = %v, Go %v", c[0], c[1], got, want)
+		}
+		got, err = MatchFold(ctx, c[0], c[1])
+		if err != nil {
+			t.Fatalf("MatchFold(%q, %q): %v", c[0], c[1], err)
+		}
+		if want := fnmatch.MatchFold(c[0], c[1]); got != want {
+			t.Errorf("MatchFold(%q, %q) = %v, Go %v", c[0], c[1], got, want)
+		}
+	}
+}
+
+// rawAny builds a match-any frame byte for byte, so the engine's own
+// validation is reachable: Go's encoder never sends invalid UTF-8.
+func rawAny(name string, patterns ...string) []byte {
+	buf := appendField(nil, name)
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(patterns)))
+	for _, p := range patterns {
+		buf = appendField(buf, p)
+	}
+	return buf
+}
+
+// A refused frame is an error, not a poison, and the answer cannot depend on
+// order: a malformed pattern after a matching one is still refused, because
+// the engine validates the whole frame before matching.
+func TestEngineRefusesMalformedFramesWithoutPoison(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	actx := gusset.ContextWithOpcode(ctx, opcodeMatchAny)
+	for name, frame := range map[string][]byte{
+		"invalid UTF-8 after a match": rawAny("a.py", "*.py", "\xff"),
+		"trailing bytes":              append(rawAny("a", "*"), 0),
+		"truncated":                   rawAny("a", "*")[:9],
+		"field past the cap":          binary.LittleEndian.AppendUint32(nil, maxField+1),
+		"count past the cap":          binary.LittleEndian.AppendUint32(appendField(nil, "a"), maxPatterns+1),
+	} {
+		_, err := call(actx, frame)
+		if err == nil {
+			t.Errorf("%s: accepted", name)
+			continue
+		}
+		if poisoned(err) {
+			t.Fatalf("%s poisoned the handle: %v", name, err)
+		}
 	}
 	if got, err := MatchAny(ctx, []string{"*.py"}, "a.py"); err != nil || !got {
 		t.Fatalf("next MatchAny = %v, %v", got, err)
+	}
+}
+
+func TestAnswerRejectsUnknownBytes(t *testing.T) {
+	for _, out := range [][]byte{nil, {3}, {0, 0}, {0xff}} {
+		if _, err := answer(out); err == nil {
+			t.Errorf("answer(%v) accepted", out)
+		}
+	}
+	for _, b := range []byte{noMatch, match, undecided} {
+		if a, err := answer([]byte{b}); err != nil || a != b {
+			t.Errorf("answer(%d) = %d, %v", b, a, err)
+		}
 	}
 }
 
@@ -250,13 +381,13 @@ func TestPoisonUnderConcurrencyRecovers(t *testing.T) {
 	}
 }
 
-// An opcode already on the caller's context must not reach Match's frame:
-// opcode 1 decoded it as a match-any frame, the self-test opcode panicked
-// the shared handle.
+// An opcode already on the caller's context must not reach the frame: opcode
+// 0 would decode a match-any frame as a single match, the self-test opcode
+// panicked the shared handle.
 func TestMatchIgnoresAnOpcodeOnTheContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	for _, op := range []uint32{opcodeMatchAny, opcodeSelfTestPanic} {
+	for _, op := range []uint32{opcodeMatch, opcodeSelfTestPanic} {
 		got, err := Match(gusset.ContextWithOpcode(ctx, op), "*.py", "a.py")
 		if err != nil || !got {
 			t.Fatalf("Match under opcode %#x = %v, %v", op, got, err)
@@ -267,23 +398,6 @@ func TestMatchIgnoresAnOpcodeOnTheContext(t *testing.T) {
 	}
 	if got, err := Match(ctx, "*.py", "a.py"); err != nil || !got {
 		t.Fatalf("shared handle after opcode contexts: %v, %v", got, err)
-	}
-}
-
-// A pattern in a later frame with bad UTF-8 is an error even when the first
-// frame matches: validation is over the whole list, not per frame.
-func TestMatchAnyValidatesAcrossFrames(t *testing.T) {
-	long := strings.Repeat("a", maxField)
-	list := []string{"*"}
-	for i := 0; i < 8; i++ {
-		list = append(list, long)
-	}
-	list = append(list, "\xff")
-	if _, n := encodeAny("x", list); n >= len(list) {
-		t.Fatal("the list fit one frame; the case is not exercised")
-	}
-	if _, err := MatchAny(context.Background(), list, "x"); err == nil || !strings.Contains(err.Error(), "UTF-8") {
-		t.Fatalf("got %v, want a UTF-8 error", err)
 	}
 }
 
@@ -327,40 +441,33 @@ func TestSelfTestProvesTheFirewall(t *testing.T) {
 	}
 }
 
-// FuzzMatchParity is the differential check across the boundary: for valid
-// UTF-8 the Rust engine and the Go matcher must agree, and anything else is
-// an engine error that leaves the handle usable. Run with
+// FuzzMatchParity is the differential check across the boundary: for every
+// input, valid UTF-8 or not and of any length, the engine path answers what
+// fnmatch answers, case-sensitive and folded, and never errors. Run with
 // go test -fuzz=FuzzMatchParity ./gussetfn.
 func FuzzMatchParity(f *testing.F) {
 	for _, seed := range [][2]string{
 		{"*.py", "src/foo.py"}, {"[!a-c]*", "d"}, {"[c-a-e]", "e"}, {"[]]", "]"},
 		{"[!]", "!"}, {"**?*", "ab"}, {"\xff", "a"}, {"[\\]", "\\"}, {"a*b*c*d*e", "aXbXcXdXe"},
+		{"?\xff?", "\xfe\xfe\xfe"}, {"*.PEM", "a.pem"}, {"İ*", "i̇x"}, {"[Σ]", "ς"},
 	} {
 		f.Add(seed[0], seed[1])
 	}
 	ctx := context.Background()
 	f.Fuzz(func(t *testing.T, pattern, name string) {
-		if len(pattern) > maxField || len(name) > maxField {
-			if _, err := Match(ctx, pattern, name); err == nil {
-				t.Fatal("an overlong field was accepted")
-			}
-			return
-		}
 		got, err := Match(ctx, pattern, name)
-		if !utf8.ValidString(pattern) || !utf8.ValidString(name) {
-			if err == nil {
-				t.Fatalf("invalid UTF-8 (%q, %q) matched instead of failing", pattern, name)
-			}
-			if poisoned(err) {
-				t.Fatalf("invalid UTF-8 poisoned the handle: %v", err)
-			}
-			return
-		}
 		if err != nil {
 			t.Fatalf("Match(%q, %q): %v", pattern, name, err)
 		}
 		if want := fnmatch.Match(pattern, name); got != want {
 			t.Fatalf("Match(%q, %q): gusset %v, Go %v", pattern, name, got, want)
+		}
+		got, err = MatchFold(ctx, pattern, name)
+		if err != nil {
+			t.Fatalf("MatchFold(%q, %q): %v", pattern, name, err)
+		}
+		if want := fnmatch.MatchFold(pattern, name); got != want {
+			t.Fatalf("MatchFold(%q, %q): gusset %v, Go %v", pattern, name, got, want)
 		}
 		any, err := MatchAny(ctx, []string{pattern, pattern + "x"}, name)
 		if err != nil {

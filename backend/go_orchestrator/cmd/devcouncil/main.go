@@ -166,6 +166,9 @@ func openRegistry(root string) *devcouncil.Registry {
 	cfg := filepath.Join(root, ".devcouncil", "config.yaml")
 	if regFlags, err := flags.NewHarnessRegistry(cfg); err == nil {
 		if gg, err := gate.New(regFlags, root, nil); err == nil {
+			// The engine answers every pattern question this gate asks; a
+			// failure is a hard denial under the engine rules, not a guess.
+			gg.Matcher = policyMatcher()
 			g = gg
 		}
 	}

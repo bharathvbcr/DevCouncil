@@ -8,6 +8,7 @@ import (
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/gussetfn"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 	"github.com/bharathvbcr/gusset"
 )
 
@@ -29,3 +30,6 @@ func runGussetCheck() int {
 		st.LiveBytes, st.PeakBytes, st.AllocCount, gusset.Threads())
 	return 0
 }
+
+// policyMatcher is the engine: this host always links it on unix.
+func policyMatcher() policy.Matcher { return gussetfn.Matcher{} }

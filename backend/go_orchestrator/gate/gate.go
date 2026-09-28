@@ -25,6 +25,10 @@ type Gate struct {
 	Subsystems policy.SubsystemMap
 	// GlobalAllowedCommands supplement every task's own command allowlist.
 	GlobalAllowedCommands []string
+	// Matcher answers every policy decision's pattern questions; nil is
+	// fnmatch. A host that links the Gusset engine sets gussetfn.Matcher
+	// here, and a matcher error is a hard denial under the engine rules.
+	Matcher policy.Matcher
 	// OnIssue is notified after a grant is issued, so a composition root can
 	// make it durable.
 	//
@@ -106,6 +110,7 @@ func (g *Gate) EvaluateWrite(path string, task *dc.Task, op dc.Operation) (polic
 		AllowNeighbors: neighbors,
 		AllowSameDir:   sameDir,
 		HardRules:      hardRules,
+		Matcher:        g.Matcher,
 	}
 	decision := fg.EvaluateFileChange(path, task, op, false)
 	return g.settle(decision, mode, modeOrigin, flags.PolicyFileMode), nil
@@ -130,6 +135,7 @@ func (g *Gate) EvaluateRead(path string, task *dc.Task) (policy.Decision, error)
 		Root:       g.Root,
 		Subsystems: g.Subsystems,
 		HardRules:  hardRules,
+		Matcher:    g.Matcher,
 	}
 	return g.settle(fg.EvaluateRead(path, task), mode, modeOrigin, flags.PolicyFileMode), nil
 }
@@ -159,6 +165,7 @@ func (g *Gate) EvaluateCommand(command string, task *dc.Task) (policy.Decision, 
 	decision := policy.CommandGate{
 		GlobalAllowedCommands: g.GlobalAllowedCommands,
 		HardRules:             hardRules,
+		Matcher:               g.Matcher,
 		// Without the root, argv[0] normalisation cannot tell this tree's
 		// .venv/bin/dev from a foreign one at the same layout, and fails
 		// closed by normalising neither. Passing it restores the repo's own

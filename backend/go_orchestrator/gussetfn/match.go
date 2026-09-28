@@ -2,13 +2,15 @@
 
 // Package gussetfn matches paths through dc-glob on the Gusset runtime.
 //
-// The write gate does not call this. fnmatch.Match returns a bool, and a
-// Gusset failure has nowhere to go except "no match" or "match" — one of
-// those opens a path the gate meant to refuse, the other denies a write the
-// gate meant to allow, and a poisoned handle would do it for every later
-// check. Callers that can return an error use Match. The gusset-check
-// commands of devcouncil, manvi, jarvis and GitPulse run SelfTest; Manvi's
-// serve policy plane runs Check (never a deliberate panic) before answering.
+// Every entry point answers exactly what fnmatch answers for the same
+// arguments, or an error. The error is why the policy gates can use it:
+// Matcher satisfies policy.Matcher, and a gate turns an error into a denial
+// under path.engine_unavailable or command.engine_unavailable instead of
+// guessing a bool. A Gusset failure has no honest bool — "no match" opens a
+// path the gate meant to refuse, "match" denies a write it meant to allow.
+// The gusset-check commands of devcouncil, manvi, jarvis and GitPulse run
+// SelfTest; Manvi's serve runs Check (never a deliberate panic) before it
+// hands its gates a Matcher.
 package gussetfn
 
 import (
@@ -17,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,20 +29,26 @@ import (
 	"github.com/bharathvbcr/gusset"
 )
 
-// maxField matches MAX_FIELD in the umbrella. Both sides refuse a larger
-// field so a caller cannot push a multi-megabyte pattern through the inline
-// copy on the cgo thread.
-const maxField = 1024
+// maxField matches MAX_FIELD in the umbrella: fnmatch's 16384-rune cap at
+// four bytes a rune. A field fnmatch would match always fits it.
+const maxField = 16_384 * 4
 
-// Opcodes the umbrella registers (rust/gusset-engine). Opcode 0 is Match.
+// Opcodes the umbrella registers (rust/gusset-engine). Opcode 0 is the
+// single-pattern frame, which only tests send now: every entry point here is
+// a list of one or more.
 const (
+	opcodeMatch         uint32 = 0
 	opcodeMatchAny      uint32 = 1
 	opcodeSelfTestPanic uint32 = 0x7fff_0001
 )
 
-// maxFrame is Gusset's inline-copy limit. A MatchAny list is split into
-// frames under it; a bigger []byte would be refused by Call.
+// maxFrame is Gusset's inline-copy limit. A frame over it travels in a
+// Rust-owned buffer (roundTrip); a bigger []byte would be refused by Call.
 const maxFrame = 4096
+
+// maxFrameBytes bounds one frame, so a very long list is several bounded
+// crossings rather than one allocation of its whole size.
+const maxFrameBytes = 1 << 20
 
 // maxPatterns matches MAX_PATTERNS in the umbrella.
 const maxPatterns = 1024
@@ -184,7 +193,7 @@ func call(ctx context.Context, payload []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		out, err := h.Call(ctx, payload)
+		out, err := roundTrip(ctx, h, payload)
 		if err == nil {
 			return out, nil
 		}
@@ -202,97 +211,157 @@ func call(ctx context.Context, payload []byte) ([]byte, error) {
 	}
 }
 
-// decodeBool reads the engine's one-byte answer.
-func decodeBool(out []byte) (bool, error) {
-	if len(out) != 1 || (out[0] != 0 && out[0] != 1) {
-		return false, fmt.Errorf("gusset: engine returned %q, want a single 0 or 1", out)
+// answer reads the engine's one-byte answer: 0 no match, 1 match, 2
+// undecided (dc-glob's None — past its cap or out of step budget).
+func answer(out []byte) (byte, error) {
+	if len(out) != 1 || out[0] > undecided {
+		return 0, fmt.Errorf("gusset: engine returned %q, want a single 0, 1 or 2", out)
 	}
-	return out[0] == 1, nil
+	return out[0], nil
 }
 
-func encode(pattern, name string) ([]byte, error) {
-	if len(pattern) > maxField || len(name) > maxField {
-		return nil, fmt.Errorf("gusset: pattern or name exceeds %d bytes", maxField)
+// Answer bytes, matching NO_MATCH, MATCH and UNDECIDED in the umbrella.
+const (
+	noMatch   byte = 0
+	match     byte = 1
+	undecided byte = 2
+)
+
+// normalize gives the engine the text Go's matcher walks. fnmatch converts
+// with []rune, which reads each invalid UTF-8 byte as U+FFFD; the engine
+// takes &str and refuses invalid UTF-8. strings.ToValidUTF8 would collapse a
+// run of invalid bytes into one U+FFFD and shift every position after it, so
+// "[!a]?\xff\xff" would be answered for a different name.
+func normalize(s string) string {
+	if utf8.ValidString(s) {
+		return s
 	}
-	// Invalid UTF-8 is delivered to the engine, which must return an error
-	// rather than panic. Rejecting it here would never exercise that path.
-	buf := make([]byte, 4+len(pattern)+len(name))
-	binary.LittleEndian.PutUint16(buf[0:2], uint16(len(pattern)))
-	copy(buf[2:], pattern)
-	off := 2 + len(pattern)
-	binary.LittleEndian.PutUint16(buf[off:off+2], uint16(len(name)))
-	copy(buf[off+2:], name)
-	return buf, nil
+	return string([]rune(s))
 }
 
-// Match reports whether name matches pattern under Python fnmatch rules.
+func appendField(buf []byte, s string) []byte {
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(s)))
+	return append(buf, s...)
+}
+
+// roundTrip sends one frame on h: inline under Gusset's 4 KiB copy limit,
+// through a Rust-owned buffer above it. A long command or path must reach the
+// engine, because Go's matcher answers for it; the old 1 KiB field cap made
+// those an error, which the gate would have turned into a denial.
+func roundTrip(ctx context.Context, h *gusset.Handle, frame []byte) ([]byte, error) {
+	if len(frame) <= maxFrame {
+		return h.Call(ctx, frame)
+	}
+	in, err := h.NewBuffer(len(frame))
+	if err != nil {
+		return nil, err
+	}
+	defer in.Free()
+	dst := in.Bytes()
+	if len(dst) != len(frame) {
+		// Bytes is nil once the handle is closed under us; classify it as
+		// that, so call retries on the replacement handle.
+		return nil, fmt.Errorf("gusset: input buffer unavailable: %w", gusset.ErrClosed)
+	}
+	copy(dst, frame)
+	out, err := h.CallBuffer(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	defer out.Free()
+	return append([]byte(nil), out.Bytes()...), nil
+}
+
+// Match reports whether name matches pattern, exactly as fnmatch.Match does.
 //
-// A Gusset or engine error is returned, never converted into a boolean.
-// The handle is not poisoned by a bad frame: the next well-formed call
-// still runs. A handle that is poisoned anyway is retired, and the next call
+// Every input Go answers is answered: invalid UTF-8 is normalized the way
+// fnmatch reads it, and an input past fnmatch's cap is no match, decided here
+// without a crossing. Only a Gusset or engine failure is an error, and it is
+// returned, never converted into a boolean. The handle is not poisoned by a
+// bad frame; a handle that is poisoned anyway is retired, and the next call
 // opens a new one.
 func Match(ctx context.Context, pattern, name string) (bool, error) {
-	if ctx == nil {
-		return false, errors.New("gusset: nil context")
-	}
-	payload, err := encode(pattern, name)
-	if err != nil {
-		return false, err
-	}
-	// Opcode 0, whatever the caller's context carries. gusset reads the
-	// opcode from ctx, so a ctx that had passed through MatchAny's opcode —
-	// or the self-test's — decoded this frame as a match-any frame, or
-	// panicked the shared handle.
-	out, err := call(gusset.ContextWithOpcode(ctx, 0), payload)
-	if err != nil {
-		return false, err
-	}
-	return decodeBool(out)
+	return MatchAny(ctx, []string{pattern}, name)
 }
 
-// MatchAny reports whether name matches any pattern in patterns.
+// MatchFold is fnmatch.MatchFold across the boundary: case-folded, and an
+// input the matcher cannot decide counts as a match, because MatchFold is
+// the deny-list entry point and a false there lets a write through.
+func MatchFold(ctx context.Context, pattern, name string) (bool, error) {
+	return MatchAnyFold(ctx, []string{pattern}, name)
+}
+
+// MatchAny reports whether name matches any pattern, as fnmatch.MatchAny does.
 //
-// The list crosses the boundary in as few frames as fit Gusset's 4 KiB
-// inline copy, one call each, stopping at the first frame that matches. It
-// used to be one call per pattern. Every field is length- and UTF-8-checked
-// here before the first frame is sent, so a malformed pattern is an error
-// even when an earlier one, in this frame or an earlier frame, would have
-// matched; the engine re-validates each frame on its own side.
+// The list crosses in frames of at most maxPatterns patterns and
+// maxFrameBytes bytes, one call each, stopping at the first frame that
+// matches. A frame over 4 KiB travels in a Rust-owned buffer.
 func MatchAny(ctx context.Context, patterns []string, name string) (bool, error) {
+	return ask(ctx, patterns, name, false)
+}
+
+// MatchAnyFold is fnmatch.MatchAnyFold across the boundary; see MatchFold.
+func MatchAnyFold(ctx context.Context, patterns []string, name string) (bool, error) {
+	return ask(ctx, patterns, name, true)
+}
+
+// ask is the one path for all four entry points.
+//
+// Go decides what it can decide without the engine, with fnmatch's own
+// rules, so the two can only differ in the walk itself: an oversized name or
+// pattern is no match case-sensitively and a match case-folded, and folding
+// is fnmatch.Fold, so Unicode case rules are Go's on both paths. An UNDECIDED
+// answer (the step budget, which both sides compute identically) reads the
+// same way.
+func ask(ctx context.Context, patterns []string, name string, fold bool) (bool, error) {
 	if ctx == nil {
 		return false, errors.New("gusset: nil context")
 	}
-	if len(name) > maxField {
-		return false, fmt.Errorf("gusset: name exceeds %d bytes", maxField)
-	}
-	if !utf8.ValidString(name) {
-		return false, errors.New("gusset: name is not valid UTF-8")
-	}
-	for _, p := range patterns {
-		if len(p) > maxField {
-			return false, fmt.Errorf("gusset: pattern exceeds %d bytes", maxField)
-		}
-		if !utf8.ValidString(p) {
-			return false, fmt.Errorf("gusset: pattern %q is not valid UTF-8", p)
-		}
+	if err := ctx.Err(); err != nil {
+		// Refused on a dead context even when the answer needs no crossing.
+		return false, err
 	}
 	if len(patterns) == 0 {
-		// Still a real answer, and still refused on a dead context.
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
 		return false, nil
 	}
+	if fnmatch.Oversized(name) {
+		return fold, nil
+	}
+	kept := make([]string, 0, len(patterns))
+	for _, p := range patterns {
+		if fnmatch.Oversized(p) {
+			if fold {
+				return true, nil
+			}
+			continue
+		}
+		if fold {
+			p = fnmatch.Fold(p)
+		}
+		kept = append(kept, normalize(p))
+	}
+	if fold {
+		name = fnmatch.Fold(name)
+	}
+	name = normalize(name)
+
+	// Opcode 1, whatever the caller's context carries. gusset reads the
+	// opcode from ctx, so a ctx that had passed through another opcode — the
+	// self-test's — would decode this frame as that, or panic the shared
+	// handle.
 	actx := gusset.ContextWithOpcode(ctx, opcodeMatchAny)
-	for rest := patterns; len(rest) > 0; {
+	for rest := kept; len(rest) > 0; {
 		frame, used := encodeAny(name, rest)
 		out, err := call(actx, frame)
 		if err != nil {
 			return false, err
 		}
-		matched, err := decodeBool(out)
-		if err != nil || matched {
-			return matched, err
+		a, err := answer(out)
+		if err != nil {
+			return false, err
+		}
+		if a == match || (a == undecided && fold) {
+			return true, nil
 		}
 		rest = rest[used:]
 	}
@@ -300,22 +369,20 @@ func MatchAny(ctx context.Context, patterns []string, name string) (bool, error)
 }
 
 // encodeAny packs name and as many leading patterns as fit one frame, and
-// reports how many it took. Fields are length-checked by the caller, so one
-// pattern always fits: 2+1024+2+2+1024 is far below maxFrame.
+// reports how many it took. One pattern always fits: fields are under
+// fnmatch's cap, far below maxFrameBytes.
 func encodeAny(name string, patterns []string) ([]byte, int) {
-	size := 2 + len(name) + 2
+	size := 4 + len(name) + 4
 	n := 0
-	for n < len(patterns) && n < maxPatterns && size+2+len(patterns[n]) <= maxFrame {
-		size += 2 + len(patterns[n])
+	for n < len(patterns) && n < maxPatterns && (n == 0 || size+4+len(patterns[n]) <= maxFrameBytes) {
+		size += 4 + len(patterns[n])
 		n++
 	}
 	buf := make([]byte, 0, size)
-	buf = binary.LittleEndian.AppendUint16(buf, uint16(len(name)))
-	buf = append(buf, name...)
-	buf = binary.LittleEndian.AppendUint16(buf, uint16(n))
+	buf = appendField(buf, name)
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(n))
 	for _, p := range patterns[:n] {
-		buf = binary.LittleEndian.AppendUint16(buf, uint16(len(p)))
-		buf = append(buf, p...)
+		buf = appendField(buf, p)
 	}
 	return buf, n
 }
@@ -351,10 +418,43 @@ func Check(ctx context.Context) error {
 		}
 	}
 
-	if _, err := Match(ctx, "\xff", "a"); err == nil {
-		return errors.New("invalid UTF-8 must be refused by the engine")
-	} else if errors.Is(err, gusset.ErrPanic) || errors.Is(err, gusset.ErrPoisoned) {
-		return fmt.Errorf("invalid UTF-8 poisoned the handle: %w", err)
+	// A frame the engine refuses is an error, not a panic: the handle stays
+	// usable. Go never builds one (invalid UTF-8 is normalized first), so it
+	// is sent raw, on opcode 0.
+	bad := binary.LittleEndian.AppendUint32(nil, 1)
+	bad = append(bad, 0xff)
+	bad = appendField(bad, "a")
+	if _, err := call(gusset.ContextWithOpcode(ctx, opcodeMatch), bad); err == nil {
+		return errors.New("a frame with invalid UTF-8 must be refused by the engine")
+	} else if poisoned(err) {
+		return fmt.Errorf("a refused frame poisoned the handle: %w", err)
+	}
+
+	// Inputs Go answers without the engine's help must get Go's answer:
+	// invalid UTF-8 read as U+FFFD per byte, case folding, and a frame over
+	// the 4 KiB inline copy.
+	long := strings.Repeat("a/", 3000) + "Secret.PEM"
+	for _, v := range []struct {
+		pattern, name string
+		fold          bool
+	}{
+		{"?\xff?", "\xff\xff\xff", false},
+		{"[!a]", "\xff", false},
+		{"*.pem", "keys/ID.PEM", true},
+		{"*.pem", long, true},
+		{"*.PEM", long, false},
+	} {
+		got, err := ask(ctx, []string{v.pattern}, v.name, v.fold)
+		if err != nil {
+			return fmt.Errorf("ask(%q, %.40q, fold=%v): %w", v.pattern, v.name, v.fold, err)
+		}
+		want := fnmatch.Match(v.pattern, v.name)
+		if v.fold {
+			want = fnmatch.MatchFold(v.pattern, v.name)
+		}
+		if got != want {
+			return fmt.Errorf("gusset and Go fnmatch disagree on (%q, %.40q, fold=%v): gusset %v, go %v", v.pattern, v.name, v.fold, got, want)
+		}
 	}
 
 	// A payload whose first byte is 1 panics the diagnostic engine. With the
@@ -365,9 +465,6 @@ func Check(ctx context.Context) error {
 	}
 	if !got {
 		return errors.New("literal 0x01 did not match itself")
-	}
-	if !utf8.ValidString("\x01") {
-		return errors.New("internal: 0x01 was expected to be valid UTF-8")
 	}
 
 	anyPatterns := []string{"*.rs", "*.go", "src/*.py"}

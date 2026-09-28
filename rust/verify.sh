@@ -83,6 +83,9 @@ else
   eval "$engine_exports"
   go -C ../backend/go_orchestrator build -o bin/ ./cmd/devcouncil
   go -C ../backend/go_orchestrator test -count=1 ./gussetfn
+  # The whole policy suite again with the engine as every gate's default
+  # matcher, plus a decision-for-decision comparison against fnmatch.
+  go -C ../backend/go_orchestrator test -count=1 -tags gussetengine ./policy
   ../backend/go_orchestrator/bin/devcouncil gusset-check
 fi
 

@@ -23,6 +23,8 @@ on:
       - ".github/actions/setup-gusset/**"
       - "rust/gusset-engine/**"
       - "backend/go_orchestrator/gussetfn/**"
+      - "backend/go_orchestrator/policy/**"
+      - "backend/go_orchestrator/fnmatch/**"
   pull_request:
     paths:
       - "rust/devmap-*/**"
@@ -37,6 +39,8 @@ on:
       - ".github/actions/setup-gusset/**"
       - "rust/gusset-engine/**"
       - "backend/go_orchestrator/gussetfn/**"
+      - "backend/go_orchestrator/policy/**"
+      - "backend/go_orchestrator/fnmatch/**"
   workflow_dispatch:
 
 permissions:
