@@ -3160,7 +3160,11 @@ impl Store {
     /// even when the application has write access to the file. A writer must
     /// upgrade an older store explicitly before an advisory reader can use it.
     pub fn open_read_only<P: AsRef<Path>>(db_path: P) -> Result<Self> {
-        let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path.as_ref())
+        Self::retrying_lost_races(|| Self::open_read_only_once(db_path.as_ref()))
+    }
+
+    fn open_read_only_once(db_path: &Path) -> Result<Self> {
+        let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path)
             .map_err(|error| refusal(error.to_string()))?;
         let path = resolved.as_path();
         Self::validate_database_file(path)?;
@@ -3230,11 +3234,15 @@ impl Store {
         )
     }
 
-    pub fn open<P: AsRef<Path>>(db_path: P) -> Result<Self> {
+    /// Run an open, retrying `SQLITE_PROTOCOL` within
+    /// [`Store::PROTOCOL_RETRY_DEADLINE`]. Shared by every entry point that
+    /// opens a connection: read-only opens lost the same race on Windows
+    /// (`concurrent_readers_cannot_enqueue_writer_work`).
+    fn retrying_lost_races(open: impl Fn() -> Result<Self>) -> Result<Self> {
         let deadline = std::time::Instant::now() + Self::PROTOCOL_RETRY_DEADLINE;
         let mut pause = std::time::Duration::from_millis(10);
         loop {
-            match Self::open_once(db_path.as_ref()) {
+            match open() {
                 Err(error)
                     if Self::lost_a_locking_race(&error)
                         && std::time::Instant::now() + pause < deadline =>
@@ -3245,6 +3253,10 @@ impl Store {
                 outcome => return outcome,
             }
         }
+    }
+
+    pub fn open<P: AsRef<Path>>(db_path: P) -> Result<Self> {
+        Self::retrying_lost_races(|| Self::open_once(db_path.as_ref()))
     }
 
     fn open_once(db_path: &Path) -> Result<Self> {
