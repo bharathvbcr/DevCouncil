@@ -1,3 +1,5 @@
+//go:build unix
+
 package gussetfn
 
 import (
@@ -414,7 +416,9 @@ func TestStatsCountBuffersOnce(t *testing.T) {
 	}
 	after := gusset.Stats().LiveBytes
 	delta := int64(during) - int64(before)
-	if delta < n || delta > n+n/2 {
+	// Process-wide, so a concurrent free from an earlier test's cleanup can
+	// pull it slightly under n; double-counting would put it near 2n.
+	if delta < n-n/16 || delta > n+n/2 {
 		t.Fatalf("an %d-byte buffer moved LiveBytes by %d; want about %d once", n, delta, n)
 	}
 	if int64(after)-int64(before) > n/8 {
