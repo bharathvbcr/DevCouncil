@@ -58,6 +58,10 @@ function ensureGussetEngine() {
     "--locked",
     "--manifest-path",
     "rust/gusset-engine/Cargo.toml",
+    // Where gussetfn's #cgo -L and the hash below look, whatever
+    // CARGO_TARGET_DIR says.
+    "--target-dir",
+    "rust/gusset-engine/target",
   ]);
   const archive = path.join(REPO_ROOT, "rust", "gusset-engine", "target", "release", "libgusset.a");
   if (!existsSync(archive)) {
@@ -68,7 +72,10 @@ function ensureGussetEngine() {
   // Go hashes cgo flags, not the libraries they link, so a rebuilt archive
   // is otherwise not relinked and a cached "ok" is replayed against the old one.
   const sum = createHash("sha256").update(readFileSync(archive)).digest("hex").slice(0, 32);
-  const base = (process.env.CGO_CFLAGS ?? "-O2 -g")
+  // `go env` reports the process env, a `go env -w` setting, or Go's default.
+  const goEnv = spawnSync("go", ["env", "CGO_CFLAGS"], { encoding: "utf8", shell: false });
+  const current = goEnv.status === 0 ? goEnv.stdout.trim() : (process.env.CGO_CFLAGS || "-O2 -g");
+  const base = current
     .replace(/(^| )-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=\S*/g, "")
     .trim();
   process.env.CGO_CFLAGS = `${base ? `${base} ` : ""}-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=${sum}`;

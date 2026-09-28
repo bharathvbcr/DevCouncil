@@ -367,6 +367,11 @@ export function defaultSources(root) {
     packageLockPath: path.join(root, "package-lock.json"),
     cargoTomlPath: path.join(root, "rust", "Cargo.toml"),
     cargoLockPath: path.join(root, "rust", "Cargo.lock"),
+    // The Gusset umbrella is its own workspace with its own lock, and dc-glob
+    // inherits the product version, so a version bump that skips this lock
+    // breaks every `cargo build --locked` of the umbrella (setup-gusset,
+    // verify.sh, cgo-env.sh) — which is how 0.2.3 sat in it at 1.3.5.
+    umbrellaLockPath: path.join(root, "rust", "gusset-engine", "Cargo.lock"),
     // `devcouncil/version`, not `cmd/devcouncil`: the constant moved into a
     // library so `devcouncil/mcp` could import it, and this gate must read
     // the owner rather than the alias that `package main` keeps for printing.
@@ -399,6 +404,12 @@ export function inspectRelease(sources, opts = {}) {
   const cargoToml = read(sources.cargoTomlPath, "rust/Cargo.toml");
   const cargoLock = read(sources.cargoLockPath, "rust/Cargo.lock");
   const goSrc = read(sources.goVersionPath, "version.go");
+  // Optional so fixtures without an umbrella still inspect; the umbrella's
+  // own --locked build refuses a missing lock.
+  const umbrellaLock =
+    sources.umbrellaLockPath && existsSync(sources.umbrellaLockPath)
+      ? readFileSync(sources.umbrellaLockPath, "utf8")
+      : null;
 
   const versions = {
     "package.json": pkg ? parseNpmVersion(pkg) : null,
@@ -411,6 +422,9 @@ export function inspectRelease(sources, opts = {}) {
       : null,
     "version.go": goSrc ? parseGoVersion(goSrc) : null,
   };
+  if (umbrellaLock != null) {
+    versions["rust/gusset-engine/Cargo.lock dc-glob"] = parseCargoLockVersion(umbrellaLock, "dc-glob");
+  }
 
   const present = Object.values(versions).filter((v) => typeof v === "string" && v !== "");
   const identity = present[0] ?? null;

@@ -31,8 +31,18 @@ if [[ ! -f "$here/../../../gusset/crates/gusset/Cargo.toml" ]]; then
   echo "cgo-env.sh: gusset is not checked out next to DevCouncil ($here/../../../gusset)" >&2
   exit 1
 fi
+# Go splits CGO_LDFLAGS on spaces and gussetfn's #cgo -L uses ${SRCDIR}, which
+# cgo refuses to expand to a path with spaces; fail here, by name.
+if [[ "$here" == *" "* ]]; then
+  echo "cgo-env.sh: $here contains a space, which cgo cannot link from" >&2
+  exit 1
+fi
 if [[ "$build" -eq 1 ]]; then
-  cargo build --release --locked --manifest-path "$here/Cargo.toml" >&2
+  # --target-dir pins the output where gussetfn's #cgo -L and the hash below
+  # look. Without it an inherited CARGO_TARGET_DIR (two lanes on one
+  # checkout) sent the fresh archive elsewhere and this script keyed Go on
+  # the stale one it then linked.
+  cargo build --release --locked --manifest-path "$here/Cargo.toml" --target-dir "$here/target" >&2
 fi
 archive="$here/target/release/libgusset.a"
 if [[ ! -f "$archive" ]]; then
@@ -48,7 +58,10 @@ fi
 ldflags="-L$here/target/release"
 # Replace, never stack: runtime/cgo builds with -Werror, and a second -D of
 # the same macro from re-sourcing this in one shell is a redefinition error.
-base="$(printf '%s' "${CGO_CFLAGS:--O2 -g}" | sed -E 's/(^| )-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=[^ ]*//g; s/^ +//')"
+# Seed from `go env`, which reports the process env, a `go env -w` setting or
+# Go's default -O2 -g, in that order; the process env alone missed -w.
+current="$(go env CGO_CFLAGS 2>/dev/null || printf '%s' "${CGO_CFLAGS:--O2 -g}")"
+base="$(printf '%s' "$current" | sed -E 's/(^| )-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=[^ ]*//g; s/^ +//')"
 cflags="${base:+$base }-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=$sum"
 if [[ "$mode" == export ]]; then
   printf 'export CGO_ENABLED=1\nexport CGO_LDFLAGS=%q\nexport CGO_CFLAGS=%q\n' "$ldflags" "$cflags"
