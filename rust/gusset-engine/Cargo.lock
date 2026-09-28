@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "dc-glob"
-version = "0.2.3"
+version = "1.3.5"
 
 [[package]]
 name = "devcouncil-gusset-engine"
@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "gusset"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "libc",
  "static_assertions",

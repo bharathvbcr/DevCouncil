@@ -5,6 +5,7 @@
  * as a pass.
  */
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -63,6 +64,14 @@ function ensureGussetEngine() {
     console.error(`FAIL: ${archive} is missing after cargo build`);
     process.exit(1);
   }
+  // Key Go's caches on the archive, as rust/gusset-engine/cgo-env.sh does:
+  // Go hashes cgo flags, not the libraries they link, so a rebuilt archive
+  // is otherwise not relinked and a cached "ok" is replayed against the old one.
+  const sum = createHash("sha256").update(readFileSync(archive)).digest("hex").slice(0, 32);
+  const base = (process.env.CGO_CFLAGS ?? "-O2 -g")
+    .replace(/(^| )-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=\S*/g, "")
+    .trim();
+  process.env.CGO_CFLAGS = `${base ? `${base} ` : ""}-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=${sum}`;
 }
 
 function gofmtClean() {
