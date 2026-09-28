@@ -680,6 +680,11 @@ when an enclosing hit already prints its lines. The last quarter goes to
 `related_tests`: tests that reach the implementation hits over inbound call edges
 (depth 3), including `#[test]` functions beside the code, nearest first. It reads no
 file beyond what `devmap_ask` reads, and `tokens_used` never exceeds the budget.
+The repository-wide attribution gap, which bounds how complete the call edges and
+related tests can be, is stated once as `coverage_gap`; `related_tests.walk_incomplete`
+says only where that walk stopped. A nested symbol's hit carries `source_indent`,
+the whitespace its first line had before the span began, so the source reads as
+the file has it.
 
 The last two join the graph to git and run in opposite directions.
 `devmap_blast` goes **forward** — these lines changed, what depends on them —

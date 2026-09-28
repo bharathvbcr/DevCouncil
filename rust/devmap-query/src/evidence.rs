@@ -100,6 +100,12 @@ pub struct EvidencePack {
     /// nearest first, excluding test files already in `files`. Its own
     /// counters and `walk_incomplete` describe it; they are not the hits'.
     pub related_tests: Response<AffectedTest>,
+    /// Repository-wide: how much of the call graph could not be attributed,
+    /// so how far `calls`, `called_by` and `related_tests` may fall short.
+    /// Stated once for the pack rather than repeated on each list; `None` when
+    /// the generation records no gap or no edge was walked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_gap: Option<String>,
     pub source_freshness: SourceFreshness,
     pub shown: u32,
     pub hidden: u32,
@@ -209,6 +215,7 @@ pub fn assemble(
     Ok(EvidencePack {
         files,
         related_tests,
+        coverage_gap: None,
         source_freshness,
         shown,
         hidden,
@@ -407,6 +414,7 @@ mod tests {
             source_span: source.to_string(),
             source_unavailable_reason: None,
             source_span_omitted_bytes: None,
+            source_indent: None,
             score,
         }
     }

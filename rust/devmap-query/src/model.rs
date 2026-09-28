@@ -394,6 +394,16 @@ pub struct SymbolHit {
     /// Serialized only when it happened, so existing consumers see no new key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_span_omitted_bytes: Option<u32>,
+    /// The whitespace before the symbol on its first line, when the span
+    /// starts mid-line — a method inside a class, a function inside a module
+    /// block. `source_span` is verbatim from the symbol's first byte, so its
+    /// first line has lost this indentation while every later line kept its
+    /// own; a reader that prepends this sees the lines as the file has them.
+    /// `None` at column zero, when anything but spaces and tabs precedes the
+    /// symbol, or when the source was unavailable; omitted then, so existing
+    /// consumers see no new key for top-level symbols.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_indent: Option<String>,
     pub score: f32,
 }
 

@@ -548,3 +548,73 @@ fn a_capped_whole_file_hit_is_a_lead_not_a_block() {
     );
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// A method's first line gets its indentation back; a top-level symbol has
+/// none to give and adds no key to the wire form.
+#[test]
+fn a_nested_symbol_carries_the_indentation_its_first_line_lost() {
+    let root = scratch("indent");
+    let store = disk_store(&root, &[("ledger.py", LEDGER)]);
+    let hits = StoreQueryEngine::new(&store)
+        .ask("ledger", 10_000, 0.0)
+        .unwrap()
+        .items;
+    let method = hits
+        .iter()
+        .find(|hit| hit.symbol_name == "ledger_total")
+        .expect("the method is a hit");
+    assert_eq!(method.source_indent.as_deref(), Some("    "), "{method:#?}");
+    assert!(method.source_span.starts_with("def ledger_total"));
+    let function = hits
+        .iter()
+        .find(|hit| hit.symbol_name == "ledger_report")
+        .expect("the function is a hit");
+    assert_eq!(function.source_indent, None);
+    let wire = serde_json::to_value(function).unwrap();
+    assert!(wire.get("source_indent").is_none(), "{wire}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// The repository-wide attribution gap is stated once, on the pack; the
+/// related-test list says only where its own walk stopped.
+#[test]
+fn the_repository_wide_gap_is_stated_once() {
+    let root = scratch("gap");
+    let store = disk_store(
+        &root,
+        &[
+            (
+                "ledger.py",
+                // `rows` has no inferable type and two classes define
+                // `frobnicate`, so the call has namesakes but no target: an
+                // unexplained attribution site, which is what the gap counts.
+                "def ledger_total(rows):\n    return rows.frobnicate()\n",
+            ),
+            (
+                "shapes.py",
+                "class Square:\n    def frobnicate(self):\n        return 1\n\n\n\
+                 class Circle:\n    def frobnicate(self):\n        return 2\n",
+            ),
+            (
+                "tests/test_ledger.py",
+                "from ledger import ledger_total\n\n\n\
+                 def test_total():\n    assert ledger_total([1]) == 1\n",
+            ),
+        ],
+    );
+    let pack = StoreQueryEngine::new(&store)
+        .ask_evidence("ledger total", 10_000, 0.0)
+        .unwrap();
+    assert_pack_is_sound(&pack, 10_000);
+    let gap = pack
+        .coverage_gap
+        .as_deref()
+        .unwrap_or_else(|| panic!("an unresolved call is a coverage gap: {pack:#?}"));
+    assert!(gap.contains("repository-wide"), "{gap}");
+    let list = pack.related_tests.walk_incomplete.as_deref().unwrap_or("");
+    assert!(
+        !list.contains("repository-wide") && !list.contains(gap),
+        "the list repeats the gap: {list}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}

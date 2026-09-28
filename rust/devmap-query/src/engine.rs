@@ -1736,7 +1736,7 @@ impl<'a> StoreQueryEngine<'a> {
                 self.store.latest_test_entry_symbols()?,
             )
         };
-        let related_tests = match edges.as_deref() {
+        let (related_tests, coverage_gap) = match edges.as_deref() {
             Some(edges) => self.evidence_related_tests(
                 edges,
                 &response,
@@ -1745,9 +1745,12 @@ impl<'a> StoreQueryEngine<'a> {
                 test_budget,
                 min_confidence,
             )?,
-            None => self.finish(budget_take(Vec::new(), test_budget, |_| 0)),
+            None => (
+                self.finish(budget_take(Vec::new(), test_budget, |_| 0)),
+                None,
+            ),
         };
-        Ok(crate::evidence::assemble(
+        let mut pack = crate::evidence::assemble(
             response,
             &qualified,
             edges.as_deref(),
@@ -1755,7 +1758,9 @@ impl<'a> StoreQueryEngine<'a> {
             &test_symbols,
             related_tests,
             &self.cancel,
-        )?)
+        )?;
+        pack.coverage_gap = coverage_gap;
+        Ok(pack)
     }
 
     /// Test files reaching the pack's implementation hits, nearest first.
@@ -1767,6 +1772,11 @@ impl<'a> StoreQueryEngine<'a> {
     /// `#[test] fn` beside the code it tests is found too. Tests that are
     /// already hits are dropped *before* budgeting, so the counters describe
     /// the list as returned.
+    ///
+    /// Returns the repository-wide attribution gap separately from the list's
+    /// own `walk_incomplete`. It is the same sentence on every query, and
+    /// folded into the list it buried the one clause about *this* walk — where
+    /// it stopped — under a paragraph about the whole repository.
     fn evidence_related_tests(
         &self,
         edges: &GenerationEdges,
@@ -1775,7 +1785,7 @@ impl<'a> StoreQueryEngine<'a> {
         test_symbols: &std::collections::HashSet<String>,
         token_budget: u32,
         min_confidence: f32,
-    ) -> anyhow::Result<Response<AffectedTest>> {
+    ) -> anyhow::Result<(Response<AffectedTest>, Option<String>)> {
         let mut targets: Vec<String> = Vec::new();
         let mut hits: BTreeSet<(&str, &str)> = BTreeSet::new();
         for (hit, name) in response.items.iter().zip(qualified) {
@@ -1786,7 +1796,10 @@ impl<'a> StoreQueryEngine<'a> {
             }
         }
         if targets.is_empty() {
-            return Ok(self.finish(budget_take(Vec::new(), token_budget, |_| 0)));
+            return Ok((
+                self.finish(budget_take(Vec::new(), token_budget, |_| 0)),
+                None,
+            ));
         }
         let walk = self.blast_walk(edges, &targets, EVIDENCE_TEST_DEPTH, min_confidence)?;
         // Seeds are implementation hits by construction, so only the bands can
@@ -1816,8 +1829,8 @@ impl<'a> StoreQueryEngine<'a> {
             .collect();
         tests.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.path.cmp(&b.path)));
         let mut related = budget_take(tests, token_budget, affected_test_tokens);
-        related.walk_incomplete = walk.incomplete_reason();
-        Ok(self.finish(related))
+        related.walk_incomplete = walk.stop.reason(walk.depth_cap, TRAVERSAL_MAX_NODES);
+        Ok((self.finish(related), walk.coverage_gap))
     }
 
     /// The ask walk, with each shown hit's qualified name alongside it.
@@ -3280,6 +3293,7 @@ impl<'a> QueryEngine<'a> {
                     source_span,
                     source_unavailable_reason,
                     source_span_omitted_bytes,
+                    source_indent: None,
                     score,
                 });
             }
@@ -4808,6 +4822,9 @@ fn hit_from_stored(
             .line_range(text)
         })
         .unwrap_or((0, 0));
+    let source_indent = source
+        .as_deref()
+        .and_then(|text| line_indent_before(text, row.span_start));
     let (source_span, source_span_omitted_bytes) = cap_source_span(source_span, token_budget);
     SymbolHit {
         symbol_name: row.name,
@@ -4817,8 +4834,25 @@ fn hit_from_stored(
         source_span,
         source_unavailable_reason,
         source_span_omitted_bytes,
+        source_indent,
         score,
     }
+}
+
+/// Longest indentation [`SymbolHit::source_indent`] carries. Past this the
+/// prefix is not indentation anyone reads, and it is not worth its bytes.
+const MAX_SOURCE_INDENT: usize = 256;
+
+/// The spaces and tabs between the start of `offset`'s line and `offset`, or
+/// `None` at column zero or when anything else precedes it on the line.
+fn line_indent_before(text: &str, offset: usize) -> Option<String> {
+    let before = text.get(..offset)?;
+    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+    let prefix = &before[line_start..];
+    (!prefix.is_empty()
+        && prefix.len() <= MAX_SOURCE_INDENT
+        && prefix.bytes().all(|byte| byte == b' ' || byte == b'\t'))
+    .then(|| prefix.to_string())
 }
 
 /// Cap a hit's source span so one hit can never exceed the whole token budget.

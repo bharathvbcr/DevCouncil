@@ -3651,8 +3651,12 @@ fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
                 unit.hit.span.1,
                 unit.qualified_name
             );
+            let indent = unit.hit.source_indent.as_deref().unwrap_or("");
             for (offset, text) in unit.hit.source_span.lines().enumerate() {
-                outln!("{}: {text}", unit.hit.span.0 as usize + offset);
+                // The span starts at the symbol, not the line; give the first
+                // line back the indentation its neighbours kept.
+                let lead = if offset == 0 { indent } else { "" };
+                outln!("{}: {lead}{text}", unit.hit.span.0 as usize + offset);
             }
             if let Some(omitted) = unit.hit.source_span_omitted_bytes {
                 outln!("... {omitted} more bytes not shown (budget); read the file for the rest");
@@ -3699,6 +3703,9 @@ fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
         if let Some(reason) = &tests.walk_incomplete {
             outln!("warning: related tests: {reason}");
         }
+    }
+    if let Some(gap) = &pack.coverage_gap {
+        outln!("note: call-graph coverage (repository-wide): {gap}");
     }
 }
 
