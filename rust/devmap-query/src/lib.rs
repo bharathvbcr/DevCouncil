@@ -14,6 +14,7 @@ pub mod cypher;
 pub mod digest;
 pub mod engine;
 pub mod escape;
+pub mod evidence;
 pub mod export;
 pub mod freshness;
 pub mod guides;
@@ -59,6 +60,7 @@ pub use engine::{
     MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH, PREVIEW_CALLER_MIN_CONFIDENCE,
 };
 pub use escape::{html_escape, render_symbol_label};
+pub use evidence::{EvidenceFile, EvidencePack, EvidenceRole, EvidenceUnit};
 pub use linguist::{palette, swatch, Swatch, LINGUIST_VERSION, NEUTRAL_COLOR};
 pub use manifest::{
     generate_lean_manifest_json, generate_manifest, generate_manifest_with_edges,

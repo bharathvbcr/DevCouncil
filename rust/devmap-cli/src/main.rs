@@ -749,6 +749,11 @@ enum Commands {
         /// speculative edges in the PageRank walk.
         #[arg(long, default_value_t = devmap_query::ASK_DEFAULT_MIN_CONFIDENCE)]
         min_confidence: f32,
+        /// Answer as an evidence pack: files in rank order with their role
+        /// (implementation or test), the call edges between hits, then each
+        /// hit's verbatim source with line numbers. Same ranking and budget.
+        #[arg(long)]
+        evidence: bool,
     },
     Deps {
         file: String,
@@ -3544,6 +3549,106 @@ fn emit_search(resp: &devmap_query::Response<devmap_query::SymbolHit>) {
     emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
 }
 
+/// Files first, then source: the order a reader uses an answer in.
+///
+/// The file list is short enough to decide what to read; the source blocks
+/// below it mean the obvious reads are already done. A folded unit points at
+/// the block that shows it instead of printing its lines twice.
+fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
+    if let ResolutionAvailability::Unavailable { reason } = &pack.resolution {
+        emit_unavailable(reason);
+        return;
+    }
+    let symbols: usize = pack.files.iter().map(|file| file.units.len()).sum();
+    // Qualified names lead with the file path, which the list already shows.
+    let short = |file: &str, name: &'_ str| -> String {
+        name.strip_prefix(file)
+            .and_then(|rest| rest.strip_prefix("::"))
+            .unwrap_or(name)
+            .to_string()
+    };
+    let shorten = |file: &str, names: &[String]| -> String {
+        names
+            .iter()
+            .map(|name| short(file, name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    outln!(
+        "Evidence: {} file{}, {} symbol{}.",
+        pack.files.len(),
+        if pack.files.len() == 1 { "" } else { "s" },
+        symbols,
+        if symbols == 1 { "" } else { "s" }
+    );
+    for file in &pack.files {
+        outln!("- {}  ({})", file.file_path, file.role.as_str());
+        for unit in &file.units {
+            let mut line = format!(
+                "    {}-{}  {}  {}",
+                unit.hit.span.0,
+                unit.hit.span.1,
+                unit.hit.kind,
+                short(&file.file_path, &unit.qualified_name)
+            );
+            if !unit.calls.is_empty() {
+                line.push_str(&format!(
+                    "  calls: {}",
+                    shorten(&file.file_path, &unit.calls)
+                ));
+            }
+            if !unit.called_by.is_empty() {
+                line.push_str(&format!(
+                    "  called by: {}",
+                    shorten(&file.file_path, &unit.called_by)
+                ));
+            }
+            if let Some(container) = &unit.contained_in {
+                line.push_str(&format!(
+                    "  (source shown in {})",
+                    short(&file.file_path, container)
+                ));
+            }
+            outln!("{line}");
+        }
+    }
+    outln!("End file list.");
+    for file in &pack.files {
+        for unit in &file.units {
+            if unit.contained_in.is_some() {
+                continue;
+            }
+            outln!("");
+            if let Some(reason) = &unit.hit.source_unavailable_reason {
+                outln!(
+                    "Source {} ({}): {reason}",
+                    file.file_path,
+                    unit.qualified_name
+                );
+                continue;
+            }
+            outln!(
+                "Source {} lines {}-{} ({}):",
+                file.file_path,
+                unit.hit.span.0,
+                unit.hit.span.1,
+                unit.qualified_name
+            );
+            for (offset, text) in unit.hit.source_span.lines().enumerate() {
+                outln!("{}: {text}", unit.hit.span.0 as usize + offset);
+            }
+            if let Some(omitted) = unit.hit.source_span_omitted_bytes {
+                outln!("... {omitted} more bytes not shown (budget); read the file for the rest");
+            }
+        }
+    }
+    outln!("");
+    emit_truncation(pack.shown, pack.hidden, pack.total, pack.truncated);
+    if let Some(reason) = &pack.walk_incomplete {
+        outln!("warning: {reason}");
+    }
+}
+
 fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedEdge>) {
     if let ResolutionAvailability::Unavailable { reason } = &resp.resolution {
         emit_unavailable(reason);
@@ -5980,6 +6085,22 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             question,
             budget,
             min_confidence,
+            evidence: true,
+        } => {
+            let store = open_for_read(cli)?;
+            let engine = StoreQueryEngine::new(&store);
+            let pack = engine.ask_evidence(question, *budget, *min_confidence)?;
+            if cli.json {
+                emit_json(cli, &serde_json::to_value(&pack)?)?;
+            } else {
+                emit_evidence_pack(&pack);
+            }
+        }
+        Commands::Ask {
+            question,
+            budget,
+            min_confidence,
+            evidence: false,
         } => {
             let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);

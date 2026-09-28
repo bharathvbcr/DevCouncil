@@ -1701,19 +1701,60 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         min_confidence: f32,
     ) -> anyhow::Result<Response<SymbolHit>> {
+        Ok(self.ask_ranked(query, token_budget, min_confidence)?.0)
+    }
+
+    /// [`Self::ask`], answered as an evidence pack: hits grouped by file in
+    /// rank order, each file marked test or implementation, the call edges
+    /// that connect the hits, and a nested hit's source folded into the hit
+    /// that already shows it. See [`crate::evidence`].
+    pub fn ask_evidence(
+        &self,
+        query: &str,
+        token_budget: u32,
+        min_confidence: f32,
+    ) -> anyhow::Result<crate::evidence::EvidencePack> {
+        let (response, qualified) = self.ask_ranked(query, token_budget, min_confidence)?;
+        let edges = if response.items.is_empty() {
+            None
+        } else {
+            self.generation_edges()?
+        };
+        Ok(crate::evidence::assemble(
+            response,
+            &qualified,
+            edges.as_deref(),
+            min_confidence,
+        ))
+    }
+
+    /// The ask walk, with each shown hit's qualified name alongside it.
+    ///
+    /// `SymbolHit` carries the bare name, and a bare name cannot be joined
+    /// against call edges — two files can each define `run`. The second vector
+    /// is index-aligned with `response.items` and exists for that join.
+    fn ask_ranked(
+        &self,
+        query: &str,
+        token_budget: u32,
+        min_confidence: f32,
+    ) -> anyhow::Result<(Response<SymbolHit>, Vec<String>)> {
         self.cancel.check()?;
         let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
         let Some(snapshot) = self.store.all_symbols_page()? else {
-            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
-                reason: "no persisted generation is available".to_string(),
-            }));
+            return Ok((
+                self.unavailable(ResolutionAvailability::Unavailable {
+                    reason: "no persisted generation is available".to_string(),
+                }),
+                Vec::new(),
+            ));
         };
         let coverage_gap = search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref()));
         let symbols = snapshot.rows;
         if symbols.is_empty() || query.trim().is_empty() {
             let mut response = budget_take(Vec::new(), token_budget, |_| 0);
             response.walk_incomplete = coverage_gap;
-            return Ok(self.finish(response));
+            return Ok((self.finish(response), Vec::new()));
         }
 
         let docstrings = crate::ask::docstring_by_qualified_name(&self.store.latest_extractions()?);
@@ -1733,7 +1774,7 @@ impl<'a> StoreQueryEngine<'a> {
             let mut response = budget_take(Vec::new(), token_budget, |_| 0);
             response.walk_incomplete =
                 devmap_analyze::combine_reasons(coverage_gap, empty_ask_gap(query));
-            return Ok(self.finish(response));
+            return Ok((self.finish(response), Vec::new()));
         }
 
         let seed_positions: Vec<usize> = scored.iter().map(|(position, _)| *position).collect();
@@ -1784,7 +1825,7 @@ impl<'a> StoreQueryEngine<'a> {
                 coverage_gap,
                 Some(crate::ask::confidence_withheld_reason()),
             );
-            return Ok(self.finish(response));
+            return Ok((self.finish(response), Vec::new()));
         }
 
         let mut personalization = vec![0.0; nodes.len()];
@@ -1833,11 +1874,13 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         coverage_gap: Option<String>,
         extra_gap: Option<String>,
-    ) -> anyhow::Result<Response<SymbolHit>> {
+    ) -> anyhow::Result<(Response<SymbolHit>, Vec<String>)> {
         let total = u32::try_from(ordered.len()).unwrap_or(u32::MAX);
         let mut hits = Vec::new();
+        let mut qualified = Vec::new();
         for &(position, score) in ordered.iter().take(budget_page_size(token_budget)) {
             self.cancel.check()?;
+            qualified.push(symbols[position].qualified_name.clone());
             hits.push(hit_from_stored(
                 symbols[position].clone(),
                 repo_root,
@@ -1850,7 +1893,9 @@ impl<'a> StoreQueryEngine<'a> {
         response.hidden = total.saturating_sub(response.shown);
         response.truncated = response.hidden > 0;
         response.walk_incomplete = devmap_analyze::combine_reasons(coverage_gap, extra_gap);
-        Ok(self.finish(response))
+        // `budget_take` keeps a prefix, so the names stay aligned by truncation.
+        qualified.truncate(response.items.len());
+        Ok((self.finish(response), qualified))
     }
 
     /// What the map cost against what reading files would have.
