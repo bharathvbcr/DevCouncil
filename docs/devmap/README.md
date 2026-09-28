@@ -468,7 +468,7 @@ diagnostics with the panel state and its existing rotating logs.
 | `devmap deps <file>` | What this file depends on |
 | `devmap trace <a> <b>` | A path between two symbols |
 | `devmap neighbors <targets…>` | Callers and callees for several targets at once |
-| `devmap affected <targets…>` | Test files the change reaches, nearest first |
+| `devmap affected <targets…>` | Files holding tests the change reaches, nearest first — test-path files, and runner-invoked tests (`#[test]`, pytest `test_*`, JUnit `@Test`) beside the code |
 | `devmap dead` | Dead-symbol candidates: confident vs unconfirmed, each with reason |
 | `devmap clones` | Duplicated and structurally similar bodies |
 | `devmap preview --file f --content -` | What an *unsaved* edit would break |

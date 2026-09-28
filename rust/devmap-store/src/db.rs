@@ -7126,6 +7126,51 @@ generation {latest}; run `devmap status` to re-verify",
 
     /// Load the canonical extraction payloads for the latest generation. This
     /// supports differential re-resolution without touching unchanged files.
+    /// Qualified names a test runner invokes in the latest generation.
+    ///
+    /// The `RuntimeEntryPoint` wiring annotations whose details
+    /// [`devmap_extract::wiring::is_test_harness_reason`] recognises, read
+    /// without decoding whole extractions: SQLite pulls out only the
+    /// `wiring` array, and only from files whose payload mentions an entry
+    /// point at all. `affected_tests` runs on every hook-driven query, and a
+    /// full [`Self::latest_extractions`] decode there would cost more than the
+    /// walk it serves.
+    pub fn latest_test_entry_symbols(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
+            return Ok(std::collections::HashSet::new());
+        };
+        let mut stmt = snapshot.prepare(
+            "SELECT json_extract(f.extraction_json, '$.wiring'), p.path
+             FROM generation_files f
+             JOIN paths p ON p.id = f.file_id
+             WHERE f.generation_id = ?1
+               AND instr(f.extraction_json, 'RuntimeEntryPoint') > 0",
+        )?;
+        let rows = stmt.query_map(params![gen], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut symbols = std::collections::HashSet::new();
+        for row in rows {
+            let (json, path) = row?;
+            let Some(json) = json else { continue };
+            let wiring: Vec<devmap_extract::model::WiringAnnotation> = serde_json::from_str(&json)
+                .map_err(|error| {
+                    refusal(format!("stored wiring for {path} is invalid: {error}"))
+                })?;
+            symbols.extend(
+                wiring
+                    .into_iter()
+                    .filter(|annotation| {
+                        annotation.kind == devmap_extract::model::WiringKind::RuntimeEntryPoint
+                            && devmap_extract::wiring::is_test_harness_reason(&annotation.details)
+                    })
+                    .map(|annotation| annotation.target_symbol),
+            );
+        }
+        Ok(symbols)
+    }
+
     pub fn latest_extractions(&self) -> Result<Vec<Extraction>> {
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {

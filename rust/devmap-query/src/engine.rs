@@ -1194,6 +1194,10 @@ impl<'a> StoreQueryEngine<'a> {
             ));
         };
         let walk = self.blast_walk(&index, targets, max_depth, min_confidence)?;
+        // A test is a symbol in a test file or one a test runner invokes, so a
+        // `#[test] fn` beside the code it tests is named too; its file is the
+        // entry's `path`, like any other test's.
+        let test_symbols = self.store.latest_test_entry_symbols()?;
 
         // Derived from the *complete* walk, never from the budgeted layers.
         // Reading the presentation back would drop every test whose band the
@@ -1207,11 +1211,11 @@ impl<'a> StoreQueryEngine<'a> {
         // counts as an affected test.
         let mut nearest: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
         for (symbol, file) in &walk.seeds {
-            record_test_hit(&mut nearest, symbol, file, 0);
+            record_test_hit(&mut nearest, &test_symbols, symbol, file, 0);
         }
         for band in &walk.bands {
             for (symbol, file) in &band.members {
-                record_test_hit(&mut nearest, symbol, file, band.depth);
+                record_test_hit(&mut nearest, &test_symbols, symbol, file, band.depth);
             }
         }
 
@@ -1701,9 +1705,7 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         min_confidence: f32,
     ) -> anyhow::Result<Response<SymbolHit>> {
-        Ok(self
-            .ask_ranked(query, token_budget, min_confidence, None)?
-            .0)
+        Ok(self.ask_ranked(query, token_budget, min_confidence)?.0)
     }
 
     /// [`Self::ask`], answered as an evidence pack: hits grouped by file in
@@ -1722,17 +1724,15 @@ impl<'a> StoreQueryEngine<'a> {
         min_confidence: f32,
     ) -> anyhow::Result<crate::evidence::EvidencePack> {
         let test_budget = token_budget / EVIDENCE_TEST_BUDGET_SHARE;
-        let mut test_symbols = std::collections::HashSet::new();
-        let (response, qualified) = self.ask_ranked(
-            query,
-            token_budget - test_budget,
-            min_confidence,
-            Some(&mut test_symbols),
-        )?;
-        let edges = if response.items.is_empty() {
-            None
+        let (response, qualified) =
+            self.ask_ranked(query, token_budget - test_budget, min_confidence)?;
+        let (edges, test_symbols) = if response.items.is_empty() {
+            (None, std::collections::HashSet::new())
         } else {
-            self.generation_edges()?
+            (
+                self.generation_edges()?,
+                self.store.latest_test_entry_symbols()?,
+            )
         };
         let related_tests = match edges.as_deref() {
             Some(edges) => self.evidence_related_tests(
@@ -1823,16 +1823,11 @@ impl<'a> StoreQueryEngine<'a> {
     /// `SymbolHit` carries the bare name, and a bare name cannot be joined
     /// against call edges — two files can each define `run`. The second vector
     /// is index-aligned with `response.items` and exists for that join.
-    ///
-    /// `test_symbols`, when given, is filled with the qualified names a test
-    /// runner invokes ([`crate::ask::test_entry_symbols`]), read from the same
-    /// extractions the docstrings come from so the pack pays for one load.
     fn ask_ranked(
         &self,
         query: &str,
         token_budget: u32,
         min_confidence: f32,
-        test_symbols: Option<&mut std::collections::HashSet<String>>,
     ) -> anyhow::Result<(Response<SymbolHit>, Vec<String>)> {
         self.cancel.check()?;
         let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
@@ -1852,12 +1847,7 @@ impl<'a> StoreQueryEngine<'a> {
             return Ok((self.finish(response), Vec::new()));
         }
 
-        let extractions = self.store.latest_extractions()?;
-        if let Some(test_symbols) = test_symbols {
-            *test_symbols = crate::ask::test_entry_symbols(&extractions);
-        }
-        let docstrings = crate::ask::docstring_by_qualified_name(&extractions);
-        drop(extractions);
+        let docstrings = crate::ask::docstring_by_qualified_name(&self.store.latest_extractions()?);
         let texts: Vec<String> = symbols
             .iter()
             .map(|symbol| {
@@ -4082,11 +4072,12 @@ fn is_test_file_name(file_name: &str) -> bool {
 /// same scope it is built in.
 fn record_test_hit(
     nearest: &mut BTreeMap<String, (usize, BTreeSet<String>)>,
+    test_symbols: &std::collections::HashSet<String>,
     symbol: &str,
     file: &str,
     depth: usize,
 ) {
-    if !is_test_path(file) {
+    if !is_test_path(file) && !test_symbols.contains(symbol) {
         return;
     }
     let entry = nearest
