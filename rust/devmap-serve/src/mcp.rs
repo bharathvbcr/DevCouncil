@@ -2343,7 +2343,9 @@ fn discover_result() -> Value {
 
 /// Guidance handed to the model on connect. One copy, used by both eras.
 const INSTRUCTIONS: &str = "Ask the DevMap code graph before reading files. Prefer the devmap_* \
-tools over GitNexus or grep for callers, blast radius, traces and dead code. Always pass \
+tools over GitNexus or grep for callers, blast radius, traces and dead code; for a behaviour whose \
+name you do not know, start with devmap_ask_evidence, which returns the ranked files, their source \
+and the tests that reach them in one answer. Always pass \
 `repo_path` (the absolute repository path) on every `devmap_*` call, and check `repository.root` \
 in the envelope before trusting the answer — Cursor shares one MCP process across workspace \
 tabs. Every answer is budgeted and reports what it withheld: check `truncated` and \

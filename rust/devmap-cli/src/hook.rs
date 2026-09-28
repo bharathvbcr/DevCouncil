@@ -736,7 +736,8 @@ fn is_unsafe_root(root: &Path) -> bool {
 /// names are the adoption lever, and the caveat is what keeps an empty answer
 /// from being read as proof of absence.
 const DEVMAP_DIRECTIVE: &str = "Ask DevMap before reading files: devmap_search, devmap_explore, \
-     devmap_impact, devmap_trace, devmap_affected_tests. Check truncated/walk_incomplete before \
+     devmap_ask_evidence (behaviour -> files, source and tests), devmap_impact, devmap_trace, \
+     devmap_affected_tests. Check truncated/walk_incomplete before \
      treating an empty list as \"does not exist\".";
 
 /// Longest per-repository clause. Bounds one repository's contribution so a
