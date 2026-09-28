@@ -25,7 +25,7 @@ runs:
         # Pinned to the sibling revision this tree was linked against.
         # Bump deliberately; tracking main would let a Gusset push fail a
         # DevCouncil release without a DevCouncil commit.
-        ref: b6f5200bfff4730e4e5268bead7e743d684cb67e
+        ref: 709c2b7b85be0de7c263471d933f395bb3b1b27f
         path: third_party/gusset
         persist-credentials: false
 
