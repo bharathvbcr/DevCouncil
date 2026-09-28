@@ -69,15 +69,18 @@ else
     echo "Check out https://github.com/bharathvbcr/gusset there. CI does this in .github/actions/setup-gusset." >&2
     exit 1
   fi
-  if [[ ! -f "$archive" ]]; then
-    echo "building gusset-engine release staticlib (libgusset.a is not in git)"
-    cargo build --release --locked --manifest-path gusset-engine/Cargo.toml
-  fi
-  if [[ ! -f "$archive" ]]; then
-    echo "GATE FAIL: $archive is missing after cargo build --release --locked" >&2
+  # Always the incremental build, never "only when missing": that linked
+  # whatever archive an older checkout left behind. cgo-env.sh also keys Go's
+  # caches on the archive's hash, without which a rebuilt archive is not
+  # relinked and a cached test result is replayed against the old one.
+  echo "building gusset-engine release staticlib (libgusset.a is not in git)"
+  eval "$(gusset-engine/cgo-env.sh --export)" || {
+    echo "GATE FAIL: gusset-engine/cgo-env.sh could not build $archive" >&2
     exit 1
-  fi
+  }
   go -C ../backend/go_orchestrator build -o bin/ ./cmd/devcouncil
+  go -C ../backend/go_orchestrator test -count=1 ./gussetfn
+  ../backend/go_orchestrator/bin/devcouncil gusset-check
 fi
 
 step "3/9 tests"

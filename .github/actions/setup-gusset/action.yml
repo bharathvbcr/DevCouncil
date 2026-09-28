@@ -25,7 +25,7 @@ runs:
         # Pinned to the sibling revision this tree was linked against.
         # Bump deliberately; tracking main would let a Gusset push fail a
         # DevCouncil release without a DevCouncil commit.
-        ref: 7a56c3c98d026b4e445f687140c90d70755e8590
+        ref: b6f5200bfff4730e4e5268bead7e743d684cb67e
         path: third_party/gusset
         persist-credentials: false
 
@@ -102,3 +102,8 @@ runs:
           cargo build --release --locked
         fi
         test -f target/release/libgusset.a
+        # Key Go's build and test caches on the archive (see cgo-env.sh):
+        # setup-go restores GOCACHE, and without this a cached link or a
+        # cached "ok" from an older archive is replayed.
+        # The -L is already in gussetfn/engine.go; only the key is needed here.
+        ./cgo-env.sh --no-build | grep -v "^CGO_LDFLAGS=" >> "$GITHUB_ENV"
