@@ -32,6 +32,15 @@ impl std::fmt::Display for StoreRefusal {
 
 impl std::error::Error for StoreRefusal {}
 
+/// Held while a read-only connection opens and makes its first read, the
+/// moment it maps the WAL index. Concurrent read-only connections in one
+/// process setting that up together livelocked on Windows: every one of them
+/// got SQLITE_PROTOCOL for as long as they kept retrying, and no read-write
+/// connection was there to finish the index for them
+/// (`concurrent_readers_cannot_enqueue_writer_work`). Serialised, the first
+/// sets it up and the rest find it ready. Reads after that run concurrently.
+static READ_ONLY_SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn refusal(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
 }
@@ -3195,12 +3204,17 @@ impl Store {
             )));
         }
         let _sidecars = Self::checked_sidecars(path)?;
+        let setup = READ_ONLY_SETUP
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut conn = Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(Self::BUSY_TIMEOUT)?;
-        let stamped: i32 = match conn.query_row("PRAGMA user_version", [], |row| row.get(0)) {
+        let first_read = conn.query_row("PRAGMA user_version", [], |row| row.get(0));
+        drop(setup);
+        let stamped: i32 = match first_read {
             Ok(version) => version,
             Err(error) if path.is_file() && Self::directory_refused_the_wal(&error) => {
                 conn = Self::open_immutable(path)?;
