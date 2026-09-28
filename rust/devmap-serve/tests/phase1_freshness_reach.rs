@@ -230,7 +230,8 @@ async fn concurrent_status_while_store_deleted_mid_session_fails_closed() {
             "removing the store failed: {error}"
         );
         assert!(store_path.is_file(), "a refused delete leaves the store");
-        slot.get().expect("the store the delete could not touch still serves");
+        slot.get()
+            .expect("the store the delete could not touch still serves");
         return;
     }
     let err = match slot.get() {

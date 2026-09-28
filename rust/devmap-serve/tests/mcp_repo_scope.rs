@@ -619,6 +619,7 @@ async fn two_spellings_of_one_case_insensitive_path_open_one_canonical_root() {
     );
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn windows_file_uri_is_rejected_not_reinterpreted() {
     let unix = scratch("uri-unix");
@@ -919,7 +920,9 @@ async fn roots_list_error_keeps_the_previous_good_list() {
 #[test]
 fn parse_roots_list_caps_at_max_and_reports_overflow() {
     let roots: Vec<Value> = (0..200)
-        .map(|i| json!({"uri": format!("file:///tmp/devmap-overflow-{i}")}))
+        // In the host's own spelling: a Windows server refuses a drive-less
+        // `file:///tmp/...` as a unix path, which left nothing to cap.
+        .map(|i| json!({"uri": file_uri(&std::env::temp_dir().join(format!("devmap-overflow-{i}")))}))
         .collect();
     let (paths, _skipped, overflow) =
         devmap_serve::mcp::parse_roots_list_result(&json!({"roots": roots}));
@@ -929,4 +932,29 @@ fn parse_roots_list_caps_at_max_and_reports_overflow() {
         "parse must cap at MAX_ROOTS"
     );
     assert_eq!(overflow, 200 - devmap_serve::root_resolve::MAX_ROOTS);
+}
+
+/// The same rule from the other side: a Windows server does not resolve a
+/// drive-less unix path against its current drive.
+#[cfg(windows)]
+#[tokio::test]
+async fn unix_file_uri_is_rejected_not_reinterpreted_on_windows() {
+    let native = scratch("uri-native");
+    plant_store(&native);
+    let slot = Arc::new(StoreSlot::resolving(None, native.clone(), None));
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": ROOTS_LIST_REQUEST_ID,
+        "result": {
+            "roots": [{"uri": "file:///Users/nobody/project"}]
+        }
+    });
+    assert!(handle_line(&slot, &response.to_string()).await.is_none());
+    assert!(
+        !slot
+            .candidate_roots()
+            .iter()
+            .any(|root| root.to_string_lossy().contains("nobody")),
+        "a unix URI must not become a root on Windows"
+    );
 }
