@@ -6,6 +6,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+/// Whether `text` names `path` in a spelling the platform gives it: as
+/// written, or canonical. Windows canonicalises to a `\\?\` verbatim path
+/// with long names where the temp dir used 8.3 short ones (`RUNNER~1`), and
+/// macOS to `/private/var` for `/var`; every one is the same directory.
+fn names(text: &str, path: &std::path::Path) -> bool {
+    if text.contains(&path.display().to_string()) {
+        return true;
+    }
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    let shown = canonical.display().to_string();
+    text.contains(shown.strip_prefix(r"\\?\").unwrap_or(&shown))
+}
+
 fn scratch(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "devmap-cli-scope-{name}-{}-{}",
@@ -56,9 +71,11 @@ fn write_mcp(path: &Path, command: &str) {
     }
     std::fs::write(
         path,
-        format!(
-            r#"{{"mcpServers":{{"devmap":{{"type":"stdio","command":"{command}","args":["mcp"]}}}}}}"#
-        ),
+        // Built, not formatted: a Windows path spliced into a JSON literal is
+        // `"C:\Users\…"`, an invalid escape, and the host config it writes
+        // fails to parse — doctor then correctly reports nothing registered.
+        serde_json::json!({"mcpServers": {"devmap": {"type": "stdio", "command": command, "args": ["mcp"]}}})
+            .to_string(),
     )
     .unwrap();
 }
@@ -176,7 +193,7 @@ fn build_from_home_refuses_instead_of_indexing() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        combined.contains(&home.display().to_string()),
+        names(&combined, &home),
         "refusal must name the resolved root: {combined}"
     );
     let store = home
@@ -212,7 +229,7 @@ fn doctor_warns_when_a_host_config_names_a_missing_binary() {
         "a host config pointing at a path that is not a file must not look like a clean doctor: {payload}"
     );
     assert!(
-        warning.contains(&missing.display().to_string()) || warning.contains("no-such-devmap"),
+        names(warning, &missing) || warning.contains("no-such-devmap"),
         "warning must name the missing path: {warning}"
     );
     let skew = payload.get("binary_skew_warning");

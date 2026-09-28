@@ -177,11 +177,8 @@ pub fn validate_repo_path(raw: &str) -> Result<PathBuf, String> {
             raw.len()
         ));
     }
-    if looks_like_windows_path(raw) {
-        return Err(
-            "repo_path looks like a Windows path; this server only opens unix filesystem paths"
-                .into(),
-        );
+    if let Some(refusal) = foreign_path_refusal(raw) {
+        return Err(refusal.into());
     }
     let path = Path::new(raw);
     if !path.is_absolute() {
@@ -202,11 +199,58 @@ pub fn validate_repo_path(raw: &str) -> Result<PathBuf, String> {
     })
 }
 
-/// MCP `roots/list` URI → a unix filesystem path, or `None` to skip.
+/// Why `raw` is a path from the other platform, if it is.
 ///
-/// Windows-style (`file:///C:/…`) and non-file URIs are skipped rather than
-/// reinterpreted. Percent-decoding refuses invalid UTF-8 rather than using
-/// lossy replacement.
+/// A path is opened only in its host's own spelling, never reinterpreted: a
+/// unix server refuses `C:\…` and `/C:/…` rather than reading them as
+/// relative names or a `/C:` directory, and a Windows server refuses `/Users/…`
+/// rather than resolving it against the current drive. This used to be the
+/// unix rule on every host, so on Windows every native path was refused with a
+/// message saying the server "only opens unix filesystem paths".
+#[cfg(not(windows))]
+fn foreign_path_refusal(raw: &str) -> Option<&'static str> {
+    looks_like_windows_path(raw).then_some(
+        "repo_path looks like a Windows path; this server only opens unix filesystem paths",
+    )
+}
+
+#[cfg(windows)]
+fn foreign_path_refusal(raw: &str) -> Option<&'static str> {
+    // `\\server\share`, `//server/share` and `\\?\C:\…` are native; a single
+    // leading slash is a unix path with no drive.
+    let unix_style = raw.starts_with('/') && !raw.starts_with("//");
+    unix_style.then_some(
+        "repo_path looks like a unix path; this server only opens Windows paths with a drive or UNC share",
+    )
+}
+
+/// MCP `roots/list` URI → a path on this host, or `None` to skip.
+///
+/// On unix, Windows-style (`file:///C:/…`) and non-file URIs are skipped
+/// rather than reinterpreted. On Windows, only `file:///<drive>:/…` is taken,
+/// and a drive-less URI (`file:///Users/…`) is skipped. Percent-decoding
+/// refuses invalid UTF-8 rather than using lossy replacement.
+#[cfg(windows)]
+pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // `file://localhost/C:/…` names the same file as `file:///C:/…`; any other
+    // authority is a remote host.
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let path = rest.strip_prefix('/')?;
+    let decoded = percent_decode_strict(path)?;
+    let bytes = decoded.as_bytes();
+    let drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\');
+    if !drive_absolute {
+        return None;
+    }
+    Some(PathBuf::from(decoded.replace('/', "\\")))
+}
+
+/// See the Windows variant above.
+#[cfg(not(windows))]
 pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let path = if let Some(rest) = uri.strip_prefix("file://") {
         if rest.starts_with('/') {
@@ -404,6 +448,21 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// Whether `text` names `path` in a spelling the platform gives it: as
+    /// written, or canonical. Windows canonicalises to a `\\?\` verbatim path
+    /// with long names where the temp dir used 8.3 short ones (`RUNNER~1`), and
+    /// macOS to `/private/var` for `/var`; every one is the same directory.
+    fn names(text: &str, path: &std::path::Path) -> bool {
+        if text.contains(&path.display().to_string()) {
+            return true;
+        }
+        let Ok(canonical) = path.canonicalize() else {
+            return false;
+        };
+        let shown = canonical.display().to_string();
+        text.contains(shown.strip_prefix(r"\\?\").unwrap_or(&shown))
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "devmap-root-resolve-{name}-{}-{}",
@@ -443,11 +502,11 @@ mod tests {
         .resolve()
         .expect_err("cwd store and MCP-root store must not first-wins");
         assert!(
-            err.contains(&via_root.display().to_string()),
+            names(&err, &via_root),
             "error must name the MCP root: {err}"
         );
         assert!(
-            err.contains(&via_cwd.display().to_string()),
+            names(&err, &via_cwd),
             "error must name the cwd/--root repository: {err}"
         );
         assert!(
@@ -637,12 +696,9 @@ mod tests {
         }
         .resolve()
         .expect_err("two stores must not first-wins");
+        assert!(names(&err, &first), "error must name the first root: {err}");
         assert!(
-            err.contains(&first.display().to_string()),
-            "error must name the first root: {err}"
-        );
-        assert!(
-            err.contains(&second.display().to_string()),
+            names(&err, &second),
             "error must name the second root: {err}"
         );
         assert!(
@@ -653,6 +709,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn windows_file_uri_is_not_reinterpreted_as_a_unix_path() {
         assert!(file_uri_to_path("file:///C:/Users/nobody/project").is_none());
@@ -676,5 +733,39 @@ mod tests {
             file_uri_to_path("file:/Users/example/project").is_none(),
             "a single-slash file: URI is not a unix path"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_unix_file_uri_is_not_reinterpreted_on_windows() {
+        assert_eq!(
+            file_uri_to_path("file:///C:/Users/example/project").unwrap(),
+            PathBuf::from(r"C:\Users\example\project")
+        );
+        assert_eq!(
+            file_uri_to_path("file://localhost/D:/src/a%20b").unwrap(),
+            PathBuf::from(r"D:\src\a b")
+        );
+        assert!(
+            file_uri_to_path("file:///Users/example/project").is_none(),
+            "a drive-less URI must not resolve against the current drive"
+        );
+        assert!(file_uri_to_path("file://example.com/C:/x").is_none());
+        assert!(file_uri_to_path("file:///C:/tmp/foo%00bar").is_none());
+        assert!(file_uri_to_path("https://example.com/repo").is_none());
+    }
+
+    #[test]
+    fn repo_path_is_refused_in_the_other_platform_s_spelling() {
+        #[cfg(not(windows))]
+        let (foreign, marker) = (r"C:\Users\nobody\project", "Windows path");
+        #[cfg(windows)]
+        let (foreign, marker) = ("/Users/nobody/project", "unix path");
+        let err = validate_repo_path(foreign).expect_err("a foreign path must be refused");
+        assert!(err.contains(marker), "{err}");
+        // And a real directory in this host's own spelling opens.
+        let here = scratch("native-spelling");
+        let opened = validate_repo_path(here.to_str().unwrap()).expect("native path opens");
+        assert_eq!(opened, here.canonicalize().unwrap());
     }
 }

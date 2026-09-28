@@ -154,25 +154,33 @@ fn the_fanout_metric_matches_a_hand_counted_corpus() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // The shell gates do not use rusqlite. They run `tools/fanout.sh`, which
-    // is whatever `sqlite3` is on PATH. Apple's CLI `-readonly` cannot open
-    // this store; the script must still return the same row.
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/fanout.sh");
-    let shell = Command::new("bash")
-        .arg(&script)
-        .arg(&db)
-        .output()
-        .expect("fanout.sh");
-    assert!(
-        shell.status.success(),
-        "fanout.sh failed: {}",
-        String::from_utf8_lossy(&shell.stderr)
-    );
-    let shell_line = String::from_utf8(shell.stdout).expect("fanout.sh stdout is utf-8");
-    assert!(
-        shell_line.contains(&format!("fanout_edges={EXPECTED_EDGES}")),
-        "fanout.sh row did not match the hand count: {shell_line}"
-    );
+    // The shell half runs where its consumers do: `verify.sh` and
+    // `memory_model_probe.sh` are unix shell gates. On a Windows runner a bare
+    // `bash` is the WSL launcher, which exits non-zero with nothing on stderr
+    // when no distribution is installed. Everything below this block checks
+    // the same numbers through rusqlite and runs everywhere.
+    #[cfg(unix)]
+    {
+        // The shell gates do not use rusqlite. They run `tools/fanout.sh`, which
+        // is whatever `sqlite3` is on PATH. Apple's CLI `-readonly` cannot open
+        // this store; the script must still return the same row.
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/fanout.sh");
+        let shell = Command::new("bash")
+            .arg(&script)
+            .arg(&db)
+            .output()
+            .expect("fanout.sh");
+        assert!(
+            shell.status.success(),
+            "fanout.sh failed: {}",
+            String::from_utf8_lossy(&shell.stderr)
+        );
+        let shell_line = String::from_utf8(shell.stdout).expect("fanout.sh stdout is utf-8");
+        assert!(
+            shell_line.contains(&format!("fanout_edges={EXPECTED_EDGES}")),
+            "fanout.sh row did not match the hand count: {shell_line}"
+        );
+    }
 
     let f = fanout(&db);
 
