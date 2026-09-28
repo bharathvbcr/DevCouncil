@@ -451,11 +451,16 @@ func TestAnAreaIsFoundWithoutWalkingEveryIndexedFile(t *testing.T) {
 	// be work rather than memory: the miss is timed against a map eight times
 	// larger holding the same areas. A scan of the path table grows with it; a
 	// set lookup does not.
-	small, large := build(256), build(2048)
+	//
+	// The gap is 32x the files against a bound of 8x. It was 8x against 3x,
+	// and shared macOS runners measured 3.4x and 7.4x for a lookup that never
+	// touches the file table: scheduler noise alone crossed a bound that left
+	// no room for it. A scan still reads about 32x and fails by a wide margin.
+	small, large := build(256), build(256*32)
 	const probe = "elsewhere/entirely/deep/enough/x.go"
 	ratio := pairedLookupRatio(small, large, probe)
-	if ratio > 3 {
-		t.Fatalf("resolving one path took %.1fx longer against 8x the files; the lookup is "+
+	if ratio > 8 {
+		t.Fatalf("resolving one path took %.1fx longer against 32x the files; the lookup is "+
 			"walking the path table rather than consulting the set of areas", ratio)
 	}
 }
@@ -467,7 +472,7 @@ func TestAnAreaIsFoundWithoutWalkingEveryIndexedFile(t *testing.T) {
 // pause looks like the large map scanning the path table. Pairing them
 // measures both under the same load, and alternating which runs first
 // cancels a drift across the pair. A real scan of 8x the files is still
-// about 8x on every pair, so the median stays over the bound.
+// about 32x on every pair, so the median stays over the bound.
 func pairedLookupRatio(small, large *Map, probe string) float64 {
 	const rounds = 9
 	ratios := make([]float64, 0, rounds)
