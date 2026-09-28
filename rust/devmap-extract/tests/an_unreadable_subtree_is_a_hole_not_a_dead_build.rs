@@ -88,6 +88,9 @@ fn a_directory_the_walker_cannot_open_is_a_refusal_and_the_rest_is_indexed() {
     .unwrap();
     fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
     let _restore = Unreadable(root.join("locked"));
+    if !restriction_holds(root.join("locked")) {
+        return;
+    }
 
     let (sources, report) = match collect_sources_with_report(&root) {
         Ok(answer) => answer,
@@ -158,6 +161,9 @@ fn a_root_that_cannot_be_opened_is_still_an_error() {
     fs::write(locked.join("a.py"), "def a():\n    return 1\n").unwrap();
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
     let _restore = Unreadable(locked.clone());
+    if !restriction_holds(&locked) {
+        return;
+    }
     assert!(
         collect_sources_with_report(&locked).is_err(),
         "a root this process cannot open must fail rather than report an empty \
@@ -221,6 +227,9 @@ fn go_module_discovery_steps_over_a_subtree_it_cannot_open() {
     fs::write(root.join("locked/go.mod"), "module example.com/hidden\n").unwrap();
     fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
     let _restore = Unreadable(root.join("locked"));
+    if !restriction_holds(root.join("locked")) {
+        return;
+    }
 
     let modules = devmap_extract::collect_go_modules(&root).unwrap_or_else(|error| {
         panic!(
@@ -244,4 +253,46 @@ fn go_module_discovery_still_fails_on_a_root_it_cannot_open() {
         devmap_extract::collect_go_modules(&missing).is_err(),
         "a missing root must fail rather than report a repository with no Go modules"
     );
+}
+
+/// Whether the mode bits just set actually refuse this process.
+///
+/// Root, and filesystems that ignore mode bits, read through `0o000` and write
+/// through read-only, and then the condition this test builds cannot exist.
+/// The test says so on stderr and stops rather than failing on its
+/// environment; wherever the restriction holds, every assertion runs.
+#[cfg(unix)]
+fn restriction_holds(path: impl AsRef<std::path::Path>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = path.as_ref();
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    let refused = if mode & 0o444 == 0 {
+        if meta.is_dir() {
+            std::fs::read_dir(path).is_err()
+        } else {
+            std::fs::File::open(path).is_err()
+        }
+    } else if meta.is_dir() {
+        let probe = path.join(".devmap-permission-probe");
+        match std::fs::File::create(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                false
+            }
+            Err(_) => true,
+        }
+    } else {
+        std::fs::OpenOptions::new().append(true).open(path).is_err()
+    };
+    if !refused {
+        eprintln!(
+            "skipped: mode {mode:o} on {} does not refuse this process (running as root?); \
+             the condition this test needs cannot be built here",
+            path.display()
+        );
+    }
+    refused
 }

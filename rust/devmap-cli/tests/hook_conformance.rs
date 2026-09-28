@@ -578,6 +578,11 @@ fn pinned_root_disables_discovery() {
     let pinned = scratch("pin-locked");
     seed_store(&pinned);
     make_undetachable(&pinned);
+    #[cfg(unix)]
+    if !restriction_holds(pinned.join(".devcouncil/codeintel")) {
+        make_detachable(&pinned);
+        return;
+    }
     let run = run_hook(
         "post-tool-use",
         payload.as_bytes(),
@@ -1896,4 +1901,46 @@ fn post_tool_use_blast_names_why_the_list_is_short() {
     assert_ne!(two.code, Some(2));
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Whether the mode bits just set actually refuse this process.
+///
+/// Root, and filesystems that ignore mode bits, read through `0o000` and write
+/// through read-only, and then the condition this test builds cannot exist.
+/// The test says so on stderr and stops rather than failing on its
+/// environment; wherever the restriction holds, every assertion runs.
+#[cfg(unix)]
+fn restriction_holds(path: impl AsRef<std::path::Path>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = path.as_ref();
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    let refused = if mode & 0o444 == 0 {
+        if meta.is_dir() {
+            std::fs::read_dir(path).is_err()
+        } else {
+            std::fs::File::open(path).is_err()
+        }
+    } else if meta.is_dir() {
+        let probe = path.join(".devmap-permission-probe");
+        match std::fs::File::create(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                false
+            }
+            Err(_) => true,
+        }
+    } else {
+        std::fs::OpenOptions::new().append(true).open(path).is_err()
+    };
+    if !refused {
+        eprintln!(
+            "skipped: mode {mode:o} on {} does not refuse this process (running as root?); \
+             the condition this test needs cannot be built here",
+            path.display()
+        );
+    }
+    refused
 }

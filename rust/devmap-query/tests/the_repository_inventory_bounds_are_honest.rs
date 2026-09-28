@@ -198,6 +198,10 @@ fn a_manifest_that_could_not_be_read_is_named_not_dropped() {
         std::fs::Permissions::from_mode(0o000),
     )
     .unwrap();
+    if !restriction_holds(root.join("package.json")) {
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
 
     let scanned = inventory::scan(&root);
     assert!(scanned.computed);
@@ -358,6 +362,10 @@ fn unreadable_directory_is_reported_in_inventory() {
     std::fs::create_dir(&blocked).unwrap();
     std::fs::write(blocked.join("Cargo.toml"), "[package]\nname = 'nested'\n").unwrap();
     std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if !restriction_holds(&blocked) {
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
     let scanned = inventory::scan(&root);
     std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::remove_dir_all(root).unwrap();
@@ -450,6 +458,10 @@ fn unreadable_git_paths_and_failed_git_inventory_cannot_claim_complete() {
         .unwrap()
         .success());
     std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if !restriction_holds(&blocked) {
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
     let scanned = inventory::scan(&root);
     std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
@@ -464,4 +476,46 @@ fn unreadable_git_paths_and_failed_git_inventory_cannot_claim_complete() {
     assert!(!scanned.is_complete());
     assert!(!scanned.unavailable_reason.is_empty());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Whether the mode bits just set actually refuse this process.
+///
+/// Root, and filesystems that ignore mode bits, read through `0o000` and write
+/// through read-only, and then the condition this test builds cannot exist.
+/// The test says so on stderr and stops rather than failing on its
+/// environment; wherever the restriction holds, every assertion runs.
+#[cfg(unix)]
+fn restriction_holds(path: impl AsRef<std::path::Path>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = path.as_ref();
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    let refused = if mode & 0o444 == 0 {
+        if meta.is_dir() {
+            std::fs::read_dir(path).is_err()
+        } else {
+            std::fs::File::open(path).is_err()
+        }
+    } else if meta.is_dir() {
+        let probe = path.join(".devmap-permission-probe");
+        match std::fs::File::create(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                false
+            }
+            Err(_) => true,
+        }
+    } else {
+        std::fs::OpenOptions::new().append(true).open(path).is_err()
+    };
+    if !refused {
+        eprintln!(
+            "skipped: mode {mode:o} on {} does not refuse this process (running as root?); \
+             the condition this test needs cannot be built here",
+            path.display()
+        );
+    }
+    refused
 }
