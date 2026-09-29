@@ -157,22 +157,34 @@ fn the_fanout_metric_matches_a_hand_counted_corpus() {
     // The shell gates do not use rusqlite. They run `tools/fanout.sh`, which
     // is whatever `sqlite3` is on PATH. Apple's CLI `-readonly` cannot open
     // this store; the script must still return the same row.
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/fanout.sh");
-    let shell = Command::new("bash")
-        .arg(&script)
-        .arg(&db)
-        .output()
-        .expect("fanout.sh");
-    assert!(
-        shell.status.success(),
-        "fanout.sh failed: {}",
-        String::from_utf8_lossy(&shell.stderr)
-    );
-    let shell_line = String::from_utf8(shell.stdout).expect("fanout.sh stdout is utf-8");
-    assert!(
-        shell_line.contains(&format!("fanout_edges={EXPECTED_EDGES}")),
-        "fanout.sh row did not match the hand count: {shell_line}"
-    );
+    //
+    // The script needs the `sqlite3` CLI. Where it is missing the shell half
+    // cannot run, and says so; the rusqlite half below still checks the same
+    // number. CI must have it: there a missing `sqlite3` fails the test rather
+    // than quietly dropping the gate's own check.
+    let sqlite3 = Command::new("sqlite3").arg("--version").output().is_ok();
+    if sqlite3 {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/fanout.sh");
+        let shell = Command::new("bash")
+            .arg(&script)
+            .arg(&db)
+            .output()
+            .expect("fanout.sh");
+        assert!(
+            shell.status.success(),
+            "fanout.sh failed: {}",
+            String::from_utf8_lossy(&shell.stderr)
+        );
+        let shell_line = String::from_utf8(shell.stdout).expect("fanout.sh stdout is utf-8");
+        assert!(
+            shell_line.contains(&format!("fanout_edges={EXPECTED_EDGES}")),
+            "fanout.sh row did not match the hand count: {shell_line}"
+        );
+    } else if std::env::var_os("CI").is_some() {
+        panic!("sqlite3 is not on PATH; the verify.sh fan-out gate cannot run in CI without it");
+    } else {
+        eprintln!("skipped the fanout.sh half: sqlite3 is not on PATH");
+    }
 
     let f = fanout(&db);
 

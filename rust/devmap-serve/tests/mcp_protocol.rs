@@ -75,7 +75,7 @@ fn every_declared_tool_maps_to_a_command() {
     let specs = tool_specs();
     assert_eq!(
         specs.len(),
-        15,
+        16,
         "the tool surface changed; update this count"
     );
     for spec in &specs {
@@ -86,7 +86,7 @@ fn every_declared_tool_maps_to_a_command() {
         let arguments = match name {
             "devmap_status" | "devmap_dead_symbols" | "devmap_clones" => json!({}),
             "devmap_search" => json!({"query": "helper"}),
-            "devmap_ask" => json!({"query": "cache freshness"}),
+            "devmap_ask" | "devmap_ask_evidence" => json!({"query": "cache freshness"}),
             "devmap_skeleton" => json!({"file": "core.py"}),
             "devmap_dependencies" | "devmap_impact" => json!({"target": "core.py"}),
             "devmap_trace" => json!({"from": "helper"}),
@@ -747,5 +747,54 @@ async fn tools_list_carries_its_cache_hint_on_the_shared_dispatcher() {
     assert!(
         pinged["result"].get("ttlMs").is_none(),
         "ping is not cacheable and must not be advertised as such: {pinged}"
+    );
+}
+
+/// `devmap_ask_evidence` answers the same hits as `devmap_ask`, grouped by
+/// file, with the call edge between them joined in.
+#[tokio::test]
+async fn ask_evidence_groups_the_ask_hits_by_file_with_their_call_edges() {
+    let store = corpus();
+    // The pack holds a quarter of its budget for related tests.
+    let ask = call(
+        &store,
+        "devmap_ask",
+        json!({"query": "helper run rows", "budget": 1500}),
+    )
+    .await;
+    let pack = call(
+        &store,
+        "devmap_ask_evidence",
+        json!({"query": "helper run rows", "budget": 2000}),
+    )
+    .await;
+    assert_eq!(pack["result"]["isError"], json!(false), "{pack}");
+    let ask = &ask["result"]["structuredContent"];
+    let pack = &pack["result"]["structuredContent"];
+    for field in ["shown", "hidden", "total", "truncated"] {
+        assert_eq!(pack[field], ask[field], "{field} must be ask's");
+    }
+
+    let files = pack["files"].as_array().expect("files");
+    let units: Vec<&Value> = files
+        .iter()
+        .flat_map(|file| file["units"].as_array().expect("units"))
+        .collect();
+    assert_eq!(units.len(), ask["items"].as_array().expect("items").len());
+    assert!(files.iter().all(|file| file["role"] == "implementation"));
+
+    let run = units
+        .iter()
+        .find(|unit| unit["symbol_name"] == "run")
+        .unwrap_or_else(|| panic!("run is a hit: {pack}"));
+    let helper = units
+        .iter()
+        .find(|unit| unit["symbol_name"] == "helper")
+        .unwrap_or_else(|| panic!("helper is a hit: {pack}"));
+    assert_eq!(run["calls"], json!([helper["qualified_name"]]), "{pack}");
+    assert_eq!(
+        helper["called_by"],
+        json!([run["qualified_name"]]),
+        "{pack}"
     );
 }

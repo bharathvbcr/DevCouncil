@@ -226,6 +226,39 @@ fn spawn_with_retry(
     unreachable!("the final attempt always returns")
 }
 
+/// Spawn `command` as the leader of a process group of its own, for a child
+/// the caller drives interactively.
+///
+/// [`run_bounded`] runs a command to completion; a language server answers
+/// many requests over one session and cannot go through it. Such a caller owns
+/// its own deadline, and this gives it the half of the runner's discipline
+/// that does not depend on running to completion: the child leads its group,
+/// so [`kill_group`] reaches everything it started. Pipes, stdin and the
+/// deadline are the caller's to set.
+pub fn spawn_group(command: &mut Command) -> std::io::Result<std::process::Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command.spawn()
+}
+
+/// `SIGKILL` the process group a [`spawn_group`] child leads, then reap the
+/// child. Safe to call more than once.
+///
+/// A child that has already exited is only reaped, never signalled by group:
+/// once reaped its pid is free for reuse, and a negated stale pid could name
+/// somebody else's group. Descendants of a leader that exited on its own are
+/// the one case this cannot reach.
+pub fn kill_group(child: &mut std::process::Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    kill_descendants(child);
+    let _ = child.wait();
+}
+
 /// Run `command` to completion within `bounds`.
 ///
 /// `stdin`, `stdout` and `stderr` are set here; anything the caller configured

@@ -807,7 +807,13 @@ fn a_read_only_store_serves_the_same_edges() {
     fs::set_permissions(&db, perms).unwrap();
     let mut dir_perms = fs::metadata(&dir).unwrap().permissions();
     dir_perms.set_readonly(true);
-    fs::set_permissions(&dir, dir_perms).unwrap();
+    fs::set_permissions(&dir, dir_perms.clone()).unwrap();
+    if !restriction_holds(&db) {
+        #[allow(clippy::permissions_set_readonly_false)]
+        dir_perms.set_readonly(false);
+        let _ = fs::set_permissions(&dir, dir_perms);
+        return;
+    }
 
     let readonly = Store::open(&db).unwrap();
     assert!(readonly.is_read_only(), "the fixture must be read-only");
@@ -951,4 +957,46 @@ fn a_writer_killed_between_closing_and_inserting_leaves_every_edge_servable() {
         "a killed close left rows ended that nothing ended"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Whether the mode bits just set actually refuse this process.
+///
+/// Root, and filesystems that ignore mode bits, read through `0o000` and write
+/// through read-only, and then the condition this test builds cannot exist.
+/// The test says so on stderr and stops rather than failing on its
+/// environment; wherever the restriction holds, every assertion runs.
+#[cfg(unix)]
+fn restriction_holds(path: impl AsRef<std::path::Path>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = path.as_ref();
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    let refused = if mode & 0o444 == 0 {
+        if meta.is_dir() {
+            std::fs::read_dir(path).is_err()
+        } else {
+            std::fs::File::open(path).is_err()
+        }
+    } else if meta.is_dir() {
+        let probe = path.join(".devmap-permission-probe");
+        match std::fs::File::create(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                false
+            }
+            Err(_) => true,
+        }
+    } else {
+        std::fs::OpenOptions::new().append(true).open(path).is_err()
+    };
+    if !refused {
+        eprintln!(
+            "skipped: mode {mode:o} on {} does not refuse this process (running as root?); \
+             the condition this test needs cannot be built here",
+            path.display()
+        );
+    }
+    refused
 }

@@ -378,6 +378,16 @@ pub enum IpcCommand {
         #[serde(default = "default_ask_confidence")]
         min_confidence: f32,
     },
+    /// [`Self::Ask`], answered as an evidence pack: the same hits grouped by
+    /// file with a role, the call edges between hits, and nested source
+    /// folded into the hit that shows it.
+    AskEvidence {
+        query: String,
+        #[serde(default = "default_budget")]
+        budget: u32,
+        #[serde(default = "default_ask_confidence")]
+        min_confidence: f32,
+    },
     Deps {
         target: String,
         #[serde(default = "default_budget")]
@@ -717,6 +727,11 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
             query,
             budget,
             min_confidence,
+        }
+        | IpcCommand::AskEvidence {
+            query,
+            budget,
+            min_confidence,
         } => (query.as_str(), *budget, 1, Some(*min_confidence)),
         IpcCommand::Deps {
             target,
@@ -1046,6 +1061,15 @@ pub(crate) fn dispatch(
             budget,
             min_confidence,
         } => Ok(serde_json::to_value(engine.ask(
+            &query,
+            budget,
+            min_confidence,
+        )?)?),
+        IpcCommand::AskEvidence {
+            query,
+            budget,
+            min_confidence,
+        } => Ok(serde_json::to_value(engine.ask_evidence(
             &query,
             budget,
             min_confidence,

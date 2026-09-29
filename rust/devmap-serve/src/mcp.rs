@@ -620,8 +620,15 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// only kill.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A response must acquire its writer and reach the peer within this bound.
+/// A response must reach the peer within this bound once it holds the writer.
 /// A stopped reader must not retain every admission permit indefinitely.
+///
+/// The bound covers the write and flush, not the wait for the writer lock.
+/// Queueing behind other responses is not a stuck peer: a pipelined burst of
+/// ten thousand requests queued some responses past 5s on a busy machine while
+/// every write was instant, and the "timeout" ended a healthy session. A stuck
+/// peer is still bounded: the holder's write times out, leaves the stream
+/// marked failed, and every waiter then refuses at once.
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Requests one connection may have outstanding at once.
@@ -830,6 +837,7 @@ const TOOLS: &[(&str, &str)] = &[
     ("devmap_status", "status"),
     ("devmap_search", "search"),
     ("devmap_ask", "ask"),
+    ("devmap_ask_evidence", "ask_evidence"),
     ("devmap_dependencies", "deps"),
     ("devmap_impact", "impact"),
     ("devmap_trace", "trace"),
@@ -978,6 +986,31 @@ a name. A query that shares no terms with any name or docstring returns nothing 
 corpus at zero. Default `min_confidence` is the deterministic rung; lower it to include weaker \
 edges. When every edge among the seeds sits below the floor, the answer is empty with a line that \
 says the matches were withheld for confidence rather than absent.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "maxLength": 4096,
+                        "description": "A plain-language question or description of behaviour."},
+                    "budget": budget_prop(2000),
+                    "min_confidence": confidence_prop_defaulting(devmap_query::ASK_DEFAULT_MIN_CONFIDENCE)
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        ),
+        "ask_evidence" => (
+            "The `devmap_ask` answer shaped for reading, so the first reads are already done. \
+Three quarters of `budget` go to the hits, in `devmap_ask`'s order; a hit whose lines an earlier \
+hit already prints costs only its lead, so the pack holds every hit `devmap_ask` would at that \
+budget and sometimes more. A quarter goes to `related_tests`: test files that reach the implementation hits over \
+inbound call edges (depth 3), nearest first. The hits are grouped into `files` in rank \
+order. Each unit has a `role`: `test` when its file is a test path or a test runner invokes it (`#[test]`, \
+pytest `test_*`, JUnit `@Test`), else `implementation`; a file is `test` when its path is or all its \
+units are. Each file lists its `units` in line order: \
+the hit with its verbatim source, `qualified_name`, `calls` / `called_by` naming other hits joined \
+by admitted call edges at the same `min_confidence`, and `contained_in` when its lines are already \
+shown by an enclosing hit. Use it for a behaviour question in unfamiliar code; use `devmap_search` \
+for a known name.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1384,6 +1417,40 @@ fn describe_output(cmd: &str) -> Value {
             "Symbols matching a plain-language question, seeded by name/docstring TF-IDF and \
 re-ranked by personalized PageRank over call edges. Read `truncated` and `walk_incomplete`.",
         ),
+        "ask_evidence" => json!({
+            "type": "object",
+            "properties": {
+                "files": {"type": "array",
+                    "description": "Files in rank order. Each: `file_path`, `role` \
+        (`implementation` | `test`), `score` (its best unit's), and `units` in line order. A unit is a \
+        `devmap_ask` hit plus `qualified_name`, `role`, optional `calls` / `called_by` (other hits, over admitted \
+        call edges) and optional `contained_in` (the enclosing unit that shows its source; its own \
+        `source_span` is then empty)."},
+                "related_tests": {"type": "object",
+                    "description": "Test files reaching the implementation hits, as a budgeted \
+        envelope of its own (`items`, `shown`, `hidden`, `total`, `truncated`, `walk_incomplete`). Each \
+        item: `path`, `depth` (edges from the nearest hit), `symbols` reached (sampled) and \
+        `reached_symbols`. A reached symbol is a test by path or because a test runner invokes it; tests \
+        that are already hits are not repeated."},
+                "coverage_gap": {"type": ["string", "null"],
+                    "description": "Repository-wide attribution gap: how far `calls`, `called_by` and \
+        `related_tests` may fall short. Stated once; `related_tests.walk_incomplete` says only where that walk \
+        stopped."},
+                "shown": {"type": "integer", "description": "Hits present across `files`."},
+                "hidden": {"type": "integer",
+                    "description": "Hits the token budget withheld. Non-zero means this answer is a prefix."},
+                "total": {"type": "integer", "description": "shown + hidden."},
+                "truncated": {"type": "boolean"},
+                "tokens_used": {"type": "integer",
+                    "description": "The whole pack, after folding and including `related_tests`; never over `budget`."},
+                "resolution": {"type": ["string", "object"]},
+                "walk_incomplete": {"type": ["string", "null"],
+                    "description": "Present only when the producer stopped early; the answer is partial by an unknown amount."}
+            },
+            "required": ["files", "related_tests", "shown", "hidden", "total", "truncated",
+                "tokens_used", "resolution"],
+            "additionalProperties": true
+        }),
         "deps" => budgeted_envelope("Outbound edges from the target."),
         "impact" => budgeted_envelope("Symbols that reach the target, walked in reverse."),
         "trace" => budgeted_envelope("Call paths from the origin, or between the two endpoints."),
@@ -2288,7 +2355,9 @@ fn discover_result() -> Value {
 
 /// Guidance handed to the model on connect. One copy, used by both eras.
 const INSTRUCTIONS: &str = "Ask the DevMap code graph before reading files. Prefer the devmap_* \
-tools over GitNexus or grep for callers, blast radius, traces and dead code. Always pass \
+tools over GitNexus or grep for callers, blast radius, traces and dead code; for a behaviour whose \
+name you do not know, start with devmap_ask_evidence, which returns the ranked files, their source \
+and the tests that reach them in one answer. Always pass \
 `repo_path` (the absolute repository path) on every `devmap_*` call, and check `repository.root` \
 in the envelope before trusting the answer — Cursor shares one MCP process across workspace \
 tabs. Every answer is budgeted and reports what it withheld: check `truncated` and \
@@ -3532,9 +3601,10 @@ where
     let mut payload = serde_json::to_vec(frame)?;
     payload.push(b'\n');
     // The lock spans the write and the flush, so two concurrent responses cannot
-    // interleave their bytes into one unparseable line.
+    // interleave their bytes into one unparseable line. It is taken outside
+    // the deadline; see [`RESPONSE_WRITE_TIMEOUT`].
+    let mut writer = writer.lock().await;
     tokio::time::timeout(RESPONSE_WRITE_TIMEOUT, async {
-        let mut writer = writer.lock().await;
         anyhow::ensure!(
             !writer.failed,
             "MCP response stream failed on an earlier frame"

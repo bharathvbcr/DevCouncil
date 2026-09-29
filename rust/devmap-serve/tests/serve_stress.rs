@@ -1220,3 +1220,76 @@ async fn ten_thousand_pipelined_stdio_requests_stay_inside_the_ceiling() {
         started.elapsed()
     );
 }
+
+/// A peer that never accepts a byte.
+struct StalledSink;
+
+impl tokio::io::AsyncWrite for StalledSink {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Pending
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Pending
+    }
+}
+
+/// A stopped reader still ends the session in one write deadline, not one per
+/// queued response.
+///
+/// The write deadline no longer covers waiting for the writer lock, so a
+/// response queued behind a busy but healthy stream is not failed. What must
+/// survive that change is the bound on a *stuck* stream: the first writer times
+/// out holding the lock, the stream stays marked failed, and each response
+/// queued behind it refuses as soon as it gets the lock. Two hundred queued
+/// responses at five seconds each would be seventeen minutes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopped_reader_fails_the_session_in_one_deadline() {
+    const REQUESTS: u64 = 200;
+    let script: Vec<u8> = (0..REQUESTS)
+        .flat_map(|id| {
+            let mut line = tools_list(id).into_bytes();
+            line.push(b'\n');
+            line
+        })
+        .collect();
+    let started = Instant::now();
+    let served = tokio::time::timeout(
+        Duration::from_secs(60),
+        devmap_serve::mcp::serve_streams_with_admission(
+            corpus_slot(),
+            tokio::io::BufReader::new(Scripted {
+                bytes: script,
+                offset: 0,
+            }),
+            StalledSink,
+            devmap_serve::Admission::new(32),
+        ),
+    )
+    .await
+    .expect("a stopped reader must end the session, not hang it");
+    let error = served.expect_err("a peer that reads nothing cannot be served");
+    assert!(
+        error.to_string().contains("exceeded") || error.to_string().contains("failed"),
+        "{error:#}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "a stopped reader held the session for {:?}",
+        started.elapsed()
+    );
+}

@@ -555,6 +555,7 @@ async fn every_tool_result_conforms_to_the_output_schema_it_declared() {
         ("devmap_status", json!({})),
         ("devmap_search", json!({"query": "helper"})),
         ("devmap_ask", json!({"query": "helper"})),
+        ("devmap_ask_evidence", json!({"query": "helper"})),
         ("devmap_dependencies", json!({"target": "run"})),
         ("devmap_impact", json!({"target": "helper"})),
         ("devmap_trace", json!({"from": "run"})),

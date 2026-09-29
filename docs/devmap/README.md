@@ -468,7 +468,7 @@ diagnostics with the panel state and its existing rotating logs.
 | `devmap deps <file>` | What this file depends on |
 | `devmap trace <a> <b>` | A path between two symbols |
 | `devmap neighbors <targets…>` | Callers and callees for several targets at once |
-| `devmap affected <targets…>` | Test files the change reaches, nearest first |
+| `devmap affected <targets…>` | Files holding tests the change reaches, nearest first — test-path files, and runner-invoked tests (`#[test]`, pytest `test_*`, JUnit `@Test`) beside the code |
 | `devmap dead` | Dead-symbol candidates: confident vs unconfirmed, each with reason |
 | `devmap clones` | Duplicated and structurally similar bodies |
 | `devmap preview --file f --content -` | What an *unsaved* edit would break |
@@ -660,12 +660,31 @@ devmap serve .    # index over IPC, watching the tree for changes
 devmap mcp        # speak MCP on stdin/stdout, for an agent host
 ```
 
-`devmap mcp` publishes thirteen read-only tools: `devmap_status`, `devmap_search`,
-`devmap_dependencies`, `devmap_impact`, `devmap_trace`, `devmap_neighbors`,
-`devmap_dead_symbols`, `devmap_clones`, `devmap_preview`, `devmap_explore`,
-`devmap_affected_tests`, `devmap_blast` and `devmap_suspects`. Every one declares an
-`outputSchema`, and the server validates its own answers against the schema it
-published before emitting them.
+`devmap mcp` publishes sixteen read-only tools: `devmap_status`, `devmap_search`,
+`devmap_ask`, `devmap_ask_evidence`, `devmap_dependencies`, `devmap_impact`,
+`devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_skeleton`,
+`devmap_clones`, `devmap_preview`, `devmap_explore`, `devmap_affected_tests`,
+`devmap_blast` and `devmap_suspects`. Every one declares an `outputSchema`, and the
+server validates its own answers against the schema it published before emitting them.
+
+`devmap_ask_evidence` (CLI: `devmap ask --evidence`) is `devmap_ask` shaped for
+reading. Three quarters of the budget go to the hits, in `devmap_ask`'s order and
+grouped into files in rank order; a hit whose lines an earlier hit already prints
+costs only its lead, so the pack holds every hit `devmap_ask` would at that budget
+and sometimes more. Like `search`, it materialises at most 200 hits whatever the
+budget, since each one is a verified file read. Each hit carries its
+verbatim source, a `role` (`test` when its file is a test path or a test runner
+invokes it — `#[test]`, pytest `test_*`, JUnit `@Test` — else `implementation`), the
+other hits it `calls` or is `called_by` over admitted call edges, and `contained_in`
+when an enclosing hit already prints its lines. The last quarter goes to
+`related_tests`: tests that reach the implementation hits over inbound call edges
+(depth 3), including `#[test]` functions beside the code, nearest first. It reads no
+file beyond what `devmap_ask` reads, and `tokens_used` never exceeds the budget.
+The repository-wide attribution gap, which bounds how complete the call edges and
+related tests can be, is stated once as `coverage_gap`; `related_tests.walk_incomplete`
+says only where that walk stopped. A nested symbol's hit carries `source_indent`,
+the whitespace its first line had before the span began, so the source reads as
+the file has it.
 
 The last two join the graph to git and run in opposite directions.
 `devmap_blast` goes **forward** — these lines changed, what depends on them —

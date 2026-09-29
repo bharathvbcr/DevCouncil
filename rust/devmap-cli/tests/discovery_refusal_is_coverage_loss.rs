@@ -66,7 +66,8 @@ fn fixture(name: &str) -> PathBuf {
 
 /// `helper`'s only caller, made unreadable so discovery records a refusal.
 #[cfg(unix)]
-fn write_unreadable_caller(root: &Path) {
+/// Writes the fixture and reports whether the caller is really unreadable.
+fn write_unreadable_caller(root: &Path) -> bool {
     std::fs::write(root.join("lib.py"), "def helper():\n    return 42\n").unwrap();
     let app = root.join("app.py");
     std::fs::write(
@@ -77,6 +78,7 @@ fn write_unreadable_caller(root: &Path) {
     let mut perms = std::fs::metadata(&app).unwrap().permissions();
     perms.set_mode(0o000);
     std::fs::set_permissions(&app, perms).unwrap();
+    restriction_holds(&app)
 }
 
 #[cfg(unix)]
@@ -107,7 +109,9 @@ fn write_oversized_caller(root: &Path) {
 #[cfg(unix)]
 fn a_refused_file_degrades_the_graph_and_demotes_the_findings_it_could_not_check() {
     let root = fixture("audit");
-    write_unreadable_caller(&root);
+    if !write_unreadable_caller(&root) {
+        return;
+    }
 
     let build = json(&root, &["--json", "build", "."]);
     assert_eq!(
@@ -269,7 +273,9 @@ fn an_ordinary_non_source_file_is_not_a_refusal() {
 #[cfg(unix)]
 fn a_refusal_is_stable_across_rebuilds_and_a_readable_file_is_re_extracted() {
     let root = fixture("unchanged");
-    write_unreadable_caller(&root);
+    if !write_unreadable_caller(&root) {
+        return;
+    }
 
     let first = json(&root, &["--json", "build", "."]);
     assert_eq!(first["discovery_refused_files"], 1, "{first}");
@@ -412,4 +418,46 @@ fn a_build_whose_root_is_a_regular_file_is_refused_and_writes_nothing() {
         serde_json::Value::Null,
         "no generation may be written for a root that was never walked: {status}"
     );
+}
+
+/// Whether the mode bits just set actually refuse this process.
+///
+/// Root, and filesystems that ignore mode bits, read through `0o000` and write
+/// through read-only, and then the condition this test builds cannot exist.
+/// The test says so on stderr and stops rather than failing on its
+/// environment; wherever the restriction holds, every assertion runs.
+#[cfg(unix)]
+fn restriction_holds(path: impl AsRef<std::path::Path>) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = path.as_ref();
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    let refused = if mode & 0o444 == 0 {
+        if meta.is_dir() {
+            std::fs::read_dir(path).is_err()
+        } else {
+            std::fs::File::open(path).is_err()
+        }
+    } else if meta.is_dir() {
+        let probe = path.join(".devmap-permission-probe");
+        match std::fs::File::create(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                false
+            }
+            Err(_) => true,
+        }
+    } else {
+        std::fs::OpenOptions::new().append(true).open(path).is_err()
+    };
+    if !refused {
+        eprintln!(
+            "skipped: mode {mode:o} on {} does not refuse this process (running as root?); \
+             the condition this test needs cannot be built here",
+            path.display()
+        );
+    }
+    refused
 }

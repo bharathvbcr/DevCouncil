@@ -736,7 +736,8 @@ fn is_unsafe_root(root: &Path) -> bool {
 /// names are the adoption lever, and the caveat is what keeps an empty answer
 /// from being read as proof of absence.
 const DEVMAP_DIRECTIVE: &str = "Ask DevMap before reading files: devmap_search, devmap_explore, \
-     devmap_impact, devmap_trace, devmap_affected_tests. Check truncated/walk_incomplete before \
+     devmap_ask_evidence (behaviour -> files, source and tests), devmap_impact, devmap_trace, \
+     devmap_affected_tests. Check truncated/walk_incomplete before \
      treating an empty list as \"does not exist\".";
 
 /// Longest per-repository clause. Bounds one repository's contribution so a
@@ -3892,6 +3893,51 @@ mod lock_tests {
         fs::create_dir_all(&lock).unwrap();
         fs::write(lock.join("pid"), reaped_pid().to_string()).unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        /// Whether the mode bits just set actually refuse this process.
+        ///
+        /// Root, and filesystems that ignore mode bits, read through `0o000` and write
+        /// through read-only, and then the condition this test builds cannot exist.
+        /// The test says so on stderr and stops rather than failing on its
+        /// environment; wherever the restriction holds, every assertion runs.
+        fn restriction_holds(path: impl AsRef<std::path::Path>) -> bool {
+            use std::os::unix::fs::PermissionsExt;
+            let path = path.as_ref();
+            let Ok(meta) = std::fs::metadata(path) else {
+                return true;
+            };
+            let mode = meta.permissions().mode() & 0o777;
+            let refused = if mode & 0o444 == 0 {
+                if meta.is_dir() {
+                    std::fs::read_dir(path).is_err()
+                } else {
+                    std::fs::File::open(path).is_err()
+                }
+            } else if meta.is_dir() {
+                let probe = path.join(".devmap-permission-probe");
+                match std::fs::File::create(&probe) {
+                    Ok(_) => {
+                        let _ = std::fs::remove_file(&probe);
+                        false
+                    }
+                    Err(_) => true,
+                }
+            } else {
+                std::fs::OpenOptions::new().append(true).open(path).is_err()
+            };
+            if !refused {
+                eprintln!(
+                    "skipped: mode {mode:o} on {} does not refuse this process (running as root?); \
+                     the condition this test needs cannot be built here",
+                    path.display()
+                );
+            }
+            refused
+        }
+        if !restriction_holds(&parent) {
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            let _ = fs::remove_dir_all(&base);
+            return;
+        }
 
         let outcome = try_acquire_lock_dir(&lock);
 
