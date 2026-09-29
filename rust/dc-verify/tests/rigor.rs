@@ -118,7 +118,10 @@ fn ordinary_code_is_not_flagged_as_a_secret() {
         ],
     )];
     let findings = scan_secrets(&files);
-    assert!(findings.is_empty(), "ordinary code was reported as a secret");
+    assert!(
+        findings.is_empty(),
+        "ordinary code was reported as a secret"
+    );
 }
 
 #[test]
@@ -256,7 +259,11 @@ fn the_gates_read_a_parsed_diff_end_to_end() {
     assert_eq!(files.len(), 1);
 
     let secrets = scan_secrets(&files);
-    assert_eq!(secrets.len(), 1, "the parsed diff should yield one secret finding");
+    assert_eq!(
+        secrets.len(),
+        1,
+        "the parsed diff should yield one secret finding"
+    );
     assert_eq!(secrets[0].path, "src/auth.go");
     assert!(
         secrets[0].line > 0,
