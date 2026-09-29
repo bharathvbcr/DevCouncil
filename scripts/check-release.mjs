@@ -2,7 +2,8 @@
 /**
  * Release identity gate. Every producer of a vX.Y.Z tag reads a different
  * file: the Git tag, package.json, package-lock.json, rust workspace
- * version, Cargo.lock, and the Go `Version` stamp. A tag that names 0.2.0
+ * version, every Cargo.lock under rust/, and the Go `Version` stamp. The
+ * version must also continue the release line in docs/releases. A tag that names 0.2.0
  * while those files still say something else ships the wrong product under
  * the right name. This check fails before any build minutes are spent.
  *
@@ -216,6 +217,194 @@ export function membersNotInheritingVersion(rustRoot, members) {
     }
   }
   return offenders;
+}
+
+/**
+ * Every `[[package]]` in a Cargo.lock, as name, version and whether it has a
+ * `source` (registry or git). Path dependencies — workspace members and the
+ * crates a nested lock reaches through `path = "../..."` — have none.
+ *
+ * @param {string} source
+ * @returns {{ name: string, version: string | null, local: boolean }[]}
+ */
+export function parseCargoLockPackages(source) {
+  const blocks = source.split(/^\[\[package\]\]\s*$/m).slice(1);
+  /** @type {{ name: string, version: string | null, local: boolean }[]} */
+  const out = [];
+  for (const block of blocks) {
+    const body = block.split(/^\[/m)[0];
+    const name = /^name\s*=\s*"([^"]*)"/m.exec(body);
+    if (!name) continue;
+    const version = /^version\s*=\s*"([^"]*)"/m.exec(body);
+    out.push({
+      name: name[1],
+      version: version ? version[1] : null,
+      local: !/^source\s*=/m.test(body),
+    });
+  }
+  return out;
+}
+
+/**
+ * Cargo.lock files that record workspace crates: the workspace's own lock and
+ * the lock of every standalone crate directly under `rustRoot` that opts out of
+ * the workspace (`rust/gusset-engine`). Measured 2026-09-27: the v1.3.5 bump
+ * regenerated `rust/Cargo.lock` but not `rust/gusset-engine/Cargo.lock`, which
+ * kept dc-glob at 0.2.3. This gate read only the first, so it passed while
+ * every `cargo build --locked` of the umbrella — CI's setup-gusset, verify.sh,
+ * ci-local — failed.
+ *
+ * @param {string} rustRoot
+ * @returns {string[]}
+ */
+export function workspaceLockfiles(rustRoot) {
+  if (!existsSync(rustRoot)) return [];
+  /** @type {string[]} */
+  const found = [];
+  const top = path.join(rustRoot, "Cargo.lock");
+  if (existsSync(top)) found.push(top);
+  for (const entry of readdirSync(rustRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const lock = path.join(rustRoot, entry.name, "Cargo.lock");
+    if (existsSync(lock)) found.push(lock);
+  }
+  return found.sort();
+}
+
+/**
+ * Workspace crates a lockfile records at a version other than the product's.
+ * Every member inherits `[workspace.package] version`, so a lock that names
+ * one at anything else is stale: `cargo build --locked` against it fails.
+ *
+ * @param {string} rustRoot
+ * @param {readonly string[]} members  workspace member directories
+ * @param {string} identity  the product version
+ * @returns {string[]} one human-readable reason per stale entry
+ */
+export function staleWorkspaceLockEntries(rustRoot, members, identity) {
+  /** @type {Set<string>} */
+  const crateNames = new Set();
+  for (const member of members) {
+    const manifestPath = path.join(rustRoot, member, "Cargo.toml");
+    if (!existsSync(manifestPath)) continue;
+    const name = /^name\s*=\s*"([^"]+)"/m.exec(readFileSync(manifestPath, "utf8"));
+    crateNames.add(name ? name[1] : member);
+  }
+  /** @type {string[]} */
+  const stale = [];
+  for (const lockPath of workspaceLockfiles(rustRoot)) {
+    const rel = path.relative(path.dirname(rustRoot), lockPath).split(path.sep).join("/");
+    for (const pkg of parseCargoLockPackages(readFileSync(lockPath, "utf8"))) {
+      if (!pkg.local || !crateNames.has(pkg.name)) continue;
+      if (pkg.version !== identity) {
+        stale.push(
+          `${rel} records ${pkg.name} ${JSON.stringify(pkg.version)}, expected ${JSON.stringify(identity)}; ` +
+            `regenerate it (cargo update -p ${pkg.name} --offline in ${path.posix.dirname(rel)})`,
+        );
+      }
+    }
+  }
+  return stale;
+}
+
+/** Marker a notes file carries when its version is not in the release line. */
+export const WITHDRAWN_MARKER = "<!-- release: withdrawn -->";
+
+/**
+ * Whether notes are withdrawn: the marker on a line of its own. Notes that
+ * only *quote* it — v0.2.4.md explains the marker inline — are not.
+ *
+ * @param {string} notes
+ */
+export function notesAreWithdrawn(notes) {
+  return notes.split(/\r?\n/).some((line) => line.trim() === WITHDRAWN_MARKER);
+}
+
+/**
+ * @param {string} version
+ * @returns {[number, number, number] | null}
+ */
+function semverParts(version) {
+  const m = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(version);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+/**
+ * @param {[number, number, number]} a
+ * @param {[number, number, number]} b
+ */
+function compareParts(a, b) {
+  return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+}
+
+/**
+ * The versions that may follow `prior`: the next patch, minor or major.
+ *
+ * @param {string} prior
+ * @returns {string[]}
+ */
+export function successorVersions(prior) {
+  const p = semverParts(prior);
+  if (!p) return [];
+  const [major, minor, patch] = p;
+  return [`${major}.${minor}.${patch + 1}`, `${major}.${minor + 1}.0`, `${major + 1}.0.0`];
+}
+
+/**
+ * Whether the product version continues the release line in `notesDir`.
+ *
+ * Every other check here compares the product's files with each other, so a
+ * bump that moves all of them together to a wrong number passes all of them.
+ * Measured 2026-09-27: 0.2.3 went to 1.3.5 in one commit, and the gate said
+ * "consistent". The notes directory is the release history this repository
+ * owns, so the product version must be the newest release in it or a single
+ * step past it, and no release in it may be newer than the product.
+ *
+ * A notes file carrying {@link WITHDRAWN_MARKER} on its own line is history kept for its
+ * readers but outside the line (a pre-unification number, a mistaken bump).
+ *
+ * @param {string} notesDir
+ * @param {string} identity
+ * @returns {string[]}
+ */
+export function releaseLineGaps(notesDir, identity) {
+  const current = semverParts(identity);
+  if (!current) return [`product version ${JSON.stringify(identity)} is not <major>.<minor>.<patch>`];
+  if (!existsSync(notesDir)) return [];
+  /** @type {{ version: string, parts: [number, number, number] }[]} */
+  const line = [];
+  /** @type {string[]} */
+  const errors = [];
+  for (const name of readdirSync(notesDir)) {
+    const m = /^v(.+)\.md$/.exec(name);
+    if (!m) continue;
+    const parts = semverParts(m[1]);
+    if (!parts) continue;
+    if (notesAreWithdrawn(readFileSync(path.join(notesDir, name), "utf8"))) {
+      if (m[1] === identity) {
+        errors.push(`product version ${identity} is marked withdrawn in docs/releases/${name}`);
+      }
+      continue;
+    }
+    line.push({ version: m[1], parts });
+  }
+  const newer = line.filter((r) => compareParts(r.parts, current) > 0).map((r) => `v${r.version}`);
+  if (newer.length > 0) {
+    errors.push(
+      `docs/releases has notes newer than product version ${identity}: ${newer.join(", ")}. ` +
+        `Bump past them, or mark each withdrawn with ${WITHDRAWN_MARKER}`,
+    );
+  }
+  const prior = line
+    .filter((r) => compareParts(r.parts, current) < 0)
+    .sort((a, b) => compareParts(b.parts, a.parts))[0];
+  if (prior && !successorVersions(prior.version).includes(identity)) {
+    errors.push(
+      `product version ${identity} does not follow the last release ${prior.version}; ` +
+        `expected one of ${successorVersions(prior.version).join(", ")}`,
+    );
+  }
+  return errors;
 }
 
 /**
@@ -459,6 +648,17 @@ export function inspectRelease(sources, opts = {}) {
       for (const reason of membersNotInheritingVersion(sources.rustRoot, members)) {
         errors.push(reason);
       }
+      if (identity) {
+        for (const reason of staleWorkspaceLockEntries(sources.rustRoot, members, identity)) {
+          errors.push(reason);
+        }
+      }
+    }
+  }
+
+  if (identity) {
+    for (const reason of releaseLineGaps(sources.notesDir, identity)) {
+      errors.push(reason);
     }
   }
 

@@ -12,9 +12,11 @@ import {
   inspectRelease,
   membersNotInheritingVersion,
   missingArchives,
+  notesAreWithdrawn,
   npmPublishCreatesGitHubRelease,
   npmPublishSkipsExistingVersion,
   packageIsDistable,
+  parseCargoLockPackages,
   parseCargoLockVersion,
   parseDistWorkspaceTargets,
   parseGoVersion,
@@ -22,10 +24,15 @@ import {
   parseTomlSectionVersion,
   parseWorkspaceMembers,
   releaseIsIdempotent,
+  releaseLineGaps,
   releaseNotesPublishGaps,
   releasePutsAnnouncementBodyInEnv,
   releaseUsesNotesFile,
+  staleWorkspaceLockEntries,
+  successorVersions,
   tagNamesHead,
+  WITHDRAWN_MARKER,
+  workspaceLockfiles,
 } from "./check-release.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -372,6 +379,111 @@ describe("workspace version inheritance", () => {
     const members = parseWorkspaceMembers(readFileSync(path.join(rustRoot, "Cargo.toml"), "utf8"));
     assert.ok(members.length >= 13, `members=${members.length}`);
     assert.deepEqual(membersNotInheritingVersion(rustRoot, members), []);
+  });
+});
+
+describe("workspace crates in every lockfile", () => {
+  it("tells path packages from registry ones", () => {
+    const lock =
+      '[[package]]\nname = "dc-glob"\nversion = "0.2.3"\n\n' +
+      '[[package]]\nname = "libc"\nversion = "0.2.189"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n';
+    assert.deepEqual(parseCargoLockPackages(lock), [
+      { name: "dc-glob", version: "0.2.3", local: true },
+      { name: "libc", version: "0.2.189", local: false },
+    ]);
+  });
+
+  it("fails a nested crate's lock that kept a workspace crate at the old version", () => {
+    // The v1.3.5 shape: rust/Cargo.lock regenerated, rust/gusset-engine/Cargo.lock not.
+    const root = scratchTree("nested-lock");
+    mkdirSync(path.join(root, "rust", "gusset-engine"), { recursive: true });
+    writeFileSync(
+      path.join(root, "rust", "gusset-engine", "Cargo.lock"),
+      '[[package]]\nname = "devmap-store"\nversion = "0.1.9"\n\n' +
+        '[[package]]\nname = "gusset"\nversion = "0.0.1"\n',
+    );
+    const rustRoot = path.join(root, "rust");
+    assert.equal(workspaceLockfiles(rustRoot).length, 2);
+    const stale = staleWorkspaceLockEntries(rustRoot, ["devmap-cli", "devmap-store"], "0.2.0");
+    assert.equal(stale.length, 1, stale.join("\n"));
+    assert.ok(stale[0].includes("rust/gusset-engine/Cargo.lock") && stale[0].includes("devmap-store"));
+    // …and it reaches the gate. The foreign path crate (gusset) is not ours to judge.
+    const result = inspectRelease(defaultSources(root));
+    assert.ok(result.errors.some((e) => e.includes("gusset-engine") && e.includes("0.1.9")));
+    assert.ok(!result.errors.some((e) => e.includes("records gusset ")));
+  });
+
+  it("ignores a registry crate that shares a workspace crate's name", () => {
+    const root = scratchTree("nested-lock-registry");
+    writeFileSync(
+      path.join(root, "rust", "Cargo.lock"),
+      `[[package]]\nname = "${DIST_PACKAGE}"\nversion = "0.2.0"\n\n` +
+        '[[package]]\nname = "devmap-store"\nversion = "9.9.9"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n',
+    );
+    assert.deepEqual(
+      staleWorkspaceLockEntries(path.join(root, "rust"), ["devmap-cli", "devmap-store"], "0.2.0"),
+      [],
+    );
+  });
+
+  it("holds for this repository: every lock under rust/ records the product version", () => {
+    const rustRoot = path.join(REPO_ROOT, "rust");
+    const members = parseWorkspaceMembers(readFileSync(path.join(rustRoot, "Cargo.toml"), "utf8"));
+    const version = parseTomlSectionVersion(
+      readFileSync(path.join(rustRoot, "Cargo.toml"), "utf8"),
+      "[workspace.package]",
+    );
+    assert.ok(workspaceLockfiles(rustRoot).some((p) => p.endsWith(path.join("gusset-engine", "Cargo.lock"))));
+    assert.deepEqual(staleWorkspaceLockEntries(rustRoot, members, version ?? ""), []);
+  });
+});
+
+describe("release line", () => {
+  /** @param {Record<string, string>} notes */
+  function notesDir(notes) {
+    const dir = mkdtempSync(path.join(tmpdir(), "devcouncil-rel-line-"));
+    tempDirs.push(dir);
+    for (const [name, body] of Object.entries(notes)) writeFileSync(path.join(dir, name), body);
+    return dir;
+  }
+
+  it("names the next patch, minor and major", () => {
+    assert.deepEqual(successorVersions("0.2.3"), ["0.2.4", "0.3.0", "1.0.0"]);
+  });
+
+  it("fails the 0.2.3 → 1.3.5 jump every file agreed on", () => {
+    const dir = notesDir({ "v0.2.3.md": "0.2.3", "v1.3.5.md": "1.3.5" });
+    const gaps = releaseLineGaps(dir, "1.3.5");
+    assert.equal(gaps.length, 1);
+    assert.ok(gaps[0].includes("0.2.4, 0.3.0, 1.0.0"));
+  });
+
+  it("accepts the current release and a single step past it", () => {
+    const dir = notesDir({ "v0.2.2.md": "0.2.2", "v0.2.3.md": "0.2.3" });
+    assert.deepEqual(releaseLineGaps(dir, "0.2.3"), []);
+    assert.deepEqual(releaseLineGaps(dir, "0.3.0"), []);
+  });
+
+  it("fails notes newer than the product until they are marked withdrawn", () => {
+    const dir = notesDir({ "v0.2.3.md": "0.2.3", "v1.3.5.md": "1.3.5" });
+    assert.ok(releaseLineGaps(dir, "0.2.3").some((e) => e.includes("v1.3.5")));
+    writeFileSync(path.join(dir, "v1.3.5.md"), `# 1.3.5\n\n${WITHDRAWN_MARKER}\n`);
+    assert.deepEqual(releaseLineGaps(dir, "0.2.3"), []);
+  });
+
+  it("counts the marker only on a line of its own, not quoted in prose", () => {
+    assert.equal(notesAreWithdrawn(`# v1.3.5\n\n${WITHDRAWN_MARKER}\n> Withdrawn.\n`), true);
+    assert.equal(notesAreWithdrawn(`Notes outside the line carry \`${WITHDRAWN_MARKER}\`.\n`), false);
+  });
+
+  it("does not let the product version itself be a withdrawn one", () => {
+    const dir = notesDir({ "v0.2.3.md": "0.2.3", "v1.3.5.md": `${WITHDRAWN_MARKER}\n` });
+    assert.ok(releaseLineGaps(dir, "1.3.5").some((e) => e.includes("withdrawn")));
+  });
+
+  it("holds for this repository", () => {
+    const pkg = JSON.parse(readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"));
+    assert.deepEqual(releaseLineGaps(path.join(REPO_ROOT, "docs", "releases"), pkg.version), []);
   });
 });
 
