@@ -1,3 +1,5 @@
+//go:build unix
+
 package gussetfn
 
 import (
@@ -6,8 +8,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/bharathvbcr/gusset"
 )
 
 func TestCheckAgreesAndDoesNotPoison(t *testing.T) {
@@ -31,22 +31,6 @@ func TestCancelledContextDoesNotMatch(t *testing.T) {
 	_, err := Match(ctx, "*.py", "src/foo.py")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
-	}
-}
-
-func TestOverlongFieldIsRefusedBeforeTheCall(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	pattern := make([]byte, maxField+1)
-	for i := range pattern {
-		pattern[i] = 'a'
-	}
-	_, err := Match(ctx, string(pattern), "a")
-	if err == nil {
-		t.Fatal("expected a length refusal")
-	}
-	if errors.Is(err, gusset.ErrPanic) {
-		t.Fatalf("length refusal panicked: %v", err)
 	}
 }
 

@@ -16,6 +16,8 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # Run by hand on a branch, so a fix is verified before its PR exists.
+  workflow_dispatch:
   schedule:
     - cron: '34 21 * * 0'
 

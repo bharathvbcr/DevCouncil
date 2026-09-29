@@ -8,7 +8,6 @@ import (
 	"unicode"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/fnmatch"
 )
 
 // Git-safety patterns, ported from DevCouncil. Compiled once: they are checked
@@ -101,6 +100,11 @@ type CommandGate struct {
 	// a bare `dev` and none inherits `dev`'s allowlist entries. A gate that
 	// leaves this unset is therefore stricter, never looser.
 	Root string
+	// Matcher answers the allowlist questions. Nil is GoMatcher. A matcher
+	// that fails turns the decision into a denial under
+	// RuleCommandEngineUnavailable: an allowlist that cannot be consulted
+	// allows nothing.
+	Matcher Matcher
 }
 
 // maxSubstitutionDepth bounds the recursion into command-substitution
@@ -118,7 +122,12 @@ const maxSubstitutionDepth = 8
 // the single entry point closes that, and it cannot loosen anything: every
 // git-safety outcome is a denial or a warning, never an allow that skips the
 // allowlist below.
-func (g CommandGate) EvaluateCommand(command string, task *dc.Task) Decision {
+func (g CommandGate) EvaluateCommand(command string, task *dc.Task) (d Decision) {
+	taskID := ""
+	if task != nil {
+		taskID = task.ID
+	}
+	defer failClosed(&d, RuleCommandEngineUnavailable, command, taskID, g.HardRules)
 	// Length is checked once, here, before any rung reads the line. Every rung
 	// below is a scan and several recurse, so an unbounded line is an unbounded
 	// amount of work handed to the gate by whoever composed the string — and
@@ -268,7 +277,7 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 			normalized, taskID))
 	}
 
-	if fnmatch.MatchAny(NoTaskAllowedCommands, normalized) {
+	if matcherOf(g.Matcher).any(NoTaskAllowedCommands, normalized) {
 		return g.finish(allow("Bootstrap or read-only command allowed.", normalized, taskID), normalized, taskID)
 	}
 
@@ -285,17 +294,17 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 			normalized, ""))
 	}
 
-	if fnmatch.MatchAny(LeaseLifecycleAllowedCommands, normalized) {
+	if matcherOf(g.Matcher).any(LeaseLifecycleAllowedCommands, normalized) {
 		return g.finish(allow("Lease lifecycle or repo maintenance command allowed.", normalized, taskID), normalized, taskID)
 	}
 
 	// Allowlist entries are matched against both the raw and normalized forms,
 	// so a task listing ".venv/bin/dev *" still works while a path-prefixed
 	// "dev map" continues to hit the lifecycle patterns after normalization.
-	if matchesEither(task.AllowedCommands, normalized, raw) {
+	if matchesEither(matcherOf(g.Matcher), task.AllowedCommands, normalized, raw) {
 		return g.finish(allow("Command matches task allowed_commands.", normalized, task.ID), normalized, task.ID)
 	}
-	if matchesEither(g.GlobalAllowedCommands, normalized, raw) {
+	if matchesEither(matcherOf(g.Matcher), g.GlobalAllowedCommands, normalized, raw) {
 		return g.finish(allow("Command matches global allowed commands.", normalized, task.ID), normalized, task.ID)
 	}
 
@@ -1570,13 +1579,10 @@ func isRepoDevBinary(token, root string) bool {
 	}
 }
 
-func matchesEither(patterns []string, normalized, raw string) bool {
-	for _, pattern := range patterns {
-		if fnmatch.Match(pattern, normalized) || fnmatch.Match(pattern, raw) {
-			return true
-		}
-	}
-	return false
+func matchesEither(mt matching, patterns []string, normalized, raw string) bool {
+	// Two questions, one per form, instead of two per pattern: "some pattern
+	// matches either form" is the same OR.
+	return mt.any(patterns, normalized) || mt.any(patterns, raw)
 }
 
 func collapseSpaces(s string) string { return strings.Join(strings.Fields(s), " ") }

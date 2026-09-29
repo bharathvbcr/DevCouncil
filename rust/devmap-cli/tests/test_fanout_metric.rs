@@ -154,6 +154,12 @@ fn the_fanout_metric_matches_a_hand_counted_corpus() {
         String::from_utf8_lossy(&out.stderr)
     );
 
+    // The shell half runs where its consumers do: `verify.sh` and
+    // `memory_model_probe.sh` are unix shell gates. On a Windows runner a bare
+    // `bash` is the WSL launcher, which exits non-zero with nothing on stderr
+    // when no distribution is installed. Everything below this block checks
+    // the same numbers through rusqlite and runs everywhere.
+    //
     // The shell gates do not use rusqlite. They run `tools/fanout.sh`, which
     // is whatever `sqlite3` is on PATH. Apple's CLI `-readonly` cannot open
     // this store; the script must still return the same row.
@@ -162,8 +168,8 @@ fn the_fanout_metric_matches_a_hand_counted_corpus() {
     // cannot run, and says so; the rusqlite half below still checks the same
     // number. CI must have it: there a missing `sqlite3` fails the test rather
     // than quietly dropping the gate's own check.
-    let sqlite3 = Command::new("sqlite3").arg("--version").output().is_ok();
-    if sqlite3 {
+    #[cfg(unix)]
+    if Command::new("sqlite3").arg("--version").output().is_ok() {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/fanout.sh");
         let shell = Command::new("bash")
             .arg(&script)

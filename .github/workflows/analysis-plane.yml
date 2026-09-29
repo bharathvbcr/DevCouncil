@@ -24,11 +24,13 @@ on:
       - "rust/**"
       - "backend/go_orchestrator/**"
       - ".github/workflows/analysis-plane.yml"
+      - ".github/actions/setup-gusset/**"
   pull_request:
     paths:
       - "rust/**"
       - "backend/go_orchestrator/**"
       - ".github/workflows/analysis-plane.yml"
+      - ".github/actions/setup-gusset/**"
   workflow_dispatch:
 
 permissions:

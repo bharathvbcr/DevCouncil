@@ -130,6 +130,16 @@ func decide(pattern, name string, oversizeIsMatch bool) bool {
 	return matched
 }
 
+// Oversized reports whether s is past the length matched exactly (maxUnits
+// Unicode scalar values). Past it, Match answers false and MatchFold true
+// without walking. Exported so a matcher answering for this package — the
+// in-process engine behind gussetfn — applies the same rule.
+func Oversized(s string) bool { return oversized(s) }
+
+// Fold is the case folding MatchFold applies to both arguments, exported for
+// the same reason as Oversized.
+func Fold(s string) string { return fold(s) }
+
 func oversized(s string) bool {
 	if len(s) > maxUnits*utf8.UTFMax {
 		return true

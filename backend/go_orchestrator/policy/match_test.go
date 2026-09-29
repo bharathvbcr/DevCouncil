@@ -40,13 +40,13 @@ func TestMatchesAnyIsThePlannedPathLoop(t *testing.T) {
 }
 
 func TestPathMatchesExactAndGlob(t *testing.T) {
-	if !pathMatches("src/a.go", "src/a.go") {
+	if !pathMatches(matcherOf(nil), "src/a.go", "src/a.go") {
 		t.Fatal("an exact path must match itself")
 	}
-	if !pathMatches("src/*.go", "src/a.go") {
+	if !pathMatches(matcherOf(nil), "src/*.go", "src/a.go") {
 		t.Fatal("a glob must match a file in that directory")
 	}
-	if !pathMatches("src/*.go", "src/sub/a.go") {
+	if !pathMatches(matcherOf(nil), "src/*.go", "src/sub/a.go") {
 		t.Fatal("Python fnmatch '*' crosses a directory; this gate must too")
 	}
 }

@@ -152,17 +152,23 @@ type FileGate struct {
 	AllowSameDir bool
 	// HardRules mirrors flags.PolicyHardRules. False is reported, never silent.
 	HardRules bool
+	// Matcher answers the ladder's pattern questions. Nil is GoMatcher. A
+	// matcher that fails turns the decision into a denial under
+	// RulePathEngineUnavailable.
+	Matcher Matcher
 }
 
 // EvaluateFileChange walks DevCouncil's decision ladder in its original order.
 // Order is the contract: the secret-path rung must run before the task rung, or
 // a task could authorise a write to .env by listing it as a planned file.
-func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation, internal bool) Decision {
+func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation, internal bool) (d Decision) {
 	normalized, outside := NormalizeRepoPath(g.Root, path)
 	taskID := ""
 	if task != nil {
 		taskID = task.ID
 	}
+	mt := matcherOf(g.Matcher)
+	defer failClosed(&d, RulePathEngineUnavailable, normalized, taskID, g.HardRules)
 
 	if g.HardRules {
 		// Checked on the raw input and again on the normalized result: a ".."
@@ -180,10 +186,10 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 		}
 		// Case-folded: on APFS and NTFS ".ENV" and ".env" are one file, so a
 		// case-sensitive check would read the pattern and still allow the write.
-		if fnmatch.MatchAnyFold(SecretPathPatterns, normalized) {
+		if mt.anyFold(SecretPathPatterns, normalized) {
 			return deny(RuleSecretPath, "Secret and credential paths are never writable.", normalized, taskID)
 		}
-		if !internal && matchesRestricted(normalized) {
+		if !internal && matchesRestricted(mt, normalized) {
 			return deny(RuleRestrictedPath, "Protected repository paths cannot be modified.", normalized, taskID)
 		}
 	}
@@ -200,7 +206,7 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 	// case-sensitive on purpose: its failure direction is denial, which is
 	// safe, and folding it would let a differently-cased path claim another
 	// entry's authorisation.)
-	if fnmatch.MatchAnyFold(task.ForbiddenChanges, normalized) {
+	if mt.anyFold(task.ForbiddenChanges, normalized) {
 		return g.noteHardRules(deny(RuleForbiddenChange, "Path is listed in forbidden_changes.", normalized, task.ID))
 	}
 	if entry, aliased := forbiddenAlias(g.Root, normalized, task.ForbiddenChanges); aliased {
@@ -209,7 +215,7 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 			normalized, task.ID))
 	}
 
-	planned, widened := plannedFileFor(normalized, task)
+	planned, widened := plannedFileFor(mt, normalized, task)
 	if planned == nil {
 		return g.noteHardRules(g.unplannedDecision(normalized, task))
 	}
@@ -241,7 +247,7 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 	// the spelling an agent would reach for to make it absent. Over-blocking a
 	// file that differs from a manifest only by case costs a warning, which is
 	// all this rung ever produces.
-	if fnmatch.MatchAnyFold(ProtectedWritePatterns, normalized) {
+	if mt.anyFold(ProtectedWritePatterns, normalized) {
 		d := warn(RuleProtectedWrite,
 			normalized+" is a protected high-impact file; verification gates must approve it.", normalized, task.ID)
 		d.Widened = widened
@@ -304,12 +310,14 @@ func operationRefusal(planned *dc.PlannedFile, op dc.Operation, path string, tas
 // makes a deploy key readable. It answers only when hard rules are on, exactly
 // like the write rung it sits beside, so a posture that turns enforcement off
 // turns this off too rather than pretending otherwise.
-func (g FileGate) EvaluateRead(path string, task *dc.Task) Decision {
+func (g FileGate) EvaluateRead(path string, task *dc.Task) (d Decision) {
 	normalized, outside := NormalizeRepoPath(g.Root, path)
 	taskID := ""
 	if task != nil {
 		taskID = task.ID
 	}
+	mt := matcherOf(g.Matcher)
+	defer failClosed(&d, RulePathEngineUnavailable, normalized, taskID, g.HardRules)
 	if !g.HardRules {
 		return g.noteHardRules(allow("Read is not gated when hard rules are off.", normalized, taskID))
 	}
@@ -324,7 +332,7 @@ func (g FileGate) EvaluateRead(path string, task *dc.Task) Decision {
 	}
 	// Case-folded for the same reason the write rung is: ".ENV" and ".env" are
 	// one file on APFS and NTFS.
-	if fnmatch.MatchAnyFold(SecretPathPatterns, normalized) {
+	if mt.anyFold(SecretPathPatterns, normalized) {
 		return deny(RuleSecretRead,
 			"Secret and credential paths are not readable. Their contents would enter the model's "+
 				"context, which no later redaction can undo.", normalized, taskID)
@@ -338,6 +346,11 @@ func (g FileGate) EvaluateRead(path string, task *dc.Task) Decision {
 // It exists for the callers that filter a result set — a search returning lines
 // from many files — where the question is asked once per file and a full
 // decision per hit would be recorded noise rather than a record.
+//
+// It uses fnmatch directly, not a Matcher. It returns a bool with nowhere to
+// put an engine error except "refused", and it is asked once per hit of a
+// search; its answer is the one a FileGate with GoMatcher gives, which every
+// Matcher is required to equal.
 func ReadRefused(root, path string) bool {
 	normalized, outside := NormalizeRepoPath(root, path)
 	if outside {
@@ -828,19 +841,21 @@ func MatchesPlannedPath(path string, planned []dc.PlannedFile) bool {
 // about the same path: a file planned read-only stays read-only however many
 // times an agent appends it, because the read-only entry is found first and
 // decides.
-func plannedFileFor(path string, task *dc.Task) (*dc.PlannedFile, string) {
-	if pf := matchPlannedFile(path, task.PlannedFiles); pf != nil {
+func plannedFileFor(mt matching, path string, task *dc.Task) (*dc.PlannedFile, string) {
+	if pf := matchPlannedFile(mt, path, task.PlannedFiles); pf != nil {
 		return pf, ""
 	}
-	if pf := matchPlannedFile(path, task.AgentAppendedPlannedFiles); pf != nil {
+	if pf := matchPlannedFile(mt, path, task.AgentAppendedPlannedFiles); pf != nil {
 		return pf, pf.Path
 	}
 	return nil, ""
 }
 
-func matchPlannedFile(path string, planned []dc.PlannedFile) *dc.PlannedFile {
+// matchPlannedFile returns the first entry that matches, so it asks entry by
+// entry: which entry decides is the rule, and a batched "any" cannot say.
+func matchPlannedFile(mt matching, path string, planned []dc.PlannedFile) *dc.PlannedFile {
 	for i := range planned {
-		if pathMatches(planned[i].Path, path) {
+		if pathMatches(mt, planned[i].Path, path) {
 			return &planned[i]
 		}
 	}
@@ -901,14 +916,17 @@ func forbiddenAlias(root, path string, forbidden []string) (string, bool) {
 	return "", false
 }
 
-func pathMatches(pattern, path string) bool {
+func pathMatches(mt matching, pattern, path string) bool {
 	p := normalizeSlashes(pattern)
-	return path == p || fnmatch.Match(p, path)
+	return path == p || mt.any([]string{p}, path)
 }
 
+// matchesAny backs MatchesPlannedPath, a bool API called outside any gate
+// entry point, so there is no failClosed to catch an engine error: it asks
+// fnmatch, never the configurable default.
 func matchesAny(patterns []string, path string) bool {
 	for _, raw := range patterns {
-		if pathMatches(raw, path) {
+		if pathMatches(matching{m: GoMatcher}, raw, path) {
 			return true
 		}
 	}
@@ -935,12 +953,15 @@ func matchesAny(patterns []string, path string) bool {
 // false. Bare ".git" and ".devcouncil" were added to the list by hand to
 // paper over that; the other seven agent-config entries were not. Trimming the
 // separator and comparing components states the rule once, for every entry.
-func matchesRestricted(path string) bool {
+func matchesRestricted(mt matching, path string) bool {
+	// One question for the whole glob half: "any pattern matches" is the OR
+	// the loop below used to compute pattern by pattern, and the prefix half
+	// does not depend on it.
+	if mt.anyFold(RestrictedPathPatterns, path) {
+		return true
+	}
 	lower := strings.ToLower(path)
 	for _, pattern := range RestrictedPathPatterns {
-		if fnmatch.MatchFold(pattern, path) {
-			return true
-		}
 		// Folded here for the same filesystem reason as the glob above.
 		prefix := strings.ToLower(strings.TrimSuffix(strings.Trim(pattern, "*"), "/"))
 		if prefix == "" {

@@ -20,6 +20,11 @@ on:
       - "rust/Cargo.lock"
       - "rust/.gitignore"
       - ".github/workflows/rust.yml"
+      - ".github/actions/setup-gusset/**"
+      - "rust/gusset-engine/**"
+      - "backend/go_orchestrator/gussetfn/**"
+      - "backend/go_orchestrator/policy/**"
+      - "backend/go_orchestrator/fnmatch/**"
   pull_request:
     paths:
       - "rust/devmap-*/**"
@@ -31,6 +36,11 @@ on:
       - "rust/Cargo.lock"
       - "rust/.gitignore"
       - ".github/workflows/rust.yml"
+      - ".github/actions/setup-gusset/**"
+      - "rust/gusset-engine/**"
+      - "backend/go_orchestrator/gussetfn/**"
+      - "backend/go_orchestrator/policy/**"
+      - "backend/go_orchestrator/fnmatch/**"
   workflow_dispatch:
 
 permissions:
@@ -205,6 +215,63 @@ jobs:
       # incremental-vs-cold equivalence check that caught SC16.
       - name: Full gate suite
         run: bash ./verify.sh
+
+  # A release that links the engine statically is only as good as its panic
+  # firewall. On a glibc runner musl-gcc needs Rust's own libunwind.a and
+  # --eh-frame-hdr (cgo-env.sh --target=*-linux-musl prints both); without
+  # the second the binary links and matches and then aborts on the first
+  # Rust panic instead of returning ErrPanic (I2). This builds the host that
+  # way, proves it is static and carries PT_GNU_EH_FRAME, runs gusset-check,
+  # and proves gusset-check fails the same build without --eh-frame-hdr, so a
+  # green run here means the check can see the defect it guards against.
+  static-musl:
+    name: static musl host (engine + panic firewall)
+    runs-on: ubuntu-latest
+    # The workflow defaults run steps to rust/; these paths are repo-root.
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/gusset-engine
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go_orchestrator/go.mod
+      - name: Set up Gusset
+        uses: ./.github/actions/setup-gusset
+      - name: Install musl-gcc
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build, inspect and self-test the static host
+        run: |
+          set -euo pipefail
+          exports="$(rust/gusset-engine/cgo-env.sh --export --target=x86_64-unknown-linux-musl)"
+          eval "$exports"
+          bin="$RUNNER_TEMP/devcouncil-static"
+          go -C backend/go_orchestrator build -trimpath -tags netgo,osusergo \
+            -ldflags "-linkmode external -extldflags '$GUSSET_STATIC_EXTLDFLAGS'" \
+            -o "$bin" ./cmd/devcouncil
+          file "$bin" | tee /dev/stderr | grep -q "statically linked"
+          readelf -lW "$bin" | grep -q GNU_EH_FRAME
+          "$bin" gusset-check
+      - name: gusset-check rejects the build without --eh-frame-hdr
+        run: |
+          set -euo pipefail
+          exports="$(rust/gusset-engine/cgo-env.sh --export --no-build --target=x86_64-unknown-linux-musl)"
+          eval "$exports"
+          broken="${GUSSET_STATIC_EXTLDFLAGS/-Wl,--eh-frame-hdr /}"
+          bin="$RUNNER_TEMP/devcouncil-no-ehframe"
+          go -C backend/go_orchestrator build -trimpath -tags netgo,osusergo \
+            -ldflags "-linkmode external -extldflags '$broken'" \
+            -o "$bin" ./cmd/devcouncil
+          if "$bin" gusset-check; then
+            echo "::error::gusset-check passed a static build with no unwind table; it cannot see a dead panic firewall"
+            exit 1
+          fi
 
   parity:
     name: release build

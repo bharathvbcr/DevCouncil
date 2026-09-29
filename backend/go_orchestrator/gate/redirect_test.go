@@ -232,7 +232,12 @@ func runInThrowawayTree(t *testing.T, command string) []string {
 		t.Fatal(err)
 	}
 	before := treeSnapshot(root)
-	cmd := exec.Command("sh", "-c", command)
+	// `wait` so a backgrounded write (`echo hi > .env &`) lands before the
+	// tree is read. Without it sh exited first, the write was reported as
+	// nothing, and it landed during t.TempDir's cleanup, which then failed
+	// with "directory not empty" (macOS, 241b018). Every corpus entry is a
+	// complete command, so a trailing line cannot change how it parses.
+	cmd := exec.Command("sh", "-c", command+"\nwait")
 	cmd.Dir = root
 	// A corpus entry that hangs would wedge the suite; nothing here reads
 	// stdin, and closing it turns any that starts to into an immediate EOF.
@@ -248,6 +253,17 @@ func runInThrowawayTree(t *testing.T, command string) []string {
 	}
 	sort.Strings(changed)
 	return changed
+}
+
+// A backgrounded write is a write. The corpus holds `echo hi > .env &`, and
+// the invariant above only means something for it if its write is seen.
+func TestThrowawayTreeSeesABackgroundedWrite(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		written := runInThrowawayTree(t, "sleep 0.05; echo hi > .env &")
+		if len(written) != 1 || written[0] != ".env" {
+			t.Fatalf("run %d: saw %v, want [.env]", i, written)
+		}
+	}
 }
 
 func treeSnapshot(root string) map[string]string {

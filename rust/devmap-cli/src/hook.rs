@@ -4,6 +4,7 @@
 //! Exit 2 is treated as "block the agent" on those hosts, so this path never
 //! exits 2: success and no-ops are 0, failures are 1.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -1848,10 +1849,7 @@ fn detach_build(executable: &Path, root: &Path) -> anyhow::Result<()> {
     }
     spawn_detached_with_cleanup(
         executable,
-        &format!(
-            "--root {} build",
-            shell_single_quote(&root.display().to_string())
-        ),
+        &[OsStr::new("--root"), root.as_os_str(), OsStr::new("build")],
         &lock_dir,
     )
 }
@@ -1863,10 +1861,11 @@ fn detach_session_report(executable: &Path, root: &Path) -> anyhow::Result<()> {
     }
     spawn_detached_with_cleanup(
         executable,
-        &format!(
-            "--root {} session-report",
-            shell_single_quote(&root.display().to_string())
-        ),
+        &[
+            OsStr::new("--root"),
+            root.as_os_str(),
+            OsStr::new("session-report"),
+        ],
         &lock_dir,
     )
 }
@@ -1983,44 +1982,165 @@ fn lock_dir_is_stale(lock_dir: &Path) -> bool {
         let rc = unsafe { libc::kill(pid, 0) };
         rc != 0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        !windows_process_is_running(pid as u32)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
     }
 }
 
+/// Keep this process's own stdin/stdout/stderr out of every child it spawns.
+///
+/// Windows hands a child every inheritable handle of its parent, whatever the
+/// child's own stdio is set to, and the pipes the host gave this hook are
+/// inheritable. A detached build would hold the host's pipe open, and the host,
+/// waiting for the hook's output to end, would wait for the build. unix never
+/// had this: std marks every descriptor but 0-2 close-on-exec, and 0-2 are
+/// redirected. Clearing the flag changes only what children receive; this
+/// process's own reads and writes are unaffected.
+#[cfg(windows)]
+fn stop_standard_handles_from_being_inherited() {
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const HANDLE_FLAG_INHERIT: u32 = 0x1;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle returns this process's handle or null/invalid,
+        // and SetHandleInformation on either only fails.
+        unsafe {
+            let handle = GetStdHandle(which);
+            if !handle.is_null() && handle as isize != -1 {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
+/// Whether `pid` names a running process. It was not asked at all on Windows:
+/// every lock read as live until [`LOCK_MAX_AGE`], so a build that died without
+/// removing its lock stopped that repository's rebuilds for half an hour.
+#[cfg(windows)]
+fn windows_process_is_running(pid: u32) -> bool {
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+        fn GetExitCodeProcess(process: *mut std::ffi::c_void, code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+    // SAFETY: plain Win32 calls on a handle this function opens and closes.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // A process this user may not query still exists; anything else
+            // (invalid parameter) is no process with that pid.
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        // Unknown is held, like every other unknown owner here.
+        !ok || code == STILL_ACTIVE
+    }
+}
+
+/// The coalescing lock this process was started to hold, released on drop.
+///
+/// Only the Windows spawn names one ([`OWNED_LOCK_ENV`]). It is removed only if
+/// its `pid` file names this process, so the variable cannot direct the removal
+/// of any other directory: a stale or hostile value is ignored.
+pub struct OwnedLock(Option<PathBuf>);
+
+impl OwnedLock {
+    /// Take the lock named in the environment, and unset the variable so no
+    /// grandchild inherits the claim.
+    pub fn from_env() -> Self {
+        let Some(dir) = std::env::var_os(OWNED_LOCK_ENV) else {
+            return Self(None);
+        };
+        // Only the Windows spawn sets it, and Windows serialises environment
+        // access in the OS, so the runtime threads already started are safe.
+        std::env::remove_var(OWNED_LOCK_ENV);
+        Self(Some(PathBuf::from(dir)))
+    }
+}
+
+impl Drop for OwnedLock {
+    fn drop(&mut self) {
+        let Some(dir) = self.0.take() else {
+            return;
+        };
+        // The spawning hook writes our pid a moment after the spawn; a child
+        // that finishes first leaves the lock for the stale check, which now
+        // sees this pid dead.
+        let owner = devmap_query::stat_memo::read_bounded(&dir.join("pid"), MAX_PID_BYTES);
+        if owner.as_deref().map(str::trim) == Some(std::process::id().to_string().as_str()) {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+#[cfg(unix)]
 fn shell_single_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
+/// Environment variable naming the coalescing lock a detached child owns and
+/// must remove when it exits. Set only on Windows, where there is no shell to
+/// do it; see [`OwnedLock`].
+pub const OWNED_LOCK_ENV: &str = "DEVMAP_HOOK_OWNED_LOCK";
+
+/// Spawn `executable args…` detached, holding `lock_dir` for its lifetime.
+///
+/// unix runs it under `sh -c` in a new session, and the shell removes the lock
+/// when the child exits. Windows has no shell to rely on — this path required
+/// `sh` there, and with none on PATH no hook ever started a build — so the
+/// child is started directly as a detached process and removes the lock itself
+/// on exit ([`OwnedLock`]); a child that dies without doing so leaves a lock
+/// [`lock_dir_is_stale`] now recognises by its dead pid.
 fn spawn_detached_with_cleanup(
     executable: &Path,
-    args_shell: &str,
+    args: &[&OsStr],
     lock_dir: &Path,
 ) -> anyhow::Result<()> {
-    let exe = executable
-        .to_str()
-        .ok_or_else(|| anyhow!("executable path is not UTF-8"))?;
-    let lock = lock_dir
-        .to_str()
-        .ok_or_else(|| anyhow!("lock path is not UTF-8"))?;
-    // The lock directory is held for the child's lifetime so concurrent hooks
-    // coalesce onto one build. The shell removes it when the child exits.
-    let script = format!(
-        "{} {}; status=$?; rm -rf {}; exit $status",
-        shell_single_quote(exe),
-        args_shell,
-        shell_single_quote(lock)
-    );
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
     #[cfg(unix)]
-    {
+    let mut cmd = {
+        let exe = executable
+            .to_str()
+            .ok_or_else(|| anyhow!("executable path is not UTF-8"))?;
+        let lock = lock_dir
+            .to_str()
+            .ok_or_else(|| anyhow!("lock path is not UTF-8"))?;
+        let mut quoted = Vec::with_capacity(args.len());
+        for arg in args {
+            let arg = arg
+                .to_str()
+                .ok_or_else(|| anyhow!("argument is not UTF-8"))?;
+            quoted.push(shell_single_quote(arg));
+        }
+        // The lock directory is held for the child's lifetime so concurrent
+        // hooks coalesce onto one build. The shell removes it when the child
+        // exits.
+        let script = format!(
+            "{} {}; status=$?; rm -rf {}; exit $status",
+            shell_single_quote(exe),
+            quoted.join(" "),
+            shell_single_quote(lock)
+        );
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script);
         use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {
@@ -2030,7 +2150,28 @@ fn spawn_detached_with_cleanup(
                 Ok(())
             });
         }
-    }
+        cmd
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        stop_standard_handles_from_being_inherited();
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        let mut cmd = Command::new(executable);
+        cmd.args(args)
+            .env(OWNED_LOCK_ENV, lock_dir)
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        cmd
+    };
+    #[cfg(not(any(unix, windows)))]
+    let mut cmd: Command = {
+        let _ = (executable, args);
+        anyhow::bail!("detached builds are not supported on this platform");
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn detached {}", executable.display()))?;
@@ -3685,7 +3826,7 @@ mod lock_tests {
         let lock = root.join("lock");
         assert!(try_acquire_lock_dir(&lock).unwrap());
 
-        spawn_detached_with_cleanup(Path::new("/bin/sleep"), "5", &lock).unwrap();
+        spawn_detached_with_cleanup(Path::new("/bin/sleep"), &[OsStr::new("5")], &lock).unwrap();
         std::thread::sleep(Duration::from_millis(200));
 
         let recorded: i32 = fs::read_to_string(lock.join("pid"))

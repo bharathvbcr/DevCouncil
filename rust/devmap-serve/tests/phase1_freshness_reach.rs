@@ -12,6 +12,34 @@ use devmap_serve::RootResolveInput;
 use devmap_store::Store;
 use serde_json::json;
 
+/// Whether `text` names `path` in a spelling the platform gives it: as
+/// written, or canonical. Windows canonicalises to a `\\?\` verbatim path
+/// with long names where the temp dir used 8.3 short ones (`RUNNER~1`), and
+/// macOS to `/private/var` for `/var`; every one is the same directory.
+fn names(text: &str, path: &std::path::Path) -> bool {
+    if text.contains(&path.display().to_string()) {
+        return true;
+    }
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    let shown = canonical.display().to_string();
+    text.contains(shown.strip_prefix(r"\\?\").unwrap_or(&shown))
+}
+
+/// `path` as a `file://` URI in this platform's form: `file:///C:/…` on
+/// Windows. `format!("file://{}", path.display())` gives `file://C:\…` there,
+/// which is not a file URI at all.
+fn file_uri(path: &std::path::Path) -> String {
+    let shown = path.display().to_string();
+    if cfg!(windows) {
+        let bare = shown.strip_prefix(r"\\?\").unwrap_or(&shown);
+        format!("file:///{}", bare.replace('\\', "/"))
+    } else {
+        format!("file://{shown}")
+    }
+}
+
 fn scratch(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "devmap-p1-{name}-{}-{}",
@@ -99,7 +127,7 @@ async fn mcp_roots_list_does_not_silently_replace_a_cwd_store() {
         "jsonrpc": "2.0",
         "id": ROOTS_LIST_REQUEST_ID,
         "result": {
-            "roots": [{"uri": format!("file://{}", repo_b.display())}]
+            "roots": [{"uri": file_uri(&repo_b)}]
         }
     });
     assert!(handle_line(&slot, &response.to_string()).await.is_none());
@@ -108,7 +136,7 @@ async fn mcp_roots_list_does_not_silently_replace_a_cwd_store() {
         Err(err) => err,
     };
     assert!(
-        err.contains(&repo_a.display().to_string()) && err.contains(&repo_b.display().to_string()),
+        names(&err, &repo_a) && names(&err, &repo_b),
         "must name both repositories: {err}"
     );
 }
@@ -124,7 +152,7 @@ async fn mcp_roots_list_opens_when_cwd_has_no_store() {
         "jsonrpc": "2.0",
         "id": ROOTS_LIST_REQUEST_ID,
         "result": {
-            "roots": [{"uri": format!("file://{}", repo.display())}]
+            "roots": [{"uri": file_uri(&repo)}]
         }
     });
     assert!(handle_line(&slot, &response.to_string()).await.is_none());
@@ -192,7 +220,20 @@ async fn concurrent_status_while_store_deleted_mid_session_fails_closed() {
     let store_path = plant_store(&root);
     let slot = Arc::new(StoreSlot::resolving(None, root.clone(), None));
     let _ = slot.get().expect("open");
-    std::fs::remove_file(&store_path).unwrap();
+    if let Err(error) = std::fs::remove_file(&store_path) {
+        // Windows refuses to delete a file an open handle holds without
+        // FILE_SHARE_DELETE (os error 32), so the mid-session deletion this
+        // test exercises cannot happen there: the store stays whole and keeps
+        // serving. Anything else is a real failure.
+        assert!(
+            cfg!(windows) && error.raw_os_error() == Some(32),
+            "removing the store failed: {error}"
+        );
+        assert!(store_path.is_file(), "a refused delete leaves the store");
+        slot.get()
+            .expect("the store the delete could not touch still serves");
+        return;
+    }
     let err = match slot.get() {
         Ok(_) => panic!("deleted store must not reopen"),
         Err(err) => err,

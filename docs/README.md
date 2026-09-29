@@ -13,7 +13,7 @@ CLI. [Project overview](../README.md) · [Website](https://devcouncil.vbcr.dev/)
 | Connect an editor or coding agent | [Coding CLI integration](coding-cli-integration.md) |
 | Find symbols, callers, impact and candidate tests | [Code graph guide](code-graph.md) |
 | Search text exactly, or rank files by what they are about | [Ranked search](lexical-search.md) |
-| Choose a binary, library or host boundary | [Architecture](architecture.md) |
+| Choose a binary, library or host boundary | [Architecture](architecture.md); what runs in-process on Gusset: [Gusset candidates](gusset-candidates.md) |
 | Use tasks, leases and verification | [Task workflow](workflow.md) and [MCP task loop](hero-loop.md) |
 | Look up commands and flags | [CLI reference](cli-reference.md) |
 | Understand limitations and retired commands | [Project status](project-status.md) |

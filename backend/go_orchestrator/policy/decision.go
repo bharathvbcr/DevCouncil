@@ -125,6 +125,15 @@ const (
 	// the read and redacting known values are different controls; this is the
 	// first one.
 	RuleSecretRead RuleID = "path.secret_read"
+
+	// RulePathEngineUnavailable and RuleCommandEngineUnavailable refuse a
+	// write, read or command because the pattern engine the gate was given
+	// (see Matcher) failed to answer. Their own rules, not the rung that
+	// asked: an engine outage recorded as path.secret would say something
+	// false about the path. Hard, because nothing was judged, so there is
+	// nothing a grant could be scoped to.
+	RulePathEngineUnavailable    RuleID = "path.engine_unavailable"
+	RuleCommandEngineUnavailable RuleID = "command.engine_unavailable"
 )
 
 // severities is the authoritative classification. A rule absent from this map
@@ -146,19 +155,21 @@ var severities = map[RuleID]Severity{
 	// negotiable. The three git-safety rules protect the verification gates
 	// themselves: a --no-verify commit or a force push can erase the evidence
 	// the whole system reasons about, and no scope decision authorises that.
-	RuleCommandEmpty:           Hard,
-	RuleCommandBypassFlag:      Hard,
-	RuleCommandForcePush:       Hard,
-	RuleCommandProtectedReset:  Hard,
-	RuleCommandProtectedPush:   WarnSeverity,
-	RuleCommandNoLease:         Soft,
-	RuleCommandNotAllowed:      Soft,
-	RuleCommandSubstitution:    Hard,
-	RuleCommandHeredoc:         Hard,
-	RuleCommandReparse:         Hard,
-	RuleCommandTooLong:         Hard,
-	RuleCommandDirectoryChange: Hard,
-	RuleSecretRead:             Hard,
+	RuleCommandEmpty:             Hard,
+	RuleCommandBypassFlag:        Hard,
+	RuleCommandForcePush:         Hard,
+	RuleCommandProtectedReset:    Hard,
+	RuleCommandProtectedPush:     WarnSeverity,
+	RuleCommandNoLease:           Soft,
+	RuleCommandNotAllowed:        Soft,
+	RuleCommandSubstitution:      Hard,
+	RuleCommandHeredoc:           Hard,
+	RuleCommandReparse:           Hard,
+	RuleCommandTooLong:           Hard,
+	RuleCommandDirectoryChange:   Hard,
+	RuleSecretRead:               Hard,
+	RulePathEngineUnavailable:    Hard,
+	RuleCommandEngineUnavailable: Hard,
 }
 
 // Subject says what a rule's Target names: a path on disk, or a shell command.
@@ -214,6 +225,9 @@ var subjects = map[RuleID]Subject{
 	RuleCommandDirectoryChange: SubjectCommand,
 
 	RuleSecretRead: SubjectPath,
+
+	RulePathEngineUnavailable:    SubjectPath,
+	RuleCommandEngineUnavailable: SubjectCommand,
 }
 
 // SubjectOf returns what a rule's Target names.
