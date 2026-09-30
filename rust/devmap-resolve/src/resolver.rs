@@ -1573,9 +1573,14 @@ impl Resolver {
             // Keyed on the directory, not the package clause: a file that
             // failed to parse has no clause to key on, and it may belong to
             // any package in its directory.
+            // A `Partial` parse vouches only because its extraction vetoes every
+            // unexported token in the file (see `go_unexported_tokens`); every
+            // other non-clean outcome contributed no member list worth trusting.
             if ext.file_path.ends_with(".go")
-                && (!matches!(ext.parse_outcome, ParseOutcome::Clean)
-                    || ext.go_member_names.is_none())
+                && (!matches!(
+                    ext.parse_outcome,
+                    ParseOutcome::Clean | ParseOutcome::Partial { .. }
+                ) || ext.go_member_names.is_none())
             {
                 self.go_package_dirs_unvouched
                     .insert(Self::parent_dir(&ext.file_path));
@@ -4009,8 +4014,11 @@ impl Resolver {
     /// * any field or interface method of the name, from any struct or
     ///   interface literal in the package;
     /// * any `.go` file in the directory whose extraction cannot vouch for the
-    ///   whole declaration set (not a clean parse, or cached before
-    ///   `go_member_names` existed) — the missing namesake could be there;
+    ///   whole declaration set (a failed or pattern-recovered parse, or cached
+    ///   before `go_member_names` existed) — the missing namesake could be
+    ///   there. A `Partial` parse is not one of them: its extraction vetoes
+    ///   every unexported token in the file, so it blocks exactly the names it
+    ///   could be hiding;
     /// * cgo's `C.name()`, which names a C function, not a Go method.
     fn unexported_selector_target(
         &self,

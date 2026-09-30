@@ -535,8 +535,21 @@ fn extract_treesitter_before_deadline(
                 }
 
                 let (go_interface_methods, go_method_params, go_member_names) = if lang == "go" {
-                    let (interface_methods, method_params, member_names) =
+                    let (interface_methods, method_params, mut member_names) =
                         go_method_sets(root, source, &file_symbol_name);
+                    // A file tree-sitter could not parse cleanly may hold a
+                    // declaration the walk never saw. Every declaration spells
+                    // its name, so each unexported token in the text is a
+                    // possible namesake: vetoing all of them keeps the
+                    // unexported-selector rung sound for this package without
+                    // switching it off for names this file never mentions. (One
+                    // `Partial` file among scholarlm's 471 in `internal/api` had
+                    // silenced the rung for the whole package.)
+                    if !matches!(parse_outcome, ParseOutcome::Clean) {
+                        member_names.extend(go_unexported_tokens(source));
+                        member_names.sort();
+                        member_names.dedup();
+                    }
                     go_interface_method_exemptions(
                         &symbols,
                         &interface_methods,
@@ -2662,6 +2675,35 @@ fn go_method_sets(
     member_names.sort();
     member_names.dedup();
     (interface_methods, method_params, member_names)
+}
+
+/// Every identifier-shaped token in `source` that Go would keep unexported.
+///
+/// Deliberately lexical and over-inclusive — comments, strings and keywords
+/// contribute too. It is the veto list for a file whose syntax tree cannot be
+/// trusted to have shown every declaration, and a spare veto only costs an
+/// answer, never a wrong one. Linear in the source, one pass.
+fn go_unexported_tokens(source: &str) -> Vec<String> {
+    let mut tokens = BTreeSet::new();
+    let mut start: Option<usize> = None;
+    for (index, character) in source
+        .char_indices()
+        .chain(std::iter::once((source.len(), ' ')))
+    {
+        let continues = character == '_' || character.is_alphanumeric();
+        match (start, continues) {
+            (None, true) if !character.is_numeric() => start = Some(index),
+            (Some(from), false) => {
+                let token = &source[from..index];
+                if go_name_is_unexported(token) {
+                    tokens.insert(token);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    tokens.into_iter().map(str::to_string).collect()
 }
 
 /// A Go identifier the language keeps inside its package: its first character

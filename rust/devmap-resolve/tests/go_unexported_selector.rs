@@ -15,7 +15,7 @@
 //! has a case.
 
 use devmap_extract::extract_file;
-use devmap_extract::model::Extraction;
+use devmap_extract::model::{Extraction, ParseOutcome};
 use devmap_resolve::model::{Resolution, ResolutionKind, ResolutionResult};
 use devmap_resolve::Resolver;
 
@@ -262,16 +262,78 @@ fn a_cgo_call_is_not_a_go_method() {
 }
 
 #[test]
-fn a_package_with_an_unparsed_file_abstains() {
-    let broken = "package api\n\nfunc broken( {\n";
+fn a_partially_parsed_file_vetoes_only_the_names_it_spells() {
+    // Broken, and never mentions the method: the package keeps its answer.
+    let unrelated = "package api\n\nfunc broken( {\n";
     let result = resolve(&[
         ("api/yolo.go", YOLO),
         ("api/handler.go", HANDLER),
-        ("api/broken.go", broken),
+        ("api/broken.go", unrelated),
+    ]);
+    assert_eq!(
+        calls_from(&result, HANDLER_SYMBOL, "recordReplayEvent").len(),
+        1,
+        "one broken file must not silence a package for names it never spells"
+    );
+
+    // Broken exactly where a second declaration of the name sits.
+    let hiding = "package api\n\ntype other struct{}\n\nfunc (o *other) recordReplayEvent( {\n";
+    let result = resolve(&[
+        ("api/yolo.go", YOLO),
+        ("api/handler.go", HANDLER),
+        ("api/broken.go", hiding),
     ]);
     assert!(
         calls_from(&result, HANDLER_SYMBOL, "recordReplayEvent").is_empty(),
-        "a file that did not parse cleanly may hold the namesake that vetoes the answer"
+        "a broken file that spells the name may hold its second declaration"
+    );
+}
+
+#[test]
+fn a_failed_extraction_silences_its_package() {
+    let mut extractions: Vec<Extraction> = [
+        ("api/yolo.go", YOLO),
+        ("api/handler.go", HANDLER),
+        ("api/lost.go", "package api\n"),
+    ]
+    .iter()
+    .map(|(path, source)| extract_file(path, source))
+    .collect();
+    extractions[2].parse_outcome = ParseOutcome::Failed {
+        reason: "simulated".to_string(),
+    };
+    let result = resolve_extractions(&extractions);
+    assert!(
+        calls_from(&result, HANDLER_SYMBOL, "recordReplayEvent").is_empty(),
+        "a file that contributed nothing could declare anything"
+    );
+}
+
+#[test]
+fn the_partial_veto_is_lexical_and_complete() {
+    let ext = extract_file(
+        "api/broken.go",
+        "package api\n\n// flushAll is \"quoted\" _under 9lives\nfunc (o *other) Settle( {\n",
+    );
+    assert!(matches!(ext.parse_outcome, ParseOutcome::Partial { .. }));
+    let names = ext
+        .go_member_names
+        .expect("a Go extraction always states its list");
+    for spelled in [
+        "flushAll", "quoted", "_under", "lives", "package", "api", "o", "other",
+    ] {
+        assert!(
+            names.contains(&spelled.to_string()),
+            "missing {spelled}: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"Settle".to_string()),
+        "exported names are never vetoes"
+    );
+    assert!(
+        !names.iter().any(|name| name.starts_with(char::is_numeric)),
+        "{names:?}"
     );
 }
 
@@ -330,5 +392,34 @@ func each[T interface{ settle() }](t T) {}
         extract_file("app.py", "def f():\n    pass\n").go_member_names,
         None,
         "only Go states the list"
+    );
+}
+
+#[test]
+fn the_partial_veto_survives_hostile_text() {
+    // Multibyte identifiers, emoji, a token at end of input, and ~1 MB of
+    // distinct names: no panic on a char boundary, nothing dropped.
+    let mut source = String::from("package api\n\n// ñame 🚀 émoji_x\nfunc (o *other) Settle( {\n");
+    for index in 0..40_000 {
+        source.push_str(&format!("// v{index}_x\n"));
+    }
+    source.push_str("tailtoken");
+    let ext = extract_file("api/hostile.go", &source);
+    assert!(
+        matches!(ext.parse_outcome, ParseOutcome::Partial { .. }),
+        "{:?} members={:?}",
+        ext.parse_outcome,
+        ext.go_member_names.as_ref().map(Vec::len)
+    );
+    let names = ext.go_member_names.unwrap();
+    for spelled in ["ñame", "émoji_x", "v0_x", "v39999_x", "tailtoken"] {
+        assert!(
+            names.binary_search(&spelled.to_string()).is_ok(),
+            "missing {spelled}"
+        );
+    }
+    assert!(
+        names.windows(2).all(|pair| pair[0] < pair[1]),
+        "sorted and deduplicated"
     );
 }
