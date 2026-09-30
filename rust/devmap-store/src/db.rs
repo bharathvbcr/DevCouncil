@@ -1787,6 +1787,66 @@ impl std::fmt::Display for VacuumAction {
 /// One owner for the rule. Four bounded readers each carried their own copy of
 /// this clamp and a fifth, `latest_unresolved`, was written without it; that is
 /// the shape a shared helper exists to prevent.
+/// What a WAL sidecar's link count says about it, read from an open handle.
+#[derive(Debug, PartialEq, Eq)]
+enum SidecarLinks {
+    /// The ordinary case: one name, this one.
+    Single,
+    /// Deleted after it was opened — SQLite removes `-wal` when the last
+    /// writer connection closes, so a reader racing a committing build sees
+    /// this. It is the missing-sidecar case, and refusing it failed reads
+    /// exactly while a build committed (`queries_succeed_while_a_build_is_committing`).
+    Unlinked,
+    /// A second name for the same inode: the alias the check exists to refuse,
+    /// because WAL and writer ownership could then diverge.
+    Aliased,
+}
+
+fn sidecar_links(count: u64) -> SidecarLinks {
+    match count {
+        0 => SidecarLinks::Unlinked,
+        1 => SidecarLinks::Single,
+        _ => SidecarLinks::Aliased,
+    }
+}
+
+#[cfg(test)]
+mod sidecar_link_tests {
+    use super::{sidecar_links, SidecarLinks};
+
+    #[test]
+    fn only_a_second_name_is_an_alias() {
+        assert_eq!(sidecar_links(0), SidecarLinks::Unlinked);
+        assert_eq!(sidecar_links(1), SidecarLinks::Single);
+        assert_eq!(sidecar_links(2), SidecarLinks::Aliased);
+        assert_eq!(sidecar_links(u64::MAX), SidecarLinks::Aliased);
+    }
+
+    /// The race is real, not hypothetical: a handle opened before the file is
+    /// deleted reports zero links, which the old `!= 1` test called "multiple".
+    #[cfg(unix)]
+    #[test]
+    fn a_sidecar_deleted_after_open_reports_zero_links() {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-sidecar-unlinked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal = dir.join("index.sqlite-wal");
+        std::fs::write(&wal, b"").unwrap();
+        let handle = std::fs::File::open(&wal).unwrap();
+        std::fs::remove_file(&wal).unwrap();
+        let links = devmap_extract::safe_fs::file_link_count(&handle).unwrap();
+        assert_eq!(links, 0);
+        assert_eq!(sidecar_links(links), SidecarLinks::Unlinked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 fn sqlite_limit(limit: usize) -> i64 {
     limit.min(i64::MAX as usize) as i64
 }
@@ -3453,16 +3513,22 @@ impl Store {
             let path = std::path::PathBuf::from(name);
             match SafeFile::open(&path, Access::Read, Creation::Never) {
                 Ok(file) => {
-                    if devmap_extract::safe_fs::file_link_count(&file)
-                        .map_err(|error| refusal(error.to_string()))?
-                        != 1
-                    {
-                        return Err(refusal(format!(
-                            "sidecar {} has multiple hard links",
-                            path.display()
-                        )));
+                    let links = devmap_extract::safe_fs::file_link_count(&file)
+                        .map_err(|error| refusal(error.to_string()))?;
+                    match sidecar_links(links) {
+                        SidecarLinks::Single => sidecars.push(file),
+                        // SQLite deletes `-wal` when the last writer connection
+                        // closes, so a build committing between this open and
+                        // this check leaves an unlinked handle. That is the
+                        // missing-sibling case below, not an alias.
+                        SidecarLinks::Unlinked => {}
+                        SidecarLinks::Aliased => {
+                            return Err(refusal(format!(
+                                "sidecar {} has multiple hard links",
+                                path.display()
+                            )));
+                        }
                     }
-                    sidecars.push(file);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
