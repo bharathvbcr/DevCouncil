@@ -179,3 +179,7 @@ required-features = ["parse"]
 [[test]]
 name = "python_path_constants_and_loaders"
 required-features = ["parse"]
+
+[[test]]
+name = "python_sys_path_imports"
+required-features = ["parse"]

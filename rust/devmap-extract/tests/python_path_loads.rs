@@ -303,6 +303,148 @@ x = a()
     }
 }
 
+fn search_directories(extraction: &Extraction) -> Vec<(String, Option<u32>)> {
+    path_loads(extraction)
+        .into_iter()
+        .filter(|import| {
+            import.path_load.as_ref().unwrap().kind
+                == devmap_extract::model::PathLoadKind::SearchDirectory
+        })
+        .map(|import| {
+            (
+                import.module_specifier.clone(),
+                import.path_load.as_ref().unwrap().anchor_up,
+            )
+        })
+        .collect()
+}
+
+/// Each readable module-level `sys.path` write is one `SearchDirectory`
+/// import carrying its anchor; the BINN spellings all read.
+#[test]
+fn sys_path_inserts_record_their_directory_and_anchor() {
+    let source = "\
+import os
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), \"..\"))
+sys.path.append(os.path.join(HERE, \"lib\"))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT / \"scripts\"))
+sys.path[:0] = [str(ROOT / \"vendor\")]
+";
+    let extraction = extract_file("scripts/test_x.py", source);
+    assert_eq!(
+        search_directories(&extraction),
+        [
+            ("scripts/aws".to_string(), Some(1)),
+            (String::new(), Some(1)),
+            (String::new(), Some(0)),
+            ("..".to_string(), Some(0)),
+            ("lib".to_string(), Some(0)),
+            ("scripts".to_string(), Some(1)),
+            ("vendor".to_string(), Some(1)),
+        ]
+    );
+}
+
+/// Any write this pass cannot follow withdraws every entry in the file.
+#[test]
+fn an_unfollowable_sys_path_write_withdraws_every_entry() {
+    for (label, write) in [
+        ("reassigned", "sys.path = [\"/opt\"]\n"),
+        ("augmented", "sys.path += [\"/opt\"]\n"),
+        ("removed", "sys.path.remove(\"/opt\")\n"),
+        ("popped", "sys.path.pop(0)\n"),
+        ("deleted", "del sys.path[0]\n"),
+        ("item set", "sys.path[0] = \"/opt\"\n"),
+        ("unreadable insert", "sys.path.insert(0, somewhere)\n"),
+        ("cwd-relative insert", "sys.path.insert(0, \"scripts\")\n"),
+        (
+            "removed in a function",
+            "def f():\n    sys.path.remove(\"/opt\")\n",
+        ),
+    ] {
+        let source = format!(
+            "import sys\nfrom pathlib import Path\nROOT = Path(__file__).resolve().parent.parent\n\
+             sys.path.insert(0, str(ROOT / \"scripts\"))\n{write}"
+        );
+        let extraction = extract_file("scripts/test_x.py", &source);
+        assert!(
+            search_directories(&extraction).is_empty(),
+            "{label}: {:?}",
+            search_directories(&extraction)
+        );
+    }
+}
+
+/// An insert inside a function or class body is recorded with a scope — the
+/// resolver's veto — and one it cannot read has no anchor and no directory.
+/// Neither withdraws the module-level entries.
+#[test]
+fn in_function_sys_path_inserts_are_recorded_as_scoped_vetoes() {
+    let source = "\
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))
+
+class Tooling:
+    sys.path.insert(0, str(ROOT / \"vendor\"))
+
+    def test_azure(self):
+        sys.path.insert(0, str(ROOT / \"scripts\" / \"azure\"))
+
+    def test_anywhere(self, where):
+        sys.path.append(where)
+";
+    let extraction = extract_file("scripts/test_x.py", source);
+    let entries: Vec<(String, Option<u32>, Option<String>)> = path_loads(&extraction)
+        .into_iter()
+        .filter_map(|import| {
+            let load = import.path_load.as_ref()?;
+            (load.kind == devmap_extract::model::PathLoadKind::SearchDirectory).then(|| {
+                (
+                    import.module_specifier.clone(),
+                    load.anchor_up,
+                    load.scope.clone(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(entries.len(), 4, "{entries:?}");
+    assert_eq!(entries[0], ("scripts/aws".to_string(), Some(1), None));
+    // A class body: scoped to the file, and read as unreadable.
+    assert_eq!(entries[1].0, "");
+    assert_eq!(entries[1].1, None);
+    assert!(entries[1].2.is_some(), "{entries:?}");
+    // A readable insert in a method keeps its directory and names the method.
+    assert_eq!(entries[2].0, "scripts/azure");
+    assert_eq!(entries[2].1, Some(1));
+    assert!(
+        entries[2]
+            .2
+            .as_deref()
+            .is_some_and(|scope| scope.ends_with("test_azure")),
+        "{entries:?}"
+    );
+    // An unreadable one in a method: no anchor, no directory.
+    assert_eq!(entries[3].0, "");
+    assert_eq!(entries[3].1, None);
+    assert!(
+        entries[3]
+            .2
+            .as_deref()
+            .is_some_and(|scope| scope.ends_with("test_anywhere")),
+        "{entries:?}"
+    );
+}
+
 /// A module-level path constant carries its anchor into every use, at module
 /// level and inside a method.
 #[test]
