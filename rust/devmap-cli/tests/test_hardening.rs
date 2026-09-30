@@ -643,6 +643,15 @@ fn test_runtime_entry_points_are_exempt_without_exempting_their_file() {
             exempt: &["Widget.connectedCallback"],
             still_dead: "Widget.unusedMethod",
         },
+        // The `register(test, Skip)` seam: the decorator is a parameter the
+        // caller injected, so the callee decides when the nested function
+        // runs. A nested function nothing hands anywhere stays dead.
+        Case {
+            path: "src/plugins.py",
+            source: "def register(test):\n    @test\n    def collected():\n        pass\n\n    def orphan_nested():\n        pass\n",
+            exempt: &["register.collected"],
+            still_dead: "register.orphan_nested",
+        },
     ];
 
     for case in &cases {
@@ -688,6 +697,116 @@ fn test_runtime_entry_points_are_exempt_without_exempting_their_file() {
              the entry-point exemption leaked to file scope: {:?}",
             case.path,
             case.still_dead,
+            analysis.dead_symbols
+        );
+    }
+}
+
+/// A helper called only through template syntax is called.
+///
+/// `dev_t<T>(p)` was recorded as a call whose callee the extractor filed as a
+/// local of the calling kernel, so the resolver classified the site
+/// `local_binding` and the helper was published at 0.9 with no reason — the
+/// tier whose contract is "safe to act on". Measured on MLSystemsLab: 12 CUDA
+/// `__device__` helpers and 4 Metal `inline` helpers, none of them dead. The
+/// uncalled twin beside each must stay confidently dead: the fix is an edge,
+/// not an exemption.
+#[test]
+fn a_template_call_keeps_its_callee_out_of_the_confident_dead_tier() {
+    for (path, source) in [
+        (
+            "k/a.cu",
+            "template <typename T>\n__device__ __forceinline__ void dev_t(T *p) { p[0] = 1; }\n\
+             __device__ __forceinline__ void dev_dead(float *p) { p[2] = 1; }\n\
+             template <typename T>\n__global__ void kern(T *p) {\n    dev_t<T>(p);\n}\n",
+        ),
+        (
+            "k/a.metal",
+            "template <bool B>\ninline void dev_t(device float *row, uint n) { row[0] = n; }\n\
+             inline void dev_dead(device float *row) { row[2] = 0; }\n\
+             kernel void entry_k(device float *row [[buffer(0)]], uint gid [[thread_position_in_grid]]) {\n\
+             \x20   dev_t<false>(row, gid);\n}\n",
+        ),
+    ] {
+        let ext = extract_file(path, source);
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(std::slice::from_ref(&ext));
+        let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
+        let analysis = analyze(std::slice::from_ref(&ext), &resolution);
+        let confidently_dead = |name: &str| {
+            analysis.dead_symbols.iter().any(|report| {
+                report.symbol_name == name && !report.is_exempt && report.confidence >= 0.9
+            })
+        };
+        assert!(
+            !confidently_dead("dev_t"),
+            "{path}: `dev_t<…>(…)` is a call to dev_t: {:?}\nunresolved: {:?}",
+            analysis.dead_symbols,
+            resolution.unresolved
+        );
+        assert!(
+            confidently_dead("dev_dead"),
+            "{path}: the uncalled helper beside it must stay confidently dead: {:?}",
+            analysis.dead_symbols
+        );
+    }
+}
+
+/// A helper called only from a `#define` body is called, and a type reached
+/// only as a `Type::member` scope is used.
+///
+/// The two remaining C-family shapes measured on MLSystemsLab after the
+/// template-call fix: 9 Metal `inline` helpers stamped into kernels by
+/// function-like macros, and `MmaTiles`, mentioned only as
+/// `MmaTiles::kThreads`. The uncalled twin of each stays confidently dead —
+/// including a helper named only inside a comment in the macro body.
+#[test]
+fn a_macro_body_call_and_a_qualified_scope_keep_their_targets_out_of_the_confident_dead_tier() {
+    // Two macros rather than one: the grammar's preprocessor scanner drops a
+    // macro whose comment-terminated line is followed by a template-call
+    // line (see `a_function_like_macro_body_calls_what_it_names`).
+    let ext = extract_file(
+        "k/m.cu",
+        "#define STAMP(NAME) \\\n\
+         \x20 __global__ void NAME(float *p) { \\\n\
+         \x20   dev_plain(p); /* dead_in_comment(p) */ \\\n\
+         \x20   dev_plain(p); \\\n\
+         \x20 }\n\
+         #define STAMP2(NAME) \\\n\
+         \x20 __global__ void NAME(float *p) { \\\n\
+         \x20   macro_only_helper<float>(p); p[0] = sizeof(\"dead_in_string(p)\"); \\\n\
+         \x20 }\n\
+         __global__ void scoped(float *p) { constexpr int k = Plain::K; p[1] = k; }\n\
+         __device__ void dev_plain(float *p) { p[1] = 1; }\n\
+         template <typename T> __device__ void macro_only_helper(T *p) { p[3] = 1; }\n\
+         __device__ void dead_in_comment(float *p) { p[4] = 1; }\n\
+         __device__ void dead_in_string(float *p) { p[5] = 1; }\n\
+         struct Plain { static constexpr int K = 4; };\n\
+         struct PlainUnused { static constexpr int K = 5; };\n\
+         STAMP(stamped_kernel)\n\
+         STAMP2(stamped_kernel2)\n",
+    );
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
+    let analysis = analyze(std::slice::from_ref(&ext), &resolution);
+    let confidently_dead = |name: &str| {
+        analysis.dead_symbols.iter().any(|report| {
+            report.symbol_name == name && !report.is_exempt && report.confidence >= 0.9
+        })
+    };
+    for live in ["dev_plain", "macro_only_helper", "Plain"] {
+        assert!(
+            !confidently_dead(live),
+            "{live} is reached from the macro body: {:?}\nunresolved: {:?}",
+            analysis.dead_symbols,
+            resolution.unresolved
+        );
+    }
+    for dead in ["dead_in_comment", "dead_in_string", "PlainUnused"] {
+        assert!(
+            confidently_dead(dead),
+            "{dead} has no call site and must stay confidently dead: {:?}",
             analysis.dead_symbols
         );
     }
