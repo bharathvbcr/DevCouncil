@@ -980,17 +980,44 @@ const CALLEE_IN_REASON_MAX: usize = 60;
 /// act on". Every callback interface of every other library had the same
 /// problem, and the shape they share is written in the syntax.
 pub fn js_object_literal_argument_reason(callee: &str) -> String {
-    let callee = callee.trim();
-    let shown: String = if callee.chars().count() > CALLEE_IN_REASON_MAX {
-        callee
-            .chars()
+    let shown = bounded_for_reason(callee);
+    format!("declared in an object literal passed to `{shown}` — that callee decides when it runs")
+}
+
+/// Why a Python function decorated with a callable its enclosing function
+/// received as a parameter is exempt.
+///
+/// The same statement about the evidence as
+/// [`js_object_literal_argument_reason`], for the decorator spelling of it:
+/// `@test def case(): …` inside `def register(test, …)` is `case = test(case)`,
+/// and `test` is whatever the caller of `register` passed. The syntax shows the
+/// function being handed to an injected callable; it does not show that the
+/// callable runs it, and the reason says exactly that.
+///
+/// Both names are bounded the same way the callee above is: a decorator can be
+/// an arbitrarily long member chain, and the reason is provenance a human
+/// reads, not an identity anything matches on.
+pub fn python_injected_decorator_reason(decorator: &str, owner: &str) -> String {
+    let decorator = bounded_for_reason(decorator);
+    let owner = bounded_for_reason(owner);
+    format!(
+        "decorated by `{decorator}`, a parameter of the enclosing `{owner}` — that callee decides when it runs"
+    )
+}
+
+/// `text`, trimmed and cut to [`CALLEE_IN_REASON_MAX`] characters with a
+/// marker when it was cut — the one bound every reason that quotes source
+/// text goes through.
+fn bounded_for_reason(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() > CALLEE_IN_REASON_MAX {
+        text.chars()
             .take(CALLEE_IN_REASON_MAX)
             .chain("…".chars())
             .collect()
     } else {
-        callee.to_string()
-    };
-    format!("declared in an object literal passed to `{shown}` — that callee decides when it runs")
+        text.to_string()
+    }
 }
 
 fn looks_like_reexport_init(path: &str, source: &str) -> bool {

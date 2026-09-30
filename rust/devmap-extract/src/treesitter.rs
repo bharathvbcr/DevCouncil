@@ -2964,6 +2964,66 @@ fn metal_shader_entry_reason_of(node: Node, source: &str) -> Option<&'static str
     crate::wiring::metal_shader_entry_reason(&word)
 }
 
+/// The decorator on a Python function whose root name is a parameter of an
+/// enclosing callable, and that callable's name — or `None`.
+///
+/// `@test` and `@test.skip(…)` both qualify when `test` is a parameter: the
+/// value is injected either way, and whatever it registers, the decision is
+/// the caller's. The **nearest** enclosing callable that binds the root
+/// decides, in either direction: as a parameter the decorator is injected; as
+/// a local (`test = functools.lru_cache` one scope in) it is rebound and the
+/// outer parameter is shadowed, so no claim is made. A root that is bound
+/// nowhere on the way up — an import, a module-level function, `other` in
+/// `@other.test` — is not injected, whatever an outer parameter is called.
+///
+/// Keyed on the binding rather than on the spelling on purpose. The decorator
+/// hint table (`crate::wiring::is_wiring_decorator`) is pinned equal to the
+/// Python kernel's and exempts the whole *file*; this claims one function, on
+/// evidence the syntax carries.
+fn python_injected_decorator(node: Node, source: &str) -> Option<(String, String)> {
+    let decorated =
+        bounded_parent(node).filter(|parent| parent.kind() == "decorated_definition")?;
+    let mut cursor = decorated.walk();
+    let decorators: Vec<String> = decorated
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "decorator")
+        .map(|decorator| get_node_text(decorator, source))
+        .collect();
+    for text in decorators {
+        let base = text
+            .trim()
+            .trim_start_matches('@')
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let root = base.split('.').next().unwrap_or("").trim();
+        if !is_user_ident(root) {
+            continue;
+        }
+        let mut ancestor = bounded_parent(decorated);
+        while let Some(scope) = ancestor {
+            if is_callable_node(scope) {
+                let mut parameters = BTreeSet::new();
+                collect_parameter_names(scope, source, &mut parameters);
+                if parameters.contains(root) {
+                    let owner = scope
+                        .child_by_field_name("name")
+                        .map(|name| get_node_text(name, source))
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| "<anonymous>".to_string());
+                    return Some((base.to_string(), owner));
+                }
+                if with_scope_locals(scope, source, |locals| locals.contains(root)) {
+                    break;
+                }
+            }
+            ancestor = bounded_parent(scope);
+        }
+    }
+    None
+}
+
 /// Nearest enclosing type-like declaration, so a method is owned by its type.
 pub(crate) fn generic_enclosing_type(node: Node, source: &str) -> Option<String> {
     let mut ancestor = bounded_parent(node);
@@ -3121,6 +3181,19 @@ fn extract_node(
                                 details: reason.to_string(),
                             });
                         }
+                    }
+                    // The structural rule the name tables above cannot
+                    // express: `@test` inside `def register(test, …)` hands
+                    // the function to a callable the caller injected, and
+                    // that callable — not this corpus — decides when it runs.
+                    if let Some((decorator, owner)) = python_injected_decorator(node, source) {
+                        wiring.push(WiringAnnotation {
+                            kind: WiringKind::RuntimeEntryPoint,
+                            target_symbol: qualified_name.clone(),
+                            details: crate::wiring::python_injected_decorator_reason(
+                                &decorator, &owner,
+                            ),
+                        });
                     }
                     symbols.push(ExtractedSymbol {
                         name: n.clone(),
@@ -7067,10 +7140,42 @@ fn node_contains(haystack: Node, needle: Node) -> bool {
 /// are genuine references. Returns the outermost node of the chain — the
 /// declaration itself — so callers can tell a function definition from a
 /// variable or parameter binding.
+/// Whether `parent` is a C++ template wrapper whose `name` field is `node`.
+///
+/// `template_function` (`f<T>` as a callee, or an explicit specialization's
+/// declarator), `template_method` (`obj.f<T>`) and `template_type`
+/// (`Tiles<4>`) all put the name they wrap on a `name` field, and none of
+/// them binds anything: the wrapper is transparent, and whether the name
+/// declares or uses is decided one level up. The generic "a `name` field is a
+/// binding" rule in [`is_defining_name`] read the wrapper itself as the
+/// declaration, so every template *call* filed its callee as a local of the
+/// calling function — the resolver then classified the site `local_binding`
+/// and the helper was published confidently dead. Measured on MLSystemsLab:
+/// every `__device__` helper and every Metal `inline` helper reached through
+/// `f<T>(…)`, and every template struct whose only mentions were
+/// instantiations.
+fn is_template_wrapper_name(parent: Node, node: Node) -> bool {
+    matches!(
+        parent.kind(),
+        "template_function" | "template_method" | "template_type"
+    ) && parent
+        .child_by_field_name("name")
+        .is_some_and(|name| name.id() == node.id())
+}
+
 fn c_declarator_declaration(node: Node) -> Option<Node> {
     let mut current = node;
     let mut climbed = false;
     while let Some(parent) = bounded_parent(current) {
+        // `spec<float>` in `template <> void spec<float>(float *p) {…}`: the
+        // declarator chain runs through the wrapper, and stopping at it would
+        // leave the specialization's own name looking like a use of the
+        // primary template — the self-reference shape
+        // `c_family_declarations_do_not_reference_themselves` pins.
+        if is_template_wrapper_name(parent, current) {
+            current = parent;
+            continue;
+        }
         if parent
             .child_by_field_name("declarator")
             .is_none_or(|declarator| declarator.id() != current.id())
@@ -7165,6 +7270,13 @@ fn is_defining_name(node: Node) -> bool {
         // contract looks confidently dead.
         if parent.kind() == "generic_type" {
             return false;
+        }
+        // The C++ spelling of the same shape, but transparent rather than a
+        // verdict: `f<T>(x)` is a use and `template <> struct Tiles<8> {…}` is
+        // a declaration, and only the node above the wrapper can tell which.
+        if is_template_wrapper_name(parent, current) {
+            current = parent;
+            continue;
         }
         if field_contains(parent, "name", node)
             || field_contains(parent, "alias", node)
@@ -8109,6 +8221,17 @@ fn is_call_callee(node: Node) -> bool {
     let Some(parent) = bounded_parent(node) else {
         return false;
     };
+    // `f<T>(x)`: the call's `function` field is the wrapper, and the name
+    // inside it is the callee. Without this the name was also emitted as a
+    // `Name` reference beside the `Call` one — two references for one site.
+    let (node, parent) = if is_template_wrapper_name(parent, node) {
+        match bounded_parent(parent) {
+            Some(grand) => (parent, grand),
+            None => return false,
+        }
+    } else {
+        (node, parent)
+    };
     // An Objective-C keyword message has one `method` field per selector part,
     // so the single-field lookup below would only ever recognise the first.
     // Each part is the callee's name, never a use of some same-named symbol.
@@ -8955,6 +9078,204 @@ mod tests {
             .collect();
         assert!(qualified.contains(&"a.c::helper"), "{qualified:?}");
         assert!(qualified.contains(&"a.c::caller"), "{qualified:?}");
+    }
+
+    /// A C-family template call names its callee; it binds no local.
+    ///
+    /// `dev_t<T>(p)` puts the callee identifier on the `name` field of a
+    /// `template_function`, and the generic "a `name` field is a binding"
+    /// rule in `is_defining_name` filed it as a local of the calling
+    /// function. The resolver then classified the recorded call as
+    /// `local_binding` — "the callee is a local binding whose value is not
+    /// known" — and `analyze_liveness` reported the helper confidently dead.
+    /// Measured on MLSystemsLab: every `__device__` helper and every Metal
+    /// `inline` template helper called through `f<T>(…)` — `load_b`,
+    /// `copy_wait`, `stage_tile`, `norm_rope_row` — was published at 0.9 with
+    /// no reason, while the plain-call twins beside them resolved.
+    #[test]
+    fn a_c_family_template_call_names_its_callee_and_binds_no_local() {
+        for (path, lang, source) in [
+            (
+                "k.cu",
+                "cuda",
+                "template <typename T>\n__device__ __forceinline__ void dev_t(T *p) { p[0] = 1; }\n\
+                 template <typename T>\n__global__ void kern(T *p) {\n    dev_t<T>(p);\n}\n",
+            ),
+            (
+                "a.metal",
+                "cpp",
+                "template <bool B>\ninline void dev_t(device float *row, uint n) { row[0] = n; }\n\
+                 kernel void entry_k(device float *row [[buffer(0)]], uint gid [[thread_position_in_grid]]) {\n\
+                 \x20   dev_t<false>(row, gid);\n}\n",
+            ),
+        ] {
+            let extraction = extract_treesitter(path, lang, source);
+            let call = extraction
+                .calls
+                .iter()
+                .find(|call| call.callee_name == "dev_t")
+                .unwrap_or_else(|| panic!("{path}: the template call is recorded: {:?}", extraction.calls));
+            assert!(
+                extraction.local_binding_at(call.span.start_byte, "dev_t").is_none(),
+                "{path}: a template callee is a use of the helper, not a local of the caller: {:?}",
+                extraction.local_bindings
+            );
+            assert!(
+                !name_refs(&extraction).contains(&"dev_t"),
+                "{path}: the callee position is a Call reference, not also a Name one: {:?}",
+                extraction.references
+            );
+        }
+    }
+
+    /// The template wrapper is transparent in both directions.
+    ///
+    /// An explicit specialization `spec<float>` is a declaration: its name
+    /// sits on the same `template_function` node a call uses, and clearing
+    /// that node blanket-wise would have the specialization *reference* the
+    /// primary template — the self-reference shape
+    /// `c_family_declarations_do_not_reference_themselves` pins. A
+    /// `template_type` use, `Tiles<4>::BR`, is the mirror image: it was
+    /// suppressed as a declaration, so a template struct whose only mentions
+    /// were instantiations looked confidently dead (`Tiles`, `MmaTiles` in
+    /// `flash_attn_cuda.cu`). The partial specialization keeps declaring.
+    #[test]
+    fn a_template_specialization_declares_and_a_template_type_use_references() {
+        let specialised = extract_treesitter(
+            "s.cu",
+            "cuda",
+            "template <typename T>\n__device__ void spec(T *p) { p[0] = 2; }\n\
+             template <>\n__device__ void spec<float>(float *p) { p[0] = 3; }\n",
+        );
+        assert!(
+            !name_refs(&specialised).contains(&"spec"),
+            "an explicit specialization declares its name; it does not reference the primary: {:?}",
+            specialised.references
+        );
+        assert!(
+            specialised.local_bindings.is_empty(),
+            "a specialization's own name is a symbol binding, not a local: {:?}",
+            specialised.local_bindings
+        );
+
+        let used = extract_treesitter(
+            "t.cu",
+            "cuda",
+            "template <int N>\nstruct Tiles { static constexpr int BR = N; };\n\
+             __global__ void kern(float *p) { int x = Tiles<4>::BR; p[0] = x; }\n",
+        );
+        assert!(
+            used.references
+                .iter()
+                .any(|reference| reference.name == "Tiles"
+                    && matches!(reference.kind, ReferenceKind::Type | ReferenceKind::Name)),
+            "`Tiles<4>::BR` is a use of the template struct: {:?}",
+            used.references
+        );
+
+        let partial = extract_treesitter(
+            "u.cu",
+            "cuda",
+            "template <int N>\nstruct Tiles { static constexpr int BR = N; };\n\
+             template <>\nstruct Tiles<8> { static constexpr int BR = 1; };\n",
+        );
+        assert!(
+            !partial
+                .references
+                .iter()
+                .any(|reference| reference.name == "Tiles"),
+            "a specialization's head declares; it is not a use of the primary: {:?}",
+            partial.references
+        );
+    }
+
+    /// A nested function decorated with a parameter of its enclosing function
+    /// is handed to that parameter — a callable the caller injected — and the
+    /// callee decides when it runs.
+    ///
+    /// The `register(test, Skip)` seam: `nanolab/tests.py` calls each test
+    /// module's `register(test, Skip)`, and inside it every test is
+    /// `@test def name(): …`. Nothing else in the module names the function;
+    /// 26 of them were published at 0.9 with no reason. The gate is the
+    /// *binding* of the decorator's root, not its spelling: an imported
+    /// decorator, a module-level function of the same name reached from a
+    /// sibling scope, a member access whose root is not the parameter, and a
+    /// nearer scope that rebinds the name all stay ordinary decorated
+    /// functions — and `never_passed_anywhere` stays dead.
+    #[test]
+    fn an_injected_decorator_hands_the_nested_function_to_its_caller() {
+        let extraction = extract_treesitter(
+            "c.py",
+            "python",
+            "import functools\n\
+             \n\
+             def register(test, Skip):\n\
+             \x20   @test\n\
+             \x20   def collected_by_injected_decorator():\n\
+             \x20       pass\n\
+             \n\
+             \x20   @test.skip('reason')\n\
+             \x20   def collected_through_a_member_of_the_parameter():\n\
+             \x20       pass\n\
+             \n\
+             \x20   @functools.lru_cache\n\
+             \x20   def decorated_by_import_dead():\n\
+             \x20       pass\n\
+             \n\
+             \x20   def never_passed_anywhere():\n\
+             \x20       pass\n\
+             \n\
+             \x20   def inner():\n\
+             \x20       test = functools.lru_cache\n\
+             \x20       @test\n\
+             \x20       def rebound_in_the_nearer_scope():\n\
+             \x20           pass\n\
+             \n\
+             def test(fn):\n\
+             \x20   return fn\n\
+             \n\
+             def sibling_collision(unrelated):\n\
+             \x20   @test\n\
+             \x20   def decorated_by_the_module_function():\n\
+             \x20       pass\n\
+             \n\
+             def qualified_collision(test):\n\
+             \x20   @other.test\n\
+             \x20   def decorated_by_a_member_named_like_the_parameter():\n\
+             \x20       pass\n\
+             \n\
+             @test\n\
+             def module_level_decorated():\n\
+             \x20   pass\n",
+        );
+        let mut targets: Vec<&str> = extraction
+            .wiring
+            .iter()
+            .filter(|annotation| annotation.kind == WiringKind::RuntimeEntryPoint)
+            .map(|annotation| annotation.target_symbol.as_str())
+            .collect();
+        targets.sort_unstable();
+        assert_eq!(
+            targets,
+            [
+                "c.py::register.collected_by_injected_decorator",
+                "c.py::register.collected_through_a_member_of_the_parameter",
+            ],
+            "only a decorator rooted at a parameter of an enclosing callable is injected: {:?}",
+            extraction.wiring
+        );
+        let reason = extraction
+            .wiring
+            .iter()
+            .find(|annotation| {
+                annotation.target_symbol == "c.py::register.collected_by_injected_decorator"
+            })
+            .map(|annotation| annotation.details.as_str())
+            .expect("annotated");
+        assert!(
+            reason.contains("`test`") && reason.contains("`register`"),
+            "the reason names the decorator and the function that received it: {reason}"
+        );
     }
 
     /// The declarator suppression follows `declarator` identity, not subtree

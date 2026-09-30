@@ -471,7 +471,14 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// scoped to where they run, as vetoes: such an insert may run before any
 /// import in the file, so a module its directory also holds is not linked. A
 /// v62 row has no vetoes and would link those imports confidently.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "63";
+///
+/// v64 stops filing a C++ template callee (`f<T>(…)`) or template type use
+/// (`Tiles<4>::BR`) as a local binding of the enclosing function, and records
+/// a Python function decorated with a parameter of its enclosing callable as
+/// a `RuntimeEntryPoint`. A v63 row carries the spurious local binding — so
+/// the resolver classifies every such call `local_binding` and the helper is
+/// published confidently dead — and lacks the annotation.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "64";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
