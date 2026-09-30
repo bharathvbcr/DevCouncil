@@ -3540,6 +3540,18 @@ impl Resolver {
             .unwrap_or_else(|| ".".to_string())
     }
 
+    /// Mark Go package directories whose files on disk the index does not
+    /// fully hold, so the unexported-selector rung abstains there.
+    ///
+    /// The extractions can vouch for the files they are; they cannot say that
+    /// no other `.go` file shares their directory — a gitignored generated
+    /// file is compiled into the package and read by nobody. The builder
+    /// supplies that fact from disk (`devmap_extract::go_dirs_with_unindexed_files`).
+    /// Call it **after** [`Self::index_extractions`], which resets the set.
+    pub fn mark_go_dirs_incomplete(&mut self, dirs: impl IntoIterator<Item = String>) {
+        self.go_package_dirs_unvouched.extend(dirs);
+    }
+
     fn go_name_is_unexported(name: &str) -> bool {
         !name.is_empty() && !Self::go_name_is_exported(name)
     }

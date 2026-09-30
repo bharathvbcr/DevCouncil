@@ -1242,6 +1242,11 @@ impl Daemon {
             Err(error) => warn!("go.mod collection failed for {:?}: {error}", self.root),
         }
         resolver.index_extractions(&extractions);
+        // After `index_extractions`, which resets the set this extends.
+        resolver.mark_go_dirs_incomplete(devmap_extract::go_dirs_with_unindexed_files(
+            &self.root,
+            extractions.iter().map(|ext| ext.file_path.as_str()),
+        ));
         let resolution = resolver.resolve_all(&extractions)?;
         let analysis = analyze_with_discovery(&extractions, &resolution, discovery);
         // The reading the carry-forward decision was made against, not a fresh

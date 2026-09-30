@@ -5785,6 +5785,11 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             progress.timed("resolver:index", || {
                 resolver.index_go_modules(&go_modules);
                 resolver.index_extractions(&extractions);
+                // After `index_extractions`, which resets the set this extends.
+                resolver.mark_go_dirs_incomplete(devmap_extract::go_dirs_with_unindexed_files(
+                    path,
+                    extractions.iter().map(|ext| ext.file_path.as_str()),
+                ));
                 Ok::<(), std::convert::Infallible>(())
             })?;
             progress.stage(

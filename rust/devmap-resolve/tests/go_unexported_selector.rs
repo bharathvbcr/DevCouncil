@@ -423,3 +423,29 @@ fn the_partial_veto_survives_hostile_text() {
         "sorted and deduplicated"
     );
 }
+
+/// Disk evidence the builder supplies: a package directory holding a `.go` file
+/// the index never read (a gitignored `*.pb.go`) may hold the second method or
+/// the field that vetoes the answer, so the rung abstains there.
+#[test]
+fn a_directory_marked_incomplete_from_disk_abstains() {
+    let extractions: Vec<Extraction> = [("api/yolo.go", YOLO), ("api/handler.go", HANDLER)]
+        .iter()
+        .map(|(path, source)| extract_file(path, source))
+        .collect();
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    resolver.mark_go_dirs_incomplete(["api".to_string()]);
+    let result = resolver.resolve_all(&extractions).unwrap();
+    assert!(calls_from(&result, HANDLER_SYMBOL, "recordReplayEvent").is_empty());
+
+    // The mark is per directory: another package keeps its answer.
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    resolver.mark_go_dirs_incomplete(["other".to_string()]);
+    let result = resolver.resolve_all(&extractions).unwrap();
+    assert_eq!(
+        calls_from(&result, HANDLER_SYMBOL, "recordReplayEvent").len(),
+        1
+    );
+}
