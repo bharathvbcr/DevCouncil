@@ -436,7 +436,14 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// nothing depends on, and a cached Go field key would keep producing a
 /// fabricated `SamePackage` edge — from a cache, with no degraded marker to say
 /// why.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "58";
+///
+/// v59 records a Go file's unexported field and interface-method names
+/// (`Extraction::go_member_names`), the veto the resolver's
+/// unexported-selector rung needs before it may bind `job.recordReplayEvent()`
+/// to the package's one `recordReplayEvent` method. A v58 row carries `None`
+/// there, and the rung abstains for any package holding one — so without the
+/// bump a warm cache would silently keep the rung off, not make it unsound.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "59";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

@@ -534,12 +534,18 @@ fn extract_treesitter_before_deadline(
                     );
                 }
 
-                let (go_interface_methods, go_method_params) = if lang == "go" {
-                    let sets = go_method_sets(root, source, &file_symbol_name);
-                    go_interface_method_exemptions(&symbols, &sets.0, &sets.1, &mut wiring);
-                    sets
+                let (go_interface_methods, go_method_params, go_member_names) = if lang == "go" {
+                    let (interface_methods, method_params, member_names) =
+                        go_method_sets(root, source, &file_symbol_name);
+                    go_interface_method_exemptions(
+                        &symbols,
+                        &interface_methods,
+                        &method_params,
+                        &mut wiring,
+                    );
+                    (interface_methods, method_params, Some(member_names))
                 } else {
-                    (Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new(), None)
                 };
                 if extraction_overran(deadline) {
                     // Labelled by what actually ran for *this* language. The
@@ -683,6 +689,7 @@ fn extract_treesitter_before_deadline(
                     go_build_constrained: lang == "go" && go_build_constrained(path, source),
                     go_interface_methods,
                     go_method_params,
+                    go_member_names,
                     // After `walk_tree`, so the per-scope cache it warmed is
                     // reused rather than every callable's subtree being walked
                     // a second time.
@@ -1499,6 +1506,7 @@ fn unparsed_extraction(
         go_build_constrained: false,
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
+        go_member_names: None,
         scope_locals: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
@@ -1704,6 +1712,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         go_build_constrained: false,
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
+        go_member_names: None,
         scope_locals: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
@@ -2532,13 +2541,27 @@ fn go_param_count(parameters: Node) -> usize {
 /// carried on the `Extraction` and joined in `devmap-analyze`. Embedded
 /// interfaces (`interface { io.Reader }`) parse as `type_elem`, not
 /// `method_elem`, so their methods are not represented here.
+///
+/// The third list is [`Extraction::go_member_names`]: every unexported field
+/// and interface-method name in the file, from **any** struct or interface
+/// literal. Collected on the `struct_type` / `interface_type` node itself rather
+/// than under `type_spec`, because a generic constraint
+/// (`[T interface{ flush() }]`) and an anonymous struct (`var cfg struct{ run
+/// func() }`) declare selectors too, and missing one would let the resolver
+/// bind `x.flush()` to a concrete method it does not name.
 fn go_method_sets(
     root: Node,
     source: &str,
     file_symbol_name: &str,
-) -> (Vec<GoInterfaceMethod>, Vec<GoMethodParams>) {
+) -> (Vec<GoInterfaceMethod>, Vec<GoMethodParams>, Vec<String>) {
     let mut interface_methods = Vec::new();
     let mut method_params = Vec::new();
+    let mut member_names = Vec::new();
+    let mut record_member = |name: &str| {
+        if go_name_is_unexported(name) {
+            member_names.push(name.to_string());
+        }
+    };
     let mut worklist = vec![root];
     // Same stride idiom as `walk_tree`. This pass runs *after* the walk has
     // returned, over the whole tree again, and until now had no deadline at
@@ -2555,6 +2578,34 @@ fn go_method_sets(
             }
         }
         match node.kind() {
+            "interface_type" => {
+                let mut member_cursor = node.walk();
+                for member in node.named_children(&mut member_cursor) {
+                    if matches!(member.kind(), "method_elem" | "method_spec") {
+                        if let Some(method) = member.child_by_field_name("name") {
+                            record_member(get_node_text(method, source).as_str());
+                        }
+                    }
+                }
+            }
+            "field_declaration" => {
+                let mut name_cursor = node.walk();
+                let mut named = false;
+                for name in node.children_by_field_name("name", &mut name_cursor) {
+                    named = true;
+                    record_member(get_node_text(name, source).as_str());
+                }
+                // An embedded field is named by its type: `*pkg.recorder[T]`
+                // declares the field `recorder`.
+                if !named {
+                    if let Some(embedded) = node.child_by_field_name("type") {
+                        let text = get_node_text(embedded, source);
+                        let head = text.split('[').next().unwrap_or(&text);
+                        let bare = head.rsplit('.').next().unwrap_or(head);
+                        record_member(bare.trim_start_matches('*').trim());
+                    }
+                }
+            }
             "type_spec" => {
                 if let (Some(name), Some(declared)) = (
                     node.child_by_field_name("name"),
@@ -2608,7 +2659,17 @@ fn go_method_sets(
         ))
     });
     method_params.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
-    (interface_methods, method_params)
+    member_names.sort();
+    member_names.dedup();
+    (interface_methods, method_params, member_names)
+}
+
+/// A Go identifier the language keeps inside its package: its first character
+/// is not an uppercase letter. `_` and non-ASCII lowercase are unexported too.
+pub(crate) fn go_name_is_unexported(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|first| !first.is_uppercase())
 }
 
 /// Same-file half of the interface exemption, as a symbol-scoped annotation.

@@ -364,6 +364,21 @@ pub struct Resolver {
     /// declared on its type, not in the package block, so a bare name cannot
     /// reach it.
     go_package_symbols: BTreeMap<(String, String, String), Vec<PackageDecl>>,
+    /// The unexported-selector rung's index: `(directory, package clause,
+    /// method name)` → every concrete method of that **unexported** name the
+    /// package declares, as `(file, qualified name)`. See
+    /// [`Resolver::unexported_selector_target`].
+    go_package_methods: BTreeMap<(String, String, String), Vec<(String, String)>>,
+    /// `(directory, package clause, name)` for every unexported struct field or
+    /// interface method the package declares. A name here vetoes the rung: the
+    /// selector may be the field or the interface method, not the concrete one.
+    go_package_member_vetoes: BTreeSet<(String, String, String)>,
+    /// Directories holding a `.go` file whose extraction cannot vouch for the
+    /// package's complete declaration set — not a clean parse, or no
+    /// `go_member_names` (a payload cached before they were collected). A
+    /// package here gets no unexported-selector answers at all: one unseen file
+    /// could declare the second method or the vetoing field.
+    go_package_dirs_unvouched: BTreeSet<String>,
     /// file_path → Swift module name derived from the path.
     ///
     /// A Swift target is one unqualified namespace. Computed from the path
@@ -456,6 +471,9 @@ impl Resolver {
             go_modules_fresh: false,
             go_package_by_file: BTreeMap::new(),
             go_package_symbols: BTreeMap::new(),
+            go_package_methods: BTreeMap::new(),
+            go_package_member_vetoes: BTreeSet::new(),
+            go_package_dirs_unvouched: BTreeSet::new(),
             swift_module_by_file: BTreeMap::new(),
             swift_module_files: BTreeMap::new(),
             swift_module_symbols: BTreeMap::new(),
@@ -1394,6 +1412,9 @@ impl Resolver {
         self.symbol_parents.clear();
         self.go_package_by_file.clear();
         self.go_package_symbols.clear();
+        self.go_package_methods.clear();
+        self.go_package_member_vetoes.clear();
+        self.go_package_dirs_unvouched.clear();
         self.swift_module_by_file.clear();
         self.swift_module_files.clear();
         self.swift_module_symbols.clear();
@@ -1533,6 +1554,31 @@ impl Resolver {
                         .or_default()
                         .push((ext.file_path.clone(), sym.qualified_name.clone(), sym.kind));
                 }
+                for sym in &ext.symbols {
+                    if sym.kind == SymbolKind::Method && Self::go_name_is_unexported(&sym.name) {
+                        self.go_package_methods
+                            .entry((dir.clone(), pkg.to_string(), sym.name.clone()))
+                            .or_default()
+                            .push((ext.file_path.clone(), sym.qualified_name.clone()));
+                    }
+                }
+                for name in ext.go_member_names.iter().flatten() {
+                    self.go_package_member_vetoes.insert((
+                        dir.clone(),
+                        pkg.to_string(),
+                        name.clone(),
+                    ));
+                }
+            }
+            // Keyed on the directory, not the package clause: a file that
+            // failed to parse has no clause to key on, and it may belong to
+            // any package in its directory.
+            if ext.file_path.ends_with(".go")
+                && (!matches!(ext.parse_outcome, ParseOutcome::Clean)
+                    || ext.go_member_names.is_none())
+            {
+                self.go_package_dirs_unvouched
+                    .insert(Self::parent_dir(&ext.file_path));
             }
             if ext.language == "swift" {
                 if let Some(module) = devmap_extract::languages::swift_module_of(&ext.file_path) {
@@ -2800,6 +2846,28 @@ impl Resolver {
                             }));
                         }
                     }
+                    // 2f. An unexported Go selector on a receiver no rung above
+                    // could type. `SamePackage` because the evidence is the
+                    // package block again — this time Go's rule that an
+                    // unexported selector cannot leave it. See
+                    // `unexported_selector_target` for every abstention.
+                    if resolution.is_none() && family == LangFamily::Go {
+                        if let Some(recv) = call.receiver_expr.as_deref() {
+                            if let Some((target_file, target_symbol, package_name)) = self
+                                .unexported_selector_target(
+                                    &ext.file_path,
+                                    recv,
+                                    &call.callee_name,
+                                )
+                            {
+                                resolution = Some(Arc::new(Resolution::SamePackage {
+                                    target_symbol,
+                                    target_file,
+                                    package_name,
+                                }));
+                            }
+                        }
+                    }
                     // A Swift module is the same scope rule as a Go package:
                     // every file-level name is unqualified throughout the
                     // target. Reuses `SamePackage` rather than a second kind —
@@ -3377,6 +3445,10 @@ impl Resolver {
             .unwrap_or_else(|| ".".to_string())
     }
 
+    fn go_name_is_unexported(name: &str) -> bool {
+        !name.is_empty() && !Self::go_name_is_exported(name)
+    }
+
     fn go_name_is_exported(name: &str) -> bool {
         name.rsplit('.')
             .next()
@@ -3905,6 +3977,66 @@ impl Resolver {
             path != file && accept(*kind) && (source_is_test || !path.ends_with("_test.go"))
         });
         let (target_file, target_symbol, _) = visible.next()?;
+        visible
+            .next()
+            .is_none()
+            .then(|| (target_file.clone(), target_symbol.clone(), package.clone()))
+    }
+
+    /// Where `x.name()` goes when `name` is an **unexported** Go method and the
+    /// type of `x` could not be inferred.
+    ///
+    /// Go's own visibility rule makes this a proof rather than a guess. An
+    /// unexported selector is resolvable only inside the package that declares
+    /// it — the compiler refuses `x.m` for another package's unexported `m`
+    /// even when `x`'s type embeds that package's type — so whatever `x` is,
+    /// `.name` names something *this* package declares: a concrete method, a
+    /// struct field, or an interface method. With exactly one concrete method
+    /// of that name visible and no field or interface method sharing it, that
+    /// method is the callee.
+    ///
+    /// Measured on scholarlm: 13,143 of 104,696 Go `uninferred_receiver` rows
+    /// have an unexported callee, and `job.recordReplayEvent(cancelled)` in
+    /// `WisDevJobCancelHandler` — `job` bound by `yoloJobStore.get(id)`, a
+    /// return type the receiver rungs cannot read — was one of them.
+    ///
+    /// Abstains, never guesses:
+    /// * the package is keyed on `(directory, package clause)`, so an external
+    ///   `package foo_test` sees nothing of `package foo`;
+    /// * a non-test file does not see a method a `_test.go` file declares;
+    /// * two concrete methods of the name (two types, or two build-constrained
+    ///   variants of one) — the receiver's type decides and is unknown;
+    /// * any field or interface method of the name, from any struct or
+    ///   interface literal in the package;
+    /// * any `.go` file in the directory whose extraction cannot vouch for the
+    ///   whole declaration set (not a clean parse, or cached before
+    ///   `go_member_names` existed) — the missing namesake could be there;
+    /// * cgo's `C.name()`, which names a C function, not a Go method.
+    fn unexported_selector_target(
+        &self,
+        file: &str,
+        receiver: &str,
+        name: &str,
+    ) -> Option<(String, String, String)> {
+        if !Self::go_name_is_unexported(name) || Self::path_root(receiver) == "C" {
+            return None;
+        }
+        let dir = Self::parent_dir(file);
+        if self.go_package_dirs_unvouched.contains(&dir) {
+            return None;
+        }
+        let package = self.go_package_by_file.get(file)?;
+        let key = (dir, package.clone(), name.to_string());
+        if self.go_package_member_vetoes.contains(&key) {
+            return None;
+        }
+        let source_is_test = file.ends_with("_test.go");
+        let mut visible = self
+            .go_package_methods
+            .get(&key)?
+            .iter()
+            .filter(|(path, _)| source_is_test || !path.ends_with("_test.go"));
+        let (target_file, target_symbol) = visible.next()?;
         visible
             .next()
             .is_none()

@@ -1332,6 +1332,26 @@ pub struct Extraction {
     /// cross-file interface join can compare arity and not just name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub go_method_params: Vec<GoMethodParams>,
+    /// Every **unexported** name a Go selector could reach that is not a
+    /// concrete method: struct field names (embedded fields by their type's
+    /// name) and interface method names, from *every* struct and interface
+    /// literal in the file — named types, generic constraints, anonymous
+    /// structs alike. Sorted and deduplicated.
+    ///
+    /// The veto half of the resolver's unexported-selector rung. Inside
+    /// package P, `x.m()` with a lowercase `m` can only name something P
+    /// declares — Go refuses an unexported selector from another package even
+    /// through embedding — so exactly one concrete method `m` in P is the
+    /// callee *unless* a field or an interface method of P shares the name.
+    /// Exported names are not recorded: the rung never answers for them,
+    /// because an exported selector can name another package's method.
+    ///
+    /// `None` means "not collected" — a non-Go file, or an extraction cached
+    /// before this field existed — and the rung abstains for the whole package
+    /// rather than read absence as "no namesake". `Some(vec![])` is a real
+    /// answer: this file declares no such name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub go_member_names: Option<Vec<String>>,
     /// `(qualified scope, local name)` for every value a callable binds itself:
     /// parameters, `let`/`:=`/`=` targets, loop variables, `with … as` handles.
     ///
