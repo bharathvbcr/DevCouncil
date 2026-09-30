@@ -298,7 +298,12 @@ fn save(store: &Store, files: &[(&str, String)]) {
     let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     store
-        .save_generation_with_opts(&extractions, &resolution, &analysis, GenerationWriteOpts::default())
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
         .unwrap();
 }
 
@@ -312,10 +317,17 @@ fn one_read_caps_each_name_separately() {
     let store = store_of(&[
         ("ledger.py", LEDGER.to_string()),
         ("many.py", many),
-        ("rare.py", "def rare(book):\n    return book.close()\n".to_string()),
+        (
+            "rare.py",
+            "def rare(book):\n    return book.close()\n".to_string(),
+        ),
     ]);
     let generation = store.latest_generation_id().unwrap().unwrap();
-    let names = vec!["settle".to_string(), "close".to_string(), "absent".to_string()];
+    let names = vec![
+        "settle".to_string(),
+        "close".to_string(),
+        "absent".to_string(),
+    ];
     let found = store
         .unresolved_sites_naming(generation, &names, MAX_NAMESAKE_SITES_PER_NAME)
         .unwrap()
@@ -324,11 +336,21 @@ fn one_read_caps_each_name_separately() {
     assert!(found["settle"].1, "the generic name hit its cap");
     assert_eq!(found["close"].0.len(), 1);
     assert!(!found["close"].1, "the rare name was not cut");
-    assert!(found["absent"].0.is_empty() && !found["absent"].1, "a checked absence");
-    let files: Vec<&str> = found["settle"].0.iter().map(|row| row.source_symbol.as_str()).collect();
+    assert!(
+        found["absent"].0.is_empty() && !found["absent"].1,
+        "a checked absence"
+    );
+    let files: Vec<&str> = found["settle"]
+        .0
+        .iter()
+        .map(|row| row.source_symbol.as_str())
+        .collect();
     let mut sorted = files.clone();
     sorted.sort();
-    assert_eq!(files, sorted, "a capped prefix is the same prefix on every read");
+    assert_eq!(
+        files, sorted,
+        "a capped prefix is the same prefix on every read"
+    );
 }
 
 /// The ledger is read at the walk's generation. A site that only a later
@@ -338,7 +360,13 @@ fn one_read_caps_each_name_separately() {
 fn the_ledger_is_read_at_the_generation_asked_for() {
     let store = store_of(&[("ledger.py", LEDGER.to_string())]);
     let first = store.latest_generation_id().unwrap().unwrap();
-    save(&store, &[("ledger.py", LEDGER.to_string()), ("untyped.py", UNTYPED.to_string())]);
+    save(
+        &store,
+        &[
+            ("ledger.py", LEDGER.to_string()),
+            ("untyped.py", UNTYPED.to_string()),
+        ],
+    );
     let second = store.latest_generation_id().unwrap().unwrap();
     assert!(second > first);
     let names = vec!["settle".to_string()];
@@ -350,5 +378,9 @@ fn the_ledger_is_read_at_the_generation_asked_for() {
     };
     assert_eq!(at(first), Some(0), "the untyped caller did not exist yet");
     assert_eq!(at(second), Some(1));
-    assert_eq!(at(second + 1000), None, "a generation that is not retained is not read");
+    assert_eq!(
+        at(second + 1000),
+        None,
+        "a generation that is not retained is not read"
+    );
 }
