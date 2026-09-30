@@ -236,3 +236,46 @@ fn search_and_explore_still_return_the_set() {
         explore.definitions.resolution
     );
 }
+
+/// The refusal is only useful if its candidates work. The ids it listed were
+/// `file::file::symbol` — the stored symbol is already qualified and the
+/// formatter prefixed the file again — and every one of them, pasted back,
+/// answered "has no indexed traversal start". An agent read that as "DevMap
+/// has no entry point for this function" (scholarlm `runHttpBridgeMode` and
+/// `resolveConfig`, each declared in two copied directories).
+#[test]
+fn every_candidate_the_refusal_names_is_an_answerable_target() {
+    let root = scratch("candidates");
+    let store = namesake_fixture(&root);
+    let engine = StoreQueryEngine::new(&store);
+    let message = engine
+        .impact(impact_req("authenticate"))
+        .expect_err("two definitions must refuse")
+        .to_string();
+    let listed = message
+        .split("candidates: ")
+        .nth(1)
+        .expect("the refusal lists its candidates");
+    let candidates: Vec<&str> = listed.split(", ").map(str::trim).collect();
+    assert_eq!(
+        candidates,
+        vec!["auth_a.py::authenticate", "auth_b.py::authenticate"],
+        "each candidate is `file::symbol`, once"
+    );
+    for candidate in candidates {
+        let answer = engine.impact(impact_req(candidate)).unwrap();
+        assert!(
+            matches!(answer.resolution, ResolutionAvailability::Available),
+            "{candidate} was suggested and must be accepted: {:?}",
+            answer.resolution
+        );
+        assert!(
+            answer
+                .items
+                .iter()
+                .any(|edge| edge.source_symbol.ends_with("use_a")
+                    || edge.source_symbol.ends_with("use_b")),
+            "{candidate} must reach its own caller"
+        );
+    }
+}

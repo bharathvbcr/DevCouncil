@@ -3735,6 +3735,16 @@ fn node_id_of(file_path: &str, symbol_name: &str) -> String {
     if symbol_name.is_empty() {
         return file_path.to_string();
     }
+    // A stored symbol is usually qualified already (`file::name`). Prefixing
+    // it again produced `file::file::name` — an id no traversal accepts, and
+    // the one the ambiguous-name refusal told agents to paste back.
+    if symbol_name == file_path
+        || symbol_name
+            .strip_prefix(file_path)
+            .is_some_and(|rest| rest.starts_with("::"))
+    {
+        return symbol_name.to_string();
+    }
     format!("{file_path}::{symbol_name}")
 }
 
