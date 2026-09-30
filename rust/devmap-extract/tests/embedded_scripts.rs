@@ -789,8 +789,10 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // whole package rather than read the absence as "no namesake".
     //
     // v61 reads Python path constants and parameterised path loaders.
+    //
+    // v62 records the directories a Python file puts on `sys.path`.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "61",
+        EXTRACTION_SCHEMA_VERSION, "62",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

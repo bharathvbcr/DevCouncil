@@ -303,6 +303,86 @@ x = a()
     }
 }
 
+fn search_directories(extraction: &Extraction) -> Vec<(String, Option<u32>)> {
+    path_loads(extraction)
+        .into_iter()
+        .filter(|import| {
+            import.path_load.as_ref().unwrap().kind
+                == devmap_extract::model::PathLoadKind::SearchDirectory
+        })
+        .map(|import| {
+            (
+                import.module_specifier.clone(),
+                import.path_load.as_ref().unwrap().anchor_up,
+            )
+        })
+        .collect()
+}
+
+/// Each readable module-level `sys.path` write is one `SearchDirectory`
+/// import carrying its anchor; the BINN spellings all read.
+#[test]
+fn sys_path_inserts_record_their_directory_and_anchor() {
+    let source = "\
+import os
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), \"..\"))
+sys.path.append(os.path.join(HERE, \"lib\"))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT / \"scripts\"))
+sys.path[:0] = [str(ROOT / \"vendor\")]
+";
+    let extraction = extract_file("scripts/test_x.py", source);
+    assert_eq!(
+        search_directories(&extraction),
+        [
+            ("scripts/aws".to_string(), Some(1)),
+            (String::new(), Some(1)),
+            (String::new(), Some(0)),
+            ("..".to_string(), Some(0)),
+            ("lib".to_string(), Some(0)),
+            ("scripts".to_string(), Some(1)),
+            ("vendor".to_string(), Some(1)),
+        ]
+    );
+}
+
+/// Any write this pass cannot follow withdraws every entry in the file.
+#[test]
+fn an_unfollowable_sys_path_write_withdraws_every_entry() {
+    for (label, write) in [
+        ("reassigned", "sys.path = [\"/opt\"]\n"),
+        ("augmented", "sys.path += [\"/opt\"]\n"),
+        ("removed", "sys.path.remove(\"/opt\")\n"),
+        ("popped", "sys.path.pop(0)\n"),
+        ("deleted", "del sys.path[0]\n"),
+        ("item set", "sys.path[0] = \"/opt\"\n"),
+        ("unreadable insert", "sys.path.insert(0, somewhere)\n"),
+        ("cwd-relative insert", "sys.path.insert(0, \"scripts\")\n"),
+        (
+            "removed in a function",
+            "def f():\n    sys.path.remove(\"/opt\")\n",
+        ),
+    ] {
+        let source = format!(
+            "import sys\nfrom pathlib import Path\nROOT = Path(__file__).resolve().parent.parent\n\
+             sys.path.insert(0, str(ROOT / \"scripts\"))\n{write}"
+        );
+        let extraction = extract_file("scripts/test_x.py", &source);
+        assert!(
+            search_directories(&extraction).is_empty(),
+            "{label}: {:?}",
+            search_directories(&extraction)
+        );
+    }
+}
+
 /// A module-level path constant carries its anchor into every use, at module
 /// level and inside a method.
 #[test]

@@ -460,7 +460,13 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// function (`def load(name, relative): ... ROOT / relative ...`) bound at each
 /// call site to its `.py` literal. A v60 row has neither import, so those loads
 /// keep abstaining from a warm cache with nothing to say why.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "61";
+///
+/// v62 records every directory a Python file puts on `sys.path` at module
+/// level, anchored on `__file__`, as a `SearchDirectory` path load — the
+/// evidence the resolver needs to place `import analyse_wave20` after
+/// `sys.path.insert(0, str(ROOT / "scripts" / "aws"))`. A v61 row has none, so
+/// those imports would stay unresolved from a warm cache.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "62";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

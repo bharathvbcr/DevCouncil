@@ -815,6 +815,32 @@ pub struct PathLoad {
     /// which Python resolves against the process's working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_up: Option<u32>,
+    /// What the path names: a module file (the default), or a directory the
+    /// file put on `sys.path`.
+    #[serde(default, skip_serializing_if = "PathLoadKind::is_module")]
+    pub kind: PathLoadKind,
+}
+
+/// See [`PathLoad::kind`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PathLoadKind {
+    /// `module_specifier` is a `.py` file loaded by path.
+    #[default]
+    Module,
+    /// `module_specifier` is a directory — possibly empty, meaning the anchor
+    /// directory itself — inserted on `sys.path` at module level by this file
+    /// (`sys.path.insert(0, str(ROOT / "scripts"))`). Not an import of
+    /// anything: it widens where this file's *later* imports may resolve, and
+    /// `span` is where it happened, so an import before it is untouched. Only
+    /// ever emitted with an anchor (`anchor_up` is `Some`), and never for a
+    /// file that also removes or reassigns `sys.path`.
+    SearchDirectory,
+}
+
+impl PathLoadKind {
+    pub fn is_module(&self) -> bool {
+        *self == PathLoadKind::Module
+    }
 }
 
 /// Parse `a`, `a as b`, or `{ a as b, c }` import lists into parallel name vectors.

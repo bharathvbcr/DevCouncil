@@ -225,6 +225,11 @@ pub struct Resolver {
     /// every other function of the file. `scope` is the binding's
     /// `LocalBinding::scope` identity, `None` for a module global.
     path_module_bindings: BTreeMap<String, BTreeMap<(Option<String>, String), String>>,
+    /// Per-file directories a Python file put on `sys.path` at module level,
+    /// each with the byte offset of the insert, resolved to repo-relative
+    /// directories. Read only for that file, and only for imports after the
+    /// offset — see [`Self::resolve_via_search_dirs`].
+    py_search_dirs: BTreeMap<String, Vec<(usize, String)>>,
     /// Rust crate name, spelled as a `use` spells it, -> that crate's `src`
     /// root. `None` where two indexed crates claim the same name.
     ///
@@ -466,6 +471,7 @@ impl Resolver {
             files_by_dir: BTreeMap::new(),
             py_files_by_name: BTreeMap::new(),
             path_module_bindings: BTreeMap::new(),
+            py_search_dirs: BTreeMap::new(),
             rust_crate_roots: BTreeMap::new(),
             reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
@@ -1411,6 +1417,7 @@ impl Resolver {
         self.files_by_dir.clear();
         self.py_files_by_name.clear();
         self.path_module_bindings.clear();
+        self.py_search_dirs.clear();
         self.rust_crate_roots.clear();
         self.reexport_chains.clear();
         self.receiver_types.clear();
@@ -1738,6 +1745,12 @@ impl Resolver {
                 }
             };
             let mut file_path_modules: BTreeMap<(Option<String>, String), String> = BTreeMap::new();
+            // Before this file's imports are read: they consult it.
+            let search_dirs = self.search_dirs_of(ext);
+            if !search_dirs.is_empty() {
+                self.py_search_dirs
+                    .insert(ext.file_path.clone(), search_dirs);
+            }
             for imp in &ext.imports {
                 // A Python module loaded by file path binds a *scoped* handle,
                 // so it goes to its own table and never to `file_bindings`. A
@@ -1781,6 +1794,9 @@ impl Resolver {
                             self.swift_file_declaring(&imp.module_specifier, name)
                         } else {
                             self.resolve_import_path(&ext.file_path, &ext.language, &spec)
+                                .or_else(|| {
+                                    self.resolve_via_search_dirs(ext, imp.span.start_byte, &spec)
+                                })
                         };
                         // `from pkg import cmd` binds an attribute of
                         // `pkg/__init__.py` when that file defines one, and the
@@ -1829,11 +1845,15 @@ impl Resolver {
                             Some(file)
                         } else {
                             let submodule = (ext.language == "python").then(|| {
-                                self.resolve_import_path(
-                                    &ext.file_path,
-                                    &ext.language,
-                                    &format!("{}.{}", imp.module_specifier, name),
-                                )
+                                let dotted = format!("{}.{}", imp.module_specifier, name);
+                                self.resolve_import_path(&ext.file_path, &ext.language, &dotted)
+                                    .or_else(|| {
+                                        self.resolve_via_search_dirs(
+                                            ext,
+                                            imp.span.start_byte,
+                                            &dotted,
+                                        )
+                                    })
                             });
                             submodule.flatten().or(direct)
                         };
@@ -1848,11 +1868,7 @@ impl Resolver {
                     if alias == Some("_") {
                         continue;
                     }
-                    let targets = self.resolve_import_targets(
-                        &ext.file_path,
-                        &ext.language,
-                        &imp.module_specifier,
-                    );
+                    let targets = self.resolve_import_targets_or_search_dirs(ext, imp);
                     let Some(target_f) = targets.first().cloned() else {
                         // A whole-module import that named no indexed file:
                         // `import "strings"`, `import react from "react"`. The
@@ -2487,6 +2503,8 @@ impl Resolver {
                 let mut path_loaded: BTreeSet<String> = BTreeSet::new();
                 for imp in &ext.imports {
                     let targets = match &imp.path_load {
+                        // A `sys.path` entry is not an import of anything.
+                        Some(load) if load.kind == PathLoadKind::SearchDirectory => continue,
                         Some(load) => match self.resolve_path_load(
                             &ext.file_path,
                             &imp.module_specifier,
@@ -2497,11 +2515,7 @@ impl Resolver {
                             Some(target) if !path_loaded.insert(target.clone()) => continue,
                             resolved => resolved.into_iter().collect(),
                         },
-                        None => self.resolve_import_targets(
-                            &ext.file_path,
-                            &ext.language,
-                            &imp.module_specifier,
-                        ),
+                        None => self.resolve_import_targets_or_search_dirs(ext, imp),
                     };
                     // R5. A relative specifier that named no indexed file is an
                     // index gap: the `Imports` edge that should exist is
@@ -4604,6 +4618,102 @@ impl Resolver {
             .filter(|path| path.as_str() == specifier || path.ends_with(&suffix));
         let only = matches.next()?;
         matches.next().is_none().then(|| only.clone())
+    }
+
+    /// This file's `sys.path` entries as repo-relative directories, with the
+    /// offset of each insert. An entry that climbs above the repository root
+    /// names nothing the corpus has and is dropped.
+    fn search_dirs_of(&self, ext: &Extraction) -> Vec<(usize, String)> {
+        if ext.language != "python" {
+            return Vec::new();
+        }
+        let dir = Self::parent_dir(&ext.file_path);
+        let mut out = Vec::new();
+        for imp in &ext.imports {
+            let Some(load) = imp
+                .path_load
+                .as_ref()
+                .filter(|load| load.kind == PathLoadKind::SearchDirectory)
+            else {
+                continue;
+            };
+            let Some(up) = load.anchor_up else {
+                continue;
+            };
+            let mut base = Some(dir.clone());
+            for _ in 0..up {
+                base = base.and_then(|base| {
+                    (!base.is_empty()).then(|| {
+                        base.rsplit_once('/')
+                            .map(|(parent, _)| parent.to_string())
+                            .unwrap_or_default()
+                    })
+                });
+            }
+            let Some(base) = base else { continue };
+            if let Some(directory) = Self::normalize_rel(&base, &imp.module_specifier) {
+                out.push((imp.span.start_byte, directory));
+            }
+        }
+        // The extractor emits at most 64 per file; a payload that carries
+        // more — hand-built, or from elsewhere — is refused here too, so each
+        // import's cost stays bounded whatever arrives.
+        if out.len() > 64 {
+            return Vec::new();
+        }
+        out
+    }
+
+    /// The one indexed file a Python module name reaches through this file's
+    /// own `sys.path` entries: `<dir>/X.py` or `<dir>/X/__init__.py`, over the
+    /// entries inserted **before** `at`. Asked only after ordinary resolution
+    /// found nothing, so an import the ordinary rules answer keeps that answer.
+    /// Two candidates — two entries, or a module and a package of one name in
+    /// one entry — are one of several, and abstain. A relative import names
+    /// its own package, never a `sys.path` entry.
+    fn resolve_via_search_dirs(&self, ext: &Extraction, at: usize, module: &str) -> Option<String> {
+        let dirs = self.py_search_dirs.get(&ext.file_path)?;
+        let module = module.trim_matches(|c| c == '\'' || c == '"');
+        if module.is_empty() || module.starts_with('.') {
+            return None;
+        }
+        let relative = module.replace('.', "/");
+        let mut hits: BTreeSet<String> = BTreeSet::new();
+        for (inserted, directory) in dirs {
+            if *inserted >= at {
+                continue;
+            }
+            for candidate in [format!("{relative}.py"), format!("{relative}/__init__.py")] {
+                let Some(path) = Self::normalize_rel(directory, &candidate) else {
+                    continue;
+                };
+                if self.file_symbols.contains_key(&path) {
+                    hits.insert(path);
+                }
+            }
+        }
+        if hits.len() == 1 {
+            hits.pop_first()
+        } else {
+            None
+        }
+    }
+
+    /// Ordinary import resolution, then — for Python only, and only when that
+    /// found nothing — this file's `sys.path` entries.
+    fn resolve_import_targets_or_search_dirs(
+        &self,
+        ext: &Extraction,
+        imp: &ExtractedImport,
+    ) -> Vec<String> {
+        let targets =
+            self.resolve_import_targets(&ext.file_path, &ext.language, &imp.module_specifier);
+        if !targets.is_empty() || ext.language != "python" {
+            return targets;
+        }
+        self.resolve_via_search_dirs(ext, imp.span.start_byte, &imp.module_specifier)
+            .into_iter()
+            .collect()
     }
 
     /// The file a path-loaded Python module handle names, read at a use site.

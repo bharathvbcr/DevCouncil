@@ -48,7 +48,7 @@
 //! the extraction cache keys on `(path, source)` alone, so nothing that
 //! depends on the rest of the corpus can be baked into an extraction.
 
-use crate::model::{ExtractedImport, PathLoad, Span};
+use crate::model::{ExtractedImport, PathLoad, PathLoadKind, Span};
 use crate::treesitter::{enclosing_callable_qualified, walk_deadline_passed};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tree_sitter::Node;
@@ -73,6 +73,10 @@ const MAX_CALLEE_BYTES: usize = 128;
 const MAX_RAW_CHARS: usize = 160;
 /// Deadline check stride over the node walk.
 const DEADLINE_STRIDE: usize = 256;
+/// The most `sys.path` entries one file may contribute. Each import is
+/// checked against every entry inserted before it, so this bounds that cost
+/// per import; a file past it abstains rather than pay it.
+const MAX_SEARCH_DIRECTORIES: usize = 64;
 
 /// Every path load in a Python file, as imports the resolver can join.
 ///
@@ -91,6 +95,7 @@ pub(crate) fn python_path_loads(
         "run_path",
         "SourceFileLoader",
         "load_source",
+        "sys.path",
     ]
     .iter()
     .any(|needle| source.contains(needle))
@@ -238,6 +243,28 @@ enum Event<'tree> {
         node: Node<'tree>,
         scope: Option<String>,
     },
+    /// A write to `sys.path`: a directory inserted (`insert`, `append`,
+    /// `sys.path[:0] = [...]`), with the expression naming it, or anything
+    /// else — `remove`, `pop`, reassignment, `del` — which leaves the search
+    /// path unknowable and so `directory` is `None`.
+    SysPath {
+        node: Node<'tree>,
+        directory: Option<Node<'tree>>,
+        module_level: bool,
+    },
+}
+
+/// The `sys.path` method a callee names, if any: `Some(Some(index))` for an
+/// insert whose directory is positional argument `index`, `Some(None)` for
+/// any other mutation.
+fn sys_path_method(callee: &str) -> Option<Option<usize>> {
+    match callee.strip_prefix("sys.path.")? {
+        "insert" => Some(Some(1)),
+        "append" => Some(Some(0)),
+        "remove" | "pop" | "clear" | "extend" | "reverse" | "sort" | "__setitem__"
+        | "__delitem__" | "__iadd__" => Some(None),
+        _ => None,
+    }
 }
 
 fn text<'s>(node: Node, source: &'s str) -> &'s str {
@@ -415,6 +442,57 @@ fn collect_events<'tree>(
             in_class: context.in_class,
             module_level_statement,
         };
+        // Writes to `sys.path` other than through a method call.
+        let module_level = context.function.is_none() && !context.in_class;
+        match node.kind() {
+            "assignment" | "augmented_assignment" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    let written = text(left, source);
+                    if written == "sys.path"
+                        || written.starts_with("sys.path[")
+                        || written.starts_with("sys.path.")
+                    {
+                        // `sys.path[:0] = [a, b]` prepends; anything else —
+                        // `sys.path = [...]`, `sys.path += [...]`,
+                        // `sys.path[0] = x` — is a write this pass cannot
+                        // follow.
+                        let slice = left
+                            .child_by_field_name("subscript")
+                            .map(|slice| text(slice, source).replace(char::is_whitespace, ""));
+                        let right = node.child_by_field_name("right");
+                        let prepend = node.kind() == "assignment"
+                            && left.kind() == "subscript"
+                            && matches!(slice.as_deref(), Some(":0" | "0:0"))
+                            && right.is_some_and(|right| right.kind() == "list");
+                        match right.filter(|_| prepend) {
+                            Some(list) => {
+                                let mut cursor = list.walk();
+                                for element in list.named_children(&mut cursor) {
+                                    events.push(Event::SysPath {
+                                        node,
+                                        directory: Some(element),
+                                        module_level,
+                                    });
+                                }
+                            }
+                            None => events.push(Event::SysPath {
+                                node,
+                                directory: None,
+                                module_level,
+                            }),
+                        }
+                    }
+                }
+            }
+            "delete_statement" if text(node, source).contains("sys.path") => {
+                events.push(Event::SysPath {
+                    node,
+                    directory: None,
+                    module_level,
+                });
+            }
+            _ => {}
+        }
         match node.kind() {
             "assignment" => {
                 if let Some(left) = node.child_by_field_name("left") {
@@ -500,7 +578,16 @@ fn collect_events<'tree>(
             "call" => {
                 if let Some(function) = node.child_by_field_name("function") {
                     let callee = text(function, source);
-                    if load_kind(callee).is_some_and(|kind| kind != LoadKind::ModuleFromSpec) {
+                    if let Some(insert) = sys_path_method(callee) {
+                        let directory =
+                            insert.and_then(|index| positional_arguments(node).get(index).copied());
+                        events.push(Event::SysPath {
+                            node,
+                            directory,
+                            module_level,
+                        });
+                    } else if load_kind(callee).is_some_and(|kind| kind != LoadKind::ModuleFromSpec)
+                    {
                         events.push(Event::Load {
                             node,
                             scope: scope_of(&context),
@@ -821,6 +908,8 @@ impl<'a, 'tree> Pass<'a, 'tree> {
                         self.record_load(*node, loc);
                     }
                 }
+                // Read once, at emission: see `search_directories`.
+                Event::SysPath { .. } => {}
                 Event::Call { node, scope } => {
                     // Only a parameterised loader's call names a file of its
                     // own; a fixed loader's file was recorded at its `def`.
@@ -1330,6 +1419,7 @@ impl<'a, 'tree> Pass<'a, 'tree> {
             }
             out.push(path_import(raw, loc, None, None, span.clone()));
         }
+        out.extend(self.search_directories());
         out.sort_by(|a, b| {
             (a.span.start_byte, &a.alias, &a.module_specifier).cmp(&(
                 b.span.start_byte,
@@ -1339,6 +1429,102 @@ impl<'a, 'tree> Pass<'a, 'tree> {
         });
         out
     }
+
+    /// The directories this file puts on `sys.path` at module level, each
+    /// with where it happened, as `SearchDirectory` imports.
+    ///
+    /// All or nothing. A write this pass cannot follow — `sys.path.remove`,
+    /// reassignment, `del`, or a module-level insert of a directory it cannot
+    /// read — anywhere in the file leaves the search path unknown, and an
+    /// unknown entry ahead of a known one could hold the module first. So one
+    /// such write withdraws every directory. An insert inside a function runs
+    /// only when the function is called: it is neither recorded nor, when it
+    /// is readable, a reason to withdraw the rest.
+    fn search_directories(&self) -> Vec<ExtractedImport> {
+        let module_scope = None;
+        let mut out = Vec::new();
+        for event in self.events {
+            let Event::SysPath {
+                node,
+                directory,
+                module_level,
+            } = event
+            else {
+                continue;
+            };
+            let read = directory.and_then(|directory| {
+                let mut budget = MAX_EVAL_NODES;
+                let items = self.eval(directory, &module_scope, 0, &mut budget).ok()?;
+                directory_from_items(&items)
+            });
+            match (read, *module_level) {
+                (Some((tail, anchor_up)), true) => out.push(ExtractedImport {
+                    raw_import: raw_text(text(*node, self.source)),
+                    module_specifier: tail,
+                    imported_names: Vec::new(),
+                    local_names: Vec::new(),
+                    alias: None,
+                    span: Span {
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                    },
+                    path_load: Some(PathLoad {
+                        scope: None,
+                        anchor_up: Some(anchor_up),
+                        kind: PathLoadKind::SearchDirectory,
+                    }),
+                }),
+                (Some(_), false) => {}
+                // An insert inside a function that could not be read is not
+                // a module-level fact either.
+                (None, false) if directory.is_some() => {}
+                (None, _) => return Vec::new(),
+            }
+        }
+        // A real script inserts a handful. Past the cap every import would be
+        // checked against every entry, so the file abstains instead.
+        if out.len() > MAX_SEARCH_DIRECTORIES {
+            return Vec::new();
+        }
+        out
+    }
+}
+
+/// A `sys.path` entry's steps as a directory: `(tail, anchor_up)`, where the
+/// directory is the loading file's own directory climbed `anchor_up` levels,
+/// then `tail` (possibly empty, possibly climbing with `..`). Only an entry
+/// anchored on `__file__` is read — a bare literal is relative to the working
+/// directory, which the source does not fix.
+fn directory_from_items(items: &[Item]) -> Option<(String, u32)> {
+    let anchor = items
+        .iter()
+        .rposition(|item| !matches!(item, Item::Lit(_)))?;
+    let Item::Anchor(level) = items[anchor] else {
+        return None;
+    };
+    if level == 0
+        || items[..anchor]
+            .iter()
+            .any(|item| !matches!(item, Item::Lit(_) | Item::Anchor(_)))
+    {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for item in &items[anchor + 1..] {
+        let Item::Lit(literal) = item else {
+            return None;
+        };
+        if literal.starts_with('/') || literal.contains('\\') || literal.contains(':') {
+            return None;
+        }
+        parts.extend(
+            literal
+                .split('/')
+                .filter(|part| !part.is_empty() && *part != "."),
+        );
+    }
+    let tail = parts.join("/");
+    (tail.len() <= MAX_PATH_BYTES).then_some((tail, level - 1))
 }
 
 fn path_import(
@@ -1358,6 +1544,7 @@ fn path_import(
         path_load: Some(PathLoad {
             scope,
             anchor_up: loc.anchor_up,
+            kind: PathLoadKind::Module,
         }),
     }
 }
@@ -1589,6 +1776,68 @@ mod tests {
             ratio < 40.0,
             "10x the calls took {ratio:.1}x the time ({small_best:?} -> {large_best:?}), \
              which is the shape of a quadratic pass"
+        );
+    }
+
+    fn search_directories(loads: &[crate::model::ExtractedImport]) -> Vec<&str> {
+        loads
+            .iter()
+            .filter(|import| {
+                import
+                    .path_load
+                    .as_ref()
+                    .is_some_and(|load| load.kind == crate::model::PathLoadKind::SearchDirectory)
+            })
+            .map(|import| import.module_specifier.as_str())
+            .collect()
+    }
+
+    /// Thousands of `sys.path` writes cost linear time: past the per-file cap
+    /// the file abstains, and reaching that verdict is one pass.
+    #[test]
+    fn thousands_of_sys_path_inserts_cost_linear_time_and_abstain_past_the_cap() {
+        let file = |count: usize| -> String {
+            let mut source = String::from(
+                "import sys\nfrom pathlib import Path\nROOT = Path(__file__).resolve().parent.parent\n",
+            );
+            for i in 0..count {
+                source.push_str(&format!(
+                    "sys.path.insert(0, str(ROOT / \"d{i}\"))\nimport m{i}\n"
+                ));
+            }
+            source
+        };
+        let at_cap = file(super::MAX_SEARCH_DIRECTORIES);
+        let at_cap_tree = parse(&at_cap);
+        assert_eq!(
+            search_directories(&python_path_loads(
+                at_cap_tree.root_node(),
+                &at_cap,
+                "s/a.py"
+            ))
+            .len(),
+            super::MAX_SEARCH_DIRECTORIES
+        );
+        let small = file(400);
+        let large = file(4_000);
+        let small_tree = parse(&small);
+        let large_tree = parse(&large);
+        let mut small_best = Duration::MAX;
+        let mut large_best = Duration::MAX;
+        for _ in 0..3 {
+            let start = Instant::now();
+            let small_loads = python_path_loads(small_tree.root_node(), &small, "s/a.py");
+            small_best = small_best.min(start.elapsed());
+            let start = Instant::now();
+            let large_loads = python_path_loads(large_tree.root_node(), &large, "s/a.py");
+            large_best = large_best.min(start.elapsed());
+            assert!(search_directories(&small_loads).is_empty());
+            assert!(search_directories(&large_loads).is_empty());
+        }
+        let ratio = large_best.as_secs_f64() / small_best.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 40.0,
+            "10x the inserts took {ratio:.1}x the time ({small_best:?} -> {large_best:?})"
         );
     }
 
