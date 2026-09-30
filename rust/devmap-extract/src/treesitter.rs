@@ -4278,7 +4278,7 @@ fn extract_node(
         _ => {
             let c_family = is_c_family_grammar(lang);
             if c_family {
-                extract_c_family_call(node, source, file_symbol_name, calls, references);
+                extract_c_family_call(lang, node, source, file_symbol_name, calls, references);
                 extract_c_header_export(node, source, file_symbol_name, exports);
             } else {
                 // Every other language reaching this arm gets declarations only
@@ -5132,6 +5132,7 @@ fn extract_c_header_export(
 /// are all `call_expression` with a `function` field, so they need no separate
 /// handling, while `new` and Objective-C messages are distinct node kinds.
 fn extract_c_family_call(
+    lang: &str,
     node: Node,
     source: &str,
     file_symbol_name: &str,
@@ -5139,6 +5140,10 @@ fn extract_c_family_call(
     references: &mut Vec<ExtractedReference>,
 ) {
     if is_inside_c_attribute(node) {
+        return;
+    }
+    if node.kind() == "preproc_function_def" {
+        extract_c_macro_body_calls(lang, node, source, file_symbol_name, calls, references);
         return;
     }
     let span = node_span(node);
@@ -5200,6 +5205,164 @@ fn extract_c_family_call(
         receiver_expr,
         span,
     });
+}
+
+thread_local! {
+    /// One parser per grammar, reused for C-family macro-body probes — the
+    /// same economy as `MACRO_PROBE_PARSER`, keyed by grammar because a Metal
+    /// body is C++ and a CUDA body is CUDA.
+    static C_MACRO_PROBE_PARSER: RefCell<Option<(&'static str, Parser)>> =
+        const { RefCell::new(None) };
+}
+
+/// Longest `#define` body the probe parses.
+///
+/// Past it the macro is simply not read, which is the fail-open direction for
+/// this rule: a missing edge is one more finding a reader sees, never a hidden
+/// one. No function-like macro in any corpus measured here comes within two
+/// orders of magnitude of it.
+const C_MACRO_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// Most probe-tree nodes one macro body is walked for.
+const C_MACRO_PROBE_MAX_NODES: usize = 50_000;
+
+/// The name the statement-shaped probe wraps a body in, and never a callee.
+const C_MACRO_PROBE: &str = "__devmap_macro_probe";
+
+/// Calls written inside a function-like macro's body, attributed to the macro.
+///
+/// The grammar leaves a `#define` body as one `preproc_arg` token, so nothing
+/// inside it is a node and no call in it was ever recorded. The macro itself is
+/// a symbol (`c_family_declaration` emits `preproc_function_def` as a
+/// function), and every use of it is recorded as a call, so a helper the macro
+/// body calls had a live caller with no edge to it. Measured on MLSystemsLab:
+/// nine Metal `inline` template helpers, each stamped into a kernel by a
+/// `KERNEL(...)` macro and each published confidently dead.
+///
+/// The body is parsed, not scanned — the way [`probe_macro_body`] treats a
+/// Rust macro invocation — by the file's own grammar, twice: bare, for a
+/// declaration-shaped body (`kernel void NAME(…) { … }`), and wrapped in a
+/// function, for a statement-shaped one. A `call_expression` outside any
+/// `ERROR` subtree in either parse is a syntactic call; a name inside a comment
+/// or a string, a keyword before `(`, and a token the grammar could not place
+/// are not. The macro's own parameters are excluded: `NAME(float *p)` is the
+/// stamped kernel's declarator, not a call to `NAME`.
+///
+/// Line continuations are removed and `##` is pasted first, which is exactly
+/// what the preprocessor does with them. Stringification (`#x`) is left as
+/// written and parses as an error around the one token, costing at most the
+/// calls in that statement.
+fn extract_c_macro_body_calls(
+    lang: &str,
+    node: Node,
+    source: &str,
+    file_symbol_name: &str,
+    calls: &mut Vec<ExtractedCall>,
+    references: &mut Vec<ExtractedReference>,
+) {
+    let Some(name) = get_child_text(node, "name", source).filter(|name| is_user_ident(name)) else {
+        return;
+    };
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+    let raw = get_node_text(value, source);
+    if raw.len() > C_MACRO_BODY_MAX_BYTES {
+        return;
+    }
+    let mut parameters = BTreeSet::new();
+    if let Some(params) = node.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for child in params.named_children(&mut cursor) {
+            if child.kind() == "identifier" {
+                parameters.insert(get_node_text(child, source));
+            }
+        }
+    }
+    let Some((grammar, language)) = grammar_for(lang) else {
+        return;
+    };
+    let body = raw
+        .replace("\\\r\n", "\n")
+        .replace("\\\n", "\n")
+        .replace("##", "");
+    let mut found: BTreeSet<(String, Option<String>)> = BTreeSet::new();
+    for probe in [
+        body.clone(),
+        format!("void {C_MACRO_PROBE}() {{\n{body}\n}}\n"),
+    ] {
+        let parsed = C_MACRO_PROBE_PARSER.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.as_ref().is_none_or(|(held, _)| *held != grammar) {
+                let mut parser = Parser::new();
+                if parser.set_language(&language).is_err() {
+                    return None;
+                }
+                *slot = Some((grammar, parser));
+            }
+            slot.as_mut()
+                .and_then(|(_, parser)| parser.parse(&probe, None))
+        });
+        let Some(tree) = parsed else {
+            continue;
+        };
+        collect_c_probe_calls(tree.root_node(), &probe, &parameters, &mut found);
+    }
+    let caller = format!("{file_symbol_name}::{name}");
+    let span = node_span(value);
+    for (callee, receiver) in found {
+        references.push(ExtractedReference {
+            name: callee.clone(),
+            kind: ReferenceKind::Call,
+            span: span.clone(),
+            enclosing_symbol: Some(caller.clone()),
+            assigned_to: None,
+            receiver_expr: receiver.clone(),
+        });
+        calls.push(ExtractedCall {
+            caller_symbol: Some(caller.clone()),
+            callee_name: callee,
+            receiver_expr: receiver,
+            span: span.clone(),
+        });
+    }
+}
+
+/// Every `call_expression` in a probe tree that sits outside an `ERROR`
+/// subtree and names something other than a macro parameter or the probe
+/// wrapper itself.
+fn collect_c_probe_calls(
+    root: Node,
+    probe: &str,
+    parameters: &BTreeSet<String>,
+    found: &mut BTreeSet<(String, Option<String>)>,
+) {
+    let mut stack = vec![root];
+    let mut visited = 0usize;
+    while let Some(current) = stack.pop() {
+        visited += 1;
+        if visited > C_MACRO_PROBE_MAX_NODES {
+            break;
+        }
+        // Nothing under a node the grammar could not place is a syntactic
+        // fact; a fabricated call is worse than a missing one.
+        if current.is_error() {
+            continue;
+        }
+        if current.kind() == "call_expression" {
+            if let Some(function) = current.child_by_field_name("function") {
+                if let Some((callee, receiver)) = split_call_target(function, probe) {
+                    if is_user_ident(&callee)
+                        && callee != C_MACRO_PROBE
+                        && !parameters.contains(&callee)
+                    {
+                        found.insert((callee, receiver));
+                    }
+                }
+            }
+        }
+        push_named_children(current, &mut stack);
+    }
 }
 
 /// The callee's identity — its name, and the receiver expression it is reached
@@ -6934,7 +7097,14 @@ fn maybe_push_name_reference(
     references: &mut Vec<ExtractedReference>,
 ) {
     let mut ref_kind = match node.kind() {
-        "type_identifier" | "nested_type_identifier" => ReferenceKind::Type,
+        // `namespace_identifier` is how tree-sitter-cpp spells the scope of
+        // `Plain::K`: a use of `Plain`, which a struct mentioned no other way
+        // — `MmaTiles::kThreads`, `MmaTiles::BR` — had no reference for at
+        // all. A `namespace ns { … }` head is on the definition's `name`
+        // field, which `is_defining_name` below already refuses.
+        "type_identifier" | "nested_type_identifier" | "namespace_identifier" => {
+            ReferenceKind::Type
+        }
         "identifier"
         | "shorthand_property_identifier"
         | "property_identifier"
@@ -9275,6 +9445,162 @@ mod tests {
         assert!(
             reason.contains("`test`") && reason.contains("`register`"),
             "the reason names the decorator and the function that received it: {reason}"
+        );
+    }
+
+    /// `Plain::K` reaches into `Plain`; the scope half is a use of the type.
+    ///
+    /// tree-sitter-cpp spells the scope of a `qualified_identifier` as a
+    /// `namespace_identifier`, a node kind the name-reference walk never
+    /// visited, so a struct whose only mentions were `MmaTiles::kThreads`
+    /// and `MmaTiles::BR` had no inbound reference at all — not an
+    /// unresolved one, none — and was published confidently dead. A
+    /// `namespace ns { … }` head is the declaration of `ns`, not a use.
+    #[test]
+    fn a_qualified_scope_is_a_use_of_the_type_it_reaches_into() {
+        let extraction = extract_treesitter(
+            "q.cu",
+            "cuda",
+            "struct Plain { static constexpr int K = 4; };\n\
+             __global__ void kern(float *p) { constexpr int k = Plain::K; p[0] = k; }\n\
+             namespace ns { int x; }\n",
+        );
+        assert!(
+            extraction
+                .references
+                .iter()
+                .any(|reference| reference.name == "Plain"
+                    && matches!(reference.kind, ReferenceKind::Type | ReferenceKind::Name)),
+            "`Plain::K` names Plain: {:?}",
+            extraction.references
+        );
+        assert!(
+            !extraction
+                .references
+                .iter()
+                .any(|reference| reference.name == "ns"),
+            "a namespace head declares; it is not a use: {:?}",
+            extraction.references
+        );
+    }
+
+    /// A function-like macro's body calls what it names, and the macro is the
+    /// caller.
+    ///
+    /// The grammar leaves a `#define` body as one `preproc_arg` token, so a
+    /// helper whose only call sites sit inside macro bodies — every
+    /// `mm_bf16_*`, `mm_nn_coop_f32acc` and `mm_i8_dequant_coop` in
+    /// MLSystemsLab's Metal kernels, each stamped out by a `KERNEL(...)`
+    /// macro — had no inbound edge and was published confidently dead. The
+    /// body is parsed by the file's own grammar, the way `probe_macro_body`
+    /// already does for Rust, so a name inside a comment or a string, a
+    /// keyword before `(`, and the macro's own parameters contribute nothing.
+    ///
+    /// The bodies are shaped to what the grammar's preprocessor scanner
+    /// accepts: measured, a block comment closing a continuation line that is
+    /// followed by a keyword line (`if`) or a template-call line (`f<T>(…)`)
+    /// makes tree-sitter drop the whole macro into `preproc_def` + `ERROR`,
+    /// in both the C++ and CUDA grammars. That macro is then not a symbol at
+    /// all — fail-open, one more finding per helper it calls — and nothing
+    /// here can reach it, so the comment and the template call live in
+    /// different macros.
+    #[test]
+    fn a_function_like_macro_body_calls_what_it_names() {
+        let extraction = extract_treesitter(
+            "k.cu",
+            "cuda",
+            "#define STAMP(NAME) \\\n\
+             \x20 __global__ void NAME(float *p) { \\\n\
+             \x20   dev_plain(p); /* dead_in_comment(p) */ \\\n\
+             \x20   dev_plain(p); \\\n\
+             \x20 }\n\
+             #define STAMP2(NAME) \\\n\
+             \x20 __global__ void NAME(float *p) { \\\n\
+             \x20   macro_only_helper<float>(p); p[0] = sizeof(\"dead_in_string(p)\"); \\\n\
+             \x20   constexpr int k = Plain::K; p[1] = k; \\\n\
+             \x20 }\n\
+             #define GUARD(x) if (!(x)) return;\n\
+             #define APPLY(f, x) f(x)\n\
+             #define TORN(x) torn_helper(x) +\n\
+             __device__ void dev_plain(float *p) { p[1] = 1; }\n\
+             __device__ int torn_helper(float *p) { return 1; }\n\
+             template <typename T> __device__ void macro_only_helper(T *p) { p[3] = 1; }\n\
+             __device__ void dead_in_comment(float *p) { p[4] = 1; }\n\
+             __device__ void dead_in_string(float *p) { p[5] = 1; }\n\
+             struct Plain { static constexpr int K = 4; };\n\
+             STAMP(stamped_kernel)\n\
+             STAMP2(stamped_kernel2)\n",
+        );
+        let calls_from = |caller: &str| -> Vec<&str> {
+            let mut names: Vec<&str> = extraction
+                .calls
+                .iter()
+                .filter(|call| call.caller_symbol.as_deref() == Some(caller))
+                .map(|call| call.callee_name.as_str())
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            names
+        };
+        assert_eq!(
+            calls_from("k.cu::STAMP"),
+            ["dev_plain"],
+            "a name inside a comment is not a callee: {:?}",
+            extraction.calls
+        );
+        assert_eq!(
+            calls_from("k.cu::STAMP2"),
+            ["macro_only_helper"],
+            "a template call is a call; a name inside a string and `sizeof` are not: {:?}",
+            extraction.calls
+        );
+        assert!(
+            calls_from("k.cu::GUARD").is_empty(),
+            "a keyword before `(` is not a callee: {:?}",
+            extraction.calls
+        );
+        assert!(
+            calls_from("k.cu::APPLY").is_empty(),
+            "a macro parameter in callee position is the caller's argument, not a symbol: {:?}",
+            extraction.calls
+        );
+        // `torn_helper(x) +` is an expression fragment: both probe parses can
+        // only place the call inside an `ERROR` node. Refusing it is the
+        // fail-open direction — the helper shows up as one finding too many
+        // rather than being resurrected by a token the grammar could not
+        // place.
+        assert!(
+            calls_from("k.cu::TORN").is_empty(),
+            "a call the grammar could only place under an ERROR node is not a syntactic fact: {:?}",
+            extraction.calls
+        );
+        assert!(
+            extraction
+                .references
+                .iter()
+                .any(|reference| reference.name == "macro_only_helper"
+                    && reference.kind == ReferenceKind::Call
+                    && reference.enclosing_symbol.as_deref() == Some("k.cu::STAMP2")),
+            "the call is also a reference the resolver can attribute: {:?}",
+            extraction.references
+        );
+        // The Metal spelling: `kernel void` plus `[[buffer(n)]]` attributes
+        // inside the body, parsed by the C++ grammar.
+        let metal = extract_treesitter(
+            "a.metal",
+            "cpp",
+            "#define TUNE(NAME, SM) \\\n\
+             \x20 kernel void NAME(device float *A [[buffer(0)]], uint tg [[threadgroup_position_in_grid]]) { \\\n\
+             \x20   mm_tune<SM>(A, tg); \\\n\
+             \x20 }\n\
+             template <int SM> inline void mm_tune(device float *A, uint tg) { A[tg] = SM; }\n\
+             TUNE(mm_64, 64)\n",
+        );
+        assert!(
+            metal.calls.iter().any(|call| call.callee_name == "mm_tune"
+                && call.caller_symbol.as_deref() == Some("a.metal::TUNE")),
+            "a Metal kernel-stamping macro calls its template helper: {:?}",
+            metal.calls
         );
     }
 

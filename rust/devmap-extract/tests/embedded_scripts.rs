@@ -795,8 +795,9 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v63 records in-function `sys.path` inserts as scoped vetoes.
     //
     // v64 drops the spurious local binding a C++ template callee or template
-    // type use produced, and annotates a Python function decorated with a
-    // parameter of its enclosing callable.
+    // type use produced, annotates a Python function decorated with a
+    // parameter of its enclosing callable, references the scope of `T::m`,
+    // and records the calls inside a function-like macro body.
     assert_eq!(
         EXTRACTION_SCHEMA_VERSION, "64",
         "reading <script> blocks changes what a cached payload means, and so does \

@@ -752,6 +752,66 @@ fn a_template_call_keeps_its_callee_out_of_the_confident_dead_tier() {
     }
 }
 
+/// A helper called only from a `#define` body is called, and a type reached
+/// only as a `Type::member` scope is used.
+///
+/// The two remaining C-family shapes measured on MLSystemsLab after the
+/// template-call fix: 9 Metal `inline` helpers stamped into kernels by
+/// function-like macros, and `MmaTiles`, mentioned only as
+/// `MmaTiles::kThreads`. The uncalled twin of each stays confidently dead —
+/// including a helper named only inside a comment in the macro body.
+#[test]
+fn a_macro_body_call_and_a_qualified_scope_keep_their_targets_out_of_the_confident_dead_tier() {
+    // Two macros rather than one: the grammar's preprocessor scanner drops a
+    // macro whose comment-terminated line is followed by a template-call
+    // line (see `a_function_like_macro_body_calls_what_it_names`).
+    let ext = extract_file(
+        "k/m.cu",
+        "#define STAMP(NAME) \\\n\
+         \x20 __global__ void NAME(float *p) { \\\n\
+         \x20   dev_plain(p); /* dead_in_comment(p) */ \\\n\
+         \x20   dev_plain(p); \\\n\
+         \x20 }\n\
+         #define STAMP2(NAME) \\\n\
+         \x20 __global__ void NAME(float *p) { \\\n\
+         \x20   macro_only_helper<float>(p); p[0] = sizeof(\"dead_in_string(p)\"); \\\n\
+         \x20 }\n\
+         __global__ void scoped(float *p) { constexpr int k = Plain::K; p[1] = k; }\n\
+         __device__ void dev_plain(float *p) { p[1] = 1; }\n\
+         template <typename T> __device__ void macro_only_helper(T *p) { p[3] = 1; }\n\
+         __device__ void dead_in_comment(float *p) { p[4] = 1; }\n\
+         __device__ void dead_in_string(float *p) { p[5] = 1; }\n\
+         struct Plain { static constexpr int K = 4; };\n\
+         struct PlainUnused { static constexpr int K = 5; };\n\
+         STAMP(stamped_kernel)\n\
+         STAMP2(stamped_kernel2)\n",
+    );
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
+    let analysis = analyze(std::slice::from_ref(&ext), &resolution);
+    let confidently_dead = |name: &str| {
+        analysis.dead_symbols.iter().any(|report| {
+            report.symbol_name == name && !report.is_exempt && report.confidence >= 0.9
+        })
+    };
+    for live in ["dev_plain", "macro_only_helper", "Plain"] {
+        assert!(
+            !confidently_dead(live),
+            "{live} is reached from the macro body: {:?}\nunresolved: {:?}",
+            analysis.dead_symbols,
+            resolution.unresolved
+        );
+    }
+    for dead in ["dead_in_comment", "dead_in_string", "PlainUnused"] {
+        assert!(
+            confidently_dead(dead),
+            "{dead} has no call site and must stay confidently dead: {:?}",
+            analysis.dead_symbols
+        );
+    }
+}
+
 #[test]
 fn test_dead_code_detection() {
     let f1 = extract_file(
