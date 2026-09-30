@@ -93,6 +93,7 @@ fn import(specifier: &str) -> ExtractedImport {
         local_names: Vec::new(),
         alias: None,
         span: span(),
+        path_load: None,
     }
 }
 

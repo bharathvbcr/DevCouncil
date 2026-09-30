@@ -212,6 +212,19 @@ pub struct Resolver {
     /// `file_symbols` takes an entry per extraction unconditionally, including
     /// files that declare no symbol.
     files_by_dir: BTreeMap<String, Vec<String>>,
+    /// Indexed `.py` files grouped by file name, for the suffix rung of a
+    /// Python path load (see [`Self::resolve_path_load`]). Built once, so a
+    /// file of thousands of loads costs one lookup each rather than a scan of
+    /// the corpus each.
+    py_files_by_name: BTreeMap<String, Vec<String>>,
+    /// Per-file `(scope, local)` → the file a path-loaded Python module
+    /// handle names (`module = module_from_spec(spec)` and friends).
+    ///
+    /// Deliberately not `import_bindings`, which is per file with **no scope
+    /// test**: a handle bound inside one function would bind the same name in
+    /// every other function of the file. `scope` is the binding's
+    /// `LocalBinding::scope` identity, `None` for a module global.
+    path_module_bindings: BTreeMap<String, BTreeMap<(Option<String>, String), String>>,
     /// Rust crate name, spelled as a `use` spells it, -> that crate's `src`
     /// root. `None` where two indexed crates claim the same name.
     ///
@@ -451,6 +464,8 @@ impl Resolver {
             file_symbols: BTreeMap::new(),
             selector_symbols: BTreeMap::new(),
             files_by_dir: BTreeMap::new(),
+            py_files_by_name: BTreeMap::new(),
+            path_module_bindings: BTreeMap::new(),
             rust_crate_roots: BTreeMap::new(),
             reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
@@ -1394,6 +1409,8 @@ impl Resolver {
         self.file_symbols.clear();
         self.selector_symbols.clear();
         self.files_by_dir.clear();
+        self.py_files_by_name.clear();
+        self.path_module_bindings.clear();
         self.rust_crate_roots.clear();
         self.reexport_chains.clear();
         self.receiver_types.clear();
@@ -1633,6 +1650,19 @@ impl Resolver {
             files.sort();
         }
         self.files_by_dir = files_by_dir;
+        let mut py_files_by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for path in self
+            .file_symbols
+            .keys()
+            .filter(|path| path.ends_with(".py"))
+        {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            py_files_by_name
+                .entry(name.to_string())
+                .or_default()
+                .push(path.clone());
+        }
+        self.py_files_by_name = py_files_by_name;
 
         // Which crate each indexed `src/lib.rs` or `src/main.rs` is the root
         // of, keyed by the name a `use` would spell. Built here for the same
@@ -1707,7 +1737,24 @@ impl Resolver {
                     file_external.insert(local, specifier.to_string());
                 }
             };
+            let mut file_path_modules: BTreeMap<(Option<String>, String), String> = BTreeMap::new();
             for imp in &ext.imports {
+                // A Python module loaded by file path binds a *scoped* handle,
+                // so it goes to its own table and never to `file_bindings`. A
+                // load that binds nothing (`run_path`) contributes only the
+                // file edge, which the resolution pass emits.
+                if let Some(load) = &imp.path_load {
+                    if let Some(local) = imp.alias.as_ref() {
+                        if let Some(target) = self.resolve_path_load(
+                            &ext.file_path,
+                            &imp.module_specifier,
+                            load.anchor_up,
+                        ) {
+                            file_path_modules.insert((load.scope.clone(), local.clone()), target);
+                        }
+                    }
+                    continue;
+                }
                 if !imp.imported_names.is_empty() {
                     for (idx, name) in imp.imported_names.iter().enumerate() {
                         // A legacy singular alias is safe only for a single
@@ -1902,6 +1949,10 @@ impl Resolver {
             if !file_bindings.is_empty() {
                 self.import_bindings
                     .insert(ext.file_path.clone(), file_bindings);
+            }
+            if !file_path_modules.is_empty() {
+                self.path_module_bindings
+                    .insert(ext.file_path.clone(), file_path_modules);
             }
 
             let family = LangFamily::from_lang(&ext.language);
@@ -2429,12 +2480,29 @@ impl Resolver {
                 }
 
                 // Resolve imports
+                //
+                // One path-loaded file is often named by several imports in the
+                // same loader — the handle, and the loader function that
+                // returns it — but it is one dependency, so one edge.
+                let mut path_loaded: BTreeSet<String> = BTreeSet::new();
                 for imp in &ext.imports {
-                    let targets = self.resolve_import_targets(
-                        &ext.file_path,
-                        &ext.language,
-                        &imp.module_specifier,
-                    );
+                    let targets = match &imp.path_load {
+                        Some(load) => match self.resolve_path_load(
+                            &ext.file_path,
+                            &imp.module_specifier,
+                            load.anchor_up,
+                        ) {
+                            // Already linked: neither a second edge nor a
+                            // spurious "resolved to nothing" row.
+                            Some(target) if !path_loaded.insert(target.clone()) => continue,
+                            resolved => resolved.into_iter().collect(),
+                        },
+                        None => self.resolve_import_targets(
+                            &ext.file_path,
+                            &ext.language,
+                            &imp.module_specifier,
+                        ),
+                    };
                     // R5. A relative specifier that named no indexed file is an
                     // index gap: the `Imports` edge that should exist is
                     // missing, and emitting only on success made that
@@ -2680,6 +2748,28 @@ impl Resolver {
                                             imported_from: recv.clone(),
                                         }));
                                     }
+                                }
+                            }
+                        }
+                    }
+
+                    // 2b'. A Python module handle loaded by file path —
+                    // `module = module_from_spec(spec)`. Scoped: the handle
+                    // is read through the use site's own binding, so a
+                    // same-named local in another function never matches.
+                    if resolution.is_none() {
+                        if let Some(recv) = call.receiver_expr.as_deref() {
+                            if let Some(target_f) =
+                                self.path_module_for(ext, call.span.start_byte, recv)
+                            {
+                                if let Some((resolved_file, resolved_sym)) =
+                                    self.lookup_in_package(target_f, &call.callee_name)
+                                {
+                                    resolution = Some(Arc::new(Resolution::ImportScoped {
+                                        target_symbol: resolved_sym,
+                                        target_file: resolved_file,
+                                        imported_from: recv.to_string(),
+                                    }));
                                 }
                             }
                         }
@@ -4445,6 +4535,96 @@ impl Resolver {
             .collect()
     }
 
+    /// The indexed file a Python path load names, or `None`.
+    ///
+    /// `specifier` is the literal path tail the extractor read
+    /// (`scripts/build_supplement.py`); `anchor_up` says what it is relative
+    /// to (see `devmap_extract::model::PathLoad`).
+    ///
+    /// * **Anchored** (`Path(__file__).parents[1] / "x.py"`): exactly one
+    ///   candidate, the loader's directory climbed `anchor_up` levels. It is
+    ///   indexed or the load abstains; nothing else is tried, because the
+    ///   source said where the file is.
+    /// * **Unanchored** (`ROOT / "x.py"` with `ROOT` opaque, or a bare
+    ///   literal, which Python reads against the working directory): (a) the
+    ///   loader's own directory and (b) the repository root, and if both name
+    ///   different indexed files that is "one of several" and abstains; then
+    ///   (c) the one indexed `.py` file whose path ends with the specifier.
+    ///   Two such files abstain. A specifier that climbs (`..`) is only
+    ///   meaningful against (a) and never suffix-matched.
+    fn resolve_path_load(
+        &self,
+        current_file: &str,
+        specifier: &str,
+        anchor_up: Option<u32>,
+    ) -> Option<String> {
+        let indexed = |path: &str| self.file_symbols.contains_key(path);
+        let dir = Self::parent_dir(current_file);
+        if let Some(up) = anchor_up {
+            let mut base = dir;
+            for _ in 0..up {
+                if base.is_empty() {
+                    // Above the repository root: not a file this corpus has.
+                    return None;
+                }
+                base = base
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent.to_string())
+                    .unwrap_or_default();
+            }
+            let candidate = Self::normalize_rel(&base, specifier)?;
+            return indexed(&candidate).then_some(candidate);
+        }
+        let climbs = specifier.split('/').any(|part| part == "..");
+        let mut hits: BTreeSet<String> = BTreeSet::new();
+        for base in [dir.as_str(), ""] {
+            if climbs && base.is_empty() {
+                continue;
+            }
+            if let Some(candidate) = Self::normalize_rel(base, specifier) {
+                if indexed(&candidate) {
+                    hits.insert(candidate);
+                }
+            }
+        }
+        match hits.len() {
+            0 => {}
+            1 => return hits.pop_first(),
+            _ => return None,
+        }
+        if climbs {
+            return None;
+        }
+        let name = specifier.rsplit('/').next()?;
+        let suffix = format!("/{specifier}");
+        let mut matches = self
+            .py_files_by_name
+            .get(name)?
+            .iter()
+            .filter(|path| path.as_str() == specifier || path.ends_with(&suffix));
+        let only = matches.next()?;
+        matches.next().is_none().then(|| only.clone())
+    }
+
+    /// The file a path-loaded Python module handle names, read at a use site.
+    ///
+    /// The key is the use site's own binding scope: inside the function that
+    /// bound the handle (or a closure over it) the extractor's
+    /// `LocalBinding::scope` names that function; with no site binding the
+    /// name is a module global. A binding of an anonymous callable has no
+    /// scope identity to join on and abstains. `load().fn()` — a call through
+    /// a same-file loader function — records the receiver identity `load`
+    /// (the inner call's callee, arguments dropped), and the extractor keys
+    /// the loader at module level under that same name.
+    fn path_module_for(&self, ext: &Extraction, site: usize, receiver: &str) -> Option<&String> {
+        let table = self.path_module_bindings.get(&ext.file_path)?;
+        let scope = match ext.local_binding_at(site, receiver) {
+            Some(binding) => Some(binding.scope.clone()?),
+            None => None,
+        };
+        table.get(&(scope, receiver.to_string()))
+    }
+
     /// Every indexed file in the directory a JVM package name maps to.
     fn resolve_package_wildcard(&self, lang: &str, package: &str) -> Vec<String> {
         let Some(rule) = crate::importpath::rule_for(lang) else {
@@ -4612,6 +4792,23 @@ impl Resolver {
             }
         }
 
+        // A Python module handle loaded by file path. Before the local-binding
+        // refusal below, because a function-scoped handle *is* a local
+        // binding — the one local whose value is known.
+        if let Some(module_file) = self.path_module_for(ext, reference.span.start_byte, receiver) {
+            let (resolved_file, resolved_symbol) = self.lookup_in_package(module_file, name)?;
+            return Some(self.reference_edge(
+                ext,
+                &resolved_file,
+                &resolved_symbol,
+                reference,
+                Resolution::ImportScoped {
+                    target_symbol: self.qualified_for(&resolved_file, &resolved_symbol),
+                    target_file: resolved_file.clone(),
+                    imported_from: receiver.to_string(),
+                },
+            ));
+        }
         if ext
             .local_binding_at(reference.span.start_byte, receiver)
             .is_some()

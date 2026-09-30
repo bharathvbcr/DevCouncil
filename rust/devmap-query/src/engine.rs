@@ -2757,6 +2757,12 @@ pub fn link_candidates(
         let extractions = store.latest_extractions()?;
         for extraction in &extractions {
             for import in &extraction.imports {
+                // A Python module loaded by file path names a file beside its
+                // loader, never a module another repository provides — and
+                // `scripts/x.py` would otherwise match a provider of `scripts`.
+                if import.path_load.is_some() {
+                    continue;
+                }
                 let specifier = import.module_specifier.trim();
                 if specifier.is_empty() || specifier.starts_with('.') {
                     continue;

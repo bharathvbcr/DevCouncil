@@ -50,6 +50,10 @@ pub use git_metadata::{git_metadata, GitMetadata};
 pub mod notebook;
 #[cfg(feature = "parse")]
 mod parent_index;
+// Python modules loaded by file path. Walks a parse tree, and its one caller is
+// `treesitter::extract_treesitter`.
+#[cfg(feature = "parse")]
+mod pyload;
 #[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod wiring;

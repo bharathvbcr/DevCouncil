@@ -782,11 +782,13 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // reference that should never have been there, a Go struct-literal field
     // key. A v57 row has neither addition and keeps the spurious reference.
     //
-    // v59 records a Go file's unexported field and interface-method names.
-    // A v58 row has none, and the unexported-selector rung abstains for its
+    // v59 adds an import for every Python module loaded by file path.
+    //
+    // v60 records a Go file's unexported field and interface-method names.
+    // A v59 row has none, and the unexported-selector rung abstains for its
     // whole package rather than read the absence as "no namesake".
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "59",
+        EXTRACTION_SCHEMA_VERSION, "60",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

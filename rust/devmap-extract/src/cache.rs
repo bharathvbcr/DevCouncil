@@ -437,13 +437,23 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// fabricated `SamePackage` edge — from a cache, with no degraded marker to say
 /// why.
 ///
-/// v59 records a Go file's unexported field and interface-method names
+/// v59 records a Python module loaded **by file path** —
+/// `importlib.util.spec_from_file_location`, `runpy.run_path`,
+/// `SourceFileLoader(...)`, `imp.load_source` — as an import carrying
+/// `path_load`, with the local handle it is bound to and that handle's scope;
+/// see `pyload`. A v58 row has no such import, so the loaded file has no edge
+/// from its loader and every `module.fn()` through the handle stays an
+/// `uninferred_receiver` — `impact fn` answers "no callers" for functions whose
+/// only callers are those scripts and tests. Served from a v58 cache the gap
+/// would persist with nothing to say why.
+///
+/// v60 records a Go file's unexported field and interface-method names
 /// (`Extraction::go_member_names`), the veto the resolver's
 /// unexported-selector rung needs before it may bind `job.recordReplayEvent()`
-/// to the package's one `recordReplayEvent` method. A v58 row carries `None`
+/// to the package's one `recordReplayEvent` method. A v59 row carries `None`
 /// there, and the rung abstains for any package holding one — so without the
 /// bump a warm cache would silently keep the rung off, not make it unsound.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "59";
+pub const EXTRACTION_SCHEMA_VERSION: &str = "60";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
