@@ -16,8 +16,8 @@ pub use db::{
     FileSymbolsPage, GenerationWriteOpts, PageSizeConversion, PendingClaim, PendingEnqueueReport,
     PendingReconcile, PendingSupersede, PendingWatermark, QuerySourceFreshness, SearchPage,
     SourceTreeDelta, Store, StoreStatus, StoredEdge, StoredFile, StoredSymbol, UnresolvedSiteRow,
-    UnsupportedSchema, VacuumAction, VacuumOutcome, WalCheckpointMode, WalCheckpointResult,
-    WriteBreakdown, WriterLock, MAX_PENDING_ATTEMPTS,
+    UnresolvedSitesByName, UnsupportedSchema, VacuumAction, VacuumOutcome, WalCheckpointMode,
+    WalCheckpointResult, WriteBreakdown, WriterLock, MAX_PENDING_ATTEMPTS,
 };
 pub use edge_index::{
     edge_kind_from_stored, edge_resolution, resolution_kind_from_stored, resolution_kind_label,

@@ -811,6 +811,12 @@ fn impact_accepts_layers_and_forwards_it() {
         Ok(devmap_serve::protocol::IpcCommand::Impact { layers, .. }) => assert!(layers),
         other => panic!("layers must reach the impact command: {other:?}"),
     }
-    let refused = to_ipc_command("devmap_impact", Some(&json!({"target": "x", "layer": true})));
-    assert!(refused.is_err(), "a misspelling is still refused, not defaulted");
+    let refused = to_ipc_command(
+        "devmap_impact",
+        Some(&json!({"target": "x", "layer": true})),
+    );
+    assert!(
+        refused.is_err(),
+        "a misspelling is still refused, not defaulted"
+    );
 }

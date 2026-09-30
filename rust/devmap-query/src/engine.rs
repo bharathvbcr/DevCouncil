@@ -273,7 +273,7 @@ impl<'a> StoreQueryEngine<'a> {
         devmap_store::checked_min_confidence(req.min_confidence)?;
         let layer_budget = req.token_budget / 2;
         let edge_budget = req.token_budget.saturating_sub(layer_budget);
-        let Some(index) = self.generation_edges()? else {
+        let Some((generation, index)) = self.store.generation_edges_with_id()? else {
             let reason = "no persisted generation is available".to_string();
             return Ok(LayeredImpact {
                 edges: unavailable_response(ResolutionAvailability::Unavailable {
@@ -300,7 +300,7 @@ impl<'a> StoreQueryEngine<'a> {
             None,
             Some(layer_budget),
         )?;
-        self.attach_unresolved_namesakes(&index, &target, min_confidence, &mut edges)?;
+        self.attach_unresolved_namesakes(generation, &index, &target, min_confidence, &mut edges)?;
         Ok(LayeredImpact {
             edges,
             // `Some` by construction: `band_budget` was `Some` on the call
@@ -765,7 +765,7 @@ impl<'a> StoreQueryEngine<'a> {
         // locks, reads and drops — so nothing below this line holds it. An
         // abandoned traversal therefore cannot block the drain loop's writes
         // while it unwinds.
-        let Some(index) = self.generation_edges()? else {
+        let Some((generation, index)) = self.store.generation_edges_with_id()? else {
             return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
@@ -777,7 +777,13 @@ impl<'a> StoreQueryEngine<'a> {
         let target = req.query.clone();
         let min_confidence = req.min_confidence;
         let mut response = self.traverse_over(&index, &direction, req, min_rung)?;
-        self.attach_unresolved_namesakes(&index, &target, min_confidence, &mut response)?;
+        self.attach_unresolved_namesakes(
+            generation,
+            &index,
+            &target,
+            min_confidence,
+            &mut response,
+        )?;
         Ok(response)
     }
 
@@ -789,8 +795,13 @@ impl<'a> StoreQueryEngine<'a> {
     /// whose every caller went unresolved has no inbound edge, so it is no
     /// traversal start, and that is precisely the method whose callers are all
     /// in the ledger.
+    ///
+    /// `generation` is the one `index` was built from. The ledger is read at
+    /// that generation, so the edges and the candidates describe one state of
+    /// the repository even when a daemon commits between the two reads.
     fn attach_unresolved_namesakes<T>(
         &self,
+        generation: u32,
         index: &GenerationEdges,
         target: &str,
         min_confidence: f32,
@@ -800,8 +811,21 @@ impl<'a> StoreQueryEngine<'a> {
         // reported by the walk; the names below then come from the query text.
         let starts = indexed_traversal_starts(index, target, true, min_confidence, &self.cancel)
             .unwrap_or_default();
-        let Some(namesakes) = self.unresolved_namesakes(target, &starts)? else {
-            return Ok(());
+        let namesakes = match self.unresolved_namesakes(generation, target, &starts)? {
+            NamesakeRead::NotApplicable => return Ok(()),
+            NamesakeRead::GenerationGone => {
+                // Checked, and could not be answered consistently: saying
+                // nothing here would read as "the ledger holds no candidates".
+                let note = format!(
+                    "the unresolved ledger could not be read at generation {generation}, the one \
+                     these edges came from (it was pruned mid-query); callers the resolver could \
+                     not bind are not listed — ask again"
+                );
+                response.walk_incomplete =
+                    devmap_analyze::combine_reasons(response.walk_incomplete.take(), Some(note));
+                return Ok(());
+            }
+            NamesakeRead::Read(namesakes) => namesakes,
         };
         if !namesakes.sites.is_empty() || namesakes.truncated {
             let note = format!(
@@ -831,18 +855,19 @@ impl<'a> StoreQueryEngine<'a> {
         Ok(())
     }
 
-    /// The unresolved call sites whose callee is the bare name of a target.
+    /// The unresolved call sites at `generation` whose callee is the bare name
+    /// of a target — one ledger read for every name.
     ///
     /// `starts` are `(qualified symbol, file)`. With none, the name is read off
-    /// the query itself; a path query names no callee and answers `None`.
-    /// Sites in another language family than the start that named them are
-    /// counted and dropped. With no start there is no family to compare, and
-    /// every site is kept.
+    /// the query itself; a path query names no callee. Sites in another
+    /// language family than the start that named them are counted and dropped.
+    /// With no start there is no family to compare, and every site is kept.
     fn unresolved_namesakes(
         &self,
+        generation: u32,
         target: &str,
         starts: &[(String, String)],
-    ) -> anyhow::Result<Option<UnresolvedNamesakes>> {
+    ) -> anyhow::Result<NamesakeRead> {
         // name → the families of the starts that carry it; empty = unknown.
         let mut wanted: BTreeMap<String, BTreeSet<LangFamily>> = BTreeMap::new();
         for (symbol, file) in starts {
@@ -869,24 +894,28 @@ impl<'a> StoreQueryEngine<'a> {
                 | crate::query_match::StartQuery::Nothing => (None, BTreeSet::new()),
             };
             let Some(name) = name else {
-                return Ok(None);
+                return Ok(NamesakeRead::NotApplicable);
             };
             wanted.insert(name.to_string(), families);
         }
         let names_not_checked = wanted.len().saturating_sub(MAX_NAMESAKE_NAMES);
+        let wanted: Vec<(String, BTreeSet<LangFamily>)> =
+            wanted.into_iter().take(MAX_NAMESAKE_NAMES).collect();
+        let names: Vec<String> = wanted.iter().map(|(name, _)| name.clone()).collect();
+        self.cancel.check()?;
+        let Some(mut found) =
+            self.store
+                .unresolved_sites_naming(generation, &names, MAX_NAMESAKE_SITES_PER_NAME)?
+        else {
+            return Ok(NamesakeRead::GenerationGone);
+        };
         let mut namesakes = UnresolvedNamesakes {
+            generation_id: generation,
             names_not_checked,
             ..UnresolvedNamesakes::default()
         };
-        for (name, families) in wanted.into_iter().take(MAX_NAMESAKE_NAMES) {
-            self.cancel.check()?;
-            let Some((generation, rows, truncated)) = self
-                .store
-                .unresolved_sites_named(&name, MAX_NAMESAKE_SITES_PER_NAME)?
-            else {
-                return Ok(None);
-            };
-            namesakes.generation_id = generation;
+        for (name, families) in wanted {
+            let (rows, truncated) = found.remove(&name).unwrap_or_default();
             namesakes.truncated |= truncated;
             for row in rows {
                 if !families.is_empty() && !families.contains(&family_of_path(&row.source_file)) {
@@ -903,7 +932,7 @@ impl<'a> StoreQueryEngine<'a> {
             }
             namesakes.names.push(name);
         }
-        Ok(Some(namesakes))
+        Ok(NamesakeRead::Read(namesakes))
     }
 
     /// The traversal itself, over an index the caller already holds.
@@ -3833,6 +3862,15 @@ fn indexed_traversed_edges(
 /// Lifted out of `traverse` so the blast radius resolves its seeds through the
 /// same matcher the traversal does. Resolving them two ways is how a radius
 /// ends up seeded from a symbol the trace never visits.
+/// What a ledger read for `impact` came back with.
+enum NamesakeRead {
+    /// The target names no callee (a file or blank query).
+    NotApplicable,
+    /// The walk's generation is no longer retained, so no consistent read.
+    GenerationGone,
+    Read(UnresolvedNamesakes),
+}
+
 /// The name a call site would record for a symbol: the last segment of a
 /// qualified name, past `::` and past `.`. `a/job.go::YoloJob.record` and
 /// `YoloJob.record` both call `record`. `None` for an empty tail.

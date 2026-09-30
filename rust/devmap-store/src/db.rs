@@ -1647,7 +1647,10 @@ fn charge(sink: &mut f64) -> Charge<'_> {
     }
 }
 
-/// One unresolved call site, as [`Store::unresolved_sites_named`] returns it.
+/// Per name: its sites, and whether the per-name cap cut them.
+pub type UnresolvedSitesByName = BTreeMap<String, (Vec<UnresolvedSiteRow>, bool)>;
+
+/// One unresolved call site, as [`Store::unresolved_sites_naming`] returns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnresolvedSiteRow {
     pub source_file: String,
@@ -6117,60 +6120,99 @@ impl Store {
         Ok(rows)
     }
 
-    /// The latest generation's unresolved call sites whose callee is exactly
-    /// `callee_name`, at most `limit` of them, with the generation they came
-    /// from and whether `limit` cut the list.
+    /// Unresolved call sites at `generation` whose callee is one of `names`, at
+    /// most `limit_per_name` per name, each name's rows ordered by
+    /// `(file, symbol)` and flagged when the cap cut them.
     ///
     /// The ledger is where a caller the resolver could not bind is kept — an
     /// untyped receiver, a module loaded by path — and until this existed no
     /// query read it by name: `impact` answered from edges alone, and a method
-    /// whose only production caller sat here reported no such caller. Ordered
-    /// by `(file, symbol)` so a capped prefix is the same prefix on every read.
+    /// whose only production caller sat here reported no such caller.
     ///
-    /// Not indexed on `callee_name`: measured on scholarlm's 558,288 ledger rows
-    /// the scan costs ~40 ms warm, and an index is a schema change.
-    pub fn unresolved_sites_named(
+    /// **One scan for every name.** The ledger is not indexed on `callee_name`
+    /// (an index is a schema change), so each read is a pass over the ledger —
+    /// measured on scholarlm's 558,288 rows at ~40 ms warm. A read per name
+    /// made a file-target `impact` pay eight of them: +218 ms end to end.
+    /// `ROW_NUMBER()` partitioned by name applies the per-name cap inside the
+    /// one pass, and one row past each cap says whether it bit.
+    ///
+    /// **At the caller's generation, not the latest.** `impact` walks one
+    /// generation's edges and reads this beside it; a daemon can commit
+    /// between the two. Ledger rows carry `valid_from`/`valid_to`, so any
+    /// retained generation is readable exactly. `None` when `generation` is no
+    /// longer retained — the pair cannot be made consistent, and the caller
+    /// must say so rather than mix two states of the repository.
+    pub fn unresolved_sites_naming(
         &self,
-        callee_name: &str,
-        limit: usize,
-    ) -> Result<Option<(u32, Vec<UnresolvedSiteRow>, bool)>> {
+        generation: u32,
+        names: &[String],
+        limit_per_name: usize,
+    ) -> Result<Option<UnresolvedSitesByName>> {
         let conn = lock_conn(&self.conn)?;
-        let Some(generation) = Self::latest_generation_id_locked(&conn)? else {
-            return Ok(None);
-        };
-        let mut stmt = conn.prepare(
-            "SELECT p.path, u.source_symbol, u.receiver, c.text
-             FROM unresolved_rows u
-             JOIN paths p            ON p.id = u.source_file_id
-             JOIN unresolved_texts c ON c.id = u.classification_id
-             WHERE u.callee_name = ?1
-               AND u.valid_from <= ?2
-               AND (u.valid_to IS NULL OR u.valid_to > ?2)
-             ORDER BY p.path, u.source_symbol, u.unresolved_id
-             LIMIT ?3",
+        let retained: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM generations WHERE id = ?1)",
+            params![generation],
+            |row| row.get(0),
         )?;
-        // One past the limit, so a list that exactly fills it is not reported
-        // as cut.
-        let mut rows = stmt
-            .query_map(
-                params![
-                    callee_name,
-                    generation,
-                    sqlite_limit(limit.saturating_add(1))
-                ],
-                |row| {
-                    Ok(UnresolvedSiteRow {
-                        source_file: row.get(0)?,
-                        source_symbol: row.get(1)?,
-                        receiver: row.get(2)?,
-                        classification: row.get(3)?,
-                    })
-                },
-            )?
-            .collect::<Result<Vec<_>>>()?;
-        let truncated = rows.len() > limit;
-        rows.truncate(limit);
-        Ok(Some((generation, rows, truncated)))
+        if !retained {
+            return Ok(None);
+        }
+        let mut found: UnresolvedSitesByName = names
+            .iter()
+            .map(|name| (name.clone(), (Vec::new(), false)))
+            .collect();
+        if names.is_empty() {
+            return Ok(Some(found));
+        }
+        let placeholders = vec!["?"; names.len()].join(", ");
+        let sql = format!(
+            "SELECT callee_name, path, source_symbol, receiver, class, rn FROM (
+                 SELECT u.callee_name AS callee_name, p.path AS path,
+                        u.source_symbol AS source_symbol, u.receiver AS receiver,
+                        c.text AS class,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY u.callee_name
+                            ORDER BY p.path, u.source_symbol, u.unresolved_id
+                        ) AS rn
+                 FROM unresolved_rows u
+                 JOIN paths p            ON p.id = u.source_file_id
+                 JOIN unresolved_texts c ON c.id = u.classification_id
+                 WHERE u.callee_name IN ({placeholders})
+                   AND u.valid_from <= ?
+                   AND (u.valid_to IS NULL OR u.valid_to > ?)
+             )
+             WHERE rn <= ?
+             ORDER BY callee_name, rn"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let generation = i64::from(generation);
+        let cap = sqlite_limit(limit_per_name.saturating_add(1));
+        let mut values: Vec<rusqlite::types::Value> = names
+            .iter()
+            .map(|name| rusqlite::types::Value::Text(name.clone()))
+            .collect();
+        values.push(rusqlite::types::Value::Integer(generation));
+        values.push(rusqlite::types::Value::Integer(generation));
+        values.push(rusqlite::types::Value::Integer(cap));
+        let mut rows = stmt.query(rusqlite::params_from_iter(values.iter()))?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            let rank: i64 = row.get(5)?;
+            let Some((sites, truncated)) = found.get_mut(&name) else {
+                continue;
+            };
+            if usize::try_from(rank).unwrap_or(usize::MAX) > limit_per_name {
+                *truncated = true;
+                continue;
+            }
+            sites.push(UnresolvedSiteRow {
+                source_file: row.get(1)?,
+                source_symbol: row.get(2)?,
+                receiver: row.get(3)?,
+                classification: row.get(4)?,
+            });
+        }
+        Ok(Some(found))
     }
 
     /// Total unresolved rows across every retained generation. Test-facing:
@@ -7751,6 +7793,17 @@ generation {latest}; run `devmap status` to re-verify",
     /// until the next load rewrote it. Labelling the entry with the generation
     /// its rows came from makes the key mean what it says.
     pub fn generation_edges(&self) -> Result<Option<std::sync::Arc<GenerationEdges>>> {
+        Ok(self.generation_edges_with_id()?.map(|(_, index)| index))
+    }
+
+    /// [`Self::generation_edges`], with the generation the index was built from.
+    ///
+    /// For a caller that pairs the walk with a second read — the unresolved
+    /// ledger — and must make that read at the same generation, not at
+    /// whichever one a daemon committed in between.
+    pub fn generation_edges_with_id(
+        &self,
+    ) -> Result<Option<(u32, std::sync::Arc<GenerationEdges>)>> {
         let current = {
             let conn = lock_conn(&self.conn)?;
             Self::latest_generation_id_locked(&conn)?
@@ -7761,7 +7814,7 @@ generation {latest}; run `devmap status` to re-verify",
         if let Ok(cache) = self.edge_index.lock() {
             if let Some((generation, index)) = cache.as_ref() {
                 if *generation == current {
-                    return Ok(Some(std::sync::Arc::clone(index)));
+                    return Ok(Some((current, std::sync::Arc::clone(index))));
                 }
             }
         }
@@ -7772,7 +7825,7 @@ generation {latest}; run `devmap status` to re-verify",
         if let Ok(mut cache) = self.edge_index.lock() {
             *cache = Some((loaded, std::sync::Arc::clone(&index)));
         }
-        Ok(Some(index))
+        Ok(Some((loaded, index)))
     }
 
     /// The latest generation's adjacency, read fresh, and the generation it

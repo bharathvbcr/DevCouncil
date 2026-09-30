@@ -287,3 +287,68 @@ fn the_wire_form_omits_the_field_only_when_it_was_not_checked() {
         "not checked, so not on the wire"
     );
 }
+
+fn save(store: &Store, files: &[(&str, String)]) {
+    let extractions: Vec<_> = files
+        .iter()
+        .map(|(path, body)| extract_file(path, body))
+        .collect();
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    store
+        .save_generation_with_opts(&extractions, &resolution, &analysis, GenerationWriteOpts::default())
+        .unwrap();
+}
+
+/// One ledger pass answers every name, each capped on its own: a generic name
+/// that fills its cap must not starve, or flag, a rare one read beside it.
+#[test]
+fn one_read_caps_each_name_separately() {
+    let many: String = (0..MAX_NAMESAKE_SITES_PER_NAME + 5)
+        .map(|index| format!("def caller_{index}(book):\n    return book.settle()\n\n\n"))
+        .collect();
+    let store = store_of(&[
+        ("ledger.py", LEDGER.to_string()),
+        ("many.py", many),
+        ("rare.py", "def rare(book):\n    return book.close()\n".to_string()),
+    ]);
+    let generation = store.latest_generation_id().unwrap().unwrap();
+    let names = vec!["settle".to_string(), "close".to_string(), "absent".to_string()];
+    let found = store
+        .unresolved_sites_naming(generation, &names, MAX_NAMESAKE_SITES_PER_NAME)
+        .unwrap()
+        .expect("the generation is retained");
+    assert_eq!(found["settle"].0.len(), MAX_NAMESAKE_SITES_PER_NAME);
+    assert!(found["settle"].1, "the generic name hit its cap");
+    assert_eq!(found["close"].0.len(), 1);
+    assert!(!found["close"].1, "the rare name was not cut");
+    assert!(found["absent"].0.is_empty() && !found["absent"].1, "a checked absence");
+    let files: Vec<&str> = found["settle"].0.iter().map(|row| row.source_symbol.as_str()).collect();
+    let mut sorted = files.clone();
+    sorted.sort();
+    assert_eq!(files, sorted, "a capped prefix is the same prefix on every read");
+}
+
+/// The ledger is read at the walk's generation. A site that only a later
+/// generation holds must not appear in an answer about the earlier one, and a
+/// generation that is gone answers None rather than silently reading another.
+#[test]
+fn the_ledger_is_read_at_the_generation_asked_for() {
+    let store = store_of(&[("ledger.py", LEDGER.to_string())]);
+    let first = store.latest_generation_id().unwrap().unwrap();
+    save(&store, &[("ledger.py", LEDGER.to_string()), ("untyped.py", UNTYPED.to_string())]);
+    let second = store.latest_generation_id().unwrap().unwrap();
+    assert!(second > first);
+    let names = vec!["settle".to_string()];
+    let at = |generation| {
+        store
+            .unresolved_sites_naming(generation, &names, 10)
+            .unwrap()
+            .map(|found| found["settle"].0.len())
+    };
+    assert_eq!(at(first), Some(0), "the untyped caller did not exist yet");
+    assert_eq!(at(second), Some(1));
+    assert_eq!(at(second + 1000), None, "a generation that is not retained is not read");
+}
