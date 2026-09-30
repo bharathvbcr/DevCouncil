@@ -302,3 +302,82 @@ x = a()
         );
     }
 }
+
+/// A module-level path constant carries its anchor into every use, at module
+/// level and inside a method.
+#[test]
+fn a_path_constant_records_its_literal_tail_and_anchor() {
+    let source = "\
+import importlib.util
+import pathlib
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+BUILDER = ROOT / \"scripts/build_paper.py\"
+
+spec = importlib.util.spec_from_file_location(\"build_paper\", BUILDER)
+bp = importlib.util.module_from_spec(spec)
+
+class T:
+    @staticmethod
+    def _builder():
+        spec = importlib.util.spec_from_file_location(\"build_paper\", str(BUILDER))
+        mod = importlib.util.module_from_spec(spec)
+        return mod
+";
+    let extraction = extract_file("scripts/test_paper_build.py", source);
+    for alias in ["bp", "mod"] {
+        let handles = bound(&extraction, alias);
+        assert_eq!(handles.len(), 1, "{alias}: {:?}", extraction.imports);
+        assert_eq!(handles[0].module_specifier, "scripts/build_paper.py");
+        assert_eq!(handles[0].path_load.as_ref().unwrap().anchor_up, Some(1));
+    }
+}
+
+/// Each call of a parameterised loader is its own import, bound to its own
+/// handle; the loader's name is never bound, because it names a different
+/// file at every call.
+#[test]
+fn a_parameterised_loader_records_one_import_per_call_site() {
+    let source = "\
+import importlib.util
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+
+def load(name, relative):
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+    mod = importlib.util.module_from_spec(spec)
+    return mod
+
+W21 = load(\"analyse_wave21\", \"scripts/aws/analyse_wave21.py\")
+W20 = load(name=\"analyse_wave20\", relative=\"scripts/aws/analyse_wave20.py\")
+load(\"analyse_wave19\", \"scripts/aws/analyse_wave19.py\")
+";
+    let extraction = extract_file("scripts/test_wave21_analyser.py", source);
+    for (alias, specifier) in [
+        ("W21", "scripts/aws/analyse_wave21.py"),
+        ("W20", "scripts/aws/analyse_wave20.py"),
+    ] {
+        let handles = bound(&extraction, alias);
+        assert_eq!(handles.len(), 1, "{alias}: {:?}", extraction.imports);
+        assert_eq!(handles[0].module_specifier, specifier);
+        assert_eq!(handles[0].path_load.as_ref().unwrap().anchor_up, Some(1));
+    }
+    assert!(
+        bound(&extraction, "load").is_empty(),
+        "{:?}",
+        extraction.imports
+    );
+    // The unbound call is still a dependency.
+    assert!(
+        path_loads(&extraction)
+            .iter()
+            .any(
+                |import| import.module_specifier == "scripts/aws/analyse_wave19.py"
+                    && import.alias.is_none()
+            ),
+        "{:?}",
+        extraction.imports
+    );
+    // The `def` itself names no file.
+    assert_eq!(path_loads(&extraction).len(), 3, "{:?}", extraction.imports);
+}

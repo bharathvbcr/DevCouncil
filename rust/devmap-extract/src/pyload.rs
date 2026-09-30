@@ -21,6 +21,9 @@
 //!   `HERE / "sub" / "x.py"` — joined after the last non-literal. A base
 //!   written in terms of `__file__` is kept as an anchor (`parents[1]` is two
 //!   directories up from the loader); any other base is recorded as unknown.
+//!   A module-level constant bound exactly once, never declared `global`,
+//!   to an anchor or to a whole `.py` path (`BUILDER = ROOT /
+//!   "scripts/build_paper.py"`) is read through wherever it is used.
 //!   An f-string, a concatenation, a non-literal tail, or a tail that does not
 //!   end in `.py` records nothing.
 //! * **Which local is the module.** `module_from_spec(spec)` (following the
@@ -28,7 +31,12 @@
 //!   .load_module()` (chained or through a loader variable),
 //!   `imp.load_source(...)`, and a same-file loader function that returns such
 //!   a handle (`def load(): ...; return module`, used as `load().fn()` or
-//!   `m = load(); m.fn()`). `runpy.run_path` is a dependency but returns the
+//!   `m = load(); m.fn()`), or a *parameterised* one whose parameter is the
+//!   path's tail (`def load(name, relative): ... ROOT / relative ...`),
+//!   bound at each call site to the `.py` literal it passes for that
+//!   parameter (`W21 = load("w21", "scripts/aws/analyse_wave21.py")`). A
+//!   parameter rebound in the body, used twice, or used anywhere but the tail
+//!   is not substituted. `runpy.run_path` is a dependency but returns the
 //!   module's globals *dict*, so its result is never bound as a module.
 //!
 //! A handle that is rebound after its load, or bound to two different paths,
@@ -89,12 +97,16 @@ pub(crate) fn python_path_loads(
     {
         return Vec::new();
     }
-    let Some(Collected { events, parameters }) = collect_events(root, source, file_symbol_name)
+    let Some(Collected {
+        events,
+        parameters,
+        globals,
+    }) = collect_events(root, source, file_symbol_name)
     else {
         return Vec::new();
     };
-    let mut pass = Pass::new(source, file_symbol_name, &events, parameters);
-    pass.compute_anchors();
+    let mut pass = Pass::new(source, file_symbol_name, &events, parameters, globals);
+    pass.compute_constants();
     pass.run(&BTreeMap::new());
     let loaders = pass.loader_functions();
     if !loaders.is_empty() {
@@ -157,13 +169,45 @@ struct Loc {
     anchor_up: Option<u32>,
 }
 
+/// A path as this pass knows it: a place, or — inside a parameterised loader
+/// function — a place still waiting for the one parameter that is its tail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathV {
+    Fixed(Loc),
+    /// Path steps whose **last** step is the only [`Item::Param`]. Filled in at
+    /// each call site of the loader with that call's literal argument.
+    Template(Vec<Item>),
+}
+
 /// The value a local holds, as far as this pass tracks values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Val {
-    Spec(Loc),
-    Loader(Loc),
-    Module(Loc),
+    Spec(PathV),
+    Loader(PathV),
+    Module(PathV),
     Other,
+}
+
+/// A same-file, module-level function that returns a path-loaded module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoaderFn {
+    /// Always the same file: `def supplement(): ... return module`.
+    Fixed(Loc),
+    /// `def load(name, relative): ... ROOT / relative ... return mod` — the
+    /// file is whatever literal the call site passes for `param`.
+    Param {
+        steps: Vec<Item>,
+        param: String,
+        position: Option<usize>,
+    },
+}
+
+/// A parameter of a function scope, with its positional index when a
+/// positional argument can reach it.
+#[derive(Debug, Clone)]
+struct Param {
+    name: String,
+    position: Option<usize>,
 }
 
 /// One syntactic fact, in document order.
@@ -184,6 +228,13 @@ enum Event<'tree> {
     },
     /// A call to one of the loader APIs, wherever it sits.
     Load {
+        node: Node<'tree>,
+        scope: Option<String>,
+    },
+    /// A call of a bare name with arguments — a candidate call of a
+    /// parameterised loader function, whose file is a dependency even when
+    /// the result is not bound.
+    Call {
         node: Node<'tree>,
         scope: Option<String>,
     },
@@ -270,11 +321,13 @@ struct Context<'tree> {
     module_statement: bool,
 }
 
-/// The facts [`collect_events`] reads, and the per-scope parameter names the
-/// value model needs for shadowing.
+/// The facts [`collect_events`] reads, the per-scope parameters the value
+/// model needs for shadowing and substitution, and every name some function
+/// declares `global` or `nonlocal` — a name that can be rebound from anywhere.
 struct Collected<'tree> {
     events: Vec<Event<'tree>>,
-    parameters: HashMap<Option<String>, HashSet<String>>,
+    parameters: HashMap<Option<String>, Vec<Param>>,
+    globals: HashSet<String>,
 }
 
 fn collect_events<'tree>(
@@ -286,7 +339,8 @@ fn collect_events<'tree>(
     // the function's body so the answer is that function's identity — the
     // string its calls record as `caller_symbol`.
     let mut scopes: HashMap<usize, Option<String>> = HashMap::new();
-    let mut parameters: HashMap<Option<String>, HashSet<String>> = HashMap::new();
+    let mut parameters: HashMap<Option<String>, Vec<Param>> = HashMap::new();
+    let mut globals: HashSet<String> = HashSet::new();
     let mut scope_of = |context: &Context<'tree>| -> Option<String> {
         let function = context.function?;
         scopes
@@ -295,22 +349,41 @@ fn collect_events<'tree>(
                 let scope = function
                     .child_by_field_name("body")
                     .and_then(|body| enclosing_callable_qualified(body, source, file_symbol_name));
-                let mut names = Vec::new();
+                let mut params = Vec::new();
                 if let Some(list) = function.child_by_field_name("parameters") {
                     let mut walker = list.walk();
+                    // Positional indices stop at `*`, `*args` or `**kw`: a
+                    // parameter after one of those is keyword-only.
+                    let mut position = Some(0usize);
                     for parameter in list.named_children(&mut walker) {
+                        let splat = matches!(
+                            parameter.kind(),
+                            "list_splat_pattern" | "dictionary_splat_pattern" | "keyword_separator"
+                        );
+                        if splat {
+                            position = None;
+                        }
                         let named = match parameter.kind() {
                             "identifier" => Some(parameter),
+                            "positional_separator" | "keyword_separator" => None,
                             _ => parameter
                                 .child_by_field_name("name")
                                 .or_else(|| parameter.named_child(0)),
                         };
+                        let mut names = Vec::new();
                         if let Some(named) = named {
                             target_names(named, source, &mut names);
                         }
+                        for name in names {
+                            params.push(Param {
+                                name,
+                                position: if splat { None } else { position },
+                            });
+                            position = position.map(|index| index + 1);
+                        }
                     }
                 }
-                parameters.entry(scope.clone()).or_default().extend(names);
+                parameters.entry(scope.clone()).or_default().extend(params);
                 scope
             })
             .clone()
@@ -432,6 +505,23 @@ fn collect_events<'tree>(
                             node,
                             scope: scope_of(&context),
                         });
+                    } else if function.kind() == "identifier"
+                        && node
+                            .child_by_field_name("arguments")
+                            .is_some_and(|arguments| arguments.named_child_count() > 0)
+                    {
+                        events.push(Event::Call {
+                            node,
+                            scope: scope_of(&context),
+                        });
+                    }
+                }
+            }
+            "global_statement" | "nonlocal_statement" => {
+                let mut cursor = node.walk();
+                for name in node.named_children(&mut cursor) {
+                    if name.kind() == "identifier" {
+                        globals.insert(text(name, source).to_string());
                     }
                 }
             }
@@ -470,7 +560,11 @@ fn collect_events<'tree>(
         }
         stack[mark..].reverse();
     }
-    Some(Collected { events, parameters })
+    Some(Collected {
+        events,
+        parameters,
+        globals,
+    })
 }
 
 /// One step of a path expression.
@@ -480,6 +574,9 @@ enum Item {
     /// A value written in terms of `__file__`: `0` is the file itself, `n` is
     /// `n` directories up from it.
     Anchor(u32),
+    /// A parameter of the function the path is written in, never rebound in
+    /// it. Only a parameterised loader's call site can say what it holds.
+    Param(String),
     Opaque,
 }
 
@@ -490,16 +587,21 @@ struct Pass<'a, 'tree> {
     source: &'a str,
     file_symbol_name: &'a str,
     events: &'a [Event<'tree>],
-    /// Module-level names bound exactly once to a `__file__`-anchored value.
-    anchors: HashMap<String, u32>,
+    /// Module-level names bound exactly once, never declared `global` or
+    /// `nonlocal` anywhere, to a value this pass reads completely: a
+    /// `__file__` anchor (`ROOT`) or a whole path (`BUILDER = ROOT /
+    /// "scripts/x.py"`). The value is the constant's path steps.
+    constants: HashMap<String, Vec<Item>>,
+    /// Names some function declares `global` or `nonlocal`.
+    globals: HashSet<String>,
     /// `(scope, name)` for every name any statement in that scope binds.
     assigned: HashSet<(Option<String>, String)>,
-    /// Parameter names of each function scope that has an event.
-    parameters: HashMap<Option<String>, HashSet<String>>,
+    /// Parameters of each function scope that has an event, in order.
+    parameters: HashMap<Option<String>, Vec<Param>>,
     state: HashMap<(Option<String>, String), Val>,
     bindings: BTreeMap<(Option<String>, String), Binding>,
     /// Loader functions: scope → what `return` hands back.
-    returns: BTreeMap<String, Option<Loc>>,
+    returns: BTreeMap<String, Option<PathV>>,
     /// Every load whose path was readable, for the file-level edge.
     loads: Vec<(Loc, Span, String)>,
 }
@@ -515,7 +617,8 @@ impl<'a, 'tree> Pass<'a, 'tree> {
         source: &'a str,
         file_symbol_name: &'a str,
         events: &'a [Event<'tree>],
-        parameters: HashMap<Option<String>, HashSet<String>>,
+        parameters: HashMap<Option<String>, Vec<Param>>,
+        globals: HashSet<String>,
     ) -> Self {
         let mut assigned = HashSet::new();
         for event in events {
@@ -529,7 +632,8 @@ impl<'a, 'tree> Pass<'a, 'tree> {
             source,
             file_symbol_name,
             events,
-            anchors: HashMap::new(),
+            constants: HashMap::new(),
+            globals,
             assigned,
             parameters,
             state: HashMap::new(),
@@ -546,6 +650,14 @@ impl<'a, 'tree> Pass<'a, 'tree> {
         self.loads.clear();
     }
 
+    fn is_parameter(&self, scope: &Option<String>, name: &str) -> bool {
+        scope.is_some()
+            && self
+                .parameters
+                .get(scope)
+                .is_some_and(|params| params.iter().any(|param| param.name == name))
+    }
+
     /// Whether `name`, read inside `scope`, is that scope's own local — bound
     /// by a statement in it, or one of its function's parameters. Python
     /// decides locality for the whole function body at once, so a binding
@@ -554,11 +666,7 @@ impl<'a, 'tree> Pass<'a, 'tree> {
         if scope.is_none() {
             return false;
         }
-        self.assigned.contains(&(scope.clone(), name.to_string()))
-            || self
-                .parameters
-                .get(scope)
-                .is_some_and(|names| names.contains(name))
+        self.assigned.contains(&(scope.clone(), name.to_string())) || self.is_parameter(scope, name)
     }
 
     /// The value `name` holds when read inside `scope`: the scope's own
@@ -575,7 +683,72 @@ impl<'a, 'tree> Pass<'a, 'tree> {
         Val::Other
     }
 
-    fn run(&mut self, loaders: &BTreeMap<String, Loc>) {
+    /// The module a call of a same-file loader function returns, if `call`
+    /// is one and its argument can be read.
+    ///
+    /// The callee must be a bare name this scope does not bind itself, and
+    /// that name must be one of this file's recognised loaders — a `load`
+    /// that loads data, or a loader in another file, is not consulted. A
+    /// fixed loader takes no positional argument that could change what it
+    /// loads; a parameterised one needs the tail argument as a plain `.py`
+    /// string literal, passed positionally or by keyword, with no splat that
+    /// could move it.
+    fn loader_call(
+        &self,
+        call: Node,
+        scope: &Option<String>,
+        loaders: &BTreeMap<String, LoaderFn>,
+    ) -> Option<Loc> {
+        let function = call.child_by_field_name("function")?;
+        if function.kind() != "identifier" {
+            return None;
+        }
+        let name = text(function, self.source);
+        if self.is_local(scope, name) {
+            return None;
+        }
+        match loaders.get(name)? {
+            LoaderFn::Fixed(loc) => positional_arguments(call).is_empty().then(|| loc.clone()),
+            LoaderFn::Param {
+                steps,
+                param,
+                position,
+            } => {
+                let arguments = call.child_by_field_name("arguments")?;
+                let mut positional = Vec::new();
+                let mut by_keyword = None;
+                let mut cursor = arguments.walk();
+                for argument in arguments.named_children(&mut cursor) {
+                    match argument.kind() {
+                        "comment" => {}
+                        "list_splat" | "dictionary_splat" => return None,
+                        "keyword_argument" => {
+                            let keyword = argument.child_by_field_name("name")?;
+                            if text(keyword, self.source) == param {
+                                by_keyword = argument.child_by_field_name("value");
+                            }
+                        }
+                        _ => positional.push(argument),
+                    }
+                    if positional.len() > MAX_SEGMENTS {
+                        return None;
+                    }
+                }
+                let argument = position
+                    .and_then(|index| positional.get(index).copied())
+                    .or(by_keyword)?;
+                if argument.kind() != "string" {
+                    return None;
+                }
+                let literal = string_literal(argument, self.source).ok()?;
+                let mut filled = steps.clone();
+                *filled.last_mut()? = Item::Lit(literal);
+                loc_from_items(&filled)
+            }
+        }
+    }
+
+    fn run(&mut self, loaders: &BTreeMap<String, LoaderFn>) {
         for event in self.events {
             match event {
                 Event::Bind {
@@ -594,7 +767,7 @@ impl<'a, 'tree> Pass<'a, 'tree> {
                         let key = (scope.clone(), name.clone());
                         self.state.insert(key.clone(), val.clone());
                         match &val {
-                            Val::Module(loc) => {
+                            Val::Module(PathV::Fixed(loc)) => {
                                 let span = Span {
                                     start_byte: node.start_byte(),
                                     end_byte: node.end_byte(),
@@ -626,7 +799,7 @@ impl<'a, 'tree> Pass<'a, 'tree> {
                         continue;
                     };
                     let returned = match self.classify(*value, scope, loaders) {
-                        Val::Module(loc) => Some(loc),
+                        Val::Module(path) => Some(path),
                         _ => None,
                     };
                     match self.returns.get(&function) {
@@ -644,17 +817,34 @@ impl<'a, 'tree> Pass<'a, 'tree> {
                     let Some(kind) = function.and_then(|f| load_kind(text(f, self.source))) else {
                         continue;
                     };
-                    if let Some(loc) = self.path_of_call(*node, kind, scope) {
-                        let span = Span {
-                            start_byte: node.start_byte(),
-                            end_byte: node.end_byte(),
-                        };
-                        self.loads
-                            .push((loc, span, raw_text(text(*node, self.source))));
+                    if let Some(PathV::Fixed(loc)) = self.path_of_call(*node, kind, scope) {
+                        self.record_load(*node, loc);
+                    }
+                }
+                Event::Call { node, scope } => {
+                    // Only a parameterised loader's call names a file of its
+                    // own; a fixed loader's file was recorded at its `def`.
+                    let parameterised = node
+                        .child_by_field_name("function")
+                        .and_then(|function| loaders.get(text(function, self.source)))
+                        .is_some_and(|loader| matches!(loader, LoaderFn::Param { .. }));
+                    if parameterised {
+                        if let Some(loc) = self.loader_call(*node, scope, loaders) {
+                            self.record_load(*node, loc);
+                        }
                     }
                 }
             }
         }
+    }
+
+    fn record_load(&mut self, node: Node, loc: Loc) {
+        let span = Span {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        };
+        self.loads
+            .push((loc, span, raw_text(text(node, self.source))));
     }
 
     /// What a right-hand side evaluates to, in this pass's small value model.
@@ -662,7 +852,7 @@ impl<'a, 'tree> Pass<'a, 'tree> {
         &self,
         value: Node,
         scope: &Option<String>,
-        loaders: &BTreeMap<String, Loc>,
+        loaders: &BTreeMap<String, LoaderFn>,
     ) -> Val {
         let mut value = value;
         let mut unwrapped = 0;
@@ -674,13 +864,8 @@ impl<'a, 'tree> Pass<'a, 'tree> {
             unwrapped += 1;
         }
         match value.kind() {
-            "identifier" => match self.lookup(scope, text(value, self.source)) {
-                // An alias of a module handle is the same module.
-                Val::Module(loc) => Val::Module(loc),
-                Val::Loader(loc) => Val::Loader(loc),
-                Val::Spec(loc) => Val::Spec(loc),
-                Val::Other => Val::Other,
-            },
+            // An alias of a handle is the same handle.
+            "identifier" => self.lookup(scope, text(value, self.source)),
             "call" => {
                 let Some(function) = value.child_by_field_name("function") else {
                     return Val::Other;
@@ -702,13 +887,13 @@ impl<'a, 'tree> Pass<'a, 'tree> {
                         LoadKind::ModuleFromSpec => match positional_arguments(value).first() {
                             Some(argument) if argument.kind() == "identifier" => {
                                 match self.lookup(scope, text(*argument, self.source)) {
-                                    Val::Spec(loc) => Val::Module(loc),
+                                    Val::Spec(path) => Val::Module(path),
                                     _ => Val::Other,
                                 }
                             }
                             Some(argument) if argument.kind() == "call" => {
                                 match self.classify(*argument, scope, loaders) {
-                                    Val::Spec(loc) => Val::Module(loc),
+                                    Val::Spec(path) => Val::Module(path),
                                     _ => Val::Other,
                                 }
                             }
@@ -724,29 +909,23 @@ impl<'a, 'tree> Pass<'a, 'tree> {
                 {
                     if let Some(object) = function.child_by_field_name("object") {
                         if object.kind() == "identifier" || object.kind() == "call" {
-                            if let Val::Loader(loc) = self.classify(object, scope, loaders) {
-                                return Val::Module(loc);
+                            if let Val::Loader(path) = self.classify(object, scope, loaders) {
+                                return Val::Module(path);
                             }
                         }
                     }
                     return Val::Other;
                 }
-                // A same-file loader function: `m = load()`.
-                if function.kind() == "identifier" && positional_arguments(value).is_empty() {
-                    let name = text(function, self.source);
-                    if !self.is_local(scope, name) {
-                        if let Some(loc) = loaders.get(name) {
-                            return Val::Module(loc.clone());
-                        }
-                    }
-                }
-                Val::Other
+                // A same-file loader function: `m = load()`, `W = load("w",
+                // "scripts/w.py")`.
+                self.loader_call(value, scope, loaders)
+                    .map_or(Val::Other, |loc| Val::Module(PathV::Fixed(loc)))
             }
             _ => Val::Other,
         }
     }
 
-    fn path_of_call(&self, call: Node, kind: LoadKind, scope: &Option<String>) -> Option<Loc> {
+    fn path_of_call(&self, call: Node, kind: LoadKind, scope: &Option<String>) -> Option<PathV> {
         let (index, keyword) = kind.path_argument()?;
         let arguments = call.child_by_field_name("arguments")?;
         if arguments.kind() != "argument_list" {
@@ -773,7 +952,7 @@ impl<'a, 'tree> Pass<'a, 'tree> {
         let expression = positional.get(index).copied().or(by_keyword)?;
         let mut budget = MAX_EVAL_NODES;
         let items = self.eval(expression, scope, 0, &mut budget).ok()?;
-        loc_from_items(&items)
+        path_from_items(items)
     }
 
     /// A path expression as a sequence of literal, anchored and opaque steps.
@@ -802,13 +981,21 @@ impl<'a, 'tree> Pass<'a, 'tree> {
                 if name == "__file__" {
                     return Ok(vec![Item::Anchor(0)]);
                 }
+                // A parameter the function never rebinds: what it holds is a
+                // question only a call site can answer.
+                if self.is_parameter(scope, name)
+                    && !self.assigned.contains(&(scope.clone(), name.to_string()))
+                {
+                    return Ok(vec![Item::Param(name.to_string())]);
+                }
                 if self.is_local(scope, name) {
                     return Ok(vec![Item::Opaque]);
                 }
-                Ok(vec![self
-                    .anchors
+                Ok(self
+                    .constants
                     .get(name)
-                    .map_or(Item::Opaque, |level| Item::Anchor(*level))])
+                    .cloned()
+                    .unwrap_or_else(|| vec![Item::Opaque]))
             }
             "binary_operator" => {
                 // Walk the left spine iteratively: `a / b / c / …` nests to
@@ -970,26 +1157,50 @@ impl<'a, 'tree> Pass<'a, 'tree> {
         }
     }
 
-    /// Module-level loader functions: `name → Loc` for every top-level
-    /// function whose every `return` hands back the same path-loaded module.
-    fn loader_functions(&self) -> BTreeMap<String, Loc> {
+    /// Module-level loader functions: every top-level function, bound once at
+    /// module level and never declared `global` anywhere, whose every
+    /// `return` hands back the same path-loaded module — a fixed file, or a
+    /// template whose tail is one of its parameters.
+    fn loader_functions(&self) -> BTreeMap<String, LoaderFn> {
         let prefix = format!("{}::", self.file_symbol_name);
         let counts = self.module_bind_counts();
         let mut out = BTreeMap::new();
         for (scope, returned) in &self.returns {
-            let Some(loc) = returned else { continue };
+            let Some(returned) = returned else { continue };
             let Some(name) = scope.strip_prefix(&prefix) else {
                 continue;
             };
             if name.is_empty() || name.contains(['.', ':']) {
                 continue;
             }
-            // Rebound at module level — `supplement = other` — is no longer
-            // the function this pass read. The `def` itself is the one bind.
-            if counts.get(name) != Some(&1) {
+            // Rebound at module level — `supplement = other` — or from a
+            // function through `global`, it is no longer the function this
+            // pass read. The `def` itself is the one bind.
+            if counts.get(name) != Some(&1) || self.globals.contains(name) {
                 continue;
             }
-            out.insert(name.to_string(), loc.clone());
+            let loader = match returned {
+                PathV::Fixed(loc) => LoaderFn::Fixed(loc.clone()),
+                PathV::Template(steps) => {
+                    let Some(Item::Param(param)) = steps.last() else {
+                        continue;
+                    };
+                    let Some(position) = self
+                        .parameters
+                        .get(&Some(scope.clone()))
+                        .and_then(|params| params.iter().find(|p| &p.name == param))
+                        .map(|p| p.position)
+                    else {
+                        continue;
+                    };
+                    LoaderFn::Param {
+                        steps: steps.clone(),
+                        param: param.clone(),
+                        position,
+                    }
+                }
+            };
+            out.insert(name.to_string(), loader);
         }
         out
     }
@@ -1010,11 +1221,14 @@ impl<'a, 'tree> Pass<'a, 'tree> {
         counts
     }
 
-    /// Module-level names bound exactly once, directly under the module, to
-    /// a value written in terms of `__file__`: `ROOT = Path(__file__)
-    /// .resolve().parents[1]`, `HERE = os.path.dirname(__file__)`. Evaluated
-    /// in document order so `ROOT = HERE.parent` sees `HERE`.
-    fn compute_anchors(&mut self) {
+    /// Module-level constants: names bound exactly once, directly under the
+    /// module, never declared `global`/`nonlocal` by any function, to a value
+    /// this pass reads completely — a `__file__` anchor (`ROOT =
+    /// Path(__file__).resolve().parents[1]`, `HERE =
+    /// os.path.dirname(__file__)`) or a whole `.py` path (`BUILDER = ROOT /
+    /// "scripts/build_paper.py"`). Evaluated in document order so `ROOT =
+    /// HERE.parent` sees `HERE` and `BUILDER` sees `ROOT`.
+    fn compute_constants(&mut self) {
         let counts = self.module_bind_counts();
         let module_scope = None;
         for event in self.events {
@@ -1030,21 +1244,24 @@ impl<'a, 'tree> Pass<'a, 'tree> {
                 continue;
             };
             let [name] = &names[..] else { continue };
-            if counts.get(name.as_str()) != Some(&1) {
+            if counts.get(name.as_str()) != Some(&1) || self.globals.contains(name) {
                 continue;
             }
             let mut budget = MAX_EVAL_NODES;
-            if let Ok(items) = self.eval(*value, &module_scope, 0, &mut budget) {
-                if let [Item::Anchor(level)] = items[..] {
-                    if level >= 1 {
-                        self.anchors.insert(name.clone(), level);
-                    }
-                }
+            let Ok(items) = self.eval(*value, &module_scope, 0, &mut budget) else {
+                continue;
+            };
+            let complete = items
+                .iter()
+                .all(|item| matches!(item, Item::Lit(_) | Item::Anchor(_)));
+            let anchor = matches!(items[..], [Item::Anchor(level)] if level >= 1);
+            if complete && (anchor || loc_from_items(&items).is_some()) {
+                self.constants.insert(name.clone(), items);
             }
         }
     }
 
-    fn emit(&self, loaders: &BTreeMap<String, Loc>) -> Vec<ExtractedImport> {
+    fn emit(&self, loaders: &BTreeMap<String, LoaderFn>) -> Vec<ExtractedImport> {
         let mut out: Vec<ExtractedImport> = Vec::new();
         let mut bound: HashSet<&Loc> = HashSet::new();
         for ((scope, name), binding) in &self.bindings {
@@ -1064,7 +1281,8 @@ impl<'a, 'tree> Pass<'a, 'tree> {
         // the inner call's callee with its argument list dropped — `load` —
         // so the loader function's own name, at module level, is the key that
         // use site joins on. A function-local `load` shadowing it has a site
-        // binding of its own and so a different key.
+        // binding of its own and so a different key. Fixed loaders only: a
+        // parameterised loader's name names a different file at every call.
         let mut definitions: HashMap<&str, Span> = HashMap::new();
         if !loaders.is_empty() {
             for event in self.events {
@@ -1086,7 +1304,10 @@ impl<'a, 'tree> Pass<'a, 'tree> {
                 }
             }
         }
-        for (name, loc) in loaders {
+        for (name, loader) in loaders {
+            let LoaderFn::Fixed(loc) = loader else {
+                continue;
+            };
             let span = definitions.get(name.as_str()).cloned().unwrap_or(Span {
                 start_byte: 0,
                 end_byte: 0,
@@ -1201,12 +1422,33 @@ fn string_literal(node: Node, source: &str) -> Result<String, Abstain> {
     Ok(content.to_string())
 }
 
+/// A path expression's steps as a place, or as a template for a
+/// parameterised loader.
+///
+/// A template needs exactly one parameter step, and it must be the **last**
+/// step: `ROOT / relative`, or `relative` alone. Then each call site's literal
+/// argument completes the path exactly. A parameter anywhere else — `ROOT /
+/// folder / "mod.py"`, `ROOT / relative / relative` — is not substituted; it
+/// is read as an unknown base, as any opaque value is.
+fn path_from_items(items: Vec<Item>) -> Option<PathV> {
+    let params = items
+        .iter()
+        .filter(|item| matches!(item, Item::Param(_)))
+        .count();
+    if params == 1 && matches!(items.last(), Some(Item::Param(_))) {
+        return Some(PathV::Template(items));
+    }
+    loc_from_items(&items).map(PathV::Fixed)
+}
+
 /// The literal tail after the last non-literal step, as a relative path.
 fn loc_from_items(items: &[Item]) -> Option<Loc> {
     let last_non_literal = items.iter().rposition(|item| !matches!(item, Item::Lit(_)));
     let tail = &items[last_non_literal.map_or(0, |index| index + 1)..];
     let anchor_up = match last_non_literal.map(|index| &items[index]) {
-        None | Some(Item::Opaque) => None,
+        // A parameter that is not the path's tail says no more about the
+        // base than an opaque value does.
+        None | Some(Item::Opaque) | Some(Item::Param(_)) => None,
         // `__file__ / "x.py"` names nothing.
         Some(Item::Anchor(0)) => return None,
         Some(Item::Anchor(level)) => Some(level - 1),
@@ -1296,6 +1538,56 @@ mod tests {
         assert!(
             ratio < 40.0,
             "10x the loads took {ratio:.1}x the time ({small_best:?} -> {large_best:?}), \
+             which is the shape of a quadratic pass"
+        );
+    }
+
+    /// The parameterised-loader shape: one `def load(name, relative)` and a
+    /// call per module, half at module level and half inside functions.
+    fn parameterised_calls(count: usize) -> String {
+        let mut source = String::from(
+            "import importlib.util\nfrom pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\n\
+             BUILDER = ROOT / \"scripts/build_paper.py\"\n\
+             def load(name, relative):\n    spec = importlib.util.spec_from_file_location(name, ROOT / relative)\n    \
+             mod = importlib.util.module_from_spec(spec)\n    return mod\n",
+        );
+        for i in 0..count {
+            if i % 2 == 0 {
+                source.push_str(&format!("W{i} = load(\"w{i}\", \"scripts/aws/w{i}.py\")\n"));
+            } else {
+                source.push_str(&format!(
+                    "def use{i}():\n    w = load(\"w{i}\", relative=\"scripts/aws/w{i}.py\")\n    return w.run()\n"
+                ));
+            }
+        }
+        source
+    }
+
+    /// Thousands of parameterised loader calls cost linear time, and every
+    /// call is read.
+    #[test]
+    fn thousands_of_parameterised_loader_calls_cost_linear_time() {
+        let small = parameterised_calls(400);
+        let large = parameterised_calls(4_000);
+        let small_tree = parse(&small);
+        let large_tree = parse(&large);
+        let mut small_best = Duration::MAX;
+        let mut large_best = Duration::MAX;
+        for _ in 0..3 {
+            let start = Instant::now();
+            let small_loads = python_path_loads(small_tree.root_node(), &small, "scripts/s.py");
+            small_best = small_best.min(start.elapsed());
+            let start = Instant::now();
+            let large_loads = python_path_loads(large_tree.root_node(), &large, "scripts/l.py");
+            large_best = large_best.min(start.elapsed());
+            // One bound handle per call.
+            assert_eq!(small_loads.len(), 400);
+            assert_eq!(large_loads.len(), 4_000);
+        }
+        let ratio = large_best.as_secs_f64() / small_best.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 40.0,
+            "10x the calls took {ratio:.1}x the time ({small_best:?} -> {large_best:?}), \
              which is the shape of a quadratic pass"
         );
     }
