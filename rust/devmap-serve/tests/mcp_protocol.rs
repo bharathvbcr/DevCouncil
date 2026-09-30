@@ -798,3 +798,19 @@ async fn ask_evidence_groups_the_ask_hits_by_file_with_their_call_edges() {
         "{pack}"
     );
 }
+
+/// `devmap_impact` takes `layers`, so an agent can tell the direct callers
+/// (band 1) from the rest of a depth-3 walk — the flat `items` list mixes every
+/// hop, and read as one list it made a direct caller look like routing code.
+#[test]
+fn impact_accepts_layers_and_forwards_it() {
+    match to_ipc_command(
+        "devmap_impact",
+        Some(&json!({"target": "yolo.go::YoloJob.recordReplayEvent", "layers": true})),
+    ) {
+        Ok(devmap_serve::protocol::IpcCommand::Impact { layers, .. }) => assert!(layers),
+        other => panic!("layers must reach the impact command: {other:?}"),
+    }
+    let refused = to_ipc_command("devmap_impact", Some(&json!({"target": "x", "layer": true})));
+    assert!(refused.is_err(), "a misspelling is still refused, not defaulted");
+}
