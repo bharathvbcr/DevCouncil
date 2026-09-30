@@ -246,11 +246,14 @@ enum Event<'tree> {
     /// A write to `sys.path`: a directory inserted (`insert`, `append`,
     /// `sys.path[:0] = [...]`), with the expression naming it, or anything
     /// else — `remove`, `pop`, reassignment, `del` — which leaves the search
-    /// path unknowable and so `directory` is `None`.
+    /// path unknowable and so `directory` is `None`. `scope` is the
+    /// enclosing function's identity, `None` at module level and in a class
+    /// body.
     SysPath {
         node: Node<'tree>,
         directory: Option<Node<'tree>>,
         module_level: bool,
+        scope: Option<String>,
     },
 }
 
@@ -464,6 +467,7 @@ fn collect_events<'tree>(
                             && left.kind() == "subscript"
                             && matches!(slice.as_deref(), Some(":0" | "0:0"))
                             && right.is_some_and(|right| right.kind() == "list");
+                        let scope = scope_of(&context);
                         match right.filter(|_| prepend) {
                             Some(list) => {
                                 let mut cursor = list.walk();
@@ -472,6 +476,7 @@ fn collect_events<'tree>(
                                         node,
                                         directory: Some(element),
                                         module_level,
+                                        scope: scope.clone(),
                                     });
                                 }
                             }
@@ -479,6 +484,7 @@ fn collect_events<'tree>(
                                 node,
                                 directory: None,
                                 module_level,
+                                scope,
                             }),
                         }
                     }
@@ -489,6 +495,7 @@ fn collect_events<'tree>(
                     node,
                     directory: None,
                     module_level,
+                    scope: scope_of(&context),
                 });
             }
             _ => {}
@@ -585,6 +592,7 @@ fn collect_events<'tree>(
                             node,
                             directory,
                             module_level,
+                            scope: scope_of(&context),
                         });
                     } else if load_kind(callee).is_some_and(|kind| kind != LoadKind::ModuleFromSpec)
                     {
@@ -1430,56 +1438,80 @@ impl<'a, 'tree> Pass<'a, 'tree> {
         out
     }
 
-    /// The directories this file puts on `sys.path` at module level, each
-    /// with where it happened, as `SearchDirectory` imports.
+    /// The directories this file puts on `sys.path`, each with where it
+    /// happened, as `SearchDirectory` imports.
     ///
-    /// All or nothing. A write this pass cannot follow — `sys.path.remove`,
-    /// reassignment, `del`, or a module-level insert of a directory it cannot
-    /// read — anywhere in the file leaves the search path unknown, and an
-    /// unknown entry ahead of a known one could hold the module first. So one
-    /// such write withdraws every directory. An insert inside a function runs
-    /// only when the function is called: it is neither recorded nor, when it
-    /// is readable, a reason to withdraw the rest.
+    /// A module-level insert has `scope: None`: it runs when the file loads,
+    /// before every import that follows it, and is what an import resolves
+    /// through. An insert inside a function or class body has `scope:
+    /// Some(..)` — the function's identity, or the file's own symbol for a
+    /// class body — and is only a veto: it runs whenever the function is
+    /// called, which may be before any import in the file, so a module it
+    /// could supply is a module the import may not reach where the
+    /// module-level entries say. One whose directory cannot be read (or sits
+    /// in a class body, whose names this pass does not scope) is recorded
+    /// with no `anchor_up` and an empty directory: it could point anywhere,
+    /// and vetoes every `sys.path`-derived link in the file.
+    ///
+    /// All or nothing otherwise. A write this pass cannot follow —
+    /// `sys.path.remove`, reassignment, `del`, or a module-level insert of a
+    /// directory it cannot read — anywhere in the file leaves the search path
+    /// unknown, and an unknown entry ahead of a known one could hold the
+    /// module first. So one such write withdraws every directory.
     fn search_directories(&self) -> Vec<ExtractedImport> {
-        let module_scope = None;
         let mut out = Vec::new();
         for event in self.events {
             let Event::SysPath {
                 node,
                 directory,
                 module_level,
+                scope,
             } = event
             else {
                 continue;
             };
-            let read = directory.and_then(|directory| {
-                let mut budget = MAX_EVAL_NODES;
-                let items = self.eval(directory, &module_scope, 0, &mut budget).ok()?;
-                directory_from_items(&items)
-            });
-            match (read, *module_level) {
-                (Some((tail, anchor_up)), true) => out.push(ExtractedImport {
-                    raw_import: raw_text(text(*node, self.source)),
-                    module_specifier: tail,
-                    imported_names: Vec::new(),
-                    local_names: Vec::new(),
-                    alias: None,
-                    span: Span {
-                        start_byte: node.start_byte(),
-                        end_byte: node.end_byte(),
-                    },
-                    path_load: Some(PathLoad {
-                        scope: None,
-                        anchor_up: Some(anchor_up),
-                        kind: PathLoadKind::SearchDirectory,
-                    }),
+            let Some(directory) = directory else {
+                return Vec::new();
+            };
+            // A class body is neither module level nor a function scope the
+            // evaluator can key on; its insert is read as unreadable.
+            let readable_scope = *module_level || scope.is_some();
+            let read = readable_scope
+                .then(|| {
+                    let mut budget = MAX_EVAL_NODES;
+                    let items = self.eval(*directory, scope, 0, &mut budget).ok()?;
+                    directory_from_items(&items)
+                })
+                .flatten();
+            let (tail, anchor_up, entry_scope) = match (read, *module_level) {
+                (Some((tail, anchor_up)), true) => (tail, Some(anchor_up), None),
+                (None, true) => return Vec::new(),
+                (read, false) => {
+                    let entry_scope = scope
+                        .clone()
+                        .unwrap_or_else(|| self.file_symbol_name.to_string());
+                    match read {
+                        Some((tail, anchor_up)) => (tail, Some(anchor_up), Some(entry_scope)),
+                        None => (String::new(), None, Some(entry_scope)),
+                    }
+                }
+            };
+            out.push(ExtractedImport {
+                raw_import: raw_text(text(*node, self.source)),
+                module_specifier: tail,
+                imported_names: Vec::new(),
+                local_names: Vec::new(),
+                alias: None,
+                span: Span {
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                },
+                path_load: Some(PathLoad {
+                    scope: entry_scope,
+                    anchor_up,
+                    kind: PathLoadKind::SearchDirectory,
                 }),
-                (Some(_), false) => {}
-                // An insert inside a function that could not be read is not
-                // a module-level fact either.
-                (None, false) if directory.is_some() => {}
-                (None, _) => return Vec::new(),
-            }
+            });
         }
         // A real script inserts a handful. Past the cap every import would be
         // checked against every entry, so the file abstains instead.

@@ -466,7 +466,12 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// evidence the resolver needs to place `import analyse_wave20` after
 /// `sys.path.insert(0, str(ROOT / "scripts" / "aws"))`. A v61 row has none, so
 /// those imports would stay unresolved from a warm cache.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "62";
+///
+/// v63 also records `sys.path` inserts made inside a function or class body,
+/// scoped to where they run, as vetoes: such an insert may run before any
+/// import in the file, so a module its directory also holds is not linked. A
+/// v62 row has no vetoes and would link those imports confidently.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "63";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

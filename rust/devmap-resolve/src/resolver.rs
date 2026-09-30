@@ -176,6 +176,23 @@ struct SelectorDeclaration {
     in_global_sheet: bool,
 }
 
+/// One Python file's `sys.path`, as far as its own source fixes it.
+#[derive(Debug, Clone, Default)]
+struct PySearchPath {
+    /// Module-level inserts: the byte offset of each, and its repo-relative
+    /// directory. An import after the offset resolves through it.
+    entries: Vec<(usize, String)>,
+    /// Directories inserted inside a function or class body. Such an insert
+    /// may run before any import in the file, so it only vetoes: a module it
+    /// could supply is not linked through `entries` unless both name the
+    /// same file.
+    vetoes: Vec<String>,
+    /// An insert this file makes somewhere the source does not fix — an
+    /// unreadable in-function directory, or one above the repository root —
+    /// could supply any module, so no `sys.path`-derived link is made.
+    veto_all: bool,
+}
+
 pub struct Resolver {
     symbol_index: BTreeMap<String, Vec<IndexedSymbol>>,
     file_symbols: BTreeMap<String, Vec<String>>, // file_path -> symbol_names
@@ -225,11 +242,10 @@ pub struct Resolver {
     /// every other function of the file. `scope` is the binding's
     /// `LocalBinding::scope` identity, `None` for a module global.
     path_module_bindings: BTreeMap<String, BTreeMap<(Option<String>, String), String>>,
-    /// Per-file directories a Python file put on `sys.path` at module level,
-    /// each with the byte offset of the insert, resolved to repo-relative
-    /// directories. Read only for that file, and only for imports after the
-    /// offset — see [`Self::resolve_via_search_dirs`].
-    py_search_dirs: BTreeMap<String, Vec<(usize, String)>>,
+    /// Per-file `sys.path` entries of a Python file, resolved to
+    /// repo-relative directories. Read only for that file — see
+    /// [`Self::resolve_via_search_dirs`].
+    py_search_dirs: BTreeMap<String, PySearchPath>,
     /// Rust crate name, spelled as a `use` spells it, -> that crate's `src`
     /// root. `None` where two indexed crates claim the same name.
     ///
@@ -1746,10 +1762,10 @@ impl Resolver {
             };
             let mut file_path_modules: BTreeMap<(Option<String>, String), String> = BTreeMap::new();
             // Before this file's imports are read: they consult it.
-            let search_dirs = self.search_dirs_of(ext);
-            if !search_dirs.is_empty() {
+            let search_path = self.search_dirs_of(ext);
+            if !search_path.entries.is_empty() {
                 self.py_search_dirs
-                    .insert(ext.file_path.clone(), search_dirs);
+                    .insert(ext.file_path.clone(), search_path);
             }
             for imp in &ext.imports {
                 // A Python module loaded by file path binds a *scoped* handle,
@@ -4620,15 +4636,18 @@ impl Resolver {
         matches.next().is_none().then(|| only.clone())
     }
 
-    /// This file's `sys.path` entries as repo-relative directories, with the
-    /// offset of each insert. An entry that climbs above the repository root
-    /// names nothing the corpus has and is dropped.
-    fn search_dirs_of(&self, ext: &Extraction) -> Vec<(usize, String)> {
+    /// This file's `sys.path` as repo-relative directories: module-level
+    /// entries with the offset of each insert, and the vetoes of inserts made
+    /// inside functions. An entry that climbs above the repository root, or
+    /// a veto with no readable directory, names a directory outside what the
+    /// corpus can check and vetoes every `sys.path`-derived link.
+    fn search_dirs_of(&self, ext: &Extraction) -> PySearchPath {
+        let mut out = PySearchPath::default();
         if ext.language != "python" {
-            return Vec::new();
+            return out;
         }
         let dir = Self::parent_dir(&ext.file_path);
-        let mut out = Vec::new();
+        let mut count = 0usize;
         for imp in &ext.imports {
             let Some(load) = imp
                 .path_load
@@ -4637,29 +4656,31 @@ impl Resolver {
             else {
                 continue;
             };
-            let Some(up) = load.anchor_up else {
-                continue;
-            };
-            let mut base = Some(dir.clone());
-            for _ in 0..up {
-                base = base.and_then(|base| {
-                    (!base.is_empty()).then(|| {
-                        base.rsplit_once('/')
-                            .map(|(parent, _)| parent.to_string())
-                            .unwrap_or_default()
-                    })
-                });
-            }
-            let Some(base) = base else { continue };
-            if let Some(directory) = Self::normalize_rel(&base, &imp.module_specifier) {
-                out.push((imp.span.start_byte, directory));
+            count += 1;
+            let directory = load.anchor_up.and_then(|up| {
+                let mut base = Some(dir.clone());
+                for _ in 0..up {
+                    base = base.and_then(|base| {
+                        (!base.is_empty()).then(|| {
+                            base.rsplit_once('/')
+                                .map(|(parent, _)| parent.to_string())
+                                .unwrap_or_default()
+                        })
+                    });
+                }
+                Self::normalize_rel(&base?, &imp.module_specifier)
+            });
+            match (directory, load.scope.is_some()) {
+                (Some(directory), false) => out.entries.push((imp.span.start_byte, directory)),
+                (Some(directory), true) => out.vetoes.push(directory),
+                (None, _) => out.veto_all = true,
             }
         }
         // The extractor emits at most 64 per file; a payload that carries
         // more — hand-built, or from elsewhere — is refused here too, so each
         // import's cost stays bounded whatever arrives.
-        if out.len() > 64 {
-            return Vec::new();
+        if count > 64 {
+            return PySearchPath::default();
         }
         out
     }
@@ -4671,32 +4692,44 @@ impl Resolver {
     /// Two candidates — two entries, or a module and a package of one name in
     /// one entry — are one of several, and abstain. A relative import names
     /// its own package, never a `sys.path` entry.
+    ///
+    /// An insert inside a function may have run before this import, whatever
+    /// their order in the file, so a directory it inserted that also holds
+    /// the module vetoes the link unless it names the same file; and an
+    /// insert whose directory the source does not fix vetoes every link.
     fn resolve_via_search_dirs(&self, ext: &Extraction, at: usize, module: &str) -> Option<String> {
-        let dirs = self.py_search_dirs.get(&ext.file_path)?;
+        let search = self.py_search_dirs.get(&ext.file_path)?;
+        if search.veto_all {
+            return None;
+        }
         let module = module.trim_matches(|c| c == '\'' || c == '"');
         if module.is_empty() || module.starts_with('.') {
             return None;
         }
         let relative = module.replace('.', "/");
+        let candidates = [format!("{relative}.py"), format!("{relative}/__init__.py")];
+        let found = |directory: &str| {
+            candidates
+                .iter()
+                .filter_map(|candidate| Self::normalize_rel(directory, candidate))
+                .filter(|path| self.file_symbols.contains_key(path))
+                .collect::<Vec<_>>()
+        };
         let mut hits: BTreeSet<String> = BTreeSet::new();
-        for (inserted, directory) in dirs {
-            if *inserted >= at {
-                continue;
-            }
-            for candidate in [format!("{relative}.py"), format!("{relative}/__init__.py")] {
-                let Some(path) = Self::normalize_rel(directory, &candidate) else {
-                    continue;
-                };
-                if self.file_symbols.contains_key(&path) {
-                    hits.insert(path);
-                }
+        for (inserted, directory) in &search.entries {
+            if *inserted < at {
+                hits.extend(found(directory));
             }
         }
-        if hits.len() == 1 {
-            hits.pop_first()
-        } else {
-            None
+        if hits.len() != 1 {
+            return None;
         }
+        let target = hits.pop_first()?;
+        let vetoed = search
+            .vetoes
+            .iter()
+            .any(|directory| found(directory).iter().any(|path| *path != target));
+        (!vetoed).then_some(target)
     }
 
     /// Ordinary import resolution, then — for Python only, and only when that

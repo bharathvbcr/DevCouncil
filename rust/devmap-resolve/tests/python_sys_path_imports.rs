@@ -18,7 +18,7 @@
 //! An import that resolves ordinarily keeps its ordinary answer.
 
 use devmap_extract::extract_file;
-use devmap_extract::model::{EdgeKind, Extraction};
+use devmap_extract::model::{Confidence, EdgeKind, Extraction};
 use devmap_resolve::model::ResolutionResult;
 use devmap_resolve::Resolver;
 
@@ -302,6 +302,203 @@ def test_it():
         "scripts/aws/analyse_wave20.py"
     ));
     assert!(callers_of(&resolution, "scripts/aws/analyse_wave20.py::spearman").is_empty());
+}
+
+/// `BINN/scripts/test_campaign_tooling.py`, in shape: `scripts/aws/` and
+/// `scripts/` inserted at module level, `scripts/azure/` inserted inside one
+/// test, and `plan_cells` / `collect` present in both `aws/` and `azure/`.
+///
+/// Whether that test has run before any given import is call order, which
+/// the source does not fix — so `plan_cells` and `collect` may be either
+/// file, and are not linked. A module only `aws/` holds is unaffected, and so
+/// is an in-function insert of `aws/` itself, which names the same file.
+const CAMPAIGN_TOOLING: &str = "\
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))
+sys.path.insert(0, str(ROOT / \"scripts\"))
+
+import plan_cells  # noqa: E402
+from plan_cells import cell, estimated_seconds  # noqa: E402
+
+
+class Planner(unittest.TestCase):
+    def test_block(self):
+        sys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))
+        import claim_next
+        claim_next.claim()
+        cell()
+
+    def test_all_three_analysers_share_one_owner(self):
+        import analyse_campaign
+        sys.path.insert(0, str(ROOT / \"scripts\" / \"azure\"))
+        import analyse as azure_analyse
+        azure_analyse.run()
+        analyse_campaign.run()
+
+
+class Collect(unittest.TestCase):
+    def test_collect(self):
+        import collect
+        collect.gather()
+";
+
+fn campaign_corpus() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("scripts/test_campaign_tooling.py", CAMPAIGN_TOOLING),
+        (
+            "scripts/aws/plan_cells.py",
+            "def cell():\n    pass\n\ndef estimated_seconds(c):\n    return 0\n",
+        ),
+        (
+            "scripts/azure/plan_cells.py",
+            "def cell():\n    pass\n\ndef estimated_seconds(c):\n    return 0\n",
+        ),
+        ("scripts/aws/collect.py", "def gather():\n    pass\n"),
+        ("scripts/azure/collect.py", "def gather():\n    pass\n"),
+        ("scripts/aws/claim_next.py", "def claim():\n    pass\n"),
+        ("scripts/aws/analyse_campaign.py", "def run():\n    pass\n"),
+        ("scripts/azure/analyse.py", "def run():\n    pass\n"),
+    ]
+}
+
+/// Callers above the speculative floor. A bare `cell()` whose import bound
+/// nothing still meets the resolver's general ambiguous-global rung — two
+/// `cell`s, one speculative edge each, excluded from default walks — which
+/// is not a `sys.path` link and not what the veto governs.
+fn confident_callers_of(resolution: &ResolutionResult, callee: &str) -> Vec<String> {
+    resolution
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.edge_kind == EdgeKind::Calls
+                && edge.target_symbol == callee
+                && edge.confidence > Confidence::SPECULATIVE
+        })
+        .map(|edge| edge.source_symbol.clone())
+        .collect()
+}
+
+#[test]
+fn an_in_function_insert_vetoes_a_module_it_could_supply_instead() {
+    let resolution = resolve(&campaign_corpus());
+    let from = "scripts/test_campaign_tooling.py";
+    for (module, function) in [("plan_cells", "cell"), ("collect", "gather")] {
+        for dir in ["aws", "azure"] {
+            let target = format!("scripts/{dir}/{module}.py");
+            assert!(
+                !imports(&resolution, from, &target),
+                "{target}: linked although the in-function azure insert may shadow it"
+            );
+            assert!(
+                confident_callers_of(&resolution, &format!("{target}::{function}")).is_empty(),
+                "{target}: callers {:?}",
+                confident_callers_of(&resolution, &format!("{target}::{function}"))
+            );
+        }
+    }
+    // The vetoing directory does not hold these: they still link.
+    for target in [
+        "scripts/aws/claim_next.py",
+        "scripts/aws/analyse_campaign.py",
+    ] {
+        assert!(imports(&resolution, from, target), "{target}: not linked");
+    }
+    assert!(
+        callers_of(&resolution, "scripts/aws/claim_next.py::claim")
+            .iter()
+            .any(|c| c == "scripts/test_campaign_tooling.py::Planner.test_block"),
+        "{:?}",
+        callers_of(&resolution, "scripts/aws/claim_next.py::claim")
+    );
+    // Only an in-function insert reaches `analyse`: never a link.
+    assert!(!imports(&resolution, from, "scripts/azure/analyse.py"));
+}
+
+/// An in-function insert of the directory the module-level entries already
+/// name vetoes nothing: both name the same file.
+#[test]
+fn an_in_function_insert_naming_the_same_file_does_not_veto() {
+    let source = "\
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))
+import analyse_wave20 as a20
+
+def setup():
+    sys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))
+
+def test_it():
+    a20.spearman([], [])
+";
+    let resolution = resolve(&[
+        ("scripts/test_wave20_analyser.py", source),
+        ("scripts/aws/analyse_wave20.py", WAVE20),
+    ]);
+    assert!(imports(
+        &resolution,
+        "scripts/test_wave20_analyser.py",
+        "scripts/aws/analyse_wave20.py"
+    ));
+    assert!(!callers_of(&resolution, "scripts/aws/analyse_wave20.py::spearman").is_empty());
+}
+
+/// An insert the source does not pin — unreadable inside a function, in a
+/// class body, or above the repository root — could supply any module: every
+/// `sys.path`-derived link in the file abstains. An import the ordinary rules
+/// answer never depended on `sys.path` and keeps its edge.
+#[test]
+fn an_unpinned_insert_vetoes_every_sys_path_link_but_not_ordinary_imports() {
+    for (label, veto) in [
+        (
+            "unreadable in a function",
+            "def later(where):\n    sys.path.insert(0, where)\n",
+        ),
+        (
+            "in a class body",
+            "class Holder:\n    sys.path.insert(0, str(ROOT / \"vendor\"))\n",
+        ),
+        (
+            "above the repository root",
+            "sys.path.insert(0, str(Path(__file__).resolve().parents[4] / \"lib\"))\n",
+        ),
+    ] {
+        let source = format!(
+            "import sys\nfrom pathlib import Path\nROOT = Path(__file__).resolve().parent.parent\n\
+             sys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))\n{veto}\
+             import analyse_wave20 as a20\nimport helper\n\n\
+             def test_it():\n    a20.spearman([], [])\n    helper.assist()\n"
+        );
+        let resolution = resolve(&[
+            ("scripts/test_wave20_analyser.py", &source),
+            ("scripts/aws/analyse_wave20.py", WAVE20),
+            ("scripts/helper.py", "def assist():\n    pass\n"),
+        ]);
+        assert!(
+            !imports(
+                &resolution,
+                "scripts/test_wave20_analyser.py",
+                "scripts/aws/analyse_wave20.py"
+            ),
+            "{label}: the sys.path link was made"
+        );
+        assert!(
+            callers_of(&resolution, "scripts/aws/analyse_wave20.py::spearman").is_empty(),
+            "{label}"
+        );
+        assert!(
+            imports(
+                &resolution,
+                "scripts/test_wave20_analyser.py",
+                "scripts/helper.py"
+            ),
+            "{label}: the ordinary import lost its edge"
+        );
+    }
 }
 
 /// An insert in one file says nothing about another file's imports.

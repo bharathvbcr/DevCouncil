@@ -383,6 +383,68 @@ fn an_unfollowable_sys_path_write_withdraws_every_entry() {
     }
 }
 
+/// An insert inside a function or class body is recorded with a scope — the
+/// resolver's veto — and one it cannot read has no anchor and no directory.
+/// Neither withdraws the module-level entries.
+#[test]
+fn in_function_sys_path_inserts_are_recorded_as_scoped_vetoes() {
+    let source = "\
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / \"scripts\" / \"aws\"))
+
+class Tooling:
+    sys.path.insert(0, str(ROOT / \"vendor\"))
+
+    def test_azure(self):
+        sys.path.insert(0, str(ROOT / \"scripts\" / \"azure\"))
+
+    def test_anywhere(self, where):
+        sys.path.append(where)
+";
+    let extraction = extract_file("scripts/test_x.py", source);
+    let entries: Vec<(String, Option<u32>, Option<String>)> = path_loads(&extraction)
+        .into_iter()
+        .filter_map(|import| {
+            let load = import.path_load.as_ref()?;
+            (load.kind == devmap_extract::model::PathLoadKind::SearchDirectory).then(|| {
+                (
+                    import.module_specifier.clone(),
+                    load.anchor_up,
+                    load.scope.clone(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(entries.len(), 4, "{entries:?}");
+    assert_eq!(entries[0], ("scripts/aws".to_string(), Some(1), None));
+    // A class body: scoped to the file, and read as unreadable.
+    assert_eq!(entries[1].0, "");
+    assert_eq!(entries[1].1, None);
+    assert!(entries[1].2.is_some(), "{entries:?}");
+    // A readable insert in a method keeps its directory and names the method.
+    assert_eq!(entries[2].0, "scripts/azure");
+    assert_eq!(entries[2].1, Some(1));
+    assert!(
+        entries[2]
+            .2
+            .as_deref()
+            .is_some_and(|scope| scope.ends_with("test_azure")),
+        "{entries:?}"
+    );
+    // An unreadable one in a method: no anchor, no directory.
+    assert_eq!(entries[3].0, "");
+    assert_eq!(entries[3].1, None);
+    assert!(
+        entries[3]
+            .2
+            .as_deref()
+            .is_some_and(|scope| scope.ends_with("test_anywhere")),
+        "{entries:?}"
+    );
+}
+
 /// A module-level path constant carries its anchor into every use, at module
 /// level and inside a method.
 #[test]
