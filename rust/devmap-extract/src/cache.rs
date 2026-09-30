@@ -453,7 +453,14 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// to the package's one `recordReplayEvent` method. A v59 row carries `None`
 /// there, and the rung abstains for any package holding one — so without the
 /// bump a warm cache would silently keep the rung off, not make it unsound.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "60";
+///
+/// v61 reads two more Python path-load shapes — see `pyload`: a module-level
+/// path constant (`BUILDER = ROOT / "scripts/x.py"` then
+/// `spec_from_file_location(name, BUILDER)`), and a parameterised loader
+/// function (`def load(name, relative): ... ROOT / relative ...`) bound at each
+/// call site to its `.py` literal. A v60 row has neither import, so those loads
+/// keep abstaining from a warm cache with nothing to say why.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "61";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

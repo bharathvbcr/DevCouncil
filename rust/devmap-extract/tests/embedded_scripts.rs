@@ -787,8 +787,10 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v60 records a Go file's unexported field and interface-method names.
     // A v59 row has none, and the unexported-selector rung abstains for its
     // whole package rather than read the absence as "no namesake".
+    //
+    // v61 reads Python path constants and parameterised path loaders.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "60",
+        EXTRACTION_SCHEMA_VERSION, "61",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );
