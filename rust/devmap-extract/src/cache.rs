@@ -473,14 +473,18 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// v62 row has no vetoes and would link those imports confidently.
 ///
 /// v64 stops filing a C++ template callee (`f<T>(…)`) or template type use
-/// (`Tiles<4>::BR`) as a local binding of the enclosing function, records a
-/// Python function decorated with a parameter of its enclosing callable as a
-/// `RuntimeEntryPoint`, records the scope of `Plain::K` as a Type reference,
-/// and records the calls written inside a function-like `#define` body with
-/// the macro as their caller. A v63 row carries the spurious local binding —
-/// so the resolver classifies every such call `local_binding` and the helper
-/// is published confidently dead — and has none of the other three.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "64";
+/// (`Tiles<4>::BR`) as a local binding of the enclosing function, and records
+/// a Python function decorated with a parameter of its enclosing callable as
+/// a `RuntimeEntryPoint`. A v63 row carries the spurious local binding — so
+/// the resolver classifies every such call `local_binding` and the helper is
+/// published confidently dead — and lacks the annotation.
+///
+/// v65 records the scope of `Plain::K` as a Type reference, and records the
+/// calls written inside a function-like `#define` body with the macro as
+/// their caller. A v64 row has neither, so a struct reached only as
+/// `T::member` and a helper called only from a macro body would stay
+/// confidently dead from a warm cache with nothing to say why.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "65";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
