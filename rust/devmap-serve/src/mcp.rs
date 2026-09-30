@@ -1043,15 +1043,21 @@ symbol name.",
         ),
         "impact" => (
             "Blast radius: what reaches the target, walked in reverse to a depth cap. Use \
-before deleting or changing a symbol. A result carrying walk_incomplete is a partial blast \
-radius, not a complete one.",
+before deleting or changing a symbol. `items` mixes every hop; pass layers=true to get \
+`blast_radius` banded by distance, where depth 1 is the direct callers. `unresolved_namesakes` \
+lists call sites that name the target but were not bound to it (untyped receiver, module \
+loaded by file path) — candidates to verify, not callers. A result carrying walk_incomplete \
+is a partial blast radius, not a complete one.",
             json!({
                 "type": "object",
                 "properties": {
                     "target": {"type": "string", "maxLength": 4096,
                         "description": "File path or symbol name."},
                     "budget": budget_prop(2000),
-                    "depth": depth_prop(3)
+                    "depth": depth_prop(3),
+                    "layers": {"type": "boolean", "default": false,
+                        "description": "Also band the reached symbols by hop distance \
+(`blast_radius.layers`). The budget is split between the bands and the edge list."}
                 },
                 "required": ["target"],
                 "additionalProperties": false

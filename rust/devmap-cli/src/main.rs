@@ -8767,6 +8767,7 @@ mod tests {
                 dead_clusters: clusters,
                 dead_clusters_truncated: 0,
                 dead_clusters_incomplete: incomplete.map(str::to_string),
+                unresolved_namesakes: None,
             }
         }
         let joined = |resp| dead_cluster_lines(&resp).join("\n");

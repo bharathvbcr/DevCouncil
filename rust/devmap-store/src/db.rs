@@ -1647,6 +1647,18 @@ fn charge(sink: &mut f64) -> Charge<'_> {
     }
 }
 
+/// One unresolved call site, as [`Store::unresolved_sites_named`] returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedSiteRow {
+    pub source_file: String,
+    pub source_symbol: String,
+    /// The receiver expression as written, when the call had one.
+    pub receiver: Option<String>,
+    /// The ledger's own class: `uninferred_receiver`, `unresolved`,
+    /// `external`, … — why the resolver did not bind it.
+    pub classification: String,
+}
+
 /// One committed build, as recorded by [`Store::build_history`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildHistoryRow {
@@ -6103,6 +6115,62 @@ impl Store {
             })?
             .collect::<Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// The latest generation's unresolved call sites whose callee is exactly
+    /// `callee_name`, at most `limit` of them, with the generation they came
+    /// from and whether `limit` cut the list.
+    ///
+    /// The ledger is where a caller the resolver could not bind is kept — an
+    /// untyped receiver, a module loaded by path — and until this existed no
+    /// query read it by name: `impact` answered from edges alone, and a method
+    /// whose only production caller sat here reported no such caller. Ordered
+    /// by `(file, symbol)` so a capped prefix is the same prefix on every read.
+    ///
+    /// Not indexed on `callee_name`: measured on scholarlm's 558,288 ledger rows
+    /// the scan costs ~40 ms warm, and an index is a schema change.
+    pub fn unresolved_sites_named(
+        &self,
+        callee_name: &str,
+        limit: usize,
+    ) -> Result<Option<(u32, Vec<UnresolvedSiteRow>, bool)>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some(generation) = Self::latest_generation_id_locked(&conn)? else {
+            return Ok(None);
+        };
+        let mut stmt = conn.prepare(
+            "SELECT p.path, u.source_symbol, u.receiver, c.text
+             FROM unresolved_rows u
+             JOIN paths p            ON p.id = u.source_file_id
+             JOIN unresolved_texts c ON c.id = u.classification_id
+             WHERE u.callee_name = ?1
+               AND u.valid_from <= ?2
+               AND (u.valid_to IS NULL OR u.valid_to > ?2)
+             ORDER BY p.path, u.source_symbol, u.unresolved_id
+             LIMIT ?3",
+        )?;
+        // One past the limit, so a list that exactly fills it is not reported
+        // as cut.
+        let mut rows = stmt
+            .query_map(
+                params![
+                    callee_name,
+                    generation,
+                    sqlite_limit(limit.saturating_add(1))
+                ],
+                |row| {
+                    Ok(UnresolvedSiteRow {
+                        source_file: row.get(0)?,
+                        source_symbol: row.get(1)?,
+                        receiver: row.get(2)?,
+                        classification: row.get(3)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>>>()?;
+        let truncated = rows.len() > limit;
+        rows.truncate(limit);
+        Ok(Some((generation, rows, truncated)))
     }
 
     /// Total unresolved rows across every retained generation. Test-facing:

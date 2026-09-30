@@ -288,7 +288,9 @@ impl<'a> StoreQueryEngine<'a> {
             });
         };
         let direction = index.directed(true, req.min_confidence);
-        let (edges, bands) = self.traverse_walked(
+        let target = req.query.clone();
+        let min_confidence = req.min_confidence;
+        let (mut edges, bands) = self.traverse_walked(
             &index,
             &direction,
             Request {
@@ -298,6 +300,7 @@ impl<'a> StoreQueryEngine<'a> {
             None,
             Some(layer_budget),
         )?;
+        self.attach_unresolved_namesakes(&index, &target, min_confidence, &mut edges)?;
         Ok(LayeredImpact {
             edges,
             // `Some` by construction: `band_budget` was `Some` on the call
@@ -768,7 +771,139 @@ impl<'a> StoreQueryEngine<'a> {
             }));
         };
         let direction = index.directed(reverse, req.min_confidence);
-        self.traverse_over(&index, &direction, req, min_rung)
+        if !reverse {
+            return self.traverse_over(&index, &direction, req, min_rung);
+        }
+        let target = req.query.clone();
+        let min_confidence = req.min_confidence;
+        let mut response = self.traverse_over(&index, &direction, req, min_rung)?;
+        self.attach_unresolved_namesakes(&index, &target, min_confidence, &mut response)?;
+        Ok(response)
+    }
+
+    /// Attach the ledger's unresolved sites that name `target` to an `impact`
+    /// answer, and say so in `walk_incomplete` when there are any.
+    ///
+    /// The names come from the walk's own starts when it has them, and from the
+    /// query text when it has none — the second is not a corner case. A method
+    /// whose every caller went unresolved has no inbound edge, so it is no
+    /// traversal start, and that is precisely the method whose callers are all
+    /// in the ledger.
+    fn attach_unresolved_namesakes<T>(
+        &self,
+        index: &GenerationEdges,
+        target: &str,
+        min_confidence: f32,
+        response: &mut Response<T>,
+    ) -> anyhow::Result<()> {
+        // A refused start query (an ambiguous bare name) has already been
+        // reported by the walk; the names below then come from the query text.
+        let starts = indexed_traversal_starts(index, target, true, min_confidence, &self.cancel)
+            .unwrap_or_default();
+        let Some(namesakes) = self.unresolved_namesakes(target, &starts)? else {
+            return Ok(());
+        };
+        if !namesakes.sites.is_empty() || namesakes.truncated {
+            let note = format!(
+                "{}{} unresolved call site(s) name {} and are not edges — an untyped receiver, a \
+                 module loaded by path; they are listed in `unresolved_namesakes` as candidates \
+                 to verify, not as callers",
+                if namesakes.truncated { "at least " } else { "" },
+                namesakes.sites.len(),
+                namesakes.names.join(", "),
+            );
+            response.walk_incomplete =
+                devmap_analyze::combine_reasons(response.walk_incomplete.take(), Some(note));
+        }
+        // A capped check must not read as a clean one: an empty `sites` with
+        // names left unchecked is "not looked", not "none there".
+        if namesakes.names_not_checked > 0 {
+            let note = format!(
+                "the unresolved ledger was checked for {} name(s) only; {} more were not looked up \
+                 (`unresolved_namesakes.names_not_checked`)",
+                namesakes.names.len(),
+                namesakes.names_not_checked,
+            );
+            response.walk_incomplete =
+                devmap_analyze::combine_reasons(response.walk_incomplete.take(), Some(note));
+        }
+        response.unresolved_namesakes = Some(namesakes);
+        Ok(())
+    }
+
+    /// The unresolved call sites whose callee is the bare name of a target.
+    ///
+    /// `starts` are `(qualified symbol, file)`. With none, the name is read off
+    /// the query itself; a path query names no callee and answers `None`.
+    /// Sites in another language family than the start that named them are
+    /// counted and dropped. With no start there is no family to compare, and
+    /// every site is kept.
+    fn unresolved_namesakes(
+        &self,
+        target: &str,
+        starts: &[(String, String)],
+    ) -> anyhow::Result<Option<UnresolvedNamesakes>> {
+        // name → the families of the starts that carry it; empty = unknown.
+        let mut wanted: BTreeMap<String, BTreeSet<LangFamily>> = BTreeMap::new();
+        for (symbol, file) in starts {
+            if !symbol.contains("::") {
+                continue; // a file node: it is not called by name
+            }
+            if let Some(name) = bare_callee_name(symbol) {
+                wanted
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(family_of_path(file));
+            }
+        }
+        if wanted.is_empty() {
+            let (name, families) = match crate::query_match::classify(target.trim()) {
+                crate::query_match::StartQuery::Qualified { file, symbol } => (
+                    bare_callee_name(symbol),
+                    BTreeSet::from([family_of_path(file)]),
+                ),
+                crate::query_match::StartQuery::Symbol(name) => {
+                    (bare_callee_name(name), BTreeSet::new())
+                }
+                crate::query_match::StartQuery::Path(_)
+                | crate::query_match::StartQuery::Nothing => (None, BTreeSet::new()),
+            };
+            let Some(name) = name else {
+                return Ok(None);
+            };
+            wanted.insert(name.to_string(), families);
+        }
+        let names_not_checked = wanted.len().saturating_sub(MAX_NAMESAKE_NAMES);
+        let mut namesakes = UnresolvedNamesakes {
+            names_not_checked,
+            ..UnresolvedNamesakes::default()
+        };
+        for (name, families) in wanted.into_iter().take(MAX_NAMESAKE_NAMES) {
+            self.cancel.check()?;
+            let Some((generation, rows, truncated)) = self
+                .store
+                .unresolved_sites_named(&name, MAX_NAMESAKE_SITES_PER_NAME)?
+            else {
+                return Ok(None);
+            };
+            namesakes.generation_id = generation;
+            namesakes.truncated |= truncated;
+            for row in rows {
+                if !families.is_empty() && !families.contains(&family_of_path(&row.source_file)) {
+                    namesakes.other_language_sites += 1;
+                    continue;
+                }
+                namesakes.sites.push(UnresolvedSite {
+                    source_file: row.source_file,
+                    source_symbol: row.source_symbol,
+                    callee_name: name.clone(),
+                    receiver: row.receiver,
+                    classification: row.classification,
+                });
+            }
+            namesakes.names.push(name);
+        }
+        Ok(Some(namesakes))
     }
 
     /// The traversal itself, over an index the caller already holds.
@@ -2140,6 +2275,7 @@ impl<'a> StoreQueryEngine<'a> {
             dead_clusters: None,
             dead_clusters_truncated: 0,
             dead_clusters_incomplete: None,
+            unresolved_namesakes: None,
         };
 
         // `Skipped` is here for the same reason `Failed` is, and the reason is
@@ -3240,6 +3376,7 @@ impl<'a> QueryEngine<'a> {
                 dead_clusters: None,
                 dead_clusters_truncated: 0,
                 dead_clusters_incomplete: None,
+                unresolved_namesakes: None,
             };
         }
         let q_lower = req.query.to_lowercase();
@@ -3680,6 +3817,20 @@ fn indexed_traversed_edges(
 /// Lifted out of `traverse` so the blast radius resolves its seeds through the
 /// same matcher the traversal does. Resolving them two ways is how a radius
 /// ends up seeded from a symbol the trace never visits.
+/// The name a call site would record for a symbol: the last segment of a
+/// qualified name, past `::` and past `.`. `a/job.go::YoloJob.record` and
+/// `YoloJob.record` both call `record`. `None` for an empty tail.
+fn bare_callee_name(symbol: &str) -> Option<&str> {
+    let tail = symbol.rsplit("::").next().unwrap_or(symbol);
+    let tail = tail.rsplit('.').next().unwrap_or(tail).trim();
+    (!tail.is_empty()).then_some(tail)
+}
+
+/// The resolution family a repository path belongs to, by its language.
+fn family_of_path(path: &str) -> LangFamily {
+    LangFamily::from_lang(devmap_extract::languages::detect_language(Path::new(path)))
+}
+
 fn indexed_traversal_starts(
     index: &GenerationEdges,
     target: &str,
@@ -4134,6 +4285,7 @@ fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
         dead_clusters: None,
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
+        unresolved_namesakes: None,
     }
 }
 
@@ -4940,6 +5092,7 @@ where
         dead_clusters: None,
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
+        unresolved_namesakes: None,
     }
 }
 
@@ -4968,6 +5121,7 @@ where
             dead_clusters: None,
             dead_clusters_truncated: 0,
             dead_clusters_incomplete: None,
+            unresolved_namesakes: None,
         };
     }
     Response {
@@ -4986,6 +5140,7 @@ where
         dead_clusters: None,
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
+        unresolved_namesakes: None,
     }
 }
 
