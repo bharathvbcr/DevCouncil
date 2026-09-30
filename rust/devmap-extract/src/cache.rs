@@ -436,7 +436,17 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// nothing depends on, and a cached Go field key would keep producing a
 /// fabricated `SamePackage` edge — from a cache, with no degraded marker to say
 /// why.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "58";
+///
+/// v59 records a Python module loaded **by file path** —
+/// `importlib.util.spec_from_file_location`, `runpy.run_path`,
+/// `SourceFileLoader(...)`, `imp.load_source` — as an import carrying
+/// `path_load`, with the local handle it is bound to and that handle's scope;
+/// see `pyload`. A v58 row has no such import, so the loaded file has no edge
+/// from its loader and every `module.fn()` through the handle stays an
+/// `uninferred_receiver` — `impact fn` answers "no callers" for functions whose
+/// only callers are those scripts and tests. Served from a v58 cache the gap
+/// would persist with nothing to say why.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "59";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

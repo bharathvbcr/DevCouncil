@@ -305,3 +305,11 @@ required-features = ["parse"]
 name = "markup_under_stress"
 required-features = ["parse"]
 
+
+[[test]]
+name = "python_path_loads"
+required-features = ["parse"]
+
+[[test]]
+name = "python_path_loads_under_stress"
+required-features = ["parse"]

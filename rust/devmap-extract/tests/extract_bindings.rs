@@ -12,8 +12,8 @@ use devmap_extract::model::{LocalBinding, ReferenceKind};
 fn extraction_schema_version_tracks_binding_and_ruleguard() {
     assert_eq!(
         devmap_extract::cache::EXTRACTION_SCHEMA_VERSION,
-        "58",
-        "v58 records a shell `source` as a glob import and a `build.rs`'s `cargo:rerun-if-changed=` paths as dynamic references, and stops emitting a Go struct-literal field key as a name reference, on top of v57's object-literal method exemption, v56's Rust `pub use` exports, v55's inline-module `super` receiver, v54's declared-field types, v53's receiver-prefix reduction and v52's duplicate-callee drop, while retaining v48 bindings, v49 ruleguard wiring, v50 attribution fixes and v51 captured-receiver classifications"
+        "59",
+        "v59 records a Python module loaded by file path as a `path_load` import; v58 records a shell `source` as a glob import and a `build.rs`'s `cargo:rerun-if-changed=` paths as dynamic references, and stops emitting a Go struct-literal field key as a name reference, on top of v57's object-literal method exemption, v56's Rust `pub use` exports, v55's inline-module `super` receiver, v54's declared-field types, v53's receiver-prefix reduction and v52's duplicate-callee drop, while retaining v48 bindings, v49 ruleguard wiring, v50 attribution fixes and v51 captured-receiver classifications"
     );
 }
 

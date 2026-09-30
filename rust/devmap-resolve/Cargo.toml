@@ -167,3 +167,7 @@ required-features = ["parse"]
 [[test]]
 name = "deref_transparent_receivers"
 required-features = ["parse"]
+
+[[test]]
+name = "python_modules_loaded_by_path"
+required-features = ["parse"]

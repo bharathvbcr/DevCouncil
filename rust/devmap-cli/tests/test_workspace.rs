@@ -177,6 +177,37 @@ fn an_import_of_another_repos_go_module_is_a_link_candidate() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A Python module loaded by file path names a file beside its loader. It is
+/// not a module another repository provides, even when that repository has a
+/// package whose name is the path's first directory.
+#[test]
+fn a_python_path_load_is_not_a_cross_repo_link() {
+    let base = scratch("pathload");
+    let a = base.join("svc-a");
+    let b = base.join("lib-b");
+    build_repo(
+        &a,
+        &[
+            (
+                "run.py",
+                "import importlib.util\n\
+                 spec = importlib.util.spec_from_file_location(\"x\", \"scripts/x.py\")\n\
+                 mod = importlib.util.module_from_spec(spec)\n",
+            ),
+            ("scripts/x.py", "def go():\n    pass\n"),
+        ],
+    );
+    build_repo(&b, &[("scripts/__init__.py", "")]);
+
+    let workspace = registry(&[("svca", &a), ("libb", &b)]);
+    let links = link_candidates(&workspace).unwrap();
+    assert!(
+        links.is_empty(),
+        "a path load was reported as a cross-repo link: {links:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// Symbol names shared between repositories must not become links. Two repos
 /// both declaring `New` is the normal case, not a dependency.
 #[test]

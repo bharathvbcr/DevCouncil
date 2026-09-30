@@ -781,8 +781,10 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // dynamic-reference form per `cargo:rerun-if-changed=` — and drops one
     // reference that should never have been there, a Go struct-literal field
     // key. A v57 row has neither addition and keeps the spurious reference.
+    //
+    // v59 adds an import for every Python module loaded by file path.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "58",
+        EXTRACTION_SCHEMA_VERSION, "59",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

@@ -783,6 +783,38 @@ pub struct ExtractedImport {
     pub local_names: Vec<String>,
     pub alias: Option<String>,
     pub span: Span,
+    /// Set when this import is a Python module loaded **by file path** —
+    /// `importlib.util.spec_from_file_location`, `runpy.run_path`,
+    /// `SourceFileLoader(...)`, `imp.load_source` — rather than by name.
+    ///
+    /// `module_specifier` is then the literal path tail as written
+    /// (`scripts/build_supplement.py`), never a dotted module name, and `alias`
+    /// is the local handle the loaded module is bound to (`None` when nothing
+    /// is bound: `run_path` returns a globals dict, not a module).
+    ///
+    /// Resolution is the resolver's, not the extractor's: the extraction
+    /// cache keys on `(path, source)` alone, so which indexed file a path names
+    /// can only be decided where the whole corpus is in hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_load: Option<PathLoad>,
+}
+
+/// Where a path-loaded Python module's handle lives, and what its path is
+/// relative to. See [`ExtractedImport::path_load`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathLoad {
+    /// Graph identity of the callable the handle is a local of — the same
+    /// string a call inside it records as `ExtractedCall::caller_symbol` and a
+    /// use site records as `LocalBinding::scope`. `None` at module level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// `Some(n)`: the path is relative to the loading file's own directory
+    /// climbed `n` levels, because its base was written in terms of `__file__`
+    /// (`Path(__file__).parent`, `.parents[1]`, `os.path.dirname(__file__)`).
+    /// `None`: the base is not known — an opaque variable, or a bare literal,
+    /// which Python resolves against the process's working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_up: Option<u32>,
 }
 
 /// Parse `a`, `a as b`, or `{ a as b, c }` import lists into parallel name vectors.
@@ -1708,6 +1740,7 @@ mod gate_and_binding_tests {
                 start_byte: 0,
                 end_byte: 0,
             },
+            path_load: None,
         };
 
         let import = ExtractedImport {

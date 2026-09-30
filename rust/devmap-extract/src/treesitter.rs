@@ -644,6 +644,16 @@ fn extract_treesitter_before_deadline(
                     &references,
                     &imports,
                 );
+                // Python modules loaded by file path (`spec_from_file_location`
+                // and friends) — see `pyload`. Before the gate below, so the
+                // walk's deadline bounds it like every other stage.
+                if lang == "python" {
+                    imports.extend(crate::pyload::python_path_loads(
+                        root,
+                        source,
+                        &file_symbol_name,
+                    ));
+                }
 
                 // The last gate before the file is published. Everything above
                 // has either finished or latched `WALK_OVERRAN`; this is what
@@ -3073,6 +3083,7 @@ fn extract_node(
                     local_names,
                     alias,
                     span,
+                    path_load: None,
                 });
             }
             "call" => {
@@ -3354,6 +3365,7 @@ fn extract_node(
                         local_names,
                         alias,
                         span,
+                        path_load: None,
                     });
                 }
             }
@@ -3423,6 +3435,7 @@ fn extract_node(
                                             local_names: vec![],
                                             alias: None,
                                             span: span.clone(),
+                                            path_load: None,
                                         });
                                     }
                                 }
@@ -3987,6 +4000,7 @@ fn extract_node(
                         local_names: vec![],
                         alias,
                         span,
+                        path_load: None,
                     });
                 }
             }
@@ -6213,6 +6227,7 @@ fn rust_use_imports(
             local_names,
             alias: None,
             span: span.clone(),
+            path_load: None,
         });
     }
     for (specifier, alias) in whole_module {
@@ -6223,6 +6238,7 @@ fn rust_use_imports(
             local_names: vec![],
             alias,
             span: span.clone(),
+            path_load: None,
         });
     }
     Some(())
