@@ -36,6 +36,11 @@ stack has several overlapping UI frameworks and the right choice depends on targ
 - `winget` for tooling; `nuget`/`dotnet add package` for dependencies.
 - Visual Studio diagnostics for profiling.
 
+## Language policy
+
+The UI uses the native Windows stack above. Logic shared with other platforms
+lives in a Rust core called through a C ABI. See the `language-policy` skill.
+
 ## What to record before coding
 
 - Target framework(s), .NET SDK version, and which UI stack the change belongs to.

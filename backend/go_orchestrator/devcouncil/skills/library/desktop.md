@@ -35,6 +35,14 @@ and the project's own pinned versions.
 - Tauri: `cargo tauri dev`/`cargo tauri build`, plus the frontend's own build.
 - Qt: `qmake`/`cmake` + `make`/`ninja`, `windeployqt`/`macdeployqt`, `ctest`.
 
+## Language policy
+
+New desktop apps are native per platform: Swift on macOS, the native Windows
+stack on Windows, Rust with GTK 4 on Linux. Existing Tauri apps keep Tauri, with
+logic in Rust and the web layer as UI only; Electron is maintenance-only. Ask the
+owner before choosing a cross-platform framework for a new app. See the
+`language-policy` skill.
+
 ## What to record before coding
 
 - The framework + version and the OS targets you must support.

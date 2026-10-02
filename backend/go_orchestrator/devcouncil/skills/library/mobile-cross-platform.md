@@ -35,6 +35,12 @@ project's own pinned versions.
 - React Native / Expo: `npm`/`yarn`/`pnpm`, `npx react-native run-android|run-ios`,
   `pod install` (iOS), `npx expo start`, `eas build`, `npm test`.
 
+## Language policy
+
+This skill is for maintaining existing Flutter/React Native apps. New mobile apps
+are native — Swift on Apple platforms, Kotlin on Android — with shared logic in a
+Rust core. See the `language-policy`, `ios` and `android` skills.
+
 ## What to record before coding
 
 - The framework/SDK versions and the iOS/Android minimums you must support.

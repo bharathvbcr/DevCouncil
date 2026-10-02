@@ -39,6 +39,13 @@ the project's own version catalog.
 - The `android` command-line tool and `sdkmanager`/`avdmanager` for SDK and emulator setup.
 - Android Studio for profiling (Perfetto traces) and Compose preview.
 
+## Language policy
+
+UI and platform integration are Kotlin. Logic shared with Apple platforms or a
+server lives in a Rust core called through generated bindings (for example
+UniFFI) — verify the binding tool's current docs first. See the
+`language-policy` skill.
+
 ## What to record before coding
 
 - Effective `minSdk`/`targetSdk` and the version catalog entries you will use.

@@ -36,6 +36,13 @@ current docs and the project's own conventions.
   `dagster job execute`, `spark-submit`/`pyspark`. Prefer the project's wrapper/Makefile.
 - Validate transforms on a dev schema/sample before touching production datasets.
 
+## Language policy
+
+New pipeline stages that do real compute are Rust or Go; SQL stays SQL. Existing
+Python/PySpark DAG code is kept as orchestration — propose a Rust/Go port with a
+benchmark when a stage is the bottleneck. Dataframe work that stays in Python uses
+Polars rather than pandas. See the `language-policy` skill.
+
 ## What to record before coding
 
 - The engine/dialect and the exact models/DAGs you will change.

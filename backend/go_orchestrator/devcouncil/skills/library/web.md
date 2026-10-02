@@ -37,6 +37,12 @@ docs and the project's `package.json` — not from memory.
 - The framework CLI (`next`, `vite`, `ng`, `svelte-kit`) for dev/build.
 - `eslint`/`prettier`/`tsc --noEmit` and the test runner (Vitest/Jest/Playwright) if configured.
 
+## Language policy
+
+TypeScript is for the UI layer. Compute belongs in a Rust/Go backend or in Rust
+compiled to WebAssembly; new server code is Go or Rust, not Node. See the
+`language-policy` skill.
+
 ## What to record before coding
 
 - Framework + major version, build tool, package manager, and Node version.

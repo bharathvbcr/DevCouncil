@@ -37,6 +37,12 @@ against the toolchain/standard docs and the project's own build config.
   an emulator (QEMU/Renode) when hardware isn't available.
 - Flash/debug: the project's `openocd`/`gdb`/`probe-rs`/`idf.py flash` flow.
 
+## Language policy
+
+New native and systems code is Rust. C and C++ are for existing code, vendor SDKs
+and targets Rust cannot reach. A Go caller reaches Rust through gusset when the
+two share a process. See the `language-policy` skill.
+
 ## What to record before coding
 
 - The toolchain/standard/target and the exact build config you will use.

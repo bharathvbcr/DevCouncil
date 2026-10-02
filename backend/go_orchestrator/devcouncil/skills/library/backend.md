@@ -41,6 +41,13 @@ release notes, and against the project's own dependency manifests.
   the command the repo already uses so the change is verifiable.
 - Containers: `docker build` / `docker compose up` when the service is containerized.
 
+## Language policy
+
+New services are Go; the engines they host are Rust, called through gusset when
+they run in-process. Python frameworks (FastAPI, Django, Flask) are for existing
+services only — match them when editing, and propose a Go/Rust port with a
+benchmark when a Python path is the bottleneck. See the `language-policy` skill.
+
 ## What to record before coding
 
 - The runtime/framework versions and the exact dependencies you will use.

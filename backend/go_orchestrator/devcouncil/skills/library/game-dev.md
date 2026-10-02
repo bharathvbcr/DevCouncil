@@ -35,6 +35,12 @@ project's own version and conventions.
 - Unreal: `UnrealBuildTool`/`RunUAT BuildCookRun`, Automation tests, Unreal Insights.
 - Godot: `godot --headless --export-release`, `godot --headless --run-tests` / GUT.
 
+## Language policy
+
+Use the engine's own language for gameplay code. Performance-critical native
+extensions are written in Rust where the engine's extension API allows it. See
+the `language-policy` skill.
+
 ## What to record before coding
 
 - The engine + version, render pipeline / scripting backend, and target platform budget.

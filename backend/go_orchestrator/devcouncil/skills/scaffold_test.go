@@ -9,14 +9,29 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/skills"
 )
 
-func TestEmbeddedLibraryHasSeventeenSkills(t *testing.T) {
+func TestEmbeddedLibraryHasEighteenSkills(t *testing.T) {
 	all, err := skills.Embedded.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) != 17 {
-		t.Fatalf("want 17 domain skills, got %d", len(all))
+	if len(all) != 18 {
+		t.Fatalf("want 18 domain skills, got %d", len(all))
 	}
+}
+
+// The language policy is installed under the name its frontmatter declares, so
+// a renamed or mistyped header would ship guidance no agent host asks for.
+func TestEmbeddedLibraryCarriesLanguagePolicy(t *testing.T) {
+	all, err := skills.Embedded.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range all {
+		if s.Name == "language-policy" {
+			return
+		}
+	}
+	t.Fatal("language-policy missing from the embedded library")
 }
 
 func TestScaffoldCoreEngineering(t *testing.T) {

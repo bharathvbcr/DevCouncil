@@ -37,6 +37,12 @@ Apple deprecates APIs aggressively and gates features on OS version.
 - `swift build` / `swift test` for SwiftPM targets; `swiftformat`/`swiftlint` if configured.
 - Instruments for profiling.
 
+## Language policy
+
+UI and platform integration are Swift. Logic shared with Android or a server
+lives in a Rust core called through generated bindings (for example UniFFI) —
+verify the binding tool's current docs first. See the `language-policy` skill.
+
 ## What to record before coding
 
 - Swift version, deployment target, and dependency-manager choice.

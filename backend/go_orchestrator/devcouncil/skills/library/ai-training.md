@@ -39,6 +39,14 @@ environment files.
 - Experiment tracking (W&B, MLflow, TensorBoard) and `nvidia-smi` for GPU monitoring.
 - `datasets`/`dvc` for data, and a pinned environment (`uv`/`conda`/`pip-tools`).
 
+## Language policy
+
+Python stays as orchestration — the training loop and the framework API. Kernels
+and hot loops go into Rust (tessl for GEMM/NN work on Apple silicon, or a
+purpose-built crate), exposed to Python through a C ABI with `ctypes` or through
+PyO3. The Python reference implementation becomes the oracle the kernel's parity
+test compares against. See the `language-policy` skill.
+
 ## What to record before coding
 
 - Framework + version, Python + CUDA versions, and the hardware/precision plan.
