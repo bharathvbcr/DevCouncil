@@ -800,8 +800,12 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     //
     // v65 references the scope of `T::m` and records the calls inside a
     // function-like macro body.
+    //
+    // v66 emits every Python module-scope binding and the module bindings and
+    // type aliases other shapes dropped, reads import names off the tree, and
+    // stops a module binding from shadowing its own module-level reads.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "65",
+        EXTRACTION_SCHEMA_VERSION, "66",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

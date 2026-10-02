@@ -3528,8 +3528,9 @@ impl Resolver {
             "candidate visits",
         )?;
         let mut candidates = Vec::new();
-        for (path, _, candidate_family, identity) in hits {
+        for (path, kind, candidate_family, identity) in hits {
             if family.admits(*candidate_family)
+                && !Self::never_a_call_target(family, *kind)
                 && (*candidate_family != LangFamily::Go
                     || Self::go_symbol_visible_from(file, path, name))
                 && (!Self::family_needs_explicit_receiver(family)
@@ -3560,6 +3561,27 @@ impl Resolver {
         });
         cache.sets.insert(key, Arc::clone(&candidates));
         Ok(candidates)
+    }
+
+    /// Whether a declaration of `kind` can never be what a bare call in
+    /// `family` names, so the global rung must not offer it.
+    ///
+    /// `Interface` is an interface or a type alias. In Rust a type alias is not
+    /// a constructor (`type HWND = isize; HWND(0)` is E0423) and a trait is its
+    /// own kind; a Python `type V = …` alias raises when called; a TypeScript
+    /// interface or alias has no runtime value. So for these families an
+    /// `Interface` namesake is never the callee — yet once type aliases became
+    /// symbols, `HWND(ptr)` building the external `windows` crate's tuple
+    /// struct bound to a framework's `pub type HWND = isize` at `UniqueGlobal`,
+    /// thirteen fabricated callers on one corpus. Kotlin (`fun interface`
+    /// SAM conversions) and Java (`new Listener() { … }`) can name an interface
+    /// in call position, so they keep the candidate.
+    fn never_a_call_target(family: LangFamily, kind: SymbolKind) -> bool {
+        kind == SymbolKind::Interface
+            && matches!(
+                family,
+                LangFamily::Rust | LangFamily::Python | LangFamily::JsTs
+            )
     }
 
     fn parent_dir(current_file: &str) -> String {
@@ -5110,6 +5132,35 @@ impl Resolver {
                     | SymbolKind::Trait
             )
         };
+        // What the same-file rung accepts in type and heritage position.
+        //
+        // TypeScript and Rust keep types and values in separate namespaces, so
+        // a `const Foo` and a `type Foo` coexist and an annotation means the
+        // type — the kind filter is what chooses between them. Python has one
+        // namespace: a type is whatever a module-scope name is bound to, and
+        // the aliases a typed codebase writes most are assignments —
+        // `Purpose = Literal[…]`, `T = TypeVar("T")`, `UserId = NewType(…)` —
+        // as is a base class built at runtime (`Base = declarative_base()`).
+        // The binding lexical scope found is the only candidate there is, so
+        // refusing it left every one of them with no reader and reported dead.
+        //
+        // JavaScript and TypeScript keep the filter for annotations, but a
+        // class's `extends` is not one: it takes an expression, evaluated at
+        // runtime, and `class Admin extends Mixed` with
+        // `const Mixed = mixin(Base)` is the mixin idiom. The extractor files
+        // heritage for a `class` only — an interface's `extends` never arrives
+        // as `Heritage` — and `implements`, which does name a type, is
+        // `HeritageInterface` and stays filtered.
+        //
+        // Same-file only. The global rung below has no scope proof, and the
+        // import rung never filtered by kind.
+        let is_lexical_type = |kind: SymbolKind| {
+            is_type(kind)
+                || (kind == SymbolKind::Variable
+                    && (family == LangFamily::Python
+                        || (family == LangFamily::JsTs
+                            && reference.kind == ReferenceKind::Heritage)))
+        };
 
         // X45. A *qualified* type is resolved by its qualifier, before any
         // rung that reads the bare name.
@@ -5182,10 +5233,9 @@ impl Resolver {
                 reference.enclosing_symbol.as_deref(),
                 name,
             ) {
-                if self
-                    .symbol_kind_in(&ext.file_path, &identity)
-                    .is_some_and(|kind| !prefer_types || is_type(kind))
-                {
+                if self.file_declares_as(&ext.file_path, &identity, |kind| {
+                    !prefer_types || is_lexical_type(kind)
+                }) {
                     return Some(self.reference_edge(
                         ext,
                         &ext.file_path,
@@ -5375,6 +5425,35 @@ impl Resolver {
             // confident-dead. Agreeing kinds are one kind.
             let first = *file_hits.first()?;
             file_hits.iter().all(|kind| *kind == first).then_some(first)
+        })
+    }
+
+    /// Whether `file` declares `identity` as at least one kind `admits`.
+    ///
+    /// `identity` is the qualified name [`Self::lexical_target`] answered
+    /// with, and `symbol_index` holds every declaration under its qualified
+    /// name as well as its bare one, so the hits are the declarations of that
+    /// one identity and never a same-named member elsewhere in the file.
+    ///
+    /// The same-file rung's question, which is not [`Self::symbol_kind_in`]'s.
+    /// That one answers "what kind is this?" and abstains when the file's
+    /// declarations disagree — right for a caller that dispatches on the kind.
+    /// The rung only asks whether a declaration the reference may name is
+    /// there, and lexical scope has already proved which identity it is. A
+    /// name declared twice with two kinds on purpose is TypeScript's companion
+    /// idiom — `const User = z.object(…)` beside
+    /// `type User = z.infer<typeof User>` — and the abstention left every
+    /// annotation of `User` in its own file, and every value read of it, with
+    /// no target.
+    fn file_declares_as(
+        &self,
+        file: &str,
+        identity: &str,
+        admits: impl Fn(SymbolKind) -> bool,
+    ) -> bool {
+        self.symbol_index.get(identity).is_some_and(|hits| {
+            hits.iter()
+                .any(|(path, kind, _, _)| path == file && admits(*kind))
         })
     }
 

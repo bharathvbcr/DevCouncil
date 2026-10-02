@@ -409,26 +409,28 @@ fn python_dunder_all_requires_a_real_assignment() {
         .any(|symbol| symbol.name == "ghost" && symbol.is_exported));
 }
 
-/// An alias is a second *name*, not a computed value.
+/// A computed module binding is a symbol, and `__all__` decides only whether it
+/// is exported.
 ///
-/// A Python module-level binding survives the `__all__` filter only when it is
-/// named there or when it is an alias — "a second name for something already
-/// referenceable" — because emitting the rest would add a symbol for every
-/// private module constant in the repository, whose only graph effect is
-/// dead-code noise. The alias test asked whether the right-hand side's
-/// *outermost* node was an `identifier` or an `attribute`, which every dotted
-/// expression satisfies however it was computed:
-/// `OUT = Path(__file__).resolve().parent` is an `attribute` whose object is a
-/// `call`, and it names nothing another module can import.
+/// History, because the rule flipped twice. Python module bindings were once
+/// kept only when `__all__` named them, plus an "alias" exemption (a right-hand
+/// side that is a bare or dotted name). That exemption first admitted every
+/// dotted expression — `OUT = Path(__file__).resolve().parent` is an
+/// `attribute` whose object is a `call` — and six such path constants were then
+/// reported dead at 0.9, so it was narrowed to pure names and this test pinned
+/// computed bindings *out* of the graph.
 ///
-/// Measured on this repository, that admitted 54 of 54 Python `Variable`
-/// symbols — every one a path constant of exactly that shape — and six of them
-/// were then reported dead at 0.9, in the tier documented as the only one that
-/// indicates a defect. The noise the filter exists to prevent arrived through
-/// the exemption in the filter.
+/// The six findings were not evidence that computed constants are noise. Each
+/// was read only at module level (`OUT / "summary.json"`), and a module-level
+/// assignment was filed as a *local* of the module, so it shadowed itself and
+/// every module-level read was dropped before the resolver saw it. With that
+/// fixed, a constant is judged by its edges like a function, and the
+/// `__all__`/alias filter — which also hid every constant `__all__` omitted,
+/// imported or not — is gone. `python_module_constants` in `devmap-resolve`
+/// pins the reads; this pins the symbols.
 #[test]
-fn a_computed_module_binding_is_not_an_alias() {
-    let dropped = [
+fn a_computed_module_binding_is_a_symbol_and_all_decides_its_export() {
+    let computed = [
         // The measured shape, and the four other ways to compute a value whose
         // outermost node looks like a name.
         (
@@ -453,20 +455,22 @@ fn a_computed_module_binding_is_not_an_alias() {
             "VALUE",
         ),
     ];
-    for (path, source, name) in dropped {
+    for (path, source, name) in computed {
         let ext = extract_file(path, source);
         assert!(
-            !ext.symbols.iter().any(|symbol| symbol.name == name),
-            "{path}: {name} is a computed constant, not an alias, and must not be a symbol: {:?}",
             ext.symbols
                 .iter()
-                .map(|symbol| symbol.name.as_str())
+                .any(|symbol| symbol.name == name && !symbol.is_exported),
+            "{path}: {name} is a module attribute another file can import, and no \
+             `__all__` publishes it: {:?}",
+            ext.symbols
+                .iter()
+                .map(|symbol| (symbol.name.as_str(), symbol.is_exported))
                 .collect::<Vec<_>>()
         );
     }
 
-    // A genuine alias is still a second name for something importable, and
-    // dropping one deletes a name other modules import.
+    // An alias is a module binding like any other, and still a symbol.
     let kept = [
         ("bare.py", "from x import Other\nAlias = Other\n", "Alias"),
         (
@@ -488,7 +492,7 @@ fn a_computed_module_binding_is_not_an_alias() {
         );
     }
 
-    // And `__all__` still outranks the alias rule in both directions.
+    // And `__all__` decides export whatever computed the value.
     let ext = extract_file(
         "declared.py",
         "from pathlib import Path\n__all__ = [\"OUT\"]\nOUT = Path(__file__).parent\n",
@@ -791,12 +795,15 @@ fn a_call_target_that_is_not_a_name_records_no_callee() {
 /// bindings across the repository named it, resolved to a file that (as far as
 /// the resolver could tell) does not declare it, and fell off the ladder.
 ///
-/// The scope is the point of the test: an alias is kept, and the constants that
-/// motivated the `__all__` filter are still dropped. Widening this to every
-/// module-level assignment would add a node per private constant and turn each
-/// one into a dead-code candidate.
+/// This test once also pinned the constants beside the alias *out* of the graph,
+/// to keep the `__all__` filter's scope narrow. That filter hid every constant
+/// `__all__` omitted — `REQUIRED_CONTROLS`, imported by name from a test, among
+/// them — and its premise (a constant's only graph effect is dead-code noise)
+/// rested on module-level reads being dropped, which is fixed. Every
+/// module-scope binding is a symbol now; `__all__` decides only export, and
+/// liveness skips `_private` names as it always has.
 #[test]
-fn a_python_reexport_alias_is_a_symbol_and_a_constant_is_not() {
+fn a_python_reexport_alias_is_a_symbol_and_so_is_a_constant() {
     let ext = extract_file(
         "domain/evidence.py",
         concat!(
@@ -819,13 +826,19 @@ fn a_python_reexport_alias_is_a_symbol_and_a_constant_is_not() {
             "a re-export alias is a name other modules import: {names:?}"
         );
     }
-    for dropped in ["DEFAULT_TIMEOUT", "_private", "logger", "computed"] {
+    for constant in ["DEFAULT_TIMEOUT", "_private", "logger", "computed"] {
         assert!(
-            !names.contains(&dropped),
-            "{dropped:?} is a value, not an alias, and must stay out of the \
-             graph as it always has: {names:?}"
+            names.contains(&constant),
+            "{constant:?} is a module attribute another file can import: {names:?}"
         );
     }
+    assert!(
+        ext.symbols
+            .iter()
+            .filter(|symbol| symbol.kind == devmap_extract::model::SymbolKind::Variable)
+            .all(|symbol| !symbol.is_exported),
+        "the module declares no `__all__`, so nothing is exported"
+    );
 }
 
 /// Every callable exports the values it binds, under the identity its own calls

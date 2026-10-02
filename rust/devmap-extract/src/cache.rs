@@ -484,7 +484,21 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// their caller. A v64 row has neither, so a struct reached only as
 /// `T::member` and a helper called only from a macro body would stay
 /// confidently dead from a warm cache with nothing to say why.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "65";
+///
+/// v66 emits every Python module-scope binding as a `Variable` (`__all__` now
+/// decides only `is_exported`), including bindings under a module-level
+/// `try`/`if`/`with`/`for` and every name an unpacking target binds; emits
+/// type aliases in Python, Rust and Go, every name of a multi-name Go spec, and
+/// each name a TS/JS destructuring pattern binds instead of one symbol named by
+/// the pattern's text; keeps a TS/JS binding published by `export { … }` or
+/// `export default`; reads Python and TS/JS import names off the tree, so a
+/// comment or an inline `type` is no longer bound as a name and the name after
+/// it is no longer lost; splits `import a, b` into one import per module; and
+/// stops filing an emitted module binding as a module-scope local, which
+/// dropped every module-level read of it. A v65 row lacks all of this — most
+/// sharply, a constant `__all__` omitted has no node and its importers no
+/// target — so it must not be served to this build.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "66";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

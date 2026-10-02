@@ -39,6 +39,18 @@ name = "adversarial_resolve"
 required-features = ["parse"]
 
 [[test]]
+name = "python_module_constants"
+required-features = ["parse"]
+
+[[test]]
+name = "type_aliases_are_not_call_targets"
+required-features = ["parse"]
+
+[[test]]
+name = "same_file_type_position"
+required-features = ["parse"]
+
+[[test]]
 name = "rust_qualified_super_calls"
 required-features = ["parse"]
 

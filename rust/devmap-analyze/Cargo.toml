@@ -153,3 +153,7 @@ required-features = ["parse"]
 [[test]]
 name = "external_base_dispatch"
 required-features = ["parse"]
+
+[[test]]
+name = "python_constant_liveness"
+required-features = ["parse"]
