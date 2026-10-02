@@ -232,7 +232,7 @@ devmap gap-record --tool <TOOL> --gap-id <ID> --reason <REASON>
 devmap session-report [--last]
 
 # Visualizers & Servers
-devmap map-html             # Subsystem map (.devmap/map.html or .devcouncil/map.html)
+devmap map-html             # Subsystem map (.devmap/map.html or .devcouncil/map.html); see code-graph.md
 devmap html                 # Symbol graph HTML
 devmap mcp                  # DevMap MCP stdio (13 read-only tools)
 devmap export               # GraphML

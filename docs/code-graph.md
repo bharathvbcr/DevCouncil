@@ -106,6 +106,40 @@ The repository map's `files` list locates source. `subsystems`, entry points,
 critical files, neighbors and handoff paths help follow ownership. Role-file
 samples carry separate totals. Trust current source when a map disagrees.
 
+## Read the repository map page
+
+`devmap map-html` renders `map.html` from the map `devmap build --manifest`
+writes. It is one offline file: no network, no CDN, with the graph renderer
+inlined. Open it directly in a browser. It sits next to the symbol graph
+(`devmap html`), which is linked from its footer.
+
+Each dot is a subsystem, an area DevMap selected as a unit. The map shows a
+selected set, not a partition of the repository. The coverage note under
+Languages gives the share of indexed files inside the drawn subsystems, and the
+repo-wide language bar counts every indexed file.
+
+| On the page | Meaning |
+|---|---|
+| Dot colour | The subsystem's dominant language, in GitHub Linguist's colour. A ringed swatch has no Linguist colour and is drawn neutral. |
+| Dot size | File count by default. Layout offers degree and constant sizing. |
+| Green ring, ★ | The subsystem contains entry points. |
+| Blue edge | Neighbour: adjacent areas in the import and call graph. |
+| Purple edge | Handoff: work passes from one area into another through specific files. |
+| Stat tiles | Subsystems drawn, edges between them, indexed files, languages. Hover for definitions. |
+| Liveness badges | Repo-wide counts: entry roots, unwired files, dead symbols, unreachable files. Hover for definitions. |
+
+Selecting a subsystem opens its detail: language mix, entry points, critical
+files, clickable neighbours, handoffs and role files. A neighbour that is not a
+drawn subsystem is shown greyed and does not link. "not computed for this map"
+means the map was built without that evidence, which differs from "none". "Hide
+notes & Markdown" removes subsystems whose indexed files are all notes or
+documentation; mixed subsystems stay.
+
+The liveness badges follow the rules in the next section. They are candidates,
+and a count shown as "N of M" or "total unknown" is a sample. When
+`unreachable unreliable` appears, entry roots were not trustworthy and the
+unreachable count is withheld.
+
 ## Dead code and liveness
 
 `devmap dead --json` returns candidates with per-row confidence. No inbound

@@ -12,6 +12,8 @@ Kernel sources live under [`rust/`](../../rust/) (`devmap-*` crates, `vendor/`,
 
 Concurrent agent worktrees: [design, audit and rollout contract](AGENTIC_WORKTREE_DESIGN.md), with archived [native qualification and schema-20 cutover](../archive/devmap/SCHEMA20_QUALIFICATION_2026-09-09.md). Navigation is read-only; use explicit `devmap repair --schema` only after coordinating all installed readers and writers.
 
+Latest dated review: [extraction and resolver audit, 2026-10-02](EXTRACTION_RESOLVE_AUDIT_2026-10-02.md).
+
 Host applications can link the query crate or use the versioned JSON and HTML
 process contract in [HOST_INTEGRATION.md](HOST_INTEGRATION.md).
 
