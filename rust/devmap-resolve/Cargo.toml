@@ -55,6 +55,10 @@ name = "rust_qualified_super_calls"
 required-features = ["parse"]
 
 [[test]]
+name = "rust_qualified_path_calls"
+required-features = ["parse"]
+
+[[test]]
 name = "audit_regressions"
 required-features = ["parse"]
 

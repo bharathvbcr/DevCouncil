@@ -26,6 +26,28 @@ type CandidateSet = Arc<[(String, String)]>;
 /// target when an indexed subtype overrides the same name, because `self` can
 /// be that subtype at runtime. Call-site emission must abstain into the
 /// unresolved ledger rather than fall through to `SameFile`.
+/// Where a Rust path's first segment can be placed.
+///
+/// `Keyword` is `crate` / `self` / `super`. `Crate` is one indexed crate
+/// root of that name. `Child` is a module file under this module and not
+/// a crate. `Ambiguous` is a name two crates claim, or a name that is both
+/// a child module and a crate. `Unknown` is everything else — `std`, an
+/// external crate, a path this file does not contain — and the call ladder
+/// leaves it for classification.
+enum RustPathRoot {
+    Keyword,
+    Crate(String),
+    Child,
+    Ambiguous,
+    Unknown,
+}
+
+enum RustModulePlace {
+    Unique(String),
+    Ambiguous,
+    Absent,
+}
+
 enum ImplicitReceiverAnswer {
     Unique {
         target_file: String,
@@ -2945,6 +2967,26 @@ impl Resolver {
                         }
                     }
 
+                    // 2d'. A Rust path written at the call.
+                    //
+                    // `crate::resolver::Resolver::resolve_all()` does not name
+                    // an import and it does not name a bare type, so every
+                    // rung above leaves it for `ModulePath`. The path is the
+                    // evidence: it places one module, and either a free
+                    // function in that file or a method of a type that file
+                    // declares. After 2d so an import in this file still wins,
+                    // and only for Rust — `work::helper()` in C++ is not this
+                    // module system.
+                    if resolution.is_none() && family == LangFamily::Rust {
+                        if let Some(recv) = call.receiver_expr.as_deref() {
+                            if let Some(found) =
+                                self.rust_qualified_call(&ext.file_path, recv, &call.callee_name)
+                            {
+                                resolution = Some(Arc::new(found));
+                            }
+                        }
+                    }
+
                     // 2e. X45. The package block. A bare `Trim(raw)` in
                     // `search/rank.go` names `search/provider.go`'s `Trim`
                     // because Go's package-level scope spans the package's
@@ -3698,6 +3740,282 @@ impl Resolver {
             components.pop();
         }
         "src".to_string()
+    }
+
+    /// The directory this file's own child modules live in.
+    ///
+    /// The first reading of [`Self::rust_module_dirs`]: a `mod.rs` / `lib.rs` /
+    /// `main.rs` keeps children beside itself, and a leaf keeps them in its
+    /// nested directory. The second reading is the parent directory, which the
+    /// import rung still tries so an old `use` does not go missing. A *call*
+    /// must not use it. `helper::run()` in `ledger/bindings.rs` is not the
+    /// sibling `ledger/helper.rs`; that path is `super::helper`.
+    fn rust_call_base(file: &str) -> String {
+        Self::rust_module_dirs(file)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Self::parent_dir(file))
+    }
+
+    fn rust_path_within_index(&self, path: &str) -> bool {
+        let segments = path.split("::").count();
+        segments > 0 && segments <= self.max_indexed_path_depth.saturating_add(2)
+    }
+
+    fn rust_child_shapes(&self, file: &str, name: &str) -> usize {
+        if !Self::is_plain_ident(name) {
+            return 0;
+        }
+        let Some(joined) = Self::normalize_rel(&Self::rust_call_base(file), name) else {
+            return 0;
+        };
+        let mut shapes = 0usize;
+        if self.file_symbols.contains_key(&format!("{joined}.rs")) {
+            shapes += 1;
+        }
+        if self.file_symbols.contains_key(&format!("{joined}/mod.rs")) {
+            shapes += 1;
+        }
+        shapes
+    }
+
+    fn rust_path_root(&self, file: &str, path: &str) -> RustPathRoot {
+        let root = path.split("::").next().unwrap_or("");
+        if matches!(root, "crate" | "self" | "super") {
+            return RustPathRoot::Keyword;
+        }
+        let child = self.rust_child_shapes(file, root) > 0;
+        match self.rust_crate_roots.get(root) {
+            Some(None) => RustPathRoot::Ambiguous,
+            Some(Some(_)) if child => RustPathRoot::Ambiguous,
+            Some(Some(src)) => RustPathRoot::Crate(src.clone()),
+            None if child => RustPathRoot::Child,
+            None => RustPathRoot::Unknown,
+        }
+    }
+
+    fn consider_indexed(&self, found: &mut Vec<String>, candidate: String) {
+        if self.file_symbols.contains_key(&candidate) {
+            found.push(candidate);
+        }
+    }
+
+    fn consider_crate_root_files(&self, found: &mut Vec<String>, src_root: &str) {
+        self.consider_indexed(found, format!("{src_root}/lib.rs"));
+        self.consider_indexed(found, format!("{src_root}/main.rs"));
+    }
+
+    /// Every conventional file of the module whose directory is `dir`.
+    ///
+    /// More than one hit is ambiguity, not a preference: `work.rs` and
+    /// `work/mod.rs` are both the module `work`, and picking either would
+    /// invent the call's target.
+    fn consider_module_dir(&self, found: &mut Vec<String>, dir: &str) {
+        let dir = dir.trim_end_matches('/');
+        for candidate in [
+            format!("{dir}/mod.rs"),
+            format!("{dir}.rs"),
+            format!("{dir}/lib.rs"),
+            format!("{dir}/main.rs"),
+        ] {
+            self.consider_indexed(found, candidate);
+        }
+    }
+
+    fn consider_module_rel(&self, found: &mut Vec<String>, base: &str, tail: &str) {
+        if tail.is_empty() || !tail.split("::").all(Self::is_plain_ident) {
+            return;
+        }
+        let rel = tail.replace("::", "/");
+        let Some(joined) = Self::normalize_rel(base, &rel) else {
+            return;
+        };
+        self.consider_indexed(found, format!("{joined}.rs"));
+        self.consider_indexed(found, format!("{joined}/mod.rs"));
+    }
+
+    /// Indexed files the whole path names, with no segment popped.
+    ///
+    /// `resolve_import_path` walks a `use` by dropping a trailing type name
+    /// until a file appears. A call must not: `crate::resolver::Resolver`
+    /// would land on `resolver.rs` and then look the callee up there, which
+    /// is a different path from the one the author wrote.
+    fn rust_module_files(&self, file: &str, path: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        if path == "self" {
+            self.consider_indexed(&mut found, file.to_string());
+            return found;
+        }
+        if path == "crate" {
+            self.consider_crate_root_files(&mut found, &Self::rust_crate_src_root(file));
+            return found;
+        }
+        if path == "super" {
+            let parent = Self::parent_dir(&Self::rust_call_base(file));
+            self.consider_module_dir(&mut found, &parent);
+            return found;
+        }
+        if let Some(tail) = path.strip_prefix("crate::") {
+            self.consider_module_rel(&mut found, &Self::rust_crate_src_root(file), tail);
+            return found;
+        }
+        if let Some(tail) = path.strip_prefix("self::") {
+            self.consider_module_rel(&mut found, &Self::rust_call_base(file), tail);
+            return found;
+        }
+        if let Some(rest) = path.strip_prefix("super::") {
+            let mut hops = 1usize;
+            let mut tail = rest;
+            while let Some(more) = tail.strip_prefix("super::") {
+                hops += 1;
+                tail = more;
+            }
+            let mut base = Self::rust_call_base(file);
+            for _ in 0..hops {
+                base = Self::parent_dir(&base);
+            }
+            if tail.is_empty() {
+                self.consider_module_dir(&mut found, &base);
+            } else {
+                self.consider_module_rel(&mut found, &base, tail);
+            }
+            return found;
+        }
+        match self.rust_path_root(file, path) {
+            RustPathRoot::Crate(src_root) => {
+                if let Some((_, tail)) = path.split_once("::") {
+                    self.consider_module_rel(&mut found, &src_root, tail);
+                } else {
+                    self.consider_crate_root_files(&mut found, &src_root);
+                }
+            }
+            RustPathRoot::Child => {
+                self.consider_module_rel(&mut found, &Self::rust_call_base(file), path);
+            }
+            RustPathRoot::Keyword | RustPathRoot::Ambiguous | RustPathRoot::Unknown => {}
+        }
+        found
+    }
+
+    fn rust_exact_module(&self, file: &str, path: &str) -> RustModulePlace {
+        if !self.rust_path_within_index(path) || !path.split("::").all(Self::is_plain_ident) {
+            return RustModulePlace::Absent;
+        }
+        match self.rust_path_root(file, path) {
+            RustPathRoot::Unknown => RustModulePlace::Absent,
+            RustPathRoot::Ambiguous => RustModulePlace::Ambiguous,
+            RustPathRoot::Keyword | RustPathRoot::Crate(_) | RustPathRoot::Child => {
+                let mut hits = self.rust_module_files(file, path);
+                hits.sort();
+                hits.dedup();
+                match hits.len() {
+                    0 => RustModulePlace::Absent,
+                    1 => RustModulePlace::Unique(hits.remove(0)),
+                    _ => RustModulePlace::Ambiguous,
+                }
+            }
+        }
+    }
+
+    fn rust_type_kind(kind: SymbolKind) -> bool {
+        matches!(
+            kind,
+            SymbolKind::Struct
+                | SymbolKind::Enum
+                | SymbolKind::Class
+                | SymbolKind::Trait
+                | SymbolKind::Interface
+        )
+    }
+
+    fn rust_module_resolution(
+        caller: &str,
+        target_file: &str,
+        target_symbol: &str,
+        path: &str,
+    ) -> Resolution {
+        if caller == target_file {
+            Resolution::SameFile {
+                target_symbol: target_symbol.to_string(),
+                target_file: target_file.to_string(),
+            }
+        } else {
+            Resolution::ImportScoped {
+                target_symbol: target_symbol.to_string(),
+                target_file: target_file.to_string(),
+                imported_from: path.to_string(),
+            }
+        }
+    }
+
+    /// A Rust call whose receiver is a module path: `crate::work::helper()`,
+    /// `super::helper()`, `other_crate::Resolver::resolve_all()`.
+    ///
+    /// Two shapes, and the first one wins so they cannot both fire. The whole
+    /// receiver is a module and the callee is a free function in that file, or
+    /// the receiver's last segment is a type declared in the module the prefix
+    /// names and the callee is a method of that type in that file. Either
+    /// shape binds only when exactly one indexed file is the module. A second
+    /// file, a second method, or a prefix that had to be popped is no target.
+    fn rust_qualified_call(&self, file: &str, receiver: &str, callee: &str) -> Option<Resolution> {
+        if !Self::is_plain_ident(callee) {
+            return None;
+        }
+        if !Self::receiver_is_module_path(receiver)
+            && !matches!(receiver, "crate" | "self" | "super")
+        {
+            return None;
+        }
+        match self.rust_exact_module(file, receiver) {
+            RustModulePlace::Ambiguous => return None,
+            RustModulePlace::Unique(module_file) => {
+                let (target_file, target_symbol) = self.lookup_in_package(&module_file, callee)?;
+                if self.symbol_kind_in(&target_file, callee) != Some(SymbolKind::Function) {
+                    return None;
+                }
+                return Some(Self::rust_module_resolution(
+                    file,
+                    &target_file,
+                    &target_symbol,
+                    receiver,
+                ));
+            }
+            RustModulePlace::Absent => {}
+        }
+        let (module_path, type_name) = receiver.rsplit_once("::")?;
+        if !Self::is_plain_ident(type_name) {
+            return None;
+        }
+        let module_file = match self.rust_exact_module(file, module_path) {
+            RustModulePlace::Unique(module_file) => module_file,
+            RustModulePlace::Ambiguous | RustModulePlace::Absent => return None,
+        };
+        if !self
+            .symbol_kind_in(&module_file, type_name)
+            .is_some_and(Self::rust_type_kind)
+        {
+            return None;
+        }
+        let hits = self.type_methods.get(&(
+            LangFamily::Rust,
+            type_name.to_string(),
+            callee.to_string(),
+        ))?;
+        let mut matched: Vec<&(String, String)> = hits
+            .iter()
+            .filter(|(path, _)| path == &module_file)
+            .collect();
+        matched.sort();
+        matched.dedup();
+        if matched.len() != 1 {
+            return None;
+        }
+        let (target_file, target_symbol) = matched[0];
+        Some(Resolution::ReceiverType {
+            target_symbol: target_symbol.clone(),
+            target_file: target_file.clone(),
+            receiver_type: type_name.to_string(),
+        })
     }
 
     fn import_local_name(lang: &str, specifier: &str) -> String {

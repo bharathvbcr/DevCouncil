@@ -196,10 +196,12 @@ fn python_superclass_dispatch_still_abstains() {
     );
 }
 
-/// A receiver with segments left over is deliberately left alone — the rewrite
-/// claims only what it can prove.
+/// A receiver with segments left over spends the same inline `super`s a bare
+/// one does. The remainder stays on the receiver so the resolver can place the
+/// type; it is not dropped and it is not left as a `super` this nesting has
+/// already paid for.
 #[test]
-fn a_multi_segment_super_receiver_is_not_rewritten() {
+fn a_multi_segment_super_receiver_spends_inline_supers() {
     let extraction = extract_file(
         "crates/thing/src/work.rs",
         "pub struct Thing;\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        let _ = super::Thing::build();\n    }\n}\n",
@@ -211,8 +213,9 @@ fn a_multi_segment_super_receiver_is_not_rewritten() {
         .expect("the call is extracted");
     assert_eq!(
         call.receiver_expr.as_deref(),
-        Some("super::Thing"),
-        "only a receiver of exactly `super` is absorbed; anything further is \
-         left for a rung that can place it"
+        Some("self::Thing"),
+        "one `super` pays for `mod tests`; `Thing` is this file's type, spelled \
+         `self::Thing`. got {:?}",
+        call.receiver_expr
     );
 }

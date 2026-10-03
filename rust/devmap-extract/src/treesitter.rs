@@ -6690,22 +6690,51 @@ fn collect_rust_use_leaves(
 /// same answer by the same rule: once the nesting absorbs the `super`, the
 /// target is this file's own module, spelled `self`.
 ///
-/// Deliberately restricted to a receiver that is *exactly* `super`. A receiver
-/// with segments left over (`super::Thing`) names something this function
-/// cannot place without the file's own inline-module table, so it is returned
-/// unchanged — losing an edge rather than inventing one.
+/// Leading `super` segments are spent against the inline-module depth, the
+/// same accounting [`rust_use_specifier`] uses. `super::helper()` inside
+/// `mod tests` becomes `self`. `super::Thing::build()` becomes `self::Thing`:
+/// one `super` paid for the inline module, and `Thing` is still this file's
+/// type. A `super` that outlasts the nesting is left in the receiver
+/// (`super::super::helper` at depth one stays `super::helper`) so the resolver
+/// can walk out of the file. Anything that is not a path of plain identifiers
+/// is returned unchanged.
 ///
 /// Depth beyond one is treated the same way because the extractor flattens
 /// inline modules: a `fn` inside `mod a { mod b { … } }` is extracted with the
 /// file-level qualified name, so every `super` that stays inside the file lands
 /// in the one namespace the file has.
 fn rust_absorb_inline_super(node: Node, receiver: Option<String>) -> Option<String> {
-    match receiver {
-        Some(receiver) if receiver == "super" && rust_inline_module_depth(node) > 0 => {
-            Some("self".to_string())
-        }
-        other => other,
+    let receiver = receiver?;
+    let depth = rust_inline_module_depth(node);
+    if depth == 0
+        || !receiver.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    {
+        return Some(receiver);
     }
+    let mut segments: Vec<&str> = receiver.split("::").collect();
+    if segments.first() != Some(&"super") {
+        return Some(receiver);
+    }
+    let mut spent = 0usize;
+    while spent < depth && segments.first() == Some(&"super") {
+        segments.remove(0);
+        spent += 1;
+    }
+    if spent == 0 {
+        return Some(receiver);
+    }
+    if segments.is_empty() {
+        return Some("self".to_string());
+    }
+    if segments.first() == Some(&"super") {
+        return Some(segments.join("::"));
+    }
+    Some(format!("self::{}", segments.join("::")))
 }
 
 fn rust_inline_module_depth(node: Node) -> usize {
