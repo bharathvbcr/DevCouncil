@@ -48,6 +48,255 @@ fn number(store: &Store, raw: &str, path: &str) -> i64 {
 }
 const PREPARE: &str = r#"{"id":"run","request_id":"prepare","expected_revision":0,"task_id":"t","source_revision":1,"repository_id":"r","repository_revision":1,"provider":"codex","permission_mode":"ask","cwd":"/checkout","git_dir":"/checkout/.git","git_common_dir":"/checkout/.git","head_oid":null}"#;
 const CLAIM: &str = r#"{"id":"run","request_id":"claim","expected_revision":1,"owner_id":"host-one","session_id":"terminal-one"}"#;
+/// The profile-wide bound in `runs.rs`. Transcribed on purpose: the refusal
+/// message is asserted to name it, so a change there fails here.
+const CAPACITY: usize = 8;
+
+/// A preparation for the same repository in a linked worktree `name`.
+fn in_worktree(name: &str) -> String {
+    PREPARE
+        .replace("\"run\"", &format!("\"run-{name}\""))
+        .replace("\"prepare\"", &format!("\"prepare-{name}\""))
+        .replace(
+            "\"cwd\":\"/checkout\"",
+            &format!("\"cwd\":\"/worktrees/{name}\""),
+        )
+        .replace(
+            "\"git_dir\":\"/checkout/.git\"",
+            &format!("\"git_dir\":\"/checkout/.git/worktrees/{name}\""),
+        )
+}
+fn reconcile(id: &str, revision: i64, reconciler: &str, prior: &str, reason: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","request_id":"reconcile-{id}-{reconciler}-{revision}","expected_revision":{revision},"owner_id":"{reconciler}","prior_owner_id":"{prior}","reason":"{reason}"}}"#
+    )
+}
+
+#[test]
+fn worktrees_of_one_repository_run_concurrently_but_one_checkout_holds_one_run() {
+    let (store, _) = fixture();
+    call(&store, "runs.prepare", PREPARE);
+    // Same repository, its own working tree: admitted. This is the case the
+    // per-repository slot refused, and the reason only one task could run.
+    call(&store, "runs.prepare", &in_worktree("a"));
+    call(&store, "runs.prepare", &in_worktree("b"));
+    let again = in_worktree("a")
+        .replace("\"run-a\"", "\"run-a2\"")
+        .replace("\"prepare-a\"", "\"prepare-a2\"");
+    let refused = request(&store, "runs.prepare", &again).unwrap_err();
+    assert_eq!(refused.code, "checkout_busy");
+    assert!(refused.message.contains("another worktree"));
+    let main_again = PREPARE
+        .replace("\"run\"", "\"run-main2\"")
+        .replace("\"prepare\"", "\"prepare-main2\"");
+    assert_eq!(
+        request(&store, "runs.prepare", &main_again)
+            .unwrap_err()
+            .code,
+        "checkout_busy"
+    );
+    assert_eq!(
+        number(&store, &call(&store, "runs.list", "{}"), "$.total"),
+        3
+    );
+    // Releasing one checkout frees exactly that checkout.
+    call(
+        &store,
+        "runs.cancel",
+        r#"{"id":"run-a","request_id":"cancel-a","expected_revision":1}"#,
+    );
+    call(&store, "runs.prepare", &again);
+    assert_eq!(
+        request(&store, "runs.prepare", &main_again)
+            .unwrap_err()
+            .code,
+        "checkout_busy"
+    );
+}
+
+#[test]
+fn a_reconciled_attempt_releases_its_checkout_as_an_uncertain_exit_with_a_notice() {
+    let (store, _) = fixture();
+    call(&store, "runs.prepare", PREPARE);
+    call(&store, "runs.claim", CLAIM);
+    call(
+        &store,
+        "runs.started",
+        r#"{"id":"run","request_id":"started","expected_revision":2,"owner_id":"host-one","session_id":"terminal-one","process_id":42,"process_start":"native-birth"}"#,
+    );
+    let second = PREPARE
+        .replace("\"run\"", "\"second\"")
+        .replace("\"prepare\"", "\"second-prepare\"");
+    assert_eq!(
+        request(&store, "runs.prepare", &second).unwrap_err().code,
+        "checkout_busy"
+    );
+    let saved = call(
+        &store,
+        "runs.reconcile",
+        &reconcile(
+            "run",
+            3,
+            "host-two",
+            "host-one",
+            "owner process 7 is gone; child 42 is gone",
+        ),
+    );
+    assert_eq!(text(&store, &saved, "$.item.state"), "exited");
+    assert_eq!(number(&store, &saved, "$.item.outcome_uncertain"), 1);
+    let exit: Option<i64> = store
+        .connection()
+        .query_row(
+            "SELECT json_extract(?1,'$.item.exit_code')",
+            [&saved],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(exit, None, "a reconciler never observed an exit status");
+    assert!(text(&store, &saved, "$.item.reason").starts_with("Reconciled: owner process 7"));
+    // The original owner and session are kept as the record of who ran it.
+    assert_eq!(text(&store, &saved, "$.item.owner_id"), "host-one");
+    call(&store, "runs.prepare", &second);
+    let inbox = call(&store, "attention.list", r#"{"filter":"all"}"#);
+    assert_eq!(text(&store, &inbox, "$.items[0].kind"), "run_unresolved");
+    assert_eq!(text(&store, &inbox, "$.items[0].target_id"), "run");
+    // An ended attempt cannot be reconciled again, nor finished by its owner.
+    assert_eq!(
+        request(
+            &store,
+            "runs.reconcile",
+            &reconcile("run", 4, "host-three", "host-one", "again")
+        )
+        .unwrap_err()
+        .code,
+        "invalid_state"
+    );
+}
+
+#[test]
+fn reconciliation_refuses_the_owner_a_misnamed_owner_an_unstarted_attempt_and_no_evidence() {
+    let (store, _) = fixture();
+    call(&store, "runs.prepare", PREPARE);
+    // Prepared: nothing was ever claimed, and `cancel` is how that ends.
+    assert_eq!(
+        request(
+            &store,
+            "runs.reconcile",
+            &reconcile("run", 1, "host-two", "host-one", "gone")
+        )
+        .unwrap_err()
+        .code,
+        "invalid_state"
+    );
+    call(&store, "runs.claim", CLAIM);
+    for (input, code) in [
+        // The live owner reports its own outcome; reconcile is for the others.
+        (
+            reconcile("run", 2, "host-one", "host-one", "gone"),
+            "invalid_state",
+        ),
+        // A reconciler must name the owner it actually judged.
+        (
+            reconcile("run", 2, "host-two", "host-zero", "gone"),
+            "owner_mismatch",
+        ),
+        (
+            reconcile("run", 2, "host-two", "host-one", "   "),
+            "invalid_input",
+        ),
+        (
+            reconcile("run", 1, "host-two", "host-one", "gone"),
+            "revision_conflict",
+        ),
+    ] {
+        assert_eq!(
+            request(&store, "runs.reconcile", &input).unwrap_err().code,
+            code,
+            "{input}"
+        );
+    }
+    let extra =
+        reconcile("run", 2, "host-two", "host-one", "gone").replacen('{', r#"{"exit_code":0,"#, 1);
+    assert_eq!(
+        request(&store, "runs.reconcile", &extra).unwrap_err().code,
+        "invalid_input",
+        "a reconciliation cannot claim an exit status"
+    );
+    assert_eq!(
+        text(
+            &store,
+            &call(&store, "runs.get", r#"{"id":"run"}"#),
+            "$.item.state"
+        ),
+        "starting"
+    );
+}
+
+#[test]
+fn concurrent_preparations_admit_one_per_checkout_and_never_exceed_capacity() {
+    let (store, _) = fixture();
+    let dir = std::env::temp_dir().join(format!(
+        "dc-run-slots-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("profile.sqlite");
+    store
+        .connection()
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    let race = |inputs: Vec<String>| -> Vec<Result<String, dc_store::workbench::Error>> {
+        let barrier = Arc::new(std::sync::Barrier::new(inputs.len()));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = inputs
+                .into_iter()
+                .map(|input| {
+                    let barrier = barrier.clone();
+                    let path = path.clone();
+                    scope.spawn(move || {
+                        let mut store = Store::open(&path).unwrap();
+                        store.set_clock(|| 1000);
+                        barrier.wait();
+                        request(&store, "runs.prepare", &input)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    };
+    // Twelve writers for one checkout: exactly one wins, every loser is told
+    // the checkout is taken — never a store error, never two runs.
+    let same: Vec<String> = (0..12)
+        .map(|i| {
+            PREPARE
+                .replace("\"run\"", &format!("\"same-{i}\""))
+                .replace("\"prepare\"", &format!("\"same-prepare-{i}\""))
+        })
+        .collect();
+    let outcomes = race(same);
+    assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), 1);
+    for refusal in outcomes.iter().filter_map(|r| r.as_ref().err()) {
+        assert_eq!(refusal.code, "checkout_busy", "{}", refusal.message);
+    }
+    // Then sixteen distinct worktrees: the remaining capacity is admitted
+    // and the rest are refused for capacity, not for a busy checkout.
+    let outcomes = race((0..16).map(|i| in_worktree(&format!("w{i}"))).collect());
+    assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), CAPACITY - 1);
+    for refusal in outcomes.iter().filter_map(|r| r.as_ref().err()) {
+        assert_eq!(refusal.code, "capacity_reached", "{}", refusal.message);
+    }
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(
+        number(&reopened, &call(&reopened, "runs.list", "{}"), "$.total"),
+        CAPACITY as i64
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
 
 #[test]
 fn failed_managed_initialization_keeps_process_evidence_and_never_forges_a_thread() {
@@ -427,7 +676,7 @@ fn uncertain_processes_keep_the_repository_reserved_and_cannot_turn_into_success
         .replace("\"prepare\"", "\"second-prepare\"");
     assert_eq!(
         request(&store, "runs.prepare", &other).unwrap_err().code,
-        "repository_busy"
+        "checkout_busy"
     );
     let false_success = r#"{"id":"run","request_id":"false-success","expected_revision":3,"owner_id":"host-one","session_id":"terminal-one","outcome":"exited","exit_code":0,"reason":"Time passed"}"#;
     assert_eq!(
@@ -560,7 +809,7 @@ fn independent_connections_share_one_consumable_claim_and_reopening_cannot_reiss
 #[test]
 fn preparation_limits_and_pagination_preserve_counts_without_copying_source_bodies() {
     let (store, _) = fixture();
-    for i in 0..3 {
+    for i in 0..=CAPACITY {
         call(
             &store,
             "repositories.put",
@@ -584,16 +833,19 @@ fn preparation_limits_and_pagination_preserve_counts_without_copying_source_bodi
             .replace("\"r\"", &format!("\"r{i}\""))
             .replace("/checkout", &format!("/checkout/{i}"))
     };
-    call(&store, "runs.prepare", &prepare(0));
-    call(&store, "runs.prepare", &prepare(1));
-    assert_eq!(
-        request(&store, "runs.prepare", &prepare(2))
-            .unwrap_err()
-            .code,
-        "capacity_reached"
+    for i in 0..CAPACITY {
+        call(&store, "runs.prepare", &prepare(i));
+    }
+    let full = request(&store, "runs.prepare", &prepare(CAPACITY)).unwrap_err();
+    assert_eq!(full.code, "capacity_reached");
+    assert!(
+        full.message
+            .starts_with(&format!("{CAPACITY} runs are already")),
+        "the refusal must state the bound it enforces: {}",
+        full.message
     );
     let first = call(&store, "runs.list", r#"{"limit":1}"#);
-    assert_eq!(number(&store, &first, "$.total"), 2);
+    assert_eq!(number(&store, &first, "$.total"), CAPACITY as i64);
     assert_eq!(number(&store, &first, "$.shown"), 1);
     assert!(!first.contains("Large source text"));
     let cursor = text(&store, &first, "$.next_cursor");
@@ -602,15 +854,15 @@ fn preparation_limits_and_pagination_preserve_counts_without_copying_source_bodi
         "runs.list",
         &format!(r#"{{"limit":1,"cursor":"{cursor}"}}"#),
     );
-    assert_eq!(number(&store, &second, "$.total"), 2);
+    assert_eq!(number(&store, &second, "$.total"), CAPACITY as i64);
     assert_eq!(text(&store, &second, "$.items[0].id"), "run-1");
-    assert_eq!(number(&store, &second, "$.has_more"), 0);
+    assert_eq!(number(&store, &second, "$.has_more"), 1);
     call(
         &store,
         "runs.cancel",
         r#"{"id":"run-0","request_id":"cancel-zero","expected_revision":1}"#,
     );
-    call(&store, "runs.prepare", &prepare(2));
+    call(&store, "runs.prepare", &prepare(CAPACITY));
     assert_eq!(
         number(
             &store,
@@ -626,7 +878,7 @@ fn preparation_limits_and_pagination_preserve_counts_without_copying_source_bodi
             .query_row("SELECT count(*) FROM work_run_inputs", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        3
+        CAPACITY as i64 + 1
     );
     assert!(
         store
