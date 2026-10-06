@@ -511,6 +511,15 @@ fn a_launch_snapshot_is_durable_and_claim_receipts_never_authorize_a_second_spaw
         text(&store, &captured, "$.item.brief.task.description"),
         "Preserve exact evidence"
     );
+    // The attempt records the guidance it was given, so what an agent was told
+    // does not depend on which host or harness binary launched it.
+    assert!(
+        text(&store, &captured, "$.item.brief.markdown").starts_with(&format!(
+            "# Task brief v1\n\n{}\n{}\n\n## Title\n",
+            dc_store::workbench::AGENT_GUIDANCE_HEADING,
+            dc_store::workbench::AGENT_GUIDANCE.trim()
+        ))
+    );
     let claimed = call(&store, "runs.claim", CLAIM);
     assert_eq!(text(&store, &claimed, "$.item.state"), "starting");
     assert_eq!(

@@ -214,6 +214,56 @@ fn a_large_brief_preserves_unicode_and_every_criterion_without_truncation() {
     assert!(markdown.ends_with(&format!("- [ ] {}\n", criteria[39])));
 }
 
+/// Every handoff (a copied task, a terminal launch, a managed run) delivers
+/// this export, so the guidance travels in it rather than in each host. It
+/// comes first, because an agent should read how to work before the task; it
+/// sits under one heading of its own with no heading inside it, so a reader
+/// that parses briefs back can skip exactly that section; and it names no
+/// completion step, because an inspect launch may not change the task's status.
+#[test]
+fn a_brief_opens_with_the_agent_guidance_and_then_the_task() {
+    use dc_store::workbench::{AGENT_GUIDANCE, AGENT_GUIDANCE_HEADING};
+    let store = fixture();
+    let result = call(
+        &store,
+        "items.brief.get",
+        r#"{"id":"t","expected_revision":1}"#,
+    );
+    let markdown = field(&store, &result, "$.item.markdown");
+    let guidance = AGENT_GUIDANCE.trim();
+    assert!(
+        markdown.starts_with(&format!(
+            "# Task brief v1\n\n{AGENT_GUIDANCE_HEADING}\n{guidance}\n\n## Title\nPreserve E42\n"
+        )),
+        "{markdown}"
+    );
+    assert_eq!(markdown.matches(AGENT_GUIDANCE_HEADING).count(), 1);
+    assert!(guidance.lines().all(|line| !line.starts_with('#')));
+    for named in [
+        "Use the title as the goal",
+        "Preserve the author's intent",
+        "Read before you write",
+        "AGENTS.md, CLAUDE.md",
+        "Never write over a file you have not read",
+        "gitpulse_insights",
+        "gitpulse_collision_risk",
+        "devmap_impact",
+        "devmap_affected_tests",
+        "devcouncil_* MCP tools",
+        "check its gates.mode",
+        "absolute repo_path",
+        "Every fix ships with a test that fails without it",
+        "Verify before you claim",
+        "could not run is never reported as one that passed",
+    ] {
+        assert!(guidance.contains(named), "guidance omits {named:?}");
+    }
+    assert!(!guidance.contains("gitpulse_complete_task"));
+    // Every brief pays for it, and a stored task near the export bound is
+    // refused rather than cut; keep the standing cost small.
+    assert!(AGENT_GUIDANCE.len() < 4096, "{}", AGENT_GUIDANCE.len());
+}
+
 #[test]
 fn an_empty_description_and_criteria_do_not_invent_instructions() {
     let store = fixture();
