@@ -9,6 +9,7 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/dcverify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/lappi"
 )
 
 // Gap is one verification finding. Field names and nullability match the
@@ -134,6 +135,11 @@ type Input struct {
 	// change. Empty means the coverage gate does not run; the findings gates
 	// still do.
 	CoveragePath string
+
+	// Lappi asks the Lappi agent about each changed file and records the
+	// exchange, as DEVCOUNCIL_LAPPI_ASK / DEVCOUNCIL_LAPPI_COLLECT say. Nil
+	// means neither. It can only add advisory, non-blocking gaps.
+	Lappi *lappi.Asker
 
 	// RunCommand executes one verification command. Nil means commands are
 	// skipped with reason "command runner unavailable".

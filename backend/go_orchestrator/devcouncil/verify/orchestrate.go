@@ -108,6 +108,10 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 	meta.CoverageMeasured = rigor.coverageMeasured
 	meta.CoverageSkippedReason = rigor.coverageSkippedReason
 
+	// Lappi, admission only: it may append advisory, non-blocking gaps and
+	// nothing else (verify/lappi.go). Nil in.Lappi — the default — skips it.
+	gaps = appendLappiAdvisory(gaps, runLappi(ctx, in, taskID, gaps))
+
 	meta.CompilerActive = false
 	meta.VerificationMode = "coarse"
 	gaps = NormalizeGaps(gaps)
@@ -404,6 +408,7 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID, 
 		RunCommand:   DefaultRunCommand(root),
 		Rigor:        RigorClient(root),
 		CoveragePath: coveragePath,
+		Lappi:        LappiAsker(),
 	}
 	gaps, meta := Run(ctx, in)
 	result := ToMCP(taskID, gaps, meta)
