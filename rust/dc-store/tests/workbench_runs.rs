@@ -979,3 +979,164 @@ fn bypass_is_explicit_for_each_new_attempt_and_claimed_runs_cannot_be_cancelled_
         "invalid_input"
     );
 }
+
+/// The host names how many attempts may be live at once; the store enforces
+/// exactly that number, refuses a malformed one as input, and never lets a
+/// host raise it past the shared ceiling.
+#[test]
+fn a_host_named_run_limit_is_enforced_exactly_and_bounded() {
+    use dc_store::workbench::{DEFAULT_ACTIVE_RUNS, MAX_ACTIVE_RUNS_CEILING};
+    assert_eq!(DEFAULT_ACTIVE_RUNS, CAPACITY as i64);
+    let with_limit = |name: &str, limit: &str| {
+        in_worktree(name).replacen('{', &format!(r#"{{"max_active_runs":{limit},"#), 1)
+    };
+    let (store, _) = fixture();
+    for bad in [
+        "0",
+        "-1",
+        "65",
+        "1.5",
+        "\"8\"",
+        "true",
+        "[8]",
+        "9007199254740991",
+    ] {
+        let refused = request(&store, "runs.prepare", &with_limit("bad", bad)).unwrap_err();
+        assert_eq!(
+            refused.code, "invalid_input",
+            "max_active_runs={bad}: {}",
+            refused.message
+        );
+    }
+    assert_eq!(
+        number(&store, &call(&store, "runs.list", "{}"), "$.total"),
+        0,
+        "a refused limit must not leave a run behind"
+    );
+    // A limit of one admits one, and the refusal names the limit in force.
+    call(&store, "runs.prepare", &with_limit("one", "1"));
+    let full = request(&store, "runs.prepare", &with_limit("two", "1")).unwrap_err();
+    assert_eq!(full.code, "capacity_reached");
+    assert!(
+        full.message.starts_with("1 runs are already"),
+        "{}",
+        full.message
+    );
+    // Raising it admits more at once; lowering it below what is live refuses
+    // new work without touching the attempts already admitted.
+    for i in 0..11 {
+        call(
+            &store,
+            "runs.prepare",
+            &with_limit(&format!("raised-{i}"), "12"),
+        );
+    }
+    let full = request(&store, "runs.prepare", &with_limit("raised-12", "12")).unwrap_err();
+    assert_eq!(full.code, "capacity_reached");
+    let lowered = request(&store, "runs.prepare", &with_limit("lowered", "2")).unwrap_err();
+    assert_eq!(lowered.code, "capacity_reached");
+    assert!(
+        lowered.message.starts_with("2 runs are already"),
+        "{}",
+        lowered.message
+    );
+    assert_eq!(
+        number(&store, &call(&store, "runs.list", "{}"), "$.total"),
+        12
+    );
+    // Omitted means the default, so a client that never names a limit keeps
+    // the bound it always had.
+    let (store, _) = fixture();
+    for i in 0..CAPACITY {
+        call(
+            &store,
+            "runs.prepare",
+            &in_worktree(&format!("default-{i}")),
+        );
+    }
+    assert_eq!(
+        request(&store, "runs.prepare", &in_worktree("default-over"))
+            .unwrap_err()
+            .code,
+        "capacity_reached"
+    );
+    // And the ceiling itself is reachable, and is the last admission.
+    let (store, _) = fixture();
+    let ceiling = MAX_ACTIVE_RUNS_CEILING.to_string();
+    for i in 0..MAX_ACTIVE_RUNS_CEILING {
+        call(
+            &store,
+            "runs.prepare",
+            &with_limit(&format!("c{i}"), &ceiling),
+        );
+    }
+    assert_eq!(
+        request(&store, "runs.prepare", &with_limit("c-over", &ceiling))
+            .unwrap_err()
+            .code,
+        "capacity_reached"
+    );
+}
+
+/// Eighty writers race a limit of sixty-four, each in its own worktree: the
+/// admission count is exactly the limit — the check and the insert are one
+/// transaction, so concurrency can never overshoot a raised limit.
+#[test]
+fn racing_preparations_never_exceed_a_raised_limit() {
+    use dc_store::workbench::MAX_ACTIVE_RUNS_CEILING;
+    let (store, _) = fixture();
+    let dir = std::env::temp_dir().join(format!(
+        "dc-run-limit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("profile.sqlite");
+    store
+        .connection()
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    let inputs: Vec<String> = (0..80)
+        .map(|i| {
+            in_worktree(&format!("race-{i}")).replacen(
+                '{',
+                &format!(r#"{{"max_active_runs":{MAX_ACTIVE_RUNS_CEILING},"#),
+                1,
+            )
+        })
+        .collect();
+    let barrier = Arc::new(std::sync::Barrier::new(inputs.len()));
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = inputs
+            .into_iter()
+            .map(|input| {
+                let barrier = barrier.clone();
+                let path = path.clone();
+                scope.spawn(move || {
+                    let mut store = Store::open(&path).unwrap();
+                    store.set_clock(|| 1000);
+                    barrier.wait();
+                    request(&store, "runs.prepare", &input)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(
+        outcomes.iter().filter(|r| r.is_ok()).count() as i64,
+        MAX_ACTIVE_RUNS_CEILING
+    );
+    for refusal in outcomes.iter().filter_map(|r| r.as_ref().err()) {
+        assert_eq!(refusal.code, "capacity_reached", "{}", refusal.message);
+    }
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(
+        number(&reopened, &call(&reopened, "runs.list", "{}"), "$.total"),
+        MAX_ACTIVE_RUNS_CEILING
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
