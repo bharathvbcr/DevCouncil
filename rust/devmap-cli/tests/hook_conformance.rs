@@ -1588,6 +1588,17 @@ fn briefs_agree_with_status_across_many_worktrees_under_concurrency() {
         .status
         .success());
 
+    let main_status: serde_json::Value = serde_json::from_slice(
+        &Command::new(DEVMAP)
+            .args(["--json", "status"])
+            .current_dir(&main)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let main_nodes = main_status["node_count"].as_u64().unwrap();
+
     std::fs::create_dir_all(main.join(".claude/worktrees")).unwrap();
     let mut lanes = Vec::new();
     for n in 0..LANES {
@@ -1595,15 +1606,18 @@ fn briefs_agree_with_status_across_many_worktrees_under_concurrency() {
         git(&main, &["worktree", "add", "-q", "--detach", &rel]);
         let lane = main.join(&rel);
         let built = n % 2 == 0;
+        // A distinct symbol count per lane, built or not: a brief that quoted
+        // a different tree's index would name a number that is not this
+        // lane's. Bare lanes need it too, because SessionStart starts a
+        // background build in a worktree of an indexed repository, so a later
+        // thread in the storm may find a bare lane indexed — by its own build,
+        // which must not count like the main checkout's.
+        let mut body = String::new();
+        for f in 0..=n {
+            body.push_str(&format!("def lane{n}_fn{f}():\n    return {f}\n"));
+        }
+        std::fs::write(lane.join("lane.py"), body).unwrap();
         if built {
-            // A distinct symbol count per lane: a brief that quoted a
-            // different tree's index would name a number that is not this
-            // lane's.
-            let mut body = String::new();
-            for f in 0..=n {
-                body.push_str(&format!("def lane{n}_fn{f}():\n    return {f}\n"));
-            }
-            std::fs::write(lane.join("lane.py"), body).unwrap();
             assert!(Command::new(DEVMAP)
                 .args(["--json", "build", "."])
                 .current_dir(&lane)
@@ -1662,10 +1676,22 @@ fn briefs_agree_with_status_across_many_worktrees_under_concurrency() {
                         "{} was briefed with counts that are not its own: wanted {expected:?}, got {text:?}",
                         lane.display()
                     );
-                } else {
+                } else if text.contains("ready,") {
+                    // Indexed mid-storm by the background build an earlier
+                    // brief of this same lane started. Its counts are its own
+                    // only if they are not the main checkout's.
                     assert!(
-                        !text.contains("ready,"),
-                        "{} is not indexed but was briefed as ready: {text:?}",
+                        !text.contains(&format!("{main_nodes} symbols")),
+                        "{} was briefed as ready with the main checkout's counts: {text:?}",
+                        lane.display()
+                    );
+                } else {
+                    // Before the background build, or while it runs: the store
+                    // either does not exist yet or holds no generation.
+                    assert!(
+                        text.contains("no DevMap index in this working tree")
+                            || text.contains("NOT QUERYABLE"),
+                        "{} is not indexed and was not told so: {text:?}",
                         lane.display()
                     );
                 }
