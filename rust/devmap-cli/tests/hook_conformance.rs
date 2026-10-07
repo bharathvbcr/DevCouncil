@@ -1729,6 +1729,29 @@ fn an_unindexed_worktree_is_told_how_to_index_itself_on_session_start_only() {
     );
     let lane = main.join(".claude/worktrees/lane");
 
+    // PreToolUse first: SessionStart now starts this lane's own build (the
+    // main checkout is indexed), and the authorization leg is about a tree
+    // that has none.
+    let pre = run_hook(
+        "pre-tool-use",
+        serde_json::to_string(&json!({
+            "session_id": "unindexed-notice",
+            "hook_event_name": "PreToolUse",
+            "cwd": lane.to_string_lossy(),
+            "tool_name": "Read",
+            "tool_input": {"file_path": lane.join("alpha.py").to_string_lossy()},
+        }))
+        .unwrap()
+        .as_bytes(),
+        &[],
+    );
+    assert_eq!(pre.code, Some(0), "{}", pre.stderr);
+    assert!(
+        pre.stdout.trim().is_empty(),
+        "PreToolUse must emit nothing for an unindexed tree, got {:?}",
+        pre.stdout
+    );
+
     let start = run_hook(
         "session-start",
         serde_json::to_string(&json!({
@@ -1765,27 +1788,101 @@ fn an_unindexed_worktree_is_told_how_to_index_itself_on_session_start_only() {
         start.stdout
     );
 
-    // Same tree, same absent index, on the event that decides authorization.
-    let pre = run_hook(
-        "pre-tool-use",
+    // The main checkout is indexed, so this repository opted in: the hook
+    // started the lane's own build rather than leaving the agent to skip it
+    // and query the parent's index (ScholarLM, 2026-10-07).
+    assert!(
+        start.stdout.contains("started here in the background"),
+        "an opted-in worktree's build must be started, not only named: {:?}",
+        start.stdout
+    );
+    assert!(
+        wait_until_queryable(&lane, Duration::from_secs(120)),
+        "the background build never made the lane queryable"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Whether `root`'s own store answers `devmap status` as query-ready within
+/// `limit`. Bounded: a build that never lands fails the test, it does not hang
+/// it.
+fn wait_until_queryable(root: &Path, limit: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        let status = Command::new(DEVMAP)
+            .args(["--json", "status"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let ready = serde_json::from_slice::<serde_json::Value>(&status.stdout)
+            .ok()
+            .and_then(|value| value.get("query_ready").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
+        let building = root
+            .join(".devcouncil/codeintel/hook-build.running")
+            .exists();
+        if ready && !building {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
+/// The control: a linked worktree whose main checkout has no store has not
+/// opted in, so the hook keeps its rule that it never creates a store — it
+/// names `devmap build` and starts nothing.
+#[test]
+fn an_unindexed_worktree_of_an_unindexed_repository_is_not_built() {
+    let base = scratch("unindexed-optout");
+    let main = base.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    git(&main, &["init", "-q"]);
+    std::fs::write(main.join("alpha.py"), "def alpha():\n    return 1\n").unwrap();
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-qm", "fixture"]);
+    std::fs::create_dir_all(main.join(".claude/worktrees")).unwrap();
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            ".claude/worktrees/lane",
+        ],
+    );
+    let lane = main.join(".claude/worktrees/lane");
+
+    let start = run_hook(
+        "session-start",
         serde_json::to_string(&json!({
-            "session_id": "unindexed-notice",
-            "hook_event_name": "PreToolUse",
+            "session_id": "unindexed-optout",
+            "hook_event_name": "SessionStart",
             "cwd": lane.to_string_lossy(),
-            "tool_name": "Read",
-            "tool_input": {"file_path": lane.join("alpha.py").to_string_lossy()},
+            "source": "startup",
         }))
         .unwrap()
         .as_bytes(),
         &[],
     );
-    assert_eq!(pre.code, Some(0), "{}", pre.stderr);
+    assert_eq!(start.code, Some(0), "{}", start.stderr);
     assert!(
-        pre.stdout.trim().is_empty(),
-        "PreToolUse must emit nothing for an unindexed tree, got {:?}",
-        pre.stdout
+        start.stdout.contains("Run `devmap build` here"),
+        "{:?}",
+        start.stdout
     );
-
+    assert!(
+        !start.stdout.contains("background"),
+        "nothing was started: {:?}",
+        start.stdout
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        !lane.join(".devcouncil").exists() && !lane.join(".devmap").exists(),
+        "a hook must not create a store in a repository that never opted in"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 
