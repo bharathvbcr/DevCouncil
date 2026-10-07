@@ -8706,6 +8706,8 @@ fn statement_node(root: Node, start: usize) -> Option<Node> {
 /// x.run())` in JavaScript or Python, `c = Wrap(func() { c.Ping() })` in Go.
 /// A Rust `let` and a Go `:=` or `var` declare a fresh variable whose scope
 /// begins after the statement, so even a closure there reads the earlier one.
+/// A Rust closure (`closure_expression`) is never the exception: it captures
+/// when it is created, so `w = make(|| w.run())` reads the earlier `w` too.
 fn use_reads_the_earlier_binding(region: Node, start: usize, use_node: Node) -> bool {
     let Some(statement) = statement_node(region, start) else {
         return false;
@@ -8725,7 +8727,16 @@ fn use_reads_the_earlier_binding(region: Node, start: usize, use_node: Node) -> 
         if parent.id() == statement.id() {
             break;
         }
-        if is_callable_node(parent) || parent.kind() == "func_literal" {
+        // Closures that read a captured variable when they run.
+        if matches!(
+            parent.kind(),
+            "func_literal"
+                | "arrow_function"
+                | "function_expression"
+                | "function"
+                | "generator_function"
+                | "lambda"
+        ) {
             return false;
         }
         node = parent;

@@ -455,6 +455,44 @@ pub fn project() {
     );
 }
 
+/// A Rust closure captures when it is created, and the right-hand side is
+/// evaluated before the assignment — so even a closure in a *reassignment*
+/// reads the earlier value, unlike a Go, JavaScript or Python closure.
+#[test]
+fn a_rust_closure_in_a_reassignment_reads_the_earlier_value() {
+    let kinds = "\
+pub struct Old;
+pub struct Wrapper;
+impl Old {
+    pub fn new() -> Self { Old }
+    pub fn zzrun(&self) {}
+}
+impl Wrapper {
+    pub fn zzrun(&self) {}
+}
+pub fn make<F: Fn()>(f: F) -> Wrapper { f(); Wrapper }
+";
+    let caller = "\
+use crate::kinds::{make, Old};
+pub fn swap() {
+    let mut w = Old::new();
+    w = make(|| w.zzrun());
+}
+";
+    let targets = calls_from(
+        &[("src/kinds.rs", kinds), ("src/swap.rs", caller), ("src/lib.rs", "mod kinds;\nmod swap;\n")],
+        "src/swap.rs::swap",
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/kinds.rs::Old.zzrun"),
+        "got {targets:?}"
+    );
+    assert!(
+        !targets.iter().any(|t| t == "src/kinds.rs::Wrapper.zzrun"),
+        "the closure captured `w` before the assignment: {targets:?}"
+    );
+}
+
 /// Go's `:=` is a Rust `let`: the inner `c` is in scope only after its
 /// statement, so the closure inside its right-hand side captures the outer `c`.
 #[test]
