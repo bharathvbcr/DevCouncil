@@ -90,6 +90,193 @@ fn a_go_var_types_the_fields_its_value_receiver_methods_are_called_on() {
     }
 }
 
+const COLLECTED: &str = "\
+pub struct Collected;
+
+impl Collected {
+    pub fn can_skip(&self) -> bool { true }
+    pub fn merge(&mut self) {}
+}
+";
+
+fn rust_calls(user: &str, method: &str) -> Vec<String> {
+    // With a second `Collected` in the corpus, as a real workspace has: the
+    // corpus-wide receiver map withdraws a type name two declarations share,
+    // so only what the binding itself states can answer.
+    let (_, result) = resolve(&[
+        ("src/collected.rs", COLLECTED),
+        ("src/user.rs", user),
+        ("other/src/lib.rs", "pub struct Collected;\n"),
+    ]);
+    calls_to(&result, &format!("src/collected.rs::Collected.{method}"))
+        .into_iter()
+        .map(|edge| edge.source_symbol.clone())
+        .collect()
+}
+
+#[test]
+fn an_ok_arm_on_a_mutex_lock_is_a_guard_that_derefs_to_the_inner_type() {
+    let user = "\
+use crate::collected::Collected;
+use std::sync::Mutex;
+
+fn skippable(shared: &Mutex<Collected>) -> bool {
+    match shared.lock() {
+        Ok(guard) => guard.can_skip(),
+        Err(poisoned) => poisoned.into_inner().can_skip(),
+    }
+}
+";
+    assert_eq!(rust_calls(user, "can_skip"), vec!["src/user.rs::skippable"]);
+}
+
+#[test]
+fn an_unwrapped_lock_in_a_let_is_a_guard() {
+    for (spelling, caller) in [
+        ("let mut guard = shared.lock().unwrap();", "a"),
+        ("let mut guard = shared.lock().expect(\"poisoned\");", "b"),
+        ("let mut guard = shared.lock()?;", "c"),
+    ] {
+        let user = format!(
+            "use crate::collected::Collected;\nuse std::sync::{{Arc, Mutex}};\n\n\
+             fn {caller}(shared: Arc<Mutex<Collected>>) -> Result<(), E> {{\n    \
+             {spelling}\n    guard.merge();\n    Ok(())\n}}\n"
+        );
+        assert_eq!(
+            rust_calls(&user, "merge"),
+            vec![format!("src/user.rs::{caller}")],
+            "`{spelling}` over an `Arc<Mutex<Collected>>` is a guard over Collected"
+        );
+    }
+}
+
+#[test]
+fn an_rwlock_read_in_if_let_is_a_guard() {
+    let user = "\
+use crate::collected::Collected;
+use std::sync::RwLock;
+
+fn peek(shared: &RwLock<Collected>) -> bool {
+    if let Ok(view) = shared.read() {
+        return view.can_skip();
+    }
+    false
+}
+";
+    assert_eq!(rust_calls(user, "can_skip"), vec!["src/user.rs::peek"]);
+}
+
+#[test]
+fn a_loop_variable_over_a_typed_collection_is_its_element() {
+    for (param, iterable) in [
+        ("items: Vec<Collected>", "items"),
+        ("items: &[Collected]", "items"),
+        ("items: &Vec<Collected>", "items.iter()"),
+        ("items: Vec<Collected>", "&items"),
+        ("items: [Collected; 4]", "items.into_iter()"),
+    ] {
+        let user = format!(
+            "use crate::collected::Collected;\n\n\
+             fn each({param}) {{\n    for item in {iterable} {{\n        item.can_skip();\n    }}\n}}\n"
+        );
+        assert_eq!(
+            rust_calls(&user, "can_skip"),
+            vec!["src/user.rs::each".to_string()],
+            "`for item in {iterable}` with `{param}` binds each Collected"
+        );
+    }
+}
+
+#[test]
+fn a_parameter_with_a_lifetime_keeps_its_type() {
+    let user = "\
+use crate::collected::Collected;
+
+pub struct Graph<'a> {
+    collected: &'a Collected,
+}
+
+impl<'a> Graph<'a> {
+    pub fn new(collected: &'a Collected, repo: &Path) -> anyhow::Result<Self> {
+        let skip = collected.can_skip();
+        for item in collected.can_skip() {}
+        Ok(Self { collected })
+    }
+}
+";
+    // A second `Collected` elsewhere, as a real workspace has: the corpus-wide
+    // receiver map withdraws a type name two declarations share, so only the
+    // binding's own declared type can answer here.
+    let (_, result) = resolve(&[
+        ("src/collected.rs", COLLECTED),
+        ("src/user.rs", user),
+        ("other/src/lib.rs", "pub struct Collected;\n"),
+    ]);
+    let callers: Vec<_> = calls_to(&result, "src/collected.rs::Collected.can_skip")
+        .into_iter()
+        .map(|edge| edge.source_symbol.clone())
+        .collect();
+    assert_eq!(
+        callers,
+        vec!["src/user.rs::Graph.new"],
+        "`&'a Collected` is a Collected; the lifetime is not part of the name"
+    );
+}
+
+#[test]
+fn a_mutex_that_is_never_locked_has_no_inner_methods() {
+    for body in [
+        "shared.can_skip();",
+        "let guard = shared.lock();\n    guard.can_skip();",
+        "match shared.lock() {\n        Err(guard) => guard.can_skip(),\n        _ => false,\n    };",
+        "let guard = shared.try_lock().unwrap();\n    guard.can_skip();",
+    ] {
+        let user = format!(
+            "use crate::collected::Collected;\nuse std::sync::Mutex;\n\n\
+             fn f(shared: &Mutex<Collected>) {{\n    {body}\n}}\n"
+        );
+        assert!(
+            rust_calls(&user, "can_skip").is_empty(),
+            "a `Mutex<T>` has no `T` methods until it is locked and unwrapped: {body}"
+        );
+    }
+}
+
+#[test]
+fn a_loop_over_an_option_or_a_map_is_not_typed() {
+    for param in [
+        "items: Option<Collected>",
+        "items: HashMap<String, Collected>",
+        "items: Vec<Vec<Collected>>",
+    ] {
+        let user = format!(
+            "use crate::collected::Collected;\n\n\
+             fn each({param}) {{\n    for item in items {{\n        item.can_skip();\n    }}\n}}\n"
+        );
+        assert!(
+            rust_calls(&user, "can_skip").is_empty(),
+            "`for item in items` with `{param}` does not yield a Collected"
+        );
+    }
+}
+
+#[test]
+fn a_closure_parameter_shadows_the_guard_it_names() {
+    let user = "\
+use crate::collected::Collected;
+use std::sync::Mutex;
+
+fn f(shared: &Mutex<Collected>, others: Vec<Other>) {
+    let guard = shared.lock().unwrap();
+    others.iter().for_each(|guard| guard.can_skip());
+}
+";
+    assert!(
+        rust_calls(user, "can_skip").is_empty(),
+        "inside the closure `guard` is the closure's parameter, not the lock"
+    );
+}
+
 #[test]
 fn a_go_var_of_a_slice_does_not_type_its_name_as_the_element() {
     // Asked of the extraction, not the edge list: an unexported selector on an

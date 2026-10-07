@@ -695,6 +695,7 @@ fn extract_treesitter_before_deadline(
                 let local_bindings = collect_site_bindings(
                     root,
                     source,
+                    lang,
                     &file_symbol_name,
                     &calls,
                     &references,
@@ -6516,7 +6517,7 @@ fn rust_type_name_is_reachable(node: Node) -> bool {
     )
 }
 
-fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
+pub(crate) fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
     if depth > 16 {
         return None;
     }
@@ -8383,6 +8384,7 @@ fn python_fixture_names(root: Node, source: &str, imports: &[ExtractedImport]) -
 fn collect_site_bindings(
     root: Node,
     source: &str,
+    lang: &str,
     file_symbol_name: &str,
     calls: &[ExtractedCall],
     references: &[ExtractedReference],
@@ -8393,6 +8395,8 @@ fn collect_site_bindings(
     let initializers = binding_initializers(references, calls);
     let mut sites = BTreeSet::new();
     let mut parameters: HashMap<usize, BTreeSet<String>> = HashMap::new();
+    // Rust only; built lazily per block, so it costs nothing elsewhere.
+    let mut binders = crate::rustlocal::Binders::new(source);
     let inputs = calls
         .iter()
         .map(|call| {
@@ -8500,12 +8504,25 @@ fn collect_site_bindings(
                                     })
                                 })
                                 .flatten();
-                            let (declared_type, initializer) = binding_facts_for(
+                            let (mut declared_type, initializer) = binding_facts_for(
                                 &declared_types,
                                 &initializers,
                                 &scope_name,
                                 name,
                             );
+                            // The binder above this very use, where the
+                            // function's text states its type — a `MutexGuard`
+                            // from `Ok(guard)`, a loop variable over a `Vec<T>`.
+                            // More specific than the `(scope, name)` facts,
+                            // which one shadowing `let` can make about a
+                            // different value, so it wins when it answers.
+                            if lang == "rust" {
+                                if let Some(stated) =
+                                    binders.binder_type(node, name, scope)
+                                {
+                                    declared_type = Some(stated);
+                                }
+                            }
                             sites.insert(LocalBinding {
                                 start_byte: span.start_byte,
                                 name: name.to_string(),

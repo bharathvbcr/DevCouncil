@@ -54,6 +54,10 @@ mod parent_index;
 // `treesitter::extract_treesitter`.
 #[cfg(feature = "parse")]
 mod pyload;
+// The type a Rust local has where its own binder states it. Walks a parse
+// tree; its one caller is `treesitter::collect_site_bindings`.
+#[cfg(feature = "parse")]
+mod rustlocal;
 #[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod wiring;
