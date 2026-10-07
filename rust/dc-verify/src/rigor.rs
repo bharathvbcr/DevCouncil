@@ -192,11 +192,18 @@ pub fn detect_stubs_report(
                     evidence: safe_evidence(evidence),
                     message: f.message.clone(),
                 });
-                scopes.push(f.scope_line);
+                scopes.push(Scope::Known(f.scope_line));
             }
         }
         let line_based = substring_findings(file, ast.is_none());
-        scopes.extend(line_based.iter().map(|_| None));
+        // A parsed file knows each placeholder's function; on the substring
+        // path it has to be inferred from the lines.
+        let unparsed = if ast.is_none() {
+            Scope::Infer
+        } else {
+            Scope::Known(None)
+        };
+        scopes.extend(line_based.iter().map(|_| unparsed));
         mine.extend(line_based);
         apply_allow_stub(&mut mine, &scopes, file, lines.as_deref());
         findings.extend(mine);
@@ -323,7 +330,7 @@ fn substring_findings(file: &FileDiff, include_bodies: bool) -> Vec<Finding> {
 /// lines stand in for it, so only a marker the diff added can cover a finding.
 fn apply_allow_stub(
     findings: &mut [Finding],
-    scopes: &[Option<u32>],
+    scopes: &[Scope],
     file: &FileDiff,
     lines: Option<&[&str]>,
 ) {
@@ -360,7 +367,11 @@ fn apply_allow_stub(
             continue;
         }
         // A marker on the function covers a placeholder in its body.
-        let reason = declared_at(finding.line).or_else(|| scope.and_then(declared_at));
+        let enclosing = match scope {
+            Scope::Known(line) => *line,
+            Scope::Infer => inferred_function_line(finding.line, &line_at),
+        };
+        let reason = declared_at(finding.line).or_else(|| enclosing.and_then(declared_at));
         match reason {
             Some(r) if !r.is_empty() => {
                 finding.message = format!("stub allowed: {r} (was: {})", finding.message);
@@ -377,6 +388,68 @@ fn apply_allow_stub(
             None => {}
         }
     }
+}
+
+/// Where a finding's enclosing function is, for [`apply_allow_stub`].
+#[derive(Debug, Clone, Copy)]
+enum Scope {
+    /// From the parse: the declaration line, or `None` for a finding that is
+    /// already anchored on one.
+    Known(Option<u32>),
+    /// Substring path: infer it with [`inferred_function_line`].
+    Infer,
+}
+
+/// How far above a finding the substring path looks for its function.
+const MAX_SCOPE_SEARCH_LINES: u32 = 400;
+
+/// The nearest line above `line` that declares a function and is indented
+/// less than `line` itself, on the substring path where there is no tree.
+///
+/// The indentation rule is what stops a marker on one function from covering
+/// code that follows it: a placeholder at the function's own depth is not in
+/// its body. A line that cannot be read ends the search, so with no working
+/// tree only the diff's own contiguous added lines are considered.
+fn inferred_function_line<'a>(line: u32, line_at: &dyn Fn(u32) -> Option<&'a str>) -> Option<u32> {
+    let indent = |s: &str| s.len() - s.trim_start().len();
+    let own = indent(line_at(line)?);
+    let mut n = line;
+    for _ in 0..MAX_SCOPE_SEARCH_LINES {
+        n = n.checked_sub(1).filter(|m| *m >= 1)?;
+        let text = line_at(n)?;
+        if text.trim().is_empty() {
+            continue;
+        }
+        if indent(text) < own && declares_function(text.trim()) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Whether a trimmed line opens a function in one of the languages whose
+/// keyword makes that recognisable from the line alone.
+fn declares_function(trimmed: &str) -> bool {
+    const MODIFIERS: &[&str] = &[
+        "pub",
+        "pub(crate)",
+        "pub(super)",
+        "async",
+        "unsafe",
+        "const",
+        "extern",
+        "export",
+        "default",
+        "static",
+        "public",
+        "private",
+        "protected",
+    ];
+    let mut words = trimmed.split_whitespace().peekable();
+    while words.peek().is_some_and(|w| MODIFIERS.contains(w)) {
+        words.next();
+    }
+    matches!(words.next(), Some("fn" | "def" | "func" | "function"))
 }
 
 /// A line that sits between a declaration and what it annotates.
