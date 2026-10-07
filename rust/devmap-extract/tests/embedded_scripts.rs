@@ -804,8 +804,12 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v66 emits every Python module-scope binding and the module bindings and
     // type aliases other shapes dropped, reads import names off the tree, and
     // stops a module binding from shadowing its own module-level reads.
+    //
+    // v68 stops a JSX tag, a C# member access and similar `name` fields from
+    // binding a local, and binds wrapped callbacks (`useCallback(() => …)`) as
+    // functions.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "66",
+        EXTRACTION_SCHEMA_VERSION, "68",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

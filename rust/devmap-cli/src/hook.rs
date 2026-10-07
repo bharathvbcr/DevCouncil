@@ -333,7 +333,7 @@ fn run_hook_inner(
         // cannot answer, and `pre_tool_use_never_emits_a_permission_decision`
         // guards what it may emit. This says nothing there.
         let stdout = match event {
-            HookEvent::SessionStart => unindexed_worktree_notice(&payload),
+            HookEvent::SessionStart => unindexed_worktree_notice(&payload, executable),
             _ => None,
         };
         return Ok(HookOutcome {
@@ -634,7 +634,16 @@ fn string_path(payload: &Value, key: &str) -> Option<PathBuf> {
 /// half — without it an agent reads an empty answer from a dead index as
 /// proof of absence, which is the same confusion the false "ready" caused,
 /// arrived at from the other side.
-fn unindexed_worktree_notice(payload: &Value) -> Option<Value> {
+///
+/// A linked worktree of a repository whose main checkout is already indexed is
+/// the one case where this hook *starts* the build instead of only naming it.
+/// Measured 2026-10-07: an agent in a fresh ScholarLM worktree was told to run
+/// `devmap build`, did not, and answered from the main checkout's index — a
+/// different working state — for the whole session. The main checkout's store
+/// is the opt-in: this repository already chose DevMap, so indexing its new
+/// worktree is no decision the hook takes on the user's behalf. Any other
+/// unindexed tree keeps the rule that a hook never creates a store.
+fn unindexed_worktree_notice(payload: &Value, executable: &Path) -> Option<Value> {
     let cwd = canonicalize_existing(&string_path(payload, "cwd")?).ok()?;
     let root = devmap_extract::git_worktree_root(&cwd)?;
     if is_unsafe_root(&root) || store_exists(&root) {
@@ -644,17 +653,65 @@ fn unindexed_worktree_notice(payload: &Value) -> Option<Value> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| root.display().to_string());
-    let text = format!(
-        "{name}: no DevMap index in this working tree. Run `devmap build` here to enable \
-         devmap_* queries; until then they cannot answer, and an empty result is not \
-         evidence that a symbol is absent."
-    );
+    let opted_in = main_checkout_of(&root).filter(|main| !is_unsafe_root(main) && store_exists(main));
+    let text = match opted_in.map(|main| (detach_build(executable, &root), main)) {
+        Some((Ok(()), main)) => format!(
+            "{name}: no DevMap index in this working tree yet, so `devmap build` was started \
+             here in the background — this repository's main checkout ({}) is indexed. Until \
+             it lands (`devmap status` reports it), devmap_* queries here cannot answer, and an \
+             empty result is not evidence that a symbol is absent. Do not query the main \
+             checkout's index for this tree: it describes a different working state.",
+            main.display()
+        ),
+        Some((Err(error), _)) => format!(
+            "{name}: no DevMap index in this working tree, and starting `devmap build` here in \
+             the background failed ({}). Run `devmap build` here to enable devmap_* queries; \
+             until then they cannot answer, and an empty result is not evidence that a symbol \
+             is absent.",
+            truncate(&error.to_string(), 120)
+        ),
+        None => format!(
+            "{name}: no DevMap index in this working tree. Run `devmap build` here to enable \
+             devmap_* queries; until then they cannot answer, and an empty result is not \
+             evidence that a symbol is absent."
+        ),
+    };
     Some(json!({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": text,
         }
     }))
+}
+
+/// Largest gitlink or `commondir` file read. Both hold one path.
+const MAX_GITLINK_BYTES: u64 = 4096;
+
+/// The main checkout of the linked worktree at `root`, from git's own files:
+/// the `.git` gitlink names `<common>/worktrees/<name>`, whose `commondir`
+/// names the common directory. `None` when `root` is itself a main checkout (its
+/// `.git` is a directory), when the common directory is bare (it has no
+/// checkout to hold a store), or when any of it cannot be read.
+fn main_checkout_of(root: &Path) -> Option<PathBuf> {
+    let gitlink = root.join(".git");
+    if !gitlink.is_file() {
+        return None;
+    }
+    let text = devmap_query::stat_memo::read_bounded(&gitlink, MAX_GITLINK_BYTES)?;
+    let gitdir = text
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?;
+    let gitdir = root.join(gitdir);
+    let common = devmap_query::stat_memo::read_bounded(&gitdir.join("commondir"), MAX_GITLINK_BYTES)?;
+    let common = gitdir.join(common.trim()).canonicalize().ok()?;
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    let main = common.parent()?.to_path_buf();
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    (main != root).then_some(main)
 }
 
 fn push_unique(out: &mut Vec<PathBuf>, path: Option<PathBuf>) {

@@ -498,7 +498,18 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// dropped every module-level read of it. A v65 row lacks all of this — most
 /// sharply, a constant `__all__` omitted has no node and its importers no
 /// target — so it must not be served to this build.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "66";
+///
+/// v68 stops filing the `name` of a JSX element, a C# member access, an
+/// annotation, an attribute or a preprocessor test as a local binding of the
+/// enclosing callable, and binds `const f = useCallback(() => …)` (and
+/// `memo`/`forwardRef`/`debounce`/`vi.fn` wrappers) as a `Function` that owns
+/// its body's calls. A v66 row carries `HomePage` as a local of every
+/// component that renders `<HomePage/>` — so the tag's call is classified
+/// `local_binding` and the component reads as callerless — and has no symbol
+/// for a wrapped callback, so none of this may be served warm. (v67 is taken
+/// by unmerged sibling branches; skipping it keeps two different payloads from
+/// sharing one identity.)
+pub const EXTRACTION_SCHEMA_VERSION: &str = "68";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

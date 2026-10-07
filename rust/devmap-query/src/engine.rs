@@ -50,7 +50,12 @@ pub const MAX_TRAVERSAL_DEPTH: usize = 64;
 pub struct QueryEngine<'a> {
     extractions: &'a [Extraction],
     resolution: &'a ResolutionResult,
+    /// The corpus half: files extraction could not fully read.
     coverage_gap: Option<String>,
+    /// The repository-wide attribution sentence. Never attached to an answer
+    /// whole — its presence is what says the per-walk check has anything to
+    /// look for (see `radius_attribution_gap`).
+    attribution_gap: Option<String>,
 }
 
 /// Query facade over the latest durable SQLite generation. Unlike
@@ -209,9 +214,20 @@ impl<'a> StoreQueryEngine<'a> {
                 reason: format!("{} could not be parsed", req.query),
             }));
         }
+        // The corpus half, then the sites written in this file that the
+        // resolver could not bind — what this file's own list cannot show.
+        let file_sites = self.radius_attribution_gap(
+            Some(snapshot.generation),
+            snapshot.analysis.as_ref(),
+            &BTreeSet::from([(snapshot.file.path.clone(), snapshot.file.path.clone())]),
+            RadiusSide::FileCallees,
+        )?;
         let coverage_gap = devmap_analyze::combine_reasons(
             file_edge_coverage_gap(&snapshot.file.parse_outcome),
-            analysis_coverage_gap(snapshot.analysis.as_ref()),
+            devmap_analyze::combine_reasons(
+                analysis_status_gap(snapshot.analysis.as_ref()),
+                file_sites,
+            ),
         );
         self.cancel.check()?;
         let edges = snapshot
@@ -300,14 +316,19 @@ impl<'a> StoreQueryEngine<'a> {
             None,
             Some(layer_budget),
         )?;
-        self.attach_unresolved_namesakes(generation, &index, &target, min_confidence, &mut edges)?;
+        let added =
+            self.attach_unresolved_namesakes(generation, &index, &target, min_confidence, &mut edges)?;
+        // `Some` by construction: `band_budget` was `Some` on the call above,
+        // and every return path of `traverse_walked` maps it.
+        let mut blast_radius = bands.ok_or_else(|| {
+            anyhow::anyhow!("a banded traversal returned no bands; this is a bug in the kernel")
+        })?;
+        // One answer, two halves: the bands are as incomplete as the edges.
+        blast_radius.layers.walk_incomplete =
+            devmap_analyze::combine_reasons(blast_radius.layers.walk_incomplete.take(), added);
         Ok(LayeredImpact {
             edges,
-            // `Some` by construction: `band_budget` was `Some` on the call
-            // above, and every return path of `traverse_walked` maps it.
-            blast_radius: bands.ok_or_else(|| {
-                anyhow::anyhow!("a banded traversal returned no bands; this is a bug in the kernel")
-            })?,
+            blast_radius,
         })
     }
 
@@ -806,6 +827,9 @@ impl<'a> StoreQueryEngine<'a> {
     /// `generation` is the one `index` was built from. The ledger is read at
     /// that generation, so the edges and the candidates describe one state of
     /// the repository even when a daemon commits between the two reads.
+    ///
+    /// Returns the qualification it added, so a caller holding a second half
+    /// of the same answer (`impact_layered`'s bands) can carry it too.
     fn attach_unresolved_namesakes<T>(
         &self,
         generation: u32,
@@ -813,13 +837,13 @@ impl<'a> StoreQueryEngine<'a> {
         target: &str,
         min_confidence: f32,
         response: &mut Response<T>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
         // A refused start query (an ambiguous bare name) has already been
         // reported by the walk; the names below then come from the query text.
         let starts = indexed_traversal_starts(index, target, true, min_confidence, &self.cancel)
             .unwrap_or_default();
         let namesakes = match self.unresolved_namesakes(generation, target, &starts)? {
-            NamesakeRead::NotApplicable => return Ok(()),
+            NamesakeRead::NotApplicable => return Ok(None),
             NamesakeRead::GenerationGone => {
                 // Checked, and could not be answered consistently: saying
                 // nothing here would read as "the ledger holds no candidates".
@@ -828,38 +852,45 @@ impl<'a> StoreQueryEngine<'a> {
                      these edges came from (it was pruned mid-query); callers the resolver could \
                      not bind are not listed — ask again"
                 );
-                response.walk_incomplete =
-                    devmap_analyze::combine_reasons(response.walk_incomplete.take(), Some(note));
-                return Ok(());
+                response.walk_incomplete = devmap_analyze::combine_reasons(
+                    response.walk_incomplete.take(),
+                    Some(note.clone()),
+                );
+                return Ok(Some(note));
             }
             NamesakeRead::Read(namesakes) => namesakes,
         };
+        let mut added = None;
         if !namesakes.sites.is_empty() || namesakes.truncated {
-            let note = format!(
-                "{}{} unresolved call site(s) name {} and are not edges — an untyped receiver, a \
-                 module loaded by path; they are listed in `unresolved_namesakes` as candidates \
-                 to verify, not as callers",
-                if namesakes.truncated { "at least " } else { "" },
-                namesakes.sites.len(),
-                namesakes.names.join(", "),
+            added = devmap_analyze::combine_reasons(
+                added,
+                Some(format!(
+                    "{}{} unresolved call site(s) name {} and are not edges — an untyped \
+                     receiver, a module loaded by path; they are listed in \
+                     `unresolved_namesakes` as candidates to verify, not as callers",
+                    if namesakes.truncated { "at least " } else { "" },
+                    namesakes.sites.len(),
+                    namesakes.names.join(", "),
+                )),
             );
-            response.walk_incomplete =
-                devmap_analyze::combine_reasons(response.walk_incomplete.take(), Some(note));
         }
         // A capped check must not read as a clean one: an empty `sites` with
         // names left unchecked is "not looked", not "none there".
         if namesakes.names_not_checked > 0 {
-            let note = format!(
-                "the unresolved ledger was checked for {} name(s) only; {} more were not looked up \
-                 (`unresolved_namesakes.names_not_checked`)",
-                namesakes.names.len(),
-                namesakes.names_not_checked,
+            added = devmap_analyze::combine_reasons(
+                added,
+                Some(format!(
+                    "the unresolved ledger was checked for {} name(s) only; {} more were not \
+                     looked up (`unresolved_namesakes.names_not_checked`)",
+                    namesakes.names.len(),
+                    namesakes.names_not_checked,
+                )),
             );
-            response.walk_incomplete =
-                devmap_analyze::combine_reasons(response.walk_incomplete.take(), Some(note));
         }
+        response.walk_incomplete =
+            devmap_analyze::combine_reasons(response.walk_incomplete.take(), added.clone());
         response.unresolved_namesakes = Some(namesakes);
-        Ok(())
+        Ok(added)
     }
 
     /// The unresolved call sites at `generation` whose callee is the bare name
@@ -999,9 +1030,12 @@ impl<'a> StoreQueryEngine<'a> {
         // hole in it is a lower bound whether it found a start or not, and
         // "no indexed traversal start" is a much weaker statement when the file
         // the symbol lives in was never read.
-        let coverage_gap = analysis_coverage_gap(index.analysis());
-        let starts =
-            indexed_traversal_starts(index, target, reverse, min_confidence, &self.cancel)?;
+        //
+        // The corpus half only. Whether unattributed calls touch this answer
+        // is asked of the nodes the walk reached, below — see
+        // `radius_attribution_gap`.
+        let coverage_gap = analysis_status_gap(index.analysis());
+        let starts = indexed_traversal_starts(index, target, reverse, min_confidence, &self.cancel)?;
         // P2.7a. The corpus-level marker above cannot see this: a `.tf` beside
         // Python hides no Python caller, so the analysis stays `Ok` — and then
         // `impact` on the `.tf` symbol itself answered `total: 0, Available`
@@ -1012,8 +1046,40 @@ impl<'a> StoreQueryEngine<'a> {
         } else {
             self.call_blind_starts(starts.iter().map(|(_, file)| file.as_str()))?
         };
-        let start: Vec<String> = starts.into_iter().map(|(symbol, _)| symbol).collect();
+        let start: Vec<String> = starts.iter().map(|(symbol, _)| symbol.clone()).collect();
         if start.is_empty() {
+            // A symbol whose every call went unbound has no outbound edge, so
+            // it is no start for a walk toward callees — and its unbound calls
+            // are exactly what this answer cannot show. Ask about the target
+            // itself. (Toward callers, `attach_unresolved_namesakes` asks.)
+            let coverage_gap = if reverse {
+                coverage_gap
+            } else {
+                let named = match crate::query_match::classify(target) {
+                    crate::query_match::StartQuery::Qualified { file, .. } => Some((
+                        RadiusSide::Callees,
+                        (target.to_string(), file.to_string()),
+                    )),
+                    crate::query_match::StartQuery::Path(path) => Some((
+                        RadiusSide::FileCallees,
+                        (path.to_string(), path.to_string()),
+                    )),
+                    crate::query_match::StartQuery::Symbol(_)
+                    | crate::query_match::StartQuery::Nothing => None,
+                };
+                match named {
+                    Some((side, key)) => devmap_analyze::combine_reasons(
+                        coverage_gap,
+                        self.radius_attribution_gap(
+                            index.generation(),
+                            index.analysis(),
+                            &BTreeSet::from([key]),
+                            side,
+                        )?,
+                    ),
+                    None => coverage_gap,
+                }
+            };
             let reason = match call_blind.reason() {
                 Some(blind) => format!("{target} has no indexed traversal start: {blind}"),
                 None => format!("{target} has no indexed traversal start"),
@@ -1067,6 +1133,19 @@ impl<'a> StoreQueryEngine<'a> {
         // would report a distribution of whatever happened to fit, and would
         // spend the budget on edges it was about to discard.
         let (traversed, rungs) = crate::rung::narrow(traversed, min_rung);
+        let coverage_gap = devmap_analyze::combine_reasons(
+            coverage_gap,
+            self.radius_attribution_gap(
+                index.generation(),
+                index.analysis(),
+                &reached_by(starts.into_iter().collect(), &traversed),
+                if reverse {
+                    RadiusSide::Callers
+                } else {
+                    RadiusSide::Callees
+                },
+            )?,
+        );
         // Also before the budget, and for the same reason: the bands describe
         // the population the walk reached, not the slice that fitted. They are
         // built from `traversed` rather than from `walk.traversed_edges` so that
@@ -1528,7 +1607,8 @@ impl<'a> StoreQueryEngine<'a> {
             },
             depth_cap,
             unresolved_seeds: false,
-            coverage_gap: analysis_coverage_gap(index.analysis()),
+            // The corpus half; the reached radius adds its own below.
+            coverage_gap: analysis_status_gap(index.analysis()),
         };
         if walk.seeds.is_empty() {
             walk.unresolved_seeds = true;
@@ -1617,6 +1697,19 @@ impl<'a> StoreQueryEngine<'a> {
                 }
             }
         }
+        let reached: BTreeSet<(String, String)> = walk
+            .seeds
+            .iter()
+            .cloned()
+            .chain(walk.bands.iter().flat_map(|band| band.members.iter().cloned()))
+            .collect();
+        let radius = self.radius_attribution_gap(
+            index.generation(),
+            index.analysis(),
+            &reached,
+            RadiusSide::Callers,
+        )?;
+        walk.coverage_gap = devmap_analyze::combine_reasons(walk.coverage_gap.take(), radius);
         Ok(walk)
     }
 
@@ -1991,6 +2084,27 @@ impl<'a> StoreQueryEngine<'a> {
                 None,
             ),
         };
+        // The pack states both directions of every hit — `calls` and
+        // `called_by` — so its gap does too: the walk above asked about the
+        // callers it could not follow, and this asks about the calls inside the
+        // hits themselves.
+        let callee_gap = match edges.as_deref() {
+            Some(edges) => {
+                let hits: BTreeSet<(String, String)> = response
+                    .items
+                    .iter()
+                    .zip(&qualified)
+                    .map(|(hit, name)| (name.clone(), hit.file_path.clone()))
+                    .collect();
+                self.radius_attribution_gap(
+                    edges.generation(),
+                    edges.analysis(),
+                    &hits,
+                    RadiusSide::Callees,
+                )?
+            }
+            None => None,
+        };
         let mut pack = crate::evidence::assemble(
             response,
             &qualified,
@@ -2000,7 +2114,7 @@ impl<'a> StoreQueryEngine<'a> {
             related_tests,
             &self.cancel,
         )?;
-        pack.coverage_gap = coverage_gap;
+        pack.coverage_gap = devmap_analyze::combine_reasons(coverage_gap, callee_gap);
         Ok(pack)
     }
 
@@ -2014,10 +2128,10 @@ impl<'a> StoreQueryEngine<'a> {
     /// already hits are dropped *before* budgeting, so the counters describe
     /// the list as returned.
     ///
-    /// Returns the repository-wide attribution gap separately from the list's
-    /// own `walk_incomplete`. It is the same sentence on every query, and
-    /// folded into the list it buried the one clause about *this* walk — where
-    /// it stopped — under a paragraph about the whole repository.
+    /// Returns the walk's coverage gap separately from the list's own
+    /// `walk_incomplete`. It belongs to the pack — the hits' `called_by` share
+    /// it — and folded into the list it buried the one clause about *this*
+    /// walk — where it stopped.
     fn evidence_related_tests(
         &self,
         edges: &GenerationEdges,
@@ -2121,7 +2235,7 @@ impl<'a> StoreQueryEngine<'a> {
             })
             .collect();
         let index = crate::semantic::SemanticIndex::build(&texts, &self.cancel)?;
-        let scored = index.score(query, &self.cancel)?;
+        let scored = index.score_terms(&crate::ask::question_terms(query), &self.cancel)?;
         if scored.is_empty() {
             let mut response = budget_take(Vec::new(), token_budget, |_| 0);
             response.walk_incomplete =
@@ -2157,13 +2271,17 @@ impl<'a> StoreQueryEngine<'a> {
             .iter()
             .map(|&position| symbols[position].qualified_name.clone())
             .collect();
+        // Membership through a set: the linear scan this replaced was
+        // O(nodes × edges) — every admitted edge searched the whole list twice.
+        let mut known: std::collections::HashSet<String> = nodes.iter().cloned().collect();
         for id in 0..edges.len() as u32 {
             self.cancel.check_every(id as usize)?;
             if edges.kind(id) != EdgeKind::Calls || !edges.admits(id, min_confidence) {
                 continue;
             }
             for name in [edges.source_symbol(id), edges.target_symbol(id)] {
-                if !nodes.iter().any(|existing| existing == name) {
+                if !known.contains(name) {
+                    known.insert(name.to_string());
                     nodes.push(name.to_string());
                 }
             }
@@ -2195,12 +2313,32 @@ impl<'a> StoreQueryEngine<'a> {
         }
 
         let ranks = crate::ask::personalized_pagerank(&outbound, &personalization, &self.cancel)?;
-        let mut ordered: Vec<(usize, f32)> = seed_positions
+        // Each side normalised to the best seed, then blended — see
+        // `ASK_LEXICAL_WEIGHT`. A zero maximum means that side separates
+        // nothing, and it contributes nothing rather than dividing by zero.
+        let graph: Vec<f32> = seed_positions
             .iter()
             .map(|&position| {
                 let name = symbols[position].qualified_name.as_str();
-                let rank = node_rank.get(name).map(|&i| ranks[i]).unwrap_or(0.0);
-                (position, rank)
+                node_rank.get(name).map(|&i| ranks[i]).unwrap_or(0.0)
+            })
+            .collect();
+        let normalise = |value: f32, max: f32| {
+            if max > 0.0 && value.is_finite() {
+                value / max
+            } else {
+                0.0
+            }
+        };
+        let max_lexical = scored.iter().map(|(_, score)| *score).fold(0.0f32, f32::max);
+        let max_graph = graph.iter().copied().fold(0.0f32, f32::max);
+        let mut ordered: Vec<(usize, f32)> = scored
+            .iter()
+            .zip(&graph)
+            .map(|(&(position, lexical), &rank)| {
+                let blended = crate::ask::ASK_LEXICAL_WEIGHT * normalise(lexical, max_lexical)
+                    + (1.0 - crate::ask::ASK_LEXICAL_WEIGHT) * normalise(rank, max_graph);
+                (position, blended)
             })
             .collect();
         ordered.sort_by(|a, b| {
@@ -3459,14 +3597,14 @@ impl<'a> QueryEngine<'a> {
             unresolved_sites: rate.unresolved_sites,
             explained_sites: rate.explained_sites,
         };
-        let coverage_gap = devmap_analyze::combine_reasons(
-            devmap_analyze::extraction_coverage(extractions).degraded_reason(),
-            attribution_coverage_gap(Some(resolution.unresolved.len()), Some(&attribution)),
-        );
         Self {
             extractions,
             resolution,
-            coverage_gap,
+            coverage_gap: devmap_analyze::extraction_coverage(extractions).degraded_reason(),
+            attribution_gap: attribution_coverage_gap(
+                Some(resolution.unresolved.len()),
+                Some(&attribution),
+            ),
         }
     }
 
@@ -3621,7 +3759,14 @@ impl<'a> QueryEngine<'a> {
             .iter()
             .find(|extraction| &extraction.file_path == file_path)
             .and_then(|extraction| file_edge_coverage_gap(&extraction.parse_outcome));
-        let coverage_gap = devmap_analyze::combine_reasons(file_gap, self.coverage_gap.clone());
+        let file_sites = self.radius_attribution_gap(
+            &BTreeSet::from([(file_path.clone(), file_path.clone())]),
+            RadiusSide::FileCallees,
+        );
+        let coverage_gap = devmap_analyze::combine_reasons(
+            file_gap,
+            devmap_analyze::combine_reasons(self.coverage_gap.clone(), file_sites),
+        );
         let mut deps = Vec::new();
 
         for edge in &self.resolution.edges {
@@ -3655,7 +3800,7 @@ impl<'a> QueryEngine<'a> {
             });
         }
         let target = req.query.trim();
-        let start: Vec<String> = self
+        let starts: BTreeSet<(String, String)> = self
             .resolution
             .edges
             .iter()
@@ -3666,8 +3811,9 @@ impl<'a> QueryEngine<'a> {
                     &edge.target_file,
                 )
             })
-            .map(|edge| edge.target_symbol.clone())
+            .map(|edge| (edge.target_symbol.clone(), edge.target_file.clone()))
             .collect();
+        let start: Vec<String> = starts.iter().map(|(symbol, _)| symbol.clone()).collect();
         if start.is_empty() {
             let mut response = unavailable_response(ResolutionAvailability::Unavailable {
                 reason: format!("{target} has no indexed inbound target"),
@@ -3693,6 +3839,10 @@ impl<'a> QueryEngine<'a> {
                 .then_with(|| a.target_file.cmp(&b.target_file))
                 .then_with(|| a.source_symbol.cmp(&b.source_symbol))
         });
+        let radius = self.radius_attribution_gap(
+            &reached_by(starts, &inbound),
+            RadiusSide::Callers,
+        );
         let mut response = budget_take(inbound, req.token_budget, |_| 25);
         // The walk's own "I stopped looking" signal, carried the way
         // `StoreQueryEngine::traverse` carries it (engine.rs, `traverse`).
@@ -3705,7 +3855,7 @@ impl<'a> QueryEngine<'a> {
         // one.
         response.walk_incomplete = devmap_analyze::combine_reasons(
             walk.stop.reason(opts.max_depth, opts.max_nodes),
-            self.coverage_gap.clone(),
+            devmap_analyze::combine_reasons(self.coverage_gap.clone(), radius),
         );
         response
     }
@@ -3718,7 +3868,7 @@ impl<'a> QueryEngine<'a> {
             });
         }
         let target = req.query.trim();
-        let start: Vec<String> = self
+        let starts: BTreeSet<(String, String)> = self
             .resolution
             .edges
             .iter()
@@ -3729,13 +3879,32 @@ impl<'a> QueryEngine<'a> {
                     &edge.source_file,
                 )
             })
-            .map(|edge| edge.source_symbol.clone())
+            .map(|edge| (edge.source_symbol.clone(), edge.source_file.clone()))
             .collect();
+        let start: Vec<String> = starts.iter().map(|(symbol, _)| symbol.clone()).collect();
         if start.is_empty() {
             let mut response = unavailable_response(ResolutionAvailability::Unavailable {
                 reason: format!("{target} has no indexed outbound source"),
             });
-            response.walk_incomplete = self.coverage_gap.clone();
+            // As the store engine asks: a symbol whose every call went unbound
+            // is no outbound start, and those calls are what is missing.
+            let named = match crate::query_match::classify(target) {
+                crate::query_match::StartQuery::Qualified { file, .. } => Some((
+                    RadiusSide::Callees,
+                    (target.to_string(), file.to_string()),
+                )),
+                crate::query_match::StartQuery::Path(path) => Some((
+                    RadiusSide::FileCallees,
+                    (path.to_string(), path.to_string()),
+                )),
+                crate::query_match::StartQuery::Symbol(_)
+                | crate::query_match::StartQuery::Nothing => None,
+            };
+            let radius = named.and_then(|(side, key)| {
+                self.radius_attribution_gap(&BTreeSet::from([key]), side)
+            });
+            response.walk_incomplete =
+                devmap_analyze::combine_reasons(self.coverage_gap.clone(), radius);
             return response;
         }
         let opts = TraversalOptions {
@@ -3756,14 +3925,32 @@ impl<'a> QueryEngine<'a> {
                 .then_with(|| a.target_file.cmp(&b.target_file))
                 .then_with(|| a.source_symbol.cmp(&b.source_symbol))
         });
+        let radius = self.radius_attribution_gap(
+            &reached_by(starts, &outbound),
+            RadiusSide::Callees,
+        );
         let mut response = budget_take(outbound, req.token_budget, |_| 25);
         // Same signal, same reason as `impact` above.
         response.walk_incomplete = devmap_analyze::combine_reasons(
             walk.stop.reason(opts.max_depth, opts.max_nodes),
-            self.coverage_gap.clone(),
+            devmap_analyze::combine_reasons(self.coverage_gap.clone(), radius),
         );
         response
     }
+}
+
+/// Every node a walk reached, with the file it was reached in: its starts and
+/// both endpoints of every edge it measured. One rule for both engines.
+fn reached_by(
+    starts: BTreeSet<(String, String)>,
+    edges: &[ResolvedEdge],
+) -> BTreeSet<(String, String)> {
+    let mut reached = starts;
+    for edge in edges {
+        reached.insert((edge.source_symbol.clone(), edge.source_file.clone()));
+        reached.insert((edge.target_symbol.clone(), edge.target_file.clone()));
+    }
+    reached
 }
 
 /// The traversed identities, mapped back to the full edges they name.
@@ -4720,6 +4907,296 @@ fn attribution_coverage_gap(
         _ => Some(format!(
             "this generation records {total} unresolved attribution site(s), but their classification breakdown is unavailable or inconsistent; these repository-wide counts are not specific to this target, so call-graph coverage for it is unknown"
         )),
+    }
+}
+
+/// Most distinct keys — reached names, walked symbols, or files — one answer
+/// checks against the unresolved ledger. Past it the check is reported as
+/// partial, never as clean.
+const MAX_RADIUS_LEDGER_KEYS: usize = 512;
+
+/// Ledger rows read per key. The note counts what it read and says "at least"
+/// when a key had more.
+const RADIUS_SITES_PER_KEY: usize = 4;
+
+/// How many site names one note spells out.
+const RADIUS_NOTE_SAMPLE: usize = 5;
+
+/// Which unattributed sites can hide part of a walk's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RadiusSide {
+    /// A walk toward callers: a site that *names* a reached symbol may be a
+    /// caller the resolver could not bind, so the walk could not follow it.
+    Callers,
+    /// A walk toward callees: a site *inside* a walked symbol may call
+    /// something the resolver could not bind.
+    Callees,
+    /// A file's own outbound edges: a site written in that file.
+    FileCallees,
+}
+
+impl StoreQueryEngine<'_> {
+    /// Whether calls the resolver could not bind touch *this* answer.
+    ///
+    /// [`attribution_coverage_gap`] is a fact about the repository — "212,976
+    /// of 571,999 sites have no indexed target" — and it is non-zero on every
+    /// real one, so stapled to every walk it said the same sentence on every
+    /// answer and told a reader nothing about the one in front of them
+    /// (measured on ScholarLM, 2026-10-07: every `impact` and `affected` call
+    /// carried it). The question a reader of one walk has is narrower and
+    /// answerable from the ledger: does an unattributed site name a symbol this
+    /// walk reached (a caller it could not follow), or sit inside one (a callee
+    /// it could not follow)? Only the sites that may hide a repository edge
+    /// count — [`devmap_resolve::UNATTRIBUTED_LABELS`]; a builtin or an external
+    /// import cannot be a missing edge to a symbol here, and neither can a
+    /// receiver call whose method name no indexed symbol carries (`rows.length`,
+    /// `mu.Unlock()`: 126,023 of ScholarLM's 200,790 untyped-receiver rows).
+    ///
+    /// Falls back to the repository-wide sentence wherever the specific check
+    /// cannot run — no generation on the index, a classification breakdown
+    /// that is missing or inconsistent — because a check that could not run
+    /// must not answer like one that found nothing. `None` only when the check
+    /// ran and found no such site, or the corpus has none at all.
+    fn radius_attribution_gap(
+        &self,
+        generation: Option<u32>,
+        analysis: Option<&devmap_analyze::model::AnalysisDisclosure>,
+        reached: &BTreeSet<(String, String)>,
+        side: RadiusSide,
+    ) -> anyhow::Result<Option<String>> {
+        // An unreadable summary is already disclosed by `analysis_status_gap`.
+        let Some(analysis) = analysis else {
+            return Ok(None);
+        };
+        let Some(repository_wide) =
+            attribution_coverage_gap(analysis.unresolved_calls, analysis.resolution_rate.as_ref())
+        else {
+            return Ok(None);
+        };
+        let breakdown_usable = matches!(
+            (analysis.unresolved_calls, analysis.resolution_rate.as_ref()),
+            (Some(total), Some(rate))
+                if rate.unresolved_sites == total && rate.explained_sites <= total
+        );
+        let Some(generation) = generation.filter(|_| breakdown_usable) else {
+            return Ok(Some(repository_wide));
+        };
+        let (keys, keys_not_checked) = radius_keys(reached, side);
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let lookup: Vec<String> = keys.iter().map(|(key, _)| key.clone()).collect();
+        self.cancel.check()?;
+        let read = match side {
+            RadiusSide::Callers => {
+                self.store
+                    .unattributed_sites_naming(generation, &lookup, RADIUS_SITES_PER_KEY)?
+            }
+            RadiusSide::Callees => {
+                self.store
+                    .unattributed_sites_within(generation, &lookup, RADIUS_SITES_PER_KEY)?
+            }
+            RadiusSide::FileCallees => {
+                self.store
+                    .unattributed_sites_in_files(generation, &lookup, RADIUS_SITES_PER_KEY)?
+            }
+        };
+        let Some(found) = read else {
+            return Ok(Some(format!(
+                "the unresolved ledger could not be read at generation {generation}, the one this \
+                 answer came from (it was pruned mid-query); whether calls the resolver could not \
+                 bind touch this answer is unknown — ask again"
+            )));
+        };
+        let found = found
+            .into_iter()
+            .map(|(key, (rows, truncated))| {
+                let rows = rows
+                    .into_iter()
+                    .map(|row| RadiusSite {
+                        source_file: row.source_file,
+                        callee_name: row.callee_name,
+                        receiver: row.receiver,
+                    })
+                    .collect();
+                (key, (rows, truncated))
+            })
+            .collect();
+        Ok(radius_note(side, &keys, keys_not_checked, found))
+    }
+}
+
+/// One unattributed site, as either engine reads it.
+struct RadiusSite {
+    source_file: String,
+    callee_name: String,
+    receiver: Option<String>,
+}
+
+/// The ledger keys a walk's reached set asks about — bare names for
+/// [`RadiusSide::Callers`], walked symbols for `Callees`, files for
+/// `FileCallees` — each with the families of the nodes that produced it, at
+/// most [`MAX_RADIUS_LEDGER_KEYS`] of them, and how many were left unchecked.
+fn radius_keys(
+    reached: &BTreeSet<(String, String)>,
+    side: RadiusSide,
+) -> (Vec<(String, BTreeSet<LangFamily>)>, usize) {
+    let mut keys: BTreeMap<String, BTreeSet<LangFamily>> = BTreeMap::new();
+    for (node, file) in reached {
+        let key = match side {
+            RadiusSide::Callers => {
+                // A file node is not called by name.
+                if !node.contains("::") {
+                    continue;
+                }
+                match bare_callee_name(node) {
+                    Some(name) => name.to_string(),
+                    None => continue,
+                }
+            }
+            RadiusSide::Callees => node.clone(),
+            RadiusSide::FileCallees => file.clone(),
+        };
+        keys.entry(key).or_default().insert(family_of_path(file));
+    }
+    let not_checked = keys.len().saturating_sub(MAX_RADIUS_LEDGER_KEYS);
+    (
+        keys.into_iter().take(MAX_RADIUS_LEDGER_KEYS).collect(),
+        not_checked,
+    )
+}
+
+/// The note for one radius check, from the sites read per key (at most
+/// [`RADIUS_SITES_PER_KEY`], with whether the key had more). `None` when no
+/// site touches the answer and every key was checked.
+///
+/// Shared by both engines so the in-memory one cannot phrase or count the same
+/// ledger differently. The sample is the sorted first few, so it does not
+/// depend on the order a reader met the sites in.
+fn radius_note(
+    side: RadiusSide,
+    keys: &[(String, BTreeSet<LangFamily>)],
+    keys_not_checked: usize,
+    mut found: BTreeMap<String, (Vec<RadiusSite>, bool)>,
+) -> Option<String> {
+    let mut sites = 0usize;
+    let mut more = false;
+    let mut labels: BTreeSet<String> = BTreeSet::new();
+    for (key, families) in keys {
+        let (rows, truncated) = found.remove(key).unwrap_or_default();
+        more |= truncated;
+        for row in rows {
+            // A Python call cannot be a missed caller of a Go function.
+            if side == RadiusSide::Callers {
+                let family = family_of_path(&row.source_file);
+                if !families.iter().any(|reached| family.admits(*reached)) {
+                    continue;
+                }
+            }
+            sites += 1;
+            labels.insert(match &row.receiver {
+                Some(receiver) => format!("{receiver}.{}", row.callee_name),
+                None => row.callee_name,
+            });
+        }
+    }
+    let mut notes = Vec::new();
+    if sites > 0 {
+        let count = if more {
+            format!("at least {sites}")
+        } else {
+            sites.to_string()
+        };
+        let sample = labels
+            .into_iter()
+            .take(RADIUS_NOTE_SAMPLE)
+            .collect::<Vec<_>>()
+            .join(", ");
+        notes.push(match side {
+            RadiusSide::Callers => format!(
+                "{count} call site(s) the resolver could not bind name a symbol this answer \
+                 reached ({sample}) — an untyped receiver, a local binding — so callers through \
+                 them are not in it"
+            ),
+            RadiusSide::Callees | RadiusSide::FileCallees => format!(
+                "{count} call site(s) inside what this answer walked could not be bound \
+                 ({sample}), so what they call is not in it"
+            ),
+        });
+    }
+    // A capped check must not read as a clean one.
+    if keys_not_checked > 0 {
+        notes.push(format!(
+            "only {} of {} reached key(s) were checked against the unresolved ledger",
+            keys.len(),
+            keys.len() + keys_not_checked
+        ));
+    }
+    (!notes.is_empty()).then(|| notes.join("; "))
+}
+
+impl<'a> QueryEngine<'a> {
+    /// [`StoreQueryEngine::radius_attribution_gap`] over the in-memory
+    /// resolution: the same keys, the same per-key cap in the same
+    /// `(file, symbol)` order the ledger read uses, and the same note.
+    fn radius_attribution_gap(
+        &self,
+        reached: &BTreeSet<(String, String)>,
+        side: RadiusSide,
+    ) -> Option<String> {
+        self.attribution_gap.as_ref()?;
+        let (keys, keys_not_checked) = radius_keys(reached, side);
+        if keys.is_empty() {
+            return None;
+        }
+        let mut matched: BTreeMap<&str, Vec<&UnresolvedReference>> = BTreeMap::new();
+        let wanted: BTreeSet<&str> = keys.iter().map(|(key, _)| key.as_str()).collect();
+        // The store's filter (`Store::unattributed_sites_naming`): a receiver
+        // call no symbol is named for cannot hide an edge into this index.
+        let symbol_names: std::collections::HashSet<&str> = self
+            .extractions
+            .iter()
+            .flat_map(|extraction| extraction.symbols.iter())
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        for row in &self.resolution.unresolved {
+            if row.class.is_explained()
+                || (row.receiver.is_some() && !symbol_names.contains(row.callee_name.as_str()))
+            {
+                continue;
+            }
+            let key = match side {
+                RadiusSide::Callers => row.callee_name.as_str(),
+                RadiusSide::Callees => row.source_symbol.as_str(),
+                RadiusSide::FileCallees => row.source_file.as_str(),
+            };
+            if let Some(key) = wanted.get(key) {
+                matched.entry(key).or_default().push(row);
+            }
+        }
+        let found = matched
+            .into_iter()
+            .map(|(key, mut rows)| {
+                // The ledger's order, so the per-key cap keeps the same rows.
+                rows.sort_by(|a, b| {
+                    a.source_file
+                        .cmp(&b.source_file)
+                        .then_with(|| a.source_symbol.cmp(&b.source_symbol))
+                });
+                let truncated = rows.len() > RADIUS_SITES_PER_KEY;
+                let rows = rows
+                    .into_iter()
+                    .take(RADIUS_SITES_PER_KEY)
+                    .map(|row| RadiusSite {
+                        source_file: row.source_file.clone(),
+                        callee_name: row.callee_name.clone(),
+                        receiver: row.receiver.clone(),
+                    })
+                    .collect();
+                (key.to_string(), (rows, truncated))
+            })
+            .collect();
+        radius_note(side, &keys, keys_not_checked, found)
     }
 }
 
