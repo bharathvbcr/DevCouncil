@@ -179,11 +179,17 @@ diff clean against MANVI's copy; see the note under the header.)
    where the workspace lives restates the markers independently rather than
    importing the list it is checking.
 
-**Not changed, and deliberately flagged:** `testsupport.AllowSkipEnv` is still
-`MANVI_TEST_ALLOW_SKIP` and the build lock is still `.manvi-testbin.lock`.
-Renaming an environment variable is an operational change that breaks any CI
-config referencing it, so it is left as a decision rather than taken as a
-drive-by.
+**Renamed, as a decision taken with Manvi (its GAP-19):** `testsupport.AllowSkipEnv`
+is `DEVCOUNCIL_TEST_ALLOW_SKIP` (was `MANVI_TEST_ALLOW_SKIP`), the build lock is
+`.devcouncil-testbin.lock` (was `.manvi-testbin.lock`) and the stable copies
+live in `target/devcouncil-testbin/` (was `target/manvi-testbin/`). There is no
+deprecation window in which the old variable still grants a skip: honouring it
+would let a stale config keep a seam uncovered, which is the failure this
+package exists to prevent. It is kept as `retiredAllowSkipEnv` only so a config
+that still sets it fails naming the replacement, and Manvi's `verify.sh`
+refuses both names. No CI workflow in either repository referenced the old
+names. `TestTheOnDiskAndEnvironmentNamesAreDevCouncils` and
+`TestTheRetiredOptInFailsNamingItsReplacement` pin both halves.
 
 **Not ported:** `repomap/repomap_test.go` and `repomap/integrity_test.go`. Both
 import `manvi/gate` and `manvi/policy`, which are the *policy* plane and are not

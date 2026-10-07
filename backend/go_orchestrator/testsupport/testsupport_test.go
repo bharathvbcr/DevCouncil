@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -101,13 +102,29 @@ func (r *recordingTB) wantSkip(t *testing.T, what string) {
 // leaves the run's own value restored afterwards. t.Setenv is called even when
 // the case wants the variable gone, because it is what registers the restore;
 // Unsetenv alone would leak the absence into every test that follows.
+//
+// The retired name is cleared on every case, because Unavailable fails on it
+// before reading the opt-in: a runner exporting it would otherwise turn the
+// skip cases into failures this test never set up.
 func setAllowSkip(t *testing.T, value string, set bool) {
 	t.Helper()
+	clearRetiredAllowSkip(t)
 	t.Setenv(AllowSkipEnv, value)
 	if !set {
 		if err := os.Unsetenv(AllowSkipEnv); err != nil {
 			t.Fatalf("unset %s: %v", AllowSkipEnv, err)
 		}
+	}
+}
+
+// clearRetiredAllowSkip removes the retired opt-in for the rest of the test and
+// restores the runner's value afterwards, by the same Setenv-then-Unsetenv route
+// setAllowSkip takes.
+func clearRetiredAllowSkip(t *testing.T) {
+	t.Helper()
+	t.Setenv(retiredAllowSkipEnv, "")
+	if err := os.Unsetenv(retiredAllowSkipEnv); err != nil {
+		t.Fatalf("unset %s: %v", retiredAllowSkipEnv, err)
 	}
 }
 
@@ -155,11 +172,77 @@ func TestUnavailableSkipsOnlyWhenTheOperatorOptsIn(t *testing.T) {
 	// original form of the assertion: if Unavailable returns here, the Fatal
 	// below runs and this subtest fails.
 	t.Run("the skip stops the caller", func(t *testing.T) {
+		clearRetiredAllowSkip(t)
 		t.Setenv(AllowSkipEnv, "1")
 		Unavailable(t, "missing %s", "tool")
 		t.Fatal("Unavailable returned to its caller instead of skipping it; " +
 			"a test that keeps running past an unmet prerequisite asserts nothing")
 	})
+}
+
+// TestTheRetiredOptInFailsNamingItsReplacement pins what happens to a config
+// still carrying the name the opt-in had before these helpers were DevCouncil's.
+// Honouring it would let a stale CI file keep seams uncovered with nobody having
+// chosen that under the current name; ignoring it would turn the same run red
+// with a message about the toolchain and nothing about the rename. So it fails,
+// and says what to set instead.
+//
+// Both names are spelled out rather than read from the constants: a test that
+// iterated AllowSkipEnv would follow a rename back into agreeing with itself.
+func TestTheRetiredOptInFailsNamingItsReplacement(t *testing.T) {
+	const retired, current = "MANVI_TEST_ALLOW_SKIP", "DEVCOUNCIL_TEST_ALLOW_SKIP"
+	for _, tc := range []struct {
+		name         string
+		retiredValue string
+		currentValue string
+		currentSet   bool
+	}{
+		// The config this exists for: written against the old name, untouched.
+		{name: "retired opt-in alone", retiredValue: "1"},
+		// Set to anything, not only 1. Whatever the operator meant by it, the
+		// name no longer means it, and they should hear that.
+		{name: "retired set to 0", retiredValue: "0"},
+		// Migrated, but the old line was left behind. The current opt-in would
+		// skip on its own; the stale one still has to surface so it gets deleted
+		// rather than lingering until someone wonders what it does.
+		{name: "both set", retiredValue: "1", currentValue: "1", currentSet: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(retired, tc.retiredValue)
+			t.Setenv(current, tc.currentValue)
+			if !tc.currentSet {
+				if err := os.Unsetenv(current); err != nil {
+					t.Fatalf("unset %s: %v", current, err)
+				}
+			}
+
+			rec := probe(t, func(tb testing.TB) { Unavailable(tb, "missing %s", "tool") })
+			what := fmt.Sprintf("%s=%q", retired, tc.retiredValue)
+			rec.wantFatal(t, what)
+			if msg := rec.fatals[0]; !strings.Contains(msg, current) || !strings.Contains(msg, "missing tool") {
+				t.Fatalf("%s: the failure has to name %s and still report the missing prerequisite, got:\n%s",
+					what, current, msg)
+			}
+		})
+	}
+}
+
+// TestTheOnDiskAndEnvironmentNamesAreDevCouncils pins the names these helpers
+// leave in an operator's environment and under target/. They are what a CI
+// config, a cleanup script or a reader of `ls target` sees, so a change to any
+// of them is an operational change and has to show up as a failing test rather
+// than as a quiet edit to a constant. Restated as literals for the reason the
+// retired-name test above gives.
+func TestTheOnDiskAndEnvironmentNamesAreDevCouncils(t *testing.T) {
+	for _, tc := range []struct{ what, got, want string }{
+		{"AllowSkipEnv", AllowSkipEnv, "DEVCOUNCIL_TEST_ALLOW_SKIP"},
+		{"buildLockName", buildLockName, ".devcouncil-testbin.lock"},
+		{"testBinDir", testBinDir, "devcouncil-testbin"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %q, want %q", tc.what, tc.got, tc.want)
+		}
+	}
 }
 
 func TestToolFindsAPresentBinary(t *testing.T) {

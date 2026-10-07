@@ -14,7 +14,7 @@
 //   - The workspace is found by walking up for a marker, never by counting
 //     "..". A test file that moves between directories keeps working.
 //   - A missing toolchain fails the test by default. Skipping is available only
-//     when an operator opts in explicitly with MANVI_TEST_ALLOW_SKIP=1,
+//     when an operator opts in explicitly with DEVCOUNCIL_TEST_ALLOW_SKIP=1,
 //     which makes an uncovered seam a deliberate, visible choice.
 //   - A test never execs a path cargo owns. `go test ./...` gives each package
 //     its own process, all of them sharing one target directory, and cargo
@@ -52,7 +52,15 @@ import (
 )
 
 // AllowSkipEnv opts a run into skipping when a toolchain is missing.
-const AllowSkipEnv = "MANVI_TEST_ALLOW_SKIP"
+const AllowSkipEnv = "DEVCOUNCIL_TEST_ALLOW_SKIP"
+
+// retiredAllowSkipEnv is the name AllowSkipEnv had while these helpers lived in
+// Manvi. It no longer opts anything in, and it is read only so that a config
+// still setting it fails naming its replacement. Honouring it would let a stale
+// CI file keep seams uncovered under a name nobody chose for this repository;
+// ignoring it would turn that run red with a message that says nothing about
+// the rename. Manvi's verify.sh refuses both names for the same reason.
+const retiredAllowSkipEnv = "MANVI_TEST_ALLOW_SKIP"
 
 // These helpers take testing.TB rather than *testing.T because the seams they
 // locate are driven from fuzz targets as well as from tests, and a *testing.F
@@ -62,6 +70,14 @@ const AllowSkipEnv = "MANVI_TEST_ALLOW_SKIP"
 // only when the operator has said an uncovered seam is acceptable for this run.
 func Unavailable(t testing.TB, format string, args ...any) {
 	t.Helper()
+	// Checked before the opt-in, so a config that migrated but left the old
+	// line behind still hears about it.
+	if _, set := os.LookupEnv(retiredAllowSkipEnv); set {
+		t.Fatalf(format+"\n\n"+retiredAllowSkipEnv+" is set, but it was renamed to "+AllowSkipEnv+
+			" and no longer opts a run into skipping. Remove it, and set "+AllowSkipEnv+
+			"=1 if this seam may go uncovered.", args...)
+		return
+	}
 	if os.Getenv(AllowSkipEnv) == "1" {
 		t.Skipf(format+" (skipping because "+AllowSkipEnv+"=1)", args...)
 		return
@@ -230,11 +246,11 @@ func cargoBin(t testing.TB, crate, binary string) string {
 }
 
 // buildLockName is the lock file guarding the build-and-copy critical section.
-const buildLockName = ".manvi-testbin.lock"
+const buildLockName = ".devcouncil-testbin.lock"
 
 // testBinDir holds the stable copies, under target/ so `cargo clean` reaches
 // them.
-const testBinDir = "manvi-testbin"
+const testBinDir = "devcouncil-testbin"
 
 const (
 	artifactAttempts   = 50
