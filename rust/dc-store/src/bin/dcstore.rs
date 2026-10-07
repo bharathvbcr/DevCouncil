@@ -720,17 +720,24 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                         ("id", &quote(&r.id)),
                         ("severity", &quote(&r.severity)),
                         ("gap_type", &quote(&r.gap_type)),
-                        (
-                            "task_id",
-                            &r.task_id
-                                .as_deref()
-                                .map(quote)
-                                .unwrap_or_else(|| "null".into()),
-                        ),
+                        ("task_id", &maybe(r.task_id.as_deref())),
                         ("description", &quote(&r.description)),
                         ("recommended_fix", &quote(&r.recommended_fix)),
                         ("blocking", &json_bool(r.blocking)),
                         ("evidence_json", &r.evidence_json),
+                        // What a criterion gap is about and how it was meant to
+                        // be proven. Stored by `gap-upsert` all along; without
+                        // them here the reply named a criterion gap but not its
+                        // criterion. `null` when the gap is not about one.
+                        ("requirement_id", &maybe(r.requirement_id.as_deref())),
+                        (
+                            "acceptance_criterion_id",
+                            &maybe(r.acceptance_criterion_id.as_deref()),
+                        ),
+                        (
+                            "expected_verification_method",
+                            &maybe(r.expected_verification_method.as_deref()),
+                        ),
                     ])
                 })
                 .collect();

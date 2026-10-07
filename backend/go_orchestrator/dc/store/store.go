@@ -666,6 +666,13 @@ type GapRow struct {
 	RecommendedFix string          `json:"recommended_fix"`
 	Blocking       bool            `json:"blocking"`
 	EvidenceJSON   json.RawMessage `json:"evidence_json"`
+	// The linkage that makes an acceptance-criterion gap actionable: which
+	// requirement and criterion it is about, and how that criterion was meant
+	// to be proven. Nil is "not about a criterion" and travels as SQL NULL and
+	// JSON null; it is never written as an empty string.
+	RequirementID              *string `json:"requirement_id"`
+	AcceptanceCriterionID      *string `json:"acceptance_criterion_id"`
+	ExpectedVerificationMethod *string `json:"expected_verification_method"`
 }
 
 // GapHistoryRow is what became of one gap across a task's verification runs.
@@ -874,6 +881,21 @@ func (c *Client) GapsReplace(ctx context.Context, taskID string, gaps []GapRow) 
 			args = append(args, "--blocking", "true")
 		} else {
 			args = append(args, "--blocking", "false")
+		}
+		// Absent links are omitted rather than sent empty: dcstore stores
+		// `--requirement-id ""` as an empty string, not NULL, and an empty id
+		// would read back as a gap about a criterion that has no name.
+		for _, link := range []struct {
+			flag  string
+			value *string
+		}{
+			{"--requirement-id", g.RequirementID},
+			{"--acceptance-criterion-id", g.AcceptanceCriterionID},
+			{"--expected-verification-method", g.ExpectedVerificationMethod},
+		} {
+			if link.value != nil && *link.value != "" {
+				args = append(args, link.flag, *link.value)
+			}
 		}
 		if strings.TrimSpace(string(g.EvidenceJSON)) == "" {
 			// replace the empty evidence flag value

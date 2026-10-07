@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"testing"
 )
 
@@ -76,6 +77,85 @@ func TestGapsReplacePersistsAGapItWasGiven(t *testing.T) {
 	}
 	if string(got[0].EvidenceJSON) != string(want.EvidenceJSON) {
 		t.Errorf("evidence = %s, want %s", got[0].EvidenceJSON, want.EvidenceJSON)
+	}
+}
+
+// TestGapsReplaceKeepsACriterionGapsLinkage is the regression test for an
+// acceptance-criterion gap losing what it is about on the way through the store.
+//
+// verify raises acceptance_criteria_unproven and unsupported_verification_method
+// with a requirement, a criterion and the method that criterion expected. dcstore
+// stored all three, but GapRow had no fields for them, GapsReplace sent no flags
+// for them and `gaps` emitted none of them — so devcouncil_get_gaps reported a
+// criterion gap that did not say which criterion.
+//
+// The unlinked gap is asserted too: an absent link must come back nil, not as
+// an empty string, or "this gap is not about a criterion" and "it is about a
+// criterion with no id" become the same answer.
+func TestGapsReplaceKeepsACriterionGapsLinkage(t *testing.T) {
+	c := client(t)
+	ctx := context.Background()
+
+	req, ac, method := "REQ-7", "AC-7.2", "integration_test"
+	linked := GapRow{
+		ID: "TASK-003-AC", Severity: "high", GapType: "acceptance_criteria_unproven",
+		TaskID: "TASK-003", Description: "AC-7.2 has no passing evidence",
+		RecommendedFix: "prove it", Blocking: true, EvidenceJSON: []byte(`[]`),
+		RequirementID: &req, AcceptanceCriterionID: &ac, ExpectedVerificationMethod: &method,
+	}
+	unlinked := GapRow{
+		ID: "TASK-003-STUB", Severity: "low", GapType: "stub_detected",
+		TaskID: "TASK-003", Description: "stub", RecommendedFix: "fill it",
+		EvidenceJSON: []byte(`[]`),
+	}
+	// A pointer to "" is a link with no name; it must be stored as NULL like an
+	// absent one, not as an empty string that reads back as a named criterion.
+	empty := ""
+	emptyLinked := GapRow{
+		ID: "TASK-003-EMPTY", Severity: "low", GapType: "acceptance_criteria_unproven",
+		TaskID: "TASK-003", Description: "empty", RecommendedFix: "name it",
+		EvidenceJSON:  []byte(`[]`),
+		RequirementID: &empty, AcceptanceCriterionID: &empty, ExpectedVerificationMethod: &empty,
+	}
+	if err := c.GapsReplace(ctx, "TASK-003", []GapRow{linked, unlinked, emptyLinked}); err != nil {
+		t.Fatalf("GapsReplace: %v", err)
+	}
+
+	got, _, err := c.Gaps(ctx, "TASK-003")
+	if err != nil {
+		t.Fatalf("Gaps: %v", err)
+	}
+	byID := map[string]GapRow{}
+	for _, g := range got {
+		byID[g.ID] = g
+	}
+	if len(byID) != 3 {
+		t.Fatalf("gaps = %+v, want the three that were written", got)
+	}
+
+	str := func(p *string) string {
+		if p == nil {
+			return "<nil>"
+		}
+		return fmt.Sprintf("%q", *p)
+	}
+	g := byID[linked.ID]
+	if str(g.RequirementID) != str(&req) {
+		t.Errorf("requirement_id = %s, want %s", str(g.RequirementID), str(&req))
+	}
+	if str(g.AcceptanceCriterionID) != str(&ac) {
+		t.Errorf("acceptance_criterion_id = %s, want %s", str(g.AcceptanceCriterionID), str(&ac))
+	}
+	if str(g.ExpectedVerificationMethod) != str(&method) {
+		t.Errorf("expected_verification_method = %s, want %s", str(g.ExpectedVerificationMethod), str(&method))
+	}
+
+	for _, id := range []string{unlinked.ID, emptyLinked.ID} {
+		u := byID[id]
+		if u.RequirementID != nil || u.AcceptanceCriterionID != nil || u.ExpectedVerificationMethod != nil {
+			t.Errorf("%s came back linked: requirement_id=%s acceptance_criterion_id=%s expected_verification_method=%s",
+				id, str(u.RequirementID), str(u.AcceptanceCriterionID), str(u.ExpectedVerificationMethod))
+		}
 	}
 }
 
