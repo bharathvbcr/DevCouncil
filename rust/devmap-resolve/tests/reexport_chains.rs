@@ -149,6 +149,33 @@ fn a_renaming_reexport_follows_the_local_name() {
     );
 }
 
+/// The chain was right and the consumer still missed: its binding took the
+/// terminal *file* and kept its own name for the symbol, so `publicName()`
+/// asked `impl.ts` for a `publicName` it does not declare.
+#[test]
+fn a_call_through_a_renaming_reexport_reaches_the_declared_name() {
+    let (_, resolution) = resolve(&[
+        (
+            "impl.ts",
+            "export function internal(): number {\n  return 1;\n}\n",
+        ),
+        (
+            "index.ts",
+            "export { internal as publicName } from './impl';\n",
+        ),
+        (
+            "app.ts",
+            "import { publicName } from './index';\n\nexport function run(): number {\n  return publicName();\n}\n",
+        ),
+    ]);
+    let targets: Vec<_> = call_edges(&resolution, "app.ts")
+        .into_iter()
+        .map(|edge| edge.target_symbol.clone())
+        .filter(|target| target.starts_with("impl.ts"))
+        .collect();
+    assert_eq!(targets, vec!["impl.ts::internal"]);
+}
+
 /// A cycle yields no entry, not a guess.
 ///
 /// There is no terminal file, so there is nothing true to record; naming either
@@ -202,6 +229,51 @@ fn a_direct_export_is_not_a_chain() {
     );
 }
 
+/// A Python module that re-imports a name passes it through, and the
+/// consumer's call reaches the declaration rather than a same-named decoy.
+#[test]
+fn a_python_reimport_is_followed_to_the_declaring_module() {
+    for (barrel_path, barrel, consumer) in [
+        (
+            "barrel.py",
+            "from impl import normalise\n",
+            "from barrel import normalise\n\n\ndef main():\n    return normalise(' x ')\n",
+        ),
+        (
+            "barrel.py",
+            "from impl import normalise as clean\n",
+            "from barrel import clean\n\n\ndef main():\n    return clean(' x ')\n",
+        ),
+        (
+            "pkg/__init__.py",
+            "from .impl import normalise\n",
+            "from pkg import normalise\n\n\ndef main():\n    return normalise(' x ')\n",
+        ),
+    ] {
+        let impl_path = if barrel_path.starts_with("pkg/") {
+            "pkg/impl.py"
+        } else {
+            "impl.py"
+        };
+        let (_, resolution) = resolve(&[
+            (impl_path, "def normalise(text):\n    return text.strip()\n"),
+            (barrel_path, barrel),
+            ("legacy.py", "def normalise(text):\n    return text\n"),
+            ("app.py", consumer),
+        ]);
+        let targets: Vec<_> = call_edges(&resolution, "app.py")
+            .into_iter()
+            .filter(|edge| edge.target_symbol.ends_with("::normalise"))
+            .map(|edge| edge.target_symbol.clone())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![format!("{impl_path}::normalise")],
+            "`{barrel}` passes `normalise` through to the module that declares it"
+        );
+    }
+}
+
 /// R-9, rewritten rather than deleted.
 ///
 /// The original pinned `reexport_chains` as permanently empty, which was a true
@@ -211,22 +283,40 @@ fn a_direct_export_is_not_a_chain() {
 /// assertion — chains exist for languages whose exports carry a module
 /// specifier, and nowhere else.
 ///
-/// Python is the case that matters. `from .impl import thing` in an
-/// `__init__.py` is a re-export in every sense that matters to a reader, and
-/// the extractor records it as an *import*, not as an export with a source
-/// module. There is therefore no evidence here of the kind this map is built
-/// from, and it must stay empty rather than being filled by inference.
+/// Python was pinned empty here on the reading that a `from .impl import
+/// thing` is an *import*, not an export, and so not evidence. That reading was
+/// wrong about the language: a name bound at module scope **is** an attribute
+/// of the module, so `from pkg import thing` reads `pkg.impl.thing` by
+/// Python's own rule, not by inference. Leaving the map empty cost a real
+/// finding — the consumer's binding pointed at `__init__.py`, which declares
+/// nothing, and the function it re-exports was reported dead at 0.4.
+///
+/// The evidence boundary moves with the rule and no further: an import inside
+/// a function body binds a local, not a module attribute, and makes no chain.
 #[test]
-fn reexport_chains_are_scoped_to_languages_with_export_specifiers() {
+fn reexport_chains_are_scoped_to_what_the_language_publishes() {
     let (_, python) = resolve(&[
         ("pkg/__init__.py", "from .impl import thing\n"),
         ("pkg/impl.py", "def thing():\n    return 1\n"),
     ]);
-    assert!(
-        python.reexport_chains.is_empty(),
-        "Python export syntax carries no source module, so there is no chain \
-         to record: {:?}",
+    assert_eq!(
+        python.reexport_chains.get("pkg/__init__.py::thing").map(String::as_str),
+        Some("pkg/impl.py::thing"),
+        "a module-scope import publishes the name as a module attribute: {:?}",
         python.reexport_chains
+    );
+
+    let (_, local) = resolve(&[
+        (
+            "pkg/__init__.py",
+            "def lazy():\n    from .impl import thing\n    return thing()\n",
+        ),
+        ("pkg/impl.py", "def thing():\n    return 1\n"),
+    ]);
+    assert!(
+        local.reexport_chains.is_empty(),
+        "an import inside a function binds a local, not a module attribute: {:?}",
+        local.reexport_chains
     );
 
     let (_, typescript) = resolve(&[

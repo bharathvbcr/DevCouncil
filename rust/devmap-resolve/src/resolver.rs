@@ -1985,11 +1985,20 @@ impl Resolver {
                             })
                             .flatten()
                             .and_then(|terminal| {
-                                terminal.rsplit_once("::").map(|(file, _)| file.to_string())
+                                terminal
+                                    .rsplit_once("::")
+                                    .map(|(file, symbol)| (file.to_string(), symbol.to_string()))
                             });
+                        // A renaming re-export (`export { a as b }`, `from impl
+                        // import a as b`) publishes `b` and declares `a`; the
+                        // binding must name what the terminal file declares,
+                        // or every lookup through it asks for a name that file
+                        // does not have.
+                        let mut declared_as = name.clone();
                         let resolved = if declares_name {
                             direct
-                        } else if let Some(file) = via_reexport {
+                        } else if let Some((file, symbol)) = via_reexport {
+                            declared_as = symbol;
                             Some(file)
                         } else {
                             let submodule = match ext.language.as_str() {
@@ -2028,7 +2037,7 @@ impl Resolver {
                             submodule.or(direct)
                         };
                         if let Some(target_f) = resolved {
-                            file_bindings.insert(local.to_string(), (target_f, name.clone()));
+                            file_bindings.insert(local.to_string(), (target_f, declared_as));
                         } else {
                             unresolved_import(local.to_string(), &imp.module_specifier);
                         }
@@ -2466,6 +2475,55 @@ impl Resolver {
     /// A cycle — `a.ts` re-exporting from `b.ts` re-exporting from `a.ts` —
     /// yields no entry at all. There is no terminal file, so there is nothing
     /// true to record, and recording either endpoint would invent one.
+    /// A Python module's own `from m import name` is a re-export hop.
+    ///
+    /// Python has no export statement: every name a module binds at module
+    /// scope is an attribute of that module, and `from barrel import name`
+    /// elsewhere reads it. So `barrel.py: from impl import normalise` states
+    /// where `barrel.normalise` comes from as plainly as `export { normalise }
+    /// from './impl'` does — and the chain never saw it, because only
+    /// `ext.exports` fed it. The importer's binding pointed at `barrel.py`,
+    /// which declares nothing, and `impl.normalise` was reported dead at 0.4
+    /// with its caller one file away. The same shape is every package
+    /// `__init__.py` that lifts a name out of a submodule.
+    ///
+    /// Module scope only: an import inside a function or class body binds a
+    /// local or a class attribute, never a module attribute. An explicit hop
+    /// for the same name — there is none in Python today — is never displaced.
+    fn python_import_hops(&self, ext: &Extraction, hops: &mut BTreeMap<String, (String, String)>) {
+        let enclosed = |span: &Span| {
+            ext.symbols.iter().any(|symbol| {
+                matches!(
+                    symbol.kind,
+                    SymbolKind::Function | SymbolKind::Method | SymbolKind::Class
+                ) && symbol.span.start_byte <= span.start_byte
+                    && span.end_byte <= symbol.span.end_byte
+            })
+        };
+        for imp in &ext.imports {
+            if imp.path_load.is_some() || imp.imported_names.is_empty() || enclosed(&imp.span) {
+                continue;
+            }
+            for (index, name) in imp.imported_names.iter().enumerate() {
+                if name.is_empty() || name == "*" {
+                    continue;
+                }
+                let local = imp
+                    .local_names
+                    .get(index)
+                    .filter(|local| !local.is_empty())
+                    .unwrap_or(name);
+                let spec = Self::import_spec_for_name(&imp.module_specifier, name);
+                let Some(target) = self.resolve_import_path(&ext.file_path, &ext.language, &spec)
+                else {
+                    continue;
+                };
+                hops.entry(format!("{}::{local}", ext.file_path))
+                    .or_insert((target, name.clone()));
+            }
+        }
+    }
+
     fn compute_reexport_chains(&self, extractions: &[Extraction]) -> BTreeMap<String, String> {
         // One hop per re-export, keyed by the re-exporting file's own name for
         // the symbol.
@@ -2499,6 +2557,9 @@ impl Resolver {
                     format!("{}::{}", ext.file_path, export.exported_name),
                     (target, source_name),
                 );
+            }
+            if ext.language == "python" {
+                self.python_import_hops(ext, &mut hops);
             }
         }
 
