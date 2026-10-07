@@ -7008,7 +7008,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             };
             let map_path = input
                 .as_ref()
-                .map(&resolve)
+                .map(resolve)
                 .unwrap_or_else(|| devmap_extract::paths::repo_map_path(path));
             let out_path = output
                 .as_ref()

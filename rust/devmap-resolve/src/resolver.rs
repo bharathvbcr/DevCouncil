@@ -115,16 +115,23 @@ fn charge_ambiguity(
         candidates.rows.len() as u64
     };
     let additional = candidates.evidence_bytes.saturating_mul(rows);
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-            used.checked_add(additional).filter(|next| *next <= limit)
-        })
-        .map(|_| ())
-        .map_err(|used| ResolutionLimitError {
-            resource: "ambiguity evidence bytes",
-            limit,
-            attempted: used.saturating_add(additional),
-        })
+    // An explicit compare-exchange loop rather than `fetch_update`, which Rust
+    // 1.99 deprecates in favour of `try_update` — a name older toolchains this
+    // workspace still builds on do not have.
+    let mut used = counter.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = used.checked_add(additional).filter(|next| *next <= limit) else {
+            return Err(ResolutionLimitError {
+                resource: "ambiguity evidence bytes",
+                limit,
+                attempted: used.saturating_add(additional),
+            });
+        };
+        match counter.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(()),
+            Err(current) => used = current,
+        }
+    }
 }
 
 /// Where the name a resolution rung failed on was written.

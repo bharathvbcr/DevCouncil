@@ -54,6 +54,11 @@ const MAX_PATTERN_NODES: usize = 1024;
 /// need; more would be inference this pass does not claim.
 const MAX_HOPS: usize = 2;
 
+/// One block's `let`s: binding name → `(let start byte, binder)` in source
+/// order. `None` is a `let` that binds the name in a shape this pass does not
+/// read: it still shadows.
+type BlockLets<'tree> = HashMap<String, Vec<(usize, Option<Binder<'tree>>)>>;
+
 /// One file's binder index.
 ///
 /// Asked once per use site, and a file can hold thousands of sites in one
@@ -63,10 +68,8 @@ const MAX_HOPS: usize = 2;
 /// whole extraction deadline.
 pub(crate) struct Binders<'tree, 'src> {
     source: &'src str,
-    /// Block id → binding name → `(let start byte, binder)` in source order.
-    /// `None` is a `let` that binds the name in a shape this pass does not
-    /// read: it still shadows.
-    blocks: HashMap<usize, HashMap<String, Vec<(usize, Option<Binder<'tree>>)>>>,
+    /// Block id → that block's `let`s; see [`BlockLets`].
+    blocks: HashMap<usize, BlockLets<'tree>>,
 }
 
 impl<'tree, 'src> Binders<'tree, 'src> {
