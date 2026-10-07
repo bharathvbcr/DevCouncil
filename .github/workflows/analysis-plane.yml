@@ -71,7 +71,9 @@ jobs:
       # is where that answer comes from.
       #
       # Packages are named rather than `--workspace` so this job does not
-      # compile the kernel's tree-sitter grammars.
+      # compile the kernel's tree-sitter grammars. It still compiles four:
+      # dc-verify's stub detection links the Rust, Go, Python and TypeScript
+      # grammars unconditionally.
       - name: Build
         run: cargo build -p dc-glob -p dc-proc -p dc-redact -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets
 
