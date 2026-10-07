@@ -20,7 +20,11 @@ var (
 	protectedBranchPushRe  = regexp.MustCompile(`\bgit\s+push\s+\S+\s+((head:)?(main|master)|(main|master):\S+)\b`)
 
 	uvRunDirFlagRe = regexp.MustCompile(`^(uv\s+run)((?:\s+(?:--project|--directory|-p)\s+\S+)+)(\s+.+)$`)
-	cdSegmentRe    = regexp.MustCompile(`^(?:cd|pushd|popd)(\s|$)`)
+	// A directory change at the head of a clause, including inside a subshell
+	// or group — `(cd ..; echo x > f)` moves where f lands just as surely, and
+	// was missed while the rung only matched the clause's first word — and when
+	// spelled through `builtin` or `command`.
+	cdSegmentRe = regexp.MustCompile(`^(?:[({]\s*)*(?:(?:builtin|command)\s+)?(?:cd|pushd|popd)(?:\s|$|[;)}])`)
 	// Trailing shell redirections break glob matching against patterns like
 	// "dev map *". Stripped for matching only, in a loop, so the pattern itself
 	// stays single-clause and cannot backtrack pathologically.
@@ -166,15 +170,38 @@ const maxCommandBytes = 128 << 10
 func (g CommandGate) evaluate(command string, task *dc.Task, depth int) Decision {
 	parts := SplitCommandChain(command)
 	if len(parts) > 1 {
-		var warnDecision *Decision
+		// Every clause is judged, and the refusal reported is the most
+		// important one, not the first. Returning the first let an earlier
+		// clause hide a later one: `date; git push --force` came back as
+		// `date`'s soft command.not_allowed, which a posture demotes, so the
+		// push ran; `cd src && git push --force` came back as a directory
+		// change, which a host may reasonably treat as "not judged" rather
+		// than "forbidden". The order is: a hard refusal for what a clause
+		// does, then one for what the gate could not read (IsUnreadableRule),
+		// then a soft one, then a warning.
+		var warnDecision, unreadable, soft *Decision
 		for _, part := range parts {
 			d := g.evaluateSingleCommand(part, task, depth)
-			if d.Action == Deny {
+			switch {
+			case d.Action == Deny && IsUnreadableRule(d.Rule):
+				if unreadable == nil {
+					unreadable = &d
+				}
+			case d.Action == Deny && d.Severity == Hard:
 				return d
-			}
-			if d.Action == Warn && warnDecision == nil {
+			case d.Action == Deny:
+				if soft == nil {
+					soft = &d
+				}
+			case d.Action == Warn && warnDecision == nil:
 				warnDecision = &d
 			}
+		}
+		if unreadable != nil {
+			return *unreadable
+		}
+		if soft != nil {
+			return *soft
 		}
 		if warnDecision != nil {
 			return *warnDecision
@@ -200,41 +227,65 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 		return g.noteHardRules(deny(RuleCommandEmpty, "Empty command is not allowed.", command, taskID))
 	}
 
+	// Git safety first, ahead of the rungs that refuse what they cannot read.
+	// It reads the visible text, which is all it ever reads, and it used to run
+	// only after them — so `git push --force origin main <<'EOF'` was refused
+	// as a heredoc and the force push was never named. A refusal for what the
+	// line does must never be hidden behind one for what the gate could not
+	// read (see evaluate).
+	if g.HardRules {
+		if d, fired := gitSafety(normalized, taskID); fired && d.Action == Deny {
+			return d
+		}
+	}
+
+	// The unreadable rungs (IsUnreadableRule) are collected rather than
+	// returned on the spot, so a hard refusal found later in the clause — in a
+	// substitution span, say — still outranks them. The first one found is the
+	// one reported, in the order below.
+	var unreadable, softInner, warnDecision *Decision
+	noteUnreadable := func(d Decision) {
+		if unreadable == nil {
+			unreadable = &d
+		}
+	}
+
 	// A live substitution or a heredoc carries code this ladder cannot read:
 	// an allowlist entry matched against the surrounding line never judged
 	// what `sh -c` would actually execute inside it. Substitution contents are
 	// extracted and run through this same gate — so `echo $(date)` is judged
 	// as both echo and date — and anything the scanner cannot bound is refused
 	// outright rather than guessed at. A heredoc body is expanded data with no
-	// reliable static end, so it has no extraction path and is refused.
+	// reliable static end, so it has no extraction path and is refused. (Its
+	// lines are still judged: the chain splitter breaks on unquoted newlines,
+	// so each body line reaches this ladder as a clause of its own.)
 	if hasHeredoc(raw) {
-		return g.noteHardRules(deny(RuleCommandHeredoc,
+		noteUnreadable(g.noteHardRules(deny(RuleCommandHeredoc,
 			"Heredocs carry expanded data with no statically checkable end and are not allowed; "+
-				"write the content to a file instead.", normalized, taskID))
+				"write the content to a file instead.", normalized, taskID)))
 	}
 	// Checked on the raw line, beside the heredoc rung, because it is the same
 	// refusal: a construct whose meaning is not in the text being judged. It
 	// runs before the substitution rung so that `eval $(...)` is named as the
 	// re-parse it is rather than as the substitution it also contains.
 	if word, isReparse := reparsingCommandWord(raw); isReparse {
-		return g.noteHardRules(deny(RuleCommandReparse,
+		noteUnreadable(g.noteHardRules(deny(RuleCommandReparse,
 			"`"+word+"` re-parses its argument as shell code after expansion, so nothing in this "+
 				"line — the allowlist match, the git-safety rules, or the redirection targets — "+
 				"describes what would actually run; write the commands out directly instead.",
-			normalized, taskID))
+			normalized, taskID)))
 	}
 	spans, subErr := liveSubstitutions(raw)
 	switch {
 	case subErr != nil:
-		return g.noteHardRules(deny(RuleCommandSubstitution,
+		noteUnreadable(g.noteHardRules(deny(RuleCommandSubstitution,
 			"Command substitution could not be analysed to its end and is not allowed; "+
-				"rewrite without $(), backticks, <() or >().", normalized, taskID))
+				"rewrite without $(), backticks, <() or >().", normalized, taskID)))
 	case len(spans) > 0 && depth >= maxSubstitutionDepth:
-		return g.noteHardRules(deny(RuleCommandSubstitution,
+		noteUnreadable(g.noteHardRules(deny(RuleCommandSubstitution,
 			"Command substitution nested beyond the analysis limit is not allowed; "+
-				"run the inner commands separately.", normalized, taskID))
+				"run the inner commands separately.", normalized, taskID)))
 	case len(spans) > 0:
-		var warnDecision *Decision
 		for _, span := range spans {
 			d := g.evaluate(span, task, depth+1)
 			if d.Action == Deny {
@@ -251,20 +302,19 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 				// $(…) launders nothing.
 				d.Reason = fmt.Sprintf("Substituted command `%s` was denied: %s", clipForReason(span), d.Reason)
 				d.Target = normalized
-				return d
+				switch {
+				case IsUnreadableRule(d.Rule):
+					noteUnreadable(d)
+				case d.Severity == Hard:
+					return d
+				case softInner == nil:
+					softInner = &d
+				}
+				continue
 			}
 			if d.Action == Warn && warnDecision == nil {
 				warnDecision = &d
 			}
-		}
-		if warnDecision != nil {
-			return *warnDecision
-		}
-	}
-
-	if g.HardRules {
-		if d, fired := gitSafety(normalized, taskID); fired && d.Action == Deny {
-			return d
 		}
 	}
 
@@ -273,10 +323,10 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 	// the point, because it decides where every relative path *after* it
 	// writes. See RuleCommandDirectoryChange.
 	if cdSegmentRe.MatchString(normalized) {
-		return g.noteHardRules(deny(RuleCommandDirectoryChange,
+		noteUnreadable(g.noteHardRules(deny(RuleCommandDirectoryChange,
 			"Changing the working directory is not allowed: every relative path in this command "+
 				"would then resolve somewhere other than where the gate judged it. Use paths "+
-				"relative to the repository root instead.", normalized, taskID))
+				"relative to the repository root instead.", normalized, taskID)))
 	}
 
 	// git carries its own directory change, and it is the same refusal. `git -C
@@ -284,10 +334,20 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 	// `--work-tree` split the two apart. A rung that refuses `cd` while these
 	// pass is a rung that refuses one spelling of the problem.
 	if opt, moved := gitDirectoryEscape(normalized); moved {
-		return g.noteHardRules(deny(RuleCommandDirectoryChange,
+		noteUnreadable(g.noteHardRules(deny(RuleCommandDirectoryChange,
 			"`git "+opt+"` runs against a working tree other than the one this gate judges for, "+
 				"so nothing it does was examined. Run git from the repository root instead.",
-			normalized, taskID))
+			normalized, taskID)))
+	}
+
+	if unreadable != nil {
+		return *unreadable
+	}
+	if softInner != nil {
+		return *softInner
+	}
+	if warnDecision != nil {
+		return *warnDecision
 	}
 
 	if matcherOf(g.Matcher).any(NoTaskAllowedCommands, normalized) {

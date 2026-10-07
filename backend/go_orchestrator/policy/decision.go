@@ -259,6 +259,22 @@ func RuleKnown(rule RuleID) bool {
 // IsCommandRule reports whether this rule decided about a shell command.
 func IsCommandRule(rule RuleID) bool { return SubjectOf(rule) == SubjectCommand }
 
+// unreadableRules refuse a command line because the ladder could not read it to
+// the end — not because of anything it read. They are hard for the reason given
+// beside each rule above, and they rank below every other hard refusal: when a
+// line holds both, the one about what the line does is reported, so a refusal
+// about the gate's own reach can never hide a force push.
+var unreadableRules = map[RuleID]bool{
+	RuleCommandDirectoryChange: true,
+	RuleCommandHeredoc:         true,
+	RuleCommandSubstitution:    true,
+	RuleCommandReparse:         true,
+}
+
+// IsUnreadableRule reports whether a rule refuses a line for the gate's own
+// inability to read it rather than for what it does.
+func IsUnreadableRule(rule RuleID) bool { return unreadableRules[rule] }
+
 // agentGrantable lists the rules an agent may clear for itself by default,
 // within its own lease scope and under the agent TTL ceiling.
 //
