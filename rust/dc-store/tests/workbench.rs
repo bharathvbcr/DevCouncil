@@ -378,3 +378,150 @@ fn invalid_unicode_is_a_validation_error_and_valid_pairs_round_trip() {
     assert_eq!(value(&result, "$.item.title"), "Fix 🚀 launch");
     assert_eq!(number(&f.call("events.list", "{}"), "$.total"), 2);
 }
+
+#[test]
+fn relinking_a_moved_checkout_keeps_the_repository_its_tasks_and_their_history() {
+    let f = Fixture::new();
+    f.repo("r1");
+    f.workspace("ws", r#"["r1"]"#);
+    f.task("t1", r#"["r1"]"#);
+    let relink = r#"{"request_id":"relink","id":"r1","expected_revision":1,"identity_key":"local:/moved/r1","name":"r1 (moved)"}"#;
+    let relinked = f.call("repositories.relink", relink);
+    assert_eq!(value(&relinked, "$.item.identity_key"), "local:/moved/r1");
+    assert_eq!(value(&relinked, "$.item.name"), "r1 (moved)");
+    assert_eq!(number(&relinked, "$.item.revision"), 2);
+    // The id did not change, so nothing that points at it had to: the task is
+    // still linked, still in its workspace, and was not rewritten.
+    assert_eq!(
+        number(
+            &f.call("items.list", r#"{"repository_id":"r1"}"#),
+            "$.total"
+        ),
+        1
+    );
+    assert_eq!(
+        number(
+            &f.call("repositories.list", r#"{"workspace_id":"ws"}"#),
+            "$.total"
+        ),
+        1
+    );
+    assert_eq!(
+        number(&f.call("items.get", r#"{"id":"t1"}"#), "$.item.revision"),
+        1
+    );
+    // The relink is an event of its own, and the identity it replaced is
+    // still on record in the store's revision history.
+    let events = f.call("events.list", "{}");
+    assert!(
+        events.contains(r#""kind":"repositories.relink""#),
+        "{events}"
+    );
+    let store = Connection::open(f.0.join("profile.sqlite")).unwrap();
+    let identities: Vec<String> = store
+        .prepare("SELECT json_extract(body,'$.identity_key') FROM work_revisions WHERE entity_type='repository' AND entity_id='r1' ORDER BY revision")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(identities, ["local:r1", "local:/moved/r1"]);
+    // A replayed receipt is the same answer, not a second relink.
+    assert_eq!(f.call("repositories.relink", relink), relinked);
+    // A stale revision cannot relink it somewhere else.
+    f.refuse(
+        "repositories.relink",
+        r#"{"request_id":"stale","id":"r1","expected_revision":1,"identity_key":"local:/elsewhere"}"#,
+        "revision_conflict",
+    );
+    // `repositories.put` still refuses to change an identity on its own.
+    f.refuse(
+        "repositories.put",
+        r#"{"request_id":"put","id":"r1","expected_revision":2,"name":"r1","identity_key":"local:/elsewhere"}"#,
+        "invalid_input",
+    );
+}
+
+#[test]
+fn relinking_never_merges_two_distinct_clones() {
+    let f = Fixture::new();
+    f.repo("r1");
+    f.repo("r2");
+    f.task("t1", r#"["r1"]"#);
+    f.call("items.put",r#"{"request_id":"task-t2","id":"t2","expected_revision":0,"title":"Clone work","repository_ids":["r2"],"primary_repository_id":"r2"}"#);
+    // Another record holds the identity: refused, and naming it does not help
+    // while it carries work of its own.
+    f.refuse(
+        "repositories.relink",
+        r#"{"request_id":"a","id":"r1","expected_revision":1,"identity_key":"local:r2"}"#,
+        "invalid_input",
+    );
+    f.refuse(
+        "repositories.relink",
+        r#"{"request_id":"b","id":"r1","expected_revision":1,"identity_key":"local:r2","absorb_id":"r2"}"#,
+        "repository_not_empty",
+    );
+    // A deleted task's link is history the record still holds.
+    f.call(
+        "items.delete",
+        r#"{"request_id":"del","id":"t2","expected_revision":1}"#,
+    );
+    f.refuse(
+        "repositories.relink",
+        r#"{"request_id":"c","id":"r1","expected_revision":1,"identity_key":"local:r2","absorb_id":"r2"}"#,
+        "repository_not_empty",
+    );
+    // A workspace membership alone is enough to keep a record too.
+    f.repo("r3");
+    f.workspace("ws", r#"["r3"]"#);
+    f.refuse(
+        "repositories.relink",
+        r#"{"request_id":"d","id":"r1","expected_revision":1,"identity_key":"local:r3","absorb_id":"r3"}"#,
+        "repository_not_empty",
+    );
+    // Naming a record that does not hold the identity is refused.
+    f.refuse(
+        "repositories.relink",
+        r#"{"request_id":"e","id":"r1","expected_revision":1,"identity_key":"local:moved","absorb_id":"r3"}"#,
+        "invalid_input",
+    );
+    // So is a relink that changes nothing, and one aimed at no record.
+    f.refuse(
+        "repositories.relink",
+        r#"{"request_id":"f","id":"r1","expected_revision":1,"identity_key":"local:r1"}"#,
+        "invalid_input",
+    );
+    f.refuse(
+        "repositories.relink",
+        r#"{"request_id":"g","id":"missing","expected_revision":0,"identity_key":"local:x"}"#,
+        "not_found",
+    );
+    assert_eq!(number(&f.call("repositories.list", "{}"), "$.total"), 3);
+}
+
+#[test]
+fn relinking_absorbs_only_the_empty_record_a_host_registered_for_the_new_checkout() {
+    let f = Fixture::new();
+    f.repo("r1");
+    f.task("t1", r#"["r1"]"#);
+    // Opening the moved checkout registered it again before anyone relinked.
+    f.call("repositories.put", r#"{"request_id":"fresh","id":"fresh","expected_revision":0,"name":"r1","identity_key":"local:/moved/r1"}"#);
+    f.call(
+        "repositories.relink",
+        r#"{"request_id":"relink","id":"r1","expected_revision":1,"identity_key":"local:/moved/r1","absorb_id":"fresh"}"#,
+    );
+    let repositories = f.call("repositories.list", "{}");
+    assert_eq!(number(&repositories, "$.total"), 1);
+    assert_eq!(value(&repositories, "$.items[0].id"), "r1");
+    assert_eq!(
+        value(&repositories, "$.items[0].identity_key"),
+        "local:/moved/r1"
+    );
+    assert_eq!(
+        number(
+            &f.call("items.list", r#"{"repository_id":"r1"}"#),
+            "$.total"
+        ),
+        1
+    );
+}
