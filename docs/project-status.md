@@ -16,10 +16,12 @@ availability; it does not certify every platform, editor session or release.
 | Search | Rust `dcgrep` | Ignore-aware search and optional trigram index; text matches are not semantic edges |
 | Host adapters | Six names shared by Go and Rust installers | Different outputs by host; Go's Codex task adapter remains comment-only while Rust installs DevMap MCP |
 | Engineering skills | Embedded/scaffolded instructions | Guidance, not enforced permission or proof of host loading |
-| Sandbox selector | Accepted by Go verification | Records selection; Docker/Nix isolation is not implemented |
+| Sandbox selector | `--sandbox local` only | Anything else is refused (`verify.ParseSandbox`, exit 2); Docker/Nix isolation is not implemented |
 
-Native source versions are declared independently: currently 0.2.2 in the
-Rust workspace, the Go host and the npm launcher. These are source
+Native source versions are declared independently: currently 0.2.4 in the
+Rust workspace (`rust/Cargo.toml`), the Go host
+(`backend/go_orchestrator/devcouncil/version/version.go`) and the npm launcher
+(`package.json`). These are source
 values, not proof of publication. Inspect `devmap --version`,
 `devcouncil --version` and `devmap paths --json` for installed identity.
 Old Python 0.4.x release notes belong to a different runtime lineage.
