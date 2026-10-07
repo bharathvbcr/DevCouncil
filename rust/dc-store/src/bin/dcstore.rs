@@ -171,6 +171,11 @@ const KNOWN_FLAGS: &[&str] = &[
     "line",
     "suggested-command",
     "expected-verification-method",
+    // Where a failed command's captured output was written. Listed with the
+    // handler that reads them, not after it, which is the order the comment
+    // above asks for.
+    "stdout-path",
+    "stderr-path",
 ];
 
 /// The identity a caller checks to confirm it is talking to this store and not
@@ -746,6 +751,8 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                             &r.line.map_or_else(|| "null".to_string(), |n| n.to_string()),
                         ),
                         ("suggested_command", &maybe(r.suggested_command.as_deref())),
+                        ("stdout_path", &maybe(r.stdout_path.as_deref())),
+                        ("stderr_path", &maybe(r.stderr_path.as_deref())),
                     ])
                 })
                 .collect();
@@ -831,6 +838,8 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                 acceptance_criterion_id: flag("acceptance-criterion-id").map(str::to_string),
                 expected_verification_method: flag("expected-verification-method")
                     .map(str::to_string),
+                stdout_path: flag("stdout-path").map(str::to_string),
+                stderr_path: flag("stderr-path").map(str::to_string),
             };
             store
                 .gap_upsert(&gap)

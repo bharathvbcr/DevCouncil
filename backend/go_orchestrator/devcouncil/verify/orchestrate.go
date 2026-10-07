@@ -404,6 +404,8 @@ func toStoreGaps(gaps []Gap) []store.GapRow {
 			File:                       g.File,
 			Line:                       g.Line,
 			SuggestedCommand:           g.SuggestedCommand,
+			StdoutPath:                 g.StdoutPath,
+			StderrPath:                 g.StderrPath,
 		})
 	}
 	return out

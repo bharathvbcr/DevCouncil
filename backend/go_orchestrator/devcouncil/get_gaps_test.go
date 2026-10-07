@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
@@ -11,7 +13,7 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
-// TestGetGapsReportsAGapsLinkageAndLocation reads gaps back through
+// TestGetGapsReportsAGapsOptionalFields reads gaps back through
 // devcouncil_get_gaps from a real store and checks the JSON an MCP client
 // receives.
 //
@@ -19,13 +21,19 @@ import (
 // still lost here unless it is named. An acceptance_criteria_unproven gap that
 // does not say which requirement and criterion it is about, or which method was
 // expected, tells an agent that something is unproven but not what; a gap with
-// no file, line or command tells it something is wrong but not where.
-func TestGetGapsReportsAGapsLinkageAndLocation(t *testing.T) {
+// no file, line or command tells it something is wrong but not where, and one
+// with no output paths leaves it to re-run a command to see why it failed.
+//
+// Beyond the values below, every field store.GapRow decodes must appear as a
+// key in every gap, so a field added to the store row and forgotten here fails
+// this test instead of disappearing from the tool.
+func TestGetGapsReportsAGapsOptionalFields(t *testing.T) {
 	ctx := context.Background()
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
 
 	req, ac, method := "REQ-1", "AC-1.1", "integration_test"
 	file, line, cmd := "src/a.py", 9, "pytest tests/test_a.py"
+	stdout, stderr := "runs/r1/stdout.log", "runs/r1/stderr.log"
 	if err := client.GapsReplace(ctx, "TASK-1", []store.GapRow{
 		{
 			ID: "G-AC", Severity: "high", GapType: "acceptance_criteria_unproven",
@@ -33,6 +41,7 @@ func TestGetGapsReportsAGapsLinkageAndLocation(t *testing.T) {
 			Blocking: true, EvidenceJSON: []byte(`[]`),
 			RequirementID: &req, AcceptanceCriterionID: &ac, ExpectedVerificationMethod: &method,
 			File: &file, Line: &line, SuggestedCommand: &cmd,
+			StdoutPath: &stdout, StderrPath: &stderr,
 		},
 		{
 			ID: "G-STUB", Severity: "low", GapType: "stub_detected",
@@ -71,6 +80,8 @@ func TestGetGapsReportsAGapsLinkageAndLocation(t *testing.T) {
 			"file":                         `"src/a.py"`,
 			"line":                         `9`,
 			"suggested_command":            `"pytest tests/test_a.py"`,
+			"stdout_path":                  `"runs/r1/stdout.log"`,
+			"stderr_path":                  `"runs/r1/stderr.log"`,
 		},
 		// Present and null, not absent: a missing key cannot be told apart
 		// from a server that does not report these fields at all.
@@ -81,6 +92,8 @@ func TestGetGapsReportsAGapsLinkageAndLocation(t *testing.T) {
 			"file":                         `null`,
 			"line":                         `null`,
 			"suggested_command":            `null`,
+			"stdout_path":                  `null`,
+			"stderr_path":                  `null`,
 		},
 	}
 	for _, gap := range payload.Gaps {
@@ -94,6 +107,13 @@ func TestGetGapsReportsAGapsLinkageAndLocation(t *testing.T) {
 			continue
 		}
 		delete(want, id)
+		rowType := reflect.TypeOf(store.GapRow{})
+		for i := 0; i < rowType.NumField(); i++ {
+			key := strings.Split(rowType.Field(i).Tag.Get("json"), ",")[0]
+			if _, ok := gap[key]; !ok {
+				t.Errorf("%s: store.GapRow.%s (%q) is not in the reply", id, rowType.Field(i).Name, key)
+			}
+		}
 		for key, value := range expected {
 			got, ok := gap[key]
 			if !ok {

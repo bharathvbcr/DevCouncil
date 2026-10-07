@@ -80,8 +80,9 @@ func TestGapsReplacePersistsAGapItWasGiven(t *testing.T) {
 	}
 }
 
-// TestGapsReplaceKeepsAGapsLinkageAndLocation is the regression test for a gap
-// losing what it is about, and where it is, on the way through the store.
+// TestGapsReplaceKeepsAGapsOptionalFields is the regression test for a gap
+// losing what it is about, where it is, and where its command output went, on
+// the way through the store.
 //
 // verify raises acceptance_criteria_unproven and unsupported_verification_method
 // with a requirement, a criterion and the method that criterion expected, and
@@ -89,23 +90,26 @@ func TestGapsReplacePersistsAGapItWasGiven(t *testing.T) {
 // dcstore stored all six, but GapRow had no fields for them, GapsReplace sent no
 // flags for them and `gaps` emitted none of them — so devcouncil_get_gaps
 // reported a criterion gap that did not say which criterion, and a stub that did
-// not say where.
+// not say where. A failed command's stdout and stderr paths had no column at
+// all.
 //
 // The unlinked gap is asserted too: an absent field must come back nil, not as
 // an empty string or a zero, or "this gap is not about a criterion" and "it is
 // about a criterion with no id" become the same answer.
-func TestGapsReplaceKeepsAGapsLinkageAndLocation(t *testing.T) {
+func TestGapsReplaceKeepsAGapsOptionalFields(t *testing.T) {
 	c := client(t)
 	ctx := context.Background()
 
 	req, ac, method := "REQ-7", "AC-7.2", "integration_test"
 	file, line, cmd := "src/a.go", 42, "go test ./a"
+	stdout, stderr := "runs/r1/stdout.log", "runs/r1/stderr.log"
 	linked := GapRow{
 		ID: "TASK-003-AC", Severity: "high", GapType: "acceptance_criteria_unproven",
 		TaskID: "TASK-003", Description: "AC-7.2 has no passing evidence",
 		RecommendedFix: "prove it", Blocking: true, EvidenceJSON: []byte(`[]`),
 		RequirementID: &req, AcceptanceCriterionID: &ac, ExpectedVerificationMethod: &method,
 		File: &file, Line: &line, SuggestedCommand: &cmd,
+		StdoutPath: &stdout, StderrPath: &stderr,
 	}
 	unlinked := GapRow{
 		ID: "TASK-003-STUB", Severity: "low", GapType: "stub_detected",
@@ -122,6 +126,7 @@ func TestGapsReplaceKeepsAGapsLinkageAndLocation(t *testing.T) {
 		EvidenceJSON:  []byte(`[]`),
 		RequirementID: &empty, AcceptanceCriterionID: &empty, ExpectedVerificationMethod: &empty,
 		File: &empty, SuggestedCommand: &empty,
+		StdoutPath: &empty, StderrPath: &empty,
 	}
 	if err := c.GapsReplace(ctx, "TASK-003", []GapRow{linked, unlinked, emptyLinked}); err != nil {
 		t.Fatalf("GapsReplace: %v", err)
@@ -142,13 +147,14 @@ func TestGapsReplaceKeepsAGapsLinkageAndLocation(t *testing.T) {
 	none := map[string]string{
 		"requirement_id": "<nil>", "acceptance_criterion_id": "<nil>",
 		"expected_verification_method": "<nil>", "file": "<nil>", "line": "<nil>",
-		"suggested_command": "<nil>",
+		"suggested_command": "<nil>", "stdout_path": "<nil>", "stderr_path": "<nil>",
 	}
 	for id, want := range map[string]map[string]string{
 		linked.ID: {
 			"requirement_id": `"REQ-7"`, "acceptance_criterion_id": `"AC-7.2"`,
 			"expected_verification_method": `"integration_test"`, "file": `"src/a.go"`,
 			"line": "42", "suggested_command": `"go test ./a"`,
+			"stdout_path": `"runs/r1/stdout.log"`, "stderr_path": `"runs/r1/stderr.log"`,
 		},
 		unlinked.ID:    none,
 		emptyLinked.ID: none,
@@ -182,6 +188,8 @@ func gapFields(g GapRow) map[string]string {
 		"file":                         str(g.File),
 		"line":                         line,
 		"suggested_command":            str(g.SuggestedCommand),
+		"stdout_path":                  str(g.StdoutPath),
+		"stderr_path":                  str(g.StderrPath),
 	}
 }
 

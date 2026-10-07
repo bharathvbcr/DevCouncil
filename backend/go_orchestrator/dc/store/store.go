@@ -678,6 +678,9 @@ type GapRow struct {
 	File             *string `json:"file"`
 	Line             *int    `json:"line"`
 	SuggestedCommand *string `json:"suggested_command"`
+	// Where a failed verification command's captured output was written.
+	StdoutPath *string `json:"stdout_path"`
+	StderrPath *string `json:"stderr_path"`
 }
 
 // GapHistoryRow is what became of one gap across a task's verification runs.
@@ -899,6 +902,8 @@ func (c *Client) GapsReplace(ctx context.Context, taskID string, gaps []GapRow) 
 			{"--expected-verification-method", g.ExpectedVerificationMethod},
 			{"--file", g.File},
 			{"--suggested-command", g.SuggestedCommand},
+			{"--stdout-path", g.StdoutPath},
+			{"--stderr-path", g.StderrPath},
 		} {
 			if opt.value != nil && *opt.value != "" {
 				args = append(args, opt.flag, *opt.value)

@@ -342,6 +342,10 @@ func (r *Registry) callGetGaps(ctx context.Context, args map[string]any) any {
 			"file":              row.File,
 			"line":              row.Line,
 			"suggested_command": row.SuggestedCommand,
+			// Where a failed command's captured output is, so the gap can be
+			// read without re-running the command.
+			"stdout_path": row.StdoutPath,
+			"stderr_path": row.StderrPath,
 		}
 		if h, ok := history[row.ID]; ok {
 			gap["occurrences"] = h.Occurrences
