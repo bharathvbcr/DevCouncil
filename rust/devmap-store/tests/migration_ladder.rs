@@ -59,8 +59,9 @@ fn tmp_dir(label: &str) -> PathBuf {
 /// Below 5 there is no `generations` table to hold rows, and the `version == 3`
 /// and `version == 4` blocks re-run `CREATE_SCHEMA_V3` — which builds the
 /// *current* shape — so those two rungs are covered by
-/// `test_s2_migration_v3_to_v4_preserves_cache_rows` and its neighbour in
-/// `store_hardening.rs` and
+/// `test_s2_migration_v3_to_v4_preserves_cache_rows` in `store_hardening.rs` and
+/// `test_s2_migration_v4_to_v5_preserves_generations_and_adds_analysis` in
+/// `store_hardening_without_grammars.rs`, and
 /// are structurally incapable of the divergence this file hunts.
 const OLDEST_REDUCIBLE: i32 = 5;
 
@@ -825,7 +826,8 @@ fn a_step_that_fails_its_gate_leaves_the_version_where_it_was() {
 /// same rung both execute it — the second against a database where the work is
 /// already done. That is exactly what each step's idempotency probe exists for,
 /// and it had never been exercised *concurrently*: the re-entrancy test in
-/// `store_hardening.rs` re-runs steps one after another in a single thread.
+/// `store_hardening_without_grammars.rs` re-runs steps one after another in a
+/// single thread.
 ///
 /// A daemon, an editor hook and a manual `devmap build` opening the same store
 /// on the first run after an upgrade is the ordinary case, not an exotic one.

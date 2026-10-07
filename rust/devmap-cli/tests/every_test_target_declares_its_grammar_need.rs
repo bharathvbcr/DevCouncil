@@ -107,38 +107,33 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        // These targets read persisted model/storage data. retention_churn
-        // separately requires parse for its extraction-to-retention scenarios.
+        // These targets read persisted model/storage data. Every target that
+        // builds a generation from extracted source is gated in the manifest.
+        //
+        // Until `devmap-serve` stopped being a dev-dependency of the store,
+        // this list named eleven targets that could not compile without
+        // grammars: unification turned `parse` back on for the store's whole
+        // test build, so `cargo test -p devmap-store --no-default-features`
+        // compiled them with it and the list looked true.
+        // `no_feature_off_crate_turns_parse_back_on_through_its_test_build`
+        // is what keeps it true.
         "devmap-store",
         &[
             "a_corrupt_analysis_is_not_an_absent_one",
             // Store opens and the WAL lock protocol; no extraction anywhere.
             "a_second_open_keeps_the_first_connections_locks",
             "a_refusal_names_its_reason_not_a_parameter",
-            "adversarial_store",
-            "coverage_gap_inventory",
-            "digest_scoped_delta",
+            "adversarial_store_without_grammars",
             "embedded_reader",
-            // Landed unclassified in `0197cda`, which left this gate red at
-            // HEAD. `cargo check -p devmap-store --no-default-features
-            // --all-targets` compiles it, which is the instruction in this
-            // test's own failure message.
-            "head_stamp",
+            // Its generation row is written by SQL: a build without grammars
+            // writes none.
+            "head_stamp_without_grammars",
             "kernel_defects",
-            // The unresolved-call ledger's write path. Compiles feature-off for
-            // the reason the neighbours here do: `devmap-store` depends on
-            // `devmap-extract`/`devmap-analyze` without turning their defaults
-            // off, so `extract_file` and `analyze` are present whether or not
-            // `devmap-store/parse` is.
-            "ledger_write",
             "managed_write_security",
             "migration_ladder",
             "one_symlink_rule",
-            "read_only_store",
-            "store_hardening",
-            "test_fault_injection",
-            "validity_ranges",
-            "write_breakdown",
+            "store_hardening_without_grammars",
+            "write_breakdown_without_grammars",
         ],
     ),
 ];
@@ -260,5 +255,71 @@ fn every_integration_test_is_classified_against_the_parse_feature() {
          check that could not run must not report the same green as one that ran",
         FEATURE_OFF_SAFE.len()
     );
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// A crate named in FEATURE_OFF_SAFE must really build its tests without
+/// `parse`, which a manifest that classifies every target does not prove.
+///
+/// `devmap-store` took `devmap-serve` as a dev-dependency with default
+/// features. Feature unification then switched `parse` back on for the store,
+/// for `devmap-extract` and for every crate between them, but only in the test
+/// build, where `cargo check` without `--tests` never looks. So
+/// `cargo test -p devmap-store --no-default-features` compiled every listed
+/// target with grammars, and eleven of them could not have compiled without.
+/// The list above was right about the file names and wrong about the build.
+///
+/// `cargo tree` is asked rather than the manifests read, because unification
+/// is the resolver's decision and only the resolver can state it. The tree is
+/// inverted on `devmap-extract`, so it names every feature of it that the
+/// test build enables and the edge that enabled it.
+#[test]
+fn no_feature_off_crate_turns_parse_back_on_through_its_test_build() {
+    use devmap_extract::subprocess::{run_bounded, Bounds};
+
+    let root = workspace_root();
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut problems = Vec::new();
+    for (crate_name, _) in FEATURE_OFF_SAFE {
+        let mut command = std::process::Command::new(&cargo);
+        command
+            .arg("tree")
+            .arg("--manifest-path")
+            .arg(root.join("Cargo.toml"))
+            .args(["--offline", "-p", crate_name, "--no-default-features"])
+            .args(["-e", "features,normal,dev", "-i", "devmap-extract"]);
+        let output = run_bounded(
+            &mut command,
+            Bounds {
+                deadline: std::time::Duration::from_secs(120),
+                stdout_cap: 1024 * 1024,
+                stderr_cap: 16 * 1024,
+            },
+        )
+        .unwrap_or_else(|failure| panic!("{crate_name}: cargo tree did not run: {failure}"));
+        assert!(
+            output.status.success() && !output.stdout_truncated,
+            "{crate_name}: cargo tree did not answer in full (status {}, truncated {}): {}",
+            output.status,
+            output.stdout_truncated,
+            output.stderr_trimmed()
+        );
+        let tree = output.stdout_lossy();
+        // An empty or unrelated answer is a check that did not run, and must
+        // not read as a tree with no `parse` in it.
+        assert!(
+            tree.starts_with("devmap-extract v"),
+            "{crate_name}: cargo tree did not root its answer at devmap-extract:\n{tree}"
+        );
+        if tree.contains("devmap-extract feature \"parse\"") {
+            problems.push(format!(
+                "{crate_name}: `cargo test -p {crate_name} --no-default-features` \
+                 builds devmap-extract with `parse`, so no target listed for it in \
+                 FEATURE_OFF_SAFE runs without grammars. Look for a dependency or \
+                 dev-dependency that takes a parsing crate with its default \
+                 features:\n{tree}"
+            ));
+        }
+    }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
