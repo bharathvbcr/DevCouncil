@@ -134,21 +134,15 @@ func Run(opts Options) (*Receipt, error) {
 	if selfBin == "" {
 		selfBin, _ = os.Executable()
 	}
-	// Two different questions, and conflating them is what let repository
-	// content be executed. `devmap` is the name written into the host config,
-	// which the *host* resolves later on its own PATH. `runnable` is the
-	// program this process is willing to spawn, and PATH discovery there
-	// refuses any candidate whose canonical location is inside the repository.
+	// `runnable` is the program this process is willing to spawn, and PATH
+	// discovery refuses any candidate whose canonical location is inside the
+	// repository: running repository content is what that refusal prevents.
 	// An explicit --devmap-bin stays an operator's choice, used or refused.
-	devmap := opts.DevmapBin
+	// Nothing here writes a `devmap` server entry; the spawned
+	// `devmap integrate` owns that.
 	runnable := opts.DevmapBin
-	if devmap == "" {
-		devmap = "devmap"
-		discovered, err := proc.LookPathOutside("devmap", root)
-		if err != nil {
-			runnable = ""
-		} else {
-			devmap = discovered
+	if runnable == "" {
+		if discovered, err := proc.LookPathOutside("devmap", root); err == nil {
 			runnable = discovered
 		}
 	}
@@ -168,11 +162,11 @@ func Run(opts Options) (*Receipt, error) {
 
 	switch host {
 	case "cursor":
-		if err := integrateCursor(repo, root, selfBin, devmap, mode, receipt); err != nil {
+		if err := integrateCursor(repo, root, selfBin, mode, receipt); err != nil {
 			return receipt, err
 		}
 	case "claude":
-		if err := integrateClaude(repo, root, selfBin, devmap, mode, receipt); err != nil {
+		if err := integrateClaude(repo, root, selfBin, mode, receipt); err != nil {
 			return receipt, err
 		}
 	case "codex":
@@ -194,6 +188,13 @@ func Run(opts Options) (*Receipt, error) {
 	}
 
 	// Compose DevMap assets rather than reimplementing them.
+	if mode == ModeCheck {
+		// A check runs nothing, so it never saw DevMap's half. Saying so keeps
+		// a clean receipt from reading as a clean DevMap installation.
+		receipt.Notes = append(receipt.Notes, fmt.Sprintf(
+			"devmap assets not examined: --check runs nothing, and the devmap server entry, "+
+				"guides and skills belong to DevMap; run `devmap integrate %s --check`", host))
+	}
 	if mode == ModeApply || mode == ModeDryRun {
 		if runnable == "" {
 			receipt.Notes = append(receipt.Notes,
@@ -287,7 +288,13 @@ func skillInstallArgs(root, host string) []string {
 	return args
 }
 
-func integrateCursor(repo *os.Root, root, selfBin, devmap string, mode Mode, receipt *Receipt) error {
+// The `devmap` entry in `.cursor/mcp.json` and `.mcp.json` is not written
+// here. `devmap integrate <host>`, which Run composes, owns it: it pins the entry
+// with `--root`, and for Claude withholds it while the enabled Dev Map plugin
+// registers the same server. Writing an unpinned copy here undid both on every
+// run, so `--check` reported drift forever and, beside the plugin, Claude Code
+// could load devmap twice.
+func integrateCursor(repo *os.Root, root, selfBin string, mode Mode, receipt *Receipt) error {
 	mcp := map[string]any{
 		"mcpServers": map[string]any{
 			"devcouncil": map[string]any{
@@ -297,11 +304,6 @@ func integrateCursor(repo *os.Root, root, selfBin, devmap string, mode Mode, rec
 				"env": map[string]string{
 					"DEVCOUNCIL_PROJECT_ROOT": root,
 				},
-			},
-			"devmap": map[string]any{
-				"type":    "stdio",
-				"command": devmap,
-				"args":    []string{"mcp"},
 			},
 		},
 	}
@@ -319,17 +321,13 @@ func integrateCursor(repo *os.Root, root, selfBin, devmap string, mode Mode, rec
 	return nil
 }
 
-func integrateClaude(repo *os.Root, root, selfBin, devmap string, mode Mode, receipt *Receipt) error {
+func integrateClaude(repo *os.Root, root, selfBin string, mode Mode, receipt *Receipt) error {
 	mcp := map[string]any{
 		"mcpServers": map[string]any{
 			"devcouncil": map[string]any{
 				"command": selfBin,
 				"args":    []string{"mcp"},
 				"env":     map[string]string{"DEVCOUNCIL_PROJECT_ROOT": root},
-			},
-			"devmap": map[string]any{
-				"command": devmap,
-				"args":    []string{"mcp"},
 			},
 		},
 	}
@@ -375,7 +373,8 @@ type hostMcpDoc struct {
 // hostMcpDocs are the hosts whose server document this package writes.
 //
 // Cursor and Claude are absent on purpose: their files are handled by the
-// adapters above, which also write a rule and pick up `.claude/mcp.json`.
+// adapters above, which also write a rule (Cursor) and leave the `devmap`
+// entry to `devmap integrate`.
 var hostMcpDocs = map[string]hostMcpDoc{
 	"antigravity": {rel: ".agents/mcp_config.json", container: "mcpServers"},
 	"opencode": {

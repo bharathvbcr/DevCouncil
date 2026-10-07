@@ -7,7 +7,9 @@
 //!   except that Claude's user-scope entry is withheld — and an owned unpinned
 //!   one removed — while the enabled Dev Map plugin registers the same server
 //! - rewrites per-project owned entries to `--root <abs>` (belt-and-braces;
-//!   insufficient for multi-tab Cursor — callers must still pass `repo_path`)
+//!   insufficient for multi-tab Cursor — callers must still pass `repo_path`),
+//!   except that Claude's project `.mcp.json` gets the same withholding as its
+//!   user-scope entry while the plugin is enabled
 
 use std::fs;
 use std::io::{self, Read};
@@ -238,31 +240,37 @@ pub fn integrate(
         skills_check_ok = skill_report.check_ok;
     }
 
-    if host.registers_global_mcp() {
-        // An enabled Dev Map plugin already registers `devmap` for Claude
-        // Code. A user-scope entry beside it is a second server for the same
-        // host, which `devmap doctor` reports as a duplicate — and writing it
-        // here is what kept bringing that duplicate back after it was removed.
-        let plugin_registration = match host {
-            Host::Claude => {
-                let install = claude::claude_plugin_install(&dirs_home()?);
-                let registration = claude_plugin_registration(&install);
-                if registration.is_none() {
-                    // Unknown is not "no plugin": say the write rests on it.
-                    for error in install.record_error.iter().chain(&install.load_error) {
-                        report.notes.push(format!(
-                            "claude: could not tell whether the Dev Map plugin registers devmap \
-                             ({error}); the user-scope entry was managed as if it does not"
-                        ));
-                    }
+    // An enabled Dev Map plugin already registers `devmap` for Claude Code. A
+    // user- or project-scope entry beside it is a second server for the same
+    // host: Claude Code collapses same-named servers only across its own
+    // scopes, and drops a plugin server only when another has the same
+    // command, which the absolute path these entries carry never matches.
+    // Writing either one is what kept bringing the duplicate back.
+    let plugin_registration = match host {
+        Host::Claude => {
+            let install = claude::claude_plugin_install(&dirs_home()?);
+            let registration = claude_plugin_registration(&install);
+            if registration.is_none() {
+                // Unknown is not "no plugin": say the writes rest on it.
+                for error in install.record_error.iter().chain(&install.load_error) {
+                    report.notes.push(format!(
+                        "claude: could not tell whether the Dev Map plugin registers devmap \
+                         ({error}); the user- and project-scope entries were managed as if it \
+                         does not"
+                    ));
                 }
-                registration
             }
-            _ => None,
-        };
+            registration
+        }
+        _ => None,
+    };
+
+    if host.registers_global_mcp() {
         for path in global_mcp_paths(host)? {
             let outcome = match &plugin_registration {
-                Some(plugin_mcp) => retire_global_mcp(&path, plugin_mcp, dry_run || check)?,
+                Some(plugin_mcp) => {
+                    retire_beside_plugin(&path, plugin_mcp, "user-scope", dry_run || check)?
+                }
                 None => merge_global_mcp(&path, executable, dry_run || check)?,
             };
             report.global_mcp.push(outcome);
@@ -312,14 +320,27 @@ pub fn integrate(
     }
 
     // Clean stale `--db` registrations, then offer `--root` when the project
-    // has no DevMap entry. `--root` is insufficient for multi-tab Cursor.
-    for path in project_mcp_paths(host, &root) {
-        if let Some(outcome) = clean_project_mcp(&path, executable, dry_run || check)? {
+    // has no DevMap entry. `--root` is insufficient for multi-tab Cursor. A
+    // document the host loads is instead kept clear of `devmap` while the
+    // enabled plugin registers it.
+    for site in project_mcp_sites(host, &root) {
+        if let (true, Some(plugin_mcp)) = (site.loaded, &plugin_registration) {
+            report.project_mcp.push(retire_beside_plugin(
+                &site.path,
+                plugin_mcp,
+                "project-scope",
+                dry_run || check,
+            )?);
+            continue;
+        }
+        if let Some(outcome) = clean_project_mcp(&site.path, executable, dry_run || check)? {
             report.project_mcp.push(outcome);
             continue;
         }
-        if let Some(outcome) = offer_project_mcp(&path, executable, dry_run || check)? {
-            report.project_mcp.push(outcome);
+        if site.loaded {
+            if let Some(outcome) = offer_project_mcp(&site.path, executable, dry_run || check)? {
+                report.project_mcp.push(outcome);
+            }
         }
     }
 
@@ -352,12 +373,25 @@ fn global_mcp_paths(host: Host) -> anyhow::Result<Vec<PathBuf>> {
     })
 }
 
-fn project_mcp_paths(host: Host, root: &Path) -> Vec<PathBuf> {
+/// One per-project `mcpServers` document the merge inspects.
+struct ProjectMcpSite {
+    path: PathBuf,
+    /// Whether the host loads this document. Only a loaded one is offered a
+    /// new entry, and only a loaded one duplicates an enabled plugin.
+    loaded: bool,
+}
+
+fn project_mcp_sites(host: Host, root: &Path) -> Vec<ProjectMcpSite> {
+    let site = |path: PathBuf, loaded: bool| ProjectMcpSite { path, loaded };
     match host {
-        Host::Cursor => vec![root.join(".cursor").join("mcp.json")],
+        Host::Cursor => vec![site(root.join(".cursor").join("mcp.json"), true)],
+        // Claude Code documents `<root>/.mcp.json` as its only project-scope
+        // file. `<root>/.claude/mcp.json` is named nowhere, so creating one
+        // left a file no host reads; an entry already there is still cleaned
+        // of a stale `--db`, but nothing new is written to it.
         Host::Claude => vec![
-            root.join(".mcp.json"),
-            root.join(".claude").join("mcp.json"),
+            site(root.join(".mcp.json"), true),
+            site(root.join(".claude").join("mcp.json"), false),
         ],
         // The three below are written by `host_mcp_document`, which knows each
         // one's container key and entry shape. They are deliberately absent
@@ -839,16 +873,19 @@ fn claude_plugin_registration(install: &claude::ClaudePluginInstall) -> Option<P
         })
 }
 
-/// Keep a global host config from registering `devmap` a second time beside
-/// the enabled plugin's registration at `plugin_mcp`.
+/// Keep a Claude Code config at `path` — user-scope `~/.claude.json` or a
+/// project `.mcp.json`, named by `scope` in the notes — from registering
+/// `devmap` a second time beside the enabled plugin's registration at
+/// `plugin_mcp`.
 ///
-/// Removes only an entry this installer writes in its unpinned form, the one
-/// the plugin duplicates. A pinned (`--root`/`--db`) entry or one this
-/// installer did not write is a choice someone made; it is reported and left.
-/// Every other key in the file survives.
-pub fn retire_global_mcp(
+/// Removes only an entry this installer writes in its unpinned form. A pinned
+/// (`--root`/`--db`) entry or one this installer did not write is a choice
+/// someone made; it is reported and left, and the note says Claude Code still
+/// loads it. Every other key in the file survives.
+pub fn retire_beside_plugin(
     path: &Path,
     plugin_mcp: &Path,
+    scope: &str,
     read_only: bool,
 ) -> anyhow::Result<McpMergeOutcome> {
     let outcome = |changed: bool, note: String| McpMergeOutcome {
@@ -863,7 +900,7 @@ pub fn retire_global_mcp(
             false,
             format!(
                 "not registered here: the enabled Dev Map plugin registers devmap for Claude \
-                 Code at {plugin}, and a user-scope entry would load the same server twice"
+                 Code at {plugin}, and a {scope} entry would load a second server beside it"
             ),
         )
     };
@@ -890,8 +927,8 @@ pub fn retire_global_mcp(
         return Ok(outcome(
             false,
             format!(
-                "pinned (--root/--db) devmap entry left unchanged; the enabled Dev Map plugin \
-                 also registers the unpinned server at {plugin}"
+                "pinned (--root/--db) devmap entry left unchanged, but Claude Code can load it as a \
+                 second server beside the enabled Dev Map plugin's at {plugin}; remove one"
             ),
         ));
     }
@@ -902,8 +939,8 @@ pub fn retire_global_mcp(
     Ok(outcome(
         true,
         format!(
-            "{} the user-scope devmap entry: the enabled Dev Map plugin registers the same \
-             server at {plugin}, and Claude Code loaded both",
+            "{} the {scope} devmap entry: the enabled Dev Map plugin registers devmap at \
+             {plugin}, and Claude Code would load both",
             if read_only { "would remove" } else { "removed" }
         ),
     ))
@@ -1066,7 +1103,7 @@ const MAX_HOST_CONFIG_BYTES: u64 = 1 << 20;
 /// `read_to_string` had no ceiling and no notion of what it opened, so a
 /// character device or an oversized file at a known config name was read until
 /// it stopped or the process did.
-fn read_host_config(path: &Path) -> io::Result<String> {
+pub(crate) fn read_host_config(path: &Path) -> io::Result<String> {
     let file = fs::File::open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {

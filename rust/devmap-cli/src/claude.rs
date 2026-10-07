@@ -1948,6 +1948,37 @@ pub struct ClaudePluginInstall {
     pub leftovers: Vec<PathBuf>,
 }
 
+/// Whether a settings file Claude Code reads names the project `.mcp.json`
+/// server `name` in `disabledMcpjsonServers`.
+///
+/// "A rejection in any settings file applies" and "blocks it in every
+/// permission mode" (<https://code.claude.com/docs/en/settings-reference#disabledmcpjsonservers>),
+/// so a rejected server is never loaded. Reads user `settings.json` and the
+/// project's `settings.json` / `settings.local.json`; managed settings are not
+/// read, so a server rejected only there is still counted — an over-report,
+/// never a missed duplicate. An unreadable file rejects nothing.
+pub fn claude_project_server_rejected(home: Option<&Path>, project: &Path, name: &str) -> bool {
+    let project_settings = project.join(".claude");
+    home.map(|home| home.join(".claude").join("settings.json"))
+        .into_iter()
+        .chain([
+            project_settings.join("settings.json"),
+            project_settings.join("settings.local.json"),
+        ])
+        .any(|path| {
+            crate::integrate::read_host_config(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|settings| {
+                    settings
+                        .get("disabledMcpjsonServers")?
+                        .as_array()
+                        .map(|names| names.iter().any(|n| n.as_str() == Some(name)))
+                })
+                .unwrap_or(false)
+        })
+}
+
 /// Which copy of the Dev Map plugin Claude Code loads, and what it records.
 ///
 /// A plugin whose marketplace was added from a local directory, and whose

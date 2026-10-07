@@ -27,7 +27,7 @@ or `--check` applies changes. Read the JSON receipt with `--json` when scripting
 | Host | DevMap configuration surfaces |
 |---|---|
 | Cursor | Global MCP registration, owned project entries, managed guides/rule, `.cursor/skills` and `.cursor/hooks.json` |
-| Claude | Global MCP registration, owned project entries, managed guides and `.claude/skills`; separate `devmap claude plugin` generates a plugin bundle |
+| Claude | Global MCP registration and the project `.mcp.json` entry (both withheld while the Dev Map plugin is enabled), managed guides and `.claude/skills`; separate `devmap claude plugin` generates a plugin bundle |
 | Codex | User `~/.codex/config.toml` MCP registration, `.agents/skills`, project plugin/hook assets; host trust may need renewal |
 | Antigravity | `.agents/mcp_config.json` and `.agents/skills` |
 | OpenCode | `opencode.json`, its project skills layout and a DevMap post-tool plugin |
@@ -90,12 +90,17 @@ devcouncil integrate cursor --check
 
 The Go adapter merges the `devcouncil` server and invokes DevMap integration
 when a usable binary is found. Inspect `spawned` and `notes`; a Go receipt alone
-is not proof that every DevMap asset is installed.
+is not proof that every DevMap asset is installed. The `devmap` entry in
+`.cursor/mcp.json` and `.mcp.json` is written only by `devmap integrate`,
+which pins it with `--root` and, for Claude, withholds it from both
+`~/.claude.json` and `.mcp.json` while the enabled Dev Map plugin registers
+the server. `--check` spawns nothing, so it does not examine DevMap assets;
+run `devmap integrate <host> --check` for those.
 
 | Host | Go-owned configuration |
 |---|---|
-| Cursor | `.cursor/mcp.json` and `.cursor/rules/devcouncil.mdc` |
-| Claude | `.mcp.json` with host and DevMap entries |
+| Cursor | The `devcouncil` entry in `.cursor/mcp.json`, and `.cursor/rules/devcouncil.mdc` |
+| Claude | The `devcouncil` entry in `.mcp.json` |
 | Codex | A comment-only project `.codex/config.toml` adapter; this does not register the Go host's task server |
 | Antigravity | `.agents/mcp_config.json` |
 | OpenCode | `opencode.json` |

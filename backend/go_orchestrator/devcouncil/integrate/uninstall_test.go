@@ -194,7 +194,7 @@ func TestIntegrateCursorWritesNoHooksFile(t *testing.T) {
 	}
 	defer repo.Close()
 	receipt := &Receipt{Host: "cursor", Mode: string(ModeApply), Files: map[string]string{}}
-	if err := integrateCursor(repo, root, "/bin/true", "/bin/true", ModeApply, receipt); err != nil {
+	if err := integrateCursor(repo, root, "/bin/true", ModeApply, receipt); err != nil {
 		t.Fatalf("integrateCursor: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, ".cursor", "hooks.json")); !os.IsNotExist(err) {

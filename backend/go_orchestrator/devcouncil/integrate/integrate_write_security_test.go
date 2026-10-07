@@ -24,7 +24,7 @@ func TestIntegrateRefusesSymlinkedConfigParent(t *testing.T) {
 	repo := mustOpenRoot(t, root)
 
 	receipt := &Receipt{Files: map[string]string{}}
-	if err := integrateCursor(repo, root, "/bin/true", "/bin/true", ModeApply, receipt); err == nil {
+	if err := integrateCursor(repo, root, "/bin/true", ModeApply, receipt); err == nil {
 		t.Fatalf("accepted a symlinked .cursor instead of refusing; receipt=%v", receipt.Files)
 	}
 	if _, err := os.Stat(filepath.Join(outside, "mcp.json")); err == nil {
@@ -46,7 +46,7 @@ func TestIntegrateRefusesSymlinkedConfigLeaf(t *testing.T) {
 	repo := mustOpenRoot(t, root)
 
 	receipt := &Receipt{Files: map[string]string{}}
-	if err := integrateClaude(repo, root, "/bin/true", "/bin/true", ModeApply, receipt); err == nil {
+	if err := integrateClaude(repo, root, "/bin/true", ModeApply, receipt); err == nil {
 		t.Fatalf("wrote through a symlinked .mcp.json instead of refusing; receipt=%v", receipt.Files)
 	}
 	// Replacing the link with a regular file is how the outside file's
@@ -77,7 +77,7 @@ func TestIntegrateBoundsHostConfigRead(t *testing.T) {
 	repo := mustOpenRoot(t, root)
 
 	receipt := &Receipt{Files: map[string]string{}}
-	if err := integrateClaude(repo, root, "/bin/true", "/bin/true", ModeCheck, receipt); err == nil {
+	if err := integrateClaude(repo, root, "/bin/true", ModeCheck, receipt); err == nil {
 		t.Fatalf("read a %d-byte host config with no bound (bound is %d); receipt=%v",
 			len(big), maxHostConfigBytes, receipt.Files)
 	}
@@ -90,7 +90,7 @@ func TestIntegrateWritesOrdinaryRepository(t *testing.T) {
 	repo := mustOpenRoot(t, root)
 
 	receipt := &Receipt{Files: map[string]string{}}
-	if err := integrateCursor(repo, root, "/bin/true", "/bin/true", ModeApply, receipt); err != nil {
+	if err := integrateCursor(repo, root, "/bin/true", ModeApply, receipt); err != nil {
 		t.Fatalf("integrateCursor: %v", err)
 	}
 	for _, rel := range []string{".cursor/mcp.json", ".cursor/rules/devcouncil.mdc"} {
@@ -118,23 +118,25 @@ func TestIntegrateWritesOrdinaryRepository(t *testing.T) {
 }
 
 // An existing config is still merged, and the merge is not a link-follow.
+// `devmap` is a neighbour like `other`: `devmap integrate` owns that entry.
 func TestIntegrateMergesExistingRegularConfig(t *testing.T) {
 	root := t.TempDir()
-	prior := `{"mcpServers":{"other":{"command":"/bin/echo"}}}`
+	prior := `{"mcpServers":{"other":{"command":"/bin/echo"},` +
+		`"devmap":{"type":"stdio","command":"/opt/devmap","args":["--root","/repo","mcp"]}}}`
 	if err := os.WriteFile(filepath.Join(root, ".mcp.json"), []byte(prior), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	repo := mustOpenRoot(t, root)
 
 	receipt := &Receipt{Files: map[string]string{}}
-	if err := integrateClaude(repo, root, "/bin/true", "/bin/true", ModeApply, receipt); err != nil {
+	if err := integrateClaude(repo, root, "/bin/true", ModeApply, receipt); err != nil {
 		t.Fatalf("integrateClaude: %v", err)
 	}
 	body, err := os.ReadFile(filepath.Join(root, ".mcp.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"other", "devcouncil", "devmap"} {
+	for _, want := range []string{"other", "devcouncil", `"--root"`} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("merged config lost %q:\n%s", want, body)
 		}

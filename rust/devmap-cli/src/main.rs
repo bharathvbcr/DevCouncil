@@ -2374,9 +2374,16 @@ struct McpConfigSite {
     label: String,
     path: PathBuf,
     /// `None` for a document no host loads as it stands: the plugin bundle a
-    /// marketplace installs *from*, or a plugin Claude Code has disabled. Still
-    /// inventoried — it names a binary — but never counted as a registration.
+    /// marketplace installs *from*, a plugin Claude Code has disabled, or a
+    /// project server rejected by `disabledMcpjsonServers`. Still inventoried —
+    /// it names a binary — but never counted as a registration.
     host: Option<McpHost>,
+    /// The enabled Claude Code plugin's own registration. Claude Code drops a
+    /// plugin server only when another server has the same command, and the
+    /// entries `devmap integrate` writes carry an absolute path that never
+    /// matches the plugin's, so beside it even a pinned entry is a second
+    /// server for that host.
+    plugin: bool,
 }
 
 /// Marketplace-root `.mcp.json` files from the bundle layout before the plugin
@@ -2395,8 +2402,12 @@ fn host_mcp_config_paths() -> Vec<McpConfigSite> {
 }
 
 fn host_mcp_config_sites(home: Option<&Path>, cwd: &Path) -> Vec<McpConfigSite> {
-    let site =
-        |label: String, path: PathBuf, host: Option<McpHost>| McpConfigSite { label, path, host };
+    let site = |label: String, path: PathBuf, host: Option<McpHost>| McpConfigSite {
+        label,
+        path,
+        host,
+        plugin: false,
+    };
     let mut out = Vec::new();
     if let Some(home) = home {
         out.push(site(
@@ -2418,7 +2429,10 @@ fn host_mcp_config_sites(home: Option<&Path>, cwd: &Path) -> Vec<McpConfigSite> 
         for plugin in &install.loaded {
             let mcp = plugin.dir.join(".mcp.json");
             if mcp.is_file() {
-                out.push(site(mcp.display().to_string(), mcp, host));
+                out.push(McpConfigSite {
+                    plugin: host.is_some(),
+                    ..site(mcp.display().to_string(), mcp, host)
+                });
             }
         }
         for rel in PLUGIN_BUNDLE_SOURCES {
@@ -2432,6 +2446,20 @@ fn host_mcp_config_sites(home: Option<&Path>, cwd: &Path) -> Vec<McpConfigSite> 
         ".cursor/mcp.json".to_string(),
         cwd.join(".cursor").join("mcp.json"),
         Some(McpHost::Cursor),
+    ));
+    // Claude Code's project scope. A server there connects only once approved
+    // in an interactive session, but `claude -p`, Agent SDK and cloud sessions
+    // load it without asking, so an unapproved one still counts. A rejection
+    // in `disabledMcpjsonServers` blocks it in every mode.
+    let rejected = claude::claude_project_server_rejected(home, cwd, claude::MCP_SERVER_NAME);
+    out.push(site(
+        if rejected {
+            ".mcp.json (rejected by disabledMcpjsonServers)".to_string()
+        } else {
+            ".mcp.json".to_string()
+        },
+        cwd.join(".mcp.json"),
+        (!rejected).then_some(McpHost::ClaudeCode),
     ));
     for rel in PLUGIN_BUNDLE_SOURCES {
         let path = cwd.join(rel);
@@ -2638,7 +2666,8 @@ fn mcp_entry_is_pinned(path: &Path) -> bool {
 ///
 /// `global` and `pinned` hold what a host loads, each row naming that host;
 /// `not_loaded` holds documents that name the server but that no host loads as
-/// they stand (a plugin bundle source, a disabled plugin).
+/// they stand (a plugin bundle source, a disabled plugin, a project server
+/// rejected by `disabledMcpjsonServers`).
 fn mcp_registration_inventory() -> serde_json::Value {
     mcp_registration_inventory_of(&host_mcp_config_paths())
 }
@@ -2655,6 +2684,7 @@ fn mcp_registration_inventory_of(sites: &[McpConfigSite]) -> serde_json::Value {
             "label": site.label,
             "path": site.path.display().to_string(),
             "host": site.host.map(McpHost::as_str),
+            "plugin": site.plugin,
         });
         if site.host.is_none() {
             not_loaded.push(row);
@@ -2671,10 +2701,15 @@ fn duplicate_mcp_registration_warning() -> Option<String> {
     duplicate_registration_message(&mcp_registration_inventory())
 }
 
-/// A duplicate is one host loading the same unpinned server twice — a
-/// user-scope `~/.claude.json` entry beside an enabled plugin's `.mcp.json`, or
+/// A duplicate is one host loading `devmap mcp` twice — a `~/.claude.json` or
+/// project `.mcp.json` entry beside an enabled plugin's `.mcp.json`, or
 /// `~/.cursor/mcp.json` beside a project `.cursor/mcp.json`. One registration
 /// per host, across several hosts, is the intended shape and says nothing.
+///
+/// Pinned (`--root`/`--db`) entries count only beside an enabled plugin.
+/// Claude Code collapses same-named servers across its own scopes, but keeps a
+/// plugin server unless another has the same command, so a pinned entry there
+/// is a second server rather than a narrower view of the same one.
 fn duplicate_registration_message(inventory: &serde_json::Value) -> Option<String> {
     let rows = |key: &str| {
         inventory
@@ -2683,37 +2718,77 @@ fn duplicate_registration_message(inventory: &serde_json::Value) -> Option<Strin
             .cloned()
             .unwrap_or_default()
     };
-    let mut by_host: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-    for row in rows("global") {
+    let host_of = |row: &serde_json::Value| {
+        row.get("host")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let global = rows("global");
+    let plugin_hosts: std::collections::BTreeSet<String> = global
+        .iter()
+        .filter(|row| row.get("plugin").and_then(serde_json::Value::as_bool) == Some(true))
+        .filter_map(host_of)
+        .collect();
+    let (counted_pinned, other_pinned): (Vec<_>, Vec<_>) = rows("pinned")
+        .into_iter()
+        .partition(|row| host_of(row).is_some_and(|host| plugin_hosts.contains(&host)));
+    // Each entry is (server, shown). Claude Code "connects to it once, using
+    // the definition from the highest-precedence source" when its own scopes
+    // name the same server, so `~/.claude.json` and a project `.mcp.json` are
+    // one server between them; only the plugin stands apart.
+    let mut by_host: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        Default::default();
+    for row in global.iter().chain(&counted_pinned) {
         let (Some(host), Some(label), Some(path)) = (
-            row.get("host").and_then(serde_json::Value::as_str),
+            host_of(row),
             row.get("label").and_then(serde_json::Value::as_str),
             row.get("path").and_then(serde_json::Value::as_str),
         ) else {
             continue;
         };
+        let plugin = row.get("plugin").and_then(serde_json::Value::as_bool) == Some(true);
+        let server = if host == McpHost::ClaudeCode.as_str() && !plugin {
+            "claude-code scopes".to_string()
+        } else {
+            path.to_string()
+        };
         by_host
-            .entry(host.to_string())
+            .entry(host)
             .or_default()
-            .push(format!("{label} ({path})"));
+            .push((server, format!("{label} ({path})")));
     }
     let duplicated: Vec<String> = by_host
         .into_iter()
-        .filter(|(_, entries)| entries.len() > 1)
-        .map(|(host, entries)| format!("{host} loads {}", entries.join("; ")))
+        .filter(|(_, entries)| {
+            entries
+                .iter()
+                .map(|(server, _)| server)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 1
+        })
+        .map(|(host, entries)| {
+            let shown: Vec<String> = entries.into_iter().map(|(_, shown)| shown).collect();
+            format!("{host} loads {}", shown.join("; "))
+        })
         .collect();
     if duplicated.is_empty() {
         return None;
     }
     let mut message = format!(
-        "the same unpinned `devmap mcp` command is registered more than once for one host: {}. \
-         Each registration is its own server for that host; keep one. Registrations in \
-         different hosts are not duplicates, and neither replaces passing repo_path",
+        "`devmap mcp` is registered more than once for one host: {}. Each registration is its \
+         own server for that host; keep one. Registrations in different hosts are not \
+         duplicates, and neither replaces passing repo_path",
         duplicated.join(" | ")
     );
-    let pinned = rows("pinned");
-    if !pinned.is_empty() {
-        let pinned_list = pinned
+    if !counted_pinned.is_empty() {
+        message.push_str(
+            ". A pinned (--root/--db) entry beside an enabled plugin is counted: Claude Code \
+             keeps a plugin server unless another has the same command",
+        );
+    }
+    if !other_pinned.is_empty() {
+        let pinned_list = other_pinned
             .iter()
             .filter_map(|row| row.get("path")?.as_str())
             .collect::<Vec<_>>()

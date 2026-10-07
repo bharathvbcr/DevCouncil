@@ -734,3 +734,200 @@ fn integrate_claude_leaves_a_pinned_user_scope_entry() {
         "{report}"
     );
 }
+
+fn project_mcp_outcome(report: &Value, path: &Path) -> Value {
+    report["project_mcp"]
+        .as_array()
+        .expect("project_mcp outcomes")
+        .iter()
+        .find(|row| row["path"].as_str().is_some_and(|p| names(p, path)))
+        .cloned()
+        .unwrap_or_else(|| panic!("no {} outcome: {report}", path.display()))
+}
+
+fn devmap_entry(path: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let document: Value = serde_json::from_str(&text).unwrap();
+    document["mcpServers"].get("devmap").cloned()
+}
+
+/// Claude Code loads the project `.mcp.json` too, and the `--root` entry
+/// integrate offered there names an absolute path the plugin's bare `devmap`
+/// never matches — so beside the enabled plugin it was a second server.
+#[test]
+fn integrate_claude_withholds_the_project_entry_beside_an_enabled_plugin() {
+    let home = scratch("int-proj-skip-home");
+    let project = scratch("int-proj-skip-project");
+    let plugin = install_plugin(&home, env!("CARGO_PKG_VERSION"), true);
+    let report = integrate_claude(&home, &project, &[]);
+    let mcp = project.join(".mcp.json");
+    assert!(
+        devmap_entry(&mcp).is_none(),
+        "no project entry beside the enabled plugin: {report}"
+    );
+    let outcome = project_mcp_outcome(&report, &mcp);
+    assert_eq!(outcome["changed"], false, "{report}");
+    assert!(
+        names(
+            outcome["note"].as_str().unwrap_or(""),
+            &plugin.join(".mcp.json")
+        ),
+        "the note names the plugin registration: {report}"
+    );
+    assert!(
+        !project.join(".claude").join("mcp.json").exists(),
+        "no host reads .claude/mcp.json: {report}"
+    );
+}
+
+/// An unpinned entry this installer wrote — the Go adapter's old shape — is
+/// removed rather than rewritten to `--root`, and the rest of the file stays.
+#[test]
+fn integrate_claude_removes_an_owned_project_entry_beside_an_enabled_plugin() {
+    let home = scratch("int-proj-rm-home");
+    let project = scratch("int-proj-rm-project");
+    install_plugin(&home, env!("CARGO_PKG_VERSION"), true);
+    let mcp = project.join(".mcp.json");
+    std::fs::write(
+        &mcp,
+        serde_json::json!({"mcpServers": {
+            "devmap": {"command": "/opt/bin/devmap", "args": ["mcp"]},
+            "devcouncil": {"command": "devcouncil", "args": ["mcp"]},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let report = integrate_claude(&home, &project, &[]);
+    assert!(devmap_entry(&mcp).is_none(), "{report}");
+    let after: Value = serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert_eq!(
+        after["mcpServers"]["devcouncil"]["command"], "devcouncil",
+        "{after}"
+    );
+    assert_eq!(
+        project_mcp_outcome(&report, &mcp)["changed"],
+        true,
+        "{report}"
+    );
+    let again = integrate_claude(&home, &project, &[]);
+    assert_eq!(
+        project_mcp_outcome(&again, &mcp)["changed"],
+        false,
+        "{again}"
+    );
+}
+
+/// A pinned project entry beside the plugin is left, but the note says Claude
+/// Code can load it as a second server rather than calling it harmless.
+#[test]
+fn integrate_claude_leaves_a_pinned_project_entry_and_says_it_duplicates() {
+    let home = scratch("int-proj-pin-home");
+    let project = scratch("int-proj-pin-project");
+    install_plugin(&home, env!("CARGO_PKG_VERSION"), true);
+    let mcp = project.join(".mcp.json");
+    let pinned = serde_json::json!({"mcpServers": {"devmap": {
+        "type": "stdio", "command": "devmap", "args": ["--root", "/some/repo", "mcp"]
+    }}})
+    .to_string();
+    std::fs::write(&mcp, &pinned).unwrap();
+    let report = integrate_claude(&home, &project, &[]);
+    assert_eq!(std::fs::read_to_string(&mcp).unwrap(), pinned);
+    let outcome = project_mcp_outcome(&report, &mcp);
+    assert_eq!(outcome["changed"], false, "{report}");
+    let note = outcome["note"].as_str().unwrap_or("");
+    assert!(
+        note.contains("pinned") && note.contains("second server"),
+        "{report}"
+    );
+}
+
+/// Without the plugin the project entry is still offered, but only in the
+/// `.mcp.json` Claude Code documents; `.claude/mcp.json` is named nowhere.
+#[test]
+fn integrate_claude_without_the_plugin_offers_only_the_documented_project_file() {
+    let home = scratch("int-proj-off-home");
+    let project = scratch("int-proj-off-project");
+    install_plugin(&home, env!("CARGO_PKG_VERSION"), false);
+    let report = integrate_claude(&home, &project, &[]);
+    let entry = devmap_entry(&project.join(".mcp.json"))
+        .unwrap_or_else(|| panic!("the project entry is offered: {report}"));
+    assert_eq!(entry["args"][0], "--root", "{entry}");
+    assert!(
+        !project.join(".claude").join("mcp.json").exists(),
+        "{report}"
+    );
+}
+
+/// The project `.mcp.json` is a Claude Code registration, so a pinned entry
+/// there beside the enabled plugin is a duplicate doctor can see.
+#[test]
+fn a_project_mcp_json_beside_an_enabled_plugin_is_a_duplicate() {
+    let home = scratch("doc-proj-home");
+    let cwd = scratch("doc-proj-cwd");
+    install_plugin(&home, "0.1.1", true);
+    std::fs::write(
+        cwd.join(".mcp.json"),
+        serde_json::json!({"mcpServers": {"devmap": {
+            "type": "stdio", "command": "/opt/bin/devmap", "args": ["--root", cwd, "mcp"]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let payload = doctor_payload(&home, &cwd);
+    let warning = payload["duplicate_mcp_registration_warning"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        warning.contains("claude-code") && names(warning, &cwd.join(".mcp.json")),
+        "a project entry beside the plugin must be reported: {payload}"
+    );
+}
+
+/// `disabledMcpjsonServers` blocks a project server in every mode, so a
+/// rejected entry is inventoried as not loaded and is no duplicate.
+#[test]
+fn a_rejected_project_server_is_not_a_duplicate() {
+    let home = scratch("doc-proj-rej-home");
+    let cwd = scratch("doc-proj-rej-cwd");
+    install_plugin(&home, "0.1.1", true);
+    write_mcp(&cwd.join(".mcp.json"), "/opt/bin/devmap");
+    std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+    std::fs::write(
+        cwd.join(".claude").join("settings.local.json"),
+        serde_json::json!({"disabledMcpjsonServers": ["devmap"]}).to_string(),
+    )
+    .unwrap();
+    let payload = doctor_payload(&home, &cwd);
+    assert!(
+        payload["duplicate_mcp_registration_warning"].is_null(),
+        "a rejected project server loads nothing: {payload}"
+    );
+    let not_loaded = serde_json::to_string(&payload["mcp_registrations"]["not_loaded"]).unwrap();
+    assert!(not_loaded.contains("disabledMcpjsonServers"), "{payload}");
+}
+
+/// Claude Code matches its own scopes by name and connects once, so a
+/// user-scope and a project `devmap` with no plugin are one server, not two.
+/// Beside the enabled plugin the pair is still one server — plus the plugin.
+#[test]
+fn user_and_project_scope_entries_are_one_claude_server() {
+    let home = scratch("doc-scopes-home");
+    let cwd = scratch("doc-scopes-cwd");
+    write_mcp(&home.join(".claude.json"), "/opt/bin/devmap");
+    write_mcp(&cwd.join(".mcp.json"), "/opt/bin/devmap");
+    install_plugin(&home, "0.1.1", false);
+    let payload = doctor_payload(&home, &cwd);
+    assert!(
+        payload["duplicate_mcp_registration_warning"].is_null(),
+        "same-named entries in Claude Code's own scopes collapse: {payload}"
+    );
+    install_plugin(&home, "0.1.1", true);
+    let payload = doctor_payload(&home, &cwd);
+    let warning = payload["duplicate_mcp_registration_warning"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        warning.contains(".claude.json") && names(warning, &cwd.join(".mcp.json")),
+        "beside the plugin both scope entries are named: {payload}"
+    );
+}
