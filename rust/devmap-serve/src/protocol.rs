@@ -265,6 +265,25 @@ fn default_cone_depth() -> u32 {
 /// caller-supplied root against a store copied between checkouts — see
 /// [`dc_regress_store::StoreGraph::for_indexed_repo`] — and the CLI, which
 /// does have a root, passes its own rather than using this.
+/// The tree the route views scan for client call sites: the root the store
+/// recorded indexing.
+///
+/// The graph's file paths are relative to that root, so any other directory
+/// would scan a different tree or nothing — and a scan of nothing reports every
+/// route as uncalled. The CLI falls back to its path argument; a socket or MCP
+/// request has no path argument to fall back to, so it refuses.
+fn route_scan_root(store: &Store) -> anyhow::Result<std::path::PathBuf> {
+    store
+        .latest_repo_root()?
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this store recorded no repository root, so there is no tree to scan for the \
+                 clients that call each route — run `devmap build` in the repository first"
+            )
+        })
+}
+
 fn git_joined_graph(store: &Store) -> anyhow::Result<dc_regress_store::StoreGraph<'_>> {
     dc_regress_store::StoreGraph::for_indexed_repo(store)
 }
@@ -522,6 +541,32 @@ pub enum IpcCommand {
         #[serde(default = "default_cone_depth")]
         depth: u32,
     },
+    /// HTTP routes, their handlers, their middleware, and the clients that
+    /// call them — `devmap routes`.
+    ///
+    /// Reads the indexed tree for client call sites, under the CLI's default
+    /// scan bound, so the answer carries a `scan` report saying what it read.
+    Routes {
+        /// Only routes whose path or id matches, by the predicate
+        /// `shape-check` and `api-impact` use.
+        #[serde(default)]
+        filter: Option<String>,
+        #[serde(default = "default_budget")]
+        budget: u32,
+    },
+    /// What changing one route reaches: callers, shape mismatches, middleware
+    /// and a risk band — `devmap api-impact`.
+    ApiImpact {
+        /// The route path or its `"VERB /path"` id.
+        route: String,
+    },
+    /// The openCypher subset `devmap cypher` runs. A query outside it is
+    /// refused, never widened.
+    Cypher {
+        query: String,
+        #[serde(default = "default_cypher_limit")]
+        limit: usize,
+    },
     Preview {
         /// Repository-relative path the buffer would be written to.
         file: String,
@@ -558,6 +603,14 @@ fn default_ask_confidence() -> f32 {
 
 fn default_explore_limit() -> usize {
     20
+}
+
+/// Rows `cypher` returns when the query states no `LIMIT`. The CLI's own
+/// default, so the two transports answer one query identically.
+pub const DEFAULT_CYPHER_LIMIT: usize = 50;
+
+fn default_cypher_limit() -> usize {
+    DEFAULT_CYPHER_LIMIT
 }
 
 /// `explore` pays for four sections out of one number, so its default is the
@@ -721,6 +774,38 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
             // the caller's.
             blast_selector(since.as_deref(), at.as_deref())?;
             return check_walk_depth(*depth);
+        }
+        // Graph-wide views: no walk depth and no confidence floor, so the
+        // shared tail below has nothing of theirs to check beyond what is
+        // checked here. `api_impact` and `cypher` carry no token budget at all
+        // — the first answers about one route, the second is bounded by its
+        // row ceiling — and are returned rather than handed a placeholder.
+        IpcCommand::Routes { filter, budget } => {
+            (filter.as_deref().unwrap_or_default(), *budget, 1, None)
+        }
+        IpcCommand::ApiImpact { route } => {
+            if route.trim().is_empty() {
+                return Err("api_impact needs a route path or \"VERB /path\" id".to_string());
+            }
+            if route.len() > MAX_QUERY_BYTES {
+                return Err(format!("route exceeds {MAX_QUERY_BYTES} bytes"));
+            }
+            return Ok(());
+        }
+        IpcCommand::Cypher { query, limit } => {
+            if query.len() > MAX_QUERY_BYTES {
+                return Err(format!("cypher query exceeds {MAX_QUERY_BYTES} bytes"));
+            }
+            // Refused, not clamped, at this boundary: `cypher::run` clamps a
+            // query's own `LIMIT` and reports it, but a `limit` argument the
+            // schema declares a maximum for is a caller's value to correct.
+            if !(1..=devmap_query::cypher::MAX_ROW_LIMIT).contains(limit) {
+                return Err(format!(
+                    "cypher limit must be between 1 and {}, got {limit}",
+                    devmap_query::cypher::MAX_ROW_LIMIT
+                ));
+            }
+            return Ok(());
         }
         IpcCommand::Search { query, budget, .. } => (query.as_str(), *budget, 1, None),
         IpcCommand::Ask {
@@ -1249,6 +1334,44 @@ pub(crate) fn dispatch(
                 }
             };
             Ok(serde_json::to_value(report)?)
+        }
+        IpcCommand::Routes { filter, budget } => {
+            let root = route_scan_root(store)?;
+            let graph = devmap_query::graph_core_for_store(store)?;
+            let mut mapped = devmap_query::api_routes::route_map(
+                &root,
+                &graph,
+                &devmap_query::api_routes::ScanBudget::default(),
+            );
+            if let Some(filter) = filter.as_deref() {
+                devmap_query::api_routes::retain_matching_routes(&mut mapped, filter);
+            }
+            devmap_query::api_routes::budget_routes(&mut mapped, budget);
+            Ok(mapped)
+        }
+        IpcCommand::ApiImpact { route } => {
+            let root = route_scan_root(store)?;
+            let graph = devmap_query::graph_core_for_store(store)?;
+            Ok(devmap_query::api_routes::api_impact(
+                &root,
+                &graph,
+                &devmap_query::api_routes::ScanBudget::default(),
+                &route,
+            ))
+        }
+        IpcCommand::Cypher { query, limit } => {
+            let graph = devmap_query::graph_core_for_store(store)?;
+            let result = devmap_query::cypher::run(&graph, &query, limit);
+            // A refusal is an error, exactly as the CLI exits non-zero on one:
+            // "your query was not run" must not arrive looking like "your query
+            // matched nothing".
+            if result["ok"].as_bool() != Some(true) {
+                anyhow::bail!(
+                    "{}",
+                    result["error"].as_str().unwrap_or("cypher query refused")
+                );
+            }
+            Ok(result)
         }
         IpcCommand::Preview {
             file,

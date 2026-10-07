@@ -75,7 +75,7 @@ fn every_declared_tool_maps_to_a_command() {
     let specs = tool_specs();
     assert_eq!(
         specs.len(),
-        16,
+        19,
         "the tool surface changed; update this count"
     );
     for spec in &specs {
@@ -100,6 +100,9 @@ fn every_declared_tool_maps_to_a_command() {
             // are alternatives — one of them has to be present for the
             // argument set to be a valid call at all.
             "devmap_blast" => json!({"since": "HEAD~1"}),
+            "devmap_routes" => json!({}),
+            "devmap_api_impact" => json!({"route": "/api/users"}),
+            "devmap_cypher" => json!({"query": "MATCH (a)-[r:calls]->(b) RETURN a, b"}),
             other => panic!("tool {other} has no argument fixture in this test"),
         };
         to_ipc_command(name, Some(&arguments))
@@ -925,10 +928,19 @@ async fn min_rung_keeps_ambiguous_edges_out_of_every_graph_walk() {
 async fn an_unknown_min_rung_is_refused_not_ignored() {
     let store = mixed_rung_corpus();
     for (tool, arguments) in [
-        ("devmap_dependencies", json!({"target": "helper", "min_rung": "determinstic"})),
-        ("devmap_impact", json!({"target": "shared", "min_rung": "HIGH"})),
+        (
+            "devmap_dependencies",
+            json!({"target": "helper", "min_rung": "determinstic"}),
+        ),
+        (
+            "devmap_impact",
+            json!({"target": "shared", "min_rung": "HIGH"}),
+        ),
         ("devmap_trace", json!({"from": "helper", "min_rung": ""})),
-        ("devmap_neighbors", json!({"targets": ["helper"], "min_rung": 1})),
+        (
+            "devmap_neighbors",
+            json!({"targets": ["helper"], "min_rung": 1}),
+        ),
     ] {
         let response = call(&store, tool, arguments.clone()).await;
         assert_eq!(
