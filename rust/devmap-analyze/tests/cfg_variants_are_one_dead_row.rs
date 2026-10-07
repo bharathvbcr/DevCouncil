@@ -56,7 +56,10 @@ fn two_cfg_variants_of_an_uncalled_method_are_one_row() {
         }
     }
     assert_eq!(recv, 1, "one identity, one row; got {found:?}");
-    assert_eq!(drain, 1, "a method with one declaration is still reported once");
+    assert_eq!(
+        drain, 1,
+        "a method with one declaration is still reported once"
+    );
 }
 
 #[test]
@@ -69,7 +72,11 @@ fn the_dead_list_has_no_duplicate_rows() {
     let total = keys.len();
     keys.sort();
     keys.dedup();
-    assert_eq!(keys.len(), total, "every (file, symbol) appears once; got {found:?}");
+    assert_eq!(
+        keys.len(),
+        total,
+        "every (file, symbol) appears once; got {found:?}"
+    );
 }
 
 #[test]

@@ -60,7 +60,9 @@ export function Modal() {
         "src/Modal.tsx::Modal",
     );
     assert!(
-        targets.iter().any(|t| t == "src/service.ts::SvcClass.zzupdate"),
+        targets
+            .iter()
+            .any(|t| t == "src/service.ts::SvcClass.zzupdate"),
         "an imported singleton is typed by its initializer, got {targets:?}"
     );
     assert!(
@@ -82,7 +84,9 @@ export function reset() {
 ";
     let targets = calls_from(&[("src/service.ts", source)], "src/service.ts::reset");
     assert!(
-        targets.iter().any(|t| t == "src/service.ts::SvcClass.zzupdate"),
+        targets
+            .iter()
+            .any(|t| t == "src/service.ts::SvcClass.zzupdate"),
         "got {targets:?}"
     );
 }
@@ -100,7 +104,9 @@ export function Modal() {
         "src/Modal.tsx::Modal",
     );
     assert!(
-        targets.iter().any(|t| t == "src/service.ts::SvcClass.zzclear"),
+        targets
+            .iter()
+            .any(|t| t == "src/service.ts::SvcClass.zzclear"),
         "got {targets:?}"
     );
 }
@@ -123,7 +129,9 @@ export function Modal() {
         "src/Modal.tsx::Modal",
     );
     assert!(
-        targets.iter().any(|t| t == "src/service.ts::SvcClass.zzclear"),
+        targets
+            .iter()
+            .any(|t| t == "src/service.ts::SvcClass.zzclear"),
         "got {targets:?}"
     );
 }
@@ -147,7 +155,9 @@ export function Modal() {
         "src/Modal.jsx::Modal",
     );
     assert!(
-        targets.iter().any(|t| t == "src/service.js::SvcClass.zzclear"),
+        targets
+            .iter()
+            .any(|t| t == "src/service.js::SvcClass.zzclear"),
         "got {targets:?}"
     );
 }
@@ -201,7 +211,9 @@ export function Modal() {
         "src/Modal.tsx::Modal",
     );
     assert!(
-        targets.iter().any(|t| t == "src/service.ts::SvcClass.zzupdate"),
+        targets
+            .iter()
+            .any(|t| t == "src/service.ts::SvcClass.zzupdate"),
         "got {targets:?}"
     );
     assert!(
@@ -228,7 +240,9 @@ export function Modal() {
         "src/Modal.tsx::Modal",
     );
     assert!(
-        targets.iter().any(|t| t == "src/service.ts::SvcClass.zzclear"),
+        targets
+            .iter()
+            .any(|t| t == "src/service.ts::SvcClass.zzclear"),
         "got {targets:?}"
     );
 }
@@ -246,7 +260,9 @@ export function Modal() {
         "src/Modal.tsx::Modal",
     );
     assert!(
-        targets.iter().any(|t| t == "src/service.ts::SvcClass.zzclear"),
+        targets
+            .iter()
+            .any(|t| t == "src/service.ts::SvcClass.zzclear"),
         "got {targets:?}"
     );
 }
@@ -275,7 +291,9 @@ def handle():
         "app/caller.py::handle",
     );
     assert!(
-        targets.iter().any(|t| t == "pkg/service_mod.py::Service.zzrun"),
+        targets
+            .iter()
+            .any(|t| t == "pkg/service_mod.py::Service.zzrun"),
         "got {targets:?}"
     );
 }
@@ -296,10 +314,15 @@ export function Modal() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let edges = resolver.resolve_all(&extractions).expect("resolution").edges;
+    let edges = resolver
+        .resolve_all(&extractions)
+        .expect("resolution")
+        .edges;
     assert!(
-        edges.iter().any(|edge| edge.source_symbol == "src/Modal.tsx::Modal"
-            && edge.target_symbol == "src/service.ts::SvcClass.zzclear"),
+        edges
+            .iter()
+            .any(|edge| edge.source_symbol == "src/Modal.tsx::Modal"
+                && edge.target_symbol == "src/service.ts::SvcClass.zzclear"),
         "got {:?}",
         edges
             .iter()
@@ -325,7 +348,9 @@ export function Modal() {
         "src/Modal.tsx::Modal",
     );
     assert!(
-        !targets.iter().any(|t| t == "src/service.ts::SvcClass.zzupdate"),
+        !targets
+            .iter()
+            .any(|t| t == "src/service.ts::SvcClass.zzupdate"),
         "a local `svc` shadows the import and its type is unknown, got {targets:?}"
     );
 }
@@ -343,7 +368,9 @@ export function Modal(svc) {
         "src/Modal.tsx::Modal",
     );
     assert!(
-        !targets.iter().any(|t| t == "src/service.ts::SvcClass.zzupdate"),
+        !targets
+            .iter()
+            .any(|t| t == "src/service.ts::SvcClass.zzupdate"),
         "a parameter `svc` shadows the import, got {targets:?}"
     );
 }
@@ -639,7 +666,9 @@ export function check() {
         "ops/check.js::check",
     );
     assert!(
-        targets.iter().any(|t| t.ends_with("registryAdapter.zztags")),
+        targets
+            .iter()
+            .any(|t| t.ends_with("registryAdapter.zztags")),
         "got {targets:?}"
     );
 }
@@ -662,7 +691,10 @@ pub fn affected() -> Vec<blast::ZzReport> {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let edges = resolver.resolve_all(&extractions).expect("resolution").edges;
+    let edges = resolver
+        .resolve_all(&extractions)
+        .expect("resolution")
+        .edges;
     assert!(
         edges
             .iter()
@@ -696,7 +728,10 @@ export function nav() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let edges = resolver.resolve_all(&extractions).expect("resolution").edges;
+    let edges = resolver
+        .resolve_all(&extractions)
+        .expect("resolution")
+        .edges;
     let from_nav: Vec<_> = edges
         .iter()
         .filter(|edge| edge.source_symbol == "src/nav.ts::nav")
@@ -730,7 +765,9 @@ export function Modal() {
         "src/Modal.tsx::Modal",
     );
     assert!(
-        targets.iter().any(|t| t == "src/service.ts::SvcClass.zzbuild"),
+        targets
+            .iter()
+            .any(|t| t == "src/service.ts::SvcClass.zzbuild"),
         "static call on an imported class, got {targets:?}"
     );
 }

@@ -231,8 +231,9 @@ impl SemanticIndex {
         if terms.is_empty() {
             return None;
         }
-        let (present, absent): (Vec<&String>, Vec<&String>) =
-            terms.iter().partition(|term| self.idf.contains_key(term.as_str()));
+        let (present, absent): (Vec<&String>, Vec<&String>) = terms
+            .iter()
+            .partition(|term| self.idf.contains_key(term.as_str()));
         let best = hits
             .iter()
             .filter_map(|&index| self.documents.get(index))
@@ -281,10 +282,10 @@ impl SemanticIndex {
 /// what it is looking for. Used only by [`SemanticIndex::coverage_note`];
 /// scoring keeps every term and lets IDF weigh it.
 const STOPWORDS: &[&str] = &[
-    "about", "after", "an", "and", "any", "are", "as", "at", "be", "before", "by", "can",
-    "does", "do", "for", "from", "how", "if", "in", "into", "is", "it", "its", "not", "of",
-    "on", "or", "over", "so", "that", "the", "then", "there", "this", "to", "under", "up",
-    "via", "what", "when", "where", "which", "while", "who", "why", "with",
+    "about", "after", "an", "and", "any", "are", "as", "at", "be", "before", "by", "can", "does",
+    "do", "for", "from", "how", "if", "in", "into", "is", "it", "its", "not", "of", "on", "or",
+    "over", "so", "that", "the", "then", "there", "this", "to", "under", "up", "via", "what",
+    "when", "where", "which", "while", "who", "why", "with",
 ];
 
 #[cfg(test)]

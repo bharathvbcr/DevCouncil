@@ -2730,8 +2730,7 @@ fn duplicate_registration_message(inventory: &serde_json::Value) -> Option<Strin
     // the definition from the highest-precedence source" when its own scopes
     // name the same server, so `~/.claude.json` and a project `.mcp.json` are
     // one server between them; only the plugin stands apart.
-    let mut by_host: std::collections::BTreeMap<String, Vec<(String, String)>> =
-        Default::default();
+    let mut by_host: std::collections::BTreeMap<String, Vec<(String, String)>> = Default::default();
     for row in global.iter().chain(&counted_pinned) {
         let (Some(host), Some(label), Some(path)) = (
             host_of(row),
@@ -3767,7 +3766,12 @@ fn emit_scope(scope: Option<&devmap_query::ScopeReport>) {
         return;
     };
     let mut named: Vec<String> = scope.paths.clone();
-    named.extend(scope.languages.iter().map(|language| format!("[{language}]")));
+    named.extend(
+        scope
+            .languages
+            .iter()
+            .map(|language| format!("[{language}]")),
+    );
     outln!(
         "scope: {} ({} of {} files, {} of {} symbols)",
         named.join(" "),

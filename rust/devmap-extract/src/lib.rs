@@ -6,7 +6,6 @@ pub mod cache;
 pub mod clonesig;
 pub mod deref;
 // Pure text: the resolver reads Rust function headers with it, and has no tree.
-pub mod rustsig;
 #[cfg(feature = "parse")]
 pub mod embedded;
 pub mod fallback;
@@ -18,6 +17,7 @@ pub mod heritage;
 pub mod langcalls;
 #[cfg(feature = "parse")]
 pub(crate) mod langdecl;
+pub mod rustsig;
 // Takes a `tree_sitter::Node` for the same reason `langimports` does, and is
 // called from the same seam.
 #[cfg(feature = "parse")]

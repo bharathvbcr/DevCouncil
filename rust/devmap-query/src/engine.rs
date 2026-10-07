@@ -316,8 +316,13 @@ impl<'a> StoreQueryEngine<'a> {
             None,
             Some(layer_budget),
         )?;
-        let added =
-            self.attach_unresolved_namesakes(generation, &index, &target, min_confidence, &mut edges)?;
+        let added = self.attach_unresolved_namesakes(
+            generation,
+            &index,
+            &target,
+            min_confidence,
+            &mut edges,
+        )?;
         // `Some` by construction: `band_budget` was `Some` on the call above,
         // and every return path of `traverse_walked` maps it.
         let mut blast_radius = bands.ok_or_else(|| {
@@ -1035,7 +1040,8 @@ impl<'a> StoreQueryEngine<'a> {
         // is asked of the nodes the walk reached, below — see
         // `radius_attribution_gap`.
         let coverage_gap = analysis_status_gap(index.analysis());
-        let starts = indexed_traversal_starts(index, target, reverse, min_confidence, &self.cancel)?;
+        let starts =
+            indexed_traversal_starts(index, target, reverse, min_confidence, &self.cancel)?;
         // P2.7a. The corpus-level marker above cannot see this: a `.tf` beside
         // Python hides no Python caller, so the analysis stays `Ok` — and then
         // `impact` on the `.tf` symbol itself answered `total: 0, Available`
@@ -1056,10 +1062,9 @@ impl<'a> StoreQueryEngine<'a> {
                 coverage_gap
             } else {
                 let named = match crate::query_match::classify(target) {
-                    crate::query_match::StartQuery::Qualified { file, .. } => Some((
-                        RadiusSide::Callees,
-                        (target.to_string(), file.to_string()),
-                    )),
+                    crate::query_match::StartQuery::Qualified { file, .. } => {
+                        Some((RadiusSide::Callees, (target.to_string(), file.to_string())))
+                    }
                     crate::query_match::StartQuery::Path(path) => Some((
                         RadiusSide::FileCallees,
                         (path.to_string(), path.to_string()),
@@ -1701,7 +1706,11 @@ impl<'a> StoreQueryEngine<'a> {
             .seeds
             .iter()
             .cloned()
-            .chain(walk.bands.iter().flat_map(|band| band.members.iter().cloned()))
+            .chain(
+                walk.bands
+                    .iter()
+                    .flat_map(|band| band.members.iter().cloned()),
+            )
             .collect();
         let radius = self.radius_attribution_gap(
             index.generation(),
@@ -2500,7 +2509,10 @@ impl<'a> StoreQueryEngine<'a> {
                 0.0
             }
         };
-        let max_lexical = scored.iter().map(|(_, score)| *score).fold(0.0f32, f32::max);
+        let max_lexical = scored
+            .iter()
+            .map(|(_, score)| *score)
+            .fold(0.0f32, f32::max);
         let max_graph = graph.iter().copied().fold(0.0f32, f32::max);
         let mut ordered: Vec<(usize, f32)> = scored
             .iter()
@@ -4044,10 +4056,8 @@ impl<'a> QueryEngine<'a> {
                 .then_with(|| a.target_file.cmp(&b.target_file))
                 .then_with(|| a.source_symbol.cmp(&b.source_symbol))
         });
-        let radius = self.radius_attribution_gap(
-            &reached_by(starts, &inbound),
-            RadiusSide::Callers,
-        );
+        let radius =
+            self.radius_attribution_gap(&reached_by(starts, &inbound), RadiusSide::Callers);
         let mut response = budget_take(inbound, req.token_budget, |_| 25);
         // The walk's own "I stopped looking" signal, carried the way
         // `StoreQueryEngine::traverse` carries it (engine.rs, `traverse`).
@@ -4094,10 +4104,9 @@ impl<'a> QueryEngine<'a> {
             // As the store engine asks: a symbol whose every call went unbound
             // is no outbound start, and those calls are what is missing.
             let named = match crate::query_match::classify(target) {
-                crate::query_match::StartQuery::Qualified { file, .. } => Some((
-                    RadiusSide::Callees,
-                    (target.to_string(), file.to_string()),
-                )),
+                crate::query_match::StartQuery::Qualified { file, .. } => {
+                    Some((RadiusSide::Callees, (target.to_string(), file.to_string())))
+                }
                 crate::query_match::StartQuery::Path(path) => Some((
                     RadiusSide::FileCallees,
                     (path.to_string(), path.to_string()),
@@ -4105,9 +4114,8 @@ impl<'a> QueryEngine<'a> {
                 crate::query_match::StartQuery::Symbol(_)
                 | crate::query_match::StartQuery::Nothing => None,
             };
-            let radius = named.and_then(|(side, key)| {
-                self.radius_attribution_gap(&BTreeSet::from([key]), side)
-            });
+            let radius = named
+                .and_then(|(side, key)| self.radius_attribution_gap(&BTreeSet::from([key]), side));
             response.walk_incomplete =
                 devmap_analyze::combine_reasons(self.coverage_gap.clone(), radius);
             return response;
@@ -4130,10 +4138,8 @@ impl<'a> QueryEngine<'a> {
                 .then_with(|| a.target_file.cmp(&b.target_file))
                 .then_with(|| a.source_symbol.cmp(&b.source_symbol))
         });
-        let radius = self.radius_attribution_gap(
-            &reached_by(starts, &outbound),
-            RadiusSide::Callees,
-        );
+        let radius =
+            self.radius_attribution_gap(&reached_by(starts, &outbound), RadiusSide::Callees);
         let mut response = budget_take(outbound, req.token_budget, |_| 25);
         // Same signal, same reason as `impact` above.
         response.walk_incomplete = devmap_analyze::combine_reasons(

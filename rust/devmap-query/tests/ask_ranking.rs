@@ -405,7 +405,8 @@ fn hub_store() -> Store {
     let mut files: Vec<(String, String)> = vec![
         (
             "backend/go_orchestrator/internal/api/full_paper_routes.go".into(),
-            "package api\n\nfunc decodeSearchPapers(value any) []string {\n\treturn nil\n}\n".into(),
+            "package api\n\nfunc decodeSearchPapers(value any) []string {\n\treturn nil\n}\n"
+                .into(),
         ),
         (
             "backend/go_orchestrator/internal/util/journal.go".into(),
@@ -456,9 +457,15 @@ fn a_name_that_says_what_was_asked_outranks_a_hub_the_seeds_call() {
 #[test]
 fn question_words_do_not_seed_symbols() {
     let store = hub_store();
-    let hits = ask(&store, "where does the Go backend decode seeded papers", 0.0);
+    let hits = ask(
+        &store,
+        "where does the Go backend decode seeded papers",
+        0.0,
+    );
     assert!(
-        hits.items.iter().all(|hit| hit.symbol_name != "whereClause"),
+        hits.items
+            .iter()
+            .all(|hit| hit.symbol_name != "whereClause"),
         "`where` is a question word here, not a term: {:?}",
         hits.items
             .iter()

@@ -604,7 +604,10 @@ fn a_module_imported_from_super_is_not_the_parent_file() {
             "rust/store/src/workbench/automation.rs",
             "use super::{enhancements};\n\npub fn prepare() {\n    enhancements::mutate();\n}\n",
         ),
-        ("rust/store/src/workbench/enhancements.rs", "pub fn mutate() {}\n"),
+        (
+            "rust/store/src/workbench/enhancements.rs",
+            "pub fn mutate() {}\n",
+        ),
     ]);
 
     let edges = call_edges(&result, "::mutate");
@@ -614,7 +617,10 @@ fn a_module_imported_from_super_is_not_the_parent_file() {
         "`use super::{{enhancements}}` binds the module, so `enhancements::mutate` \
          is not the parent's own `mutate`; got {edges:?}"
     );
-    assert_eq!(edges[0].target_file, "rust/store/src/workbench/enhancements.rs");
+    assert_eq!(
+        edges[0].target_file,
+        "rust/store/src/workbench/enhancements.rs"
+    );
 }
 
 #[test]
@@ -694,7 +700,9 @@ fn an_import_alias_shadows_a_crate_of_the_same_name() {
 
     let edges = call_edges(&result, "::matches");
     assert!(
-        edges.iter().all(|edge| edge.target_file != "rust/dc-glob/src/lib.rs"),
+        edges
+            .iter()
+            .all(|edge| edge.target_file != "rust/dc-glob/src/lib.rs"),
         "`use crate::shim as dc_glob` makes `dc_glob` the alias, not the crate; \
          got {edges:?}"
     );

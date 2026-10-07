@@ -118,7 +118,10 @@ fn the_calls_in_a_use_callback_body_belong_to_the_callback() {
 fn the_component_that_passes_the_callback_references_it() {
     let store = store();
     assert_eq!(
-        callers(&store, "src/App.tsx::AppContent.openDocumentGenerationSetup"),
+        callers(
+            &store,
+            "src/App.tsx::AppContent.openDocumentGenerationSetup"
+        ),
         vec!["src/App.tsx::AppContent".to_string()]
     );
 }

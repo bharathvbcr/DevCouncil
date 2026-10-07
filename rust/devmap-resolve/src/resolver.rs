@@ -682,8 +682,9 @@ impl Resolver {
             let [span] = spans.as_slice() else {
                 continue;
             };
-            let within =
-                |inner: &Span| inner.start_byte >= span.start_byte && inner.end_byte <= span.end_byte;
+            let within = |inner: &Span| {
+                inner.start_byte >= span.start_byte && inner.end_byte <= span.end_byte
+            };
             // What the declaration itself spells: methods written inside it,
             // and names it reads at module scope (`{ get, post }`). A name read
             // inside one of those methods' bodies has an enclosing symbol and
@@ -748,7 +749,8 @@ impl Resolver {
             };
             let key = (ext.file_path.clone(), name.to_string());
             if self.unique_indexed_type(family, &initializer.name) {
-                self.module_value_types.insert(key, initializer.name.clone());
+                self.module_value_types
+                    .insert(key, initializer.name.clone());
             } else if initializer.kind == ReferenceKind::Call {
                 // A factory. Its declaration may sit in a file not yet indexed,
                 // so the shape is kept and resolved when it is read.
@@ -819,9 +821,12 @@ impl Resolver {
     /// The language family a file was indexed under, read from its own `File`
     /// symbol so it cannot disagree with the family its symbols carry.
     fn family_of_file(&self, file: &str) -> Option<LangFamily> {
-        self.symbol_index.get(file)?.iter().find_map(|(path, kind, family, _)| {
-            (path == file && *kind == SymbolKind::File).then_some(*family)
-        })
+        self.symbol_index
+            .get(file)?
+            .iter()
+            .find_map(|(path, kind, family, _)| {
+                (path == file && *kind == SymbolKind::File).then_some(*family)
+            })
     }
 
     /// The nominal type a factory call returns, from the callee's written
@@ -887,7 +892,9 @@ impl Resolver {
                 }
             }
         };
-        let written = self.return_types.get(&(callee_file.clone(), callee.clone()))?;
+        let written = self
+            .return_types
+            .get(&(callee_file.clone(), callee.clone()))?;
         let mut nominal = Self::admissible_nominal_type(written)?;
         if nominal == "Self" {
             nominal = self.declaring_type_of(&callee_file, &callee)?.to_string();
@@ -970,8 +977,9 @@ impl Resolver {
     /// (`api = { get }`), and never when it is a typed instance — rung 1 owns
     /// that answer, and a method its class lacks is not the module's function.
     fn module_member_admitted(&self, file: &str, receiver: &str, member: &str) -> bool {
-        let Some((declaring_file, declared)) =
-            self.value_imports.get(&(file.to_string(), receiver.to_string()))
+        let Some((declaring_file, declared)) = self
+            .value_imports
+            .get(&(file.to_string(), receiver.to_string()))
         else {
             return true;
         };
@@ -998,8 +1006,9 @@ impl Resolver {
     /// and the literal-type rung below the import rungs answers it; only a
     /// non-type value stops the ladder when its type is unknown.
     fn imports_a_type(&self, file: &str, local: &str) -> bool {
-        let Some((declaring_file, declared)) =
-            self.value_imports.get(&(file.to_string(), local.to_string()))
+        let Some((declaring_file, declared)) = self
+            .value_imports
+            .get(&(file.to_string(), local.to_string()))
         else {
             return false;
         };
@@ -1031,8 +1040,9 @@ impl Resolver {
         local: &str,
         member: &str,
     ) -> bool {
-        let Some((declaring_file, declared)) =
-            self.value_imports.get(&(file.to_string(), local.to_string()))
+        let Some((declaring_file, declared)) = self
+            .value_imports
+            .get(&(file.to_string(), local.to_string()))
         else {
             return false;
         };
@@ -1296,9 +1306,7 @@ impl Resolver {
                         self.declaring_site(target_file, target_symbol);
                     self.lookup_in_package(&target_file, &target_symbol)
                 })?;
-            let header = self
-                .rust_signatures
-                .get(&(callee_file, callee_identity))?;
+            let header = self.rust_signatures.get(&(callee_file, callee_identity))?;
             let header = rustsig::parse_header(header)?;
             return Self::admissible_nominal_type(rustsig::closure_parameter(&header, arg, param)?);
         }
@@ -2517,9 +2525,9 @@ impl Resolver {
                             })
                             .flatten()
                             .and_then(|terminal| {
-                                terminal
-                                    .rsplit_once("::")
-                                    .map(|(file, declared)| (file.to_string(), declared.to_string()))
+                                terminal.rsplit_once("::").map(|(file, declared)| {
+                                    (file.to_string(), declared.to_string())
+                                })
                             });
                         // A renaming re-export (`export { a as b }`, `from impl
                         // import a as b`) publishes `b` and declares `a`; the
@@ -4927,7 +4935,8 @@ impl Resolver {
             RustModulePlace::Ambiguous => return None,
             RustModulePlace::Unique(module_file) => {
                 let (decl_file, decl_name) = self.declaring_site(&module_file, callee);
-                let (target_file, target_symbol) = self.lookup_in_package(&decl_file, &decl_name)?;
+                let (target_file, target_symbol) =
+                    self.lookup_in_package(&decl_file, &decl_name)?;
                 if self.symbol_kind_in(&target_file, &decl_name) != Some(SymbolKind::Function) {
                     return None;
                 }
@@ -4955,15 +4964,11 @@ impl Resolver {
         {
             return None;
         }
-        let hits = self.type_methods.get(&(
-            LangFamily::Rust,
-            type_name.clone(),
-            callee.to_string(),
-        ))?;
-        let mut matched: Vec<&(String, String)> = hits
-            .iter()
-            .filter(|(path, _)| path == &type_file)
-            .collect();
+        let hits =
+            self.type_methods
+                .get(&(LangFamily::Rust, type_name.clone(), callee.to_string()))?;
+        let mut matched: Vec<&(String, String)> =
+            hits.iter().filter(|(path, _)| path == &type_file).collect();
         matched.sort();
         matched.dedup();
         if matched.len() != 1 {

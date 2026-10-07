@@ -55,11 +55,16 @@ func Register() {
 }
 ";
     let targets = calls_from(
-        &[("reg/registry.go", GO_REGISTRY), ("reg/register.go", caller)],
+        &[
+            ("reg/registry.go", GO_REGISTRY),
+            ("reg/register.go", caller),
+        ],
         "reg/register.go::Register",
     );
     assert!(
-        targets.iter().any(|t| t == "reg/registry.go::Registry.Zzadd"),
+        targets
+            .iter()
+            .any(|t| t == "reg/registry.go::Registry.Zzadd"),
         "got {targets:?}"
     );
 }
@@ -87,7 +92,9 @@ func Register() {
         "reg/register.go::Register",
     );
     assert!(
-        targets.iter().any(|t| t == "reg/registry.go::Registry.Zzadd"),
+        targets
+            .iter()
+            .any(|t| t == "reg/registry.go::Registry.Zzadd"),
         "got {targets:?}"
     );
 }
@@ -115,7 +122,9 @@ func Register() {
         "reg/register.go::Register",
     );
     assert!(
-        targets.iter().any(|t| t == "reg/registry.go::Registry.Zzadd"),
+        targets
+            .iter()
+            .any(|t| t == "reg/registry.go::Registry.Zzadd"),
         "got {targets:?}"
     );
 }
@@ -131,11 +140,16 @@ func Register() {
 }
 ";
     let targets = calls_from(
-        &[("reg/registry.go", GO_REGISTRY), ("reg/register.go", caller)],
+        &[
+            ("reg/registry.go", GO_REGISTRY),
+            ("reg/register.go", caller),
+        ],
         "reg/register.go::Register",
     );
     assert!(
-        targets.iter().any(|t| t == "reg/registry.go::Registry.Zzadd"),
+        targets
+            .iter()
+            .any(|t| t == "reg/registry.go::Registry.Zzadd"),
         "got {targets:?}"
     );
 }
@@ -268,7 +282,9 @@ def handle():
         "app/caller.py::handle",
     );
     assert!(
-        targets.iter().any(|t| t == "pkg/factories.py::Worker.zzrun"),
+        targets
+            .iter()
+            .any(|t| t == "pkg/factories.py::Worker.zzrun"),
         "got {targets:?}"
     );
 }
@@ -292,7 +308,10 @@ pub fn caller() {
     let extractions = vec![extract_file("src/lib.rs", source)];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let edges = resolver.resolve_all(&extractions).expect("resolution").edges;
+    let edges = resolver
+        .resolve_all(&extractions)
+        .expect("resolution")
+        .edges;
     let hits = edges
         .iter()
         .filter(|edge| {
@@ -376,10 +395,15 @@ pub fn make() {
     let extractions = vec![extract_file("src/lib.rs", source)];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let edges = resolver.resolve_all(&extractions).expect("resolution").edges;
+    let edges = resolver
+        .resolve_all(&extractions)
+        .expect("resolution")
+        .edges;
     assert!(
-        edges.iter().any(|edge| edge.source_symbol == "src/lib.rs::make"
-            && edge.target_symbol == "src/lib.rs::Builder.zzbuild"),
+        edges
+            .iter()
+            .any(|edge| edge.source_symbol == "src/lib.rs::make"
+                && edge.target_symbol == "src/lib.rs::Builder.zzbuild"),
         "got {:?}",
         edges
             .iter()
@@ -413,7 +437,11 @@ pub fn build() {
 }
 ";
     let targets = calls_from(
-        &[("src/store.rs", store), ("src/index.rs", index), ("src/lib.rs", "mod store;\nmod index;\n")],
+        &[
+            ("src/store.rs", store),
+            ("src/index.rs", index),
+            ("src/lib.rs", "mod store;\nmod index;\n"),
+        ],
         "src/index.rs::build",
     );
     assert!(
@@ -446,11 +474,17 @@ pub fn project() {
 }
 ";
     let targets = calls_from(
-        &[("src/kinds.rs", kinds), ("src/snapshot.rs", test), ("src/lib.rs", "mod kinds;\nmod snapshot;\n")],
+        &[
+            ("src/kinds.rs", kinds),
+            ("src/snapshot.rs", test),
+            ("src/lib.rs", "mod kinds;\nmod snapshot;\n"),
+        ],
         "src/snapshot.rs::project",
     );
     assert!(
-        targets.iter().any(|t| t == "src/kinds.rs::Wrapper.zzsnapshot"),
+        targets
+            .iter()
+            .any(|t| t == "src/kinds.rs::Wrapper.zzsnapshot"),
         "got {targets:?}"
     );
 }
@@ -480,7 +514,11 @@ pub fn swap() {
 }
 ";
     let targets = calls_from(
-        &[("src/kinds.rs", kinds), ("src/swap.rs", caller), ("src/lib.rs", "mod kinds;\nmod swap;\n")],
+        &[
+            ("src/kinds.rs", kinds),
+            ("src/swap.rs", caller),
+            ("src/lib.rs", "mod kinds;\nmod swap;\n"),
+        ],
         "src/swap.rs::swap",
     );
     assert!(
@@ -590,7 +628,10 @@ pub fn check(text: &str) {
     // A second `Scanner` keeps the index-time class map from answering, so
     // the use is typed by its own binding, as on the corpus that found it.
     let targets = calls_from(
-        &[("src/json.rs", source), ("src/other.rs", "pub struct Scanner;\n")],
+        &[
+            ("src/json.rs", source),
+            ("src/other.rs", "pub struct Scanner;\n"),
+        ],
         "src/json.rs::check",
     );
     assert!(
@@ -617,11 +658,16 @@ pub fn run() {
 }
 ";
     let targets = calls_from(
-        &[("src/pipe.rs", source), ("src/other.rs", "pub struct PipeDrain;\n")],
+        &[
+            ("src/pipe.rs", source),
+            ("src/other.rs", "pub struct PipeDrain;\n"),
+        ],
         "src/pipe.rs::run",
     );
     assert!(
-        targets.iter().any(|t| t == "src/pipe.rs::PipeDrain.zzdrain"),
+        targets
+            .iter()
+            .any(|t| t == "src/pipe.rs::PipeDrain.zzdrain"),
         "got {targets:?}"
     );
 }
@@ -652,7 +698,10 @@ func pick(ieee bool) {
 }
 ";
     let targets = calls_from(
-        &[("search/providers.go", providers), ("search/pick.go", caller)],
+        &[
+            ("search/providers.go", providers),
+            ("search/pick.go", caller),
+        ],
         "search/pick.go::pick",
     );
     assert!(
@@ -675,13 +724,18 @@ func Register() {
 }
 ";
     let targets = calls_from(
-        &[("reg/registry.go", GO_REGISTRY), ("reg/register.go", caller)],
+        &[
+            ("reg/registry.go", GO_REGISTRY),
+            ("reg/register.go", caller),
+        ],
         "reg/register.go::Register",
     );
     // Whatever else may type `w`, the factory rung must not: `(T, error)`
     // names no single value. The binding is two-target, so nothing does.
     assert!(
-        !targets.iter().any(|t| t == "reg/registry.go::Registry.Zzadd"),
+        !targets
+            .iter()
+            .any(|t| t == "reg/registry.go::Registry.Zzadd"),
         "got {targets:?}"
     );
 }
@@ -838,7 +892,10 @@ func TestHelpers(t *testing.T) {
         !targets.iter().any(|t| t.starts_with("rpc/")),
         "the other package's `Client` is not this one: {targets:?}"
     );
-    for expected in ["llm/client.go::Client.Zzhealth", "llm/client.go::Client.Zzembed"] {
+    for expected in [
+        "llm/client.go::Client.Zzhealth",
+        "llm/client.go::Client.Zzembed",
+    ] {
         assert!(
             targets.iter().any(|t| t == expected),
             "{expected} missing: {targets:?}"
@@ -880,7 +937,9 @@ func Handle() {
         "api/handler.go::Handle",
     );
     assert!(
-        !targets.iter().any(|t| t == "api/handler.go::Client.Zzembed"),
+        !targets
+            .iter()
+            .any(|t| t == "api/handler.go::Client.Zzembed"),
         "`c` is llm's Client, not api's: {targets:?}"
     );
 }

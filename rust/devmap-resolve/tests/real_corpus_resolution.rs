@@ -187,7 +187,9 @@ fn markdev_resolution_has_not_regressed() {
         devmap_extract::extract_tree_with_report(&root).expect("MarkDev extracts");
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions).expect("MarkDev resolves");
+    let resolution = resolver
+        .resolve_all(&extractions)
+        .expect("MarkDev resolves");
 
     // caller -> callee name -> every target a Calls edge binds it to.
     let mut answers: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
@@ -196,7 +198,10 @@ fn markdev_resolution_has_not_regressed() {
             continue;
         }
         answers
-            .entry((edge.source_symbol.as_str(), last_segment(&edge.target_symbol)))
+            .entry((
+                edge.source_symbol.as_str(),
+                last_segment(&edge.target_symbol),
+            ))
             .or_default()
             .insert(edge.target_symbol.as_str());
     }
@@ -268,7 +273,10 @@ fn markdev_resolution_has_not_regressed() {
 
     let precision = tally.correct * 1000 / tally.bound.max(1);
     let recall = tally.correct * 1000 / tally.in_corpus.max(1);
-    println!("\nMarkDev resolution sample ({} sites at {pinned}):", sites.len());
+    println!(
+        "\nMarkDev resolution sample ({} sites at {pinned}):",
+        sites.len()
+    );
     println!("{}", rows.join("\n"));
     println!(
         "  bound {} (correct {}, wrong {}), missed {}, abstained on external {}\n  \

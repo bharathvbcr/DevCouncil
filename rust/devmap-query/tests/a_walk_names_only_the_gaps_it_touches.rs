@@ -121,7 +121,9 @@ fn a_caller_walk_names_the_unbound_site_that_names_a_reached_symbol() {
     let impact = StoreQueryEngine::new(&store)
         .impact(request("app.py::leaf", 3))
         .unwrap();
-    let reason = impact.walk_incomplete.expect("`widget.middle()` names `middle`");
+    let reason = impact
+        .walk_incomplete
+        .expect("`widget.middle()` names `middle`");
     assert!(reason.contains("widget.middle"), "{reason}");
     assert!(!reason.contains("repository-wide"), "{reason}");
 }
@@ -137,7 +139,9 @@ fn a_callee_walk_names_the_unbound_site_inside_what_it_walked() {
         .unwrap_or_else(|| panic!("`other` holds an unbound call: {trace:?}"));
     assert!(reason.contains("thing.frobnicate"), "{reason}");
     let deps = engine.dependencies(request("other.py", 1)).unwrap();
-    let reason = deps.walk_incomplete.expect("`other.py` holds an unbound call");
+    let reason = deps
+        .walk_incomplete
+        .expect("`other.py` holds an unbound call");
     assert!(reason.contains("thing.frobnicate"), "{reason}");
 }
 
@@ -157,7 +161,11 @@ fn ledger_classes(store: &Store, callee: &str) -> Vec<String> {
         .unresolved_sites_naming(generation, &[callee.to_string()], 10)
         .unwrap()
         .unwrap();
-    found[callee].0.iter().map(|row| row.classification.clone()).collect()
+    found[callee]
+        .0
+        .iter()
+        .map(|row| row.classification.clone())
+        .collect()
 }
 
 #[test]

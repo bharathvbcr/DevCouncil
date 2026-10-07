@@ -1843,7 +1843,11 @@ fn wait_until_queryable(root: &Path, limit: Duration) -> bool {
             .unwrap();
         let ready = serde_json::from_slice::<serde_json::Value>(&status.stdout)
             .ok()
-            .and_then(|value| value.get("query_ready").and_then(serde_json::Value::as_bool))
+            .and_then(|value| {
+                value
+                    .get("query_ready")
+                    .and_then(serde_json::Value::as_bool)
+            })
             .unwrap_or(false);
         let building = root
             .join(".devcouncil/codeintel/hook-build.running")

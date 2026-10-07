@@ -32,7 +32,8 @@ pub fn stamp_return_types(symbols: &mut [ExtractedSymbol], root: Node, source: &
         let Some(node) = root.descendant_for_byte_range(start, end) else {
             continue;
         };
-        symbol.return_type = callable_of(node).and_then(|callable| written_return(callable, source));
+        symbol.return_type =
+            callable_of(node).and_then(|callable| written_return(callable, source));
     }
 }
 
@@ -141,11 +142,20 @@ mod tests {
                       func Open() (*Registry, error) { return nil, nil }\n\
                       func Nothing() {}\n\
                       func (r *Registry) Clone() Registry { return *r }\n";
-        assert_eq!(return_of("r.go", source, "NewRegistry").as_deref(), Some("*Registry"));
-        assert_eq!(return_of("r.go", source, "Wrapped").as_deref(), Some("*Registry"));
+        assert_eq!(
+            return_of("r.go", source, "NewRegistry").as_deref(),
+            Some("*Registry")
+        );
+        assert_eq!(
+            return_of("r.go", source, "Wrapped").as_deref(),
+            Some("*Registry")
+        );
         assert_eq!(return_of("r.go", source, "Open"), None);
         assert_eq!(return_of("r.go", source, "Nothing"), None);
-        assert_eq!(return_of("r.go", source, "Clone").as_deref(), Some("Registry"));
+        assert_eq!(
+            return_of("r.go", source, "Clone").as_deref(),
+            Some("Registry")
+        );
     }
 
     #[test]
@@ -158,7 +168,10 @@ mod tests {
         assert_eq!(return_of("f.ts", source, "make").as_deref(), Some("Svc"));
         assert_eq!(return_of("f.ts", source, "clone").as_deref(), Some("Svc"));
         assert_eq!(return_of("f.ts", source, "arrow").as_deref(), Some("Svc"));
-        assert_eq!(return_of("f.ts", source, "load").as_deref(), Some("Promise<Svc>"));
+        assert_eq!(
+            return_of("f.ts", source, "load").as_deref(),
+            Some("Promise<Svc>")
+        );
         assert_eq!(return_of("f.ts", source, "bare"), None);
     }
 

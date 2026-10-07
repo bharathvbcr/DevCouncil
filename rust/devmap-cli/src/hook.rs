@@ -653,7 +653,8 @@ fn unindexed_worktree_notice(payload: &Value, executable: &Path) -> Option<Value
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| root.display().to_string());
-    let opted_in = main_checkout_of(&root).filter(|main| !is_unsafe_root(main) && store_exists(main));
+    let opted_in =
+        main_checkout_of(&root).filter(|main| !is_unsafe_root(main) && store_exists(main));
     let text = match opted_in.map(|main| (detach_build(executable, &root), main)) {
         Some((Ok(()), main)) => format!(
             "{name}: no DevMap index in this working tree yet, so `devmap build` was started \
@@ -704,7 +705,8 @@ fn main_checkout_of(root: &Path) -> Option<PathBuf> {
         .map(str::trim)
         .filter(|path| !path.is_empty())?;
     let gitdir = root.join(gitdir);
-    let common = devmap_query::stat_memo::read_bounded(&gitdir.join("commondir"), MAX_GITLINK_BYTES)?;
+    let common =
+        devmap_query::stat_memo::read_bounded(&gitdir.join("commondir"), MAX_GITLINK_BYTES)?;
     let common = gitdir.join(common.trim()).canonicalize().ok()?;
     if common.file_name()? != ".git" {
         return None;

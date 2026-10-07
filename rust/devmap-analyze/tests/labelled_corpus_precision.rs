@@ -200,7 +200,11 @@ fn the_extracted_tier_has_no_false_positives() {
                     "{}: `{symbol_id}` is live but was called dead at {} ({confidence:.2}){}",
                     truth.fixture,
                     tier(*confidence),
-                    if truth.strict { " [strict fixture]" } else { "" },
+                    if truth.strict {
+                        " [strict fixture]"
+                    } else {
+                        ""
+                    },
                 ));
             } else {
                 entry.true_positive += 1;

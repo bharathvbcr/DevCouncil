@@ -2216,7 +2216,8 @@ fn callable_binding_name(node: Node, source: &str) -> Option<String> {
     // `const save = useCallback(() => { … }, [deps])`: the binding *is* the
     // function, reached through a wrapper that returns something calling it.
     // Named by the declarator, exactly as the symbol emitter names it.
-    js_wrapper_declarator(node, source).and_then(|declarator| get_child_text(declarator, "name", source))
+    js_wrapper_declarator(node, source)
+        .and_then(|declarator| get_child_text(declarator, "name", source))
 }
 
 /// Callees that return a function which, when called, runs the function they
@@ -8700,13 +8701,9 @@ fn collect_site_bindings(
                             // resolver as an initializer shape, in place of the
                             // facts' guess at the same binding.
                             if lang == "rust" {
-                                if let Some(stated) =
-                                    binders.binder_type(node, name, scope)
-                                {
+                                if let Some(stated) = binders.binder_type(node, name, scope) {
                                     declared_type = Some(stated);
-                                } else if let Some(hint) =
-                                    binders.binder_hint(node, name, scope)
-                                {
+                                } else if let Some(hint) = binders.binder_hint(node, name, scope) {
                                     initializer = Some(hint);
                                 }
                             }

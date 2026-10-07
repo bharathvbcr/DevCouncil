@@ -199,7 +199,10 @@ fn closure_argument_hint(closure: Node, param: usize, source: &str) -> Option<St
         .named_children(&mut cursor)
         .filter(|child| !child.kind().ends_with("comment"))
         .position(|child| child.id() == closure.id())?;
-    Some(format!("|{}|{arg}|{param}", get_node_text(function, source)))
+    Some(format!(
+        "|{}|{arg}|{param}",
+        get_node_text(function, source)
+    ))
 }
 
 /// Every `let` in `block`, by each name its pattern mentions.
@@ -499,7 +502,10 @@ fn strip_unwrap<'tree>(value: Node<'tree>, source: &str) -> (Node<'tree>, bool) 
 }
 
 /// `receiver.method(args)`, split.
-fn method_call<'tree>(node: Node<'tree>, source: &str) -> Option<(Node<'tree>, String, Node<'tree>)> {
+fn method_call<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, String, Node<'tree>)> {
     if node.kind() != "call_expression" {
         return None;
     }
@@ -560,7 +566,10 @@ fn loop_element<'tree>(
         return None;
     }
     let local = get_node_text(collection, source);
-    let ty = peel(type_of_local(binders, collection, &local, scope, hops + 1)?, source)?;
+    let ty = peel(
+        type_of_local(binders, collection, &local, scope, hops + 1)?,
+        source,
+    )?;
     if ty.kind() == "array_type" {
         return ty.child_by_field_name("element");
     }
@@ -572,10 +581,12 @@ fn peel<'tree>(mut ty: Node<'tree>, source: &str) -> Option<Node<'tree>> {
     for _ in 0..MAX_PEEL {
         match ty.kind() {
             "reference_type" | "pointer_type" => ty = ty.child_by_field_name("type")?,
-            "generic_type" => match single_argument_of(ty, crate::deref::RUST_DEREF_TRANSPARENT, source) {
-                Some(inner) => ty = inner,
-                None => return Some(ty),
-            },
+            "generic_type" => {
+                match single_argument_of(ty, crate::deref::RUST_DEREF_TRANSPARENT, source) {
+                    Some(inner) => ty = inner,
+                    None => return Some(ty),
+                }
+            }
             _ => return Some(ty),
         }
     }
@@ -584,7 +595,11 @@ fn peel<'tree>(mut ty: Node<'tree>, source: &str) -> Option<Node<'tree>> {
 
 /// The one type argument of `Outer<T>` when `Outer` is one of `outers`.
 /// Lifetimes are not type arguments; a second type argument refuses.
-fn single_argument_of<'tree>(ty: Node<'tree>, outers: &[&str], source: &str) -> Option<Node<'tree>> {
+fn single_argument_of<'tree>(
+    ty: Node<'tree>,
+    outers: &[&str],
+    source: &str,
+) -> Option<Node<'tree>> {
     if ty.kind() != "generic_type" {
         return None;
     }

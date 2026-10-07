@@ -76,9 +76,18 @@ fn a_go_var_types_the_fields_its_value_receiver_methods_are_called_on() {
     let (_, result) = resolve(&[("dc/requirement.go", GO_REQUIREMENT)]);
 
     for (target, caller) in [
-        ("dc/requirement.go::Priority.valid", "dc/requirement.go::decodeRequirement"),
-        ("dc/requirement.go::Source.valid", "dc/requirement.go::decodeRequirement"),
-        ("dc/requirement.go::Method.valid", "dc/requirement.go::decodeAcceptance"),
+        (
+            "dc/requirement.go::Priority.valid",
+            "dc/requirement.go::decodeRequirement",
+        ),
+        (
+            "dc/requirement.go::Source.valid",
+            "dc/requirement.go::decodeRequirement",
+        ),
+        (
+            "dc/requirement.go::Method.valid",
+            "dc/requirement.go::decodeAcceptance",
+        ),
     ] {
         let edges = calls_to(&result, target);
         assert_eq!(
@@ -297,12 +306,16 @@ pub fn not_a_closure(shared: &Mutex<Collected>, tally: Collected) {}
 #[test]
 fn a_closure_parameter_has_the_type_its_callee_declares() {
     for (import, call) in [
-        ("use crate::note::note;", "note(&shared, |c| { c.merge(); });"),
-        ("use crate::note::note_generic;", "note_generic(&shared, |c| c.merge());"),
+        (
+            "use crate::note::note;",
+            "note(&shared, |c| { c.merge(); });",
+        ),
+        (
+            "use crate::note::note_generic;",
+            "note_generic(&shared, |c| c.merge());",
+        ),
     ] {
-        let user = format!(
-            "{import}\n\nfn walk(shared: Mutex<Collected>) {{\n    {call}\n}}\n"
-        );
+        let user = format!("{import}\n\nfn walk(shared: Mutex<Collected>) {{\n    {call}\n}}\n");
         let (_, result) = resolve(&[
             ("src/collected.rs", COLLECTED),
             ("src/note.rs", NOTE),
@@ -337,15 +350,16 @@ fn a_closure_parameter_has_the_type_its_callee_declares() {
 fn a_closure_is_not_typed_by_a_callee_this_file_does_not_bind() {
     for (import, call) in [
         // Not a closure parameter type.
-        ("use crate::note::not_a_closure;", "not_a_closure(&shared, |c| c.merge());"),
+        (
+            "use crate::note::not_a_closure;",
+            "not_a_closure(&shared, |c| c.merge());",
+        ),
         // Never imported: a corpus-wide match on the name is not evidence.
         ("", "note(&shared, |c| c.merge());"),
         // A method call: its receiver would have to be typed first.
         ("use crate::note::note;", "shared.note(|c| c.merge());"),
     ] {
-        let user = format!(
-            "{import}\n\nfn walk(shared: Mutex<Collected>) {{\n    {call}\n}}\n"
-        );
+        let user = format!("{import}\n\nfn walk(shared: Mutex<Collected>) {{\n    {call}\n}}\n");
         let (_, result) = resolve(&[
             ("src/collected.rs", COLLECTED),
             ("src/note.rs", NOTE),
@@ -446,7 +460,11 @@ fn a_python_annotated_parameter_types_its_receiver() {
 
 #[test]
 fn a_python_annotation_that_is_not_the_type_binds_nothing() {
-    for signature in ["shapes: list[Shape]", "shape: Shape | None", "shape: Optional[Shape]"] {
+    for signature in [
+        "shapes: list[Shape]",
+        "shape: Shape | None",
+        "shape: Optional[Shape]",
+    ] {
         let report = format!(
             "from shapes import Shape\n\n\ndef summarise({signature}):\n    return shape.describe()\n"
         );
@@ -490,7 +508,11 @@ fn a_go_var_of_a_slice_does_not_type_its_name_as_the_element() {
         "`var p *Item` types `p`; `var xs []Item` makes `xs` a slice, not an Item"
     );
     let edges = calls_to(&result, "dc/list.go::Item.Run");
-    assert_eq!(edges.len(), 1, "only `p.Run()` is a call on an Item; got {edges:?}");
+    assert_eq!(
+        edges.len(),
+        1,
+        "only `p.Run()` is a call on an Item; got {edges:?}"
+    );
 }
 
 #[test]

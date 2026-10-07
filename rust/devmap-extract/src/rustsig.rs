@@ -389,9 +389,13 @@ mod tests {
     fn a_constructor_returns_its_type_only_once_unwrapped_through_a_result() {
         let read = parse_header("fn read(conn: &Connection) -> Result<Self>").unwrap();
         assert!(returns_type(&read, "PathRanks", true));
-        assert!(!returns_type(&read, "PathRanks", false), "a Result is not a PathRanks");
+        assert!(
+            !returns_type(&read, "PathRanks", false),
+            "a Result is not a PathRanks"
+        );
 
-        let open = parse_header("pub fn open(path: &Path) -> anyhow::Result<Store, Error>").unwrap();
+        let open =
+            parse_header("pub fn open(path: &Path) -> anyhow::Result<Store, Error>").unwrap();
         assert!(returns_type(&open, "Store", true));
         assert!(!returns_type(&open, "Other", true));
 
@@ -415,15 +419,37 @@ mod tests {
     #[test]
     fn a_closure_parameter_is_read_from_every_closure_spelling() {
         for (signature, expected) in [
-            ("fn note(shared: &M, tally: impl FnOnce(&mut Collected)) -> W", "&mut Collected"),
-            ("fn note(shared: &M, tally: &dyn Fn(&Collected))", "&Collected"),
-            ("fn note(shared: &M, tally: Box<dyn FnMut(Collected) + Send>)", "Collected"),
-            ("fn note<F: FnOnce(&mut Collected)>(shared: &M, tally: F)", "&mut Collected"),
-            ("fn note<F>(shared: &M, tally: F) where F: Send + FnMut(&mut Collected) -> u8", "&mut Collected"),
-            ("fn note(&self, shared: &M, tally: impl Fn(&Collected))", "&Collected"),
+            (
+                "fn note(shared: &M, tally: impl FnOnce(&mut Collected)) -> W",
+                "&mut Collected",
+            ),
+            (
+                "fn note(shared: &M, tally: &dyn Fn(&Collected))",
+                "&Collected",
+            ),
+            (
+                "fn note(shared: &M, tally: Box<dyn FnMut(Collected) + Send>)",
+                "Collected",
+            ),
+            (
+                "fn note<F: FnOnce(&mut Collected)>(shared: &M, tally: F)",
+                "&mut Collected",
+            ),
+            (
+                "fn note<F>(shared: &M, tally: F) where F: Send + FnMut(&mut Collected) -> u8",
+                "&mut Collected",
+            ),
+            (
+                "fn note(&self, shared: &M, tally: impl Fn(&Collected))",
+                "&Collected",
+            ),
         ] {
             let header = parse_header(signature).unwrap();
-            assert_eq!(closure_parameter(&header, 1, 0), Some(expected), "{signature}");
+            assert_eq!(
+                closure_parameter(&header, 1, 0),
+                Some(expected),
+                "{signature}"
+            );
         }
     }
 

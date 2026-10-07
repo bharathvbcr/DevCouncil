@@ -300,7 +300,10 @@ fn reexport_chains_are_scoped_to_what_the_language_publishes() {
         ("pkg/impl.py", "def thing():\n    return 1\n"),
     ]);
     assert_eq!(
-        python.reexport_chains.get("pkg/__init__.py::thing").map(String::as_str),
+        python
+            .reexport_chains
+            .get("pkg/__init__.py::thing")
+            .map(String::as_str),
         Some("pkg/impl.py::thing"),
         "a module-scope import publishes the name as a module attribute: {:?}",
         python.reexport_chains
