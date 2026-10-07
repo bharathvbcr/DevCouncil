@@ -401,6 +401,9 @@ func toStoreGaps(gaps []Gap) []store.GapRow {
 			RequirementID:              g.RequirementID,
 			AcceptanceCriterionID:      g.AcceptanceCriterionID,
 			ExpectedVerificationMethod: g.ExpectedVerificationMethod,
+			File:                       g.File,
+			Line:                       g.Line,
+			SuggestedCommand:           g.SuggestedCommand,
 		})
 	}
 	return out

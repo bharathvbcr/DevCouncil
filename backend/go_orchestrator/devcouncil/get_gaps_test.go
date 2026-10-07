@@ -11,25 +11,28 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
-// TestGetGapsReportsACriterionGapsLinkage reads gaps back through
+// TestGetGapsReportsAGapsLinkageAndLocation reads gaps back through
 // devcouncil_get_gaps from a real store and checks the JSON an MCP client
 // receives.
 //
 // The handler builds each gap field by field, so a field the store carries is
 // still lost here unless it is named. An acceptance_criteria_unproven gap that
 // does not say which requirement and criterion it is about, or which method was
-// expected, tells an agent that something is unproven but not what.
-func TestGetGapsReportsACriterionGapsLinkage(t *testing.T) {
+// expected, tells an agent that something is unproven but not what; a gap with
+// no file, line or command tells it something is wrong but not where.
+func TestGetGapsReportsAGapsLinkageAndLocation(t *testing.T) {
 	ctx := context.Background()
 	client := store.New(testsupport.DCStore(t), filepath.Join(t.TempDir(), "state.sqlite"))
 
 	req, ac, method := "REQ-1", "AC-1.1", "integration_test"
+	file, line, cmd := "src/a.py", 9, "pytest tests/test_a.py"
 	if err := client.GapsReplace(ctx, "TASK-1", []store.GapRow{
 		{
 			ID: "G-AC", Severity: "high", GapType: "acceptance_criteria_unproven",
 			TaskID: "TASK-1", Description: "AC-1.1 unproven", RecommendedFix: "prove it",
 			Blocking: true, EvidenceJSON: []byte(`[]`),
 			RequirementID: &req, AcceptanceCriterionID: &ac, ExpectedVerificationMethod: &method,
+			File: &file, Line: &line, SuggestedCommand: &cmd,
 		},
 		{
 			ID: "G-STUB", Severity: "low", GapType: "stub_detected",
@@ -65,13 +68,19 @@ func TestGetGapsReportsACriterionGapsLinkage(t *testing.T) {
 			"requirement_id":               `"REQ-1"`,
 			"acceptance_criterion_id":      `"AC-1.1"`,
 			"expected_verification_method": `"integration_test"`,
+			"file":                         `"src/a.py"`,
+			"line":                         `9`,
+			"suggested_command":            `"pytest tests/test_a.py"`,
 		},
 		// Present and null, not absent: a missing key cannot be told apart
-		// from a server that does not report linkage at all.
+		// from a server that does not report these fields at all.
 		"G-STUB": {
 			"requirement_id":               `null`,
 			"acceptance_criterion_id":      `null`,
 			"expected_verification_method": `null`,
+			"file":                         `null`,
+			"line":                         `null`,
+			"suggested_command":            `null`,
 		},
 	}
 	for _, gap := range payload.Gaps {

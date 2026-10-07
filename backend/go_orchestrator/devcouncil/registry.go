@@ -338,6 +338,10 @@ func (r *Registry) callGetGaps(ctx context.Context, args map[string]any) any {
 			"requirement_id":               row.RequirementID,
 			"acceptance_criterion_id":      row.AcceptanceCriterionID,
 			"expected_verification_method": row.ExpectedVerificationMethod,
+			// Where the gap is and what reproduces it; null when it has none.
+			"file":              row.File,
+			"line":              row.Line,
+			"suggested_command": row.SuggestedCommand,
 		}
 		if h, ok := history[row.ID]; ok {
 			gap["occurrences"] = h.Occurrences

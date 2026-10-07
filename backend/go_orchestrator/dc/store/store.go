@@ -673,6 +673,11 @@ type GapRow struct {
 	RequirementID              *string `json:"requirement_id"`
 	AcceptanceCriterionID      *string `json:"acceptance_criterion_id"`
 	ExpectedVerificationMethod *string `json:"expected_verification_method"`
+	// Where the gap is and how to reproduce it. Nil is "not file-scoped" or
+	// "no command", carried the same way as the links above.
+	File             *string `json:"file"`
+	Line             *int    `json:"line"`
+	SuggestedCommand *string `json:"suggested_command"`
 }
 
 // GapHistoryRow is what became of one gap across a task's verification runs.
@@ -882,20 +887,25 @@ func (c *Client) GapsReplace(ctx context.Context, taskID string, gaps []GapRow) 
 		} else {
 			args = append(args, "--blocking", "false")
 		}
-		// Absent links are omitted rather than sent empty: dcstore stores
+		// Absent fields are omitted rather than sent empty: dcstore stores
 		// `--requirement-id ""` as an empty string, not NULL, and an empty id
 		// would read back as a gap about a criterion that has no name.
-		for _, link := range []struct {
+		for _, opt := range []struct {
 			flag  string
 			value *string
 		}{
 			{"--requirement-id", g.RequirementID},
 			{"--acceptance-criterion-id", g.AcceptanceCriterionID},
 			{"--expected-verification-method", g.ExpectedVerificationMethod},
+			{"--file", g.File},
+			{"--suggested-command", g.SuggestedCommand},
 		} {
-			if link.value != nil && *link.value != "" {
-				args = append(args, link.flag, *link.value)
+			if opt.value != nil && *opt.value != "" {
+				args = append(args, opt.flag, *opt.value)
 			}
+		}
+		if g.Line != nil {
+			args = append(args, "--line", strconv.Itoa(*g.Line))
 		}
 		if strings.TrimSpace(string(g.EvidenceJSON)) == "" {
 			// replace the empty evidence flag value

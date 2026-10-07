@@ -738,6 +738,14 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                             "expected_verification_method",
                             &maybe(r.expected_verification_method.as_deref()),
                         ),
+                        // Where the gap is and what reproduces it, dropped the
+                        // same way and for as long.
+                        ("file", &maybe(r.file.as_deref())),
+                        (
+                            "line",
+                            &r.line.map_or_else(|| "null".to_string(), |n| n.to_string()),
+                        ),
+                        ("suggested_command", &maybe(r.suggested_command.as_deref())),
                     ])
                 })
                 .collect();
@@ -797,6 +805,16 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                 flag("blocking").unwrap_or("false"),
                 "1" | "true" | "True" | "yes"
             );
+            // Refused rather than parsed with `.ok()`: a `--line 4x` used to
+            // store a gap with no location and report success, so the caller
+            // believed it had recorded where the gap was.
+            let line = match flag("line") {
+                Some(raw) => Some(
+                    raw.parse::<i64>()
+                        .map_err(|_| Failure::Fatal(format!("--line {raw:?} is not a number")))?,
+                ),
+                None => None,
+            };
             let gap = dc_store::records::GapRow {
                 id: required("id")?.to_string(),
                 severity: flag("severity").unwrap_or("medium").to_string(),
@@ -808,7 +826,7 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                 recommended_fix: flag("recommended-fix").unwrap_or("").to_string(),
                 blocking,
                 file: flag("file").map(str::to_string),
-                line: flag("line").and_then(|s| s.parse().ok()),
+                line,
                 suggested_command: flag("suggested-command").map(str::to_string),
                 acceptance_criterion_id: flag("acceptance-criterion-id").map(str::to_string),
                 expected_verification_method: flag("expected-verification-method")
