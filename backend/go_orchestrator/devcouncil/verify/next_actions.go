@@ -181,6 +181,20 @@ func missingEvidence(g Gap) *string {
 	return nil
 }
 
+// GapTypes lists every gap type this package routes to a category, sorted.
+//
+// It exists so the host can read every action text NextActionFor writes and
+// hold the commands they name to its dispatch table: those texts once told
+// agents to run `dev scope update`, which no host dispatches.
+func GapTypes() []string {
+	out := make([]string, 0, len(categoryByGapType))
+	for gapType := range categoryByGapType {
+		out = append(out, gapType)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // NextActionFor builds one NextAction from a Gap.
 func NextActionFor(g Gap) NextAction {
 	file := deriveFile(g)

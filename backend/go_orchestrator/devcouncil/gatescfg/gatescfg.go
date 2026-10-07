@@ -124,7 +124,10 @@ func SetVerificationMode(path, mode string) error {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
 		}
-		body := "gates:\n  mode: " + canonical + "\nexecution:\n  hook_gate:\n    mode: off\n"
+		// gates.mode only. This used to add `execution.hook_gate.mode: off`, a
+		// key Load above names as retired and nothing reads — so every new
+		// config was born carrying a setting for a gate that does not exist.
+		body := "gates:\n  mode: " + canonical + "\n"
 		return writeAtomicFile(path, []byte(body), 0o644)
 	}
 	updated, err := patchYAMLKey(string(data), "gates", "mode", canonical)

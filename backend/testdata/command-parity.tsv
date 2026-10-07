@@ -24,7 +24,8 @@
 #   gate matches that list below the no-lease refusal instead. The orientation
 #   commands the refusal message names — `dev map`, `dev doctor` — moved to
 #   NoTaskAllowedCommands so they still answer without one, which is why their
-#   rows above are unchanged. This only ever tightens.
+#   rows above are unchanged. This only ever tightens. (`dev doctor` was later
+#   retired from both lists; see the 27-row block below.)
 # DIVERGENCE from the deleted Python engine, frozen in this snapshot — 8 rows:
 #   ALLOW_TASK and ALLOW_NOTASK for `cd repo`, `cd repo && dev map`,
 #   `pushd /tmp` and `popd`.
@@ -35,6 +36,19 @@
 #   The Go gate refuses the construct instead — command.directory_change — and
 #   refuses git's spelling of it (`-C`, `--git-dir`, `--work-tree`) with it.
 #   This only ever tightens.
+# DIVERGENCE from the deleted Python engine, frozen in this snapshot — 27 rows:
+#   ALLOW_TASK and ALLOW_NOTASK for `dev status`, `dev status --json`,
+#   `dev tasks`, `dev next-task`, `dev checkout TASK-001`, `dev approve`,
+#   `dev doctor` and `devcouncil status` (which normalises to `dev status`);
+#   ALLOW_TASK for `dev release TASK-001`, `dev scope update` and
+#   `dev run-cmd pytest`; and both sections for the four `uv run … dev …` rows.
+#   Those were the Python CLI's commands and its `uv` entry point. The Go host
+#   dispatches none of them — each exits 2 — so the allowlists stopped naming
+#   them, held to the host's dispatch table by TestPolicyNamesOnlyLiveCommands
+#   (cmd/devcouncil). A lease is acquired through the devcouncil_checkout_task
+#   MCP tool, not a shell command. `dev map`, `dev graph` and the path-prefixed
+#   `.venv/bin/dev map` spellings are live and unchanged. This only ever
+#   tightens.
 NORM		
 NORM	   	
 NORM	dev status	dev status
@@ -101,12 +115,12 @@ NORM	git push origin feature	git push origin feature
 NORM	GIT PUSH ORIGIN --FORCE	GIT PUSH ORIGIN --FORCE
 ALLOW_TASK		deny
 ALLOW_TASK	   	deny
-ALLOW_TASK	dev status	allow
-ALLOW_TASK	dev status --json	allow
-ALLOW_TASK	dev tasks	allow
-ALLOW_TASK	dev next-task	allow
-ALLOW_TASK	dev checkout TASK-001	allow
-ALLOW_TASK	dev approve	allow
+ALLOW_TASK	dev status	deny
+ALLOW_TASK	dev status --json	deny
+ALLOW_TASK	dev tasks	deny
+ALLOW_TASK	dev next-task	deny
+ALLOW_TASK	dev checkout TASK-001	deny
+ALLOW_TASK	dev approve	deny
 ALLOW_TASK	git status	allow
 ALLOW_TASK	git diff	allow
 ALLOW_TASK	git diff --stat	allow
@@ -116,22 +130,22 @@ ALLOW_TASK	:	allow
 ALLOW_TASK	dev map	allow
 ALLOW_TASK	dev map query foo	allow
 ALLOW_TASK	dev graph query foo	allow
-ALLOW_TASK	dev doctor	allow
-ALLOW_TASK	dev release TASK-001	allow
-ALLOW_TASK	dev scope update	allow
-ALLOW_TASK	dev run-cmd pytest	allow
+ALLOW_TASK	dev doctor	deny
+ALLOW_TASK	dev release TASK-001	deny
+ALLOW_TASK	dev scope update	deny
+ALLOW_TASK	dev run-cmd pytest	deny
 ALLOW_TASK	pytest tests/	allow
 ALLOW_TASK	python -m pytest tests/ -q	allow
 ALLOW_TASK	uv run pytest tests/	allow
-ALLOW_TASK	uv run dev map	allow
-ALLOW_TASK	uv run --project . dev map	allow
-ALLOW_TASK	uv run --directory /repo dev status	allow
-ALLOW_TASK	uv run -p /repo dev map query x	allow
+ALLOW_TASK	uv run dev map	deny
+ALLOW_TASK	uv run --project . dev map	deny
+ALLOW_TASK	uv run --directory /repo dev status	deny
+ALLOW_TASK	uv run -p /repo dev map query x	deny
 ALLOW_TASK	.venv/bin/dev map	allow
 ALLOW_TASK	/abs/path/.venv/bin/dev status	deny
 ALLOW_TASK	./scripts/dev map	allow
 ALLOW_TASK	DevCouncil/dev map	deny
-ALLOW_TASK	devcouncil status	allow
+ALLOW_TASK	devcouncil status	deny
 ALLOW_TASK	dev map > /tmp/out.json	allow
 ALLOW_TASK	dev map >> /tmp/out.json	allow
 ALLOW_TASK	dev map 2> /tmp/err	allow
@@ -165,12 +179,12 @@ ALLOW_TASK	git push origin feature	deny
 ALLOW_TASK	GIT PUSH ORIGIN --FORCE	deny
 ALLOW_NOTASK		deny
 ALLOW_NOTASK	   	deny
-ALLOW_NOTASK	dev status	allow
-ALLOW_NOTASK	dev status --json	allow
-ALLOW_NOTASK	dev tasks	allow
-ALLOW_NOTASK	dev next-task	allow
-ALLOW_NOTASK	dev checkout TASK-001	allow
-ALLOW_NOTASK	dev approve	allow
+ALLOW_NOTASK	dev status	deny
+ALLOW_NOTASK	dev status --json	deny
+ALLOW_NOTASK	dev tasks	deny
+ALLOW_NOTASK	dev next-task	deny
+ALLOW_NOTASK	dev checkout TASK-001	deny
+ALLOW_NOTASK	dev approve	deny
 ALLOW_NOTASK	git status	allow
 ALLOW_NOTASK	git diff	allow
 ALLOW_NOTASK	git diff --stat	allow
@@ -180,22 +194,22 @@ ALLOW_NOTASK	:	allow
 ALLOW_NOTASK	dev map	allow
 ALLOW_NOTASK	dev map query foo	allow
 ALLOW_NOTASK	dev graph query foo	deny
-ALLOW_NOTASK	dev doctor	allow
+ALLOW_NOTASK	dev doctor	deny
 ALLOW_NOTASK	dev release TASK-001	deny
 ALLOW_NOTASK	dev scope update	deny
 ALLOW_NOTASK	dev run-cmd pytest	deny
 ALLOW_NOTASK	pytest tests/	deny
 ALLOW_NOTASK	python -m pytest tests/ -q	deny
 ALLOW_NOTASK	uv run pytest tests/	deny
-ALLOW_NOTASK	uv run dev map	allow
-ALLOW_NOTASK	uv run --project . dev map	allow
-ALLOW_NOTASK	uv run --directory /repo dev status	allow
-ALLOW_NOTASK	uv run -p /repo dev map query x	allow
+ALLOW_NOTASK	uv run dev map	deny
+ALLOW_NOTASK	uv run --project . dev map	deny
+ALLOW_NOTASK	uv run --directory /repo dev status	deny
+ALLOW_NOTASK	uv run -p /repo dev map query x	deny
 ALLOW_NOTASK	.venv/bin/dev map	allow
 ALLOW_NOTASK	/abs/path/.venv/bin/dev status	deny
 ALLOW_NOTASK	./scripts/dev map	allow
 ALLOW_NOTASK	DevCouncil/dev map	deny
-ALLOW_NOTASK	devcouncil status	allow
+ALLOW_NOTASK	devcouncil status	deny
 ALLOW_NOTASK	dev map > /tmp/out.json	allow
 ALLOW_NOTASK	dev map >> /tmp/out.json	allow
 ALLOW_NOTASK	dev map 2> /tmp/err	allow

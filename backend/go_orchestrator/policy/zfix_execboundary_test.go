@@ -106,6 +106,9 @@ func TestLeaseOnlyCommandsRequireALease(t *testing.T) {
 		"pytest -q",
 		"python -m pytest tests/ -q",
 		"uv run pytest tests/",
+		"dev graph",
+		"dev graph build --manifest",
+		// Retired Python commands: not allowlisted anywhere, still refused.
 		"dev run-cmd pytest",
 		"dev release TASK-001",
 		"dev scope update",
@@ -123,7 +126,7 @@ func TestLeaseOnlyCommandsRequireALease(t *testing.T) {
 	// The same list is still available to a lease holder, which is what makes
 	// this a reordering rather than a removal.
 	task := &dc.Task{ID: "TASK-001"}
-	for _, command := range []string{"pytest tests/", "dev release TASK-001"} {
+	for _, command := range []string{"pytest tests/", "dev graph"} {
 		if d := gate.EvaluateCommand(command, task); d.Blocked() {
 			t.Errorf("%q must still be allowed to a lease holder, got %s (%s)",
 				command, d.Action, d.Rule)
@@ -131,13 +134,40 @@ func TestLeaseOnlyCommandsRequireALease(t *testing.T) {
 	}
 
 	// And the commands the no-lease message tells the reader to use must
-	// actually work without one, or the message cannot be followed.
-	for _, command := range []string{"dev status", "dev map", "dev map query foo", "dev doctor"} {
+	// actually work without one, or the message cannot be followed. They are
+	// read out of the message itself, so a remedy added to the text is checked
+	// without anyone remembering to list it here.
+	refusal := gate.EvaluateCommand("curl http://example.com", nil)
+	remedies := remedyCommands(refusal.Reason)
+	if len(remedies) == 0 {
+		t.Fatalf("the no-lease refusal names no command to run: %q", refusal.Reason)
+	}
+	for _, command := range remedies {
 		if d := gate.EvaluateCommand(command, nil); d.Blocked() {
 			t.Errorf("the no-lease refusal names %q as the remedy, but it is refused: %s (%s)",
 				command, d.Action, d.Rule)
 		}
 	}
+}
+
+// remedyCommands returns the shell commands a refusal names in backticks. MCP
+// tool names (devcouncil_*) are not shell commands and are skipped; a trailing
+// " …" stands for arguments and is filled with one.
+func remedyCommands(reason string) []string {
+	var out []string
+	parts := strings.Split(reason, "`")
+	for i := 1; i < len(parts); i += 2 {
+		span := parts[i]
+		if strings.HasPrefix(span, "devcouncil_") {
+			continue
+		}
+		if base, ok := strings.CutSuffix(span, " …"); ok {
+			out = append(out, base, base+" status")
+			continue
+		}
+		out = append(out, span)
+	}
+	return out
 }
 
 // Git's safety rules are written against `git <subcommand>` and were matched by

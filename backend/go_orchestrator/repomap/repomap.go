@@ -9,17 +9,21 @@
 // # Why this derives adjacency instead of reading it
 //
 // The obvious implementation is to read `subsystems[].neighbors` from the repo
-// map artifact. Two things make that wrong, and both were found by looking at
+// map artifact. Two things made that wrong, and both were found by looking at
 // the artifact rather than at its documentation:
 //
-//  1. The Rust producer emits `"neighbors": []` unconditionally — the field is
-//     a literal in its manifest writer. The Python producer computes it from
-//     cross-area edges. A consumer reading the field cannot tell "this
-//     repository has no adjacent subsystems" from "this producer does not
-//     compute the field", and the first is a decision while the second is a
-//     missing feature. Believing it would make the gate deny neighbour-scope
-//     writes with a reason that confidently states the subsystem is not a
-//     declared neighbour.
+//  1. The Rust producer used to emit `"neighbors": []` unconditionally — the
+//     field was a literal in its manifest writer — so a consumer could not tell
+//     "this repository has no adjacent subsystems" from "this producer does not
+//     compute the field". It now computes the field
+//     (rust/devmap-query/src/manifest.rs) and says so in
+//     `meta.devmap_rust.neighbors_computed`, which settles that question. It does not
+//     make the field usable here: the list is capped per subsystem, and
+//     `liveness_meta.subsystems.neighbors_truncated` reports when names were
+//     cut, so an area missing from it is not evidence of non-adjacency.
+//     Believing the field would make the gate deny neighbour-scope writes with
+//     a reason that confidently states the subsystem is not a declared
+//     neighbour.
 //
 //  2. The artifact's two halves used different vocabularies for the same word.
 //     `files[].area` is a directory path, while `subsystems[].area` was the
@@ -38,8 +42,8 @@
 // So adjacency is computed here from the edges: if a symbol in one area
 // references a symbol in another, those areas are neighbours. That is evidence
 // rather than a claim, it uses one vocabulary throughout, and it cannot be
-// silently emptied by a producer that stubs a field. Reason 1 alone still
-// requires it, and this path reads the code graph's own `nodes[].area` — which
+// silently emptied by a producer that stubs a field. The cap in reason 1 alone
+// still requires it, and this path reads the code graph's own `nodes[].area` — which
 // was a directory prefix before the fix and after it — so neither the defect
 // nor its repair changes what this package computes.
 package repomap

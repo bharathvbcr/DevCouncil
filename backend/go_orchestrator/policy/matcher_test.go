@@ -113,7 +113,7 @@ func TestInjectedMatcherIsAskedAndAgreesWithGo(t *testing.T) {
 			}
 		}
 	}
-	for _, cmd := range []string{"go test ./...", "rm -rf /", "git status", "dev status", "echo hi > .env"} {
+	for _, cmd := range []string{"go test ./...", "rm -rf /", "git status", "dev map", "echo hi > .env"} {
 		want := CommandGate{Root: root, HardRules: true}.EvaluateCommand(cmd, task)
 		got := CommandGate{Root: root, HardRules: true, Matcher: m}.EvaluateCommand(cmd, task)
 		if !reflect.DeepEqual(got, want) {

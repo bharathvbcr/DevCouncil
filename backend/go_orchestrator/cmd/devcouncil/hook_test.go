@@ -106,50 +106,32 @@ func TestHookUnknownEventIsNoop(t *testing.T) {
 	}
 }
 
-// TestHookAgentResponseWithGateOff confirms agent-response is a no-op when
-// hook_gate.mode is off (the default).
-func TestHookAgentResponseWithGateOff(t *testing.T) {
-	root := t.TempDir()
-	// Write a config with hook_gate: off
-	cfgDir := filepath.Join(root, ".devcouncil")
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cfg := "execution:\n  hook_gate:\n    mode: 'off'\n"
-	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(cfg), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	code := dispatch([]string{
-		"hook", "agent-response",
-		"--client", "claude",
-		"--project-root", root,
-	})
-	if code != 0 {
-		t.Fatalf("agent-response with gate off exit %d, want 0", code)
-	}
-}
-
-// TestHookAgentResponseWithGateContain confirms agent-response exits 0 even
-// when containment is on — the CLI path no longer blocks; the MCP surface
-// enforces the actual gate.
-func TestHookAgentResponseWithGateContain(t *testing.T) {
-	root := t.TempDir()
-	cfgDir := filepath.Join(root, ".devcouncil")
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cfg := "execution:\n  hook_gate:\n    mode: contain\n"
-	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(cfg), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	code := dispatch([]string{
-		"hook", "agent-response",
-		"--client", "claude",
-		"--project-root", root,
-	})
-	if code != 0 {
-		t.Fatalf("agent-response with gate contain exit %d, want 0", code)
+// TestHookAgentResponseIgnoresRetiredHookGateKey confirms the retired
+// agent-response event is a silent no-op whatever a stale config says. Nothing
+// reads execution.hook_gate.mode — not the CLI, not the MCP surface — so `off`,
+// `contain` and an absent key exit 0 alike. These were two tests named
+// "WithGateOff" and "WithGateContain", as if the key still chose a behaviour.
+func TestHookAgentResponseIgnoresRetiredHookGateKey(t *testing.T) {
+	for name, cfg := range map[string]string{
+		"off":     "execution:\n  hook_gate:\n    mode: 'off'\n",
+		"contain": "execution:\n  hook_gate:\n    mode: contain\n",
+		"absent":  "gates:\n  mode: off\n",
+	} {
+		root := t.TempDir()
+		cfgDir := filepath.Join(root, ".devcouncil")
+		if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		code := dispatch([]string{
+			"hook", "agent-response",
+			"--client", "claude",
+			"--project-root", root,
+		})
+		if code != 0 {
+			t.Fatalf("hook_gate %s: agent-response exit %d, want 0", name, code)
+		}
 	}
 }

@@ -2,12 +2,6 @@ execution:
   command_timeout: 2400
   default_executor: claude
   enforce_file_scope_pre_verify: true
-  hook_gate:
-    mode: 'off'
-  stop_gate:
-    check_claims: false
-    mode: 'off'
-    verify_active_task: false
 gates:
   mode: off
 indexing:
@@ -22,23 +16,19 @@ integrations:
     enabled: false
     scope: project
     settings_path: .claude/settings.local.json
-    write_gate: false
   cursor:
     config_path: .cursor/mcp.json
     enabled: false
     hooks_path: .cursor/hooks.json
     rules_path: .cursor/rules/devcouncil.mdc
     skills_path: .cursor/skills
-    write_gate: false
   grok:
     config_path: .grok/config.toml
     enabled: false
     hooks_path: .grok/hooks/devcouncil.json
-    write_gate: false
   opencode:
     config_path: opencode.json
     enabled: false
-    write_gate: false
   warp:
     command: oz
     enabled: true
@@ -46,8 +36,6 @@ integrations:
     run_mode: local
   aider:
     enabled: true
-  codex:
-    write_gate: false
 models:
   provider: openrouter
   roles:

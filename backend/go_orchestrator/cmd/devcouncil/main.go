@@ -22,7 +22,9 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/flags"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/gate"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/repomap"
 )
 
 func main() {
@@ -42,52 +44,64 @@ func dispatch(args []string) int {
 		console.Println(`{"ok":true,"id":"host","component":"devcouncil","version":"` + Version + `"}`)
 		return 0
 	}
-	switch args[0] {
-	case "mcp", "mcp-server":
-		return runMCP()
-	case "integrate", "integrations":
-		return runIntegrate(args[1:])
-	case "skills":
-		return runSkills(args[1:])
-	case "verify":
-		return runVerify(args[1:])
-	case "grep":
-		return runGrep(args[1:])
-	case "install":
-		return runInstall(args[1:])
-	case "uninstall":
-		return runUninstall(args[1:])
-	case "disable":
-		return runDisable(args[1:])
-	case "enable":
-		return runEnable(args[1:])
-	case "gate":
-		return runGate(args[1:])
-	case "hook":
-		return runHook(args[1:])
-	case "map", "graph":
-		return runDevmap(mapArgs(args[1:]))
-	case "ast":
-		return runDevmap(astArgs(args[1:]))
-	case "gusset-check":
-		return runGussetCheck()
-	case "version", "--version", "-V", "-v":
-		for _, arg := range args[1:] {
-			if arg == "--json" {
-				console.Println(`{"ok":true,"id":"host","component":"devcouncil","version":"` + Version + `"}`)
-				return 0
-			}
-		}
-		console.Println("devcouncil " + Version)
-		return 0
-	case "help", "-h", "--help":
-		usage()
-		return 0
-	default:
+	run, ok := commands[args[0]]
+	if !ok {
 		console.Errorf("unknown command: %s\n", args[0])
 		usage()
 		return 2
 	}
+	return run(args[1:])
+}
+
+// commands is the dispatch table: every top-level command this binary runs,
+// keyed by the name a caller types after `dev` or `devcouncil`.
+//
+// It is data rather than a switch so that the things which name commands to
+// agents — the policy allowlist, its denial text and the packaged skills — can
+// be held to it by a test. Each of those once named `dev status`,
+// `dev checkout` or `dev doctor`, which exit 2 here; a name that is not a key
+// in this table is a name no agent can run.
+var commands = map[string]func(args []string) int{
+	"mcp":          func([]string) int { return runMCP() },
+	"mcp-server":   func([]string) int { return runMCP() },
+	"integrate":    runIntegrate,
+	"integrations": runIntegrate,
+	"skills":       runSkills,
+	"verify":       runVerify,
+	"grep":         runGrep,
+	"install":      runInstall,
+	"uninstall":    runUninstall,
+	"disable":      runDisable,
+	"enable":       runEnable,
+	"gate":         runGate,
+	"hook":         runHook,
+	"map":          func(args []string) int { return runDevmap(mapArgs(args)) },
+	"graph":        func(args []string) int { return runDevmap(mapArgs(args)) },
+	"ast":          func(args []string) int { return runDevmap(astArgs(args)) },
+	"gusset-check": func([]string) int { return runGussetCheck() },
+	"version":      runVersion,
+	"--version":    runVersion,
+	"-V":           runVersion,
+	"-v":           runVersion,
+	"help":         runHelp,
+	"-h":           runHelp,
+	"--help":       runHelp,
+}
+
+func runVersion(args []string) int {
+	for _, arg := range args {
+		if arg == "--json" {
+			console.Println(`{"ok":true,"id":"host","component":"devcouncil","version":"` + Version + `"}`)
+			return 0
+		}
+	}
+	console.Println("devcouncil " + Version)
+	return 0
+}
+
+func runHelp([]string) int {
+	usage()
+	return 0
 }
 
 func usage() {
@@ -130,20 +144,95 @@ Hosts: %s
 `, strings.Join(integrate.Hosts, ", "))
 }
 
-func projectRoot() string {
-	if v := os.Getenv("DEVCOUNCIL_PROJECT_ROOT"); v != "" {
-		return v
+// projectRoot is the repository a command acts on when no --project-root was
+// given: DEVCOUNCIL_PROJECT_ROOT, else the working directory.
+//
+// Both are checked by checkProjectRoot. The environment value used to be
+// returned verbatim, and a host that wrote `"${CLAUDE_PROJECT_DIR}"` into an
+// MCP config without expanding it handed this binary a relative path whose
+// first component is a literal `${CLAUDE_PROJECT_DIR}` — so state was created
+// under a directory of that name beside wherever the host happened to start.
+// A root that is wrong is refused before anything is read or written under it.
+func projectRoot() (string, error) {
+	if v, set := os.LookupEnv("DEVCOUNCIL_PROJECT_ROOT"); set {
+		return checkProjectRoot(v, "DEVCOUNCIL_PROJECT_ROOT")
 	}
 	wd, err := os.Getwd()
 	if err != nil {
-		return "."
+		return "", fmt.Errorf("cannot resolve the project root: the working directory is unreadable (%v); pass --project-root DIR", err)
 	}
-	return wd
+	return checkProjectRoot(wd, "the working directory")
+}
+
+// resolveRoot is the root after flag parsing: the --project-root value when one
+// was given (already checked by checkProjectRoot), otherwise projectRoot().
+func resolveRoot(fromFlag string) (string, error) {
+	if fromFlag != "" {
+		return fromFlag, nil
+	}
+	return projectRoot()
+}
+
+// checkProjectRoot refuses a project root that cannot be the repository the
+// caller meant, and returns it cleaned. source names where the value came from
+// so the refusal says what to fix.
+//
+// Refused: empty; containing `$` (an unexpanded variable — DevMap refuses the
+// same class in rust/devmap-serve/src/root_resolve.rs); relative (it would
+// resolve against whatever directory the host launched from); missing; not a
+// directory. Nothing is created to make a root valid.
+func checkProjectRoot(dir, source string) (string, error) {
+	if strings.TrimSpace(dir) == "" {
+		return "", fmt.Errorf("%s is empty; it must name the repository directory", source)
+	}
+	if strings.Contains(dir, "$") {
+		return "", fmt.Errorf("%s is %q, which contains an unexpanded shell variable: "+
+			"the host that launched this command did not substitute it. Configure the host "+
+			"with the absolute repository path", source, dir)
+	}
+	if !filepath.IsAbs(dir) {
+		return "", fmt.Errorf("%s is %q, which is relative; it must be an absolute path to the repository", source, dir)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("%s is %q, which cannot be used: %w", source, dir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s is %q, which is not a directory", source, dir)
+	}
+	return filepath.Clean(dir), nil
+}
+
+// projectRootFlag reads the value after a --project-root at args[i], checks it,
+// and reports it on stderr when it is refused. ok is false for a missing or
+// refused value; the caller exits 2.
+func projectRootFlag(args []string, i int) (root string, ok bool) {
+	if i >= len(args) {
+		console.Errorln("--project-root needs a directory")
+		return "", false
+	}
+	root, err := checkProjectRoot(args[i], "--project-root")
+	if err != nil {
+		console.Errorln(err)
+		return "", false
+	}
+	return root, true
 }
 
 func runMCP() int {
-	root := projectRoot()
-	reg := openRegistry(root)
+	root, err := projectRoot()
+	if err != nil {
+		console.Errorf("devcouncil mcp: %v\n", err)
+		return 2
+	}
+	g, err := openGate(root)
+	if err != nil {
+		// Served without a gate rather than not at all: the task loop and the
+		// verifier do not depend on it, and devcouncil_policy_check_write
+		// answers not_initialized instead of a verdict it could not reach.
+		console.Errorf("devcouncil mcp: write gate unavailable: %v\n", err)
+	}
+	reg := devcouncil.NewRegistry(root, openStore(root), g)
 	srv := &mcp.Server{Registry: reg}
 	if err := srv.Serve(); err != nil {
 		console.Errorf("devcouncil mcp: %v\n", err)
@@ -152,27 +241,64 @@ func runMCP() int {
 	return 0
 }
 
-func openRegistry(root string) *devcouncil.Registry {
+// openStore returns the task-store client, or nil when the project has no
+// state database.
+func openStore(root string) *store.Client {
 	db := filepath.Join(root, ".devcouncil", "state.sqlite")
-	var client *store.Client
-	if _, err := os.Stat(db); err == nil {
-		bin, _ := lookPath("dcstore")
-		if bin == "" {
-			bin = "dcstore"
-		}
-		client = store.New(bin, db)
+	if _, err := os.Stat(db); err != nil {
+		return nil
 	}
-	var g *gate.Gate
-	cfg := filepath.Join(root, ".devcouncil", "config.yaml")
-	if regFlags, err := flags.NewHarnessRegistry(cfg); err == nil {
-		if gg, err := gate.New(regFlags, root, nil); err == nil {
-			// The engine answers every pattern question this gate asks; a
-			// failure is a hard denial under the engine rules, not a guess.
-			gg.Matcher = policyMatcher()
-			g = gg
-		}
+	bin, _ := lookPath("dcstore")
+	if bin == "" {
+		bin = "dcstore"
 	}
-	return devcouncil.NewRegistry(root, client, g)
+	return store.New(bin, db)
+}
+
+// openGate builds the write gate the MCP policy tool consults, with the
+// repository's code graph behind its subsystem-neighbour rung.
+//
+// The graph is read from DevMap's resolved state directory (repomap.CodeGraphPath),
+// the same file Manvi's buildGate reads. It used to be nil here, so every
+// unplanned write recorded `repo_map.unavailable` and fell back to the
+// same-directory rung even in a repository with a built index.
+//
+// A graph that is absent leaves the map nil, which the policy layer records as
+// `repo_map.unavailable` on each decision it would have consulted. A graph that
+// is present but unreadable does the same and is also reported here, because
+// "never built" and "built and damaged" send an operator to different places.
+// Neither case allows anything the map would have refused: without a map the
+// rung falls back to same-directory, which is narrower than the neighbour
+// relation, never wider.
+func openGate(root string) (*gate.Gate, error) {
+	regFlags, err := flags.NewHarnessRegistry(filepath.Join(root, ".devcouncil", "config.yaml"))
+	if err != nil {
+		return nil, err
+	}
+	graphPath := repomap.CodeGraphPath(root)
+	m, err := repomap.LoadIfPresent(graphPath)
+	if err != nil {
+		console.Errorf("devcouncil: repo map %s is unreadable (%v); the write gate's "+
+			"subsystem-neighbour rung is unavailable and unplanned writes fall back to "+
+			"same-directory scope. Rebuild it with `dev map`.\n", graphPath, err)
+		m = nil
+	}
+	// Assigned through the nil check, as Manvi's buildGate does: a nil
+	// *repomap.Map stored in the policy.SubsystemMap interface is a non-nil
+	// interface, and the policy layer would consult a map that answers nothing
+	// instead of recording that it has none.
+	var subsystems policy.SubsystemMap
+	if m != nil {
+		subsystems = m
+	}
+	g, err := gate.New(regFlags, root, subsystems)
+	if err != nil {
+		return nil, err
+	}
+	// The engine answers every pattern question this gate asks; a failure is a
+	// hard denial under the engine rules, not a guess.
+	g.Matcher = policyMatcher()
+	return g, nil
 }
 
 func lookPath(name string) (string, error) {
@@ -388,7 +514,7 @@ func runIntegrate(args []string) int {
 	if args[0] == "uninstall" {
 		return runIntegrateUninstall(args[1:])
 	}
-	opts := integrate.Options{Root: projectRoot(), Host: args[0], Mode: integrate.ModeCheck}
+	opts := integrate.Options{Host: args[0], Mode: integrate.ModeCheck}
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
 		case "--apply":
@@ -409,11 +535,11 @@ func runIntegrate(args []string) int {
 			return 2
 		case "--project-root":
 			i++
-			if i >= len(args) {
-				console.Errorln("--project-root needs a value")
+			root, ok := projectRootFlag(args, i)
+			if !ok {
 				return 2
 			}
-			opts.Root = args[i]
+			opts.Root = root
 		case "--json":
 			// always print receipt JSON on stdout for scripting
 		default:
@@ -421,6 +547,12 @@ func runIntegrate(args []string) int {
 			return 2
 		}
 	}
+	root, err := resolveRoot(opts.Root)
+	if err != nil {
+		console.Errorf("integrate: %v\n", err)
+		return 2
+	}
+	opts.Root = root
 	self, _ := os.Executable()
 	opts.SelfBin = self
 	receipt, err := integrate.Run(opts)
@@ -450,7 +582,7 @@ func runIntegrate(args []string) int {
 // `dev hook disable` calls: DevCouncil lifecycle hooks are retired, and this is
 // the one command that takes their registrations back off a host.
 func runIntegrateUninstall(args []string) int {
-	opts := integrate.UninstallOptions{Root: projectRoot(), Target: integrate.TargetHooks, Mode: integrate.ModeApply}
+	opts := integrate.UninstallOptions{Target: integrate.TargetHooks, Mode: integrate.ModeApply}
 	modeSet := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -473,7 +605,11 @@ func runIntegrateUninstall(args []string) int {
 			case "--target":
 				opts.Target = integrate.Target(args[i])
 			case "--project-root":
-				opts.Root = args[i]
+				root, ok := projectRootFlag(args, i)
+				if !ok {
+					return 2
+				}
+				opts.Root = root
 			case "--client":
 				opts.Client = args[i]
 			}
@@ -486,6 +622,12 @@ func runIntegrateUninstall(args []string) int {
 			return 2
 		}
 	}
+	root, err := resolveRoot(opts.Root)
+	if err != nil {
+		console.Errorf("integrate uninstall: %v\n", err)
+		return 2
+	}
+	opts.Root = root
 	receipt, err := integrate.Uninstall(opts)
 	if receipt != nil {
 		if writeErr := console.JSON(receipt); writeErr != nil {
@@ -554,7 +696,7 @@ func runSkillsList(args []string) int {
 }
 
 func runSkillsScaffold(args []string) int {
-	root := projectRoot()
+	root := ""
 	dryRun := false
 	checkOnly := false
 	var filter []string
@@ -566,10 +708,11 @@ func runSkillsScaffold(args []string) int {
 			checkOnly = true
 		case "--project-root":
 			i++
-			if i >= len(args) {
+			r, ok := projectRootFlag(args, i)
+			if !ok {
 				return 2
 			}
-			root = args[i]
+			root = r
 		case "--skill":
 			i++
 			if i >= len(args) {
@@ -580,6 +723,11 @@ func runSkillsScaffold(args []string) int {
 			console.Errorf("unknown flag: %s\n", args[i])
 			return 2
 		}
+	}
+	root, err := resolveRoot(root)
+	if err != nil {
+		console.Errorf("skills scaffold: %v\n", err)
+		return 2
 	}
 	all, err := skills.Embedded.Load()
 	if err != nil {
@@ -636,7 +784,7 @@ func runSkillsScaffold(args []string) int {
 }
 
 func runVerify(args []string) int {
-	root := projectRoot()
+	root := ""
 	jsonOut := false
 	sandbox := verify.SandboxLocal
 	taskID := ""
@@ -674,11 +822,11 @@ func runVerify(args []string) int {
 			modeFlag = args[i]
 		case "--project-root":
 			i++
-			if i >= len(args) {
-				console.Errorln("--project-root needs a value")
+			r, ok := projectRootFlag(args, i)
+			if !ok {
 				return 2
 			}
-			root = args[i]
+			root = r
 		case "-h", "--help":
 			console.Errorln("usage: devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] " +
 				"[--sandbox local] [--coverage PATH]")
@@ -700,7 +848,15 @@ func runVerify(args []string) int {
 		console.Errorln("verify requires TASK_ID")
 		return 2
 	}
-	reg := openRegistry(root)
+	root, err := resolveRoot(root)
+	if err != nil {
+		console.Errorf("verify: %v\n", err)
+		return 2
+	}
+	// No write gate: verification reads the store and the lease, and building
+	// the gate would load the whole code graph for a run that never asks it a
+	// question.
+	reg := devcouncil.NewRegistry(root, openStore(root), nil)
 	gateMode := ""
 	if reg.Lease != nil {
 		gateMode = reg.Lease.GateMode

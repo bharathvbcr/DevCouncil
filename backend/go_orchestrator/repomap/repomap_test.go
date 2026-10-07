@@ -46,9 +46,9 @@ func smallGraphFixture(t *testing.T) string {
 }
 
 // TestAdjacencyIsDerivedFromEdgesNotFromTheStubbedField is the reason this
-// package computes rather than reads. The artifact's `neighbors` field is a
-// literal `[]` in one producer and computed in another, and a consumer cannot
-// tell the two apart.
+// package computes rather than reads. The artifact's `neighbors` field was
+// once a literal `[]`, and is now a capped list; neither says whether two areas
+// are coupled. The edges do.
 func TestAdjacencyIsDerivedFromEdgesNotFromTheStubbedField(t *testing.T) {
 	m, err := Load(smallGraphFixture(t))
 	if err != nil {

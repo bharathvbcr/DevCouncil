@@ -367,7 +367,13 @@ func (r *Registry) callPolicyCheck(ctx context.Context, args map[string]any) any
 		return ErrorPayload{OK: false, Code: "missing_argument", Error: "path is required"}
 	}
 	if r.Gate == nil {
-		return map[string]any{"ok": true, "path": path, "allowed": true, "note": "no gate configured"}
+		// Not a verdict. This used to answer `ok: true, allowed: true` with a
+		// note, so a host whose gate failed to build (an unreadable
+		// config.yaml, a refused flag) reported every path writable — a check
+		// that could not run answering as one that ran and passed.
+		return ErrorPayload{OK: false, Code: "not_initialized",
+			Error: "no write gate is configured for this directory, so this path was not judged; " +
+				"see the MCP server's stderr for why the gate could not be built"}
 	}
 	// Without a task, EvaluateWrite still answers secret/restricted rules.
 	d, err := r.Gate.EvaluateWrite(path, nil, dc.OpModify)

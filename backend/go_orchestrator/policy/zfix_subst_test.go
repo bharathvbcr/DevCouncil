@@ -165,7 +165,7 @@ func TestSubstitutionScanFailsClosed(t *testing.T) {
 func TestNormalizationDoesNotLaunderForeignPaths(t *testing.T) {
 	// Each of these once normalised to a bare "dev" and was allowed.
 	launderers := []string{
-		"/tmp/attacker/bin/dev status",
+		"/tmp/attacker/bin/dev map",
 		// An absolute path at the virtualenv layout is the same laundering in
 		// a more convincing costume: /tmp/attacker/.venv/bin/dev is shaped
 		// exactly like a project venv install, and only containment in the
@@ -173,18 +173,18 @@ func TestNormalizationDoesNotLaunderForeignPaths(t *testing.T) {
 		// compare against, so it attributes no absolute path to one. The
 		// rooted form is NormalizeAllowlistCommandInRoot, and it still accepts
 		// the repository's own — see TestAnAbsoluteVenvDevInsideTheRootIsStillThisReposCLI.
-		"/abs/path/.venv/bin/dev status",
-		"../../../../tmp/attacker/bin/dev status",
+		"/abs/path/.venv/bin/dev map",
+		"../../../../tmp/attacker/bin/dev map",
 		"attacker/scripts/dev run-cmd anything",
-		"/tmp/x/bin/DEV status",
-		"/tmp/x/BIN/dev status",
-		`attacker\bin\dev status`,
-		`..\..\tmp\attacker\bin\dev status`,
-		"/tmp/attacker/scripts/devcouncil status",
-		"a/b/bin/dev status",
-		"./../bin/dev status",
-		"/bin/dev status",
-		"/tmp/attacker/bin/DevCouncil status",
+		"/tmp/x/bin/DEV map",
+		"/tmp/x/BIN/dev map",
+		`attacker\bin\dev map`,
+		`..\..\tmp\attacker\bin\dev map`,
+		"/tmp/attacker/scripts/devcouncil map",
+		"a/b/bin/dev map",
+		"./../bin/dev map",
+		"/bin/dev map",
+		"/tmp/attacker/bin/DevCouncil map",
 	}
 	gate := CommandGate{HardRules: true}
 	for _, cmd := range launderers {

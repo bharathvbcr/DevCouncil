@@ -1,7 +1,7 @@
 ---
 name: devcouncil
 title: DevCouncil Integration for Claude Code
-description: Operate inside a DevCouncil-managed repo — use MCP tools and slash commands for status, scope, policy-gated writes, and evidence-first verification instead of guessing project state.
+description: Operate inside a DevCouncil-managed repo — use the DevCouncil MCP tools and the `dev` CLI for gate mode, scope, policy checks, and evidence-first verification instead of guessing project state.
 triggers:
   keywords: [devcouncil, dev council, devcouncil mcp, mcp devcouncil, dev integrate]
   markers: [.devcouncil/config.yaml]
@@ -25,46 +25,31 @@ user explicitly asks for that workflow.
 1. Open `.devcouncil/repo_map.json` for subsystem entry points, critical files, and
    cross-subsystem handoff paths. Regenerate with `dev map` after large refactors.
 2. Read `AGENTS.md` / `CLAUDE.md` for workspace conventions.
-3. Check status: `devcouncil_status` (MCP) or `/devcouncil:status` (slash command) or
-   `dev status` (CLI).
+3. Read the gate mode with `dev gate status` (add `--json` for scripting).
 
 ## Dead code / liveness
 
-Prefer `dev map dead --confidence extracted` plus file greps. Treat `inferred` as
-unconfirmed. If `entry_roots` are empty or `liveness_unreachable_unreliable` is set,
-**ignore** `unreachable_files` and mass inferred dead. Map `dead_symbol_candidates`
-are extracted ∩ token-scan (methods excluded). Prefer `dev map query|trace|dead`
-and `dev map graph-html` for symbol navigation / visualizer.
+Use `dev map dead --json` and read each row's own `confidence`: a high-confidence row
+has no inbound evidence after the call walk, a low one is unconfirmed. If `entry_roots`
+are empty or `liveness_unreachable_unreliable` is set, **ignore** `unreachable_files`.
+Map `dead_symbol_candidates` are extracted ∩ token-scan (methods excluded). For symbol
+navigation use `dev map search`, `dev map explore` and `dev map trace`; `dev map html`
+renders the graph for a browser. `dev map` passes its arguments to the `devmap` binary,
+so `devmap --help` lists the rest.
 
-## MCP tools vs CLI vs slash commands
+## MCP tools vs CLI
 
 | Need | Prefer |
 |---|---|
-| Task loop (checkout, write, verify, release) | MCP tools (`mcp__devcouncil__devcouncil_*`) |
-| Quick human-readable status / reports | Slash commands (`/devcouncil:status`, `/devcouncil:report`) |
-| Scripting, CI, headless runs | `dev` CLI (`dev verify`, `dev go`, `dev e2e`) |
-| Read-only inspection (gaps, provenance, diff) | MCP read tools before re-running verify |
+| Task loop (checkout, verify, release) | MCP tools (`mcp__devcouncil__devcouncil_*`) |
+| Gate mode | `dev gate status` |
+| Scripting, CI, headless runs | `dev verify TASK-ID --json` |
+| Read-only inspection (gaps, diff) | MCP read tools before re-running verify |
 
 MCP tool names in Claude Code are prefixed: `mcp__devcouncil__devcouncil_<name>`.
+Install the MCP server for a host with `dev integrate claude --apply`.
 
-## Slash commands (Claude Code)
-
-Install with `dev integrate claude --apply`. Commands live under `/devcouncil:*`:
-
-| Command | Purpose |
-|---|---|
-| `/devcouncil:status` | Phase, tasks, blocking gaps |
-| `/devcouncil:next` | Pick up the next unblocked task via MCP |
-| `/devcouncil:verify [TASK-ID]` | Run verification, report gaps |
-| `/devcouncil:repair [TASK-ID]` | Repair blocking gaps |
-| `/devcouncil:plan <goal>` | Plan a goal into requirements/tasks |
-| `/devcouncil:review [TASK-ID]` | Live-review critique cards |
-| `/devcouncil:report` | Full coverage report |
-| `/devcouncil:map [goal]` | Refresh/read the repo map |
-| `/devcouncil:wiki [topic]` | Consult the codebase wiki |
-| `/devcouncil:supervise [RUN-ID]` | Review a recorded agent run |
-
-## Key MCP tools (by role)
+## MCP tools (by role)
 
 This host serves exactly eight tools; `tools/list` is generated from
 `devcouncil/registry.go`'s `toolSpecs()`, so it can report no others.
@@ -75,21 +60,13 @@ This host serves exactly eight tools; `tools/list` is generated from
 **Inspection:** `devcouncil_get_diff`, `devcouncil_get_gaps`
 
 **Policy:** `devcouncil_policy_check_write` — a preflight that answers whether a
-write would be in scope; it does not perform the write
+write would be allowed; it does not perform the write
 
 **Verification:** `devcouncil_verify_task` (a lease is required in `enforce` mode)
 
-**Retired with the Python host — not served, and calling one fails:**
-`devcouncil_status`, `devcouncil_report`, `devcouncil_integration_status`,
-`devcouncil_wiki_page`, `devcouncil_graph_context`, `devcouncil_get_task`,
-`devcouncil_get_prompt`, `devcouncil_read_file`, `devcouncil_write_file`,
-`devcouncil_apply_patch`, `devcouncil_run_command`, `devcouncil_record_command`,
-`devcouncil_update_task_scope`, `devcouncil_get_next_actions`,
-`devcouncil_get_evidence`, `devcouncil_get_task_provenance`,
-`devcouncil_live_review`, `devcouncil_live_cards`, `devcouncil_live_repair_prompt`.
-Read files and run commands with your host's own tools; read persisted state from
-`.devcouncil/` or the `dev` CLI; take `next_actions` from the
-`devcouncil_verify_task` result.
+Nothing else is served. Read files and run commands with your host's own tools,
+read persisted state from `.devcouncil/` or `dev verify TASK-ID --json`, and take
+`next_actions` from the `devcouncil_verify_task` result.
 
 ## Subagents
 
@@ -103,14 +80,15 @@ When delegated, use the bundled subagents:
 
 - **Scope:** edit only files declared in the task's planned scope. No host hook
   enforces this — write-gates and contain mode are retired — so honour it yourself,
-  and use `devcouncil_policy_check_write` when you want the scope decision checked.
+  and use `devcouncil_policy_check_write` when you want a path checked. A task that
+  needs a wider scope is a question for its owner: no tool widens planned files.
 - **Evidence:** in `enforce`, run tests and call `devcouncil_verify_task`.
   In `advisory`, verification is optional and findings cannot block (except hard
   safety). In `off`, skip quality verification and report completion as unverified.
 - **Interactive Shell:** host lifecycle hooks are retired and nothing gates a write,
   Cursor/Claude Shell does **not** need a lease — do not block on checkout for ad-hoc commands.
-- **Leases:** one agent owns a task at a time; checkout before MCP gated writes or
-  verification (or when running the hero loop), then release.
+- **Leases:** one agent owns a task at a time; checkout before verification (or when
+  running the hero loop), then release.
 - **Repairs:** in `enforce`, read the typed `next_actions` out of the
   `devcouncil_verify_task` result — or `devcouncil_get_gaps` for the persisted
   list without re-verifying — and close effective blocking gaps. Outside enforce, stored quality gaps are advisory history, not a

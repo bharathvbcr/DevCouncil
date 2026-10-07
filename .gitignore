@@ -169,9 +169,6 @@ opencode.json
 .grok/
 .gitnexus/
 
-# Unexpanded agent environment variable directories
-${CLAUDE_PROJECT_DIR}/
-
 # Additional coding agent & IDE workspace directories
 .windsurf/
 .continue/

@@ -36,29 +36,31 @@ var devBinaries = map[string]bool{
 	"devcouncil.exe": true,
 }
 
-// NoTaskAllowedCommands run without any lease: orientation and the bootstrap
-// commands an agent needs in order to acquire one in the first place.
+// NoTaskAllowedCommands run without any lease: read-only orientation.
+//
+// Every `dev` entry names a command the host binary dispatches, held there by
+// TestPolicyNamesOnlyLiveCommands in cmd/devcouncil. This list used to allow
+// `dev status`, `dev tasks`, `dev approve`, `dev checkout`, `dev next-task` and
+// `dev doctor`, each also spelled `uv run dev …`: the Python CLI's commands,
+// every one of which exits 2 on the Go host, and a `uv` entry point that no
+// longer exists. A lease is acquired through the devcouncil_checkout_task MCP
+// tool, which is not a shell command and needs no entry here.
 var NoTaskAllowedCommands = []string{
-	"dev status", "dev status *",
-	"uv run dev status", "uv run dev status *",
-	"dev tasks", "dev tasks *",
-	"uv run dev tasks", "uv run dev tasks *",
-	"dev approve", "dev approve *",
-	"uv run dev approve", "uv run dev approve *",
-	"dev checkout *", "uv run dev checkout *",
-	"dev next-task", "dev next-task *",
-	"uv run dev next-task", "uv run dev next-task *",
 	"git status", "git diff", "git diff *",
 	"echo", "echo *", "true", ":",
 	// Orientation, and here rather than in LeaseLifecycleAllowedCommands
-	// because the no-lease denial below names them as the remedy. A message
+	// because the no-lease denial below names it as the remedy. A message
 	// that points at `dev map` while the list holding it sits behind the lease
 	// check is a message that cannot be followed.
 	"dev map", "dev map *",
-	"uv run dev map", "uv run dev map *",
-	"dev doctor", "dev doctor *",
-	"uv run dev doctor", "uv run dev doctor *",
 }
+
+// noLeaseRemedy is the reason a shell command is refused for want of a lease.
+// Every command it names must be one the allowlist above admits and the host
+// dispatches; the host's tests read it back from a real decision.
+const noLeaseRemedy = "Shell commands require an active task lease. Acquire one with the " +
+	"`devcouncil_checkout_task` MCP tool, or use the allowlisted read-only orientation " +
+	"commands (`git status`, `git diff`, `dev map …`)."
 
 // LeaseLifecycleAllowedCommands are available to a lease holder, independent
 // of the task's own allowed_commands.
@@ -73,13 +75,12 @@ var NoTaskAllowedCommands = []string{
 //
 // Entries that genuinely need no lease belong in NoTaskAllowedCommands, where
 // the no-lease refusal can honestly point at them.
+//
+// `dev release`, `dev lease`, `dev scope` and `dev run-cmd` were dropped with
+// the Python CLI: leases are released and renewed through the devcouncil_*
+// MCP tools, and none of those names dispatches on the Go host.
 var LeaseLifecycleAllowedCommands = []string{
-	"dev release *", "uv run dev release *",
-	"dev lease *", "uv run dev lease *",
-	"dev scope *", "uv run dev scope *",
 	"dev graph", "dev graph *",
-	"uv run dev graph", "uv run dev graph *",
-	"dev run-cmd *", "uv run dev run-cmd *",
 	"python -m pytest *", "uv run python -m pytest *",
 	"uv run pytest *", "pytest *",
 }
@@ -289,8 +290,7 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 	// lease-gated.
 	if task == nil {
 		return g.noteHardRules(deny(RuleCommandNoLease,
-			"Shell commands require an active task lease. Bootstrap with `dev checkout <TASK>`, "+
-				"or use allowlisted orientation commands (`dev status`, `dev map …`, `dev doctor`).",
+			noLeaseRemedy,
 			normalized, ""))
 	}
 

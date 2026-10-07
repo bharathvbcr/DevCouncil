@@ -10,8 +10,8 @@
 // structure: the rules that fire before a task is even consulted protect the
 // repository and the credentials in it, and no task scope can authorise them.
 // The rules that fire after are statements about *this task's declared scope*,
-// and DevCouncil's own deny message for the commonest one already points at the
-// remedy — "Expand scope with `dev scope update`".
+// and the deny message for the commonest one already names the remedy — the
+// task's owner widens its planned files (scopeRemedy in file.go).
 package policy
 
 // Action is the outcome of a policy evaluation.

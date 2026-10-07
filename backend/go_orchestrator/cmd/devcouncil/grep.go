@@ -15,7 +15,7 @@ import (
 // no production import; an empty match list is a real negative, so a missing
 // binary must be an error here the same way it is inside the client.
 func runGrep(args []string) int {
-	root := projectRoot()
+	root := ""
 	req := dcgrep.Request{}
 	jsonOut := false
 	for i := 0; i < len(args); i++ {
@@ -47,11 +47,11 @@ func runGrep(args []string) int {
 			req.IncludeIgnored = true
 		case "--project-root":
 			i++
-			if i >= len(args) {
-				console.Errorln("--project-root needs a value")
+			r, ok := projectRootFlag(args, i)
+			if !ok {
 				return 2
 			}
-			root = args[i]
+			root = r
 		case "-h", "--help":
 			console.Errorln("usage: devcouncil grep PATTERN [--json] [--path DIR] [--max N] [--ignore-case] [--include-ignored]")
 			return 0
@@ -70,6 +70,11 @@ func runGrep(args []string) int {
 	}
 	if req.Pattern == "" {
 		console.Errorln("grep requires PATTERN")
+		return 2
+	}
+	root, err := resolveRoot(root)
+	if err != nil {
+		console.Errorf("grep: %v\n", err)
 		return 2
 	}
 

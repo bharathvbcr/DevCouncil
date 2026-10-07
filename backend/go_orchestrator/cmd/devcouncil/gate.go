@@ -31,7 +31,7 @@ const gateHelp = `devcouncil gate — show or change verification-gate settings
 
 Usage:
   devcouncil gate status [--json] [--project-root DIR]
-  devcouncil gate set --mode off|advisory|enforce [--hook off|contain] [--project-root DIR]
+  devcouncil gate set --mode off|advisory|enforce [--project-root DIR]
 
 Modes:
   off        skip quality verification (default; hard-safety write policy stays on)
@@ -48,7 +48,7 @@ This command is for a human operator. Agents should not flip gates.
 
 func runGateStatus(args []string) int {
 	jsonOut := false
-	root := projectRoot()
+	root := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-h", "--help":
@@ -58,15 +58,20 @@ func runGateStatus(args []string) int {
 			jsonOut = true
 		case "--project-root":
 			i++
-			if i >= len(args) {
-				console.Errorln("--project-root needs a directory")
+			r, ok := projectRootFlag(args, i)
+			if !ok {
 				return 2
 			}
-			root = args[i]
+			root = r
 		default:
 			console.Errorf("unknown flag: %s\n", args[i])
 			return 2
 		}
+	}
+	root, err := resolveRoot(root)
+	if err != nil {
+		console.Errorf("gate status: %v\n", err)
+		return 2
 	}
 	snap := gatescfg.Load(root)
 	if jsonOut {
@@ -86,7 +91,7 @@ func runGateStatus(args []string) int {
 }
 
 func runGateSet(args []string) int {
-	root := projectRoot()
+	root := ""
 	mode := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -111,11 +116,11 @@ func runGateSet(args []string) int {
 			return 2
 		case "--project-root":
 			i++
-			if i >= len(args) {
-				console.Errorln("--project-root needs a directory")
+			r, ok := projectRootFlag(args, i)
+			if !ok {
 				return 2
 			}
-			root = args[i]
+			root = r
 		default:
 			console.Errorf("unknown flag: %s\n", args[i])
 			return 2
@@ -123,6 +128,11 @@ func runGateSet(args []string) int {
 	}
 	if mode == "" {
 		console.Errorln("gate set requires --mode")
+		return 2
+	}
+	root, err := resolveRoot(root)
+	if err != nil {
+		console.Errorf("gate set: %v\n", err)
 		return 2
 	}
 	path := filepath.Join(root, ".devcouncil", "config.yaml")

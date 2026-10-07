@@ -62,6 +62,27 @@ func TestLoadReadsNestedGatesMode(t *testing.T) {
 	}
 }
 
+// A config created by `gate set` holds the one key this package reads. It used
+// to also carry execution.hook_gate.mode, retired with the lifecycle hooks.
+func TestSetVerificationModeCreatesOnlyLiveKeys(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, ".devcouncil", "config.yaml")
+	if err := SetVerificationMode(path, "advisory"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "gates:\n  mode: advisory\n"; string(got) != want {
+		t.Fatalf("new config = %q, want %q", got, want)
+	}
+	if snap := Load(root); snap.VerificationMode != ModeAdvisory || snap.VerificationOrigin != OriginConfig {
+		t.Fatalf("Load of the new config = %s/%s, want advisory/config",
+			snap.VerificationMode, snap.VerificationOrigin)
+	}
+}
+
 func TestSetVerificationModePatchesExisting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	orig := "project:\n  name: demo\ngates:\n  mode: enforce\nindexing:\n  auto_refresh: true\n"

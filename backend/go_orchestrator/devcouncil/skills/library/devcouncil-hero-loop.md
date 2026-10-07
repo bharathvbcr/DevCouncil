@@ -3,7 +3,7 @@ name: devcouncil-hero-loop
 title: DevCouncil Hero Loop (Checkout → Verify → Release)
 description: Run DevCouncil's autonomous task loop in Claude Code — checkout a lease, implement inside scope, verify with deterministic gates, self-repair from typed next_actions, then release.
 triggers:
-  keywords: [hero loop, verify loop, checkout task, verify task, release task, next task, dev go, dev e2e, dev repair, task lease]
+  keywords: [hero loop, verify loop, checkout task, verify task, release task, next task, task lease]
   markers: [.devcouncil/config.yaml]
 ---
 
@@ -34,30 +34,26 @@ checkout_task ─▶ (agent implements) ─▶ verify_task ─▶ passed? ─▶
 
 ```
 devcouncil_next_task          # highest-priority unblocked task (or a known TASK-ID)
-devcouncil_checkout_task      # acquire lease — required before writes or verify when
-                              # write-gates / contain mode are active
+devcouncil_checkout_task      # acquire lease — required before verify in enforce
 ```
 
 Checkout returns the scope with the lease: planned files, allowed commands,
-expected tests and gate mode all ride on its result. `devcouncil_get_task` and
-`devcouncil_get_prompt` belonged to the retired Python host and are not served.
+expected tests and gate mode all ride on its result.
 
 One agent owns the task at a time. If checkout fails (lease held), do not bypass — pick
 another task or wait for release.
 
 ### 2. Implement inside scope
 
-- Read and edit files, and run tests, with your host's own tools. This host serves
-  no `devcouncil_read_file`, `devcouncil_write_file`, `devcouncil_apply_patch`,
-  `devcouncil_run_command` or `devcouncil_record_command` — they belonged to the
-  retired Python host, and nothing gates a write as it happens.
+- Read and edit files, and run tests, with your host's own tools. DevCouncil serves
+  no file or shell tools, and nothing gates a write as it happens.
 - Inspect changes with `devcouncil_get_diff`.
 - Preflight questionable paths with `devcouncil_policy_check_write`, the one policy
   tool that survived. It answers the scope question; it does not perform the write.
 
 Stay inside the task's **planned files** and **allowed commands**. Do not expand scope
-silently: there is no `devcouncil_update_task_scope` here, so a task that genuinely
-needs a wider scope is a question for the human, not a tool call.
+silently: no tool widens a task's planned files, so a task that genuinely needs a
+wider scope is a question for its owner, not a tool call.
 
 When the advisor tool is available, consult it before committing to an approach, when
 stuck on a recurring error, and before declaring the task complete.
@@ -82,7 +78,7 @@ devcouncil_get_gaps           # cheap read of persisted gaps — no re-verify
 ```
 
 Each action is typed (`category`: `fix_code`, `add_test`, `fix_verification`, `scope`,
-`security`, `review`, `plan`) with `file`, `line`, and often `suggested_command`.
+`security`, `review`, `plan`, `refresh_map`) with `file`, `line`, and often `suggested_command`.
 Fix each blocking action, then call `devcouncil_verify_task` again. Repeat until clean.
 
 Inside this opted-in loop, do **not** weaken tests, stub around gaps, or skip
@@ -100,24 +96,15 @@ Report: task ID, what changed, verification result, and any advisory (non-blocki
 
 | Entry | When |
 |---|---|
-| `/devcouncil:next` | Interactive Claude Code — shells out then instructs MCP loop |
-| `dev go [TASK-ID]` | CLI-driven loop with repair budget |
-| `dev e2e "<goal>" --executor claude` | Full plan → implement → verify automation |
 | Subagent `devcouncil-implementer` | Delegate the entire loop |
+| `dev verify TASK-ID --json` | Scripting or CI: the same verifier, from a shell |
 
-## Lite on-ramp (no task graph yet)
-
-Before full planning, taste the evidence gate on the current diff:
-
-```bash
-dev check --verify --goal "requirement text" --test "python -m pytest tests/ -q"
-```
-
-Same deterministic verifier as the hero loop. Graduate to `dev plan` once you trust the gate.
+DevCouncil has no command that plans a goal into tasks or drives the loop for you;
+Manvi is the harness that runs it end to end.
 
 ## Common mistakes
 
-- Skipping checkout during the **hero loop** / contain mode (MCP gated writes and verify need a lease).
+- Skipping checkout during the **hero loop** (verification needs a lease in `enforce`).
   Interactive assist Shell does not require checkout.
 - Calling `devcouncil_verify_task` without a lease in `enforce` mode (rejected).
 - Declaring done on test pass alone (verifier may report `diff_not_exercised`, stubs, scope gaps).

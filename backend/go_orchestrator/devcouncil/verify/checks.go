@@ -89,8 +89,8 @@ func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []str
 				Description: "New test file " + cf + " was added but not planned for this task " +
 					"(advisory: added tests cannot change shipped behavior).",
 				Evidence: []string{cf},
-				RecommendedFix: "Append " + cf + " with `dev scope update <task_id> --lease-token <token> " +
-					"--planned-file " + cf + "` (or fold the tests into a planned test file).",
+				RecommendedFix: "Fold the tests into a planned test file, or ask the task's owner to add " + cf +
+					" to its planned files.",
 				Blocking: false,
 				File:     filePtr(cf),
 			})
@@ -103,8 +103,8 @@ func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []str
 			TaskID:      taskID,
 			Description: "File " + cf + " was modified but not planned for this task.",
 			Evidence:    []string{cf},
-			RecommendedFix: "Revert changes to " + cf + " or append it with " +
-				"`dev scope update <task_id> --lease-token <token> --planned-file " + cf + "`.",
+			RecommendedFix: "Revert changes to " + cf + ", or ask the task's owner to add it to the " +
+				"task's planned files.",
 			Blocking: true,
 			File:     filePtr(cf),
 		})

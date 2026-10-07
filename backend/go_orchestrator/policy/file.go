@@ -359,6 +359,13 @@ func ReadRefused(root, path string) bool {
 	return fnmatch.MatchAnyFold(SecretPathPatterns, normalized)
 }
 
+// scopeRemedy closes every unplanned-scope refusal. It used to say "Expand
+// scope with `dev scope update`", a Python CLI command that exits 2 on the Go
+// host and has no equivalent in it or in Manvi: no tool widens a task's planned
+// files, so the honest remedy names the person who can.
+const scopeRemedy = "Widening a task's planned files is a decision for the task's owner; " +
+	"ask them rather than writing outside the plan."
+
 func (g FileGate) unplannedDecision(path string, task *dc.Task) Decision {
 	base := deny(RuleUnplannedScope,
 		"Task "+task.ID+" does not authorize changes to "+path+".", path, task.ID)
@@ -467,7 +474,7 @@ func (g FileGate) unplannedDecision(path string, task *dc.Task) Decision {
 	// question that could not be asked, never a second opinion on one that was.
 	base.Reason = "Task " + task.ID + " does not authorize changes to " + path +
 		" (subsystem `" + targetArea + "` is outside planned files and not a declared neighbor). " +
-		"Expand scope with `dev scope update`."
+		scopeRemedy
 	return base
 }
 
@@ -500,7 +507,7 @@ func (g FileGate) sameDirDecision(path string, task *dc.Task, base Decision) Dec
 		base.Reason = "Task " + task.ID + " does not authorize changes to " + path +
 			", the repo map that would place it in a subsystem is unavailable, and a path " +
 			"at the repository root has no directory that could stand in for one. " +
-			"Expand scope with `dev scope update`."
+			scopeRemedy
 		return base
 	}
 
@@ -524,7 +531,7 @@ func (g FileGate) sameDirDecision(path string, task *dc.Task, base Decision) Dec
 
 	base.Reason = "Task " + task.ID + " does not authorize changes to " + path +
 		" (no planned file is writable in `" + dir + "`, and the repo map that would " +
-		"place it in a subsystem is unavailable). Expand scope with `dev scope update`."
+		"place it in a subsystem is unavailable). " + scopeRemedy
 	return base
 }
 
