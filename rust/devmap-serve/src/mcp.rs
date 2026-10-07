@@ -2502,6 +2502,9 @@ async fn call_tool(
 
     let started = Instant::now();
     let args = params.get("arguments").cloned();
+    // The host session this server was spawned for; `None` where the host does
+    // not identify one (Cursor shares one server across tabs).
+    let session_id = crate::session_log::host_session_id();
     // First, before any store is resolved or opened: a replaced binary's answer
     // is wrong whichever repository it is about. A tool error, not a protocol
     // one, because the model is who has to act on it.
@@ -2513,6 +2516,7 @@ async fn call_tool(
         Err(reason) => {
             crate::session_log::append_query(
                 &PathBuf::new(),
+                session_id,
                 &name,
                 args.as_ref(),
                 None,
@@ -2525,6 +2529,7 @@ async fn call_tool(
     let log_err = |db_path: &Path, message: &str| {
         crate::session_log::append_query(
             db_path,
+            session_id,
             &name,
             args.as_ref(),
             None,
@@ -2596,6 +2601,7 @@ async fn call_tool(
         Ok(Ok(Ok(value))) => {
             crate::session_log::append_query(
                 &db_path,
+                session_id,
                 &name,
                 args.as_ref(),
                 Some(&value),
@@ -2614,6 +2620,7 @@ async fn call_tool(
             let message = err.to_string();
             crate::session_log::append_query(
                 &db_path,
+                session_id,
                 &name,
                 args.as_ref(),
                 None,
@@ -2635,6 +2642,7 @@ being reported because a partial traversal cannot be distinguished from a comple
             );
             crate::session_log::append_query(
                 &db_path,
+                session_id,
                 &name,
                 args.as_ref(),
                 None,

@@ -51,9 +51,181 @@ pub fn classify(structured: &Value) -> Honesty {
     }
 }
 
+/// Environment variable Claude Code sets on every MCP server it spawns.
+///
+/// Its value is the same identifier the host's hook payloads carry as
+/// `session_id` — checked on 2026-10-06 against a live session, whose
+/// `devmap mcp` process and PreToolUse marker both named it. Cursor shares one
+/// server across tabs and sets nothing, so records from it stay unattributed
+/// rather than guessed at.
+pub const HOST_SESSION_ENV: &str = "CLAUDE_CODE_SESSION_ID";
+
+/// Longest session identifier kept. Hosts send UUIDs; this bounds a hostile or
+/// pathological one before it reaches a record or a file name.
+pub const MAX_SESSION_ID_CHARS: usize = 512;
+
+/// A session identifier as recorded: trimmed, non-empty, bounded.
+pub fn normalize_session_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.chars().take(MAX_SESSION_ID_CHARS).collect())
+}
+
+/// The host session this server process serves, read once.
+///
+/// A stdio MCP server is spawned per host session, so the environment it was
+/// started with names that session for the life of the process.
+pub fn host_session_id() -> Option<&'static str> {
+    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        std::env::var(HOST_SESSION_ENV)
+            .ok()
+            .and_then(|raw| normalize_session_id(&raw))
+    })
+    .as_deref()
+}
+
+/// Filesystem-safe, collision-free name for a session.
+///
+/// The readable prefix keeps a directory debuggable by eye; the FNV-1a suffix
+/// is what makes two sessions sharing a 48-character prefix distinct, so a
+/// truncated name can never stand for a different session. Shared by every
+/// per-session marker — the hook's and this module's — so the two can never
+/// disagree about which file is whose.
+pub fn session_file_stem(session_id: &str) -> String {
+    let digest = fnv1a64(session_id.as_bytes());
+    let readable: String = session_id
+        .chars()
+        .take(48)
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{readable}.{digest:016x}")
+}
+
+/// FNV-1a, written out rather than taken from `DefaultHasher`.
+///
+/// A marker has to mean the same thing across separate processes, and
+/// `DefaultHasher`'s output is explicitly not guaranteed stable across Rust
+/// releases. A rebuilt binary that hashed a session differently would treat
+/// every live session as new — silently version-dependent.
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Directory of "this session has queried" markers, beside the live log.
+///
+/// Separate from the log because the log is shared by every session working in
+/// the repository and is rotated when *any* of them ends: a session's queries
+/// can leave `live.jsonl` while it is still running. A marker outlives that.
+pub fn queried_dir(db_path: &Path) -> PathBuf {
+    sessions_dir(db_path).join("queried")
+}
+
+/// Prefix on every queried marker; pruning removes only names carrying it.
+const QUERIED_PREFIX: &str = "q.";
+
+/// Newest queried markers kept. A marker is needed only while its session is
+/// live, so this bounds the directory without touching any session in use.
+pub const MAX_QUERIED_MARKERS: usize = 256;
+
+/// Most directory entries one prune examines, so a directory that somehow grew
+/// far past its cap is trimmed over several calls rather than in one stall.
+pub const MAX_PRUNE_SCAN: usize = 512;
+
+fn queried_marker(db_path: &Path, session_id: &str) -> PathBuf {
+    queried_dir(db_path).join(format!("{QUERIED_PREFIX}{}", session_file_stem(session_id)))
+}
+
+/// Whether any query has ever been attributed to a session beside this store.
+///
+/// The precondition for asking [`session_has_queried`] at all: where no server
+/// has ever attributed a query — a host that does not identify its sessions,
+/// or a server older than attribution — "no marker" means "cannot tell", not
+/// "has not queried".
+pub fn attribution_seen(db_path: &Path) -> bool {
+    queried_dir(db_path).is_dir()
+}
+
+/// Whether this session has made at least one DevMap query against the store.
+pub fn session_has_queried(db_path: &Path, session_id: &str) -> bool {
+    normalize_session_id(session_id).is_some_and(|id| queried_marker(db_path, &id).is_file())
+}
+
+/// Record that `session_id` has queried. Idempotent; exclusive creation makes
+/// the first writer of a concurrent burst the only one that prunes.
+///
+/// Through `SafeFile` like the log beside it, so a linked `queried` directory
+/// cannot become permission to create files in its target.
+fn mark_queried(db_path: &Path, session_id: &str) -> std::io::Result<()> {
+    use devmap_extract::safe_fs::{Access, Creation};
+    let marker = queried_marker(db_path, session_id);
+    if marker.is_file() {
+        return Ok(());
+    }
+    match SafeFile::open(&marker, Access::Append, Creation::New) {
+        Ok(_) => {
+            prune_oldest(&queried_dir(db_path), QUERIED_PREFIX, MAX_QUERIED_MARKERS);
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Keep the newest `cap` files named `prefix*` in `dir` and drop the rest.
+///
+/// Bounded twice: at most [`MAX_PRUNE_SCAN`] entries are examined, and only
+/// names carrying `prefix` are eligible, so nothing else sharing the directory
+/// can be removed. Every error is swallowed — pruning is housekeeping, and
+/// housekeeping must never fail the call that triggered it.
+pub fn prune_oldest(dir: &Path, prefix: &str, cap: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut markers: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.take(MAX_PRUNE_SCAN).flatten() {
+        let path = entry.path();
+        let eligible = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(prefix));
+        if !eligible {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        markers.push((modified, path));
+    }
+    if markers.len() <= cap {
+        return;
+    }
+    markers.sort_by_key(|left| std::cmp::Reverse(left.0));
+    for (_, path) in markers.into_iter().skip(cap) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Append one query record. Never returns an error the caller should honour.
+///
+/// `session_id` is the host session the call came from ([`host_session_id`]
+/// for a stdio server), recorded on the row and, when present, marked in
+/// [`queried_dir`] so a hook can tell a session that has asked DevMap anything
+/// from one that has not without reading the log.
 pub fn append_query(
     db_path: &Path,
+    session_id: Option<&str>,
     tool: &str,
     args: Option<&Value>,
     structured: Option<&Value>,
@@ -65,8 +237,10 @@ pub fn append_query(
         walk_incomplete: None,
         empty: false,
     });
+    let session_id = session_id.and_then(normalize_session_id);
     let record = json!({
         "ts_ms": now_ms(),
+        "session_id": session_id,
         "tool": tool,
         "args": sanitize_args(args),
         "ok": error.is_none(),
@@ -107,6 +281,13 @@ pub fn append_query(
     })();
     if let Err(error) = result {
         tracing::warn!("MCP query logging skipped: {error}");
+    }
+    // Independent of the log: a log at its size limit refuses the row, and the
+    // session has still queried. Behind the same store-exists check above.
+    if let Some(id) = &session_id {
+        if let Err(error) = mark_queried(db_path, id) {
+            tracing::warn!("MCP queried-session marker skipped: {error}");
+        }
     }
 }
 
@@ -356,6 +537,7 @@ mod tests {
         fs::write(&db, b"store-present").unwrap();
         append_query(
             &db,
+            None,
             "devmap_search",
             Some(&json!({"query": "Foo"})),
             Some(&json!({"items": [], "truncated": false})),
@@ -369,6 +551,81 @@ mod tests {
         assert_eq!(rows[0]["tool"], "devmap_search");
         assert_eq!(rows[0]["empty"], true);
         assert_eq!(rows[0]["ok"], true);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn store_in(name: &str) -> (PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("devmap-session-attr-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("devmap.sqlite");
+        fs::write(&db, b"store-present").unwrap();
+        (dir, db)
+    }
+
+    /// 73 of 75 recorded sessions carried `session_id: null`: nothing on the
+    /// query path knew which host session asked. The row now says.
+    #[test]
+    fn a_query_row_carries_the_host_session_and_marks_it() {
+        let (dir, db) = store_in("row");
+        assert!(!attribution_seen(&db));
+        append_query(&db, Some(" sess-1 "), "devmap_search", None, None, None, 1);
+        append_query(&db, None, "devmap_search", None, None, None, 1);
+        let rows = read_live(&db).unwrap().records;
+        assert_eq!(rows[0]["session_id"], "sess-1");
+        assert!(
+            rows[1]["session_id"].is_null(),
+            "an unidentified host stays unattributed, not guessed"
+        );
+        assert!(attribution_seen(&db));
+        assert!(session_has_queried(&db, "sess-1"));
+        assert!(!session_has_queried(&db, "sess-2"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The live log is shared by every session in the repository and rotated
+    /// when any of them ends. A session that queried before another one ended
+    /// has still queried.
+    #[test]
+    fn the_queried_marker_outlives_log_rotation() {
+        let (dir, db) = store_in("rotate");
+        append_query(&db, Some("sess-1"), "devmap_search", None, None, None, 1);
+        assert!(rotate_live(&db, "session-1").unwrap());
+        assert!(read_live(&db).unwrap().records.is_empty());
+        assert!(session_has_queried(&db, "sess-1"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hostile_session_ids_stay_inside_the_marker_directory() {
+        let (dir, db) = store_in("hostile");
+        for hostile in ["../../escape", "/etc/passwd", "a/b\\c", ".."] {
+            append_query(&db, Some(hostile), "devmap_search", None, None, None, 1);
+            assert!(session_has_queried(&db, hostile), "{hostile}");
+        }
+        for entry in fs::read_dir(queried_dir(&db)).unwrap().flatten() {
+            let name = entry.file_name().into_string().unwrap();
+            assert!(name.starts_with(QUERIED_PREFIX), "{name}");
+            assert!(!name.contains('/') && !name.contains('\\'), "{name}");
+        }
+        assert!(!dir.parent().unwrap().join("escape").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_and_spares_foreign_files() {
+        let (dir, _db) = store_in("prune");
+        let target = dir.join("markers");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("foreign"), b"").unwrap();
+        for i in 0..5 {
+            fs::write(target.join(format!("q.{i}")), b"").unwrap();
+        }
+        prune_oldest(&target, "q.", 2);
+        let left = fs::read_dir(&target).unwrap().count();
+        assert_eq!(left, 3, "two markers and the foreign file");
+        assert!(target.join("foreign").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -387,7 +644,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let db = dir.join("codeintel").join("devmap.sqlite");
-        append_query(&db, "devmap_status", None, None, Some("no store"), 1);
+        append_query(&db, None, "devmap_status", None, None, Some("no store"), 1);
         assert!(
             !live_log_path(&db).exists(),
             "an unresolved slot must not create {} from a missing store",

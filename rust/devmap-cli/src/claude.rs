@@ -1226,6 +1226,18 @@ pub const DEVMAP_HOOKS: &[DevmapHook] = &[
                   session summary synchronously.",
     },
     DevmapHook {
+        event: "UserPromptSubmit",
+        matcher: "",
+        hook_event: "user-prompt-submit",
+        timeout_secs: Some(5),
+        status_message: "",
+        purpose: "61 of 75 recorded sessions made no DevMap query despite the SessionStart \
+                  directive. `devmap hook user-prompt-submit` adds one short reminder to a \
+                  turn only while the session's own record shows no query, at most three \
+                  times, and goes silent at the first one. It spawns nothing and reads no \
+                  log: one marker lookup per prompt.",
+    },
+    DevmapHook {
         event: "PostToolUse",
         matcher: WRITE_TOOL_MATCHER,
         hook_event: "post-tool-use",
@@ -1273,9 +1285,10 @@ pub fn event_coverage() -> Vec<(&'static str, Option<&'static DevmapHook>, &'sta
                     "Not handled: Dev Map has no claim to verify at a stop, and blocking one \
                      on an index would be a gate it was never asked to be."
                 }
-                "UserPromptSubmit" | "UserPromptExpansion" | "MessageDisplay" => {
+                "UserPromptExpansion" | "MessageDisplay" => {
                     "Not handled: these run on the human's critical path, and index status \
-                     on every prompt is noise rather than context."
+                     on every prompt is noise rather than context. UserPromptSubmit is the \
+                     exception, and only for a session with no recorded query."
                 }
                 "PreCompact" | "PostCompact" | "PreModelSwitch" | "PostModelSwitch"
                 | "ConfigChange" | "Setup" | "SubagentStart" | "Notification"

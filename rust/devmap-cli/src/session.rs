@@ -307,11 +307,28 @@ fn build_report(db: &Path, session_id: Option<&str>) -> anyhow::Result<Value> {
         }
     }
     let issues = notable_queries(&queries);
+    // The live log is shared by every session in the repository, so
+    // `query_count` is the log's, not the ending session's. Per-session counts
+    // come from the id each row carries; a row from a host that names no
+    // session is counted as unattributed rather than credited to anyone.
+    let mut by_session: Map<String, Value> = Map::new();
+    let mut unattributed = 0u64;
+    for row in &queries {
+        match row.get("session_id").and_then(Value::as_str) {
+            Some(id) => bump(&mut by_session, id),
+            None => unattributed += 1,
+        }
+    }
+    let session_query_count =
+        session_id.map(|id| by_session.get(id).and_then(Value::as_u64).unwrap_or(0));
     Ok(json!({
         "stamp": stamp,
         "session_id": session_id,
         "store": db.display().to_string(),
         "query_count": queries.len(),
+        "session_query_count": session_query_count,
+        "queries_by_session": by_session,
+        "unattributed_query_count": unattributed,
         "unreadable_lines": unreadable,
         "unreadable_query_lines": live.malformed,
         "unreadable_gap_lines": gap_ledger.malformed,
@@ -711,6 +728,25 @@ mod tests {
             "{markdown}"
         );
         let _ = fs::remove_dir_all(gaps_path(&db).parent().unwrap().parent().unwrap());
+    }
+
+    /// The live log is shared by every session in the repository. The report
+    /// for the session that ended counts that session's queries, and does not
+    /// credit a row whose host named no session to anyone.
+    #[test]
+    fn the_report_counts_the_ending_sessions_queries_apart_from_the_logs() {
+        let db = scratch_db("by-session");
+        fs::write(&db, b"store-present").unwrap();
+        for session in [Some("ended"), Some("ended"), Some("other"), None] {
+            session_log::append_query(&db, session, "devmap_search", None, None, None, 1);
+        }
+        let report = build_report(&db, Some("ended")).unwrap();
+        assert_eq!(report["session_id"], json!("ended"), "{report}");
+        assert_eq!(report["query_count"], json!(4), "{report}");
+        assert_eq!(report["session_query_count"], json!(2), "{report}");
+        assert_eq!(report["queries_by_session"]["other"], json!(1), "{report}");
+        assert_eq!(report["unattributed_query_count"], json!(1), "{report}");
+        let _ = fs::remove_dir_all(db.parent().unwrap());
     }
 
     /// The latest line decides, so a gap that recurs after being closed is open

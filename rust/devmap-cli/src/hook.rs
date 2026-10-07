@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context};
 use devmap_extract::subprocess;
+use devmap_serve::session_log;
 use serde_json::{json, Value};
 
 /// Hard cap on hook stdin. Anything larger is treated as malformed and ignored.
@@ -76,15 +77,6 @@ const PRE_TOOL_SKELETON_ROWS: usize = 40;
 /// of a very busy repository — a duplicate line, not a wrong one.
 pub const MAX_PRE_TOOL_MARKERS: usize = 64;
 
-/// How many directory entries pruning will examine. A marker directory that
-/// somehow grew past this is trimmed over several invocations instead of
-/// stalling one tool call on an unbounded readdir.
-pub const MAX_PRUNE_SCAN: usize = 512;
-
-/// Longest session identifier accepted from the payload before it is folded to
-/// a digest. Hosts send UUIDs; this bounds a hostile or pathological one.
-const MAX_SESSION_ID_BYTES: usize = 512;
-
 /// Longest prefix of a shell command inspected for a search verb. A command is
 /// classified by how it starts, so reading further buys nothing.
 const MAX_COMMAND_SNIFF_BYTES: usize = 256;
@@ -139,6 +131,7 @@ const SHELL_TOOLS: &[&str] = &["bash", "shell", "run_terminal_cmd", "terminal"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
     SessionStart,
+    UserPromptSubmit,
     PreToolUse,
     PostToolUse,
     SessionEnd,
@@ -148,6 +141,7 @@ impl HookEvent {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SessionStart => "session-start",
+            Self::UserPromptSubmit => "user-prompt-submit",
             Self::PreToolUse => "pre-tool-use",
             Self::PostToolUse => "post-tool-use",
             Self::SessionEnd => "session-end",
@@ -157,6 +151,7 @@ impl HookEvent {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "session-start" => Some(Self::SessionStart),
+            "user-prompt-submit" => Some(Self::UserPromptSubmit),
             "pre-tool-use" => Some(Self::PreToolUse),
             "post-tool-use" => Some(Self::PostToolUse),
             "session-end" => Some(Self::SessionEnd),
@@ -217,6 +212,10 @@ pub fn render_host_stdout(event: HookEvent, payload: &Value, stdout: &Value) -> 
             HookEvent::PostToolUse | HookEvent::SessionEnd => {
                 additional.map(|ctx| json!({ "additional_context": ctx }).to_string())
             }
+            // Never installed on Cursor: its prompt hook, `beforeSubmitPrompt`,
+            // decides whether the prompt is sent, and a Cursor server is shared
+            // across tabs, so no query there is attributable to a session.
+            HookEvent::UserPromptSubmit => None,
         };
     }
     if let Some(ctx) = additional {
@@ -361,6 +360,13 @@ fn run_hook_inner(
                 roots: selection.roots,
             })
         }
+        HookEvent::UserPromptSubmit => Ok(HookOutcome {
+            exit_code: 0,
+            stdout: user_prompt_submit_sync(&selection, &payload),
+            // One root by construction, as for PreToolUse.
+            stderr_line: None,
+            roots: selection.roots,
+        }),
         HookEvent::PreToolUse => {
             let stdout = pre_tool_use_sync(executable, &selection, &payload)?;
             Ok(HookOutcome {
@@ -400,11 +406,16 @@ fn run_hook_inner(
             })
         }
         HookEvent::SessionEnd => {
+            // The report names the session that ended. Without this, 73 of 75
+            // recorded reports said `session_id: null` and could never be
+            // joined to the queries that session made.
+            let session = payload_str(&payload, &["session_id", "sessionId"])
+                .and_then(session_log::normalize_session_id);
             let budget_note = detach_roots(
                 executable,
                 &selection.roots,
                 DETACH_BUDGET,
-                detach_session_report,
+                |executable, root| detach_session_report(executable, root, session.as_deref()),
             )?;
             Ok(HookOutcome {
                 exit_code: 0,
@@ -969,6 +980,57 @@ const PRE_TOOL_CONTEXT_CAP: usize = 400;
 /// Larger paste budget when the first-read hook carries a file's signature list
 /// instead of the short tool-name directive.
 const PRE_TOOL_SKELETON_CONTEXT_CAP: usize = 3500;
+
+/// The prompt-time nudge. Short on purpose: it lands on every human turn of a
+/// session that has not asked the index anything yet.
+const PROMPT_NUDGE: &str = "DevMap has recorded no query from this session. Before grepping or \
+     reading files to find code, ask the index: devmap_search / devmap_explore for where a \
+     symbol lives, devmap_ask_evidence for a behaviour you cannot name, devmap_impact before \
+     changing one.";
+
+/// Most prompt nudges one session receives, whatever else is true.
+///
+/// The nudge rests on attribution — a server stamping its queries with the
+/// session it serves — and a session the host renames under a running server
+/// would look query-free forever. A bound turns that failure into a few short
+/// lines instead of one on every turn.
+const MAX_PROMPT_NUDGES: usize = 3;
+
+/// Remind a session that has made no DevMap query, on the human's turn.
+///
+/// Measured: 61 of 75 recorded sessions made zero queries, though every one
+/// was told about the index at SessionStart and at its first read. A reminder
+/// tied to the session's own record is the one thing those two cannot be.
+///
+/// On the human's critical path, so it spawns nothing and reads no log: one
+/// `stat` for the session's queried marker, which the MCP server writes on its
+/// first query ([`session_log::append_query`]), and at most a few `create_new`s
+/// for the nudge bound. Silent whenever "no query" cannot be told apart from
+/// "cannot tell": no session id in the payload, or a store beside which no
+/// query has ever been attributed to a session (a host that does not identify
+/// its sessions to the server, or a server older than attribution).
+fn user_prompt_submit_sync(selection: &RootSelection, payload: &Value) -> Option<Value> {
+    let root = selection.roots.first()?;
+    let session = payload_str(payload, &["session_id", "sessionId"])
+        .and_then(session_log::normalize_session_id)?;
+    let db = state_dir(root).join("codeintel").join("devmap.sqlite");
+    if !session_log::attribution_seen(&db) || session_log::session_has_queried(&db, &session) {
+        return None;
+    }
+    let stem = session_log::session_file_stem(&session);
+    let dir = marker_dir(root);
+    let owed = (0..MAX_PROMPT_NUDGES).any(|turn| {
+        claim_once(&dir, &format!("{MARKER_PREFIX}prompt{turn}.{stem}")) == Claim::First
+    });
+    owed.then(|| {
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": PROMPT_NUDGE,
+            }
+        })
+    })
+}
 
 /// Restate the directive at the moment the agent is about to bypass the index.
 ///
@@ -1580,9 +1642,9 @@ const MARKER_PREFIX: &str = "nav.";
 
 /// Filesystem-safe, collision-free marker name for this session.
 ///
-/// The readable prefix keeps the directory debuggable by eye; the FNV-1a suffix
-/// is what makes two sessions sharing a 48-character prefix distinct, so a
-/// truncated name can never silence a different session. A payload with no
+/// The name is [`session_log::session_file_stem`], shared with the queried
+/// markers the MCP server writes, so the two can never disagree about which
+/// file belongs to which session. A payload with no
 /// session identifier falls back to the process id, which nudges once per hook
 /// process — wrong in the harmless direction, where a host that omits the field
 /// gets a few extra lines rather than none at all.
@@ -1597,39 +1659,9 @@ fn session_marker_name(payload: &Value) -> String {
             "session",
         ],
     )
-    .map(str::trim)
-    .filter(|id| !id.is_empty())
-    .map(|id| id.chars().take(MAX_SESSION_ID_BYTES).collect::<String>())
+    .and_then(session_log::normalize_session_id)
     .unwrap_or_else(|| format!("anon-{}", std::process::id()));
-
-    let digest = fnv1a64(raw.as_bytes());
-    let readable: String = raw
-        .chars()
-        .take(48)
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("{MARKER_PREFIX}{readable}.{digest:016x}")
-}
-
-/// FNV-1a, written out rather than taken from `DefaultHasher`.
-///
-/// The marker has to mean the same thing across separate processes, and
-/// `DefaultHasher`'s output is explicitly not guaranteed stable across Rust
-/// releases. A rebuilt binary that hashed a session differently would re-nudge
-/// every live session once — small, but silently version-dependent.
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    format!("{MARKER_PREFIX}{}", session_log::session_file_stem(&raw))
 }
 
 /// Outcome of trying to be the first navigation hook of a session.
@@ -1659,47 +1691,10 @@ fn claim_once(dir: &Path, name: &str) -> Claim {
         .open(dir.join(name))
     {
         Ok(_) => {
-            prune_markers(dir, MAX_PRE_TOOL_MARKERS);
+            session_log::prune_oldest(dir, MARKER_PREFIX, MAX_PRE_TOOL_MARKERS);
             Claim::First
         }
         Err(_) => Claim::Skip,
-    }
-}
-
-/// Keep the newest `cap` markers and drop the rest.
-///
-/// Bounded twice: at most [`MAX_PRUNE_SCAN`] entries are examined, so a
-/// directory that somehow grew far past the cap is trimmed over several
-/// invocations instead of stalling one tool call on an unbounded readdir; and
-/// only names carrying [`MARKER_PREFIX`] are eligible, so nothing else that
-/// shares the directory can be removed. Every error is swallowed — pruning is
-/// housekeeping, and housekeeping must never fail a tool call.
-fn prune_markers(dir: &Path, cap: usize) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut markers: Vec<(SystemTime, PathBuf)> = Vec::new();
-    for entry in entries.take(MAX_PRUNE_SCAN).flatten() {
-        let path = entry.path();
-        let is_marker = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(MARKER_PREFIX));
-        if !is_marker {
-            continue;
-        }
-        let modified = entry
-            .metadata()
-            .and_then(|meta| meta.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        markers.push((modified, path));
-    }
-    if markers.len() <= cap {
-        return;
-    }
-    markers.sort_by_key(|left| std::cmp::Reverse(left.0));
-    for (_, path) in markers.into_iter().skip(cap) {
-        let _ = fs::remove_file(path);
     }
 }
 
@@ -1818,7 +1813,7 @@ fn detach_roots(
     executable: &Path,
     roots: &[PathBuf],
     budget: Duration,
-    detach: fn(&Path, &Path) -> anyhow::Result<()>,
+    detach: impl Fn(&Path, &Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<Option<String>> {
     let started = Instant::now();
     for (index, root) in roots.iter().enumerate() {
@@ -1857,20 +1852,32 @@ fn detach_build(executable: &Path, root: &Path) -> anyhow::Result<()> {
     )
 }
 
-fn detach_session_report(executable: &Path, root: &Path) -> anyhow::Result<()> {
+fn detach_session_report(
+    executable: &Path,
+    root: &Path,
+    session: Option<&str>,
+) -> anyhow::Result<()> {
     let lock_dir = coalesce_lock_dir(root, "session-report");
     if !try_acquire_lock_dir(&lock_dir)? {
         return Ok(());
     }
-    spawn_detached_with_cleanup(
-        executable,
-        &[
-            OsStr::new("--root"),
-            root.as_os_str(),
-            OsStr::new("session-report"),
-        ],
-        &lock_dir,
-    )
+    let args = session_report_args(root, session);
+    let args: Vec<&OsStr> = args.iter().map(std::ffi::OsString::as_os_str).collect();
+    spawn_detached_with_cleanup(executable, &args, &lock_dir)
+}
+
+/// `session-report`'s argument vector. The id travels as one `--session-id=`
+/// token, so a host id that begins with `-` cannot be read as another flag.
+fn session_report_args(root: &Path, session: Option<&str>) -> Vec<std::ffi::OsString> {
+    let mut args = vec![
+        "--root".into(),
+        root.as_os_str().to_owned(),
+        "session-report".into(),
+    ];
+    if let Some(session) = session {
+        args.push(format!("--session-id={session}").into());
+    }
+    args
 }
 
 fn coalesce_lock_dir(root: &Path, kind: &str) -> PathBuf {
@@ -3166,7 +3173,7 @@ mod tests {
             thread::sleep(Duration::from_millis(6));
         }
 
-        prune_markers(&dir, 4);
+        session_log::prune_oldest(&dir, MARKER_PREFIX, 4);
         let remaining: Vec<String> = fs::read_dir(&dir)
             .unwrap()
             .flatten()
@@ -3440,6 +3447,130 @@ mod tests {
             second.stdout
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn prompt(root: &Path, session: &str) -> HookOutcome {
+        let payload = json!({
+            "session_id": session,
+            "cwd": root.to_string_lossy(),
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "fix the bug",
+        });
+        // A path that cannot run: this hook must spawn nothing.
+        run_hook(
+            HookEvent::UserPromptSubmit,
+            serde_json::to_string(&payload).unwrap().as_bytes(),
+            Path::new("/nonexistent/devmap"),
+            None,
+        )
+    }
+
+    fn store_db(root: &Path) -> PathBuf {
+        state_dir(root).join("codeintel").join("devmap.sqlite")
+    }
+
+    fn nudge_text(outcome: &HookOutcome) -> Option<String> {
+        outcome
+            .stdout
+            .as_ref()?
+            .pointer("/hookSpecificOutput/additionalContext")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// The nudge speaks while the session has asked DevMap nothing, and goes
+    /// silent at its first query — recorded by the MCP server's own writer,
+    /// not by a file this test makes by hand.
+    #[test]
+    fn the_prompt_nudge_goes_silent_after_the_first_query() {
+        let root = scratch("prompt-nudge");
+        store_bearing(&root);
+        let db = store_db(&root);
+        // Another session's query is what establishes that this store's server
+        // attributes queries at all.
+        session_log::append_query(&db, Some("other"), "devmap_search", None, None, None, 1);
+
+        let before = prompt(&root, "quiet-1");
+        assert_eq!(before.exit_code, 0);
+        let text = nudge_text(&before).expect("a query-free session must be nudged");
+        assert!(text.contains("devmap_search"), "{text}");
+
+        session_log::append_query(&db, Some("quiet-1"), "devmap_explore", None, None, None, 1);
+        for _ in 0..3 {
+            let after = prompt(&root, "quiet-1");
+            assert!(
+                after.stdout.is_none(),
+                "a session that has queried was nudged again: {:?}",
+                after.stdout
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// "No marker" means "has not queried" only where some query has ever been
+    /// attributed beside this store. Before that it means "cannot tell", and a
+    /// hook that cannot tell says nothing.
+    #[test]
+    fn the_prompt_nudge_is_silent_where_queries_were_never_attributed() {
+        let root = scratch("prompt-unattributed");
+        store_bearing(&root);
+        session_log::append_query(&store_db(&root), None, "devmap_search", None, None, None, 1);
+        assert!(prompt(&root, "s-1").stdout.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_prompt_nudge_is_bounded_per_session_and_needs_an_id() {
+        let root = scratch("prompt-bound");
+        store_bearing(&root);
+        session_log::append_query(
+            &store_db(&root),
+            Some("other"),
+            "devmap_search",
+            None,
+            None,
+            None,
+            1,
+        );
+        let spoken = (0..MAX_PROMPT_NUDGES + 3)
+            .filter(|_| prompt(&root, "never-asks").stdout.is_some())
+            .count();
+        assert_eq!(spoken, MAX_PROMPT_NUDGES);
+        assert!(
+            prompt(&root, "fresh").stdout.is_some(),
+            "the bound is per session"
+        );
+        assert!(
+            prompt(&root, "  ").stdout.is_none(),
+            "no id, no attribution, no nudge"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Cursor's prompt hook decides whether the prompt is sent; nothing renders.
+    #[test]
+    fn the_prompt_nudge_renders_nothing_on_cursor() {
+        let payload = json!({"cursor_version": "1.7", "session_id": "c"});
+        let stdout = json!({"hookSpecificOutput": {"additionalContext": "x"}});
+        assert_eq!(
+            render_host_stdout(HookEvent::UserPromptSubmit, &payload, &stdout),
+            None
+        );
+    }
+
+    /// Without the id, a report can never be joined to its session's queries.
+    #[test]
+    fn session_end_names_the_session_in_its_report_command() {
+        let root = Path::new("/repo");
+        let args = session_report_args(root, Some("-looks-like-a-flag"));
+        assert_eq!(
+            args.last().unwrap(),
+            std::ffi::OsStr::new("--session-id=-looks-like-a-flag"),
+            "one token, so a leading dash cannot become a flag: {args:?}"
+        );
+        assert!(!session_report_args(root, None)
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("--session-id")));
     }
 
     /// A hook whose work genuinely fails exits 1, never 2.
