@@ -88,8 +88,11 @@ pub fn append_query(
     let result = (|| -> std::io::Result<()> {
         use devmap_extract::safe_fs::{Access, Creation, SafeFile};
         // Inspect the raw database ancestry too: a linked state directory must
-        // not become permission to create telemetry in its target.
-        let _database = SafeFile::open(db_path, Access::Read, Creation::Never)?;
+        // not become permission to create telemetry in its target. Inspected,
+        // not opened: this runs after every query against a store this process
+        // holds open, and closing a handle on it releases the connection's
+        // SQLite locks — see `safe_fs::inspect_regular`.
+        devmap_extract::safe_fs::inspect_regular(db_path)?;
         let mut file =
             SafeFile::open(&live_log_path(db_path), Access::Append, Creation::IfMissing)?;
         if line.len() > 16 * 1024

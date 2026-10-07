@@ -3502,8 +3502,16 @@ impl Store {
     /// kernel's to keep consistent. Best-effort and owner-only: a sidecar
     /// another user owns is left for that user, and the write that follows
     /// reports it.
-    fn checked_sidecars(db_path: &Path) -> Result<Vec<devmap_extract::safe_fs::SafeFile>> {
-        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+    /// Validate both WAL sidecars and report the ones present.
+    ///
+    /// Inspected through their directory entries, never opened: this runs on
+    /// every open, in processes that already hold connections to this store,
+    /// and closing a descriptor on `-shm` releases every SQLite lock the
+    /// process holds on it. See `safe_fs::inspect_regular` and
+    /// `tests/a_second_open_keeps_the_first_connections_locks.rs`.
+    fn checked_sidecars(
+        db_path: &Path,
+    ) -> Result<Vec<(std::path::PathBuf, devmap_extract::safe_fs::EntryStatus)>> {
         // Validate both siblings before SQLite or permission repair touches
         // either. A missing sibling is normal; an unsafe one is a refusal.
         let mut sidecars = Vec::new();
@@ -3511,16 +3519,15 @@ impl Store {
             let mut name = db_path.as_os_str().to_os_string();
             name.push(suffix);
             let path = std::path::PathBuf::from(name);
-            match SafeFile::open(&path, Access::Read, Creation::Never) {
-                Ok(file) => {
-                    let links = devmap_extract::safe_fs::file_link_count(&file)
-                        .map_err(|error| refusal(error.to_string()))?;
-                    match sidecar_links(links) {
-                        SidecarLinks::Single => sidecars.push(file),
-                        // SQLite deletes `-wal` when the last writer connection
-                        // closes, so a build committing between this open and
-                        // this check leaves an unlinked handle. That is the
-                        // missing-sibling case below, not an alias.
+            match devmap_extract::safe_fs::inspect_regular(&path) {
+                Ok(entry) => {
+                    match sidecar_links(entry.links) {
+                        SidecarLinks::Single => sidecars.push((path, entry)),
+                        // A directory entry never reports zero links — a
+                        // sidecar SQLite deleted between the lookup and the
+                        // stat arrives as `NotFound` below — but the count is
+                        // the classifier's to read, and an unlinked file is the
+                        // missing-sibling case, not an alias.
                         SidecarLinks::Unlinked => {}
                         SidecarLinks::Aliased => {
                             return Err(refusal(format!(
@@ -3545,34 +3552,74 @@ impl Store {
     fn repair_sidecar_modes(db_path: &Path) -> Result<()> {
         #[cfg(unix)]
         {
-            use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+            use devmap_extract::safe_fs::{Access, Creation, EntryStatus, SafeFile};
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
             let sidecars = Self::checked_sidecars(db_path)?;
             const OWNER_WRITE: u32 = 0o200;
+            // Decided from directory entries, with no descriptor on the store:
+            // this runs before every writable open, usually in a process that
+            // already holds a connection to this store, and closing a handle on
+            // it would release that connection's locks. See `checked_sidecars`.
+            let own = match devmap_extract::safe_fs::inspect_regular(db_path) {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(refusal(error.to_string())),
+            };
+            // Only our own writable database authorizes repairing our sidecars.
+            if own.mode & OWNER_WRITE == 0 || !own.is_owned_by_current_user() {
+                return Ok(());
+            }
+            let needing: Vec<(std::path::PathBuf, EntryStatus)> = sidecars
+                .into_iter()
+                .filter(|(_, entry)| entry.uid == own.uid && entry.mode & OWNER_WRITE == 0)
+                .collect();
+            if needing.is_empty() {
+                return Ok(());
+            }
+            // The repair itself needs handles: `fchmod` and the replacement
+            // checks below are descriptor operations. Reaching here means a
+            // sidecar this user owns lacks the owner-write bit, which SQLite
+            // never leaves on a sidecar a writable connection created — it
+            // takes a read of a store that was read-only at the time. A
+            // connection this process opened *then* and still holds is the one
+            // whose locks these handles' close can release; that is named here
+            // rather than handled, because the alternative is chmod by path.
+            let same_entry = |file: &SafeFile, entry: &EntryStatus| -> Result<bool> {
+                let held = file
+                    .metadata()
+                    .map_err(|error| refusal(error.to_string()))?;
+                Ok(held.dev() == entry.dev && held.ino() == entry.ino)
+            };
             let database = match SafeFile::open(db_path, Access::Read, Creation::Never) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(refusal(error.to_string())),
             };
-            let own = database
-                .metadata()
-                .map_err(|error| refusal(error.to_string()))?;
-            // Only our own writable database authorizes repairing our sidecars.
-            if own.mode() & OWNER_WRITE == 0
-                || !database
-                    .is_owned_by_current_user()
-                    .map_err(|error| refusal(error.to_string()))?
-            {
-                return Ok(());
+            if !same_entry(&database, &own)? {
+                return Err(refusal(format!(
+                    "database {} was replaced while its sidecars were being examined",
+                    db_path.display()
+                )));
             }
             let mut repairs = Vec::new();
-            for file in sidecars {
-                let metadata = file
-                    .metadata()
-                    .map_err(|error| refusal(error.to_string()))?;
-                if metadata.uid() == own.uid() && metadata.mode() & OWNER_WRITE == 0 {
-                    repairs.push((file, metadata.permissions()));
+            for (path, entry) in needing {
+                let file = match SafeFile::open(&path, Access::Read, Creation::Never) {
+                    Ok(file) => file,
+                    // Deleted by SQLite since it was inspected: nothing to repair.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(refusal(error.to_string())),
+                };
+                if !same_entry(&file, &entry)? {
+                    return Err(refusal(format!(
+                        "sidecar {} was replaced while being examined",
+                        path.display()
+                    )));
                 }
+                let permissions = file
+                    .metadata()
+                    .map_err(|error| refusal(error.to_string()))?
+                    .permissions();
+                repairs.push((file, permissions));
             }
             if repairs.is_empty() {
                 return Ok(());

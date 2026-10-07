@@ -110,6 +110,8 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         "devmap-store",
         &[
             "a_corrupt_analysis_is_not_an_absent_one",
+            // Store opens and the WAL lock protocol; no extraction anywhere.
+            "a_second_open_keeps_the_first_connections_locks",
             "a_refusal_names_its_reason_not_a_parameter",
             "adversarial_store",
             "coverage_gap_inventory",
