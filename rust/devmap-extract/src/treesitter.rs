@@ -7539,6 +7539,7 @@ fn maybe_push_name_reference(
                         swift_parameter_bound_from_type(node, source)
                             .or_else(|| ts_parameter_bound_from_type(node, source))
                             .or_else(|| go_var_bound_from_type(node, source))
+                            .or_else(|| python_parameter_bound_from_type(node, source))
                     })
                     .flatten()
             }),
@@ -9087,6 +9088,35 @@ fn swift_parameter_bound_from_type(node: Node, source: &str) -> Option<String> {
         current = parent;
     }
     None
+}
+
+/// The parameter a Python annotation types: `def summarise(shape: Shape)`.
+///
+/// The annotation was already read as a Type reference — that is how
+/// `summarise -> Shape` existed — but nothing bound it to `shape`, so
+/// `shape.describe()` had no receiver type and `Shape.describe` was reported
+/// dead with its caller in the same signature. Only an annotation that *is*
+/// the type counts — the identifier must be the whole `type` node: in
+/// `xs: list[Shape]` or `s: Shape | None` the name is not what the parameter
+/// holds, so nothing is bound.
+fn python_parameter_bound_from_type(node: Node, source: &str) -> Option<String> {
+    let annotation = bounded_parent(node).filter(|parent| parent.kind() == "type")?;
+    let parameter = bounded_parent(annotation)
+        .filter(|parent| matches!(parent.kind(), "typed_parameter" | "typed_default_parameter"))?;
+    if !parameter
+        .child_by_field_name("type")
+        .is_some_and(|ty| ty.id() == annotation.id())
+    {
+        return None;
+    }
+    // `typed_default_parameter` names its binding; `typed_parameter` holds it
+    // as its first child, which is a `list_splat_pattern` for `*args: T`.
+    let binding = parameter
+        .child_by_field_name("name")
+        .or_else(|| parameter.named_child(0))
+        .filter(|binding| binding.kind() == "identifier")?;
+    let name = get_node_text(binding, source);
+    (is_user_ident(&name) && name != "self" && name != "cls").then_some(name)
 }
 
 /// The variable a Go `var w T` declares, when `node` is that type.

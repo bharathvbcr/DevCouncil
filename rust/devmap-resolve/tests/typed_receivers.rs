@@ -413,6 +413,56 @@ fn f(shared: &Mutex<Collected>, others: Vec<Other>) {
     );
 }
 
+const SHAPES_PY: &str = "\
+class Shape:
+    def describe(self):
+        return 'shape'
+
+
+class Other:
+    def describe(self):
+        return 'other'
+";
+
+#[test]
+fn a_python_annotated_parameter_types_its_receiver() {
+    for signature in ["shape: Shape", "shape: Shape = None"] {
+        let report = format!(
+            "from shapes import Shape\n\n\ndef summarise({signature}):\n    return shape.describe()\n"
+        );
+        let (_, result) = resolve(&[("shapes.py", SHAPES_PY), ("report.py", &report)]);
+        let callers: Vec<_> = calls_to(&result, "shapes.py::Shape.describe")
+            .into_iter()
+            .map(|edge| edge.source_symbol.clone())
+            .collect();
+        assert_eq!(
+            callers,
+            vec!["report.py::summarise"],
+            "`{signature}` makes `shape` a Shape"
+        );
+        assert!(calls_to(&result, "shapes.py::Other.describe").is_empty());
+    }
+}
+
+#[test]
+fn a_python_annotation_that_is_not_the_type_binds_nothing() {
+    for signature in ["shapes: list[Shape]", "shape: Shape | None", "shape: Optional[Shape]"] {
+        let report = format!(
+            "from shapes import Shape\n\n\ndef summarise({signature}):\n    return shape.describe()\n"
+        );
+        let (extractions, _) = resolve(&[("shapes.py", SHAPES_PY), ("report.py", &report)]);
+        let bound: Vec<_> = extractions[1]
+            .references
+            .iter()
+            .filter(|reference| reference.name == "Shape" && reference.assigned_to.is_some())
+            .collect();
+        assert!(
+            bound.is_empty(),
+            "`{signature}` does not make the parameter a Shape; got {bound:?}"
+        );
+    }
+}
+
 #[test]
 fn a_go_var_of_a_slice_does_not_type_its_name_as_the_element() {
     // Asked of the extraction, not the edge list: an unexported selector on an
