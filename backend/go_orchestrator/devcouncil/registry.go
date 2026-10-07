@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
@@ -393,7 +392,7 @@ func (r *Registry) callPolicyCheck(ctx context.Context, args map[string]any) any
 		parsed, known := policyCheckOperations[raw]
 		if !known {
 			return ErrorPayload{OK: false, Code: "invalid_argument",
-				Error: "devcouncil_policy_check_write: operation must be create, modify or delete, not " + strconv.Quote(raw)}
+				Error: fmt.Sprintf("devcouncil_policy_check_write: operation must be create, modify or delete, not %q", raw)}
 		}
 		op = parsed
 	}
