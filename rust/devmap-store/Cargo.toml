@@ -47,3 +47,9 @@ required-features = ["parse"]
 [[test]]
 name = "a_differential_write_trusts_what_it_read"
 required-features = ["parse"]
+
+# Builds the generation whose index it then damages, and writing a generation
+# needs the parsing frontend.
+[[test]]
+name = "a_damaged_full_text_index_is_named"
+required-features = ["parse"]
