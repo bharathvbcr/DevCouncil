@@ -192,7 +192,84 @@ impl SemanticIndex {
         });
         Ok(scored)
     }
+
+    /// How well the best of the first `hits` documents covers `query`, as a
+    /// disclosure for the response — or `None` when there is nothing to say.
+    ///
+    /// Cosine similarity ranks, but it does not say whether *any* hit answers
+    /// the question: a page where every name shares exactly one word with a
+    /// six-word query is ranked just as confidently as a page of answers. Two
+    /// facts separate them, and both are cheap here because the vocabulary is
+    /// already built:
+    ///
+    /// - **absent terms** — a query term no indexed name or docstring contains
+    ///   at all, so nothing on the page can be about it (`unmount` when the
+    ///   index holds names and the behaviour lives in bodies);
+    /// - **weak match** — no hit among the first `hits` carries more than one
+    ///   of the query's terms that the corpus does contain.
+    ///
+    /// Function words (`in`, `after`, `the`) are left out of both counts: they
+    /// are in the query because it is a sentence, not because the asker wants a
+    /// symbol named after them.
+    pub fn coverage_note(&self, query: &str, hits: &[usize]) -> Option<String> {
+        let mut terms: Vec<String> = tokenize(query)
+            .into_iter()
+            .filter(|term| !STOPWORDS.contains(&term.as_str()))
+            .collect();
+        terms.sort_unstable();
+        terms.dedup();
+        if terms.is_empty() {
+            return None;
+        }
+        let (present, absent): (Vec<&String>, Vec<&String>) =
+            terms.iter().partition(|term| self.idf.contains_key(term.as_str()));
+        let mut notes = Vec::new();
+        if !absent.is_empty() {
+            let listed: Vec<&str> = absent.iter().map(|term| term.as_str()).collect();
+            notes.push(format!(
+                "the index contains none of the terms {}; it holds names and \
+                 docstrings, not bodies, so a behaviour named only in code bodies \
+                 is not findable here",
+                listed.join(", ")
+            ));
+        }
+        if present.len() >= 2 {
+            let best = hits
+                .iter()
+                .filter_map(|&index| self.documents.get(index))
+                .map(|document| {
+                    present
+                        .iter()
+                        .filter(|term| document.contains_key(term.as_str()))
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            if best <= 1 {
+                let listed: Vec<&str> = present.iter().map(|term| term.as_str()).collect();
+                notes.push(format!(
+                    "weak match: no hit among the first {} matches more than one \
+                     of the terms {}; these are single-word coincidences, not \
+                     answers — narrow the question to a name, or read the code \
+                     the hits do not cover",
+                    hits.len(),
+                    listed.join(", ")
+                ));
+            }
+        }
+        (!notes.is_empty()).then(|| notes.join("; "))
+    }
 }
+
+/// Words a plain-language question carries for grammar, never as the name of
+/// what it is looking for. Used only by [`SemanticIndex::coverage_note`];
+/// scoring keeps every term and lets IDF weigh it.
+const STOPWORDS: &[&str] = &[
+    "about", "after", "an", "and", "any", "are", "as", "at", "be", "before", "by", "can",
+    "does", "do", "for", "from", "how", "if", "in", "into", "is", "it", "its", "not", "of",
+    "on", "or", "over", "so", "that", "the", "then", "there", "this", "to", "under", "up",
+    "via", "what", "when", "where", "which", "while", "who", "why", "with",
+];
 
 #[cfg(test)]
 mod tests {

@@ -160,6 +160,67 @@ pub fn personalized_pagerank(
     Ok(rank)
 }
 
+/// How many of the best TF-IDF matches the coverage note judges.
+///
+/// The first page an agent reads, not the whole tail: a weak head under a
+/// strong match ranked 400th is still a weak answer.
+pub const ASK_COVERAGE_HEAD: usize = 10;
+
+/// The most the call graph may lift a seed's relevance: `1 + ASK_GRAPH_LIFT`.
+///
+/// The graph re-rank exists to prefer, among matches for the question, the
+/// ones the rest of the matches call — the hub of a feature over its leaves.
+/// It must not decide *what matches*. Ordering by PageRank mass alone did:
+/// mass tracks how densely a region of the repository is resolved, so on a
+/// polyglot tree the language with the most resolved call edges won every
+/// question, whatever it asked. Bounded this way, a seed can only overtake one
+/// whose relevance is within `1 / (1 + ASK_GRAPH_LIFT)` of its own.
+pub const ASK_GRAPH_LIFT: f32 = 0.25;
+
+/// Relevance times a bounded centrality lift, for every seed in `scored`.
+///
+/// Personalized PageRank gives each seed at least its restart share,
+/// `ASK_RESTART * teleport`; whatever it holds beyond that arrived over call
+/// edges. The ratio of the two is how much the graph favours the seed,
+/// independent of how relevant it was to begin with. It is compressed with a
+/// logarithm and normalised against the most-favoured seed, so the lift lies
+/// in `[0, ASK_GRAPH_LIFT]` and a seed nothing calls keeps its TF-IDF score
+/// unchanged.
+pub fn blend_relevance_and_rank(
+    scored: &[(usize, f32)],
+    rank_of: impl Fn(usize) -> f32,
+) -> Vec<(usize, f32)> {
+    let total: f32 = scored.iter().map(|(_, score)| score).sum();
+    if !(total > 0.0) {
+        return scored.to_vec();
+    }
+    let favour: Vec<f32> = scored
+        .iter()
+        .map(|&(position, score)| {
+            let floor = ASK_RESTART * score / total;
+            let rank = rank_of(position);
+            if floor > 0.0 && rank.is_finite() && rank > floor {
+                (rank / floor).ln()
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let most = favour.iter().copied().fold(0.0_f32, f32::max);
+    scored
+        .iter()
+        .zip(&favour)
+        .map(|(&(position, score), &favour)| {
+            let lift = if most > 0.0 {
+                ASK_GRAPH_LIFT * favour / most
+            } else {
+                0.0
+            };
+            (position, score * (1.0 + lift))
+        })
+        .collect()
+}
+
 /// Line carried when seeds matched but every call edge among them sat below
 /// the confidence floor.
 pub fn confidence_withheld_reason() -> String {
@@ -199,6 +260,41 @@ mod tests {
             ranks[0] >= ranks[1],
             "seed should keep at least as much mass as its callee: {ranks:?}"
         );
+    }
+
+    #[test]
+    fn a_seed_the_graph_does_not_favour_keeps_its_relevance() {
+        let scored = vec![(0, 0.8), (1, 0.2)];
+        let total = 1.0;
+        // Both seeds hold exactly their restart share: nothing flowed in.
+        let blended = blend_relevance_and_rank(&scored, |position| {
+            ASK_RESTART * scored[position].1 / total
+        });
+        assert_eq!(blended, scored);
+    }
+
+    #[test]
+    fn the_graph_lift_is_bounded() {
+        // Seed 1 is barely relevant and absorbs almost all the mass.
+        let scored = vec![(0, 0.8), (1, 0.2)];
+        let blended =
+            blend_relevance_and_rank(&scored, |position| if position == 1 { 0.99 } else { 0.2 });
+        let lifted = blended[1].1;
+        assert!(
+            lifted <= 0.2 * (1.0 + ASK_GRAPH_LIFT) + f32::EPSILON,
+            "the lift is capped at {ASK_GRAPH_LIFT}: {blended:?}"
+        );
+        assert!(blended[0].1 > lifted, "relevance still decides: {blended:?}");
+    }
+
+    #[test]
+    fn degenerate_scores_and_ranks_do_not_poison_the_order() {
+        assert_eq!(blend_relevance_and_rank(&[], |_| 1.0), Vec::new());
+        let zero = vec![(0, 0.0), (1, 0.0)];
+        assert_eq!(blend_relevance_and_rank(&zero, |_| 1.0), zero);
+        let scored = vec![(0, 0.5), (1, 0.5)];
+        let blended = blend_relevance_and_rank(&scored, |_| f32::NAN);
+        assert!(blended.iter().all(|(_, score)| score.is_finite()), "{blended:?}");
     }
 
     #[test]

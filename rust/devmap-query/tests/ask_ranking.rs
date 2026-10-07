@@ -246,6 +246,106 @@ fn docstring_terms_seed_when_present() {
     );
 }
 
+/// Relevance first, centrality second.
+///
+/// The re-rank once ordered seeds by PageRank mass alone, so a symbol matching
+/// one query term but called from everywhere outranked the one symbol that
+/// matched the question. On a polyglot repository that is a language bias: the
+/// language with the densest resolved call graph wins every query. Asked about
+/// "stale async state update" in a React frontend, `ask` answered with Go
+/// structs called `RuntimeStateStore`.
+#[test]
+fn a_central_single_term_match_does_not_outrank_the_match_for_the_question() {
+    let mut files: Vec<(String, String)> = vec![
+        (
+            "guard.py".into(),
+            "def guard_stale_async_update():\n    return 1\n".into(),
+        ),
+        (
+            "store.py".into(),
+            "class RuntimeStateStore:\n    pass\n".into(),
+        ),
+    ];
+    for i in 0..30 {
+        files.push((
+            format!("reader{i}.py"),
+            format!(
+                "from store import RuntimeStateStore\n\n\
+                 def state_reader_{i}():\n    return RuntimeStateStore()\n"
+            ),
+        ));
+    }
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect();
+    let store = store_of(&borrowed);
+    let response = ask(
+        &store,
+        "stale async state update after unmount",
+        ASK_DEFAULT_MIN_CONFIDENCE,
+    );
+    let first = response.items.first().map(|hit| hit.symbol_name.as_str());
+    assert_eq!(
+        first,
+        Some("guard_stale_async_update"),
+        "three matched terms outrank one, however central: {:?}",
+        response
+            .items
+            .iter()
+            .map(|hit| (&hit.symbol_name, hit.score))
+            .collect::<Vec<_>>()
+    );
+    let note = response.walk_incomplete.as_deref().unwrap_or("");
+    assert!(
+        note.contains("unmount"),
+        "a query term no indexed name or docstring contains is named: {note:?}"
+    );
+}
+
+/// When no hit covers more than one of the question's terms, the answer says
+/// so. A ranked page of single-word coincidences is otherwise
+/// indistinguishable from a page of answers.
+#[test]
+fn a_page_of_single_term_coincidences_is_labelled_weak() {
+    let store = store_of(&[
+        ("a.py", "def stale_after():\n    return 1\n"),
+        ("b.py", "def state_store():\n    return 2\n"),
+        ("c.py", "def update_row():\n    return 3\n"),
+    ]);
+    let response = ask(
+        &store,
+        "stale async state update in components",
+        ASK_DEFAULT_MIN_CONFIDENCE,
+    );
+    assert!(response.total >= 1, "{response:?}");
+    let note = response.walk_incomplete.as_deref().unwrap_or("");
+    assert!(
+        note.contains("weak match"),
+        "every hit matched one term of a multi-term question: {note:?}"
+    );
+
+    // And the same disclosure on the names-only surface.
+    let semantic = StoreQueryEngine::new(&store)
+        .search_semantic("stale async state update in components", 10_000)
+        .unwrap();
+    let note = semantic.walk_incomplete.as_deref().unwrap_or("");
+    assert!(note.contains("weak match"), "{note:?}");
+}
+
+/// The control: a hit that covers the question is not labelled weak.
+#[test]
+fn a_hit_covering_the_question_is_not_labelled_weak() {
+    let store = store_of(&[
+        ("a.py", "def guard_stale_async_update():\n    return 1\n"),
+        ("b.py", "def state_store():\n    return 2\n"),
+    ]);
+    let response = ask(&store, "stale async update", ASK_DEFAULT_MIN_CONFIDENCE);
+    let note = response.walk_incomplete.as_deref().unwrap_or("");
+    assert!(!note.contains("weak match"), "{note:?}");
+    assert!(!note.contains("contains none of"), "{note:?}");
+}
+
 #[test]
 fn call_adjacency_excludes_edges_below_the_floor() {
     let index = devmap_store::GenerationEdges::build(

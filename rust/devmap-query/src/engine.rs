@@ -1819,6 +1819,11 @@ impl<'a> StoreQueryEngine<'a> {
         let repo_root = snapshot.repo_root;
         let scored = index.score(query, &self.cancel)?;
         let total = u32::try_from(scored.len()).unwrap_or(u32::MAX);
+        let head: Vec<usize> = scored
+            .iter()
+            .take(crate::ask::ASK_COVERAGE_HEAD)
+            .map(|(position, _)| *position)
+            .collect();
         // Materialise only as far down the ranking as the budget could reach.
         // Every scored symbol used to be turned into a `SymbolHit` first — one
         // `read_to_string` each — and budgeted afterwards, so a query matching
@@ -1848,8 +1853,10 @@ impl<'a> StoreQueryEngine<'a> {
         // the texts scored here are `name` and `qualified_name` and nothing
         // else. See [`SEARCH_SCOPE_NOTE`].
         response.walk_incomplete = devmap_analyze::combine_reasons(
-            coverage_gap,
-            empty_semantic_gap(response.total, query),
+            devmap_analyze::combine_reasons(coverage_gap, empty_semantic_gap(response.total, query)),
+            (!head.is_empty())
+                .then(|| index.coverage_note(query, &head))
+                .flatten(),
         );
         Ok(self.finish(response))
     }
@@ -2052,6 +2059,17 @@ impl<'a> StoreQueryEngine<'a> {
             return Ok((self.finish(response), Vec::new()));
         }
 
+        // Judged on the TF-IDF head, before the graph re-rank can move it: the
+        // note is about whether any name answers the question, which the call
+        // graph has no say in.
+        let coverage_note = index.coverage_note(
+            query,
+            &scored
+                .iter()
+                .take(crate::ask::ASK_COVERAGE_HEAD)
+                .map(|(position, _)| *position)
+                .collect::<Vec<_>>(),
+        );
         let seed_positions: Vec<usize> = scored.iter().map(|(position, _)| *position).collect();
         let seed_names: std::collections::HashSet<&str> = seed_positions
             .iter()
@@ -2067,7 +2085,7 @@ impl<'a> StoreQueryEngine<'a> {
                 snapshot.repo_root.as_deref(),
                 token_budget,
                 coverage_gap,
-                None,
+                coverage_note,
                 fold_aware,
             );
         };
@@ -2118,14 +2136,10 @@ impl<'a> StoreQueryEngine<'a> {
         }
 
         let ranks = crate::ask::personalized_pagerank(&outbound, &personalization, &self.cancel)?;
-        let mut ordered: Vec<(usize, f32)> = seed_positions
-            .iter()
-            .map(|&position| {
-                let name = symbols[position].qualified_name.as_str();
-                let rank = node_rank.get(name).map(|&i| ranks[i]).unwrap_or(0.0);
-                (position, rank)
-            })
-            .collect();
+        let mut ordered = crate::ask::blend_relevance_and_rank(&scored, |position| {
+            let name = symbols[position].qualified_name.as_str();
+            node_rank.get(name).map(|&i| ranks[i]).unwrap_or(0.0)
+        });
         ordered.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -2138,7 +2152,7 @@ impl<'a> StoreQueryEngine<'a> {
             snapshot.repo_root.as_deref(),
             token_budget,
             coverage_gap,
-            None,
+            coverage_note,
             fold_aware,
         )
     }
