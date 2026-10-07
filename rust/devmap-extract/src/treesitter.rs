@@ -2016,7 +2016,7 @@ fn walk_tree(
 }
 
 /// Nodes walked between deadline checks. See `walk_tree`.
-const DEADLINE_CHECK_STRIDE: u32 = 256;
+pub(crate) const DEADLINE_CHECK_STRIDE: u32 = 256;
 
 /// The `{ a, b as c }` clause of a JavaScript/TypeScript import or export
 /// statement, or `None` when the statement has no binding clause at all.

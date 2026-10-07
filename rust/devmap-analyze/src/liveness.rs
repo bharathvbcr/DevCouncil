@@ -1798,8 +1798,10 @@ pub fn analyze_liveness_with_coverage(
         // construction. `is_parse_failed` could not see this because the parse
         // did not fail — that is exactly how CFML and Terraform symbols reached
         // the `extracted` tier.
-        let file_is_call_blind =
-            a_grammar_read_this_file(ext) && !ext.capabilities().contains(Capability::Calls);
+        // `Extraction::is_call_blind` is the one predicate `impact` and
+        // `trace` refuse an empty answer with, so the two surfaces cannot
+        // disagree about which files were never looked at.
+        let file_is_call_blind = ext.is_call_blind();
 
         // Every finding about a symbol in this file, priced against the
         // blindness that actually bears on it.

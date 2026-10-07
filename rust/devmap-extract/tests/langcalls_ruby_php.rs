@@ -122,13 +122,25 @@ class Service
 end
 "#;
     let extraction = devmap_extract::extract_file("s.rb", source);
+    // `run` takes no parameters and binds nothing, so the argument `arg` and
+    // the receiver `other` are bare sends too: Ruby calls a method for each.
     assert_eq!(
         calls_of(&extraction),
         vec![
             (
                 "s.rb::Service.run".to_string(),
                 String::new(),
+                "arg".to_string()
+            ),
+            (
+                "s.rb::Service.run".to_string(),
+                String::new(),
                 "helper".to_string()
+            ),
+            (
+                "s.rb::Service.run".to_string(),
+                String::new(),
+                "other".to_string()
             ),
             (
                 "s.rb::Service.run".to_string(),
@@ -339,6 +351,272 @@ fn ruby_operator_and_setter_sends_are_refused_but_predicates_are_kept() {
         .iter()
         .any(|symbol| symbol.qualified_name == "o.rb::A.ok?"));
     assert_no_orphaned_callers(&extraction);
+}
+
+/// Callee names a file's calls make from inside `caller`, sorted.
+fn callees_from(extraction: &Extraction, caller: &str) -> Vec<String> {
+    let mut names: Vec<String> = extraction
+        .calls
+        .iter()
+        .filter(|call| call.caller_symbol.as_deref() == Some(caller))
+        .map(|call| call.callee_name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The measured control (GAP-1 residue). `def entry; bare_helper; end` is a
+/// send: Ruby's parser commits an identifier to a method call unless a binding
+/// of that name appears in the enclosing scope, and nothing here binds
+/// `bare_helper`. tree-sitter-ruby gives it a plain `identifier`, not a `call`,
+/// so before this was claimed `impact` on `bare_helper` answered a confident
+/// zero. The second method is the same name read as a local, which Ruby reads
+/// as the local — recording a call there would be the SC9 wrong edge.
+#[test]
+fn a_bare_ruby_send_is_a_call_and_a_local_read_of_the_same_name_is_not() {
+    let source = "class CtlRb\n  def entry\n    bare_helper\n  end\n  def entry_local\n    bare_helper = 1\n    bare_helper\n  end\n  def bare_helper\n    1\n  end\nend\n";
+    let extraction = devmap_extract::extract_file("ctl.rb", source);
+    assert_eq!(
+        calls_of(&extraction),
+        vec![(
+            "ctl.rb::CtlRb.entry".to_string(),
+            String::new(),
+            "bare_helper".to_string()
+        )]
+    );
+    // The mirrored reference is what the resolver reads; one call, one reference.
+    let references: Vec<_> = extraction
+        .references
+        .iter()
+        .filter(|reference| reference.kind == ReferenceKind::Call)
+        .map(|reference| {
+            (
+                reference.name.as_str(),
+                reference.enclosing_symbol.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        references,
+        vec![("bare_helper", Some("ctl.rb::CtlRb.entry"))]
+    );
+    assert_no_orphaned_callers(&extraction);
+}
+
+/// Every value position a bare send can occupy, each with no binding of the
+/// name in scope. `current_user.name` is the Rails shape: `current_user` is the
+/// receiver *and* a send.
+#[test]
+fn bare_ruby_sends_are_claimed_in_every_value_position() {
+    let source = r##"
+class Page
+  def endless = endless_target
+  def statement; in_statement; end
+  def argument; render in_argument; end
+  def receiver; current_user.name; end
+  def assigned; x = in_assignment; x; end
+  def interpolated; "#{in_interpolation}"; end
+  def condition; return 1 if in_condition; end
+  def operand; in_left + in_right; end
+  def indexed; in_object[in_index]; end
+  def in_block; [1].each { |i| in_block_body(i); in_block_bare }; end
+  def defaulted(a = in_default); a; end
+  def rescued; risky rescue in_rescue_modifier; end
+end
+"##;
+    let extraction = devmap_extract::extract_file("p.rb", source);
+    let expect = [
+        ("endless", vec!["endless_target"]),
+        ("statement", vec!["in_statement"]),
+        ("argument", vec!["in_argument", "render"]),
+        ("receiver", vec!["current_user", "name"]),
+        ("assigned", vec!["in_assignment"]),
+        ("interpolated", vec!["in_interpolation"]),
+        ("condition", vec!["in_condition"]),
+        ("operand", vec!["in_left", "in_right"]),
+        ("indexed", vec!["in_index", "in_object"]),
+        ("in_block", vec!["each", "in_block_bare", "in_block_body"]),
+        ("defaulted", vec!["in_default"]),
+        ("rescued", vec!["in_rescue_modifier", "risky"]),
+    ];
+    for (method, callees) in expect {
+        assert_eq!(
+            callees_from(&extraction, &format!("p.rb::Page.{method}")),
+            callees,
+            "calls made by `{method}`"
+        );
+    }
+    // `x = in_assignment` binds `x` to the send's value, as `x = f()` would.
+    let assigned = find_call(&extraction, "in_assignment");
+    assert_eq!(assigned.receiver_expr, None);
+    let reference = extraction
+        .references
+        .iter()
+        .find(|reference| reference.name == "in_assignment")
+        .expect("the bare send records its reference");
+    assert_eq!(reference.assigned_to.as_deref(), Some("x"));
+    assert_callees_are_identifiers(&extraction);
+    assert_no_orphaned_callers(&extraction);
+}
+
+/// Every binding form Ruby has, each followed by a read of the bound name. Not
+/// one of these reads is a send, so not one may become a call. A form missed
+/// here is a confidently wrong edge on ordinary code, which is why the list is
+/// exhaustive against the grammar's binding positions rather than a sample.
+#[test]
+fn no_ruby_local_binding_form_is_mistaken_for_a_send() {
+    let source = r#"
+def positional(p); p; end
+def optional(q = 1); q; end
+def splat(*r); r; end
+def keyword(k:, kd: 1); k; kd; end
+def double_splat(**o); o; end
+def block_param(&blk); blk; end
+def destructured_param((da, db)); da; db; end
+def assigned; a = 1; a; end
+def operator_assigned; oa ||= 1; oa; end
+def multiple; ma, (mb, *mc) = 1, 2; ma; mb; mc; end
+def block_params; [1].each { |bp; blocal| bp; blocal }; end
+def do_block_params; [1].each do |dp| dp end; end
+def lambda_params; ->(lp) { lp }; end
+def rescue_var; begin; rescue StandardError => err; err; end; end
+def for_var; for fv in [1]; fv; end; end
+def array_pattern(v); case v; in [pa, *prest] then pa; prest; end; end
+def hash_pattern(v); case v; in {hk: hv} then hv; end; end
+def hash_shorthand(v); case v; in {hs:} then hs; end; end
+def as_pattern(v); case v; in Integer => asv then asv; end; end
+def find_pattern(v); case v; in [*, fp, *] then fp; end; end
+def alternative(v); case v; in [alt] | {alt:} then alt; end; end
+def guarded(v); case v; in [gv] if gv then gv; end; end
+def rightward(v); v => {rk:}; rk; end
+def test_pattern(v); v in tp; tp; end
+def named_capture(s); /(?<cap>\d+)/ =~ s; cap; end
+def quoted_capture(s); /(?'qcap'\d+)/ =~ s; qcap; end
+def bound_later; late; late = 1; end
+def bound_in_block; [1].each { inner_bound = 1 }; inner_bound; end
+"#;
+    let extraction = devmap_extract::extract_file("l.rb", source);
+    // The only sends in the file are the ones written as sends.
+    assert_eq!(callees(&extraction), vec!["each", "each", "each"]);
+    assert_no_orphaned_callers(&extraction);
+}
+
+/// Identifiers in a value position that still are not a send Ruby makes, or
+/// whose scope this module cannot judge, are refused rather than guessed at.
+#[test]
+fn ruby_identifiers_that_are_not_judged_sends_are_refused() {
+    let source = r#"
+class Child < parent_expr
+  alias new_name old_name
+  undef gone
+  def probe; defined?(maybe_defined); end
+  def implicit_it; [1].each { it }; end
+  def numbered; [1].each { _1 + _2 }; end
+  def pinned(v); case v; in ^pinned_local then 1; end; end
+  def obj.singleton_owner; 1; end
+end
+class << singleton_expr
+end
+"#;
+    let extraction = devmap_extract::extract_file("r.rb", source);
+    assert_eq!(callees(&extraction), vec!["each", "each"]);
+    assert_no_orphaned_callers(&extraction);
+}
+
+/// Ruby's scope gates are `def`, `class`, `module` and the file: a local of
+/// the class body is not visible inside a method, and a method's locals are
+/// not visible to its sibling. Blocks are not gates, so a block sees the
+/// method's locals. Each half of that rule is load-bearing in one direction.
+#[test]
+fn ruby_locals_are_judged_per_def_class_and_file_scope() {
+    let source = r#"
+top_local = 1
+class Gate
+  body_local = 1
+  def reads_body_local; body_local; end
+  def reads_top_local; top_local; end
+  def owns_one; mine = 1; mine; end
+  def reads_sibling; mine; end
+  def through_block; seen = 1; [1].each { seen }; end
+end
+top_local
+"#;
+    let extraction = devmap_extract::extract_file("g.rb", source);
+    assert_eq!(
+        callees_from(&extraction, "g.rb::Gate.reads_body_local"),
+        vec!["body_local"]
+    );
+    assert_eq!(
+        callees_from(&extraction, "g.rb::Gate.reads_top_local"),
+        vec!["top_local"]
+    );
+    assert_eq!(
+        callees_from(&extraction, "g.rb::Gate.reads_sibling"),
+        vec!["mine"]
+    );
+    assert!(callees_from(&extraction, "g.rb::Gate.owns_one").is_empty());
+    assert_eq!(
+        callees_from(&extraction, "g.rb::Gate.through_block"),
+        vec!["each"]
+    );
+    // The class body reads none of its own locals, and the file reads its own.
+    assert!(callees_from(&extraction, "g.rb::Gate").is_empty());
+    assert!(extraction
+        .calls
+        .iter()
+        .all(|call| call.caller_symbol.is_some() || call.callee_name != "top_local"));
+    assert_no_orphaned_callers(&extraction);
+}
+
+/// A method Ruby defines without `def` has no declaration in the graph, so a
+/// bare send naming it can only bind to a *different* method of that name —
+/// measured on Homebrew, `TapCaskUnavailableError#to_s` calling its own
+/// `attr_reader :tap` was bound to `Cask.tap` at 0.9. No call to
+/// such a name can be right, so none is recorded; the plain `def` beside them
+/// keeps its edge, which is the control that the refusal is not wholesale.
+#[test]
+fn a_bare_send_to_a_method_defined_without_def_is_refused() {
+    let source = r#"
+class Err
+  attr_reader :reason
+  attr_accessor(:acc)
+  attr :plain_attr
+  private attr_reader :priv
+  define_method(:made) { 1 }
+  alias_method :aliased, :to_s
+  alias kw_alias to_s
+  def_delegators :@target, :forwarded
+  delegate :railsy, to: :target
+  def to_s; reason; acc; plain_attr; priv; made; aliased; kw_alias; forwarded; railsy; real; end
+  def real; 1; end
+  class << self
+    attr_reader :meta
+    def build; meta; end
+  end
+end
+class Point < Struct.new(:px, :py)
+  def norm; px; end
+end
+"#;
+    let extraction = devmap_extract::extract_file("a.rb", source);
+    assert_eq!(callees_from(&extraction, "a.rb::Err.to_s"), vec!["real"]);
+    assert!(callees_from(&extraction, "a.rb::build").is_empty());
+    assert!(callees_from(&extraction, "a.rb::Point.norm").is_empty());
+    assert_no_orphaned_callers(&extraction);
+}
+
+/// A scope tree-sitter could not parse cleanly has no trustworthy binding
+/// list: error recovery can drop the very assignment that makes a name local.
+/// Its bare identifiers are refused; a clean sibling method keeps its sends.
+#[test]
+fn a_ruby_scope_with_a_parse_error_claims_no_bare_sends() {
+    let source = "def clean; clean_send; end\ndef broken\n  x = = 1\n  x\n  broken_send\nend\n";
+    let extraction = devmap_extract::extract_file("e.rb", source);
+    assert_eq!(callees_from(&extraction, "e.rb::clean"), vec!["clean_send"]);
+    assert!(extraction
+        .calls
+        .iter()
+        .all(|call| call.callee_name != "x" && call.callee_name != "broken_send"));
 }
 
 // ---------------------------------------------------------------- PHP

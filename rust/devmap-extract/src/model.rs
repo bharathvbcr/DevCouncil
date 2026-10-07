@@ -1446,13 +1446,7 @@ impl Extraction {
     /// `RegexFallback` and `Unavailable` are excluded: a grammar was *wanted*
     /// there and did not run, which is a failure and is charged as one.
     pub fn grammar_read_this_file(&self) -> bool {
-        matches!(
-            self.engine,
-            ExtractionEngine::TreeSitter { .. } | ExtractionEngine::Notebook { .. }
-        ) && matches!(
-            self.parse_outcome,
-            ParseOutcome::Clean | ParseOutcome::Partial { .. }
-        )
+        grammar_read(&self.engine, &self.parse_outcome)
     }
 
     /// Whether this file can be the subject of a liveness verdict, and if not,
@@ -1547,12 +1541,14 @@ impl Extraction {
     /// future engine that re-dispatches to another grammar answers here rather
     /// than at four call sites that would each have to remember.
     pub fn capabilities(&self) -> crate::languages::Capabilities {
-        match &self.engine {
-            ExtractionEngine::Notebook { kernel_language } => {
-                crate::languages::capabilities_for_language(kernel_language)
-            }
-            _ => crate::languages::capabilities_for_language(&self.language),
-        }
+        capabilities_of(&self.language, &self.engine)
+    }
+
+    /// Whether a grammar read this file and no call extractor exists for its
+    /// language — every symbol in it is uncalled and calls nothing *by
+    /// construction*. See [`is_call_blind`].
+    pub fn is_call_blind(&self) -> bool {
+        is_call_blind(&self.language, &self.engine, &self.parse_outcome)
     }
 
     /// Method `qualified_name` to declared parameter count, for the Go
@@ -1591,6 +1587,56 @@ impl Extraction {
         });
         durable
     }
+}
+
+/// What the extractor can observe in a file read by `engine` under
+/// `language`. The body of [`Extraction::capabilities`], lifted out so a
+/// *stored* file row — which keeps `language` and `engine` but not the
+/// extraction — gets the same answer, notebook kernels included.
+pub fn capabilities_of(
+    language: &str,
+    engine: &ExtractionEngine,
+) -> crate::languages::Capabilities {
+    match engine {
+        ExtractionEngine::Notebook { kernel_language } => {
+            crate::languages::capabilities_for_language(kernel_language)
+        }
+        _ => crate::languages::capabilities_for_language(language),
+    }
+}
+
+/// The body of [`Extraction::grammar_read_this_file`], for the same reason as
+/// [`capabilities_of`].
+pub fn grammar_read(engine: &ExtractionEngine, parse_outcome: &ParseOutcome) -> bool {
+    matches!(
+        engine,
+        ExtractionEngine::TreeSitter { .. } | ExtractionEngine::Notebook { .. }
+    ) && matches!(
+        parse_outcome,
+        ParseOutcome::Clean | ParseOutcome::Partial { .. }
+    )
+}
+
+/// Whether a grammar read this file cleanly in a language this build has no
+/// call extractor for.
+///
+/// The one predicate `dead` prices a symbol's ceiling with and `impact` /
+/// `trace` refuse an empty answer with (P2.7a). Two copies is how the two
+/// came to disagree: `dead` charged a `.tf` symbol as call-blind while
+/// `impact` on the same symbol answered `total: 0, Available` with no
+/// qualification — a check that never ran, published as one that found
+/// nothing.
+///
+/// Files a grammar did not read are not call-blind: they are charged as
+/// parse failures or pattern recoveries instead, and charging them twice
+/// would double-count one hole.
+pub fn is_call_blind(
+    language: &str,
+    engine: &ExtractionEngine,
+    parse_outcome: &ParseOutcome,
+) -> bool {
+    grammar_read(engine, parse_outcome)
+        && !capabilities_of(language, engine).contains(crate::languages::Capability::Calls)
 }
 
 #[cfg(test)]

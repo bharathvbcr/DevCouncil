@@ -629,15 +629,22 @@ impl<'a> StoreQueryEngine<'a> {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
-        let coverage_gap = analysis_coverage_gap(index.analysis());
+        let (from, to) = req.query;
+        let from = from.trim();
+        let to = to.trim();
+        // "No indexed path" is a claim about the graph only where both
+        // endpoints' calls were looked for (P2.7a). Bare-name endpoints name no
+        // file and are not checked here; a qualified or path endpoint is.
+        let coverage_gap = devmap_analyze::combine_reasons(
+            analysis_coverage_gap(index.analysis()),
+            self.call_blind_starts(query_file(from).into_iter().chain(query_file(to)))?
+                .reason(),
+        );
         let unavailable = |reason: String| {
             let mut response = unavailable_response(ResolutionAvailability::Unavailable { reason });
             response.walk_incomplete = coverage_gap.clone();
             response
         };
-        let (from, to) = req.query;
-        let from = from.trim();
-        let to = to.trim();
         if from.is_empty() || to.is_empty() {
             return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "scoped trace endpoints must not be empty".to_string(),
@@ -993,13 +1000,24 @@ impl<'a> StoreQueryEngine<'a> {
         // "no indexed traversal start" is a much weaker statement when the file
         // the symbol lives in was never read.
         let coverage_gap = analysis_coverage_gap(index.analysis());
-        let start: Vec<String> =
-            indexed_traversal_starts(index, target, reverse, min_confidence, &self.cancel)?
-                .into_iter()
-                .map(|(symbol, _)| symbol)
-                .collect();
+        let starts =
+            indexed_traversal_starts(index, target, reverse, min_confidence, &self.cancel)?;
+        // P2.7a. The corpus-level marker above cannot see this: a `.tf` beside
+        // Python hides no Python caller, so the analysis stays `Ok` — and then
+        // `impact` on the `.tf` symbol itself answered `total: 0, Available`
+        // for a file whose calls were never looked for. With no start, the file
+        // the query names is the only one there is to ask about.
+        let call_blind = if starts.is_empty() {
+            self.call_blind_starts(query_file(target))?
+        } else {
+            self.call_blind_starts(starts.iter().map(|(_, file)| file.as_str()))?
+        };
+        let start: Vec<String> = starts.into_iter().map(|(symbol, _)| symbol).collect();
         if start.is_empty() {
-            let reason = format!("{target} has no indexed traversal start");
+            let reason = match call_blind.reason() {
+                Some(blind) => format!("{target} has no indexed traversal start: {blind}"),
+                None => format!("{target} has no indexed traversal start"),
+            };
             let mut response = unavailable_response(ResolutionAvailability::Unavailable {
                 reason: reason.clone(),
             });
@@ -1055,9 +1073,19 @@ impl<'a> StoreQueryEngine<'a> {
         // every banded node is an endpoint of an edge this answer measured —
         // the two halves partition one set, and a node can appear in one and not
         // the other only if the budgeter trimmed it, which the budgeter counts.
-        let incomplete =
-            devmap_analyze::combine_reasons(walk.stop.reason(max_depth, max_nodes), coverage_gap);
-        let bands = band_budget.map(|budget| {
+        let incomplete = devmap_analyze::combine_reasons(
+            devmap_analyze::combine_reasons(walk.stop.reason(max_depth, max_nodes), coverage_gap),
+            call_blind.reason(),
+        );
+        // Refused rather than qualified only when nothing was measured: every
+        // start is call-blind *and* the walk found nothing. A bare name that
+        // also matched a Python symbol has a real half, and an answer with
+        // edges in it is evidence, so both keep `Available` and carry the
+        // reason instead.
+        let refuse_empty = call_blind
+            .reason()
+            .filter(|_| call_blind.every_start_is_blind() && traversed.is_empty());
+        let mut bands = band_budget.map(|budget| {
             blast_radius_from_edges(
                 &start,
                 &traversed,
@@ -1083,8 +1111,57 @@ impl<'a> StoreQueryEngine<'a> {
         // that gets a live symbol deleted, and it read identically in both
         // cases. The disclosure rides on the index so it describes the same
         // generation the edges came from.
+        //
+        // The third is about the start itself (P2.7a): see `refuse_empty`.
         response.walk_incomplete = incomplete;
+        if let Some(reason) = refuse_empty {
+            response.resolution = ResolutionAvailability::Unavailable {
+                reason: reason.clone(),
+            };
+            if let Some(bands) = bands.as_mut() {
+                bands.layers.resolution = ResolutionAvailability::Unavailable { reason };
+            }
+        }
         Ok((response, bands))
+    }
+
+    /// Which of `files` a grammar read in a language with no call extractor,
+    /// by [`devmap_extract::model::is_call_blind`] — the predicate `dead`
+    /// prices the same files with.
+    ///
+    /// Read through [`Store::latest_file`], as `explore` reads a definition's
+    /// language, so a daemon commit between the edge load and this read can
+    /// describe the path one generation later. The language of a path cannot
+    /// change between generations; its engine can only if the file was edited,
+    /// which a re-ask observes.
+    ///
+    /// Bounded: at most [`MAX_CALL_BLIND_FILES_CHECKED`] distinct files are
+    /// read, and the rest are counted as unchecked rather than as clean — a
+    /// capped check must not read as one that found nothing.
+    fn call_blind_starts<'f>(
+        &self,
+        files: impl IntoIterator<Item = &'f str>,
+    ) -> anyhow::Result<CallBlindStarts> {
+        let distinct: BTreeSet<&str> = files.into_iter().collect();
+        let mut starts = CallBlindStarts {
+            unchecked: distinct.len().saturating_sub(MAX_CALL_BLIND_FILES_CHECKED),
+            ..CallBlindStarts::default()
+        };
+        for path in distinct.into_iter().take(MAX_CALL_BLIND_FILES_CHECKED) {
+            self.cancel.check()?;
+            starts.checked += 1;
+            let Some(file) = self.store.latest_file(path)? else {
+                continue;
+            };
+            if devmap_extract::model::is_call_blind(
+                &file.language,
+                &file.engine,
+                &file.parse_outcome,
+            ) {
+                starts.blind.push((file.path, file.language));
+            }
+        }
+        Ok(starts)
     }
 
     /// Definitions matching `query`, each with its source, both call-graph
@@ -4512,6 +4589,78 @@ fn file_edge_coverage_gap(outcome: &ParseOutcome) -> Option<String> {
             "this file was not parsed ({reason}); no calls or imports were extracted from it \
              at all, so an empty list here is not evidence the file has no dependencies"
         )),
+    }
+}
+
+/// Most distinct start files one traversal reads a call-blind verdict for.
+///
+/// A traversal start is almost always one symbol in one file; a bare name like
+/// `new` can match hundreds. Each check is one store read, so the fan-out is
+/// bounded, and what the bound skipped is reported in
+/// [`CallBlindStarts::reason`] rather than treated as clean.
+const MAX_CALL_BLIND_FILES_CHECKED: usize = 16;
+
+/// The call-blind files among a traversal's starts. See
+/// [`StoreQueryEngine::call_blind_starts`].
+#[derive(Debug, Default)]
+struct CallBlindStarts {
+    /// `(path, language)` of every checked start file that is call-blind.
+    blind: Vec<(String, String)>,
+    /// Distinct start files actually read.
+    checked: usize,
+    /// Distinct start files the bound left unread.
+    unchecked: usize,
+}
+
+impl CallBlindStarts {
+    /// Whether nothing the answer rests on was measured: at least one start
+    /// was checked, every checked start is call-blind, and none went unread.
+    fn every_start_is_blind(&self) -> bool {
+        self.checked > 0 && self.unchecked == 0 && self.blind.len() == self.checked
+    }
+
+    /// The caveat, or `None` when no checked start is call-blind.
+    ///
+    /// `None` on every answer about a language that has a call extractor is
+    /// the load-bearing case, for the reason [`analysis_coverage_gap`] gives:
+    /// a caveat that rides on every answer tells a reader nothing. Wording is
+    /// direction-neutral because `impact` and `trace` share it, and it keeps
+    /// the phrase "no call extractor" that `dead`'s `CALL_BLIND_REASON` and
+    /// the coverage report use, so all three read as one fact.
+    fn reason(&self) -> Option<String> {
+        if self.blind.is_empty() {
+            return None;
+        }
+        let files: Vec<String> = self
+            .blind
+            .iter()
+            .map(|(path, language)| format!("{path} (`{language}`)"))
+            .collect();
+        let mut reason = format!(
+            "{} {} in a language with no call extractor in this build; no call into or out of \
+             {} was ever extracted, so an empty or short answer here is the extractor's \
+             absence, not the code's",
+            files.join(", "),
+            if files.len() == 1 { "is" } else { "are" },
+            if files.len() == 1 { "it" } else { "them" },
+        );
+        if self.unchecked > 0 {
+            reason.push_str(&format!(
+                "; {} more start file(s) were not checked for this",
+                self.unchecked
+            ));
+        }
+        Some(reason)
+    }
+}
+
+/// The file a traversal query names, when it names one — for the answer that
+/// found no start and so has no start file to ask about.
+fn query_file(query: &str) -> Option<&str> {
+    match crate::query_match::classify(query) {
+        crate::query_match::StartQuery::Qualified { file, .. } => Some(file),
+        crate::query_match::StartQuery::Path(path) => Some(path),
+        crate::query_match::StartQuery::Symbol(_) | crate::query_match::StartQuery::Nothing => None,
     }
 }
 
