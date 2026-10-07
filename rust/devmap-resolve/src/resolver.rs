@@ -631,6 +631,35 @@ impl Resolver {
             ))
     }
 
+    /// Whether `root`, written as a receiver's first segment, is a **value**
+    /// at this site rather than a module or crate name.
+    ///
+    /// `serde_json::from_str(x)` and `let serde_json = build(); serde_json.
+    /// take()` reduce to the same receiver string, and only the scope's own
+    /// binding tables separate them. One owner, because the classifier and the
+    /// Rust path rung must agree: a root the classifier calls a value must
+    /// never be bound as a crate by the rung.
+    ///
+    /// A positive use-site fact is authoritative even for an untyped capture.
+    /// Absence is not proof of no binding — older or hand-built extractions
+    /// may omit site facts — so the file-wide maps are kept as wider evidence.
+    fn root_is_a_value(
+        &self,
+        file_path: &str,
+        enclosing_symbol: &str,
+        root: &str,
+        receiver_binding: Option<&LocalBinding>,
+    ) -> bool {
+        receiver_binding.is_some()
+            || self.scope_declares_local(file_path, enclosing_symbol, root)
+            || self
+                .declared_types
+                .contains_key(&format!("{file_path}:{root}@type"))
+            || self
+                .receiver_types
+                .contains_key(&format!("{file_path}:{root}"))
+    }
+
     /// A binding belongs to its lexical scope. An untyped local must veto the
     /// file-wide fallback just as a typed one supplies the scoped answer.
     ///
@@ -1255,14 +1284,8 @@ impl Resolver {
         // A positive use-site fact is authoritative even for an untyped
         // capture. Absence is not proof of no binding: older/hand-built
         // extractions may omit site facts, so retain their wider evidence.
-        let root_is_a_value_here = receiver_binding.is_some()
-            || self.scope_declares_local(file_path, enclosing_symbol, root)
-            || self
-                .declared_types
-                .contains_key(&format!("{file_path}:{root}@type"))
-            || self
-                .receiver_types
-                .contains_key(&format!("{file_path}:{root}"));
+        let root_is_a_value_here =
+            self.root_is_a_value(file_path, enclosing_symbol, root, receiver_binding);
         // The bare shape requires the receiver to *be* the root and nothing
         // else. `std::fs::write("out.txt", body)` as the receiver of `unwrap()`
         // is also rooted at `std`, and it is an expression, not a module — the
@@ -1882,18 +1905,40 @@ impl Resolver {
                         } else if let Some(file) = via_reexport {
                             Some(file)
                         } else {
-                            let submodule = (ext.language == "python").then(|| {
-                                let dotted = format!("{}.{}", imp.module_specifier, name);
-                                self.resolve_import_path(&ext.file_path, &ext.language, &dotted)
-                                    .or_else(|| {
-                                        self.resolve_via_search_dirs(
-                                            ext,
-                                            imp.span.start_byte,
-                                            &dotted,
-                                        )
-                                    })
-                            });
-                            submodule.flatten().or(direct)
+                            let submodule = match ext.language.as_str() {
+                                "python" => {
+                                    let dotted = format!("{}.{}", imp.module_specifier, name);
+                                    self.resolve_import_path(&ext.file_path, &ext.language, &dotted)
+                                        .or_else(|| {
+                                            self.resolve_via_search_dirs(
+                                                ext,
+                                                imp.span.start_byte,
+                                                &dotted,
+                                            )
+                                        })
+                                }
+                                // The same shape in Rust: `use devmap_serve::
+                                // session_log;` names the module `session_log`,
+                                // and the crate root it was bound to declares
+                                // no such item — `pub mod session_log;` is a
+                                // module declaration, not a symbol — so every
+                                // `session_log::read_live()` through it found
+                                // nothing. Only a file that *is* that module
+                                // counts: a walk that popped the name back off
+                                // lands on the parent, which is `direct`.
+                                "rust" => self
+                                    .resolve_import_path(
+                                        &ext.file_path,
+                                        &ext.language,
+                                        &format!("{}::{}", imp.module_specifier, name),
+                                    )
+                                    .filter(|file| {
+                                        file.ends_with(&format!("/{name}.rs"))
+                                            || file.ends_with(&format!("/{name}/mod.rs"))
+                                    }),
+                                _ => None,
+                            };
+                            submodule.or(direct)
                         };
                         if let Some(target_f) = resolved {
                             file_bindings.insert(local.to_string(), (target_f, name.clone()));
@@ -2977,11 +3022,30 @@ impl Resolver {
                     // declares. After 2d so an import in this file still wins,
                     // and only for Rust — `work::helper()` in C++ is not this
                     // module system.
+                    //
+                    // A bare root — `dc_glob::matches()` reduces to the
+                    // receiver `dc_glob` — is a crate only when nothing in
+                    // this scope binds that name and no `use` here does: a
+                    // local or an import alias shadows the extern crate.
                     if resolution.is_none() && family == LangFamily::Rust {
                         if let Some(recv) = call.receiver_expr.as_deref() {
-                            if let Some(found) =
-                                self.rust_qualified_call(&ext.file_path, recv, &call.callee_name)
-                            {
+                            let bare_root_is_free = Self::is_plain_ident(recv)
+                                && !self.root_is_a_value(
+                                    &ext.file_path,
+                                    call.caller_symbol.as_deref().unwrap_or(&ext.file_path),
+                                    recv,
+                                    ext.local_binding_at(call.span.start_byte, recv),
+                                )
+                                && !self
+                                    .import_bindings
+                                    .get(&ext.file_path)
+                                    .is_some_and(|bindings| bindings.contains_key(recv));
+                            if let Some(found) = self.rust_qualified_call(
+                                &ext.file_path,
+                                recv,
+                                &call.callee_name,
+                                bare_root_is_free,
+                            ) {
                                 resolution = Some(Arc::new(found));
                             }
                         }
@@ -3886,7 +3950,14 @@ impl Resolver {
                 if let Some((_, tail)) = path.split_once("::") {
                     self.consider_module_rel(&mut found, &src_root, tail);
                 } else {
-                    self.consider_crate_root_files(&mut found, &src_root);
+                    // A crate *name* is the library target. A package with
+                    // both `lib.rs` and `main.rs` is not ambiguous to an
+                    // importer — the binary is not addressable by name — so
+                    // `main.rs` answers only when there is no library.
+                    self.consider_indexed(&mut found, format!("{src_root}/lib.rs"));
+                    if found.is_empty() {
+                        self.consider_indexed(&mut found, format!("{src_root}/main.rs"));
+                    }
                 }
             }
             RustPathRoot::Child => {
@@ -3957,20 +4028,41 @@ impl Resolver {
     /// names and the callee is a method of that type in that file. Either
     /// shape binds only when exactly one indexed file is the module. A second
     /// file, a second method, or a prefix that had to be popped is no target.
-    fn rust_qualified_call(&self, file: &str, receiver: &str, callee: &str) -> Option<Resolution> {
+    ///
+    /// A receiver with no `::` left — `dc_glob::matches()` reduces to `dc_glob`
+    /// — is syntactically indistinguishable from a value, so it is a path only
+    /// when the caller has established `bare_root_is_free` (no local, no import
+    /// of that name) and the name is an indexed crate. A bare child module is
+    /// not taken here: `mod work;` already binds `work` through its import.
+    ///
+    /// A crate root that states `pub use index::build_index;` declares nothing
+    /// itself, so both shapes follow the root's re-export to the declaring
+    /// file — the statement says where the name comes from.
+    fn rust_qualified_call(
+        &self,
+        file: &str,
+        receiver: &str,
+        callee: &str,
+        bare_root_is_free: bool,
+    ) -> Option<Resolution> {
         if !Self::is_plain_ident(callee) {
             return None;
         }
+        let bare_crate = bare_root_is_free
+            && Self::is_plain_ident(receiver)
+            && matches!(self.rust_path_root(file, receiver), RustPathRoot::Crate(_));
         if !Self::receiver_is_module_path(receiver)
             && !matches!(receiver, "crate" | "self" | "super")
+            && !bare_crate
         {
             return None;
         }
         match self.rust_exact_module(file, receiver) {
             RustModulePlace::Ambiguous => return None,
             RustModulePlace::Unique(module_file) => {
-                let (target_file, target_symbol) = self.lookup_in_package(&module_file, callee)?;
-                if self.symbol_kind_in(&target_file, callee) != Some(SymbolKind::Function) {
+                let (decl_file, decl_name) = self.declaring_site(&module_file, callee);
+                let (target_file, target_symbol) = self.lookup_in_package(&decl_file, &decl_name)?;
+                if self.symbol_kind_in(&target_file, &decl_name) != Some(SymbolKind::Function) {
                     return None;
                 }
                 return Some(Self::rust_module_resolution(
@@ -3990,20 +4082,21 @@ impl Resolver {
             RustModulePlace::Unique(module_file) => module_file,
             RustModulePlace::Ambiguous | RustModulePlace::Absent => return None,
         };
+        let (type_file, type_name) = self.declaring_site(&module_file, type_name);
         if !self
-            .symbol_kind_in(&module_file, type_name)
+            .symbol_kind_in(&type_file, &type_name)
             .is_some_and(Self::rust_type_kind)
         {
             return None;
         }
         let hits = self.type_methods.get(&(
             LangFamily::Rust,
-            type_name.to_string(),
+            type_name.clone(),
             callee.to_string(),
         ))?;
         let mut matched: Vec<&(String, String)> = hits
             .iter()
-            .filter(|(path, _)| path == &module_file)
+            .filter(|(path, _)| path == &type_file)
             .collect();
         matched.sort();
         matched.dedup();
@@ -4014,8 +4107,28 @@ impl Resolver {
         Some(Resolution::ReceiverType {
             target_symbol: target_symbol.clone(),
             target_file: target_file.clone(),
-            receiver_type: type_name.to_string(),
+            receiver_type: type_name,
         })
+    }
+
+    /// The file and name that actually declare `name` as `file` exposes it.
+    ///
+    /// `file` itself when it declares the name; otherwise the terminal of the
+    /// re-export `file` states for it (`pub use index::build_index;`), which
+    /// `compute_reexport_chains` has already followed through nested barrels
+    /// and refused for a cycle. With neither, `file` and `name` unchanged, so a
+    /// caller's own lookup fails exactly as it did before.
+    fn declaring_site(&self, file: &str, name: &str) -> (String, String) {
+        if self.symbol_kind_in(file, name).is_none() {
+            if let Some((terminal_file, terminal_name)) = self
+                .reexport_chains
+                .get(&format!("{file}::{name}"))
+                .and_then(|terminal| terminal.rsplit_once("::"))
+            {
+                return (terminal_file.to_string(), terminal_name.to_string());
+            }
+        }
+        (file.to_string(), name.to_string())
     }
 
     fn import_local_name(lang: &str, specifier: &str) -> String {

@@ -492,3 +492,204 @@ fn python_and_go_qualified_calls_still_follow_their_imports() {
         "a Go package-qualified call still resolves into the imported package"
     );
 }
+
+// A path whose root is a crate name or a `use`-imported module, with no `::`
+// left in the receiver once the callee is split off. `dc_grep::build_index()`
+// reduces to the receiver `dc_grep`, and the rung above fired only for a
+// receiver that still contained `::` — so every call into a sibling crate's
+// root, and every `module::f()` through `use other_crate::module`, was filed
+// as an uninferred receiver with the crate name as its "value".
+
+const GLOB_LIB: &str = "\
+pub fn matches(pattern: &str, name: &str) -> bool {
+    pattern == name
+}
+";
+
+#[test]
+fn a_lib_calls_a_sibling_crate_root_function_by_crate_name() {
+    let (_, result) = resolve(&[
+        (
+            "rust/dc-verify/src/lib.rs",
+            "pub fn classify_scope(p: &str, c: &str) -> bool {\n    \
+             dc_glob::matches(p, c)\n}\n",
+        ),
+        ("rust/dc-glob/src/lib.rs", GLOB_LIB),
+        ("rust/other/src/lib.rs", GLOB_LIB),
+    ]);
+
+    let edges = call_edges(&result, "::matches");
+    assert_eq!(
+        edges.len(),
+        1,
+        "`dc_glob::matches` names the crate `dc-glob`'s root; got {edges:?}"
+    );
+    assert_eq!(edges[0].source_file, "rust/dc-verify/src/lib.rs");
+    assert_eq!(edges[0].target_file, "rust/dc-glob/src/lib.rs");
+    assert!(
+        classes_of(&result, "matches").is_empty(),
+        "a bound call is not also an uninferred receiver: {:?}",
+        classes_of(&result, "matches")
+    );
+}
+
+#[test]
+fn a_bin_calls_its_own_lib_by_crate_name_through_a_reexport() {
+    let (_, result) = resolve(&[
+        (
+            "rust/dc-grep/src/bin/dcgrep.rs",
+            "use dc_grep::IndexRequest;\n\nfn index(r: &IndexRequest) {\n    \
+             dc_grep::build_index(r);\n}\n",
+        ),
+        (
+            "rust/dc-grep/src/lib.rs",
+            "mod index;\npub use index::{IndexRequest, build_index};\n",
+        ),
+        (
+            "rust/dc-grep/src/index.rs",
+            "pub struct IndexRequest;\npub fn build_index(r: &IndexRequest) {}\n",
+        ),
+        ("rust/elsewhere/src/index.rs", "pub fn build_index() {}\n"),
+    ]);
+
+    let edges = call_edges(&result, "::build_index");
+    assert_eq!(
+        edges.len(),
+        1,
+        "the bin's `dc_grep::build_index` reaches the declaration its crate root \
+         re-exports; got {edges:?}"
+    );
+    assert_eq!(edges[0].source_file, "rust/dc-grep/src/bin/dcgrep.rs");
+    assert_eq!(edges[0].target_file, "rust/dc-grep/src/index.rs");
+}
+
+#[test]
+fn a_lib_calls_through_a_use_imported_sibling_crate_module() {
+    let (_, result) = resolve(&[
+        (
+            "rust/devmap-cli/src/session.rs",
+            "use devmap_serve::session_log;\n\nfn build_report(db: &str) {\n    \
+             let live = session_log::read_live(db);\n}\n",
+        ),
+        ("rust/devmap-serve/src/lib.rs", "pub mod session_log;\n"),
+        (
+            "rust/devmap-serve/src/session_log.rs",
+            "pub fn read_live(db: &str) {}\n",
+        ),
+        (
+            "rust/devmap-cli/src/session_log.rs",
+            "pub fn read_live(db: &str) {}\n",
+        ),
+    ]);
+
+    let edges = call_edges(&result, "::read_live");
+    assert_eq!(
+        edges.len(),
+        1,
+        "`use devmap_serve::session_log; session_log::read_live()` names the \
+         sibling crate's module, not a same-named file in this crate; got {edges:?}"
+    );
+    assert_eq!(edges[0].source_file, "rust/devmap-cli/src/session.rs");
+    assert_eq!(edges[0].target_file, "rust/devmap-serve/src/session_log.rs");
+}
+
+#[test]
+fn a_local_named_like_a_crate_is_still_a_value() {
+    let (_, result) = resolve(&[
+        (
+            "rust/app/src/lib.rs",
+            "pub fn run() {\n    let dc_glob = make();\n    dc_glob.matches(\"a\", \"b\");\n}\n",
+        ),
+        ("rust/dc-glob/src/lib.rs", GLOB_LIB),
+    ]);
+
+    assert!(
+        call_edges(&result, "::matches").is_empty(),
+        "a local `dc_glob` is a value, not the crate; got {:?}",
+        call_edges(&result, "::matches")
+    );
+}
+
+#[test]
+fn a_type_the_crate_root_reexports_names_its_declaring_file() {
+    let (_, result) = resolve(&[
+        (
+            "rust/app/src/lib.rs",
+            "pub fn run() {\n    other_crate::Resolver::resolve_all();\n}\n",
+        ),
+        (
+            "rust/other-crate/src/lib.rs",
+            "mod resolver;\npub use resolver::Resolver;\n",
+        ),
+        (
+            "rust/other-crate/src/resolver.rs",
+            "pub struct Resolver;\nimpl Resolver {\n    pub fn resolve_all() {}\n}\n",
+        ),
+        (
+            "rust/decoy/src/resolver.rs",
+            "pub struct Resolver;\nimpl Resolver {\n    pub fn resolve_all() {}\n}\n",
+        ),
+    ]);
+
+    let edges = call_edges(&result, "resolve_all");
+    assert_eq!(edges.len(), 1, "got {edges:?}");
+    assert_eq!(edges[0].target_file, "rust/other-crate/src/resolver.rs");
+}
+
+#[test]
+fn a_crate_name_is_its_library_when_it_also_has_a_main() {
+    let (_, result) = resolve(&[
+        (
+            "rust/app/src/lib.rs",
+            "pub fn run() {\n    dc_glob::matches(\"a\", \"b\");\n}\n",
+        ),
+        ("rust/dc-glob/src/lib.rs", GLOB_LIB),
+        ("rust/dc-glob/src/main.rs", "fn main() {}\n"),
+    ]);
+
+    let edges = call_edges(&result, "::matches");
+    assert_eq!(
+        edges.len(),
+        1,
+        "a binary is not addressable by crate name, so lib.rs + main.rs is one \
+         target; got {edges:?}"
+    );
+    assert_eq!(edges[0].target_file, "rust/dc-glob/src/lib.rs");
+}
+
+#[test]
+fn an_import_alias_shadows_a_crate_of_the_same_name() {
+    let (_, result) = resolve(&[
+        (
+            "rust/app/src/lib.rs",
+            "use crate::shim as dc_glob;\n\npub fn run() {\n    dc_glob::matches(\"a\", \"b\");\n}\n",
+        ),
+        ("rust/app/src/shim.rs", GLOB_LIB),
+        ("rust/dc-glob/src/lib.rs", GLOB_LIB),
+    ]);
+
+    let edges = call_edges(&result, "::matches");
+    assert!(
+        edges.iter().all(|edge| edge.target_file != "rust/dc-glob/src/lib.rs"),
+        "`use crate::shim as dc_glob` makes `dc_glob` the alias, not the crate; \
+         got {edges:?}"
+    );
+}
+
+#[test]
+fn a_bare_crate_root_two_directories_claim_abstains() {
+    let (_, result) = resolve(&[
+        (
+            "rust/app/src/lib.rs",
+            "pub fn run() {\n    shared::matches(\"a\", \"b\");\n}\n",
+        ),
+        ("crates/shared/src/lib.rs", GLOB_LIB),
+        ("vendor/shared/src/lib.rs", GLOB_LIB),
+    ]);
+
+    assert!(
+        call_edges(&result, "::matches").is_empty(),
+        "two crates named `shared` are not a path to either; got {:?}",
+        call_edges(&result, "::matches")
+    );
+}
