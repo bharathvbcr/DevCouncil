@@ -751,6 +751,21 @@ pub struct ExtractedSymbol {
     /// carry a number nothing reads back.
     #[serde(default, skip_serializing)]
     pub declaration_hash: Option<u64>,
+    /// The return type a callable's declaration writes, verbatim and trimmed:
+    /// `*Registry` for Go's `func NewRegistry() *Registry`, `Svc` for
+    /// TypeScript's `function make(): Svc` and Python's `-> Svc`, `Self` for a
+    /// Rust `fn new() -> Self`.
+    ///
+    /// The fact that types a factory-built value. `w := NewWorker()` and
+    /// `const svc = createService()` are the idiomatic constructors in Go and
+    /// in most service-style TypeScript, and without the callee's written
+    /// return type the receiver `w` had no type and every method called on it
+    /// had no caller. Recorded as written; the resolver decides what is a
+    /// nominal type (it refuses generics, tuples and unions) so one owner
+    /// holds that rule. `None` when nothing was written, and for a Go result
+    /// list of more than one type: `(T, error)` names no single value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_type: Option<String>,
 }
 
 /// Two hashes of one symbol body, from [`crate::clonesig`].
@@ -946,6 +961,44 @@ pub struct ExtractedReference {
     /// import.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_expr: Option<String>,
+}
+
+impl ExtractedReference {
+    /// The simple shape of the expression this reference starts, when it is an
+    /// initializer: `T{..}` for a constructor, `T::new` for a Rust associated
+    /// constructor, `recv.f` for a call through a receiver, and the bare callee
+    /// otherwise. `None` for anything that is not a call or a constructor.
+    ///
+    /// One owner for the spelling, because two readers need it: the extractor
+    /// stamps it on a local binding's `initializer`, and the resolver reads it
+    /// for a module-scope value, whose declaration has no local binding.
+    ///
+    /// A call *reference* does not always carry `receiver_expr` — `Engine::new`
+    /// is a `scoped_identifier` whose receiver lives on the mirrored
+    /// `ExtractedCall` — so the call whose span contains this reference is
+    /// consulted for it.
+    pub fn initializer_shape(&self, calls: &[ExtractedCall]) -> Option<String> {
+        match self.kind {
+            ReferenceKind::Constructor => Some(format!("{}{{..}}", self.name)),
+            ReferenceKind::Call => {
+                let receiver = self.receiver_expr.as_deref().or_else(|| {
+                    calls.iter().find_map(|call| {
+                        (call.callee_name == self.name
+                            && call.span.start_byte <= self.span.start_byte
+                            && call.span.end_byte >= self.span.end_byte)
+                            .then_some(call.receiver_expr.as_deref())
+                            .flatten()
+                    })
+                });
+                Some(match receiver {
+                    Some(receiver) if self.name == "new" => format!("{receiver}::new"),
+                    Some(receiver) => format!("{receiver}.{}", self.name),
+                    None => self.name.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1843,6 +1896,7 @@ mod go_interface_exemption_tests {
             parent_symbol: None,
             body_signature: None,
             declaration_hash: None,
+            return_type: None,
         }
     }
 

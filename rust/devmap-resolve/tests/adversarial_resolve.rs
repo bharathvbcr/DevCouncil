@@ -82,6 +82,7 @@ fn symbol(path: &str, name: &str) -> ExtractedSymbol {
         docstring: None,
         body_signature: None,
         declaration_hash: None,
+        return_type: None,
     }
 }
 

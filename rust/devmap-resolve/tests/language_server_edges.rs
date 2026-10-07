@@ -31,6 +31,7 @@ fn symbol(file: &str, name: &str, start: usize, end: usize) -> ExtractedSymbol {
         parent_symbol: None,
         body_signature: None,
         declaration_hash: None,
+        return_type: None,
     }
 }
 

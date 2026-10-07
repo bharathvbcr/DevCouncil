@@ -509,7 +509,19 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// for a wrapped callback, so none of this may be served warm. (v67 is taken
 /// by unmerged sibling branches; skipping it keeps two different payloads from
 /// sharing one identity.)
-pub const EXTRACTION_SCHEMA_VERSION: &str = "68";
+///
+/// v69 records each callable's written return type (`ExtractedSymbol::
+/// return_type`) and binds a single-name Go `var`/`const` spec's initializer
+/// to its name (`assigned_to`). A row without it leaves a factory-built
+/// receiver — `w := NewWorker()`, `var r = NewRegistry()`,
+/// `const s = createService()` — untyped.
+///
+/// v70 is the merge of the lanes that claimed 67, 68 and 69 on separate
+/// branches. Each of those numbers was stamped on payloads that carry only
+/// that lane's half, so the combined payload takes a number none of them used:
+/// a v69 row from the return-type branch lacks v68's bindings, and a v68 row
+/// lacks return types.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "70";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

@@ -808,8 +808,13 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v68 stops a JSX tag, a C# member access and similar `name` fields from
     // binding a local, and binds wrapped callbacks (`useCallback(() => …)`) as
     // functions.
+    //
+    // v69 records each callable's written return type and binds a single-name
+    // Go `var`/`const` spec's initializer to its name.
+    //
+    // v70 is the merge of the 67/68/69 lanes under a number none of them used.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "68",
+        EXTRACTION_SCHEMA_VERSION, "70",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );
