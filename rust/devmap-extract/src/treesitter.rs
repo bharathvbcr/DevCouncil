@@ -7517,6 +7517,7 @@ fn maybe_push_name_reference(
                     .then(|| {
                         swift_parameter_bound_from_type(node, source)
                             .or_else(|| ts_parameter_bound_from_type(node, source))
+                            .or_else(|| go_var_bound_from_type(node, source))
                     })
                     .flatten()
             }),
@@ -9039,6 +9040,50 @@ fn swift_parameter_bound_from_type(node: Node, source: &str) -> Option<String> {
             return None;
         }
         current = parent;
+    }
+    None
+}
+
+/// The variable a Go `var w T` declares, when `node` is that type.
+///
+/// The Go spelling of a typed local with no initializer, and the idiomatic
+/// one for a value decoded in place: `var w requirementWire;
+/// json.Unmarshal(data, &w); w.Priority.valid()`. A parameter's type was
+/// already bound to its name; this declaration was not, so `w` had no type and
+/// every method reached through it — the `valid` checks on each decoded field
+/// — was reported dead.
+///
+/// Only a pointer or package qualifier may stand between the type and the
+/// spec: `var xs []T` and `var m map[K]T` do not make `xs` a `T`. A spec
+/// declaring several names (`var a, b T`) types each of them identically,
+/// but which one this reference serves is not knowable from one
+/// `assigned_to`, so it binds none.
+fn go_var_bound_from_type(node: Node, source: &str) -> Option<String> {
+    let mut current = node;
+    for _ in 0..4 {
+        let parent = bounded_parent(current)?;
+        match parent.kind() {
+            "pointer_type" | "qualified_type" => current = parent,
+            "var_spec" => {
+                if !parent
+                    .child_by_field_name("type")
+                    .is_some_and(|ty| ty.id() == current.id())
+                {
+                    return None;
+                }
+                let mut cursor = parent.walk();
+                let mut names = parent
+                    .children_by_field_name("name", &mut cursor)
+                    .filter(|name| name.kind() == "identifier");
+                let only = names.next()?;
+                if names.next().is_some() {
+                    return None;
+                }
+                let name = get_node_text(only, source);
+                return (is_user_ident(&name) && name != "_").then_some(name);
+            }
+            _ => return None,
+        }
     }
     None
 }
