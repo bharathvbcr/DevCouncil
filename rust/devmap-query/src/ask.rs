@@ -206,6 +206,12 @@ pub fn personalized_pagerank(
     Ok(rank)
 }
 
+/// How many of the best TF-IDF matches the coverage note judges.
+///
+/// The first page an agent reads, not the whole tail: a weak head under a
+/// strong match ranked 400th is still a weak answer.
+pub const ASK_COVERAGE_HEAD: usize = 10;
+
 /// Line carried when seeds matched but every call edge among them sat below
 /// the confidence floor.
 pub fn confidence_withheld_reason() -> String {
