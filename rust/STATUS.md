@@ -10,7 +10,11 @@
 `dc-glob`, `dc-grep`, `dc-proc`, `dc-store`, `dc-verify`) and their Go clients,
 ported from the MANVI harness (`~/Code/devtools/Manvi`) into DevCouncil starting
 2026-09-01. The workspace also holds `dc-regress` and `dc-regress-store`, which
-have no MANVI counterpart.
+have no MANVI counterpart, and `dc-redact` (2026-10-07): the credential table
+split out of `dc-verify` so GitPulse can vendor it without `dc-verify`'s
+tree-sitter. `dc-verify` depends on it by path, so MANVI's symlinked
+`crates/dc-verify` needs a `crates/dc-redact` symlink and workspace member
+beside it from the moment this lands on DevCouncil `main`.
 
 **Read this file as a dated record.** It was written on 2026-09-01, when the
 Python `src/devcouncil/` still existed and nothing called this code, and its
