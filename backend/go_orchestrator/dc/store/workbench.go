@@ -20,7 +20,7 @@ const maxWorkbenchReply = 2 << 20
 func WorkbenchMethods() []string {
 	return []string{
 		"workspaces.list", "workspaces.get", "workspaces.put", "workspaces.delete",
-		"repositories.list", "repositories.get", "repositories.put",
+		"repositories.list", "repositories.get", "repositories.put", "repositories.relink",
 		"items.list", "items.get", "items.brief.get", "items.put", "items.delete", "items.history",
 		"events.list",
 		"attention.list", "attention.get", "attention.update",
