@@ -325,6 +325,44 @@ pub struct Resolver {
     subtypes: BTreeMap<(LangFamily, String), BTreeSet<String>>,
     /// Per-file local import name → (target file, exported symbol) for import-scoped calls (G6).
     import_bindings: BTreeMap<String, BTreeMap<String, (String, String)>>,
+    /// `(importing file, local name)` → the `(file, name)` that **declares** the
+    /// value a named import binds, for the subset of `import_bindings` that
+    /// name a declared value rather than a module.
+    ///
+    /// `import { svc } from './service'` and `from pkg import obj` bind a
+    /// *value*; `import * as service`, `import pkg` and a Python submodule
+    /// bound by `from pkg import cmd` bind a *module*. Both land in
+    /// `import_bindings` with the same shape, and the module-member rung (2b)
+    /// read every one of them as a module: `svc.zzhelper()` bound to a free
+    /// function `zzhelper` that merely shares the module, at DETERMINISTIC.
+    /// Recorded at the one place the binding is made, because only there is it
+    /// known which branch chose the target — inferring it afterwards from
+    /// `file_symbols` cannot tell `service.py` declaring `service` from the
+    /// module `service` itself.
+    value_imports: BTreeMap<(String, String), (String, String)>,
+    /// `(file, name)` → the one indexed class a **module-scope** value is an
+    /// instance of: `export const svc = new SvcClass()`, Python
+    /// `service = Service()`.
+    ///
+    /// Kept apart from `receiver_types`, whose `file:var` key is written by
+    /// every assignment in the file whatever its scope — so a function-local
+    /// `const svc = new Other()` would lend the exported `svc` its type. This
+    /// map is written only from the declaration's own initializer, and
+    /// withdrawn when anything else in the file assigns the name. It is what a
+    /// value import is typed by in another file, which is the whole shape of a
+    /// singleton service: declared once, called everywhere else.
+    module_value_types: BTreeMap<(String, String), String>,
+    /// `(file, name)` → the names a module-scope value's **own declaration**
+    /// carries: the shorthand properties of `export const api = { get, post }`
+    /// and the methods written inside `export const log = { info() {…} }`.
+    ///
+    /// The evidence that makes `api.get()` a call to the module's `get`. A
+    /// named value import is not a module, so its members are not the
+    /// module's free functions in general — `svc.helper()` on a service
+    /// instance is never a sibling `function helper` — but an object literal
+    /// built from those functions is exactly that. Only a name the literal
+    /// itself spells is admitted, so the coincidence stays refused.
+    module_value_members: BTreeMap<(String, String), BTreeSet<String>>,
     /// `file:scope:var` and `file:var` → the *declared* type name of a value,
     /// whether or not that type is indexed (SC25).
     ///
@@ -519,6 +557,9 @@ impl Resolver {
             supertypes: BTreeMap::new(),
             subtypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
+            value_imports: BTreeMap::new(),
+            module_value_types: BTreeMap::new(),
+            module_value_members: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             external_imports: BTreeMap::new(),
             unindexed_local_imports: BTreeMap::new(),
@@ -540,6 +581,246 @@ impl Resolver {
             max_indexed_path_depth: 0,
             unique_basename: BTreeMap::new(),
         }
+    }
+
+    /// The one indexed `Class`/`Struct` called `name` in a family `family`
+    /// admits, or `None` when there is no such type or more than one.
+    ///
+    /// The same test the receiver maps have always applied before binding a
+    /// name to a type: a type the corpus declares twice cannot be dispatched
+    /// on, so it types nothing.
+    fn unique_indexed_type(&self, family: LangFamily, name: &str) -> bool {
+        self.symbol_index.get(name).is_some_and(|candidates| {
+            candidates
+                .iter()
+                .filter(|(_, kind, candidate_family, _)| {
+                    family.admits(*candidate_family)
+                        && matches!(kind, SymbolKind::Class | SymbolKind::Struct)
+                })
+                .count()
+                == 1
+        })
+    }
+
+    /// Fill [`Self::module_value_types`] for one file.
+    ///
+    /// A module-scope value is typed by its declaration's **initializer** —
+    /// the outermost reference the extractor attached to the declared name
+    /// inside the declaration's own span. "Outermost" is the earliest start:
+    /// in `new Service(makeDep())` the constructor begins before its
+    /// arguments, and every argument carries the same `assigned_to`, so taking
+    /// any of them would type the singleton by its dependency. A tie at the
+    /// earliest offset is two readings of one expression and abstains.
+    ///
+    /// Withdrawn — never re-answered — when anything else in the file assigns
+    /// the name a constructor or call: a second module-level assignment, or a
+    /// function that reassigns it (`function swap() { svc = new Other(); }`).
+    /// A function-local of the same name is indistinguishable from that
+    /// reassignment in the extraction, so it withdraws the answer too; that
+    /// costs an abstention, where reading it the other way would cost a
+    /// confidently wrong edge.
+    fn index_module_value_types(&mut self, ext: &Extraction, family: LangFamily) {
+        let mut declarations: BTreeMap<&str, Vec<&Span>> = BTreeMap::new();
+        for symbol in &ext.symbols {
+            if symbol.kind == SymbolKind::Variable
+                && symbol.parent_symbol.as_deref() == Some(ext.file_path.as_str())
+            {
+                declarations
+                    .entry(symbol.name.as_str())
+                    .or_default()
+                    .push(&symbol.span);
+            }
+        }
+        for (name, spans) in declarations {
+            // Two module-level declarations of one name: the type is whichever
+            // ran last, which is not a fact the extraction holds.
+            let [span] = spans.as_slice() else {
+                continue;
+            };
+            let within =
+                |inner: &Span| inner.start_byte >= span.start_byte && inner.end_byte <= span.end_byte;
+            // What the declaration itself spells: methods written inside it,
+            // and names it reads at module scope (`{ get, post }`). A name read
+            // inside one of those methods' bodies has an enclosing symbol and
+            // is not a member.
+            let members: BTreeSet<String> = ext
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.name != name && within(&symbol.span))
+                .map(|symbol| symbol.name.clone())
+                .chain(
+                    ext.references
+                        .iter()
+                        .filter(|reference| {
+                            reference.enclosing_symbol.is_none()
+                                && reference.receiver_expr.is_none()
+                                && matches!(reference.kind, ReferenceKind::Name)
+                                && within(&reference.span)
+                        })
+                        .map(|reference| reference.name.clone()),
+                )
+                .collect();
+            if !members.is_empty() {
+                self.module_value_members
+                    .insert((ext.file_path.clone(), name.to_string()), members);
+            }
+            let mut earliest: Option<(usize, &ExtractedReference)> = None;
+            let mut tied = false;
+            let mut reassigned = false;
+            for reference in &ext.references {
+                if reference.assigned_to.as_deref() != Some(name)
+                    || !matches!(
+                        reference.kind,
+                        ReferenceKind::Constructor | ReferenceKind::Call
+                    )
+                {
+                    continue;
+                }
+                let in_declaration = reference.enclosing_symbol.is_none()
+                    && reference.span.start_byte >= span.start_byte
+                    && reference.span.end_byte <= span.end_byte;
+                if !in_declaration {
+                    reassigned = true;
+                    break;
+                }
+                match earliest {
+                    Some((start, _)) if reference.span.start_byte > start => {}
+                    Some((start, _)) if reference.span.start_byte == start => tied = true,
+                    _ => {
+                        earliest = Some((reference.span.start_byte, reference));
+                        tied = false;
+                    }
+                }
+            }
+            if reassigned || tied {
+                continue;
+            }
+            let Some((_, initializer)) = earliest else {
+                continue;
+            };
+            if self.unique_indexed_type(family, &initializer.name) {
+                self.module_value_types.insert(
+                    (ext.file_path.clone(), name.to_string()),
+                    initializer.name.clone(),
+                );
+            }
+        }
+    }
+
+    /// The class a module-scope value `name` declared in `file` is an instance
+    /// of, following a re-export chain to the file that declares it.
+    fn module_value_type(&self, file: &str, name: &str) -> Option<String> {
+        if let Some(found) = self
+            .module_value_types
+            .get(&(file.to_string(), name.to_string()))
+        {
+            return Some(found.clone());
+        }
+        let terminal = self.reexport_chains.get(&format!("{file}::{name}"))?;
+        let (declaring_file, declared) = terminal.rsplit_once("::")?;
+        self.module_value_types
+            .get(&(declaring_file.to_string(), declared.to_string()))
+            .cloned()
+    }
+
+    /// The type of a receiver this file reaches through an import: a named
+    /// import of a module-scope instance (`import { svc }`, `from m import
+    /// svc`), or one member of an imported module handle (`ns.svc`,
+    /// `service_module.service`).
+    fn imported_receiver_type(&self, file: &str, receiver: &str) -> Option<String> {
+        if Self::is_plain_ident(receiver) {
+            let (declaring_file, declared) = self
+                .value_imports
+                .get(&(file.to_string(), receiver.to_string()))?;
+            return self.module_value_type(declaring_file, declared);
+        }
+        let (root, member) = Self::one_hop_field(receiver)?;
+        if self.is_value_import(file, root) {
+            return None;
+        }
+        let (module_file, _) = self.import_bindings.get(file)?.get(root)?;
+        self.module_value_type(module_file, member)
+    }
+
+    /// Whether `member` may be read as a module-level declaration when it is
+    /// reached through `receiver`, a name `file` imports.
+    ///
+    /// A module handle: always — that is what a module member is. An imported
+    /// type (`Page.SystematicReview`, `SvcClass.build()`): always, the static
+    /// shape. A named import of any other value: only when the value's own
+    /// declaration spells the member, which is the object-literal namespace
+    /// (`api = { get }`), and never when it is a typed instance — rung 1 owns
+    /// that answer, and a method its class lacks is not the module's function.
+    fn module_member_admitted(&self, file: &str, receiver: &str, member: &str) -> bool {
+        let Some((declaring_file, declared)) =
+            self.value_imports.get(&(file.to_string(), receiver.to_string()))
+        else {
+            return true;
+        };
+        if self.imports_a_type(file, receiver) {
+            return true;
+        }
+        if self.module_value_type(declaring_file, declared).is_some() {
+            return false;
+        }
+        self.module_value_members
+            .get(&(declaring_file.clone(), declared.clone()))
+            .is_some_and(|members| members.contains(member))
+    }
+
+    /// Whether `local` in `file` is a named import of a declared value rather
+    /// than a module handle. See [`Self::value_imports`].
+    fn is_value_import(&self, file: &str, local: &str) -> bool {
+        self.value_imports
+            .contains_key(&(file.to_string(), local.to_string()))
+    }
+
+    /// Whether the value `local` imports into `file` is itself a type
+    /// declaration. `SvcClass.build()` on an imported class is a static call,
+    /// and the literal-type rung below the import rungs answers it; only a
+    /// non-type value stops the ladder when its type is unknown.
+    fn imports_a_type(&self, file: &str, local: &str) -> bool {
+        let Some((declaring_file, declared)) =
+            self.value_imports.get(&(file.to_string(), local.to_string()))
+        else {
+            return false;
+        };
+        self.symbol_index.get(declared).is_some_and(|candidates| {
+            candidates.iter().any(|(path, kind, _, _)| {
+                path == declaring_file
+                    && matches!(
+                        kind,
+                        SymbolKind::Class
+                            | SymbolKind::Struct
+                            | SymbolKind::Enum
+                            | SymbolKind::Interface
+                            | SymbolKind::Trait
+                    )
+            })
+        })
+    }
+
+    /// Whether the declaration a named import binds owns a member `member` in
+    /// its own file — a factory whose returned object literal declares it
+    /// (`registryAdapter(run).tagsForDigest()`), recorded by the extractor as
+    /// `registryAdapter.tagsForDigest`. The literal-type rung answers that
+    /// shape from the import's own declaring file, so the import-scoped stop
+    /// must leave it to that rung rather than pre-empt it.
+    fn imported_declaration_owns(
+        &self,
+        family: LangFamily,
+        file: &str,
+        local: &str,
+        member: &str,
+    ) -> bool {
+        let Some((declaring_file, declared)) =
+            self.value_imports.get(&(file.to_string(), local.to_string()))
+        else {
+            return false;
+        };
+        self.type_methods
+            .get(&(family, declared.clone(), member.to_string()))
+            .is_some_and(|hits| hits.iter().any(|(path, _)| path == declaring_file))
     }
 
     /// Record `key -> type_name`, poisoning the key if a second type claims it.
@@ -662,8 +943,19 @@ impl Resolver {
                         .then(|| scope.and_then(|scope| self.declaring_type_of(file, scope)))
                         .flatten()
                         .map(str::to_string)
-                })?;
-            return self.field_type_on(file, &owner, field);
+                });
+            return match owner {
+                Some(owner) => self.field_type_on(file, &owner, field),
+                // `ns.svc.run()`: the root is no typed value, but it may be an
+                // imported module whose member is a module-scope instance. A
+                // root the scope binds itself shadows the import.
+                None if root_binding.is_none()
+                    && !scope.is_some_and(|scope| self.scope_declares_local(file, scope, root)) =>
+                {
+                    self.imported_receiver_type(file, name)
+                }
+                None => None,
+            };
         }
 
         if let Some(binding) = binding {
@@ -702,6 +994,9 @@ impl Resolver {
             .get(&format!("{file}:{name}"))
             .cloned()
             .or_else(|| self.lookup_declared_type_name(file, None, name))
+            // Last, because every rung above is evidence written in this file
+            // and an import is evidence about another one.
+            .or_else(|| self.imported_receiver_type(file, name))
     }
 
     /// `root.field` with exactly one hop of plain identifiers — the shape
@@ -1465,6 +1760,9 @@ impl Resolver {
         self.supertypes.clear();
         self.subtypes.clear();
         self.import_bindings.clear();
+        self.value_imports.clear();
+        self.module_value_types.clear();
+        self.module_value_members.clear();
         self.declared_types.clear();
         self.external_imports.clear();
         self.unindexed_local_imports.clear();
@@ -1755,6 +2053,8 @@ impl Resolver {
         // universe built above.
         for ext in extractions {
             let mut file_bindings = BTreeMap::new();
+            // The value-binding subset of `file_bindings`; see `value_imports`.
+            let mut file_values: Vec<(String, (String, String))> = Vec::new();
             // SC18: the mirror of `file_bindings` — every local name whose
             // module resolved to no indexed file. Recorded from the same walk so
             // the two maps cannot disagree about what an import specifier means.
@@ -1875,11 +2175,38 @@ impl Resolver {
                             })
                             .flatten()
                             .and_then(|terminal| {
-                                terminal.rsplit_once("::").map(|(file, _)| file.to_string())
+                                terminal
+                                    .rsplit_once("::")
+                                    .map(|(file, declared)| (file.to_string(), declared.to_string()))
                             });
+                        // Both branches that answer with a file *declaring* the
+                        // name bind a value; the submodule fallback below binds
+                        // a module. `via_reexport` keeps the terminal's own
+                        // name, because `export { svc as questions }` publishes
+                        // a name the declaring file never wrote.
+                        let declared_value = if declares_name {
+                            direct.clone().map(|file| (file, name.clone()))
+                        } else {
+                            via_reexport.clone()
+                        };
+                        // Only where an import binds one namespace. A Rust
+                        // `use blast::{blast}` binds the function while
+                        // `blast::Report` still walks the module of the same
+                        // name — values and modules live apart there, so the
+                        // binding says nothing about what a path through it
+                        // means.
+                        let single_namespace = matches!(
+                            LangFamily::from_lang(&ext.language),
+                            LangFamily::JsTs | LangFamily::Python
+                        );
+                        if let (true, Some(declared), Some(_)) =
+                            (single_namespace, &declared_value, &direct)
+                        {
+                            file_values.push((local.to_string(), declared.clone()));
+                        }
                         let resolved = if declares_name {
                             direct
-                        } else if let Some(file) = via_reexport {
+                        } else if let Some((file, _)) = via_reexport {
                             Some(file)
                         } else {
                             let submodule = (ext.language == "python").then(|| {
@@ -2000,6 +2327,17 @@ impl Resolver {
                 self.unindexed_local_imports
                     .insert(ext.file_path.clone(), file_local_gap);
             }
+            for (local, declared) in file_values {
+                // A later whole-module import of the same local name replaces
+                // the binding, and with it the claim that the name is a value.
+                let still_value = file_bindings
+                    .get(&local)
+                    .is_some_and(|(target, _): &(String, String)| target == &declared.0);
+                if still_value {
+                    self.value_imports
+                        .insert((ext.file_path.clone(), local), declared);
+                }
+            }
             if !file_bindings.is_empty() {
                 self.import_bindings
                     .insert(ext.file_path.clone(), file_bindings);
@@ -2119,6 +2457,7 @@ impl Resolver {
                     );
                 }
             }
+            self.index_module_value_types(ext, family);
             // A `let x = self.field` (including through `if` / `&`) takes the
             // field's type, so `x.run()` can dispatch. Field `Type` references
             // are indexed just above; this pass is a second walk so a field
@@ -2791,13 +3130,39 @@ impl Resolver {
                             && ext.local_binding_at(call.span.start_byte, &recv).is_none() {
                             if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
                                 if let Some((target_f, _)) = bindings.get(&recv) {
-                                    if let Some((resolved_file, resolved_sym)) =
-                                        self.lookup_in_package(target_f, &method)
+                                    // A module member: a member of a module
+                                    // handle, of an imported type, or of an
+                                    // object literal that spells it — never
+                                    // an arbitrary value's method that shares
+                                    // a name with a free function beside it.
+                                    if self.module_member_admitted(&ext.file_path, &recv, &method) {
+                                        if let Some((resolved_file, resolved_sym)) =
+                                            self.lookup_in_package(target_f, &method)
+                                        {
+                                            resolution = Some(Arc::new(Resolution::ImportScoped {
+                                                target_symbol: resolved_sym,
+                                                target_file: resolved_file,
+                                                imported_from: recv.clone(),
+                                            }));
+                                        }
+                                    }
+                                    if resolution.is_none()
+                                        && self.is_value_import(&ext.file_path, &recv)
+                                        && !self.imports_a_type(&ext.file_path, &recv)
+                                        && !self.imported_declaration_owns(
+                                            family,
+                                            &ext.file_path,
+                                            &recv,
+                                            &method,
+                                        )
                                     {
-                                        resolution = Some(Arc::new(Resolution::ImportScoped {
-                                            target_symbol: resolved_sym,
-                                            target_file: resolved_file,
-                                            imported_from: recv.clone(),
+                                        // Stop here. The import is this file's
+                                        // evidence about `recv`, so a later
+                                        // rung matching a same-spelled type
+                                        // elsewhere would be a coincidence
+                                        // outranking it (R-2).
+                                        resolution = Some(Arc::new(Resolution::Unresolved {
+                                            reason: "the receiver is an imported value whose type is not known".to_string(),
                                         }));
                                     }
                                 }
@@ -5308,6 +5673,10 @@ impl Resolver {
             .local_binding_at(reference.span.start_byte, receiver)
             .is_some()
         {
+            return None;
+        }
+        // The call ladder's rung-2b rule, for the same reason.
+        if !self.module_member_admitted(&ext.file_path, receiver, name) {
             return None;
         }
         let (module_file, _) = self.import_bindings.get(&ext.file_path)?.get(receiver)?;

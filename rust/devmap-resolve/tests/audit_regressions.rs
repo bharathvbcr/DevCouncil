@@ -252,7 +252,32 @@ fn every_edge_confidence_matches_the_evidence_it_names() {
 /// coincidence won at DETERMINISTIC.
 #[test]
 fn an_import_binding_outranks_a_same_spelled_type_elsewhere() {
+    // `parser` is a submodule, so `parser.parse()` is a member of that module.
     let result = resolve(&[
+        (
+            "u.py",
+            "from real import parser\n\ndef go():\n    return parser.parse()\n",
+        ),
+        ("real/__init__.py", ""),
+        ("real/parser.py", "def parse():\n    return 1\n"),
+        (
+            "other.py",
+            "class parser:\n    def parse(self):\n        return 2\n",
+        ),
+    ]);
+    assert_eq!(
+        calls(&result),
+        ["u.py::go->real/parser.py::parse"],
+        "the import in this file names what `parser` is; a same-named class \
+         elsewhere is a coincidence"
+    );
+
+    // When the import binds a *function* `parser`, `parser.parse` is an
+    // attribute of that function object. It is neither the coincidental class
+    // method nor the module's free function `parse`, which this fixture once
+    // asserted only because the module-member rung read every import as a
+    // module.
+    let value = resolve(&[
         (
             "u.py",
             "from real import parser\n\ndef go():\n    return parser.parse()\n",
@@ -266,11 +291,10 @@ fn an_import_binding_outranks_a_same_spelled_type_elsewhere() {
             "class parser:\n    def parse(self):\n        return 2\n",
         ),
     ]);
-    assert_eq!(
-        calls(&result),
-        ["u.py::go->real.py::parse"],
-        "the import in this file names what `parser` is; a same-named class \
-         elsewhere is a coincidence"
+    assert!(
+        calls(&value).is_empty(),
+        "a value import is not a module and spells no class: {:?}",
+        calls(&value)
     );
 
     // Positive control: with no import to contradict it, a receiver written as
