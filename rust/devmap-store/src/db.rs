@@ -153,9 +153,10 @@ use crate::schema::{
     MIGRATION_V16_TO_V17, MIGRATION_V17_TO_V18_BACKFILL_EDGES,
     MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED, MIGRATION_V17_TO_V18_RENAME_EDGES,
     MIGRATION_V17_TO_V18_RENAME_UNRESOLVED, MIGRATION_V18_TO_V19, MIGRATION_V19_TO_V20,
-    MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5,
-    MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8,
-    MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, PYTHON_INDEX_SCHEMA_VERSION, VALIDITY_RANGE_TABLES,
+    MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22, MIGRATION_V23_TO_V24, MIGRATION_V3_TO_V4,
+    MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
+    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, PYTHON_INDEX_SCHEMA_VERSION,
+    VALIDITY_RANGE_TABLES,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -2844,6 +2845,8 @@ impl Store {
             // to hold: a store built from scratch and one walked up the ladder
             // are indistinguishable.
             tx.execute_batch(MIGRATION_V21_TO_V22)?;
+            // After v21's drop of the same index, as on the ladder.
+            tx.execute_batch(MIGRATION_V23_TO_V24)?;
             Self::validate_schema(tx)?;
             tx.execute(
                 &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION),
@@ -3214,6 +3217,13 @@ impl Store {
             // stamp makes an older binary refuse the store rather than
             // reconstructing those rows as neighbouring tiers.
             conn.execute("PRAGMA user_version = 23", [])?;
+            version = 23;
+        }
+        if version == 23 {
+            // `CREATE INDEX IF NOT EXISTS`, so a racing opener that already
+            // built it makes this a no-op rather than a failure.
+            conn.execute_batch(MIGRATION_V23_TO_V24)?;
+            conn.execute("PRAGMA user_version = 24", [])?;
             version = CURRENT_SCHEMA_VERSION;
         }
         if version != CURRENT_SCHEMA_VERSION {
