@@ -167,7 +167,7 @@ devcouncil skills scaffold [--skill NAME] [--project-root DIR] [--dry-run] [--ch
 ### Task Verification
 
 ```bash
-devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local|docker|nix] [--coverage PATH] [--project-root DIR]
+devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local] [--coverage PATH] [--project-root DIR]
 ```
 
 Verifies the working-tree diff for `TASK_ID` through Go `verify.Run()`: no-work, planned-file scope, orphan diffs, dependency-risk, and expected-test / allowed-command execution. It also spawns **`dcverify`** for the rigor gates — stub detection (`stub_detected`), secret scanning (`security_risk`), and diff↔coverage (`diff_not_exercised`).
@@ -176,7 +176,7 @@ Verifies the working-tree diff for `TASK_ID` through Go `verify.Run()`: no-work,
 - `dcverify` is discovered on `PATH`, excluding any candidate inside the repository under analysis (`proc.LookPathOutside`); `MANVI_VERIFY_BINARY` overrides discovery. It remains a separately installed component (`devcouncil install --only=dcverify`).
 - `--mode`: `off` (default when unset) skips quality verification and reports `status: "skipped"`, `passed: false`, and `verification_skipped: true`; `advisory` still blocks hard-safety gaps; `enforce` blocks every `Blocking` gap. Hard-safety write policy is unchanged.
 - `--json`: Output machine-readable verification results and typed `next_actions` for agent self-repair. Skipped tasks increment `completed_without_verification`, not `verified_tasks`. Completion and verification remain separate outcomes.
-- `--sandbox`: Copied onto the report. Only local execution is implemented (`/bin/sh -c` in the project root). `docker` and `nix` are accepted as labels and do **not** isolate (TASK-P7-2). Usage text still lists them; do not treat that as a working sandbox.
+- `--sandbox`: Only `local` exists: verification commands run on the host (`/bin/sh -c` in the project root), and the report's `sandbox` field is always `local` because that is where they ran. Any other value (`docker`, `nix`, anything) is refused with exit 2 before a store is opened or a command runs (TASK-P7-2). MCP `devcouncil_verify_task` takes no sandbox argument and refuses one with `code: invalid_argument`.
 
 ### DevMap Shorthands
 

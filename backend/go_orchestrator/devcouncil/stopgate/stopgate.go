@@ -32,7 +32,9 @@ type Input struct {
 	Store    *store.Client
 	TaskID   string
 	GateMode string
-	Sandbox  string
+	// Sandbox is the isolation requested; empty means local. Anything
+	// verify.ParseSandbox refuses produces a skipped decision.
+	Sandbox string
 	// CoveragePath is an optional coverage profile for the diff∩coverage gate.
 	// Empty means that gate does not run and the report says so. The MCP tool
 	// leaves it empty: its input schema carries no field for a path.
@@ -92,11 +94,9 @@ func Run(ctx context.Context, in Input) Outcome {
 	if gateMode == "" {
 		gateMode = "off"
 	}
-	sandbox := in.Sandbox
-	if sandbox == "" {
-		sandbox = "local"
-	}
-	mcp, gaps, err := verify.VerifyTask(ctx, in.Root, in.Store, in.TaskID, gateMode, sandbox, in.CoveragePath)
+	// Passed through as asked. VerifyTask refuses an isolation it cannot
+	// provide, which lands below as a skipped, non-allowing decision.
+	mcp, gaps, err := verify.VerifyTask(ctx, in.Root, in.Store, in.TaskID, gateMode, in.Sandbox, in.CoveragePath)
 	if err != nil {
 		return Outcome{Decision: Result{
 			OK: false, Allow: false, Skipped: true,

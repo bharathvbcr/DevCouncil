@@ -27,7 +27,6 @@ func TestGoldenLeasedVerifyShape(t *testing.T) {
 	in := verify.Input{
 		Task:         task,
 		GateMode:     "enforce",
-		Sandbox:      "local",
 		Difficulty:   "easy",
 		ChangedFiles: nil,
 		DiffContent:  "",
@@ -104,7 +103,6 @@ func TestGoldenCLIVerifyShape(t *testing.T) {
 	in := verify.Input{
 		Task:        task,
 		GateMode:    "enforce",
-		Sandbox:     "local",
 		Difficulty:  "easy",
 		DiffEmpty:   true,
 		WorkPresent: false,

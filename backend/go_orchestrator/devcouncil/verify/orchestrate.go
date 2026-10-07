@@ -46,6 +46,32 @@ func AllowedNextToolsForVerify() []string {
 	}
 }
 
+// SandboxLocal is the only isolation verify provides: none. Verification
+// commands run on the host, through /bin/sh -c in the project root
+// (DefaultRunCommand).
+const SandboxLocal = "local"
+
+// ParseSandbox resolves a requested sandbox to the one verify will actually
+// run in, or refuses it.
+//
+// `docker` and `nix` used to be accepted here, ignored, and written onto the
+// report and the store as the sandbox the run used — so a run that executed on
+// the host could be recorded as isolated (TASK-P7-2). A request for isolation
+// this host does not have is refused rather than downgraded: an operator who
+// asked for a container is relying on it, and running their commands on the
+// host anyway is exactly the outcome they asked to avoid.
+func ParseSandbox(requested string) (string, error) {
+	switch strings.TrimSpace(requested) {
+	case "", SandboxLocal:
+		return SandboxLocal, nil
+	default:
+		return "", fmt.Errorf(
+			"sandbox %q is not implemented: verification commands run on the host "+
+				"(/bin/sh -c in the project root), so the only sandbox is %q",
+			requested, SandboxLocal)
+	}
+}
+
 // Run executes the Phase-5 verification gates for one task and returns gaps.
 //
 // Coverage that cannot run is recorded as CoverageSkippedReason — never as a
@@ -56,10 +82,10 @@ func AllowedNextToolsForVerify() []string {
 // ctx bounds the subprocess work — the rigor gates are a dcverify child — so a
 // cancelled verify does not leave one running.
 func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
-	meta.Sandbox = in.Sandbox
-	if meta.Sandbox == "" {
-		meta.Sandbox = "local"
-	}
+	// What ran, not what was asked for. Input has no sandbox field: the
+	// request is validated by ParseSandbox at the entry points, and the only
+	// value that survives it is the one this function executes in.
+	meta.Sandbox = SandboxLocal
 	meta.GateMode = in.GateMode
 	if meta.GateMode == "" {
 		meta.GateMode = "off"
@@ -378,7 +404,13 @@ func shortHash(s string) string {
 // tool schema has no field for a path, and inventing one would be a protocol
 // change — so today that gate is reachable from `devcouncil verify --coverage`
 // and from a library caller that runs its own tests under coverage.
+//
+// sandbox is refused unless ParseSandbox accepts it, before anything runs or
+// is persisted.
 func VerifyTask(ctx context.Context, root string, client *store.Client, taskID, gateMode, sandbox, coveragePath string) (MCPResult, []Gap, error) {
+	if _, err := ParseSandbox(sandbox); err != nil {
+		return MCPResult{}, nil, err
+	}
 	if client == nil {
 		return MCPResult{}, nil, fmt.Errorf("store unavailable")
 	}
@@ -399,7 +431,6 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID, 
 		Root:         root,
 		Task:         task,
 		GateMode:     gateMode,
-		Sandbox:      sandbox,
 		Difficulty:   task.Difficulty,
 		ChangedFiles: changed,
 		DiffContent:  diff,

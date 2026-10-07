@@ -9,6 +9,7 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gatescfg"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/stopgate"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/gate"
 )
 
@@ -238,7 +239,25 @@ func (r *Registry) callNextTask(ctx context.Context, args map[string]any) any {
 	return map[string]any{"ok": true, "task_id": ids[0], "task": task}
 }
 
+// verifyTaskArguments is every argument devcouncil_verify_task's schema
+// declares. Nothing enforces a tool schema at runtime, so callVerify checks it.
+var verifyTaskArguments = map[string]bool{"task_id": true, "lease_token": true}
+
 func (r *Registry) callVerify(ctx context.Context, args map[string]any) any {
+	// Refused before the lease or the store is consulted. An argument dropped
+	// without a word is a configuration the caller believes it made: a
+	// `sandbox: "docker"` that was ignored came back as a report the caller
+	// would read as the isolated run it asked for, while every command ran on
+	// the host (TASK-P7-2).
+	for name := range args {
+		if !verifyTaskArguments[name] {
+			msg := "devcouncil_verify_task takes only task_id and lease_token; refusing argument " + name
+			if name == "sandbox" {
+				msg += ": verification runs on the host and the only sandbox is " + verify.SandboxLocal
+			}
+			return ErrorPayload{OK: false, Code: "invalid_argument", Error: msg}
+		}
+	}
 	taskID, _ := args["task_id"].(string)
 	token, _ := args["lease_token"].(string)
 	if taskID == "" || token == "" {
@@ -258,7 +277,7 @@ func (r *Registry) callVerify(ctx context.Context, args map[string]any) any {
 		gateMode = gatescfg.Load(r.Root).VerificationMode
 	}
 	out := stopgate.Run(ctx, stopgate.Input{
-		Root: r.Root, Store: r.Store, TaskID: taskID, GateMode: gateMode, Sandbox: "local",
+		Root: r.Root, Store: r.Store, TaskID: taskID, GateMode: gateMode, Sandbox: verify.SandboxLocal,
 	})
 	if out.Decision.Skipped {
 		return ErrorPayload{OK: false, Code: "verify_error", Error: out.Decision.Reason}

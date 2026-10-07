@@ -111,7 +111,7 @@ Usage:
   devcouncil skills list
   devcouncil skills scaffold [--skill NAME] [--project-root DIR] [--dry-run] [--check]
                                    --check writes nothing and exits 1 if any file is missing or differs
-  devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local|docker|nix] [--coverage PATH]
+  devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local] [--coverage PATH]
   devcouncil grep PATTERN [--json] [--path DIR] [--max N] [--ignore-case]
                                    Search via the `+"`dcgrep`"+` client (missing binary is an error, never an empty match list)
   devcouncil map [devmap args…]   Exec `+"`devmap`"+` (bare invocation: build --manifest)
@@ -638,7 +638,7 @@ func runSkillsScaffold(args []string) int {
 func runVerify(args []string) int {
 	root := projectRoot()
 	jsonOut := false
-	sandbox := "local"
+	sandbox := verify.SandboxLocal
 	taskID := ""
 	modeFlag := ""
 	coveragePath := ""
@@ -659,7 +659,12 @@ func runVerify(args []string) int {
 				console.Errorln("--sandbox needs a value")
 				return 2
 			}
-			sandbox = args[i]
+			parsed, err := verify.ParseSandbox(args[i])
+			if err != nil {
+				console.Errorln(err)
+				return 2
+			}
+			sandbox = parsed
 		case "--mode":
 			i++
 			if i >= len(args) {

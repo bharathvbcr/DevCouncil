@@ -118,8 +118,8 @@ result’s own mode to interpret a run. Do not infer mode from an old README or
 from an agent’s claimed posture.
 
 Expected commands execute through the local shell in the project root.
-`--sandbox local|docker|nix` records the selection but the gateway does not
-implement Docker or Nix isolation. A task lease is also not a filesystem lock
+There is no Docker or Nix isolation: `--sandbox` accepts only `local`, and any
+other value is refused with exit 2 rather than recorded. A task lease is also not a filesystem lock
 against arbitrary editors. [Repository boundaries](SECURITY_BOUNDARIES.md)
 provide the detailed implementation limits.
 

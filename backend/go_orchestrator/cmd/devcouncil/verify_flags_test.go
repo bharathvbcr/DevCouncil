@@ -41,6 +41,57 @@ func TestVerifyHelpNamesTheCoverageFlag(t *testing.T) {
 	}
 }
 
+// TASK-P7-2: only local execution exists, so any other sandbox is refused as a
+// usage error before a store is opened or a command runs. It used to be
+// accepted and written onto the report as the sandbox the run used.
+func TestVerifyRefusesASandboxItCannotProvide(t *testing.T) {
+	for _, value := range []string{"docker", "nix", "bogus"} {
+		stderr, restore := swapStderr(t)
+		code := dispatch([]string{"verify", "TASK-1", "--sandbox", value})
+		restore()
+
+		if code != 2 {
+			t.Fatalf("--sandbox %s: exit %d, want 2; stderr=%s", value, code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), value) {
+			t.Errorf("--sandbox %s: the refusal must name the value: %q", value, stderr.String())
+		}
+	}
+}
+
+// The two usage texts used to disagree: the top-level usage advertised
+// local|docker|nix while `verify -h` said local.
+func TestVerifyUsageTextsAgreeOnTheSandbox(t *testing.T) {
+	stdout, restoreOut := swapStdout(t)
+	stderr, restoreErr := swapStderr(t)
+	dispatch([]string{"verify", "--help"})
+	restoreErr()
+	restoreOut()
+
+	help := stdout.String() + stderr.String()
+	if !strings.Contains(help, "[--sandbox local]") {
+		t.Errorf("verify --help does not say [--sandbox local]: %q", help)
+	}
+
+	topErr, restoreTop := swapStderr(t)
+	usage()
+	restoreTop()
+	var top string
+	for _, line := range strings.Split(topErr.String(), "\n") {
+		if strings.Contains(line, "devcouncil verify ") {
+			top = line
+		}
+	}
+	if !strings.Contains(top, "[--sandbox local]") {
+		t.Errorf("top-level usage line for verify does not say [--sandbox local]: %q", top)
+	}
+	for _, text := range []string{help, top} {
+		if strings.Contains(text, "docker") || strings.Contains(text, "nix]") {
+			t.Errorf("a usage text still advertises an isolation that does not exist")
+		}
+	}
+}
+
 // TestVerifyStillRefusesUnknownFlags is the positive control for the parser
 // change: adding a case to that switch must not turn it into one that accepts
 // anything. An unknown flag silently ignored is an operator who thinks they

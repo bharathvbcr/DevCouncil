@@ -115,7 +115,6 @@ type Input struct {
 	Root       string
 	Task       *store.Task
 	GateMode   string
-	Sandbox    string
 	Difficulty string
 
 	// ChangedFiles and DiffContent come from git (or a test double).

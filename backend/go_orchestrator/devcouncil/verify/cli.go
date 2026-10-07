@@ -10,6 +10,8 @@ import (
 // RunCLI implements
 // `devcouncil verify [TASK_ID] [--json] [--sandbox local] [--coverage PATH]`.
 //
+// A sandbox other than local is refused with exit 2; see ParseSandbox.
+//
 // coveragePath is empty unless the operator names a profile. The rigor gates
 // that read added lines run regardless; only the diff∩coverage gate needs one,
 // and without it the report says so rather than reporting a diff as exercised.
@@ -19,8 +21,12 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gate
 		writeJSON(payload)
 		return 1
 	}
-	if sandbox == "" {
-		sandbox = "local"
+	sandbox, err := ParseSandbox(sandbox)
+	if err != nil {
+		// A usage error, like an unknown flag: nothing ran, nothing was
+		// recorded, and the operator asked for something this host cannot do.
+		writeJSON(map[string]any{"ok": false, "error": err.Error()})
+		return 2
 	}
 	if gateMode == "" {
 		gateMode = "off"
