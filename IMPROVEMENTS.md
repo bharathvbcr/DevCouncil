@@ -1,5 +1,21 @@
 # DevCouncil Improvement Backlog
 
+> **Historical ledger — read before running anything below (checked 2026-10-07).**
+> The Python product was retired in Phase 7 (2026-09-10; decision table in
+> [docs/PHASE7_LONG_TAIL.md](docs/PHASE7_LONG_TAIL.md)). Commit `3286db5e`
+> (2026-09-10) deleted the 398 files under `src/devcouncil/` together with
+> `pyproject.toml` and `uv.lock`; none of them exists at HEAD. There is no
+> Python package, no `uv` path and no pytest lane: `dev`/`devcouncil` is the Go
+> host (`backend/go_orchestrator`) and the map engine is the Rust workspace
+> (`rust/`). The only `.py` files still tracked are benchmark and repo scripts,
+> parser fixtures under `rust/testdata/`, a demo under `examples/`, and two
+> stdlib-only harness tests for `rust/tools/soak.sh` that CI runs with plain
+> `python3` (`tests/unit/README.md`, `.github/workflows/ci.yml:76-77`). Every
+> Python module path, `uv`/`pytest`/`dev …` command and Python test named in the
+> entries below is the historical record of what was true on that entry's date,
+> not something to run. Entries are kept as written; corrections are added
+> beside them, dated.
+
 Prioritized findings from a full-codebase review (July 2026). File refs verified against source.
 
 ## Status after implementation session (2026-07-05)
@@ -662,6 +678,36 @@ consecutive clean runs. Pre-existing and not a product bug: `flock` is released
 by the OS on process exit, so the leftover PID-named `.lock` files in TMPDIR are
 harmless. Left alone deliberately — retiming a locking test could mask a real
 regression, and the honest report is worth more than a green run.
+
+**Correction (2026-10-07): the `flock`-release explanation above is not
+supported by the code.** The observation (two failures under load, 52/52 clean)
+stays as recorded; the cause it offers was never demonstrated. What the code
+shows:
+
+- The test still exists, body unchanged since `01677010` (2026-09-01):
+  `rust/devmap-serve/src/protocol.rs:2552-2568`.
+- Nothing in `lock_ipc_endpoint_with`, `UnixIpcServer::bind` or its `Drop`
+  (`protocol.rs:1578-1642`, `:1671-1708`, `:1757-1772`) gives a dropped lock
+  file a way to stay locked inside the same process, and the test's own comment
+  (`:2561-2564`) asserts release on drop. After `drop(first)` the socket is
+  unlinked, so the rebind skips the liveness probe; the only step left that can
+  refuse it is `try_lock`. "The release has not taken effect yet" was the one
+  candidate offered, and no code path or measurement backs it.
+- The code under the test changed after this note was written (`f8c9d3ad`,
+  2026-09-02 15:34). `592e3940` (2026-09-02 21:10, not an ancestor of the note)
+  made `Drop` unlink the `.lock` file while still holding the lock
+  (`protocol.rs:1757-1772`), so the rebind now locks a freshly created file.
+  "Leftover PID-named `.lock` files are harmless" described the earlier `Drop`,
+  which removed only the socket; at HEAD a leftover `.lock` means an abnormal
+  exit. `4cfe50d9` (2026-09-05) added a 125 ms retry on `WouldBlock`
+  (`LOCK_CONTENTION_WINDOW`, `protocol.rs:48`, `:1614-1634`). Its own test
+  (`a_briefly_held_endpoint_lock_is_waited_out_not_refused`, `:3214-3263`) is
+  about contention between two daemons, not a drop-then-rebind in one process.
+- The "full pytest run" load source no longer exists (Python retired, `3286db5e`).
+
+Unverified: that the failure was ever reproduced, what actually caused it,
+whether it still occurs at HEAD, and whether the later changes fixed it. No
+cause is recorded in the code or in git history.
 
 ## Dev Map kernel audit, second pass (2026-09-02)
 
