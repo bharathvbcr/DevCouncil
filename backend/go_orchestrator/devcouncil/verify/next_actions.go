@@ -22,6 +22,8 @@ var categoryByGapType = map[string]string{
 	"task_not_implemented":            "plan",
 	"stub_detected":                   "fix_code",
 	"stub_declared":                   "review",
+	"assert_free_test":                "add_test",
+	"skipped_test":                    "add_test",
 	"suspicious_effort":               "review",
 	"coarse_acceptance_proof":         "add_test",
 	"unwired_file":                    "fix_code",

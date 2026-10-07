@@ -70,6 +70,16 @@ const identity = "dc-verify"
 const (
 	GateStubDetection = "stub_detection"
 	GateSecretScan    = "secret_scan"
+	// GateAssertFreeTest and GateSkippedTest are the test-rigor checks in
+	// dc-verify/src/stub_ast.rs: an added test with no assertion in its body,
+	// and an added test that is unconditionally skipped.
+	GateAssertFreeTest = "assert_free_test"
+	GateSkippedTest    = "skipped_test"
+	// GateStubAllowed is not a check that runs. It is where a stub-family
+	// finding lands when an `allow-stub: <reason>` marker covers it: advisory,
+	// carrying the reason, so the report records the decision instead of
+	// losing the stub.
+	GateStubAllowed = "stub_allowed"
 )
 
 // GateDiffCoverage names the coverage half of the rigor layer. It is not a
@@ -370,7 +380,10 @@ func (r *Result) GatesRun() []string {
 	// state in which it was configured away. It is named here so a report that
 	// lists the gates it applied does not leave out the one measurement that
 	// ran on every pass.
-	gates := []string{GateSecretScan, GateStubDetection, GateSubstance}
+	// The test-rigor checks run inside detect_stubs on every check, so they
+	// are as unconditional as the stub gate. GateStubAllowed is an outcome of
+	// that gate, not a gate of its own, and is not listed.
+	gates := []string{GateSecretScan, GateStubDetection, GateAssertFreeTest, GateSkippedTest, GateSubstance}
 	if r.coverageMeasured {
 		gates = append(gates, GateDiffCoverage)
 	}
@@ -544,7 +557,7 @@ func (c *Client) run(ctx context.Context, args []string, stdin string, out any) 
 func validate(out *Result) error {
 	for _, finding := range out.Findings {
 		switch finding.Gate {
-		case GateStubDetection, GateSecretScan:
+		case GateStubDetection, GateSecretScan, GateAssertFreeTest, GateSkippedTest, GateStubAllowed:
 		default:
 			return fmt.Errorf(
 				"verifier reported a finding from gate %q, which this client cannot map to a gap; "+

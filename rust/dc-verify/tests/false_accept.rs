@@ -26,7 +26,8 @@
 //! standing negative control for the gates it was not written for.
 
 use dc_verify::parse_unified;
-use dc_verify::rigor::{Severity, detect_stubs, scan_secrets};
+use dc_verify::rigor::{GATE_STUB_ALLOWED, Severity, detect_stubs, scan_secrets};
+use dc_verify::stub_ast::{GATE_ASSERT_FREE_TEST, GATE_SKIPPED_TEST};
 use dc_verify::substance;
 
 /// What a findings gate must say about a case.
@@ -101,6 +102,9 @@ struct Case {
     name: String,
     secret_scan: Expect,
     stub_detection: Expect,
+    stub_allowed: Expect,
+    assert_free_test: Expect,
+    skipped_test: Expect,
     substance: ExpectSubstance,
     diff: String,
 }
@@ -163,6 +167,9 @@ fn build_case(name: String, headers: &[String], body: &[String]) -> Case {
     };
     let secret_scan = Expect::parse(&find("secret_scan:"), &name, "secret_scan");
     let stub_detection = Expect::parse(&find("stub_detection:"), &name, "stub_detection");
+    let stub_allowed = Expect::parse(&find("stub_allowed:"), &name, "stub_allowed");
+    let assert_free_test = Expect::parse(&find("assert_free_test:"), &name, "assert_free_test");
+    let skipped_test = Expect::parse(&find("skipped_test:"), &name, "skipped_test");
     let substance = ExpectSubstance::parse(&find("substance:"), &name);
 
     let diff = body.join("\n");
@@ -174,6 +181,9 @@ fn build_case(name: String, headers: &[String], body: &[String]) -> Case {
         name,
         secret_scan,
         stub_detection,
+        stub_allowed,
+        assert_free_test,
+        skipped_test,
         substance,
         diff,
     }
@@ -206,10 +216,20 @@ fn the_gates_accept_nothing_they_should_catch_and_flag_nothing_clean() {
             )
         });
 
-        // --- the two findings gates ---
+        // --- the findings gates ---
+        //
+        // detect_stubs reports under four gate names: placeholders and empty
+        // bodies, stubs an allow-stub marker declared, assert-free tests and
+        // skipped tests. Each is judged on its own expectation. With no
+        // working tree here, files the diff adds whole are parsed and every
+        // other file falls back to the substring checks.
+        let stubs = detect_stubs(&files);
         for (gate, expected, findings) in [
             ("secret_scan", case.secret_scan, scan_secrets(&files)),
-            ("stub_detection", case.stub_detection, detect_stubs(&files)),
+            ("stub_detection", case.stub_detection, stubs.clone()),
+            (GATE_STUB_ALLOWED, case.stub_allowed, stubs.clone()),
+            (GATE_ASSERT_FREE_TEST, case.assert_free_test, stubs.clone()),
+            (GATE_SKIPPED_TEST, case.skipped_test, stubs.clone()),
         ] {
             let mine: Vec<_> = findings.iter().filter(|f| f.gate == gate).collect();
             let blocking = mine

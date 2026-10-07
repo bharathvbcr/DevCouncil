@@ -12,7 +12,7 @@
 use std::io::Read;
 use std::process::ExitCode;
 
-use dc_verify::rigor::{Finding, Severity, detect_stubs, intersect_coverage, scan_secrets};
+use dc_verify::rigor::{Finding, Severity, detect_stubs_with, intersect_coverage, scan_secrets};
 use dc_verify::{classify_scope, parse_unified};
 
 #[path = "../evidence_cli.rs"]
@@ -206,7 +206,9 @@ fn check(
 
     let scope = classify_scope(&files, planned);
     let mut findings = scan_secrets(&files);
-    findings.extend(detect_stubs(&files));
+    findings.extend(detect_stubs_with(&files, &|file| {
+        read_post_image(root, &file.path)
+    }));
 
     // Coverage measurements, when the caller supplied them. A missing file is
     // fatal rather than silently treated as "no coverage": a caller that asked
@@ -244,6 +246,42 @@ fn check(
         string_array(&coverage.skipped_by_type),
         substance_object(&substance),
     ))
+}
+
+/// Reads a changed file as it stands in the working tree under `root`, for
+/// the AST stub checks.
+///
+/// `None` sends the file to the substring checks; it is never a clean answer.
+/// The path comes from a diff, so it is refused unless it is relative and
+/// stays inside `root`, and the read is bounded. `detect_stubs_with` then
+/// believes the content only if the diff's added lines are where the diff
+/// says they are.
+fn read_post_image(root: Option<&std::path::Path>, path: &str) -> Option<String> {
+    use std::io::Read as _;
+    use std::path::Component;
+    let root = root?;
+    let rel = std::path::Path::new(path);
+    if !rel
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        return None;
+    }
+    let full = root.join(rel);
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+    if !meta.is_file() || meta.len() > dc_verify::stub_ast::MAX_SOURCE_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&full)
+        .ok()?
+        .take(dc_verify::stub_ast::MAX_SOURCE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > dc_verify::stub_ast::MAX_SOURCE_BYTES {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Renders the substance measurement.

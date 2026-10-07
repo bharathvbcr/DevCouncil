@@ -339,7 +339,7 @@ func TestACleanReportWithNoProfileNeverClaimsCoverageRan(t *testing.T) {
 	// ones", and a proxy stops tracking what it stood for the moment the set
 	// changes: adding the substance measurement made this assertion fail while
 	// the property it was written to hold was still true.
-	want := []string{GateSecretScan, GateStubDetection, GateSubstance}
+	want := []string{GateSecretScan, GateStubDetection, GateAssertFreeTest, GateSkippedTest, GateSubstance}
 	if len(gates) != len(want) {
 		t.Fatalf("GatesRun()=%v, want exactly %v", gates, want)
 	}

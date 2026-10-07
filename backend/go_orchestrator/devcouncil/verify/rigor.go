@@ -240,6 +240,21 @@ func gapsFromFindings(taskID string, findings []dcverify.Finding) []Gap {
 				severity = "low"
 				fix = "Resolve or justify the marker before marking the task done."
 			}
+		case dcverify.GateStubAllowed:
+			// A stub an `allow-stub: <reason>` marker declared intentional.
+			// Recorded rather than dropped, carrying the reason in the
+			// description, so a reviewer can see what was waved through.
+			gapType = "stub_declared"
+			severity = "low"
+			fix = "Review the declared stub and its reason; replace it before the work is called done."
+		case dcverify.GateAssertFreeTest:
+			gapType = "assert_free_test"
+			severity = "medium"
+			fix = "Make the added test assert on the behaviour it is named for, or call a helper that does."
+		case dcverify.GateSkippedTest:
+			gapType = "skipped_test"
+			severity = "medium"
+			fix = "Remove the unconditional skip, or make the skip conditional on what the test needs."
 		default:
 			// Unreachable: dc/dcverify refuses a reply carrying a gate it
 			// cannot map, so this cannot be a finding silently dropped. The

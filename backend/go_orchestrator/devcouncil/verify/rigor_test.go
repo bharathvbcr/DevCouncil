@@ -168,6 +168,54 @@ func TestRigorFindingsRouteToRepairActions(t *testing.T) {
 	}
 }
 
+// The AST checks' gates reach the gap vocabulary: a declared stub as
+// stub_declared carrying its reason, and the two test-rigor checks as their
+// own advisory gaps routed to add_test.
+func TestStubFamilyGatesBecomeTheirGaps(t *testing.T) {
+	in := withRigor(t, "TASK-AST", "enforce")
+	in.Task.PlannedFiles = []dc.PlannedFile{{Path: "src/t.rs", AllowedChange: dc.ChangeCreate}}
+	in.ChangedFiles = []string{"src/t.rs"}
+	in.DiffContent = `diff --git a/src/t.rs b/src/t.rs
+new file mode 100644
+--- /dev/null
++++ b/src/t.rs
+@@ -0,0 +1,8 @@
++// allow-stub: the parser lands in the next task
++pub fn parse() { todo!() }
++#[test]
++#[ignore]
++fn later() { assert!(true); }
++#[test]
++fn hollow() { let _ = parse; }
++
+`
+	gaps, meta := verify.Run(context.Background(), in)
+	byType := gapsByType(gaps)
+	declared := byType["stub_declared"]
+	if len(declared) != 1 || declared[0].Blocking ||
+		!strings.Contains(declared[0].Description, "the parser lands in the next task") {
+		t.Errorf("stub_declared = %+v, want one non-blocking gap carrying the reason", declared)
+	}
+	if n := len(byType["stub_detected"]); n != 0 {
+		t.Errorf("an allowed stub still produced %d stub_detected gaps", n)
+	}
+	result := verify.ToMCP("TASK-AST", gaps, meta)
+	routed := map[string]string{}
+	for _, a := range result.AdvisoryActions {
+		routed[a.GapType] = a.Category
+	}
+	for gapType, category := range map[string]string{
+		"skipped_test": "add_test", "assert_free_test": "add_test", "stub_declared": "review",
+	} {
+		if len(byType[gapType]) != 1 || byType[gapType][0].Blocking {
+			t.Errorf("%s gaps = %+v, want exactly one non-blocking", gapType, byType[gapType])
+		}
+		if routed[gapType] != category {
+			t.Errorf("%s routed to %q, want %q", gapType, routed[gapType], category)
+		}
+	}
+}
+
 // TestAnUnconfiguredVerifierSaysSoRatherThanReportingClean is the honesty
 // invariant at the most common state: dcverify is an optional component, so
 // most repositories run without it.

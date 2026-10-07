@@ -12,7 +12,9 @@
 //! conservative about what it flags: a rigor check with a high false-positive
 //! rate gets turned off, and a gate nobody runs protects nothing.
 
-use crate::FileDiff;
+use std::collections::{HashMap, HashSet};
+
+use crate::{ChangeStatus, FileDiff, stub_ast};
 
 /// How serious a finding is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +87,7 @@ pub struct Finding {
 /// Placeholder markers. Matched case-insensitively against added lines only:
 /// an existing TODO in untouched code is somebody else's decision, and
 /// flagging it would make every diff in a legacy file fail.
-const STUB_MARKERS: &[&str] = &[
+pub(crate) const STUB_MARKERS: &[&str] = &[
     "todo",
     "fixme",
     "xxx:",
@@ -107,18 +109,134 @@ const EMPTY_BODIES: &[&str] = &[
     "pass  # todo",
 ];
 
-/// Runs the stub and effort heuristics over a diff.
+/// The gate an allow-stub marker moves a finding to. See [`apply_allow_stub`].
+pub const GATE_STUB_ALLOWED: &str = "stub_allowed";
+
+/// The marker that declares a stub intentional. It must carry a reason:
+/// `// allow-stub: waiting on the v2 API`. A bare marker suppresses nothing.
+pub const ALLOW_STUB_MARKER: &str = "allow-stub";
+
+/// Runs the stub and test-rigor checks over a diff with no post-change source.
 ///
-/// Only added lines are read. A gate that also read removed lines would flag a
-/// diff for *deleting* a TODO, which is the opposite of what it is for.
+/// Files the diff adds whole are still parsed — their added lines *are* the
+/// file. Everything else falls back to the substring checks. The `dcverify`
+/// binary uses [`detect_stubs_with`] and reads the working tree.
 pub fn detect_stubs(files: &[FileDiff]) -> Vec<Finding> {
+    detect_stubs_with(files, &|_| None)
+}
+
+/// Runs the stub and test-rigor checks, parsing each changed file's
+/// post-change source when `source` can supply it.
+///
+/// Only constructs on added lines are reported. A gate that also read removed
+/// lines would flag a diff for *deleting* a TODO, which is the opposite of
+/// what it is for.
+///
+/// For a file in a language [`stub_ast`] parses, whose source is available and
+/// agrees with the diff, the placeholder, empty-body, skipped-test and
+/// assert-free-test checks come from the tree and are [`Strength::Proven`]
+/// (assert-free: `Derived`). Otherwise the substring checks run, as before, and
+/// say they are `Derived`. Either way the comment-marker check is line-based.
+///
+/// Every finding then passes through [`apply_allow_stub`].
+pub fn detect_stubs_with(
+    files: &[FileDiff],
+    source: &dyn Fn(&FileDiff) -> Option<String>,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
     for file in files {
+        let post_image = post_image(file, source);
+        let lines: Option<Vec<&str>> = post_image.as_deref().map(|s| s.lines().collect());
+        let ast = match (stub_ast::Lang::for_path(&file.path), post_image.as_deref()) {
+            (Some(lang), Some(src)) => {
+                let added: HashSet<u32> = file.added_lines.iter().map(|(n, _)| *n).collect();
+                stub_ast::analyze(lang, src, &added)
+            }
+            _ => None,
+        };
+        let mut mine = Vec::new();
+        let mut scopes = Vec::new();
+        if let Some(ast) = &ast {
+            for f in ast {
+                let evidence = lines
+                    .as_ref()
+                    .and_then(|l| l.get(f.line as usize - 1))
+                    .copied()
+                    .unwrap_or("");
+                mine.push(Finding {
+                    gate: f.gate,
+                    severity: f.severity,
+                    strength: f.strength,
+                    path: file.path.clone(),
+                    line: f.line,
+                    evidence: safe_evidence(evidence),
+                    message: f.message.clone(),
+                });
+                scopes.push(f.scope_line);
+            }
+        }
+        let line_based = substring_findings(file, ast.is_none());
+        scopes.extend(line_based.iter().map(|_| None));
+        mine.extend(line_based);
+        apply_allow_stub(&mut mine, &scopes, file, lines.as_deref());
+        findings.extend(mine);
+    }
+    findings
+}
+
+/// The file as it stands after the change, or `None` when it cannot be known.
+///
+/// A file the diff adds whole is its added lines. Anything else comes from
+/// `source`, and is believed only if every added line of the diff is at its
+/// stated line number in it: a working tree that moved on since the diff was
+/// taken would otherwise attribute findings to the wrong lines.
+fn post_image(file: &FileDiff, source: &dyn Fn(&FileDiff) -> Option<String>) -> Option<String> {
+    let whole_file = file.status == ChangeStatus::Added
+        && file
+            .added_lines
+            .iter()
+            .enumerate()
+            .all(|(i, (n, _))| *n as usize == i + 1);
+    let text = if whole_file {
+        let mut s = String::new();
+        for (_, line) in &file.added_lines {
+            s.push_str(line);
+            s.push('\n');
+        }
+        s
+    } else {
+        source(file)?
+    };
+    if text.len() > stub_ast::MAX_SOURCE_BYTES {
+        return None;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let agrees = file.added_lines.iter().all(|(n, content)| {
+        lines
+            .get((*n as usize).wrapping_sub(1))
+            .is_some_and(|l| l.trim_end_matches('\r') == content.trim_end_matches('\r'))
+    });
+    agrees.then_some(text)
+}
+
+/// The line-based checks: placeholder bodies (only when the file was not
+/// parsed) and comment markers (always).
+fn substring_findings(file: &FileDiff, include_bodies: bool) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    {
         for (line_no, content) in &file.added_lines {
             let lowered = content.to_ascii_lowercase();
             let trimmed = lowered.trim();
+            if trimmed.contains(ALLOW_STUB_MARKER) {
+                // The declaration itself, not a stub. Its reason is recorded
+                // on the finding it covers.
+                continue;
+            }
 
-            if let Some(marker) = EMPTY_BODIES.iter().find(|m| trimmed.contains(**m)) {
+            if let Some(marker) = EMPTY_BODIES
+                .iter()
+                .find(|m| include_bodies && trimmed.contains(**m))
+            {
                 findings.push(Finding {
                     gate: "stub_detection",
                     severity: Severity::Blocking,
@@ -167,6 +285,97 @@ pub fn detect_stubs(files: &[FileDiff]) -> Vec<Finding> {
         }
     }
     findings
+}
+
+/// Honours `allow-stub: <reason>` declarations.
+///
+/// A finding is covered when the marker is on its own line or in the run of
+/// comment, attribute and decorator lines directly above it. A covered finding
+/// with a non-empty reason moves to [`GATE_STUB_ALLOWED`] as an advisory
+/// finding carrying the reason and what it would have been, so the report
+/// records the decision rather than losing the stub. A marker with no reason
+/// is not honoured; the finding stays and says so.
+///
+/// `lines` is the post-change file when known; otherwise the diff's added
+/// lines stand in for it, so only a marker the diff added can cover a finding.
+fn apply_allow_stub(
+    findings: &mut [Finding],
+    scopes: &[Option<u32>],
+    file: &FileDiff,
+    lines: Option<&[&str]>,
+) {
+    let added: HashMap<u32, &str> = file
+        .added_lines
+        .iter()
+        .map(|(n, s)| (*n, s.as_str()))
+        .collect();
+    let line_at = |n: u32| -> Option<&str> {
+        match lines {
+            Some(l) => l.get((n as usize).checked_sub(1)?).copied(),
+            None => added.get(&n).copied(),
+        }
+    };
+    // The marker on `start`, or in the annotation lines directly above it.
+    let declared_at = |start: u32| -> Option<String> {
+        let mut n = start;
+        let mut first = true;
+        while let Some(text) = line_at(n) {
+            let trimmed = text.trim();
+            if !first && !is_annotation_line(trimmed) {
+                return None;
+            }
+            if let Some(r) = allow_stub_reason(trimmed) {
+                return Some(r);
+            }
+            first = false;
+            n = n.checked_sub(1).filter(|m| *m >= 1)?;
+        }
+        None
+    };
+    for (finding, scope) in findings.iter_mut().zip(scopes) {
+        if finding.gate == "secret_scan" {
+            continue;
+        }
+        // A marker on the function covers a placeholder in its body.
+        let reason = declared_at(finding.line).or_else(|| scope.and_then(declared_at));
+        match reason {
+            Some(r) if !r.is_empty() => {
+                finding.message = format!("stub allowed: {r} (was: {})", finding.message);
+                finding.gate = GATE_STUB_ALLOWED;
+                finding.severity = Severity::Advisory;
+            }
+            Some(_) => {
+                finding.message = format!(
+                    "{} (an {ALLOW_STUB_MARKER} marker covers this line but gives no reason, \
+                     so it is not honoured)",
+                    finding.message
+                );
+            }
+            None => {}
+        }
+    }
+}
+
+/// A line that sits between a declaration and what it annotates.
+fn is_annotation_line(trimmed: &str) -> bool {
+    trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with('@')
+        || trimmed.starts_with("--")
+}
+
+/// The reason an allow-stub marker on this line gives, `Some("")` for a
+/// marker with none, or `None` when there is no marker.
+fn allow_stub_reason(line: &str) -> Option<String> {
+    let at = line.to_ascii_lowercase().find(ALLOW_STUB_MARKER)?;
+    let rest = &line[at + ALLOW_STUB_MARKER.len()..];
+    let reason = rest
+        .trim_start_matches([':', '(', ' ', '\t', '='])
+        .trim_end_matches(['*', '/', ')', '>', '-', ' ', '\t'])
+        .trim();
+    Some(reason.to_string())
 }
 
 /// Reports whether a line looks like a comment or a string literal, which is
