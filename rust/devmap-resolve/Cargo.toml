@@ -203,3 +203,7 @@ required-features = ["parse"]
 [[test]]
 name = "typed_receivers"
 required-features = ["parse"]
+
+[[test]]
+name = "real_corpus_resolution"
+required-features = ["parse"]
