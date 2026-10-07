@@ -33,6 +33,7 @@ import (
 // that are *not* in that map.
 var storeCommands = []string{
 	"acquire", "diagnose", "release", "renew", "active", "list", "task", "ready", "health", "scope-append",
+	"requirements",
 }
 
 // FuzzStoreReplyIsNeverAZeroValueReadAsSuccess fuzzes the Go side of the store

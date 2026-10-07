@@ -83,6 +83,8 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
     (
         "devmap-query",
         &[
+            // Exists to run without grammars: GitPulse's shape.
+            "a_query_only_build_can_call_a_store_current",
             "artifact_writer_security",
             "artifacts_sidecar_adversarial",
             "documentation_visibility",
@@ -110,6 +112,8 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         "devmap-store",
         &[
             "a_corrupt_analysis_is_not_an_absent_one",
+            // Store opens and the WAL lock protocol; no extraction anywhere.
+            "a_second_open_keeps_the_first_connections_locks",
             "a_refusal_names_its_reason_not_a_parameter",
             "adversarial_store",
             "coverage_gap_inventory",

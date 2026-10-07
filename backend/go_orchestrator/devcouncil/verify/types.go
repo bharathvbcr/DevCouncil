@@ -126,6 +126,13 @@ type Input struct {
 	// Commands are expected_tests, falling back to allowed_commands.
 	Commands []string
 
+	// Requirements are the requirements the task links to, which carry the
+	// verification method of each acceptance criterion it claims.
+	// RequirementsErr is set when they could not be read, and then every
+	// claimed criterion blocks (criteria.go).
+	Requirements    store.LinkedRequirements
+	RequirementsErr error
+
 	// Rigor runs the stub, secret and diff∩coverage gates by spawning
 	// dcverify. Nil means they do not run, which is reported as
 	// RigorSkippedReason and never as a clean rigor pass.

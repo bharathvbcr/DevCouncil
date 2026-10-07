@@ -10,6 +10,14 @@ dc-glob = { path = "../dc-glob" }
 dc-proc = { path = "../dc-proc" }
 dc-evidence = { path = "../dc-evidence" }
 serde_json = "1.0.151"
+# AST-aware stub and test-rigor detection (src/stub_ast.rs). The same grammar
+# versions devmap-extract already builds, from the workspace table; enabled
+# unconditionally, so there is no feature-off shape to rot.
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-typescript = { workspace = true }
 
 [lints]
 workspace = true

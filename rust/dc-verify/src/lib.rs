@@ -19,6 +19,7 @@
 pub mod coverage;
 pub mod json_stdout;
 pub mod rigor;
+pub mod stub_ast;
 pub mod substance;
 
 use std::fmt;

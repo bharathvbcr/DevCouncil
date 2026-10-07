@@ -39,12 +39,11 @@ required-features = ["parse"]
 name = "symbols_for_file"
 required-features = ["parse"]
 
-# The carry-forward guards these tests exercise only exist when an identity can
-# be computed: with `parse` off, `current_payload_identity` returns `None`, no
-# payload is ever carried, and the partial-extraction write is refused outright
-# rather than reaching the decision under test. Gated rather than listed as
-# feature-off-safe because the tests would not merely fail to compile -- they
-# would assert something else.
+# The carry-forward guards these tests exercise live in `save_generation_timed`,
+# which is `#[cfg(feature = "parse")]`: a build without grammars writes no
+# generation, so the decision under test is never reached. Gated rather than
+# listed as feature-off-safe because the tests would not merely fail to compile
+# -- they would assert something else.
 [[test]]
 name = "a_differential_write_trusts_what_it_read"
 required-features = ["parse"]

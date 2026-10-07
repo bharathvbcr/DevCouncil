@@ -70,6 +70,16 @@ const identity = "dc-verify"
 const (
 	GateStubDetection = "stub_detection"
 	GateSecretScan    = "secret_scan"
+	// GateAssertFreeTest and GateSkippedTest are the test-rigor checks in
+	// dc-verify/src/stub_ast.rs: an added test with no assertion in its body,
+	// and an added test that is unconditionally skipped.
+	GateAssertFreeTest = "assert_free_test"
+	GateSkippedTest    = "skipped_test"
+	// GateStubAllowed is not a check that runs. It is where a stub-family
+	// finding lands when an `allow-stub: <reason>` marker covers it: advisory,
+	// carrying the reason, so the report records the decision instead of
+	// losing the stub.
+	GateStubAllowed = "stub_allowed"
 )
 
 // GateDiffCoverage names the coverage half of the rigor layer. It is not a
@@ -302,6 +312,12 @@ type Result struct {
 	// has to attach before it can be acted on.
 	Substance Substance `json:"substance"`
 
+	// StubASTParsedFiles is how many changed files the stub checks parsed
+	// rather than line-matched. The test-rigor gates run only on those, so
+	// GatesRun names them only when it is above zero. An older verifier sends
+	// no count, which reads as zero: it parsed nothing.
+	StubASTParsedFiles int `json:"stub_ast_parsed_files"`
+
 	// The coverage arrays as they arrive. Callers read Coverage instead, which
 	// carries the same data with the measured/unmeasured distinction that makes
 	// it safe to act on; these stay unexported-by-intent behind that accessor.
@@ -327,6 +343,7 @@ type wireResult struct {
 	CoverageUnmeasured    []string      `json:"coverage_unmeasured"`
 	CoverageGaps          []CoverageGap `json:"coverage_gaps"`
 	CoverageSkippedByType []string      `json:"coverage_skipped_by_type"`
+	StubASTParsedFiles    int           `json:"stub_ast_parsed_files"`
 	// A pointer so its ABSENCE is detectable. A verifier built before the
 	// substance gate existed emits no `substance` key, which decodes into a
 	// zero value — nought added lines, judged false — and that is
@@ -371,6 +388,14 @@ func (r *Result) GatesRun() []string {
 	// lists the gates it applied does not leave out the one measurement that
 	// ran on every pass.
 	gates := []string{GateSecretScan, GateStubDetection, GateSubstance}
+	// The test-rigor checks run only on files the verifier parsed (Rust, Go,
+	// Python, TypeScript with a source that matched the diff). A diff with
+	// none of those ran neither check, and naming them would report a test
+	// examination that never happened. GateStubAllowed is an outcome of the
+	// stub gate, not a gate of its own, and is never listed.
+	if r.StubASTParsedFiles > 0 {
+		gates = append(gates, GateAssertFreeTest, GateSkippedTest)
+	}
 	if r.coverageMeasured {
 		gates = append(gates, GateDiffCoverage)
 	}
@@ -418,6 +443,7 @@ func (c *Client) Check(ctx context.Context, req Request) (*Result, error) {
 		Orphans:               wire.Orphans,
 		UntouchedPlanned:      wire.UntouchedPlanned,
 		Findings:              wire.Findings,
+		StubASTParsedFiles:    wire.StubASTParsedFiles,
 		coverageGaps:          wire.CoverageGaps,
 		coverageUnmeasured:    wire.CoverageUnmeasured,
 		coverageSkippedByType: wire.CoverageSkippedByType,
@@ -544,7 +570,7 @@ func (c *Client) run(ctx context.Context, args []string, stdin string, out any) 
 func validate(out *Result) error {
 	for _, finding := range out.Findings {
 		switch finding.Gate {
-		case GateStubDetection, GateSecretScan:
+		case GateStubDetection, GateSecretScan, GateAssertFreeTest, GateSkippedTest, GateStubAllowed:
 		default:
 			return fmt.Errorf(
 				"verifier reported a finding from gate %q, which this client cannot map to a gap; "+
@@ -578,6 +604,10 @@ func validate(out *Result) error {
 
 	if out.Files < 0 {
 		return fmt.Errorf("verifier reported %d files, which is not a count", out.Files)
+	}
+	if out.StubASTParsedFiles < 0 || out.StubASTParsedFiles > out.Files {
+		return fmt.Errorf("verifier reported %d parsed files for a diff of %d files",
+			out.StubASTParsedFiles, out.Files)
 	}
 
 	// The substance classes must partition the added lines. Checked here as

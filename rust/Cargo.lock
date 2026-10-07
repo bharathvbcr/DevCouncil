@@ -342,6 +342,11 @@ dependencies = [
  "dc-glob",
  "dc-proc",
  "serde_json",
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
 ]
 
 [[package]]
@@ -441,6 +446,7 @@ dependencies = [
  "devmap-store",
  "libc",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
 ]

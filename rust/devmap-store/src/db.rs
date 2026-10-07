@@ -2242,34 +2242,6 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// The identity a payload written by *this* build would carry, or `None` when
-/// this build cannot know.
-///
-/// The answer is the compiled grammar versions, so without the `parse` feature
-/// there is no answer — not "current" and not "stale", but *unknown*. That
-/// distinction is the whole reason this is one function: both callers previously
-/// reached straight into `devmap_extract::cache`, which is `#[cfg(feature =
-/// "parse")]`, so `--no-default-features` did not compile at all and the
-/// feature's own documentation ("Off, this crate builds without tree-sitter and
-/// answers questions about a persisted map rather than building one") was false.
-/// That configuration is not hypothetical: `devmap-extract/Cargo.toml` records
-/// GitPulse linking `devmap-query` to answer impact queries in-process, never
-/// indexing, and paying 49 crates and 32 C-compiled grammars for it.
-///
-/// Neither caller may turn `None` into a match. A payload whose currency was
-/// never checked must not be reported as current.
-fn current_payload_identity(language: &str) -> Option<(String, String)> {
-    #[cfg(feature = "parse")]
-    {
-        Some(devmap_extract::cache::current_payload_identity(language))
-    }
-    #[cfg(not(feature = "parse"))]
-    {
-        let _ = language;
-        None
-    }
-}
-
 impl Store {
     /// Page cache for a write connection, in KiB (negative = KiB, per SQLite).
     ///
@@ -3510,8 +3482,16 @@ impl Store {
     /// kernel's to keep consistent. Best-effort and owner-only: a sidecar
     /// another user owns is left for that user, and the write that follows
     /// reports it.
-    fn checked_sidecars(db_path: &Path) -> Result<Vec<devmap_extract::safe_fs::SafeFile>> {
-        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+    /// Validate both WAL sidecars and report the ones present.
+    ///
+    /// Inspected through their directory entries, never opened: this runs on
+    /// every open, in processes that already hold connections to this store,
+    /// and closing a descriptor on `-shm` releases every SQLite lock the
+    /// process holds on it. See `safe_fs::inspect_regular` and
+    /// `tests/a_second_open_keeps_the_first_connections_locks.rs`.
+    fn checked_sidecars(
+        db_path: &Path,
+    ) -> Result<Vec<(std::path::PathBuf, devmap_extract::safe_fs::EntryStatus)>> {
         // Validate both siblings before SQLite or permission repair touches
         // either. A missing sibling is normal; an unsafe one is a refusal.
         let mut sidecars = Vec::new();
@@ -3519,16 +3499,15 @@ impl Store {
             let mut name = db_path.as_os_str().to_os_string();
             name.push(suffix);
             let path = std::path::PathBuf::from(name);
-            match SafeFile::open(&path, Access::Read, Creation::Never) {
-                Ok(file) => {
-                    let links = devmap_extract::safe_fs::file_link_count(&file)
-                        .map_err(|error| refusal(error.to_string()))?;
-                    match sidecar_links(links) {
-                        SidecarLinks::Single => sidecars.push(file),
-                        // SQLite deletes `-wal` when the last writer connection
-                        // closes, so a build committing between this open and
-                        // this check leaves an unlinked handle. That is the
-                        // missing-sibling case below, not an alias.
+            match devmap_extract::safe_fs::inspect_regular(&path) {
+                Ok(entry) => {
+                    match sidecar_links(entry.links) {
+                        SidecarLinks::Single => sidecars.push((path, entry)),
+                        // A directory entry never reports zero links — a
+                        // sidecar SQLite deleted between the lookup and the
+                        // stat arrives as `NotFound` below — but the count is
+                        // the classifier's to read, and an unlinked file is the
+                        // missing-sibling case, not an alias.
                         SidecarLinks::Unlinked => {}
                         SidecarLinks::Aliased => {
                             return Err(refusal(format!(
@@ -3553,34 +3532,74 @@ impl Store {
     fn repair_sidecar_modes(db_path: &Path) -> Result<()> {
         #[cfg(unix)]
         {
-            use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+            use devmap_extract::safe_fs::{Access, Creation, EntryStatus, SafeFile};
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
             let sidecars = Self::checked_sidecars(db_path)?;
             const OWNER_WRITE: u32 = 0o200;
+            // Decided from directory entries, with no descriptor on the store:
+            // this runs before every writable open, usually in a process that
+            // already holds a connection to this store, and closing a handle on
+            // it would release that connection's locks. See `checked_sidecars`.
+            let own = match devmap_extract::safe_fs::inspect_regular(db_path) {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(refusal(error.to_string())),
+            };
+            // Only our own writable database authorizes repairing our sidecars.
+            if own.mode & OWNER_WRITE == 0 || !own.is_owned_by_current_user() {
+                return Ok(());
+            }
+            let needing: Vec<(std::path::PathBuf, EntryStatus)> = sidecars
+                .into_iter()
+                .filter(|(_, entry)| entry.uid == own.uid && entry.mode & OWNER_WRITE == 0)
+                .collect();
+            if needing.is_empty() {
+                return Ok(());
+            }
+            // The repair itself needs handles: `fchmod` and the replacement
+            // checks below are descriptor operations. Reaching here means a
+            // sidecar this user owns lacks the owner-write bit, which SQLite
+            // never leaves on a sidecar a writable connection created — it
+            // takes a read of a store that was read-only at the time. A
+            // connection this process opened *then* and still holds is the one
+            // whose locks these handles' close can release; that is named here
+            // rather than handled, because the alternative is chmod by path.
+            let same_entry = |file: &SafeFile, entry: &EntryStatus| -> Result<bool> {
+                let held = file
+                    .metadata()
+                    .map_err(|error| refusal(error.to_string()))?;
+                Ok(held.dev() == entry.dev && held.ino() == entry.ino)
+            };
             let database = match SafeFile::open(db_path, Access::Read, Creation::Never) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(refusal(error.to_string())),
             };
-            let own = database
-                .metadata()
-                .map_err(|error| refusal(error.to_string()))?;
-            // Only our own writable database authorizes repairing our sidecars.
-            if own.mode() & OWNER_WRITE == 0
-                || !database
-                    .is_owned_by_current_user()
-                    .map_err(|error| refusal(error.to_string()))?
-            {
-                return Ok(());
+            if !same_entry(&database, &own)? {
+                return Err(refusal(format!(
+                    "database {} was replaced while its sidecars were being examined",
+                    db_path.display()
+                )));
             }
             let mut repairs = Vec::new();
-            for file in sidecars {
-                let metadata = file
-                    .metadata()
-                    .map_err(|error| refusal(error.to_string()))?;
-                if metadata.uid() == own.uid() && metadata.mode() & OWNER_WRITE == 0 {
-                    repairs.push((file, metadata.permissions()));
+            for (path, entry) in needing {
+                let file = match SafeFile::open(&path, Access::Read, Creation::Never) {
+                    Ok(file) => file,
+                    // Deleted by SQLite since it was inspected: nothing to repair.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(refusal(error.to_string())),
+                };
+                if !same_entry(&file, &entry)? {
+                    return Err(refusal(format!(
+                        "sidecar {} was replaced while being examined",
+                        path.display()
+                    )));
                 }
+                let permissions = file
+                    .metadata()
+                    .map_err(|error| refusal(error.to_string()))?
+                    .permissions();
+                repairs.push((file, permissions));
             }
             if repairs.is_empty() {
                 return Ok(());
@@ -4736,16 +4755,10 @@ impl Store {
                     if deleted.contains(&path) || affected.contains(&path) {
                         continue;
                     }
-                    // `None` (no parsing frontend) is deliberately not a
-                    // match: carrying a row forward on an identity this build
-                    // could not compute would claim a currency nothing checked.
-                    // Not carrying is merely conservative.
-                    let identity_matches = current_payload_identity(&language).is_some_and(
-                        |(current_grammar, current_analyzer)| {
-                            grammar.as_deref() == Some(current_grammar.as_str())
-                                && analyzer.as_deref() == Some(current_analyzer.as_str())
-                        },
-                    );
+                    let (current_grammar, current_analyzer) =
+                        devmap_extract::cache::current_payload_identity(&language);
+                    let identity_matches = grammar.as_deref() == Some(current_grammar.as_str())
+                        && analyzer.as_deref() == Some(current_analyzer.as_str());
                     // A content hash that moved without the path being declared
                     // affected means the caller's affected set is wrong; the
                     // stored payload describes different bytes either way.
@@ -6419,19 +6432,12 @@ impl Store {
         })?;
         for row in rows {
             let (language, grammar, analyzer) = row?;
-            let Some((current_grammar, current_analyzer)) = current_payload_identity(&language)
-            else {
-                // Loud, not `false`. `false` means "rebuild", and a build with
-                // no parsing frontend cannot rebuild — the caller would loop.
-                // `true` would be worse: a currency claim from a check that did
-                // not run.
-                return Err(refusal(format!(
-                    "whether the stored payload is current cannot be decided by this build: \
-                     the answer is the compiled grammar version for {language:?}, and this \
-                     binary was built without the parsing frontend. Build with \
-                     `--features parse` to ask."
-                )));
-            };
+            // Answers without the parsing frontend too, from the identities a
+            // parsing build of this version stamps (`PAYLOAD_GRAMMAR_IDENTITIES`,
+            // pinned to the compiled grammars by a test). A query-only reader
+            // such as GitPulse's could otherwise never call a store current.
+            let (current_grammar, current_analyzer) =
+                devmap_extract::cache::current_payload_identity(&language);
             // A NULL version predates these columns: unknown identity is not a
             // matching one.
             if grammar.as_deref() != Some(current_grammar.as_str())

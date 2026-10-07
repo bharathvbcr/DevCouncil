@@ -339,6 +339,9 @@ func TestACleanReportWithNoProfileNeverClaimsCoverageRan(t *testing.T) {
 	// ones", and a proxy stops tracking what it stood for the moment the set
 	// changes: adding the substance measurement made this assertion fail while
 	// the property it was written to hold was still true.
+	//
+	// The test-rigor gates are not among them: they run only on files the
+	// verifier parsed, and this reply parsed none.
 	want := []string{GateSecretScan, GateStubDetection, GateSubstance}
 	if len(gates) != len(want) {
 		t.Fatalf("GatesRun()=%v, want exactly %v", gates, want)
@@ -347,6 +350,32 @@ func TestACleanReportWithNoProfileNeverClaimsCoverageRan(t *testing.T) {
 		if gates[i] != gate {
 			t.Fatalf("GatesRun()=%v, want exactly %v", gates, want)
 		}
+	}
+}
+
+// The assert-free and skipped-test checks examine only files the verifier
+// parsed. A diff of languages it does not parse ran neither, and the report
+// must not list them as applied; one parsed file means they ran.
+func TestTestRigorGatesCountAsRunOnlyWhenAFileWasParsed(t *testing.T) {
+	parsed := strings.Replace(cleanReply, `"files":1,`, `"files":1,"stub_ast_parsed_files":1,`, 1)
+	result, err := checkWith(t, reply(t, parsed), Request{Diff: oneFileDiff})
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	got := strings.Join(result.GatesRun(), ",")
+	for _, gate := range []string{GateAssertFreeTest, GateSkippedTest} {
+		if !strings.Contains(got, gate) {
+			t.Errorf("GatesRun()=%s omits %s although a file was parsed", got, gate)
+		}
+	}
+
+	negative := strings.Replace(cleanReply, `"files":1,`, `"files":1,"stub_ast_parsed_files":-1,`, 1)
+	if _, err := checkWith(t, reply(t, negative), Request{Diff: oneFileDiff}); err == nil {
+		t.Error("a negative parsed-file count was accepted")
+	}
+	tooMany := strings.Replace(cleanReply, `"files":1,`, `"files":1,"stub_ast_parsed_files":2,`, 1)
+	if _, err := checkWith(t, reply(t, tooMany), Request{Diff: oneFileDiff}); err == nil {
+		t.Error("more parsed files than the diff touched was accepted")
 	}
 }
 

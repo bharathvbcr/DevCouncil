@@ -121,7 +121,18 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 			commands = in.Task.AllowedCommands
 		}
 	}
-	gaps = append(gaps, RunVerificationCommands(taskID, commands, in.RunCommand)...)
+	commandGaps := RunVerificationCommands(taskID, commands, in.RunCommand)
+	gaps = append(gaps, commandGaps...)
+
+	// Each claimed acceptance criterion, dispatched on its verification
+	// method. Commands count as passing only if at least one ran and none
+	// produced a gap: no commands is no evidence, not clean evidence.
+	var claimed []string
+	if in.Task != nil {
+		claimed = in.Task.AcceptanceCriterionIDs
+	}
+	commandsPassed := len(commands) > 0 && len(commandGaps) == 0
+	gaps = append(gaps, dispatchCriteria(taskID, claimed, in.Requirements, in.RequirementsErr, commands, commandsPassed)...)
 
 	// Stub detection, secret scanning and diff∩coverage, all of which live in
 	// dcverify. The outcome carries its own account of what ran: never
@@ -427,19 +438,30 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID, 
 		// never as a pass.
 		changed, diff, empty = nil, "", true
 	}
+	// Read only when the task claims criteria, so a task without any costs no
+	// extra store round trip. A read error is carried, not returned: it
+	// becomes a blocking gap per criterion, beside everything else this run
+	// can still say.
+	var linked store.LinkedRequirements
+	var linkedErr error
+	if len(task.AcceptanceCriterionIDs) > 0 {
+		linked, linkedErr = client.Requirements(ctx, taskID)
+	}
 	in := Input{
-		Root:         root,
-		Task:         task,
-		GateMode:     gateMode,
-		Difficulty:   task.Difficulty,
-		ChangedFiles: changed,
-		DiffContent:  diff,
-		DiffEmpty:    empty,
-		WorkPresent:  !empty,
-		RunCommand:   DefaultRunCommand(root),
-		Rigor:        RigorClient(root),
-		CoveragePath: coveragePath,
-		Lappi:        LappiAsker(),
+		Requirements:    linked,
+		RequirementsErr: linkedErr,
+		Root:            root,
+		Task:            task,
+		GateMode:        gateMode,
+		Difficulty:      task.Difficulty,
+		ChangedFiles:    changed,
+		DiffContent:     diff,
+		DiffEmpty:       empty,
+		WorkPresent:     !empty,
+		RunCommand:      DefaultRunCommand(root),
+		Rigor:           RigorClient(root),
+		CoveragePath:    coveragePath,
+		Lappi:           LappiAsker(),
 	}
 	gaps, meta := Run(ctx, in)
 	result := ToMCP(taskID, gaps, meta)
