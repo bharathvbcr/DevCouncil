@@ -27,6 +27,7 @@ pub mod map_preview;
 pub mod model;
 pub mod query_match;
 pub mod rung;
+pub mod scope;
 pub mod snapshots;
 pub mod stat_memo;
 
@@ -76,3 +77,4 @@ pub use snapshots::{semantic_snapshot_for_file, semantic_snapshots, SemanticSnap
 
 pub use ask::{ASK_DEFAULT_MIN_CONFIDENCE, ASK_MAX_ITERS, ASK_RESTART};
 pub use rung::{filter_by_rung, histogram as rung_histogram, Rung, RungHistogram};
+pub use scope::{ResolvedScope, ScopeReport, SymbolScope, MAX_SCOPE_LANGUAGES, MAX_SCOPE_PATHS};

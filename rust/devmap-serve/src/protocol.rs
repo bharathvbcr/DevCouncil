@@ -366,6 +366,14 @@ pub enum IpcCommand {
         /// gets exactly the search it always got.
         #[serde(default)]
         semantic: bool,
+        /// Repository-relative path prefixes the ranking is restricted to.
+        /// Semantic search only: keyword search with a scope is refused. An older daemon
+        /// ignores this field; see `scope_of`.
+        #[serde(default)]
+        paths: Vec<String>,
+        /// Languages the ranking is restricted to, as the extractor labels them.
+        #[serde(default)]
+        languages: Vec<String>,
     },
     /// Plain-language find: name+docstring TF-IDF seeds, re-ranked by
     /// personalized PageRank over call edges. Distinct from `Search` with
@@ -377,6 +385,12 @@ pub enum IpcCommand {
         /// Minimum call-edge confidence. Defaults to the deterministic rung.
         #[serde(default = "default_ask_confidence")]
         min_confidence: f32,
+        /// Path prefixes to rank within; see `scope_of`.
+        #[serde(default)]
+        paths: Vec<String>,
+        /// Languages to rank within; see `scope_of`.
+        #[serde(default)]
+        languages: Vec<String>,
     },
     /// [`Self::Ask`], answered as an evidence pack: the same hits grouped by
     /// file with a role, the call edges between hits, and nested source
@@ -387,6 +401,10 @@ pub enum IpcCommand {
         budget: u32,
         #[serde(default = "default_ask_confidence")]
         min_confidence: f32,
+        #[serde(default)]
+        paths: Vec<String>,
+        #[serde(default)]
+        languages: Vec<String>,
     },
     Deps {
         target: String,
@@ -655,7 +673,64 @@ fn request_min_rung(command: &IpcCommand) -> Option<&str> {
     }
 }
 
+/// The scope a ranking command carries, checked for shape.
+///
+/// `Ok(None)` for a command with no scope, or none given. Whether each prefix
+/// and language names something indexed is checked by the engine against the
+/// generation it ranks, the only place that question has an answer.
+///
+/// A client sending a scope over the socket to an older daemon gets an
+/// unscoped answer: the socket protocol ignores fields it does not know so
+/// that a newer client can talk to an older kernel. That client must require
+/// `scope` on the answer, which only a daemon that applied one sets. The MCP
+/// surface has no such gap — it dispatches in-process and refuses arguments
+/// its schema does not declare.
+fn scope_of(command: &IpcCommand) -> Result<Option<devmap_query::SymbolScope>, String> {
+    match command {
+        IpcCommand::Search {
+            paths,
+            languages,
+            semantic,
+            ..
+        } => scope_from(paths, languages, *semantic),
+        IpcCommand::Ask {
+            paths, languages, ..
+        }
+        | IpcCommand::AskEvidence {
+            paths, languages, ..
+        } => scope_from(paths, languages, true),
+        _ => Ok(None),
+    }
+}
+
+/// [`scope_of`] over the fields themselves, for `dispatch`, which has already
+/// destructured the command. `ranked` is false only for keyword search.
+fn scope_from(
+    paths: &[String],
+    languages: &[String],
+    ranked: bool,
+) -> Result<Option<devmap_query::SymbolScope>, String> {
+    let scope = devmap_query::SymbolScope::new(paths, languages).map_err(|err| err.to_string())?;
+    if scope.is_some() && !ranked {
+        // Refused, not applied after the fact: the store cuts keyword search
+        // to a bm25-ordered page before anything here sees it, so a scope
+        // applied to that page would rank over whatever the whole-corpus cut
+        // happened to keep, and count against a total it did not scope.
+        return Err(
+            "paths and languages scope semantic search only; keyword search ranks a page the \
+             full-text index has already cut from the whole repository. Pass semantic: true, \
+             or drop the scope"
+                .to_string(),
+        );
+    }
+    Ok(scope)
+}
+
 pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
+    // Before the store is touched, for the reason `Blast` gives below: a
+    // caller-fixable argument must not be masked by an environment fault.
+    scope_of(&request.command)?;
+
     // Refused, never defaulted. A typo silently answered at full breadth is a
     // filtered answer the caller believes is narrow — the same class of error
     // as `Clones::kind`, which this mirrors deliberately.
@@ -727,11 +802,13 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
             query,
             budget,
             min_confidence,
+            ..
         }
         | IpcCommand::AskEvidence {
             query,
             budget,
             min_confidence,
+            ..
         } => (query.as_str(), *budget, 1, Some(*min_confidence)),
         IpcCommand::Deps {
             target,
@@ -1043,9 +1120,14 @@ pub(crate) fn dispatch(
             query,
             budget,
             semantic,
+            paths,
+            languages,
         } => {
+            // Re-derived rather than trusted from `validate_request`: a scope
+            // that reached here unchecked is still refused, never dropped.
+            let scope = scope_from(&paths, &languages, semantic).map_err(anyhow::Error::msg)?;
             let response = if semantic {
-                engine.search_semantic(&query, budget)?
+                engine.search_semantic_scoped(&query, budget, scope.as_ref())?
             } else {
                 engine.search(Request {
                     query,
@@ -1060,20 +1142,32 @@ pub(crate) fn dispatch(
             query,
             budget,
             min_confidence,
-        } => Ok(serde_json::to_value(engine.ask(
-            &query,
-            budget,
-            min_confidence,
-        )?)?),
+            paths,
+            languages,
+        } => {
+            let scope = scope_from(&paths, &languages, true).map_err(anyhow::Error::msg)?;
+            Ok(serde_json::to_value(engine.ask_scoped(
+                &query,
+                budget,
+                min_confidence,
+                scope.as_ref(),
+            )?)?)
+        }
         IpcCommand::AskEvidence {
             query,
             budget,
             min_confidence,
-        } => Ok(serde_json::to_value(engine.ask_evidence(
-            &query,
-            budget,
-            min_confidence,
-        )?)?),
+            paths,
+            languages,
+        } => {
+            let scope = scope_from(&paths, &languages, true).map_err(anyhow::Error::msg)?;
+            Ok(serde_json::to_value(engine.ask_evidence_scoped(
+                &query,
+                budget,
+                min_confidence,
+                scope.as_ref(),
+            )?)?)
+        }
         IpcCommand::Deps {
             target,
             budget,
@@ -2142,6 +2236,144 @@ mod tests {
         );
     }
 
+    /// A scope given as MCP arguments reaches the engine.
+    ///
+    /// The MCP layer builds an `IpcCommand` by deserialising the argument
+    /// object, and `IpcCommand` ignores fields it does not know. So a scope
+    /// declared in the tool schema but spelled differently in the enum would
+    /// pass validation and be dropped, answering unscoped. The `scope` on the
+    /// answer is what only an applied scope sets.
+    #[test]
+    fn a_scope_given_as_mcp_arguments_reaches_every_ranking_command() {
+        let store = corpus_store(8, None);
+        for (tool, extra) in [
+            ("devmap_ask", serde_json::json!({})),
+            ("devmap_ask_evidence", serde_json::json!({})),
+            ("devmap_search", serde_json::json!({"semantic": true})),
+        ] {
+            let mut arguments = serde_json::json!({
+                "query": "widget",
+                "paths": ["./things.py"],
+                "languages": ["Python"],
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                arguments[key] = value.clone();
+            }
+            let command = crate::mcp::to_ipc_command(tool, Some(&arguments))
+                .unwrap_or_else(|err| panic!("{tool}: {err:?}"));
+            let request = IpcRequest {
+                version: PROTOCOL_VERSION,
+                command,
+            };
+            validate_request(&request).unwrap_or_else(|err| panic!("{tool}: {err}"));
+            let value = dispatch(
+                &store,
+                request,
+                &devmap_query::Cancel::new(),
+                &UnappliedEdits::default(),
+            )
+            .unwrap_or_else(|err| panic!("{tool}: {err}"));
+            assert_eq!(
+                value["scope"]["paths"],
+                serde_json::json!(["things.py"]),
+                "{tool}"
+            );
+            assert_eq!(
+                value["scope"]["languages"],
+                serde_json::json!(["python"]),
+                "{tool}"
+            );
+            assert_eq!(value["scope"]["files"], 1, "{tool}: {value}");
+        }
+    }
+
+    #[test]
+    fn a_scope_naming_no_indexed_file_is_refused_at_dispatch() {
+        let store = corpus_store(8, None);
+        let request = IpcRequest {
+            version: PROTOCOL_VERSION,
+            command: IpcCommand::Ask {
+                query: "widget".to_string(),
+                budget: 2_000,
+                min_confidence: devmap_query::ASK_DEFAULT_MIN_CONFIDENCE,
+                paths: vec!["frontend".to_string()],
+                languages: Vec::new(),
+            },
+        };
+        assert!(
+            validate_request(&request).is_ok(),
+            "existence is the engine's check"
+        );
+        let error = dispatch(
+            &store,
+            request,
+            &devmap_query::Cancel::new(),
+            &UnappliedEdits::default(),
+        )
+        .expect_err("a prefix matching nothing must be refused, not answered empty")
+        .to_string();
+        assert!(
+            error.contains("\"frontend\" matches no indexed file"),
+            "{error}"
+        );
+    }
+
+    /// Keyword search ranks a page the full-text index already cut from the
+    /// whole repository, so a scope cannot be applied before ranking there.
+    /// It is refused rather than applied to the page or ignored.
+    #[test]
+    fn a_scope_on_keyword_search_is_refused_before_and_at_dispatch() {
+        let keyword = || IpcRequest {
+            version: PROTOCOL_VERSION,
+            command: IpcCommand::Search {
+                query: "widget".to_string(),
+                budget: 2_000,
+                semantic: false,
+                paths: vec!["things.py".to_string()],
+                languages: Vec::new(),
+            },
+        };
+        let error = validate_request(&keyword()).unwrap_err();
+        assert!(error.contains("semantic search only"), "{error}");
+        let error = dispatch(
+            &corpus_store(8, None),
+            keyword(),
+            &devmap_query::Cancel::new(),
+            &UnappliedEdits::default(),
+        )
+        .expect_err("dispatch must not trust that validation ran")
+        .to_string();
+        assert!(error.contains("semantic search only"), "{error}");
+        let mcp = crate::mcp::to_ipc_command(
+            "devmap_search",
+            Some(&serde_json::json!({"query": "widget", "languages": ["python"]})),
+        )
+        .unwrap();
+        assert!(validate_request(&IpcRequest {
+            version: PROTOCOL_VERSION,
+            command: mcp,
+        })
+        .is_err());
+    }
+
+    /// A client that predates the scope fields sends none, and gets exactly
+    /// the unscoped answer it always got — no `scope` on the wire.
+    #[test]
+    fn a_ranking_request_without_scope_fields_is_unscoped() {
+        let legacy: IpcRequest =
+            serde_json::from_str(r#"{"version":1,"cmd":"ask","query":"widget","budget":2000}"#)
+                .unwrap();
+        assert!(validate_request(&legacy).is_ok());
+        let value = dispatch(
+            &corpus_store(8, None),
+            legacy,
+            &devmap_query::Cancel::new(),
+            &UnappliedEdits::default(),
+        )
+        .unwrap();
+        assert!(value.get("scope").is_none(), "{value}");
+    }
+
     /// The `affected` dispatch arm carries its list and its radius separately.
     #[test]
     fn the_affected_dispatch_returns_a_budgeted_test_list_and_its_radius() {
@@ -2445,6 +2677,8 @@ mod tests {
                 query,
                 budget,
                 semantic: false,
+                paths: Vec::new(),
+                languages: Vec::new(),
             },
         };
 
@@ -2631,6 +2865,8 @@ mod tests {
                 query: "widget".to_string(),
                 budget: 2_000,
                 semantic: true,
+                paths: Vec::new(),
+                languages: Vec::new(),
             },
         };
         let cancel = devmap_query::Cancel::new();

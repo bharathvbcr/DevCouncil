@@ -1795,12 +1795,66 @@ impl<'a> StoreQueryEngine<'a> {
         query: &str,
         token_budget: u32,
     ) -> anyhow::Result<Response<SymbolHit>> {
+        self.search_semantic_scoped(query, token_budget, None)
+    }
+
+    /// [`Self::search_semantic`] over the symbols `scope` admits, with IDF
+    /// computed over that corpus alone. `None` is the whole repository. A
+    /// scope that names no indexed file is refused; see [`crate::scope`].
+    pub fn search_semantic_scoped(
+        &self,
+        query: &str,
+        token_budget: u32,
+        scope: Option<&crate::scope::SymbolScope>,
+    ) -> anyhow::Result<Response<SymbolHit>> {
         self.cancel.check()?;
-        let Some(snapshot) = self.store.all_symbols_page()? else {
+        let Some((snapshot, resolved)) = self.ranking_corpus(scope)? else {
             return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
+        let mut response = self.search_semantic_over(query, token_budget, snapshot)?;
+        response.scope = resolved.map(|resolved| resolved.report);
+        Ok(response)
+    }
+
+    /// The symbol rows a ranking runs over: the whole latest generation, or
+    /// the part of it `scope` admits, with the scope checked against the files
+    /// that same generation indexed.
+    ///
+    /// Filtered here, before any index is built, so the term weights and the
+    /// call subgraph a scoped ranking uses are the scope's own. `None` when
+    /// the store holds no generation.
+    fn ranking_corpus(
+        &self,
+        scope: Option<&crate::scope::SymbolScope>,
+    ) -> anyhow::Result<
+        Option<(
+            devmap_store::SearchPage,
+            Option<crate::scope::ResolvedScope>,
+        )>,
+    > {
+        let Some(scope) = scope else {
+            return Ok(self.store.all_symbols_page()?.map(|page| (page, None)));
+        };
+        let Some((mut page, files)) = self.store.all_symbols_page_with_files()? else {
+            return Ok(None);
+        };
+        let mut resolved = scope.resolve(&files, page.repo_root.as_deref())?;
+        let corpus_symbols = page.rows.len();
+        page.rows.retain(|row| resolved.contains(&row.path));
+        resolved.report.symbols = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+        resolved.report.corpus_symbols = u32::try_from(corpus_symbols).unwrap_or(u32::MAX);
+        page.total = resolved.report.symbols;
+        Ok(Some((page, Some(resolved))))
+    }
+
+    fn search_semantic_over(
+        &self,
+        query: &str,
+        token_budget: u32,
+        snapshot: devmap_store::SearchPage,
+    ) -> anyhow::Result<Response<SymbolHit>> {
         let coverage_gap = search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref()));
         let symbols = snapshot.rows;
         if symbols.is_empty() || query.trim().is_empty() {
@@ -1853,7 +1907,10 @@ impl<'a> StoreQueryEngine<'a> {
         // the texts scored here are `name` and `qualified_name` and nothing
         // else. See [`SEARCH_SCOPE_NOTE`].
         response.walk_incomplete = devmap_analyze::combine_reasons(
-            devmap_analyze::combine_reasons(coverage_gap, empty_semantic_gap(response.total, query)),
+            devmap_analyze::combine_reasons(
+                coverage_gap,
+                empty_semantic_gap(response.total, query),
+            ),
             (!head.is_empty())
                 .then(|| index.coverage_note(query, &head))
                 .flatten(),
@@ -1876,8 +1933,22 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         min_confidence: f32,
     ) -> anyhow::Result<Response<SymbolHit>> {
+        self.ask_scoped(query, token_budget, min_confidence, None)
+    }
+
+    /// [`Self::ask`] over the symbols `scope` admits: seeds are scored with
+    /// IDF over the scoped corpus, and PageRank walks only call edges whose
+    /// two ends are both in scope. `None` is the whole repository. A scope
+    /// that names no indexed file is refused; see [`crate::scope`].
+    pub fn ask_scoped(
+        &self,
+        query: &str,
+        token_budget: u32,
+        min_confidence: f32,
+        scope: Option<&crate::scope::SymbolScope>,
+    ) -> anyhow::Result<Response<SymbolHit>> {
         Ok(self
-            .ask_ranked(query, token_budget, min_confidence, false)?
+            .ask_ranked(query, token_budget, min_confidence, false, scope)?
             .0)
     }
 
@@ -1896,9 +1967,28 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         min_confidence: f32,
     ) -> anyhow::Result<crate::evidence::EvidencePack> {
+        self.ask_evidence_scoped(query, token_budget, min_confidence, None)
+    }
+
+    /// [`Self::ask_evidence`] within `scope`, ranked as [`Self::ask_scoped`]
+    /// ranks. `related_tests` lists only test files in scope; the pack's
+    /// `scope.related_tests_outside_scope` counts the ones the walk reached
+    /// and left out.
+    pub fn ask_evidence_scoped(
+        &self,
+        query: &str,
+        token_budget: u32,
+        min_confidence: f32,
+        scope: Option<&crate::scope::SymbolScope>,
+    ) -> anyhow::Result<crate::evidence::EvidencePack> {
         let test_budget = token_budget / EVIDENCE_TEST_BUDGET_SHARE;
-        let (response, qualified) =
-            self.ask_ranked(query, token_budget - test_budget, min_confidence, true)?;
+        let (response, qualified, resolved) = self.ask_ranked(
+            query,
+            token_budget - test_budget,
+            min_confidence,
+            true,
+            scope,
+        )?;
         let (edges, test_symbols) = if response.items.is_empty() {
             (None, std::collections::HashSet::new())
         } else {
@@ -1907,7 +1997,7 @@ impl<'a> StoreQueryEngine<'a> {
                 self.store.latest_test_entry_symbols()?,
             )
         };
-        let (related_tests, coverage_gap) = match edges.as_deref() {
+        let (related_tests, coverage_gap, outside_scope) = match edges.as_deref() {
             Some(edges) => self.evidence_related_tests(
                 edges,
                 &response,
@@ -1915,10 +2005,12 @@ impl<'a> StoreQueryEngine<'a> {
                 &test_symbols,
                 test_budget,
                 min_confidence,
+                resolved.as_ref(),
             )?,
             None => (
                 self.finish(budget_take(Vec::new(), test_budget, |_| 0)),
                 None,
+                0,
             ),
         };
         let mut pack = crate::evidence::assemble(
@@ -1931,6 +2023,9 @@ impl<'a> StoreQueryEngine<'a> {
             &self.cancel,
         )?;
         pack.coverage_gap = coverage_gap;
+        if let Some(scope) = pack.scope.as_mut() {
+            scope.related_tests_outside_scope = outside_scope;
+        }
         Ok(pack)
     }
 
@@ -1948,6 +2043,12 @@ impl<'a> StoreQueryEngine<'a> {
     /// own `walk_incomplete`. It is the same sentence on every query, and
     /// folded into the list it buried the one clause about *this* walk — where
     /// it stopped — under a paragraph about the whole repository.
+    ///
+    /// Under a `scope`, a reached test file outside it is left out and
+    /// counted: the third value is how many distinct such files there were.
+    /// The walk itself is not scoped — a test in scope that reaches a hit
+    /// through code outside it is still found.
+    #[allow(clippy::too_many_arguments)]
     fn evidence_related_tests(
         &self,
         edges: &GenerationEdges,
@@ -1956,7 +2057,8 @@ impl<'a> StoreQueryEngine<'a> {
         test_symbols: &std::collections::HashSet<String>,
         token_budget: u32,
         min_confidence: f32,
-    ) -> anyhow::Result<(Response<AffectedTest>, Option<String>)> {
+        scope: Option<&crate::scope::ResolvedScope>,
+    ) -> anyhow::Result<(Response<AffectedTest>, Option<String>, u32)> {
         let mut targets: Vec<String> = Vec::new();
         let mut hits: BTreeSet<(&str, &str)> = BTreeSet::new();
         for (hit, name) in response.items.iter().zip(qualified) {
@@ -1970,16 +2072,22 @@ impl<'a> StoreQueryEngine<'a> {
             return Ok((
                 self.finish(budget_take(Vec::new(), token_budget, |_| 0)),
                 None,
+                0,
             ));
         }
         let walk = self.blast_walk(edges, &targets, EVIDENCE_TEST_DEPTH, min_confidence)?;
         // Seeds are implementation hits by construction, so only the bands can
         // hold a test.
         let mut nearest: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
+        let mut outside_scope: BTreeSet<&str> = BTreeSet::new();
         for band in &walk.bands {
             for (symbol, file) in &band.members {
                 let is_test = is_test_path(file) || test_symbols.contains(symbol);
                 if !is_test || hits.contains(&(file.as_str(), symbol.as_str())) {
+                    continue;
+                }
+                if scope.is_some_and(|scope| !scope.contains(file)) {
+                    outside_scope.insert(file.as_str());
                     continue;
                 }
                 let entry = nearest
@@ -2001,7 +2109,8 @@ impl<'a> StoreQueryEngine<'a> {
         tests.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.path.cmp(&b.path)));
         let mut related = budget_take(tests, token_budget, affected_test_tokens);
         related.walk_incomplete = walk.stop.reason(walk.depth_cap, TRAVERSAL_MAX_NODES);
-        Ok((self.finish(related), walk.coverage_gap))
+        let outside_scope = u32::try_from(outside_scope.len()).unwrap_or(u32::MAX);
+        Ok((self.finish(related), walk.coverage_gap, outside_scope))
     }
 
     /// The ask walk, with each shown hit's qualified name alongside it.
@@ -2014,23 +2123,56 @@ impl<'a> StoreQueryEngine<'a> {
     /// inside an earlier hit's whole source costs only its lead
     /// ([`crate::evidence::fold_aware_take`]). Plain `ask` prints every hit's
     /// source and budgets it so.
+    ///
+    /// The third value is the checked scope, `None` when unscoped or when no
+    /// generation exists.
+    #[allow(clippy::type_complexity)]
     fn ask_ranked(
         &self,
         query: &str,
         token_budget: u32,
         min_confidence: f32,
         fold_aware: bool,
-    ) -> anyhow::Result<(Response<SymbolHit>, Vec<String>)> {
+        scope: Option<&crate::scope::SymbolScope>,
+    ) -> anyhow::Result<(
+        Response<SymbolHit>,
+        Vec<String>,
+        Option<crate::scope::ResolvedScope>,
+    )> {
         self.cancel.check()?;
         let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
-        let Some(snapshot) = self.store.all_symbols_page()? else {
+        let Some((snapshot, resolved)) = self.ranking_corpus(scope)? else {
             return Ok((
                 self.unavailable(ResolutionAvailability::Unavailable {
                     reason: "no persisted generation is available".to_string(),
                 }),
                 Vec::new(),
+                None,
             ));
         };
+        let (mut response, qualified) = self.ask_ranked_over(
+            query,
+            token_budget,
+            min_confidence,
+            fold_aware,
+            snapshot,
+            resolved.as_ref(),
+        )?;
+        response.scope = resolved.as_ref().map(|resolved| resolved.report.clone());
+        Ok((response, qualified, resolved))
+    }
+
+    /// [`Self::ask_ranked`] over an already loaded — and, under a scope,
+    /// already narrowed — corpus.
+    fn ask_ranked_over(
+        &self,
+        query: &str,
+        token_budget: u32,
+        min_confidence: f32,
+        fold_aware: bool,
+        snapshot: devmap_store::SearchPage,
+        scope: Option<&crate::scope::ResolvedScope>,
+    ) -> anyhow::Result<(Response<SymbolHit>, Vec<String>)> {
         let coverage_gap = search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref()));
         let symbols = snapshot.rows;
         if symbols.is_empty() || query.trim().is_empty() {
@@ -2094,6 +2236,11 @@ impl<'a> StoreQueryEngine<'a> {
         // Seeds that never appear on an edge still keep their personalization
         // mass; endpoints outside the seed set exist so mass can flow along
         // the graph before we re-rank the seed set alone.
+        //
+        // Under a scope, only edges with both ends in scope add nodes, so mass
+        // cannot leave the scope and come back through code the caller
+        // excluded. `call_adjacency` joins by node, so those edges are then
+        // absent from the walk too.
         let mut nodes: Vec<String> = seed_positions
             .iter()
             .map(|&position| symbols[position].qualified_name.clone())
@@ -2101,6 +2248,11 @@ impl<'a> StoreQueryEngine<'a> {
         for id in 0..edges.len() as u32 {
             self.cancel.check_every(id as usize)?;
             if edges.kind(id) != EdgeKind::Calls || !edges.admits(id, min_confidence) {
+                continue;
+            }
+            if scope.is_some_and(|scope| {
+                !scope.contains(edges.source_file(id)) || !scope.contains(edges.target_file(id))
+            }) {
                 continue;
             }
             for name in [edges.source_symbol(id), edges.target_symbol(id)] {
@@ -2319,6 +2471,7 @@ impl<'a> StoreQueryEngine<'a> {
             dead_clusters_truncated: 0,
             dead_clusters_incomplete: None,
             unresolved_namesakes: None,
+            scope: None,
         };
 
         // `Skipped` is here for the same reason `Failed` is, and the reason is
@@ -3426,6 +3579,7 @@ impl<'a> QueryEngine<'a> {
                 dead_clusters_truncated: 0,
                 dead_clusters_incomplete: None,
                 unresolved_namesakes: None,
+                scope: None,
             };
         }
         let q_lower = req.query.to_lowercase();
@@ -4354,6 +4508,7 @@ fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
         unresolved_namesakes: None,
+        scope: None,
     }
 }
 
@@ -5161,6 +5316,7 @@ where
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
         unresolved_namesakes: None,
+        scope: None,
     }
 }
 
@@ -5190,6 +5346,7 @@ where
             dead_clusters_truncated: 0,
             dead_clusters_incomplete: None,
             unresolved_namesakes: None,
+            scope: None,
         };
     }
     Response {
@@ -5209,6 +5366,7 @@ where
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
         unresolved_namesakes: None,
+        scope: None,
     }
 }
 

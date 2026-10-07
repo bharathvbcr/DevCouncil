@@ -241,6 +241,10 @@ name = "ask_evidence"
 required-features = ["parse"]
 
 [[test]]
+name = "ask_scope"
+required-features = ["parse"]
+
+[[test]]
 name = "affected_counts_inline_tests"
 required-features = ["parse"]
 

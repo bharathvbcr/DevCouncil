@@ -1059,6 +1059,10 @@ pub struct SearchPage {
     pub analysis: Option<AnalysisDisclosure>,
 }
 
+/// Every file one generation indexed, as `(path, language)`; see
+/// [`Store::all_symbols_page_with_files`].
+pub type IndexedFiles = Vec<(String, String)>;
+
 /// File parse state, touching edges, and coverage from one pinned generation.
 #[derive(Debug, Clone)]
 pub struct FileEdges {
@@ -7392,6 +7396,43 @@ generation {latest}; run `devmap status` to re-verify",
             repo_root: Self::generation_repo_root_in(&snapshot, generation)?,
             analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
         }))
+    }
+
+    /// [`Self::all_symbols_page`], with every file the same generation indexed
+    /// as `(path, language)`, ordered by path.
+    ///
+    /// A scoped ranking checks its path prefixes and languages against this
+    /// list, so it has to describe the generation the rows came from: a list
+    /// read by a second "latest" lookup could refuse a prefix the rows do
+    /// cover, or admit one they do not. Read from the generation's files, not
+    /// derived from the rows, so a file is listed whatever it declares.
+    pub fn all_symbols_page_with_files(&self) -> Result<Option<(SearchPage, IndexedFiles)>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let rows = Self::all_symbols_in(&snapshot, generation)?;
+        let mut stmt = snapshot.prepare(
+            "SELECT p.path, f.language
+             FROM generation_files f
+             JOIN paths p ON p.id = f.file_id
+             WHERE f.generation_id = ?1
+             ORDER BY p.path",
+        )?;
+        let files = stmt
+            .query_map(params![generation], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<(String, String)>>>()?;
+        Ok(Some((
+            SearchPage {
+                generation,
+                total: u32::try_from(rows.len())
+                    .map_err(|_| refusal("symbol count exceeds u32"))?,
+                rows,
+                repo_root: Self::generation_repo_root_in(&snapshot, generation)?,
+                analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
+            },
+            files,
+        )))
     }
 
     fn all_symbols_in(snapshot: &Connection, gen: u32) -> Result<Vec<StoredSymbol>> {
