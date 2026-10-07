@@ -498,7 +498,15 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// dropped every module-level read of it. A v65 row lacks all of this — most
 /// sharply, a constant `__all__` omitted has no node and its importers no
 /// target — so it must not be served to this build.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "66";
+///
+/// v67 records a Rust function's header as its `signature`; types a Rust
+/// local from its own binder (a `MutexGuard` from `Ok(g)` or an unwrapped
+/// `.lock()`, a loop variable over a `Vec<T>`/`[T]`/set) and hands the
+/// resolver the value shape of `T::f(..)?` and of a closure argument; and
+/// binds a Go `var w T` to `w`. A v66 row has no headers to read a return or
+/// closure type from and no binder facts, so every method reached only through
+/// such a local would stay an uninferred receiver from a warm cache.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "67";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

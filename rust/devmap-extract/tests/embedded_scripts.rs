@@ -804,8 +804,11 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v66 emits every Python module-scope binding and the module bindings and
     // type aliases other shapes dropped, reads import names off the tree, and
     // stops a module binding from shadowing its own module-level reads.
+    //
+    // v67 records Rust function headers, types Rust locals from their own
+    // binders, and binds a Go `var w T`.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "66",
+        EXTRACTION_SCHEMA_VERSION, "67",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );
