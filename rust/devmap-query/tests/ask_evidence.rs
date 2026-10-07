@@ -575,10 +575,14 @@ fn a_nested_symbol_carries_the_indentation_its_first_line_lost() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// The repository-wide attribution gap is stated once, on the pack; the
-/// related-test list says only where its own walk stopped.
+/// The pack's attribution gap is stated once, on the pack; the related-test
+/// list says only where its own walk stopped.
+///
+/// The gap names the site that causes it — `rows.frobnicate`, an untyped
+/// receiver inside the hit — rather than a repository-wide count that every
+/// answer carried alike (retired 2026-10-07; see `radius_attribution_gap`).
 #[test]
-fn the_repository_wide_gap_is_stated_once() {
+fn the_packs_gap_is_stated_once_and_names_its_site() {
     let root = scratch("gap");
     let store = disk_store(
         &root,
@@ -610,10 +614,11 @@ fn the_repository_wide_gap_is_stated_once() {
         .coverage_gap
         .as_deref()
         .unwrap_or_else(|| panic!("an unresolved call is a coverage gap: {pack:#?}"));
-    assert!(gap.contains("repository-wide"), "{gap}");
+    assert!(gap.contains("rows.frobnicate"), "{gap}");
+    assert!(!gap.contains("repository-wide"), "{gap}");
     let list = pack.related_tests.walk_incomplete.as_deref().unwrap_or("");
     assert!(
-        !list.contains("repository-wide") && !list.contains(gap),
+        !list.contains("frobnicate") && !list.contains(gap),
         "the list repeats the gap: {list}"
     );
     let _ = std::fs::remove_dir_all(root);

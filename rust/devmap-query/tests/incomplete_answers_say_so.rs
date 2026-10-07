@@ -373,8 +373,15 @@ fn mixed_attribution_counts_exclude_explained_sites_and_name_their_scope() {
     );
 }
 
+/// A completed walk must not erase an unbound call that may be one of its
+/// callers. `widget.helper()` has no inferable receiver and names `helper`, so
+/// both `affected` and `explore` over `helper` must say so — and name it.
+///
+/// Until 2026-10-07 this asserted the repository-wide sentence, which every
+/// walk carried whatever it reached; the per-walk check replaced it
+/// (`a_walk_names_only_the_gaps_it_touches.rs`).
 #[test]
-fn affected_tests_and_explore_keep_repository_coverage_warnings() {
+fn affected_tests_and_explore_carry_a_gap_that_touches_their_radius() {
     let store = store_of(
         &[
             ("lib.py", "def helper():\n    return 1\n"),
@@ -383,6 +390,7 @@ fn affected_tests_and_explore_keep_repository_coverage_warnings() {
                 "from lib import helper\ndef test_helper():\n    return helper()\n",
             ),
             ("unknown.py", "def entry(callback):\n    callback()\n"),
+            ("widgets.py", "def poke(widget):\n    widget.helper()\n"),
         ],
         &[],
     );
@@ -395,18 +403,59 @@ fn affected_tests_and_explore_keep_repository_coverage_warnings() {
         .items
         .iter()
         .any(|test| test.path == "test_app.py"));
-    assert!(
-        affected.tests.walk_incomplete.is_some(),
-        "a completed walk must not erase unresolved callbacks: {affected:?}"
-    );
+    let reason = affected
+        .tests
+        .walk_incomplete
+        .clone()
+        .unwrap_or_else(|| panic!("`widget.helper()` may be a caller: {affected:?}"));
+    assert!(reason.contains("widget.helper"), "{reason}");
     assert_eq!(
         affected.tests.walk_incomplete,
         affected.blast_radius.layers.walk_incomplete
     );
     let explored = engine.explore("helper", 5, 10_000, 0.0, 64).unwrap();
     assert!(
-        explored.blast_radius.layers.walk_incomplete.is_some(),
+        explored
+            .blast_radius
+            .layers
+            .walk_incomplete
+            .as_deref()
+            .is_some_and(|reason| reason.contains("widget.helper")),
         "{explored:?}"
+    );
+}
+
+/// A function that reaches its caller as a callback is passed there by name,
+/// and the passing is an edge. So `callback()` — a local binding no namesake
+/// check can see through — does not hide a caller of `helper`: `wire` is in
+/// the answer, through the value it passes.
+#[test]
+fn a_callback_route_is_reached_through_the_value_passed_into_it() {
+    let store = store_of(
+        &[
+            ("lib.py", "def helper():\n    return 1\n"),
+            (
+                "app.py",
+                "from lib import helper\n\n\ndef entry(callback):\n    callback()\n\n\n\
+                 def wire():\n    entry(helper)\n",
+            ),
+        ],
+        &[],
+    );
+    let impact = StoreQueryEngine::new(&store)
+        .impact(Request {
+            query: "lib.py::helper".into(),
+            token_budget: 10_000,
+            min_confidence: 0.0,
+            max_depth: 64,
+        })
+        .unwrap();
+    assert!(
+        impact
+            .items
+            .iter()
+            .any(|edge| edge.source_symbol == "app.py::wire"),
+        "the passer is a caller of the callback: {impact:?}"
     );
 }
 
@@ -419,6 +468,9 @@ fn layered_impact_keeps_the_same_coverage_warning_on_both_halves() {
                 "app.py",
                 "from lib import helper\ndef entry(callback):\n    helper()\n    callback()\n",
             ),
+            // Names the start: both the radius check and the start's own
+            // namesake listing fire, and both halves must carry both.
+            ("widgets.py", "def poke(widget):\n    widget.helper()\n"),
         ],
         &[],
     );
@@ -439,12 +491,17 @@ fn layered_impact_keeps_the_same_coverage_warning_on_both_halves() {
 
 #[test]
 fn in_memory_traversals_keep_the_same_attribution_warning_as_storage() {
+    // `gadget.entry()` names `entry`, which `impact helper` reaches, so both
+    // engines must raise the same per-walk gap from their two copies of the
+    // ledger. It names a reached symbol rather than the start, because the
+    // start's namesake listing is the store engine's alone.
     let files = [
         ("lib.py", "def helper():\n    return 1\n"),
         (
             "app.py",
             "from lib import helper\ndef entry(callback):\n    helper()\n    callback()\n",
         ),
+        ("gadgets.py", "def poke(gadget):\n    gadget.entry()\n"),
     ];
     let extractions: Vec<_> = files
         .iter()
@@ -493,6 +550,8 @@ fn output_budget_depth_and_attribution_gaps_survive_together() {
                 "a.py",
                 "from b import b\ndef a(callback):\n    b()\n    callback()\n",
             ),
+            // Names `c`, which a depth-1 walk from `d` reaches.
+            ("e.py", "def e(widget):\n    widget.c()\n"),
         ],
         &[],
     );
@@ -507,7 +566,7 @@ fn output_budget_depth_and_attribution_gaps_survive_together() {
     assert!(report.edges.truncated && report.edges.total > report.edges.shown);
     let reason = report.edges.walk_incomplete.as_ref().unwrap();
     assert!(
-        reason.contains("depth") && reason.contains("unresolved attribution"),
+        reason.contains("depth") && reason.contains("could not bind"),
         "{reason}"
     );
     assert_eq!(

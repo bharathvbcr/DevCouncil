@@ -1520,9 +1520,9 @@ re-ranked by personalized PageRank over call edges. Read `truncated` and `walk_i
         `reached_symbols`. A reached symbol is a test by path or because a test runner invokes it; tests \
         that are already hits are not repeated."},
                 "coverage_gap": {"type": ["string", "null"],
-                    "description": "Repository-wide attribution gap: how far `calls`, `called_by` and \
-        `related_tests` may fall short. Stated once; `related_tests.walk_incomplete` says only where that walk \
-        stopped."},
+                    "description": "Where calls the resolver could not bind touch this pack: sites inside a \
+        hit (`calls` may fall short) and sites naming a symbol the related-test walk reached (`called_by` and \
+        `related_tests` may). Stated once; `related_tests.walk_incomplete` says only where that walk stopped."},
                 "shown": {"type": "integer", "description": "Hits present across `files`."},
                 "hidden": {"type": "integer",
                     "description": "Hits the token budget withheld. Non-zero means this answer is a prefix."},

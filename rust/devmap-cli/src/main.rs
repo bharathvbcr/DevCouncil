@@ -3920,7 +3920,7 @@ fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
         }
     }
     if let Some(gap) = &pack.coverage_gap {
-        outln!("note: call-graph coverage (repository-wide): {gap}");
+        outln!("note: call-graph coverage: {gap}");
     }
 }
 

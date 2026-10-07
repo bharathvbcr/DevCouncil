@@ -763,6 +763,7 @@ impl GenerationEdgesBuilder {
             confidence_mismatches,
             text: self.text,
             analysis,
+            generation: None,
             empty: Vec::new(),
         }
     }
@@ -848,6 +849,12 @@ pub struct GenerationEdges {
     /// it. `None` means the disclosure could not be read, which is a distinct
     /// answer from a disclosure saying coverage was complete.
     analysis: Option<AnalysisDisclosure>,
+    /// The generation these edges were read from, when the store loaded them.
+    ///
+    /// `None` for an index built by hand. A caller that pairs a walk with a
+    /// ledger read needs the id to make both describe one generation, and
+    /// without it must say the paired read could not run.
+    generation: Option<u32>,
     by_source_symbol: Adjacency,
     by_target_symbol: Adjacency,
     by_source_file: Adjacency,
@@ -908,6 +915,19 @@ impl GenerationEdges {
     /// `None` is "could not be read", not "complete" — see the field.
     pub fn analysis(&self) -> Option<&AnalysisDisclosure> {
         self.analysis.as_ref()
+    }
+
+    /// The generation the store read these edges from; `None` when built by
+    /// hand. See the field.
+    pub fn generation(&self) -> Option<u32> {
+        self.generation
+    }
+
+    /// Label the index with the generation its rows came from. Store-only:
+    /// the store is the one reader that knows.
+    pub(crate) fn with_generation(mut self, generation: u32) -> Self {
+        self.generation = Some(generation);
+        self
     }
 
     pub fn len(&self) -> usize {

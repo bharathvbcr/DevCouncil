@@ -260,3 +260,7 @@ required-features = ["parse"]
 [[test]]
 name = "a_wrapped_callback_is_a_function"
 required-features = ["parse"]
+
+[[test]]
+name = "a_walk_names_only_the_gaps_it_touches"
+required-features = ["parse"]
