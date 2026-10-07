@@ -73,6 +73,95 @@ fn reconcile(id: &str, revision: i64, reconciler: &str, prior: &str, reason: &st
 }
 
 #[test]
+fn a_relink_waits_for_live_runs_and_then_moves_new_runs_to_the_new_checkout() {
+    let (store, _) = fixture();
+    call(&store, "runs.prepare", PREPARE);
+    let relink = r#"{"id":"r","request_id":"relink","expected_revision":1,"identity_key":"local:/moved/.git"}"#;
+    // A prepared attempt holds `/checkout`; moving the identity under it would
+    // leave a run whose checkout no longer belongs to its repository.
+    assert_eq!(
+        request(&store, "repositories.relink", relink)
+            .unwrap_err()
+            .code,
+        "repository_busy"
+    );
+    call(
+        &store,
+        "runs.cancel",
+        r#"{"id":"run","request_id":"cancel","expected_revision":1}"#,
+    );
+    call(&store, "repositories.relink", relink);
+    // The finished attempt keeps its repository and the checkout it ran in.
+    let old = call(&store, "runs.get", r#"{"id":"run"}"#);
+    assert_eq!(text(&store, &old, "$.item.repository_id"), "r");
+    assert!(text(&store, &old, "$.item.git_dir").ends_with("/checkout/.git"));
+    // A new attempt is admitted only from the checkout the repository now names.
+    let stale = PREPARE
+        .replace("\"run\"", "\"run-stale\"")
+        .replace("\"prepare\"", "\"prepare-stale\"")
+        .replace("\"repository_revision\":1", "\"repository_revision\":2");
+    assert_eq!(
+        request(&store, "runs.prepare", &stale).unwrap_err().code,
+        "repository_mismatch"
+    );
+    let moved = stale
+        .replace("\"run-stale\"", "\"run-moved\"")
+        .replace("\"prepare-stale\"", "\"prepare-moved\"")
+        .replace("/checkout", "/moved");
+    call(&store, "runs.prepare", &moved);
+}
+
+#[test]
+fn a_record_that_has_run_anything_is_never_absorbed_by_a_relink() {
+    let (store, _) = fixture();
+    call(
+        &store,
+        "repositories.put",
+        r#"{"id":"other","request_id":"other","expected_revision":0,"name":"Clone","identity_key":"local:/clone/.git"}"#,
+    );
+    let prepare = PREPARE
+        .replace("\"run\"", "\"run-clone\"")
+        .replace("\"prepare\"", "\"prepare-clone\"")
+        .replace("\"repository_id\":\"r\"", "\"repository_id\":\"other\"")
+        .replace("/checkout", "/clone");
+    // The run is cancelled, so only its history remains — and history is
+    // still something a record holds.
+    call(
+        &store,
+        "items.put",
+        r#"{"id":"t","request_id":"link-other","expected_revision":1,"title":"Keep E42","description":"Preserve exact evidence","repository_ids":["r","other"],"primary_repository_id":"r"}"#,
+    );
+    call(
+        &store,
+        "runs.prepare",
+        &prepare.replace("\"source_revision\":1", "\"source_revision\":2"),
+    );
+    call(
+        &store,
+        "runs.cancel",
+        r#"{"id":"run-clone","request_id":"cancel-clone","expected_revision":1}"#,
+    );
+    call(
+        &store,
+        "items.put",
+        r#"{"id":"t","request_id":"unlink-other","expected_revision":2,"title":"Keep E42","description":"Preserve exact evidence","repository_ids":["r"],"primary_repository_id":"r"}"#,
+    );
+    let refused = request(
+        &store,
+        "repositories.relink",
+        r#"{"id":"r","request_id":"relink","expected_revision":1,"identity_key":"local:/clone/.git","absorb_id":"other"}"#,
+    )
+    .unwrap_err();
+    assert_eq!(refused.code, "repository_not_empty");
+    assert!(refused.message.contains("1 run(s)"), "{}", refused.message);
+    assert!(
+        refused.message.contains("0 task link(s)"),
+        "{}",
+        refused.message
+    );
+}
+
+#[test]
 fn worktrees_of_one_repository_run_concurrently_but_one_checkout_holds_one_run() {
     let (store, _) = fixture();
     call(&store, "runs.prepare", PREPARE);
