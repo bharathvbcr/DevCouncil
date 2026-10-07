@@ -12,31 +12,32 @@ use serde_json::{json, Map, Value};
 
 use devmap_serve::session_log;
 
-/// Known GitNexus-shaped questions DevMap does not yet answer as first-class tools.
+/// Questions DevMap answers only on the CLI, or not at all, rather than as MCP tools.
+///
+/// `detect_changes` is not here: `devmap blast --since <rev>` (MCP `devmap_blast`)
+/// maps a diff to what depends on it. `cypher`, `pdg_query`, `taint_explain` and
+/// `route_map` are real commands, so each note names the command an agent can
+/// run instead of claiming the capability does not exist.
 const MISSING_CAPABILITIES: &[(&str, &str)] = &[
-    (
-        "detect_changes",
-        "git-diff → affected flows; workaround: `devmap impact` / `devmap affected` on changed symbols",
-    ),
     (
         "rename",
         "graph-backed coordinated rename; workaround: `devmap search` + `devmap preview`",
     ),
     (
         "cypher",
-        "ad-hoc graph query language; workaround: compose `explore` / `neighbors` / `trace`",
+        "CLI only: `devmap cypher` (an openCypher subset); there is no MCP tool",
     ),
     (
         "pdg_query",
-        "control/data dependence; Python `dev map --pdg` exists, the kernel MCP does not",
+        "CLI only: `devmap pdg <file>` (Python files); there is no MCP tool",
     ),
     (
         "taint_explain",
-        "source→sink taint findings; Python `dev map --pdg` exists, the kernel MCP does not",
+        "CLI only: `devmap pdg --taint <file>` (Python files); there is no MCP tool",
     ),
     (
         "route_map",
-        "HTTP route → handler → consumer map; not in the kernel tool list",
+        "CLI only: `devmap routes`; there is no MCP tool",
     ),
     (
         "clusters_processes",
@@ -257,7 +258,7 @@ fn build_report(db: &Path, session_id: Option<&str>) -> anyhow::Result<Value> {
     let live = session_log::read_live(db)?;
     let gap_ledger = read_gaps(db)?;
     let queries = live.records;
-    let gaps = gap_ledger.records;
+    let (gaps, resolved_gaps) = open_gaps(gap_ledger.records);
     // Records that were written but cannot be read back. Reported next to the
     // counts they are missing from, so a degraded report is visibly degraded.
     let unreadable = live.malformed.saturating_add(gap_ledger.malformed);
@@ -321,6 +322,7 @@ fn build_report(db: &Path, session_id: Option<&str>) -> anyhow::Result<Value> {
         "tools": tools,
         "issues": issues,
         "gaps": gaps,
+        "resolved_gaps": resolved_gaps,
         "missing_capabilities": MISSING_CAPABILITIES.iter().map(|(name, note)| json!({
             "capability": name,
             "note": note,
@@ -342,6 +344,68 @@ fn notable_queries(queries: &[Map<String, Value>]) -> Vec<Value> {
         })
         .map(|row| Value::Object(row.clone()))
         .collect()
+}
+
+/// The key a gap is opened and closed under: its `gap_id`.
+///
+/// A row with no usable `gap_id` (the writer refuses to write one, but a ledger
+/// that was appended to by hand holds some) is keyed by when it was written, as
+/// `unkeyed@<ts_ms>`, so it can be closed by recording that key as the
+/// `--gap-id`. A row with no timestamp either is keyed by its position and
+/// stays open: nothing can name it, so nothing can close it.
+fn gap_key(row: &Value, index: usize) -> String {
+    let id = row
+        .get("gap_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    if let Some(id) = id {
+        return id.to_string();
+    }
+    match row.get("ts_ms").and_then(Value::as_u64) {
+        Some(ts) => format!("unkeyed@{ts}"),
+        None => format!("unkeyed#{index}"),
+    }
+}
+
+/// Collapse the append-only gap ledger to the gaps that are still open.
+///
+/// The ledger is a history: a gap is recorded, later recorded again with
+/// `resolved: true`, and may be recorded open again if it recurs. Reporting every
+/// line made `session-report` list work that had been closed — the report said
+/// "35 recorded gaps" of which a third were fixed — so the latest line for each
+/// key decides, and a key whose latest line is `resolved` is counted, not shown.
+/// Returns the open rows in the order their keys first appeared, each as its
+/// latest line, and how many keys are closed.
+fn open_gaps(rows: Vec<Value>) -> (Vec<Value>, usize) {
+    use std::collections::HashMap;
+    let mut order: Vec<String> = Vec::new();
+    let mut latest: HashMap<String, Value> = HashMap::new();
+    for (index, mut row) in rows.into_iter().enumerate() {
+        let key = gap_key(&row, index);
+        if key.starts_with("unkeyed") {
+            if let Some(object) = row.as_object_mut() {
+                // Shown so a person can close it: the key is not in the row.
+                object.insert("gap_key".into(), json!(key));
+            }
+        }
+        if latest.insert(key.clone(), row).is_none() {
+            order.push(key);
+        }
+    }
+    let mut open = Vec::new();
+    let mut resolved = 0usize;
+    for key in order {
+        let Some(row) = latest.remove(&key) else {
+            continue;
+        };
+        if row.get("resolved") == Some(&Value::Bool(true)) {
+            resolved += 1;
+        } else {
+            open.push(row);
+        }
+    }
+    (open, resolved)
 }
 
 /// Read the gap ledger, counting rather than failing on an unreadable line.
@@ -415,7 +479,7 @@ parsed back; it rotates with this report, so the next session starts clean."
     }
     format!(
         "DevMap session: {queries} queries, {truncated} truncated, {incomplete} walk_incomplete, \
-{empty} empty, {errors} errors, {gaps} recorded gaps{lost}. Read truncated/walk_incomplete before \
+{empty} empty, {errors} errors, {gaps} open gaps{lost}. Read truncated/walk_incomplete before \
 treating an empty list as 'does not exist'. Do not fall back to GitNexus — record a gap instead."
     )
 }
@@ -488,7 +552,7 @@ fn render_markdown(report: &Value) -> String {
         }
         _ => out.push_str("None recorded.\n\n"),
     }
-    out.push_str("## Agent-recorded gaps\n\n");
+    out.push_str("## Open agent-recorded gaps\n\n");
     match report.get("gaps").and_then(Value::as_array) {
         Some(gaps) if !gaps.is_empty() => {
             for gap in gaps {
@@ -496,9 +560,16 @@ fn render_markdown(report: &Value) -> String {
             }
             out.push('\n');
         }
-        _ => out.push_str("None recorded this session.\n\n"),
+        _ => out.push_str("None open.\n\n"),
     }
-    out.push_str("## Capabilities GitNexus has that DevMap does not (yet)\n\n");
+    if let Some(resolved) = report
+        .get("resolved_gaps")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0)
+    {
+        out.push_str(&format!("{resolved} recorded gaps are resolved.\n\n"));
+    }
+    out.push_str("## Questions DevMap answers only on the CLI, or not yet\n\n");
     if let Some(caps) = report.get("missing_capabilities").and_then(Value::as_array) {
         for cap in caps {
             out.push_str(&format!(
@@ -608,6 +679,84 @@ mod tests {
         let _ = fs::remove_dir_all(gaps_path(&db).parent().unwrap().parent().unwrap());
     }
 
+    fn open_ids(db: &Path) -> Vec<String> {
+        let report = build_report(db, None).unwrap();
+        report["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| gap_key(row, 0))
+            .collect()
+    }
+
+    /// The ledger is a history; the report is what is still open. Before this
+    /// the report listed every line, so a gap closed with `--resolved` kept
+    /// showing, and a gap recorded twice (opened, then resolved) showed twice.
+    #[test]
+    fn a_resolved_gap_is_counted_and_not_listed() {
+        let db = scratch_db("resolved");
+        record_gap(&db, "t", "GAP-OPEN", "still broken", None, false).unwrap();
+        record_gap(&db, "t", "GAP-DONE", "was broken", None, false).unwrap();
+        record_gap(&db, "t", "GAP-DONE", "fixed in abc123", None, true).unwrap();
+
+        let report = build_report(&db, None).unwrap();
+        assert_eq!(open_ids(&db), vec!["GAP-OPEN".to_string()], "{report}");
+        assert_eq!(report["resolved_gaps"], json!(1), "{report}");
+        let text = brief(&report);
+        assert!(text.contains("1 open gaps"), "{text}");
+        let markdown = render_markdown(&report);
+        assert!(!markdown.contains("GAP-DONE"), "{markdown}");
+        assert!(
+            markdown.contains("1 recorded gaps are resolved"),
+            "{markdown}"
+        );
+        let _ = fs::remove_dir_all(gaps_path(&db).parent().unwrap().parent().unwrap());
+    }
+
+    /// The latest line decides, so a gap that recurs after being closed is open
+    /// again, and the recurrence carries the new reason.
+    #[test]
+    fn a_gap_recorded_again_after_resolution_is_open_with_its_new_reason() {
+        let db = scratch_db("reopen");
+        record_gap(&db, "t", "GAP-R", "first", None, false).unwrap();
+        record_gap(&db, "t", "GAP-R", "fixed", None, true).unwrap();
+        record_gap(&db, "t", "GAP-R", "it came back", None, false).unwrap();
+        let report = build_report(&db, None).unwrap();
+        let gaps = report["gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 1, "{report}");
+        assert_eq!(gaps[0]["reason"], json!("it came back"));
+        assert_eq!(report["resolved_gaps"], json!(0), "{report}");
+        let _ = fs::remove_dir_all(gaps_path(&db).parent().unwrap().parent().unwrap());
+    }
+
+    /// A line with no `gap_id` — only a hand-written ledger has one, since the
+    /// writer refuses them — stays visible as open rather than being dropped,
+    /// names the key that closes it, and is closed by recording that key.
+    #[test]
+    fn a_line_without_a_gap_id_is_shown_and_can_be_closed_by_its_key() {
+        let db = scratch_db("unkeyed");
+        let path = gaps_path(&db);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "{\"ts_ms\":1789109200000,\"tool\":\"devmap_status\",\"reason\":\"old\"}\n\
+             {\"tool\":\"t\",\"gap_id\":\"  \",\"reason\":\"blank id, no timestamp\"}\n",
+        )
+        .unwrap();
+
+        let report = build_report(&db, None).unwrap();
+        let gaps = report["gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 2, "an id-less line must not vanish: {report}");
+        assert_eq!(gaps[0]["gap_key"], json!("unkeyed@1789109200000"));
+        assert_eq!(gaps[1]["gap_key"], json!("unkeyed#1"));
+
+        record_gap(&db, "t", "unkeyed@1789109200000", "stale", None, true).unwrap();
+        let report = build_report(&db, None).unwrap();
+        assert_eq!(report["gaps"].as_array().unwrap().len(), 1, "{report}");
+        assert_eq!(report["resolved_gaps"], json!(1), "{report}");
+        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
     /// One oversized entry must not be able to fill the ledger the next agent
     /// has to append to.
     #[test]
@@ -669,6 +818,17 @@ mod tests {
             };
             fs::remove_dir_all(root).unwrap();
             assert!(refused, "linked {case} source was accepted");
+        }
+    }
+
+    /// The table is read by agents as a list of what to work around, so a note
+    /// that names a retired Python command, or lists a capability another
+    /// command covers, sends them to something that is not there.
+    #[test]
+    fn the_capability_table_names_no_python_surface_and_omits_what_blast_covers() {
+        for (name, note) in MISSING_CAPABILITIES {
+            assert_ne!(*name, "detect_changes", "`devmap blast` covers it");
+            assert!(!note.contains("Python `dev"), "{name}: {note}");
         }
     }
 
