@@ -1049,8 +1049,10 @@ fn router_middleware(
 fn express_use_re() -> Result<&'static Regex, String> {
     static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"(?m)\b([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\.use\s*\("#)
-            .map_err(|error| format!("invalid Express middleware matcher: {error}"))
+        Regex::new(
+            r#"(?m)(?-u:\b)([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\.use\s*\("#,
+        )
+        .map_err(|error| format!("invalid Express middleware matcher: {error}"))
     })
     .as_ref()
     .map_err(Clone::clone)
@@ -1127,11 +1129,17 @@ fn express_router_uses(
 /// …, `Any`), and the `Handle`/`HandleFunc` pair net/http, gorilla/mux and chi
 /// share. The receiver is not matched by name, for the reason the Express and
 /// Python matchers are not: a router is whatever the author called it.
+///
+/// The word boundary is ASCII (`(?-u:\b)`), as in every matcher added beside
+/// it. The identifiers it bounds are ASCII by construction, and a Unicode `\b`
+/// makes the regex crate's lazy DFA give up at the first non-ASCII byte — a
+/// comment in any other script — and finish the file on a slower engine. These
+/// run on every Go, JavaScript and TypeScript file an index reads.
 fn go_route_re() -> Result<&'static Regex, String> {
     static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(concat!(
-            r#"(?m)\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"#,
+            r#"(?m)(?-u:\b)([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"#,
             r#"((?:\.With\((?:[^()]|\([^()]*\))*\))*)"#,
             r#"\.(Get|Post|Put|Delete|Patch|Head|Options|GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any|HandleFunc|Handle)"#,
             r#"\s*\(\s*(?:"([^"\n]*)"|`([^`]*)`)\s*,"#,
@@ -1146,7 +1154,7 @@ fn go_route_re() -> Result<&'static Regex, String> {
 fn go_use_re() -> Result<&'static Regex, String> {
     static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"(?m)\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.Use\s*\("#)
+        Regex::new(r#"(?m)(?-u:\b)([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.Use\s*\("#)
             .map_err(|error| format!("invalid Go middleware matcher: {error}"))
     })
     .as_ref()
@@ -1159,7 +1167,7 @@ fn go_derivation_re() -> Result<&'static Regex, String> {
     static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?m)\b([A-Za-z_][A-Za-z0-9_]*)\s*:?=\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.(Group|With)\s*\("#,
+            r#"(?m)(?-u:\b)([A-Za-z_][A-Za-z0-9_]*)\s*:?=\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.(Group|With)\s*\("#,
         )
         .map_err(|error| format!("invalid Go router derivation matcher: {error}"))
     })
@@ -1251,7 +1259,14 @@ fn go_chained_methods(source: &str, call_end: usize) -> Vec<String> {
 /// a call (`mux.Handle("/x", auth(h))`), which has no registration to read.
 fn go_routes(source: &str) -> Result<Vec<ExtractedRoute>, String> {
     let framework = go_router_framework(source);
-    let blocks = brace_blocks(source);
+    // Scopes are only consulted for a `Use` or a derivation, so a file with
+    // neither — most Go files, including most route files — never pays for
+    // the brace walk.
+    let blocks = if go_use_re()?.is_match(source) || go_derivation_re()?.is_match(source) {
+        brace_blocks(source)
+    } else {
+        Vec::new()
+    };
 
     let mut uses = Vec::new();
     for cap in go_use_re()?.captures_iter(source) {

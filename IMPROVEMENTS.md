@@ -843,6 +843,10 @@ coherent again:
   kernel-written graph since the kernel became the only writer; deleting the producer changed
   nothing and only made the absence visible. Recorded rather than papered over: the consumer
   branch stays, so a future kernel edge kind fills it instead of being re-invented.
+  **Filled 2026-10-06 (K-REG):** the kernel writes `EdgeKind::Registers` (`registers`), route
+  node → middleware symbol, from Express and Go-router middleware producers; `route_map`
+  reports `middleware` per route, null where no producer ran (Flask, FastAPI, Django, Axum).
+  The edge runs the way `routes_to` does, not the Python's file → route ownership direction.
 - **What the kernel does not yet write, found by converting the tests** (each pinned as a
   strict `xfail` in `tests/`, so the day the kernel fills one the suite says so instead of
   staying quietly green). `rust-port/crates/devmap-query/src/manifest.rs:224-229` writes
@@ -862,7 +866,7 @@ coherent again:
   `dev map routes` and the MCP `route_map` all have input. The seven strict `xfail`s in
   `tests/unit/test_graph_query_tools.py` did exactly what they were for: they turned into
   `XPASS(strict)` failures the moment the kernel filled the gap, and are gone. `registrations`
-  above is still empty — there is still no `registers` edge kind. And `dev map query <leaf> --json` reports
+  above was still empty then; the `registers` edge kind landed 2026-10-06 (see above). And `dev map query <leaf> --json` reports
   `callees_unavailable: "… is not indexed"` for a symbol that *is* indexed and simply has
   no callees, which is a wording bug that reads as a data-loss bug. Subsystem granularity
   also changed (14 whole-repo areas against the old per-package split under
