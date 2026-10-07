@@ -913,6 +913,12 @@ coherent again:
   no callees, which is a wording bug that reads as a data-loss bug. Subsystem granularity
   also changed (14 whole-repo areas against the old per-package split under
   `src/devcouncil/`); that is the kernel's design, not a gap.
+  **Closed, checked 2026-10-07.** The manifest fields this paragraph lists as empty are
+  computed now: `rust/devmap-query/src/manifest.rs` writes `frameworks` from the repository
+  inventory (`:519`) and `neighbors`, `handoff_paths` and `role_files` per subsystem
+  (`:437-439`), and gives each file a `kind` (`:275`). The `callees_unavailable` wording bug
+  is fixed in `rust/devmap-query/src/engine.rs:534-560`: callees come from the forward
+  traversal, which answers for a symbol id. Not found: a test pinning that last one.
 - **Two config knobs with no reader are gone, and a removed key no longer goes quiet.**
   `IndexingConfig.repo_map_dependents_cap` had exactly one reader, `repo_mapper.py:153`,
   which went with `build_dependents`; the kernel writes `dependents` now and does not read
@@ -1521,12 +1527,20 @@ observed once earlier; it stays recorded as observed-once, not as a defect.
   `SchemaDeclared`, `DistinctOrphanEndpoints` and the interned decoder. The register entry is
   therefore "port the accumulated fixes across", not "delete". Two proofs and the Chesterton's
   fence are in STATUS.md.
+  **Closed, checked 2026-10-07.** MANVI's `manvi/go.mod:19` now replaces the DevCouncil module
+  with `../../DevCouncil/backend/go_orchestrator`, and no `package repomap` or `package devmap`
+  is left in the MANVI tree (`rg -uu`): its copies are gone, so the register entry no longer
+  stands.
 * **New, and load-bearing:** `devmap-query/src/manifest.rs:302` writes `"neighbors": []` as a
   literal, and `src/devcouncil/indexing/subsystem_map.py::are_neighbors` reads that field. The
   "allow a write into a neighbouring subsystem" rung in `execution/policy_engine.py:628` can
   therefore never fire, and `verification/checks/subsystem_boundary.py` flags every cross-area
   change as drift. Measured: 0 of this repository's 16 subsystems and 0 of the scholarlm map's
   12 carry a non-empty `neighbors`. See STATUS.md for the two candidate owners.
+  **Superseded, checked 2026-10-07.** The producer no longer writes the literal: it computes
+  `neighbors` and says so in `meta.devmap_rust.neighbors_computed`
+  (`rust/devmap-query/src/manifest.rs:782-800`; `tests/subsystem_neighbours_are_computed.rs`).
+  The Python consumers named above no longer exist.
 
 ## Python typing: mypy to zero (2026-09-05)
 
@@ -1803,6 +1817,9 @@ gaps are `rust-port/testdata/fixtures/languages/cobol/main.cob` and `scripts/ins
 pattern), and `rust-port/vendor/grammars/cobol/parser.c` (refused by discovery) — each with the
 kernel's own reason. That binary does not yet report `edge_confidence_mismatches`, and the
 `edges` check says so rather than passing.
+**Closed, checked 2026-10-07.** The kernel reports `edge_confidence_mismatches`
+(`devmap_status` returns it, `0` on this index; `rust/devmap-cli/tests/status_names_what_it_could_not_read.rs:229-286`
+pins it in both directions).
 
 ## Staleness is age, not coverage (2026-09-06)
 
