@@ -94,3 +94,10 @@ required-features = ["parse"]
 [[test]]
 name = "write_breakdown"
 required-features = ["parse"]
+
+# Builds the generation whose index it then damages from `extract_file`, and
+# writes it with `save_generation`, which a build without grammars does not
+# link.
+[[test]]
+name = "a_damaged_full_text_index_is_named"
+required-features = ["parse"]

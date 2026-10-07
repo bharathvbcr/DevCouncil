@@ -80,42 +80,140 @@ fn write_mcp(path: &Path, command: &str) {
     .unwrap();
 }
 
-#[test]
-fn doctor_reports_duplicate_mcp_registrations_including_plugin_cache() {
-    let home = scratch("doc-home");
-    let cwd = scratch("doc-cwd");
-    std::fs::create_dir_all(cwd.join(".devcouncil").join("codeintel")).unwrap();
-    write_mcp(&home.join(".cursor").join("mcp.json"), "devmap");
-    write_mcp(&home.join(".claude.json"), "devmap");
-    write_mcp(
-        &home
-            .join(".claude")
-            .join("plugins")
-            .join("cache")
-            .join("devmap-local")
-            .join("devmap")
-            .join("0.1.1")
-            .join(".mcp.json"),
-        "devmap",
-    );
-    let out = run_in(&cwd, &["--json", "doctor"], Some(&home));
+/// Lay down a Dev Map plugin install the way Claude Code records one: the
+/// version directory under the cache, `installed_plugins.json` naming it, and
+/// `enabledPlugins` in `settings.json`.
+fn install_plugin(home: &Path, version: &str, enabled: bool) -> PathBuf {
+    let plugins = home.join(".claude").join("plugins");
+    let dir = plugins
+        .join("cache")
+        .join("devmap-local")
+        .join("devmap")
+        .join(version);
+    write_mcp(&dir.join(".mcp.json"), "devmap");
+    std::fs::write(
+        plugins.join("installed_plugins.json"),
+        serde_json::json!({"version": 2, "plugins": {"devmap@devmap-local": [
+            {"scope": "user", "installPath": dir, "version": version}
+        ]}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".claude").join("settings.json"),
+        serde_json::json!({"enabledPlugins": {"devmap@devmap-local": enabled}}).to_string(),
+    )
+    .unwrap();
+    dir
+}
+
+fn doctor_payload(home: &Path, cwd: &Path) -> Value {
+    let out = run_in(cwd, &["--json", "doctor"], Some(home));
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let payload = one_json(&out, "doctor");
+    one_json(&out, "doctor")
+}
+
+/// The genuine duplicate: one host — Claude Code — loading a user-scope
+/// `~/.claude.json` entry and an enabled plugin's `.mcp.json`.
+#[test]
+fn claude_json_beside_an_enabled_plugin_is_a_duplicate() {
+    let home = scratch("doc-home");
+    let cwd = scratch("doc-cwd");
+    write_mcp(&home.join(".claude.json"), "devmap");
+    let plugin = install_plugin(&home, "0.1.1", true);
+    let payload = doctor_payload(&home, &cwd);
     let warning = payload
         .get("duplicate_mcp_registration_warning")
         .and_then(Value::as_str)
         .unwrap_or("");
     assert!(
-        !warning.is_empty(),
-        "duplicate registrations must be reported: {payload}"
+        warning.contains("claude-code") && warning.contains(".claude.json"),
+        "one host loading two registrations must be reported: {payload}"
     );
     assert!(
-        warning.contains("mcp.json") || warning.contains("plugin"),
-        "must mention the plugin-cache or mcp.json: {warning}"
+        names(warning, &plugin.join(".mcp.json")),
+        "must name the plugin's .mcp.json: {warning}"
+    );
+}
+
+/// Cursor and Claude Code never share a process: one registration in each is
+/// two hosts served once apiece, not a duplicate.
+#[test]
+fn cursor_beside_a_claude_plugin_is_not_a_duplicate() {
+    let home = scratch("doc-cross-home");
+    let cwd = scratch("doc-cross-cwd");
+    write_mcp(&home.join(".cursor").join("mcp.json"), "devmap");
+    install_plugin(&home, "0.1.1", true);
+    let payload = doctor_payload(&home, &cwd);
+    assert!(
+        payload["duplicate_mcp_registration_warning"].is_null(),
+        "registrations in different hosts must not warn: {payload}"
+    );
+    let global = payload["mcp_registrations"]["global"]
+        .as_array()
+        .expect("global registrations");
+    let hosts: Vec<&str> = global.iter().filter_map(|r| r["host"].as_str()).collect();
+    assert_eq!(
+        hosts.len(),
+        2,
+        "both registrations are inventoried: {payload}"
+    );
+    assert!(
+        hosts.contains(&"cursor") && hosts.contains(&"claude-code"),
+        "{payload}"
+    );
+}
+
+/// Only an enabled plugin's `.mcp.json` is loaded, so only it counts.
+#[test]
+fn a_disabled_plugin_is_not_counted_as_a_registration() {
+    let home = scratch("doc-disabled-home");
+    let cwd = scratch("doc-disabled-cwd");
+    write_mcp(&home.join(".claude.json"), "devmap");
+    install_plugin(&home, "0.1.1", false);
+    let payload = doctor_payload(&home, &cwd);
+    assert!(
+        payload["duplicate_mcp_registration_warning"].is_null(),
+        "a disabled plugin loads nothing: {payload}"
+    );
+    let not_loaded = payload["mcp_registrations"]["not_loaded"]
+        .as_array()
+        .expect("not_loaded registrations");
+    assert_eq!(
+        not_loaded.len(),
+        1,
+        "the disabled plugin is still inventoried: {payload}"
+    );
+}
+
+/// A cache directory from an earlier install is loaded by nothing. It used to
+/// count as a second Claude registration and as a version mismatch.
+#[test]
+fn a_leftover_cache_version_is_neither_a_registration_nor_a_warning() {
+    let home = scratch("doc-leftover-home");
+    let cwd = scratch("doc-leftover-cwd");
+    let leftover = home
+        .join(".claude")
+        .join("plugins")
+        .join("cache")
+        .join("devmap-local")
+        .join("devmap")
+        .join("0.0.1");
+    write_mcp(&leftover.join(".mcp.json"), "devmap");
+    install_plugin(&home, "0.1.1", true);
+    let payload = doctor_payload(&home, &cwd);
+    assert!(
+        payload["duplicate_mcp_registration_warning"].is_null(),
+        "a leftover cache version is not a registration: {payload}"
+    );
+    let rows = serde_json::to_string(&payload["mcp_registrations"]).unwrap();
+    assert!(
+        !rows.contains("0.0.1"),
+        "a leftover must not be inventoried as a registration: {rows}"
     );
 }
 
