@@ -5,6 +5,8 @@
 pub mod cache;
 pub mod clonesig;
 pub mod deref;
+// Pure text: the resolver reads Rust function headers with it, and has no tree.
+pub mod rustsig;
 #[cfg(feature = "parse")]
 pub mod embedded;
 pub mod fallback;

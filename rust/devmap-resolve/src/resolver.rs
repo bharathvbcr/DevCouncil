@@ -286,6 +286,10 @@ pub struct Resolver {
     /// Ambiguity abstains rather than picking, the same rule
     /// [`Self::unique_basename`] follows.
     rust_crate_roots: BTreeMap<String, Option<String>>,
+    /// `(file, qualified name)` → the header a Rust function was declared
+    /// with. Read by the rungs that type a binding from a return type or a
+    /// closure parameter; see `devmap_extract::rustsig`.
+    rust_signatures: BTreeMap<(String, String), String>,
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
     reexport_chains: BTreeMap<String, String>,
@@ -511,6 +515,7 @@ impl Resolver {
             path_module_bindings: BTreeMap::new(),
             py_search_dirs: BTreeMap::new(),
             rust_crate_roots: BTreeMap::new(),
+            rust_signatures: BTreeMap::new(),
             reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
@@ -699,6 +704,9 @@ impl Resolver {
             if let Some(from_facts) = Self::type_from_binding_facts(binding) {
                 return Some(from_facts);
             }
+            if let Some(from_header) = self.type_from_rust_header(file, scope, binding) {
+                return Some(from_header);
+            }
             let declaring_scope = binding.scope.as_deref()?;
             return self
                 .scoped_receiver_types
@@ -731,6 +739,76 @@ impl Resolver {
             .get(&format!("{file}:{name}"))
             .cloned()
             .or_else(|| self.lookup_declared_type_name(file, None, name))
+    }
+
+    /// The type a Rust binding has according to a **function header** in the
+    /// corpus — the half of binder typing one file cannot do alone, because
+    /// the function is usually declared in another file. The extractor states
+    /// the shape (see `devmap_extract::rustlocal`); this reads the header.
+    ///
+    /// * `T::f()` / `T::f()?`: `T` when every indexed `T::f` is declared to
+    ///   return `Self` or `T` — through a `Result`/`Option` only when the call
+    ///   was unwrapped, because a `Result<T>` is not a `T`. With no `T::new`
+    ///   indexed, an un-unwrapped `T::new()` keeps the reading the
+    ///   initializer shape always gave it.
+    /// * `|f|k|p`: parameter `p` of the closure type `f` declares for its
+    ///   argument `k`. `f` is bound only as this file binds it — its own
+    ///   lexical scope or a `use` — never by a corpus-wide name match, which
+    ///   would type the closure by some other crate's `f`.
+    fn type_from_rust_header(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        binding: &devmap_extract::model::LocalBinding,
+    ) -> Option<String> {
+        use devmap_extract::rustsig;
+        let shape = binding.initializer.as_deref()?;
+        if let Some(closure) = shape.strip_prefix('|') {
+            let mut parts = closure.split('|');
+            let (callee, arg, param) = (parts.next()?, parts.next()?, parts.next()?);
+            let (arg, param): (usize, usize) = (arg.parse().ok()?, param.parse().ok()?);
+            let (callee_file, callee_identity) = self
+                .lexical_target(file, LangFamily::Rust, scope, callee)
+                .map(|identity| (file.to_string(), identity))
+                .or_else(|| {
+                    let (target_file, target_symbol) =
+                        self.import_bindings.get(file)?.get(callee)?;
+                    let (target_file, target_symbol) =
+                        self.declaring_site(target_file, target_symbol);
+                    self.lookup_in_package(&target_file, &target_symbol)
+                })?;
+            let header = self
+                .rust_signatures
+                .get(&(callee_file, callee_identity))?;
+            let header = rustsig::parse_header(header)?;
+            return Self::admissible_nominal_type(rustsig::closure_parameter(&header, arg, param)?);
+        }
+        let (call, unwrapped) = match shape.strip_suffix("()?") {
+            Some(call) => (call, true),
+            None => (shape.strip_suffix("()")?, false),
+        };
+        let (written_type, function) = call.split_once("::")?;
+        if !Self::is_plain_ident(written_type) || !Self::is_plain_ident(function) {
+            return None;
+        }
+        let type_name = if written_type == "Self" {
+            self.declaring_type_of(file, scope?)?.to_string()
+        } else {
+            written_type.to_string()
+        };
+        let Some(hits) =
+            self.type_methods
+                .get(&(LangFamily::Rust, type_name.clone(), function.to_string()))
+        else {
+            return (function == "new" && !unwrapped).then_some(type_name);
+        };
+        let every_hit_returns_it = hits.iter().all(|(hit_file, hit_identity)| {
+            self.rust_signatures
+                .get(&(hit_file.clone(), hit_identity.clone()))
+                .and_then(|header| rustsig::parse_header(header))
+                .is_some_and(|header| rustsig::returns_type(&header, &type_name, unwrapped))
+        });
+        (!hits.is_empty() && every_hit_returns_it).then_some(type_name)
     }
 
     /// `root.field` with exactly one hop of plain identifiers — the shape
@@ -1480,6 +1558,7 @@ impl Resolver {
         self.path_module_bindings.clear();
         self.py_search_dirs.clear();
         self.rust_crate_roots.clear();
+        self.rust_signatures.clear();
         self.reexport_chains.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
@@ -1548,6 +1627,14 @@ impl Resolver {
             let family = LangFamily::from_lang(&ext.language);
             let mut file_syms = Vec::new();
             for sym in &ext.symbols {
+                if family == LangFamily::Rust {
+                    if let Some(signature) = &sym.signature {
+                        self.rust_signatures.insert(
+                            (ext.file_path.clone(), sym.qualified_name.clone()),
+                            signature.clone(),
+                        );
+                    }
+                }
                 let identity: Arc<str> = Arc::from(sym.qualified_name.as_str());
                 self.symbol_index
                     .entry(sym.name.clone())

@@ -95,6 +95,38 @@ impl<'tree, 'src> Binders<'tree, 'src> {
             .and_then(|ty| rust_type_name(ty, self.source, 0))
     }
 
+    /// What the binder says about `name` that only the whole corpus can turn
+    /// into a type, as an initializer shape the resolver reads:
+    ///
+    /// * `T::f()` / `T::f()?` — the value of an associated-function call, and
+    ///   whether a `?`, `.unwrap()` or `.expect(..)` unwrapped it. The
+    ///   resolver types the binding `T` when `f`'s declared return type says
+    ///   so; `T::new()` keeps its old reading when no `new` is indexed.
+    /// * `|f|k|p` — parameter `p` of a closure passed as argument `k` of a
+    ///   call to the bare function `f`, typed by `f`'s declared closure type.
+    ///
+    /// Neither shape can collide with the shapes the `(scope, name)` facts
+    /// write — `T::new`, `T{..}`, `recv.method`, a bare name.
+    pub(crate) fn binder_hint(
+        &mut self,
+        use_node: Node<'tree>,
+        name: &str,
+        scope: Node<'tree>,
+    ) -> Option<String> {
+        if !is_plain_ident(name) {
+            return None;
+        }
+        let source = self.source;
+        match binder_of(self, use_node, name, scope)? {
+            Binder::Value(value) => {
+                let (inner, unwrapped) = strip_unwrap(value, source);
+                associated_call_hint(inner, unwrapped, source)
+            }
+            Binder::ClosureParam(closure, index) => closure_argument_hint(closure, index, source),
+            Binder::Typed(_) | Binder::OkPattern(_) | Binder::Loop(_) => None,
+        }
+    }
+
     /// The last `let` in `block` before `child` that binds `name`.
     ///
     /// `Some(None)` is a `let` that binds the name in a shape this pass does
@@ -124,6 +156,50 @@ impl<'tree, 'src> Binders<'tree, 'src> {
             (None, None) => None,
         }
     }
+}
+
+/// `T::f()` / `T::f()?` for a call written `path::T::f(..)`.
+fn associated_call_hint(call: Node, unwrapped: bool, source: &str) -> Option<String> {
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "scoped_identifier" {
+        return None;
+    }
+    let path = function.child_by_field_name("path")?;
+    let method = get_node_text(function.child_by_field_name("name")?, source);
+    let path = get_node_text(path, source);
+    let type_name = path.rsplit("::").next()?.trim();
+    let type_name = type_name.split('<').next()?.trim();
+    if !is_plain_ident(type_name) || !is_plain_ident(&method) {
+        return None;
+    }
+    // A type is capitalised; `module::f()` is a free function of a module,
+    // whose return type this shape does not describe.
+    if !type_name.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    Some(format!(
+        "{type_name}::{method}(){}",
+        if unwrapped { "?" } else { "" }
+    ))
+}
+
+/// `|f|k|p` for parameter `p` of a closure that is argument `k` of `f(..)`.
+fn closure_argument_hint(closure: Node, param: usize, source: &str) -> Option<String> {
+    let arguments = bounded_parent(closure).filter(|node| node.kind() == "arguments")?;
+    let call = bounded_parent(arguments).filter(|node| node.kind() == "call_expression")?;
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "identifier" {
+        return None;
+    }
+    let mut cursor = arguments.walk();
+    let arg = arguments
+        .named_children(&mut cursor)
+        .filter(|child| !child.kind().ends_with("comment"))
+        .position(|child| child.id() == closure.id())?;
+    Some(format!("|{}|{arg}|{param}", get_node_text(function, source)))
 }
 
 /// Every `let` in `block`, by each name its pattern mentions.
@@ -174,6 +250,8 @@ enum Binder<'tree> {
     OkPattern(Node<'tree>),
     /// The pattern of a `for` loop, with the iterated expression.
     Loop(Node<'tree>),
+    /// An untyped parameter of a closure, with the closure and its position.
+    ClosureParam(Node<'tree>, usize),
 }
 
 fn type_of_local<'tree>(
@@ -199,6 +277,7 @@ fn type_of_local<'tree>(
         }
         Binder::OkPattern(scrutinee) => lock_guard_target(binders, scrutinee, scope, hops),
         Binder::Loop(iterable) => loop_element(binders, iterable, scope, hops),
+        Binder::ClosureParam(..) => None,
     }
 }
 
@@ -291,18 +370,27 @@ fn binder_of<'tree>(
     None
 }
 
+/// A function's or closure's own parameter named `name`. A closure parameter
+/// with no written type is recorded with its position, for the resolver to
+/// type from the function the closure is passed to.
 fn parameter_binder<'tree>(scope: Node<'tree>, name: &str, source: &str) -> Option<Binder<'tree>> {
     let params = scope.child_by_field_name("parameters")?;
+    let closure = scope.kind() == "closure_expression";
     let mut cursor = params.walk();
-    for param in params.named_children(&mut cursor) {
-        if param.kind() != "parameter" {
-            continue;
-        }
-        let Some(pattern) = param.child_by_field_name("pattern") else {
-            continue;
-        };
-        if simple_pattern_is(pattern, name, source) {
-            return param.child_by_field_name("type").map(Binder::Typed);
+    for (index, param) in params
+        .named_children(&mut cursor)
+        .filter(|param| !param.kind().ends_with("comment"))
+        .enumerate()
+    {
+        if param.kind() == "parameter" {
+            let Some(pattern) = param.child_by_field_name("pattern") else {
+                continue;
+            };
+            if simple_pattern_is(pattern, name, source) {
+                return param.child_by_field_name("type").map(Binder::Typed);
+            }
+        } else if closure && simple_pattern_is(param, name, source) {
+            return Some(Binder::ClosureParam(scope, index));
         }
     }
     None

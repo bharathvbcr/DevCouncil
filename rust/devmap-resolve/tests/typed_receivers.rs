@@ -223,6 +223,142 @@ impl<'a> Graph<'a> {
     );
 }
 
+const RANKS: &str = "\
+pub struct PathRanks;
+
+impl PathRanks {
+    pub fn read(conn: &Connection) -> Result<Self> { todo!() }
+    pub fn fresh() -> Self { PathRanks }
+    pub fn other(conn: &Connection) -> Result<Other> { todo!() }
+    pub fn rank_of(&self, id: i64) -> u32 { 0 }
+}
+";
+
+fn rank_callers(user: &str) -> Vec<String> {
+    let (_, result) = resolve(&[
+        ("src/ranks.rs", RANKS),
+        ("src/user.rs", user),
+        ("other/src/lib.rs", "pub struct PathRanks;\n"),
+    ]);
+    calls_to(&result, "src/ranks.rs::PathRanks.rank_of")
+        .into_iter()
+        .map(|edge| edge.source_symbol.clone())
+        .collect()
+}
+
+#[test]
+fn a_binding_from_an_associated_function_has_its_declared_return_type() {
+    for value in [
+        "PathRanks::read(&snapshot)?",
+        "PathRanks::read(&snapshot).unwrap()",
+        "PathRanks::read(&snapshot).expect(\"ranks\")",
+        "crate::ranks::PathRanks::read(&snapshot)?",
+        "PathRanks::fresh()",
+    ] {
+        let user = format!(
+            "use crate::ranks::PathRanks;\n\n\
+             fn user(snapshot: &Connection) -> Result<()> {{\n    \
+             let paths = {value};\n    paths.rank_of(1);\n    Ok(())\n}}\n"
+        );
+        assert_eq!(
+            rank_callers(&user),
+            vec!["src/user.rs::user"],
+            "`let paths = {value}` is a PathRanks by `read`'s declared return type"
+        );
+    }
+}
+
+#[test]
+fn a_result_that_was_not_unwrapped_is_not_its_ok_type() {
+    for value in [
+        "PathRanks::read(&snapshot)",
+        "PathRanks::other(&snapshot)?",
+        "PathRanks::missing(&snapshot)?",
+    ] {
+        let user = format!(
+            "use crate::ranks::PathRanks;\n\n\
+             fn user(snapshot: &Connection) {{\n    let paths = {value};\n    paths.rank_of(1);\n}}\n"
+        );
+        assert!(
+            rank_callers(&user).is_empty(),
+            "`let paths = {value}` is not a PathRanks"
+        );
+    }
+}
+
+const NOTE: &str = "\
+use crate::collected::Collected;
+
+pub fn note(shared: &Mutex<Collected>, tally: impl FnOnce(&mut Collected)) {}
+pub fn note_generic<F>(shared: &Mutex<Collected>, tally: F) where F: FnOnce(&mut Collected) {}
+pub fn not_a_closure(shared: &Mutex<Collected>, tally: Collected) {}
+";
+
+#[test]
+fn a_closure_parameter_has_the_type_its_callee_declares() {
+    for (import, call) in [
+        ("use crate::note::note;", "note(&shared, |c| { c.merge(); });"),
+        ("use crate::note::note_generic;", "note_generic(&shared, |c| c.merge());"),
+    ] {
+        let user = format!(
+            "{import}\n\nfn walk(shared: Mutex<Collected>) {{\n    {call}\n}}\n"
+        );
+        let (_, result) = resolve(&[
+            ("src/collected.rs", COLLECTED),
+            ("src/note.rs", NOTE),
+            ("src/user.rs", &user),
+            ("other/src/lib.rs", "pub struct Collected;\n"),
+        ]);
+        let callers: Vec<_> = calls_to(&result, "src/collected.rs::Collected.merge")
+            .into_iter()
+            .map(|edge| edge.source_symbol.clone())
+            .collect();
+        assert_eq!(callers, vec!["src/user.rs::walk"], "{call}");
+    }
+
+    // The callee in the same file, as `dc-grep`'s `note` is.
+    let same_file = format!(
+        "{}\nfn walk(shared: Mutex<Collected>) {{\n    note(&shared, |c| c.merge());\n}}\n",
+        NOTE
+    );
+    let (_, result) = resolve(&[
+        ("src/collected.rs", COLLECTED),
+        ("src/note.rs", &same_file),
+        ("other/src/lib.rs", "pub struct Collected;\n"),
+    ]);
+    assert_eq!(
+        calls_to(&result, "src/collected.rs::Collected.merge").len(),
+        1,
+        "a callee declared beside the call types its closure too"
+    );
+}
+
+#[test]
+fn a_closure_is_not_typed_by_a_callee_this_file_does_not_bind() {
+    for (import, call) in [
+        // Not a closure parameter type.
+        ("use crate::note::not_a_closure;", "not_a_closure(&shared, |c| c.merge());"),
+        // Never imported: a corpus-wide match on the name is not evidence.
+        ("", "note(&shared, |c| c.merge());"),
+        // A method call: its receiver would have to be typed first.
+        ("use crate::note::note;", "shared.note(|c| c.merge());"),
+    ] {
+        let user = format!(
+            "{import}\n\nfn walk(shared: Mutex<Collected>) {{\n    {call}\n}}\n"
+        );
+        let (_, result) = resolve(&[
+            ("src/collected.rs", COLLECTED),
+            ("src/note.rs", NOTE),
+            ("src/user.rs", &user),
+            ("other/src/lib.rs", "pub struct Collected;\n"),
+        ]);
+        assert!(
+            calls_to(&result, "src/collected.rs::Collected.merge").is_empty(),
+            "{call}"
+        );
+    }
+}
+
 #[test]
 fn a_mutex_that_is_never_locked_has_no_inner_methods() {
     for body in [

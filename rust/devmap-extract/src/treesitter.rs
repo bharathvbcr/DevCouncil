@@ -4021,7 +4021,7 @@ fn extract_node(
                         span,
                         is_exported: text.starts_with("pub"),
                         docstring: None,
-                        signature: None,
+                        signature: rust_fn_signature(node, source),
                         parent_symbol: Some(match &owner {
                             Some(type_name) => format!("{}::{}", file_symbol_name, type_name),
                             None => enclosing_callable_qualified(node, source, file_symbol_name)
@@ -4113,7 +4113,7 @@ fn extract_node(
                         span,
                         is_exported: false,
                         docstring: None,
-                        signature: None,
+                        signature: rust_fn_signature(node, source),
                         parent_symbol: Some(match &owner {
                             Some(type_name) => format!("{}::{}", file_symbol_name, type_name),
                             None => enclosing_callable_qualified(node, source, file_symbol_name)
@@ -6972,6 +6972,26 @@ fn js_object_literal_argument_callee(node: Node, source: &str) -> Option<String>
     }
 }
 
+/// A Rust function's header — from the item's start to its body, or the whole
+/// item for a bodiless signature — with whitespace collapsed to single spaces.
+///
+/// What the skeleton shows for the function, and what the resolver reads a
+/// return type and a closure parameter's type out of (see
+/// [`crate::rustsig`]): `fn read(conn: &Connection) -> Result<Self>`.
+/// A header longer than [`crate::rustsig::MAX_SIGNATURE_BYTES`] is not
+/// recorded, because a truncated one would read as a different header.
+fn rust_fn_signature(node: Node, source: &str) -> Option<String> {
+    let end = node
+        .child_by_field_name("body")
+        .map_or(node.end_byte(), |body| body.start_byte());
+    let header = source.get(node.start_byte()..end)?;
+    let header = header.trim().trim_end_matches(';').trim_end();
+    if header.is_empty() || header.len() > crate::rustsig::MAX_SIGNATURE_BYTES {
+        return None;
+    }
+    Some(header.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 /// Whether a `use_declaration` republishes beyond the crate that wrote it.
 ///
 /// Exactly a bare `pub`. `pub(crate)`, `pub(super)` and `pub(in path)` are all
@@ -8504,7 +8524,7 @@ fn collect_site_bindings(
                                     })
                                 })
                                 .flatten();
-                            let (mut declared_type, initializer) = binding_facts_for(
+                            let (mut declared_type, mut initializer) = binding_facts_for(
                                 &declared_types,
                                 &initializers,
                                 &scope_name,
@@ -8516,11 +8536,19 @@ fn collect_site_bindings(
                             // More specific than the `(scope, name)` facts,
                             // which one shadowing `let` can make about a
                             // different value, so it wins when it answers.
+                            // What it cannot type alone — the value of
+                            // `T::f(..)?`, a closure's parameter — it hands the
+                            // resolver as an initializer shape, in place of the
+                            // facts' guess at the same binding.
                             if lang == "rust" {
                                 if let Some(stated) =
                                     binders.binder_type(node, name, scope)
                                 {
                                     declared_type = Some(stated);
+                                } else if let Some(hint) =
+                                    binders.binder_hint(node, name, scope)
+                                {
+                                    initializer = Some(hint);
                                 }
                             }
                             sites.insert(LocalBinding {
