@@ -397,6 +397,15 @@ func toStoreGaps(gaps []Gap) []store.GapRow {
 			RecommendedFix: g.RecommendedFix,
 			Blocking:       g.Blocking,
 			EvidenceJSON:   ev,
+
+			RequirementID:              g.RequirementID,
+			AcceptanceCriterionID:      g.AcceptanceCriterionID,
+			ExpectedVerificationMethod: g.ExpectedVerificationMethod,
+			File:                       g.File,
+			Line:                       g.Line,
+			SuggestedCommand:           g.SuggestedCommand,
+			StdoutPath:                 g.StdoutPath,
+			StderrPath:                 g.StderrPath,
 		})
 	}
 	return out
