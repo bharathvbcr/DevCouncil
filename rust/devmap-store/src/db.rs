@@ -1619,11 +1619,10 @@ impl WriteBreakdown {
 /// leave the one build worth profiling as the one build with no profile.
 ///
 /// Gated on `parse` because its only caller is: `save_generation_timed` is the
-/// write path and needs the grammar-identity stamps. With the feature off this
-/// is dead code, and `cargo clippy -p devmap-query --no-default-features`
-/// refuses it -- the store's own feature-off check cannot, because
-/// `devmap-serve` is a dev-dependency that pulls default features straight back
-/// in. [`WriteBreakdown`] itself stays ungated: it is public, an embedder that
+/// write path, which a build without grammars does not carry (see
+/// [`Store::save_generation`]). With the feature off this is dead code, and
+/// `cargo check -p devmap-store --no-default-features` warns about it.
+/// [`WriteBreakdown`] itself stays ungated: it is public, an embedder that
 /// reads a persisted map can name the type, and gating it would gate the
 /// re-export too.
 #[cfg(feature = "parse")]
@@ -4564,8 +4563,18 @@ impl Store {
         ((gen_id as i64) << 32) | (node_ord as i64)
     }
 
-    /// Writes a generation. Part of the build path, so it needs the parsing
-    /// frontend's grammar-identity stamps and is gated with it.
+    /// Writes a generation.
+    ///
+    /// Gated on `parse` by scope, not by need: a build without grammars answers
+    /// questions about a persisted map and never builds one, so it does not
+    /// link the write path. Nothing here calls a grammar. The identity each
+    /// payload is stamped with comes from
+    /// `devmap_extract::cache::current_payload_identity`, which answers in both
+    /// configurations, and with these gates and the `CacheKey` constructors' gate
+    /// removed the store compiles feature-off without a warning (checked
+    /// 2026-10-06). Ungating is therefore a decision about what an
+    /// embedder links, and it should come with a feature-off test that writes a
+    /// generation, not just with the gates removed.
     #[cfg(feature = "parse")]
     pub fn save_generation(
         &self,
