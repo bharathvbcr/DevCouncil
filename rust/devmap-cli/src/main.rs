@@ -2379,8 +2379,10 @@ struct McpConfigSite {
     host: Option<McpHost>,
 }
 
-/// Plugin bundle sources `devmap claude plugin` writes. A marketplace copies
-/// them into the plugin cache on install; nothing loads them in place.
+/// Marketplace-root `.mcp.json` files from the bundle layout before the plugin
+/// moved into its own `<out>/devmap/` directory. No host loads a file at a
+/// marketplace root; the in-place plugin a local marketplace does load is
+/// reached through [`claude::claude_plugin_install`].
 const PLUGIN_BUNDLE_SOURCES: &[&str] = &[
     ".devcouncil/devmap-plugin/.mcp.json",
     ".devmap/devmap-plugin/.mcp.json",
@@ -2407,13 +2409,14 @@ fn host_mcp_config_sites(home: Option<&Path>, cwd: &Path) -> Vec<McpConfigSite> 
             home.join(".claude.json"),
             Some(McpHost::ClaudeCode),
         ));
-        // Only the version Claude Code's install record names. Every other
+        // Only the copy Claude Code loads: in place for a local-directory
+        // marketplace, else the version its install record names. Every other
         // directory under the cache is a leftover from an earlier install that
         // nothing loads; `plugin_cleanup_note` reports those.
-        let install = claude_plugin_install(home);
+        let install = claude::claude_plugin_install(home);
         let host = (install.enabled == Some(true)).then_some(McpHost::ClaudeCode);
-        for dir in &install.active {
-            let mcp = dir.join(".mcp.json");
+        for plugin in &install.loaded {
+            let mcp = plugin.dir.join(".mcp.json");
             if mcp.is_file() {
                 out.push(site(mcp.display().to_string(), mcp, host));
             }
@@ -2437,96 +2440,6 @@ fn host_mcp_config_sites(home: Option<&Path>, cwd: &Path) -> Vec<McpConfigSite> 
         }
     }
     out
-}
-
-/// What Claude Code records about the Dev Map plugin under one home.
-struct ClaudePluginInstall {
-    /// `~/.claude/plugins/cache/<marketplace>/<plugin>`.
-    cache: PathBuf,
-    /// Version directories `installed_plugins.json` names under [`Self::cache`]:
-    /// the ones Claude Code actually loads.
-    active: Vec<PathBuf>,
-    /// `enabledPlugins` in `~/.claude/settings.json` for the recorded key.
-    /// `None` when no setting names it.
-    enabled: Option<bool>,
-    /// Why the install record could not be read, when it exists but is not
-    /// usable. A record nobody could read is not a record naming nothing.
-    record_error: Option<String>,
-    /// Version directories under the cache that the record does not name.
-    leftovers: Vec<PathBuf>,
-}
-
-fn claude_plugin_install(home: &Path) -> ClaudePluginInstall {
-    let plugins = home.join(".claude").join("plugins");
-    let cache = plugins
-        .join("cache")
-        .join(claude::MARKETPLACE_NAME)
-        .join(claude::PLUGIN_NAME);
-    let record = plugins.join("installed_plugins.json");
-    let mut active: Vec<PathBuf> = Vec::new();
-    let mut keys: Vec<String> = Vec::new();
-    let mut record_error = None;
-    match std::fs::read_to_string(&record) {
-        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(value) => match value.get("plugins").and_then(serde_json::Value::as_object) {
-                // Matched by where the install lives, not by spelling the key:
-                // the key is `<plugin>@<marketplace>`, and the cache path is the
-                // part this binary owns.
-                Some(map) => {
-                    for (key, installs) in map {
-                        let paths = installs
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|install| install.get("installPath")?.as_str())
-                            .map(PathBuf::from);
-                        for path in paths {
-                            if path.parent() == Some(cache.as_path()) && !active.contains(&path) {
-                                active.push(path);
-                                if !keys.contains(key) {
-                                    keys.push(key.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                None => {
-                    record_error = Some(format!("{} has no `plugins` object", record.display()))
-                }
-            },
-            Err(error) => record_error = Some(format!("{} is not JSON: {error}", record.display())),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => record_error = Some(format!("{}: {error}", record.display())),
-    }
-    let enabled = std::fs::read_to_string(home.join(".claude").join("settings.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|settings| {
-            let map = settings.get("enabledPlugins")?.as_object()?;
-            let flags: Vec<bool> = keys
-                .iter()
-                .filter_map(|key| map.get(key)?.as_bool())
-                .collect();
-            (!flags.is_empty()).then(|| flags.contains(&true))
-        });
-    let mut leftovers: Vec<PathBuf> = std::fs::read_dir(&cache)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|dir| dir.is_dir() && !active.contains(dir))
-                .collect()
-        })
-        .unwrap_or_default();
-    leftovers.sort();
-    ClaudePluginInstall {
-        cache,
-        active,
-        enabled,
-        record_error,
-        leftovers,
-    }
 }
 
 fn resolve_devmap_command(command: &str) -> PathBuf {
@@ -2716,15 +2629,9 @@ fn mcp_entry_is_pinned(path: &Path) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
         return false;
     };
-    let Some(args) = value
-        .pointer("/mcpServers/devmap/args")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return false;
-    };
-    args.iter()
-        .filter_map(serde_json::Value::as_str)
-        .any(|a| a == "--root" || a == "--db")
+    value
+        .pointer("/mcpServers/devmap")
+        .is_some_and(integrate::entry_is_pinned)
 }
 
 /// Registrations of `devmap mcp` across the documents a diagnostic inspects.
@@ -2889,11 +2796,18 @@ fn plugin_health(home: &Path) -> PluginHealth {
     let mut issues = Vec::new();
     let mut cleanup = Vec::new();
     let binary_version = env!("CARGO_PKG_VERSION");
-    let install = claude_plugin_install(home);
+    let install = claude::claude_plugin_install(home);
     if let Some(error) = &install.record_error {
         issues.push(format!(
             "cannot tell which Dev Map plugin version Claude Code loads ({error}); the \
              installed version is unchecked"
+        ));
+    }
+    if let Some(error) = &install.load_error {
+        issues.push(format!(
+            "cannot tell whether Claude Code loads the Dev Map plugin in place from its \
+             marketplace ({error}); only the install record's copy is checked, and it may not \
+             be the one sessions load"
         ));
     }
     if !install.leftovers.is_empty() {
@@ -2903,15 +2817,15 @@ fn plugin_health(home: &Path) -> PluginHealth {
             .filter_map(|dir| dir.file_name()?.to_str())
             .collect::<Vec<_>>()
             .join(", ");
-        let active = if install.active.is_empty() {
+        let active = if install.loaded.is_empty() {
             "no install record names any version".to_string()
         } else {
             format!(
                 "the active install is {}",
                 install
-                    .active
+                    .loaded
                     .iter()
-                    .map(|dir| dir.display().to_string())
+                    .map(|plugin| plugin.dir.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -2922,19 +2836,48 @@ fn plugin_health(home: &Path) -> PluginHealth {
             install.cache.display()
         ));
     }
-    for dir in &install.active {
+    // A third state, neither loaded nor a leftover: the record still names a
+    // cache copy, but the plugin loads in place. Not deletable — the record
+    // names it — and not checked, because no session reads it.
+    if install
+        .loaded
+        .iter()
+        .any(|plugin| plugin.origin == claude::LoadOrigin::InPlace)
+        && !install.recorded.is_empty()
+    {
+        cleanup.push(format!(
+            "installed_plugins.json names {}, but the {} marketplace is a local directory, so \
+             sessions load the plugin in place from {}; the cache copy is not checked",
+            install
+                .recorded
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            claude::MARKETPLACE_NAME,
+            install
+                .loaded
+                .iter()
+                .map(|plugin| plugin.dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    for plugin in &install.loaded {
+        let dir = &plugin.dir;
         if !dir.is_dir() {
+            let named_by = match plugin.origin {
+                claude::LoadOrigin::InstallRecord => "installed_plugins.json names this install",
+                claude::LoadOrigin::InPlace => {
+                    "the local marketplace loads the plugin in place from here"
+                }
+            };
             issues.push(format!(
-                "{}: installed_plugins.json names this install, and it does not exist",
+                "{}: {named_by}, and it does not exist",
                 dir.display()
             ));
             continue;
         }
-        let version_name = dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
         let hooks = dir.join("hooks").join("hooks.json");
         let mcp = dir.join(".mcp.json");
         if !hooks.is_file() || !mcp.is_file() {
@@ -2945,11 +2888,18 @@ fn plugin_health(home: &Path) -> PluginHealth {
             ));
             continue;
         }
-        if version_name != binary_version {
-            issues.push(format!(
-                "{}: installed plugin version {version_name} does not match binary {binary_version}",
+        match plugin.version.as_deref() {
+            Some(version) if version == binary_version => {}
+            Some(version) => issues.push(format!(
+                "{}: installed plugin version {version} does not match binary {binary_version}",
                 dir.display()
-            ));
+            )),
+            None => issues.push(format!(
+                "{}: no version could be read for the loaded plugin (`version` in \
+                 .claude-plugin/plugin.json for an in-place copy, the directory name for a \
+                 cached one); its version is unchecked",
+                dir.display()
+            )),
         }
         if let Ok(text) = std::fs::read_to_string(&hooks) {
             if text.contains("\"args\"") || text.contains("\"async\"") {

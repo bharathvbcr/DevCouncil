@@ -1900,6 +1900,243 @@ pub fn validate_file(path: &Path, strict: bool) -> anyhow::Result<Report> {
     Ok(Report::new(diagnostics, strict))
 }
 
+// ---------------------------------------------------------------------------
+// The copy Claude Code loads
+// ---------------------------------------------------------------------------
+
+/// Where a [`LoadedPlugin`] path came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadOrigin {
+    /// `installPath` in `installed_plugins.json`: a copy under the cache.
+    InstallRecord,
+    /// A relative-path plugin of a local-directory marketplace, which Claude
+    /// Code loads from the marketplace folder itself.
+    InPlace,
+}
+
+/// One copy of the Dev Map plugin that Claude Code sessions load.
+pub struct LoadedPlugin {
+    pub dir: PathBuf,
+    /// The version this copy declares: the version directory's name for a
+    /// cached install, `.claude-plugin/plugin.json`'s `version` for an
+    /// in-place one. `None` when an in-place copy declares none.
+    pub version: Option<String>,
+    pub origin: LoadOrigin,
+}
+
+/// What Claude Code records about the Dev Map plugin under one home.
+pub struct ClaudePluginInstall {
+    /// `~/.claude/plugins/cache/<marketplace>/<plugin>`.
+    pub cache: PathBuf,
+    /// The copies sessions load. See [`claude_plugin_install`] for how the
+    /// in-place copy of a local marketplace takes precedence over the record.
+    pub loaded: Vec<LoadedPlugin>,
+    /// Version directories `installed_plugins.json` names under
+    /// [`Self::cache`]. The loaded copies unless the plugin loads in place.
+    pub recorded: Vec<PathBuf>,
+    /// `enabledPlugins` in `~/.claude/settings.json` for the plugin's key.
+    /// `None` when no setting names it.
+    pub enabled: Option<bool>,
+    /// Why the install record could not be read, when it exists but is not
+    /// usable. A record nobody could read is not a record naming nothing.
+    pub record_error: Option<String>,
+    /// Why the marketplace could not be resolved to the copy it loads. Set,
+    /// [`Self::loaded`] falls back to the install record, which may not be
+    /// what a session runs.
+    pub load_error: Option<String>,
+    /// Version directories under the cache that the record does not name.
+    pub leftovers: Vec<PathBuf>,
+}
+
+/// Which copy of the Dev Map plugin Claude Code loads, and what it records.
+///
+/// A plugin whose marketplace was added from a local directory, and whose
+/// marketplace entry names a relative source, "loads in place from its path
+/// inside the marketplace folder" and "needs no install record because it
+/// loads from the marketplace itself"
+/// (<https://code.claude.com/docs/en/plugins/loading>). `installed_plugins.json`
+/// may still name a cache copy for it — Claude Code 2.1.292 reports that
+/// `installPath` beside a different `readFromFolder` — and a check that read
+/// the cache copy inspected files no session loads. Every other marketplace
+/// copies the plugin into the cache and loads that copy, so for those the
+/// install record is the answer.
+pub fn claude_plugin_install(home: &Path) -> ClaudePluginInstall {
+    let plugins = home.join(".claude").join("plugins");
+    let cache = plugins
+        .join("cache")
+        .join(MARKETPLACE_NAME)
+        .join(PLUGIN_NAME);
+    let record = plugins.join("installed_plugins.json");
+    let mut recorded: Vec<PathBuf> = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
+    let mut record_error = None;
+    match std::fs::read_to_string(&record) {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(value) => match value.get("plugins").and_then(Value::as_object) {
+                // Matched by where the install lives, not by spelling the key:
+                // the key is `<plugin>@<marketplace>`, and the cache path is the
+                // part this binary owns.
+                Some(map) => {
+                    for (key, installs) in map {
+                        let paths = installs
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|install| install.get("installPath")?.as_str())
+                            .map(PathBuf::from);
+                        for path in paths {
+                            if path.parent() == Some(cache.as_path()) && !recorded.contains(&path) {
+                                recorded.push(path);
+                                if !keys.contains(key) {
+                                    keys.push(key.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    record_error = Some(format!("{} has no `plugins` object", record.display()))
+                }
+            },
+            Err(error) => record_error = Some(format!("{} is not JSON: {error}", record.display())),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => record_error = Some(format!("{}: {error}", record.display())),
+    }
+    let (in_place, load_error) = match in_place_plugin_dir(&plugins) {
+        Ok(dir) => (dir, None),
+        Err(error) => (None, Some(error)),
+    };
+    let loaded = match in_place {
+        Some(dir) => {
+            // An in-place plugin may have no record at all; its enabled flag
+            // is still keyed `<plugin>@<marketplace>`.
+            let key = format!("{PLUGIN_NAME}@{MARKETPLACE_NAME}");
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+            vec![LoadedPlugin {
+                version: manifest_version(&dir),
+                dir,
+                origin: LoadOrigin::InPlace,
+            }]
+        }
+        None => recorded
+            .iter()
+            .map(|dir| LoadedPlugin {
+                dir: dir.clone(),
+                version: dir.file_name().and_then(|n| n.to_str()).map(str::to_string),
+                origin: LoadOrigin::InstallRecord,
+            })
+            .collect(),
+    };
+    let enabled = std::fs::read_to_string(home.join(".claude").join("settings.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|settings| {
+            let map = settings.get("enabledPlugins")?.as_object()?;
+            let flags: Vec<bool> = keys
+                .iter()
+                .filter_map(|key| map.get(key)?.as_bool())
+                .collect();
+            (!flags.is_empty()).then(|| flags.contains(&true))
+        });
+    let mut leftovers: Vec<PathBuf> = std::fs::read_dir(&cache)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|dir| dir.is_dir() && !recorded.contains(dir))
+                .collect()
+        })
+        .unwrap_or_default();
+    leftovers.sort();
+    ClaudePluginInstall {
+        cache,
+        loaded,
+        recorded,
+        enabled,
+        record_error,
+        load_error,
+        leftovers,
+    }
+}
+
+/// The in-place plugin directory, when the Dev Map marketplace is a local
+/// directory whose entry for the plugin is a relative path.
+///
+/// `Ok(None)` is a positive answer: no such marketplace is recorded, it is a
+/// remote source whose plugins are copied into the cache, or its entry is not
+/// a relative path. `Err` means the question could not be answered.
+fn in_place_plugin_dir(plugins: &Path) -> Result<Option<PathBuf>, String> {
+    let known = plugins.join("known_marketplaces.json");
+    let text = match std::fs::read_to_string(&known) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", known.display())),
+    };
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("{} is not JSON: {error}", known.display()))?;
+    let Some(entry) = value.get(MARKETPLACE_NAME) else {
+        return Ok(None);
+    };
+    let root = match entry.pointer("/source/source").and_then(Value::as_str) {
+        // `installLocation` is "the path you gave" for a local marketplace,
+        // and the directory source's `path` is the marketplace root.
+        Some("directory") => entry
+            .get("installLocation")
+            .or_else(|| entry.pointer("/source/path"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                format!(
+                    "{}: the `{MARKETPLACE_NAME}` directory marketplace names no path",
+                    known.display()
+                )
+            })?,
+        // Read in place too, but the documentation states the in-place rule
+        // for directories, not for a marketplace file; resolving it would be
+        // a guess, and a guess here decides which copy every check reads.
+        Some("file") => {
+            return Err(format!(
+                "{}: the `{MARKETPLACE_NAME}` marketplace is a `file` source, whose plugin \
+                 location is not resolved here",
+                known.display()
+            ))
+        }
+        _ => return Ok(None),
+    };
+    let manifest = root.join(".claude-plugin").join("marketplace.json");
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|error| format!("{}: {error}", manifest.display()))?;
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("{} is not JSON: {error}", manifest.display()))?;
+    let source = value
+        .get("plugins")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|plugin| plugin.get("name").and_then(Value::as_str) == Some(PLUGIN_NAME))
+        .and_then(|plugin| plugin.get("source")?.as_str());
+    let Some(source) = source.filter(|s| s.starts_with("./") || s.starts_with("../")) else {
+        return Ok(None);
+    };
+    // Relative sources resolve from the marketplace root. `./` segments are
+    // dropped so the path reads the way Claude Code reports it.
+    let relative: PathBuf = Path::new(source)
+        .components()
+        .filter(|part| !matches!(part, std::path::Component::CurDir))
+        .collect();
+    Ok(Some(root.join(relative)))
+}
+
+/// `version` from a plugin directory's `.claude-plugin/plugin.json`.
+fn manifest_version(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(".claude-plugin").join("plugin.json")).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    value.get("version")?.as_str().map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
