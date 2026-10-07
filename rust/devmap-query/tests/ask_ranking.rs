@@ -296,11 +296,29 @@ fn a_central_single_term_match_does_not_outrank_the_match_for_the_question() {
             .map(|hit| (&hit.symbol_name, hit.score))
             .collect::<Vec<_>>()
     );
-    let note = response.walk_incomplete.as_deref().unwrap_or("");
-    assert!(
-        note.contains("unmount"),
-        "a query term no indexed name or docstring contains is named: {note:?}"
+    // Answered: one hit covers three of the five terms. `walk_incomplete` is
+    // counted by the session ledger as a health signal, so a question with one
+    // unfamiliar word (`unmount`) and a real answer must not raise it.
+    assert_eq!(response.walk_incomplete, None, "{response:?}");
+}
+
+/// When most of what was asked appears nowhere in the index, the answer names
+/// those terms: the behaviour lives in bodies, which this index does not hold.
+#[test]
+fn a_question_made_mostly_of_unindexed_words_names_them() {
+    let store = store_of(&[
+        ("a.py", "def guard_stale_reads():\n    return 1\n"),
+        ("b.py", "def other():\n    return 2\n"),
+    ]);
+    let response = ask(
+        &store,
+        "stale closure after unmount cleanup",
+        ASK_DEFAULT_MIN_CONFIDENCE,
     );
+    let note = response.walk_incomplete.as_deref().unwrap_or("");
+    for term in ["closure", "unmount", "cleanup"] {
+        assert!(note.contains(term), "{term} missing from {note:?}");
+    }
 }
 
 /// When no hit covers more than one of the question's terms, the answer says

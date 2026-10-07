@@ -191,7 +191,8 @@ pub fn blend_relevance_and_rank(
     rank_of: impl Fn(usize) -> f32,
 ) -> Vec<(usize, f32)> {
     let total: f32 = scored.iter().map(|(_, score)| score).sum();
-    if !(total > 0.0) {
+    // NaN fails `is_finite`, so a poisoned score cannot reach the division.
+    if !total.is_finite() || total <= 0.0 {
         return scored.to_vec();
     }
     let favour: Vec<f32> = scored

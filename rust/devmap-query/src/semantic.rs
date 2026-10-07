@@ -223,8 +223,27 @@ impl SemanticIndex {
         }
         let (present, absent): (Vec<&String>, Vec<&String>) =
             terms.iter().partition(|term| self.idf.contains_key(term.as_str()));
+        let best = hits
+            .iter()
+            .filter_map(|&index| self.documents.get(index))
+            .map(|document| {
+                present
+                    .iter()
+                    .filter(|term| document.contains_key(term.as_str()))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        let weak = present.len() >= 2 && best <= 1;
+        // The note rides `walk_incomplete`, which the session ledger counts as
+        // an index-health signal. It must stay rare: a question with one
+        // unfamiliar word and a hit covering the rest is answered, and saying
+        // otherwise on every sentence-shaped query would drown the signal.
+        // Absent terms are named only when the answer is weak anyway, or when
+        // they are at least half of what was asked.
+        let mostly_absent = !absent.is_empty() && absent.len() * 2 >= terms.len();
         let mut notes = Vec::new();
-        if !absent.is_empty() {
+        if !absent.is_empty() && (weak || mostly_absent) {
             let listed: Vec<&str> = absent.iter().map(|term| term.as_str()).collect();
             notes.push(format!(
                 "the index contains none of the terms {}; it holds names and \
@@ -233,29 +252,16 @@ impl SemanticIndex {
                 listed.join(", ")
             ));
         }
-        if present.len() >= 2 {
-            let best = hits
-                .iter()
-                .filter_map(|&index| self.documents.get(index))
-                .map(|document| {
-                    present
-                        .iter()
-                        .filter(|term| document.contains_key(term.as_str()))
-                        .count()
-                })
-                .max()
-                .unwrap_or(0);
-            if best <= 1 {
-                let listed: Vec<&str> = present.iter().map(|term| term.as_str()).collect();
-                notes.push(format!(
-                    "weak match: no hit among the first {} matches more than one \
-                     of the terms {}; these are single-word coincidences, not \
-                     answers — narrow the question to a name, or read the code \
-                     the hits do not cover",
-                    hits.len(),
-                    listed.join(", ")
-                ));
-            }
+        if weak {
+            let listed: Vec<&str> = present.iter().map(|term| term.as_str()).collect();
+            notes.push(format!(
+                "weak match: no hit among the first {} matches more than one \
+                 of the terms {}; these are single-word coincidences, not \
+                 answers — narrow the question to a name, or read the code \
+                 the hits do not cover",
+                hits.len(),
+                listed.join(", ")
+            ));
         }
         (!notes.is_empty()).then(|| notes.join("; "))
     }
