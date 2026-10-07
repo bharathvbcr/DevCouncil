@@ -1805,32 +1805,6 @@ fn graph_value_for_read(store: &Store, db: &std::path::Path) -> anyhow::Result<s
     )
 }
 
-/// The graph the read-only surfaces answer from: the artifact's `nodes` and
-/// `edges` from the latest generation, and none of its panels — no `git log`,
-/// no intel, no dead-code list, no freshness. `build_graph_core_value` says
-/// what building the whole artifact cost these commands.
-fn graph_core_for_read(store: &Store) -> anyhow::Result<serde_json::Value> {
-    store
-        .latest_generation_id()?
-        .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
-    let extractions = store.latest_extractions()?;
-    let analysis = store
-        .latest_analysis()?
-        .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
-    let edges = store
-        .latest_edges(0.0)?
-        .into_iter()
-        .map(resolved_edge_from_stored)
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let repo_root = store.latest_repo_root()?;
-    Ok(devmap_query::build_graph_core_value(
-        &extractions,
-        &analysis,
-        &edges,
-        repo_root.as_deref(),
-    ))
-}
-
 fn write_consumer_artifacts(
     store: &Store,
     request: ManifestRequest<'_>,
@@ -3507,31 +3481,6 @@ fn repo_root_for(store: &Store, path: &std::path::Path) -> anyhow::Result<PathBu
         .latest_repo_root()?
         .map(PathBuf::from)
         .unwrap_or_else(|| path.to_path_buf()))
-}
-
-/// Keep only routes matching the filter, leaving the scan report intact.
-fn retain_matching_routes(mapped: &mut serde_json::Value, filter: &str) {
-    let kept: Vec<serde_json::Value> = mapped["routes"]
-        .as_array()
-        .map(|routes| {
-            routes
-                .iter()
-                .filter(|route| {
-                    let path = route["path"].as_str().unwrap_or("");
-                    let id = route["id"].as_str().unwrap_or("");
-                    path.contains(filter)
-                        || id.contains(filter)
-                        || devmap_query::api_routes::paths_match(path, filter)
-                })
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-    // `count` stays the number of routes the graph holds; `shown` is what the
-    // filter kept. Overwriting `count` would make a filtered view read as the
-    // whole surface.
-    mapped["shown"] = serde_json::json!(kept.len());
-    mapped["routes"] = serde_json::Value::Array(kept);
 }
 
 /// One line per route, then the scan's own limits.
@@ -8002,7 +7951,7 @@ empty graph, which would read as 'this file has no control flow'.",
         }
         Commands::Cypher { query, limit } => {
             let store = open_for_read(cli)?;
-            let graph = graph_core_for_read(&store)?;
+            let graph = devmap_query::graph_core_for_store(&store)?;
             let result = devmap_query::cypher::run(&graph, query, *limit);
             if cli.json {
                 emit_json(cli, &result)?;
@@ -8141,12 +8090,12 @@ represent them",
             max_file_bytes,
         } => {
             let store = open_for_read(cli)?;
-            let graph = graph_core_for_read(&store)?;
+            let graph = devmap_query::graph_core_for_store(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
             let mut mapped = devmap_query::api_routes::route_map(&root, &graph, &budget);
             if let Some(filter) = filter {
-                retain_matching_routes(&mut mapped, filter);
+                devmap_query::api_routes::retain_matching_routes(&mut mapped, filter);
             }
             if cli.json {
                 emit_json(cli, &mapped)?;
@@ -8161,7 +8110,7 @@ represent them",
             max_file_bytes,
         } => {
             let store = open_for_read(cli)?;
-            let graph = graph_core_for_read(&store)?;
+            let graph = devmap_query::graph_core_for_store(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
             let checked =
@@ -8179,7 +8128,7 @@ represent them",
             max_file_bytes,
         } => {
             let store = open_for_read(cli)?;
-            let graph = graph_core_for_read(&store)?;
+            let graph = devmap_query::graph_core_for_store(&store)?;
             let budget = scan_budget(*max_files, *max_file_bytes);
             let root = repo_root_for(&store, path)?;
             let impact = devmap_query::api_routes::api_impact(&root, &graph, &budget, route);

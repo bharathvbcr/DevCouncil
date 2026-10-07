@@ -4134,6 +4134,94 @@ impl Resolver {
 
                 // Resolve routes
                 for route in &ext.routes {
+                    // The route's node identity, not a bare "VERB /path"
+                    // label. `ExtractedRoute::node_id` owns the shape so the
+                    // graph export can emit a node under the same id; an edge
+                    // whose source names no node leaves every route consumer
+                    // reading an empty graph.
+                    let route_source = route.node_id(&ext.file_path);
+
+                    // Middleware first in the loop body only because the
+                    // handler arm ends in `continue`s; neither depends on the
+                    // other. Each named entry binds through the handler's
+                    // ladder to a `Registers` edge, or is recorded as not
+                    // binding — the same Class A rule: an unbound middleware
+                    // must not look like a route that registers none.
+                    for entry in route.middleware.iter().flatten() {
+                        // An anonymous entry — an arrow function, a `func`
+                        // literal — names nothing. The route node lists it by
+                        // expression; there is no symbol to bind or miss.
+                        if entry.name.is_empty() {
+                            continue;
+                        }
+                        // A package's middleware — `cors()`, chi's
+                        // `middleware.Logger`, `express.json()` — is outside
+                        // the repository, and the file's own import says so.
+                        // Classified `External`, which the dead-code namesake
+                        // veto ignores, rather than left to a global name
+                        // lookup that would bind it to whatever repository
+                        // symbol shares its name.
+                        let binding = entry.qualifier.as_deref().unwrap_or(&entry.name);
+                        if let Some(module) = self
+                            .external_imports
+                            .get(&ext.file_path)
+                            .and_then(|imports| imports.get(binding))
+                        {
+                            unresolved.push(UnresolvedReference {
+                                source_file: ext.file_path.clone(),
+                                source_symbol: route_source.clone(),
+                                callee_name: entry.name.clone(),
+                                kind: UnresolvedKind::Route,
+                                resolution: Resolution::Unresolved {
+                                    reason: format!(
+                                        "route middleware {:?} in {} comes from external \
+                                         module {module:?}",
+                                        entry.expression, ext.file_path
+                                    ),
+                                },
+                                class: UnresolvedClass::External {
+                                    module: module.clone(),
+                                },
+                                receiver: entry.qualifier.clone(),
+                            });
+                            continue;
+                        }
+                        match self.bind_route_reference(
+                            ext,
+                            family,
+                            &entry.name,
+                            entry.qualifier.as_deref(),
+                        ) {
+                            Ok((target_f, resolution)) => {
+                                let target_symbol = self.qualified_for(&target_f, &entry.name);
+                                edges.push(ResolvedEdge::resolved(
+                                    ext.file_path.clone(),
+                                    target_f,
+                                    route_source.clone(),
+                                    target_symbol,
+                                    EdgeKind::Registers,
+                                    Arc::new(resolution),
+                                    Some(format!("{}:{}", route.framework, entry.scope.label())),
+                                ));
+                            }
+                            Err(candidate_count) => unresolved.push(UnresolvedReference {
+                                source_file: ext.file_path.clone(),
+                                source_symbol: route_source.clone(),
+                                callee_name: entry.name.clone(),
+                                kind: UnresolvedKind::Route,
+                                resolution: Resolution::Unresolved {
+                                    reason: format!(
+                                        "route middleware {:?} in {} bound to none of {} \
+                                         same-family candidates",
+                                        entry.expression, ext.file_path, candidate_count
+                                    ),
+                                },
+                                class: UnresolvedClass::Unresolved,
+                                receiver: entry.qualifier.clone(),
+                            }),
+                        }
+                    }
+
                     // An anonymous handler — an Express arrow function — has no
                     // name to resolve, so there is nothing to bind and nothing
                     // to report. Every other route names a handler, and either
@@ -4141,69 +4229,11 @@ impl Resolver {
                     if route.handler_name.is_empty() {
                         continue;
                     }
-                    let hits = self.symbol_index.get(&route.handler_name);
-                    // The route's node identity, not a bare "VERB /path"
-                    // label. `ExtractedRoute::node_id` owns the shape so the
-                    // graph export can emit a node under the same id; an edge
-                    // whose source names no node leaves every route consumer
-                    // reading an empty graph.
-                    let route_source = route.node_id(&ext.file_path);
-                    let mut candidate_count = 0usize;
-                    let route_target = hits.and_then(|hits| {
-                        let same_file: Vec<_> = hits
-                            .iter()
-                            .filter(|(path, _, _, _)| path == &ext.file_path)
-                            .collect();
-                        if same_file.len() == 1 {
-                            let (target_f, _, _, _) = same_file[0];
-                            return Some((
-                                target_f.clone(),
-                                Resolution::SameFile {
-                                    target_symbol: route.handler_name.clone(),
-                                    target_file: target_f.clone(),
-                                },
-                            ));
-                        }
-                        if let Some((target_f, target_symbol)) = self
-                            .import_bindings
-                            .get(&ext.file_path)
-                            .and_then(|bindings| bindings.get(&route.handler_name))
-                        {
-                            return Some((
-                                target_f.clone(),
-                                Resolution::ImportScoped {
-                                    target_symbol: target_symbol.clone(),
-                                    target_file: target_f.clone(),
-                                    imported_from: route.handler_name.clone(),
-                                },
-                            ));
-                        }
-                        let family_hits: Vec<_> = hits
-                            .iter()
-                            .filter(|(path, _, candidate_family, _)| {
-                                family.admits(*candidate_family)
-                                    && (*candidate_family != LangFamily::Go
-                                        || Self::go_symbol_visible_from(
-                                            &ext.file_path,
-                                            path,
-                                            &route.handler_name,
-                                        ))
-                            })
-                            .collect();
-                        candidate_count = family_hits.len();
-                        (family_hits.len() == 1).then(|| {
-                            let (target_f, _, _, _) = family_hits[0];
-                            (
-                                target_f.clone(),
-                                Resolution::UniqueGlobal {
-                                    target_symbol: route.handler_name.clone(),
-                                    target_file: target_f.clone(),
-                                    family,
-                                },
-                            )
-                        })
-                    });
-                    let Some((target_f, resolution)) = route_target else {
+                    let route_target =
+                        self.bind_route_reference(ext, family, &route.handler_name, None);
+                    let (target_f, resolution) = match route_target {
+                        Ok(bound) => bound,
+                        Err(candidate_count) => {
                         // Class A. A route whose handler did not bind used to
                         // produce no edge and no record, byte-identical to a
                         // route with no named handler at all. `HandlesRoute` is
@@ -4231,6 +4261,7 @@ impl Resolver {
                             receiver: None,
                         });
                         continue;
+                        }
                     };
                     // The handler by its graph identity, the way every
                     // other edge kind names its target. `route.handler_name`
@@ -4479,6 +4510,90 @@ impl Resolver {
     fn go_symbol_visible_from(source_file: &str, target_file: &str, name: &str) -> bool {
         Self::go_name_is_exported(name)
             || Self::parent_dir(source_file) == Self::parent_dir(target_file)
+    }
+
+    /// Bind a name a route registration wrote — its handler, or a piece of its
+    /// middleware — to the declaration it names.
+    ///
+    /// The one ladder for both, so a handler and a middleware written the same
+    /// way bind the same way: a single same-file declaration, then this file's
+    /// import binding, then a single same-family declaration anywhere (a Go
+    /// one only if it is visible from here). `Err` carries how many
+    /// same-family candidates the last rung saw, so ambiguity (2) and absence
+    /// (0) stay distinguishable in the ledger.
+    ///
+    /// `qualifier` is the binding a qualified reference went through —
+    /// `middleware` in `middleware.Logger`. A qualified name is never a
+    /// same-file or import-bound bare name, so those rungs are skipped, and the
+    /// global rung admits only a declaration whose directory or file stem *is*
+    /// the qualifier: Go names a package after its directory and a namespace
+    /// import after its module. Without that narrowing, chi's
+    /// `middleware.Logger` would bind to whichever one `Logger` the repository
+    /// happens to declare.
+    fn bind_route_reference(
+        &self,
+        ext: &Extraction,
+        family: LangFamily,
+        name: &str,
+        qualifier: Option<&str>,
+    ) -> Result<(String, Resolution), usize> {
+        let Some(hits) = self.symbol_index.get(name) else {
+            return Err(0);
+        };
+        if qualifier.is_none() {
+            let mut same_file = hits.iter().filter(|(path, ..)| path == &ext.file_path);
+            if let (Some((target_f, ..)), None) = (same_file.next(), same_file.next()) {
+                return Ok((
+                    target_f.clone(),
+                    Resolution::SameFile {
+                        target_symbol: name.to_string(),
+                        target_file: target_f.clone(),
+                    },
+                ));
+            }
+            if let Some((target_f, target_symbol)) = self
+                .import_bindings
+                .get(&ext.file_path)
+                .and_then(|bindings| bindings.get(name))
+            {
+                return Ok((
+                    target_f.clone(),
+                    Resolution::ImportScoped {
+                        target_symbol: target_symbol.clone(),
+                        target_file: target_f.clone(),
+                        imported_from: name.to_string(),
+                    },
+                ));
+            }
+        }
+        let family_hits: Vec<_> = hits
+            .iter()
+            .filter(|(path, _, candidate_family, _)| {
+                family.admits(*candidate_family)
+                    && (*candidate_family != LangFamily::Go
+                        || Self::go_symbol_visible_from(&ext.file_path, path, name))
+                    && qualifier.is_none_or(|qualifier| {
+                        let dir = Self::parent_dir(path);
+                        let stem = path
+                            .rsplit('/')
+                            .next()
+                            .and_then(|file| file.split('.').next())
+                            .unwrap_or_default();
+                        dir.rsplit('/').next() == Some(qualifier) || stem == qualifier
+                    })
+            })
+            .collect();
+        match family_hits.as_slice() {
+            [(target_f, ..)] => Ok((
+                target_f.clone(),
+                Resolution::UniqueGlobal {
+                    target_symbol: name.to_string(),
+                    target_file: target_f.clone(),
+                    family,
+                },
+            )),
+            many => Err(many.len()),
+        }
     }
 
     /// Delegates to `importpath::normalize_rel`, which is the single owner.
@@ -8770,6 +8885,94 @@ mod reference_resolution_tests {
         assert!(
             edges_of(&anonymous, &[EdgeKind::HandlesRoute]).is_empty(),
             "an arrow-function handler is anonymous and binds to nothing"
+        );
+    }
+
+    /// Route middleware binds through the handler's ladder to a `Registers`
+    /// edge from the route node, and what does not bind is recorded, not lost.
+    ///
+    /// Three outcomes, each with its own evidence: a repository function binds
+    /// (`Registers`, which is also what keeps it from reading as dead); a
+    /// package's middleware is `External` by the file's own import, so it can
+    /// neither bind to a same-named repository symbol nor veto that symbol's
+    /// dead-code finding; and a qualified Go reference binds only to a
+    /// declaration in the package its qualifier names — chi's
+    /// `middleware.Logger` must not become an edge to the one `Logger` this
+    /// repository happens to declare in another package.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn route_middleware_binds_to_a_registers_edge_or_says_why_not() {
+        let express = resolve(&[
+            (
+                "app.js",
+                "import cors from 'cors';\n\
+                 import { requireAuth } from './auth';\n\
+                 app.use(cors());\n\
+                 app.use(requireAuth);\n\
+                 app.get('/users', audit, listUsers);\n\
+                 function audit(req, res, next) { next(); }\n\
+                 function listUsers(req, res) {}\n",
+            ),
+            (
+                "auth.js",
+                "export function requireAuth(req, res, next) { next(); }\n",
+            ),
+            // A repository symbol sharing the package middleware's name.
+            ("util.js", "export function cors() {}\n"),
+        ]);
+        assert_eq!(
+            edges_of(&express, &[EdgeKind::Registers]),
+            [
+                "app.js::GET /users->app.js::audit",
+                "app.js::GET /users->auth.js::requireAuth",
+            ],
+            "repository middleware binds; the package's `cors()` does not bind to util.js"
+        );
+        let cors = express
+            .unresolved
+            .iter()
+            .find(|row| row.callee_name == "cors")
+            .expect("the package middleware is recorded, not dropped");
+        assert_eq!(cors.kind, UnresolvedKind::Route);
+        assert!(
+            matches!(&cors.class, UnresolvedClass::External { module } if module == "cors"),
+            "{:?}",
+            cors.class
+        );
+
+        let go = resolve(&[
+            (
+                "api/routes.go",
+                "package api\n\n\
+                 import \"github.com/go-chi/chi/v5/middleware\"\n\n\
+                 func Routes(r Router) {\n\
+                 \tr.Use(middleware.Logger)\n\
+                 \tr.Use(auth.Check)\n\
+                 \tr.Use(auth.Logger)\n\
+                 \tr.Get(\"/orders\", ListOrders)\n\
+                 }\n\n\
+                 func ListOrders() {}\n",
+            ),
+            ("auth/check.go", "package auth\n\nfunc Check() {}\n"),
+            ("logging/log.go", "package logging\n\nfunc Logger() {}\n"),
+        ]);
+        // `middleware.Logger` is stopped by the file's external import;
+        // `auth.Logger` has no import to stop it, and the repository's only
+        // `Logger` lives in `logging/` — only the qualifier keeps it unbound.
+        assert_eq!(
+            edges_of(&go, &[EdgeKind::Registers]),
+            ["api/routes.go::GET /orders->auth/check.go::Check"],
+            "a qualified reference binds inside the package it names, and nowhere else"
+        );
+        assert!(
+            go.unresolved.iter().any(|row| row.callee_name == "Logger"
+                && row.receiver.as_deref() == Some("auth")
+                && row.class == UnresolvedClass::Unresolved),
+            "the unbound `auth.Logger` is recorded as not binding"
+        );
+        assert_eq!(
+            edges_of(&go, &[EdgeKind::HandlesRoute]),
+            ["api/routes.go::GET /orders->api/routes.go::ListOrders"]
         );
     }
 

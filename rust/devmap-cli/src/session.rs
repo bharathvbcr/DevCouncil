@@ -12,36 +12,48 @@ use serde_json::{json, Map, Value};
 
 use devmap_serve::session_log;
 
-/// Questions DevMap answers only on the CLI, or not at all, rather than as MCP tools.
+/// Known questions an agent asks that the DevMap MCP server does not answer as
+/// a tool: `(capability, the tool it would be, note)`.
 ///
-/// `detect_changes` is not here: `devmap blast --since <rev>` (MCP `devmap_blast`)
-/// maps a diff to what depends on it. `cypher`, `pdg_query`, `taint_explain` and
-/// `route_map` are real commands, so each note names the command an agent can
-/// run instead of claiming the capability does not exist.
-const MISSING_CAPABILITIES: &[(&str, &str)] = &[
+/// Each entry names the tool so the list can be checked against the registry
+/// the server publishes — `tests::no_missing_capability_is_a_served_tool`. The
+/// list said `detect_changes`, `cypher` and `route_map` were missing while
+/// `devmap_blast` already answered the first, and it cited a retired Python
+/// `dev map --pdg` as the PDG's home for weeks after `devmap pdg` landed; a
+/// list nothing checks drifts in exactly that direction.
+///
+/// What is still CLI-only, and why it stays so (decided 2026-10-06 with
+/// `GAP-P7-DEVMAP-MCP-CLI`): `pdg` reads one Python file from disk rather than
+/// the index and its sinks are a heuristic list — a security review's
+/// question, not graph navigation; `shape-check` sweeps every route, which is
+/// an audit pass, while the per-route answer an agent changing a route needs
+/// is already in `devmap_api_impact`.
+const MISSING_CAPABILITIES: &[(&str, &str, &str)] = &[
     (
         "rename",
-        "graph-backed coordinated rename; workaround: `devmap search` + `devmap preview`",
-    ),
-    (
-        "cypher",
-        "CLI only: `devmap cypher` (an openCypher subset); there is no MCP tool",
+        "devmap_rename",
+        "graph-backed coordinated rename; workaround: `devmap_search` + `devmap_preview`",
     ),
     (
         "pdg_query",
-        "CLI only: `devmap pdg <file>` (Python files); there is no MCP tool",
+        "devmap_pdg",
+        "per-function control/data dependence graphs; CLI-only: `devmap pdg FILE` (Python files)",
     ),
     (
         "taint_explain",
-        "CLI only: `devmap pdg --taint <file>` (Python files); there is no MCP tool",
+        "devmap_pdg",
+        "statements reaching a known sink; CLI-only: `devmap pdg FILE --taint` (Python, heuristic sinks)",
     ),
     (
-        "route_map",
-        "CLI only: `devmap routes`; there is no MCP tool",
+        "shape_check",
+        "devmap_shape_check",
+        "repo-wide handler-vs-consumer key comparison; CLI-only: `devmap shape-check`; per route, \
+         `devmap_api_impact` carries the mismatches",
     ),
     (
         "clusters_processes",
-        "precomputed execution-flow resources; workaround: subsystems in repo_map.json + `explore`",
+        "devmap_clusters",
+        "precomputed execution-flow resources; workaround: subsystems in repo_map.json + `devmap_explore`",
     ),
 ];
 
@@ -340,8 +352,9 @@ fn build_report(db: &Path, session_id: Option<&str>) -> anyhow::Result<Value> {
         "issues": issues,
         "gaps": gaps,
         "resolved_gaps": resolved_gaps,
-        "missing_capabilities": MISSING_CAPABILITIES.iter().map(|(name, note)| json!({
+        "missing_capabilities": MISSING_CAPABILITIES.iter().map(|(name, tool, note)| json!({
             "capability": name,
+            "tool": tool,
             "note": note,
         })).collect::<Vec<_>>(),
         "queries": queries,
@@ -605,6 +618,41 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The list of missing capabilities is checked against the registry the
+    /// MCP server publishes, in both directions that have gone wrong.
+    ///
+    /// No entry may name a tool the server serves — `detect_changes` sat here
+    /// beside a live `devmap_blast`. And the capabilities this list used to
+    /// carry and the server now answers must stay answered, by the tool the
+    /// session report's readers were told to wait for: removing one of those
+    /// tools would otherwise leave nothing saying the gap reopened.
+    #[test]
+    fn no_missing_capability_is_a_served_tool() {
+        let served = devmap_serve::mcp::TOOL_NAMES;
+        for (capability, tool, _) in MISSING_CAPABILITIES {
+            assert!(
+                tool.starts_with("devmap_"),
+                "{capability}: name the MCP tool it would be, not a CLI command: {tool}"
+            );
+            assert!(
+                !served.contains(tool),
+                "{capability} is listed as missing, but the MCP server serves {tool}"
+            );
+        }
+        for (capability, tool) in [
+            ("detect_changes", "devmap_blast"),
+            ("cypher", "devmap_cypher"),
+            ("route_map", "devmap_routes"),
+            ("api_impact", "devmap_api_impact"),
+        ] {
+            assert!(
+                served.contains(&tool),
+                "{capability} left this list because {tool} answers it; {tool} is gone, so \
+                 the capability is missing again and belongs back in MISSING_CAPABILITIES"
+            );
+        }
+    }
+
     /// A store path in its own directory, so parallel tests cannot collide.
     fn scratch_db(label: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -862,7 +910,7 @@ mod tests {
     /// command covers, sends them to something that is not there.
     #[test]
     fn the_capability_table_names_no_python_surface_and_omits_what_blast_covers() {
-        for (name, note) in MISSING_CAPABILITIES {
+        for (name, _tool, note) in MISSING_CAPABILITIES {
             assert_ne!(*name, "detect_changes", "`devmap blast` covers it");
             assert!(!note.contains("Python `dev"), "{name}: {note}");
         }

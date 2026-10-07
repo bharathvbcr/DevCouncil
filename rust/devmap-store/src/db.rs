@@ -3238,6 +3238,14 @@ impl Store {
             // built it makes this a no-op rather than a failure.
             conn.execute_batch(MIGRATION_V23_TO_V24)?;
             conn.execute("PRAGMA user_version = 24", [])?;
+            version = 24;
+        }
+        if version == 24 {
+            // Version-only rung: `Registers` edges (route middleware) are free
+            // TEXT in the existing `edge_kind` column. Advancing the stamp
+            // makes an older binary refuse the store at open instead of
+            // failing every edge read on a kind it cannot parse.
+            conn.execute("PRAGMA user_version = 25", [])?;
             version = CURRENT_SCHEMA_VERSION;
         }
         if version != CURRENT_SCHEMA_VERSION {

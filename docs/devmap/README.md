@@ -572,12 +572,28 @@ not — never a band that reads as "safe to change", because absence from an
 unfinished, pattern-based search is not evidence of no caller. `scope` says what
 `complete` covers: the files the graph names, not the whole working tree.
 
-`middleware` is `null` rather than empty on every route: there is no
-registration edge kind for it to be read from. `framework` is `null` only on a
-route recovered from an edge with no route node. `capabilities` carries
-`route_nodes` and `routes_without_a_route_node` beside the two availability
-flags, so a null can be told apart from an empty one — `[]` would mean "this
-route has none", which is a different claim.
+`middleware` is read where a producer exists — Express (`X.use(...)` registered
+earlier on the same router, mount paths honoured, plus the arguments between
+path and handler) and Go routers (chi, gin, echo, gorilla/mux, net/http: `r.Use`,
+chi's `.With(...)`, and `Group`/`With` derivations). Router-level entries are
+lexical: a `Use` covers the routes after it in its own block, so a chi
+`r.Group(func(r chi.Router) { r.Use(auth) ... })` does not leak `auth` onto the
+routes after the group. Each entry carries its `expression`, its `scope`
+(`router` or `route`) and `symbol.resolution`: `id` when a `registers` edge
+binds it to a repository symbol, `unbound` when it names one the resolver could
+not place or an external package (the unresolved ledger says which),
+`anonymous` for an inline function. Flask, FastAPI, Django and Axum routes have
+no producer, and their `middleware` is `null` — unknown, never `[]`, which would
+claim the route has none. `framework` is `null` only on a route recovered from
+an edge with no route node. `capabilities` carries `route_nodes`,
+`routes_without_a_route_node`, `routes_with_middleware` and
+`routes_without_middleware_producer` beside the availability flags, so a null
+can be told apart from an empty one.
+
+Go routes are recorded under their own path: a gin `Group("/v1")` or chi
+`Route("/api", ...)` prefix is not applied, as an Express route on a mounted
+router is not. Middleware applied by wrapping a handler in a call
+(`mux.Handle("/x", auth(h))`) has no registration to read and is not reported.
 
 ### See
 
@@ -662,12 +678,26 @@ devmap serve .    # index over IPC, watching the tree for changes
 devmap mcp        # speak MCP on stdin/stdout, for an agent host
 ```
 
-`devmap mcp` publishes sixteen read-only tools: `devmap_status`, `devmap_search`,
+`devmap mcp` publishes nineteen read-only tools: `devmap_status`, `devmap_search`,
 `devmap_ask`, `devmap_ask_evidence`, `devmap_dependencies`, `devmap_impact`,
 `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_skeleton`,
 `devmap_clones`, `devmap_preview`, `devmap_explore`, `devmap_affected_tests`,
-`devmap_blast` and `devmap_suspects`. Every one declares an `outputSchema`, and the
+`devmap_blast`, `devmap_suspects`, `devmap_routes`, `devmap_api_impact` and
+`devmap_cypher`. Every one declares an `outputSchema`, and the
 server validates its own answers against the schema it published before emitting them.
+`devmap_dependencies`, `devmap_impact`, `devmap_trace` and `devmap_neighbors` take
+`min_rung` (`deterministic`, `high`, `speculative`) to keep weaker rungs — an
+`AmbiguousGlobal` fan-out — out of the walk; an unknown rung is refused.
+`devmap_dead_symbols` carries `dead_clusters`, the component pass that finds
+subsystems whose functions only call each other.
+
+Two CLI views stay CLI-only, by decision rather than omission: `devmap pdg`
+reads one Python file from disk rather than the index, and its sinks are a
+heuristic list — a security review's question, not graph navigation; and
+`devmap shape-check` sweeps every route, which is an audit pass, while the
+per-route mismatches an agent changing a route needs are in `devmap_api_impact`.
+`devmap session-report` lists what is missing under `missing_capabilities`, each
+entry naming the tool it would be, and a test fails if one of them is served.
 
 `devmap_ask_evidence` (CLI: `devmap ask --evidence`) is `devmap_ask` shaped for
 reading. Three quarters of the budget go to the hits, in `devmap_ask`'s order and

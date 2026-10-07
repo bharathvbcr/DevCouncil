@@ -894,6 +894,9 @@ const TOOLS: &[(&str, &str)] = &[
     ("devmap_affected_tests", "affected"),
     ("devmap_suspects", "suspects"),
     ("devmap_blast", "blast"),
+    ("devmap_routes", "routes"),
+    ("devmap_api_impact", "api_impact"),
+    ("devmap_cypher", "cypher"),
 ];
 
 /// The declared tool names, in published order.
@@ -1400,6 +1403,47 @@ the line I am looking at\". Give this or `since`, never both."},
                 "additionalProperties": false
             }),
         ),
+        "routes" => (
+            "HTTP routes the index holds, each with its handlers, its middleware, and the client call sites that reach it. Routes come from route nodes (Express, Go routers, Flask/FastAPI, Django, Axum); client call sites from a bounded pattern scan of the files the graph names, so read `scan.complete` before treating an empty `consumers` list as 'nothing calls this route'. `middleware` is null where no producer ran for the route's framework (Flask, FastAPI, Django, Axum) — unknown, never none — and a list in run order where one did (Express, Go), each entry's `symbol.resolution` saying whether it bound to a repository symbol. `capabilities` carries the counts behind every null. `count` is every route the graph holds; `total` is what the filter kept and `shown` what fit the budget.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "filter": {"type": "string", "maxLength": 4096,
+                        "description": "Only routes whose path or id contains this, or whose path \
+matches it with parameters normalised (`/users/:id` matches `/users/42`)."},
+                    "budget": budget_prop(2000)
+                },
+                "additionalProperties": false
+            }),
+        ),
+        "api_impact" => (
+            "What changing one HTTP route reaches: the client call sites that hit it, the response keys they read that its handler does not return, its middleware, and a risk band with its reason. `found: false` means no route matched the name — a different fact from a route nothing calls, which is `found: true` with no consumers. The risk band is `unknown`, never `none`, whenever the handler source or the scan could not be read in full.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "route": {"type": "string", "minLength": 1, "maxLength": 4096,
+                        "description": "The route path (`/api/users/:id`) or its `VERB /path` id."}
+                },
+                "required": ["route"],
+                "additionalProperties": false
+            }),
+        ),
+        "cypher" => (
+            "A small openCypher subset over the call graph, for questions by edge kind that the other tools do not ask: `MATCH (a)-[r:calls|imports|routes_to|registers|…]->(b) WHERE … RETURN a, b LIMIT n`, with `contains(a.name, '…')` and `starts with(b.path, '…')` joined by `AND`. Anything outside the subset — another clause, an unknown relationship type, a WHERE term it cannot evaluate — is refused as an error, never answered with every row. The answer carries `shown` and `total`, and `limit_capped` when a LIMIT above the ceiling was cut.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 1, "maxLength": 4096,
+                        "description": "The query, e.g. `MATCH (a)-[r:registers]->(b) RETURN a, b`."},
+                    "limit": {"type": "integer", "minimum": 1,
+                        "maximum": devmap_query::cypher::MAX_ROW_LIMIT,
+                        "default": crate::protocol::DEFAULT_CYPHER_LIMIT,
+                        "description": "Rows to return when the query states no LIMIT."}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        ),
         other => unreachable!("command tag {other} has no schema"),
     };
     (description, with_repo_scope_args(schema))
@@ -1817,6 +1861,79 @@ a partial corpus is a lower bound, not a clean bill. Candidate list to verify, n
             },
             "required": ["change", "changed_files", "seeds", "unattributed", "impacted", "files",
                          "modules", "tests", "unavailable", "complete"],
+            "additionalProperties": true
+        }),
+        // Fields transcribed from `api_routes::route_map` and `budget_routes`.
+        "routes" => json!({
+            "type": "object",
+            "properties": {
+                "routes": {"type": "array",
+                    "description": "One row per route declaration: `id`, `verb`, `path`, \
+        `normalized_path`, `file`, `line`, `framework`, `handlers`, `handler_keys`, `consumers`, \
+        and `middleware` — null when no producer ran for the framework, else entries with `name`, \
+        `expression`, `scope` (`router` | `route`) and `symbol.resolution` (`id`, `ambiguous`, \
+        `unbound`, `anonymous`)."},
+                "count": {"type": "integer",
+                    "description": "Every route the graph holds, before any filter or budget."},
+                "shown": {"type": "integer"},
+                "hidden": {"type": "integer",
+                    "description": "Routes the token budget withheld."},
+                "total": {"type": "integer",
+                    "description": "Routes after the filter: shown + hidden."},
+                "truncated": {"type": "boolean"},
+                "scan": {"type": "object",
+                    "description": "What the client call-site scan read. With `complete` false an \
+        empty `consumers` list means 'we stopped looking', not 'nothing calls this'."},
+                "capabilities": {"type": "object",
+                    "description": "Which fields this index could fill, and for how many routes: \
+        `framework_available`, `middleware_available`, `routes_with_middleware`, \
+        `routes_without_middleware_producer`."}
+            },
+            "required": ["routes", "count", "shown", "hidden", "total", "truncated", "scan",
+                         "capabilities"],
+            "additionalProperties": true
+        }),
+        // Fields transcribed from `api_routes::api_impact`; `required` names
+        // only what both its found and not-found answers carry.
+        "api_impact" => json!({
+            "type": "object",
+            "properties": {
+                "route": {"type": "string"},
+                "found": {"type": "boolean",
+                    "description": "False when no route matched the name — not the same as a \
+        route nothing calls."},
+                "consumers": {"type": "array"},
+                "shape_mismatches": {"type": "array"},
+                "middleware": {"type": ["array", "null"],
+                    "description": "The route's middleware, or null when no producer ran for its \
+        framework."},
+                "risk": {"type": "string"},
+                "risk_reason": {"type": "string"},
+                "scan": {"type": "object"}
+            },
+            "required": ["route", "found", "consumers", "shape_mismatches", "risk",
+                         "risk_reason", "scan"],
+            "additionalProperties": true
+        }),
+        // Fields transcribed from `cypher::run`'s success answer; a refusal
+        // never reaches here, `dispatch` turns it into a tool error.
+        "cypher" => json!({
+            "type": "object",
+            "properties": {
+                "ok": {"type": "boolean"},
+                "rows": {"type": "array",
+                    "description": "`a_id` and, for a relationship pattern, `rel` and `b_id`."},
+                "relationships": {"type": "array"},
+                "shown": {"type": "integer"},
+                "total": {"type": "integer",
+                    "description": "Every matching row, before the limit."},
+                "truncated": {"type": "boolean"},
+                "limit_requested": {"type": "integer"},
+                "limit_applied": {"type": "integer"},
+                "limit_capped": {"type": "boolean",
+                    "description": "True when a LIMIT above the server ceiling was cut to it."}
+            },
+            "required": ["ok", "rows", "shown", "total", "truncated", "limit_applied"],
             "additionalProperties": true
         }),
         other => unreachable!("command tag {other} has no output schema"),

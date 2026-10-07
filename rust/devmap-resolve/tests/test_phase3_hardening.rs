@@ -447,6 +447,7 @@ fn route_handler_prefers_its_own_file_over_index_order() {
             start_byte: 0,
             end_byte: 1,
         },
+        middleware: None,
     });
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[earlier.clone(), routed.clone()]);

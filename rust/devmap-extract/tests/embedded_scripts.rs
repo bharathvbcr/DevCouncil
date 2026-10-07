@@ -816,8 +816,11 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     //
     // v71 adds the resolver-precision lane's v67: Rust function headers, Rust
     // locals typed from their own binders, and a Go `var w T`.
+    //
+    // v72 adds the MCP-parity lane's v67: route middleware (Express and Go)
+    // and Go routes; a row without it says no producer ran for either.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "71",
+        EXTRACTION_SCHEMA_VERSION, "72",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

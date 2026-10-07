@@ -362,6 +362,16 @@ async fn every_published_default_is_the_default_that_is_applied() {
             // proves the MCP wiring routes to them at all.
             "devmap_suspects" => json!({"symptom": "helper", "since": "HEAD~1"}),
             "devmap_blast" => json!({"since": "HEAD~1"}),
+            // The route views scan the indexed tree, and this in-memory corpus
+            // recorded none, so both arms of `routes`' `budget` default refuse
+            // alike — the same plain statement as for the git-joined pair. The
+            // substantive run is `every_tool_result_conforms_to_the_output_schema_it_declared`
+            // in `mcp_spec_conformance`, over a corpus on disk. `api_impact`
+            // declares no default at all.
+            "devmap_routes" => json!({}),
+            "devmap_api_impact" => json!({"route": "/api/users"}),
+            // `limit` is checked substantively here: the corpus has a graph.
+            "devmap_cypher" => json!({"query": "MATCH (a)-[r:calls]->(b) RETURN a, b"}),
             other => panic!("tool {other} has no fixture in this gate"),
         };
 

@@ -58,6 +58,7 @@ fn route(verb: &str, path: &str) -> ExtractedRoute {
             start_byte: 0,
             end_byte: 1,
         },
+        middleware: None,
     }
 }
 

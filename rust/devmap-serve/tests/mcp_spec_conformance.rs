@@ -50,6 +50,17 @@ fn corpus() -> Arc<StoreSlot> {
     Arc::new(StoreSlot::ready("in-memory", Arc::new(store)))
 }
 
+/// An Express route with middleware, unchanged across the two revisions, so the
+/// route views answer about real content and the change `blast` measures is
+/// still only `core.py`'s.
+const API_JS: (&str, &str) = (
+    "api.js",
+    "app.use(requireAuth);\n\
+     app.get('/api/items', listItems);\n\
+     function requireAuth(req, res, next) { next(); }\n\
+     function listItems(req, res) { res.json({ items: [] }); }\n",
+);
+
 /// The same corpus, behind a real git checkout.
 ///
 /// `devmap_suspects` and `devmap_blast` join the graph to git, so an in-memory
@@ -96,6 +107,7 @@ fn git_corpus() -> Option<(Arc<StoreSlot>, String, tempdir::Dir)> {
             "caller.py",
             "from core import helper\n\n\ndef run(rows):\n    return helper(rows)\n",
         ),
+        API_JS,
     ];
     let after = [
         ("core.py", "def helper(rows):\n    return sum(rows) + 1\n"),
@@ -103,6 +115,7 @@ fn git_corpus() -> Option<(Arc<StoreSlot>, String, tempdir::Dir)> {
             "caller.py",
             "from core import helper\n\n\ndef run(rows):\n    return helper(rows)\n",
         ),
+        API_JS,
     ];
     for (path, source) in before {
         std::fs::write(root.join(path), source).ok()?;
@@ -569,10 +582,15 @@ async fn every_tool_result_conforms_to_the_output_schema_it_declared() {
         ),
         ("devmap_explore", json!({"query": "helper"})),
         ("devmap_affected_tests", json!({"targets": ["helper"]})),
+        (
+            "devmap_cypher",
+            json!({"query": "MATCH (a)-[r:calls]->(b) RETURN a, b"}),
+        ),
     ];
 
-    // The two git-joined tools need a checkout, so they run against the git
-    // corpus and are listed separately. Both lists are summed against
+    // The two git-joined tools need a checkout, and the two route views need
+    // the indexed tree on disk to scan for callers, so all four run against
+    // the git corpus and are listed separately. Both lists are summed against
     // `TOOL_NAMES` below: splitting the fixture must not become a way to drop
     // a tool from the count.
     let git = git_corpus();
@@ -580,6 +598,8 @@ async fn every_tool_result_conforms_to_the_output_schema_it_declared() {
         Some((_, base, _)) => vec![
             ("devmap_suspects", json!({"symptom": "run", "since": base})),
             ("devmap_blast", json!({"since": base})),
+            ("devmap_routes", json!({})),
+            ("devmap_api_impact", json!({"route": "/api/items"})),
         ],
         None => Vec::new(),
     };
@@ -601,7 +621,14 @@ async fn every_tool_result_conforms_to_the_output_schema_it_declared() {
     let mut checked = 0usize;
     for (tool, args) in arguments.iter().chain(git_arguments.iter()) {
         let target = match git_store {
-            Some(git_store) if matches!(*tool, "devmap_suspects" | "devmap_blast") => git_store,
+            Some(git_store)
+                if matches!(
+                    *tool,
+                    "devmap_suspects" | "devmap_blast" | "devmap_routes" | "devmap_api_impact"
+                ) =>
+            {
+                git_store
+            }
             _ => &store,
         };
         let frame = json!({
@@ -635,12 +662,98 @@ async fn every_tool_result_conforms_to_the_output_schema_it_declared() {
     );
 }
 
+async fn tool(store: &Arc<StoreSlot>, name: &str, arguments: Value) -> Value {
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    })
+    .to_string();
+    handle_line(store, &frame).await.expect("answered")["result"].clone()
+}
+
+/// GAP-P7-DEVMAP-MCP-CLI: the route views and cypher answer over MCP from
+/// the same graph the CLI reads, with content — not merely a conforming shape.
+///
+/// And the two ways they cannot answer arrive as errors, never as an empty
+/// success: a store that recorded no tree has nothing to scan for callers,
+/// and a query outside the cypher subset was not run.
+#[tokio::test]
+async fn the_route_views_and_cypher_answer_over_mcp() {
+    let (store, _, _dir) = git_corpus().expect("a git checkout for the route views");
+
+    let routes = tool(&store, "devmap_routes", json!({})).await;
+    assert_eq!(routes["isError"], json!(false), "{routes}");
+    let mapped = &routes["structuredContent"];
+    let items = &mapped["routes"][0];
+    assert_eq!(items["path"], "/api/items", "{mapped}");
+    assert_eq!(items["handlers"][0]["name"], "listItems", "{mapped}");
+    assert_eq!(items["middleware"][0]["name"], "requireAuth", "{mapped}");
+    assert_eq!(
+        items["middleware"][0]["symbol"]["resolution"], "id",
+        "bound through its registers edge: {mapped}"
+    );
+    assert_eq!(mapped["capabilities"]["middleware_available"], true);
+
+    let filtered = tool(&store, "devmap_routes", json!({"filter": "/nothing"})).await;
+    let filtered = &filtered["structuredContent"];
+    assert_eq!(
+        filtered["count"], 1,
+        "count is the whole surface: {filtered}"
+    );
+    assert_eq!(
+        filtered["total"], 0,
+        "total is what the filter kept: {filtered}"
+    );
+
+    let starved = tool(&store, "devmap_routes", json!({"budget": 1})).await;
+    let starved = &starved["structuredContent"];
+    assert_eq!(starved["shown"], 0, "{starved}");
+    assert_eq!(
+        starved["truncated"], true,
+        "a budget cut says so: {starved}"
+    );
+
+    let impact = tool(&store, "devmap_api_impact", json!({"route": "/api/items"})).await;
+    assert_eq!(impact["isError"], json!(false), "{impact}");
+    assert_eq!(impact["structuredContent"]["found"], true, "{impact}");
+    assert_eq!(
+        impact["structuredContent"]["middleware"], items["middleware"],
+        "{impact}"
+    );
+
+    let edges = tool(
+        &store,
+        "devmap_cypher",
+        json!({"query": "MATCH (a)-[r:registers]->(b) RETURN a, b"}),
+    )
+    .await;
+    assert_eq!(edges["isError"], json!(false), "{edges}");
+    assert_eq!(edges["structuredContent"]["total"], 1, "{edges}");
+
+    let refused = tool(
+        &store,
+        "devmap_cypher",
+        json!({"query": "MATCH (a)-[r:no_such_kind]->(b) RETURN a, b"}),
+    )
+    .await;
+    assert_eq!(
+        refused["isError"],
+        json!(true),
+        "a query that was not run must not read as one that matched nothing: {refused}"
+    );
+
+    let no_tree = tool(&corpus(), "devmap_routes", json!({})).await;
+    assert_eq!(no_tree["isError"], json!(true), "{no_tree}");
+    assert!(
+        no_tree.to_string().contains("repository root"),
+        "the refusal names what is missing: {no_tree}"
+    );
+}
+
 /// A store whose analysis is the given one, over a corpus holding a private
 /// pair that call only each other — a component nothing outside reaches, which
 /// a one-hop inbound join cannot see because each member has an inbound edge.
-fn dead_cluster_corpus(
-    shape: impl FnOnce(&mut devmap_analyze::AnalysisSummary),
-) -> Arc<StoreSlot> {
+fn dead_cluster_corpus(shape: impl FnOnce(&mut devmap_analyze::AnalysisSummary)) -> Arc<StoreSlot> {
     let files = [
         ("core.py", "def helper(rows):\n    return sum(rows)\n"),
         (
@@ -686,16 +799,17 @@ async fn dead_answer(store: &Arc<StoreSlot>) -> Value {
 #[tokio::test]
 async fn the_dead_tool_carries_and_declares_dead_clusters() {
     let structured = dead_answer(&dead_cluster_corpus(|_| {})).await;
-    let clusters = structured["dead_clusters"]
-        .as_array()
-        .unwrap_or_else(|| panic!("the component pass ran, so its list must be present: {structured}"));
+    let clusters = structured["dead_clusters"].as_array().unwrap_or_else(|| {
+        panic!("the component pass ran, so its list must be present: {structured}")
+    });
     let members: Vec<&str> = clusters
         .iter()
         .flat_map(|cluster| cluster["members"].as_array().into_iter().flatten())
         .filter_map(Value::as_str)
         .collect();
     assert!(
-        members.iter().any(|m| m.ends_with("_ping")) && members.iter().any(|m| m.ends_with("_pong")),
+        members.iter().any(|m| m.ends_with("_ping"))
+            && members.iter().any(|m| m.ends_with("_pong")),
         "the mutually-recursive pair is one dead cluster: {structured}"
     );
     assert!(
@@ -713,10 +827,21 @@ async fn the_dead_tool_carries_and_declares_dead_clusters() {
         .expect("dead tool declared");
     let declared = &spec["outputSchema"]["properties"];
     assert_eq!(declared["dead_clusters"]["type"], json!("array"), "{spec}");
-    assert_eq!(declared["dead_clusters_incomplete"]["type"], json!("string"), "{spec}");
-    assert_eq!(declared["dead_clusters_truncated"]["type"], json!("integer"), "{spec}");
+    assert_eq!(
+        declared["dead_clusters_incomplete"]["type"],
+        json!("string"),
+        "{spec}"
+    );
+    assert_eq!(
+        declared["dead_clusters_truncated"]["type"],
+        json!("integer"),
+        "{spec}"
+    );
     assert!(
-        spec["description"].as_str().unwrap_or("").contains("dead_clusters"),
+        spec["description"]
+            .as_str()
+            .unwrap_or("")
+            .contains("dead_clusters"),
         "an agent reads the description, not the schema: {spec}"
     );
 

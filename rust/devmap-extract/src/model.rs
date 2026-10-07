@@ -166,6 +166,13 @@ pub enum EdgeKind {
     Implements,
     SubscribesTo,
     HandlesRoute,
+    /// A route runs a piece of middleware before its handler: `app.use(auth)`
+    /// ahead of `app.get('/x', h)`, `r.Use(mw)`, an inline `app.get('/x',
+    /// auth, h)`. Source is the route node — the same identity `HandlesRoute`
+    /// starts from — and target the middleware symbol, so a route's
+    /// out-edges are everything it dispatches to and the middleware is
+    /// reached from outside the call graph exactly as a handler is.
+    Registers,
     WiredTo,
     MemberOf,
     DependsOn,
@@ -1016,6 +1023,78 @@ pub struct ExtractedRoute {
     pub path_pattern: String,
     pub handler_name: String,
     pub span: Span,
+    /// The middleware that runs before this route's handler, in order.
+    ///
+    /// Three states, and the difference between the first two is the point:
+    ///
+    /// * `None` — no middleware producer ran for this route. Flask, FastAPI,
+    ///   Django and Axum routes have none, and so does every route a binary
+    ///   older than the field extracted. A consumer must report middleware as
+    ///   *unknown* here, never as empty.
+    /// * `Some([])` — a producer ran and this route has no middleware.
+    /// * `Some([..])` — what the producer found, router-registered entries
+    ///   first, then the route's own, which is the order the frameworks run
+    ///   them.
+    ///
+    /// `serde(default)` reads a cached extraction written before the field as
+    /// `None`, which is the truth about it.
+    #[serde(default)]
+    pub middleware: Option<Vec<ExtractedMiddleware>>,
+}
+
+/// One piece of middleware a route runs through.
+///
+/// Recorded as written, not as resolved: `name` is the symbol the expression
+/// names and `qualifier` the binding it was reached through, and the resolver
+/// decides whether that is a repository symbol (a `Registers` edge), an
+/// external package, or neither. The extractor cannot tell `middleware.Logger`
+/// from chi apart from a repository package called `middleware`; the resolver
+/// holds the file's imports and can.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedMiddleware {
+    /// The symbol the expression names: `auth` for `auth`,
+    /// `requireRole` for `requireRole('admin')` (the factory is the symbol the
+    /// repository declares), `Logger` for `middleware.Logger`. Empty when it
+    /// names none — an arrow function, a `func` literal — so there is nothing
+    /// to bind and the entry is reported by its expression alone.
+    pub name: String,
+    /// The root binding of a qualified expression — `middleware` in
+    /// `middleware.Logger`, `express` in `express.json()` — or `None` for a
+    /// bare name.
+    #[serde(default)]
+    pub qualifier: Option<String>,
+    /// The argument's source text, trimmed and capped at
+    /// [`MIDDLEWARE_EXPRESSION_CAP`] bytes, so an anonymous entry is still
+    /// identifiable.
+    pub expression: String,
+    pub scope: MiddlewareScope,
+    pub span: Span,
+}
+
+/// Longest middleware expression kept verbatim, in bytes. An inline arrow
+/// function can be a whole handler body; the head of it identifies it.
+pub const MIDDLEWARE_EXPRESSION_CAP: usize = 160;
+
+/// Where a piece of middleware was attached to the route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MiddlewareScope {
+    /// Registered on the router before the route was: `app.use(auth)`,
+    /// `r.Use(auth)`, or inherited by a group derived from that router.
+    Router,
+    /// Passed in the route's own registration: `app.get('/x', auth, h)`,
+    /// gin's `r.GET("/x", auth, h)`, echo's trailing middleware, chi's
+    /// `r.With(auth).Get(...)`.
+    Route,
+}
+
+impl MiddlewareScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            MiddlewareScope::Router => "router",
+            MiddlewareScope::Route => "route",
+        }
+    }
 }
 
 impl ExtractedRoute {
