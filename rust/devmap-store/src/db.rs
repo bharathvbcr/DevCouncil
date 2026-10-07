@@ -6307,7 +6307,8 @@ impl Store {
     }
 
     /// [`Self::unresolved_sites_naming`], keeping only the sites that may hide
-    /// an edge — the classes in [`devmap_resolve::UNATTRIBUTED_LABELS`].
+    /// an edge — the classes in [`devmap_resolve::UNATTRIBUTED_LABELS`], minus
+    /// receiver calls whose method name no symbol at `generation` carries.
     ///
     /// The filter is in SQL, not applied to the rows afterwards, so the
     /// per-name cap counts only the rows that matter: a name with a hundred
@@ -6323,7 +6324,9 @@ impl Store {
     }
 
     /// The unattributed sites whose *caller* is one of `symbols`, keyed by that
-    /// caller — the calls inside a walked symbol the resolver could not bind.
+    /// caller — the calls inside a walked symbol the resolver could not bind
+    /// and that may hide an edge (same filter as
+    /// [`Self::unattributed_sites_naming`]).
     ///
     /// The ledger has no index on `source_symbol` (adding one is a schema
     /// change), so this is one scan of it: measured on ScholarLM's 573,716
@@ -6369,6 +6372,7 @@ impl Store {
         generation: u32,
         key: LedgerKey,
         keys: &[String],
+        // Only the sites that may hide an edge: see `unattributed_sites_naming`.
         unattributed_only: bool,
         limit_per_key: usize,
     ) -> Result<Option<UnresolvedSitesByName>> {
@@ -6394,9 +6398,18 @@ impl Store {
             LedgerKey::SourceFile => "p.path",
         };
         let placeholders = vec!["?"; keys.len()].join(", ");
+        // A receiver call whose method name no symbol at this generation
+        // carries cannot be a missed edge into it — an edge needs a target, and
+        // no target has that name (`rows.length`, `mu.Unlock()`: 126,023 of
+        // ScholarLM's 200,790 untyped-receiver rows). A receiver-less call
+        // keeps counting without a namesake: `f = make(); f()` may hold any
+        // function. In SQL, before the cap, for the reason the class filter is.
         let class_filter = if unattributed_only {
             format!(
-                "AND c.text IN ({})",
+                "AND c.text IN ({})
+                   AND (u.receiver IS NULL
+                        OR u.callee_name IN (SELECT n.name FROM generation_nodes n
+                                             WHERE n.generation_id = ?))",
                 vec!["?"; devmap_resolve::UNATTRIBUTED_LABELS.len()].join(", ")
             )
         } else {
@@ -6437,6 +6450,7 @@ impl Store {
                     .iter()
                     .map(|label| rusqlite::types::Value::Text((*label).to_string())),
             );
+            values.push(rusqlite::types::Value::Integer(generation));
         }
         values.push(rusqlite::types::Value::Integer(cap));
         let mut rows = stmt.query(rusqlite::params_from_iter(values.iter()))?;

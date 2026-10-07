@@ -141,6 +141,119 @@ fn a_callee_walk_names_the_unbound_site_inside_what_it_walked() {
     assert!(reason.contains("thing.frobnicate"), "{reason}");
 }
 
+/// Method calls on an untyped receiver whose method name no indexed symbol
+/// carries — the shape of `rows.length`, `mu.Unlock()`, `now.Sub(t)`. No edge
+/// into this index can hide behind one, because an edge needs a target and no
+/// target has that name. Measured on ScholarLM 2026-10-07: 126,023 of the
+/// 200,790 `uninferred_receiver` rows, and they put a note on 17 of 21 traces.
+const ROWS: &str = "def tally(rows):
+    rows.count_everything()
+    return rows.sum_the_lot()
+";
+
+fn ledger_classes(store: &Store, callee: &str) -> Vec<String> {
+    let generation = store.latest_generation_id().unwrap().unwrap();
+    let found = store
+        .unresolved_sites_naming(generation, &[callee.to_string()], 10)
+        .unwrap()
+        .unwrap();
+    found[callee].0.iter().map(|row| row.classification.clone()).collect()
+}
+
+#[test]
+fn a_method_no_symbol_is_named_cannot_hide_a_callee() {
+    let store = store_with(&[("app.py", APP), ("rows.py", ROWS)], |_| {});
+    // The premise: the sites are in the ledger, unattributed — the class the
+    // walk would otherwise have counted.
+    assert_eq!(
+        ledger_classes(&store, "count_everything"),
+        vec!["uninferred_receiver".to_string()]
+    );
+    let engine = StoreQueryEngine::new(&store);
+    let trace = engine.trace(request("rows.py::tally", 3)).unwrap();
+    assert_eq!(trace.walk_incomplete, None, "{trace:?}");
+    let deps = engine.dependencies(request("rows.py", 1)).unwrap();
+    assert_eq!(deps.walk_incomplete, None, "{deps:?}");
+}
+
+#[test]
+fn the_in_memory_engine_applies_the_same_namesake_test() {
+    // Both engines phrase one note through `radius_note`; they must also agree
+    // on which sites reach it.
+    let extractions = vec![extract_file("app.py", APP), extract_file("rows.py", ROWS)];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let engine = devmap_query::QueryEngine::new(&extractions, &resolution);
+    let trace = engine.trace(request("rows.py::tally", 3));
+    assert_eq!(trace.walk_incomplete, None, "{trace:?}");
+}
+
+#[test]
+fn sites_that_cannot_hide_an_edge_do_not_use_up_the_per_key_cap() {
+    // Five namesake-less calls ahead of one that may hide an edge, in one
+    // symbol. The ledger read caps each key at four rows: if the namesake
+    // test ran after the cap, the four kept rows would all be filtered out
+    // and the one real site would vanish with a "more" flag and no note.
+    let source = "class Square:
+    def frobnicate(self):
+        return 1
+
+
+class Circle:
+    def frobnicate(self):
+        return 2
+
+
+def busy(rows, thing):
+    rows.alpha_nothing()
+    rows.beta_nothing()
+    rows.gamma_nothing()
+    rows.delta_nothing()
+    rows.epsilon_nothing()
+    return thing.frobnicate()
+";
+    let store = store_with(&[("app.py", APP), ("busy.py", source)], |_| {});
+    let trace = StoreQueryEngine::new(&store)
+        .trace(request("busy.py::busy", 3))
+        .unwrap();
+    let reason = trace
+        .walk_incomplete
+        .clone()
+        .unwrap_or_else(|| panic!("`thing.frobnicate()` may hide an edge: {trace:?}"));
+    assert!(reason.contains("thing.frobnicate"), "{reason}");
+    assert!(reason.starts_with("1 call site(s)"), "{reason}");
+    assert!(!reason.contains("_nothing"), "{reason}");
+}
+
+#[test]
+fn a_bare_local_call_still_counts_without_a_namesake() {
+    // `f = make(); f()` — the local may hold any function, so the missing
+    // namesake proves nothing about where the call lands.
+    let source = "def make():
+    return len
+
+
+def run():
+    f = make()
+    return f()
+";
+    let store = store_with(&[("app.py", APP), ("local.py", source)], |_| {});
+    let classes = ledger_classes(&store, "f");
+    assert!(
+        classes.iter().any(|class| class == "local_binding"),
+        "the premise: `f()` is an unbound local call: {classes:?}"
+    );
+    let trace = StoreQueryEngine::new(&store)
+        .trace(request("local.py::run", 3))
+        .unwrap();
+    let reason = trace
+        .walk_incomplete
+        .clone()
+        .unwrap_or_else(|| panic!("`f()` may call anything: {trace:?}"));
+    assert!(reason.contains("could not be bound (f)"), "{reason}");
+}
+
 #[test]
 fn affected_tests_drop_the_repository_wide_count() {
     let store = store_with(

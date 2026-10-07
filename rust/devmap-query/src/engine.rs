@@ -4795,9 +4795,11 @@ impl StoreQueryEngine<'_> {
     /// carried it). The question a reader of one walk has is narrower and
     /// answerable from the ledger: does an unattributed site name a symbol this
     /// walk reached (a caller it could not follow), or sit inside one (a callee
-    /// it could not follow)? Only the classes that may hide a repository edge
+    /// it could not follow)? Only the sites that may hide a repository edge
     /// count — [`devmap_resolve::UNATTRIBUTED_LABELS`]; a builtin or an external
-    /// import cannot be a missing edge to a symbol here.
+    /// import cannot be a missing edge to a symbol here, and neither can a
+    /// receiver call whose method name no indexed symbol carries (`rows.length`,
+    /// `mu.Unlock()`: 126,023 of ScholarLM's 200,790 untyped-receiver rows).
     ///
     /// Falls back to the repository-wide sentence wherever the specific check
     /// cannot run — no generation on the index, a classification breakdown
@@ -4998,8 +5000,18 @@ impl<'a> QueryEngine<'a> {
         }
         let mut matched: BTreeMap<&str, Vec<&UnresolvedReference>> = BTreeMap::new();
         let wanted: BTreeSet<&str> = keys.iter().map(|(key, _)| key.as_str()).collect();
+        // The store's filter (`Store::unattributed_sites_naming`): a receiver
+        // call no symbol is named for cannot hide an edge into this index.
+        let symbol_names: std::collections::HashSet<&str> = self
+            .extractions
+            .iter()
+            .flat_map(|extraction| extraction.symbols.iter())
+            .map(|symbol| symbol.name.as_str())
+            .collect();
         for row in &self.resolution.unresolved {
-            if row.class.is_explained() {
+            if row.class.is_explained()
+                || (row.receiver.is_some() && !symbol_names.contains(row.callee_name.as_str()))
+            {
                 continue;
             }
             let key = match side {
