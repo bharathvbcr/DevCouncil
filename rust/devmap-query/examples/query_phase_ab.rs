@@ -346,6 +346,7 @@ fn debug_kind_name(kind: EdgeKind) -> &'static str {
         EdgeKind::Implements => "Implements",
         EdgeKind::SubscribesTo => "SubscribesTo",
         EdgeKind::HandlesRoute => "HandlesRoute",
+        EdgeKind::Registers => "Registers",
         EdgeKind::WiredTo => "WiredTo",
         EdgeKind::MemberOf => "MemberOf",
         EdgeKind::DependsOn => "DependsOn",

@@ -498,7 +498,15 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// dropped every module-level read of it. A v65 row lacks all of this — most
 /// sharply, a constant `__all__` omitted has no node and its importers no
 /// target — so it must not be served to this build.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "66";
+///
+/// v67 records route middleware — `ExtractedRoute::middleware` for Express
+/// (`use` registrations and the arguments between path and handler) and for Go
+/// routers — and records Go routes at all: chi, gin, echo, gorilla/mux and
+/// net/http. A v66 row has `middleware: None` on every route and no Go routes,
+/// which reads as "no producer ran"; served warm, it would keep every
+/// `Registers` edge and every Go `HandlesRoute` edge out of the graph with
+/// nothing to say the producer exists.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "67";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

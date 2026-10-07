@@ -3199,6 +3199,14 @@ impl Store {
             // stamp makes an older binary refuse the store rather than
             // reconstructing those rows as neighbouring tiers.
             conn.execute("PRAGMA user_version = 23", [])?;
+            version = 23;
+        }
+        if version == 23 {
+            // Version-only rung: `Registers` edges (route middleware) are free
+            // TEXT in the existing `edge_kind` column. Advancing the stamp
+            // makes an older binary refuse the store at open instead of
+            // failing every edge read on a kind it cannot parse.
+            conn.execute("PRAGMA user_version = 24", [])?;
             version = CURRENT_SCHEMA_VERSION;
         }
         if version != CURRENT_SCHEMA_VERSION {

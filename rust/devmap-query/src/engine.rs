@@ -3020,6 +3020,7 @@ fn edge_kind_name(kind: EdgeKind) -> &'static str {
         EdgeKind::Implements => "Implements",
         EdgeKind::SubscribesTo => "SubscribesTo",
         EdgeKind::HandlesRoute => "HandlesRoute",
+        EdgeKind::Registers => "Registers",
         EdgeKind::WiredTo => "WiredTo",
         EdgeKind::MemberOf => "MemberOf",
         EdgeKind::DependsOn => "DependsOn",
@@ -3347,6 +3348,38 @@ pub(crate) fn contained_repo_path(
 
 pub fn resolved_edge_from_stored(edge: StoredEdge) -> anyhow::Result<ResolvedEdge> {
     stored_edge_to_resolved(edge)
+}
+
+/// The latest generation's graph core — nodes, edges and route nodes — read
+/// from the store, for the views that walk the whole graph: `routes`,
+/// `shape-check`, `api-impact` and `cypher`.
+///
+/// The artifact's `nodes` and `edges` and none of its panels — no `git log`,
+/// no intel, no dead-code list, no freshness; `build_graph_core_value` says
+/// what building the whole artifact cost these views. One owner, so the CLI
+/// and the MCP server answer those questions from the same graph. Every edge
+/// is read (`min_confidence` 0): the views report each edge's own confidence
+/// rather than pre-filtering it away.
+pub fn graph_core_for_store(store: &Store) -> anyhow::Result<serde_json::Value> {
+    store
+        .latest_generation_id()?
+        .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
+    let extractions = store.latest_extractions()?;
+    let analysis = store
+        .latest_analysis()?
+        .ok_or_else(|| anyhow::anyhow!("no committed generation: run `devmap build` first"))?;
+    let edges = store
+        .latest_edges(0.0)?
+        .into_iter()
+        .map(resolved_edge_from_stored)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let repo_root = store.latest_repo_root()?;
+    Ok(crate::build_graph_core_value(
+        &extractions,
+        &analysis,
+        &edges,
+        repo_root.as_deref(),
+    ))
 }
 
 fn stored_edge_to_resolved(edge: StoredEdge) -> anyhow::Result<ResolvedEdge> {
@@ -5211,7 +5244,7 @@ mod tests {
     /// a compile error there; this array is what stops a new variant from being
     /// *added to the enum and to that match* while going untested. The length
     /// assertion below is what stops the array itself from silently shrinking.
-    const ALL_EDGE_KINDS: [EdgeKind; 14] = [
+    const ALL_EDGE_KINDS: [EdgeKind; 15] = [
         EdgeKind::Imports,
         EdgeKind::Calls,
         EdgeKind::Contains,
@@ -5221,6 +5254,7 @@ mod tests {
         EdgeKind::Implements,
         EdgeKind::SubscribesTo,
         EdgeKind::HandlesRoute,
+        EdgeKind::Registers,
         EdgeKind::WiredTo,
         EdgeKind::MemberOf,
         EdgeKind::DependsOn,
@@ -5277,7 +5311,7 @@ mod tests {
             ALL_EDGE_KINDS.len(),
             "the kind table must hold one distinct name per variant"
         );
-        assert_eq!(ALL_EDGE_KINDS.len(), 14, "a variant was added or removed");
+        assert_eq!(ALL_EDGE_KINDS.len(), 15, "a variant was added or removed");
     }
 
     /// A symbol too large for the budget is returned capped, and says so.

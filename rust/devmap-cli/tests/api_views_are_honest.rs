@@ -140,8 +140,9 @@ fn a_route_the_resolver_bound_is_visible_with_its_handler_and_its_caller() {
         .ends_with("client.js"));
 
     // The framework is the route node's, no longer dropped at the store
-    // boundary. Middleware still has no `registers` edge kind to be read from,
-    // and stays null.
+    // boundary. FastAPI has no middleware producer, so its middleware is
+    // unknown — null, never `[]` — and nothing in this repository claims the
+    // capability.
     assert_eq!(
         route["framework"], "fastapi/flask",
         "the route node carries the framework the resolver knew: {route}"
@@ -160,6 +161,140 @@ fn a_route_the_resolver_bound_is_visible_with_its_handler_and_its_caller() {
         .as_str()
         .unwrap()
         .contains("not the whole working tree"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Route middleware, end to end: extracted, bound to a `registers` edge,
+/// stored, and read back by `devmap routes` — for an Express app and a chi
+/// router. The Express route runs the router's `use` and its own inline
+/// middleware, in that order; the Go route runs its router's `Use`.
+#[test]
+fn express_and_go_routes_report_their_middleware() {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "devmap-api-middleware-{}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("server")).unwrap();
+    std::fs::create_dir_all(root.join("gosvc")).unwrap();
+    std::fs::write(
+        root.join("server/auth.js"),
+        "function requireAuth(req, res, next) { next(); }\nmodule.exports = { requireAuth };\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("server/app.js"),
+        "const express = require('express');\n\
+         const { requireAuth } = require('./auth');\n\
+         const app = express();\n\
+         app.use(requireAuth);\n\
+         app.get('/api/items', audit, listItems);\n\
+         function audit(req, res, next) { next(); }\n\
+         function listItems(req, res) { res.json({ items: [] }); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("gosvc/routes.go"),
+        "package gosvc\n\n\
+         import (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\n\
+         func Routes(r chi.Router) {\n\
+         \tr.Use(Authenticate)\n\
+         \tr.Get(\"/api/orders\", ListOrders)\n\
+         }\n\n\
+         func Authenticate(next http.Handler) http.Handler { return next }\n\n\
+         func ListOrders(w http.ResponseWriter, req *http.Request) {}\n",
+    )
+    .unwrap();
+    build(&root);
+
+    let mapped = json(&run(&root, &["routes", ".", "--json"]));
+    let route = |path: &str| {
+        mapped["routes"]
+            .as_array()
+            .expect("routes array")
+            .iter()
+            .find(|route| route["path"] == path)
+            .unwrap_or_else(|| panic!("no route {path}: {mapped}"))
+            .clone()
+    };
+    let bound = |route: &serde_json::Value| -> Vec<(String, String, String)> {
+        route["middleware"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a producer ran, so middleware is a list: {route}"))
+            .iter()
+            .map(|entry| {
+                (
+                    entry["name"].as_str().unwrap_or_default().to_string(),
+                    entry["scope"].as_str().unwrap_or_default().to_string(),
+                    entry["symbol"]["path"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect()
+    };
+
+    let items = route("/api/items");
+    assert_eq!(items["framework"], "express", "{items}");
+    assert_eq!(items["handlers"][0]["name"], "listItems", "{items}");
+    assert_eq!(
+        bound(&items),
+        [
+            (
+                "requireAuth".into(),
+                "router".into(),
+                "server/auth.js".into()
+            ),
+            ("audit".into(), "route".into(), "server/app.js".into()),
+        ],
+        "{items}"
+    );
+
+    let orders = route("/api/orders");
+    assert_eq!(orders["framework"], "chi", "{orders}");
+    assert_eq!(orders["handlers"][0]["name"], "ListOrders", "{orders}");
+    assert_eq!(
+        bound(&orders),
+        [(
+            "Authenticate".into(),
+            "router".into(),
+            "gosvc/routes.go".into()
+        )],
+        "{orders}"
+    );
+
+    assert_eq!(
+        mapped["capabilities"]["middleware_available"], true,
+        "{mapped}"
+    );
+    assert_eq!(
+        mapped["capabilities"]["routes_with_middleware"], 2,
+        "{mapped}"
+    );
+
+    // The edges themselves made it through the store: the view above could
+    // have resolved names some other way, `cypher` reads the edge kind.
+    let edges = json(&run(
+        &root,
+        &[
+            "--json",
+            "cypher",
+            "MATCH (a)-[r:registers]->(b) RETURN a, b",
+        ],
+    ));
+    assert_eq!(edges["ok"], true, "{edges}");
+    assert_eq!(edges["total"], 3, "three middleware bindings: {edges}");
+
+    let impact = json(&run(&root, &["api-impact", "/api/items", ".", "--json"]));
+    assert_eq!(impact["middleware"], items["middleware"], "{impact}");
 
     let _ = std::fs::remove_dir_all(&root);
 }
