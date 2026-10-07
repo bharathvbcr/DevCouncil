@@ -2684,15 +2684,23 @@ impl Resolver {
                             .filter(|_| family.admits(family))
                         {
                             let key = (family, class_type.clone(), call.callee_name.clone());
-                            if let Some(hits) = self.type_methods.get(&key) {
-                                if hits.len() == 1 {
-                                    let (target_f, target_symbol) = &hits[0];
-                                    resolution = Some(Arc::new(Resolution::ReceiverType {
-                                        target_symbol: target_symbol.clone(),
-                                        target_file: target_f.clone(),
-                                        receiver_type: class_type.clone(),
-                                    }));
-                                }
+                            if let Some((target_f, target_symbol)) =
+                                self.type_methods.get(&key).and_then(|hits| {
+                                    self.receiver_type_method(
+                                        ext,
+                                        call.caller_symbol.as_deref(),
+                                        recv,
+                                        site_binding,
+                                        &class_type,
+                                        hits,
+                                    )
+                                })
+                            {
+                                resolution = Some(Arc::new(Resolution::ReceiverType {
+                                    target_symbol: target_symbol.clone(),
+                                    target_file: target_f.clone(),
+                                    receiver_type: class_type.clone(),
+                                }));
                             }
                         }
                     }
@@ -4720,6 +4728,128 @@ impl Resolver {
         (candidates.len() == 1).then(|| candidates.pop().unwrap())
     }
 
+    /// The one `type_methods` hit a typed receiver dispatches to.
+    ///
+    /// `type_methods` is keyed by the *bare* type name, so `(Go, "Client",
+    /// "Zzembed")` holds both `rpc.Client.Zzembed` and `llm.Client.Zzembed`
+    /// when two packages declare a `Client`. One hit is the answer, as it always
+    /// was. Several are refused — except in the one case Go's scoping settles:
+    /// a type spelled **unqualified, in the caller's own file**, means the type
+    /// the caller's package block declares ([`Self::go_own_package_method`]).
+    ///
+    /// `class_type` cannot say which case it is: the binding facts record
+    /// `&rpc.Client{}` as `Client{..}` and `c *rpc.Client` as `Client`, and a
+    /// type reached through a field or a call is spelled relative to whichever
+    /// package declared *that*. So the spelling is read again, from the
+    /// references the extractor emitted for this variable
+    /// ([`Self::go_receiver_spelled_bare`]).
+    fn receiver_type_method<'a>(
+        &self,
+        ext: &Extraction,
+        scope: Option<&str>,
+        receiver: &str,
+        binding: Option<&LocalBinding>,
+        class_type: &str,
+        hits: &'a [(String, String)],
+    ) -> Option<&'a (String, String)> {
+        if let [only] = hits {
+            return Some(only);
+        }
+        let scope = binding.and_then(|b| b.scope.as_deref()).or(scope);
+        if ext.language != "go" || !Self::go_receiver_spelled_bare(ext, scope, receiver, class_type)
+        {
+            return None;
+        }
+        self.go_own_package_method(ext, class_type, hits)
+    }
+
+    /// Whether this file wrote `receiver`'s type as a bare `class_type`, and
+    /// never as a qualified one.
+    ///
+    /// The Go extractor ties each typed name to the variable it types through
+    /// `assigned_to`: a parameter or method receiver `c *Client` is a `Type`
+    /// reference, `c := &Client{}` a `Constructor` reference, and a qualified
+    /// parameter type `c *rpc.Client` adds a `TypeQualifier` reference naming
+    /// `rpc`. A composite literal carries no qualifier reference, but its span
+    /// is the written type, so `rpc.Client{}` is the `Client` whose span is
+    /// longer than its name.
+    ///
+    /// Refuses any qualified spelling of the variable in the scope, and a type
+    /// nothing here wrote for it: one learned from a call's return, or a
+    /// field's (`h.Inner` names no variable, so no reference is assigned to
+    /// it, and its type is spelled in the package that declared the field).
+    fn go_receiver_spelled_bare(
+        ext: &Extraction,
+        scope: Option<&str>,
+        receiver: &str,
+        class_type: &str,
+    ) -> bool {
+        let mut bare = false;
+        for reference in ext.references.iter().filter(|reference| {
+            reference.assigned_to.as_deref() == Some(receiver)
+                && reference.enclosing_symbol.as_deref() == scope
+        }) {
+            match reference.kind {
+                ReferenceKind::TypeQualifier => return false,
+                ReferenceKind::Type if reference.name == class_type => bare = true,
+                ReferenceKind::Constructor if reference.name == class_type => {
+                    let written = reference.span.end_byte - reference.span.start_byte;
+                    if written != reference.name.len() {
+                        return false;
+                    }
+                    bare = true;
+                }
+                _ => {}
+            }
+        }
+        bare
+    }
+
+    /// The method `class_type` declares in `file`'s own Go package, when the
+    /// package block is where a bare `class_type` written in `file` points.
+    ///
+    /// The type's declaration is [`Self::lookup_in_package`]'s answer — this
+    /// file, then the one non-test file of its `(directory, package clause)`
+    /// — and the method must sit in that same package, under the build-tag
+    /// rule [`Self::same_package_target`] states: a non-test file does not see
+    /// a `_test.go` declaration. A file with a dot-import refuses outright: it
+    /// puts another package's names in this file's scope, so even a bare
+    /// `Client` can mean someone else's.
+    fn go_own_package_method<'a>(
+        &self,
+        ext: &Extraction,
+        class_type: &str,
+        hits: &'a [(String, String)],
+    ) -> Option<&'a (String, String)> {
+        if ext
+            .imports
+            .iter()
+            .any(|imp| imp.alias.as_deref() == Some("."))
+        {
+            return None;
+        }
+        let file = ext.file_path.as_str();
+        let (declaring_file, _) = self.lookup_in_package(file, class_type)?;
+        let dir = Self::parent_dir(&declaring_file);
+        let package = self.go_package_by_file.get(&declaring_file)?;
+        let source_is_test = file.ends_with("_test.go");
+        let mut own: Vec<&(String, String)> = hits
+            .iter()
+            .filter(|(path, _)| {
+                path.ends_with(".go")
+                    && Self::parent_dir(path) == dir
+                    && self.go_package_by_file.get(path) == Some(package)
+                    && (source_is_test || !path.ends_with("_test.go"))
+            })
+            .collect();
+        own.sort();
+        own.dedup();
+        match own.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+
     fn go_import_edge_targets(&self, files: &[String]) -> Vec<String> {
         let mut nodes = BTreeSet::new();
         for file in files {
@@ -5218,32 +5348,41 @@ impl Resolver {
         receiver: &str,
         name: &str,
     ) -> Option<ResolvedEdge> {
+        let binding = {
+            let root = Self::path_root(receiver);
+            ext.local_binding_at(reference.span.start_byte, root)
+                .or_else(|| ext.local_binding_at(reference.span.start_byte, receiver))
+        };
         if let Some(class_type) = self.receiver_type_for(
             &ext.file_path,
             reference.enclosing_symbol.as_deref(),
             receiver,
-            {
-                let root = Self::path_root(receiver);
-                ext.local_binding_at(reference.span.start_byte, root)
-                    .or_else(|| ext.local_binding_at(reference.span.start_byte, receiver))
-            },
+            binding,
         ) {
             let key = (family, class_type.clone(), name.to_string());
-            if let Some(hits) = self.type_methods.get(&key) {
-                if hits.len() == 1 {
-                    let (target_file, target_symbol) = &hits[0];
-                    return Some(self.reference_edge(
+            if let Some((target_file, target_symbol)) =
+                self.type_methods.get(&key).and_then(|hits| {
+                    self.receiver_type_method(
                         ext,
-                        target_file,
-                        target_symbol,
-                        reference,
-                        Resolution::ReceiverType {
-                            target_symbol: self.qualified_for(target_file, target_symbol),
-                            target_file: target_file.clone(),
-                            receiver_type: class_type.clone(),
-                        },
-                    ));
-                }
+                        reference.enclosing_symbol.as_deref(),
+                        receiver,
+                        binding,
+                        &class_type,
+                        hits,
+                    )
+                })
+            {
+                return Some(self.reference_edge(
+                    ext,
+                    target_file,
+                    target_symbol,
+                    reference,
+                    Resolution::ReceiverType {
+                        target_symbol: self.qualified_for(target_file, target_symbol),
+                        target_file: target_file.clone(),
+                        receiver_type: class_type.clone(),
+                    },
+                ));
             }
         }
 

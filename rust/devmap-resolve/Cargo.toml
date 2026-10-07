@@ -123,6 +123,10 @@ name = "go_package_scope"
 required-features = ["parse"]
 
 [[test]]
+name = "go_own_package_receiver"
+required-features = ["parse"]
+
+[[test]]
 name = "rust_self_type"
 required-features = ["parse"]
 
