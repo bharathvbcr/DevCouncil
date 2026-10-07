@@ -250,6 +250,7 @@ fn file_symbol(path: &str, exported: bool) -> ExtractedSymbol {
         parent_symbol: None,
         body_signature: None,
         declaration_hash: None,
+        return_type: None,
     }
 }
 

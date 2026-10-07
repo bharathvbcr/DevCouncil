@@ -492,6 +492,7 @@ fn extract_treesitter_before_deadline(
                     parent_symbol: None,
                     body_signature: None,
                     declaration_hash: None,
+                    return_type: None,
                 });
 
                 // File-level wiring first, so a file-scoped exemption always
@@ -691,6 +692,7 @@ fn extract_treesitter_before_deadline(
                 // later and silently omit its signatures.
                 crate::clonesig::stamp_signatures(&mut symbols, root, source);
                 crate::clonesig::stamp_declaration_hashes(&mut symbols, root, source);
+                crate::returns::stamp_return_types(&mut symbols, root, source);
 
                 let local_bindings = collect_site_bindings(
                     root,
@@ -1628,6 +1630,7 @@ fn module_binding_symbol(
         parent_symbol: Some(file_symbol_name.to_string()),
         body_signature: None,
         declaration_hash: None,
+        return_type: None,
     }
 }
 
@@ -1735,6 +1738,7 @@ fn unparsed_extraction(
             parent_symbol: None,
             body_signature: None,
             declaration_hash: None,
+            return_type: None,
         }],
         imports: Vec::new(),
         calls: Vec::new(),
@@ -1828,6 +1832,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         // bodies, and `None` means "not computed", never "no duplicates".
         body_signature: None,
         declaration_hash: None,
+        return_type: None,
     });
     symbols.extend(scan.symbols);
     let mut diagnostics: Vec<String> = Vec::new();
@@ -3374,6 +3379,7 @@ fn extract_node(
                             parent_symbol: Some(file_symbol_name.to_string()),
                             body_signature: None,
                             declaration_hash: None,
+                            return_type: None,
                         });
                     }
                 }
@@ -3444,6 +3450,7 @@ fn extract_node(
                         parent_symbol: Some(parent_symbol),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -3460,6 +3467,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -3610,6 +3618,7 @@ fn extract_node(
                         parent_symbol: Some(parent_symbol),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -3658,6 +3667,7 @@ fn extract_node(
                                 parent_symbol: Some(parent_symbol),
                                 body_signature: None,
                                 declaration_hash: None,
+                                return_type: None,
                             });
                         }
                     }
@@ -3677,6 +3687,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -3694,6 +3705,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -3711,6 +3723,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -3728,6 +3741,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4028,6 +4042,7 @@ fn extract_node(
                         }),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4120,6 +4135,7 @@ fn extract_node(
                         }),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4141,6 +4157,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4168,6 +4185,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4403,6 +4421,7 @@ fn extract_node(
                         parent_symbol: Some(parent_symbol),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4424,6 +4443,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4465,6 +4485,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4571,6 +4592,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4658,6 +4680,7 @@ fn extract_node(
                     parent_symbol: Some(declaration.parent_symbol(file_symbol_name)),
                     body_signature: None,
                     declaration_hash: None,
+                    return_type: None,
                 });
                 // Same SC12 binding Rust and Go already emit: a parameter's
                 // declared type is the only typed binding available when the
@@ -8389,7 +8412,8 @@ fn collect_site_bindings(
 ) -> Vec<LocalBinding> {
     let fixtures = python_fixture_names(root, source, imports);
     let declared_types = binding_declared_types(references);
-    let initializers = binding_initializers(references, calls);
+    let mut initializers = binding_initializers(references, calls);
+    collapse_initializers_to_statements(root, &mut initializers);
     let mut sites = BTreeSet::new();
     let mut parameters: HashMap<usize, BTreeSet<String>> = HashMap::new();
     let inputs = calls
@@ -8499,12 +8523,9 @@ fn collect_site_bindings(
                                     })
                                 })
                                 .flatten();
-                            let (declared_type, initializer) = binding_facts_for(
-                                &declared_types,
-                                &initializers,
-                                &scope_name,
-                                name,
-                            );
+                            let declared_type =
+                                binding_declared_type_for(&declared_types, &scope_name, name);
+                            let initializer = initializer_at(&initializers, name, node, scope);
                             sites.insert(LocalBinding {
                                 start_byte: span.start_byte,
                                 name: name.to_string(),
@@ -8544,17 +8565,24 @@ fn binding_declared_types(
     out
 }
 
-/// Call/Constructor refs with `assigned_to`, reduced to a simple initializer shape.
+/// Call/Constructor refs with `assigned_to`, reduced to a simple initializer
+/// shape, as `binding name -> [(assignment start, shape)]` in source order.
 ///
-/// Call *references* do not always carry `receiver_expr` — `extracted_reference`
-/// derives it from member-access shape, while `Engine::new` is a
-/// `scoped_identifier` whose receiver lives on the mirrored `ExtractedCall`.
-/// Join on the call span that contains the reference when filling `T::new`.
+/// Only the **outermost** expression of each assignment is kept. Every
+/// argument of `p := NewDBLP(dep())` carries `assigned_to: p` too, and taking
+/// `dep` would type `p` by its dependency; a candidate whose start lies inside
+/// another candidate's call is an argument of it.
+///
+/// Keyed by name alone, not by enclosing symbol: which assignment a use reads
+/// is decided by position in [`initializer_at`], because a name is commonly
+/// reassigned in one function — every `t.Run(…, func() { p := … })` subtest
+/// rebinds `p` — and the first assignment is not the one a later use sees.
 fn binding_initializers(
     references: &[ExtractedReference],
     calls: &[ExtractedCall],
-) -> HashMap<(Option<String>, String), String> {
-    let mut out = HashMap::new();
+) -> HashMap<String, Vec<(usize, String)>> {
+    // (start, end of the expression it begins, shape) per bound name.
+    let mut candidates: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
     for reference in references {
         let Some(bound) = reference.assigned_to.as_ref() else {
             continue;
@@ -8562,51 +8590,266 @@ fn binding_initializers(
         if bound.is_empty() {
             continue;
         }
-        let shape = match reference.kind {
-            ReferenceKind::Constructor => Some(format!("{}{{..}}", reference.name)),
-            ReferenceKind::Call => {
-                let receiver = reference.receiver_expr.as_deref().or_else(|| {
-                    calls.iter().find_map(|call| {
-                        (call.callee_name == reference.name
-                            && call.span.start_byte <= reference.span.start_byte
-                            && call.span.end_byte >= reference.span.end_byte)
-                            .then_some(call.receiver_expr.as_deref())
-                            .flatten()
-                    })
-                });
-                Some(match receiver {
-                    Some(receiver) if reference.name == "new" => format!("{receiver}::new"),
-                    Some(receiver) => format!("{receiver}.{}", reference.name),
-                    None => reference.name.clone(),
-                })
-            }
-            _ => None,
-        };
-        let Some(shape) = shape else {
+        let Some(shape) = reference.initializer_shape(calls) else {
             continue;
         };
-        out.entry((reference.enclosing_symbol.clone(), bound.clone()))
-            .or_insert(shape);
+        let extent_end = calls
+            .iter()
+            .filter(|call| {
+                call.callee_name == reference.name
+                    && call.span.start_byte <= reference.span.start_byte
+                    && call.span.end_byte >= reference.span.end_byte
+            })
+            .map(|call| call.span.end_byte)
+            .min()
+            .unwrap_or(reference.span.end_byte);
+        candidates.entry(bound.clone()).or_default().push((
+            reference.span.start_byte,
+            extent_end,
+            shape,
+        ));
     }
-    out
+    candidates
+        .into_iter()
+        .map(|(name, found)| {
+            let mut outermost: Vec<(usize, String)> = found
+                .iter()
+                .filter(|(start, end, _)| {
+                    !found.iter().any(|(other_start, other_end, _)| {
+                        // An argument of another candidate's call.
+                        (other_start < start && start < other_end)
+                            // The outer link of a chain rooted at another
+                            // candidate: `PipeDrain::new(r).expect(..)` starts
+                            // where `PipeDrain::new` starts and contains it.
+                            // The value is typed by the root, and the outer
+                            // link's shape names a method of an expression.
+                            || (other_start == start && other_end < end)
+                    })
+                })
+                .map(|(start, _, shape)| (*start, shape.clone()))
+                .collect();
+            outermost.sort();
+            outermost.dedup();
+            (name, outermost)
+        })
+        .collect()
 }
 
-fn binding_facts_for(
+/// Keep one initializer per assignment *statement*: the one that starts it.
+///
+/// [`binding_initializers`] drops a call's own arguments and a chain's outer
+/// links by span, but a struct or composite literal has no call span: in
+/// `let s = Scanner { bytes: text.as_bytes(), .. }` the field's
+/// `text.as_bytes` carries `assigned_to: s` too, starts after `Scanner`, and —
+/// being nearer the use — would be read as the value. Grouping by the
+/// statement each candidate sits in, and keeping the earliest, leaves the
+/// expression the statement assigns. Statements are told apart with the tree,
+/// which this pass has and `binding_initializers` does not.
+fn collapse_initializers_to_statements(
+    root: Node,
+    initializers: &mut HashMap<String, Vec<(usize, String)>>,
+) {
+    for assignments in initializers.values_mut() {
+        // Sorted by start, so the first candidate of each statement is its
+        // earliest; a candidate whose statement the tree cannot name stands
+        // alone.
+        let mut current: Option<usize> = None;
+        assignments.retain(|(start, _)| {
+            let statement = statement_start(root, *start);
+            let repeats = statement.is_some() && statement == current;
+            current = statement;
+            !repeats
+        });
+    }
+}
+
+/// Start byte of the statement holding the byte at `start`: the highest
+/// ancestor below a block, a callable, or the file.
+fn statement_start(root: Node, start: usize) -> Option<usize> {
+    statement_node(root, start).map(|statement| statement.start_byte())
+}
+
+/// The statement holding the byte at `start`, as [`statement_start`] finds it.
+fn statement_node(root: Node, start: usize) -> Option<Node> {
+    let mut node = root.descendant_for_byte_range(start, start)?;
+    while let Some(parent) = bounded_parent(node) {
+        if parent.id() == root.id()
+            || is_callable_node(parent)
+            || matches!(
+                parent.kind(),
+                "block"
+                    | "statement_block"
+                    | "compound_statement"
+                    | "func_literal"
+                    | "source_file"
+                    | "program"
+                    | "module"
+                    | "class_body"
+                    | "declaration_list"
+            )
+        {
+            return Some(node);
+        }
+        node = parent;
+    }
+    Some(node)
+}
+
+/// Whether a use inside the statement that assigns `name` at `start` reads the
+/// binding *before* that statement.
+///
+/// `let wrapped = spawn(move || { wrapped.snapshot(); wrapped })` moves the
+/// earlier `wrapped` into the closure: the right-hand side is evaluated before
+/// the name is bound, so a use there — `x = wrap(x)` too — sees what the name
+/// held before. A closure is the exception where the variable is the same one
+/// and is read when the closure runs, after the assignment: `x = make(() =>
+/// x.run())` in JavaScript or Python, `c = Wrap(func() { c.Ping() })` in Go.
+/// A Rust `let` and a Go `:=` or `var` declare a fresh variable whose scope
+/// begins after the statement, so even a closure there reads the earlier one.
+fn use_reads_the_earlier_binding(region: Node, start: usize, use_node: Node) -> bool {
+    let Some(statement) = statement_node(region, start) else {
+        return false;
+    };
+    let use_start = use_node.start_byte();
+    if !(statement.start_byte() <= use_start && use_start < statement.end_byte()) {
+        return false;
+    }
+    if matches!(
+        statement.kind(),
+        "let_declaration" | "short_var_declaration" | "var_declaration"
+    ) {
+        return true;
+    }
+    let mut node = use_node;
+    while let Some(parent) = bounded_parent(node) {
+        if parent.id() == statement.id() {
+            break;
+        }
+        if is_callable_node(parent) || parent.kind() == "func_literal" {
+            return false;
+        }
+        node = parent;
+    }
+    true
+}
+
+/// The initializer of `name` that a use at `use_node` reads, searched outward
+/// from the use to `scope` — the callable that binds the name.
+///
+/// At each enclosing region (a callable, or a Go `func_literal`, which
+/// `is_callable_node` does not count as a scope) the assignments to `name`
+/// inside the region and before the use are walked from the nearest back:
+///
+/// - `x = x.with_y()` re-assigns the value from itself — a builder step — and
+///   says nothing new about its type, so it is passed over;
+/// - a use inside the assignment's own right-hand side reads the value from
+///   before it ([`use_reads_the_earlier_binding`]), so it is passed over too;
+/// - an assignment inside a block that does not also hold the use ran only on
+///   some paths (`if ieee { p = NewIEEE() }`), so its shape is collected and
+///   the walk continues to the value it may have left in place;
+/// - the first assignment that runs on every path to the use ends the walk.
+///
+/// Every collected shape must agree, or the answer is `None`: naming one
+/// branch's constructor would type the other branch's value. A region with no
+/// assignment widens the search. This replaced a map that kept the *first*
+/// assignment in the enclosing function, which typed every `t.Run` subtest's
+/// `p` by the first subtest's constructor.
+fn initializer_at(
+    initializers: &HashMap<String, Vec<(usize, String)>>,
+    name: &str,
+    use_node: Node,
+    scope: Node,
+) -> Option<String> {
+    let assignments = initializers.get(name)?;
+    let use_start = use_node.start_byte();
+    let mut region = bounded_parent(use_node);
+    while let Some(node) = region {
+        let is_scope = node.id() == scope.id();
+        if is_scope || is_callable_node(node) || node.kind() == "func_literal" {
+            let mut seen: Option<&str> = None;
+            let mut settled = false;
+            for (start, shape) in assignments
+                .iter()
+                .rev()
+                .filter(|(start, _)| *start >= node.start_byte() && *start < use_start)
+            {
+                if reassigns_from_itself(shape, name)
+                    || use_reads_the_earlier_binding(node, *start, use_node)
+                {
+                    continue;
+                }
+                match seen {
+                    Some(earlier) if earlier != shape.as_str() => return None,
+                    _ => seen = Some(shape.as_str()),
+                }
+                if !assignment_is_conditional(node, *start, use_start) {
+                    settled = true;
+                    break;
+                }
+            }
+            if let Some(shape) = seen {
+                // Conditional assignments with nothing unconditional before
+                // them: on some path the binding came from outside this
+                // region, so the shape is not the only value it can hold.
+                return settled.then(|| shape.to_string());
+            }
+        }
+        if is_scope {
+            break;
+        }
+        region = bounded_parent(node);
+    }
+    None
+}
+
+/// `x = x.step()`: an initializer whose receiver is the binding itself.
+///
+/// A method call on the binding, and nothing else: `lexical::store::Builder::
+/// new` is a path whose first segment merely shares the binding's name, and a
+/// chain written across lines (`window\n  .center()`) carries the line break
+/// in its receiver text.
+fn reassigns_from_itself(shape: &str, name: &str) -> bool {
+    let compact: String = shape.chars().filter(|c| !c.is_whitespace()).collect();
+    compact
+        .strip_prefix(name)
+        .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// Whether the assignment starting at `start` sits in a block that does not
+/// also contain the use at `use_start`, between itself and `region`.
+fn assignment_is_conditional(region: Node, start: usize, use_start: usize) -> bool {
+    let Some(mut node) = region.descendant_for_byte_range(start, start) else {
+        return true;
+    };
+    while node.id() != region.id() {
+        let contains_use = node.start_byte() <= use_start && use_start < node.end_byte();
+        if contains_use {
+            return false;
+        }
+        if matches!(
+            node.kind(),
+            "block" | "statement_block" | "compound_statement" | "else_clause"
+        ) {
+            return true;
+        }
+        let Some(parent) = bounded_parent(node) else {
+            return true;
+        };
+        node = parent;
+    }
+    false
+}
+
+fn binding_declared_type_for(
     declared_types: &HashMap<(Option<String>, String), String>,
-    initializers: &HashMap<(Option<String>, String), String>,
     scope: &Option<String>,
     name: &str,
-) -> (Option<String>, Option<String>) {
+) -> Option<String> {
     let key = (scope.clone(), name.to_string());
-    let declared_type = declared_types.get(&key).cloned().or_else(|| {
+    declared_types.get(&key).cloned().or_else(|| {
         // File-scoped Type bindings (rare) and unscoped parameter rows.
         declared_types.get(&(None, name.to_string())).cloned()
-    });
-    let initializer = initializers
-        .get(&key)
-        .cloned()
-        .or_else(|| initializers.get(&(None, name.to_string())).cloned());
-    (declared_type, initializer)
+    })
 }
 
 fn name_is_shadowed_by_local(node: Node, source: &str, name: &str) -> bool {
@@ -8948,6 +9191,18 @@ fn assignment_binding(mut node: Node, source: &str) -> Option<String> {
                 .child_by_field_name("left")
                 .or_else(|| node.child_by_field_name("name")),
             "variable_declarator" => node.child_by_field_name("name"),
+            // Go `var x = New()` / `const x = …`, at package level or in a
+            // function. `name` repeats for `var a, b = …`, which binds two
+            // names to two values; nothing here says which value is whose, so
+            // only the single-name spec binds.
+            "var_spec" | "const_spec" => {
+                let mut cursor = node.walk();
+                let mut names = node.children_by_field_name("name", &mut cursor);
+                match (names.next(), names.next()) {
+                    (Some(only), None) => Some(only),
+                    _ => return None,
+                }
+            }
             "let_declaration" => node
                 .child_by_field_name("pattern")
                 .or_else(|| node.child_by_field_name("name")),

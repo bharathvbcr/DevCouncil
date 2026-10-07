@@ -363,6 +363,15 @@ pub struct Resolver {
     /// built from those functions is exactly that. Only a name the literal
     /// itself spells is admitted, so the coincidence stays refused.
     module_value_members: BTreeMap<(String, String), BTreeSet<String>>,
+    /// `(file, qualified name)` → the return type a callable's declaration
+    /// writes, as the extractor recorded it. What types a factory-built value;
+    /// read only through [`Self::factory_return_type`].
+    return_types: BTreeMap<(String, String), String>,
+    /// `(file, name)` → the initializer shape of a module-scope value built by
+    /// a call that is not a class: `var r = NewRegistry()`, `export const s =
+    /// createService()`. Resolved lazily, because the factory may be declared
+    /// in a file indexed after this one.
+    module_value_factories: BTreeMap<(String, String), (LangFamily, String)>,
     /// `file:scope:var` and `file:var` → the *declared* type name of a value,
     /// whether or not that type is indexed (SC25).
     ///
@@ -560,6 +569,8 @@ impl Resolver {
             value_imports: BTreeMap::new(),
             module_value_types: BTreeMap::new(),
             module_value_members: BTreeMap::new(),
+            return_types: BTreeMap::new(),
+            module_value_factories: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             external_imports: BTreeMap::new(),
             unindexed_local_imports: BTreeMap::new(),
@@ -631,6 +642,35 @@ impl Resolver {
                     .push(&symbol.span);
             }
         }
+        // An unexported Go package var is no symbol — the extractor publishes
+        // only exported package bindings — but its initializer is bound to its
+        // name at package scope. Go has no package-level statements other than
+        // declarations, and forbids declaring a name twice in a package, so the
+        // whole file is that declaration's span: every package-scope reference
+        // bound to the name belongs to it.
+        if ext.language == "go" {
+            if let Some(file_span) = ext
+                .symbols
+                .iter()
+                .find(|symbol| symbol.kind == SymbolKind::File)
+                .map(|symbol| &symbol.span)
+            {
+                for reference in &ext.references {
+                    let Some(bound) = reference.assigned_to.as_deref() else {
+                        continue;
+                    };
+                    if reference.enclosing_symbol.is_none()
+                        && matches!(
+                            reference.kind,
+                            ReferenceKind::Constructor | ReferenceKind::Call
+                        )
+                        && !declarations.contains_key(bound)
+                    {
+                        declarations.insert(bound, vec![file_span]);
+                    }
+                }
+            }
+        }
         for (name, spans) in declarations {
             // Two module-level declarations of one name: the type is whichever
             // ran last, which is not a fact the extraction holds.
@@ -660,7 +700,10 @@ impl Resolver {
                         .map(|reference| reference.name.clone()),
                 )
                 .collect();
-            if !members.is_empty() {
+            // Members are read only for a value import, which Go does not have
+            // — and a Go declaration's span may be the whole file, which would
+            // make every symbol in it a member.
+            if !members.is_empty() && ext.language != "go" {
                 self.module_value_members
                     .insert((ext.file_path.clone(), name.to_string()), members);
             }
@@ -698,29 +741,199 @@ impl Resolver {
             let Some((_, initializer)) = earliest else {
                 continue;
             };
+            let key = (ext.file_path.clone(), name.to_string());
             if self.unique_indexed_type(family, &initializer.name) {
-                self.module_value_types.insert(
-                    (ext.file_path.clone(), name.to_string()),
-                    initializer.name.clone(),
-                );
+                self.module_value_types.insert(key, initializer.name.clone());
+            } else if initializer.kind == ReferenceKind::Call {
+                // A factory. Its declaration may sit in a file not yet indexed,
+                // so the shape is kept and resolved when it is read.
+                if let Some(shape) = initializer.initializer_shape(&ext.calls) {
+                    self.module_value_factories.insert(key, (family, shape));
+                }
             }
         }
     }
 
     /// The class a module-scope value `name` declared in `file` is an instance
-    /// of, following a re-export chain to the file that declares it.
+    /// of, following a re-export chain to the file that declares it, and — for
+    /// Go — to the sibling file of the same package that declares it.
     fn module_value_type(&self, file: &str, name: &str) -> Option<String> {
-        if let Some(found) = self
-            .module_value_types
-            .get(&(file.to_string(), name.to_string()))
-        {
+        if let Some(found) = self.module_value_type_in(file, name) {
+            return Some(found);
+        }
+        if let Some(terminal) = self.reexport_chains.get(&format!("{file}::{name}")) {
+            let (declaring_file, declared) = terminal.rsplit_once("::")?;
+            return self.module_value_type_in(declaring_file, declared);
+        }
+        self.go_package_value_type(file, name)
+    }
+
+    /// The type one file's own declaration of `name` gives it: a constructor
+    /// initializer recorded at index time, or a factory resolved now.
+    fn module_value_type_in(&self, file: &str, name: &str) -> Option<String> {
+        let key = (file.to_string(), name.to_string());
+        if let Some(found) = self.module_value_types.get(&key) {
             return Some(found.clone());
         }
-        let terminal = self.reexport_chains.get(&format!("{file}::{name}"))?;
-        let (declaring_file, declared) = terminal.rsplit_once("::")?;
-        self.module_value_types
-            .get(&(declaring_file.to_string(), declared.to_string()))
-            .cloned()
+        let (family, shape) = self.module_value_factories.get(&key)?;
+        self.factory_return_type(*family, file, None, shape)
+    }
+
+    /// A Go package-level value declared in another file of `file`'s package.
+    ///
+    /// A Go package is one namespace spread over its files, so
+    /// `defaultRegistry.Add()` in `register.go` names the `var` in
+    /// `registry.go` with no import between them. Only an answer every
+    /// declaring file agrees on is given: two build-constrained files may each
+    /// declare the name, and they need not agree.
+    fn go_package_value_type(&self, file: &str, name: &str) -> Option<String> {
+        if !file.ends_with(".go") || !Self::is_plain_ident(name) {
+            return None;
+        }
+        let package = self.go_package_by_file.get(file)?;
+        let mut found: Option<String> = None;
+        for sibling in self.go_files_in_dir(&Self::parent_dir(file)) {
+            if sibling == file || self.go_package_by_file.get(&sibling) != Some(package) {
+                continue;
+            }
+            let key = (sibling.clone(), name.to_string());
+            if !self.module_value_types.contains_key(&key)
+                && !self.module_value_factories.contains_key(&key)
+            {
+                continue;
+            }
+            let typed = self.module_value_type_in(&sibling, name)?;
+            match &found {
+                Some(existing) if existing != &typed => return None,
+                _ => found = Some(typed),
+            }
+        }
+        found
+    }
+
+    /// The language family a file was indexed under, read from its own `File`
+    /// symbol so it cannot disagree with the family its symbols carry.
+    fn family_of_file(&self, file: &str) -> Option<LangFamily> {
+        self.symbol_index.get(file)?.iter().find_map(|(path, kind, family, _)| {
+            (path == file && *kind == SymbolKind::File).then_some(*family)
+        })
+    }
+
+    /// The nominal type a factory call returns, from the callee's written
+    /// return type: `NewRegistry` → `Registry` for `func NewRegistry()
+    /// *Registry`, `svc.make` → `Svc`, `Svc::open` → `Svc`.
+    ///
+    /// The callee is found the way the call ladder would find it, and only by
+    /// rungs that name one declaration: a file-level function of this file (or
+    /// of its Go package), a named import, a member of an imported module
+    /// handle, or an associated function of a type. A bare callee the scope
+    /// binds itself — a parameter or a local closure named `make` — is not the
+    /// module's `make`, so it abstains. The answer must be a single indexed
+    /// class or struct; a generic, a tuple, `Promise<T>` or an optional names
+    /// no type a method can be dispatched on, and `admissible_nominal_type`
+    /// refuses each.
+    fn factory_return_type(
+        &self,
+        family: LangFamily,
+        file: &str,
+        scope: Option<&str>,
+        shape: &str,
+    ) -> Option<String> {
+        let shape = shape.trim();
+        if shape.ends_with("{..}") || shape.ends_with("::new") {
+            // Constructor shapes have their own rung, which needs no callee.
+            return None;
+        }
+        let (callee_file, callee) = if let Some((owner, function)) = shape.rsplit_once("::") {
+            let owner = owner.rsplit("::").next()?;
+            self.unique_type_method(family, owner, function)?
+        } else if let Some((receiver, function)) = shape.rsplit_once('.') {
+            if !Self::is_plain_ident(receiver)
+                || !Self::is_plain_ident(function)
+                || scope.is_some_and(|scope| self.scope_declares_local(file, scope, receiver))
+            {
+                return None;
+            }
+            let module = self
+                .import_bindings
+                .get(file)
+                .and_then(|bindings| bindings.get(receiver))
+                .filter(|_| !self.is_value_import(file, receiver));
+            match module {
+                Some((module_file, _)) => self.lookup_in_package(module_file, function)?,
+                // `Svc.create()`: a static factory on a type this corpus
+                // declares once.
+                None if self.unique_indexed_type(family, receiver) => {
+                    self.unique_type_method(family, receiver, function)?
+                }
+                None => return None,
+            }
+        } else {
+            if !Self::is_plain_ident(shape)
+                || scope.is_some_and(|scope| self.scope_declares_local(file, scope, shape))
+            {
+                return None;
+            }
+            match self.lookup_in_package(file, shape) {
+                Some(found) => found,
+                None => {
+                    let (target, declared) = self.import_bindings.get(file)?.get(shape)?;
+                    self.lookup_in_package(target, declared)?
+                }
+            }
+        };
+        let written = self.return_types.get(&(callee_file.clone(), callee.clone()))?;
+        let mut nominal = Self::admissible_nominal_type(written)?;
+        if nominal == "Self" {
+            nominal = self.declaring_type_of(&callee_file, &callee)?.to_string();
+        }
+        (self.unique_indexed_type(family, &nominal)
+            || self.names_one_type_in_both(file, &callee_file, &nominal))
+        .then_some(nominal)
+    }
+
+    /// Whether `nominal`, read where the factory wrote it and where the call is
+    /// written, is the same one type declaration.
+    ///
+    /// A type name is what a receiver map holds, and the method rung reads it
+    /// in the *caller's* scope — which is how `client := &Client{}` dispatches
+    /// in a corpus with a `Client` in every package. A factory's return type is
+    /// written in the *callee's* scope, so a name the corpus declares twice is
+    /// only safe to hand on when both scopes bind it to one declaration: the
+    /// same file, or the same Go package. Anywhere else the caller's `Client`
+    /// may be another type, and the corpus-wide uniqueness test decides.
+    fn names_one_type_in_both(&self, file: &str, callee_file: &str, nominal: &str) -> bool {
+        let Some(here) = self.lookup_in_package(file, nominal) else {
+            return false;
+        };
+        if self.lookup_in_package(callee_file, nominal).as_ref() != Some(&here) {
+            return false;
+        }
+        self.symbol_index.get(nominal).is_some_and(|candidates| {
+            candidates.iter().any(|(path, kind, _, identity)| {
+                *path == here.0
+                    && **identity == *here.1
+                    && matches!(kind, SymbolKind::Class | SymbolKind::Struct)
+            })
+        })
+    }
+
+    /// The one method `type_name` declares called `method`, as `(file,
+    /// qualified name)`, or `None` when it declares none or the type name is
+    /// declared twice.
+    fn unique_type_method(
+        &self,
+        family: LangFamily,
+        type_name: &str,
+        method: &str,
+    ) -> Option<(String, String)> {
+        let hits = self
+            .type_methods
+            .get(&(family, type_name.to_string(), method.to_string()))?;
+        let [only] = hits.as_slice() else {
+            return None;
+        };
+        Some(only.clone())
     }
 
     /// The type of a receiver this file reaches through an import: a named
@@ -962,6 +1175,14 @@ impl Resolver {
             if let Some(from_facts) = Self::type_from_binding_facts(binding) {
                 return Some(from_facts);
             }
+            // `w := NewWorker()`: the binding's initializer is a factory, and
+            // the factory's declaration says what it returns.
+            if let Some(from_factory) = binding.initializer.as_deref().and_then(|shape| {
+                let family = self.family_of_file(file)?;
+                self.factory_return_type(family, file, binding.scope.as_deref(), shape)
+            }) {
+                return Some(from_factory);
+            }
             let declaring_scope = binding.scope.as_deref()?;
             return self
                 .scoped_receiver_types
@@ -997,6 +1218,9 @@ impl Resolver {
             // Last, because every rung above is evidence written in this file
             // and an import is evidence about another one.
             .or_else(|| self.imported_receiver_type(file, name))
+            // A Go package-level value is in scope in every file of its
+            // package, with no import between them.
+            .or_else(|| self.module_value_type(file, name))
     }
 
     /// `root.field` with exactly one hop of plain identifiers — the shape
@@ -1763,6 +1987,8 @@ impl Resolver {
         self.value_imports.clear();
         self.module_value_types.clear();
         self.module_value_members.clear();
+        self.return_types.clear();
+        self.module_value_factories.clear();
         self.declared_types.clear();
         self.external_imports.clear();
         self.unindexed_local_imports.clear();
@@ -1844,6 +2070,12 @@ impl Resolver {
                             .or_default()
                             .push((ext.file_path.clone(), sym.qualified_name.clone()));
                     }
+                }
+                if let Some(written) = &sym.return_type {
+                    self.return_types.insert(
+                        (ext.file_path.clone(), sym.qualified_name.clone()),
+                        written.clone(),
+                    );
                 }
                 self.symbol_index
                     .entry(sym.qualified_name.clone())

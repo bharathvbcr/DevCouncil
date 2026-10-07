@@ -54,6 +54,10 @@ mod parent_index;
 // `treesitter::extract_treesitter`.
 #[cfg(feature = "parse")]
 mod pyload;
+// The return type a callable writes. Walks a parse tree; its one caller is
+// `treesitter::extract_treesitter`.
+#[cfg(feature = "parse")]
+mod returns;
 #[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod wiring;

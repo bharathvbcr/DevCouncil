@@ -2063,6 +2063,7 @@ mod tests {
             parent_symbol: None,
             body_signature: None,
             declaration_hash: None,
+            return_type: None,
         }
     }
 
