@@ -499,14 +499,14 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// sharply, a constant `__all__` omitted has no node and its importers no
 /// target — so it must not be served to this build.
 ///
-/// v68 records each callable's written return type (`ExtractedSymbol::
+/// v69 records each callable's written return type (`ExtractedSymbol::
 /// return_type`) and binds a single-name Go `var`/`const` spec's initializer
-/// to its name (`assigned_to`). It skips 67, which two unmerged branches
-/// claim: an identical one-line bump merges without a conflict, and two
-/// different payloads must never share a version. A v66 row has neither, so
+/// to its name (`assigned_to`). It skips 67 and 68, which other unmerged
+/// branches claim: an identical one-line bump merges without a conflict, and
+/// two different payloads must never share a version. A v66 row has neither, so
 /// a factory-built receiver — `w := NewWorker()`, `var r = NewRegistry()`,
 /// `const s = createService()` — would stay untyped under this build.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "68";
+pub const EXTRACTION_SCHEMA_VERSION: &str = "69";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

@@ -805,10 +805,10 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // type aliases other shapes dropped, reads import names off the tree, and
     // stops a module binding from shadowing its own module-level reads.
     //
-    // v68 records each callable's written return type and binds a single-name
+    // v69 records each callable's written return type and binds a single-name
     // Go `var`/`const` spec's initializer to its name.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "68",
+        EXTRACTION_SCHEMA_VERSION, "69",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );
