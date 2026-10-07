@@ -2,6 +2,20 @@
 
 17 work orders across 5 phases. Every item below is an edit point, not a direction.
 
+> **Historical record (2026-10-07).** This plan was written against a tree that no longer exists
+> in this form. Read it with these changes in mind:
+>
+> - **Python is gone.** Every Python surface it cites was deleted with Phase 7 (`3286db5e`,
+>   2026-09-10), and no `src/` tree remains. That covers `src/devcouncil/…`, including the MCP
+>   `codeintel.py` / `map.py` handlers, `liveness_ratchet.py`, `dead_symbols.py`, `wiring.py`,
+>   `repo_mapper.py`, `map_artifacts.py`, `graph/liveness.py` and `DevMapClient`. It also covers
+>   the Python registry behind the frozen golden and `parity_harness.py`. W2.2, W2.4, W3.1, W3.2,
+>   W3.3 and the P3 preamble therefore describe consumers that were later removed, not live ones.
+> - **Paths moved.** `rust-port/` and `rust-port/crates/` became `rust/` in `ee595607`
+>   (2026-09-11). Line numbers below predate that move.
+> - **Still present.** `benchmarks/map_bench.py` still exists.
+> - **Landing status.** See the Plan status table and the per-row marks in `DEVMAP_REVIEW.md`.
+
 The kernel's resolution discipline is the strongest of the four tools surveyed (devmap, gortex,
 GitNexus, trace-mcp) — and it is undermined by three places where the analysis layer reads a
 structural blind spot as evidence.
