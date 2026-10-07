@@ -594,6 +594,30 @@ fn a_lib_calls_through_a_use_imported_sibling_crate_module() {
 }
 
 #[test]
+fn a_module_imported_from_super_is_not_the_parent_file() {
+    let (_, result) = resolve(&[
+        (
+            "rust/store/src/workbench/mod.rs",
+            "mod automation;\nmod enhancements;\n\nfn mutate() {}\n",
+        ),
+        (
+            "rust/store/src/workbench/automation.rs",
+            "use super::{enhancements};\n\npub fn prepare() {\n    enhancements::mutate();\n}\n",
+        ),
+        ("rust/store/src/workbench/enhancements.rs", "pub fn mutate() {}\n"),
+    ]);
+
+    let edges = call_edges(&result, "::mutate");
+    assert_eq!(
+        edges.len(),
+        1,
+        "`use super::{{enhancements}}` binds the module, so `enhancements::mutate` \
+         is not the parent's own `mutate`; got {edges:?}"
+    );
+    assert_eq!(edges[0].target_file, "rust/store/src/workbench/enhancements.rs");
+}
+
+#[test]
 fn a_local_named_like_a_crate_is_still_a_value() {
     let (_, result) = resolve(&[
         (
