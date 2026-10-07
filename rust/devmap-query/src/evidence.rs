@@ -116,6 +116,11 @@ pub struct EvidencePack {
     pub resolution: ResolutionAvailability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk_incomplete: Option<String>,
+    /// The scope the hits were ranked within; see [`crate::Response::scope`].
+    /// `related_tests` is restricted to it too, and
+    /// `related_tests_outside_scope` counts what that left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::scope::ScopeReport>,
 }
 
 /// Build the pack from an `ask` response and its index-aligned qualified names.
@@ -142,6 +147,7 @@ pub fn assemble(
         truncated,
         resolution,
         walk_incomplete,
+        scope,
         ..
     } = response;
 
@@ -225,6 +231,7 @@ pub fn assemble(
         tokens_used,
         resolution,
         walk_incomplete,
+        scope,
     })
 }
 

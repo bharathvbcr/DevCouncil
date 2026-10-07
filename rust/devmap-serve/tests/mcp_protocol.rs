@@ -952,3 +952,79 @@ async fn an_unknown_min_rung_is_refused_not_ignored() {
     .await;
     assert_eq!(response["result"]["isError"], json!(true), "{response}");
 }
+
+/// A scoped ranking over the whole `tools/call` path: arguments accepted by
+/// the schema, applied by the engine, and the answer — `scope` included —
+/// passing the output check the server runs against its own `outputSchema`.
+#[tokio::test]
+async fn a_scoped_ranking_call_answers_from_the_scope_and_reports_it() {
+    let store = corpus();
+    for (tool, arguments) in [
+        (
+            "devmap_ask",
+            json!({"query": "helper rows", "paths": ["core.py"]}),
+        ),
+        (
+            "devmap_ask_evidence",
+            json!({"query": "helper rows", "paths": ["core.py"]}),
+        ),
+        (
+            "devmap_search",
+            json!({"query": "helper", "semantic": true, "languages": ["python"]}),
+        ),
+    ] {
+        let response = call(&store, tool, arguments.clone()).await;
+        let result = &response["result"];
+        assert_eq!(
+            result["isError"],
+            json!(false),
+            "{tool} {arguments}: {response}"
+        );
+        let structured = &result["structuredContent"];
+        assert!(
+            structured["scope"]["files"].as_u64().unwrap_or(0) >= 1,
+            "{tool}: {structured}"
+        );
+        assert!(
+            structured["scope"]["corpus_files"].as_u64().unwrap_or(0) >= 2,
+            "{tool}: the whole corpus size rides beside the scoped one: {structured}"
+        );
+    }
+}
+
+/// Refused, never answered empty: a prefix naming no indexed file, and a
+/// scope on keyword search, which cannot honour one.
+#[tokio::test]
+async fn a_scope_that_cannot_be_honoured_is_a_tool_error() {
+    let store = corpus();
+    for (tool, arguments, names) in [
+        (
+            "devmap_ask",
+            json!({"query": "helper", "paths": ["frontend/"]}),
+            "matches no indexed file",
+        ),
+        (
+            "devmap_ask_evidence",
+            json!({"query": "helper", "languages": ["tsx"]}),
+            "labels no indexed file",
+        ),
+        (
+            "devmap_search",
+            json!({"query": "helper", "paths": ["core.py"]}),
+            "semantic search only",
+        ),
+        (
+            "devmap_search",
+            json!({"query": "helper", "semantic": true, "paths": []}),
+            "paths",
+        ),
+    ] {
+        let response = call(&store, tool, arguments.clone()).await;
+        assert_eq!(
+            response["result"]["isError"],
+            json!(true),
+            "{tool} {arguments}: {response}"
+        );
+        assert!(response.to_string().contains(names), "{tool}: {response}");
+    }
+}

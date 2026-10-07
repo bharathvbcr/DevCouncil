@@ -1017,6 +1017,45 @@ fn rung_prop() -> Value {
     })
 }
 
+/// The `paths` property of the three ranking tools.
+///
+/// `ranking` names what is narrowed, so `devmap_search` can say it applies
+/// only with `semantic`. The bound is [`devmap_query::MAX_SCOPE_PATHS`], read
+/// rather than restated, so the published `maxItems` is the one the engine
+/// enforces.
+fn scope_paths_prop(ranking: &str) -> Value {
+    json!({
+        "type": "array",
+        "items": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "minItems": 1,
+        "maxItems": devmap_query::MAX_SCOPE_PATHS,
+        "description": format!(
+            "Restrict {ranking} to files under these repository-relative path prefixes \
+    (`frontend/`, `src/app.tsx`); an absolute path inside the repository is accepted. A prefix \
+    matches at a path segment, so `frontend` does not admit `frontend2/`. Applied before ranking, so \
+    term weights and the call graph are the scope's own. A prefix that matches no indexed file is \
+    refused, never answered empty. The answer's `scope` reports the scoped and whole corpus sizes."
+        )
+    })
+}
+
+/// The `languages` property of the three ranking tools; see
+/// [`scope_paths_prop`].
+fn scope_languages_prop(ranking: &str) -> Value {
+    json!({
+        "type": "array",
+        "items": {"type": "string", "minLength": 1, "maxLength": 64},
+        "minItems": 1,
+        "maxItems": devmap_query::MAX_SCOPE_LANGUAGES,
+        "description": format!(
+            "Restrict {ranking} to files in these languages, as the index labels them \
+    (`go`, `python`, `typescript`, `tsx` — `.tsx` is its own label). Combined with `paths`, a file \
+    must satisfy both. A language no indexed file has is refused, and the refusal lists the ones \
+    there are."
+        )
+    })
+}
+
 /// The description and input schema for one command tag.
 ///
 /// The single owner of both. `tool_specs` publishes what this returns and
@@ -1042,7 +1081,11 @@ file and line, budgeted to a token cap.",
                         "description": "Symbol name or prefix to search for."},
                     "budget": budget_prop(2000),
                     "semantic": {"type": "boolean", "default": false,
-                        "description": "Rank by name similarity instead of FTS prefix matching."}
+                        "description": "Rank by name similarity instead of FTS prefix matching."},
+                    "paths": scope_paths_prop(
+                        "a `semantic: true` search (refused on keyword search)"),
+                    "languages": scope_languages_prop(
+                        "a `semantic: true` search (refused on keyword search)")
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -1053,7 +1096,7 @@ file and line, budgeted to a token cap.",
 plus docstrings when present, then re-ranks with personalized PageRank over stored call edges. \
 Use this for a question about behaviour; use `devmap_search` (optionally with `semantic`) for \
 a name. A query that shares no terms with any name or docstring returns nothing — not the whole \
-corpus at zero. Default `min_confidence` is the deterministic rung; lower it to include weaker \
+corpus at zero. Pass `paths` / `languages` to answer from one subtree or language only. Default `min_confidence` is the deterministic rung; lower it to include weaker \
 edges. When every edge among the seeds sits below the floor, the answer is empty with a line that \
 says the matches were withheld for confidence rather than absent.",
             json!({
@@ -1062,7 +1105,9 @@ says the matches were withheld for confidence rather than absent.",
                     "query": {"type": "string", "maxLength": 4096,
                         "description": "A plain-language question or description of behaviour."},
                     "budget": budget_prop(2000),
-                    "min_confidence": confidence_prop_defaulting(devmap_query::ASK_DEFAULT_MIN_CONFIDENCE)
+                    "min_confidence": confidence_prop_defaulting(devmap_query::ASK_DEFAULT_MIN_CONFIDENCE),
+                    "paths": scope_paths_prop("the question"),
+                    "languages": scope_languages_prop("the question")
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -1080,14 +1125,17 @@ units are. Each file lists its `units` in line order: \
 the hit with its verbatim source, `qualified_name`, `calls` / `called_by` naming other hits joined \
 by admitted call edges at the same `min_confidence`, and `contained_in` when its lines are already \
 shown by an enclosing hit. Use it for a behaviour question in unfamiliar code; use `devmap_search` \
-for a known name.",
+for a known name. Pass `paths` / `languages` to rank within one subtree or language; \
+`related_tests` is then restricted to it too, and `scope.related_tests_outside_scope` counts what that left out.",
             json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "maxLength": 4096,
                         "description": "A plain-language question or description of behaviour."},
                     "budget": budget_prop(2000),
-                    "min_confidence": confidence_prop_defaulting(devmap_query::ASK_DEFAULT_MIN_CONFIDENCE)
+                    "min_confidence": confidence_prop_defaulting(devmap_query::ASK_DEFAULT_MIN_CONFIDENCE),
+                    "paths": scope_paths_prop("the question"),
+                    "languages": scope_languages_prop("the question")
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -1445,6 +1493,19 @@ fn budgeted_envelope(items: &str) -> Value {
     })
 }
 
+/// A ranking tool's output schema, declaring the `scope` a scoped answer
+/// carries. Optional — absent from an unscoped answer — so it adds a field a
+/// client can read without requiring one an older answer lacks.
+fn with_scope_output(mut schema: Value) -> Value {
+    schema["properties"]["scope"] = json!({
+        "type": "object",
+        "description": "Present only when `paths` or `languages` was given: the prefixes and \
+    languages applied, `files` and `symbols` in scope, and `corpus_files` / `corpus_symbols` the \
+    whole index held. `total` counts matches within the scope."
+    });
+    schema
+}
+
 /// The shape a tool's `structuredContent` is promised to have.
 ///
 /// The single owner of that promise: [`tool_specs`] publishes what this returns
@@ -1499,12 +1560,14 @@ fn describe_output(cmd: &str) -> Value {
                 "is_fresh", "degraded_reason", "quarantined_count", "coverage_gaps"],
             "additionalProperties": true
         }),
-        "search" => budgeted_envelope("Ranked symbol hits: name, file, kind, span and source."),
-        "ask" => budgeted_envelope(
+        "search" => with_scope_output(budgeted_envelope(
+            "Ranked symbol hits: name, file, kind, span and source.",
+        )),
+        "ask" => with_scope_output(budgeted_envelope(
             "Symbols matching a plain-language question, seeded by name/docstring TF-IDF and \
 re-ranked by personalized PageRank over call edges. Read `truncated` and `walk_incomplete`.",
-        ),
-        "ask_evidence" => json!({
+        )),
+        "ask_evidence" => with_scope_output(json!({
             "type": "object",
             "properties": {
                 "files": {"type": "array",
@@ -1537,7 +1600,7 @@ re-ranked by personalized PageRank over call edges. Read `truncated` and `walk_i
             "required": ["files", "related_tests", "shown", "hidden", "total", "truncated",
                 "tokens_used", "resolution"],
             "additionalProperties": true
-        }),
+        })),
         "deps" => budgeted_envelope("Outbound edges from the target."),
         "impact" => budgeted_envelope("Symbols that reach the target, walked in reverse."),
         "trace" => budgeted_envelope("Call paths from the origin, or between the two endpoints."),

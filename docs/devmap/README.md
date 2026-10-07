@@ -688,6 +688,21 @@ says only where that walk stopped. A nested symbol's hit carries `source_indent`
 the whitespace its first line had before the span began, so the source reads as
 the file has it.
 
+`devmap_ask`, `devmap_ask_evidence` and `devmap_search` with `semantic: true` take an
+optional scope (CLI: repeatable `--path` and `--language` on `ask` and
+`search --semantic`): `paths`, repository-relative prefixes matched at a path
+segment, and `languages`, as the index labels them (`.tsx` is `tsx`, not
+`typescript`). The scope is applied before ranking — term weights are computed
+over the scoped symbols, and the PageRank walk uses only call edges with both ends
+in scope — so an audit of `frontend/` is not answered with backend names. A prefix
+or language that matches no indexed file is refused with what is there, never
+answered empty. A scoped answer carries `scope`: the prefixes and languages
+applied, `files` and `symbols` in scope, and the whole index's `corpus_files` and
+`corpus_symbols`; an evidence pack's `related_tests` is restricted to the scope and
+`scope.related_tests_outside_scope` counts what that left out. Keyword `search` is
+refused a scope, because it ranks a page the full-text index has already cut from
+the whole repository.
+
 The last two join the graph to git and run in opposite directions.
 `devmap_blast` goes **forward** — these lines changed, what depends on them —
 walking inbound call edges to the symbols, files, modules and tests downstream

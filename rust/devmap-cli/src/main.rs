@@ -734,6 +734,16 @@ enum Commands {
         /// than ones that contain it.
         #[arg(long)]
         semantic: bool,
+        /// Rank only files under this repository-relative path prefix
+        /// (repeatable). Needs `--semantic`: keyword search ranks a page the
+        /// full-text index already cut, so a scope is refused there. A prefix
+        /// matching no indexed file is refused.
+        #[arg(long = "path", value_name = "PREFIX")]
+        paths: Vec<String>,
+        /// Rank only files in this language, as the index labels it
+        /// (repeatable; `typescript` and `tsx` are distinct). Needs `--semantic`.
+        #[arg(long = "language", value_name = "LANGUAGE")]
+        languages: Vec<String>,
     },
     /// Plain-language find over names, docstrings, and the call graph.
     ///
@@ -755,6 +765,16 @@ enum Commands {
         /// the hits. A quarter of the budget is held for the test list.
         #[arg(long)]
         evidence: bool,
+        /// Answer only from files under this repository-relative path prefix
+        /// (repeatable). Applied before ranking, so term weights and the call
+        /// graph are the scope's own. A prefix matching no indexed file is
+        /// refused.
+        #[arg(long = "path", value_name = "PREFIX")]
+        paths: Vec<String>,
+        /// Answer only from files in this language, as the index labels it
+        /// (repeatable; `typescript` and `tsx` are distinct).
+        #[arg(long = "language", value_name = "LANGUAGE")]
+        languages: Vec<String>,
     },
     Deps {
         file: String,
@@ -3777,6 +3797,7 @@ fn emit_search(resp: &devmap_query::Response<devmap_query::SymbolHit>) {
         emit_unavailable(reason);
         return;
     }
+    emit_scope(resp.scope.as_ref());
     for hit in &resp.items {
         outln!(
             "{}:{}-{}  {}  {}",
@@ -3790,6 +3811,30 @@ fn emit_search(resp: &devmap_query::Response<devmap_query::SymbolHit>) {
     emit_truncation(resp.shown, resp.hidden, resp.total, resp.truncated);
 }
 
+/// One line naming what a scoped answer was ranked over, so a short list in
+/// the human output is attributable to the scope as it is in `--json`.
+fn emit_scope(scope: Option<&devmap_query::ScopeReport>) {
+    let Some(scope) = scope else {
+        return;
+    };
+    let mut named: Vec<String> = scope.paths.clone();
+    named.extend(scope.languages.iter().map(|language| format!("[{language}]")));
+    outln!(
+        "scope: {} ({} of {} files, {} of {} symbols)",
+        named.join(" "),
+        scope.files,
+        scope.corpus_files,
+        scope.symbols,
+        scope.corpus_symbols
+    );
+    if scope.related_tests_outside_scope > 0 {
+        outln!(
+            "scope: {} related test file(s) outside the scope left out",
+            scope.related_tests_outside_scope
+        );
+    }
+}
+
 /// Files first, then source: the order a reader uses an answer in.
 ///
 /// The file list is short enough to decide what to read; the source blocks
@@ -3800,6 +3845,7 @@ fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
         emit_unavailable(reason);
         return;
     }
+    emit_scope(pack.scope.as_ref());
     let symbols: usize = pack.files.iter().map(|file| file.units.len()).sum();
     // Qualified names lead with the file path, which the list already shows.
     let short = |file: &str, name: &'_ str| -> String {
@@ -6370,11 +6416,20 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             query,
             budget,
             semantic,
+            paths,
+            languages,
         } => {
+            let scope = devmap_query::SymbolScope::new(paths, languages)?;
+            if scope.is_some() && !*semantic {
+                anyhow::bail!(
+                    "--path and --language scope `--semantic` search only; keyword search ranks a \
+                     page the full-text index has already cut from the whole repository"
+                );
+            }
             let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
             let resp = if *semantic {
-                engine.search_semantic(query, *budget)?
+                engine.search_semantic_scoped(query, *budget, scope.as_ref())?
             } else {
                 engine.search(Request {
                     query: query.clone(),
@@ -6394,10 +6449,14 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             budget,
             min_confidence,
             evidence: true,
+            paths,
+            languages,
         } => {
+            let scope = devmap_query::SymbolScope::new(paths, languages)?;
             let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
-            let pack = engine.ask_evidence(question, *budget, *min_confidence)?;
+            let pack =
+                engine.ask_evidence_scoped(question, *budget, *min_confidence, scope.as_ref())?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&pack)?)?;
             } else {
@@ -6409,10 +6468,13 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             budget,
             min_confidence,
             evidence: false,
+            paths,
+            languages,
         } => {
+            let scope = devmap_query::SymbolScope::new(paths, languages)?;
             let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
-            let resp = engine.ask(question, *budget, *min_confidence)?;
+            let resp = engine.ask_scoped(question, *budget, *min_confidence, scope.as_ref())?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&resp)?)?;
             } else {
@@ -9014,6 +9076,7 @@ mod tests {
                 dead_clusters_truncated: 0,
                 dead_clusters_incomplete: incomplete.map(str::to_string),
                 unresolved_namesakes: None,
+                scope: None,
             }
         }
         let joined = |resp| dead_cluster_lines(&resp).join("\n");
