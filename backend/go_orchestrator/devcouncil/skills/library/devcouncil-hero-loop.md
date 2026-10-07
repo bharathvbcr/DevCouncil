@@ -50,6 +50,8 @@ another task or wait for release.
 - Inspect changes with `devcouncil_get_diff`.
 - Preflight questionable paths with `devcouncil_policy_check_write`, the one policy
   tool that survived. It answers the scope question; it does not perform the write.
+  Pass your `task_id` and the `operation` (`create`, `modify` or `delete`): without
+  `task_id` the answer stops at `task.absent` and says nothing about scope.
 
 Stay inside the task's **planned files** and **allowed commands**. Do not expand scope
 silently: no tool widens a task's planned files, so a task that genuinely needs a

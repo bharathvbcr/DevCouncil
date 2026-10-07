@@ -62,6 +62,10 @@ This host serves exactly eight tools; `tools/list` is generated from
 **Policy:** `devcouncil_policy_check_write` — a preflight that answers whether a
 write would be allowed; it does not perform the write
 
+Pass `task_id` (and `operation`: `create`, `modify` or `delete`) to have the path
+judged against that task's planned scope. Without `task_id` the answer stops at
+`task.absent` after the secret, restricted and outside-root rules.
+
 **Verification:** `devcouncil_verify_task` (a lease is required in `enforce` mode)
 
 Nothing else is served. Read files and run commands with your host's own tools,

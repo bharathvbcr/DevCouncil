@@ -134,8 +134,8 @@ func toolSpecs() []ToolSpec {
 		},
 		{
 			Name:        "devcouncil_policy_check_write",
-			Description: "Ask whether a write to a path would be allowed under the current gate posture and optional task scope.",
-			InputSchema: rawSchema(`{"type":"object","properties":{"path":{"type":"string"},"task_id":{"type":"string"},"operation":{"type":"string"}},"required":["path"],"additionalProperties":false}`),
+			Description: "Ask whether a write to a path would be allowed under the current gate posture. Pass task_id to judge it against that task's planned scope; without one the answer stops at task.absent after the secret, restricted and outside-root rules. operation is create, modify (the default) or delete.",
+			InputSchema: rawSchema(`{"type":"object","properties":{"path":{"type":"string"},"task_id":{"type":"string"},"operation":{"type":"string","enum":["create","modify","delete"]}},"required":["path"],"additionalProperties":false}`),
 			Behaviour:   ro,
 		},
 	}
@@ -360,11 +360,28 @@ func (r *Registry) callGetGaps(ctx context.Context, args map[string]any) any {
 	}
 }
 
+// callPolicyCheck judges a write against the named task's scope. It used to
+// read only path: task_id was dropped without a word, so the ladder stopped at
+// task.absent and a caller asking "is this in my task's scope?" got an answer
+// about no task at all, which it would read as the one it asked for.
+//
+// Call has already refused any argument the schema does not declare, of the
+// wrong type, or outside its enum, so operation is one of create, modify or
+// delete here. dc.OpWrite is deliberately not offered: a caller that can say
+// which of create and modify it means gets the stricter answer.
 func (r *Registry) callPolicyCheck(ctx context.Context, args map[string]any) any {
-	_ = ctx
 	path, _ := args["path"].(string)
 	if path == "" {
 		return ErrorPayload{OK: false, Code: "missing_argument", Error: "path is required"}
+	}
+	op := dc.OpModify
+	if raw, given := args["operation"].(string); given {
+		op = dc.Operation(raw)
+	}
+	taskID, taskGiven := args["task_id"].(string)
+	if taskGiven && taskID == "" {
+		return ErrorPayload{OK: false, Code: "invalid_argument",
+			Error: "devcouncil_policy_check_write: task_id is empty; omit it to ask without a task"}
 	}
 	if r.Gate == nil {
 		// Not a verdict. This used to answer `ok: true, allowed: true` with a
@@ -375,8 +392,25 @@ func (r *Registry) callPolicyCheck(ctx context.Context, args map[string]any) any
 			Error: "no write gate is configured for this directory, so this path was not judged; " +
 				"see the MCP server's stderr for why the gate could not be built"}
 	}
-	// Without a task, EvaluateWrite still answers secret/restricted rules.
-	d, err := r.Gate.EvaluateWrite(path, nil, dc.OpModify)
+	// Without a task, EvaluateWrite still answers secret/restricted rules. With
+	// one, every failure to load it is its own answer: falling through to a nil
+	// task would report task.absent for a store that could not be read.
+	var task *dc.Task
+	if taskGiven {
+		if r.Store == nil {
+			return ErrorPayload{OK: false, Code: "not_initialized",
+				Error: "DevCouncil state is unavailable in this directory, so task " + taskID + " could not be loaded."}
+		}
+		stored, err := r.Store.Task(ctx, taskID)
+		if err != nil {
+			return ErrorPayload{OK: false, Code: "store_error", Error: err.Error()}
+		}
+		if stored == nil {
+			return map[string]any{"ok": false, "error": fmt.Sprintf("Task %s not found.", taskID), "code": "not_found", "task_id": taskID}
+		}
+		task = stored.Domain()
+	}
+	d, err := r.Gate.EvaluateWrite(path, task, op)
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error(), "code": "policy_error"}
 	}
@@ -419,16 +453,14 @@ func undeclaredArgument(tool string, args map[string]any) (ErrorPayload, bool) {
 			return ErrorPayload{OK: false, Code: "invalid_argument",
 				Error: tool + " has an unreadable input schema: " + err.Error()}, true
 		}
-		if schema.AdditionalProperties == nil || *schema.AdditionalProperties {
-			return ErrorPayload{}, false
-		}
+		closed := schema.AdditionalProperties != nil && !*schema.AdditionalProperties
 		names := make([]string, 0, len(args))
 		for name := range args {
 			names = append(names, name)
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			if _, declared := schema.Properties[name]; declared {
+			if _, declared := schema.Properties[name]; declared || !closed {
 				continue
 			}
 			declaredNames := make([]string, 0, len(schema.Properties))
@@ -442,7 +474,97 @@ func undeclaredArgument(tool string, args map[string]any) (ErrorPayload, bool) {
 			}
 			return ErrorPayload{OK: false, Code: "invalid_argument", Error: msg}, true
 		}
+		for _, name := range names {
+			property, declared := schema.Properties[name]
+			if !declared {
+				continue
+			}
+			if refusal, refused := mistypedArgument(tool, name, property, args[name]); refused {
+				return refusal, true
+			}
+		}
 		return ErrorPayload{}, false
 	}
 	return ErrorPayload{}, false
+}
+
+// mistypedArgument refuses a declared argument whose value is not the type, or
+// not one of the values, its schema property names. Handlers read arguments
+// with `args[k].(T)`, which drops a mistyped value as silently as an undeclared
+// one: `force: "true"` on checkout ran an unforced checkout, `staged: "yes"`
+// diffed the working tree, a numeric task_id asked about no task at all. A
+// property shape this checker does not understand refuses the call rather than
+// passing whatever arrived.
+func mistypedArgument(tool, name string, property json.RawMessage, value any) (ErrorPayload, bool) {
+	var p struct {
+		Type  string `json:"type"`
+		Enum  []any  `json:"enum"`
+		Items *struct {
+			Type string `json:"type"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(property, &p); err != nil {
+		return ErrorPayload{OK: false, Code: "invalid_argument",
+			Error: tool + " has an unreadable schema for " + name + ": " + err.Error()}, true
+	}
+	refuse := func(want string) (ErrorPayload, bool) {
+		return ErrorPayload{OK: false, Code: "invalid_argument",
+			Error: fmt.Sprintf("%s: %s must be %s, got %s", tool, name, want, jsonTypeName(value))}, true
+	}
+	switch p.Type {
+	case "string", "boolean":
+		if jsonTypeName(value) != p.Type {
+			return refuse("a " + p.Type)
+		}
+	case "array":
+		items, ok := value.([]any)
+		if !ok || p.Items == nil {
+			return refuse("an array")
+		}
+		for _, item := range items {
+			if jsonTypeName(item) != p.Items.Type {
+				return refuse("an array of " + p.Items.Type + "s")
+			}
+		}
+	default:
+		return ErrorPayload{OK: false, Code: "invalid_argument",
+			Error: fmt.Sprintf("%s: the schema for %s declares type %q, which this host cannot check", tool, name, p.Type)}, true
+	}
+	if len(p.Enum) == 0 {
+		return ErrorPayload{}, false
+	}
+	if p.Type == "array" {
+		// Comparing two slices with == panics, and no schema here needs it.
+		return ErrorPayload{OK: false, Code: "invalid_argument",
+			Error: fmt.Sprintf("%s: the schema for %s puts an enum on an array, which this host cannot check", tool, name)}, true
+	}
+	allowed := make([]string, 0, len(p.Enum))
+	for _, v := range p.Enum {
+		if v == value {
+			return ErrorPayload{}, false
+		}
+		allowed = append(allowed, fmt.Sprint(v))
+	}
+	return ErrorPayload{OK: false, Code: "invalid_argument",
+		Error: fmt.Sprintf("%s: %s must be one of %s, not %q", tool, name, strings.Join(allowed, ", "), fmt.Sprint(value))}, true
+}
+
+// jsonTypeName is the JSON Schema type of a value decoded by encoding/json.
+func jsonTypeName(v any) string {
+	switch v.(type) {
+	case nil:
+		return "null"
+	case string:
+		return "string"
+	case bool:
+		return "boolean"
+	case float64, json.Number:
+		return "number"
+	case []any:
+		return "array"
+	case map[string]any:
+		return "object"
+	default:
+		return fmt.Sprintf("%T", v)
+	}
 }

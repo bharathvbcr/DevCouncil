@@ -32,7 +32,7 @@ which both advertises and dispatches these names:
 | `devcouncil_next_task` | Select available task work |
 | `devcouncil_verify_task` | Evaluate task changes and return verification metadata/gaps |
 | `devcouncil_get_gaps` | Read the recorded task gaps |
-| `devcouncil_policy_check_write` | Ask the host policy whether a write is permitted |
+| `devcouncil_policy_check_write` | Ask the host policy whether a write is permitted; pass `task_id` (and `operation`) to judge it against that task's planned scope |
 
 Use the tool’s advertised input schema. The host does not offer arbitrary
 `read_file`, `write_file`, `run_command`, scope-update or rollback MCP tools.

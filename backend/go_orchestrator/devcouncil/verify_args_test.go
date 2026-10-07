@@ -2,6 +2,7 @@ package devcouncil_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -22,6 +23,74 @@ func TestEveryToolRefusesArgumentsItsSchemaDoesNotDeclare(t *testing.T) {
 		payload, ok := out.(devcouncil.ErrorPayload)
 		if !ok || payload.Code != "invalid_argument" || !strings.Contains(payload.Error, "not_in_the_schema") {
 			t.Errorf("%s: got %T %+v, want invalid_argument naming the argument", spec.Name, out, out)
+		}
+	}
+}
+
+// The same class one step on: a declared argument of the wrong type is dropped
+// as silently as an undeclared one, because handlers read `args[k].(T)`.
+// `force: "true"` ran an unforced checkout and `staged: "yes"` diffed the
+// working tree. Every declared property, on every tool, refuses a value of
+// another JSON type before any lease, store or gate is consulted.
+func TestEveryToolRefusesArgumentsOfTheWrongType(t *testing.T) {
+	reg := devcouncil.NewRegistry(t.TempDir(), nil, nil)
+	wrong := map[string][]any{
+		"string":  {float64(7), true, nil, []any{"x"}, map[string]any{}},
+		"boolean": {"true", float64(1), nil},
+		"array":   {"src/a.go", []any{float64(7)}, []any{"ok", nil}},
+	}
+	checked := 0
+	for _, spec := range reg.Specs() {
+		var schema struct {
+			Properties map[string]struct {
+				Type string `json:"type"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(spec.InputSchema, &schema); err != nil {
+			t.Fatalf("%s: %v", spec.Name, err)
+		}
+		for name, prop := range schema.Properties {
+			values, known := wrong[prop.Type]
+			if !known {
+				t.Fatalf("%s.%s: no wrong-type values for schema type %q", spec.Name, name, prop.Type)
+			}
+			for _, v := range values {
+				out, err := reg.Call(context.Background(), spec.Name, map[string]any{name: v})
+				if err != nil {
+					t.Fatalf("%s %s=%#v: %v", spec.Name, name, v, err)
+				}
+				payload, ok := out.(devcouncil.ErrorPayload)
+				if !ok || payload.Code != "invalid_argument" || !strings.Contains(payload.Error, name) {
+					t.Errorf("%s %s=%#v: got %T %+v, want invalid_argument naming %s", spec.Name, name, v, out, out, name)
+				}
+				checked++
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no property was checked; the schemas could not be read")
+	}
+
+	// The drops named above, written out so they do not depend on reading the
+	// schema back, plus an enum: operation takes only what its schema lists.
+	for _, tc := range []struct {
+		tool string
+		args map[string]any
+		name string
+	}{
+		{"devcouncil_checkout_task", map[string]any{"task_id": "T", "client_id": "c", "force": "true"}, "force"},
+		{"devcouncil_get_diff", map[string]any{"staged": "yes"}, "staged"},
+		{"devcouncil_get_diff", map[string]any{"paths": []any{"a.go", float64(7)}}, "paths"},
+		{"devcouncil_policy_check_write", map[string]any{"path": "a.go", "operation": "write"}, "operation"},
+		{"devcouncil_policy_check_write", map[string]any{"path": "a.go", "operation": "MODIFY"}, "operation"},
+	} {
+		out, err := reg.Call(context.Background(), tc.tool, tc.args)
+		if err != nil {
+			t.Fatalf("%s %v: %v", tc.tool, tc.args, err)
+		}
+		payload, ok := out.(devcouncil.ErrorPayload)
+		if !ok || payload.Code != "invalid_argument" || !strings.Contains(payload.Error, tc.name) {
+			t.Errorf("%s %v: got %T %+v, want invalid_argument naming %s", tc.tool, tc.args, out, out, tc.name)
 		}
 	}
 }
