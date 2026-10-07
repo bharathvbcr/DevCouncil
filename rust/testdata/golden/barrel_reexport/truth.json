@@ -1,0 +1,28 @@
+{
+  "_comment": "Hand-labelled ground truth. `live` is the answer a careful reviewer gives with the whole corpus in front of them, and `why` is the evidence — a label without one is an opinion. Edit only with a reason recorded here.",
+  "source": "testdata/fixtures/tier_a/barrel_reexport",
+  "strict": true,
+  "notes": "Barrel re-export. app.py imports `normalise` from barrel.py, which declares nothing and only re-imports it from impl.py; legacy.py declares a same-named function nothing reaches. The barrel is the only evidence of which `normalise` app.py calls. Strict: a live symbol claimed at any tier fails. Confirmed 2026-10-07 by breaking the mechanism and watching `the_extracted_tier_has_no_false_positives` fail: removing the Python module-scope import hop from `compute_reexport_chains` bound app.py's import to barrel.py, left the call unresolved, and reported `impl.py::normalise` dead at the inferred tier (0.40).",
+  "symbols": [
+    {
+      "symbol_id": "app.py::main",
+      "live": true,
+      "why": "Called at module level (app.py:8)."
+    },
+    {
+      "symbol_id": "impl.py::normalise",
+      "live": true,
+      "why": "app.py calls `normalise` imported from barrel.py, and barrel.py's `normalise` is impl.py's (barrel.py:1)."
+    },
+    {
+      "symbol_id": "impl.py::orphan",
+      "live": false,
+      "why": "Neither re-exported nor called."
+    },
+    {
+      "symbol_id": "legacy.py::normalise",
+      "live": false,
+      "why": "Shares the name, but no import reaches legacy.py."
+    }
+  ]
+}

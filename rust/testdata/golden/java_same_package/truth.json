@@ -1,0 +1,48 @@
+{
+  "_comment": "Hand-labelled ground truth. `live` is the answer a careful reviewer gives with the whole corpus in front of them, and `why` is the evidence — a label without one is an opinion. Edit only with a reason recorded here.",
+  "source": "testdata/fixtures/tier_b/java_same_package",
+  "strict": true,
+  "notes": "Import-less Java. Main, Service and Ledger share `package com.acme.billing`, so Main names both classes with no import at all. Service and Ledger each declare `compute`, so the name alone cannot say which one `service.compute(41)` calls: only the local's type can, and that type comes from its construction (`Service service = new Service()`). Without the Ledger decoy the corpus-unique-name fallback bound the call anyway and the fixture proved nothing. Two fences answer two questions. The dead-code verdicts on `compute` and `fee` are protected by the package-private exemption (non-private Java members are treated as exported), so they hold even without the edge. The *resolution* is fenced by W4.2: this fixture's Java rate is in `testdata/resolution_baseline.json`. Confirmed 2026-10-07 by breaking the mechanism and watching `per_language_resolution_has_not_regressed` fail with `java_same_package/java: 777 -> 555`: the construction typing has two redundant paths — the resolver binding a constructed local to its unique class, and the extractor recording a `Service{..}` initializer on the call site's local binding — and both had to be disabled before either `compute` edge was lost. `retired` is private, so it is claimable, and it is the recall label.",
+  "symbols": [
+    {
+      "symbol_id": "Main.java::Main",
+      "live": true,
+      "why": "Public class holding the program's entry point."
+    },
+    {
+      "symbol_id": "Main.java::Main.main",
+      "live": true,
+      "why": "`public static void main(String[])`, run by the JVM."
+    },
+    {
+      "symbol_id": "Service.java::Service",
+      "live": true,
+      "why": "Constructed by Main.main (Main.java:5) with no import: same package."
+    },
+    {
+      "symbol_id": "Service.java::Service.compute",
+      "live": true,
+      "why": "`service.compute(41)` on `service = new Service()` (Main.java:6)."
+    },
+    {
+      "symbol_id": "Service.java::Service.fee",
+      "live": true,
+      "why": "Called by compute (Service.java:5)."
+    },
+    {
+      "symbol_id": "Service.java::Service.retired",
+      "live": false,
+      "why": "Private and called by nothing in its class."
+    },
+    {
+      "symbol_id": "Ledger.java::Ledger",
+      "live": true,
+      "why": "Constructed by Main.main (Main.java:7) with no import: same package."
+    },
+    {
+      "symbol_id": "Ledger.java::Ledger.compute",
+      "live": true,
+      "why": "`ledger.compute(2)` on `ledger = new Ledger()` (Main.java:8); the same-named decoy for Service.compute."
+    }
+  ]
+}
