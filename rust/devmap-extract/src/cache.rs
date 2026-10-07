@@ -547,18 +547,27 @@ impl CacheKey {
 /// `save_generation_with_metadata` — 65,615 stored against 65,798 analysed.
 /// Anything that decides whether a stored payload may be reused must ask this
 /// function rather than assemble the string itself.
-/// Needs a compiled grammar to answer, so it exists only with `parse` on.
 ///
-/// `devmap-store` already guards this: its own `current_payload_identity`
-/// returns `Option` and documents that this one is `#[cfg(feature = "parse")]`.
-/// The gate that comment relies on had been lost, so `--no-default-features`
-/// did not build and the wrapper guarded a condition that could not arise.
-#[cfg(feature = "parse")]
+/// Answers in both configurations. With `parse` on, the grammar half is
+/// computed from the linked grammar. Without it, the answer comes from
+/// [`crate::languages::PAYLOAD_GRAMMAR_IDENTITIES`], which a test pins to that
+/// computation for every declared language, so a query-only build can still
+/// tell a current store from a stale one.
 pub fn current_payload_identity(language: &str) -> (String, String) {
     (
-        grammar_version_for(language),
+        stamped_grammar_identity(language),
         format!("{ANALYZER_VERSION}:extract-v{EXTRACTION_SCHEMA_VERSION}"),
     )
+}
+
+#[cfg(feature = "parse")]
+fn stamped_grammar_identity(language: &str) -> String {
+    grammar_version_for(language)
+}
+
+#[cfg(not(feature = "parse"))]
+fn stamped_grammar_identity(language: &str) -> String {
+    crate::languages::payload_grammar_identity(language)
 }
 
 /// Real compiled grammar semver — never a constant placeholder (closes S14).
@@ -842,6 +851,56 @@ mod tests {
     /// matches means silent full re-extraction; a key that *collides* across
     /// languages means one language's payload can be served for another's file.
     /// The existing test only compared Python against JavaScript.
+    /// The committed table a query-only build answers from is the one a
+    /// parsing build computes, for every language `detect_language` can return.
+    ///
+    /// On a mismatch the message is the whole replacement table, so a grammar
+    /// bump costs a paste rather than an investigation.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn the_committed_grammar_identities_are_the_compiled_ones() {
+        let mut languages = crate::languages::declared_language_ids();
+        // Detected by extension and declared through the fallback table, but
+        // named here as well: its identity is the one composed from kernel
+        // grammars, and a declaration change must not silently drop it.
+        if !languages.contains(&"notebook") {
+            languages.push("notebook");
+        }
+        let mut expected = Vec::new();
+        let mut mismatched = Vec::new();
+        for language in &languages {
+            let compiled = grammar_version_for(language);
+            if compiled != format!("unavailable:{language}") {
+                expected.push(format!("    ({language:?}, {compiled:?}),"));
+            }
+            let committed = crate::languages::payload_grammar_identity(language);
+            if committed != compiled {
+                mismatched.push(format!(
+                    "{language}: committed {committed:?}, compiled {compiled:?}"
+                ));
+            }
+        }
+        // A table row for a language this build does not declare is a row
+        // nothing can ever look up — and a sign the registry renamed one.
+        for (name, _) in crate::languages::PAYLOAD_GRAMMAR_IDENTITIES {
+            if !languages.contains(name) {
+                mismatched.push(format!("{name}: in the table but not a declared language"));
+            }
+        }
+        assert!(
+            mismatched.is_empty(),
+            "PAYLOAD_GRAMMAR_IDENTITIES disagrees with the compiled grammars:\n  {}\n\n\
+             Replace the table in languages.rs with:\n\
+             pub const PAYLOAD_GRAMMAR_IDENTITIES: &[(&str, &str)] = &[\n{}\n];",
+            mismatched.join("\n  "),
+            expected.join("\n")
+        );
+        assert!(
+            !crate::languages::PAYLOAD_GRAMMAR_IDENTITIES.is_empty(),
+            "an empty table would agree with a build that linked no grammar"
+        );
+    }
+
     #[test]
     #[cfg(feature = "parse")]
     fn every_linked_grammar_has_a_distinct_real_identity() {

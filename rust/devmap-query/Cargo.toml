@@ -20,6 +20,13 @@ regex.workspace = true
 # devmap-cli, so nothing new enters the tree.
 libc.workspace = true
 
+[dev-dependencies]
+# `a_query_only_build_can_call_a_store_current` has to seed a generation with
+# grammars off, where the store writes none, so it inserts the rows by SQL.
+# Already a workspace dependency built for devmap-store, so no new crate enters
+# the tree — the same reasoning devmap-serve records for its own dev use.
+rusqlite.workspace = true
+
 [features]
 default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter
