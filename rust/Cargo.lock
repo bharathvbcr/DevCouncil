@@ -308,6 +308,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc-redact"
+version = "0.2.4"
+
+[[package]]
 name = "dc-regress"
 version = "0.2.4"
 dependencies = [
@@ -341,6 +345,7 @@ dependencies = [
  "dc-evidence",
  "dc-glob",
  "dc-proc",
+ "dc-redact",
  "serde_json",
  "tree-sitter",
  "tree-sitter-go",

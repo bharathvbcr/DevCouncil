@@ -60,7 +60,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy -p dc-glob -p dc-proc -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets -- -D warnings
+        run: cargo clippy -p dc-glob -p dc-proc -p dc-redact -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets -- -D warnings
 
       # dc-store compiles SQLite from source (rusqlite "bundled"), so a failure
       # here is a C toolchain or portability problem rather than a test problem.
@@ -71,9 +71,11 @@ jobs:
       # is where that answer comes from.
       #
       # Packages are named rather than `--workspace` so this job does not
-      # compile the kernel's tree-sitter grammars.
+      # compile the kernel's tree-sitter grammars. It still compiles four:
+      # dc-verify's stub detection links the Rust, Go, Python and TypeScript
+      # grammars unconditionally.
       - name: Build
-        run: cargo build -p dc-glob -p dc-proc -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets
+        run: cargo build -p dc-glob -p dc-proc -p dc-redact -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets
 
       # dc-verify's json_contract runs the host's `--json` commands as real
       # processes and fails if it cannot find the binary. The module's only
@@ -89,7 +91,7 @@ jobs:
         run: go build -o bin/ ./cmd/devcouncil
 
       - name: Test
-        run: cargo test -p dc-glob -p dc-proc -p dc-grep -p dc-store -p dc-verify -p dc-evidence
+        run: cargo test -p dc-glob -p dc-proc -p dc-redact -p dc-grep -p dc-store -p dc-verify -p dc-evidence
 
   go:
     name: clients (${{ matrix.os }})

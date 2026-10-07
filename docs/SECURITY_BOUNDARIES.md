@@ -116,8 +116,8 @@ whole-process RSS ceiling. `dcjsoncheck`'s manifest and commands are the
 operator's, not repository content.
 
 One bounded runner serves every process boundary in the Rust workspace, and it
-lives in `dc-proc` so the analysis plane can use it without compiling
-tree-sitter grammars — `devmap_extract::subprocess` is a re-export of that one
+lives in `dc-proc` so `dc-verify` and `dc-regress` can use it without
+depending on the kernel — `devmap_extract::subprocess` is a re-export of that one
 implementation, not a second copy. Its properties are the ones a caller cannot
 reliably assemble by hand: a wall-clock deadline, a kill that reaches the
 child's whole process group, and both pipes drained concurrently on their own

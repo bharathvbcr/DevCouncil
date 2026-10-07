@@ -9,6 +9,10 @@ description = "Deterministic verifier core: diff parsing and planned-scope class
 dc-glob = { path = "../dc-glob" }
 dc-proc = { path = "../dc-proc" }
 dc-evidence = { path = "../dc-evidence" }
+# The credential table the secret gate and every evidence field share. Its own
+# crate so a consumer that only redacts — GitPulse's ledger — need not compile
+# the tree-sitter below.
+dc-redact = { path = "../dc-redact" }
 serde_json = "1.0.151"
 # AST-aware stub and test-rigor detection (src/stub_ast.rs). The same grammar
 # versions devmap-extract already builds, from the workspace table; enabled
