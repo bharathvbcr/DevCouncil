@@ -57,6 +57,41 @@ func TestAnUnknownVerificationMethodIsRefused(t *testing.T) {
 	}
 }
 
+// llm_review used to be accepted here and dispatched on nowhere: no gate, no
+// harness, no executor. A criterion carrying it read as checkable and could
+// never fail. It is refused at validation like any other method nothing
+// discharges, until a consuming harness (Manvi) implements it.
+func TestLLMReviewIsRefusedBecauseNothingDischargesIt(t *testing.T) {
+	var ac AcceptanceCriterion
+	err := json.Unmarshal([]byte(
+		`{"id":"AC-7","description":"reads well","verification_method":"llm_review"}`), &ac)
+	if err == nil {
+		t.Fatal("llm_review decoded, but no executor in this tree can discharge it")
+	}
+	if !strings.Contains(err.Error(), "AC-7") || !strings.Contains(err.Error(), "llm_review") {
+		t.Errorf("the refusal must name the criterion and the method: %v", err)
+	}
+	for _, m := range VerificationMethods() {
+		if m == "llm_review" {
+			t.Errorf("VerificationMethods still lists llm_review")
+		}
+	}
+}
+
+// Every listed method decodes, so the list and the validator cannot drift.
+func TestEveryListedVerificationMethodDecodes(t *testing.T) {
+	if len(VerificationMethods()) == 0 {
+		t.Fatal("no verification methods listed")
+	}
+	for _, m := range VerificationMethods() {
+		var ac AcceptanceCriterion
+		raw := `{"id":"AC-1","description":"x","verification_method":"` + string(m) + `"}`
+		if err := json.Unmarshal([]byte(raw), &ac); err != nil {
+			t.Errorf("listed method %q does not decode: %v", m, err)
+		}
+	}
+}
+
 // DevCouncil defaults a missing source to "planner" rather than rejecting the
 // requirement, because these round trip through LLM rewrites that drop
 // provenance. Both planes must make the same call or one will refuse to load a

@@ -5,8 +5,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
@@ -82,6 +84,70 @@ func TestATasksRequirementsCrossTheBoundary(t *testing.T) {
 		if task.AcceptanceCriterionIDs[i] != id {
 			t.Errorf("acceptance criterion id %d = %q, want %q", i, task.AcceptanceCriterionIDs[i], id)
 		}
+	}
+}
+
+// plantRequirements writes requirement rows through sqlite3, as the planner
+// would, and points TASK-1 at reqIDs.
+func plantRequirements(t *testing.T, db, reqIDs string, rows ...string) {
+	t.Helper()
+	sqlite, err := exec.LookPath("sqlite3")
+	if err != nil {
+		testsupport.Unavailable(t, "sqlite3 is not on PATH, so no requirement row can be planted")
+	}
+	stmt := "UPDATE tasks SET requirement_ids_json = '" + reqIDs + "' WHERE id = 'TASK-1';"
+	for _, row := range rows {
+		stmt += "INSERT INTO requirements (id, title, description, priority, source, " +
+			"acceptance_criteria_json) VALUES " + row + ";"
+	}
+	// #nosec G204 -- sqlite is resolved by exec.LookPath, db is this test's
+	// own t.TempDir, and stmt is built from this file's literals.
+	cmd := exec.CommandContext(t.Context(), sqlite, db, stmt)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("planting requirements: %v\n%s", err, out)
+	}
+}
+
+// The verifier dispatches on each criterion's verification method, which it
+// can only do if the requirement rows reach this side decoded.
+func TestRequirementsCrossTheBoundaryDecoded(t *testing.T) {
+	c, db := plantTaskWithLinks(t, `[]`, `["AC-1","AC-2"]`)
+	plantRequirements(t, db, `["REQ-1","REQ-GONE"]`,
+		`('REQ-1','sums','','high','user','[{"id":"AC-1","description":"adds","verification_method":"unit_test"},`+
+			`{"id":"AC-2","description":"by hand","verification_method":"manual","required":false}]')`)
+
+	linked, err := c.Requirements(context.Background(), "TASK-1")
+	if err != nil {
+		t.Fatalf("reading requirements: %v", err)
+	}
+	if len(linked.Requirements) != 1 || linked.Requirements[0].ID != "REQ-1" {
+		t.Fatalf("requirements = %+v, want [REQ-1]", linked.Requirements)
+	}
+	acs := linked.Requirements[0].AcceptanceCriteria
+	if len(acs) != 2 || acs[0].Method != dc.VerifyUnitTest || acs[1].Method != dc.VerifyManual {
+		t.Fatalf("criteria = %+v", acs)
+	}
+	if !acs[0].Required || acs[1].Required {
+		t.Errorf("required flags = %v,%v, want true,false", acs[0].Required, acs[1].Required)
+	}
+	if len(linked.Missing) != 1 || linked.Missing[0] != "REQ-GONE" {
+		t.Errorf("missing = %v, want [REQ-GONE]", linked.Missing)
+	}
+}
+
+// A stored criterion no gate can discharge is an error, not a criterion
+// quietly left out of the list the verifier dispatches on.
+func TestARequirementCarryingAnUndischargeableMethodIsAnError(t *testing.T) {
+	c, db := plantTaskWithLinks(t, `[]`, `["AC-1"]`)
+	plantRequirements(t, db, `["REQ-1"]`,
+		`('REQ-1','reads well','','high','user','[{"id":"AC-1","description":"x","verification_method":"llm_review"}]')`)
+
+	if _, err := c.Requirements(context.Background(), "TASK-1"); err == nil ||
+		!strings.Contains(err.Error(), "llm_review") {
+		t.Fatalf("err = %v, want a refusal naming llm_review", err)
+	}
+	if _, err := c.Requirements(context.Background(), "NO-SUCH-TASK"); err == nil {
+		t.Fatal("an unknown task read as one with no requirements")
 	}
 }
 

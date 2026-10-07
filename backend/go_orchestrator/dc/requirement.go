@@ -27,18 +27,32 @@ import (
 // everywhere else.
 type VerificationMethod string
 
+// `llm_review` is deliberately absent. It used to be accepted here and was
+// dispatched on nowhere: no gate, harness or executor in this tree discharges
+// it, so a criterion carrying it read as checkable and could never fail. It is
+// refused at decode until a consuming harness (Manvi) implements it, at which
+// point it is added back here together with its executor in
+// devcouncil/verify/criteria.go.
 const (
 	VerifyUnitTest        VerificationMethod = "unit_test"
 	VerifyIntegrationTest VerificationMethod = "integration_test"
 	VerifyManual          VerificationMethod = "manual"
 	VerifyStaticCheck     VerificationMethod = "static_check"
-	VerifyLLMReview       VerificationMethod = "llm_review"
 )
 
+// VerificationMethods is every method a criterion may carry. The verifier's
+// dispatch table is tested against this list, so a method added here without
+// an executor or an explicit unsupported gap fails a test rather than passing
+// silently.
+func VerificationMethods() []VerificationMethod {
+	return []VerificationMethod{VerifyUnitTest, VerifyIntegrationTest, VerifyManual, VerifyStaticCheck}
+}
+
 func (m VerificationMethod) valid() bool {
-	switch m {
-	case VerifyUnitTest, VerifyIntegrationTest, VerifyManual, VerifyStaticCheck, VerifyLLMReview:
-		return true
+	for _, known := range VerificationMethods() {
+		if m == known {
+			return true
+		}
 	}
 	return false
 }
@@ -118,8 +132,8 @@ func (a *AcceptanceCriterion) UnmarshalJSON(data []byte) error {
 	if !w.Method.valid() {
 		return fmt.Errorf(
 			"acceptance criterion %s has verification_method %q, which no gate can discharge "+
-				"(want one of unit_test, integration_test, manual, static_check, llm_review)",
-			w.ID, w.Method)
+				"(want one of %v)",
+			w.ID, w.Method, VerificationMethods())
 	}
 	a.ID = w.ID
 	a.Description = w.Description

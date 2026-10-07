@@ -121,6 +121,107 @@ fn a_task_with_no_links_reads_as_empty_rather_than_absent() {
     );
 }
 
+/// Plants two requirements and a task linking them plus one id no row defines.
+fn task_with_requirement_rows(name: &str) -> std::path::PathBuf {
+    let db = task_with_links(name);
+    let store = Store::open(&db).expect("open store");
+    store
+        .connection()
+        .execute_batch(
+            "UPDATE tasks SET requirement_ids_json = '[\"REQ-2\",\"REQ-GONE\",\"REQ-1\"]' \
+               WHERE id = 'TASK-1'; \
+             INSERT INTO requirements (id, title, description, priority, source, \
+               acceptance_criteria_json) VALUES \
+               ('REQ-1', 'sums', 'adds two numbers', 'high', 'user', \
+                '[{\"id\":\"AC-1\",\"description\":\"adds\",\"verification_method\":\"unit_test\"}]'), \
+               ('REQ-2', 'errors', 'says \"why\"', 'low', 'planner', '[]'), \
+               ('REQ-UNLINKED', 'other', '', 'low', 'planner', '[]');",
+        )
+        .expect("plant requirements");
+    db
+}
+
+/// The verifier dispatches on each criterion's verification method, so it has
+/// to be able to read the requirement rows a task links to. Before this the
+/// table was created and read by nothing, and every method was validated and
+/// then ignored.
+#[test]
+fn a_tasks_linked_requirements_are_read_in_link_order() {
+    let db = task_with_requirement_rows("requirements-rows");
+    let store = Store::open(&db).expect("open store");
+    let linked = store
+        .task_requirements("TASK-1")
+        .expect("read requirements")
+        .expect("task exists");
+
+    let ids: Vec<&str> = linked.rows.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["REQ-2", "REQ-1"],
+        "rows in the order the task links them"
+    );
+    assert_eq!(
+        linked.missing,
+        ["REQ-GONE"],
+        "a linked id with no row must be reported, not dropped: a criterion \
+         nobody can read is not a criterion that passed"
+    );
+    assert!(!linked.truncated);
+    assert_eq!(linked.rows[1].priority, "high");
+    assert!(
+        linked.rows[1]
+            .acceptance_criteria_json
+            .contains("unit_test")
+    );
+}
+
+#[test]
+fn an_unknown_task_has_no_requirements_answer() {
+    let db = seeded("requirements-unknown-task");
+    let store = Store::open(&db).expect("open store");
+    assert!(
+        store
+            .task_requirements("NOPE")
+            .expect("read requirements")
+            .is_none()
+    );
+}
+
+#[test]
+fn the_requirements_reach_the_boundary_reply() {
+    let db = task_with_requirement_rows("requirements-reply");
+    let reply = dcstore(&db, &["requirements", "--task", "TASK-1"]);
+
+    assert_eq!(reply.code, 0, "requirements read failed: {}", reply.stdout);
+    // The criteria column is carried as a JSON string, so a malformed row
+    // reaches the Go plane as a decode error it reports rather than as a
+    // reply that no longer parses.
+    assert!(
+        reply
+            .stdout
+            .contains("\"acceptance_criteria_json\":\"[{\\\"id\\\":\\\"AC-1\\\""),
+        "criteria column not carried verbatim: {}",
+        reply.stdout
+    );
+    assert!(
+        reply.stdout.contains("\"missing\":[\"REQ-GONE\"]"),
+        "missing ids not reported: {}",
+        reply.stdout
+    );
+    assert!(
+        !reply.stdout.contains("REQ-UNLINKED"),
+        "a requirement the task does not link leaked into its answer: {}",
+        reply.stdout
+    );
+    let unknown = dcstore(&db, &["requirements", "--task", "NOPE"]);
+    assert_eq!(unknown.code, 0, "{}", unknown.stdout);
+    assert!(
+        unknown.stdout.contains("\"task_found\":false"),
+        "an unknown task must say so: {}",
+        unknown.stdout
+    );
+}
+
 /// The same fail-closed rule the other scope columns get.
 ///
 /// These values are embedded into the reply as raw JSON text, so a column that

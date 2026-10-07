@@ -108,12 +108,18 @@ type response struct {
 	// GapID is gap-upsert's answer. It is a separate key from EvidenceID
 	// rather than sharing `id`: one envelope decodes every reply on this
 	// boundary, and a string and an integer cannot occupy one field.
-	GapID     string          `json:"gap_id"`
-	Evidence  []EvidenceRow   `json:"evidence"`
-	Gaps      []GapRow        `json:"gaps"`
-	History   []GapHistoryRow `json:"history"`
-	Truncated bool            `json:"truncated"`
-	Shown     int             `json:"shown"`
+	GapID    string        `json:"gap_id"`
+	Evidence []EvidenceRow `json:"evidence"`
+	// Requirements, Missing and TaskFound are the `requirements` reply.
+	// TaskFound is a pointer so a reply without the key is refused rather
+	// than read as an unknown task.
+	Requirements []requirementRow `json:"requirements"`
+	Missing      []string         `json:"missing"`
+	TaskFound    *bool            `json:"task_found"`
+	Gaps         []GapRow         `json:"gaps"`
+	History      []GapHistoryRow  `json:"history"`
+	Truncated    bool             `json:"truncated"`
+	Shown        int              `json:"shown"`
 }
 
 func (r *response) UnmarshalJSON(data []byte) error {
@@ -726,6 +732,70 @@ func (c *Client) EvidenceAppend(ctx context.Context, kind string, taskID, requir
 		return 0, fmt.Errorf("evidence-append refused: %s", out.Error)
 	}
 	return out.EvidenceID, nil
+}
+
+// requirementRow is one `requirements` row as the store sends it. The criteria
+// arrive as a JSON string the store does not validate; Requirements decodes
+// them through dc.Requirement, which refuses an unknown verification method.
+type requirementRow struct {
+	ID                     string `json:"id"`
+	Title                  string `json:"title"`
+	Description            string `json:"description"`
+	Priority               string `json:"priority"`
+	Source                 string `json:"source"`
+	AcceptanceCriteriaJSON string `json:"acceptance_criteria_json"`
+}
+
+// LinkedRequirements is what a task's requirement links resolve to.
+type LinkedRequirements struct {
+	Requirements []dc.Requirement
+	// Missing is every linked id no requirement row defines.
+	Missing []string
+}
+
+// Requirements reads the requirements a task links to, decoded and validated.
+//
+// Every failure is an error rather than a shorter list: a requirement that
+// could not be read, a criterion whose method no gate discharges, a truncated
+// reply and an unknown task all leave the caller unable to say what the task
+// has to prove, and a verifier must not read that as "nothing to prove".
+func (c *Client) Requirements(ctx context.Context, taskID string) (LinkedRequirements, error) {
+	out, err := c.run(ctx, "requirements", "--task", taskID)
+	if err != nil {
+		return LinkedRequirements{}, err
+	}
+	if out.TaskFound == nil {
+		return LinkedRequirements{}, fmt.Errorf("store: requirements reply for %s carries no task_found", taskID)
+	}
+	if !*out.TaskFound {
+		return LinkedRequirements{}, fmt.Errorf("store: task %s not found", taskID)
+	}
+	if out.Truncated {
+		return LinkedRequirements{}, fmt.Errorf("store: task %s links more requirements than one reply carries", taskID)
+	}
+	linked := LinkedRequirements{
+		Requirements: make([]dc.Requirement, 0, len(out.Requirements)),
+		Missing:      out.Missing,
+	}
+	for _, row := range out.Requirements {
+		criteria := json.RawMessage(row.AcceptanceCriteriaJSON)
+		if !json.Valid(criteria) {
+			return LinkedRequirements{}, fmt.Errorf("store: requirement %s has unreadable acceptance criteria", row.ID)
+		}
+		doc, err := json.Marshal(map[string]any{
+			"id": row.ID, "title": row.Title, "description": row.Description,
+			"priority": row.Priority, "source": row.Source, "acceptance_criteria": criteria,
+		})
+		if err != nil {
+			return LinkedRequirements{}, fmt.Errorf("store: requirement %s: %w", row.ID, err)
+		}
+		var req dc.Requirement
+		if err := json.Unmarshal(doc, &req); err != nil {
+			return LinkedRequirements{}, fmt.Errorf("store: requirement %s: %w", row.ID, err)
+		}
+		linked.Requirements = append(linked.Requirements, req)
+	}
+	return linked, nil
 }
 
 // EvidenceList returns evidence rows (newest first), optionally for one task.

@@ -6,32 +6,33 @@ import (
 )
 
 var categoryByGapType = map[string]string{
-	"orphan_diff":                    "scope",
-	"planned_file_not_changed":       "scope",
-	"dependency_risk":                "scope",
-	"test_failed":                    "fix_code",
-	"invalid_verification_command":   "fix_verification",
-	"acceptance_criteria_unproven":   "add_test",
-	"diff_not_exercised":             "add_test",
-	"missing_test":                   "add_test",
-	"security_risk":                  "security",
-	"architecture_drift":             "review",
-	"assumption_violated":            "review",
-	"migration_gap":                  "fix_code",
-	"requirement_not_planned":        "plan",
-	"task_not_implemented":           "plan",
-	"stub_detected":                  "fix_code",
-	"stub_declared":                  "review",
-	"suspicious_effort":              "review",
-	"coarse_acceptance_proof":        "add_test",
-	"unwired_file":                   "fix_code",
-	"dead_symbol":                    "fix_code",
-	"stranded_code":                  "fix_code",
-	"resolution_regression":          "fix_code",
-	"stale_map":                      "refresh_map",
-	"skipped_verification_command":   "fix_verification",
-	"architecture_check_unavailable": "review",
-	"rigor_check_unavailable":        "fix_verification",
+	"orphan_diff":                     "scope",
+	"planned_file_not_changed":        "scope",
+	"dependency_risk":                 "scope",
+	"test_failed":                     "fix_code",
+	"invalid_verification_command":    "fix_verification",
+	"acceptance_criteria_unproven":    "add_test",
+	"diff_not_exercised":              "add_test",
+	"missing_test":                    "add_test",
+	"security_risk":                   "security",
+	"architecture_drift":              "review",
+	"assumption_violated":             "review",
+	"migration_gap":                   "fix_code",
+	"requirement_not_planned":         "plan",
+	"task_not_implemented":            "plan",
+	"stub_detected":                   "fix_code",
+	"stub_declared":                   "review",
+	"suspicious_effort":               "review",
+	"coarse_acceptance_proof":         "add_test",
+	"unwired_file":                    "fix_code",
+	"dead_symbol":                     "fix_code",
+	"stranded_code":                   "fix_code",
+	"resolution_regression":           "fix_code",
+	"stale_map":                       "refresh_map",
+	"skipped_verification_command":    "fix_verification",
+	"architecture_check_unavailable":  "review",
+	"rigor_check_unavailable":         "fix_verification",
+	"unsupported_verification_method": "fix_verification",
 }
 
 func looksLikePath(value string) bool {
@@ -61,8 +62,8 @@ func actionText(g Gap, file *string) string {
 	}
 	switch g.GapType {
 	case "orphan_diff":
-		return "Revert changes to " + target + " or append it with " +
-			"`dev scope update <task_id> --lease-token <token> --planned-file " + target + "`."
+		return "Revert changes to " + target + ", or ask the task's owner to add it to the " +
+			"task's planned files."
 	case "planned_file_not_changed":
 		return "Modify " + target + " as planned, or remove it from the task's planned files."
 	case "dependency_risk":
@@ -112,8 +113,8 @@ func actionText(g Gap, file *string) string {
 			"listed criterion specifically, then re-verify."
 	case "unwired_file":
 		return "Import or register `" + target + "` from its intended non-test caller " +
-			"(append the caller with `dev scope update <task_id> --lease-token <token> " +
-			"--planned-file <caller>` if needed), or delete the unused file."
+			"(if that caller is outside the planned files, ask the task's owner to add it), " +
+			"or delete the unused file."
 	case "dead_symbol":
 		loc := target
 		if g.Line != nil {
@@ -127,11 +128,21 @@ func actionText(g Gap, file *string) string {
 			}
 		}
 		return "Call or register `" + symbol + "` at " + loc + " from the code that needs it " +
-			"(use `dev scope update ... --planned-file <caller>` if the caller is " +
-			"out of scope), or remove it."
+			"(if that caller is outside the planned files, ask the task's owner to add it), " +
+			"or remove it."
 	case "stranded_code":
 		return "Restore the import/call that kept `" + target + "` live, or delete the " +
 			"stranded module if it is intentionally unused."
+	case "unsupported_verification_method":
+		criterion, method := "this acceptance criterion", "its verification method"
+		if g.AcceptanceCriterionID != nil {
+			criterion = *g.AcceptanceCriterionID
+		}
+		if g.ExpectedVerificationMethod != nil {
+			method = *g.ExpectedVerificationMethod
+		}
+		return "Verify cannot check " + criterion + " (" + method + "). Have a person confirm it and " +
+			"re-plan it with unit_test, integration_test or static_check, or mark it required: false."
 	case "stale_map":
 		return "Run `dev map` to regenerate the repository map, then re-verify."
 	default:

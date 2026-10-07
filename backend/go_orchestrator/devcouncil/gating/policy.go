@@ -20,6 +20,10 @@ var HardSafetyGapTypes = map[string]struct{}{
 	// failing test is evidence, while this is the absence of evidence about
 	// whether a credential is in the change.
 	"rigor_check_unavailable": {},
+	// A required acceptance criterion whose verification method verify has no
+	// executor for. Like a skipped command, nothing checked it; advisory mode
+	// demoting it would turn "not examined" into "passed".
+	"unsupported_verification_method": {},
 }
 
 // IsHardSafetyGap reports whether a gap type is in the hard-safety set.
