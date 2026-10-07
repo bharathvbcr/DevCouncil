@@ -96,6 +96,37 @@ new file mode 100644
     );
 }
 
+/// In the substring fallback a marker on one function must not reach code
+/// that follows it at the same depth: the covering declaration has to be less
+/// indented than the placeholder.
+#[test]
+fn a_fallback_marker_does_not_cover_code_after_its_function() {
+    let diff = "diff --git a/src/y.rs b/src/y.rs
+--- a/src/y.rs
++++ b/src/y.rs
+@@ -1,0 +1,3 @@
++// allow-stub: a is waiting on the codec
++fn a() -> u8 { todo!() }
++const B: u8 = todo!();
+";
+    let files = parse_unified(diff).unwrap();
+    let findings = detect_stubs_with(&files, &|_| None);
+    let a = findings
+        .iter()
+        .find(|f| f.line == 2)
+        .expect("a finding on line 2");
+    assert_eq!(a.gate, GATE_STUB_ALLOWED, "{findings:?}");
+    let b = findings
+        .iter()
+        .find(|f| f.line == 3)
+        .expect("a finding on line 3");
+    assert_eq!(
+        (b.gate, b.severity),
+        ("stub_detection", Severity::Blocking),
+        "the marker on `a` covered the placeholder after it: {findings:?}"
+    );
+}
+
 struct Root(PathBuf);
 
 impl Root {

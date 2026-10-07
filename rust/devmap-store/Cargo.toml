@@ -16,9 +16,6 @@ serde_json.workspace = true
 anyhow.workspace = true
 rayon.workspace = true
 
-[dev-dependencies]
-devmap-serve = { path = "../devmap-serve" }
-
 [package.metadata.dist]
 # hold_uncommitted_child is a test helper. cargo-dist announced it as a
 # v0.2.0 artifact until this flag was set; a GitHub Release must not ship it.
@@ -48,8 +45,59 @@ required-features = ["parse"]
 name = "a_differential_write_trusts_what_it_read"
 required-features = ["parse"]
 
-# Builds the generation whose index it then damages, and writing a generation
-# needs the parsing frontend.
+# These build their fixtures by extracting source (`extract_file`,
+# `extract_tree_with_report`) and then write a generation from it. They were
+# listed as feature-off-safe while `devmap-serve` was a dev-dependency here,
+# which switched `parse` back on for the whole test build, so none of them had
+# ever compiled without grammars. Each one that mixed in grammar-free cases had
+# those moved to a `*_without_grammars` target, which is not gated.
+[[test]]
+name = "adversarial_store"
+required-features = ["parse"]
+
+[[test]]
+name = "coverage_gap_inventory"
+required-features = ["parse"]
+
+[[test]]
+name = "digest_scoped_delta"
+required-features = ["parse"]
+
+[[test]]
+name = "head_stamp"
+required-features = ["parse"]
+
+[[test]]
+name = "kernel_defects_from_source"
+required-features = ["parse"]
+
+[[test]]
+name = "ledger_write"
+required-features = ["parse"]
+
+[[test]]
+name = "read_only_store"
+required-features = ["parse"]
+
+[[test]]
+name = "store_hardening"
+required-features = ["parse"]
+
+[[test]]
+name = "test_fault_injection"
+required-features = ["parse"]
+
+[[test]]
+name = "validity_ranges"
+required-features = ["parse"]
+
+[[test]]
+name = "write_breakdown"
+required-features = ["parse"]
+
+# Builds the generation whose index it then damages from `extract_file`, and
+# writes it with `save_generation`, which a build without grammars does not
+# link.
 [[test]]
 name = "a_damaged_full_text_index_is_named"
 required-features = ["parse"]

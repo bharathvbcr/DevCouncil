@@ -1,5 +1,21 @@
 # DevCouncil Improvement Backlog
 
+> **Historical ledger — read before running anything below (checked 2026-10-07).**
+> The Python product was retired in Phase 7 (2026-09-10; decision table in
+> [docs/PHASE7_LONG_TAIL.md](docs/PHASE7_LONG_TAIL.md)). Commit `3286db5e`
+> (2026-09-10) deleted the 398 files under `src/devcouncil/` together with
+> `pyproject.toml` and `uv.lock`; none of them exists at HEAD. There is no
+> Python package, no `uv` path and no pytest lane: `dev`/`devcouncil` is the Go
+> host (`backend/go_orchestrator`) and the map engine is the Rust workspace
+> (`rust/`). The only `.py` files still tracked are benchmark and repo scripts,
+> parser fixtures under `rust/testdata/`, a demo under `examples/`, and two
+> stdlib-only harness tests for `rust/tools/soak.sh` that CI runs with plain
+> `python3` (`tests/unit/README.md`, `.github/workflows/ci.yml:76-77`). Every
+> Python module path, `uv`/`pytest`/`dev …` command and Python test named in the
+> entries below is the historical record of what was true on that entry's date,
+> not something to run. Entries are kept as written; corrections are added
+> beside them, dated.
+
 Prioritized findings from a full-codebase review (July 2026). File refs verified against source.
 
 ## Status after implementation session (2026-07-05)
@@ -663,6 +679,36 @@ by the OS on process exit, so the leftover PID-named `.lock` files in TMPDIR are
 harmless. Left alone deliberately — retiming a locking test could mask a real
 regression, and the honest report is worth more than a green run.
 
+**Correction (2026-10-07): the `flock`-release explanation above is not
+supported by the code.** The observation (two failures under load, 52/52 clean)
+stays as recorded; the cause it offers was never demonstrated. What the code
+shows:
+
+- The test still exists, body unchanged since `01677010` (2026-09-01):
+  `rust/devmap-serve/src/protocol.rs:2552-2568`.
+- Nothing in `lock_ipc_endpoint_with`, `UnixIpcServer::bind` or its `Drop`
+  (`protocol.rs:1578-1642`, `:1671-1708`, `:1757-1772`) gives a dropped lock
+  file a way to stay locked inside the same process, and the test's own comment
+  (`:2561-2564`) asserts release on drop. After `drop(first)` the socket is
+  unlinked, so the rebind skips the liveness probe; the only step left that can
+  refuse it is `try_lock`. "The release has not taken effect yet" was the one
+  candidate offered, and no code path or measurement backs it.
+- The code under the test changed after this note was written (`f8c9d3ad`,
+  2026-09-02 15:34). `592e3940` (2026-09-02 21:10, not an ancestor of the note)
+  made `Drop` unlink the `.lock` file while still holding the lock
+  (`protocol.rs:1757-1772`), so the rebind now locks a freshly created file.
+  "Leftover PID-named `.lock` files are harmless" described the earlier `Drop`,
+  which removed only the socket; at HEAD a leftover `.lock` means an abnormal
+  exit. `4cfe50d9` (2026-09-05) added a 125 ms retry on `WouldBlock`
+  (`LOCK_CONTENTION_WINDOW`, `protocol.rs:48`, `:1614-1634`). Its own test
+  (`a_briefly_held_endpoint_lock_is_waited_out_not_refused`, `:3214-3263`) is
+  about contention between two daemons, not a drop-then-rebind in one process.
+- The "full pytest run" load source no longer exists (Python retired, `3286db5e`).
+
+Unverified: that the failure was ever reproduced, what actually caused it,
+whether it still occurs at HEAD, and whether the later changes fixed it. No
+cause is recorded in the code or in git history.
+
 ## Dev Map kernel audit, second pass (2026-09-02)
 
 Scope: everything between `dev map` and the store — the Python seam, the kernel's
@@ -867,6 +913,12 @@ coherent again:
   no callees, which is a wording bug that reads as a data-loss bug. Subsystem granularity
   also changed (14 whole-repo areas against the old per-package split under
   `src/devcouncil/`); that is the kernel's design, not a gap.
+  **Closed, checked 2026-10-07.** The manifest fields this paragraph lists as empty are
+  computed now: `rust/devmap-query/src/manifest.rs` writes `frameworks` from the repository
+  inventory (`:519`) and `neighbors`, `handoff_paths` and `role_files` per subsystem
+  (`:437-439`), and gives each file a `kind` (`:275`). The `callees_unavailable` wording bug
+  is fixed in `rust/devmap-query/src/engine.rs:534-560`: callees come from the forward
+  traversal, which answers for a symbol id. Not found: a test pinning that last one.
 - **Two config knobs with no reader are gone, and a removed key no longer goes quiet.**
   `IndexingConfig.repo_map_dependents_cap` had exactly one reader, `repo_mapper.py:153`,
   which went with `build_dependents`; the kernel writes `dependents` now and does not read
@@ -1475,12 +1527,20 @@ observed once earlier; it stays recorded as observed-once, not as a defect.
   `SchemaDeclared`, `DistinctOrphanEndpoints` and the interned decoder. The register entry is
   therefore "port the accumulated fixes across", not "delete". Two proofs and the Chesterton's
   fence are in STATUS.md.
+  **Closed, checked 2026-10-07.** MANVI's `manvi/go.mod:19` now replaces the DevCouncil module
+  with `../../DevCouncil/backend/go_orchestrator`, and no `package repomap` or `package devmap`
+  is left in the MANVI tree (`rg -uu`): its copies are gone, so the register entry no longer
+  stands.
 * **New, and load-bearing:** `devmap-query/src/manifest.rs:302` writes `"neighbors": []` as a
   literal, and `src/devcouncil/indexing/subsystem_map.py::are_neighbors` reads that field. The
   "allow a write into a neighbouring subsystem" rung in `execution/policy_engine.py:628` can
   therefore never fire, and `verification/checks/subsystem_boundary.py` flags every cross-area
   change as drift. Measured: 0 of this repository's 16 subsystems and 0 of the scholarlm map's
   12 carry a non-empty `neighbors`. See STATUS.md for the two candidate owners.
+  **Superseded, checked 2026-10-07.** The producer no longer writes the literal: it computes
+  `neighbors` and says so in `meta.devmap_rust.neighbors_computed`
+  (`rust/devmap-query/src/manifest.rs:782-800`; `tests/subsystem_neighbours_are_computed.rs`).
+  The Python consumers named above no longer exist.
 
 ## Python typing: mypy to zero (2026-09-05)
 
@@ -1757,6 +1817,9 @@ gaps are `rust-port/testdata/fixtures/languages/cobol/main.cob` and `scripts/ins
 pattern), and `rust-port/vendor/grammars/cobol/parser.c` (refused by discovery) — each with the
 kernel's own reason. That binary does not yet report `edge_confidence_mismatches`, and the
 `edges` check says so rather than passing.
+**Closed, checked 2026-10-07.** The kernel reports `edge_confidence_mismatches`
+(`devmap_status` returns it, `0` on this index; `rust/devmap-cli/tests/status_names_what_it_could_not_read.rs:229-286`
+pins it in both directions).
 
 ## Staleness is age, not coverage (2026-09-06)
 

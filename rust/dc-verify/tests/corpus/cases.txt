@@ -927,6 +927,25 @@ new file mode 100644
 +    todo!()
 +}
 
+### case: fallback-allow-stub-above-the-function
+### secret_scan: clean
+### stub_detection: clean
+### stub_allowed: advisory
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: A modified file with no working tree: the substring path, not the
+###   parser. A marker above the function still covers the placeholder in its
+###   body, found by the nearest less-indented declaration line above it.
+diff --git a/src/store3.rs b/src/store3.rs
+--- a/src/store3.rs
++++ b/src/store3.rs
+@@ -10,0 +11,4 @@
++// allow-stub: the storage API lands in the next task
++pub fn persist(bytes: &[u8]) -> usize {
++    todo!()
++}
+
 ### case: ast-allow-stub-without-a-reason-is-not-honoured
 ### secret_scan: clean
 ### stub_detection: blocking

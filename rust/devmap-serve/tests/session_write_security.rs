@@ -10,7 +10,7 @@ fn session_rotation_checks_both_names_and_preserves_normal_records() {
     fs::create_dir_all(&root).unwrap();
     let db = root.join("store.sqlite");
     fs::write(&db, "store").unwrap();
-    append_query(&db, "devmap_status", None, None, None, 1);
+    append_query(&db, None, "devmap_status", None, None, None, 1);
     assert_eq!(read_live(&db).unwrap().records.len(), 1);
     assert!(rotate_live(&db, "../outside").is_err());
     fs::write(root.join("sentinel"), "outside sentinel").unwrap();
@@ -61,7 +61,7 @@ fn session_appends_refuse_linked_files_and_ancestors() {
             "state" => {}
             _ => unreachable!(),
         }
-        append_query(&db, "devmap_status", None, None, None, 1);
+        append_query(&db, None, "devmap_status", None, None, None, 1);
         assert_eq!(
             fs::read(&victim).unwrap(),
             b"outside sentinel\n",

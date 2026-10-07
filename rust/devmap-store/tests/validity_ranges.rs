@@ -791,7 +791,12 @@ fn a_row_whose_validity_range_is_inverted_cannot_be_written() {
 }
 
 /// A read-only store serves every edge a writable one does.
+///
+/// Unix only, as `restriction_holds` is: it asks whether mode bits refuse this
+/// process, which is how it tells an inert fixture from a passing one. Ungated,
+/// this target did not compile for Windows.
 #[test]
+#[cfg(unix)]
 fn a_read_only_store_serves_the_same_edges() {
     let dir = tmp_dir("v18-read-only");
     let db = dir.join("index.sqlite");

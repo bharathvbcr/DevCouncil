@@ -3,7 +3,9 @@
 //! `devmap integrate <cursor|claude|codex>`:
 //! - writes/refreshes marker-guarded guides and `.cursor/rules/devmap.mdc`
 //! - installs the five embedded DevMap skills into the host's skill layout
-//! - registers `devmap mcp` (no `--db`) in the global Cursor / Claude configs
+//! - registers `devmap mcp` (no `--db`) in the global Cursor / Claude configs,
+//!   except that Claude's user-scope entry is withheld — and an owned unpinned
+//!   one removed — while the enabled Dev Map plugin registers the same server
 //! - rewrites per-project owned entries to `--root <abs>` (belt-and-braces;
 //!   insufficient for multi-tab Cursor — callers must still pass `repo_path`)
 
@@ -237,8 +239,32 @@ pub fn integrate(
     }
 
     if host.registers_global_mcp() {
+        // An enabled Dev Map plugin already registers `devmap` for Claude
+        // Code. A user-scope entry beside it is a second server for the same
+        // host, which `devmap doctor` reports as a duplicate — and writing it
+        // here is what kept bringing that duplicate back after it was removed.
+        let plugin_registration = match host {
+            Host::Claude => {
+                let install = claude::claude_plugin_install(&dirs_home()?);
+                let registration = claude_plugin_registration(&install);
+                if registration.is_none() {
+                    // Unknown is not "no plugin": say the write rests on it.
+                    for error in install.record_error.iter().chain(&install.load_error) {
+                        report.notes.push(format!(
+                            "claude: could not tell whether the Dev Map plugin registers devmap \
+                             ({error}); the user-scope entry was managed as if it does not"
+                        ));
+                    }
+                }
+                registration
+            }
+            _ => None,
+        };
         for path in global_mcp_paths(host)? {
-            let outcome = merge_global_mcp(&path, executable, dry_run || check)?;
+            let outcome = match &plugin_registration {
+                Some(plugin_mcp) => retire_global_mcp(&path, plugin_mcp, dry_run || check)?,
+                None => merge_global_mcp(&path, executable, dry_run || check)?,
+            };
             report.global_mcp.push(outcome);
         }
     }
@@ -785,6 +811,104 @@ pub fn merge_global_mcp(
     })
 }
 
+/// The `.mcp.json` of the Dev Map plugin Claude Code loads, when the plugin is
+/// enabled and that file registers `devmap`.
+///
+/// Read through the same resolution `devmap doctor` uses, so integrate and the
+/// duplicate check agree on which copy is loaded. A plugin that is installed
+/// but whose loaded copy registers no `devmap` server leaves the user-scope
+/// entry as the only registration, and it is still written.
+fn claude_plugin_registration(install: &claude::ClaudePluginInstall) -> Option<PathBuf> {
+    if install.enabled != Some(true) {
+        return None;
+    }
+    install
+        .loaded
+        .iter()
+        .map(|plugin| plugin.dir.join(".mcp.json"))
+        .find(|mcp| {
+            read_host_config(mcp)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .is_some_and(|document| {
+                    document
+                        .get("mcpServers")
+                        .and_then(|servers| servers.get(MCP_SERVER_NAME))
+                        .is_some()
+                })
+        })
+}
+
+/// Keep a global host config from registering `devmap` a second time beside
+/// the enabled plugin's registration at `plugin_mcp`.
+///
+/// Removes only an entry this installer writes in its unpinned form, the one
+/// the plugin duplicates. A pinned (`--root`/`--db`) entry or one this
+/// installer did not write is a choice someone made; it is reported and left.
+/// Every other key in the file survives.
+pub fn retire_global_mcp(
+    path: &Path,
+    plugin_mcp: &Path,
+    read_only: bool,
+) -> anyhow::Result<McpMergeOutcome> {
+    let outcome = |changed: bool, note: String| McpMergeOutcome {
+        path: path.to_path_buf(),
+        changed,
+        removed_stale_db: false,
+        note,
+    };
+    let plugin = plugin_mcp.display();
+    let skipped = || {
+        outcome(
+            false,
+            format!(
+                "not registered here: the enabled Dev Map plugin registers devmap for Claude \
+                 Code at {plugin}, and a user-scope entry would load the same server twice"
+            ),
+        )
+    };
+    if !path.exists() {
+        return Ok(skipped());
+    }
+    let mut document = read_json_object(path)?;
+    let Some(existing) = document
+        .get("mcpServers")
+        .and_then(|servers| servers.get(MCP_SERVER_NAME))
+    else {
+        return Ok(skipped());
+    };
+    if !is_owned_devmap_entry(existing) {
+        return Ok(outcome(
+            false,
+            format!(
+                "devmap entry present but not owned by this installer; left unchanged, though \
+                 the enabled Dev Map plugin also registers devmap at {plugin}"
+            ),
+        ));
+    }
+    if entry_is_pinned(existing) {
+        return Ok(outcome(
+            false,
+            format!(
+                "pinned (--root/--db) devmap entry left unchanged; the enabled Dev Map plugin \
+                 also registers the unpinned server at {plugin}"
+            ),
+        ));
+    }
+    if !read_only {
+        mcp_servers_mut(&mut document)?.remove(MCP_SERVER_NAME);
+        write_json_pretty(path, &document)?;
+    }
+    Ok(outcome(
+        true,
+        format!(
+            "{} the user-scope devmap entry: the enabled Dev Map plugin registers the same \
+             server at {plugin}, and Claude Code loaded both",
+            if read_only { "would remove" } else { "removed" }
+        ),
+    ))
+}
+
 /// Rewrite a per-project owned `devmap` entry to `devmap --root <abs> mcp`.
 ///
 /// Covers stale `--db` and the belt-and-braces `["mcp"]` form. `--root` is
@@ -914,6 +1038,20 @@ fn entry_has_db_arg(entry: &Value) -> bool {
         .get("args")
         .and_then(Value::as_array)
         .is_some_and(|args| args.iter().any(|a| a.as_str() == Some("--db")))
+}
+
+/// Whether a `devmap` server entry is pinned to one repository or store by
+/// `--root` or `--db`. Doctor counts pinned entries apart from the unpinned
+/// server, which is the one a second registration duplicates.
+pub fn entry_is_pinned(entry: &Value) -> bool {
+    entry
+        .get("args")
+        .and_then(Value::as_array)
+        .is_some_and(|args| {
+            args.iter()
+                .filter_map(Value::as_str)
+                .any(|a| a == "--root" || a == "--db")
+        })
 }
 
 /// The most a host config this module inspects may weigh.

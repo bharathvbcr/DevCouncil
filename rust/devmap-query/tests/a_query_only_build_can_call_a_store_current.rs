@@ -8,11 +8,12 @@
 //! "this binary was built without the parsing frontend", for a store the CLI
 //! reported fresh.
 //!
-//! This target lives here, not in `devmap-store`, on purpose. `devmap-store`'s
-//! test build pulls `devmap-serve` in as a dev-dependency, which turns `parse`
-//! back on, so `cargo test -p devmap-store --no-default-features` never runs a
-//! store test without grammars. `devmap-query`'s test build does stay
-//! grammar-free, and this crate is the one GitPulse links.
+//! This target lives here, not in `devmap-store`, because this crate is the
+//! one GitPulse links. When it landed it had a second reason: `devmap-store`'s
+//! test build took `devmap-serve` as a dev-dependency, which turned `parse`
+//! back on, so no store test ran without grammars. That edge is gone, and
+//! `no_feature_off_crate_turns_parse_back_on_through_its_test_build` in
+//! `devmap-cli` keeps both crates' test builds grammar-free.
 //!
 //! The rows are written by SQL because a build without grammars writes no
 //! generation. They are stamped with the identities a parsing build of this

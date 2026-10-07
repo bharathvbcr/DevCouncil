@@ -5,6 +5,15 @@ presentation, output framing, failure reporting, and cancellation. This is not
 an assertion that every defect in the analysis engines or every operating
 system has been eliminated.
 
+**Status as of 2026-10-07.** The work this audit describes is committed: it
+landed as `2619cbef` (2026-09-12), so "source changes remain uncommitted" below
+was true only while the audit was open. The command counts below are the
+2026-09-12 surface: `devmap --help` now lists **43** top-level commands
+(excluding `help`), not 37. The stress figures (37 JSON forms, 33 finite forms,
+35 PTY runs, and so on) are measurements of the earlier surface and have not
+been re-run, so nothing here says the six commands added since were exercised
+by them.
+
 ## Command coverage and ownership
 
 | Surface | Policy and canonical owner |
@@ -20,10 +29,10 @@ system has been eliminated.
 | `dev` | Existing symlink to the same Go host |
 | `dcmap` development driver | Existing thin mapcli driver; no parallel presentation implementation or new legacy surface |
 
-DevMap's 37 explicit top-level commands have an exhaustive presentation policy.
+DevMap's 37 explicit top-level commands (43 as of 2026-10-07; see the status note above) had an exhaustive presentation policy when this was written.
 Nested workspace, Claude, skills, and integration actions inherit their owner;
 raw configuration actions explicitly opt out. Clap-generated help is unchanged.
-The stress script exercises 33 finite DevMap command forms plus build, four Go
+The stress script exercised 33 finite DevMap command forms (a 2026-09-12 count, not re-measured) plus build, four Go
 JSON command forms, raw exports, live terminals, and an actual HTTP listener.
 This is command-form coverage, not every possible argument combination.
 
@@ -150,8 +159,8 @@ The previous binaries were copied and hash-verified before installation in
 `/Users/bharath/.local/share/devcouncil/backups/command-ui-20260912T170145Z`.
 That directory also contains the installed binary hashes and post-install stress
 receipts. Existing server processes were not restarted; new launches use the
-updated executables. Source changes remain uncommitted, and concurrent changes
-outside this presentation work were preserved.
+updated executables. Source changes were uncommitted at the time (they are `2619cbef` now), and
+concurrent changes outside this presentation work were preserved.
 
 ## Qualification limits
 

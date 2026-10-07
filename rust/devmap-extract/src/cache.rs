@@ -520,10 +520,13 @@ pub struct CacheKey {
 }
 
 /// Building a key means asking "may a payload extracted by *this* build be
-/// reused", and only a build with grammars can answer it. The struct itself
-/// stays available with `parse` off: a query-only consumer reads
-/// `grammar_version` / `analyzer_version` off stored rows, it just cannot
-/// compute what its own build would stamp, because it stamps nothing.
+/// reused", which only the extraction cache asks, and the extraction cache is
+/// build-path code that a build without grammars does not link. That is the
+/// whole reason for the gate: [`current_payload_identity`] answers in both
+/// configurations, so a query-only build could compute the key, it just has
+/// nothing to look up with it. The struct itself stays available with `parse`
+/// off, because a query-only consumer reads `grammar_version` /
+/// `analyzer_version` off stored rows.
 #[cfg(feature = "parse")]
 impl CacheKey {
     pub fn for_source(language: &str, source: &str) -> Self {

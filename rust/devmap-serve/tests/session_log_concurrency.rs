@@ -40,6 +40,7 @@ fn concurrent_appends_never_tear_a_record() {
                 for n in 0..PER_WRITER {
                     append_query(
                         &db,
+                        None,
                         "devmap_search",
                         Some(&json!({"writer": writer, "n": n, "pad": "x".repeat(96)})),
                         Some(&json!({"items": [], "truncated": false})),
@@ -133,7 +134,7 @@ fn reading_while_a_writer_appends_is_not_tampering() {
     let root = scratch("read-during-append");
     let db = root.join("store.sqlite");
     fs::write(&db, "store").unwrap();
-    append_query(&db, "devmap_status", None, None, None, 1);
+    append_query(&db, None, "devmap_status", None, None, None, 1);
 
     let stop = std::sync::atomic::AtomicBool::new(false);
     let failures = std::sync::atomic::AtomicUsize::new(0);
@@ -146,6 +147,7 @@ fn reading_while_a_writer_appends_is_not_tampering() {
             while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
                 append_query(
                     &writer_db,
+                    None,
                     "devmap_search",
                     Some(&json!({"pad": "z".repeat(256)})),
                     None,
@@ -206,6 +208,7 @@ fn rotation_under_concurrent_appends_loses_no_record() {
                     for n in 0..PER_WRITER {
                         append_query(
                             &db,
+                            None,
                             "devmap_search",
                             Some(&json!({"w": writer, "n": n})),
                             None,

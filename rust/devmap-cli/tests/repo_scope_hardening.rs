@@ -399,3 +399,338 @@ fn doctor_resolves_bare_devmap_and_hashes_binaries() {
     );
     assert_eq!(row["sha256_status"], "hashed", "{row}");
 }
+
+/// Lay down a local-path marketplace the way `/plugin marketplace add <dir>`
+/// records one: `known_marketplaces.json` naming `root` as a `directory`
+/// source, and `root/.claude-plugin/marketplace.json` listing the plugin at
+/// the relative source `./devmap`. Claude Code loads such a plugin in place
+/// from `root/devmap`, not from the cache copy `installed_plugins.json`
+/// names. Returns the in-place plugin directory, holding a well-formed
+/// bundle whose `plugin.json` says `version`.
+fn local_marketplace(home: &Path, root: &Path, version: &str) -> PathBuf {
+    let plugins = home.join(".claude").join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::write(
+        plugins.join("known_marketplaces.json"),
+        serde_json::json!({"devmap-local": {
+            "source": {"source": "directory", "path": root},
+            "installLocation": root,
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
+    std::fs::write(
+        root.join(".claude-plugin").join("marketplace.json"),
+        serde_json::json!({"name": "devmap-local", "plugins": [
+            {"name": "devmap", "source": "./devmap", "version": version}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let dir = root.join("devmap");
+    write_healthy_plugin(&dir, version);
+    dir
+}
+
+/// A plugin directory that passes every `plugin_health` check at `version`.
+fn write_healthy_plugin(dir: &Path, version: &str) {
+    write_mcp(&dir.join(".mcp.json"), "devmap");
+    std::fs::create_dir_all(dir.join("hooks")).unwrap();
+    std::fs::write(
+        dir.join("hooks").join("hooks.json"),
+        r#"{"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"/abs/devmap hook session-end","timeout":3}]}]}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
+    std::fs::write(
+        dir.join(".claude-plugin").join("plugin.json"),
+        serde_json::json!({"name": "devmap", "version": version}).to_string(),
+    )
+    .unwrap();
+}
+
+fn global_rows(payload: &Value) -> Vec<String> {
+    payload["mcp_registrations"]["global"]
+        .as_array()
+        .expect("global registrations")
+        .iter()
+        .filter_map(|row| row["path"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// A plugin from a local-path marketplace loads in place. The cache copy the
+/// install record names is not what a session runs, so a malformed, older
+/// cache copy must not raise a warning, and the registration doctor
+/// inventories is the in-place `.mcp.json`.
+#[test]
+fn an_in_place_marketplace_plugin_is_the_copy_doctor_checks() {
+    let home = scratch("inplace-home");
+    let cwd = scratch("inplace-cwd");
+    let market = scratch("inplace-market");
+    // The record names a cache copy that is both stale and malformed (no
+    // hooks/hooks.json).
+    let cache = install_plugin(&home, "0.0.1", true);
+    let loaded = local_marketplace(&home, &market, env!("CARGO_PKG_VERSION"));
+    let payload = doctor_payload(&home, &cwd);
+    assert!(
+        payload["plugin_warning"].is_null(),
+        "the in-place copy is healthy; the cache copy is not loaded: {payload}"
+    );
+    let rows = global_rows(&payload);
+    assert!(
+        rows.iter().any(|row| names(row, &loaded.join(".mcp.json"))),
+        "the in-place .mcp.json is the loaded registration: {payload}"
+    );
+    assert!(
+        !rows.iter().any(|row| names(row, &cache.join(".mcp.json"))),
+        "the cache copy is not a registration: {payload}"
+    );
+    let note = payload["plugin_cleanup_note"].as_str().unwrap_or("");
+    assert!(
+        !(note.contains("safe to delete") && names(note, &cache)),
+        "the copy the install record names is not a deletable leftover: {payload}"
+    );
+}
+
+/// The other direction: the cache copy is current and well-formed, but the
+/// in-place copy a session loads has drifted. Checking the cache said nothing.
+#[test]
+fn a_drifted_in_place_plugin_is_reported_even_when_the_cache_is_current() {
+    let home = scratch("drift-home");
+    let cwd = scratch("drift-cwd");
+    let market = scratch("drift-market");
+    let cache = install_plugin(&home, env!("CARGO_PKG_VERSION"), true);
+    write_healthy_plugin(&cache, env!("CARGO_PKG_VERSION"));
+    let loaded = local_marketplace(&home, &market, "0.0.1");
+    let payload = doctor_payload(&home, &cwd);
+    let warning = payload["plugin_warning"].as_str().unwrap_or("");
+    assert!(
+        warning.contains("0.0.1") && names(warning, &loaded),
+        "the loaded in-place copy is at 0.0.1 and must be named: {payload}"
+    );
+}
+
+/// An in-place plugin needs no install record; `enabledPlugins` alone decides
+/// whether it loads. Without a record it must still count as a registration.
+#[test]
+fn an_in_place_plugin_without_an_install_record_still_counts() {
+    let home = scratch("norecord-home");
+    let cwd = scratch("norecord-cwd");
+    let market = scratch("norecord-market");
+    let loaded = local_marketplace(&home, &market, env!("CARGO_PKG_VERSION"));
+    std::fs::write(
+        home.join(".claude").join("settings.json"),
+        serde_json::json!({"enabledPlugins": {"devmap@devmap-local": true}}).to_string(),
+    )
+    .unwrap();
+    write_mcp(&home.join(".claude.json"), "devmap");
+    let payload = doctor_payload(&home, &cwd);
+    let warning = payload["duplicate_mcp_registration_warning"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        warning.contains(".claude.json") && names(warning, &loaded.join(".mcp.json")),
+        "the user-scope entry duplicates the in-place plugin: {payload}"
+    );
+}
+
+/// A `file` marketplace source is not resolved to an in-place copy. That is an
+/// unanswered question, and it must read as one rather than as a clean check
+/// of the cache copy.
+#[test]
+fn an_unresolved_marketplace_source_is_reported_not_assumed() {
+    let home = scratch("filesrc-home");
+    let cwd = scratch("filesrc-cwd");
+    install_plugin(&home, env!("CARGO_PKG_VERSION"), true);
+    std::fs::write(
+        home.join(".claude/plugins/known_marketplaces.json"),
+        serde_json::json!({"devmap-local": {
+            "source": {"source": "file", "path": "/m/.claude-plugin/marketplace.json"},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let payload = doctor_payload(&home, &cwd);
+    let warning = payload["plugin_warning"].as_str().unwrap_or("");
+    assert!(
+        warning.contains("`file` source") && warning.contains("may not be the one"),
+        "{payload}"
+    );
+}
+
+fn integrate_claude(home: &Path, project: &Path, extra: &[&str]) -> Value {
+    let project_arg = project.display().to_string();
+    let mut args = vec![
+        "--json",
+        "integrate",
+        "claude",
+        "--project-root",
+        &project_arg,
+    ];
+    args.extend_from_slice(extra);
+    let out = run_in(project, &args, Some(home));
+    assert!(
+        out.status.success(),
+        "integrate claude {extra:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    one_json(&out, "integrate claude")
+}
+
+fn claude_json_outcome(report: &Value, home: &Path) -> Value {
+    report["global_mcp"]
+        .as_array()
+        .expect("global_mcp outcomes")
+        .iter()
+        .find(|row| {
+            row["path"]
+                .as_str()
+                .is_some_and(|path| names(path, &home.join(".claude.json")))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("no ~/.claude.json outcome: {report}"))
+}
+
+/// `~/.claude.json` with an owned unpinned `devmap` entry beside another
+/// server and an unrelated top-level key.
+fn claude_json_with_devmap(home: &Path) -> PathBuf {
+    let path = home.join(".claude.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "numStartups": 7,
+            "mcpServers": {
+                "devmap": {"type": "stdio", "command": "devmap", "args": ["mcp"]},
+                "other": {"type": "stdio", "command": "other", "args": []},
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    path
+}
+
+/// The duplicate `devmap doctor` reports came back after every manual removal:
+/// `integrate claude` wrote the user-scope entry whether or not the enabled
+/// plugin already registered the same server. It now removes our own entry
+/// and leaves everything else in the file alone.
+#[test]
+fn integrate_claude_removes_the_user_scope_duplicate_of_an_enabled_plugin() {
+    let home = scratch("int-dup-home");
+    let project = scratch("int-dup-project");
+    let plugin = install_plugin(&home, env!("CARGO_PKG_VERSION"), true);
+    let path = claude_json_with_devmap(&home);
+    let report = integrate_claude(&home, &project, &[]);
+    let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        after["mcpServers"].get("devmap").is_none(),
+        "the duplicate user-scope entry is removed: {after}"
+    );
+    assert_eq!(after["mcpServers"]["other"]["command"], "other", "{after}");
+    assert_eq!(after["numStartups"], 7, "{after}");
+    let outcome = claude_json_outcome(&report, &home);
+    assert_eq!(outcome["changed"], true, "{report}");
+    let note = outcome["note"].as_str().unwrap_or("");
+    assert!(
+        names(note, &plugin.join(".mcp.json")),
+        "the note names the plugin registration that made it a duplicate: {report}"
+    );
+    // A second run has nothing left to do.
+    let again = integrate_claude(&home, &project, &[]);
+    assert_eq!(
+        claude_json_outcome(&again, &home)["changed"],
+        false,
+        "{again}"
+    );
+}
+
+#[test]
+fn integrate_claude_dry_run_reports_the_removal_without_writing() {
+    let home = scratch("int-dry-home");
+    let project = scratch("int-dry-project");
+    let plugin = install_plugin(&home, env!("CARGO_PKG_VERSION"), true);
+    let path = claude_json_with_devmap(&home);
+    let before = std::fs::read(&path).unwrap();
+    let report = integrate_claude(&home, &project, &["--dry-run"]);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "dry-run writes nothing"
+    );
+    let outcome = claude_json_outcome(&report, &home);
+    assert_eq!(outcome["changed"], true, "{report}");
+    // A pending removal, not a pending rewrite of the entry.
+    assert!(
+        names(
+            outcome["note"].as_str().unwrap_or(""),
+            &plugin.join(".mcp.json")
+        ),
+        "{report}"
+    );
+}
+
+/// No user-scope entry and an enabled plugin: nothing is written, and the
+/// report says why rather than staying silent.
+#[test]
+fn integrate_claude_does_not_write_beside_an_enabled_plugin() {
+    let home = scratch("int-skip-home");
+    let project = scratch("int-skip-project");
+    let plugin = install_plugin(&home, env!("CARGO_PKG_VERSION"), true);
+    let report = integrate_claude(&home, &project, &[]);
+    let path = home.join(".claude.json");
+    if path.exists() {
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(after["mcpServers"].get("devmap").is_none(), "{after}");
+    }
+    let outcome = claude_json_outcome(&report, &home);
+    assert_eq!(outcome["changed"], false, "{report}");
+    assert!(
+        names(
+            outcome["note"].as_str().unwrap_or(""),
+            &plugin.join(".mcp.json")
+        ),
+        "{report}"
+    );
+}
+
+/// A disabled plugin loads nothing, so the user-scope entry is the only
+/// registration and is still written.
+#[test]
+fn integrate_claude_registers_when_the_plugin_is_disabled() {
+    let home = scratch("int-off-home");
+    let project = scratch("int-off-project");
+    install_plugin(&home, env!("CARGO_PKG_VERSION"), false);
+    let report = integrate_claude(&home, &project, &[]);
+    let after: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+    assert!(after["mcpServers"].get("devmap").is_some(), "{after}");
+    assert_eq!(
+        claude_json_outcome(&report, &home)["changed"],
+        true,
+        "{report}"
+    );
+}
+
+/// A pinned user-scope entry is a deliberate choice, not the unpinned
+/// duplicate; it is reported and left in place.
+#[test]
+fn integrate_claude_leaves_a_pinned_user_scope_entry() {
+    let home = scratch("int-pin-home");
+    let project = scratch("int-pin-project");
+    install_plugin(&home, env!("CARGO_PKG_VERSION"), true);
+    let path = home.join(".claude.json");
+    let pinned = serde_json::json!({"mcpServers": {"devmap": {
+        "type": "stdio", "command": "devmap", "args": ["--root", "/some/repo", "mcp"]
+    }}})
+    .to_string();
+    std::fs::write(&path, &pinned).unwrap();
+    let report = integrate_claude(&home, &project, &[]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), pinned);
+    let outcome = claude_json_outcome(&report, &home);
+    assert_eq!(outcome["changed"], false, "{report}");
+    assert!(
+        outcome["note"].as_str().unwrap_or("").contains("pinned"),
+        "{report}"
+    );
+}

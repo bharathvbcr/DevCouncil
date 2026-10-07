@@ -6,14 +6,21 @@
 > (section E covers this plane). This file stays authoritative for the analysis-plane
 > detail; the kernel port ledger is archived at [`docs/archive/devmap/STATUS.md`](../docs/archive/devmap/STATUS.md). Live follow-ups: [`docs/TODO.md`](../docs/TODO.md).
 
-**What this is:** the four `dc-*` crates and their Go clients, ported from the MANVI
-harness (`~/Code/devtools/Manvi`) into DevCouncil on 2026-09-01.
+**What this is:** the six `dc-*` crates MANVI also carries (`dc-evidence`,
+`dc-glob`, `dc-grep`, `dc-proc`, `dc-store`, `dc-verify`) and their Go clients,
+ported from the MANVI harness (`~/Code/devtools/Manvi`) into DevCouncil starting
+2026-09-01. The workspace also holds `dc-regress` and `dc-regress-store`, which
+have no MANVI counterpart.
 
-**What it is not:** a replacement for anything. Nothing in `src/devcouncil/` calls
-this code yet. Every Python verification gate, lease repository and search path in
-DevCouncil runs exactly as it did before this port. Read [§4](#4-what-this-does-not-yet-improve)
-before assuming the Rust side is an upgrade to the Python it resembles — in one
-significant case it is measurably less capable, and cutting over would weaken a gate.
+**Read this file as a dated record.** It was written on 2026-09-01, when the
+Python `src/devcouncil/` still existed and nothing called this code, and its
+"not a replacement" framing was true then. It is not true now (checked
+2026-10-07): `src/` is gone (Phase 7, 2026-09-10), and the Go host's
+`verify.Run` spawns `dcverify` (`backend/go_orchestrator/devcouncil/verify/orchestrate.go`),
+with `dc/store`, `dc/dcgrep` and `dc/dcverify` as the Go clients. [§4](#4-what-this-does-not-yet-improve)
+and [§5](#5-state-of-the-handoff) compare against Python that no longer exists;
+they stay as the record of why the cutover went the way it did, and the Python
+columns in them describe nothing that runs.
 
 > **These are DevCouncil components, and DevCouncil is upstream.**
 >
@@ -27,23 +34,19 @@ significant case it is measurably less capable, and cutting over would weaken a 
 >
 > The two copies still have no build-time relationship, so nothing fails when
 > they drift — [§6](#6-the-two-copies) is the standing decision that needs
-> making. **Exactly two files are deliberately different**, and a mirroring
-> script has to know both:
->
-> - `dc-store/tests/interop.rs` — this copy resolves DevCouncil as its own
->   ancestor; MANVI's searches upward for a sibling checkout.
-> - `dc-glob/src/lib.rs` — the parity fixture is the repository-root
->   `testdata/fnmatch-parity.tsv` (one copy, shared with the Go matcher). The
->   matcher itself has diverged from MANVI's: input caps, a step budget, and
->   the inverted-range cases CPython keeps.
->
-> Four paths exist only here and have no MANVI counterpart: `.gitignore`,
-> `README.md`, `STATUS.md`, and `testdata/` (MANVI keeps the parity fixture at
-> its repository root). Every other file is byte-identical:
+> making. **This used to say exactly two files were deliberately different
+> (`dc-store/tests/interop.rs` and `dc-glob/src/lib.rs`). That is no longer
+> true:** on 2026-10-07 a per-crate `diff -rq --exclude=target` of all six
+> `dc-*` crates against `~/Code/devtools/Manvi/crates` reported no difference
+> at all, those two files included. Only the workspace-level files differ
+> (`Cargo.toml` does), and the paths that exist only here —
+> `.gitignore`, `README.md`, `STATUS.md`, `testdata/`, the kernel crates, and
+> `dc-regress` / `dc-regress-store` — have no MANVI counterpart. Re-check with:
 >
 > ```bash
-> diff -rq --exclude=target <manvi>/crates rust \
->   | grep -v 'Only in rust'   # must name exactly the two files above
+> for c in dc-evidence dc-glob dc-grep dc-proc dc-store dc-verify; do
+>   diff -rq --exclude=target <manvi>/crates/$c rust/$c   # prints nothing when identical
+> done
 > ```
 >
 > The relationship, the component inventory, and the checklist a newly ported
@@ -144,7 +147,9 @@ A passing test is not evidence until it has been shown it can fail.
 
 ## 3. Changes made during the port
 
-Four, all forced by the move. Everything else is byte-identical to MANVI.
+Four, all forced by the move. Everything else was byte-identical to MANVI.
+(As of 2026-10-07 the four have converged too: all six shared `dc-*` crates
+diff clean against MANVI's copy; see the note under the header.)
 
 1. **`dc-glob` fixture path.** The CPython `fnmatch` parity fixture lives once,
    at `testdata/fnmatch-parity.tsv` in the repository root. `dc-glob` and the Go
@@ -196,7 +201,7 @@ the Python they resemble, and in one case they are clearly worse.
 
 | Capability | DevCouncil (Python) | `dc-verify` (Rust) | Honest verdict |
 |---|---|---|---|
-| **Stub / placeholder detection** | `verification/stub_detector.py`, 369 lines: **AST parse** of changed files, per-language idioms, `devcouncil: allow-stub` escape hatch gated on the task mentioning scaffolding, assert-free test detection, skipped-test detection, separate stub-**declaration** audit | **2026-10-06:** `rigor::detect_stubs_with` + `stub_ast`: tree-sitter parse (Rust, Go, Python, TypeScript/TSX) of each changed file's post-image, read from `--root` and believed only when it matches the diff's added lines. Placeholders (`todo!`/`unimplemented!`, `panic("TODO")`, `raise NotImplementedError` as a whole body outside `@abstractmethod`, `throw new Error("not implemented")`) block and are `proven`; empty / `pass`-only bodies are advisory, and block when a comment inside says unfinished. Skipped tests (`#[ignore]`, first-statement `t.Skip`, `pytest.mark.skip`/`unittest.skip`, `it.skip`/`xit`/…) are advisory `skipped_test`; tests with no assertion are advisory, `derived` `assert_free_test`. `allow-stub: <reason>` on or above the line, or above the enclosing function, moves the finding to advisory `stub_allowed` carrying the reason (`stub_declared` gap); a marker with no reason is ignored. Other languages, unreadable or mismatched sources, and syntax errors fall back to the old substring check, labelled `derived`. Measured on `tests/corpus/cases.txt` (44 cases, 0 false accepts, 0 false positives; disabling the parse path gives 12 false accepts and 3 false positives). | **Parity on the listed capabilities**, Python having been retired in Phase 7. Not ported: the Python escape hatch's "task mentions scaffolding" gate (here the reason is required and recorded instead), and the separate declaration audit. In the substring fallback a marker above a function does not reach a placeholder inside it. |
+| **Stub / placeholder detection** | `verification/stub_detector.py`, 369 lines: **AST parse** of changed files, per-language idioms, `devcouncil: allow-stub` escape hatch gated on the task mentioning scaffolding, assert-free test detection, skipped-test detection, separate stub-**declaration** audit | **2026-10-06:** `rigor::detect_stubs_with` + `stub_ast`: tree-sitter parse (Rust, Go, Python, TypeScript/TSX) of each changed file's post-image, read from `--root` and believed only when it matches the diff's added lines. Placeholders (`todo!`/`unimplemented!`, `panic("TODO")`, `raise NotImplementedError` as a whole body outside `@abstractmethod`, `throw new Error("not implemented")`) block and are `proven`; empty / `pass`-only bodies are advisory, and block when a comment inside says unfinished. Skipped tests (`#[ignore]`, first-statement `t.Skip`, `pytest.mark.skip`/`unittest.skip`, `it.skip`/`xit`/…) are advisory `skipped_test`; tests with no assertion are advisory, `derived` `assert_free_test`. `allow-stub: <reason>` on or above the line, or above the enclosing function, moves the finding to advisory `stub_allowed` carrying the reason (`stub_declared` gap); a marker with no reason is ignored. Other languages, unreadable or mismatched sources, and syntax errors fall back to the old substring check, labelled `derived`. Measured on `tests/corpus/cases.txt` (45 cases, 0 false accepts, 0 false positives; disabling the parse path gives 12 false accepts and 3 false positives). | **Parity on the listed capabilities**, Python having been retired in Phase 7. Not ported: the Python escape hatch's "task mentions scaffolding" gate (here the reason is required and recorded instead), and the separate declaration audit. In the substring fallback the function a marker covers is inferred as the nearest less-indented `fn`/`def`/`func`/`function` line above the placeholder, which misses languages without such a keyword (Java, C#). |
 | **Secret / credential scanning** | `gating/checks/secret_scan_check.py`, wired into `verifier.py` and `gated_write.py` | `rigor::scan_secrets`, with evidence redaction | Roughly comparable; both exist. Needs a differential corpus run before either is called better. **Unverified.** |
 | **Orphan-diff / scope** | `checks/orphan_diff.py` reads `git diff --name-status`, exact set membership against planned paths | `parse_unified` + `classify_scope`, full unified-diff parse, fail-closed on malformed input | Rust parses the diff body rather than trusting git's name list, and returns `untouched_planned` as well. **Plausible improvement, unmeasured.** |
 | **Diff↔coverage** | `diff_coverage.py` + `coverage_measurement.py`, ~800 lines, runs the suite under instrumentation; coverage.py-centric | `coverage::parse` handles **Go `-coverprofile` and LCOV**; does not run anything | **Complementary, not competing.** Rust adds non-Python coverage formats; Python owns the instrumentation run. |
