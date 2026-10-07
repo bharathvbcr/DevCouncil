@@ -165,11 +165,21 @@ impl SemanticIndex {
     /// not a match, and padding a ranked list with them turns "nothing matched"
     /// into a page of results.
     pub fn score(&self, query: &str, cancel: &Cancel) -> Result<Vec<(usize, f32)>, QueryCancelled> {
-        let terms = tokenize(query);
+        self.score_terms(&tokenize(query), cancel)
+    }
+
+    /// [`Self::score`] over terms the caller already chose — `ask` drops the
+    /// words a question is phrased in before scoring (see
+    /// [`crate::ask::question_terms`]).
+    pub fn score_terms(
+        &self,
+        terms: &[String],
+        cancel: &Cancel,
+    ) -> Result<Vec<(usize, f32)>, QueryCancelled> {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let query_vector = Self::unit_vector(&terms, &self.idf);
+        let query_vector = Self::unit_vector(terms, &self.idf);
         let mut scored: Vec<(usize, f32)> = Vec::new();
         for (index, document) in self.documents.iter().enumerate() {
             cancel.check_every(index)?;

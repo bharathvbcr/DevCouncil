@@ -272,3 +272,79 @@ fn call_adjacency_excludes_edges_below_the_floor() {
         call_adjacency(&index, &nodes, &seeds, Confidence::SPECULATIVE.0);
     assert!(any && admitted);
 }
+
+/// The ScholarLM shape, measured 2026-10-07: "where does the Go backend decode
+/// seeded papers" ranked `decodeSearchPapers` 44th, behind `AsOptionalString`,
+/// `WriteErrorCtx` and `firstNonEmpty`.
+///
+/// Two causes. "Go" and "backend" match the *path* of every Go symbol, so
+/// almost the whole backend became a seed; and the order was personalized
+/// PageRank alone, so a helper every seed calls collected the mass of all of
+/// them and outranked the one symbol whose name says what was asked. The words
+/// "where", "does" and "the" also became query terms, seeding any symbol that
+/// happened to contain one.
+fn hub_store() -> Store {
+    let mut files: Vec<(String, String)> = vec![
+        (
+            "backend/go_orchestrator/internal/api/full_paper_routes.go".into(),
+            "package api\n\nfunc decodeSearchPapers(value any) []string {\n\treturn nil\n}\n".into(),
+        ),
+        (
+            "backend/go_orchestrator/internal/util/journal.go".into(),
+            "package util\n\nfunc AsOptionalString(value any) string {\n\treturn \"\"\n}\n".into(),
+        ),
+        (
+            // Shares only the word "where" with the question.
+            "web/sql/clause.ts".into(),
+            "export function whereClause(): string {\n  return '';\n}\n".into(),
+        ),
+    ];
+    for index in 0..40 {
+        files.push((
+            format!("backend/go_orchestrator/internal/handlers/h{index}.go"),
+            format!(
+                "package handlers\n\nimport \"scholarlm/backend/go_orchestrator/internal/util\"\n\n\
+                 func Handler{index}() string {{\n\treturn util.AsOptionalString({index})\n}}\n"
+            ),
+        ));
+    }
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect();
+    store_of(&borrowed)
+}
+
+#[test]
+fn a_name_that_says_what_was_asked_outranks_a_hub_the_seeds_call() {
+    let store = hub_store();
+    let hits = ask(
+        &store,
+        "where does the Go backend decode seeded papers",
+        0.0,
+    );
+    let names: Vec<&str> = hits
+        .items
+        .iter()
+        .map(|hit| hit.symbol_name.as_str())
+        .collect();
+    assert_eq!(
+        names.first().copied(),
+        Some("decodeSearchPapers"),
+        "ranked: {names:?}"
+    );
+}
+
+#[test]
+fn question_words_do_not_seed_symbols() {
+    let store = hub_store();
+    let hits = ask(&store, "where does the Go backend decode seeded papers", 0.0);
+    assert!(
+        hits.items.iter().all(|hit| hit.symbol_name != "whereClause"),
+        "`where` is a question word here, not a term: {:?}",
+        hits.items
+            .iter()
+            .map(|hit| hit.symbol_name.as_str())
+            .collect::<Vec<_>>()
+    );
+}

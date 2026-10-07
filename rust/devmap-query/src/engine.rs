@@ -2156,7 +2156,7 @@ impl<'a> StoreQueryEngine<'a> {
             })
             .collect();
         let index = crate::semantic::SemanticIndex::build(&texts, &self.cancel)?;
-        let scored = index.score(query, &self.cancel)?;
+        let scored = index.score_terms(&crate::ask::question_terms(query), &self.cancel)?;
         if scored.is_empty() {
             let mut response = budget_take(Vec::new(), token_budget, |_| 0);
             response.walk_incomplete =
@@ -2192,13 +2192,17 @@ impl<'a> StoreQueryEngine<'a> {
             .iter()
             .map(|&position| symbols[position].qualified_name.clone())
             .collect();
+        // Membership through a set: the linear scan this replaced was
+        // O(nodes × edges) — every admitted edge searched the whole list twice.
+        let mut known: std::collections::HashSet<String> = nodes.iter().cloned().collect();
         for id in 0..edges.len() as u32 {
             self.cancel.check_every(id as usize)?;
             if edges.kind(id) != EdgeKind::Calls || !edges.admits(id, min_confidence) {
                 continue;
             }
             for name in [edges.source_symbol(id), edges.target_symbol(id)] {
-                if !nodes.iter().any(|existing| existing == name) {
+                if !known.contains(name) {
+                    known.insert(name.to_string());
                     nodes.push(name.to_string());
                 }
             }
@@ -2230,12 +2234,32 @@ impl<'a> StoreQueryEngine<'a> {
         }
 
         let ranks = crate::ask::personalized_pagerank(&outbound, &personalization, &self.cancel)?;
-        let mut ordered: Vec<(usize, f32)> = seed_positions
+        // Each side normalised to the best seed, then blended — see
+        // `ASK_LEXICAL_WEIGHT`. A zero maximum means that side separates
+        // nothing, and it contributes nothing rather than dividing by zero.
+        let graph: Vec<f32> = seed_positions
             .iter()
             .map(|&position| {
                 let name = symbols[position].qualified_name.as_str();
-                let rank = node_rank.get(name).map(|&i| ranks[i]).unwrap_or(0.0);
-                (position, rank)
+                node_rank.get(name).map(|&i| ranks[i]).unwrap_or(0.0)
+            })
+            .collect();
+        let normalise = |value: f32, max: f32| {
+            if max > 0.0 && value.is_finite() {
+                value / max
+            } else {
+                0.0
+            }
+        };
+        let max_lexical = scored.iter().map(|(_, score)| *score).fold(0.0f32, f32::max);
+        let max_graph = graph.iter().copied().fold(0.0f32, f32::max);
+        let mut ordered: Vec<(usize, f32)> = scored
+            .iter()
+            .zip(&graph)
+            .map(|(&(position, lexical), &rank)| {
+                let blended = crate::ask::ASK_LEXICAL_WEIGHT * normalise(lexical, max_lexical)
+                    + (1.0 - crate::ask::ASK_LEXICAL_WEIGHT) * normalise(rank, max_graph);
+                (position, blended)
             })
             .collect();
         ordered.sort_by(|a, b| {
