@@ -83,6 +83,8 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
     (
         "devmap-query",
         &[
+            // Exists to run without grammars: GitPulse's shape.
+            "a_query_only_build_can_call_a_store_current",
             "artifact_writer_security",
             "artifacts_sidecar_adversarial",
             "documentation_visibility",

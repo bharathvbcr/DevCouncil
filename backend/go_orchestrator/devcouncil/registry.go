@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
@@ -140,7 +142,17 @@ func toolSpecs() []ToolSpec {
 }
 
 // Call dispatches one tool by name.
+//
+// Arguments the tool's own input schema does not declare are refused first,
+// with invalid_argument, before any lease, store or git is consulted. Nothing
+// else enforces a schema at runtime, and an argument dropped without a word is
+// a configuration the caller believes it made: `sandbox: "docker"` on
+// verify_task came back as a report the caller would read as the isolated run
+// it asked for, while every command ran on the host (TASK-P7-2).
 func (r *Registry) Call(ctx context.Context, name string, args map[string]any) (any, error) {
+	if refusal, ok := undeclaredArgument(name, args); ok {
+		return refusal, nil
+	}
 	switch name {
 	case "devcouncil_get_diff":
 		return r.callGetDiff(ctx, args)
@@ -239,25 +251,7 @@ func (r *Registry) callNextTask(ctx context.Context, args map[string]any) any {
 	return map[string]any{"ok": true, "task_id": ids[0], "task": task}
 }
 
-// verifyTaskArguments is every argument devcouncil_verify_task's schema
-// declares. Nothing enforces a tool schema at runtime, so callVerify checks it.
-var verifyTaskArguments = map[string]bool{"task_id": true, "lease_token": true}
-
 func (r *Registry) callVerify(ctx context.Context, args map[string]any) any {
-	// Refused before the lease or the store is consulted. An argument dropped
-	// without a word is a configuration the caller believes it made: a
-	// `sandbox: "docker"` that was ignored came back as a report the caller
-	// would read as the isolated run it asked for, while every command ran on
-	// the host (TASK-P7-2).
-	for name := range args {
-		if !verifyTaskArguments[name] {
-			msg := "devcouncil_verify_task takes only task_id and lease_token; refusing argument " + name
-			if name == "sandbox" {
-				msg += ": verification runs on the host and the only sandbox is " + verify.SandboxLocal
-			}
-			return ErrorPayload{OK: false, Code: "invalid_argument", Error: msg}
-		}
-	}
 	taskID, _ := args["task_id"].(string)
 	token, _ := args["lease_token"].(string)
 	if taskID == "" || token == "" {
@@ -435,3 +429,60 @@ func (r *Registry) callPolicyCheck(ctx context.Context, args map[string]any) any
 }
 
 func rawSchema(s string) json.RawMessage { return json.RawMessage(s) }
+
+// argumentHints says, for an argument callers send expecting it to work, why
+// it is refused rather than merely that it is.
+var argumentHints = map[string]string{
+	"sandbox": "verification runs on the host and the only sandbox is " + verify.SandboxLocal,
+}
+
+// undeclaredArgument refuses an argument the named tool's input schema does
+// not declare, when that schema sets additionalProperties:false. The schema is
+// read from toolSpecs, the same text tools/list advertises, so the check and
+// the advertisement cannot disagree. Names are checked in sorted order so the
+// refusal is deterministic. An unknown tool is left to Call's own refusal.
+func undeclaredArgument(tool string, args map[string]any) (ErrorPayload, bool) {
+	if len(args) == 0 {
+		return ErrorPayload{}, false
+	}
+	for _, spec := range toolSpecs() {
+		if spec.Name != tool {
+			continue
+		}
+		var schema struct {
+			Properties           map[string]json.RawMessage `json:"properties"`
+			AdditionalProperties *bool                      `json:"additionalProperties"`
+		}
+		if err := json.Unmarshal(spec.InputSchema, &schema); err != nil {
+			// A schema this package wrote and cannot read is a bug here, and
+			// refusing every call names it rather than accepting anything.
+			return ErrorPayload{OK: false, Code: "invalid_argument",
+				Error: tool + " has an unreadable input schema: " + err.Error()}, true
+		}
+		if schema.AdditionalProperties == nil || *schema.AdditionalProperties {
+			return ErrorPayload{}, false
+		}
+		names := make([]string, 0, len(args))
+		for name := range args {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if _, declared := schema.Properties[name]; declared {
+				continue
+			}
+			declaredNames := make([]string, 0, len(schema.Properties))
+			for p := range schema.Properties {
+				declaredNames = append(declaredNames, p)
+			}
+			sort.Strings(declaredNames)
+			msg := tool + " takes only " + strings.Join(declaredNames, ", ") + "; refusing argument " + name
+			if hint, ok := argumentHints[name]; ok {
+				msg += ": " + hint
+			}
+			return ErrorPayload{OK: false, Code: "invalid_argument", Error: msg}, true
+		}
+		return ErrorPayload{}, false
+	}
+	return ErrorPayload{}, false
+}

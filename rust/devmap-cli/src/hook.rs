@@ -759,7 +759,10 @@ const HEALTH_NOTE_CAP: usize = 200;
 /// Every one of them — a version that disagrees with the binary, a malformed
 /// bundle layout, hooks still written in the `args`/`async` form — is repaired
 /// by regenerating the bundle, so a single constant remedy is accurate rather
-/// than a guess.
+/// than a guess. That holds because the check reads only the install Claude
+/// Code records as active: cache directories left by earlier installs are not
+/// repaired by reinstalling, so they go to `plugin_cleanup_note` in
+/// diagnostics and never reach this brief.
 const HEALTH_REMEDY: &str = "re-run `devmap claude plugin` and reinstall the bundle";
 
 /// Defensive ceiling on the whole SessionStart context.

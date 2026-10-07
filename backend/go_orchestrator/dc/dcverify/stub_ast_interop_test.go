@@ -55,6 +55,30 @@ new file mode 100644
 	}
 }
 
+// The real binary's parsed-file count decides whether the test-rigor gates
+// are reported as applied.
+func TestTestRigorGatesAreClaimedOnlyForParsedLanguages(t *testing.T) {
+	for _, tc := range []struct {
+		path  string
+		line  string
+		claim bool
+	}{
+		{"src/T.java", "class T { void t() {} }", false},
+		{"src/t.rs", "fn t() {}", true},
+	} {
+		diff := "diff --git a/" + tc.path + " b/" + tc.path + "\nnew file mode 100644\n--- /dev/null\n+++ b/" +
+			tc.path + "\n@@ -0,0 +1 @@\n+" + tc.line + "\n"
+		result, err := client(t).Check(context.Background(), Request{Diff: diff})
+		if err != nil {
+			t.Fatalf("%s: %v", tc.path, err)
+		}
+		gates := strings.Join(result.GatesRun(), ",")
+		if got := strings.Contains(gates, GateSkippedTest); got != tc.claim {
+			t.Errorf("%s: GatesRun()=%s; claims test-rigor ran = %v, want %v", tc.path, gates, got, tc.claim)
+		}
+	}
+}
+
 // A modified file is parsed from the working tree under --root, which is what
 // lets the gate tell a placeholder from the same bytes in a string literal.
 func TestTheBinaryParsesTheWorkingTreeAndHonoursAllowStub(t *testing.T) {

@@ -143,7 +143,26 @@ pub fn detect_stubs_with(
     files: &[FileDiff],
     source: &dyn Fn(&FileDiff) -> Option<String>,
 ) -> Vec<Finding> {
+    detect_stubs_report(files, source).findings
+}
+
+/// What one stub pass found, and how many files it parsed to find it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StubReport {
+    pub findings: Vec<Finding>,
+    /// Files analysed by [`stub_ast`] rather than line-matched. The skipped-
+    /// and assert-free-test checks exist only on that path, so a report with
+    /// zero here ran neither, and must not say it did.
+    pub parsed_files: usize,
+}
+
+/// [`detect_stubs_with`], also reporting how many files were parsed.
+pub fn detect_stubs_report(
+    files: &[FileDiff],
+    source: &dyn Fn(&FileDiff) -> Option<String>,
+) -> StubReport {
     let mut findings = Vec::new();
+    let mut parsed_files = 0;
     for file in files {
         let post_image = post_image(file, source);
         let lines: Option<Vec<&str>> = post_image.as_deref().map(|s| s.lines().collect());
@@ -157,6 +176,7 @@ pub fn detect_stubs_with(
         let mut mine = Vec::new();
         let mut scopes = Vec::new();
         if let Some(ast) = &ast {
+            parsed_files += 1;
             for f in ast {
                 let evidence = lines
                     .as_ref()
@@ -181,7 +201,10 @@ pub fn detect_stubs_with(
         apply_allow_stub(&mut mine, &scopes, file, lines.as_deref());
         findings.extend(mine);
     }
-    findings
+    StubReport {
+        findings,
+        parsed_files,
+    }
 }
 
 /// The file as it stands after the change, or `None` when it cannot be known.

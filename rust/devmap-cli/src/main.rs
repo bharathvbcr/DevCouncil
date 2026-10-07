@@ -2174,6 +2174,7 @@ fn doctor_report(
         "duplicate_mcp_registration_warning": duplicate_mcp_registration_warning(),
         "stray_state_warning": stray_state_warning(),
         "plugin_warning": plugin_warning(),
+        "plugin_cleanup_note": plugin_cleanup_note(),
         "stale_server_warning": stale_server_warning(),
         "mcp_registrations": mcp_registration_inventory(),
     }))
@@ -2309,7 +2310,12 @@ fn inventory_devmap_binaries(
             }
         }
     }
-    for (label, config_path) in host_mcp_config_paths() {
+    for McpConfigSite {
+        label,
+        path: config_path,
+        ..
+    } in host_mcp_config_paths()
+    {
         if let Some(command) = read_devmap_command_from_mcp_config(&config_path) {
             let resolved = resolve_devmap_command(&command);
             let key = resolved.display().to_string();
@@ -2342,54 +2348,185 @@ fn inventory_devmap_binaries(
     Ok(rows)
 }
 
-fn host_mcp_config_paths() -> Vec<(String, PathBuf)> {
+/// The host that loads an MCP config document.
+///
+/// Two registrations are duplicates only when one host loads both. Cursor and
+/// Claude Code never share a process, so an entry in each is two hosts served
+/// once apiece — counting them together reported a duplicate on every machine
+/// that had integrated both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum McpHost {
+    Cursor,
+    ClaudeCode,
+}
+
+impl McpHost {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cursor => "cursor",
+            Self::ClaudeCode => "claude-code",
+        }
+    }
+}
+
+/// One MCP config document a diagnostic inspects.
+struct McpConfigSite {
+    label: String,
+    path: PathBuf,
+    /// `None` for a document no host loads as it stands: the plugin bundle a
+    /// marketplace installs *from*, or a plugin Claude Code has disabled. Still
+    /// inventoried — it names a binary — but never counted as a registration.
+    host: Option<McpHost>,
+}
+
+/// Plugin bundle sources `devmap claude plugin` writes. A marketplace copies
+/// them into the plugin cache on install; nothing loads them in place.
+const PLUGIN_BUNDLE_SOURCES: &[&str] = &[
+    ".devcouncil/devmap-plugin/.mcp.json",
+    ".devmap/devmap-plugin/.mcp.json",
+];
+
+fn host_mcp_config_paths() -> Vec<McpConfigSite> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    host_mcp_config_sites(home.as_deref(), &cwd)
+}
+
+fn host_mcp_config_sites(home: Option<&Path>, cwd: &Path) -> Vec<McpConfigSite> {
+    let site =
+        |label: String, path: PathBuf, host: Option<McpHost>| McpConfigSite { label, path, host };
     let mut out = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        out.push((
+    if let Some(home) = home {
+        out.push(site(
             "~/.cursor/mcp.json".to_string(),
             home.join(".cursor/mcp.json"),
+            Some(McpHost::Cursor),
         ));
-        out.push(("~/.claude.json".to_string(), home.join(".claude.json")));
-        let cache = home
-            .join(".claude")
-            .join("plugins")
-            .join("cache")
-            .join("devmap-local")
-            .join("devmap");
-        if let Ok(entries) = std::fs::read_dir(&cache) {
-            for entry in entries.flatten() {
-                let mcp = entry.path().join(".mcp.json");
-                if mcp.is_file() {
-                    out.push((mcp.display().to_string(), mcp));
-                }
+        out.push(site(
+            "~/.claude.json".to_string(),
+            home.join(".claude.json"),
+            Some(McpHost::ClaudeCode),
+        ));
+        // Only the version Claude Code's install record names. Every other
+        // directory under the cache is a leftover from an earlier install that
+        // nothing loads; `plugin_cleanup_note` reports those.
+        let install = claude_plugin_install(home);
+        let host = (install.enabled == Some(true)).then_some(McpHost::ClaudeCode);
+        for dir in &install.active {
+            let mcp = dir.join(".mcp.json");
+            if mcp.is_file() {
+                out.push(site(mcp.display().to_string(), mcp, host));
             }
         }
-        for rel in [
-            ".devcouncil/devmap-plugin/.mcp.json",
-            ".devmap/devmap-plugin/.mcp.json",
-        ] {
+        for rel in PLUGIN_BUNDLE_SOURCES {
             let path = home.join(rel);
             if path.is_file() {
-                out.push((format!("~/{rel}"), path));
+                out.push(site(format!("~/{rel}"), path, None));
             }
         }
     }
-    out.push((
+    out.push(site(
         ".cursor/mcp.json".to_string(),
-        PathBuf::from(".cursor").join("mcp.json"),
+        cwd.join(".cursor").join("mcp.json"),
+        Some(McpHost::Cursor),
     ));
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    for rel in [
-        ".devcouncil/devmap-plugin/.mcp.json",
-        ".devmap/devmap-plugin/.mcp.json",
-    ] {
+    for rel in PLUGIN_BUNDLE_SOURCES {
         let path = cwd.join(rel);
         if path.is_file() {
-            out.push((rel.to_string(), path));
+            out.push(site(rel.to_string(), path, None));
         }
     }
     out
+}
+
+/// What Claude Code records about the Dev Map plugin under one home.
+struct ClaudePluginInstall {
+    /// `~/.claude/plugins/cache/<marketplace>/<plugin>`.
+    cache: PathBuf,
+    /// Version directories `installed_plugins.json` names under [`Self::cache`]:
+    /// the ones Claude Code actually loads.
+    active: Vec<PathBuf>,
+    /// `enabledPlugins` in `~/.claude/settings.json` for the recorded key.
+    /// `None` when no setting names it.
+    enabled: Option<bool>,
+    /// Why the install record could not be read, when it exists but is not
+    /// usable. A record nobody could read is not a record naming nothing.
+    record_error: Option<String>,
+    /// Version directories under the cache that the record does not name.
+    leftovers: Vec<PathBuf>,
+}
+
+fn claude_plugin_install(home: &Path) -> ClaudePluginInstall {
+    let plugins = home.join(".claude").join("plugins");
+    let cache = plugins
+        .join("cache")
+        .join(claude::MARKETPLACE_NAME)
+        .join(claude::PLUGIN_NAME);
+    let record = plugins.join("installed_plugins.json");
+    let mut active: Vec<PathBuf> = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
+    let mut record_error = None;
+    match std::fs::read_to_string(&record) {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(value) => match value.get("plugins").and_then(serde_json::Value::as_object) {
+                // Matched by where the install lives, not by spelling the key:
+                // the key is `<plugin>@<marketplace>`, and the cache path is the
+                // part this binary owns.
+                Some(map) => {
+                    for (key, installs) in map {
+                        let paths = installs
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|install| install.get("installPath")?.as_str())
+                            .map(PathBuf::from);
+                        for path in paths {
+                            if path.parent() == Some(cache.as_path()) && !active.contains(&path) {
+                                active.push(path);
+                                if !keys.contains(key) {
+                                    keys.push(key.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    record_error = Some(format!("{} has no `plugins` object", record.display()))
+                }
+            },
+            Err(error) => record_error = Some(format!("{} is not JSON: {error}", record.display())),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => record_error = Some(format!("{}: {error}", record.display())),
+    }
+    let enabled = std::fs::read_to_string(home.join(".claude").join("settings.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|settings| {
+            let map = settings.get("enabledPlugins")?.as_object()?;
+            let flags: Vec<bool> = keys
+                .iter()
+                .filter_map(|key| map.get(key)?.as_bool())
+                .collect();
+            (!flags.is_empty()).then(|| flags.contains(&true))
+        });
+    let mut leftovers: Vec<PathBuf> = std::fs::read_dir(&cache)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|dir| dir.is_dir() && !active.contains(dir))
+                .collect()
+        })
+        .unwrap_or_default();
+    leftovers.sort();
+    ClaudePluginInstall {
+        cache,
+        active,
+        enabled,
+        record_error,
+        leftovers,
+    }
 }
 
 fn resolve_devmap_command(command: &str) -> PathBuf {
@@ -2590,57 +2727,84 @@ fn mcp_entry_is_pinned(path: &Path) -> bool {
         .any(|a| a == "--root" || a == "--db")
 }
 
+/// Registrations of `devmap mcp` across the documents a diagnostic inspects.
+///
+/// `global` and `pinned` hold what a host loads, each row naming that host;
+/// `not_loaded` holds documents that name the server but that no host loads as
+/// they stand (a plugin bundle source, a disabled plugin).
 fn mcp_registration_inventory() -> serde_json::Value {
+    mcp_registration_inventory_of(&host_mcp_config_paths())
+}
+
+fn mcp_registration_inventory_of(sites: &[McpConfigSite]) -> serde_json::Value {
     let mut global = Vec::new();
     let mut pinned = Vec::new();
-    for (label, path) in host_mcp_config_paths() {
-        if !path.is_file() || !mcp_entry_looks_like_devmap_mcp(&path) {
+    let mut not_loaded = Vec::new();
+    for site in sites {
+        if !site.path.is_file() || !mcp_entry_looks_like_devmap_mcp(&site.path) {
             continue;
         }
         let row = serde_json::json!({
-            "label": label,
-            "path": path.display().to_string(),
+            "label": site.label,
+            "path": site.path.display().to_string(),
+            "host": site.host.map(McpHost::as_str),
         });
-        if mcp_entry_is_pinned(&path) {
+        if site.host.is_none() {
+            not_loaded.push(row);
+        } else if mcp_entry_is_pinned(&site.path) {
             pinned.push(row);
         } else {
             global.push(row);
         }
     }
-    serde_json::json!({ "global": global, "pinned": pinned })
+    serde_json::json!({ "global": global, "pinned": pinned, "not_loaded": not_loaded })
 }
 
 fn duplicate_mcp_registration_warning() -> Option<String> {
-    let inventory = mcp_registration_inventory();
-    let globals = inventory
-        .get("global")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let pinned = inventory
-        .get("pinned")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if globals.len() <= 1 {
+    duplicate_registration_message(&mcp_registration_inventory())
+}
+
+/// A duplicate is one host loading the same unpinned server twice — a
+/// user-scope `~/.claude.json` entry beside an enabled plugin's `.mcp.json`, or
+/// `~/.cursor/mcp.json` beside a project `.cursor/mcp.json`. One registration
+/// per host, across several hosts, is the intended shape and says nothing.
+fn duplicate_registration_message(inventory: &serde_json::Value) -> Option<String> {
+    let rows = |key: &str| {
+        inventory
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut by_host: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for row in rows("global") {
+        let (Some(host), Some(label), Some(path)) = (
+            row.get("host").and_then(serde_json::Value::as_str),
+            row.get("label").and_then(serde_json::Value::as_str),
+            row.get("path").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        by_host
+            .entry(host.to_string())
+            .or_default()
+            .push(format!("{label} ({path})"));
+    }
+    let duplicated: Vec<String> = by_host
+        .into_iter()
+        .filter(|(_, entries)| entries.len() > 1)
+        .map(|(host, entries)| format!("{host} loads {}", entries.join("; ")))
+        .collect();
+    if duplicated.is_empty() {
         return None;
     }
-    let global_list = globals
-        .iter()
-        .filter_map(|row| {
-            Some(format!(
-                "{} ({})",
-                row.get("label")?.as_str()?,
-                row.get("path")?.as_str()?
-            ))
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
     let mut message = format!(
-        "the same unpinned `devmap mcp` command is registered more than once: {global_list}. \
-         Cursor shares one process across tabs, so duplicate global registrations are not a \
-         substitute for passing repo_path"
+        "the same unpinned `devmap mcp` command is registered more than once for one host: {}. \
+         Each registration is its own server for that host; keep one. Registrations in \
+         different hosts are not duplicates, and neither replaces passing repo_path",
+        duplicated.join(" | ")
     );
+    let pinned = rows("pinned");
     if !pinned.is_empty() {
         let pinned_list = pinned
             .iter()
@@ -2693,22 +2857,77 @@ fn stray_state_warning() -> Option<String> {
     ))
 }
 
+/// Problems with the plugin Claude Code actually loads, each repaired by
+/// regenerating and reinstalling the bundle. SessionStart injects this, so it
+/// must never carry anything that remedy does not fix — see
+/// [`plugin_cleanup_note`] for what it deliberately leaves out.
 fn plugin_warning() -> Option<String> {
-    let mut issues = Vec::new();
-    let binary_version = env!("CARGO_PKG_VERSION");
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let cache = home
-        .join(".claude")
-        .join("plugins")
-        .join("cache")
-        .join("devmap-local")
-        .join("devmap");
-    let Ok(entries) = std::fs::read_dir(&cache) else {
-        return None;
-    };
-    for entry in entries.flatten() {
-        let dir = entry.path();
+    let issues = plugin_health(&home).issues;
+    (!issues.is_empty()).then(|| issues.join("; "))
+}
+
+/// Cache directories from earlier installs that Claude Code no longer loads.
+///
+/// Kept out of [`plugin_warning`] on purpose. Checking every directory under
+/// the cache made a leftover `0.2.3` beside an active `0.2.4` read as "installed
+/// plugin version 0.2.3 does not match binary 0.2.4" in every session brief,
+/// with a remedy (reinstall) that leaves the leftover where it is. Diagnostics
+/// still name them, as housekeeping rather than as a fault.
+fn plugin_cleanup_note() -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let cleanup = plugin_health(&home).cleanup;
+    (!cleanup.is_empty()).then(|| cleanup.join("; "))
+}
+
+struct PluginHealth {
+    issues: Vec<String>,
+    cleanup: Vec<String>,
+}
+
+fn plugin_health(home: &Path) -> PluginHealth {
+    let mut issues = Vec::new();
+    let mut cleanup = Vec::new();
+    let binary_version = env!("CARGO_PKG_VERSION");
+    let install = claude_plugin_install(home);
+    if let Some(error) = &install.record_error {
+        issues.push(format!(
+            "cannot tell which Dev Map plugin version Claude Code loads ({error}); the \
+             installed version is unchecked"
+        ));
+    }
+    if !install.leftovers.is_empty() {
+        let names = install
+            .leftovers
+            .iter()
+            .filter_map(|dir| dir.file_name()?.to_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let active = if install.active.is_empty() {
+            "no install record names any version".to_string()
+        } else {
+            format!(
+                "the active install is {}",
+                install
+                    .active
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        cleanup.push(format!(
+            "leftover Dev Map plugin cache version(s) {names} under {}: Claude Code does not \
+             load them ({active}); safe to delete",
+            install.cache.display()
+        ));
+    }
+    for dir in &install.active {
         if !dir.is_dir() {
+            issues.push(format!(
+                "{}: installed_plugins.json names this install, and it does not exist",
+                dir.display()
+            ));
             continue;
         }
         let version_name = dir
@@ -2803,11 +3022,7 @@ fn plugin_warning() -> Option<String> {
         }
     }
 
-    if issues.is_empty() {
-        None
-    } else {
-        Some(issues.join("; "))
-    }
+    PluginHealth { issues, cleanup }
 }
 
 /// Parse `ps` elapsed time — `[[dd-]hh:]mm:ss` — into a duration.
@@ -6984,6 +7199,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 "duplicate_mcp_registration_warning": duplicate_mcp_registration_warning(),
                 "stray_state_warning": stray_state_warning(),
                 "plugin_warning": plugin_warning(),
+                "plugin_cleanup_note": plugin_cleanup_note(),
                 "stale_server_warning": stale_server_warning(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "build": build_identity_json(),

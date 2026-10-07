@@ -369,15 +369,19 @@ fn live_ids(db: &Path) -> Vec<i64> {
     ids
 }
 
-/// The ledger carries the prune's index and no others.
+/// The ledger carries the prune's index and `impact`'s, and no others.
 ///
 /// `idx_unresolved_rows_callee` and `idx_unresolved_rows_class` were dropped in
 /// v21: nothing read either, and together they cost two b-tree insertions on
-/// every one of this repository's 180,679 ledger rows. Pinned by name because
-/// the way they come back is someone adding a query, noticing a `SCAN`, and
-/// indexing the column without checking whether the scan was the right plan.
+/// every one of this repository's 180,679 ledger rows. v24 re-added the callee
+/// index, and only it, once `impact` started filtering the ledger by
+/// `callee_name` (`Store::unresolved_sites_naming`), with the plan and an
+/// interleaved A/B recorded on `MIGRATION_V23_TO_V24`. Still pinned by name,
+/// because the way an index comes back is someone adding a query, noticing a
+/// `SCAN`, and indexing the column without checking whether the scan was the
+/// right plan.
 #[test]
-fn the_ledger_carries_only_the_index_the_prune_uses() {
+fn the_ledger_carries_only_the_indexes_its_readers_use() {
     let dir = tmp_dir("ledger-indexes");
     let db = write_ledger(&dir, (0..10).map(row).collect());
     let conn = Connection::open(&db).unwrap();
@@ -396,8 +400,11 @@ fn the_ledger_carries_only_the_index_the_prune_uses() {
         .unwrap();
     assert_eq!(
         names,
-        vec!["idx_unresolved_rows_closed".to_string()],
-        "the ledger should carry exactly the prune's partial index"
+        vec![
+            "idx_unresolved_rows_callee".to_string(),
+            "idx_unresolved_rows_closed".to_string(),
+        ],
+        "the ledger should carry exactly the prune's partial index and impact's callee index"
     );
     let _ = fs::remove_dir_all(&dir);
 }

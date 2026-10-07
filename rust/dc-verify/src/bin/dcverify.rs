@@ -12,7 +12,7 @@
 use std::io::Read;
 use std::process::ExitCode;
 
-use dc_verify::rigor::{Finding, Severity, detect_stubs_with, intersect_coverage, scan_secrets};
+use dc_verify::rigor::{Finding, Severity, detect_stubs_report, intersect_coverage, scan_secrets};
 use dc_verify::{classify_scope, parse_unified};
 
 #[path = "../evidence_cli.rs"]
@@ -206,9 +206,8 @@ fn check(
 
     let scope = classify_scope(&files, planned);
     let mut findings = scan_secrets(&files);
-    findings.extend(detect_stubs_with(&files, &|file| {
-        read_post_image(root, &file.path)
-    }));
+    let stubs = detect_stubs_report(&files, &|file| read_post_image(root, &file.path));
+    findings.extend(stubs.findings);
 
     // Coverage measurements, when the caller supplied them. A missing file is
     // fatal rather than silently treated as "no coverage": a caller that asked
@@ -230,10 +229,13 @@ fn check(
     let substance = dc_verify::substance::measure(&files);
 
     Ok(format!(
-        "{{\"ok\":true,\"files\":{},\"in_scope\":{},\"orphans\":{},\"untouched_planned\":{},\
-         \"findings\":{},\"coverage_unmeasured\":{},\"coverage_gaps\":{},\
+        "{{\"ok\":true,\"files\":{},\"stub_ast_parsed_files\":{},\"in_scope\":{},\"orphans\":{},\
+         \"untouched_planned\":{},\"findings\":{},\"coverage_unmeasured\":{},\"coverage_gaps\":{},\
          \"coverage_skipped_by_type\":{},\"substance\":{}}}",
         files.len(),
+        // The skipped- and assert-free-test checks run only on parsed files;
+        // the host names them as applied only when this is above zero.
+        stubs.parsed_files,
         string_array(&scope.in_scope),
         string_array(&scope.orphans),
         string_array(&scope.untouched_planned),
