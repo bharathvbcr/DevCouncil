@@ -6,14 +6,21 @@
 > (section E covers this plane). This file stays authoritative for the analysis-plane
 > detail; the kernel port ledger is archived at [`docs/archive/devmap/STATUS.md`](../docs/archive/devmap/STATUS.md). Live follow-ups: [`docs/TODO.md`](../docs/TODO.md).
 
-**What this is:** the four `dc-*` crates and their Go clients, ported from the MANVI
-harness (`~/Code/devtools/Manvi`) into DevCouncil on 2026-09-01.
+**What this is:** the six `dc-*` crates MANVI also carries (`dc-evidence`,
+`dc-glob`, `dc-grep`, `dc-proc`, `dc-store`, `dc-verify`) and their Go clients,
+ported from the MANVI harness (`~/Code/devtools/Manvi`) into DevCouncil starting
+2026-09-01. The workspace also holds `dc-regress` and `dc-regress-store`, which
+have no MANVI counterpart.
 
-**What it is not:** a replacement for anything. Nothing in `src/devcouncil/` calls
-this code yet. Every Python verification gate, lease repository and search path in
-DevCouncil runs exactly as it did before this port. Read [§4](#4-what-this-does-not-yet-improve)
-before assuming the Rust side is an upgrade to the Python it resembles — in one
-significant case it is measurably less capable, and cutting over would weaken a gate.
+**Read this file as a dated record.** It was written on 2026-09-01, when the
+Python `src/devcouncil/` still existed and nothing called this code, and its
+"not a replacement" framing was true then. It is not true now (checked
+2026-10-07): `src/` is gone (Phase 7, 2026-09-10), and the Go host's
+`verify.Run` spawns `dcverify` (`backend/go_orchestrator/devcouncil/verify/orchestrate.go`),
+with `dc/store`, `dc/dcgrep` and `dc/dcverify` as the Go clients. [§4](#4-what-this-does-not-yet-improve)
+and [§5](#5-state-of-the-handoff) compare against Python that no longer exists;
+they stay as the record of why the cutover went the way it did, and the Python
+columns in them describe nothing that runs.
 
 > **These are DevCouncil components, and DevCouncil is upstream.**
 >
@@ -27,23 +34,19 @@ significant case it is measurably less capable, and cutting over would weaken a 
 >
 > The two copies still have no build-time relationship, so nothing fails when
 > they drift — [§6](#6-the-two-copies) is the standing decision that needs
-> making. **Exactly two files are deliberately different**, and a mirroring
-> script has to know both:
->
-> - `dc-store/tests/interop.rs` — this copy resolves DevCouncil as its own
->   ancestor; MANVI's searches upward for a sibling checkout.
-> - `dc-glob/src/lib.rs` — the parity fixture is the repository-root
->   `testdata/fnmatch-parity.tsv` (one copy, shared with the Go matcher). The
->   matcher itself has diverged from MANVI's: input caps, a step budget, and
->   the inverted-range cases CPython keeps.
->
-> Four paths exist only here and have no MANVI counterpart: `.gitignore`,
-> `README.md`, `STATUS.md`, and `testdata/` (MANVI keeps the parity fixture at
-> its repository root). Every other file is byte-identical:
+> making. **This used to say exactly two files were deliberately different
+> (`dc-store/tests/interop.rs` and `dc-glob/src/lib.rs`). That is no longer
+> true:** on 2026-10-07 a per-crate `diff -rq --exclude=target` of all six
+> `dc-*` crates against `~/Code/devtools/Manvi/crates` reported no difference
+> at all, those two files included. Only the workspace-level files differ
+> (`Cargo.toml` does), and the paths that exist only here —
+> `.gitignore`, `README.md`, `STATUS.md`, `testdata/`, the kernel crates, and
+> `dc-regress` / `dc-regress-store` — have no MANVI counterpart. Re-check with:
 >
 > ```bash
-> diff -rq --exclude=target <manvi>/crates rust \
->   | grep -v 'Only in rust'   # must name exactly the two files above
+> for c in dc-evidence dc-glob dc-grep dc-proc dc-store dc-verify; do
+>   diff -rq --exclude=target <manvi>/crates/$c rust/$c   # prints nothing when identical
+> done
 > ```
 >
 > The relationship, the component inventory, and the checklist a newly ported
@@ -144,7 +147,9 @@ A passing test is not evidence until it has been shown it can fail.
 
 ## 3. Changes made during the port
 
-Four, all forced by the move. Everything else is byte-identical to MANVI.
+Four, all forced by the move. Everything else was byte-identical to MANVI.
+(As of 2026-10-07 the four have converged too: all six shared `dc-*` crates
+diff clean against MANVI's copy; see the note under the header.)
 
 1. **`dc-glob` fixture path.** The CPython `fnmatch` parity fixture lives once,
    at `testdata/fnmatch-parity.tsv` in the repository root. `dc-glob` and the Go

@@ -15,8 +15,10 @@ from this isolated worktree, not from the concurrently changing checkout.
 
 - Baseline: DevCouncil `ee07c18`; canonical checkout `/Users/bharath/Code/devtools/DevCouncil`.
 - Final source: branch `codex/hook-compat-hardening`, worktree `/Users/bharath/.codex/worktrees/devcouncil-hook-hardening-20260912`.
-- Changes remain uncommitted and unmerged. Another writer changed the same Go hook
-  files during this audit; Rust loader changes in the shared checkout are unrelated.
+- **Merged:** `codex/hook-compat-hardening` is in `main` as `f2a03b6f` (2026-09-12);
+  this said "uncommitted and unmerged" while the audit was open. Another writer
+  changed the same Go hook files during this audit; Rust loader changes in the
+  shared checkout are unrelated.
 - The original overlapping Go edits were preserved under the canonical checkout's
   `.git/codex-backups/hook-overlap-20260912/` before isolation.
 - The cleanup inventory has eight paths across Claude, Cursor, Codex, Gemini,
@@ -71,12 +73,15 @@ regression `TestHookCleanupLeavesUnownedEmptyFiles` enforces that distinction.
 
 Installed SHA-256: `68ffb6b7d51fbba7aa4f6dbe3c4691b5016b5e278c87aec221eeb14529fb2c91`.
 
-Local receipts, logs, executable harness and the prior installed binary are in
-[the qualification directory](../.devcouncil/hooks-qualification/).
-A portable [source patch](../.devcouncil/hooks-qualification/hook-hardening.patch) is included for reconciliation; it is not auto-applied to the shared checkout.
-The raw [binary matrix receipt](../.devcouncil/hooks-qualification/binary-stress.json)
-and [ScholarLM status](../.devcouncil/hooks-qualification/scholarlm-status.json)
-are included there. These are ignored local evidence, not release artifacts.
+The receipts, logs, executable harness, source patch (`hook-hardening.patch`),
+binary matrix receipt (`binary-stress.json`) and ScholarLM status
+(`scholarlm-status.json`) were written to `.devcouncil/hooks-qualification/`, an
+ignored local directory (`.gitignore` excludes `.devcouncil/*`). **It does not
+exist in this checkout (checked 2026-10-07) and was never tracked, so the links
+this section used to carry pointed nowhere and have been removed.** The patch
+needs no reconciliation: the branch was merged (see Scope). Nothing here can be
+re-checked from the receipts; the verification table above is the claim as it
+was made.
 
 ## Remaining limits
 
