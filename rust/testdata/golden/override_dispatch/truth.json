@@ -1,0 +1,58 @@
+{
+  "_comment": "Hand-labelled ground truth. `live` is the answer a careful reviewer gives with the whole corpus in front of them, and `why` is the evidence — a label without one is an opinion. Edit only with a reason recorded here.",
+  "source": "testdata/fixtures/tier_a/override_dispatch",
+  "strict": true,
+  "notes": "Polymorphic override. `Square.area` is reached only through a call on a base-typed parameter (`shape: Shape` then `shape.area()` in report.py), so nothing names it directly: it is live by dispatch, which the heritage exemption reads off the `Square -> Shape` Extends edge. `Circle.area` shares the name on an unrelated type and must stay dead, which is what keeps the name join from exempting the world. Strict: a live symbol claimed at any tier fails. Confirmed 2026-10-07 by breaking each mechanism and watching `the_extracted_tier_has_no_false_positives` fail: (1) disabling the heritage-override return in `liveness.rs` (the arm that yields `heritage_override_reason`) reported `Square.area` dead at extracted (0.90); (2) disabling `python_parameter_bound_from_type` left `shape.area()` untyped and reported both `Shape.area` and `Square.area` dead at inferred (0.40).",
+  "symbols": [
+    {
+      "symbol_id": "report.py::summarise",
+      "live": true,
+      "why": "Called by run (report.py:9)."
+    },
+    {
+      "symbol_id": "report.py::run",
+      "live": true,
+      "why": "Called at module level (report.py:12)."
+    },
+    {
+      "symbol_id": "shapes.py::Shape",
+      "live": true,
+      "why": "Imported by report.py and the annotation of summarise's parameter; Square's base."
+    },
+    {
+      "symbol_id": "shapes.py::Shape.area",
+      "live": true,
+      "why": "`shape.area()` on `shape: Shape` (report.py:5)."
+    },
+    {
+      "symbol_id": "shapes.py::Square",
+      "live": true,
+      "why": "Constructed by run (report.py:9)."
+    },
+    {
+      "symbol_id": "shapes.py::Square.__init__",
+      "live": true,
+      "why": "Runs on `Square(3)` (report.py:9)."
+    },
+    {
+      "symbol_id": "shapes.py::Square.area",
+      "live": true,
+      "why": "The object passed to summarise is a Square, so `shape.area()` dispatches here; no call names it directly."
+    },
+    {
+      "symbol_id": "shapes.py::Square.perimeter",
+      "live": false,
+      "why": "Nothing calls it, and Shape declares no `perimeter` to dispatch through."
+    },
+    {
+      "symbol_id": "shapes.py::Circle",
+      "live": false,
+      "why": "Never constructed, imported or named."
+    },
+    {
+      "symbol_id": "shapes.py::Circle.area",
+      "live": false,
+      "why": "Same name as Shape.area on a type that does not extend Shape, and no Circle ever exists."
+    }
+  ]
+}

@@ -5,19 +5,23 @@
 //! correctness, and nothing anywhere answered the only question that matters
 //! about a dead-code tool: **of the symbols we called dead, how many were?**
 //!
-//! `testdata/golden/<fixture>/truth.json` answers it. Every symbol in six
-//! fixtures is hand-labelled `live` or not, each with the evidence, so the
-//! numbers below are measured against a reviewed answer rather than against a
-//! previous run of the same code.
+//! `testdata/golden/<fixture>/truth.json` answers it. Every symbol in every
+//! fixture that carries one is hand-labelled `live` or not, each with the
+//! evidence, so the numbers below are measured against a reviewed answer rather
+//! than against a previous run of the same code.
 //!
 //! **The fence is precision at `extracted`, at 1.0.** That tier's contract is
 //! "safe to act on"; a false positive in it is not a metric dip but a contract
 //! violation, and acting on one deletes live code. `inferred` and `ambiguous`
-//! claim less and are reported, not fenced.
+//! claim less and are reported, not fenced — except in a fixture whose truth
+//! sets `"strict": true`, where each live label rests on one resolution
+//! mechanism and a claim at any tier means that mechanism broke.
 //!
-//! Recall is reported too, and one fixture (`liveness_truth`) exists to make it
-//! measurable — the other five are all-live by construction, which measures
-//! precision and says nothing about what was missed.
+//! Recall is reported too. `liveness_truth` and the strict fixtures
+//! (`override_dispatch`, `barrel_reexport`, `java_same_package`) label dead
+//! symbols beside the live ones; the original language fixtures are all-live by
+//! construction, which measures precision and says nothing about what was
+//! missed.
 
 use devmap_analyze::analyze;
 use devmap_extract::extract_file;
@@ -44,6 +48,8 @@ struct Truth {
     source: PathBuf,
     /// `symbol_id -> live`
     labels: BTreeMap<String, bool>,
+    /// Every claim is fenced, at every tier. See `strict` in truth.json.
+    strict: bool,
 }
 
 fn load_truth() -> Vec<Truth> {
@@ -78,6 +84,7 @@ fn load_truth() -> Vec<Truth> {
             fixture: dir.file_name().unwrap().to_string_lossy().into_owned(),
             source: workspace_root().join(value["source"].as_str().expect("source")),
             labels,
+            strict: value["strict"].as_bool().unwrap_or(false),
         });
     }
     assert!(!out.is_empty(), "no truth.json found under testdata/golden");
@@ -185,10 +192,15 @@ fn the_extracted_tier_has_no_false_positives() {
             let entry = by_tier.entry(tier(*confidence)).or_default();
             if live {
                 entry.false_positive += 1;
+                // A strict fixture fences every tier. Its live labels each
+                // rest on one mechanism — a barrel hop, an override edge — and
+                // breaking that mechanism moves the symbol from no claim to
+                // `inferred`, which the extracted-only fence would let pass.
                 violations.push(format!(
-                    "{}: `{symbol_id}` is live but was called dead at {} ({confidence:.2})",
+                    "{}: `{symbol_id}` is live but was called dead at {} ({confidence:.2}){}",
                     truth.fixture,
                     tier(*confidence),
+                    if truth.strict { " [strict fixture]" } else { "" },
                 ));
             } else {
                 entry.true_positive += 1;
@@ -206,13 +218,22 @@ fn the_extracted_tier_has_no_false_positives() {
 
     let extracted_violations: Vec<&String> = violations
         .iter()
-        .filter(|line| line.contains("at extracted") || line.contains("drifted apart"))
+        .filter(|line| {
+            line.contains("at extracted")
+                || line.contains("drifted apart")
+                || line.ends_with("[strict fixture]")
+        })
         .collect();
+    // The headline names the fence that failed. A strict-fixture violation at
+    // `inferred` leaves `extracted` precision at 1.000, and a message reading
+    // "precision is 1.000, not 1.0" sends the reader looking for the wrong bug.
     assert!(
         extracted_violations.is_empty(),
-        "`extracted` precision is {:.3}, not 1.0. That tier means `safe to act \
-         on`, so every line below is a symbol this kernel would have told \
-         somebody to delete:\n  {}",
+        "{} live symbol(s) were claimed dead where the corpus forbids it \
+         (`extracted` precision {:.3}; strict fixtures fence every tier). Every \
+         line below is a symbol this kernel would have told somebody to \
+         delete:\n  {}",
+        extracted_violations.len(),
         extracted.true_positive as f64 / extracted_claims as f64,
         extracted_violations
             .iter()

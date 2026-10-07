@@ -1,0 +1,433 @@
+{
+  "_comment": "Real-corpus call-resolution sample, read by rust/devmap-resolve/tests/real_corpus_resolution.rs. `truth` is the declaration the call statically names, as `file::Qualified.name`, or null when it is external (std, a framework, a crate, a Python builtin) or names no declaration (macro syntax, a closure value). Labels were made by reading MarkDev's source blind to the resolver's answer; every label where the resolver disagreed, and a spot-check of agreements, was re-read by hand. `why` cites the evidence. Edit only with a reason recorded here.",
+  "corpus": "MarkDev",
+  "pinned_commit": "20dec7a820923411b21b9dc5acb25ac4ca3ef746",
+  "selection": "Every call site extracted from MarkDev whose caller makes exactly one call by that callee name (edges carry no span, so that is the only sound site-to-answer join): 27,783 sites. Stratified by language and by whether the resolver bound the site at labelling time, then within each stratum the lowest FNV-1a 64 hash of `file|caller|callee`. Swift 8 bound + 8 unbound, Rust 7 + 7, Python 5 + 5.",
+  "strata_population": {
+    "swift": {
+      "bound": 8655,
+      "unbound": 13053
+    },
+    "rust": {
+      "bound": 1019,
+      "unbound": 3018
+    },
+    "python": {
+      "bound": 588,
+      "unbound": 1412
+    }
+  },
+  "_reading_the_numbers": "Precision and recall are over THIS sample, which is half bound and half unbound by construction, not a population estimate. Unbound sites are overwhelmingly external calls (std, Foundation), which is why recall's denominator is small. The one wrong binding is a Swift `private` free function in another file (WorkspaceSaveConcurrencyTests.swift:3577) bound by UniqueGlobal to an XCTest call: file-private visibility is not honoured by that rung. The two misses are Swift method calls on a receiver typed by a chained call's return type and by a helper's return type.",
+  "_confirmed": "2026-10-07: disabling `type_from_rust_header` in the resolver lost `vault.note(..)` (core/tests/rename_stress.rs, `let mut vault = Vault::open(&root)`) and failed this test at recall 857 against the 904 floor. Disabling the re-export follow in `declaring_site` moved nothing here: no sampled site reaches a declaration through a crate-root `pub use`, so this sample does not fence that rung.",
+  "baseline": {
+    "sites": 40,
+    "bound": 20,
+    "correct": 19,
+    "wrong": 1,
+    "in_corpus_truth": 21,
+    "precision_permille": 950,
+    "recall_permille": 904
+  },
+  "sites": [
+    {
+      "language": "swift",
+      "file": "app/MarkDevKit/Diagnostics/DiagnosticsModels.swift",
+      "line": 1763,
+      "caller": "app/MarkDevKit/Diagnostics/DiagnosticsModels.swift::DiagnosticsSanitizer.label",
+      "callee": "isAlphaNumeric",
+      "receiver": "",
+      "truth": "app/MarkDevKit/Diagnostics/DiagnosticsModels.swift::DiagnosticsSanitizer.isAlphaNumeric",
+      "why": "Unqualified call in a closure in static func label resolves to `private static func isAlphaNumeric` in `private enum DiagnosticsSanitizer` (DiagnosticsModels.swift:1816); the only declaration of the name."
+    },
+    {
+      "language": "swift",
+      "file": "app/Tests/HarnessTests.swift",
+      "line": 1587,
+      "caller": "app/Tests/HarnessTests.swift::HarnessAssistantTests.testChangingBinaryPathInvalidatesAvailabilityAndCannotLaunchTheStaleBinary",
+      "callee": "XCTAssertTrue",
+      "receiver": "",
+      "truth": null,
+      "why": "XCTest's XCTAssertTrue (HarnessTests.swift imports XCTest). The in-repo `private func XCTAssertTrue` (WorkspaceSaveConcurrencyTests.swift:3577) is file-private to another file and takes a labelled `awaitValue:` parameter, so it cannot be this call."
+    },
+    {
+      "language": "swift",
+      "file": "app/MarkDevKit/Intelligence/WritingTask.swift",
+      "line": 265,
+      "caller": "app/MarkDevKit/Intelligence/WritingTask.swift::WritingResponse.admit",
+      "callee": "fitsUTF8",
+      "receiver": "BoundedText",
+      "truth": "app/MarkDevKit/Core/BoundedText.swift::BoundedText.fitsUTF8",
+      "why": "`BoundedText.fitsUTF8(raw, maximum:)` is `static func fitsUTF8(_:maximum:)` in `enum BoundedText` (BoundedText.swift:50)."
+    },
+    {
+      "language": "swift",
+      "file": "app/MarkDevKit/Navigator/NavigatorView.swift",
+      "line": 533,
+      "caller": "app/MarkDevKit/Navigator/NavigatorView.swift::NavigatorView",
+      "callee": "NavigatorTreeReloadState",
+      "receiver": "",
+      "truth": "app/MarkDevKit/Navigator/NavigatorView.swift::NavigatorTreeReloadState",
+      "why": "Construction of `struct NavigatorTreeReloadState` (NavigatorView.swift:264)."
+    },
+    {
+      "language": "swift",
+      "file": "app/Tests/AssetIngestionHardeningTests.swift",
+      "line": 249,
+      "caller": "app/Tests/AssetIngestionHardeningTests.swift::AssetIngestionHardeningTests.testMinimalValidSVGIsAcceptedWithoutImageIODecoding",
+      "callee": "DocumentAssetStore",
+      "receiver": "",
+      "truth": "app/MarkDevKit/Editor/DocumentAssetStore.swift::DocumentAssetStore",
+      "why": "Construction of `actor DocumentAssetStore` (DocumentAssetStore.swift:93)."
+    },
+    {
+      "language": "swift",
+      "file": "app/MarkDevKit/Harness/HarnessRun.swift",
+      "line": 550,
+      "caller": "app/MarkDevKit/Harness/HarnessRun.swift::HarnessProcess.reapLeader",
+      "callee": "finishWaiting",
+      "receiver": "",
+      "truth": "app/MarkDevKit/Harness/HarnessRun.swift::HarnessProcess.finishWaiting",
+      "why": "Implicit-self call to `private func finishWaiting()` in `final class HarnessProcess` (HarnessRun.swift:553)."
+    },
+    {
+      "language": "swift",
+      "file": "app/MarkDevKit/Editor/MarkdownLayoutFragment.swift",
+      "line": 604,
+      "caller": "app/MarkDevKit/Editor/MarkdownLayoutFragment.swift::MarkdownLayoutFragment.draw",
+      "callee": "drawCheckbox",
+      "receiver": "",
+      "truth": "app/MarkDevKit/Editor/MarkdownLayoutFragment.swift::MarkdownLayoutFragment.drawCheckbox",
+      "why": "Implicit-self call to `private func drawCheckbox(checked:in:at:)` in `final class MarkdownLayoutFragment` (MarkdownLayoutFragment.swift:1308)."
+    },
+    {
+      "language": "swift",
+      "file": "app/Tests/FragmentRenderingTests.swift",
+      "line": 480,
+      "caller": "app/Tests/FragmentRenderingTests.swift::FragmentRenderingTests.testLivePreviewKeepsTheSeparatorAfterMermaidEditable",
+      "callee": "make",
+      "receiver": "MarkdownTextView",
+      "truth": "app/MarkDevKit/Editor/MarkdownTextView.swift::MarkdownTextView.make",
+      "why": "`MarkdownTextView.make()` is `public static func make(theme:)` on `final class MarkdownTextView` (MarkdownTextView.swift:468); other `make`s are on unrelated types."
+    },
+    {
+      "language": "swift",
+      "file": "app/MarkDevKit/Workspace/RecoveryJournal.swift",
+      "line": 831,
+      "caller": "app/MarkDevKit/Workspace/RecoveryJournal.swift::RecoveryJournalDiskFormat.decodeRecord",
+      "callee": "hash",
+      "receiver": "SHA256",
+      "truth": null,
+      "why": "CryptoKit `SHA256.hash(data:)`; no in-repo SHA256."
+    },
+    {
+      "language": "swift",
+      "file": "app/MarkDevKit/Brand/MarkDevLogo.swift",
+      "line": 55,
+      "caller": "app/MarkDevKit/Brand/MarkDevLogo.swift::MarkDevLogo.draw",
+      "callee": "insetBy",
+      "receiver": "canvas",
+      "truth": null,
+      "why": "CoreGraphics `CGRect.insetBy(dx:dy:)` on a `CGRect` (MarkDevLogo.swift:46)."
+    },
+    {
+      "language": "swift",
+      "file": "app/Tests/SecureLocalFileSystemTests.swift",
+      "line": 528,
+      "caller": "app/Tests/SecureLocalFileSystemTests.swift::SecureLocalFileSystemTests.testSameUIDMutationInsideRenameBoundaryDocumentsPlatformLimit",
+      "callee": "commit",
+      "receiver": "try guarded.transaction(\u2026",
+      "truth": "app/MarkDevKit/Workspace/SecureLocalFileSystem.swift::FileTransaction.commit",
+      "why": "`handle(calls)` returns `SecureLocalDirectoryHandle`, whose `transaction(...)` (SecureLocalFileSystem.swift:785) returns `FileTransaction`; `func commit()` is at :1591. The other `commit` methods are on unrelated types."
+    },
+    {
+      "language": "swift",
+      "file": "app/MarkDevKit/Navigator/FileTree.swift",
+      "line": 415,
+      "caller": "app/MarkDevKit/Navigator/FileTree.swift::FileTree.readUTF8File",
+      "callee": "append",
+      "receiver": "data",
+      "truth": null,
+      "why": "Foundation `Data.append` on `var data = Data()` (FileTree.swift:409)."
+    },
+    {
+      "language": "swift",
+      "file": "app/Tests/PictureStressTests.swift",
+      "line": 484,
+      "caller": "app/Tests/PictureStressTests.swift::PictureStressTests.testRandomEditsAroundPicturesKeepEveryPictureCoherent",
+      "callee": "append",
+      "receiver": "chosen",
+      "truth": null,
+      "why": "Swift stdlib `Array.append` on `chosen: [String]` (PictureStressTests.swift:483)."
+    },
+    {
+      "language": "swift",
+      "file": "app/MarkDevKit/Diagnostics/DiagnosticsScopedRunStore.swift",
+      "line": 278,
+      "caller": "app/MarkDevKit/Diagnostics/DiagnosticsScopedRunStore.swift::DiagnosticsTrustedDirectoryChain",
+      "callee": "reversed",
+      "receiver": "nodes",
+      "truth": null,
+      "why": "Swift stdlib `reversed()` on `nodes: [Node]` (DiagnosticsScopedRunStore.swift:270)."
+    },
+    {
+      "language": "swift",
+      "file": "app/Tests/PictureHardeningTests.swift",
+      "line": 484,
+      "caller": "app/Tests/PictureHardeningTests.swift::LoopbackListener",
+      "callee": "setsockopt",
+      "receiver": "",
+      "truth": null,
+      "why": "Darwin `setsockopt`."
+    },
+    {
+      "language": "swift",
+      "file": "app/Tests/TerminalSessionsTests.swift",
+      "line": 131,
+      "caller": "app/Tests/TerminalSessionsTests.swift::TerminalSessionsTests.testClosingTheLastSessionLandsOnThePrevious",
+      "callee": "close",
+      "receiver": "sessions",
+      "truth": "app/MarkDevKit/Terminal/TerminalSessions.swift::TerminalSessions.close",
+      "why": "`sessions` is `makeSessions() -> TerminalSessions` (TerminalSessionsTests.swift:19); `public func close(_:)` is at TerminalSessions.swift:216."
+    },
+    {
+      "language": "rust",
+      "file": "core/crates/markdev-html/src/lib.rs",
+      "line": 190,
+      "caller": "core/crates/markdev-html/src/lib.rs::render_document",
+      "callee": "render_document_with_options",
+      "receiver": "",
+      "truth": "core/crates/markdev-html/src/lib.rs::render_document_with_options",
+      "why": "Same-module free fn `pub fn render_document_with_options` (markdev-html/src/lib.rs:194)."
+    },
+    {
+      "language": "rust",
+      "file": "core/crates/markdev-md/src/parse.rs",
+      "line": 1341,
+      "caller": "core/crates/markdev-md/src/parse.rs::emit_delimited_math_span",
+      "callee": "at",
+      "receiver": "innermost",
+      "truth": "core/crates/markdev-md/src/parse.rs::InnermostCursor.at",
+      "why": "`innermost: &mut InnermostCursor` (parse.rs:1334); `fn at` in `impl InnermostCursor` (parse.rs:1809)."
+    },
+    {
+      "language": "rust",
+      "file": "core/src/ffi.rs",
+      "line": 846,
+      "caller": "core/src/ffi.rs::md_vault_rename",
+      "callee": "rename_note",
+      "receiver": "handle.vault",
+      "truth": "core/crates/markdev-vault/src/rename.rs::Vault.rename_note",
+      "why": "`handle.vault: Vault` (ffi.rs:618), reached through `pub use markdev_vault as vault` (core/src/lib.rs:32); `pub fn rename_note` in `impl Vault` at markdev-vault/src/rename.rs:131."
+    },
+    {
+      "language": "rust",
+      "file": "core/crates/markdev-highlight/src/lib.rs",
+      "line": 118,
+      "caller": "core/crates/markdev-highlight/src/lib.rs::configurations",
+      "callee": "capture_names",
+      "receiver": "",
+      "truth": "core/crates/markdev-highlight/src/lib.rs::capture_names",
+      "why": "Same-module free fn `fn capture_names()` (markdev-highlight/src/lib.rs:107)."
+    },
+    {
+      "language": "rust",
+      "file": "core/src/ffi.rs",
+      "line": 810,
+      "caller": "core/src/ffi.rs::md_vault_remove",
+      "callee": "read_bounded_str",
+      "receiver": "",
+      "truth": "core/src/ffi.rs::read_bounded_str",
+      "why": "Module-level `unsafe fn read_bounded_str` (ffi.rs:670)."
+    },
+    {
+      "language": "rust",
+      "file": "core/tests/rename_stress.rs",
+      "line": 220,
+      "caller": "core/tests/rename_stress.rs::renames_leave_every_code_region_byte_identical",
+      "callee": "note",
+      "receiver": "vault",
+      "truth": "core/crates/markdev-vault/src/index.rs::Vault.note",
+      "why": "`vault = Vault::open(..)` via `use markdev::vault::{Note, Vault}` (rename_stress.rs:10); `pub fn note` in `impl Vault` (markdev-vault/src/index.rs:268)."
+    },
+    {
+      "language": "rust",
+      "file": "core/src/ffi.rs",
+      "line": 438,
+      "caller": "core/src/ffi.rs::md_document_new",
+      "callee": "read_bounded_bytes",
+      "receiver": "",
+      "truth": "core/src/ffi.rs::read_bounded_bytes",
+      "why": "Module-level `unsafe fn read_bounded_bytes` (ffi.rs:695)."
+    },
+    {
+      "language": "rust",
+      "file": "core/tests/html_fragment.rs",
+      "line": 141,
+      "caller": "core/tests/html_fragment.rs::url_is_safe",
+      "callee": "replace",
+      "receiver": "value",
+      "truth": null,
+      "why": "Rust std `str::replace` on `value: &str` (html_fragment.rs:140)."
+    },
+    {
+      "language": "rust",
+      "file": "core/tests/incremental.rs",
+      "line": 66,
+      "caller": "core/tests/incremental.rs::typing_in_plain_prose_needs_no_reparse",
+      "callee": "find",
+      "receiver": "DOC",
+      "truth": null,
+      "why": "Rust std `str::find` on `const DOC: &str` (incremental.rs:47)."
+    },
+    {
+      "language": "rust",
+      "file": "core/tests/header_contract.rs",
+      "line": 48,
+      "caller": "core/tests/header_contract.rs::header",
+      "callee": "read_to_string",
+      "receiver": "fs",
+      "truth": null,
+      "why": "Rust std `std::fs::read_to_string` via `use std::fs` (header_contract.rs:32)."
+    },
+    {
+      "language": "rust",
+      "file": "core/tests/graph.rs",
+      "line": 65,
+      "caller": "core/tests/graph.rs::wiki_and_markdown_between_the_same_pair_are_one_edge",
+      "callee": "len",
+      "receiver": "graph.edges",
+      "truth": null,
+      "why": "Rust std `Vec::len` on `edges: Vec<GraphEdge>` (markdev-vault/src/graph.rs:46)."
+    },
+    {
+      "language": "rust",
+      "file": "core/crates/markdev-md/src/parse.rs",
+      "line": 1816,
+      "caller": "core/crates/markdev-md/src/parse.rs::InnermostCursor.at",
+      "callee": "filter",
+      "receiver": "self.order.get",
+      "truth": null,
+      "why": "Rust std `Option::filter` on `self.order.get(..)` (parse.rs:1788)."
+    },
+    {
+      "language": "rust",
+      "file": "core/tests/prose.rs",
+      "line": 324,
+      "caller": "",
+      "callee": "proptest_config",
+      "receiver": "",
+      "truth": null,
+      "why": "`#![proptest_config(..)]` inside `proptest! {` (prose.rs:325) is macro syntax, not a call; no `fn proptest_config` exists."
+    },
+    {
+      "language": "rust",
+      "file": "core/tests/docs_contract.rs",
+      "line": 304,
+      "caller": "core/tests/docs_contract.rs::every_relative_link_resolves",
+      "callee": "next",
+      "receiver": "target.split",
+      "truth": null,
+      "why": "Rust std `Iterator::next` on `target.split('#')` (docs_contract.rs:301)."
+    },
+    {
+      "language": "python",
+      "file": "tools/release/atomic_install.py",
+      "line": 1403,
+      "caller": "tools/release/atomic_install.py::main",
+      "callee": "recovery_action",
+      "receiver": "",
+      "truth": "tools/release/atomic_install.py::recovery_action",
+      "why": "Same-module `def recovery_action` (atomic_install.py:731)."
+    },
+    {
+      "language": "python",
+      "file": "tools/icongen/validate.py",
+      "line": 322,
+      "caller": "tools/icongen/validate.py::validate_icns",
+      "callee": "require_regular_file",
+      "receiver": "",
+      "truth": "tools/icongen/validate.py::require_regular_file",
+      "why": "Same-module `def require_regular_file` (validate.py:186)."
+    },
+    {
+      "language": "python",
+      "file": "tools/release/test_atomic_install.py",
+      "line": 418,
+      "caller": "tools/release/test_atomic_install.py::AtomicInstallTests.test_new_install_crash_policy_is_rollback_before_activation_and_finalize_after",
+      "callee": "install",
+      "receiver": "atomic_install",
+      "truth": "tools/release/atomic_install.py::install",
+      "why": "`import atomic_install` (test_atomic_install.py:14) is the sibling module; `def install` at atomic_install.py:540."
+    },
+    {
+      "language": "python",
+      "file": "tools/release/test_atomic_install.py",
+      "line": 756,
+      "caller": "tools/release/test_atomic_install.py::AtomicInstallTests.test_mutated_pending_swap_restores_prior_and_quarantines_incoming",
+      "callee": "install",
+      "receiver": "atomic_install",
+      "truth": "tools/release/atomic_install.py::install",
+      "why": "`atomic_install.install(` (test_atomic_install.py:756); `def install` at atomic_install.py:540."
+    },
+    {
+      "language": "python",
+      "file": "tools/release/signing_identity.py",
+      "line": 179,
+      "caller": "tools/release/signing_identity.py::verify_exact_signature",
+      "callee": "signature_profile",
+      "receiver": "",
+      "truth": "tools/release/signing_identity.py::signature_profile",
+      "why": "Same-module `def signature_profile` (signing_identity.py:140)."
+    },
+    {
+      "language": "python",
+      "file": "tools/release/release.py",
+      "line": 974,
+      "caller": "tools/release/release.py::release_lock",
+      "callee": "sleep",
+      "receiver": "time",
+      "truth": null,
+      "why": "Python stdlib `time.sleep` via `import time` (release.py:19); the in-repo `def sleep` is a method on an unrelated test double."
+    },
+    {
+      "language": "python",
+      "file": "tools/release/test_release.py",
+      "line": 1196,
+      "caller": "tools/release/test_release.py::ReleaseTests.test_required_top_level_resources_must_be_regular_files",
+      "callee": "symlink_to",
+      "receiver": "path",
+      "truth": null,
+      "why": "Python stdlib `pathlib.Path.symlink_to`; no in-repo `def symlink_to`."
+    },
+    {
+      "language": "python",
+      "file": "tools/release/release.py",
+      "line": 1501,
+      "caller": "tools/release/release.py::main",
+      "callee": "parse_args",
+      "receiver": "parser",
+      "truth": null,
+      "why": "Python stdlib `argparse.ArgumentParser.parse_args` on `argparse.ArgumentParser(...)` (release.py:1498)."
+    },
+    {
+      "language": "python",
+      "file": "tools/release/atomic_install.py",
+      "line": 1176,
+      "caller": "tools/release/atomic_install.py::acquire_install_lock",
+      "callee": "flock",
+      "receiver": "fcntl",
+      "truth": null,
+      "why": "Python stdlib `fcntl.flock` via `import fcntl` (atomic_install.py:7)."
+    },
+    {
+      "language": "python",
+      "file": "tools/release/signing_identity.py",
+      "line": 240,
+      "caller": "tools/release/signing_identity.py::_read_bounded_regular_file",
+      "callee": "join",
+      "receiver": "b\"\"",
+      "truth": null,
+      "why": "Python builtin `bytes.join` on the literal `b\"\"` (signing_identity.py:240)."
+    }
+  ]
+}

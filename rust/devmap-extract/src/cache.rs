@@ -521,7 +521,15 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// that lane's half, so the combined payload takes a number none of them used:
 /// a v69 row from the return-type branch lacks v68's bindings, and a v68 row
 /// lacks return types.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "70";
+///
+/// v71 adds the resolver-precision lane's v67 payload: a Rust function's
+/// header as its `signature`; a Rust local typed from its own binder (a
+/// `MutexGuard` from `Ok(g)` or an unwrapped `.lock()`, a loop variable over a
+/// `Vec<T>`/`[T]`/set); the value shape of `T::f(..)?` and of a closure
+/// argument handed to the resolver; and a Go `var w T` bound to `w`. Without
+/// them every method reached only through such a local stays an uninferred
+/// receiver from a warm cache.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "71";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

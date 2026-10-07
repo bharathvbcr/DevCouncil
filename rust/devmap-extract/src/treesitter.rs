@@ -697,6 +697,7 @@ fn extract_treesitter_before_deadline(
                 let local_bindings = collect_site_bindings(
                     root,
                     source,
+                    lang,
                     &file_symbol_name,
                     &calls,
                     &references,
@@ -4118,7 +4119,7 @@ fn extract_node(
                         span,
                         is_exported: text.starts_with("pub"),
                         docstring: None,
-                        signature: None,
+                        signature: rust_fn_signature(node, source),
                         parent_symbol: Some(match &owner {
                             Some(type_name) => format!("{}::{}", file_symbol_name, type_name),
                             None => enclosing_callable_qualified(node, source, file_symbol_name)
@@ -4211,7 +4212,7 @@ fn extract_node(
                         span,
                         is_exported: false,
                         docstring: None,
-                        signature: None,
+                        signature: rust_fn_signature(node, source),
                         parent_symbol: Some(match &owner {
                             Some(type_name) => format!("{}::{}", file_symbol_name, type_name),
                             None => enclosing_callable_qualified(node, source, file_symbol_name)
@@ -6623,7 +6624,7 @@ fn rust_type_name_is_reachable(node: Node) -> bool {
     )
 }
 
-fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
+pub(crate) fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
     if depth > 16 {
         return None;
     }
@@ -7076,6 +7077,26 @@ fn js_object_literal_argument_callee(node: Node, source: &str) -> Option<String>
         }
         current = bounded_parent(current)?;
     }
+}
+
+/// A Rust function's header — from the item's start to its body, or the whole
+/// item for a bodiless signature — with whitespace collapsed to single spaces.
+///
+/// What the skeleton shows for the function, and what the resolver reads a
+/// return type and a closure parameter's type out of (see
+/// [`crate::rustsig`]): `fn read(conn: &Connection) -> Result<Self>`.
+/// A header longer than [`crate::rustsig::MAX_SIGNATURE_BYTES`] is not
+/// recorded, because a truncated one would read as a different header.
+fn rust_fn_signature(node: Node, source: &str) -> Option<String> {
+    let end = node
+        .child_by_field_name("body")
+        .map_or(node.end_byte(), |body| body.start_byte());
+    let header = source.get(node.start_byte()..end)?;
+    let header = header.trim().trim_end_matches(';').trim_end();
+    if header.is_empty() || header.len() > crate::rustsig::MAX_SIGNATURE_BYTES {
+        return None;
+    }
+    Some(header.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// Whether a `use_declaration` republishes beyond the crate that wrote it.
@@ -7625,6 +7646,8 @@ fn maybe_push_name_reference(
                     .then(|| {
                         swift_parameter_bound_from_type(node, source)
                             .or_else(|| ts_parameter_bound_from_type(node, source))
+                            .or_else(|| go_var_bound_from_type(node, source))
+                            .or_else(|| python_parameter_bound_from_type(node, source))
                     })
                     .flatten()
             }),
@@ -8542,6 +8565,7 @@ fn python_fixture_names(root: Node, source: &str, imports: &[ExtractedImport]) -
 fn collect_site_bindings(
     root: Node,
     source: &str,
+    lang: &str,
     file_symbol_name: &str,
     calls: &[ExtractedCall],
     references: &[ExtractedReference],
@@ -8553,6 +8577,8 @@ fn collect_site_bindings(
     collapse_initializers_to_statements(root, &mut initializers);
     let mut sites = BTreeSet::new();
     let mut parameters: HashMap<usize, BTreeSet<String>> = HashMap::new();
+    // Rust only; built lazily per block, so it costs nothing elsewhere.
+    let mut binders = crate::rustlocal::Binders::new(source);
     let inputs = calls
         .iter()
         .map(|call| {
@@ -8660,9 +8686,30 @@ fn collect_site_bindings(
                                     })
                                 })
                                 .flatten();
-                            let declared_type =
+                            let mut declared_type =
                                 binding_declared_type_for(&declared_types, &scope_name, name);
-                            let initializer = initializer_at(&initializers, name, node, scope);
+                            let mut initializer = initializer_at(&initializers, name, node, scope);
+                            // The binder above this very use, where the
+                            // function's text states its type — a `MutexGuard`
+                            // from `Ok(guard)`, a loop variable over a `Vec<T>`.
+                            // More specific than the `(scope, name)` facts,
+                            // which one shadowing `let` can make about a
+                            // different value, so it wins when it answers.
+                            // What it cannot type alone — the value of
+                            // `T::f(..)?`, a closure's parameter — it hands the
+                            // resolver as an initializer shape, in place of the
+                            // facts' guess at the same binding.
+                            if lang == "rust" {
+                                if let Some(stated) =
+                                    binders.binder_type(node, name, scope)
+                                {
+                                    declared_type = Some(stated);
+                                } else if let Some(hint) =
+                                    binders.binder_hint(node, name, scope)
+                                {
+                                    initializer = Some(hint);
+                                }
+                            }
                             sites.insert(LocalBinding {
                                 start_byte: span.start_byte,
                                 name: name.to_string(),
@@ -9442,6 +9489,79 @@ fn swift_parameter_bound_from_type(node: Node, source: &str) -> Option<String> {
             return None;
         }
         current = parent;
+    }
+    None
+}
+
+/// The parameter a Python annotation types: `def summarise(shape: Shape)`.
+///
+/// The annotation was already read as a Type reference — that is how
+/// `summarise -> Shape` existed — but nothing bound it to `shape`, so
+/// `shape.describe()` had no receiver type and `Shape.describe` was reported
+/// dead with its caller in the same signature. Only an annotation that *is*
+/// the type counts — the identifier must be the whole `type` node: in
+/// `xs: list[Shape]` or `s: Shape | None` the name is not what the parameter
+/// holds, so nothing is bound.
+fn python_parameter_bound_from_type(node: Node, source: &str) -> Option<String> {
+    let annotation = bounded_parent(node).filter(|parent| parent.kind() == "type")?;
+    let parameter = bounded_parent(annotation)
+        .filter(|parent| matches!(parent.kind(), "typed_parameter" | "typed_default_parameter"))?;
+    if !parameter
+        .child_by_field_name("type")
+        .is_some_and(|ty| ty.id() == annotation.id())
+    {
+        return None;
+    }
+    // `typed_default_parameter` names its binding; `typed_parameter` holds it
+    // as its first child, which is a `list_splat_pattern` for `*args: T`.
+    let binding = parameter
+        .child_by_field_name("name")
+        .or_else(|| parameter.named_child(0))
+        .filter(|binding| binding.kind() == "identifier")?;
+    let name = get_node_text(binding, source);
+    (is_user_ident(&name) && name != "self" && name != "cls").then_some(name)
+}
+
+/// The variable a Go `var w T` declares, when `node` is that type.
+///
+/// The Go spelling of a typed local with no initializer, and the idiomatic
+/// one for a value decoded in place: `var w requirementWire;
+/// json.Unmarshal(data, &w); w.Priority.valid()`. A parameter's type was
+/// already bound to its name; this declaration was not, so `w` had no type and
+/// every method reached through it — the `valid` checks on each decoded field
+/// — was reported dead.
+///
+/// Only a pointer or package qualifier may stand between the type and the
+/// spec: `var xs []T` and `var m map[K]T` do not make `xs` a `T`. A spec
+/// declaring several names (`var a, b T`) types each of them identically,
+/// but which one this reference serves is not knowable from one
+/// `assigned_to`, so it binds none.
+fn go_var_bound_from_type(node: Node, source: &str) -> Option<String> {
+    let mut current = node;
+    for _ in 0..4 {
+        let parent = bounded_parent(current)?;
+        match parent.kind() {
+            "pointer_type" | "qualified_type" => current = parent,
+            "var_spec" => {
+                if !parent
+                    .child_by_field_name("type")
+                    .is_some_and(|ty| ty.id() == current.id())
+                {
+                    return None;
+                }
+                let mut cursor = parent.walk();
+                let mut names = parent
+                    .children_by_field_name("name", &mut cursor)
+                    .filter(|name| name.kind() == "identifier");
+                let only = names.next()?;
+                if names.next().is_some() {
+                    return None;
+                }
+                let name = get_node_text(only, source);
+                return (is_user_ident(&name) && name != "_").then_some(name);
+            }
+            _ => return None,
+        }
     }
     None
 }

@@ -818,26 +818,30 @@ fn a_second_snapshot_does_not_reuse_the_first_snapshots_go_modules() {
 /// follows `export { x } from './m'` to the file that declares `x`.
 ///
 /// The pin is kept rather than deleted, on the axis it actually protected — the
-/// map makes a claim only where the kernel has evidence. Python is the case
-/// that tests it: `from .impl import thing` in an `__init__.py` is a re-export
-/// in every sense a reader cares about, and the extractor records it as an
-/// *import*, carrying no source module on any export. So there is no evidence
-/// of the kind this map is built from, and it must stay empty here rather than
-/// be filled by inference.
+/// map makes a claim only where the kernel has evidence. It used to read a
+/// module-scope Python `from .impl import thing` as no evidence, and that was
+/// wrong about the language: a module-scope binding *is* a module attribute,
+/// so `from pkg import thing` reads `pkg.impl.thing` by Python's own rule (the
+/// ON direction is `reexport_chains.rs`). What stays without evidence is an
+/// import that binds no module attribute — one inside a function body — and
+/// that is what this pins now.
 ///
-/// The ON direction lives in `reexport_chains.rs`, which measures what the
-/// chains buy: an `AmbiguousGlobal` fan-out to two files at confidence 0.2
-/// collapsing to one `ImportScoped` edge at 1.0.
+/// The ON direction for export syntax lives in `reexport_chains.rs` too, which
+/// measures what the chains buy: an `AmbiguousGlobal` fan-out to two files at
+/// confidence 0.2 collapsing to one `ImportScoped` edge at 1.0.
 #[test]
 fn reexport_chains_are_only_claimed_where_an_export_names_its_source() {
     let result = resolve(&[
-        ("pkg/__init__.py", "from .impl import thing\n"),
+        (
+            "pkg/__init__.py",
+            "def load():\n    from .impl import thing\n    return thing\n",
+        ),
         ("pkg/impl.py", "def thing():\n    return 1\n"),
     ]);
     assert!(
         result.reexport_chains.is_empty(),
-        "Python export syntax names no source module, so inferring a chain \
-         here would be a claim without evidence: {:?}",
+        "an import inside a function binds a local, not a module attribute, so \
+         a chain here would be a claim without evidence: {:?}",
         result.reexport_chains
     );
 }

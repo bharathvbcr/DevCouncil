@@ -865,12 +865,13 @@ pub struct ResolutionResult {
     /// terminal declaration.
     ///
     /// **Empty is a real answer here, and a narrow one.** A chain is recorded
-    /// only where an export names its own source module — which is JS/TS
-    /// syntax. Python's `from .impl import thing` inside an `__init__.py` is a
-    /// re-export to any reader, and the extractor records it as an *import*
-    /// with no export-side specifier, so no chain exists for it and none is
-    /// inferred. `reexport_chains_are_only_claimed_where_an_export_names_its_
-    /// source` pins that scope.
+    /// where a file publishes a name it does not declare: a JS/TS export that
+    /// names its own source module, a Rust `pub use`, and a Python
+    /// *module-scope* `from m import name` — which binds `name` as a module
+    /// attribute, so `from barrel import name` elsewhere reaches it. An import
+    /// inside a function or class body binds a local and publishes nothing, so
+    /// it yields no chain. `reexport_chains_are_scoped_to_what_the_language_
+    /// publishes` pins that boundary.
     ///
     /// A cycle yields no entry at all: there is no terminal file, and naming
     /// either endpoint would invent one. Depth is bounded by

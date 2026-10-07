@@ -211,3 +211,11 @@ required-features = ["parse"]
 [[test]]
 name = "python_sys_path_imports"
 required-features = ["parse"]
+
+[[test]]
+name = "typed_receivers"
+required-features = ["parse"]
+
+[[test]]
+name = "real_corpus_resolution"
+required-features = ["parse"]

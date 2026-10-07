@@ -286,6 +286,10 @@ pub struct Resolver {
     /// Ambiguity abstains rather than picking, the same rule
     /// [`Self::unique_basename`] follows.
     rust_crate_roots: BTreeMap<String, Option<String>>,
+    /// `(file, qualified name)` → the header a Rust function was declared
+    /// with. Read by the rungs that type a binding from a return type or a
+    /// closure parameter; see `devmap_extract::rustsig`.
+    rust_signatures: BTreeMap<(String, String), String>,
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
     reexport_chains: BTreeMap<String, String>,
@@ -558,6 +562,7 @@ impl Resolver {
             path_module_bindings: BTreeMap::new(),
             py_search_dirs: BTreeMap::new(),
             rust_crate_roots: BTreeMap::new(),
+            rust_signatures: BTreeMap::new(),
             reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
@@ -1125,6 +1130,35 @@ impl Resolver {
             ))
     }
 
+    /// Whether `root`, written as a receiver's first segment, is a **value**
+    /// at this site rather than a module or crate name.
+    ///
+    /// `serde_json::from_str(x)` and `let serde_json = build(); serde_json.
+    /// take()` reduce to the same receiver string, and only the scope's own
+    /// binding tables separate them. One owner, because the classifier and the
+    /// Rust path rung must agree: a root the classifier calls a value must
+    /// never be bound as a crate by the rung.
+    ///
+    /// A positive use-site fact is authoritative even for an untyped capture.
+    /// Absence is not proof of no binding — older or hand-built extractions
+    /// may omit site facts — so the file-wide maps are kept as wider evidence.
+    fn root_is_a_value(
+        &self,
+        file_path: &str,
+        enclosing_symbol: &str,
+        root: &str,
+        receiver_binding: Option<&LocalBinding>,
+    ) -> bool {
+        receiver_binding.is_some()
+            || self.scope_declares_local(file_path, enclosing_symbol, root)
+            || self
+                .declared_types
+                .contains_key(&format!("{file_path}:{root}@type"))
+            || self
+                .receiver_types
+                .contains_key(&format!("{file_path}:{root}"))
+    }
+
     /// A binding belongs to its lexical scope. An untyped local must veto the
     /// file-wide fallback just as a typed one supplies the scoped answer.
     ///
@@ -1175,6 +1209,9 @@ impl Resolver {
             if let Some(from_facts) = Self::type_from_binding_facts(binding) {
                 return Some(from_facts);
             }
+            if let Some(from_header) = self.type_from_rust_header(file, scope, binding) {
+                return Some(from_header);
+            }
             // `w := NewWorker()`: the binding's initializer is a factory, and
             // the factory's declaration says what it returns.
             if let Some(from_factory) = binding.initializer.as_deref().and_then(|shape| {
@@ -1221,6 +1258,76 @@ impl Resolver {
             // A Go package-level value is in scope in every file of its
             // package, with no import between them.
             .or_else(|| self.module_value_type(file, name))
+    }
+
+    /// The type a Rust binding has according to a **function header** in the
+    /// corpus — the half of binder typing one file cannot do alone, because
+    /// the function is usually declared in another file. The extractor states
+    /// the shape (see `devmap_extract::rustlocal`); this reads the header.
+    ///
+    /// * `T::f()` / `T::f()?`: `T` when every indexed `T::f` is declared to
+    ///   return `Self` or `T` — through a `Result`/`Option` only when the call
+    ///   was unwrapped, because a `Result<T>` is not a `T`. With no `T::new`
+    ///   indexed, an un-unwrapped `T::new()` keeps the reading the
+    ///   initializer shape always gave it.
+    /// * `|f|k|p`: parameter `p` of the closure type `f` declares for its
+    ///   argument `k`. `f` is bound only as this file binds it — its own
+    ///   lexical scope or a `use` — never by a corpus-wide name match, which
+    ///   would type the closure by some other crate's `f`.
+    fn type_from_rust_header(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        binding: &devmap_extract::model::LocalBinding,
+    ) -> Option<String> {
+        use devmap_extract::rustsig;
+        let shape = binding.initializer.as_deref()?;
+        if let Some(closure) = shape.strip_prefix('|') {
+            let mut parts = closure.split('|');
+            let (callee, arg, param) = (parts.next()?, parts.next()?, parts.next()?);
+            let (arg, param): (usize, usize) = (arg.parse().ok()?, param.parse().ok()?);
+            let (callee_file, callee_identity) = self
+                .lexical_target(file, LangFamily::Rust, scope, callee)
+                .map(|identity| (file.to_string(), identity))
+                .or_else(|| {
+                    let (target_file, target_symbol) =
+                        self.import_bindings.get(file)?.get(callee)?;
+                    let (target_file, target_symbol) =
+                        self.declaring_site(target_file, target_symbol);
+                    self.lookup_in_package(&target_file, &target_symbol)
+                })?;
+            let header = self
+                .rust_signatures
+                .get(&(callee_file, callee_identity))?;
+            let header = rustsig::parse_header(header)?;
+            return Self::admissible_nominal_type(rustsig::closure_parameter(&header, arg, param)?);
+        }
+        let (call, unwrapped) = match shape.strip_suffix("()?") {
+            Some(call) => (call, true),
+            None => (shape.strip_suffix("()")?, false),
+        };
+        let (written_type, function) = call.split_once("::")?;
+        if !Self::is_plain_ident(written_type) || !Self::is_plain_ident(function) {
+            return None;
+        }
+        let type_name = if written_type == "Self" {
+            self.declaring_type_of(file, scope?)?.to_string()
+        } else {
+            written_type.to_string()
+        };
+        let Some(hits) =
+            self.type_methods
+                .get(&(LangFamily::Rust, type_name.clone(), function.to_string()))
+        else {
+            return (function == "new" && !unwrapped).then_some(type_name);
+        };
+        let every_hit_returns_it = hits.iter().all(|(hit_file, hit_identity)| {
+            self.rust_signatures
+                .get(&(hit_file.clone(), hit_identity.clone()))
+                .and_then(|header| rustsig::parse_header(header))
+                .is_some_and(|header| rustsig::returns_type(&header, &type_name, unwrapped))
+        });
+        (!hits.is_empty() && every_hit_returns_it).then_some(type_name)
     }
 
     /// `root.field` with exactly one hop of plain identifiers — the shape
@@ -1774,14 +1881,8 @@ impl Resolver {
         // A positive use-site fact is authoritative even for an untyped
         // capture. Absence is not proof of no binding: older/hand-built
         // extractions may omit site facts, so retain their wider evidence.
-        let root_is_a_value_here = receiver_binding.is_some()
-            || self.scope_declares_local(file_path, enclosing_symbol, root)
-            || self
-                .declared_types
-                .contains_key(&format!("{file_path}:{root}@type"))
-            || self
-                .receiver_types
-                .contains_key(&format!("{file_path}:{root}"));
+        let root_is_a_value_here =
+            self.root_is_a_value(file_path, enclosing_symbol, root, receiver_binding);
         // The bare shape requires the receiver to *be* the root and nothing
         // else. `std::fs::write("out.txt", body)` as the receiver of `unwrap()`
         // is also rooted at `std`, and it is an expression, not a module — the
@@ -1976,6 +2077,7 @@ impl Resolver {
         self.path_module_bindings.clear();
         self.py_search_dirs.clear();
         self.rust_crate_roots.clear();
+        self.rust_signatures.clear();
         self.reexport_chains.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
@@ -2049,6 +2151,14 @@ impl Resolver {
             let family = LangFamily::from_lang(&ext.language);
             let mut file_syms = Vec::new();
             for sym in &ext.symbols {
+                if family == LangFamily::Rust {
+                    if let Some(signature) = &sym.signature {
+                        self.rust_signatures.insert(
+                            (ext.file_path.clone(), sym.qualified_name.clone()),
+                            signature.clone(),
+                        );
+                    }
+                }
                 let identity: Arc<str> = Arc::from(sym.qualified_name.as_str());
                 self.symbol_index
                     .entry(sym.name.clone())
@@ -2411,6 +2521,12 @@ impl Resolver {
                                     .rsplit_once("::")
                                     .map(|(file, declared)| (file.to_string(), declared.to_string()))
                             });
+                        // A renaming re-export (`export { a as b }`, `from impl
+                        // import a as b`) publishes `b` and declares `a`; the
+                        // binding must name what the terminal file declares,
+                        // or every lookup through it asks for a name that file
+                        // does not have.
+                        let mut declared_as = name.clone();
                         // Both branches that answer with a file *declaring* the
                         // name bind a value; the submodule fallback below binds
                         // a module. `via_reexport` keeps the terminal's own
@@ -2438,24 +2554,47 @@ impl Resolver {
                         }
                         let resolved = if declares_name {
                             direct
-                        } else if let Some((file, _)) = via_reexport {
+                        } else if let Some((file, symbol)) = via_reexport {
+                            declared_as = symbol;
                             Some(file)
                         } else {
-                            let submodule = (ext.language == "python").then(|| {
-                                let dotted = format!("{}.{}", imp.module_specifier, name);
-                                self.resolve_import_path(&ext.file_path, &ext.language, &dotted)
-                                    .or_else(|| {
-                                        self.resolve_via_search_dirs(
-                                            ext,
-                                            imp.span.start_byte,
-                                            &dotted,
-                                        )
-                                    })
-                            });
-                            submodule.flatten().or(direct)
+                            let submodule = match ext.language.as_str() {
+                                "python" => {
+                                    let dotted = format!("{}.{}", imp.module_specifier, name);
+                                    self.resolve_import_path(&ext.file_path, &ext.language, &dotted)
+                                        .or_else(|| {
+                                            self.resolve_via_search_dirs(
+                                                ext,
+                                                imp.span.start_byte,
+                                                &dotted,
+                                            )
+                                        })
+                                }
+                                // The same shape in Rust: `use devmap_serve::
+                                // session_log;` names the module `session_log`,
+                                // and the crate root it was bound to declares
+                                // no such item — `pub mod session_log;` is a
+                                // module declaration, not a symbol — so every
+                                // `session_log::read_live()` through it found
+                                // nothing. Only a file that *is* that module
+                                // counts: a walk that popped the name back off
+                                // lands on the parent, which is `direct`.
+                                "rust" => self
+                                    .resolve_import_path(
+                                        &ext.file_path,
+                                        &ext.language,
+                                        &format!("{}::{}", imp.module_specifier, name),
+                                    )
+                                    .filter(|file| {
+                                        file.ends_with(&format!("/{name}.rs"))
+                                            || file.ends_with(&format!("/{name}/mod.rs"))
+                                    }),
+                                _ => None,
+                            };
+                            submodule.or(direct)
                         };
                         if let Some(target_f) = resolved {
-                            file_bindings.insert(local.to_string(), (target_f, name.clone()));
+                            file_bindings.insert(local.to_string(), (target_f, declared_as));
                         } else {
                             unresolved_import(local.to_string(), &imp.module_specifier);
                         }
@@ -2905,6 +3044,55 @@ impl Resolver {
     /// A cycle — `a.ts` re-exporting from `b.ts` re-exporting from `a.ts` —
     /// yields no entry at all. There is no terminal file, so there is nothing
     /// true to record, and recording either endpoint would invent one.
+    /// A Python module's own `from m import name` is a re-export hop.
+    ///
+    /// Python has no export statement: every name a module binds at module
+    /// scope is an attribute of that module, and `from barrel import name`
+    /// elsewhere reads it. So `barrel.py: from impl import normalise` states
+    /// where `barrel.normalise` comes from as plainly as `export { normalise }
+    /// from './impl'` does — and the chain never saw it, because only
+    /// `ext.exports` fed it. The importer's binding pointed at `barrel.py`,
+    /// which declares nothing, and `impl.normalise` was reported dead at 0.4
+    /// with its caller one file away. The same shape is every package
+    /// `__init__.py` that lifts a name out of a submodule.
+    ///
+    /// Module scope only: an import inside a function or class body binds a
+    /// local or a class attribute, never a module attribute. An explicit hop
+    /// for the same name — there is none in Python today — is never displaced.
+    fn python_import_hops(&self, ext: &Extraction, hops: &mut BTreeMap<String, (String, String)>) {
+        let enclosed = |span: &Span| {
+            ext.symbols.iter().any(|symbol| {
+                matches!(
+                    symbol.kind,
+                    SymbolKind::Function | SymbolKind::Method | SymbolKind::Class
+                ) && symbol.span.start_byte <= span.start_byte
+                    && span.end_byte <= symbol.span.end_byte
+            })
+        };
+        for imp in &ext.imports {
+            if imp.path_load.is_some() || imp.imported_names.is_empty() || enclosed(&imp.span) {
+                continue;
+            }
+            for (index, name) in imp.imported_names.iter().enumerate() {
+                if name.is_empty() || name == "*" {
+                    continue;
+                }
+                let local = imp
+                    .local_names
+                    .get(index)
+                    .filter(|local| !local.is_empty())
+                    .unwrap_or(name);
+                let spec = Self::import_spec_for_name(&imp.module_specifier, name);
+                let Some(target) = self.resolve_import_path(&ext.file_path, &ext.language, &spec)
+                else {
+                    continue;
+                };
+                hops.entry(format!("{}::{local}", ext.file_path))
+                    .or_insert((target, name.clone()));
+            }
+        }
+    }
+
     fn compute_reexport_chains(&self, extractions: &[Extraction]) -> BTreeMap<String, String> {
         // One hop per re-export, keyed by the re-exporting file's own name for
         // the symbol.
@@ -2938,6 +3126,9 @@ impl Resolver {
                     format!("{}::{}", ext.file_path, export.exported_name),
                     (target, source_name),
                 );
+            }
+            if ext.language == "python" {
+                self.python_import_hops(ext, &mut hops);
             }
         }
 
@@ -3582,11 +3773,30 @@ impl Resolver {
                     // declares. After 2d so an import in this file still wins,
                     // and only for Rust — `work::helper()` in C++ is not this
                     // module system.
+                    //
+                    // A bare root — `dc_glob::matches()` reduces to the
+                    // receiver `dc_glob` — is a crate only when nothing in
+                    // this scope binds that name and no `use` here does: a
+                    // local or an import alias shadows the extern crate.
                     if resolution.is_none() && family == LangFamily::Rust {
                         if let Some(recv) = call.receiver_expr.as_deref() {
-                            if let Some(found) =
-                                self.rust_qualified_call(&ext.file_path, recv, &call.callee_name)
-                            {
+                            let bare_root_is_free = Self::is_plain_ident(recv)
+                                && !self.root_is_a_value(
+                                    &ext.file_path,
+                                    call.caller_symbol.as_deref().unwrap_or(&ext.file_path),
+                                    recv,
+                                    ext.local_binding_at(call.span.start_byte, recv),
+                                )
+                                && !self
+                                    .import_bindings
+                                    .get(&ext.file_path)
+                                    .is_some_and(|bindings| bindings.contains_key(recv));
+                            if let Some(found) = self.rust_qualified_call(
+                                &ext.file_path,
+                                recv,
+                                &call.callee_name,
+                                bare_root_is_free,
+                            ) {
                                 resolution = Some(Arc::new(found));
                             }
                         }
@@ -4491,7 +4701,14 @@ impl Resolver {
                 if let Some((_, tail)) = path.split_once("::") {
                     self.consider_module_rel(&mut found, &src_root, tail);
                 } else {
-                    self.consider_crate_root_files(&mut found, &src_root);
+                    // A crate *name* is the library target. A package with
+                    // both `lib.rs` and `main.rs` is not ambiguous to an
+                    // importer — the binary is not addressable by name — so
+                    // `main.rs` answers only when there is no library.
+                    self.consider_indexed(&mut found, format!("{src_root}/lib.rs"));
+                    if found.is_empty() {
+                        self.consider_indexed(&mut found, format!("{src_root}/main.rs"));
+                    }
                 }
             }
             RustPathRoot::Child => {
@@ -4562,20 +4779,41 @@ impl Resolver {
     /// names and the callee is a method of that type in that file. Either
     /// shape binds only when exactly one indexed file is the module. A second
     /// file, a second method, or a prefix that had to be popped is no target.
-    fn rust_qualified_call(&self, file: &str, receiver: &str, callee: &str) -> Option<Resolution> {
+    ///
+    /// A receiver with no `::` left — `dc_glob::matches()` reduces to `dc_glob`
+    /// — is syntactically indistinguishable from a value, so it is a path only
+    /// when the caller has established `bare_root_is_free` (no local, no import
+    /// of that name) and the name is an indexed crate. A bare child module is
+    /// not taken here: `mod work;` already binds `work` through its import.
+    ///
+    /// A crate root that states `pub use index::build_index;` declares nothing
+    /// itself, so both shapes follow the root's re-export to the declaring
+    /// file — the statement says where the name comes from.
+    fn rust_qualified_call(
+        &self,
+        file: &str,
+        receiver: &str,
+        callee: &str,
+        bare_root_is_free: bool,
+    ) -> Option<Resolution> {
         if !Self::is_plain_ident(callee) {
             return None;
         }
+        let bare_crate = bare_root_is_free
+            && Self::is_plain_ident(receiver)
+            && matches!(self.rust_path_root(file, receiver), RustPathRoot::Crate(_));
         if !Self::receiver_is_module_path(receiver)
             && !matches!(receiver, "crate" | "self" | "super")
+            && !bare_crate
         {
             return None;
         }
         match self.rust_exact_module(file, receiver) {
             RustModulePlace::Ambiguous => return None,
             RustModulePlace::Unique(module_file) => {
-                let (target_file, target_symbol) = self.lookup_in_package(&module_file, callee)?;
-                if self.symbol_kind_in(&target_file, callee) != Some(SymbolKind::Function) {
+                let (decl_file, decl_name) = self.declaring_site(&module_file, callee);
+                let (target_file, target_symbol) = self.lookup_in_package(&decl_file, &decl_name)?;
+                if self.symbol_kind_in(&target_file, &decl_name) != Some(SymbolKind::Function) {
                     return None;
                 }
                 return Some(Self::rust_module_resolution(
@@ -4595,20 +4833,21 @@ impl Resolver {
             RustModulePlace::Unique(module_file) => module_file,
             RustModulePlace::Ambiguous | RustModulePlace::Absent => return None,
         };
+        let (type_file, type_name) = self.declaring_site(&module_file, type_name);
         if !self
-            .symbol_kind_in(&module_file, type_name)
+            .symbol_kind_in(&type_file, &type_name)
             .is_some_and(Self::rust_type_kind)
         {
             return None;
         }
         let hits = self.type_methods.get(&(
             LangFamily::Rust,
-            type_name.to_string(),
+            type_name.clone(),
             callee.to_string(),
         ))?;
         let mut matched: Vec<&(String, String)> = hits
             .iter()
-            .filter(|(path, _)| path == &module_file)
+            .filter(|(path, _)| path == &type_file)
             .collect();
         matched.sort();
         matched.dedup();
@@ -4619,8 +4858,28 @@ impl Resolver {
         Some(Resolution::ReceiverType {
             target_symbol: target_symbol.clone(),
             target_file: target_file.clone(),
-            receiver_type: type_name.to_string(),
+            receiver_type: type_name,
         })
+    }
+
+    /// The file and name that actually declare `name` as `file` exposes it.
+    ///
+    /// `file` itself when it declares the name; otherwise the terminal of the
+    /// re-export `file` states for it (`pub use index::build_index;`), which
+    /// `compute_reexport_chains` has already followed through nested barrels
+    /// and refused for a cycle. With neither, `file` and `name` unchanged, so a
+    /// caller's own lookup fails exactly as it did before.
+    fn declaring_site(&self, file: &str, name: &str) -> (String, String) {
+        if self.symbol_kind_in(file, name).is_none() {
+            if let Some((terminal_file, terminal_name)) = self
+                .reexport_chains
+                .get(&format!("{file}::{name}"))
+                .and_then(|terminal| terminal.rsplit_once("::"))
+            {
+                return (terminal_file.to_string(), terminal_name.to_string());
+            }
+        }
+        (file.to_string(), name.to_string())
     }
 
     fn import_local_name(lang: &str, specifier: &str) -> String {

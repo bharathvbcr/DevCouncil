@@ -1,0 +1,6 @@
+{
+  "_comment": "Hand-labelled ground truth. `live` is the answer a careful reviewer gives with the whole corpus in front of them, and `why` is the evidence — a label without one is an opinion. Edit only with a reason recorded here.",
+  "source": "testdata/fixtures/tier_c/cfml_app",
+  "notes": "CFML, which this build reads for imports and nothing else. `tree-sitter-cfml` gives no declaration in either dialect here (`cfml_is_deliberately_left_without_a_call_graph` pins why), so each file is one File symbol and there is nothing to label: the kernel must claim nothing, and any claim it makes about this fixture is a drift violation. A reviewer's labels are kept in prose so they are ready the day CFML gains declarations: `Greeter.greet` live (index.cfm:2), `Greeter.formatSuffix` live (called by greet), `Greeter.neverCalled` dead. NOT confirmed by breaking a fix: with no declaration extracted there is no label for any mechanism to move, so this case fences only that CFML stays silent rather than wrong.",
+  "symbols": []
+}

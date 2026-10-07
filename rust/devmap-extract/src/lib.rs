@@ -5,6 +5,8 @@
 pub mod cache;
 pub mod clonesig;
 pub mod deref;
+// Pure text: the resolver reads Rust function headers with it, and has no tree.
+pub mod rustsig;
 #[cfg(feature = "parse")]
 pub mod embedded;
 pub mod fallback;
@@ -59,6 +61,10 @@ mod pyload;
 // `treesitter::extract_treesitter`.
 #[cfg(feature = "parse")]
 mod returns;
+// The type a Rust local has where its own binder states it. Walks a parse
+// tree; its one caller is `treesitter::collect_site_bindings`.
+#[cfg(feature = "parse")]
+mod rustlocal;
 #[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod wiring;

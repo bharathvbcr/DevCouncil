@@ -813,8 +813,11 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // Go `var`/`const` spec's initializer to its name.
     //
     // v70 is the merge of the 67/68/69 lanes under a number none of them used.
+    //
+    // v71 adds the resolver-precision lane's v67: Rust function headers, Rust
+    // locals typed from their own binders, and a Go `var w T`.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "70",
+        EXTRACTION_SCHEMA_VERSION, "71",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );
