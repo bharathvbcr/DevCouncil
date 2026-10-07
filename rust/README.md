@@ -222,29 +222,26 @@ the new build is broken.
 - **A C compiler.** `dc-store` takes `rusqlite` with `bundled` and compiles
   SQLite from source rather than linking whatever `libsqlite3` the host ships.
 - **`sqlite3`** for the Go client tests, which plant a task row with it.
-- **Python with DevCouncil installed** for the interop suite (below). Without
-  it those tests skip.
+- **No Python.** Nothing in this workspace needs an interpreter; the Python
+  storage layer the interop suite used to drive was deleted in Phase 7
+  (2026-09-10).
 
 ---
 
-## The interop suite, and why it can be made fatal
+## The interop suite (retired)
 
-`dc-store/tests/interop.rs` drives **both** sides against one `state.sqlite`:
-the Rust store acquires a lease and DevCouncil's own
-`devcouncil.storage.native.TaskLeaseRepository` reads it back, then the reverse,
-then both agree on when it expires. It is the only evidence that the two
-implementations mean the same thing by a lease.
+`dc-store/tests/interop.rs` used to drive **both** sides against one
+`state.sqlite`: the Rust store acquired a lease and DevCouncil's Python
+`TaskLeaseRepository` read it back, then the reverse. That Python package no
+longer exists, so the file now holds one empty test,
+`python_storage_interop_retired_with_phase_7`, that records the retirement.
+Lease behaviour is covered by the Rust suite (`dc-store/tests/leases.rs` and the
+unit tests under `dc-store/src/`).
 
-It skips when it cannot find `.venv/bin/python` in the checkout — and a skip
-prints `ok`, which is indistinguishable from a pass in any summary. So:
-
-```bash
-DC_STORE_REQUIRE_INTEROP=1 cargo test -p dc-store --test interop
-```
-
-turns the skip into a failure that says the agreement is **UNPROVEN**. CI sets
-it (see [`../.github/workflows/analysis-plane.yml`](../.github/workflows/analysis-plane.yml)).
-Leave it unset locally if you have no venv; never leave it unset in CI.
+`DC_STORE_REQUIRE_INTEROP` is no longer read by anything (checked 2026-10-07 by
+searching the tree, ignored files included), and CI does not set it. Do not
+rely on it: setting it changes nothing. Reintroduce a cross-plane check only
+when a second writer of the same schema exists.
 
 ---
 
@@ -307,10 +304,11 @@ decided against the incumbent (the Python engine normalises any absolute
 `…/.venv/bin/dev` to a bare `dev`). Regeneration drops them and nothing puts
 them back.
 
-So before the Python is deleted, either repoint the generator at the new
-implementation, regenerate, **and re-apply those three rows** — or freeze the
-baseline and open a divergence ledger, which is what the kernel chose when it
-faced this: see [`../docs/devmap/DIVERGENCES.md`](../docs/devmap/DIVERGENCES.md).
+The Python is deleted now, so regeneration is no longer an option and the
+baseline is frozen. (The choice that was open before the deletion was to
+repoint the generator at the new implementation, regenerate **and re-apply those
+three rows**, or to freeze the baseline and open a divergence ledger, which is
+what the kernel chose when it faced this: see [`../docs/devmap/DIVERGENCES.md`](../docs/devmap/DIVERGENCES.md).)
 Three hand-maintained rows in a comment header are already a divergence ledger
 in everything but name, which is the argument for making it one.
 
