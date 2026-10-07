@@ -950,6 +950,32 @@ fn confidence_prop_defaulting(default: f32) -> Value {
 
 /// The `tools/list` payload. Deterministic: built from literals and [`TOOLS`],
 /// with no map iteration and no dependence on process or filesystem state.
+/// The `min_rung` property: a named floor on the resolution ladder.
+///
+/// The enum is read from [`devmap_query::Rung::ALL`] rather than restated, so
+/// the names a client is offered are the names `Rung::parse` accepts —
+/// `check_constraints` refuses anything else before serde sees it, and
+/// `validate_request` refuses it again behind that. There is no `default`:
+/// absent means no floor, which is not a rung, and publishing one would make
+/// `every_published_default_is_the_default_that_is_applied` compare a floored
+/// answer with an unfloored one.
+fn rung_prop() -> Value {
+    let names: Vec<&str> = devmap_query::Rung::ALL
+        .iter()
+        .map(|rung| rung.label())
+        .collect();
+    json!({
+        "type": "string",
+        "enum": names,
+        "description": "Admit only edges at or above this rung of the resolution ladder: \
+    `deterministic` (one answer the evidence admits — same file, import binding, typed receiver), \
+    `high` (adds a unique global match), `speculative` (everything, including `AmbiguousGlobal` \
+    fan-out). Omit for no floor. Prefer this to a float `min_confidence`: the rung is the boundary \
+    the resolver states. The answer's `rungs` histogram counts the population before the cut, so \
+    `filtered_out` says how much this narrowed it. Any other name is refused, never ignored."
+    })
+}
+
 /// The description and input schema for one command tag.
 ///
 /// The single owner of both. `tool_specs` publishes what this returns and
@@ -1035,7 +1061,8 @@ symbol name.",
                     "target": {"type": "string", "maxLength": 4096,
                         "description": "File path or symbol name."},
                     "budget": budget_prop(2000),
-                    "min_confidence": confidence_prop()
+                    "min_confidence": confidence_prop(),
+                    "min_rung": rung_prop()
                 },
                 "required": ["target"],
                 "additionalProperties": false
@@ -1047,7 +1074,9 @@ before deleting or changing a symbol. `items` mixes every hop; pass layers=true 
 `blast_radius` banded by distance, where depth 1 is the direct callers. `unresolved_namesakes` \
 lists call sites that name the target but were not bound to it (untyped receiver, module \
 loaded by file path) — candidates to verify, not callers. A result carrying walk_incomplete \
-is a partial blast radius, not a complete one.",
+is a partial blast radius, not a complete one. `layers` and `min_rung` are refused together: the \
+distance bands are walked without a rung floor, so honouring both would return two halves that \
+describe different graphs.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1055,6 +1084,7 @@ is a partial blast radius, not a complete one.",
                         "description": "File path or symbol name."},
                     "budget": budget_prop(2000),
                     "depth": depth_prop(3),
+                    "min_rung": rung_prop(),
                     "layers": {"type": "boolean", "default": false,
                         "description": "Also band the reached symbols by hop distance \
 (`blast_radius.layers`). The budget is split between the bands and the edge list."}
@@ -1074,7 +1104,8 @@ is supplied.",
                     "to": {"type": "string", "maxLength": 4096,
                         "description": "Optional destination; when set, returns paths between the two."},
                     "budget": budget_prop(2000),
-                    "depth": depth_prop(3)
+                    "depth": depth_prop(3),
+                    "min_rung": rung_prop()
                 },
                 "required": ["from"],
                 "additionalProperties": false
@@ -1106,7 +1137,8 @@ underneath the answer.",
                     // saw the default it wanted, and therefore omitted the
                     // field could not get the answer the schema described.
                     "depth": depth_prop(3),
-                    "min_confidence": confidence_prop()
+                    "min_confidence": confidence_prop(),
+                    "min_rung": rung_prop()
                 },
                 "required": ["targets"],
                 "additionalProperties": false

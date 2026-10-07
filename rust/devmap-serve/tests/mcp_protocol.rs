@@ -293,7 +293,7 @@ async fn a_missing_index_is_an_error_not_an_empty_success() {
         ("devmap_search", json!({"query": "helper"})),
         ("devmap_impact", json!({"target": "core.py"})),
         ("devmap_dead_symbols", json!({})),
-        ("devmap_neighbors", json!({"targets": ["helper"]})),
+        ("devmap_neighbors", json!({"targets": ["app.py::helper"]})),
     ] {
         let response = call(&store, tool, arguments).await;
         let result = &response["result"];
@@ -819,4 +819,136 @@ fn impact_accepts_layers_and_forwards_it() {
         refused.is_err(),
         "a misspelling is still refused, not defaulted"
     );
+}
+
+/// A corpus whose call graph holds both rungs: `helper` calls `shared`, which
+/// two files define and nothing imports, so the resolver records the call as an
+/// `AmbiguousGlobal` fan-out to both; `main` calls `helper` in its own file,
+/// which is deterministic.
+fn mixed_rung_corpus() -> Arc<StoreSlot> {
+    let extractions = vec![
+        devmap_extract::extract_file("lib_a.py", "def shared():\n    return 1\n"),
+        devmap_extract::extract_file("lib_b.py", "def shared():\n    return 2\n"),
+        devmap_extract::extract_file(
+            "app.py",
+            "def helper():\n    return shared()\n\n\ndef main():\n    return helper()\n",
+        ),
+    ];
+    let mut resolver = devmap_resolve::Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().expect("in-memory store");
+    store
+        .save_generation(&extractions, &resolution, &analysis)
+        .expect("generation");
+    Arc::new(StoreSlot::ready("in-memory", Arc::new(store)))
+}
+
+/// How many `AmbiguousGlobal` edges an answer carries, wherever they sit in it.
+fn ambiguous_edges(answer: &Value) -> usize {
+    answer
+        .to_string()
+        .matches(r#""kind":"AmbiguousGlobal""#)
+        .count()
+}
+
+/// DEVMAP_REVIEW R9 / W2.3: `min_rung` reaches the four graph walks over MCP.
+///
+/// The socket protocol and the CLI took a rung floor; the MCP port carried none
+/// of it over, so an agent could not keep `AmbiguousGlobal` guesses out of a
+/// refactor's dependency or blast-radius answer. Each tool is asked twice over
+/// the same corpus: without a floor the ambiguous fan-out must be present —
+/// otherwise the filtered half proves nothing — and with `deterministic` it
+/// must be gone, with the cut counted in `rungs.filtered_out`.
+#[tokio::test]
+async fn min_rung_keeps_ambiguous_edges_out_of_every_graph_walk() {
+    let store = mixed_rung_corpus();
+    for (tool, arguments) in [
+        ("devmap_dependencies", json!({"target": "app.py"})),
+        ("devmap_impact", json!({"target": "lib_a.py::shared"})),
+        ("devmap_trace", json!({"from": "app.py::helper"})),
+        ("devmap_neighbors", json!({"targets": ["app.py::helper"]})),
+    ] {
+        let unfloored = call(&store, tool, arguments.clone()).await;
+        assert_eq!(
+            unfloored["result"]["isError"],
+            json!(false),
+            "{tool}: {unfloored}"
+        );
+        let unfloored = &unfloored["result"]["structuredContent"];
+        assert!(
+            ambiguous_edges(unfloored) > 0,
+            "{tool}: the fixture must put an AmbiguousGlobal edge in the unfloored answer, or \
+             the floored half of this test passes vacuously: {unfloored}"
+        );
+
+        let mut floored_args = arguments.clone();
+        floored_args["min_rung"] = json!("deterministic");
+        let floored = call(&store, tool, floored_args).await;
+        assert_eq!(
+            floored["result"]["isError"],
+            json!(false),
+            "{tool}: {floored}"
+        );
+        let floored = &floored["result"]["structuredContent"];
+        assert_eq!(
+            ambiguous_edges(floored),
+            0,
+            "{tool}: min_rung=deterministic must drop every AmbiguousGlobal edge: {floored}"
+        );
+        let filtered_out: u64 = floored
+            .to_string()
+            .match_indices(r#""filtered_out":"#)
+            .map(|(at, matched)| {
+                floored.to_string()[at + matched.len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<u64>()
+                    .unwrap_or(0)
+            })
+            .sum();
+        assert!(
+            filtered_out > 0,
+            "{tool}: the cut must be counted, or a narrowed answer reads as a sparse graph: \
+             {floored}"
+        );
+    }
+}
+
+/// A rung that is not one is refused as a tool error, never answered unfloored.
+///
+/// A typo answered at full breadth is a filtered answer the agent believes is
+/// narrow — the AmbiguousGlobal guesses it asked to exclude are in it.
+#[tokio::test]
+async fn an_unknown_min_rung_is_refused_not_ignored() {
+    let store = mixed_rung_corpus();
+    for (tool, arguments) in [
+        ("devmap_dependencies", json!({"target": "helper", "min_rung": "determinstic"})),
+        ("devmap_impact", json!({"target": "shared", "min_rung": "HIGH"})),
+        ("devmap_trace", json!({"from": "helper", "min_rung": ""})),
+        ("devmap_neighbors", json!({"targets": ["helper"], "min_rung": 1})),
+    ] {
+        let response = call(&store, tool, arguments.clone()).await;
+        assert_eq!(
+            response["result"]["isError"],
+            json!(true),
+            "{tool} {arguments}: an invalid rung must be refused: {response}"
+        );
+        assert!(
+            response.to_string().contains("min_rung"),
+            "{tool}: the refusal names the argument the agent must correct: {response}"
+        );
+    }
+
+    // And the impact exclusion holds at this layer too: a rung floor beside the
+    // distance bands would describe two different graphs in one answer.
+    let response = call(
+        &store,
+        "devmap_impact",
+        json!({"target": "shared", "layers": true, "min_rung": "high"}),
+    )
+    .await;
+    assert_eq!(response["result"]["isError"], json!(true), "{response}");
 }
