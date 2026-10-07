@@ -635,6 +635,126 @@ async fn every_tool_result_conforms_to_the_output_schema_it_declared() {
     );
 }
 
+/// A store whose analysis is the given one, over a corpus holding a private
+/// pair that call only each other — a component nothing outside reaches, which
+/// a one-hop inbound join cannot see because each member has an inbound edge.
+fn dead_cluster_corpus(
+    shape: impl FnOnce(&mut devmap_analyze::AnalysisSummary),
+) -> Arc<StoreSlot> {
+    let files = [
+        ("core.py", "def helper(rows):\n    return sum(rows)\n"),
+        (
+            "orphans.py",
+            "def _ping(n):\n    return _pong(n - 1)\n\n\ndef _pong(n):\n    return _ping(n - 1)\n",
+        ),
+    ];
+    let extractions: Vec<_> = files
+        .iter()
+        .map(|(path, source)| devmap_extract::extract_file(path, source))
+        .collect();
+    let mut resolver = devmap_resolve::Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let mut analysis = devmap_analyze::analyze(&extractions, &resolution);
+    shape(&mut analysis);
+    let store = Store::open_in_memory().expect("in-memory store");
+    store
+        .save_generation(&extractions, &resolution, &analysis)
+        .expect("generation");
+    Arc::new(StoreSlot::ready("in-memory", Arc::new(store)))
+}
+
+async fn dead_answer(store: &Arc<StoreSlot>) -> Value {
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "devmap_dead_symbols", "arguments": {}},
+    })
+    .to_string();
+    let response = handle_line(store, &frame).await.expect("answered");
+    assert_eq!(response["result"]["isError"], json!(false), "{response}");
+    response["result"]["structuredContent"].clone()
+}
+
+/// DEVMAP_REVIEW R8: the component pass reaches an agent over MCP, declared.
+///
+/// `dead_clusters` reached the CLI and the IPC envelope, but the MCP tool never
+/// named it: no description told an agent the field existed, and the output
+/// schema did not declare it, so a client validating against the schema could
+/// not know a dead subsystem was in the answer at all. Both halves are pinned:
+/// the payload carries the cluster, and the schema declares the field with the
+/// type the payload has — checked by making the validator reject a wrong one.
+#[tokio::test]
+async fn the_dead_tool_carries_and_declares_dead_clusters() {
+    let structured = dead_answer(&dead_cluster_corpus(|_| {})).await;
+    let clusters = structured["dead_clusters"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the component pass ran, so its list must be present: {structured}"));
+    let members: Vec<&str> = clusters
+        .iter()
+        .flat_map(|cluster| cluster["members"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        members.iter().any(|m| m.ends_with("_ping")) && members.iter().any(|m| m.ends_with("_pong")),
+        "the mutually-recursive pair is one dead cluster: {structured}"
+    );
+    assert!(
+        structured.get("dead_clusters_incomplete").is_none(),
+        "a pass that ran carries no refusal: {structured}"
+    );
+    assert_eq!(
+        structured_content_violation("devmap_dead_symbols", &structured),
+        None
+    );
+
+    let spec = tool_specs()
+        .into_iter()
+        .find(|spec| spec["name"] == "devmap_dead_symbols")
+        .expect("dead tool declared");
+    let declared = &spec["outputSchema"]["properties"];
+    assert_eq!(declared["dead_clusters"]["type"], json!("array"), "{spec}");
+    assert_eq!(declared["dead_clusters_incomplete"]["type"], json!("string"), "{spec}");
+    assert_eq!(declared["dead_clusters_truncated"]["type"], json!("integer"), "{spec}");
+    assert!(
+        spec["description"].as_str().unwrap_or("").contains("dead_clusters"),
+        "an agent reads the description, not the schema: {spec}"
+    );
+
+    // The declaration is enforced, not decorative: a payload whose field has
+    // the wrong type is refused by the same check `tool_success` runs.
+    let mut wrong = structured.clone();
+    wrong["dead_clusters"] = json!("none");
+    assert!(structured_content_violation("devmap_dead_symbols", &wrong).is_some());
+    let mut wrong = structured;
+    wrong["dead_clusters_incomplete"] = json!(true);
+    assert!(structured_content_violation("devmap_dead_symbols", &wrong).is_some());
+}
+
+/// A pass that refused is said to have refused, over MCP, rather than arriving
+/// as an empty list — the strongest reading of the weakest evidence.
+#[tokio::test]
+async fn a_refused_component_pass_arrives_as_dead_clusters_incomplete() {
+    let structured = dead_answer(&dead_cluster_corpus(|analysis| {
+        analysis.dead_clusters.clusters.clear();
+        analysis.dead_clusters.refused_oversized_graph = true;
+    }))
+    .await;
+    assert!(
+        structured.get("dead_clusters").is_none(),
+        "a refused pass must not be reported as one that found nothing: {structured}"
+    );
+    assert!(
+        structured["dead_clusters_incomplete"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "the refusal names its reason: {structured}"
+    );
+    assert_eq!(
+        structured_content_violation("devmap_dead_symbols", &structured),
+        None
+    );
+}
+
 /// The validator has to be able to fail, or the test above is a tautology.
 #[test]
 fn the_output_schema_check_rejects_a_result_that_does_not_conform() {

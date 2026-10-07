@@ -1150,7 +1150,12 @@ High confidence (above the degraded ceiling) means no inbound evidence after the
 `only_ambiguous_callers` and unresolved-namesake rows sit at 0.4 (unconfirmed). \
 `NoNamesake` sites are explained gaps in the unresolved ledger, not dead findings. \
 Read `walk_incomplete` before treating an empty or short list as complete; a partial \
-corpus caps findings below the confident tier. Always pass `repo_path`.",
+corpus caps findings below the confident tier. `items` comes from a one-hop inbound join, which \
+cannot see a subsystem whose functions only call each other; `dead_clusters` is the component \
+pass that can — groups of symbols reached by nothing outside the group. An empty \
+`dead_clusters` is a finding (the pass ran and found none); an absent one means it was not \
+measured, and `dead_clusters_incomplete` says why when the pass refused. \
+`dead_clusters_truncated` counts clusters the producer's cap left out. Always pass `repo_path`.",
             json!({
                 "type": "object",
                 "properties": {"budget": budget_prop(2000)},
@@ -1495,11 +1500,41 @@ re-ranked by personalized PageRank over call edges. Read `truncated` and `walk_i
         "deps" => budgeted_envelope("Outbound edges from the target."),
         "impact" => budgeted_envelope("Symbols that reach the target, walked in reverse."),
         "trace" => budgeted_envelope("Call paths from the origin, or between the two endpoints."),
-        "dead" => budgeted_envelope(
-            "Dead-symbol reports with per-row confidence and reason: confident vs unconfirmed \
+        "dead" => {
+            let mut schema = budgeted_envelope(
+                "Dead-symbol reports with per-row confidence and reason: confident vs unconfirmed \
 (`only_ambiguous_callers`, unresolved namesake, coverage-capped). Read `walk_incomplete` — \
 a partial corpus is a lower bound, not a clean bill. Candidate list to verify, not a delete list.",
-        ),
+            );
+            // Declared, not required: all three are `skip_serializing_if` on
+            // `devmap_query::Response`, and their *absence* is itself the
+            // signal — `dead_clusters` absent is "not measured", which an
+            // over-tight schema would turn into a refused correct answer.
+            if let Some(properties) = schema["properties"].as_object_mut() {
+                properties.insert(
+                    "dead_clusters".into(),
+                    json!({"type": "array",
+                        "description": "Strongly connected groups nothing outside reaches: \
+        `cluster_id`, `members` (graph ids, sorted, capped), `size` (the real count, never the \
+        length of `members`), `confidence`, `reason`. Empty means the component pass ran and found \
+        none; absent means it was not measured for this generation."}),
+                );
+                properties.insert(
+                    "dead_clusters_truncated".into(),
+                    json!({"type": "integer",
+                        "description": "Clusters found but not listed because of the producer's \
+        cluster cap. Separate from `hidden`, which counts what the token budget trimmed from `items`."}),
+                );
+                properties.insert(
+                    "dead_clusters_incomplete".into(),
+                    json!({"type": "string",
+                        "description": "Why `dead_clusters` is absent when the pass ran and \
+        refused — a graph too large to walk. Never read an absent `dead_clusters` as 'no abandoned \
+        subsystems'."}),
+                );
+            }
+            schema
+        }
         "skeleton" => json!({
             "type": "object",
             "properties": {
