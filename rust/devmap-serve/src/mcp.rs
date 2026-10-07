@@ -110,6 +110,10 @@ pub struct StoreSlot {
     opened: Mutex<StoreLru>,
     unusable_mcp_roots: Mutex<usize>,
     roots_list_seq: Mutex<u64>,
+    /// The executable this server was started from, taken when the slot is
+    /// built — which `devmap mcp` does before it reads a frame. See
+    /// [`Self::binary_replaced`].
+    started_as: crate::binary_identity::ExecutableIdentity,
 }
 
 impl StoreSlot {
@@ -123,6 +127,7 @@ impl StoreSlot {
             opened: Mutex::new(StoreLru::new()),
             unusable_mcp_roots: Mutex::new(0),
             roots_list_seq: Mutex::new(0),
+            started_as: crate::binary_identity::executable_identity(),
         }
     }
 
@@ -153,6 +158,7 @@ impl StoreSlot {
             opened: Mutex::new(StoreLru::new()),
             unusable_mcp_roots: Mutex::new(0),
             roots_list_seq: Mutex::new(0),
+            started_as: crate::binary_identity::executable_identity(),
         }
     }
 
@@ -173,6 +179,7 @@ impl StoreSlot {
             opened: Mutex::new(cache),
             unusable_mcp_roots: Mutex::new(0),
             roots_list_seq: Mutex::new(0),
+            started_as: crate::binary_identity::executable_identity(),
         }
     }
 
@@ -549,6 +556,40 @@ use an unpinned shared server and select with repo_path.",
     /// different facts and must not arrive looking alike.
     pub fn get(&self) -> Result<Arc<Store>, String> {
         self.open_for_call(None).map(|(store, _)| store)
+    }
+
+    /// Why this server must not answer, when the executable it was started
+    /// from has been replaced on disk since.
+    ///
+    /// A stdio MCP server lives as long as its host session, and a reinstall
+    /// does not reach it: on 2026-10-05, 7 of 10 live `devmap mcp` processes on
+    /// one machine were serving an old inode of `~/.local/bin/devmap`, some for
+    /// three days, every answer computed by the kernel that predated the fix
+    /// the reinstall shipped. The `serve` daemon has retired itself on this
+    /// condition for a long time; this is the same predicate, asked per call.
+    ///
+    /// Refuses rather than exits. A host that does not respawn a stdio server
+    /// would show its tools vanishing with no reason given; a refusal names the
+    /// binary and the fix to the agent and the person reading its transcript.
+    /// The process stays up until the host restarts it, which is also what
+    /// `devmap doctor`'s stale-server warning asks for.
+    pub fn binary_replaced(&self) -> Option<String> {
+        if !crate::binary_identity::should_retire_for_new_binary(
+            self.started_as,
+            crate::binary_identity::executable_identity(),
+        ) {
+            return None;
+        }
+        let executable = std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "the devmap executable".to_string());
+        Some(format!(
+            "binary_replaced: {executable} changed on disk after this DevMap MCP server \
+(pid {}) started, so its answers would come from the kernel that was replaced. \
+Restart the MCP host, or reconnect its devmap server, to load the installed binary. \
+`devmap doctor` lists servers still running a replaced binary.",
+            std::process::id()
+        ))
     }
 }
 
@@ -2578,6 +2619,12 @@ async fn call_tool(
 
     let started = Instant::now();
     let args = params.get("arguments").cloned();
+    // First, before any store is resolved or opened: a replaced binary's answer
+    // is wrong whichever repository it is about. A tool error, not a protocol
+    // one, because the model is who has to act on it.
+    if let Some(reason) = store.binary_replaced() {
+        return Ok(tool_error(reason));
+    }
     let repo_path = match repo_scope_from_args(args.as_ref()) {
         Ok(repo_path) => repo_path,
         Err(reason) => {
