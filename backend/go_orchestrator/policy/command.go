@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 )
@@ -237,8 +238,20 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 		for _, span := range spans {
 			d := g.evaluate(span, task, depth+1)
 			if d.Action == Deny {
-				return g.noteHardRules(deny(RuleCommandSubstitution,
-					fmt.Sprintf("Substituted command was denied: %s", d.Reason), normalized, taskID))
+				// The inner refusal is returned under its own rule and
+				// severity. It used to be re-issued as a hard
+				// command.substitution, which made a refusal negotiable or not
+				// according to where the command was written: `date` alone was
+				// a soft command.not_allowed a grant or posture could clear,
+				// `echo "$(date)"` a hard denial nothing could — though the
+				// span was read to its end and nothing about it was opaque.
+				// command.substitution stays for what it names: a span the
+				// scanner could not bound (the two cases above). A hard inner
+				// refusal is still hard, so wrapping `git push --force` in
+				// $(…) launders nothing.
+				d.Reason = fmt.Sprintf("Substituted command `%s` was denied: %s", clipForReason(span), d.Reason)
+				d.Target = normalized
+				return d
 			}
 			if d.Action == Warn && warnDecision == nil {
 				warnDecision = &d
@@ -1144,6 +1157,10 @@ func RedirectTargets(command string) ([]string, bool, error) {
 		if _, dup := seen[target]; dup {
 			continue
 		}
+		// A stream device is not a file the command writes; see IsStreamDevice.
+		if IsStreamDevice(target) {
+			continue
+		}
 		if len(distinct) >= maxRedirectTargets {
 			// Past the cap the enumeration is incomplete, and incomplete is
 			// exactly what opacity means — the caller refuses rather than
@@ -1154,6 +1171,66 @@ func RedirectTargets(command string) ([]string, bool, error) {
 		distinct = append(distinct, target)
 	}
 	return distinct, opaque, nil
+}
+
+// clipForReason bounds model-authored text quoted into a decision's Reason,
+// which travels into logs, transcripts and the TUI. Cut on a rune boundary.
+func clipForReason(s string) string {
+	const limit = 120
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+// streamDevices are the device paths a redirection writes to without creating
+// or changing any file: a sink that keeps nothing, or a stream the command
+// already owns.
+var streamDevices = map[string]bool{
+	"/dev/null":   true,
+	"/dev/zero":   true,
+	"/dev/stdout": true,
+	"/dev/stderr": true,
+	"/dev/tty":    true,
+}
+
+// IsStreamDevice reports whether a redirection target is a stream rather than a
+// file, so that it is not a write for the write gate to judge.
+//
+// It used to be judged as one, and refused as path.outside_root — a hard,
+// ungrantable denial for `ls 2>/dev/null` and `cmd >/dev/null 2>&1`, which
+// appear in nearly every shell line an agent writes, while the same command
+// without the redirect ran. A redirect into /dev/fd/N writes to a descriptor
+// that is either inherited from the caller or was opened by an earlier
+// redirection on the same line, and that earlier redirection is itself a target
+// judged here.
+//
+// The match is exact after cleaning, which is how the kernel resolves the path
+// too: `/dev//null` is the sink, while `/dev/null.txt`, `/dev/fd/2x` and
+// `/dev/fd/../../etc/passwd` are ordinary paths and are judged as the writes
+// they are.
+func IsStreamDevice(target string) bool {
+	if !strings.HasPrefix(target, "/dev/") {
+		return false
+	}
+	cleaned := path.Clean(target)
+	if streamDevices[cleaned] {
+		return true
+	}
+	fd, ok := strings.CutPrefix(cleaned, "/dev/fd/")
+	if !ok || fd == "" || len(fd) > 4 {
+		return false
+	}
+	for _, r := range fd {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // maxRedirectTargets bounds how many distinct files one command line may be
