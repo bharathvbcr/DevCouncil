@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
@@ -132,8 +133,8 @@ func toolSpecs() []ToolSpec {
 		},
 		{
 			Name:        "devcouncil_policy_check_write",
-			Description: "Ask whether a write to a path would be allowed under the current gate posture and optional task scope.",
-			InputSchema: rawSchema(`{"type":"object","properties":{"path":{"type":"string"},"task_id":{"type":"string"},"operation":{"type":"string"}},"required":["path"],"additionalProperties":false}`),
+			Description: "Ask whether a write to a path would be allowed under the current gate posture. Pass task_id to judge it against that task's planned scope; without one the answer stops at task.absent after the secret, restricted and outside-root rules. operation is create, modify (the default) or delete.",
+			InputSchema: rawSchema(`{"type":"object","properties":{"path":{"type":"string"},"task_id":{"type":"string"},"operation":{"type":"string","enum":["create","modify","delete"]}},"required":["path"],"additionalProperties":false}`),
 			Behaviour:   ro,
 		},
 	}
@@ -353,17 +354,76 @@ func (r *Registry) callGetGaps(ctx context.Context, args map[string]any) any {
 	}
 }
 
+// policyCheckArguments is every argument devcouncil_policy_check_write's schema
+// declares, all strings. Nothing enforces a tool schema at runtime, so
+// callPolicyCheck checks it.
+var policyCheckArguments = map[string]bool{"path": true, "task_id": true, "operation": true}
+
+// policyCheckOperations is what the operation argument may name. dc.OpWrite is
+// deliberately absent: the schema never offered it, and a caller that can say
+// which of create and modify it means gets the stricter answer.
+var policyCheckOperations = map[string]dc.Operation{
+	string(dc.OpCreate): dc.OpCreate,
+	string(dc.OpModify): dc.OpModify,
+	string(dc.OpDelete): dc.OpDelete,
+}
+
 func (r *Registry) callPolicyCheck(ctx context.Context, args map[string]any) any {
-	_ = ctx
+	// Refused before the gate or the store is consulted. This tool used to
+	// read only path: a task_id was dropped without a word, so the ladder
+	// stopped at task.absent and a caller asking "is this in my task's scope?"
+	// got an answer about no task at all, which it would read as the one it
+	// asked for.
+	for name, value := range args {
+		if !policyCheckArguments[name] {
+			return ErrorPayload{OK: false, Code: "invalid_argument",
+				Error: "devcouncil_policy_check_write takes only path, task_id and operation; refusing argument " + name}
+		}
+		if _, ok := value.(string); !ok {
+			return ErrorPayload{OK: false, Code: "invalid_argument",
+				Error: fmt.Sprintf("devcouncil_policy_check_write: %s must be a string, got %T", name, value)}
+		}
+	}
 	path, _ := args["path"].(string)
 	if path == "" {
 		return ErrorPayload{OK: false, Code: "missing_argument", Error: "path is required"}
 	}
+	op := dc.OpModify
+	if raw, given := args["operation"].(string); given {
+		parsed, known := policyCheckOperations[raw]
+		if !known {
+			return ErrorPayload{OK: false, Code: "invalid_argument",
+				Error: "devcouncil_policy_check_write: operation must be create, modify or delete, not " + strconv.Quote(raw)}
+		}
+		op = parsed
+	}
+	taskID, taskGiven := args["task_id"].(string)
+	if taskGiven && taskID == "" {
+		return ErrorPayload{OK: false, Code: "invalid_argument",
+			Error: "devcouncil_policy_check_write: task_id is empty; omit it to ask without a task"}
+	}
 	if r.Gate == nil {
 		return map[string]any{"ok": true, "path": path, "allowed": true, "note": "no gate configured"}
 	}
-	// Without a task, EvaluateWrite still answers secret/restricted rules.
-	d, err := r.Gate.EvaluateWrite(path, nil, dc.OpModify)
+	// Without a task, EvaluateWrite still answers secret/restricted rules. With
+	// one, every failure to load it is its own answer: falling through to a nil
+	// task would report task.absent for a store that could not be read.
+	var task *dc.Task
+	if taskGiven {
+		if r.Store == nil {
+			return ErrorPayload{OK: false, Code: "not_initialized",
+				Error: "DevCouncil state is unavailable in this directory, so task " + taskID + " could not be loaded."}
+		}
+		stored, err := r.Store.Task(ctx, taskID)
+		if err != nil {
+			return ErrorPayload{OK: false, Code: "store_error", Error: err.Error()}
+		}
+		if stored == nil {
+			return map[string]any{"ok": false, "error": fmt.Sprintf("Task %s not found.", taskID), "code": "not_found", "task_id": taskID}
+		}
+		task = stored.Domain()
+	}
+	d, err := r.Gate.EvaluateWrite(path, task, op)
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error(), "code": "policy_error"}
 	}
