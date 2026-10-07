@@ -1,4 +1,5 @@
 pub mod admission;
+mod binary_identity;
 pub mod daemon;
 pub mod mcp;
 pub mod mcp_http;

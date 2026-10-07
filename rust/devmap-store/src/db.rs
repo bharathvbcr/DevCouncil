@@ -49,6 +49,38 @@ fn refusal(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
 }
 
+/// What a reader is told about a damaged full-text index, and what to do.
+///
+/// Two causes produce the same symptom, and the remedy differs, so both are
+/// named. Damage in `nodes_fts` is what `devmap repair --fts` rebuilds. But a
+/// long-lived reader whose SQLite locks were stripped (fixed in 7cdd0249, still
+/// true of any process started before it) sees a store that looks corrupt while
+/// a fresh process reads the same file cleanly — and no repair reaches that
+/// process's view.
+fn fts_damage_reason(what: &str) -> String {
+    format!(
+        "{what}; rebuild the full-text index with `devmap repair --fts`. If a fresh \
+         `devmap status` on this store reports it healthy, this process's view of the \
+         store is stale rather than the index damaged: restart it. If the damage \
+         survives the repair, the database itself is damaged: rebuild it with \
+         `devmap build --full`"
+    )
+}
+
+/// Name a corrupt read of the full-text index as that, not as a damaged database.
+///
+/// Applied only to statements that read `nodes_fts`, so a genuinely corrupt
+/// symbol table is never sent to a repair that cannot touch it. Every other
+/// error passes through unchanged.
+fn fts_failure(error: rusqlite::Error) -> rusqlite::Error {
+    if error.sqlite_error_code() != Some(rusqlite::ErrorCode::DatabaseCorrupt) {
+        return error;
+    }
+    refusal(fts_damage_reason(&format!(
+        "the full-text index (`nodes_fts`) could not be read: {error}"
+    )))
+}
+
 /// Typed refusal when a store's stamped schema is not this binary's.
 ///
 /// Carried inside `rusqlite::Error::ToSqlConversionFailure` so existing
@@ -121,9 +153,10 @@ use crate::schema::{
     MIGRATION_V16_TO_V17, MIGRATION_V17_TO_V18_BACKFILL_EDGES,
     MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED, MIGRATION_V17_TO_V18_RENAME_EDGES,
     MIGRATION_V17_TO_V18_RENAME_UNRESOLVED, MIGRATION_V18_TO_V19, MIGRATION_V19_TO_V20,
-    MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5,
-    MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8,
-    MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, PYTHON_INDEX_SCHEMA_VERSION, VALIDITY_RANGE_TABLES,
+    MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22, MIGRATION_V23_TO_V24, MIGRATION_V3_TO_V4,
+    MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
+    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, PYTHON_INDEX_SCHEMA_VERSION,
+    VALIDITY_RANGE_TABLES,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -741,6 +774,17 @@ pub struct Store {
     /// generation's. Only the newest asked-about generation is held, so this is
     /// three words of memory rather than a map that grows with history.
     generation_counts: Mutex<Option<(u32, usize, usize)>>,
+    /// `(generation, symbols reachable through the full-text index)` for the
+    /// generation last checked by `status`.
+    ///
+    /// Memoized for the reason `generation_counts` is — the count is a join
+    /// over every symbol of the generation, 6.5 ms warm and 74 ms cold on this
+    /// repository's 15,034, against a `status` that otherwise costs ~3 ms. Unlike
+    /// those counts it is not immutable: index damage can arrive mid-generation.
+    /// The per-call readability probe in `fts_health_locked` still runs, so
+    /// what the memo can hide is a *partial* loss arriving after the first
+    /// check, until the next generation or the next process.
+    fts_reachable: Mutex<Option<(u32, usize)>>,
     /// The analysis status of the generation last asked about.
     ///
     /// Immutable for the same reason the counts are — a generation's
@@ -2801,6 +2845,8 @@ impl Store {
             // to hold: a store built from scratch and one walked up the ladder
             // are indistinguishable.
             tx.execute_batch(MIGRATION_V21_TO_V22)?;
+            // After v21's drop of the same index, as on the ladder.
+            tx.execute_batch(MIGRATION_V23_TO_V24)?;
             Self::validate_schema(tx)?;
             tx.execute(
                 &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION),
@@ -3171,6 +3217,13 @@ impl Store {
             // stamp makes an older binary refuse the store rather than
             // reconstructing those rows as neighbouring tiers.
             conn.execute("PRAGMA user_version = 23", [])?;
+            version = 23;
+        }
+        if version == 23 {
+            // `CREATE INDEX IF NOT EXISTS`, so a racing opener that already
+            // built it makes this a no-op rather than a failure.
+            conn.execute_batch(MIGRATION_V23_TO_V24)?;
+            conn.execute("PRAGMA user_version = 24", [])?;
             version = CURRENT_SCHEMA_VERSION;
         }
         if version != CURRENT_SCHEMA_VERSION {
@@ -3286,6 +3339,7 @@ impl Store {
             conn: Mutex::new(conn),
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
+            fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
@@ -3411,6 +3465,7 @@ impl Store {
             conn: Mutex::new(conn),
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
+            fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
@@ -3894,6 +3949,7 @@ impl Store {
             conn: Mutex::new(conn),
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
+            fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
             source_freshness_cache: Mutex::new(None),
             db_path: None,
@@ -6647,6 +6703,113 @@ impl Store {
         Ok((nodes, edges))
     }
 
+    /// Why the latest generation's full-text index cannot be trusted, if it
+    /// cannot.
+    ///
+    /// `status` never read the index, so a store whose `nodes_fts` was
+    /// unreadable — every search failing with "database disk image is
+    /// malformed" — or half gone — every search silently returning a subset —
+    /// reported itself healthy. Two checks, priced differently:
+    ///
+    /// - **Readable**, on every call: one MATCH for one of the generation's own
+    ///   symbols, which has to walk the index structure and its postings. A
+    ///   corrupt read is the unreadable case; ~0.1 ms.
+    /// - **Whole**, once per generation (see `fts_reachable`): how many of the
+    ///   generation's symbols the map and the index together still reach,
+    ///   against how many it has. Fewer is the partial loss
+    ///   `require_searchable_index` documents it cannot see.
+    ///
+    /// A MATCH that finds nothing for a symbol whose row is still reachable is
+    /// reported too: the rows survived and the postings that find them did not.
+    fn fts_health_locked(
+        &self,
+        snapshot: &rusqlite::Transaction<'_>,
+        generation: u32,
+        node_count: usize,
+    ) -> Result<Option<String>> {
+        if node_count == 0 {
+            return Ok(None);
+        }
+        let unreadable = |error: rusqlite::Error| -> Result<Option<String>> {
+            if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseCorrupt) {
+                Ok(Some(fts_damage_reason(&format!(
+                    "the full-text index (`nodes_fts`) could not be read: {error}"
+                ))))
+            } else {
+                Err(error)
+            }
+        };
+
+        let probe: Option<String> = snapshot
+            .query_row(
+                "SELECT name FROM generation_nodes
+                 WHERE generation_id = ?1 ORDER BY ordinal LIMIT 1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let probe_hits = match &probe {
+            Some(name) => {
+                let match_query = fts_match_query(name)?;
+                match snapshot.query_row(
+                    "SELECT COUNT(*)
+                     FROM nodes_fts
+                     CROSS JOIN nodes_fts_map m
+                       ON m.rowid_ref = nodes_fts.rowid AND m.generation_id = ?1
+                     WHERE nodes_fts MATCH ?2",
+                    params![generation, match_query],
+                    |row| row.get::<_, i64>(0),
+                ) {
+                    Ok(hits) => Some(hits),
+                    Err(error) => return unreadable(error),
+                }
+            }
+            None => None,
+        };
+
+        let memo = self
+            .fts_reachable
+            .lock()
+            .ok()
+            .and_then(|cache| *cache)
+            .filter(|(cached, _)| *cached == generation)
+            .map(|(_, reachable)| reachable);
+        let reachable = match memo {
+            Some(reachable) => reachable,
+            None => {
+                let counted = snapshot.query_row(
+                    "SELECT COUNT(*) FROM nodes_fts_map m
+                     JOIN nodes_fts f ON f.rowid = m.rowid_ref
+                     WHERE m.generation_id = ?1",
+                    params![generation],
+                    |row| row.get::<_, i64>(0),
+                );
+                let reachable = match counted {
+                    Ok(count) => usize::try_from(count).unwrap_or(0),
+                    Err(error) => return unreadable(error),
+                };
+                if let Ok(mut cache) = self.fts_reachable.lock() {
+                    *cache = Some((generation, reachable));
+                }
+                reachable
+            }
+        };
+        if reachable < node_count {
+            return Ok(Some(fts_damage_reason(&format!(
+                "the full-text index reaches {reachable} of {node_count} symbols of \
+                 generation {generation}, so searches answer with a subset and report it \
+                 as the whole"
+            ))));
+        }
+        if let (Some(name), Some(0)) = (&probe, probe_hits) {
+            return Ok(Some(fts_damage_reason(&format!(
+                "the full-text index holds generation {generation}'s rows but finds none \
+                 of them: a search for its symbol {name:?} matched nothing"
+            ))));
+        }
+        Ok(None)
+    }
+
     /// The latest generation's analysis **status**, without its summary.
     ///
     /// `devmap status` needs one enum to decide whether the graph is degraded,
@@ -6941,6 +7104,33 @@ generation {latest}; run `devmap status` to re-verify",
             // not a claim that a generation read everything.
             None => CoverageGaps::default(),
         };
+        // Inside the same snapshot as the node count it is compared against.
+        let fts_reason = match latest {
+            Some(generation) => self.fts_health_locked(&snapshot, generation, node_count)?,
+            None => None,
+        };
+        let quarantine_reason = if quarantined_count > 0 {
+            // Name the paths. See `StoreStatus::quarantined_paths`: the
+            // count alone made a permanently degraded store undiagnosable
+            // without opening the database by hand.
+            let shown = quarantined_paths.join(", ");
+            let elided = quarantined_count.saturating_sub(quarantined_paths.len());
+            Some(if elided > 0 {
+                format!(
+                    "{quarantined_count} path(s) exceeded the retry threshold \
+                         (attempts >= {MAX_PENDING_ATTEMPTS}): {shown}, and {elided} more \
+                         — `devmap repair --pending` drops them"
+                )
+            } else {
+                format!(
+                    "{quarantined_count} path(s) exceeded the retry threshold \
+                         (attempts >= {MAX_PENDING_ATTEMPTS}): {shown} \
+                         — `devmap repair --pending` drops them"
+                )
+            })
+        } else {
+            None
+        };
         Ok(StoreStatus {
             db_path: db_path.to_string(),
             latest_generation: latest,
@@ -6950,28 +7140,7 @@ generation {latest}; run `devmap status` to re-verify",
             source_freshness: None,
             source_delta: None,
             analyzer_freshness: None,
-            degraded_reason: if quarantined_count > 0 {
-                // Name the paths. See `StoreStatus::quarantined_paths`: the
-                // count alone made a permanently degraded store undiagnosable
-                // without opening the database by hand.
-                let shown = quarantined_paths.join(", ");
-                let elided = quarantined_count.saturating_sub(quarantined_paths.len());
-                Some(if elided > 0 {
-                    format!(
-                        "{quarantined_count} path(s) exceeded the retry threshold \
-                         (attempts >= {MAX_PENDING_ATTEMPTS}): {shown}, and {elided} more \
-                         — `devmap repair --pending` drops them"
-                    )
-                } else {
-                    format!(
-                        "{quarantined_count} path(s) exceeded the retry threshold \
-                         (attempts >= {MAX_PENDING_ATTEMPTS}): {shown} \
-                         — `devmap repair --pending` drops them"
-                    )
-                })
-            } else {
-                None
-            },
+            degraded_reason: devmap_analyze::combine_reasons(quarantine_reason, fts_reason),
             quarantined_count,
             quarantined_paths,
             coverage_gaps,
@@ -7162,30 +7331,33 @@ generation {latest}; run `devmap status` to re-verify",
             Some(pinned) => pinned,
             None => return Ok(vec![]),
         };
-        let mut stmt = snapshot.prepare(
-            "SELECT name, qualified_name, path
-             FROM nodes_fts
-             WHERE rowid IN (SELECT rowid_ref FROM nodes_fts_map WHERE generation_id = ?1)
-               AND nodes_fts MATCH ?2
-             ORDER BY rowid
-             LIMIT ?3",
-        )?;
-        let match_q = fts_match_query(query)?;
-        let rows = stmt.query_map(params![gen, match_q, sqlite_limit(limit)], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        if out.is_empty() {
-            Self::require_searchable_index(&snapshot, gen)?;
-        }
-        Ok(out)
+        let read = || -> Result<Vec<(String, String, String)>> {
+            let mut stmt = snapshot.prepare(
+                "SELECT name, qualified_name, path
+                 FROM nodes_fts
+                 WHERE rowid IN (SELECT rowid_ref FROM nodes_fts_map WHERE generation_id = ?1)
+                   AND nodes_fts MATCH ?2
+                 ORDER BY rowid
+                 LIMIT ?3",
+            )?;
+            let match_q = fts_match_query(query)?;
+            let rows = stmt.query_map(params![gen, match_q, sqlite_limit(limit)], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            if out.is_empty() {
+                Self::require_searchable_index(&snapshot, gen)?;
+            }
+            Ok(out)
+        };
+        read().map_err(fts_failure)
     }
 
     /// Search only the latest persisted generation. This never reads or parses
@@ -7316,8 +7488,9 @@ generation {latest}; run `devmap status` to re-verify",
             return Ok(Vec::new());
         }
         let match_query = fts_match_query(query)?;
-        let mut stmt = conn.prepare(
-            "SELECT n.name, n.qualified_name, n.kind, p.path,
+        let mut stmt = conn
+            .prepare(
+                "SELECT n.name, n.qualified_name, n.kind, p.path,
                     n.span_start, n.span_end, n.is_exported, f.content_hash
              FROM nodes_fts
              CROSS JOIN nodes_fts_map m ON m.rowid_ref = nodes_fts.rowid
@@ -7329,25 +7502,28 @@ generation {latest}; run `devmap status` to re-verify",
              WHERE m.generation_id = ?1 AND nodes_fts MATCH ?2
              ORDER BY bm25(nodes_fts), p.path, n.name, n.span_start
              LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![gen, match_query, sqlite_limit(limit)], |row| {
-            let name: String = row.get(0)?;
-            let path: String = row.get(3)?;
-            let (span_start, span_end) = checked_span(&path, &name, row.get(4)?, row.get(5)?)?;
-            Ok(StoredSymbol {
-                name,
-                qualified_name: row.get(1)?,
-                kind: row.get(2)?,
-                path,
-                span_start,
-                span_end,
-                is_exported: row.get::<_, i64>(6)? != 0,
-                content_hash: row.get::<_, i64>(7)? as u64,
+            )
+            .map_err(fts_failure)?;
+        let rows = stmt
+            .query_map(params![gen, match_query, sqlite_limit(limit)], |row| {
+                let name: String = row.get(0)?;
+                let path: String = row.get(3)?;
+                let (span_start, span_end) = checked_span(&path, &name, row.get(4)?, row.get(5)?)?;
+                Ok(StoredSymbol {
+                    name,
+                    qualified_name: row.get(1)?,
+                    kind: row.get(2)?,
+                    path,
+                    span_start,
+                    span_end,
+                    is_exported: row.get::<_, i64>(6)? != 0,
+                    content_hash: row.get::<_, i64>(7)? as u64,
+                })
             })
-        })?;
-        let page = rows.collect::<Result<Vec<_>>>()?;
+            .map_err(fts_failure)?;
+        let page = rows.collect::<Result<Vec<_>>>().map_err(fts_failure)?;
         if page.is_empty() {
-            Self::require_searchable_index(conn, gen)?;
+            Self::require_searchable_index(conn, gen).map_err(fts_failure)?;
         }
         Ok(page)
     }
@@ -7371,17 +7547,19 @@ generation {latest}; run `devmap status` to re-verify",
         // 12.7s at 200k rows, against 1.7ms for the match alone. A subquery
         // does not help because the planner flattens it. `search_symbols`
         // avoids this only by accident, via `ORDER BY bm25(...)`.
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*)
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
              FROM nodes_fts
              CROSS JOIN nodes_fts_map m
                ON m.rowid_ref = nodes_fts.rowid AND m.generation_id = ?1
              WHERE nodes_fts MATCH ?2",
-            params![gen, match_query],
-            |row| row.get(0),
-        )?;
+                params![gen, match_query],
+                |row| row.get(0),
+            )
+            .map_err(fts_failure)?;
         if count == 0 {
-            Self::require_searchable_index(conn, gen)?;
+            Self::require_searchable_index(conn, gen).map_err(fts_failure)?;
         }
         u32::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))
     }
@@ -8392,9 +8570,11 @@ generation {latest}; run `devmap status` to re-verify",
     /// as the whole answer, and this check passes that store. Catching a
     /// partial loss means counting the generation's index rows against its
     /// symbol rows on every query, which is O(symbols) on a path that is
-    /// otherwise a bounded FTS lookup. `devmap repair --fts` rebuilds the index
-    /// unconditionally and is the complete answer; this is the cheap one that
-    /// turns the total loss from silence into a refusal.
+    /// otherwise a bounded FTS lookup. `status` makes that count instead, once
+    /// per generation (`fts_health_locked`), and reports a partial loss there;
+    /// `devmap repair --fts` rebuilds the index unconditionally and is the
+    /// complete answer. This is the cheap one that turns the total loss from
+    /// silence into a refusal at the moment a search would have hidden it.
     ///
     /// Called only when a search came back empty, so a query that matched
     /// nothing pays two `EXISTS` probes — both primary-key range lookups on
@@ -8782,10 +8962,34 @@ generation {latest}; run `devmap status` to re-verify",
         }
     }
 
+    /// Rebuild the full-text index from the latest generation's symbol rows.
+    ///
+    /// The index is dropped and recreated rather than emptied. `DELETE FROM
+    /// nodes_fts` has to read the index to remove each row's postings, so on
+    /// exactly the damage this exists for — a corrupt structure record, the
+    /// "database disk image is malformed" that `status` and search now name —
+    /// it failed with the same error. Dropping an FTS5 table drops its shadow
+    /// tables without reading them. The definition is taken from the store's
+    /// own `sqlite_master`, so the table comes back as this store had it rather
+    /// than as a second copy of the DDL here would say.
     pub fn repair_fts(&self) -> Result<()> {
         let mut conn = lock_conn(&self.conn)?;
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM nodes_fts", [])?;
+        let definition: String = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'nodes_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                refusal(
+                    "this store has no `nodes_fts` table to repair; it is not a current \
+                     DevMap store — run `devmap build`",
+                )
+            })?;
+        tx.execute_batch("DROP TABLE nodes_fts")?;
+        tx.execute_batch(&definition)?;
         tx.execute("DELETE FROM nodes_fts_map", [])?;
         let gen: Option<u32> = tx
             .query_row(
@@ -8824,6 +9028,10 @@ generation {latest}; run `devmap status` to re-verify",
             }
         }
         tx.commit()?;
+        // The memo described the index this just replaced.
+        if let Ok(mut cache) = self.fts_reachable.lock() {
+            *cache = None;
+        }
         Ok(())
     }
 
