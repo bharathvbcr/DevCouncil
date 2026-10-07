@@ -252,3 +252,11 @@ required-features = ["parse"]
 [[test]]
 name = "impact_names_its_unresolved_callers"
 required-features = ["parse"]
+
+[[test]]
+name = "a_rendered_component_has_a_caller"
+required-features = ["parse"]
+
+[[test]]
+name = "a_wrapped_callback_is_a_function"
+required-features = ["parse"]

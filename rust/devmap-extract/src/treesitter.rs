@@ -2207,6 +2207,88 @@ fn callable_binding_name(node: Node, source: &str) -> Option<String> {
     if parent.kind() == "variable_declarator" {
         return get_child_text(parent, "name", source);
     }
+    // `const save = useCallback(() => { … }, [deps])`: the binding *is* the
+    // function, reached through a wrapper that returns something calling it.
+    // Named by the declarator, exactly as the symbol emitter names it.
+    js_wrapper_declarator(node, source).and_then(|declarator| get_child_text(declarator, "name", source))
+}
+
+/// Callees that return a function which, when called, runs the function they
+/// were given — so `const f = wrapper(() => …)` binds `f` to that function.
+///
+/// Chosen from what a real React corpus wraps arrow consts in (ScholarLM, 2026-
+/// 10-07: `useCallback` 393 + `React.useCallback` 7, then `memo`/`forwardRef`
+/// for components). Deliberately absent: `useMemo` returns the function's
+/// *result*, so the calls inside it run in the enclosing render and belong to
+/// it; `lazy(() => import(…))` is an import thunk, not the component's body;
+/// `setTimeout`/`setInterval` return a handle, and `promise.then` / array
+/// methods return values.
+const JS_FUNCTION_WRAPPERS: &[&str] = &[
+    "useCallback",
+    "React.useCallback",
+    "useEvent",
+    "useEffectEvent",
+    "React.useEffectEvent",
+    "memo",
+    "React.memo",
+    "forwardRef",
+    "React.forwardRef",
+    "debounce",
+    "throttle",
+    "_.debounce",
+    "_.throttle",
+    "vi.fn",
+    "jest.fn",
+];
+
+/// How many wrappers deep `memo(forwardRef(() => …))` is followed.
+const JS_WRAPPER_NESTING: usize = 3;
+
+/// The function a wrapper call binds, when `value` is one: the first argument
+/// of a [`JS_FUNCTION_WRAPPERS`] call, through at most [`JS_WRAPPER_NESTING`]
+/// nested wrappers.
+fn js_wrapped_function<'tree>(value: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let mut current = value;
+    for _ in 0..JS_WRAPPER_NESTING {
+        if current.kind() != "call_expression" {
+            return None;
+        }
+        let callee = current.child_by_field_name("function")?;
+        if !JS_FUNCTION_WRAPPERS.contains(&get_node_text(callee, source).as_str()) {
+            return None;
+        }
+        let first = current.child_by_field_name("arguments")?.named_child(0)?;
+        if matches!(first.kind(), "arrow_function" | "function_expression") {
+            return Some(first);
+        }
+        current = first;
+    }
+    None
+}
+
+/// The `variable_declarator` whose value wraps `function` in
+/// [`JS_FUNCTION_WRAPPERS`] calls, or `None` when `function` is anything else
+/// — an argument of an ordinary call, or the second argument of a wrapper.
+fn js_wrapper_declarator<'tree>(function: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let mut current = function;
+    for _ in 0..JS_WRAPPER_NESTING {
+        let arguments = bounded_parent(current)?;
+        if arguments.kind() != "arguments" {
+            return None;
+        }
+        let call = bounded_parent(arguments)?;
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let parent = bounded_parent(call)?;
+        if parent.kind() == "variable_declarator" {
+            let value = parent.child_by_field_name("value")?;
+            return (value.id() == call.id()
+                && js_wrapped_function(value, source).is_some_and(|f| f.id() == function.id()))
+            .then_some(parent);
+        }
+        current = call;
+    }
     None
 }
 
@@ -3614,15 +3696,19 @@ fn extract_node(
                 }
             }
             "variable_declarator" => {
-                let value_kind = node.child_by_field_name("value").map(|value| value.kind());
+                let value = node.child_by_field_name("value");
+                // `const f = () => …` and `const f = useCallback(() => …)` both
+                // bind `f` to a function; see `JS_FUNCTION_WRAPPERS`.
+                let binds_function = value.is_some_and(|value| {
+                    matches!(value.kind(), "arrow_function" | "function_expression")
+                        || js_wrapped_function(value, source).is_some()
+                });
                 // A module-level binding — with or without an initializer
                 // (`export let U: number;`), and every name a destructuring
                 // pattern binds. Kept as a candidate whatever its own keyword
                 // says: `export { local }` may publish it further down, so the
                 // export filter runs after the walk.
-                if !matches!(value_kind, Some("arrow_function" | "function_expression"))
-                    && is_module_level(node)
-                {
+                if !binds_function && is_module_level(node) {
                     if let Some(target) = node.child_by_field_name("name") {
                         let is_exported = js_symbol_is_exported(node, source);
                         for name in js_pattern_bound_names(target, source) {
@@ -3635,31 +3721,29 @@ fn extract_node(
                         }
                     }
                 }
-                if let Some(vk) = value_kind {
-                    if vk == "arrow_function" || vk == "function_expression" {
-                        if let Some(n) = get_child_text(node, "name", source) {
-                            let is_exported = js_symbol_is_exported(node, source);
-                            let parent_symbol =
-                                enclosing_callable_qualified(node, source, file_symbol_name)
-                                    .unwrap_or_else(|| file_symbol_name.to_string());
-                            symbols.push(ExtractedSymbol {
-                                name: n.clone(),
-                                qualified_name: scoped_qualified_name(
-                                    node,
-                                    source,
-                                    file_symbol_name,
-                                    &n,
-                                ),
-                                kind: SymbolKind::Function,
-                                span,
-                                is_exported,
-                                docstring: None,
-                                signature: None,
-                                parent_symbol: Some(parent_symbol),
-                                body_signature: None,
-                                declaration_hash: None,
-                            });
-                        }
+                if binds_function {
+                    if let Some(n) = get_child_text(node, "name", source) {
+                        let is_exported = js_symbol_is_exported(node, source);
+                        let parent_symbol =
+                            enclosing_callable_qualified(node, source, file_symbol_name)
+                                .unwrap_or_else(|| file_symbol_name.to_string());
+                        symbols.push(ExtractedSymbol {
+                            name: n.clone(),
+                            qualified_name: scoped_qualified_name(
+                                node,
+                                source,
+                                file_symbol_name,
+                                &n,
+                            ),
+                            kind: SymbolKind::Function,
+                            span,
+                            is_exported,
+                            docstring: None,
+                            signature: None,
+                            parent_symbol: Some(parent_symbol),
+                            body_signature: None,
+                            declaration_hash: None,
+                        });
                     }
                 }
             }
@@ -7470,6 +7554,7 @@ fn maybe_push_name_reference(
         ref_kind = ReferenceKind::Type;
     }
     if is_argument_label(node)
+        || name_field_holds_a_use(node)
         || is_defining_name(node)
         || is_inside_import_or_export(node)
         || is_call_callee(node)
@@ -7725,8 +7810,60 @@ fn is_argument_label(node: Node) -> bool {
     })
 }
 
+/// Whether `node` is the `name` field of a node kind that spells a *use* there.
+///
+/// The generic rule in [`is_defining_name`] reads any identifier on a `name`
+/// field as a declaration, and most grammars agree. These do not — enumerated
+/// from every vendored grammar's `node-types.json` (each kind whose `name`
+/// field admits an identifier), then classified by hand:
+///
+/// - JSX `jsx_opening_element` / `jsx_closing_element` /
+///   `jsx_self_closing_element`: `<HomePage …/>` names the component it
+///   renders. Read as a declaration, the tag made `HomePage` a local of every
+///   component that rendered it, and the resolver then refused the tag's own
+///   call as "a local binding whose value is not known" — so an imported
+///   component rendered inside another component had no caller at all.
+///   Measured on ScholarLM: `HomePage`, `ResultsPage`, `UserModeProvider` and
+///   3,686 TSX sites in all were filed `local_binding`.
+/// - C# `member_access_expression` / `member_binding_expression`:
+///   `other.Format` / `x?.Format` read a member; as a declaration it shadowed a
+///   bare `Format(…)` call later in the same method.
+/// - Java/Dart `annotation` / `marker_annotation`, C-family and C# `attribute`,
+///   C `macro_type_specifier`, and the preprocessor's `#ifdef` / `#elifdef` /
+///   `#undef`: each names something declared elsewhere.
+///
+/// Left alone, deliberately: C# `qualified_name` / `alias_qualified_name`
+/// (also the spelling of a `namespace A.B` declaration, and only ever in type
+/// position inside a body, where it cannot shadow a value call), and C++
+/// `qualified_identifier` (the spelling of an out-of-line definition, which
+/// [`c_declarator_declaration`] owns).
+///
+/// Reference emission refuses these positions too, which keeps it exactly as
+/// it was: a JSX tag is already a `JsxTag` reference plus a call, and a C#
+/// member name carries no receiver here, so a bare `Name` for it could bind to
+/// an unrelated symbol of the same name.
+fn name_field_holds_a_use(node: Node) -> bool {
+    bounded_parent(node).is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "jsx_opening_element"
+                | "jsx_closing_element"
+                | "jsx_self_closing_element"
+                | "member_access_expression"
+                | "member_binding_expression"
+                | "annotation"
+                | "marker_annotation"
+                | "attribute"
+                | "macro_type_specifier"
+                | "preproc_ifdef"
+                | "preproc_elifdef"
+                | "preproc_undef"
+        ) && field_contains(parent, "name", node)
+    })
+}
+
 fn is_defining_name(node: Node) -> bool {
-    if is_argument_label(node) {
+    if is_argument_label(node) || name_field_holds_a_use(node) {
         return false;
     }
     // A grammar's `name` field is not necessarily a declaration. Java/Lua
@@ -8176,7 +8313,7 @@ fn rust_item_is_pub(node: Node, source: &str) -> bool {
     is_pub
 }
 
-fn is_symbol_binding(node: Node) -> bool {
+fn is_symbol_binding(node: Node, source: &str) -> bool {
     // A C-family function name binds a symbol, not a local. Without this the
     // `declarator` arm of `is_defining_name` would file every function's own
     // identifier into `collect_non_symbol_locals`, and `name_is_shadowed_by_local`
@@ -8222,7 +8359,7 @@ fn is_symbol_binding(node: Node) -> bool {
             matches!(
                 value.kind(),
                 "arrow_function" | "function_expression" | "generator_function"
-            )
+            ) || js_wrapped_function(value, source).is_some()
         });
     }
     false
@@ -8264,7 +8401,7 @@ fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<String> {
             if is_user_ident(&name) {
                 if module_binding_is_symbol(node, source) {
                     module_bindings.insert(name);
-                } else if !is_symbol_binding(node) {
+                } else if !is_symbol_binding(node, source) {
                     locals.insert(name);
                 }
             }
