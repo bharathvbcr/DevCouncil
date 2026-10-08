@@ -24,7 +24,7 @@ and `dcstore` (Rust), with Manvi owning the agent loop / LLM / TUI. Prefer
 | `skills/registry.py` selection | **Hard-cut delete** | `devcouncil skills list\|scaffold` (embedded FS) | Goal-based selection retired; explicit `--skill` or scaffold-all |
 | `indexing/` + `codeintel/` (non-adjunct) | **Delete** | `devmap` | Kernel sole writer since Phase 6 build cutover |
 | `storage/` SQLModel | **Delete** | `dcstore` + Go `dc/store` | Schema already transcribed into dc-store |
-| GitHub Checks + PR comments (`integrations/github.py`, `reporting/github_check.py`, `pr_comments.py`) | **Retire** | none in DevCouncil Go | Not named in the original Phase 7 table; no GitHub API client in `go_orchestrator`. Unverified whether a host app rebuilt it. |
+| GitHub Checks + PR comments (`integrations/github.py`, `reporting/github_check.py`, `pr_comments.py`) | **Hand to GitPulse** (owner decision 2026-10-07) | GitPulse task `gp-post-devcouncil-verify-checks` (not built yet) | Not named in the original Phase 7 table. DevCouncil Go gets no GitHub API client. GitPulse already talks to GitHub and will post `devcouncil verify --json` results. |
 | Offline SCA (`repo/sca.py`) | **Retire** | none | `pip-audit` / `npm audit` / `osv-scanner` wrapper; no match in Manvi or the Go host. |
 | Claim lie-detector (`verification/claims/`) | **Retire** | none | Swept into the verification hard-cut; Go `verify.Run()` has no transcript→assertion mapper. |
 | OpenHands / mini-SWE / Claude SDK executors | **Retire** | Manvi loop / hero-loop skill | Adapters were not transcribed; related job, not bug-for-bug. |
@@ -73,6 +73,7 @@ retirement-decision table.
 Successor corrections (not scheduled as ports):
 
 - **SCA:** no DevCouncil successor. GitPulse Insights Health (`src-tauri/src/analyzer/deps.rs`) runs `pip-audit` / `npm audit` / `cargo-audit` / `govulncheck` as a related job when a repo opens — not a verify gate.
-- **GitHub Checks writer:** still none. GitPulse talks to GitHub for PR checkout and reads Dependabot / code scanning; it does not post a Checks API run from `devcouncil verify`.
+- **GitHub Checks writer:** handed to GitPulse by owner decision on 2026-10-07, as GitPulse task `gp-post-devcouncil-verify-checks` (ft-52bd0659c5d4b8b5099e4123a08c09ae). Until that ships, nothing posts a Checks API run or PR comment from `devcouncil verify`. GitPulse today checks out PRs and reads Dependabot / code scanning.
+- **Isolated verification sandbox:** owner decision 2026-10-07 is to build it, not retire it, as DevCouncil task `dc-verify-isolated-sandbox` (ft-7121a94ba987a761beace32a7675461e). An approved security-impact statement must come before any code. Until then `verify.ParseSandbox` refuses everything except `local`.
 - **Thick MCP:** Manvi's native tool registry carries `get_task`, `get_next_actions`, filesystem/patch/exec, git, subagents, and `verify_task` that **does** spawn `dcverify`. That is the Python-host successor, not `devcouncil mcp`.
 - **`dcmap`:** leftover Go `cmd/dcmap` + `internal/mapcli`. Comment says superseded by `devmap` / `manvi map`. `scripts/install.sh` does not install it.

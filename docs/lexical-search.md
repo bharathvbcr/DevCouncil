@@ -127,6 +127,14 @@ python3 scripts/encode-sparse.py --root . --out /tmp/sparse.jsonl
 This is the only step that loads a model, and it is the only step that needs
 Python. Once it has written its output you can uninstall both packages.
 
+**Planned replacement (owner decision 2026-10-07).** Under the language
+policy this encoder is to be ported to Rust on tessl's inference kernels, with
+any missing kernels built in tessl. That work is task
+`dc-encode-sparse-tessl-port`. Until it lands, this script is both the encoder
+and the wordpiece oracle. The port changes only the encoder's language:
+encoding stays an offline operator step, and `dcgrep` still runs no model at
+query time.
+
 `--device mps` on Apple silicon or `--device cuda` on an NVIDIA machine will be
 considerably faster than the default CPU path.
 

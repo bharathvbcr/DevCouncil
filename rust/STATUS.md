@@ -32,26 +32,9 @@ columns in them describe nothing that runs.
 > ownership. DevCouncil is the component layer: `devmap`, `dcstore`, `dcverify`
 > and `dcgrep` are components with a JSON-on-stdio contract, useful to anything
 > that speaks it. MANVI is the harness that unifies them — it resolves each one
-> as a binary from `PATH` and **links none of them**. Going forward these crates
-> are edited here, and MANVI's `crates/` copy is a development convenience that
-> mirrors this one.
->
-> The two copies still have no build-time relationship, so nothing fails when
-> they drift — [§6](#6-the-two-copies) is the standing decision that needs
-> making. **This used to say exactly two files were deliberately different
-> (`dc-store/tests/interop.rs` and `dc-glob/src/lib.rs`). That is no longer
-> true:** on 2026-10-07 a per-crate `diff -rq --exclude=target` of all six
-> `dc-*` crates against `~/Code/devtools/Manvi/crates` reported no difference
-> at all, those two files included. Only the workspace-level files differ
-> (`Cargo.toml` does), and the paths that exist only here —
-> `.gitignore`, `README.md`, `STATUS.md`, `testdata/`, the kernel crates, and
-> `dc-regress` / `dc-regress-store` — have no MANVI counterpart. Re-check with:
->
-> ```bash
-> for c in dc-evidence dc-glob dc-grep dc-proc dc-store dc-verify; do
->   diff -rq --exclude=target <manvi>/crates/$c rust/$c   # prints nothing when identical
-> done
-> ```
+> as a binary from `PATH` and **links none of them**. These crates are edited
+> here and only here: MANVI's `crates/dc-*` entries are symlinks into this
+> directory, not copies ([§6](#6-one-owner-manvi-symlinks), closed 2026-10-07).
 >
 > The relationship, the component inventory, and the checklist a newly ported
 > component must satisfy live in MANVI's
@@ -279,36 +262,34 @@ differential run over real diffs says otherwise.
 
 ---
 
-## 6. The two copies
+## 6. One owner: MANVI symlinks
 
-Since 2026-09-01 the `dc-*` crate sources exist here **and** in MANVI, with no
-mechanism keeping them equal. The first change after the port already had to be
-applied twice by hand (§7), which is the whole problem in miniature: it worked
-because one person did both halves in one sitting, and nothing would have failed
-if they had not.
+**Closed 2026-10-07 (owner decision, task ft-2d12d0425224bfd25bb671bb83a29f1f).**
+From 2026-09-01 this section described two copies of the `dc-*` sources, here
+and in MANVI, with nothing keeping them equal. That is no longer how MANVI is
+built. Its `crates/dc-{evidence,glob,grep,proc,store,verify}` are symlinks to
+`../../DevCouncil/rust/dc-*`, committed as symlinks (git mode `120000`; the
+links date from 2026-09-11 and 2026-09-14). `dc-redact` is linked the same way.
+`cargo metadata --manifest-path <manvi>/crates/Cargo.toml` resolves every
+member through those links, and MANVI's CI places this repository at
+`../DevCouncil` (`scripts/fetch-modules.sh`) before it builds. So there is one
+source tree, this one, and a byte-diff between the two paths always comes back
+empty because both name the same files. That empty diff proves nothing about
+drift.
 
-Note what is *not* duplicated. MANVI never links these crates — it resolves
-`dcstore`, `dcverify` and `dcgrep` as binaries from `PATH`, exactly as it already
-resolves `devmap`. So the duplication is of **sources**, not of the runtime
-dependency, and the deployed arrangement is already the right one: one set of
-component binaries, one harness consuming them.
+MANVI still does not *link* these crates at runtime. It resolves `dcstore`,
+`dcverify` and `dcgrep` as binaries from `PATH`, as it does `devmap`.
 
-That narrows the options to how MANVI's source copy should end:
+The one thing still copied by hand is MANVI's `crates/Cargo.toml`
+`[workspace.dependencies]`. A symlinked member inherits `foo.workspace = true`
+from MANVI's workspace file, not this one. A key missing there fails the
+workspace load and names the key. A key whose *version* differs builds without
+complaint against a dependency this repository never tested. The decision is to
+catch that with a pin-drift check in MANVI's `verify.sh`, filed as MANVI task
+`manvi-dc-crates-pin-drift-check` (ft-2348d6433c6acaddcd1f9a69cb3742e4).
 
-1. **Delete it; require installed components.** The honest expression of
-   "DevCouncil owns the components". `toolBinary`'s cargo-build fallback stops
-   being reachable, and MANVI's test suite needs DevCouncil's binaries on `PATH`
-   — which is what its live-contract tests already assume for `devmap`.
-2. **Keep it as a development convenience, with a digest check.** MANVI can be
-   built and tested without a DevCouncil checkout; a checked-in digest of the
-   component sources makes a stale copy a test failure rather than a surprise.
-3. **Consume by path or git dependency.** Removes the source duplication without
-   removing the convenience, at the cost of coupling the two repositories'
-   release cycles — and it buys nothing at runtime, since nothing links.
-
-Option 2 is the cheapest thing that makes drift *detectable*, and option 1 is
-where this should land once installing DevCouncil's components is routine. Until
-one is chosen: **edit here, mirror to MANVI.**
+**Rule:** edit the crates here. When a crate gains a `workspace = true`
+dependency, mirror that pin into MANVI's `crates/Cargo.toml`.
 
 ## 7. Change log since the port
 

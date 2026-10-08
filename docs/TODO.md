@@ -60,7 +60,7 @@ These have no DevCouncil successor. They are gaps for the ledger, not ready task
 | Gap | Notes |
 |-----|--------|
 | `GAP-P7-SCA-LOST` | GitPulse Insights Health runs `pip-audit` / `npm audit` / `cargo-audit` / `govulncheck` on open — related job, not a verify gate. |
-| `GAP-P7-GITHUB-LOST` | GitPulse checks out PRs and reads Dependabot / code scanning; it does not post a Checks API run from `devcouncil verify`. |
+| `GAP-P7-GITHUB-LOST` | **Handed to GitPulse (owner decision 2026-10-07):** GitPulse task `gp-post-devcouncil-verify-checks` will post `devcouncil verify` results as a Checks API run / PR comment. DevCouncil builds no GitHub client. The gap stays open until that ships. |
 | `GAP-P7-CLAIMS-LOST` | Transcript claim lie-detector. |
 | `GAP-P7-DAP-LOST` / `GAP-P7-LSP-CUT` / `GAP-P7-GEPA-LOST` / `GAP-P7-OKF-LOST` / `GAP-P7-EXECUTORS-LOST` | Explicit retire. |
 | `GAP-P7-FAISS-WEAKER` | `devmap search --semantic` is lexical name similarity. |
