@@ -1,3 +1,8 @@
+// Every byte this binary puts on stdout goes through `write_stdout`: it ends
+// quietly on a closed pipe and escapes control characters on a terminal.
+// `print!`/`println!` do neither, and panic on `EPIPE`.
+#![deny(clippy::print_stdout)]
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -42,7 +47,7 @@ fn write_stdout_raw(message: std::fmt::Arguments<'_>) {
 
 macro_rules! outln {
     ($($argument:tt)*) => {
-        write_stdout(format_args!("{}\n", format_args!($($argument)*)))
+        $crate::write_stdout(format_args!("{}\n", format_args!($($argument)*)))
     };
 }
 
@@ -7440,7 +7445,10 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                             let mut cmd = std::process::Command::new(exe);
                             cmd.arg("--json").arg("--db").arg(cli.db()).arg("status");
                             let out = cmd.output()?;
-                            std::io::Write::write_all(&mut std::io::stdout(), &out.stdout)?;
+                            write_stdout_raw(format_args!(
+                                "{}",
+                                String::from_utf8_lossy(&out.stdout)
+                            ));
                             return Ok(());
                         }
                         Err(err) => {
@@ -7539,7 +7547,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             if cli.json {
                 emit_json(cli, &payload)?;
             } else {
-                println!("recorded gap {gap_id} for {tool}");
+                outln!("recorded gap {gap_id} for {tool}");
             }
         }
         Commands::History { last } => {

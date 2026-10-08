@@ -43,6 +43,39 @@ func TestJSONOutputFailureCannotReportSuccess(t *testing.T) {
 	}
 }
 
+// The protocol bypass has no session, so nothing turns a lost stdout write
+// into a failing exit unless the handler checks it. `hook --help` printed its
+// help with an unchecked fmt.Fprint and exited 0 into a closed pipe. Driven
+// through runCLI so each argv takes its real route; the pipe is not fd 1, so
+// the write returns EPIPE rather than raising SIGPIPE.
+func TestProtocolStdoutWritesReportAClosedPipe(t *testing.T) {
+	for _, args := range [][]string{
+		{"hook", "--help"},
+		{"hook", "-h"},
+		{"hook", "disable", "--help"},
+		{"--json", "version"},
+		{"--json", "--version"},
+	} {
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := reader.Close(); err != nil {
+			t.Fatal(err)
+		}
+		before := os.Stdout
+		os.Stdout = writer
+		_, restoreErr := swapStderr(t)
+		code := runCLI(args)
+		restoreErr()
+		os.Stdout = before
+		_ = writer.Close()
+		if code == 0 {
+			t.Errorf("%v: a write to a closed pipe reported success", args)
+		}
+	}
+}
+
 // A --json command owes stdout one JSON value even when no handler wrote a
 // receipt. `hook status --client <unknown>` is the path that did not: it is
 // refused inside integrate.Uninstall, which returns no receipt, and the

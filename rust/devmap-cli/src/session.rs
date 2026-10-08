@@ -206,7 +206,7 @@ pub fn run(
     }
     // SessionStart/SessionEnd stdout is the only channel the host keeps.
     // Keep it short: the files hold the rest.
-    println!("{}", brief(&report));
+    outln!("{}", brief(&report));
     let _ = writeln!(
         std::io::stderr(),
         "wrote {} and {}",
@@ -226,7 +226,7 @@ fn print_last(db: &Path, json_out: bool) -> anyhow::Result<Value> {
     if json_out {
         return Ok(report);
     }
-    println!("{}", brief(&report));
+    outln!("{}", brief(&report));
     Ok(report)
 }
 

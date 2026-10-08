@@ -41,7 +41,10 @@ func dispatch(args []string) int {
 		return 2
 	}
 	if args[0] == "--json" && len(args) > 1 && isVersionArg(args[1]) {
-		console.Println(`{"ok":true,"id":"host","component":"devcouncil","version":"` + Version + `"}`)
+		if _, err := console.Println(`{"ok":true,"id":"host","component":"devcouncil","version":"` + Version + `"}`); err != nil {
+			console.Errorf("version: %v\n", err)
+			return 1
+		}
 		return 0
 	}
 	run, ok := commands[args[0]]
@@ -614,8 +617,7 @@ func runIntegrateUninstall(args []string) int {
 			}
 		case "--json":
 		case "--help", "-h":
-			console.Print(hookHelp)
-			return 0
+			return printHookHelp()
 		default:
 			console.Errorf("unknown cleanup flag: %s\n", args[i])
 			return 2

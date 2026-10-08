@@ -852,6 +852,32 @@ fn terminal_build_output(
     json: bool,
     after_spawn: impl FnOnce(&Transcript, i32, u32),
 ) -> (std::process::Output, String) {
+    terminal_output(
+        json,
+        |command| {
+            command
+                .args(["build", "--db"])
+                .arg(root.join("index.sqlite"))
+                .arg(root)
+                .args(args)
+                .env("TERM", term)
+                .env("NO_COLOR", "1")
+                .env("LC_ALL", "en_US.UTF-8");
+        },
+        after_spawn,
+    )
+}
+
+/// Run one devmap invocation on a fresh pseudo-terminal: stderr always on the
+/// terminal, stdout on it too unless `json` pipes it. `configure` supplies the
+/// arguments and environment; the terminal transcript is returned beside the
+/// process output.
+#[cfg(unix)]
+fn terminal_output(
+    json: bool,
+    configure: impl FnOnce(&mut Command),
+    after_spawn: impl FnOnce(&Transcript, i32, u32),
+) -> (std::process::Output, String) {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::time::{Duration, Instant};
@@ -880,15 +906,8 @@ fn terminal_build_output(
     } else {
         command.stdout(slave.try_clone().unwrap());
     }
-    command
-        .args(["build", "--db"])
-        .arg(root.join("index.sqlite"))
-        .arg(root)
-        .args(args)
-        .env("TERM", term)
-        .env("NO_COLOR", "1")
-        .env("LC_ALL", "en_US.UTF-8")
-        .stderr(slave);
+    configure(&mut command);
+    command.stderr(slave);
     let mut child = command.spawn().unwrap();
     drop(command); // Drop the parent's slave before waiting for terminal EOF.
     let transcript = Transcript::default();
@@ -937,7 +956,7 @@ fn terminal_build_output(
         if Instant::now() > deadline {
             child.kill().unwrap();
             child.wait().unwrap();
-            panic!("terminal build exceeded 15 seconds");
+            panic!("terminal command exceeded 15 seconds");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1796,5 +1815,160 @@ fn a_failed_store_open_is_timed_without_claiming_extraction_ran() {
         .collect();
     assert_eq!(names, ["writer:wait", "store:open"]);
     assert!(payload["error"].is_string());
+    fs::remove_dir_all(root).expect("remove owned fixture");
+}
+
+/// `gap-record` and `session-report` print their human line through the
+/// checked stdout writer. `println!` answers `EPIPE` with a panic ("failed
+/// printing to stdout"); the writer ends quietly with exit 0. The reader is
+/// gone before the child starts, so every write meets a closed pipe rather than
+/// racing a reader that may drain it.
+///
+/// On Unix a one-shot command restores the default `SIGPIPE`, which would kill
+/// the child before either writer saw `EPIPE` and make this test unable to tell
+/// them apart. The child therefore starts with `SIGPIPE` blocked: a blocked
+/// signal stays pending and the write returns `EPIPE`, which is what every
+/// write meets on Windows, where there is no `SIGPIPE` at all.
+#[test]
+fn session_ledger_commands_end_quietly_on_a_closed_stdout() {
+    let root = temp_root();
+    let db = root.join("index.sqlite");
+    let gap: &[&str] = &[
+        "gap-record",
+        "--tool",
+        "t",
+        "--gap-id",
+        "g",
+        "--reason",
+        "r",
+    ];
+    let report: &[&str] = &["session-report"];
+    let last: &[&str] = &["session-report", "--last"];
+    for args in [gap, report, last] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_devmap"));
+        command
+            .arg("--db")
+            .arg(&db)
+            .args(args)
+            .stdout(reader_less_pipe());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: sigemptyset, sigaddset and sigprocmask are
+            // async-signal-safe, which is all pre_exec may call.
+            unsafe {
+                command.pre_exec(|| {
+                    let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+                    if libc::sigemptyset(signals.as_mut_ptr()) != 0
+                        || libc::sigaddset(signals.as_mut_ptr(), libc::SIGPIPE) != 0
+                        || libc::sigprocmask(
+                            libc::SIG_BLOCK,
+                            signals.as_ptr(),
+                            std::ptr::null_mut(),
+                        ) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("panicked") && !stderr.contains("failed printing"),
+            "devmap {args:?} panicked on a closed stdout: {stderr}"
+        );
+        assert!(
+            output.status.success(),
+            "devmap {args:?} must end quietly on a closed stdout: {:?} {stderr}",
+            output.status
+        );
+    }
+    fs::remove_dir_all(root).expect("remove owned fixture");
+}
+
+/// On a terminal, caller-supplied text in the `gap-record` line is escaped:
+/// a `--tool` carrying an escape sequence must not reach the terminal as one.
+#[cfg(unix)]
+#[test]
+fn gap_record_escapes_control_characters_on_a_terminal() {
+    let root = temp_root();
+    let db = root.join("index.sqlite");
+    let (output, terminal) = terminal_output(
+        false,
+        |command| {
+            command
+                .args(["--progress", "always", "--db"])
+                .arg(&db)
+                .args(["gap-record", "--tool", "x\u{1b}[31mred", "--gap-id", "g"])
+                .args(["--reason", "r"])
+                .env("TERM", "xterm-256color")
+                .env("NO_COLOR", "1")
+                .env("LC_ALL", "en_US.UTF-8");
+        },
+        |_, _, _| {},
+    );
+    fs::remove_dir_all(root).expect("remove owned fixture");
+    assert!(output.status.success(), "{terminal}");
+    assert!(
+        terminal.contains("recorded gap g for x"),
+        "the result line must reach the terminal: {terminal:?}"
+    );
+    assert!(
+        !terminal.contains("\u{1b}[31m"),
+        "a caller's escape sequence reached the terminal unescaped: {terminal:?}"
+    );
+    assert!(
+        terminal.contains("\\u{1b}[31mred"),
+        "the escape must be shown, not dropped: {terminal:?}"
+    );
+}
+
+/// `session-report`'s line holds only counts, so no caller text can carry a
+/// control character into it. What shows it reaches the terminal through the
+/// checked writer is that writer's own rendering: with color on, digit runs
+/// are accented, which a raw `println!` never does. One recorded gap puts the
+/// counted form of the line on screen; with nothing logged it has no digits.
+#[cfg(unix)]
+#[test]
+fn session_report_reaches_a_terminal_through_the_checked_writer() {
+    let root = temp_root();
+    let db = root.join("index.sqlite");
+    let gap = Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "gap-record",
+            "--tool",
+            "t",
+            "--gap-id",
+            "g",
+            "--reason",
+            "r",
+        ])
+        .output()
+        .unwrap();
+    assert!(gap.status.success(), "{gap:?}");
+    for args in [&["session-report"][..], &["session-report", "--last"][..]] {
+        let (output, terminal) = terminal_output(
+            false,
+            |command| {
+                command
+                    .args(["--progress", "always", "--db"])
+                    .arg(&db)
+                    .args(args)
+                    .env("TERM", "xterm-256color")
+                    .env_remove("NO_COLOR")
+                    .env("LC_ALL", "en_US.UTF-8");
+            },
+            |_, _, _| {},
+        );
+        assert!(output.status.success(), "{args:?}: {terminal}");
+        assert!(
+            terminal.contains("DevMap session: \u{1b}[1;36m0\u{1b}[0m queries"),
+            "devmap {args:?} bypassed the checked writer: {terminal:?}"
+        );
+    }
     fs::remove_dir_all(root).expect("remove owned fixture");
 }
