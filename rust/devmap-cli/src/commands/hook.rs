@@ -39,7 +39,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
 
 /// Write one hook diagnostic straight to stderr.
 ///
-/// Not through [`diagnostic`]. That path hands the line to an asynchronous
+/// Not through [`crate::diagnostic`]. That path hands the line to an asynchronous
 /// writer, and a failing hook ends in `std::process::exit`, which runs no
 /// destructors and waits for nothing — so the message was dropped on exactly
 /// the paths that had something to report. Measured 2026-09-12:

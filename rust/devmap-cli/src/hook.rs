@@ -824,7 +824,7 @@ const REPO_CLAUSE_CAP: usize = 200;
 /// budget on the paths and cut the command that fixes it.
 const HEALTH_NOTE_CAP: usize = 200;
 
-/// What to do about any condition [`crate::plugin_warning`] reports.
+/// What to do about any condition [`crate::installation::plugin_warning`] reports.
 ///
 /// Every one of them — a version that disagrees with the binary, a malformed
 /// bundle layout, hooks still written in the `args`/`async` form — is repaired
