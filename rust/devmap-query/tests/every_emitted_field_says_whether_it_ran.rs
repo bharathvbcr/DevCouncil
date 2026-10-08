@@ -9,9 +9,9 @@
 //! | `frameworks` | `[]` | `wiki.py:155,285`, `mcp/handlers/map.py:327` |
 //! | `package_managers` | `[]` | `wiki.py`, `mcp/handlers/map.py` |
 //! | `test_commands` | `[]` | `wiki.py`, `mcp/handlers/map.py` |
-//! | `candidate_files` | `[]` | `map_artifacts.py:379` (fills it on `--goal`) |
+//! | `candidate_files` | `[]` | `map_artifacts.py:379` (fills it on `--goal`) — since deleted |
 //! | `lsp` | `{}` | none found in `src/` |
-//! | `dependency_risks` | `[]` | `prompt_builder.py:830`, `map_artifacts.py:383` (fills it on `--scan-deps`) |
+//! | `dependency_risks` | `[]` | `prompt_builder.py:830`, `map_artifacts.py:383` — since deleted |
 //! | `processes` | `[]` | none found in `src/` for the manifest's copy |
 //!
 //! None carried a `*_computed` marker, so a consumer could not tell "this
@@ -32,10 +32,25 @@
 //! _run`, and `devmap-cli/tests/the_map_reads_the_repository_inventory.rs` for
 //! the computed case.
 //!
-//! The remaining four are marked `false` because the kernel cannot see what
-//! they would need: `candidate_files` is goal-dependent, `dependency_risks`
-//! needs an SCA run, and `lsp`/`processes` have no producer in this kernel at
-//! all. Marked, not guessed. No third state.
+//! The remaining four had no producer in this kernel and are no longer
+//! emitted: `candidate_files` was goal-dependent, `dependency_risks` needed an
+//! SCA run, and `lsp`/`processes` were never derived. They first shipped with
+//! a `*_computed: false` marker, which was honest but still told a reader
+//! nothing, because the marker could never be anything but `false`. Retired on
+//! 2026-10-07 after a reader search across the three repositories that consume
+//! this map:
+//!
+//! - DevCouncil: the Python readers above (`map_artifacts.py`,
+//!   `prompt_builder.py`, `wiki.py`, `mcp/handlers/map.py`) no longer exist;
+//!   no Go or Rust source reads any of the four keys or their markers.
+//! - Manvi: no tracked source names any of them (`rg -uu` hits only its own
+//!   generated `.devcouncil/repo_map.json`).
+//! - GitPulse: `src-tauri/src/devmap/repo_map.rs` reads named fields with
+//!   `#[serde(default)]` and none of these four. Its `candidate_files` is an
+//!   unrelated language-stats count, and `"lsp"` in `analyzer/language.rs` is a
+//!   file extension. Its vendored `devmap-query` and its
+//!   `fixtures/repo_map_minimal.json` still carry the keys until its next
+//!   re-vendor; nothing there reads them.
 
 #![cfg(feature = "parse")]
 
@@ -91,7 +106,7 @@ fn manifest() -> serde_json::Value {
 }
 
 /// The general rule, asserted over the whole set rather than field by field:
-/// every one of the eight either carries a value or carries a marker saying it
+/// every emitted one either carries a value or carries a marker saying it
 /// was not computed. A field that does neither is back to being unreadable.
 #[test]
 fn no_always_empty_field_ships_without_provenance() {
@@ -101,15 +116,11 @@ fn no_always_empty_field_ships_without_provenance() {
         ("frameworks", "frameworks_computed"),
         ("package_managers", "package_managers_computed"),
         ("test_commands", "test_commands_computed"),
-        ("candidate_files", "candidate_files_computed"),
         ("import_blind_files", "import_blind_files_computed"),
-        ("lsp", "lsp_computed"),
-        ("dependency_risks", "dependency_risks_computed"),
-        ("processes", "processes_computed"),
     ] {
         assert!(
             map.get(field).is_some(),
-            "{field} vanished from the manifest; its Python readers index it directly"
+            "{field} vanished from the manifest"
         );
         assert!(
             meta.get(marker).is_some_and(serde_json::Value::is_boolean),
@@ -245,22 +256,24 @@ fn subsystem_summaries_describe_composition_instead_of_being_blank() {
     );
 }
 
-/// The four that are marked `false` must be marked `false` — not quietly
-/// flipped to `true` by someone filling the marker without filling the field.
+/// The four keys no producer fills stay retired, markers included. Bringing
+/// one back as a constant is the defect this file exists to prevent; bringing
+/// one back with a real producer means replacing this pin with a computed
+/// marker and a test of the value.
 #[test]
-fn the_fields_this_kernel_cannot_see_admit_it() {
+fn keys_with_no_producer_are_not_emitted() {
     let map = manifest();
     let meta = &map["meta"]["devmap_rust"];
-    for marker in [
-        "candidate_files_computed",
-        "lsp_computed",
-        "dependency_risks_computed",
-        "processes_computed",
-    ] {
-        assert_eq!(
-            meta[marker],
-            serde_json::json!(false),
-            "{marker} claims the kernel computed a field it emits as a constant: {meta}"
+    for field in ["candidate_files", "lsp", "dependency_risks", "processes"] {
+        assert!(
+            map.get(field).is_none(),
+            "{field} is back in the manifest with nothing in this kernel to fill it: {}",
+            map[field]
+        );
+        let marker = format!("{field}_computed");
+        assert!(
+            meta.get(&marker).is_none(),
+            "{marker} is back in the manifest meta, describing a field that is not emitted: {meta}"
         );
     }
 }
