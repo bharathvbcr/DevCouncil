@@ -822,8 +822,10 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     //
     // v74 binds the names a CommonJS `require` declares (v73 is claimed by
     // the Rust struct-literal branch).
+    //
+    // v75 records string literals and the uses of a Rust module-level const.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "74",
+        EXTRACTION_SCHEMA_VERSION, "75",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

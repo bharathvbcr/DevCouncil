@@ -75,7 +75,7 @@ fn every_declared_tool_maps_to_a_command() {
     let specs = tool_specs();
     assert_eq!(
         specs.len(),
-        19,
+        20,
         "the tool surface changed; update this count"
     );
     for spec in &specs {
@@ -93,6 +93,7 @@ fn every_declared_tool_maps_to_a_command() {
             "devmap_neighbors" => json!({"targets": ["helper"]}),
             "devmap_preview" => json!({"file": "core.py", "content": "def helper():\n    pass\n"}),
             "devmap_explore" => json!({"query": "helper"}),
+            "devmap_literals" => json!({"query": "session."}),
             "devmap_affected_tests" => json!({"targets": ["helper"]}),
             "devmap_suspects" => json!({"symptom": "helper", "since": "HEAD~1"}),
             // `since` rather than no arguments: this test proves a declared
@@ -1022,8 +1023,8 @@ async fn a_scope_that_cannot_be_honoured_is_a_tool_error() {
         ),
         (
             "devmap_search",
-            json!({"query": "helper", "paths": ["core.py"]}),
-            "semantic search only",
+            json!({"query": "helper", "paths": ["frontend/"]}),
+            "matches no indexed file",
         ),
         (
             "devmap_search",

@@ -386,13 +386,17 @@ pub enum IpcCommand {
         #[serde(default)]
         semantic: bool,
         /// Repository-relative path prefixes the ranking is restricted to.
-        /// Semantic search only: keyword search with a scope is refused. An older daemon
-        /// ignores this field; see `scope_of`.
+        /// Applied before the page is cut, for keyword and semantic search.
+        /// An older daemon ignores this field; see `scope_of`.
         #[serde(default)]
         paths: Vec<String>,
         /// Languages the ranking is restricted to, as the extractor labels them.
         #[serde(default)]
         languages: Vec<String>,
+        /// Symbol kinds, matched ignoring case and echoed canonically.
+        /// One unknown entry refuses the call.
+        #[serde(default)]
+        kinds: Vec<String>,
     },
     /// Plain-language find: name+docstring TF-IDF seeds, re-ranked by
     /// personalized PageRank over call edges. Distinct from `Search` with
@@ -522,6 +526,27 @@ pub enum IpcCommand {
         depth: usize,
         #[serde(default)]
         min_confidence: f32,
+        /// Path prefixes, applied to the definition search before it is cut.
+        #[serde(default)]
+        paths: Vec<String>,
+        /// Languages, as the extractor labels them.
+        #[serde(default)]
+        languages: Vec<String>,
+        /// Symbol kinds. One unknown entry refuses the call.
+        #[serde(default)]
+        kinds: Vec<String>,
+    },
+    /// Where a string value is written, exact or by prefix.
+    ///
+    /// Distinct from [`Self::Search`], which matches symbol names. A prefix
+    /// (`exact` false) matches `session.` to `session.spawn`. Each site names
+    /// the file, line and enclosing symbol.
+    Literals {
+        query: String,
+        #[serde(default)]
+        exact: bool,
+        #[serde(default = "default_budget")]
+        budget: u32,
     },
     /// Test files reachable through the inbound blast radius of some targets.
     Affected {
@@ -757,31 +782,36 @@ fn scope_of(command: &IpcCommand) -> Result<Option<devmap_query::SymbolScope>, S
 }
 
 /// [`scope_of`] over the fields themselves, for `dispatch`, which has already
-/// destructured the command. `ranked` is false only for keyword search.
+/// destructured the command. Keyword search applies the same path and language
+/// lists in SQL; `ranked` is retained so callers stay at one signature.
 fn scope_from(
     paths: &[String],
     languages: &[String],
-    ranked: bool,
+    _ranked: bool,
 ) -> Result<Option<devmap_query::SymbolScope>, String> {
-    let scope = devmap_query::SymbolScope::new(paths, languages).map_err(|err| err.to_string())?;
-    if scope.is_some() && !ranked {
-        // Refused, not applied after the fact: the store cuts keyword search
-        // to a bm25-ordered page before anything here sees it, so a scope
-        // applied to that page would rank over whatever the whole-corpus cut
-        // happened to keep, and count against a total it did not scope.
-        return Err(
-            "paths and languages scope semantic search only; keyword search ranks a page the \
-             full-text index has already cut from the whole repository. Pass semantic: true, \
-             or drop the scope"
-                .to_string(),
-        );
-    }
-    Ok(scope)
+    devmap_query::SymbolScope::new(paths, languages).map_err(|err| err.to_string())
 }
 
 pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
     // Before the store is touched, for the reason `Blast` gives below: a
     // caller-fixable argument must not be masked by an environment fault.
+    // Name queries also carry a kind list, which `scope_of` does not see.
+    if let IpcCommand::Search {
+        paths,
+        languages,
+        kinds,
+        ..
+    }
+    | IpcCommand::Explore {
+        paths,
+        languages,
+        kinds,
+        ..
+    } = &request.command
+    {
+        devmap_query::NameQueryFilter::new(paths, languages, kinds)
+            .map_err(|err| err.to_string())?;
+    }
     scope_of(&request.command)?;
 
     // Refused, never defaulted. A typo silently answered at full breadth is a
@@ -958,6 +988,7 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
             budget,
             depth,
             min_confidence,
+            ..
         } => {
             // Refused, not clamped: a caller that asked for 500 definitions and
             // silently received 100 cannot tell a capped list from the whole
@@ -969,6 +1000,12 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
                 ));
             }
             (query.as_str(), *budget, *depth, Some(*min_confidence))
+        }
+        IpcCommand::Literals { query, budget, .. } => {
+            if query.trim().is_empty() {
+                return Err("literals requires a non-empty query".to_string());
+            }
+            (query.as_str(), *budget, 1, None)
         }
         IpcCommand::Affected {
             targets,
@@ -1207,19 +1244,31 @@ pub(crate) fn dispatch(
             semantic,
             paths,
             languages,
+            kinds,
         } => {
-            // Re-derived rather than trusted from `validate_request`: a scope
+            // Re-derived rather than trusted from `validate_request`: a filter
             // that reached here unchecked is still refused, never dropped.
-            let scope = scope_from(&paths, &languages, semantic).map_err(anyhow::Error::msg)?;
+            let filter = devmap_query::NameQueryFilter::new(&paths, &languages, &kinds)
+                .map_err(anyhow::Error::msg)?;
             let response = if semantic {
-                engine.search_semantic_scoped(&query, budget, scope.as_ref())?
+                let scope = filter
+                    .as_ref()
+                    .map(|filter| filter.symbol_scope())
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?
+                    .flatten();
+                let kinds = filter.as_ref().map(|filter| filter.kinds()).unwrap_or(&[]);
+                engine.search_semantic_filtered(&query, budget, scope.as_ref(), kinds)?
             } else {
-                engine.search(Request {
-                    query,
-                    token_budget: budget,
-                    min_confidence: 0.0,
-                    max_depth: 1,
-                })?
+                engine.search_filtered(
+                    Request {
+                        query,
+                        token_budget: budget,
+                        min_confidence: 0.0,
+                        max_depth: 1,
+                    },
+                    filter.as_ref(),
+                )?
             };
             Ok(serde_json::to_value(response)?)
         }
@@ -1363,13 +1412,24 @@ pub(crate) fn dispatch(
             budget,
             depth,
             min_confidence,
-        } => Ok(serde_json::to_value(engine.explore(
-            &query,
-            limit,
-            budget,
-            min_confidence,
-            depth,
-        )?)?),
+            paths,
+            languages,
+            kinds,
+        } => {
+            let filter = devmap_query::NameQueryFilter::new(&paths, &languages, &kinds)
+                .map_err(anyhow::Error::msg)?;
+            Ok(serde_json::to_value(engine.explore_filtered(
+                &query,
+                limit,
+                budget,
+                min_confidence,
+                depth,
+                filter.as_ref(),
+            )?)?)
+        }
+        IpcCommand::Literals { query, exact, budget } => {
+            Ok(serde_json::to_value(engine.literals(&query, exact, budget)?)?)
+        }
         IpcCommand::Affected {
             targets,
             budget,
@@ -2314,6 +2374,9 @@ mod tests {
                 budget: 8_000,
                 depth: 2,
                 min_confidence: 0.0,
+                paths: Vec::new(),
+                languages: Vec::new(),
+                kinds: Vec::new(),
             },
         };
         let value = dispatch(
@@ -2441,12 +2504,13 @@ mod tests {
         );
     }
 
-    /// Keyword search ranks a page the full-text index already cut from the
-    /// whole repository, so a scope cannot be applied before ranking there.
-    /// It is refused rather than applied to the page or ignored.
+    /// A path on keyword search is applied in the index, and the answer echoes
+    /// it. `total` counts only that file. A singular MCP alias folds into the
+    /// same lists before serde.
     #[test]
-    fn a_scope_on_keyword_search_is_refused_before_and_at_dispatch() {
-        let keyword = || IpcRequest {
+    fn a_path_on_keyword_search_is_applied_and_echoed() {
+        let store = corpus_store(8, None);
+        let request = IpcRequest {
             version: PROTOCOL_VERSION,
             command: IpcCommand::Search {
                 query: "widget".to_string(),
@@ -2454,19 +2518,27 @@ mod tests {
                 semantic: false,
                 paths: vec!["things.py".to_string()],
                 languages: Vec::new(),
+                kinds: Vec::new(),
             },
         };
-        let error = validate_request(&keyword()).unwrap_err();
-        assert!(error.contains("semantic search only"), "{error}");
-        let error = dispatch(
-            &corpus_store(8, None),
-            keyword(),
+        validate_request(&request).expect("a path of an indexed file is a valid filter");
+        let value = dispatch(
+            &store,
+            request,
             &devmap_query::Cancel::new(),
             &UnappliedEdits::default(),
         )
-        .expect_err("dispatch must not trust that validation ran")
-        .to_string();
-        assert!(error.contains("semantic search only"), "{error}");
+        .expect("dispatch applies the filter");
+        assert_eq!(value["scope"]["paths"][0], "things.py", "{value}");
+        let items = value["items"].as_array().expect("items");
+        assert!(!items.is_empty(), "{value}");
+        for item in items {
+            assert_eq!(item["file_path"], "things.py", "{item}");
+        }
+        let shown = value["shown"].as_u64().unwrap();
+        let hidden = value["hidden"].as_u64().unwrap();
+        let total = value["total"].as_u64().unwrap();
+        assert_eq!(shown + hidden, total, "{value}");
         let mcp = crate::mcp::to_ipc_command(
             "devmap_search",
             Some(&serde_json::json!({"query": "widget", "languages": ["python"]})),
@@ -2476,7 +2548,30 @@ mod tests {
             version: PROTOCOL_VERSION,
             command: mcp,
         })
-        .is_err());
+        .is_ok());
+        let folded = crate::mcp::to_ipc_command(
+            "devmap_explore",
+            Some(&serde_json::json!({
+                "query": "record",
+                "path": "src-tauri/src/ledger",
+                "language": "rust",
+                "kind": "function"
+            })),
+        )
+        .unwrap();
+        match folded {
+            IpcCommand::Explore {
+                paths,
+                languages,
+                kinds,
+                ..
+            } => {
+                assert_eq!(paths, vec!["src-tauri/src/ledger".to_string()]);
+                assert_eq!(languages, vec!["rust".to_string()]);
+                assert_eq!(kinds, vec!["function".to_string()]);
+            }
+            other => panic!("singular aliases did not fold: {other:?}"),
+        }
     }
 
     /// A client that predates the scope fields sends none, and gets exactly
@@ -2548,6 +2643,9 @@ mod tests {
                 budget: 2_000,
                 depth: 1,
                 min_confidence: 0.0,
+                paths: Vec::new(),
+                languages: Vec::new(),
+                kinds: Vec::new(),
             },
         };
         assert!(validate_request(&explore(MAX_EXPLORE_LIMIT)).is_ok());
@@ -2802,6 +2900,7 @@ mod tests {
                 semantic: false,
                 paths: Vec::new(),
                 languages: Vec::new(),
+                kinds: Vec::new(),
             },
         };
 
@@ -2990,6 +3089,7 @@ mod tests {
                 semantic: true,
                 paths: Vec::new(),
                 languages: Vec::new(),
+                kinds: Vec::new(),
             },
         };
         let cancel = devmap_query::Cancel::new();

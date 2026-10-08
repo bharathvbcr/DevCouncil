@@ -158,6 +158,9 @@ fn seed_current_store(db_path: &Path) {
 /// traceable to a line of `schema.rs`.
 fn reduce_one_rung(conn: &Connection, from_version: i32) {
     let sql: &str = match from_version {
+        // MIGRATION_V25_TO_V26: the literal-site table and its value index.
+        // Additive, so the reduction is the table; the index goes with it.
+        26 => "DROP TABLE generation_literals;",
         // MIGRATION_V24_TO_V25: version stamp only. No DDL to undo.
         25 => "",
         // MIGRATION_V23_TO_V24: the re-added `callee_name` index.

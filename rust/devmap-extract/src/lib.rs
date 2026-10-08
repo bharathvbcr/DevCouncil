@@ -66,6 +66,8 @@ mod returns;
 #[cfg(feature = "parse")]
 mod rustlocal;
 #[cfg(feature = "parse")]
+mod literals;
+#[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod tsconfig;
 pub mod wiring;

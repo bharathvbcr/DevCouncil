@@ -9,7 +9,8 @@ use devmap_extract::model::*;
 use devmap_extract::subprocess::GIT_HEAD_DEADLINE;
 #[cfg(feature = "parse")]
 use devmap_resolve::model::*;
-use rusqlite::{params, Connection, OptionalExtension, Result, TransactionBehavior};
+use rusqlite::types::ToSql;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Result, TransactionBehavior};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A refusal this store raises itself — a future schema, a read-only file, a
@@ -153,7 +154,8 @@ use crate::schema::{
     MIGRATION_V16_TO_V17, MIGRATION_V17_TO_V18_BACKFILL_EDGES,
     MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED, MIGRATION_V17_TO_V18_RENAME_EDGES,
     MIGRATION_V17_TO_V18_RENAME_UNRESOLVED, MIGRATION_V18_TO_V19, MIGRATION_V19_TO_V20,
-    MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22, MIGRATION_V23_TO_V24, MIGRATION_V3_TO_V4,
+    MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22, MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26,
+    MIGRATION_V3_TO_V4,
     MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
     MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, PYTHON_INDEX_SCHEMA_VERSION,
     VALIDITY_RANGE_TABLES,
@@ -1057,6 +1059,63 @@ pub struct SearchPage {
     /// worse than none. `None` means the analysis blob could not be read, which
     /// is itself a check that did not run — not a clean corpus.
     pub analysis: Option<AnalysisDisclosure>,
+    /// Set when the page was cut by a path, language or kind filter. The
+    /// counts here are the filtered corpus, not the name-match total — that
+    /// stays in [`Self::total`].
+    pub narrowing: Option<SearchNarrowing>,
+}
+
+/// Path, language and kind bounds applied to one keyword page, plus the
+/// corpus sizes the answer echoes. Kinds are canonical `SymbolKind::as_str`
+/// spellings. Paths are repository-relative and already checked.
+#[derive(Debug, Clone)]
+pub struct SearchNarrowing {
+    pub paths: Vec<String>,
+    pub languages: Vec<String>,
+    pub kinds: Vec<String>,
+    /// Files matching the path and language, or files holding the kind when
+    /// only a kind was given.
+    pub files: u32,
+    /// Symbols matching path, language and kind.
+    pub symbols: u32,
+    /// Files in the generation, measured in SQL. A caller that has an analysis
+    /// disclosure prefers that count when it is non-zero.
+    pub corpus_files: u32,
+    /// Symbols in the generation, measured in SQL.
+    pub corpus_symbols: u32,
+}
+
+/// Caller-supplied keyword narrowing. Empty lists admit everything on that axis.
+#[derive(Debug, Clone, Default)]
+pub struct KeywordNarrowing {
+    pub paths: Vec<String>,
+    pub languages: Vec<String>,
+    pub kinds: Vec<String>,
+}
+
+impl KeywordNarrowing {
+    pub fn active(&self) -> bool {
+        !self.paths.is_empty() || !self.languages.is_empty() || !self.kinds.is_empty()
+    }
+}
+
+/// One literal site persisted for a generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredLiteral {
+    pub file_path: String,
+    pub line: u32,
+    pub span_start: u32,
+    pub value: String,
+    pub qualified_name: String,
+    pub symbol_name: String,
+}
+
+/// A counted page of literal sites from one generation. `rows` may be shorter
+/// than `total` when the page cap cut the read; the caller still reports `total`.
+#[derive(Debug, Clone)]
+pub struct LiteralPage {
+    pub total: u32,
+    pub rows: Vec<StoredLiteral>,
 }
 
 /// Every file one generation indexed, as `(path, language)`; see
@@ -1909,6 +1968,141 @@ fn sqlite_limit(limit: usize) -> i64 {
     limit.min(i64::MAX as usize) as i64
 }
 
+fn stored_symbol_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSymbol> {
+    let name: String = row.get(0)?;
+    let path: String = row.get(3)?;
+    let (span_start, span_end) = checked_span(&path, &name, row.get(4)?, row.get(5)?)?;
+    Ok(StoredSymbol {
+        name,
+        qualified_name: row.get(1)?,
+        kind: row.get(2)?,
+        path,
+        span_start,
+        span_end,
+        is_exported: row.get::<_, i64>(6)? != 0,
+        content_hash: row.get::<_, i64>(7)? as u64,
+    })
+}
+
+fn append_narrowing(sql: &mut String, params: &mut Vec<Box<dyn ToSql>>, filter: &KeywordNarrowing) {
+    append_paths(sql, params, &filter.paths);
+    append_languages(sql, params, &filter.languages);
+    append_kinds(sql, params, &filter.kinds);
+}
+
+/// Segment-boundary prefix, the same rule as `scope::under_prefix`: `frontend`
+/// admits `frontend/app.tsx` and a file named `frontend`, never `frontend2/`.
+fn append_paths(sql: &mut String, params: &mut Vec<Box<dyn ToSql>>, paths: &[String]) {
+    if paths.is_empty() {
+        return;
+    }
+    sql.push_str(" AND (");
+    for (index, path) in paths.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" OR ");
+        }
+        sql.push_str("(p.path = ? OR substr(p.path, 1, length(?) + 1) = (? || '/'))");
+        params.push(Box::new(path.clone()));
+        params.push(Box::new(path.clone()));
+        params.push(Box::new(path.clone()));
+    }
+    sql.push(')');
+}
+
+fn append_languages(sql: &mut String, params: &mut Vec<Box<dyn ToSql>>, languages: &[String]) {
+    if languages.is_empty() {
+        return;
+    }
+    sql.push_str(" AND lower(f.language) IN (");
+    for (index, language) in languages.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('?');
+        params.push(Box::new(language.clone()));
+    }
+    sql.push(')');
+}
+
+fn append_kinds(sql: &mut String, params: &mut Vec<Box<dyn ToSql>>, kinds: &[String]) {
+    if kinds.is_empty() {
+        return;
+    }
+    sql.push_str(" AND n.kind IN (");
+    for (index, kind) in kinds.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('?');
+        params.push(Box::new(kind.clone()));
+    }
+    sql.push(')');
+}
+
+fn distinct_kinds(
+    conn: &Connection,
+    generation: u32,
+    filter: &KeywordNarrowing,
+) -> Result<BTreeSet<String>> {
+    let mut sql = String::from(
+        "SELECT DISTINCT n.kind FROM generation_nodes n
+         JOIN paths p ON p.id = n.file_id
+         JOIN generation_files f
+           ON f.generation_id = n.generation_id AND f.file_id = n.file_id
+         WHERE n.generation_id = ?",
+    );
+    let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(i64::from(generation))];
+    append_paths(&mut sql, &mut params, &filter.paths);
+    append_languages(&mut sql, &mut params, &filter.languages);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params.iter()), |row| row.get::<_, String>(0))?;
+    let mut present = BTreeSet::new();
+    for row in rows {
+        present.insert(row?);
+    }
+    Ok(present)
+}
+
+/// `?` placeholders, in order: generation, then the value bound(s).
+fn literal_predicate(
+    generation: u32,
+    query: &str,
+    exact: bool,
+) -> Result<(String, Vec<Box<dyn ToSql>>)> {
+    let mut params: Vec<Box<dyn ToSql>> =
+        vec![Box::new(i64::from(generation)), Box::new(query.to_string())];
+    if exact {
+        return Ok(("l.generation_id = ? AND l.value = ?".to_string(), params));
+    }
+    if let Some(end) = prefix_successor(query) {
+        params.push(Box::new(end));
+        Ok((
+            "l.generation_id = ? AND l.value >= ? AND l.value < ?".to_string(),
+            params,
+        ))
+    } else {
+        params.push(Box::new(query.to_string()));
+        Ok((
+            "l.generation_id = ? AND l.value >= ? AND instr(l.value, ?) = 1".to_string(),
+            params,
+        ))
+    }
+}
+
+/// The smallest string strictly above every string that starts with `prefix`,
+/// or `None` when incrementing the last non-0xFF byte is not valid UTF-8.
+fn prefix_successor(prefix: &str) -> Option<String> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    loop {
+        let last = bytes.last_mut()?;
+        if *last < 0xFF {
+            *last += 1;
+            return String::from_utf8(bytes).ok();
+        }
+        bytes.pop();
+    }
+}
+
 /// The stored byte span of a symbol row, or a refusal naming the row.
 ///
 /// S-11: three readers decoded the same two columns and two of them disagreed
@@ -2248,6 +2442,18 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "confidence",
             "is_exempt",
             "exemption_reason",
+        ],
+    ),
+    (
+        "generation_literals",
+        &[
+            "generation_id",
+            "file_id",
+            "line",
+            "span_start",
+            "value",
+            "qualified_name",
+            "symbol_name",
         ],
     ),
     (
@@ -2861,6 +3067,7 @@ impl Store {
             tx.execute_batch(MIGRATION_V21_TO_V22)?;
             // After v21's drop of the same index, as on the ladder.
             tx.execute_batch(MIGRATION_V23_TO_V24)?;
+            tx.execute_batch(MIGRATION_V25_TO_V26)?;
             Self::validate_schema(tx)?;
             tx.execute(
                 &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION),
@@ -3246,7 +3453,12 @@ impl Store {
             // makes an older binary refuse the store at open instead of
             // failing every edge read on a kind it cannot parse.
             conn.execute("PRAGMA user_version = 25", [])?;
-            version = CURRENT_SCHEMA_VERSION;
+            version = 25;
+        }
+        if version == 25 {
+            conn.execute_batch(MIGRATION_V25_TO_V26)?;
+            conn.execute("PRAGMA user_version = 26", [])?;
+            version = 26;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
@@ -5035,6 +5247,19 @@ impl Store {
                     node_ord += 1;
                 }
             }
+            if !carry.is_empty() {
+                let mut literal_carry = tx.prepare(
+                    "INSERT INTO generation_literals
+                        (generation_id, file_id, line, span_start, value, qualified_name, symbol_name)
+                     SELECT ?1, l.file_id, l.line, l.span_start, l.value, l.qualified_name, l.symbol_name
+                       FROM generation_literals l
+                       JOIN paths p ON p.id = l.file_id
+                      WHERE l.generation_id = ?2 AND p.path = ?3",
+                )?;
+                for path in &carry {
+                    literal_carry.execute(params![gen_id, prev, path])?;
+                }
+            }
         }
 
         // Insert fresh rows for every extraction whose file was not carried.
@@ -5089,6 +5314,25 @@ impl Store {
                     .execute(params![fts_rowid, gen_id])?;
                 }
                 node_ord += 1;
+            }
+            for lit in &ext.literals {
+                if lit.value.is_empty() || lit.value.as_bytes().contains(&0) {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO generation_literals
+                        (generation_id, file_id, line, span_start, value, qualified_name, symbol_name)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        gen_id,
+                        file_id,
+                        i64::from(lit.line),
+                        i64::try_from(lit.start_byte).unwrap_or(i64::MAX),
+                        lit.value,
+                        lit.enclosing_qualified_name,
+                        lit.enclosing_name,
+                    ],
+                )?;
             }
         }
 
@@ -7528,6 +7772,7 @@ generation {latest}; run `devmap status` to re-verify",
             rows,
             repo_root: Self::generation_repo_root_in(&snapshot, generation)?,
             analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
+            narrowing: None,
         }))
     }
 
@@ -7563,6 +7808,7 @@ generation {latest}; run `devmap status` to re-verify",
                 rows,
                 repo_root: Self::generation_repo_root_in(&snapshot, generation)?,
                 analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
+                narrowing: None,
             },
             files,
         )))
@@ -7638,6 +7884,7 @@ generation {latest}; run `devmap status` to re-verify",
             // search that finds nothing is only a completed check if the corpus
             // it searched was complete, and that is the fact this carries.
             analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
+            narrowing: None,
         }))
     }
 
@@ -7736,6 +7983,297 @@ generation {latest}; run `devmap status` to re-verify",
             Self::require_searchable_index(conn, gen).map_err(fts_failure)?;
         }
         u32::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))
+    }
+
+    /// Files of one generation as `(path, language)`, ordered by path.
+    fn indexed_files_in(snapshot: &Connection, generation: u32) -> Result<IndexedFiles> {
+        let mut stmt = snapshot.prepare(
+            "SELECT p.path, f.language
+             FROM generation_files f
+             JOIN paths p ON p.id = f.file_id
+             WHERE f.generation_id = ?1
+             ORDER BY p.path",
+        )?;
+        let files = stmt
+            .query_map(params![generation], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<IndexedFiles>>()?;
+        Ok(files)
+    }
+
+    /// The generation a keyword scope must be checked against, with its files.
+    ///
+    /// The caller then passes this generation id to [`Self::search_page_in`],
+    /// so the refusal and the page describe one snapshot.
+    pub fn latest_scope_inputs(&self) -> Result<Option<(u32, Option<String>, IndexedFiles)>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let files = Self::indexed_files_in(&snapshot, generation)?;
+        let root = Self::generation_repo_root_in(&snapshot, generation)?;
+        Ok(Some((generation, root, files)))
+    }
+
+    /// [`Self::search_page`] against a generation the caller already pinned.
+    ///
+    /// `narrowing` of `None`, or one with every list empty, runs the unfiltered
+    /// statements unchanged. A set filter joins the same generation's paths and
+    /// files so the count and the page see one filtered set — applying the
+    /// filter to a page the full-text index already cut would make `total`
+    /// describe a different corpus from `rows`.
+    pub fn search_page_in(
+        &self,
+        generation: u32,
+        query: &str,
+        limit: usize,
+        narrowing: Option<&KeywordNarrowing>,
+    ) -> Result<Option<SearchPage>> {
+        let conn = lock_conn(&self.conn)?;
+        let present: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM generations WHERE id = ?1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if present.is_none() {
+            return Ok(None);
+        }
+        let active = narrowing.filter(|filter| filter.active());
+        let (total, rows, applied) = if let Some(filter) = active {
+            Self::search_narrowed(&conn, generation, query, limit, filter)?
+        } else {
+            (
+                Self::count_search_symbols_locked(&conn, generation, query)?,
+                Self::search_symbols_locked(&conn, generation, query, limit)?,
+                None,
+            )
+        };
+        Ok(Some(SearchPage {
+            generation,
+            total,
+            rows,
+            repo_root: Self::generation_repo_root_in(&conn, generation)?,
+            analysis: Self::analysis_disclosure_in(&conn, generation)?,
+            narrowing: applied,
+        }))
+    }
+
+    /// Literal sites whose value equals `query`, or starts with it.
+    ///
+    /// `None` when the store holds no generation. The comparison is binary, so
+    /// `Session.` does not match `session.`. At most `page_cap` rows are
+    /// loaded; `total` is the full count either way.
+    pub fn search_literals(
+        &self,
+        query: &str,
+        exact: bool,
+        page_cap: usize,
+    ) -> Result<Option<LiteralPage>> {
+        if query.is_empty() {
+            return Err(refusal("literals requires a non-empty query"));
+        }
+        if query.contains('\0') {
+            return Err(refusal("literals query contains NUL"));
+        }
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let (predicate, mut params) = literal_predicate(generation, query, exact)?;
+        let count_sql = format!("SELECT COUNT(*) FROM generation_literals l WHERE {predicate}");
+        let count: i64 = snapshot
+            .query_row(&count_sql, params_from_iter(params.iter()), |row| row.get(0))
+            .map_err(fts_failure)?;
+        let total = u32::try_from(count)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))?;
+        let page_sql = format!(
+            "SELECT p.path, l.line, l.span_start, l.value, l.qualified_name, l.symbol_name
+             FROM generation_literals l
+             JOIN paths p ON p.id = l.file_id
+             WHERE {predicate}
+             ORDER BY p.path, l.line, l.span_start
+             LIMIT ?"
+        );
+        let limit = i64::try_from(page_cap.max(1)).unwrap_or(i64::MAX);
+        params.push(Box::new(limit));
+        let mut stmt = snapshot.prepare(&page_sql).map_err(fts_failure)?;
+        let rows = stmt
+            .query_map(params_from_iter(params.iter()), |row| {
+                Ok(StoredLiteral {
+                    file_path: row.get(0)?,
+                    line: u32::try_from(row.get::<_, i64>(1)?).unwrap_or(u32::MAX),
+                    span_start: u32::try_from(row.get::<_, i64>(2)?).unwrap_or(u32::MAX),
+                    value: row.get(3)?,
+                    qualified_name: row.get(4)?,
+                    symbol_name: row.get(5)?,
+                })
+            })
+            .map_err(fts_failure)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(fts_failure)?);
+        }
+        Ok(Some(LiteralPage { total, rows: out }))
+    }
+
+    fn search_narrowed(
+        conn: &Connection,
+        generation: u32,
+        query: &str,
+        limit: usize,
+        filter: &KeywordNarrowing,
+    ) -> Result<(u32, Vec<StoredSymbol>, Option<SearchNarrowing>)> {
+        let present = distinct_kinds(conn, generation, filter)?;
+        let missing: Vec<String> = filter
+            .kinds
+            .iter()
+            .filter(|kind| !present.contains(kind.as_str()))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            let place = if filter.paths.is_empty() && filter.languages.is_empty() {
+                "in the indexed repository"
+            } else {
+                "under the path/language"
+            };
+            let listed = if present.is_empty() {
+                "(none)".to_string()
+            } else {
+                present.iter().cloned().collect::<Vec<_>>().join(", ")
+            };
+            return Err(refusal(format!(
+                "kinds entry {missing:?} labels no symbol {place}; kinds present: {listed}"
+            )));
+        }
+        if query.trim().is_empty() {
+            let narrowing = Self::narrowing_counts(conn, generation, filter)?;
+            return Ok((0, Vec::new(), Some(narrowing)));
+        }
+        let match_query = fts_match_query(query)?;
+        let mut count_sql = String::from(
+            "SELECT COUNT(*)
+             FROM nodes_fts
+             CROSS JOIN nodes_fts_map m
+               ON m.rowid_ref = nodes_fts.rowid AND m.generation_id = ?
+             JOIN generation_nodes n
+               ON n.generation_id = m.generation_id
+              AND n.ordinal = (nodes_fts.rowid & 4294967295)
+             JOIN paths p ON p.id = n.file_id
+             JOIN generation_files f
+               ON f.generation_id = n.generation_id AND f.file_id = n.file_id
+             WHERE nodes_fts MATCH ?",
+        );
+        let mut count_params: Vec<Box<dyn ToSql>> = vec![
+            Box::new(i64::from(generation)),
+            Box::new(match_query.clone()),
+        ];
+        append_narrowing(&mut count_sql, &mut count_params, filter);
+        let count: i64 = conn
+            .query_row(
+                &count_sql,
+                params_from_iter(count_params.iter()),
+                |row| row.get(0),
+            )
+            .map_err(fts_failure)?;
+        if count == 0 {
+            Self::require_searchable_index(conn, generation).map_err(fts_failure)?;
+        }
+        let total =
+            u32::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))?;
+        let mut page_sql = String::from(
+            "SELECT n.name, n.qualified_name, n.kind, p.path,
+                    n.span_start, n.span_end, n.is_exported, f.content_hash
+             FROM nodes_fts
+             CROSS JOIN nodes_fts_map m ON m.rowid_ref = nodes_fts.rowid
+             JOIN generation_nodes n
+               ON n.generation_id = m.generation_id
+              AND n.ordinal = (nodes_fts.rowid & 4294967295)
+             JOIN paths p ON p.id = n.file_id
+             JOIN generation_files f ON f.generation_id = n.generation_id AND f.file_id = n.file_id
+             WHERE m.generation_id = ? AND nodes_fts MATCH ?",
+        );
+        let mut page_params: Vec<Box<dyn ToSql>> = vec![
+            Box::new(i64::from(generation)),
+            Box::new(match_query),
+        ];
+        append_narrowing(&mut page_sql, &mut page_params, filter);
+        page_sql.push_str(" ORDER BY bm25(nodes_fts), p.path, n.name, n.span_start LIMIT ?");
+        page_params.push(Box::new(sqlite_limit(limit)));
+        let mut stmt = conn.prepare(&page_sql).map_err(fts_failure)?;
+        let mapped = stmt
+            .query_map(params_from_iter(page_params.iter()), |row| {
+                stored_symbol_from_row(row)
+            })
+            .map_err(fts_failure)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row.map_err(fts_failure)?);
+        }
+        if rows.is_empty() {
+            Self::require_searchable_index(conn, generation).map_err(fts_failure)?;
+        }
+        let narrowing = Self::narrowing_counts(conn, generation, filter)?;
+        Ok((total, rows, Some(narrowing)))
+    }
+
+    fn narrowing_counts(
+        conn: &Connection,
+        generation: u32,
+        filter: &KeywordNarrowing,
+    ) -> Result<SearchNarrowing> {
+        let corpus_files: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM generation_files WHERE generation_id = ?1",
+            params![generation],
+            |row| row.get(0),
+        )?;
+        let corpus_symbols: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM generation_nodes WHERE generation_id = ?1",
+            params![generation],
+            |row| row.get(0),
+        )?;
+        let files: i64 = if filter.paths.is_empty() && filter.languages.is_empty() {
+            let mut sql = String::from(
+                "SELECT COUNT(DISTINCT n.file_id) FROM generation_nodes n
+                 WHERE n.generation_id = ?",
+            );
+            let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(i64::from(generation))];
+            append_kinds(&mut sql, &mut params, &filter.kinds);
+            conn.query_row(&sql, params_from_iter(params.iter()), |row| row.get(0))?
+        } else {
+            let mut sql = String::from(
+                "SELECT COUNT(*) FROM generation_files f
+                 JOIN paths p ON p.id = f.file_id
+                 WHERE f.generation_id = ?",
+            );
+            let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(i64::from(generation))];
+            append_paths(&mut sql, &mut params, &filter.paths);
+            append_languages(&mut sql, &mut params, &filter.languages);
+            conn.query_row(&sql, params_from_iter(params.iter()), |row| row.get(0))?
+        };
+        let mut symbol_sql = String::from(
+            "SELECT COUNT(*) FROM generation_nodes n
+             JOIN paths p ON p.id = n.file_id
+             JOIN generation_files f
+               ON f.generation_id = n.generation_id AND f.file_id = n.file_id
+             WHERE n.generation_id = ?",
+        );
+        let mut symbol_params: Vec<Box<dyn ToSql>> = vec![Box::new(i64::from(generation))];
+        append_narrowing(&mut symbol_sql, &mut symbol_params, filter);
+        let symbols: i64 = conn.query_row(
+            &symbol_sql,
+            params_from_iter(symbol_params.iter()),
+            |row| row.get(0),
+        )?;
+        Ok(SearchNarrowing {
+            paths: filter.paths.clone(),
+            languages: filter.languages.clone(),
+            kinds: filter.kinds.clone(),
+            files: u32::try_from(files).unwrap_or(u32::MAX),
+            symbols: u32::try_from(symbols).unwrap_or(u32::MAX),
+            corpus_files: u32::try_from(corpus_files).unwrap_or(u32::MAX),
+            corpus_symbols: u32::try_from(corpus_symbols).unwrap_or(u32::MAX),
+        })
     }
 
     pub fn latest_path_is_indexed(&self, path: &str) -> Result<bool> {
@@ -9271,6 +9809,10 @@ generation {latest}; run `devmap status` to re-verify",
             )?;
             tx.execute(
                 "DELETE FROM generation_dead_symbols WHERE generation_id = ?1",
+                params![old_gen],
+            )?;
+            tx.execute(
+                "DELETE FROM generation_literals WHERE generation_id = ?1",
                 params![old_gen],
             )?;
             tx.execute("DELETE FROM generations WHERE id = ?1", params![old_gen])?;

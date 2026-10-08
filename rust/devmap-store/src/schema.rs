@@ -1322,7 +1322,29 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_rows_callee
 /// claimed v24 for the `callee_name` index.)
 pub const MIGRATION_V24_TO_V25: &str = "";
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 25;
+/// String literals and the symbol that encloses each one.
+///
+/// A name query cannot see a string-keyed protocol: event actions, IPC
+/// command names, config keys. The coupling is the value, not a call edge.
+/// `value` is compared with `=` and a byte-range prefix, never `LIKE`, so the
+/// match stays case-sensitive. The index is `(generation_id, value)` because
+/// that is the predicate both the count and the page lead with.
+pub const MIGRATION_V25_TO_V26: &str = r#"
+CREATE TABLE IF NOT EXISTS generation_literals (
+    generation_id INTEGER NOT NULL,
+    file_id INTEGER NOT NULL,
+    line INTEGER NOT NULL,
+    span_start INTEGER NOT NULL,
+    value TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    symbol_name TEXT NOT NULL,
+    PRIMARY KEY (generation_id, file_id, span_start, value, qualified_name)
+);
+CREATE INDEX IF NOT EXISTS idx_generation_literals_value
+    ON generation_literals (generation_id, value);
+"#;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 26;
 
 /// The `user_version` the Python engine's `index.sqlite` carries — a database
 /// this kernel never wrote and cannot read. Named once, here, so the store's
@@ -1365,6 +1387,7 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     MIGRATION_V23_TO_V24,
     // Empty: v25 only stamps `user_version`.
     MIGRATION_V24_TO_V25,
+    MIGRATION_V25_TO_V26,
 ];
 
 /// Strip SQL line comments so a scan of DDL text cannot read prose as code.

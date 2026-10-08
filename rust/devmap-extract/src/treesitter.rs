@@ -759,6 +759,7 @@ fn extract_treesitter_before_deadline(
                     scope_locals: collect_scope_locals(root, source, &file_symbol_name),
                     local_bindings,
                     source_code: Some(source.to_string()),
+                    literals: Vec::new(),
                 };
 
                 // The code inside a template language's `<script>` blocks, in
@@ -795,6 +796,10 @@ fn extract_treesitter_before_deadline(
                 // after one registry lookup for every language whose entry
                 // permits neither `css` nor `html` inside it.
                 crate::markup::merge_markup(&mut extraction, root, source, lang);
+                let (literals, mut notes) =
+                    crate::literals::index_literals(root, source, lang, &extraction.symbols, deadline);
+                extraction.literals = literals;
+                extraction.diagnostics.append(&mut notes);
                 #[cfg(test)]
                 EXTRACTION_FINISH_HOOK.with(|hook| {
                     if let Some(finish) = hook.take() {
@@ -1834,6 +1839,7 @@ fn unparsed_extraction(
         scope_locals: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
+        literals: Vec::new(),
     }
 }
 
@@ -2041,6 +2047,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         scope_locals: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
+        literals: Vec::new(),
     }
 }
 

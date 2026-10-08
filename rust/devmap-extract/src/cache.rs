@@ -544,7 +544,11 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// A row without them has a `require` that binds nothing, so every call
 /// through it is unattributed. (v73 is claimed by the Rust struct-literal
 /// branch.)
-pub const EXTRACTION_SCHEMA_VERSION: &str = "74";
+///
+/// v75 records string literals and, for a Rust module-level const, the uses
+/// of that const. A cached row without them answers "no writer" for a
+/// string-keyed protocol.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "75";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
