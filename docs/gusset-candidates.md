@@ -79,8 +79,9 @@ work per call, "don't"), and each of these questions is a few µs.
 ### Tried: making the engine win
 
 Before settling on fnmatch, the engine path was rebuilt to give it its best
-case. The prototype is on branch `spike/prepared-engine` (`60ed2ef3`), with
-its own tests and benchmarks, and is not merged.
+case. The prototype (`60ed2ef3`) is merged into the engine path, with its
+own tests and benchmarks (`gussetfn/prepared_test.go`,
+`gussetfn/isolated_ab_test.go`); policy decisions still use fnmatch.
 
 - dc-glob compiles a pattern once.
 - The umbrella registers each pattern list once (`OPCODE_PREPARE`) and answers

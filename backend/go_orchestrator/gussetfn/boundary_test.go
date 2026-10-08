@@ -184,8 +184,9 @@ func TestLargeFramesTravelInABuffer(t *testing.T) {
 	if fnmatch.Oversized(name) {
 		t.Fatal("the name is past fnmatch's cap; Go would answer without a crossing")
 	}
-	if frame, _ := encodeAny(name, []string{"*id_rsa"}); len(frame) <= maxFrame {
-		t.Fatalf("frame of %d bytes fits inline; the buffer path is not exercised", len(frame))
+	// A prepared question carries the name twice, as given and folded.
+	if len(name) <= maxFrame {
+		t.Fatalf("a name of %d bytes fits inline; the buffer path is not exercised", len(name))
 	}
 	for _, p := range []string{"*id_rsa", "*.pem", "dir/*", "*/ID_RSA"} {
 		got, err := Match(ctx, p, name)
