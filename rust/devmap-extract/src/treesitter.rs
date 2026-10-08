@@ -552,6 +552,21 @@ fn extract_treesitter_before_deadline(
                         deadline,
                     );
                 }
+                if !crate::entry_names::collect(
+                    root,
+                    source,
+                    lang,
+                    &file_symbol_name,
+                    &mut references,
+                    deadline,
+                ) {
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        over_budget("reading name strings"),
+                    );
+                }
 
                 let (go_interface_methods, go_method_params, go_member_names) = if lang == "go" {
                     let (interface_methods, method_params, mut member_names) =
@@ -3255,50 +3270,6 @@ fn generic_declaration_name(node: Node, source: &str) -> Option<String> {
     None
 }
 
-/// The text of a Rust string literal when the whole of it is an identifier —
-/// the only shape a runtime's lookup-by-name accepts — else `None`.
-///
-/// One `string_content` child and nothing else: an escape sequence, an
-/// interpolation-shaped `{}` or any whitespace makes it a message, not a name.
-/// A single character is a separator or a flag, never an entry point.
-fn rust_entry_name_literal(node: Node, source: &str) -> Option<String> {
-    const MAX_ENTRY_NAME_BYTES: usize = 128;
-    let mut cursor = node.walk();
-    let mut children = node.named_children(&mut cursor);
-    let content = children.next()?;
-    if children.next().is_some() || content.kind() != "string_content" {
-        return None;
-    }
-    let text = source.get(content.byte_range())?;
-    let identifier = text.len() >= 2
-        && text.len() <= MAX_ENTRY_NAME_BYTES
-        && text
-            .bytes()
-            .next()
-            .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
-        && text.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-    identifier.then(|| text.to_string())
-}
-
-/// The name of the `const` or `static` item whose initializer holds `node`, or
-/// `None` when `node` is not inside one.
-fn rust_enclosing_item_binding(node: Node, source: &str) -> Option<String> {
-    let mut current = node.parent();
-    for _ in 0..64 {
-        let parent = current?;
-        match parent.kind() {
-            "const_item" | "static_item" => {
-                return get_child_text(parent, "name", source).filter(|name| !name.is_empty());
-            }
-            // A body is a scope boundary: a string past it belongs to that
-            // scope's own item, not to an item further out.
-            "function_item" | "closure_expression" | "source_file" => return None,
-            _ => current = parent.parent(),
-        }
-    }
-    None
-}
-
 /// The shader-entry reason for a Metal declaration, read from its own leading
 /// qualifier.
 ///
@@ -4429,36 +4400,6 @@ fn extract_node(
                             assignment_binding(node, source),
                         ));
                     }
-                }
-            }
-            // A host names a GPU kernel by string: `rt.pipeline("mlp_silu")`,
-            // or a `("encoder_attn_rows_h256_r16_g32", 16, 32)` row handed to
-            // one. Recorded wherever the literal is, because the call that
-            // consumes it is as often a wrapper (`pipeline(rt, "x", WHAT)`) or
-            // a variable bound from a table as the runtime method itself; which
-            // literals name a kernel is the resolver's question, answered from
-            // the kernels the index holds (see `ReferenceKind::EntryName`).
-            "string_literal" | "raw_string_literal" => {
-                if let Some(name) = rust_entry_name_literal(node, source) {
-                    let enclosing_symbol =
-                        enclosing_callable_qualified(node, source, file_symbol_name);
-                    // Outside any function, a name string is a `const` or
-                    // `static` initializer — `const KERNEL: &str = "mlp_silu"`
-                    // — and what dispatches it is whatever reads that item.
-                    // The item is recorded as the binding the string flows
-                    // into, so the resolver can hand the edge to its readers.
-                    let assigned_to = enclosing_symbol
-                        .is_none()
-                        .then(|| rust_enclosing_item_binding(node, source))
-                        .flatten();
-                    references.push(ExtractedReference {
-                        name,
-                        kind: ReferenceKind::EntryName,
-                        span,
-                        enclosing_symbol,
-                        assigned_to,
-                        receiver_expr: None,
-                    });
                 }
             }
             _ => {}

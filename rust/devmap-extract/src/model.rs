@@ -941,7 +941,10 @@ pub enum ReferenceKind {
     /// A string literal whose whole text is an identifier, as a host program
     /// writes the name of something a runtime looks up by name: `rt.pipeline("
     /// flash_attn_rows_h256_r16_g32")`, a `("encoder_attn_rows_h256_r16_g32",
-    /// 16, 32)` row in a dispatch table.
+    /// 16, 32)` row in a dispatch table, Swift `makeFunction(name: "…")`.
+    /// Outside any function, `assigned_to` names the top-level constant the
+    /// literal initializes, so the resolver can find what reads it. Produced
+    /// by `entry_names` for the languages a Metal host is written in.
     ///
     /// Outside the code ladder for the reason [`Self::Selector`] is: a string
     /// is not an identifier, and letting the unique-global rung answer

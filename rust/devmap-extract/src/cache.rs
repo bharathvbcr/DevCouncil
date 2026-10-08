@@ -544,8 +544,10 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// C-family function stamped by one of its file's own function-like
 /// macros (`ROWS_KERNEL(flash_attn_rows_h256_r16_g32, 256, 16, 32)`) is a
 /// `Function` symbol at the invocation, with the shader-entry annotation its
-/// expansion earns and a call to the macro; and every identifier-shaped Rust
-/// string literal is an `EntryName` reference, which the resolver joins to a
+/// expansion earns and a call to the macro; and every identifier-shaped string
+/// literal in a Metal host language (Rust, Swift, Objective-C, C, C++, CUDA,
+/// Python) is an `EntryName` reference, bound to the top-level constant it
+/// initializes when it is outside a function, which the resolver joins to a
 /// Metal entry point of that name. A v72 row has neither: served warm, every
 /// macro-stamped kernel would stay unsearchable and every `pipeline("…")` host
 /// unlinked, with nothing to say the producers exist.

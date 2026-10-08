@@ -504,3 +504,107 @@ fn dispatch(rt: &Runtime) {
         ]
     );
 }
+
+/// `(name, owner, binding)` for every `EntryName` reference in one host file.
+fn entry_names(path: &str, source: &str) -> Vec<(String, Option<String>, Option<String>)> {
+    let mut found: Vec<_> = extract_file(path, source)
+        .references
+        .into_iter()
+        .filter(|reference| reference.kind == ReferenceKind::EntryName)
+        .map(|reference| (reference.name, reference.enclosing_symbol, reference.assigned_to))
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn owned(name: &str, owner: &str) -> (String, Option<String>, Option<String>) {
+    (name.to_string(), Some(owner.to_string()), None)
+}
+
+fn bound(name: &str, binding: &str) -> (String, Option<String>, Option<String>) {
+    (name.to_string(), None, Some(binding.to_string()))
+}
+
+/// Every language a Metal host is written in records the kernel names it
+/// writes: Swift, Objective-C, metal-cpp C++ and PyObjC Python, as Rust does —
+/// each owned by its function, or bound to the top-level constant it
+/// initializes. An interpolated, escaped or bytes literal names nothing.
+#[test]
+fn every_metal_host_language_records_its_kernel_name_strings() {
+    assert_eq!(
+        entry_names(
+            "App/Renderer.swift",
+            "let kernelName = \"swift_const\"\n\
+             func build(lib: MTLLibrary) {\n\
+             \x20   let f = lib.makeFunction(name: \"swift_kernel\")\n\
+             \x20   let g = lib.makeFunction(name: \"swift_\\(x)\")\n\
+             }\n",
+        ),
+        vec![
+            bound("swift_const", "kernelName"),
+            owned("swift_kernel", "App/Renderer.swift::build"),
+        ]
+    );
+    assert_eq!(
+        entry_names(
+            "App/Renderer.m",
+            "static NSString *const kName = @\"objc_const\";\n\
+             void build(id lib) {\n\
+             \x20   id f = [lib newFunctionWithName:@\"objc_kernel\"];\n\
+             \x20   NSLog(@\"built %@\", f);\n\
+             }\n",
+        ),
+        vec![
+            bound("objc_const", "kName"),
+            owned("objc_kernel", "App/Renderer.m::build"),
+        ]
+    );
+    assert_eq!(
+        entry_names(
+            "src/renderer.cpp",
+            "static const char *kName = \"cpp_const\";\n\
+             void build(MTL::Library *lib) {\n\
+             \x20   auto f = lib->newFunction(NS::String::string(\"cpp_kernel\", NS::UTF8StringEncoding));\n\
+             \x20   auto e = \"tab\\there\";\n\
+             }\n",
+        ),
+        vec![
+            bound("cpp_const", "kName"),
+            owned("cpp_kernel", "src/renderer.cpp::build"),
+        ]
+    );
+    assert_eq!(
+        entry_names(
+            "tools/run.py",
+            "KERNEL = \"py_const\"\n\
+             def build(lib):\n\
+             \x20   f = lib.newFunctionWithName_(\"py_kernel\")\n\
+             \x20   g = lib.newFunctionWithName_(f\"py_{x}\")\n\
+             \x20   h = b\"py_bytes\"\n",
+        ),
+        vec![
+            bound("py_const", "KERNEL"),
+            owned("py_kernel", "tools/run.py::build"),
+        ]
+    );
+}
+
+/// A Rust name string in a `const` or `static` initializer is bound to the
+/// item, so the resolver can find what reads it.
+#[test]
+fn a_rust_const_kernel_name_is_bound_to_its_item() {
+    assert_eq!(
+        entry_names(
+            "src/host.rs",
+            "const PRIVATE: &str = \"rust_private\";\n\
+             static TABLE: [(&str, u32); 1] = [(\"rust_table\", 1)];\n\
+             fn f() { let p = \"rust_local\"; }\n",
+        ),
+        vec![
+            owned("rust_local", "src/host.rs::f"),
+            bound("rust_private", "PRIVATE"),
+            bound("rust_table", "TABLE"),
+        ]
+    );
+}

@@ -37,6 +37,59 @@ kernel void tune_only(device float *out [[buffer(0)]],
 kernel void const_private(device float *out [[buffer(0)]]) { out[0] = 2.0f; }
 kernel void const_public(device float *out [[buffer(0)]]) { out[0] = 3.0f; }
 kernel void assoc_kernel(device float *out [[buffer(0)]]) { out[0] = 4.0f; }
+kernel void swift_kernel(device float *out [[buffer(0)]]) { out[0] = 5.0f; }
+kernel void swift_const(device float *out [[buffer(0)]]) { out[0] = 6.0f; }
+kernel void objc_kernel(device float *out [[buffer(0)]]) { out[0] = 7.0f; }
+kernel void objc_const(device float *out [[buffer(0)]]) { out[0] = 8.0f; }
+kernel void cpp_kernel(device float *out [[buffer(0)]]) { out[0] = 9.0f; }
+kernel void cpp_const(device float *out [[buffer(0)]]) { out[0] = 10.0f; }
+kernel void py_kernel(device float *out [[buffer(0)]]) { out[0] = 11.0f; }
+kernel void py_const(device float *out [[buffer(0)]]) { out[0] = 12.0f; }
+";
+
+/// The same dispatch written in each other language a Metal host is: a name
+/// passed at the lookup, and a name kept in a top-level constant that a
+/// function reads.
+const SWIFT_HOST: &str = "let kernelName = \"swift_const\"
+
+func buildDirect(lib: MTLLibrary) {
+    let f = lib.makeFunction(name: \"swift_kernel\")
+}
+
+func buildFromConst(lib: MTLLibrary) {
+    let f = lib.makeFunction(name: kernelName)
+}
+";
+
+const OBJC_HOST: &str = "static NSString *const kName = @\"objc_const\";
+
+void buildDirect(id lib) {
+    id f = [lib newFunctionWithName:@\"objc_kernel\"];
+}
+
+void buildFromConst(id lib) {
+    id f = [lib newFunctionWithName:kName];
+}
+";
+
+const CPP_HOST: &str = "static const char *kName = \"cpp_const\";
+
+void buildDirect(MTL::Library *lib) {
+    auto f = lib->newFunction(NS::String::string(\"cpp_kernel\", NS::UTF8StringEncoding));
+}
+
+void buildFromConst(MTL::Library *lib) {
+    auto f = lib->newFunction(NS::String::string(kName, NS::UTF8StringEncoding));
+}
+";
+
+const PY_HOST: &str = "KERNEL = \"py_const\"
+
+def build_direct(lib):
+    return lib.newFunctionWithName_(\"py_kernel\")
+
+def build_from_const(lib):
+    return lib.newFunctionWithName_(KERNEL)
 ";
 
 const HOST: &str = r#"
@@ -94,6 +147,10 @@ fn extractions() -> Vec<Extraction> {
         extract_file("kernels/stamped_kernels.metal", KERNELS),
         extract_file("kernels/tune/tune.metal", TUNE),
         extract_file("src/host.rs", HOST),
+        extract_file("App/Renderer.swift", SWIFT_HOST),
+        extract_file("App/Renderer.m", OBJC_HOST),
+        extract_file("src/renderer.cpp", CPP_HOST),
+        extract_file("tools/run.py", PY_HOST),
     ]
 }
 
@@ -183,6 +240,27 @@ fn a_kernel_named_by_a_constant_reaches_the_function_that_reads_it() {
     );
 }
 
+/// Swift, Objective-C, C++ and Python hosts reach their kernels the way a Rust
+/// host does — at the lookup, and through a top-level constant.
+#[test]
+fn every_host_language_reaches_the_kernels_it_names() {
+    let store = store();
+    for (kernel, direct, via_const) in [
+        ("swift", "App/Renderer.swift::buildDirect", "App/Renderer.swift::buildFromConst"),
+        ("objc", "App/Renderer.m::buildDirect", "App/Renderer.m::buildFromConst"),
+        ("cpp", "src/renderer.cpp::buildDirect", "src/renderer.cpp::buildFromConst"),
+        ("py", "tools/run.py::build_direct", "tools/run.py::build_from_const"),
+    ] {
+        let reached_direct = reached(&store, &format!("kernels/tune/tune.metal::{kernel}_kernel"), 1);
+        assert_eq!(reached_direct, vec![direct.to_string()], "{kernel} direct");
+        let reached_const = reached(&store, &format!("kernels/tune/tune.metal::{kernel}_const"), 2);
+        assert!(
+            reached_const.contains(&via_const.to_string()),
+            "{kernel} const must reach {via_const}: {reached_const:?}"
+        );
+    }
+}
+
 /// A change to the stamping macro reaches every kernel it stamps and, through
 /// each, the Rust that dispatches it.
 #[test]
@@ -259,9 +337,18 @@ fn resolution_rate_reports_metal_under_its_own_name() {
         .unwrap_or_else(|| panic!("no metal row: {:?}", rate.by_language.keys()));
     assert!(metal.extracts_calls, "{metal:?}");
     assert!(metal.resolved_sites > 0, "{metal:?}");
+    // `src/renderer.cpp` is read by the same grammar and keeps its own row.
+    let cpp = rate
+        .by_language
+        .get("cpp")
+        .unwrap_or_else(|| panic!("no cpp row: {:?}", rate.by_language.keys()));
+    let metal_files = extractions
+        .iter()
+        .filter(|ext| ext.file_path.ends_with(".metal"))
+        .count();
+    assert_eq!(metal_files, 2);
     assert!(
-        !rate.by_language.contains_key("cpp"),
-        "no C++ file is in this corpus: {:?}",
-        rate.by_language.keys()
+        cpp.resolved_sites + cpp.unresolved_sites < metal.resolved_sites + metal.unresolved_sites,
+        "the Metal sites are not folded into the C++ row: cpp {cpp:?}, metal {metal:?}"
     );
 }
