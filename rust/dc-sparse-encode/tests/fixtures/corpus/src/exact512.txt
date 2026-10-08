@@ -1,0 +1,34 @@
+//! BERT WordPiece tokenisation, for the query side of a learned index.
+//!
+//! Every `opensearch-neural-sparse-encoding-doc-*` model and SPLADE encode
+//! documents with a neural network and queries with "a tokeniser and a weight
+//! look-up table". This is that tokeniser. It runs in the query path, so it
+//! must not need a model, a runtime, or a download — the vocabulary it works
+//! from is the one stored in the index itself.
+//!
+//! ## The failure this module is built around
+//!
+//! Documents are tokenised in Python, by the model's own tokeniser, offline.
+//! Queries are tokenised here, in Rust. Two implementations of one algorithm,
+//! and the failure mode of a private reimplementation is not a crash: it is
+//! the two sides disagreeing about what `parseJSON` splits into, so a query
+//! scores against ids no document ever carried and the answer comes back
+//! empty, ranked, and wrong.
+//!
+//! So this is never trusted to agree. The producer emits a sample of
+//! `(text, token ids)` pairs from the real tokeniser, and an index build
+//! replays every one of them through this code and refuses to publish on the
+//! first disagreement — naming the text, the ids expected and the ids
+//! produced. The same contract `dc-glob` holds against CPython's `fnmatch`,
+//! for the same reason.
+//!
+//! ## What it implements
+//!
+//! The uncased pipeline, which is what those models use:
+//!
+//!   1. drop NUL, U+FFFD, and control/format/surrogate/private-use characters;
+//!      turn the four literal whitespace characters and category `Zs` into
+//!      spaces;
+//!   2. surround each CJK ideograph with spaces, so each is its own token;
+//!   3. compose (NFC), then split on whitespace;
+//!   4. per word: lowercase, decompose (NFD) and drop
