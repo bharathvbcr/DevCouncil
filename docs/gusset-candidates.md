@@ -6,44 +6,94 @@ and a panic firewall that returns `ErrPanic` and poisons the handle (I2). It
 does not make Rust faster; it removes a process boundary. A workload belongs on
 it only when that boundary costs more than it buys.
 
-Decided 2026-09-28, with measurements from this repository.
+Decided 2026-09-28, with measurements from this repository. Policy matching
+was revisited on 2026-10-08 and moved back to Go.
 
-## On Gusset: policy pattern matching
+## Stays in Go: policy pattern matching
 
-Every pattern question the write, read and command ladders ask inside a gate
-goes to dc-glob through `gussetfn.Matcher` (see `policy/matcher.go`), in any
-host built with the engine linked. The exceptions, all deliberate:
+fnmatch (`backend/go_orchestrator/fnmatch`) is the one matcher every policy
+decision is made with. No host hands its gates a matcher: devcouncil's
+`openGate` and Manvi's `buildGate` and `serve` policy checks all leave
+`Matcher` nil, which is `policy.GoMatcher`. Policy matching went to dc-glob
+through Gusset on 2026-09-28. That left two matchers live in production, the
+engine and a 250 ms fnmatch fallback behind it, and the engine was the slower
+of the two.
 
-- `policy.ReadRefused` and `MatchesPlannedPath` are bool APIs called outside
-  any gate entry point (search-result filtering, diff reporting), so an engine
-  error would have nowhere honest to go; they ask fnmatch.
-- Grant scope matching (`grants.Grant.Matches`) asks fnmatch: a grant only
-  widens, and a false there leaves the denial standing.
-- A build without the engine — non-unix, or `CGO_ENABLED=0` — decides with
-  fnmatch throughout.
+### The measurement
 
-It qualifies where the others below do not:
+`policy.BenchmarkDecisionAB` (`policy/zengine_test.go`, `-tags gussetengine`)
+is the committed A/B. It runs the production write gate (hard rules,
+neighbour and same-directory scope on, as the flag defaults have them) over
+`policy/testdata/write_targets.txt`. That file holds the 349 paths this
+repository's last 120 commits actually wrote. The A/B also replays the exact
+pattern questions those decisions asked, on each matcher alone, and times one
+trivial crossing per decision. Rounds are interleaved and rotate which side
+goes first. Each side reports its fastest pass, a min of 105.
 
-- **Hot.** Two or three questions per gate decision, and a decision per agent
-  tool call. A process per question would cost more than the question.
-- **Pure.** No I/O, no child processes, no file descriptors.
-- **Honest failure.** A broken engine (a panic, a poisoned or closed handle, a
-  malformed answer) is a hard denial under `path.engine_unavailable` /
-  `command.engine_unavailable`, never a guess.
+```
+go test -tags gussetengine -run '^$' -bench DecisionAB -benchtime 1x ./policy
+```
 
-It is not unbounded-safe on its own, and the matcher says so. dc-glob's walk has
-a step budget and a 16384-rune cap, but inside those a pathological question
-still takes seconds (40 patterns of `*` + 8191 `a` + `b` against 16384 `a`:
-8.6 s in Go), cancellation is checked only between patterns, and the shared
-handle has four workers. So `gussetfn.Matcher` waits 250 ms for the engine and
-then answers with fnmatch — the reference the engine is held equal to — and
-counts it (`gussetfn.Fallbacks`). A slow question therefore gets the same
-answer and the same rule it would have got from Go, and questions queued behind
-slow ones wait at most the timeout. Before that fallback, a slow question came
-back as a Hard `engine_unavailable` where fnmatch gave a Soft, demotable
-denial, and a stream of slow questions could deny unrelated ones.
+Three runs on 2026-10-08, Apple M5 Pro, Go 1.27.1, ns per write decision:
 
-Cost: about 20 µs per crossing, 63 µs against Go's 23 µs per write decision.
+| side | run 1 | run 2 | run 3 |
+| --- | ---: | ---: | ---: |
+| decision, fnmatch | 57 874 | 58 479 | 57 725 |
+| decision, engine | 95 394 | 97 168 | 89 756 |
+| its 4.99 questions, fnmatch | 11 453 | 11 139 | 11 418 |
+| its 4.99 questions, engine | 26 652 | 24 433 | 29 030 |
+| one trivial crossing | 1 472 | 1 447 | 1 486 |
+
+Most of a decision is neither matcher: path normalisation's `EvalSymlinks`
+walk dominates the Go profile. On the questions themselves, the engine costs
+2.2–2.5× fnmatch.
+
+The earlier figures ("about 20 µs per crossing, 63 µs against Go's 23 µs per
+write decision") came from the sequential `BenchmarkDecision` this replaces.
+It had one synthetic path, ran each side in turn and took no minimum. The
+crossing is about 1.5 µs, not 20.
+
+### Why not batch (option b)
+
+Batching would cut the crossings, and the crossings are not the cost. Five
+questions take 24–29 µs on the engine, of which five crossings account for
+about 7 µs. That leaves 17–22 µs of frame encoding and dc-glob matching, most
+of it in the case-folded secret and protected lists (19 and 24 patterns). That
+remainder alone is more than fnmatch's 11 µs for the same questions. A
+batched call would still pay it, plus one crossing. This is inferred from
+subtracting the crossing floor, and it assumes crossing cost adds; no batched
+opcode was built to measure it directly. Batching would also have had to ask
+the ladder's questions before knowing which rung returns, against
+`EvaluateFileChange`'s order contract. gusset's own guide says the same
+(`gusset/docs/choosing.md`: under ~10 µs of work per call, "don't"), and each
+of these questions is a few µs.
+
+### What the engine still does
+
+- **Oracle.** dc-glob is the matcher dc-verify links, and the Gusset bridge is
+  how its answers are held equal to fnmatch. Under `-tags gussetengine`,
+  `rust/verify.sh` runs the whole policy suite with the engine as the default
+  matcher (`policy/zengine_test.go`): adversarial, hardening and fuzz seeds,
+  plus `TestEngineDecisionsEqualGoDecisions`. The oracle there never falls
+  back to fnmatch, because a fallback would compare fnmatch with itself. A
+  question past its 30 s bound is an error, and an error is a decision no Go
+  decision equals (`TestOracleNeverAnswersWithFnmatch`).
+- **gusset-check.** devcouncil, Manvi and GitPulse still link the umbrella
+  archive, and `gusset-check` still proves it loads, matches and contains a
+  panic (I2).
+
+Removed with this decision: `gussetfn.Matcher` (with its `DefaultTimeout`
+fallback and `Fallbacks` counter), devcouncil's `policyMatcher`, Manvi's
+`gussetcheck.Matcher` and `gussetcheck.Ready`, and `serve`'s `requireGusset`.
+The last of these refused every policy check with `E_INTERNAL` when the engine
+failed its check. The rule IDs `path.engine_unavailable` and
+`command.engine_unavailable` stay in the verdict contract. A gate given a
+matcher that fails, as the oracle can, still denies under them.
+
+Open: with no production caller, whether hosts should keep linking the
+archive at all. That covers the cgo build, `gusset-check` and the release
+jobs that run it. It is a cross-repository retirement and is not decided
+here.
 
 ## Stays a process: `dcverify`
 
@@ -82,4 +132,7 @@ A candidate earns a Gusset opcode when it is called often enough that a spawn is
 a real fraction of each call, its work is bounded or checks its `JobContext`
 between bounded steps, it has no I/O whose failure needs a process to contain,
 and its caller has an answer for "the engine is busy" that is not a failure.
-Add it to the one umbrella archive; never a second staticlib (R14).
+It also has to be faster in Rust than in Go on the real work, measured with an
+interleaved A/B over real inputs. Policy matching met every other condition
+and failed this one. Add it to the one umbrella archive; never a second
+staticlib (R14).

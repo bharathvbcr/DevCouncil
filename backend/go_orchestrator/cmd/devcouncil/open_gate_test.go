@@ -132,3 +132,17 @@ func TestOpenGateWithoutAUsableMapDegradesAndNeverWidens(t *testing.T) {
 		}
 	}
 }
+
+// fnmatch is the one matcher policy decisions are made with
+// (docs/gusset-candidates.md): a nil Matcher is fnmatch. The gate used to be
+// handed the Gusset engine on unix, which answered the same questions about
+// twice as slowly and could refuse a decision under path.engine_unavailable.
+func TestOpenGateDecidesWithFnmatch(t *testing.T) {
+	g, err := openGate(gateRepo(t, nil))
+	if err != nil {
+		t.Fatalf("openGate: %v", err)
+	}
+	if g.Matcher != nil {
+		t.Fatalf("gate matcher is %T; policy decisions must use fnmatch (nil)", g.Matcher)
+	}
+}
