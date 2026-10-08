@@ -92,19 +92,22 @@ contracts/
   CHECKSUMS                        sha256 of each contract file
   tools/
     generate_verdict_cases.py      regenerates verdict.cases.json
-    checksums.py                   writes/verifies CHECKSUMS
 ```
 
 ## Vendoring
 
-GitPulse and Manvi each carry a copy under `contracts/`. To update a consumer
-after changing a contract here:
+GitPulse and Manvi each carry a copy under `contracts/`. After changing a
+contract here, regenerate `CHECKSUMS`: the Go test that verifies it fails on the
+change and prints the replacement file.
 
 ```bash
-python3 contracts/tools/checksums.py --write
+go -C backend/go_orchestrator test ./policy -run TestContractChecksums -count=1
 ```
 
-then copy the directory into each consumer and run its contract tests. Each
+Every regular, non-hidden file in this directory other than `CHECKSUMS` is a
+contract file; `tools/` is not.
+
+Then copy the directory into each consumer and run its contract tests. Each
 consumer verifies two things independently:
 
 1. **Its vendored copy matches `CHECKSUMS`** — nobody edited the local copy.
