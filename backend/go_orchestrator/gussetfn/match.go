@@ -62,6 +62,9 @@ const poolSize = 4
 
 var (
 	registerOnce sync.Once
+	// registerErr is register's answer, latched: a registration that failed
+	// once fails for the life of the process.
+	registerErr error
 	// engineMu serialises opening; the hot path reads current without it.
 	engineMu sync.Mutex
 	current  atomic.Pointer[gusset.Handle]
@@ -89,7 +92,10 @@ func engine() (*gusset.Handle, error) {
 	if h := current.Load(); h != nil {
 		return h, nil
 	}
-	registerOnce.Do(register)
+	registerOnce.Do(func() { registerErr = register() })
+	if registerErr != nil {
+		return nil, registerErr
+	}
 	h, err := gusset.Open(gusset.WithPoolSize(poolSize))
 	if err != nil {
 		return nil, err

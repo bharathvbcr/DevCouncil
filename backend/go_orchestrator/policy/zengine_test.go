@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -298,6 +299,50 @@ func batchOf(tb testing.TB, qs []question) question {
 		batch.patterns = append(batch.patterns, q.patterns...)
 	}
 	return batch
+}
+
+// BenchmarkIsolatedDecisionAB is BenchmarkDecisionAB's write decision asked
+// the way production asks it: once per agent tool call, after the process
+// has been idle, not 349 times back to back. Each sample sleeps first,
+// sides alternate which goes first, and each reports min, p50 and p90 of
+// 300 decisions over the real write targets. Back to back, the engine's
+// workers and completion reader are still spinning from the last call;
+// here every call wakes them. Run it once:
+//
+//	go test -tags gussetengine -run '^$' -bench IsolatedDecisionAB -benchtime 1x ./policy
+func BenchmarkIsolatedDecisionAB(b *testing.B) {
+	const samples = 300
+	paths := writeTargets(b)
+	task := &dc.Task{ID: "TASK-AB", PlannedFiles: []dc.PlannedFile{
+		{Path: "docs/gusset-candidates.md"},
+		{Path: "backend/go_orchestrator/gussetfn/*"},
+		{Path: "backend/go_orchestrator/fnmatch/*"},
+	}}
+	root := b.TempDir()
+	gates := [2]FileGate{
+		{Root: root, HardRules: true, AllowNeighbors: true, AllowSameDir: true, Matcher: GoMatcher},
+		{Root: root, HardRules: true, AllowNeighbors: true, AllowSameDir: true, Matcher: engineMatcher{}},
+	}
+	gates[1].EvaluateFileChange(paths[0], task, dc.OpModify, false)
+	for _, gap := range []time.Duration{time.Millisecond, 10 * time.Millisecond} {
+		var took [2][]time.Duration
+		for i := 0; i < samples; i++ {
+			p := paths[i%len(paths)]
+			for k := 0; k < 2; k++ {
+				side := (i + k) % 2
+				time.Sleep(gap)
+				start := time.Now()
+				gates[side].EvaluateFileChange(p, task, dc.OpModify, false)
+				took[side] = append(took[side], time.Since(start))
+			}
+		}
+		for side, name := range []string{"go", "engine"} {
+			slices.Sort(took[side])
+			b.ReportMetric(float64(took[side][samples/2].Nanoseconds()), name+"-p50-ns-"+gap.String())
+		}
+		b.Logf("gap %v, %d decisions a side: go min %v p50 %v p90 %v | engine min %v p50 %v p90 %v", gap, samples,
+			took[0][0], took[0][samples/2], took[0][samples*9/10], took[1][0], took[1][samples/2], took[1][samples*9/10])
+	}
 }
 
 type question struct {

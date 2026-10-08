@@ -53,11 +53,16 @@ pub const MAX_PATTERNS: usize = 1024;
 /// reach the shared handle. `Check` never sends it.
 pub const OPCODE_SELF_TEST_PANIC: u32 = 0x7fff_0001;
 
-/// Registers the dc-glob engine on Gusset's global handler.
+/// Registers the dc-glob engine on Gusset's global handler and its opcodes.
 ///
 /// Call once, before the first submission. Registration is not a Gusset export;
 /// the umbrella owns it. The diagnostic engine stays unreachable: this handler
 /// is installed unconditionally and a stray diagnostic flag cannot displace it.
+///
+/// Returns 0 when every opcode registered, otherwise the number that did not.
+/// An opcode that failed to register would reach the global handler, which
+/// decodes its frame as a single-pattern match: a different question. Go
+/// refuses to open a handle on a non-zero return.
 ///
 /// # Safety
 ///
@@ -71,24 +76,26 @@ pub unsafe extern "C" fn devcouncil_gusset_init() -> i32 {
             match_frame(input)
         },
     );
-    register_engine(
-        OPCODE_MATCH_ANY,
-        |ctx: &JobContext, input: &[u8]| -> Result<Vec<u8>, String> {
-            ctx.check()
-                .map_err(|reason| format!("cancelled: {:?}", reason))?;
-            match_any_frame(input, || {
+    let results = [
+        register_engine(
+            OPCODE_MATCH_ANY,
+            |ctx: &JobContext, input: &[u8]| -> Result<Vec<u8>, String> {
                 ctx.check()
-                    .map_err(|reason| format!("cancelled: {:?}", reason))
-            })
-        },
-    );
-    register_engine(
-        OPCODE_SELF_TEST_PANIC,
-        |_: &JobContext, _: &[u8]| -> Result<Vec<u8>, String> {
-            panic!("devcouncil gusset self-test panic");
-        },
-    );
-    0
+                    .map_err(|reason| format!("cancelled: {:?}", reason))?;
+                match_any_frame(input, || {
+                    ctx.check()
+                        .map_err(|reason| format!("cancelled: {:?}", reason))
+                })
+            },
+        ),
+        register_engine(
+            OPCODE_SELF_TEST_PANIC,
+            |_: &JobContext, _: &[u8]| -> Result<Vec<u8>, String> {
+                panic!("devcouncil gusset self-test panic");
+            },
+        ),
+    ];
+    results.iter().filter(|r| r.is_err()).count() as i32
 }
 
 /// Reads a `u32le` at `at`.
@@ -354,5 +361,16 @@ mod tests {
         framed.extend(std::iter::repeat_n(b'a', 4));
         let err = match_frame(&framed).unwrap_err();
         assert!(err.contains("exceeds"), "{err}");
+    }
+
+    /// Init reports every opcode it could not register. A second init finds
+    /// both already registered, which gusset refuses rather than replace.
+    #[test]
+    fn init_counts_the_opcodes_that_failed_to_register() {
+        // SAFETY: test process; nothing else submits work through gusset here.
+        let first = unsafe { devcouncil_gusset_init() };
+        let second = unsafe { devcouncil_gusset_init() };
+        assert_eq!(first, 0);
+        assert_eq!(second, 2);
     }
 }

@@ -76,6 +76,46 @@ knowing which rung returns, against `EvaluateFileChange`'s order contract.
 gusset's own guide says the same (`gusset/docs/choosing.md`: under ~10 µs of
 work per call, "don't"), and each of these questions is a few µs.
 
+### Tried: making the engine win
+
+Before settling on fnmatch, the engine path was rebuilt to give it its best
+case. The prototype is on branch `spike/prepared-engine` (`60ed2ef3`), with
+its own tests and benchmarks, and is not merged.
+
+- dc-glob compiles a pattern once.
+- The umbrella registers each pattern list once (`OPCODE_PREPARE`) and answers
+  one name against many lists in a single crossing (`OPCODE_MATCH_PREPARED`).
+- gussetfn keeps a content-keyed cache of prepared lists.
+
+Back to back, a decision's questions then took 4.3 µs against fnmatch's
+14.5 µs, 0.30×. Production does not ask back to back, though. A gate decides
+once per agent tool call, after the process has been idle, and every such
+call has to wake gusset's worker and completion reader. Both spin for only
+50 µs (`WORKER_SPIN`, `ticketReaderSpin`) and then park.
+`BenchmarkIsolatedDecisionAB` (`policy/zengine_test.go`) measures that shape:
+the whole write decision, a sleep before each sample, 300 decisions a side.
+`BenchmarkIsolatedBatchAB` on the prototype branch measures the questions
+alone.
+
+| isolated, after a sleep of | fnmatch p50 / p90 | engine p50 / p90 |
+| --- | ---: | ---: |
+| whole decision, 1 ms (two runs) | 86–122 / 124–201 µs | 159–213 / 247–344 µs |
+| whole decision, 10 ms (two runs) | 136–181 / 195–270 µs | 245–295 / 362–428 µs |
+| questions only, prepared and batched, 1 ms | 17–19 / 28–35 µs | 48–50 / 74–81 µs |
+| questions only, prepared and batched, 10 ms | 21–23 / 47–59 µs | 84–89 / 113–123 µs |
+
+Even the best engine path loses about 3× on the questions, and that carries
+into every decision. Gusset cannot close the gap within its own rules:
+- A longer spin window would only help if it outlasted the gap between tool
+  calls, which means burning a core continuously.
+- A call that runs on the caller's thread would avoid the wake, but gusset's
+  R8 forbids it ("heavy work runs on Rust-spawned threads; the cgo call only
+  submits and returns"), and its guide sends work under ~10 µs to Go or raw
+  cgo.
+
+Policy matching is a few microseconds of work, asked sparsely, so it is the
+case gusset says not to take.
+
 ### What the engine still does
 
 - **Oracle.** dc-glob is the matcher dc-verify links, and the Gusset bridge is
@@ -98,10 +138,12 @@ failed its check. The rule IDs `path.engine_unavailable` and
 `command.engine_unavailable` stay in the verdict contract. A gate given a
 matcher that fails, as the oracle can, still denies under them.
 
-Open: with no production caller, whether hosts should keep linking the
-archive at all. That covers the cgo build, `gusset-check` and the release
-jobs that run it. It is a cross-repository retirement and is not decided
-here.
+Hosts keep linking the archive. devcouncil, Manvi, GitPulse and Jarvis keep
+`gusset-check`, by the owner's decision on 2026-10-08, so the oracle and the
+check stay exercised against the archive each host ships. A failed opcode
+registration is now refused at open, never left to the wrong decoder:
+`devcouncil_gusset_init` returns how many opcodes failed, and
+`gussetfn.engine` refuses to open a handle on a non-zero count.
 
 ## Stays a process: `dcverify`
 
