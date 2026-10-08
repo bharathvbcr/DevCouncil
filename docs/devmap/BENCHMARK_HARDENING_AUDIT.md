@@ -115,6 +115,70 @@ selected caller pairs or ten synthetic definition cases cannot close these
 gaps. Evidence/confidence scoring and incomplete-answer disclosures remain
 separate from the number of returned matches.
 
+Package-level function variables, closures and platform-conditioned targets
+were reproduced on 2026-10-08 with one fixture each
+(`rust/devmap-resolve/tests/function_values_and_platform_targets.rs`); what is
+resolved and what is a known limit is recorded in DIVERGENCES.md, "Known
+limits: function values and platform targets".
+
+### JavaScript resolution: classified, two classes fixed (2026-10-08)
+
+**Why the 1,705 JavaScript sites went unresolved** (generation 4144, this
+repository; 16 JS files: scripts, test probes and fixtures):
+
+| Class | Sites | Cause |
+|---|---|---|
+| `uninferred_receiver` | 837 | 827 name a member no JS/TS file declares — `includes` 77, `push` 67, `length` 51, `slice` 34, … (476 calls, 351 property reads); 10 have a JS/TS namesake (`seen.add`, `child.stdin.write`, …) |
+| `external` | 616 | `node:` imports and `node:test` / `node:assert` (`it`, `equal`, `join` on an imported `path`) |
+| `host_global` | 198 | `process.*`, `console.*`, `JSON.*` |
+| `builtin` | 39 | language builtins |
+| `no_namesake` | 10 | all 10 are `node:fs` / `node:child_process` / `node:url` functions bound by a destructured CommonJS `require` the extractor did not read |
+| `local_binding` | 3 | `resolve` of an enclosing `new Promise((resolve) => …)` |
+| `unresolved` | 2 | `resolve` from a nested callback; `original` in a probe |
+
+Net was `resolved / (resolved + unresolved − explained)` = 196 / 1,038 = 188‰:
+the 827 namesake-free members sat in the denominator although no edge could
+ever bind them. Two classes were fixable, and both are fixed with tests that
+fail on the old kernel:
+
+1. **A member no symbol of the family declares** is now `no_namesake`
+   (`a_receiver_member_nothing_declares.rs`), the evidence the bare-name ladder
+   already used. Classification only: no edge moves.
+2. **CommonJS `require`** binds what it declares (`commonjs_require_bindings.rs`):
+   `const { a, b: c } = require(m)` and `const x = require(m)`. On a local module
+   this adds edges; on this repository every `require` names a Node builtin, so
+   it moved 30 rows to `external` and added no edge.
+
+**Before / after, `devmap build --full` + `devmap status --json`**, on frozen
+snapshots (`git archive`): DevCouncil at 58bcc215, MarkDev at 20dec7a. Before
+is the main build c3907784, after is 58bcc215; each ran on its own copy.
+
+| Corpus / language | gross ‰ before → after | net ‰ before → after | resolved | unresolved | explained before → after |
+|---|---|---|---|---|---|
+| DevCouncil total | 198 → 198 | 308 → 517 | 40,731 | 163,981 | 72,642 → 125,983 |
+| javascript | 103 → 103 | 188 → 928 | 196 | 1,705 | 863 → 1,690 |
+| rust | 202 → 202 | 283 → 476 | 31,420 | 124,002 | 44,715 → 89,521 |
+| go | 189 → 189 | 460 → 699 | 7,100 | 30,307 | 21,998 → 27,261 |
+| python | 203 → 203 | 383 → 859 | 1,657 | 6,499 | 3,831 → 6,228 |
+| c | 287 → 287 | 490 → 557 | 184 | 455 | 264 → 309 |
+| cpp | 93 → 93 | 478 → 550 | 11 | 107 | 95 → 98 |
+| shell / sql / html | unchanged | 655 / 0 / 1000, unchanged | | | |
+| MarkDev total | 285 → 285 | 510 → 770 | 21,453 | 53,724 | 33,183 → 47,324 |
+| swift | 313 → 313 | 607 → 772 | 17,905 | 39,145 | 27,598 → 33,864 |
+| rust | 188 → 188 | 267 → 687 | 2,335 | 10,028 | 3,633 → 8,969 |
+| python | 198 → 198 | 292 → 949 | 1,067 | 4,311 | 1,731 → 4,254 |
+| javascript | 0 → 0 | 0 → no rate | 0 | 22 | 6 → 22 |
+
+**Read the gross column.** Edges are identical on both corpora (57,505 and
+35,498), gross is unchanged in every language, and the dead lists are
+identical row for row (27 and 5). Every net gain is the reclassification: a
+site that could never bind leaves the denominator. MarkDev's 22 JavaScript
+sites now all have no namesake, so its net rate has no denominator — the same
+shape `cfml_app` has in `resolution_baseline.json`. Labelled precision is
+unchanged: `labelled_corpus_precision.rs` reports precision 1.000 on every
+fixture with claims and dead recall 10 / 10. The residual JavaScript
+`uninferred_receiver` rows (10) are the real type-inference limit.
+
 ## Clean release provenance
 
 The clean baseline binary is retained under `.devcouncil/audit/baseline/`, built
