@@ -56,7 +56,7 @@ mod session;
 mod sha256;
 mod skills;
 
-use devmap_extract::collect_go_modules;
+use devmap_extract::collect_project_manifests;
 use devmap_query::freshness::{self, FreshnessDigests, InventoryLimits, InventorySource};
 use devmap_query::{
     generate_code_graph_encodings, generate_manifest_with_edges, resolve_manifest_output,
@@ -6019,10 +6019,11 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             };
 
             let mut resolver = Resolver::new();
-            let go_modules =
-                progress.timed("discovering Go modules", || collect_go_modules(path))?;
+            let manifests = progress.timed("discovering project manifests", || {
+                collect_project_manifests(path)
+            })?;
             progress.timed("resolver:index", || {
-                resolver.index_go_modules(&go_modules);
+                resolver.index_project_manifests(&manifests);
                 resolver.index_extractions(&extractions);
                 // After `index_extractions`, which resets the set this extends.
                 resolver.mark_go_dirs_incomplete(devmap_extract::go_dirs_with_unindexed_files(

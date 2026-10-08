@@ -63,7 +63,10 @@ fn a_go_package_function_variable_is_not_a_symbol() {
         edges(&result, EdgeKind::Calls),
         vec![("app/app.go".to_string(), "app/app.go::helper".to_string())]
     );
-    assert_eq!(class_of(&result, "app/app.go::Run", "handler"), vec!["no_namesake"]);
+    assert_eq!(
+        class_of(&result, "app/app.go::Run", "handler"),
+        vec!["no_namesake"]
+    );
 }
 
 /// Known limit, same cause: `var hook = realImpl` keeps `realImpl` live through
@@ -80,7 +83,10 @@ fn a_go_function_variable_bound_to_a_function_references_it_from_the_file() {
         vec![("app/app.go".to_string(), "app/app.go::realImpl".to_string())]
     );
     assert!(edges(&result, EdgeKind::Calls).is_empty());
-    assert_eq!(class_of(&result, "app/app.go::Run", "hook"), vec!["no_namesake"]);
+    assert_eq!(
+        class_of(&result, "app/app.go::Run", "hook"),
+        vec!["no_namesake"]
+    );
 }
 
 /// Resolved. A module-level arrow function is a `Function` that owns its
@@ -95,8 +101,14 @@ fn a_javascript_module_arrow_is_a_function_both_ways() {
     assert_eq!(
         edges(&result, EdgeKind::Calls),
         vec![
-            ("src/a.js::handler".to_string(), "src/a.js::helper".to_string()),
-            ("src/a.js::main".to_string(), "src/a.js::handler".to_string()),
+            (
+                "src/a.js::handler".to_string(),
+                "src/a.js::helper".to_string()
+            ),
+            (
+                "src/a.js::main".to_string(),
+                "src/a.js::handler".to_string()
+            ),
         ]
     );
 }
@@ -113,7 +125,10 @@ fn a_javascript_local_closure_is_a_nested_function() {
         edges(&result, EdgeKind::Calls),
         vec![
             ("src/b.js::main".to_string(), "src/b.js::main.f".to_string()),
-            ("src/b.js::main.f".to_string(), "src/b.js::helper".to_string()),
+            (
+                "src/b.js::main.f".to_string(),
+                "src/b.js::helper".to_string()
+            ),
         ]
     );
 }
@@ -130,9 +145,15 @@ fn a_rust_closure_calls_through_its_enclosing_function() {
     )]);
     assert_eq!(
         edges(&result, EdgeKind::Calls),
-        vec![("src/lib.rs::main".to_string(), "src/lib.rs::helper".to_string())]
+        vec![(
+            "src/lib.rs::main".to_string(),
+            "src/lib.rs::helper".to_string()
+        )]
     );
-    assert_eq!(class_of(&result, "src/lib.rs::main", "f"), vec!["local_binding"]);
+    assert_eq!(
+        class_of(&result, "src/lib.rs::main", "f"),
+        vec!["local_binding"]
+    );
 }
 
 /// Known limit. No platform is selected: both `open`s are real targets on
@@ -145,17 +166,35 @@ fn go_platform_twins_fan_out_by_file_suffix_and_by_build_tag() {
         (
             "suffix",
             [
-                ("sys/open_linux.go", "package sys\n\nfunc open() int { return 1 }\n"),
-                ("sys/open_darwin.go", "package sys\n\nfunc open() int { return 2 }\n"),
-                ("sys/use.go", "package sys\n\nfunc Use() int { return open() }\n"),
+                (
+                    "sys/open_linux.go",
+                    "package sys\n\nfunc open() int { return 1 }\n",
+                ),
+                (
+                    "sys/open_darwin.go",
+                    "package sys\n\nfunc open() int { return 2 }\n",
+                ),
+                (
+                    "sys/use.go",
+                    "package sys\n\nfunc Use() int { return open() }\n",
+                ),
             ],
         ),
         (
             "build tag",
             [
-                ("sys/open_linux.go", "//go:build linux\n\npackage sys\n\nfunc open() int { return 1 }\n"),
-                ("sys/open_darwin.go", "//go:build !linux\n\npackage sys\n\nfunc open() int { return 2 }\n"),
-                ("sys/use.go", "package sys\n\nfunc Use() int { return open() }\n"),
+                (
+                    "sys/open_linux.go",
+                    "//go:build linux\n\npackage sys\n\nfunc open() int { return 1 }\n",
+                ),
+                (
+                    "sys/open_darwin.go",
+                    "//go:build !linux\n\npackage sys\n\nfunc open() int { return 2 }\n",
+                ),
+                (
+                    "sys/use.go",
+                    "package sys\n\nfunc Use() int { return open() }\n",
+                ),
             ],
         ),
     ] {
@@ -163,9 +202,14 @@ fn go_platform_twins_fan_out_by_file_suffix_and_by_build_tag() {
         let calls: Vec<_> = result
             .edges
             .iter()
-            .filter(|edge| edge.edge_kind == EdgeKind::Calls && edge.source_symbol == "sys/use.go::Use")
+            .filter(|edge| {
+                edge.edge_kind == EdgeKind::Calls && edge.source_symbol == "sys/use.go::Use"
+            })
             .collect();
-        let mut targets: Vec<&str> = calls.iter().map(|edge| edge.target_symbol.as_str()).collect();
+        let mut targets: Vec<&str> = calls
+            .iter()
+            .map(|edge| edge.target_symbol.as_str())
+            .collect();
         targets.sort();
         assert_eq!(
             targets,
@@ -200,6 +244,9 @@ fn rust_cfg_twins_share_one_identity() {
     let result = resolve(&[("src/lib.rs", source)]);
     assert_eq!(
         edges(&result, EdgeKind::Calls),
-        vec![("src/lib.rs::run".to_string(), "src/lib.rs::open".to_string())]
+        vec![(
+            "src/lib.rs::run".to_string(),
+            "src/lib.rs::open".to_string()
+        )]
     );
 }

@@ -40,7 +40,10 @@ fn analyse(extractions: &[Extraction]) -> (devmap_analyze::model::AnalysisSummar
         &resolution.edges,
         None,
     );
-    (analysis, serde_json::from_str(&json).expect("the manifest is JSON"))
+    (
+        analysis,
+        serde_json::from_str(&json).expect("the manifest is JSON"),
+    )
 }
 
 fn extract_all(files: &[(&str, &str)]) -> Vec<Extraction> {
@@ -102,7 +105,10 @@ fn subsystems_on_a_foreign_tree_are_named_by_its_own_directories() {
         .iter()
         .filter_map(|subsystem| subsystem["area"].as_str())
         .collect();
-    assert!(!areas.is_empty(), "a two-service tree inferred no subsystem");
+    assert!(
+        !areas.is_empty(),
+        "a two-service tree inferred no subsystem"
+    );
     let directories: Vec<String> = FOREIGN_TREE
         .iter()
         .filter_map(|(path, _)| path.rsplit_once('/').map(|(dir, _)| dir.to_string()))
@@ -118,7 +124,13 @@ fn subsystems_on_a_foreign_tree_are_named_by_its_own_directories() {
             && areas.iter().any(|area| area.starts_with("webapp/")),
         "both services should surface as subsystems: {areas:?}"
     );
-    for foreign in ["src/devcouncil", "backend", "rust", "go_orchestrator", "devmap"] {
+    for foreign in [
+        "src/devcouncil",
+        "backend",
+        "rust",
+        "go_orchestrator",
+        "devmap",
+    ] {
         assert!(
             !areas.iter().any(|area| area.contains(foreign)),
             "a DevCouncil name {foreign:?} leaked into a foreign tree: {areas:?}"
@@ -128,7 +140,10 @@ fn subsystems_on_a_foreign_tree_are_named_by_its_own_directories() {
 
 /// The Python test's sample, one file per primary-stack language.
 const PRIMARY_STACK: &[(&str, &str)] = &[
-    ("src/app.ts", "export function app(): number { return 1; }\n"),
+    (
+        "src/app.ts",
+        "export function app(): number { return 1; }\n",
+    ),
     ("cmd/server/main.go", "package main\n\nfunc main() {}\n"),
     ("src/pkg/main.py", "def main():\n    return 1\n"),
     ("crates/core/src/lib.rs", "pub fn core() -> u32 { 1 }\n"),

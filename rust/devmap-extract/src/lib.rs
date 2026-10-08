@@ -67,6 +67,7 @@ mod returns;
 mod rustlocal;
 #[cfg(feature = "parse")]
 pub mod treesitter;
+pub mod tsconfig;
 pub mod wiring;
 
 use std::collections::BTreeMap;
@@ -78,7 +79,8 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 pub use gomod::{
-    collect_go_modules, git_worktree_root, go_dirs_with_unindexed_files, parse_go_mod, GoModule,
+    collect_go_modules, collect_project_manifests, git_worktree_root, go_dirs_with_unindexed_files,
+    parse_go_mod, GoModule, ProjectManifests,
 };
 pub use languages::{
     declared_language_ids, detect_language, is_default_index_excluded, is_ignored_path,

@@ -29,6 +29,9 @@ fn a_powershell_script_is_labelled_pattern_recovered_and_keeps_its_functions() {
         .map(|symbol| symbol.name.as_str())
         .collect();
     for name in ["Get-Widget", "Install-Thing"] {
-        assert!(functions.contains(&name), "{name} not recovered: {functions:?}");
+        assert!(
+            functions.contains(&name),
+            "{name} not recovered: {functions:?}"
+        );
     }
 }

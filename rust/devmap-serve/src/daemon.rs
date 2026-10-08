@@ -5,7 +5,7 @@ use tracing::{info, warn};
 
 use devmap_analyze::{analyze_with_discovery, DiscoveryCoverage};
 use devmap_extract::{
-    collect_go_modules, collect_sources_with_report, content_hash, extract_file,
+    collect_project_manifests, collect_sources_with_report, content_hash, extract_file,
     is_indexable_source, DiscoverySkipReason, MAX_SOURCE_BYTES,
 };
 use devmap_resolve::Resolver;
@@ -1211,9 +1211,12 @@ impl Daemon {
         let discovery = DiscoveryCoverage::refused(refusals.len());
         extractions.sort_by(|left, right| left.file_path.cmp(&right.file_path));
         let mut resolver = Resolver::new();
-        match collect_go_modules(&self.root) {
-            Ok(modules) => resolver.index_go_modules(&modules),
-            Err(error) => warn!("go.mod collection failed for {:?}: {error}", self.root),
+        match collect_project_manifests(&self.root) {
+            Ok(manifests) => resolver.index_project_manifests(&manifests),
+            Err(error) => warn!(
+                "project manifest collection failed for {:?}: {error}",
+                self.root
+            ),
         }
         resolver.index_extractions(&extractions);
         // After `index_extractions`, which resets the set this extends.

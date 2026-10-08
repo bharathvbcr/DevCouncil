@@ -91,7 +91,10 @@ fn a_function_call_check_is_the_whole_error_and_swallows_nothing() {
 #[test]
 fn a_comparison_check_parses_cleanly() {
     let source = "CREATE TABLE t (revision INTEGER NOT NULL CHECK(revision>0));\n";
-    assert_eq!(extract_file("t.sql", source).parse_outcome, ParseOutcome::Clean);
+    assert_eq!(
+        extract_file("t.sql", source).parse_outcome,
+        ParseOutcome::Clean
+    );
 }
 
 /// The names a `CREATE [TEMP|VIRTUAL] TABLE|VIEW [IF NOT EXISTS] <name>` line
@@ -102,19 +105,25 @@ fn written_declarations(source: &str) -> Vec<String> {
     let mut names = Vec::new();
     for line in source.lines() {
         let words: Vec<&str> = line.split_whitespace().collect();
-        let Some(create) = words.iter().position(|word| word.eq_ignore_ascii_case("CREATE"))
+        let Some(create) = words
+            .iter()
+            .position(|word| word.eq_ignore_ascii_case("CREATE"))
         else {
             continue;
         };
         let mut rest = words[create + 1..].iter().copied().peekable();
-        while rest
-            .peek()
-            .is_some_and(|word| ["UNIQUE", "VIRTUAL", "TEMP", "TEMPORARY"].iter().any(|k| word.eq_ignore_ascii_case(k)))
-        {
+        while rest.peek().is_some_and(|word| {
+            ["UNIQUE", "VIRTUAL", "TEMP", "TEMPORARY"]
+                .iter()
+                .any(|k| word.eq_ignore_ascii_case(k))
+        }) {
             rest.next();
         }
         let Some(kind) = rest.next() else { continue };
-        if !["TABLE", "VIEW"].iter().any(|k| kind.eq_ignore_ascii_case(k)) {
+        if !["TABLE", "VIEW"]
+            .iter()
+            .any(|k| kind.eq_ignore_ascii_case(k))
+        {
             continue;
         }
         let mut name = rest.next();
@@ -184,7 +193,12 @@ fn the_repository_schema_gaps_are_measured_and_pinned() {
     );
     assert_eq!(check_errors, 13, "the function-call CHECK gap changed size");
     assert!(written > 0, "the declaration reader found nothing to check");
-    assert_eq!(other_errors, OTHER_ERRORS, "the SQLite-dialect gap changed size");
-    assert_eq!(lost, LOST, "the tables the SQLite-dialect gap loses changed");
+    assert_eq!(
+        other_errors, OTHER_ERRORS,
+        "the SQLite-dialect gap changed size"
+    );
+    assert_eq!(
+        lost, LOST,
+        "the tables the SQLite-dialect gap loses changed"
+    );
 }
-
