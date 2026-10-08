@@ -1021,7 +1021,7 @@ fn session_start_sync(executable: &Path, selection: &RootSelection) -> anyhow::R
         ran_out_of_time,
         selection.capped,
         selection.roots.len(),
-        crate::plugin_warning(),
+        crate::installation::plugin_warning(),
     );
     Ok(json!({
         "hookSpecificOutput": {
