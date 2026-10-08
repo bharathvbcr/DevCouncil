@@ -819,8 +819,11 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     //
     // v72 adds the MCP-parity lane's v67: route middleware (Express and Go)
     // and Go routes; a row without it says no producer ran for either.
+    //
+    // v74 binds the names a CommonJS `require` declares (v73 is claimed by
+    // the Rust struct-literal branch).
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "72",
+        EXTRACTION_SCHEMA_VERSION, "74",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );
