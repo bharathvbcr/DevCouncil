@@ -75,6 +75,38 @@ SQL object references are not automatically source-file imports. One PowerShell
 file still uses a pattern fallback because no linked grammar exists. Those
 warnings remain. No dependency was added.
 
+**Reproduced 2026-10-08** (`rust/devmap-extract/tests/sql_check_constraint_parse.rs`):
+the 23 error ranges are exactly 13 column `CHECK`s whose expression calls a
+function (`CHECK(json_valid(body))`; `CHECK(revision>0)` parses cleanly) plus
+10 SQLite-only statements the linked grammar does not know — trigger bodies
+(`BEGIN … END`, `RAISE(ABORT, …)`) and `CREATE VIRTUAL TABLE … USING fts5(…)`.
+A function-call `CHECK` is confined: the error is the `CHECK(...)` text and no
+declaration is lost. The SQLite-dialect ranges are not: of the 25 tables and
+views the files write, `work_items_fts` (the FTS5 table) and `work_events` (the
+table written after a trigger the parser could not close) are not extracted.
+Indexes and triggers are not symbols in this extractor at all. The test pins
+both counts and both lost names, so a grammar change in either direction fails
+it. Repairing either gap is a grammar change; no parser dependency is
+authorised, so they stay recorded here.
+
+**SQL imports — decision 2026-10-08: `sql` stays `blind_to: ["imports"]`.**
+`devmap status` already states it per file (`import_blind`, reason "`sql` has
+no import extractor in this build"), and the resolution rate lists `imports` in
+the language's `blind_to`. A defined object-reference ↔ file relationship would
+need a table → declaring-file index and an extractor for the references a
+query makes (`FROM`, `JOIN`, `INSERT INTO`, `REFERENCES`, trigger targets);
+the files that matter here are loaded by Rust through `include_str!`, which no
+SQL-side import could express either. Not built.
+
+**PowerShell — decision 2026-10-08: pattern recovery stays, labelled as such.**
+A PowerShell grammar is a new dependency and needs the owner's approval; none
+was given. `scripts/install.ps1` is listed under `pattern_recovered` in
+`devmap status` ("no linked tree-sitter grammar for powershell; 2
+declaration(s) recovered by pattern"), its extraction carries
+`ParseOutcome::Fallback`, and DIVERGENCES.md X34/X37 record the tier. A grammar
+would buy calls and imports for `.ps1`; one installer script does not justify
+the dependency today.
+
 Remaining work includes typed-receiver propagation, package-level function
 variables/closures, platform-conditioned target selection, SQL dialect/client
 include contracts, a PowerShell parser, anonymous-scope negative binding coverage, Go callback type annotations and
@@ -433,7 +465,7 @@ in all future workloads.
 | Work still needed | Evidence required before claiming it closed |
 |---|---|
 | Binding coverage and private Rust values | A format-level distinction between unavailable facts and examined unbound sites; cold, cached and unchanged-upgrade cases for private file-level values and anonymous scopes. Existing public/export behavior must remain separate. |
-| SQL and PowerShell | Dialect/source-checked fixtures and explicit parser/provider availability. SQL object references need a defined relationship to source-file imports; fallback extraction cannot be relabeled complete. No new parser dependency was authorized or added. |
+| SQL and PowerShell | Dialect/source-checked fixtures and explicit parser/provider availability. SQL object references need a defined relationship to source-file imports; fallback extraction cannot be relabeled complete. No new parser dependency was authorized or added. **2026-10-08:** the `CHECK(json_valid(body))` gap and the SQLite-dialect gap are reproduced and pinned (`sql_check_constraint_parse.rs`); `sql` stays explicitly import-blind and PowerShell stays pattern-recovered, both by recorded decision (see "Source attribution and extractor limits"). |
 | Latency optimization | Measure the remaining teardown owners and candidate extraction/resolution/persistence work, then prove invalidation and result equivalence before narrowing work. The current measurements do not prove removable work. |
 | Broader comparison | Counterbalanced runs with more repetitions, matched actual provider capabilities and independent caller/definition ground truth. Expand persistent mutation convergence beyond the current separate DevMap soak. |
 | Durability and portability | Controlled crash/power-loss scenarios, multiple filesystems and native operating-system runs. The local kill/restart test does not simulate physical power failure. |
