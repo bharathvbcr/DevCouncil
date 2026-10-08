@@ -120,7 +120,7 @@ fn proposal_filters_and_newest_pages_preserve_ties_counts_and_pending_recovery()
 }
 fn edit(s: &Store, patch: &str, receipt: &str) {
     let raw = call(s, "items.get", r#"{"id":"t"}"#);
-    let input: String = s.connection().query_row("SELECT json_remove(json_patch(json_set(json_extract(?1,'$.item'),'$.request_id',?3,'$.expected_revision',json_extract(?1,'$.item.revision')),?2),'$.revision','$.updated_at','$.due_at')", params![raw, patch, receipt], |r| r.get(0)).unwrap();
+    let input: String = s.connection().query_row("SELECT json_remove(json_patch(json_set(json_extract(?1,'$.item'),'$.request_id',?3,'$.expected_revision',json_extract(?1,'$.item.revision')),?2),'$.revision','$.updated_at','$.completed_at','$.due_at')", params![raw, patch, receipt], |r| r.get(0)).unwrap();
     call(s, "items.put", &input);
 }
 
@@ -421,7 +421,7 @@ fn v1_migration_preserves_existing_data_and_refuses_partial_or_future_schemas() 
     let s = fixture();
     let before = call(&s, "items.get", r#"{"id":"t"}"#);
     s.connection()
-        .execute_batch("DROP TABLE work_decisions; DROP TABLE work_notification_deliveries; DROP TABLE work_notification_settings; DROP TABLE work_attention; DROP TABLE work_run_inputs; DROP TABLE work_runs; DROP TABLE work_enhancements; DROP TABLE work_enhancement_queue; DROP TABLE work_automation; UPDATE work_meta SET version=1 WHERE id=1;")
+        .execute_batch("DROP TABLE work_item_links; DROP INDEX work_items_archive; DROP INDEX work_items_completed; ALTER TABLE work_items DROP COLUMN archived; ALTER TABLE work_items DROP COLUMN completed_at; DROP TABLE work_decisions; DROP TABLE work_notification_deliveries; DROP TABLE work_notification_settings; DROP TABLE work_attention; DROP TABLE work_run_inputs; DROP TABLE work_runs; DROP TABLE work_enhancements; DROP TABLE work_enhancement_queue; DROP TABLE work_automation; UPDATE work_meta SET version=1 WHERE id=1;")
         .unwrap();
     assert_eq!(call(&s, "items.get", r#"{"id":"t"}"#), before);
     ready(&s, "migrated");
@@ -430,7 +430,7 @@ fn v1_migration_preserves_existing_data_and_refuses_partial_or_future_schemas() 
             .query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        10
+        11
     );
     s.connection()
         .execute_batch("UPDATE work_meta SET version=999 WHERE id=1")

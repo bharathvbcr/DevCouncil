@@ -21,7 +21,7 @@ func WorkbenchMethods() []string {
 	return []string{
 		"workspaces.list", "workspaces.get", "workspaces.put", "workspaces.delete",
 		"repositories.list", "repositories.get", "repositories.put", "repositories.relink",
-		"items.list", "items.get", "items.brief.get", "items.put", "items.delete", "items.history",
+		"items.list", "items.get", "items.brief.get", "items.put", "items.delete", "items.restore", "items.history",
 		"events.list",
 		"attention.list", "attention.get", "attention.update",
 		"notifications.settings.get", "notifications.settings.put", "notifications.pending.list",
