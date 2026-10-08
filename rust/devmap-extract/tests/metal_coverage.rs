@@ -6,6 +6,7 @@
 //! tests pin the answer, in both directions — what Metal must recover, and what
 //! must still be reported as a degraded parse.
 
+use devmap_extract::model::ReferenceKind;
 use devmap_extract::{extract_file, Extraction, ParseOutcome, SymbolKind, WiringKind};
 
 /// A realistic shader: compute kernels with `[[buffer(n)]]` and
@@ -323,4 +324,182 @@ fn the_shipped_metal_fixture_is_named_for_its_function_not_its_qualifier() {
     );
     assert_eq!(outcome(&extraction), "Clean");
     assert_eq!(declared(&extraction), vec!["Function:add"]);
+}
+
+/// A plain kernel, three macros, and four instantiations: one per shape the
+/// grammar gives a file-scope invocation (a call expression, and an `ERROR`
+/// when an argument is a type), one with the name in a later argument, and one
+/// stamped through a second macro.
+const STAMPED: &str = include_str!("data/stamped_kernels.metal");
+
+fn line_of(source: &str, byte: usize) -> usize {
+    source[..byte].matches('\n').count() + 1
+}
+
+/// Every kernel a file stamps with its own macro is a `Function` symbol at the
+/// line of its invocation, and carries the entry-point annotation a plain
+/// kernel does.
+///
+/// Measured on tessl before this: `encoder_attn_rows_h256_r16_g32`, stamped by
+/// `ENC_ROWS_KERNEL(…)` in `kernels/encoder_attn.metal`, returned nothing from
+/// `devmap_search`, while the plain `kernel void mlp_silu(` beside it did.
+#[test]
+fn a_macro_stamped_kernel_is_a_symbol_at_its_invocation() {
+    let extraction = extract_file("kernels/stamped_kernels.metal", STAMPED);
+    let stamped: Vec<(String, usize)> = extraction
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Function)
+        .map(|symbol| (symbol.name.clone(), line_of(STAMPED, symbol.span.start_byte)))
+        .collect();
+    for (name, line) in [
+        ("plain_scale", 8),
+        ("rows_h256_r16", 32),
+        ("rows_h512_r32", 33),
+        ("gate_direct_f32", 34),
+        ("gate_f32", 35),
+    ] {
+        assert!(
+            stamped.contains(&(name.to_string(), line)),
+            "{name} must be a Function at line {line}: {stamped:?}"
+        );
+    }
+    // The macro parameter that names the stamped function is not a function.
+    assert!(!stamped.iter().any(|(name, _)| name == "NAME"), "{stamped:?}");
+
+    let entries: Vec<&str> = extraction
+        .wiring
+        .iter()
+        .filter(|annotation| annotation.kind == WiringKind::RuntimeEntryPoint)
+        .map(|annotation| annotation.target_symbol.as_str())
+        .collect();
+    for name in [
+        "plain_scale",
+        "rows_h256_r16",
+        "rows_h512_r32",
+        "gate_direct_f32",
+        "gate_f32",
+    ] {
+        assert!(
+            entries.contains(&format!("kernels/stamped_kernels.metal::{name}").as_str()),
+            "{name} is a kernel the host dispatches by name: {entries:?}"
+        );
+    }
+    assert!(
+        !entries.iter().any(|entry| entry.ends_with("::twice")),
+        "a helper is never an entry point: {entries:?}"
+    );
+}
+
+/// The stamped kernel calls the macro that stamps it, so a change to the macro
+/// body reaches every kernel it produces — including the one the grammar could
+/// only parse as an `ERROR`, which recorded no call at all.
+#[test]
+fn a_stamped_kernel_calls_its_macro() {
+    let extraction = extract_file("kernels/stamped_kernels.metal", STAMPED);
+    let mut edges: Vec<(String, String)> = extraction
+        .calls
+        .iter()
+        .filter(|call| call.callee_name.ends_with("_KERNEL") || call.callee_name.ends_with("_IMPL"))
+        .map(|call| {
+            (
+                call.caller_symbol.clone().unwrap_or_default(),
+                call.callee_name.clone(),
+            )
+        })
+        .collect();
+    edges.sort();
+    let file = "kernels/stamped_kernels.metal";
+    assert_eq!(
+        edges,
+        vec![
+            (format!("{file}::GATE_KERNEL"), "GATE_IMPL".to_string()),
+            (format!("{file}::gate_direct_f32"), "GATE_IMPL".to_string()),
+            (format!("{file}::gate_f32"), "GATE_KERNEL".to_string()),
+            (format!("{file}::rows_h256_r16"), "ROWS_KERNEL".to_string()),
+            (format!("{file}::rows_h512_r32"), "ROWS_KERNEL".to_string()),
+        ]
+    );
+}
+
+/// A name the macro body spells itself is the same at every invocation, so it
+/// is not a stamped identity; a macro defined differently in two `#if` arms is
+/// not expanded at all; and an invocation inside a function body declares
+/// nothing.
+#[test]
+fn only_names_an_invocation_supplies_are_stamped() {
+    let source = "\
+#define FIXED(N) kernel void fixed_name(device float *x [[buffer(0)]]) { x[0] = N; }
+#if USE_A
+#define TWO(NAME) kernel void NAME(device float *x [[buffer(0)]]) { x[0] = 1; }
+#else
+#define TWO(NAME) kernel void NAME(device float *x [[buffer(0)]]) { x[0] = 2; }
+#endif
+#define STEP(NAME) kernel void NAME(device float *x [[buffer(0)]]) { x[0] = 3; }
+FIXED(1)
+FIXED(2)
+TWO(two_way)
+kernel void host(device float *x [[buffer(0)]]) {
+    STEP(inside_a_body);
+}
+";
+    let extraction = extract_file("kernels/refused.metal", source);
+    let functions: Vec<&str> = extraction
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Function)
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+    for refused in ["fixed_name", "two_way", "inside_a_body"] {
+        assert!(!functions.contains(&refused), "{refused}: {functions:?}");
+    }
+    assert!(functions.contains(&"host"), "{functions:?}");
+}
+
+/// A Rust string literal that is a bare identifier is an `EntryName`
+/// reference owned by the function it sits in; a message, a formatted string
+/// or an escaped one is not.
+#[test]
+fn a_rust_kernel_name_string_is_an_entry_name_reference() {
+    let source = r#"
+fn rows_for(dim: usize) -> Option<(&'static str, u32)> {
+    match dim {
+        256 => Some(("encoder_attn_rows_h256_r16_g32", 16)),
+        _ => None,
+    }
+}
+
+fn dispatch(rt: &Runtime) {
+    let p = rt.pipeline("mlp_silu");
+    let raw = rt.pipeline(r"copy_f32");
+    require(rt, "mlp_silu gate");
+    log("{}", "x");
+    let escaped = "tab\there";
+}
+"#;
+    let extraction = extract_file("src/host.rs", source);
+    let mut names: Vec<(String, String)> = extraction
+        .references
+        .iter()
+        .filter(|reference| reference.kind == ReferenceKind::EntryName)
+        .map(|reference| {
+            (
+                reference.name.clone(),
+                reference.enclosing_symbol.clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(
+        names,
+        vec![
+            ("copy_f32".to_string(), "src/host.rs::dispatch".to_string()),
+            (
+                "encoder_attn_rows_h256_r16_g32".to_string(),
+                "src/host.rs::rows_for".to_string()
+            ),
+            ("mlp_silu".to_string(), "src/host.rs::dispatch".to_string()),
+        ]
+    );
 }

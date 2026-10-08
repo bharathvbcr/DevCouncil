@@ -4,6 +4,8 @@
 // actually uses.
 pub mod cache;
 pub mod clonesig;
+#[cfg(feature = "parse")]
+mod cmacro;
 pub mod deref;
 // Pure text: the resolver reads Rust function headers with it, and has no tree.
 #[cfg(feature = "parse")]

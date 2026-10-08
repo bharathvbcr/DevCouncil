@@ -938,6 +938,19 @@ pub enum ReferenceKind {
     /// unresolved *code* reference: the declaration may legitimately live in a
     /// global stylesheet, a framework, or a CDN this index never saw.
     Selector,
+    /// A string literal whose whole text is an identifier, as a host program
+    /// writes the name of something a runtime looks up by name: `rt.pipeline("
+    /// flash_attn_rows_h256_r16_g32")`, a `("encoder_attn_rows_h256_r16_g32",
+    /// 16, 32)` row in a dispatch table.
+    ///
+    /// Outside the code ladder for the reason [`Self::Selector`] is: a string
+    /// is not an identifier, and letting the unique-global rung answer
+    /// `"reduce"` with some `fn reduce` would fabricate an edge. `devmap-resolve`
+    /// answers it only from declarations a runtime dispatches by name — Metal
+    /// shader entry points — and a literal naming none of them is not a failed
+    /// attribution: almost every identifier-shaped string is a key, a label or a
+    /// message, never a name anything declares.
+    EntryName,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
