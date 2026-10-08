@@ -18,8 +18,9 @@ use std::process::Command;
 #[test]
 fn version_flag_reports_this_build() {
     let want = format!(
-        "{{\"ok\":true,\"id\":\"dcstore\",\"component\":\"dc-store\",\"version\":\"{}\"}}",
-        env!("CARGO_PKG_VERSION")
+        "{{\"ok\":true,\"id\":\"dcstore\",\"component\":\"dc-store\",\"version\":\"{}\",\"workbench_schema\":{}}}",
+        env!("CARGO_PKG_VERSION"),
+        dc_store::workbench::WORKBENCH_SCHEMA
     );
     for flag in ["--version", "-V", "-v", "version"] {
         let output = Command::new(env!("CARGO_BIN_EXE_dcstore"))
