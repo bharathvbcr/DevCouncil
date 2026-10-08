@@ -62,6 +62,9 @@ const poolSize = 4
 
 var (
 	registerOnce sync.Once
+	// registerErr is register's answer, latched: a registration that failed
+	// once fails for the life of the process.
+	registerErr error
 	// engineMu serialises opening; the hot path reads current without it.
 	engineMu sync.Mutex
 	current  atomic.Pointer[gusset.Handle]
@@ -69,6 +72,9 @@ var (
 	// opens counts handles opened, so tests can tell one replacement from a
 	// stampede of them.
 	opens atomic.Int64
+	// crossings counts frames sent, so tests can tell one batched crossing
+	// from one per question.
+	crossings atomic.Int64
 )
 
 // engine returns the shared handle, opening one if there is none.
@@ -89,7 +95,10 @@ func engine() (*gusset.Handle, error) {
 	if h := current.Load(); h != nil {
 		return h, nil
 	}
-	registerOnce.Do(register)
+	registerOnce.Do(func() { registerErr = register() })
+	if registerErr != nil {
+		return nil, registerErr
+	}
 	h, err := gusset.Open(gusset.WithPoolSize(poolSize))
 	if err != nil {
 		return nil, err
@@ -211,6 +220,7 @@ func call(ctx context.Context, payload []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		crossings.Add(1)
 		out, err := roundTrip(ctx, h, payload)
 		if err == nil {
 			return out, nil
@@ -345,7 +355,7 @@ func MatchAnyFold(ctx context.Context, patterns []string, name string) (bool, er
 	return ask(ctx, patterns, name, true)
 }
 
-// ask is the one path for all four entry points.
+// ask is the one path for all four entry points: a batch of one.
 //
 // Go decides what it can decide without the engine, with fnmatch's own
 // rules, so the two can only differ in the walk itself: an oversized name or
@@ -354,37 +364,16 @@ func MatchAnyFold(ctx context.Context, patterns []string, name string) (bool, er
 // answer (the step budget, which both sides compute identically) reads the
 // same way.
 func ask(ctx context.Context, patterns []string, name string, fold bool) (bool, error) {
-	if ctx == nil {
-		return false, errors.New("gusset: nil context")
-	}
-	if err := ctx.Err(); err != nil {
-		// Refused on a dead context even when the answer needs no crossing.
+	out, err := MatchBatch(ctx, name, []Query{{Patterns: patterns, Fold: fold}})
+	if err != nil {
 		return false, err
 	}
-	if len(patterns) == 0 {
-		return false, nil
-	}
-	if fnmatch.Oversized(name) {
-		return fold, nil
-	}
-	kept := make([]string, 0, len(patterns))
-	for _, p := range patterns {
-		if fnmatch.Oversized(p) {
-			if fold {
-				return true, nil
-			}
-			continue
-		}
-		if fold {
-			p = fnmatch.Fold(p)
-		}
-		kept = append(kept, normalize(p))
-	}
-	if fold {
-		name = fnmatch.Fold(name)
-	}
-	name = normalize(name)
+	return out[0], nil
+}
 
+// askKept asks one list the engine does not hold, with match-any frames:
+// kept is already folded and normalized, and so is name.
+func askKept(ctx context.Context, kept []string, name string, fold bool) (bool, error) {
 	// Opcode 1, whatever the caller's context carries. gusset reads the
 	// opcode from ctx, so a ctx that had passed through another opcode — the
 	// self-test's — would decode this frame as that, or panic the shared
