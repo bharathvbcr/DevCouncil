@@ -1259,3 +1259,221 @@ diff --git a/config/app.ini b/config/app.ini
 +++ b/config/app.ini
 @@ -0,0 +1 @@
 +DATABASE_URL=postgres://app:hunter2@prod-db.internal:5432/app
+
+### case: java-ast-empty-method-marked-todo-blocks
+### secret_scan: clean
+### stub_detection: blocking
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: A new Java file, so it is parsed. The method's body is only a comment
+###   saying it is unfinished — the one reading of an empty body that is not
+###   ambiguous. Line-matching sees only the comment, and reports a note.
+diff --git a/src/main/java/shop/Ledger.java b/src/main/java/shop/Ledger.java
+--- /dev/null
++++ b/src/main/java/shop/Ledger.java
+@@ -0,0 +1,7 @@
++package shop;
++
++public class Ledger {
++    public void reconcile() {
++        // TODO: post the journal entries
++    }
++}
+
+### case: csharp-ast-empty-method-is-advisory
+### secret_scan: clean
+### stub_detection: advisory
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: An empty method is often a correct hook, so it is reported and does
+###   not block — as it is for the other parsed languages. No line holds a
+###   marker, so line-matching sees nothing at all.
+diff --git a/src/Shop/Hooks.cs b/src/Shop/Hooks.cs
+--- /dev/null
++++ b/src/Shop/Hooks.cs
+@@ -0,0 +1,9 @@
++namespace Shop
++{
++    public class Hooks
++    {
++        public void OnDisposed()
++        {
++        }
++    }
++}
+
+### case: java-ast-throw-quoted-in-a-text-block-is-clean
+### secret_scan: clean
+### stub_detection: clean
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: The throw is help text inside a Java text block. The tree knows it is
+###   a string; one line of it, read alone, looks like code.
+diff --git a/src/main/java/shop/Help.java b/src/main/java/shop/Help.java
+--- /dev/null
++++ b/src/main/java/shop/Help.java
+@@ -0,0 +1,8 @@
++package shop;
++
++public final class Help {
++    static final String PLUGINS = """
++        A plugin must not answer with throw new UnsupportedOperationException("todo")
++        when it is asked for a feature it lacks.
++        """;
++}
+
+### case: csharp-ast-allow-stub-above-an-attribute-covers-the-body
+### secret_scan: clean
+### stub_detection: clean
+### stub_allowed: advisory
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: The marker is above the method's attribute, the placeholder in its
+###   body. The parsed method starts at its attribute list, so the marker is
+###   directly above it. Line-matching takes `public string Get()` for the
+###   declaration and stops at `[HttpGet]`, which it does not read as an
+###   annotation, so it blocks.
+diff --git a/src/Shop/OrdersController.cs b/src/Shop/OrdersController.cs
+--- /dev/null
++++ b/src/Shop/OrdersController.cs
+@@ -0,0 +1,14 @@
++using System;
++
++namespace Shop
++{
++    public class OrdersController
++    {
++        // allow-stub: the orders API lands in TASK-40
++        [HttpGet]
++        public string Get()
++        {
++            throw new NotImplementedException();
++        }
++    }
++}
+
+### case: java-ast-placeholder-in-a-lambda-is-proven-and-blocks
+### secret_scan: clean
+### stub_detection: blocking
+### stub_allowed: advisory
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: The marker is on `register`; the placeholder is in a lambda inside
+###   `refund`, a different method, so the marker does not cover it and is
+###   reported by the declaration audit. Both paths agree; this is the
+###   positive control that a parsed Java placeholder still blocks.
+diff --git a/src/main/java/shop/Handlers.java b/src/main/java/shop/Handlers.java
+--- /dev/null
++++ b/src/main/java/shop/Handlers.java
+@@ -0,0 +1,13 @@
++package shop;
++
++public class Handlers {
++    // allow-stub: registration is wired in TASK-50
++    public void register() {
++    }
++
++    public Runnable refund(Order order) {
++        return () -> {
++            throw new UnsupportedOperationException("not implemented");
++        };
++    }
++}
+
+### case: csharp-allow-stub-above-two-attributes-covers-the-body
+### secret_scan: clean
+### stub_detection: clean
+### stub_allowed: advisory
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: Line-matched (a hunk into an existing file). The marker reaches the
+###   method across a stack of attributes, which are annotation lines in C#
+###   exactly as `@Override` is in Java.
+diff --git a/src/Shop/RefundsController.cs b/src/Shop/RefundsController.cs
+--- a/src/Shop/RefundsController.cs
++++ b/src/Shop/RefundsController.cs
+@@ -20,0 +21,7 @@
++        // allow-stub: refunds land with the payments task
++        [HttpPost]
++        [Route("refunds")]
++        public IActionResult Create(Refund refund)
++        {
++            throw new NotImplementedException();
++        }
+
+### case: csharp-ast-coalescing-throw-blocks
+### secret_scan: clean
+### stub_detection: blocking
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: A throw expression on the right of `??`: the miss path is
+###   unimplemented, which is a placeholder however the hit path reads.
+diff --git a/src/Shop/Catalog.cs b/src/Shop/Catalog.cs
+--- /dev/null
++++ b/src/Shop/Catalog.cs
+@@ -0,0 +1,8 @@
++namespace Shop
++{
++    public class Catalog
++    {
++        public Item Find(string sku) =>
++            cache.Get(sku) ?? throw new NotImplementedException();
++    }
++}
+
+### case: java-ast-identifier-argument-is-not-a-message
+### secret_scan: clean
+### stub_detection: clean
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: The argument is a constant whose name contains TODO, not a message
+###   saying the code is unfinished. The tree reads only string literals as a
+###   message; a line reads the name as text.
+diff --git a/src/main/java/shop/Tasks.java b/src/main/java/shop/Tasks.java
+--- /dev/null
++++ b/src/main/java/shop/Tasks.java
+@@ -0,0 +1,10 @@
++package shop;
++
++public class Tasks {
++    public Task next() {
++        if (queue.isEmpty()) {
++            throw new IllegalStateException(Errors.TODO_QUEUE_EMPTY);
++        }
++        return queue.poll();
++    }
++}
+
+### case: java-syntax-error-falls-back-and-still-blocks
+### secret_scan: clean
+### stub_detection: blocking
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: The file does not parse (the class is never closed), so the tree is
+###   not believed and the line checks run instead. A parse failure must not
+###   read as a clean file.
+diff --git a/src/main/java/shop/Broken.java b/src/main/java/shop/Broken.java
+--- /dev/null
++++ b/src/main/java/shop/Broken.java
+@@ -0,0 +1,6 @@
++package shop;
++
++public class Broken {
++    public int size() {
++        throw new NotImplementedException();
++    }

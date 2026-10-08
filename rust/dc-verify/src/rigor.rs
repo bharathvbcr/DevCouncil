@@ -151,17 +151,20 @@ pub fn detect_stubs_with(
     detect_stubs_report(files, source).findings
 }
 
-/// What one stub pass found, and how many files it parsed to find it.
+/// What one stub pass found, and how many files the test-rigor checks ran on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StubReport {
     pub findings: Vec<Finding>,
-    /// Files analysed by [`stub_ast`] rather than line-matched. The skipped-
-    /// and assert-free-test checks exist only on that path, so a report with
-    /// zero here ran neither, and must not say it did.
+    /// Files the skipped- and assert-free-test checks ran on: those
+    /// [`stub_ast`] parsed, in a language it has those checks for
+    /// ([`stub_ast::Lang::has_test_rigor`]). A Java or C# file is parsed for
+    /// placeholders and not counted, because no test check reads it, and a
+    /// report with zero here ran neither check and must not say it did.
     pub parsed_files: usize,
 }
 
-/// [`detect_stubs_with`], also reporting how many files were parsed.
+/// [`detect_stubs_with`], also reporting how many files the test-rigor checks
+/// ran on.
 pub fn detect_stubs_report(
     files: &[FileDiff],
     source: &dyn Fn(&FileDiff) -> Option<String>,
@@ -171,7 +174,8 @@ pub fn detect_stubs_report(
     for file in files {
         let post_image = post_image(file, source);
         let lines: Option<Vec<&str>> = post_image.as_deref().map(|s| s.lines().collect());
-        let ast = match (stub_ast::Lang::for_path(&file.path), post_image.as_deref()) {
+        let lang = stub_ast::Lang::for_path(&file.path);
+        let ast = match (lang, post_image.as_deref()) {
             (Some(lang), Some(src)) => {
                 let added: HashSet<u32> = file.added_lines.iter().map(|(n, _)| *n).collect();
                 stub_ast::analyze(lang, src, &added)
@@ -181,7 +185,9 @@ pub fn detect_stubs_report(
         let mut mine = Vec::new();
         let mut scopes = Vec::new();
         if let Some(ast) = &ast {
-            parsed_files += 1;
+            if lang.is_some_and(stub_ast::Lang::has_test_rigor) {
+                parsed_files += 1;
+            }
             for f in ast {
                 let evidence = lines
                     .as_ref()
@@ -339,9 +345,10 @@ fn substring_findings(file: &FileDiff, include_bodies: bool) -> Vec<Finding> {
     findings
 }
 
-/// Whether `path` is Java or C#: languages [`stub_ast`] does not parse, whose
-/// placeholders are a thrown exception and whose methods are declared with no
-/// keyword to anchor on.
+/// Whether `path` is Java or C#: languages whose placeholders are a thrown
+/// exception and whose methods are declared with no keyword to anchor on.
+/// [`stub_ast`] parses them when the post-change source is known; the line
+/// checks here are their fallback when it is not.
 fn is_c_family_source(path: &str) -> bool {
     path.ends_with(".java") || path.ends_with(".cs")
 }
@@ -436,16 +443,8 @@ const PLACEHOLDER_MESSAGES: &[&str] = &[
     "todo",
 ];
 
-/// The placeholder a lowercased Java or C# line throws, if any.
-///
-/// `NotImplementedException` (C#'s generated stub body, and Apache Commons')
-/// has no other use, so throwing it blocks; so does any exception whose message
-/// says the code is unfinished. A *bare* `UnsupportedOperationException` is
-/// only advisory: it is the commonest Java placeholder and also how an
-/// immutable collection refuses a mutator, and one line cannot tell them
-/// apart. One with any other message is a deliberate refusal and is not
-/// reported. `NotSupportedException` is never reported — it is how a read-only
-/// stream refuses a write.
+/// The placeholder a lowercased Java or C# line throws, if any: the line
+/// checks' reading of a `throw new T(args)`, graded by [`thrown_placeholder`].
 fn c_family_placeholder(lowered: &str) -> Option<(Severity, String)> {
     let at = lowered
         .match_indices("throw new ")
@@ -454,9 +453,34 @@ fn c_family_placeholder(lowered: &str) -> Option<(Severity, String)> {
     let thrown = &lowered[at + "throw new ".len()..];
     let open = thrown.find('(')?;
     let ty = thrown[..open].trim();
-    let ty = ty.rsplit('.').next().unwrap_or(ty);
     let args = &thrown[open + 1..];
     let args = args[..args.rfind(')').unwrap_or(args.len())].trim();
+    thrown_placeholder(ty, args, args.is_empty())
+}
+
+/// Whether throwing a Java or C# exception is a placeholder, and how much it
+/// matters. The one verdict both readings of a throw share: [`stub_ast`] from
+/// the tree, [`c_family_placeholder`] from the line.
+///
+/// `ty` is the exception's type as written, `message` the text of its
+/// arguments the caller could read (the tree passes its string literals only),
+/// and `bare` whether it was constructed with no argument at all. All three
+/// lowercased.
+///
+/// `NotImplementedException` (C#'s generated stub body, and Apache Commons')
+/// has no other use, so throwing it blocks; so does any exception whose message
+/// says the code is unfinished. A *bare* `UnsupportedOperationException` is
+/// only advisory: it is the commonest Java placeholder and also how an
+/// immutable collection refuses a mutator, and nothing in the code tells them
+/// apart. One with any other message is a deliberate refusal and is not
+/// reported. `NotSupportedException` is never reported — it is how a read-only
+/// stream refuses a write.
+pub(crate) fn thrown_placeholder(
+    ty: &str,
+    message: &str,
+    bare: bool,
+) -> Option<(Severity, String)> {
+    let ty = ty.rsplit('.').next().unwrap_or(ty).trim();
     if ty == "notimplementedexception" {
         return Some((
             Severity::Blocking,
@@ -464,7 +488,10 @@ fn c_family_placeholder(lowered: &str) -> Option<(Severity, String)> {
                 .to_string(),
         ));
     }
-    if let Some(phrase) = PLACEHOLDER_MESSAGES.iter().find(|p| contains_word(args, p)) {
+    if let Some(phrase) = PLACEHOLDER_MESSAGES
+        .iter()
+        .find(|p| contains_word(message, p))
+    {
         return Some((
             Severity::Blocking,
             format!(
@@ -472,12 +499,12 @@ fn c_family_placeholder(lowered: &str) -> Option<(Severity, String)> {
             ),
         ));
     }
-    (ty == "unsupportedoperationexception" && args.is_empty()).then(|| {
+    (ty == "unsupportedoperationexception" && bare).then(|| {
         (
             Severity::Advisory,
             "added code throws a bare `UnsupportedOperationException`: a placeholder, or a \
-             deliberate refusal such as an immutable collection's mutator — the line cannot \
-             tell which"
+             deliberate refusal such as an immutable collection's mutator — nothing in the \
+             code tells which"
                 .to_string(),
         )
     })
@@ -527,6 +554,7 @@ fn apply_allow_stub(
             None => added.get(&n).copied(),
         }
     };
+    let c_family = is_c_family_source(&file.path);
     // The marker on `start`, or in the annotation lines directly above it,
     // with the line it is on.
     let declared_at = |start: u32| -> Option<(u32, String)> {
@@ -534,7 +562,7 @@ fn apply_allow_stub(
         let mut first = true;
         while let Some(text) = line_at(n) {
             let trimmed = text.trim();
-            if !first && !is_annotation_line(trimmed) {
+            if !first && !is_annotation_line(trimmed, c_family) {
                 return None;
             }
             if let Some(r) = allow_stub_reason(trimmed) {
@@ -545,7 +573,6 @@ fn apply_allow_stub(
         }
         None
     };
-    let c_family = is_c_family_source(&file.path);
     let mut covering: HashSet<u32> = HashSet::new();
     for (finding, scope) in findings.iter_mut().zip(scopes) {
         if finding.gate == "secret_scan" {
@@ -780,8 +807,13 @@ fn declares_c_family_method(trimmed: &str) -> bool {
 }
 
 /// A line that sits between a declaration and what it annotates.
-fn is_annotation_line(trimmed: &str) -> bool {
-    trimmed.starts_with("//")
+///
+/// In Java and C# that includes a C# attribute, `[HttpGet]`. Only there: in
+/// most other languages a line opening with `[` is a list or an index, and
+/// treating it as an annotation would let a marker reach across code.
+fn is_annotation_line(trimmed: &str, c_family: bool) -> bool {
+    (c_family && trimmed.starts_with('['))
+        || trimmed.starts_with("//")
         || trimmed.starts_with('#')
         || trimmed.starts_with("/*")
         || trimmed.starts_with('*')

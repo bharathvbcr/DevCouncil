@@ -265,3 +265,34 @@ func TestTheHealthProbeAcceptsTheRealBinary(t *testing.T) {
 		t.Fatalf("the real binary must pass its own health probe: %v", err)
 	}
 }
+
+// A rename changes two paths, and the verifier judges both: the one the
+// content left as well as the one it arrived at. The reply must still pass
+// validate's "every changed path is classified exactly once" check, or every
+// task that renames a file is refused as a broken verifier.
+func TestARenameIsJudgedOnBothPathsAndTheReplyValidates(t *testing.T) {
+	diff := `diff --git a/legacy/old.go b/src/new.go
+similarity index 90%
+rename from legacy/old.go
+rename to src/new.go
+--- a/legacy/old.go
++++ b/src/new.go
+@@ -1,2 +1,2 @@
+ package calc
+-func old() {}
++func renamed() {}
+`
+	result, err := client(t).Check(context.Background(), Request{Diff: diff, Planned: []string{"src/new.go"}})
+	if err != nil {
+		t.Fatalf("a rename was refused: %v", err)
+	}
+	if result.Files != 2 {
+		t.Errorf("files = %d, want 2: a rename touches its source and its destination", result.Files)
+	}
+	if len(result.InScope) != 1 || result.InScope[0] != "src/new.go" {
+		t.Errorf("in_scope = %v, want [src/new.go]", result.InScope)
+	}
+	if len(result.Orphans) != 1 || result.Orphans[0] != "legacy/old.go" {
+		t.Errorf("orphans = %v, want [legacy/old.go]", result.Orphans)
+	}
+}

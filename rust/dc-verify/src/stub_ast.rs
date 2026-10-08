@@ -1,5 +1,5 @@
 //! AST-aware stub and test-rigor detection for Rust, Go, Python and
-//! TypeScript.
+//! TypeScript, and stub detection alone for Java and C#.
 //!
 //! `rigor::detect_stubs` used to be a per-added-line substring match, which is
 //! what the Python AST detector it replaced had warned against: `todo!()`
@@ -13,6 +13,11 @@
 //! else in the file is somebody else's decision, exactly as for the substring
 //! gate.
 //!
+//! Java and C# get the placeholder and empty-body checks and not the test
+//! ones — no JUnit or NUnit skip or assertion is read — which is why
+//! [`Lang::has_test_rigor`] exists: a report must not count a file toward the
+//! test checks when none ran on it.
+//!
 //! When the file cannot be parsed cleanly — a language this module does not
 //! know, a source it was not given, a syntax error — [`analyze`] returns
 //! `None` and the caller falls back to the substring gate, whose findings are
@@ -25,7 +30,7 @@ use std::collections::HashSet;
 
 use tree_sitter::{Language, Node, Parser};
 
-use crate::rigor::{STUB_MARKERS, Severity, Strength};
+use crate::rigor::{STUB_MARKERS, Severity, Strength, thrown_placeholder};
 
 /// The gate names this module reports under, beside `stub_detection`.
 pub const GATE_ASSERT_FREE_TEST: &str = "assert_free_test";
@@ -42,6 +47,8 @@ pub enum Lang {
     Python,
     TypeScript,
     Tsx,
+    Java,
+    CSharp,
 }
 
 impl Lang {
@@ -55,8 +62,16 @@ impl Lang {
             "py" | "pyi" => Some(Lang::Python),
             "ts" | "mts" | "cts" => Some(Lang::TypeScript),
             "tsx" => Some(Lang::Tsx),
+            "java" => Some(Lang::Java),
+            "cs" => Some(Lang::CSharp),
             _ => None,
         }
+    }
+
+    /// Whether the skipped- and assert-free-test checks exist for this
+    /// language. Java and C# are parsed for placeholders only.
+    pub fn has_test_rigor(self) -> bool {
+        !matches!(self, Lang::Java | Lang::CSharp)
     }
 
     fn grammar(self) -> Language {
@@ -66,6 +81,8 @@ impl Lang {
             Lang::Python => tree_sitter_python::LANGUAGE.into(),
             Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Lang::Java => tree_sitter_java::LANGUAGE.into(),
+            Lang::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         }
     }
 }
@@ -201,12 +218,21 @@ impl<'a> Walker<'a> {
     }
 
     fn placeholder(&mut self, node: Node<'_>, what: &str) {
+        self.placeholder_finding(
+            node,
+            Severity::Blocking,
+            format!("added code whose body is `{what}`; the task is not implemented"),
+        );
+    }
+
+    /// A placeholder at `node`, attributed to the function it sits in.
+    fn placeholder_finding(&mut self, node: Node<'_>, severity: Severity, message: String) {
         self.push(
             "stub_detection",
-            Severity::Blocking,
+            severity,
             Strength::Proven,
             line_of(node),
-            format!("added code whose body is `{what}`; the task is not implemented"),
+            message,
         );
         let scope = enclosing_function(node).map(line_of);
         if let Some(last) = self.out.last_mut() {
@@ -218,6 +244,10 @@ impl<'a> Walker<'a> {
     /// the correct implementation of a hook or a trait method. Blocking when a
     /// comment inside it says it is unfinished, which is the one reading of an
     /// empty body that is not ambiguous.
+    ///
+    /// `func` is where the finding is reported: the declaration, or for Java
+    /// and C# its name, since their declaration node begins at the annotations
+    /// above it.
     fn empty_body(&mut self, func: Node<'_>, body: Node<'_>, what: &str) {
         if !self.is_added(func) {
             return;
@@ -272,6 +302,7 @@ impl<'a> Walker<'a> {
             Lang::Go => self.visit_go(node),
             Lang::Python => self.visit_python(node),
             Lang::TypeScript | Lang::Tsx => self.visit_ts(node),
+            Lang::Java | Lang::CSharp => self.visit_c_family(node),
         }
     }
 
@@ -687,6 +718,75 @@ impl<'a> Walker<'a> {
             _ => false,
         })
     }
+
+    // ---- Java and C# ----
+
+    fn visit_c_family(&mut self, node: Node<'_>) {
+        match node.kind() {
+            // C#'s `throw_expression` is the throw in `=> throw …` and
+            // `x ?? throw …`; it throws exactly as a statement does.
+            "throw_statement" | "throw_expression" => {
+                if !self.is_added(node) {
+                    return;
+                }
+                let Some(created) = node
+                    .named_child(0)
+                    .filter(|c| c.kind() == "object_creation_expression")
+                else {
+                    return;
+                };
+                let ty = created
+                    .child_by_field_name("type")
+                    .map(|t| self.text(t).to_ascii_lowercase())
+                    .unwrap_or_default();
+                let args = created.child_by_field_name("arguments");
+                let bare = args.is_none_or(|a| a.named_child_count() == 0);
+                // Only what the arguments say in string literals: an
+                // identifier such as `TODO_LIST` is not a message.
+                let message = args
+                    .map(|a| {
+                        descendants(a)
+                            .into_iter()
+                            .filter(|n| c_family_string(n.kind()))
+                            .map(|n| self.text(n).to_ascii_lowercase())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                if let Some((severity, msg)) = thrown_placeholder(&ty, &message, bare) {
+                    self.placeholder_finding(node, severity, msg);
+                }
+            }
+            // Constructors are not checked for empty bodies: an empty private
+            // constructor is how a static class is written. Accessors are not
+            // either: `set { }` is a deliberate no-op.
+            "method_declaration" | "local_function_statement" => {
+                let Some(body) = node
+                    .child_by_field_name("body")
+                    .filter(|b| b.kind() == "block")
+                else {
+                    return;
+                };
+                if body_is_empty(body) {
+                    let anchor = node.child_by_field_name("name").unwrap_or(node);
+                    self.empty_body(anchor, body, "empty");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A string literal, in either grammar.
+fn c_family_string(kind: &str) -> bool {
+    matches!(
+        kind,
+        "string_literal"
+            | "text_block"
+            | "verbatim_string_literal"
+            | "raw_string_literal"
+            | "interpolated_string_expression"
+    )
 }
 
 /// The nearest function-like node containing `node`.
@@ -701,6 +801,14 @@ fn enclosing_function(node: Node<'_>) -> Option<Node<'_>> {
                 | "function_definition"
                 | "method_definition"
                 | "generator_function_declaration"
+                | "constructor_declaration"
+                | "compact_constructor_declaration"
+                | "local_function_statement"
+                | "property_declaration"
+                | "indexer_declaration"
+                | "operator_declaration"
+                | "conversion_operator_declaration"
+                | "destructor_declaration"
         ) {
             return Some(n);
         }
