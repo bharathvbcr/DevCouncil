@@ -6975,29 +6975,11 @@ impl Resolver {
         Some(self.reference_edge(ext, &target_file, &reference.name, reference, resolution))
     }
 
-    /// Every Metal shader entry point `ext` declares, into `entry_names`.
-    ///
-    /// Read from the extraction's own `RuntimeEntryPoint` annotations, which
-    /// the extractor attaches only to a declaration whose leading qualifier is
-    /// `kernel`, `vertex` or `fragment` — so a shader's private helper, which
-    /// the host can never look up, is never a target.
+    /// Every Metal shader entry point `ext` declares, into `entry_names`. See
+    /// [`Extraction::metal_entry_points`] — a shader's private helper, which the
+    /// host can never look up, is never a target.
     fn index_entry_names(&mut self, ext: &Extraction) {
-        if devmap_extract::languages::detect_extractor_id(Path::new(&ext.file_path))
-            != Some(devmap_extract::languages::ExtractorId::Metal)
-        {
-            return;
-        }
-        for annotation in &ext.wiring {
-            if annotation.kind != WiringKind::RuntimeEntryPoint {
-                continue;
-            }
-            let Some(symbol) = ext
-                .symbols
-                .iter()
-                .find(|symbol| symbol.qualified_name == annotation.target_symbol)
-            else {
-                continue;
-            };
+        for symbol in ext.metal_entry_points() {
             let declaring = self.entry_names.entry(symbol.name.clone()).or_default();
             if let Err(at) = declaring.binary_search(&ext.file_path) {
                 declaring.insert(at, ext.file_path.clone());

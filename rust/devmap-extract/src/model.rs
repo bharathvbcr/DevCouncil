@@ -1597,6 +1597,28 @@ impl Extraction {
         grammar_read(&self.engine, &self.parse_outcome)
     }
 
+    /// The Metal shader entry points this file declares — `kernel`, `vertex`
+    /// and `fragment` functions, plain or stamped by a macro — which a host
+    /// looks up by name.
+    ///
+    /// Read from the file's own `RuntimeEntryPoint` annotations, which the
+    /// extractor attaches only to a declaration whose leading qualifier names a
+    /// shader stage, so a shader's private helper is never one. Empty for any
+    /// file that is not Metal. The one answer both the resolver's entry-name
+    /// index and the workspace's cross-repository links read.
+    pub fn metal_entry_points(&self) -> impl Iterator<Item = &ExtractedSymbol> {
+        let is_metal = crate::languages::detect_extractor_id(std::path::Path::new(&self.file_path))
+            == Some(crate::languages::ExtractorId::Metal);
+        self.wiring
+            .iter()
+            .filter(move |annotation| is_metal && annotation.kind == WiringKind::RuntimeEntryPoint)
+            .filter_map(|annotation| {
+                self.symbols
+                    .iter()
+                    .find(|symbol| symbol.qualified_name == annotation.target_symbol)
+            })
+    }
+
     /// Whether this file can be the subject of a liveness verdict, and if not,
     /// why not. See [`FileLiveness`].
     ///

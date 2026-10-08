@@ -6896,14 +6896,25 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                         )?;
                     } else {
                         for link in &links {
-                            outln!(
-                                "{} {} -> {}  ({}; {})",
-                                link.from_repo,
-                                link.module_specifier,
-                                link.to_repo,
-                                link.from_file,
-                                link.evidence
-                            );
+                            match link.kind {
+                                devmap_query::workspace::LinkKind::Import => outln!(
+                                    "{} {} -> {}  ({}; {})",
+                                    link.from_repo,
+                                    link.module_specifier,
+                                    link.to_repo,
+                                    link.from_file,
+                                    link.evidence
+                                ),
+                                devmap_query::workspace::LinkKind::EntryName => outln!(
+                                    "{} {} -> {} {}  (\"{}\"; {})",
+                                    link.from_repo,
+                                    link.from_symbol.as_deref().unwrap_or(&link.from_file),
+                                    link.to_repo,
+                                    link.to_symbol.as_deref().unwrap_or_default(),
+                                    link.module_specifier,
+                                    link.evidence
+                                ),
+                            }
                         }
                         outln!("{} candidate link(s)", links.len());
                     }
