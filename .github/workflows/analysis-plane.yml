@@ -23,12 +23,18 @@ on:
     paths:
       - "rust/**"
       - "backend/go_orchestrator/**"
+      # policy's contract tests read these, including the CHECKSUMS check
+      # that fails when a contract changes without its manifest.
+      - "backend/contracts/**"
       - ".github/workflows/analysis-plane.yml"
       - ".github/actions/setup-gusset/**"
   pull_request:
     paths:
       - "rust/**"
       - "backend/go_orchestrator/**"
+      # policy's contract tests read these, including the CHECKSUMS check
+      # that fails when a contract changes without its manifest.
+      - "backend/contracts/**"
       - ".github/workflows/analysis-plane.yml"
       - ".github/actions/setup-gusset/**"
   workflow_dispatch:

@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"os"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
 )
 
 // runHook is the compatibility boundary for retired lifecycle commands. Event
@@ -22,7 +24,18 @@ func runHook(args []string) int {
 		fmt.Fprintln(os.Stderr, "DevCouncil lifecycle hooks are retired; use DevMap's own integration for index maintenance and DevCouncil MCP tools for verification.")
 		return 1
 	case "--help", "-h", "help":
-		fmt.Fprint(os.Stdout, hookHelp)
+		return printHookHelp()
+	}
+	return 0
+}
+
+// printHookHelp writes the help text through the console's stdout and reports
+// a failed write. `hook --help` takes the protocol bypass, where no session
+// is there to turn a lost write into a failing exit, so the caller must.
+func printHookHelp() int {
+	if _, err := console.Print(hookHelp); err != nil {
+		console.Errorf("hook help: %v\n", err)
+		return 1
 	}
 	return 0
 }

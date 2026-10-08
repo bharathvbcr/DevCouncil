@@ -1,3 +1,8 @@
+// Every byte this binary puts on stdout goes through `write_stdout`: it ends
+// quietly on a closed pipe and escapes control characters on a terminal.
+// `print!`/`println!` do neither, and panic on `EPIPE`.
+#![deny(clippy::print_stdout)]
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -42,7 +47,7 @@ fn write_stdout_raw(message: std::fmt::Arguments<'_>) {
 
 macro_rules! outln {
     ($($argument:tt)*) => {
-        write_stdout(format_args!("{}\n", format_args!($($argument)*)))
+        $crate::write_stdout(format_args!("{}\n", format_args!($($argument)*)))
     };
 }
 
@@ -2155,7 +2160,11 @@ fn doctor_report(
     let mut digests = crate::digest_cache::BinaryDigests::open_read_only(Some(&state_dir));
     let binaries = inventory_devmap_binaries(&mut digests)?;
     let skew = binaries_skew_warning(&binaries);
+    let mismatches = doctor_edge_confidence_mismatches(db, schema_version);
     let mut report = serde_json::json!({
+        // `null` when nothing was measured; the warning then says why.
+        "edge_confidence_mismatches": mismatches.as_ref().ok(),
+        "edge_confidence_warning": edge_confidence_warning(&mismatches),
         "schema_version": schema_version,
         "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
         "code_graph_schema_version": CODE_GRAPH_SCHEMA_VERSION,
@@ -2197,6 +2206,50 @@ fn extend_agent_tools(value: &mut serde_json::Value, root: &Path) {
             serde_json::json!(agents::warning(&scan)),
         );
         fields.insert("agent_tool_gaps".into(), serde_json::json!(gaps));
+    }
+}
+
+/// The edges check `doctor` lost when the Go `dcmap doctor` was retired:
+/// stored edges whose confidence contradicts their recorded resolution kind.
+///
+/// Read through the same SQL owner `status` uses, on a read-only connection,
+/// and only when the stored schema is the one this binary speaks — `Store::open`
+/// migrates, and a probe must not rewrite a store it was only asked to judge.
+/// `Err` carries why nothing was measured — no store, a schema this binary does
+/// not read, no generation, or a read that failed — so the report can say so
+/// instead of failing the whole diagnosis over one check.
+fn doctor_edge_confidence_mismatches(
+    db: &std::path::Path,
+    schema_version: Option<i32>,
+) -> Result<usize, String> {
+    match schema_version {
+        None => return Err("no devmap store at this path".to_string()),
+        Some(version) if version != devmap_store::CURRENT_SCHEMA_VERSION => {
+            return Err(format!(
+                "store schema is {version}, this binary reads {}",
+                devmap_store::CURRENT_SCHEMA_VERSION
+            ))
+        }
+        Some(_) => {}
+    }
+    let store = Store::open_read_only(db).map_err(|error| format!("store unreadable: {error}"))?;
+    store
+        .edge_confidence_mismatches()
+        .map_err(|error| format!("edge read failed: {error}"))?
+        .ok_or_else(|| "the store holds no generation".to_string())
+}
+
+/// Zero is the only passing reading. A count above zero is a store whose
+/// edges no longer agree with their own evidence, and an unmeasured count is
+/// reported as unknown rather than allowed to pass as a clean one.
+fn edge_confidence_warning(mismatches: &Result<usize, String>) -> Option<String> {
+    match mismatches {
+        Ok(0) => None,
+        Ok(count) => Some(format!(
+            "{count} stored edge(s) carry a confidence that contradicts their recorded \
+             resolution kind; rebuild with `devmap build --full`"
+        )),
+        Err(reason) => Some(format!("edge confidence is unknown, not passed: {reason}")),
     }
 }
 
@@ -7419,7 +7472,10 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                             let mut cmd = std::process::Command::new(exe);
                             cmd.arg("--json").arg("--db").arg(cli.db()).arg("status");
                             let out = cmd.output()?;
-                            std::io::Write::write_all(&mut std::io::stdout(), &out.stdout)?;
+                            write_stdout_raw(format_args!(
+                                "{}",
+                                String::from_utf8_lossy(&out.stdout)
+                            ));
                             return Ok(());
                         }
                         Err(err) => {
@@ -7518,7 +7574,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             if cli.json {
                 emit_json(cli, &payload)?;
             } else {
-                println!("recorded gap {gap_id} for {tool}");
+                outln!("recorded gap {gap_id} for {tool}");
             }
         }
         Commands::History { last } => {
