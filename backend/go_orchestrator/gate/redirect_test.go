@@ -95,6 +95,17 @@ var hiddenWriteCorpus = []string{
 	// Targets only the shell can resolve.
 	`echo hi > $(echo .env)`,
 	`echo hi > "$(printf .env)"`,
+	// The same writes made through a command's arguments rather than an
+	// operator. The rung used to read only redirections, so each of these
+	// reached .env under any posture that demotes command.not_allowed.
+	`echo hi | tee .env`,
+	`echo hi | tee -a .env`,
+	`echo hi | tee src/calc.go .env`,
+	`cp /dev/null .env`,
+	`printf x > src/calc.go && cp src/calc.go .env`,
+	`printf x > src/calc.go && mv src/calc.go .env`,
+	`printf x > src/calc.go; cp -t . src/calc.go; mv calc.go .env`,
+	`echo $(echo hi | tee .env)`,
 }
 
 // TestCommandVerdictIsNeverLooserThanTheWritesItPerforms is the invariant.

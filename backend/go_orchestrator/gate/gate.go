@@ -233,7 +233,11 @@ func (g *Gate) EvaluateCommand(command string, task *dc.Task) (policy.Decision, 
 	return g.settle(decision, mode, modeOrigin, flags.PolicyCommandMode), nil
 }
 
-// WriteEvaluator judges one redirection target as the write it actually is.
+// WriteEvaluator judges one file the command would write — a redirection
+// target or a file a command writes through its arguments — as the write it
+// actually is. Every such file is judged as a write (dc.OpWrite in the gate's
+// own evaluator), including the source mv removes; the rung does not tell the
+// evaluator which operation the command performs on it.
 //
 // It is injected rather than fixed so the rung below has exactly one
 // implementation across every plane that runs commands: the DevCouncil gate
@@ -260,11 +264,15 @@ type RedirectRefusal struct {
 	FromTarget bool
 }
 
-// EvaluateRedirects is the harness's one redirect rung.
+// EvaluateRedirects is the harness's one redirect rung — the rung for every
+// file a command line writes, named for the redirections it was first written
+// for.
 //
 // INVARIANT: no command reaches execution with any component left unevaluated.
 // A command line is not one subject but several — the command itself, and every
-// file an output redirection would write. Allowlist matching deliberately
+// file it would write: each output redirection's target, and each file a
+// command writes through its arguments (sed -i, tee, cp, mv; see
+// policy.RedirectTargets). Allowlist matching deliberately
 // normalises the redirections away so entries stay single-clause, so the string
 // that matched is never the string that runs, and the targets are judged here
 // or by nobody.
@@ -297,8 +305,8 @@ func EvaluateRedirects(command, taskID string, evalWrite WriteEvaluator) (Redire
 				Action:   policy.Deny,
 				Rule:     policy.RuleCommandSubstitution,
 				Severity: policy.SeverityOf(policy.RuleCommandSubstitution),
-				Reason: "A redirection target carries an expansion only the shell can resolve " +
-					"and was judged as an unverifiable write.",
+				Reason: "A file this command writes — a redirection target or a file operand — carries " +
+					"an expansion only the shell can resolve and was judged as an unverifiable write.",
 				Target: command,
 				TaskID: taskID,
 			},
@@ -311,7 +319,7 @@ func EvaluateRedirects(command, taskID string, evalWrite WriteEvaluator) (Redire
 			return RedirectRefusal{}, err
 		}
 		if written.Blocked() {
-			written.Reason = fmt.Sprintf("Command redirects to a file the write gate refuses (%s): %s",
+			written.Reason = fmt.Sprintf("Command writes a file the write gate refuses (%s): %s",
 				target, written.Reason)
 			return RedirectRefusal{Decision: written, Refused: true, FromTarget: true}, nil
 		}

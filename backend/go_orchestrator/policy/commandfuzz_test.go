@@ -137,6 +137,11 @@ func FuzzRedirectTargetsSeesInsideEverySubstitution(f *testing.F) {
 		`echo ${v:-$(printf x > y)}`,
 		`a > b && c $(d > e)`,
 		`echo $(( 1 << 2 )) > out`,
+		// Writes through arguments, which the scan reports beside redirects.
+		`echo $(sed -i.bak s/a/b/ f)`,
+		"echo `tee -a log`",
+		`cat <(cp a b c dir/) && mv x "$(tee y)"`,
+		`echo "$(sed -e s/x/y/ -i '' f; mv -t d a)"`,
 		`echo hi`,
 		``,
 	} {
