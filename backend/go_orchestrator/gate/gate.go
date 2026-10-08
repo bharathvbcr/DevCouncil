@@ -26,8 +26,9 @@ type Gate struct {
 	// GlobalAllowedCommands supplement every task's own command allowlist.
 	GlobalAllowedCommands []string
 	// Matcher answers every policy decision's pattern questions; nil is
-	// fnmatch. A host that links the Gusset engine sets gussetfn.Matcher
-	// here, and a matcher error is a hard denial under the engine rules.
+	// fnmatch, which every host uses (docs/gusset-candidates.md). A matcher
+	// that can fail turns its error into a hard denial under the engine
+	// rules.
 	Matcher policy.Matcher
 	// OnIssue is notified after a grant is issued, so a composition root can
 	// make it durable.

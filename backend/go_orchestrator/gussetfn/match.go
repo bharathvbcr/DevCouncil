@@ -3,14 +3,18 @@
 // Package gussetfn matches paths through dc-glob on the Gusset runtime.
 //
 // Every entry point answers exactly what fnmatch answers for the same
-// arguments, or an error. The error is why the policy gates can use it:
-// Matcher satisfies policy.Matcher, and a gate turns an error into a denial
-// under path.engine_unavailable or command.engine_unavailable instead of
-// guessing a bool. A Gusset failure has no honest bool — "no match" opens a
-// path the gate meant to refuse, "match" denies a write it meant to allow.
+// arguments, or an error; a Gusset failure has no honest bool, so it is
+// never converted into one.
+//
+// No policy gate decides with it. fnmatch is the one production matcher: the
+// committed A/B (policy.BenchmarkDecisionAB, docs/gusset-candidates.md)
+// measured the engine at about twice fnmatch's cost on the same questions,
+// with the crossing itself a small part of that. This package is the
+// differential oracle that holds dc-glob — which dc-verify links — equal to
+// fnmatch: under the gussetengine tag the whole policy suite runs through it.
 // The gusset-check commands of devcouncil, manvi, jarvis and GitPulse run
-// SelfTest; Manvi's serve runs Check (never a deliberate panic) before it
-// hands its gates a Matcher.
+// SelfTest, which proves the archive each links still loads, answers and
+// contains a panic.
 package gussetfn
 
 import (
@@ -58,6 +62,9 @@ const poolSize = 4
 
 var (
 	registerOnce sync.Once
+	// registerErr is register's answer, latched: a registration that failed
+	// once fails for the life of the process.
+	registerErr error
 	// engineMu serialises opening; the hot path reads current without it.
 	engineMu sync.Mutex
 	current  atomic.Pointer[gusset.Handle]
@@ -85,7 +92,10 @@ func engine() (*gusset.Handle, error) {
 	if h := current.Load(); h != nil {
 		return h, nil
 	}
-	registerOnce.Do(register)
+	registerOnce.Do(func() { registerErr = register() })
+	if registerErr != nil {
+		return nil, registerErr
+	}
 	h, err := gusset.Open(gusset.WithPoolSize(poolSize))
 	if err != nil {
 		return nil, err

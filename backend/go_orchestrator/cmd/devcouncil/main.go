@@ -294,14 +294,9 @@ func openGate(root string) (*gate.Gate, error) {
 	if m != nil {
 		subsystems = m
 	}
-	g, err := gate.New(regFlags, root, subsystems)
-	if err != nil {
-		return nil, err
-	}
-	// The engine answers every pattern question this gate asks; a failure is a
-	// hard denial under the engine rules, not a guess.
-	g.Matcher = policyMatcher()
-	return g, nil
+	// The gate's Matcher stays nil: fnmatch decides every pattern question
+	// (docs/gusset-candidates.md).
+	return gate.New(regFlags, root, subsystems)
 }
 
 func lookPath(name string) (string, error) {

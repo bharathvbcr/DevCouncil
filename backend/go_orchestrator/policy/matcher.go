@@ -11,16 +11,17 @@ import (
 // (fnmatch.MatchAnyFold). Every answer must equal what fnmatch gives for the
 // same arguments; only the error is new.
 //
+// GoMatcher — fnmatch — is the one production matcher; every host leaves the
+// gates' Matcher nil (docs/gusset-candidates.md). The interface is the seam
+// the gussetengine-tagged suite runs the whole ladder through the dc-glob
+// engine with, as a differential oracle.
+//
 // The error is the point of the interface. A matcher that can fail — the
 // in-process Rust engine behind gussetfn — has no honest bool for "I could
 // not answer": either value is a wrong allow or a wrong deny. The gates turn
 // an error into a denial under RulePathEngineUnavailable or
 // RuleCommandEngineUnavailable, never under the rung that asked, so the
 // record says the engine failed rather than that the path was a secret.
-//
-// This package stays free of cgo: GoMatcher is the default, and a host that
-// links the engine injects it through FileGate.Matcher and
-// CommandGate.Matcher.
 type Matcher interface {
 	MatchAny(patterns []string, name string) (bool, error)
 	MatchAnyFold(patterns []string, name string) (bool, error)

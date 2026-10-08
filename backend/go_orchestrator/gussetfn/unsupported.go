@@ -24,17 +24,6 @@ func MatchAnyFold(ctx context.Context, patterns []string, name string) (bool, er
 	return false, ErrUnsupported
 }
 
-// Matcher is policy.Matcher on the engine; here every answer is
-// ErrUnsupported, so a gate given one refuses. Hosts give it to a gate only
-// after Check passes, which it never does on this platform.
-type Matcher struct{ Timeout time.Duration }
-
-// MatchAny reports ErrUnsupported.
-func (Matcher) MatchAny([]string, string) (bool, error) { return false, ErrUnsupported }
-
-// MatchAnyFold reports ErrUnsupported.
-func (Matcher) MatchAnyFold([]string, string) (bool, error) { return false, ErrUnsupported }
-
 // Check reports ErrUnsupported: there is no engine on this platform.
 func Check(ctx context.Context) error { return ErrUnsupported }
 
