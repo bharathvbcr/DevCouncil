@@ -513,8 +513,16 @@ fn links_are_validated_kept_on_omission_and_read_from_both_ends() {
         r#"{"id":"dup","request_id":"to-deleted","expected_revision":2,"title":"T","repository_ids":["r"],"primary_repository_id":"r","links":[{"kind":"related","item_id":"b"}]}"#,
         "invalid_input",
     );
+    // But a task that already links to it can still be saved with its links:
+    // deleting one task must not make every task pointing at it unsaveable.
+    put(
+        &s,
+        "a",
+        3,
+        r#","links":[{"kind":"parent","item_id":"epic"},{"kind":"blocks","item_id":"b"},{"kind":"related","item_id":"dup"}]"#,
+    );
     // An explicit empty list unlinks, from both ends.
-    put(&s, "a", 3, r#","links":[]"#);
+    put(&s, "a", 4, r#","links":[]"#);
     assert!(!brief(&s, "epic").contains("Subtask"));
     let rows: i64 = s
         .connection()

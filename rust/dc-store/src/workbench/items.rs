@@ -101,8 +101,9 @@ fn checklist(input: &Input<'_>) -> Result<Option<String>> {
 }
 
 /// The request's links, validated against the board, or `None` when it named
-/// none. A link names a live task other than this one; a task has at most one
-/// parent, and a parent may not be one of its own descendants.
+/// none. A new link names a live task other than this one (a link the task
+/// already holds may outlive its target); a task has at most one parent, and
+/// a parent may not be one of its own descendants.
 fn links(input: &Input<'_>, id: &str) -> Result<Option<Links>> {
     match input.kind("links")?.as_deref() {
         None | Some("null") => return Ok(None),
@@ -141,12 +142,17 @@ fn links(input: &Input<'_>, id: &str) -> Result<Option<Links>> {
         if !seen.insert((kind.clone(), target.clone())) {
             return Err(Error::invalid("links contains duplicates"));
         }
-        let live: bool = input.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM work_items WHERE id=?1 AND deleted=0)",
-            [&target],
+        // A new link names a live task. One the task already holds is kept
+        // even if its target was deleted since: otherwise deleting a task
+        // would make every task that links to it unsaveable until a person
+        // found and removed the dead link.
+        let allowed: bool = input.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_items WHERE id=?1 AND deleted=0)
+                 OR EXISTS(SELECT 1 FROM work_item_links WHERE item_id=?2 AND kind=?3 AND target_id=?1)",
+            params![target, id, kind],
             |r| r.get(0),
         )?;
-        if !live {
+        if !allowed {
             return Err(Error::invalid(format!(
                 "linked task {target} does not exist or is deleted"
             )));
