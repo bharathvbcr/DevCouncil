@@ -702,12 +702,13 @@ mod tests {
     #[test]
     fn special_tokens_in_the_text_are_split_out_as_the_reference_does() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
-        let vocab: HashMap<String, u32> = std::fs::read_to_string(format!("{dir}wordpiece-vocab.txt"))
-            .expect("vocab fixture")
-            .lines()
-            .enumerate()
-            .map(|(i, t)| (t.to_string(), i as u32))
-            .collect();
+        let vocab: HashMap<String, u32> =
+            std::fs::read_to_string(format!("{dir}wordpiece-vocab.txt"))
+                .expect("vocab fixture")
+                .lines()
+                .enumerate()
+                .map(|(i, t)| (t.to_string(), i as u32))
+                .collect();
         let cases: &[(&str, &[u32])] = &[
             ("a [UNK] b", &[1037, 100, 1038]),
             ("[unk]", &[1031, 4895, 2243, 1033]),
@@ -736,7 +737,11 @@ mod tests {
         // The cap still cuts exactly, across a special token too.
         let text = "x[SEP]y[SEP]z";
         for cap in 0..=5 {
-            assert_eq!(token_ids_up_to(text, &vocab, cap), [1060, 102, 1061, 102, 1062][..cap], "cap {cap}");
+            assert_eq!(
+                token_ids_up_to(text, &vocab, cap),
+                [1060, 102, 1061, 102, 1062][..cap],
+                "cap {cap}"
+            );
         }
         // A vocabulary without the specials leaves the text alone.
         let plain: HashMap<String, u32> = [("[UNK]", 0), ("x", 1), ("[", 2), ("]", 3), ("sep", 4)]
@@ -759,12 +764,32 @@ mod tests {
         let text = "parsejson x.parse 日日 zzz parse.json ".repeat(40);
         let whole = token_ids_up_to(&text, &vocab, usize::MAX);
         assert!(whole.len() > 300, "the text must outrun the caps below");
-        for cap in [0, 1, 2, 3, 5, 7, 8, 9, 100, 299, whole.len(), whole.len() + 1] {
+        for cap in [
+            0,
+            1,
+            2,
+            3,
+            5,
+            7,
+            8,
+            9,
+            100,
+            299,
+            whole.len(),
+            whole.len() + 1,
+        ] {
             let got = token_ids_up_to(&text, &vocab, cap);
             assert_eq!(got, whole[..cap.min(whole.len())], "cap {cap}");
-            assert_eq!(crate::wordpiece_ids(&text, &vocab, cap), got, "the public entry point, cap {cap}");
+            assert_eq!(
+                crate::wordpiece_ids(&text, &vocab, cap),
+                got,
+                "the public entry point, cap {cap}"
+            );
         }
-        assert_eq!(token_ids(&text, &vocab), whole[..MAX_TOKENS.min(whole.len())]);
+        assert_eq!(
+            token_ids(&text, &vocab),
+            whole[..MAX_TOKENS.min(whole.len())]
+        );
     }
 
     /// The tokeniser, judged against the real thing.
