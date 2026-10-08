@@ -1,0 +1,295 @@
+### The scope corpus: `classify_scope` measured as a classifier.
+###
+### The unit tests in src/lib.rs show the classifier on inputs chosen to
+### pass. This file gives it a denominator. Every path a case's change touches
+### is labelled by hand, and `tests/classifier_corpus.rs` reports precision and
+### recall over those labels. The numbers in rust/STATUS.md come from here.
+###
+### LABELLING RULE (applied by hand, before the classifier was run)
+###
+###   orphan    the change adds, modifies, deletes, renames away from, or
+###             changes the mode of this path, and no planned entry names it
+###   in        some planned entry names it, as a literal path or as an
+###             fnmatch pattern in the Python dialect `classify_scope` documents
+###             (`*` crosses `/`), after `./` and `\` normalisation on both sides
+###
+### A path an entry names is the same file however the plan spells it: `./a`,
+### `a` and `a` with Windows separators are one file. A rename touches two
+### paths, and the one it renames away from is changed too: its content left it.
+###
+### FORMAT
+###
+### `### case: <name>` opens a case. Header lines that follow:
+###   `### planned: <entry>`    one per planned entry (zero is allowed)
+###   `### orphan: <path>`      a path the gate must report as an orphan
+###   `### in: <path>`          a path the gate must not report as an orphan
+###   `### note: <text>`        free text
+### The diff follows. A path the gate reports that the case does not label
+### fails the run: an unlabelled output is not a measurement.
+
+### case: exact-planned-file
+### planned: src/calc.go
+### in: src/calc.go
+diff --git a/src/calc.go b/src/calc.go
+--- a/src/calc.go
++++ b/src/calc.go
+@@ -1,1 +1,2 @@
+ package calc
++func Add(a, b int) int { return a + b }
+
+### case: unplanned-modified-file
+### planned: src/calc.go
+### in: src/calc.go
+### orphan: src/other.go
+diff --git a/src/calc.go b/src/calc.go
+--- a/src/calc.go
++++ b/src/calc.go
+@@ -1,1 +1,2 @@
+ package calc
++func Add(a, b int) int { return a + b }
+diff --git a/src/other.go b/src/other.go
+--- a/src/other.go
++++ b/src/other.go
+@@ -1,1 +1,2 @@
+ package calc
++var drift = 1
+
+### case: glob-entry-matches
+### planned: src/*.go
+### in: src/a.go
+### in: src/b.go
+diff --git a/src/a.go b/src/a.go
+--- a/src/a.go
++++ b/src/a.go
+@@ -1,1 +1,2 @@
+ package src
++var a = 1
+diff --git a/src/b.go b/src/b.go
+--- a/src/b.go
++++ b/src/b.go
+@@ -1,1 +1,2 @@
+ package src
++var b = 1
+
+### case: glob-entry-does-not-match-other-extension
+### planned: src/*.go
+### in: src/a.go
+### orphan: src/a.py
+diff --git a/src/a.go b/src/a.go
+--- a/src/a.go
++++ b/src/a.go
+@@ -1,1 +1,2 @@
+ package src
++var a = 1
+diff --git a/src/a.py b/src/a.py
+--- a/src/a.py
++++ b/src/a.py
+@@ -1,1 +1,2 @@
+ import os
++A = 1
+
+### case: doublestar-tree-entry
+### planned: docs/**
+### in: docs/guide/intro.md
+diff --git a/docs/guide/intro.md b/docs/guide/intro.md
+--- a/docs/guide/intro.md
++++ b/docs/guide/intro.md
+@@ -1,1 +1,2 @@
+ # Intro
++More.
+
+### case: dot-slash-planned-entry
+### planned: ./src/calc.go
+### in: src/calc.go
+### note: the plan spelled the path with a leading ./; it is the same file
+diff --git a/src/calc.go b/src/calc.go
+--- a/src/calc.go
++++ b/src/calc.go
+@@ -1,1 +1,2 @@
+ package calc
++var x = 1
+
+### case: windows-separator-planned-entry
+### planned: src\calc.go
+### in: src/calc.go
+diff --git a/src/calc.go b/src/calc.go
+--- a/src/calc.go
++++ b/src/calc.go
+@@ -1,1 +1,2 @@
+ package calc
++var x = 1
+
+### case: added-unplanned-file
+### planned: src/calc.go
+### orphan: src/new_helper.go
+diff --git a/src/new_helper.go b/src/new_helper.go
+new file mode 100644
+--- /dev/null
++++ b/src/new_helper.go
+@@ -0,0 +1,2 @@
++package calc
++func helper() {}
+
+### case: deleted-unplanned-file
+### planned: src/calc.go
+### orphan: src/legacy.go
+diff --git a/src/legacy.go b/src/legacy.go
+deleted file mode 100644
+--- a/src/legacy.go
++++ /dev/null
+@@ -1,2 +0,0 @@
+-package calc
+-func legacy() {}
+
+### case: deleted-planned-file
+### planned: src/legacy.go
+### in: src/legacy.go
+diff --git a/src/legacy.go b/src/legacy.go
+deleted file mode 100644
+--- a/src/legacy.go
++++ /dev/null
+@@ -1,2 +0,0 @@
+-package calc
+-func legacy() {}
+
+### case: rename-planned-to-unplanned
+### planned: src/old.go
+### in: src/old.go
+### orphan: src/moved/new.go
+### note: the destination was never planned
+diff --git a/src/old.go b/src/moved/new.go
+similarity index 90%
+rename from src/old.go
+rename to src/moved/new.go
+--- a/src/old.go
++++ b/src/moved/new.go
+@@ -1,2 +1,2 @@
+ package calc
+-func old() {}
++func renamed() {}
+
+### case: rename-unplanned-to-planned
+### planned: src/new.go
+### in: src/new.go
+### orphan: legacy/old.go
+### note: the plan named only the destination; the source path is removed
+###   from the tree, which is a change to a path the plan never named
+diff --git a/legacy/old.go b/src/new.go
+similarity index 90%
+rename from legacy/old.go
+rename to src/new.go
+--- a/legacy/old.go
++++ b/src/new.go
+@@ -1,2 +1,2 @@
+ package calc
+-func old() {}
++func renamed() {}
+
+### case: pure-rename-both-planned
+### planned: src/old.go
+### planned: src/new.go
+### in: src/old.go
+### in: src/new.go
+diff --git a/src/old.go b/src/new.go
+similarity index 100%
+rename from src/old.go
+rename to src/new.go
+
+### case: mode-change-unplanned
+### planned: src/calc.go
+### orphan: scripts/run.sh
+### note: a mode change makes a file executable; it is a change
+diff --git a/scripts/run.sh b/scripts/run.sh
+old mode 100644
+new mode 100755
+
+### case: binary-change-unplanned
+### planned: src/calc.go
+### orphan: assets/logo.png
+diff --git a/assets/logo.png b/assets/logo.png
+index 1234567..89abcde 100644
+Binary files a/assets/logo.png and b/assets/logo.png differ
+
+### case: quoted-path-with-space
+### planned: docs/my notes.md
+### in: docs/my notes.md
+diff --git "a/docs/my notes.md" "b/docs/my notes.md"
+--- "a/docs/my notes.md"
++++ "b/docs/my notes.md"
+@@ -1,1 +1,2 @@
+ # Notes
++More.
+
+### case: bracket-path-planned-literally
+### planned: app/[id]/page.tsx
+### in: app/[id]/page.tsx
+### note: a Next.js route segment; the plan means the literal path
+diff --git a/app/[id]/page.tsx b/app/[id]/page.tsx
+--- a/app/[id]/page.tsx
++++ b/app/[id]/page.tsx
+@@ -1,1 +1,2 @@
+ export default function Page() {}
++export const dynamic = "force-static";
+
+### case: directory-named-b
+### planned: b/x.go
+### in: b/x.go
+diff --git a/b/x.go b/b/x.go
+--- a/b/x.go
++++ b/b/x.go
+@@ -1,1 +1,2 @@
+ package b
++var x = 1
+
+### case: lockfile-beside-planned-change
+### planned: package.json
+### in: package.json
+### orphan: package-lock.json
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -1,1 +1,2 @@
+ {
++  "name": "x",
+diff --git a/package-lock.json b/package-lock.json
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,1 +1,2 @@
+ {
++  "lockfileVersion": 3,
+
+### case: empty-plan
+### orphan: src/calc.go
+diff --git a/src/calc.go b/src/calc.go
+--- a/src/calc.go
++++ b/src/calc.go
+@@ -1,1 +1,2 @@
+ package calc
++var x = 1
+
+### case: prefix-is-not-a-match
+### planned: src/calc.go
+### orphan: src/calc.go.bak
+diff --git a/src/calc.go.bak b/src/calc.go.bak
+new file mode 100644
+--- /dev/null
++++ b/src/calc.go.bak
+@@ -0,0 +1 @@
++package calc
+
+### case: planned-test-and-unplanned-source
+### planned: src/calc_test.go
+### in: src/calc_test.go
+### orphan: src/calc.go
+diff --git a/src/calc_test.go b/src/calc_test.go
+--- a/src/calc_test.go
++++ b/src/calc_test.go
+@@ -1,1 +1,2 @@
+ package calc
++func TestAdd(t *testing.T) {}
+diff --git a/src/calc.go b/src/calc.go
+--- a/src/calc.go
++++ b/src/calc.go
+@@ -1,1 +1,2 @@
+ package calc
++var x = 1
