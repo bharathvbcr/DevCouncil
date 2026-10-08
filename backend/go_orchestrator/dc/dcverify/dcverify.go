@@ -312,9 +312,10 @@ type Result struct {
 	// has to attach before it can be acted on.
 	Substance Substance `json:"substance"`
 
-	// StubASTParsedFiles is how many changed files the stub checks parsed
-	// rather than line-matched. The test-rigor gates run only on those, so
-	// GatesRun names them only when it is above zero. An older verifier sends
+	// StubASTParsedFiles is how many changed files the test-rigor checks ran
+	// on: files the stub checks parsed, in a language those checks exist for.
+	// A parsed Java or C# file is not counted, since no test check reads it.
+	// GatesRun names the test-rigor gates only when it is above zero. An older verifier sends
 	// no count, which reads as zero: it parsed nothing.
 	StubASTParsedFiles int `json:"stub_ast_parsed_files"`
 
@@ -388,8 +389,9 @@ func (r *Result) GatesRun() []string {
 	// lists the gates it applied does not leave out the one measurement that
 	// ran on every pass.
 	gates := []string{GateSecretScan, GateStubDetection, GateSubstance}
-	// The test-rigor checks run only on files the verifier parsed (Rust, Go,
-	// Python, TypeScript with a source that matched the diff). A diff with
+	// The test-rigor checks run only on files the verifier parsed in a
+	// language they exist for (Rust, Go, Python, TypeScript with a source that
+	// matched the diff; Java and C# are parsed for placeholders only). A diff with
 	// none of those ran neither check, and naming them would report a test
 	// examination that never happened. GateStubAllowed is an outcome of the
 	// stub gate, not a gate of its own, and is never listed.

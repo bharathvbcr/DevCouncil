@@ -12,7 +12,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dc_verify::parse_unified;
-use dc_verify::rigor::{GATE_STUB_ALLOWED, Severity, Strength, detect_stubs_with};
+use dc_verify::rigor::{
+    GATE_STUB_ALLOWED, Severity, Strength, detect_stubs_report, detect_stubs_with,
+};
 
 const MODIFIED: &str = "diff --git a/src/lib.rs b/src/lib.rs
 --- a/src/lib.rs
@@ -94,6 +96,106 @@ new file mode 100644
         "{}",
         b.message
     );
+}
+
+/// Java and C# are parsed for placeholders, so their findings are `proven` —
+/// but no test check reads them, and a report counting them toward
+/// `parsed_files` would tell the Go client the test gates ran when they did
+/// not.
+#[test]
+fn a_parsed_java_or_csharp_file_is_proven_and_not_counted_for_test_rigor() {
+    let diff = "diff --git a/src/A.java b/src/A.java
+new file mode 100644
+--- /dev/null
++++ b/src/A.java
+@@ -0,0 +1,5 @@
++class A {
++    int size() {
++        throw new UnsupportedOperationException(\"not implemented\");
++    }
++}
+diff --git a/src/B.cs b/src/B.cs
+new file mode 100644
+--- /dev/null
++++ b/src/B.cs
+@@ -0,0 +1,4 @@
++class B
++{
++    public int Size() => throw new NotImplementedException();
++}
+";
+    let files = parse_unified(diff).unwrap();
+    let report = detect_stubs_report(&files, &|_| None);
+    assert_eq!(report.parsed_files, 0, "{report:?}");
+    for (path, line) in [("src/A.java", 3), ("src/B.cs", 3)] {
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.path == path)
+            .unwrap_or_else(|| panic!("no finding in {path}: {report:?}"));
+        assert_eq!(
+            (f.gate, f.severity, f.strength, f.line),
+            ("stub_detection", Severity::Blocking, Strength::Proven, line),
+            "{path}"
+        );
+    }
+
+    // A Rust file beside them is still counted: the count is per language,
+    // not switched off.
+    let rust = "diff --git a/src/x.rs b/src/x.rs
+new file mode 100644
+--- /dev/null
++++ b/src/x.rs
+@@ -0,0 +1 @@
++pub fn a() -> u8 { 1 }
+";
+    let mut both = files;
+    both.extend(parse_unified(rust).unwrap());
+    assert_eq!(detect_stubs_report(&both, &|_| None).parsed_files, 1);
+}
+
+/// A Java method's node begins at its annotations. The finding is reported on
+/// its name's line, where Rust and Python report on `fn` and `def`; the
+/// annotation is still what an allow-stub marker above it must reach.
+#[test]
+fn a_java_empty_method_is_reported_on_its_name_and_covered_through_its_annotation() {
+    let diff = "diff --git a/src/H.java b/src/H.java
+new file mode 100644
+--- /dev/null
++++ b/src/H.java
+@@ -0,0 +1,11 @@
++class H {
++    @Override
++    public void onClose() {
++    }
++
++    // allow-stub: the retry policy is decided in TASK-31
++    @Override
++    public void retry() {
++        throw new UnsupportedOperationException();
++    }
++}
+";
+    let files = parse_unified(diff).unwrap();
+    let findings = detect_stubs_with(&files, &|_| None);
+    let empty = findings
+        .iter()
+        .find(|f| f.gate == "stub_detection")
+        .expect("the empty method is reported");
+    assert_eq!(
+        (empty.line, empty.severity, empty.strength),
+        (3, Severity::Advisory, Strength::Proven),
+        "{findings:?}"
+    );
+    assert!(empty.evidence.contains("onClose"), "{}", empty.evidence);
+
+    let allowed = findings
+        .iter()
+        .find(|f| f.gate == GATE_STUB_ALLOWED)
+        .expect("the covered placeholder is recorded");
+    assert_eq!(allowed.line, 9, "{findings:?}");
+    assert!(allowed.message.contains("TASK-31"), "{}", allowed.message);
+    assert_eq!(findings.len(), 2, "{findings:?}");
 }
 
 /// In the substring fallback a marker on one function must not reach code
