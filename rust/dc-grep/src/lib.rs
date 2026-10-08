@@ -64,6 +64,7 @@ mod lexical;
 pub use index::{IndexRequest, IndexResponse, SearchIndex, build_index};
 pub use lexical::{
     RankedHit, RankedRequest, RankedResponse, ranked_engines, ranked_search, ranked_vocabularies,
+    wordpiece_ids,
 };
 
 /// The wire schema this crate speaks. The Go client refuses a binary that
@@ -1610,7 +1611,7 @@ mod tests {
     /// max_results" — advice that could not work, because the clamp was the
     /// thing refusing them.
     ///
-    /// What made it costly rather than merely wrong: `scripts/encode-sparse.py`
+    /// What made it costly rather than merely wrong: `dc-sparse-encode`
     /// asks this question to decide which files to encode. A prefix meant the
     /// files past the cut got no model weights and silently fell back to BM25
     /// inside an index reported as learned.

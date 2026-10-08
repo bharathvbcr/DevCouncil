@@ -1,0 +1,30 @@
+[workspace]
+
+# A workspace of its own so the parent `cargo test --workspace` does not try
+# to build tessl. tessl is Apple-silicon only; a Linux CI job that compiled
+# this crate would fail before it ran a test.
+
+[package]
+name = "dc-sparse-encode"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+publish = false
+description = "Offline doc-side sparse encoder for dcgrep, on tessl. Apple silicon only."
+
+# dc-grep stays inference-free. This crate is the only place a model is loaded,
+# and it is not a member of the dc-grep workspace.
+[dependencies]
+dc-grep = { path = "../dc-grep" }
+serde_json = "1"
+
+# The BERT kernels (LayerNorm, erf-GELU, head-dim 32 attention, segment sparse
+# max) are what tessl main builds. The `feat/bert-sparse-encoder` worktree they
+# were written in is gone; this path is tessl's main checkout. Do not copy the
+# kernels into this crate.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+tessl = { path = "../../../../research/tessl" }
+
+[lints.rust]
+unsafe_code = "forbid"

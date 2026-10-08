@@ -553,9 +553,9 @@ type IndexRequest struct {
 	// MaxFiles bounds the build. Zero means the searcher's ceiling.
 	MaxFiles int `json:"max_files,omitempty"`
 	// Sparse is the output of a learned sparse encoder run offline against
-	// this repository — scripts/encode-sparse.py writes it. Empty means the
-	// ranked index is built from the searcher's own tokeniser and BM25, which
-	// needs no model.
+	// this repository. dc-sparse-encode writes it, on Apple silicon. Empty
+	// means the ranked index is built from the searcher's own tokeniser and
+	// BM25, which needs no model.
 	//
 	// The searcher never loads a model either way: a learned index carries
 	// the token and weight tables a query is scored against, so this path is

@@ -1,8 +1,8 @@
 //! Reading a learned sparse encoder's output into the index.
 //!
-//! The encoder is a neural network and it does not run here. It runs offline,
-//! in Python, against a model the operator downloaded — `scripts/encode-sparse.py`
-//! in this repository — and writes one JSONL file. This module reads that file.
+//! The encoder is a neural network and it does not run here. It runs offline
+//! in `dc-sparse-encode`, on tessl, and only on Apple silicon, and writes one
+//! JSONL file. This module reads that file.
 //! Nothing in the search path ever loads a model, which is what keeps `dcgrep`
 //! a single static binary with no runtime and no `CGO_ENABLED=1`.
 //!

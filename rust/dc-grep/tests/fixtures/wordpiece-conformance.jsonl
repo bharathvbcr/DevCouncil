@@ -1,4 +1,4 @@
-{"model": "opensearch-project/opensearch-neural-sparse-encoding-doc-v2-mini", "note": "Recorded from the model's own HuggingFace tokenizer. Regenerate with scripts/encode-sparse.py --record.", "pairs": 14810}
+{"model": "opensearch-project/opensearch-neural-sparse-encoding-doc-v2-mini", "note": "Recorded from the model's own HuggingFace tokenizer. Frozen: regenerating it from dcgrep's WordPiece would compare the tokeniser to itself. dc-sparse-encode --record prints that and does not rewrite this file.", "pairs": 14810}
 {"text": " ", "ids": []}
 {"text": "x y", "ids": [1060, 1061]}
 {"text": "!", "ids": [999]}

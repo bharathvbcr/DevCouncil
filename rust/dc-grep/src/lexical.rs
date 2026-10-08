@@ -74,6 +74,20 @@ pub fn ranked_engines() -> Vec<&'static str> {
         .collect()
 }
 
+/// The first `max_tokens` WordPiece ids of `text` against `vocab` (token to
+/// id), by the same tokeniser a `wordpiece-30522` query is split with.
+///
+/// Public so the document side can use it: `dc-sparse-encode` tokenises every
+/// document through this function, which makes the documents and the queries
+/// one implementation rather than two that the build-time parity gate has to
+/// reconcile. Agreement with the model's own tokeniser is held by the
+/// conformance fixture `the_tokeniser_reproduces_the_model_s_own` checks,
+/// including the 98 codepoints of `TABLE_SKEW` where this build's newer
+/// Unicode tables deliberately differ.
+pub fn wordpiece_ids(text: &str, vocab: &HashMap<String, u32>, max_tokens: usize) -> Vec<u32> {
+    wordpiece::token_ids_up_to(text, vocab, max_tokens)
+}
+
 /// Ranked files returned when the caller does not say.
 ///
 /// Smaller than the exact searcher's fifty because a ranked list is read from

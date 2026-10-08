@@ -29,7 +29,7 @@ different rankers, and which one a given index uses is written into the file:
 | Vocabulary | Weights from | Needs | Query side |
 |---|---|---|---|
 | `code-v1` | BM25, computed during the build | nothing | IDF, computed from the index |
-| `wordpiece-30522` | a learned sparse encoder, run offline | one Python run, once | the model's own token weights, stored in the index |
+| `wordpiece-30522` | a learned sparse encoder, run offline | one Rust run, on Apple silicon, once | the model's own token weights, stored in the index |
 
 `code-v1` is the default and needs no setup at all. It tokenises identifiers
 the way code is actually written — `parseJSONResponse` yields `parsejsonresponse`,
@@ -112,38 +112,47 @@ enough.
 **SPLADE.** `naver/splade-*` models emit the same vocabulary and work with
 `--model`, but their weights are **CC BY-NC-SA 4.0 — non-commercial**.
 DevCouncil is Apache-2.0 and ships no weights either way, so this is your
-licensing decision rather than the project's; the producer script prints a note
+licensing decision rather than the project's; the encoder prints a note
 and continues. Note also that most SPLADE checkpoints are not doc-side: a
 query-side SPLADE would need inference per query, which this design has nowhere
 to put. Use a `-doc-` checkpoint.
 
 ### 2. Encode the repository
 
+Encoding runs in `dc-sparse-encode`, offline, on Apple silicon. The forward is
+tessl's Metal kernels. `dcgrep` does not link that crate, and a query still
+does not load a model. Linux and Windows can search an index that was encoded
+on a Mac; they cannot run the encoder.
+
 ```bash
-pip install torch transformers      # not a DevCouncil dependency
-python3 scripts/encode-sparse.py --root . --out /tmp/sparse.jsonl
+cargo run --release --manifest-path rust/dc-sparse-encode/Cargo.toml -- --root . --out /tmp/sparse.jsonl
 ```
 
-This is the only step that loads a model, and it is the only step that needs
-Python. Once it has written its output you can uninstall both packages.
+The crate is not a member of the `rust/` workspace, so `cargo test --workspace`
+does not try to build tessl. It depends on a local tessl checkout at
+`../../../../research/tessl` relative to the crate — `~/Code/research/tessl`
+when this repository lives under `~/Code/devtools`. The BERT kernels
+(LayerNorm, erf-GELU, head dimension 32, the masked max) are what that
+checkout builds.
 
-**Planned replacement (owner decision 2026-10-07).** Under the language
-policy this encoder is to be ported to Rust on tessl's inference kernels, with
-any missing kernels built in tessl. That work is task
-`dc-encode-sparse-tessl-port`. Until it lands, this script is both the encoder
-and the wordpiece oracle. The port changes only the encoder's language:
-encoding stays an offline operator step, and `dcgrep` still runs no model at
-query time.
+The default model is
+`opensearch-project/opensearch-neural-sparse-encoding-doc-v2-mini`
+(Apache-2.0, 23M parameters). The doc-side family shares one 30522-token
+WordPiece vocabulary, so a larger checkpoint needs no change in `dcgrep`:
 
-`--device mps` on Apple silicon or `--device cuda` on an NVIDIA machine will be
-considerably faster than the default CPU path.
+| Model | Parameters | |
+|---|---|---|
+| doc-v2-mini | 23M | fastest, smallest; the default |
+| doc-v2-distill | 67M | the usual default elsewhere |
+| doc-v3-distill | 133M | strongest of the Apache-2.0 doc-side family |
 
-The script asks `dcgrep files` which files to encode rather than walking the
-tree itself, so the encoding covers exactly what the index will admit — same
-ignore rules, same `.gitignore`, same size limits. Its own walk does not read
-`.gitignore`, and over this repository that difference was 498 documents
-encoded for paths the index then declined, a third of the run. `--walk` forces
-the fallback, and `--dcgrep PATH` points at a binary that is not on `PATH`.
+There is no `--device`. The forward is Metal.
+
+The encoder asks `dcgrep`, in process, which files the index would admit, so
+the encoding covers the same ignore rules, the same `.gitignore` and the same
+size limits. Its own walk does not read `.gitignore`, and over this repository
+that difference was 498 documents encoded for paths the index then declined, a
+third of the run. `--walk` forces that fallback.
 
 ### 3. Build the index from it
 
@@ -272,10 +281,20 @@ test lexical::wordpiece::tests::the_tokeniser_reproduces_the_model_s_own ... ok
 `rust/dc-grep/tests/fixtures/wordpiece-*` hold the real HuggingFace tokenizer's
 full 30522-token vocabulary and its answers for 14,810 inputs: every codepoint
 across 30 Unicode ranges both alone and inside a word, the parity block, and a
-sample of lines from this repository. Re-record them with:
+sample of lines from this repository. That fixture is frozen. It was recorded
+from the model's own tokenizer. Regenerating it from this WordPiece would
+compare the tokeniser to itself, and the 98 `TABLE_SKEW` codepoints would
+disappear into a pass. `dc-sparse-encode --record` prints that and does not
+rewrite the file.
+
+The neural reference — per-layer hidden states and pooled vectors, for a short
+document, exactly 512 tokens, a document past 512, and a mixed batch — is
+`rust/dc-sparse-encode/tests/fixtures/`. Regenerate it from the local cache,
+without downloading:
 
 ```bash
-python3 scripts/encode-sparse.py --record --root .
+uv venv /tmp/oracle && uv pip install --python /tmp/oracle torch transformers numpy
+/tmp/oracle/bin/python -I rust/dc-sparse-encode/tests/fixtures/record.py
 ```
 
 ### The one divergence that is known and kept
@@ -299,12 +318,12 @@ asserts the set in both directions: nothing outside it may diverge, and
 everything inside it still must — so a crate update that closes one fails the
 test rather than being quietly absorbed into an allowlist.
 
-To re-check the boundary against a corpus larger than the committed one,
-widen `RECORD_RANGES` in `scripts/encode-sparse.py`, record into a scratch
-directory, and point the test at the result:
+A larger sweep has to be recorded from the model's tokenizer, not from this
+WordPiece, and pointed at with `DCGREP_WORDPIECE_CONFORMANCE`. The encoder has
+no `--fixtures` flag. The committed file is the corpus the test reads unless
+that variable names another one:
 
 ```bash
-python3 scripts/encode-sparse.py --record --root . --fixtures /tmp/sweep
 DCGREP_WORDPIECE_CONFORMANCE=/tmp/sweep/wordpiece-conformance.jsonl cargo test -p dc-grep the_tokeniser
 ```
 
@@ -327,12 +346,18 @@ was assigned in Unicode 14 and the linked property tables still call it
 unassigned, so it is not split off as punctuation. The conformance test names
 that single case rather than filtering it out of the fixture.
 
-The producer also checks itself end to end against the real binary, with the
-model faked:
+The encoder checks the JSONL path against `dcgrep`'s own `build_index` and
+`ranked_search`, with the model faked. Those are the functions the `dcgrep`
+binary calls:
 
 ```bash
-python3 scripts/encode-sparse.py --self-test --dcgrep ./rust/target/release/dcgrep
+cargo run --manifest-path rust/dc-sparse-encode/Cargo.toml -- --self-test
 ```
+
+`--bench` times tokenisation, the forward and the pool against the torch
+oracle, interleaved, and reports the minimum of N (at least 5). Torch stays
+on CPU. On 2026-10-08 a release build, N=5, the four fixture documents,
+doc-v2-mini: rust minimum 0.041532s, torch minimum 0.273876s.
 
 ## What the format guarantees
 

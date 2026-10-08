@@ -138,20 +138,60 @@ pub(crate) fn check_parity(
 /// dropped when it does not, since a model without an unknown token has no
 /// way to represent one.
 pub(crate) fn token_ids(text: &str, vocab: &impl Vocab) -> Vec<u32> {
+    token_ids_up_to(text, vocab, MAX_TOKENS)
+}
+
+/// [`token_ids`] stopping after `cap` ids: the first `cap` ids of the whole
+/// text's tokenisation, so a cap is exactly a truncation and never a
+/// different split. The query side caps at [`MAX_TOKENS`]; the document side
+/// (`dc-sparse-encode`) at the model's positions less `[CLS]` and `[SEP]`,
+/// which is what the reference's `truncation=True` keeps.
+pub(crate) fn token_ids_up_to(text: &str, vocab: &impl Vocab, cap: usize) -> Vec<u32> {
+    let specials: Vec<(&str, u32)> = SPECIAL_TOKENS
+        .iter()
+        .filter_map(|&t| vocab.token_id(t).map(|id| (t, id)))
+        .collect();
     let mut ids = Vec::new();
-    for word in basic_tokenize(text) {
-        if ids.len() >= MAX_TOKENS {
-            break;
-        }
-        for piece in wordpiece(&word, vocab) {
-            if ids.len() >= MAX_TOKENS {
-                break;
+    let mut rest = text;
+    while ids.len() < cap {
+        // The leftmost special token in what is left, if any. The five never
+        // overlap one another, so leftmost is the whole rule.
+        let next = specials
+            .iter()
+            .filter_map(|&(t, id)| rest.find(t).map(|at| (at, t.len(), id)))
+            .min_by_key(|&(at, _, _)| at);
+        let (plain, special) = match next {
+            Some((at, len, id)) => (&rest[..at], Some((len, id))),
+            None => (rest, None),
+        };
+        'words: for word in basic_tokenize(plain) {
+            for piece in wordpiece(&word, vocab) {
+                if ids.len() >= cap {
+                    break 'words;
+                }
+                ids.push(piece);
             }
-            ids.push(piece);
+        }
+        match special {
+            Some((len, id)) => {
+                if ids.len() < cap {
+                    ids.push(id);
+                }
+                rest = &rest[plain.len() + len..];
+            }
+            None => break,
         }
     }
     ids
 }
+
+/// BERT's special tokens, which the reference tokeniser splits out of the
+/// text before anything else and emits as their own ids, wherever they occur
+/// and exactly as written: `x[SEP]y` is `x`, `[SEP]`, `y`, while `[sep]` and
+/// `[ SEP ]` are ordinary punctuation and letters. A file that mentions
+/// `[UNK]` in its prose — this crate's own — would otherwise be tokenised
+/// differently on the two sides. Only those present in the vocabulary apply.
+const SPECIAL_TOKENS: [&str; 5] = ["[UNK]", "[SEP]", "[PAD]", "[CLS]", "[MASK]"];
 
 /// Steps 1 to 4: everything before WordPiece.
 ///
@@ -651,6 +691,82 @@ mod tests {
         assert_eq!(token_ids(&text, &reader).len(), MAX_TOKENS);
     }
 
+    /// Special tokens written in the text are split out as the reference does.
+    ///
+    /// Every expected list is what `opensearch-neural-sparse-encoding-doc-v2-mini`'s
+    /// own tokeniser (transformers 5.19, `add_special_tokens=False`) returned
+    /// for that text, recorded 2026-10-08. Before this, all of them that hold
+    /// an exact `[UNK]`/`[SEP]`/`[PAD]`/`[CLS]`/`[MASK]` came out as
+    /// `[`, letters, `]` — a document quoting `[UNK]`, as this crate's own
+    /// docs do, was tokenised differently from the model's view of it.
+    #[test]
+    fn special_tokens_in_the_text_are_split_out_as_the_reference_does() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
+        let vocab: HashMap<String, u32> = std::fs::read_to_string(format!("{dir}wordpiece-vocab.txt"))
+            .expect("vocab fixture")
+            .lines()
+            .enumerate()
+            .map(|(i, t)| (t.to_string(), i as u32))
+            .collect();
+        let cases: &[(&str, &[u32])] = &[
+            ("a [UNK] b", &[1037, 100, 1038]),
+            ("[unk]", &[1031, 4895, 2243, 1033]),
+            ("x[SEP]y", &[1060, 102, 1061]),
+            ("[CLS]", &[101]),
+            ("[MASK]s", &[103, 1055]),
+            ("foo [PAD] bar", &[29379, 0, 3347]),
+            ("[ UNK ]", &[1031, 4895, 2243, 1033]),
+            ("[CLS][SEP]", &[101, 102]),
+            ("[UNK][UNK]", &[100, 100]),
+            ("a[PAD]", &[1037, 0]),
+            ("[cls]", &[1031, 18856, 2015, 1033]),
+            ("[CLS", &[1031, 18856, 2015]),
+            ("CLS]", &[18856, 2015, 1033]),
+            ("x [SEP] y [SEP]", &[1060, 102, 1061, 102]),
+            ("naïve[SEP]café", &[15743, 102, 7668]),
+            ("日[SEP]本", &[1864, 102, 1876]),
+            ("[[UNK]]", &[1031, 100, 1033]),
+            ("tok[MASK]en", &[2000, 2243, 103, 4372]),
+            ("`[UNK]` for a word", &[1036, 100, 1036, 2005, 1037, 2773]),
+            ("[SEP][SEP][SEP]", &[102, 102, 102]),
+        ];
+        for &(text, want) in cases {
+            assert_eq!(token_ids(text, &vocab), want, "{text:?}");
+        }
+        // The cap still cuts exactly, across a special token too.
+        let text = "x[SEP]y[SEP]z";
+        for cap in 0..=5 {
+            assert_eq!(token_ids_up_to(text, &vocab, cap), [1060, 102, 1061, 102, 1062][..cap], "cap {cap}");
+        }
+        // A vocabulary without the specials leaves the text alone.
+        let plain: HashMap<String, u32> = [("[UNK]", 0), ("x", 1), ("[", 2), ("]", 3), ("sep", 4)]
+            .iter()
+            .map(|&(t, i)| (t.to_string(), i))
+            .collect();
+        assert_eq!(token_ids("x[SEP]", &plain), [1, 2, 4, 3]);
+    }
+
+    /// A cap is a truncation of the whole text's ids, never a different split:
+    /// the document side relies on it to match the reference's
+    /// `truncation=True`, which tokenises everything and then cuts.
+    #[test]
+    fn a_capped_tokenisation_is_a_prefix_of_the_whole_one() {
+        let vocab: HashMap<String, u32> = ["[UNK]", "parse", "##json", "json", "x", ".", "日"]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.to_string(), i as u32))
+            .collect();
+        let text = "parsejson x.parse 日日 zzz parse.json ".repeat(40);
+        let whole = token_ids_up_to(&text, &vocab, usize::MAX);
+        assert!(whole.len() > 300, "the text must outrun the caps below");
+        for cap in [0, 1, 2, 3, 5, 7, 8, 9, 100, 299, whole.len(), whole.len() + 1] {
+            let got = token_ids_up_to(&text, &vocab, cap);
+            assert_eq!(got, whole[..cap.min(whole.len())], "cap {cap}");
+            assert_eq!(crate::wordpiece_ids(&text, &vocab, cap), got, "the public entry point, cap {cap}");
+        }
+        assert_eq!(token_ids(&text, &vocab), whole[..MAX_TOKENS.min(whole.len())]);
+    }
+
     /// The tokeniser, judged against the real thing.
     ///
     /// `tests/fixtures/wordpiece-*` were recorded from
@@ -682,13 +798,14 @@ mod tests {
     /// `DCGREP_WORDPIECE_CONFORMANCE` points this at a different corpus. The
     /// committed one is sized to keep `cargo test` fast; a sweep large enough
     /// to be worth running is too large to commit, and a sweep that cannot be
-    /// re-run against this code is a sweep whose result expires. There is no
-    /// separate sweep mode: `scripts/encode-sparse.py --record` is the
-    /// codepoint sweep, over its `RECORD_RANGES`. For a larger one, widen
-    /// those ranges and record somewhere else with `--record --fixtures DIR`,
-    /// then set this variable to `DIR/wordpiece-conformance.jsonl`. The
-    /// vocabulary is still read from this crate's fixtures, so record from
-    /// the same model.
+    /// re-run against this code is a sweep whose result expires. The committed
+    /// fixture is frozen: it was recorded from the model's Hugging Face
+    /// tokenizer, and `dc-sparse-encode --record` prints that instead of
+    /// rewriting it. Regenerating the pairs from this WordPiece would compare
+    /// the tokeniser to itself. A larger corpus has to be recorded from the
+    /// model's tokenizer, then named with `DCGREP_WORDPIECE_CONFORMANCE` as
+    /// `DIR/wordpiece-conformance.jsonl`. The vocabulary is still read from
+    /// this crate's fixtures, so record from the same model.
     #[test]
     fn the_tokeniser_reproduces_the_model_s_own() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
