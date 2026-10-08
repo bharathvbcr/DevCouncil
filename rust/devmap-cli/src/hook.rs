@@ -2284,6 +2284,12 @@ fn spawn_detached_with_cleanup(
 
 /// Read all of stdin up to [`MAX_STDIN_BYTES`] + 1 (to detect overflow).
 pub fn read_stdin_bounded() -> io::Result<Vec<u8>> {
+    read_stdin_limited(MAX_STDIN_BYTES)
+}
+
+/// Read all of stdin up to `limit` + 1 bytes, so a caller can tell a payload
+/// that fits from one that was cut off.
+pub fn read_stdin_limited(limit: usize) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut handle = io::stdin().lock();
     let mut chunk = [0u8; 8192];
@@ -2292,9 +2298,9 @@ pub fn read_stdin_bounded() -> io::Result<Vec<u8>> {
         if n == 0 {
             break;
         }
-        if buf.len() + n > MAX_STDIN_BYTES + 1 {
+        if buf.len() + n > limit + 1 {
             buf.extend_from_slice(&chunk[..n]);
-            buf.truncate(MAX_STDIN_BYTES + 1);
+            buf.truncate(limit + 1);
             // Drain the rest so the writer does not get SIGPIPE mid-payload.
             let mut sink = [0u8; 8192];
             while handle.read(&mut sink)? > 0 {}

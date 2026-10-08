@@ -7,12 +7,15 @@ import (
 	"testing"
 )
 
-// Host config filenames are repository content: `.cursor`, `.codex` and
-// `.mcp.json` all arrive with a clone, and a tracked symlink is content too.
-// Each test below wrote outside the repository, disclosed an outside file into
-// it, or read without a bound before planWrite was rooted.
+// The Cursor rule is the one file this package still writes, and its path is
+// repository content: `.cursor` arrives with a clone, and a tracked symlink is
+// content too. Each test below wrote outside the repository, disclosed an
+// outside file into it, or read without a bound before planWrite was rooted.
+// The host documents DevMap writes carry the same contracts in
+// `rust/devmap-cli/src/integrate.rs`
+// (`a_linked_document_or_parent_is_refused_and_nothing_lands_outside`).
 
-func TestIntegrateRefusesSymlinkedConfigParent(t *testing.T) {
+func TestCursorRuleRefusesSymlinkedConfigParent(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "repo")
 	outside := filepath.Join(base, "outside")
@@ -21,124 +24,78 @@ func TestIntegrateRefusesSymlinkedConfigParent(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(root, ".cursor")); err != nil {
 		t.Fatal(err)
 	}
-	repo := mustOpenRoot(t, root)
-
 	receipt := &Receipt{Files: map[string]string{}}
-	if err := integrateCursor(repo, root, "/bin/true", ModeApply, receipt); err == nil {
+	if err := writeCursorRule(mustOpenRoot(t, root), ModeApply, receipt); err == nil {
 		t.Fatalf("accepted a symlinked .cursor instead of refusing; receipt=%v", receipt.Files)
 	}
-	if _, err := os.Stat(filepath.Join(outside, "mcp.json")); err == nil {
-		t.Fatalf("wrote outside the repository at %s", filepath.Join(outside, "mcp.json"))
+	if entries, _ := os.ReadDir(outside); len(entries) != 0 {
+		t.Fatalf("wrote outside the repository: %v", entries)
 	}
 }
 
-func TestIntegrateRefusesSymlinkedConfigLeaf(t *testing.T) {
+func TestCursorRuleRefusesSymlinkedLeaf(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "repo")
-	mustMkdirAll(t, root)
-	secret := filepath.Join(base, "private.json")
-	if err := os.WriteFile(secret, []byte(`{"apiKey":"sk-SUPER-SECRET-VALUE"}`), 0o600); err != nil {
+	mustMkdirAll(t, filepath.Join(root, ".cursor", "rules"))
+	secret := filepath.Join(base, "private.mdc")
+	if err := os.WriteFile(secret, []byte("sk-SUPER-SECRET-VALUE\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(secret, filepath.Join(root, ".mcp.json")); err != nil {
+	leaf := filepath.Join(root, filepath.FromSlash(cursorRuleRel))
+	if err := os.Symlink(secret, leaf); err != nil {
 		t.Fatal(err)
 	}
-	repo := mustOpenRoot(t, root)
-
 	receipt := &Receipt{Files: map[string]string{}}
-	if err := integrateClaude(repo, root, "/bin/true", ModeApply, receipt); err == nil {
-		t.Fatalf("wrote through a symlinked .mcp.json instead of refusing; receipt=%v", receipt.Files)
+	if err := writeCursorRule(mustOpenRoot(t, root), ModeApply, receipt); err == nil {
+		t.Fatalf("wrote through a symlinked rule instead of refusing; receipt=%v", receipt.Files)
 	}
-	// Replacing the link with a regular file is how the outside file's
-	// contents were copied into the repository, ready to be committed.
-	info, err := os.Lstat(filepath.Join(root, ".mcp.json"))
+	info, err := os.Lstat(leaf)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if info.Mode()&os.ModeSymlink == 0 {
-		body, _ := os.ReadFile(filepath.Join(root, ".mcp.json"))
-		if strings.Contains(string(body), "sk-SUPER-SECRET-VALUE") {
-			t.Fatalf("linked private file disclosed into the repository:\n%s", body)
-		}
 		t.Fatal("replaced the tracked symlink with a regular file")
+	}
+	if body, _ := os.ReadFile(secret); string(body) != "sk-SUPER-SECRET-VALUE\n" {
+		t.Fatalf("the linked file changed: %q", body)
 	}
 }
 
-func TestIntegrateBoundsHostConfigRead(t *testing.T) {
+func TestPlanWriteBoundsTheRead(t *testing.T) {
 	root := t.TempDir()
-	big := make([]byte, maxHostConfigBytes+(1<<20))
-	for i := range big {
-		big[i] = ' '
-	}
-	copy(big, []byte("{}"))
-	if err := os.WriteFile(filepath.Join(root, ".mcp.json"), big, 0o644); err != nil {
+	mustMkdirAll(t, filepath.Join(root, ".cursor", "rules"))
+	big := []byte(cursorRule + strings.Repeat(" ", maxHostConfigBytes+(1<<20)))
+	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(cursorRuleRel)), big, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	repo := mustOpenRoot(t, root)
-
 	receipt := &Receipt{Files: map[string]string{}}
-	if err := integrateClaude(repo, root, "/bin/true", ModeCheck, receipt); err == nil {
-		t.Fatalf("read a %d-byte host config with no bound (bound is %d); receipt=%v",
-			len(big), maxHostConfigBytes, receipt.Files)
+	if err := writeCursorRule(mustOpenRoot(t, root), ModeCheck, receipt); err == nil {
+		t.Fatalf("read an oversized file without a bound; receipt=%v", receipt.Files)
 	}
 }
 
 // An ordinary repository still integrates: the containment must refuse links,
 // not the supported case.
-func TestIntegrateWritesOrdinaryRepository(t *testing.T) {
+func TestCursorRuleWritesOrdinaryRepository(t *testing.T) {
 	root := t.TempDir()
-	repo := mustOpenRoot(t, root)
-
 	receipt := &Receipt{Files: map[string]string{}}
-	if err := integrateCursor(repo, root, "/bin/true", ModeApply, receipt); err != nil {
-		t.Fatalf("integrateCursor: %v", err)
+	if err := writeCursorRule(mustOpenRoot(t, root), ModeApply, receipt); err != nil {
+		t.Fatalf("writeCursorRule: %v", err)
 	}
-	for _, rel := range []string{".cursor/mcp.json", ".cursor/rules/devcouncil.mdc"} {
-		if receipt.Files[rel] != "wrote" {
-			t.Fatalf("%s: receipt says %q, want \"wrote\"", rel, receipt.Files[rel])
-		}
-		info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(rel)))
-		if err != nil {
-			t.Fatalf("%s: %v", rel, err)
-		}
-		if !info.Mode().IsRegular() {
-			t.Fatalf("%s: not a regular file (%v)", rel, info.Mode())
-		}
+	if receipt.Files[cursorRuleRel] != "wrote" {
+		t.Fatalf("receipt says %q, want \"wrote\"", receipt.Files[cursorRuleRel])
 	}
-	// No temporary is left behind by the atomic publish.
-	entries, err := os.ReadDir(filepath.Join(root, ".cursor"))
+	info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(cursorRuleRel)))
+	if err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("not a regular file: %v %v", info, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, ".cursor", "rules"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
 		if strings.Contains(e.Name(), ".devcouncil-tmp-") {
 			t.Fatalf("left a temporary behind: %s", e.Name())
-		}
-	}
-}
-
-// An existing config is still merged, and the merge is not a link-follow.
-// `devmap` is a neighbour like `other`: `devmap integrate` owns that entry.
-func TestIntegrateMergesExistingRegularConfig(t *testing.T) {
-	root := t.TempDir()
-	prior := `{"mcpServers":{"other":{"command":"/bin/echo"},` +
-		`"devmap":{"type":"stdio","command":"/opt/devmap","args":["--root","/repo","mcp"]}}}`
-	if err := os.WriteFile(filepath.Join(root, ".mcp.json"), []byte(prior), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	repo := mustOpenRoot(t, root)
-
-	receipt := &Receipt{Files: map[string]string{}}
-	if err := integrateClaude(repo, root, "/bin/true", ModeApply, receipt); err != nil {
-		t.Fatalf("integrateClaude: %v", err)
-	}
-	body, err := os.ReadFile(filepath.Join(root, ".mcp.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"other", "devcouncil", `"--root"`} {
-		if !strings.Contains(string(body), want) {
-			t.Fatalf("merged config lost %q:\n%s", want, body)
 		}
 	}
 }

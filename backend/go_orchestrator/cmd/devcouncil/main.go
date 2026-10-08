@@ -110,7 +110,7 @@ func runHelp([]string) int {
 func usage() {
 	console.Errorf(`devcouncil — DevCouncil host binary (Phase 7)
 
-The same binary is installed as `+"`dev`"+` and `+"`devcouncil`"+`.
+The same binary is installed as ` + "`dev`" + ` and ` + "`devcouncil`" + `.
 
 Usage:
   devcouncil mcp              Run the MCP stdio server
@@ -122,7 +122,7 @@ Usage:
   devcouncil gate set --mode off|advisory|enforce
   devcouncil hook <event>     Retired lifecycle compatibility (silent no-op)
   devcouncil hook status|disable [--project-root DIR] [--client HOST]
-  devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR]
+  devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR] [--devmap-bin PATH]
   devcouncil integrations …        Alias of integrate
   devcouncil integrate uninstall --target hooks [--dry-run] [--project-root DIR]
   devcouncil skills list
@@ -130,10 +130,10 @@ Usage:
                                    --check writes nothing and exits 1 if any file is missing or differs
   devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local] [--coverage PATH]
   devcouncil grep PATTERN [--json] [--path DIR] [--max N] [--ignore-case]
-                                   Search via the `+"`dcgrep`"+` client (missing binary is an error, never an empty match list)
-  devcouncil map [devmap args…]   Exec `+"`devmap`"+` (bare invocation: build --manifest)
+                                   Search via the ` + "`dcgrep`" + ` client (missing binary is an error, never an empty match list)
+  devcouncil map [devmap args…]   Exec ` + "`devmap`" + ` (bare invocation: build --manifest)
   devcouncil graph …              Alias of map
-  devcouncil ast …                Exec `+"`devmap ast`"+`
+  devcouncil ast …                Exec ` + "`devmap ast`" + `
   devcouncil gusset-check         Prove the linked Rust engine is dc-glob on Gusset
 
 Presentation: --progress auto|always|never (default: auto). JSON stays on stdout.
@@ -143,8 +143,8 @@ First-time / standalone (no host yet):
   bash scripts/install.sh --only=devmap
   bash scripts/install.sh --help
 
-Hosts: %s
-`, strings.Join(integrate.Hosts, ", "))
+Hosts: the ones ` + "`devmap integrate --help`" + ` lists; DevMap owns the host table.
+`)
 }
 
 // projectRoot is the repository a command acts on when no --project-root was
@@ -507,10 +507,9 @@ func resolveDevmap() (string, error) {
 
 func runIntegrate(args []string) int {
 	if len(args) < 1 {
-		// Name them here: this is where a caller who does not know the set
-		// arrives, and the list is now the same one `devmap integrate` takes.
-		console.Errorf("integrate requires a host; expected one of: %s\n",
-			strings.Join(integrate.Hosts, ", "))
+		// `devmap integrate` owns the host list, and its own refusal of an
+		// unknown name prints it.
+		console.Errorln("integrate requires a host; `devmap integrate --help` lists them")
 		return 2
 	}
 	if args[0] == "uninstall" {
@@ -542,6 +541,13 @@ func runIntegrate(args []string) int {
 				return 2
 			}
 			opts.Root = root
+		case "--devmap-bin":
+			i++
+			if i >= len(args) {
+				console.Errorln("--devmap-bin needs a path")
+				return 2
+			}
+			opts.DevmapBin = args[i]
 		case "--json":
 			// always print receipt JSON on stdout for scripting
 		default:

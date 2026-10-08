@@ -14,7 +14,7 @@ availability; it does not certify every platform, editor session or release.
 | Task state | Rust `dcstore` | Cooperating-client leases and durable records, not arbitrary filesystem isolation |
 | Verification | Go task checks plus Rust `dcverify` rigor | Opt-in mode; skipped checks and missing profiles must be read explicitly |
 | Search | Rust `dcgrep` | Ignore-aware search and optional trigram index; text matches are not semantic edges |
-| Host adapters | Six names shared by Go and Rust installers | Different outputs by host; Go's Codex task adapter remains comment-only while Rust installs DevMap MCP |
+| Host adapters | Six hosts, one Rust table (`devmap integrate`); the Go host passes its server over `--servers-stdin` | Different outputs by host; Codex gets `[mcp_servers.devcouncil]` merged into the project `.codex/config.toml` without rewriting other bytes |
 | Engineering skills | Embedded/scaffolded instructions | Guidance, not enforced permission or proof of host loading |
 | Sandbox selector | `--sandbox local` only | Anything else is refused (`verify.ParseSandbox`, exit 2); Docker/Nix isolation is not implemented; building it is planned (owner decision 2026-10-07, task `dc-verify-isolated-sandbox`) and is gated on an approved security-impact statement |
 

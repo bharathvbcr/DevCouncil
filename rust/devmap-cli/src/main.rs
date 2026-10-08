@@ -1598,6 +1598,12 @@ enum Commands {
         /// Command path written into MCP entries. Unset: this binary.
         #[arg(long)]
         binary: Option<PathBuf>,
+        /// Also register the servers named on stdin, in each host's own
+        /// document shape: `{"servers": [{"name", "command", "args"?, "env"?,
+        /// "cwd"?}]}`. `command` and `cwd` are absolute; `devmap` is reserved.
+        /// DevCouncil passes its own server this way.
+        #[arg(long)]
+        servers_stdin: bool,
     },
 
     /// Report build and schema versions.
@@ -1627,6 +1633,11 @@ enum SkillsAction {
         /// Exit 0 only when every selected file already matches.
         #[arg(long)]
         check: bool,
+        /// Install the skill library on stdin instead of DevMap's five:
+        /// `{"skills": [{"name", "content"}]}`. DevCouncil passes its embedded
+        /// domain skills this way, so one installer writes the receipt.
+        #[arg(long)]
+        library_stdin: bool,
     },
 }
 
@@ -4210,7 +4221,13 @@ fn emit_literals(report: &devmap_query::LiteralReport) {
         } else {
             site.qualified_name.as_str()
         };
-        outln!("{}:{}  {}  {}", site.file_path, site.line, symbol, site.value);
+        outln!(
+            "{}:{}  {}  {}",
+            site.file_path,
+            site.line,
+            symbol,
+            site.value
+        );
     }
     emit_truncation(report.shown, report.hidden, report.total, report.truncated);
     if let Some(reason) = &report.walk_incomplete {
@@ -6833,7 +6850,11 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 emit_explore(&report);
             }
         }
-        Commands::Literals { query, exact, budget } => {
+        Commands::Literals {
+            query,
+            exact,
+            budget,
+        } => {
             let store = open_for_read(cli)?;
             let report = StoreQueryEngine::new(&store).literals(query, *exact, *budget)?;
             if cli.json {
@@ -8386,6 +8407,7 @@ raise --max-nodes to widen"
             dry_run,
             check,
             binary,
+            servers_stdin,
         } => run_integrate(
             cli,
             *host,
@@ -8393,6 +8415,7 @@ raise --max-nodes to widen"
             *dry_run,
             *check,
             binary.as_deref(),
+            *servers_stdin,
         )?,
         Commands::Version { json } => {
             if *json || cli.json {
@@ -8419,19 +8442,20 @@ fn run_skills(cli: &Cli, action: &SkillsAction) -> anyhow::Result<()> {
             destinations,
             dry_run,
             check,
+            library_stdin,
         } => {
             let dests: Vec<&str> = if destinations.is_empty() {
                 skills::DEFAULT_DESTINATIONS.to_vec()
             } else {
                 destinations.iter().map(String::as_str).collect()
             };
-            let report = skills::install_devmap_skills(project_root, &dests, *dry_run, *check)?;
-            if *check && !report.check_ok {
-                anyhow::bail!(
-                    "skills install --check: {} file(s) missing or differ",
-                    report.differing.len()
-                );
-            }
+            let report = if *library_stdin {
+                let bytes = hook::read_stdin_limited(skills::MAX_LIBRARY_BYTES)?;
+                let library = skills::parse_library(&bytes)?;
+                skills::install_skills(project_root, &dests, &library, *dry_run, *check)?
+            } else {
+                skills::install_devmap_skills(project_root, &dests, *dry_run, *check)?
+            };
             if cli.json {
                 emit_json(
                     cli,
@@ -8469,6 +8493,13 @@ fn run_skills(cli: &Cli, action: &SkillsAction) -> anyhow::Result<()> {
                     report.receipt.display()
                 );
             }
+            // Printed first, then refused: the report names what differs.
+            if *check && !report.check_ok {
+                anyhow::bail!(
+                    "skills install --check: {} file(s) missing or differ",
+                    report.differing.len()
+                );
+            }
             Ok(())
         }
     }
@@ -8481,7 +8512,16 @@ fn run_integrate(
     dry_run: bool,
     check: bool,
     binary: Option<&Path>,
+    servers_stdin: bool,
 ) -> anyhow::Result<()> {
+    // Read and validated before anything is written: a malformed request must
+    // not leave DevMap's half applied and the caller's half missing.
+    let servers = if servers_stdin {
+        let bytes = hook::read_stdin_limited(integrate::MAX_SERVER_REQUEST_BYTES)?;
+        integrate::parse_server_request(&bytes)?
+    } else {
+        Vec::new()
+    };
     let executable = claude::plugin_command(&std::env::current_exe()?, binary);
     let db = cli.db();
     let (map, map_rel, graph_rel, store_rel) = integrate_map_context(project_root, &db)?;
@@ -8493,6 +8533,7 @@ fn run_integrate(
         &map_rel,
         &graph_rel,
         &store_rel,
+        &servers,
         dry_run,
         check,
     )?;
@@ -8529,9 +8570,15 @@ fn run_integrate(
                     "changed": m.changed,
                     "note": m.note,
                 })).collect::<Vec<_>>(),
+                "servers": report.servers.iter().map(|m| serde_json::json!({
+                    "path": m.path.display().to_string(),
+                    "changed": m.changed,
+                    "note": m.note,
+                })).collect::<Vec<_>>(),
                 "notes": report.notes,
                 "dry_run": dry_run,
                 "check": check,
+                "check_ok": report.check_ok,
             }),
         )?;
     } else {
@@ -8566,12 +8613,17 @@ fn run_integrate(
             .iter()
             .chain(report.project_mcp.iter())
             .chain(report.hooks.iter())
+            .chain(report.servers.iter())
         {
             outln!("  {}: {}", mcp.path.display(), mcp.note);
         }
         for note in &report.notes {
             outln!("  note: {note}");
         }
+    }
+    // Printed first, then refused: the report is what says which asset differs.
+    if check && !report.check_ok {
+        anyhow::bail!("integrate --check: assets differ from the expected installation");
     }
     Ok(())
 }

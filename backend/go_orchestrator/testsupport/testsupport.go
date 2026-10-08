@@ -46,6 +46,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -164,6 +165,21 @@ func DCVerify(t testing.TB) string { return cargoBin(t, "dc-verify", "dcverify")
 
 // DCGrep builds the Rust searcher binary and returns its path.
 func DCGrep(t testing.TB) string { return cargoBin(t, "dc-grep", "dcgrep") }
+
+// Devmap returns the devmap binary: DEVMAP_BIN when set — used or refused,
+// never replaced, the rule the host binary applies — else a build of this
+// workspace's `devmap-cli`.
+func Devmap(t testing.TB) string {
+	t.Helper()
+	if explicit := strings.TrimSpace(os.Getenv("DEVMAP_BIN")); explicit != "" {
+		info, err := os.Stat(explicit)
+		if err != nil || info.IsDir() {
+			t.Fatalf("DEVMAP_BIN=%s is not a binary (%v); an explicit binary is used or refused", explicit, err)
+		}
+		return explicit
+	}
+	return cargoBin(t, "devmap-cli", "devmap")
+}
 
 // cargoBin builds one binary and returns the path to a stable copy of it.
 //

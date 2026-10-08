@@ -27,6 +27,8 @@ moved to Go. It could not be imported, let alone pass, for months, and nothing
 noticed, because no workflow ever collected this directory. Its assertions were
 ported to `backend/go_orchestrator/devcouncil/skills/delivery_test.go`,
 `backend/go_orchestrator/cmd/devcouncil/skills_cli_test.go`, and
-`rust/devmap-cli/src/skills.rs`, and the file was deleted.
+`rust/devmap-cli/src/skills.rs`, and the file was deleted. The Go installer
+was later retired in favour of the Rust one, and the delivery contracts moved
+with it into `rust/devmap-cli/src/skills.rs`.
 
 A test nobody runs reports the same result as a test that ran and passed.

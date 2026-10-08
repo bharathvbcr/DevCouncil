@@ -1,6 +1,6 @@
 //! Host integration: global DevMap MCP registration and project assets.
 //!
-//! `devmap integrate <cursor|claude|codex>`:
+//! `devmap integrate <host>` (the hosts are [`Host`]'s variants):
 //! - writes/refreshes marker-guarded guides and `.cursor/rules/devmap.mdc`
 //! - installs the five embedded DevMap skills into the host's skill layout
 //! - registers `devmap mcp` (no `--db`) in the global Cursor / Claude configs,
@@ -10,7 +10,10 @@
 //!   insufficient for multi-tab Cursor — callers must still pass `repo_path`),
 //!   except that Claude's project `.mcp.json` gets the same withholding as its
 //!   user-scope entry while the plugin is enabled
+//! - with `--servers-stdin`, registers a caller's servers (DevCouncil's
+//!   `devcouncil`) in each host's project document via [`register_server`]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -91,10 +94,9 @@ impl Host {
 
     /// The canonical name of this host, as typed on the command line.
     ///
-    /// Tied to clap's own accepted values by a test below, and read out of this
-    /// source by the Go integrator's drift check
-    /// (`backend/go_orchestrator/devcouncil/integrate/host_selection_test.go`),
-    /// which needs the arms of this match to stay literal.
+    /// Tied to clap's own accepted values by a test below. DevCouncil's Go host
+    /// keeps no copy of this list: it passes host names through to `devmap
+    /// integrate`, whose refusal of an unknown one prints clap's list.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cursor => "cursor",
@@ -137,7 +139,12 @@ pub struct IntegrateReport {
     pub global_mcp: Vec<McpMergeOutcome>,
     pub project_mcp: Vec<McpMergeOutcome>,
     pub hooks: Vec<McpMergeOutcome>,
+    /// The caller's servers from `--servers-stdin`, one outcome each.
+    pub servers: Vec<McpMergeOutcome>,
     pub notes: Vec<String>,
+    /// Under `--check`, whether every asset already matched. The report is
+    /// returned either way, so a caller can see *which* file differs.
+    pub check_ok: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,12 +165,20 @@ pub fn integrate(
     map_rel: &str,
     graph_rel: &str,
     store_rel: &str,
+    servers: &[ServerSpec],
     dry_run: bool,
     check: bool,
 ) -> anyhow::Result<IntegrateReport> {
     let root = project_root
         .canonicalize()
         .with_context(|| format!("project root {}", project_root.display()))?;
+
+    // Every caller server is planned before DevMap writes anything: a
+    // document that refuses the caller's entry must not leave DevMap's half
+    // applied and the caller's missing.
+    for spec in servers {
+        register_server(host, &root, spec, true)?;
+    }
 
     let mut report = IntegrateReport::default();
 
@@ -344,19 +359,24 @@ pub fn integrate(
         }
     }
 
-    if check {
-        let guides_dirty = report.guides.iter().any(|g| g.changed());
-        let skills_dirty = !report.skills_differing.is_empty();
-        let mcp_dirty = report
-            .global_mcp
-            .iter()
-            .chain(report.project_mcp.iter())
-            .chain(report.hooks.iter())
-            .any(|m| m.changed);
-        if guides_dirty || skills_dirty || mcp_dirty || !skills_check_ok {
-            bail!("integrate --check: assets differ from the expected DevMap installation");
-        }
+    // The caller's servers go into the same project document, through the
+    // same per-host table, as DevMap's own entry.
+    for spec in servers {
+        report
+            .servers
+            .push(register_server(host, &root, spec, dry_run || check)?);
     }
+
+    let guides_dirty = report.guides.iter().any(|g| g.changed());
+    let skills_dirty = !report.skills_differing.is_empty();
+    let mcp_dirty = report
+        .global_mcp
+        .iter()
+        .chain(report.project_mcp.iter())
+        .chain(report.hooks.iter())
+        .chain(report.servers.iter())
+        .any(|m| m.changed);
+    report.check_ok = !(guides_dirty || skills_dirty || mcp_dirty || !skills_check_ok);
 
     Ok(report)
 }
@@ -401,16 +421,30 @@ fn project_mcp_sites(host: Host, root: &Path) -> Vec<ProjectMcpSite> {
     }
 }
 
-/// Where one host keeps its server list, and how that document is shaped.
+/// How a host's project document is encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocFormat {
+    Json,
+    /// Codex. Written by [`merge_toml_server`], which keeps every byte
+    /// outside the one table it owns.
+    Toml,
+}
+
+/// Where one host keeps its project server list, and how that document is
+/// shaped.
 ///
-/// Three hosts, three shapes, and the differences are load-bearing:
-/// Antigravity nests servers under `mcpServers`, OpenCode under `mcp`, and
-/// Warp's file *is* the server map with no wrapper at all. Declaring the shape
-/// once, here, is what lets a single writer serve all of them rather than
-/// three near-copies that drift.
+/// This is the one table of per-host documents. DevCouncil's Go host used to
+/// carry a copy for the server it registers, pinned to this one by a test that
+/// parsed this file; it now hands its server to `devmap integrate
+/// --servers-stdin` instead, so both servers are written from here.
+///
+/// The shapes are load-bearing: Antigravity nests servers under `mcpServers`,
+/// OpenCode under `mcp` with argv-array entries, Warp's file *is* the server
+/// map, and Codex is TOML under `mcp_servers`.
 struct HostMcpDoc {
     /// Path relative to the repository root.
     rel: &'static str,
+    format: DocFormat,
     /// Key the server map lives under, or `None` when the document root is it.
     container: Option<&'static str>,
     /// Extra top-level keys to establish when creating the file.
@@ -418,39 +452,62 @@ struct HostMcpDoc {
     /// Whether entries name the program as an argv array (`command: [...]`)
     /// instead of `command` + `args`.
     argv_form: bool,
+    /// Whether the host honours a `cwd` key on an entry. Antigravity resolves
+    /// relative paths against its own working directory, and Codex documents
+    /// `cwd` for stdio servers; the others name no such key.
+    accepts_cwd: bool,
+    /// Whether [`merge_host_mcp`] writes DevMap's own entry here. Cursor and
+    /// Claude carry it through [`offer_project_mcp`], which also withholds it
+    /// beside the enabled plugin, and Codex in the user-level config.
+    carries_devmap: bool,
 }
 
 impl Host {
-    /// The project-scoped server document this host reads, if this module
-    /// writes one for it.
-    ///
-    /// Cursor and Claude are absent because their documents go through the
-    /// `mcpServers` merge in [`offer_project_mcp`], which also handles their
-    /// global counterparts. Codex registers through its own TOML writer.
-    fn mcp_document(self) -> Option<HostMcpDoc> {
+    /// The project-scoped server document this host reads.
+    fn project_document(self) -> HostMcpDoc {
+        let json = |rel, container| HostMcpDoc {
+            rel,
+            format: DocFormat::Json,
+            container,
+            preamble: &[],
+            argv_form: false,
+            accepts_cwd: false,
+            carries_devmap: false,
+        };
         match self {
-            Self::Cursor | Self::Claude | Self::Codex => None,
-            Self::Antigravity => Some(HostMcpDoc {
-                rel: ".agents/mcp_config.json",
-                container: Some("mcpServers"),
-                preamble: &[],
-                argv_form: false,
-            }),
-            Self::OpenCode => Some(HostMcpDoc {
-                rel: "opencode.json",
-                container: Some("mcp"),
+            Self::Cursor => json(".cursor/mcp.json", Some("mcpServers")),
+            Self::Claude => json(".mcp.json", Some("mcpServers")),
+            // Read by Codex for trusted projects only; the user-level
+            // `~/.codex/config.toml` is where DevMap's own entry goes.
+            Self::Codex => HostMcpDoc {
+                format: DocFormat::Toml,
+                accepts_cwd: true,
+                ..json(".codex/config.toml", Some("mcp_servers"))
+            },
+            Self::Antigravity => HostMcpDoc {
+                accepts_cwd: true,
+                carries_devmap: true,
+                ..json(".agents/mcp_config.json", Some("mcpServers"))
+            },
+            Self::OpenCode => HostMcpDoc {
                 // OpenCode validates against this schema; a file created
                 // without it loses editor completion for every other key.
                 preamble: &[("$schema", "https://opencode.ai/config.json")],
                 argv_form: true,
-            }),
-            Self::Warp => Some(HostMcpDoc {
-                rel: ".devcouncil/integrations/warp-mcp.json",
-                container: None,
-                preamble: &[],
-                argv_form: false,
-            }),
+                carries_devmap: true,
+                ..json("opencode.json", Some("mcp"))
+            },
+            Self::Warp => HostMcpDoc {
+                carries_devmap: true,
+                ..json(".devcouncil/integrations/warp-mcp.json", None)
+            },
         }
+    }
+
+    /// The project document that carries DevMap's own entry, if this host has
+    /// one written by [`merge_host_mcp`].
+    fn mcp_document(self) -> Option<HostMcpDoc> {
+        Some(self.project_document()).filter(|doc| doc.carries_devmap)
     }
 }
 
@@ -476,21 +533,33 @@ pub fn merge_host_mcp(
     let Some(doc) = host.mcp_document() else {
         return Ok(None);
     };
-    let path = root.join(doc.rel);
+    let entry = host_mcp_entry(&doc, executable, root)?;
+    merge_json_server(&root.join(doc.rel), &doc, MCP_SERVER_NAME, entry, dry_run).map(Some)
+}
 
-    let mut document = match read_host_config(&path) {
-        Ok(text) if text.trim().is_empty() => empty_map(),
-        Ok(text) => serde_json::from_str::<Value>(&text).map_err(|err| {
+/// Fold one named server entry into a host's JSON project document.
+fn merge_json_server(
+    path: &Path,
+    doc: &HostMcpDoc,
+    name: &str,
+    entry: Value,
+    dry_run: bool,
+) -> anyhow::Result<McpMergeOutcome> {
+    let path = path.to_path_buf();
+    let mut document = match read_project_doc(&path)? {
+        None => empty_map(),
+        Some(text) if text.trim().is_empty() => empty_map(),
+        Some(text) => serde_json::from_str::<Value>(&text).map_err(|err| {
             // Refuse rather than overwrite: an unparseable config is far more
             // likely to be a file worth keeping than one worth replacing.
+            // serde_json reads no comments, so a commented file lands here
+            // too rather than losing them in the rewrite.
             anyhow!(
                 "{}: not JSON ({err}); refuse to overwrite a host config this \
                  module cannot read",
                 path.display()
             )
         })?,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => empty_map(),
-        Err(err) => return Err(anyhow!("{}: {err}", path.display())),
     };
     if !document.is_object() {
         bail!(
@@ -508,39 +577,56 @@ pub fn merge_host_mcp(
             .or_insert_with(|| json!(value));
     }
 
-    let entry = host_mcp_entry(&doc, executable, root)?;
-    let before = servers_of(&document, &doc).cloned();
+    let before = server_of(&document, doc, name).cloned();
     if before.as_ref() == Some(&entry) {
-        return Ok(Some(McpMergeOutcome {
+        return Ok(McpMergeOutcome {
             path,
             changed: false,
             removed_stale_db: false,
             note: format!("{} already current", doc.rel),
-        }));
+        });
     }
     // Reported rather than folded into "changed": replacing a pinned store
     // path is the repair this exists for, and a receipt that does not
     // distinguish it from a first-time write cannot show the repair happened.
-    let removed_stale_db = before.as_ref().is_some_and(entry_names_a_store);
+    let removed_stale_db =
+        name == MCP_SERVER_NAME && before.as_ref().is_some_and(entry_names_a_store);
 
-    servers_mut(&mut document, &doc)?.insert(MCP_SERVER_NAME.to_string(), entry);
+    servers_mut(&mut document, doc)?.insert(name.to_string(), entry);
 
     if !dry_run {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
+        // No `create_dir_all` first: it would follow a linked parent out of
+        // the repository. `write_atomic` creates missing directories through
+        // pinned handles and refuses a link on the way.
         write_json_pretty(&path, &document)?;
     }
-    Ok(Some(McpMergeOutcome {
+    Ok(McpMergeOutcome {
         path,
         changed: true,
         removed_stale_db,
         note: if removed_stale_db {
             format!("{}: replaced a pinned --db entry with --root", doc.rel)
         } else {
-            format!("{}: registered devmap", doc.rel)
+            format!("{}: registered {name}", doc.rel)
         },
-    }))
+    })
+}
+
+/// Read a project document without following a link at any component.
+///
+/// These files arrive with a clone, and so can a symlink in their place: a
+/// read that followed one would copy an outside file's contents into the merged
+/// result and then into the repository.
+fn read_project_doc(path: &Path) -> anyhow::Result<Option<String>> {
+    use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+    match SafeFile::open(path, Access::Read, Creation::Never) {
+        Ok(mut file) => file
+            .read_text(MAX_HOST_CONFIG_BYTES)
+            .map(Some)
+            .with_context(|| format!("reading {}", path.display())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(anyhow!("{}: {err}", path.display())),
+    }
 }
 
 /// The devmap entry in this host's spelling.
@@ -556,21 +642,402 @@ fn host_mcp_entry(doc: &HostMcpDoc, executable: &Path, root: &Path) -> anyhow::R
         .get("command")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("mcp entry has no command"))?;
-    let mut argv = vec![json!(command)];
-    for arg in standard
+    let args = standard
         .get("args")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-    {
-        argv.push(arg.clone());
-    }
-    Ok(json!({
+        .cloned();
+    Ok(argv_entry(command, args, None))
+}
+
+/// OpenCode's entry: one argv array, a declared local type, and its own name
+/// for the environment block.
+fn argv_entry(
+    command: &str,
+    args: impl IntoIterator<Item = Value>,
+    environment: Option<&BTreeMap<String, String>>,
+) -> Value {
+    let mut argv = vec![json!(command)];
+    argv.extend(args);
+    let mut entry = json!({
         "type": "local",
         "command": Value::Array(argv),
         "enabled": true,
         "timeout": 10_000,
-    }))
+    });
+    if let Some(environment) = environment.filter(|env| !env.is_empty()) {
+        entry["environment"] = json!(environment);
+    }
+    entry
+}
+
+/// The most servers one `--servers-stdin` request may register.
+const MAX_REQUESTED_SERVERS: usize = 8;
+/// Bound on the request document itself.
+pub const MAX_SERVER_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_SERVER_ARGS: usize = 64;
+const MAX_SERVER_ENV: usize = 64;
+const MAX_SERVER_STRING: usize = 4096;
+
+/// A server another tool asks `devmap integrate` to register beside DevMap's
+/// own — DevCouncil's `devcouncil` server is the caller this exists for.
+///
+/// DevMap owns every host's document shape; the caller owns only what its
+/// server runs. That split is what lets one table describe each host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerSpec {
+    pub name: String,
+    /// Absolute path of the program. A bare name would hand the host whichever
+    /// build wins on PATH, which is the contract DevMap's own entry refuses.
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    /// Working directory, written only where the host honours one.
+    pub cwd: Option<String>,
+}
+
+/// Parse and validate `{"servers": [{name, command, args?, env?, cwd?}]}`.
+///
+/// Unknown keys are refused rather than ignored: a field the caller believes
+/// was written and this reader dropped is a silent misconfiguration.
+pub fn parse_server_request(bytes: &[u8]) -> anyhow::Result<Vec<ServerSpec>> {
+    if bytes.len() > MAX_SERVER_REQUEST_BYTES {
+        bail!("server request exceeds {MAX_SERVER_REQUEST_BYTES} bytes");
+    }
+    let request: Value = serde_json::from_slice(bytes)
+        .map_err(|err| anyhow!("server request is not JSON: {err}"))?;
+    let object = request
+        .as_object()
+        .ok_or_else(|| anyhow!("server request must be a JSON object"))?;
+    refuse_unknown_keys("server request", object, &["servers"])?;
+    let servers = object
+        .get("servers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("server request needs a `servers` array"))?;
+    if servers.is_empty() || servers.len() > MAX_REQUESTED_SERVERS {
+        bail!("server request must name 1–{MAX_REQUESTED_SERVERS} servers");
+    }
+    let mut specs: Vec<ServerSpec> = Vec::with_capacity(servers.len());
+    for server in servers {
+        let spec = parse_server_spec(server)?;
+        if specs.iter().any(|seen| seen.name == spec.name) {
+            bail!("server {:?} is named twice", spec.name);
+        }
+        specs.push(spec);
+    }
+    Ok(specs)
+}
+
+fn parse_server_spec(value: &Value) -> anyhow::Result<ServerSpec> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("each server must be a JSON object"))?;
+    refuse_unknown_keys("server", object, &["name", "command", "args", "env", "cwd"])?;
+    let string = |key: &str| -> anyhow::Result<Option<String>> {
+        match object.get(key) {
+            None => Ok(None),
+            Some(Value::String(text)) => Ok(Some(checked_string(key, text)?)),
+            Some(other) => bail!("server `{key}` is {}, not a string", kind_of(other)),
+        }
+    };
+    let name = string("name")?.ok_or_else(|| anyhow!("server needs a `name`"))?;
+    let valid_name = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        && name.as_bytes()[0].is_ascii_alphanumeric();
+    if !valid_name {
+        bail!("server name {name:?} must be 1–64 of [a-z0-9_-], starting alphanumeric");
+    }
+    if name == MCP_SERVER_NAME {
+        bail!("server name {name:?} is DevMap's own entry, which `devmap integrate` writes itself");
+    }
+    let command = string("command")?.ok_or_else(|| anyhow!("server {name:?} needs a `command`"))?;
+    if !Path::new(&command).is_absolute() {
+        bail!("server {name:?}: command {command:?} must be an absolute path");
+    }
+    let cwd = string("cwd")?;
+    if let Some(cwd) = &cwd {
+        if !Path::new(cwd).is_absolute() {
+            bail!("server {name:?}: cwd {cwd:?} must be an absolute path");
+        }
+    }
+    let args = match object.get("args") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_SERVER_ARGS {
+                bail!("server {name:?}: more than {MAX_SERVER_ARGS} args");
+            }
+            items
+                .iter()
+                .map(|item| match item {
+                    Value::String(text) => checked_string("args", text),
+                    other => bail!(
+                        "server {name:?}: an arg is {}, not a string",
+                        kind_of(other)
+                    ),
+                })
+                .collect::<anyhow::Result<_>>()?
+        }
+        Some(other) => bail!(
+            "server {name:?}: `args` is {}, not an array",
+            kind_of(other)
+        ),
+    };
+    let env = match object.get("env") {
+        None => BTreeMap::new(),
+        Some(Value::Object(vars)) => {
+            if vars.len() > MAX_SERVER_ENV {
+                bail!("server {name:?}: more than {MAX_SERVER_ENV} env entries");
+            }
+            let mut env = BTreeMap::new();
+            for (key, value) in vars {
+                let valid_key = key.bytes().enumerate().all(|(i, b)| {
+                    b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())
+                }) && !key.is_empty();
+                if !valid_key {
+                    bail!("server {name:?}: env name {key:?} is not an identifier");
+                }
+                let Value::String(text) = value else {
+                    bail!(
+                        "server {name:?}: env {key} is {}, not a string",
+                        kind_of(value)
+                    );
+                };
+                env.insert(key.clone(), checked_string("env", text)?);
+            }
+            env
+        }
+        Some(other) => bail!(
+            "server {name:?}: `env` is {}, not an object",
+            kind_of(other)
+        ),
+    };
+    Ok(ServerSpec {
+        name,
+        command,
+        args,
+        env,
+        cwd,
+    })
+}
+
+fn checked_string(key: &str, text: &str) -> anyhow::Result<String> {
+    if text.len() > MAX_SERVER_STRING || text.contains('\0') {
+        bail!("server `{key}` value is over {MAX_SERVER_STRING} bytes or contains NUL");
+    }
+    Ok(text.to_string())
+}
+
+fn refuse_unknown_keys(
+    what: &str,
+    object: &Map<String, Value>,
+    known: &[&str],
+) -> anyhow::Result<()> {
+    match object.keys().find(|key| !known.contains(&key.as_str())) {
+        Some(key) => bail!("{what}: unknown key {key:?}"),
+        None => Ok(()),
+    }
+}
+
+/// Register a caller's server in `host`'s project document.
+pub fn register_server(
+    host: Host,
+    root: &Path,
+    spec: &ServerSpec,
+    dry_run: bool,
+) -> anyhow::Result<McpMergeOutcome> {
+    let doc = host.project_document();
+    let path = root.join(doc.rel);
+    let cwd = spec.cwd.as_ref().filter(|_| doc.accepts_cwd);
+    match doc.format {
+        DocFormat::Json => {
+            let entry = if doc.argv_form {
+                argv_entry(
+                    &spec.command,
+                    spec.args.iter().map(|a| json!(a)),
+                    Some(&spec.env),
+                )
+            } else {
+                let mut entry = json!({"command": spec.command, "args": spec.args});
+                if !spec.env.is_empty() {
+                    entry["env"] = json!(spec.env);
+                }
+                if let Some(cwd) = cwd {
+                    entry["cwd"] = json!(cwd);
+                }
+                entry
+            };
+            merge_json_server(&path, &doc, &spec.name, entry, dry_run)
+        }
+        DocFormat::Toml => {
+            let mut entry = toml::Table::new();
+            entry.insert("command".into(), toml::Value::String(spec.command.clone()));
+            entry.insert(
+                "args".into(),
+                toml::Value::Array(spec.args.iter().cloned().map(toml::Value::String).collect()),
+            );
+            if !spec.env.is_empty() {
+                let env: toml::Table = spec
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), toml::Value::String(v.clone())))
+                    .collect();
+                entry.insert("env".into(), toml::Value::Table(env));
+            }
+            if let Some(cwd) = cwd {
+                entry.insert("cwd".into(), toml::Value::String(cwd.clone()));
+            }
+            merge_toml_server(&path, &doc, &spec.name, entry, dry_run)
+        }
+    }
+}
+
+/// Fold one `[<container>.<name>]` table into a TOML document, keeping every
+/// byte outside that table.
+///
+/// The document is the user's: `.codex/config.toml` holds their model, their
+/// profiles and their other servers. Re-serialising it would drop comments
+/// and reorder what remains, so the table is appended — or, when present,
+/// replaced in place along with its own subtables — and the result is parsed
+/// back and compared with the original plus our entry. Any difference beyond
+/// our table, or a document whose layout keeps our table from being found as
+/// one block (an inline `mcp_servers = {…}`, dotted keys), is a refusal.
+fn merge_toml_server(
+    path: &Path,
+    doc: &HostMcpDoc,
+    name: &str,
+    entry: toml::Table,
+    dry_run: bool,
+) -> anyhow::Result<McpMergeOutcome> {
+    let container = doc
+        .container
+        .ok_or_else(|| anyhow!("{}: a TOML document names its server table", doc.rel))?;
+    let text = read_project_doc(path)?.unwrap_or_default();
+    let parsed: toml::Table = text
+        .parse()
+        .map_err(|err| anyhow!("{}: not TOML ({err}); refuse to rewrite it", path.display()))?;
+    let current = match parsed.get(container) {
+        None => None,
+        Some(toml::Value::Table(servers)) => servers.get(name),
+        Some(_) => bail!("{}: `{container}` is not a table", path.display()),
+    };
+    let wanted = toml::Value::Table(entry.clone());
+    if current == Some(&wanted) {
+        return Ok(McpMergeOutcome {
+            path: path.to_path_buf(),
+            changed: false,
+            removed_stale_db: false,
+            note: format!("{} already current", doc.rel),
+        });
+    }
+
+    let mut wrapper = toml::Table::new();
+    let mut servers = toml::Table::new();
+    servers.insert(name.to_string(), wanted.clone());
+    wrapper.insert(container.to_string(), toml::Value::Table(servers));
+    let block = toml::to_string(&wrapper).map_err(|err| anyhow!("serialize {name}: {err}"))?;
+
+    let updated = if current.is_some() {
+        replace_toml_table(&text, container, name, &block).ok_or_else(|| {
+            anyhow!(
+                "{}: [{container}.{name}] is not one block this command can replace \
+                 (inline table or dotted keys); edit it by hand",
+                path.display()
+            )
+        })?
+    } else {
+        let mut out = text.clone();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.trim().is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&block);
+        out
+    };
+
+    let reparsed: toml::Table = updated.parse().map_err(|err| {
+        anyhow!(
+            "{}: adding [{container}.{name}] would not parse ({err}); refuse to rewrite it",
+            path.display()
+        )
+    })?;
+    let mut expected = parsed.clone();
+    if let toml::Value::Table(servers) = expected
+        .entry(container.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+    {
+        servers.insert(name.to_string(), wanted);
+    }
+    if reparsed != expected {
+        bail!(
+            "{}: adding [{container}.{name}] would change other settings; refuse to rewrite it",
+            path.display()
+        );
+    }
+
+    if !dry_run {
+        devmap_query::write_atomic(path, updated.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(McpMergeOutcome {
+        path: path.to_path_buf(),
+        changed: true,
+        removed_stale_db: false,
+        note: format!("{}: registered {name}", doc.rel),
+    })
+}
+
+/// Replace the `[<container>.<name>]` block and its subtables with `block`.
+///
+/// `None` when the header is not found exactly once. The caller re-parses the
+/// result, so a layout this misreads is refused rather than written.
+fn replace_toml_table(text: &str, container: &str, name: &str, block: &str) -> Option<String> {
+    let own = format!("{container}.{name}");
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let header_of = |line: &str| -> Option<(bool, String)> {
+        let trimmed = line.trim();
+        let (array, inner) = if let Some(rest) = trimmed.strip_prefix("[[") {
+            (true, rest.split_once("]]")?.0)
+        } else {
+            (false, trimmed.strip_prefix('[')?.split_once(']')?.0)
+        };
+        let key = inner
+            .split('.')
+            .map(|part| part.trim().trim_matches(|c| c == '"' || c == '\''))
+            .collect::<Vec<_>>()
+            .join(".");
+        Some((array, key))
+    };
+    let starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| matches!(header_of(line), Some((false, ref key)) if *key == own))
+        .map(|(index, _)| index)
+        .collect();
+    let [start] = starts.as_slice() else {
+        return None;
+    };
+    let nested = format!("{own}.");
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(
+            |(_, line)| matches!(header_of(line), Some((_, ref key)) if !key.starts_with(&nested)),
+        )
+        .map_or(lines.len(), |(index, _)| index);
+    let mut out: String = lines[..*start].concat();
+    out.push_str(block);
+    if end < lines.len() {
+        out.push('\n');
+    }
+    out.push_str(&lines[end..].concat());
+    Some(out)
 }
 
 /// True when an existing entry pins a store path, in either spelling.
@@ -584,10 +1051,10 @@ fn entry_names_a_store(entry: &Value) -> bool {
         .is_some_and(|argv| argv.iter().any(|a| a.as_str() == Some("--db")))
 }
 
-fn servers_of<'a>(document: &'a Value, doc: &HostMcpDoc) -> Option<&'a Value> {
+fn server_of<'a>(document: &'a Value, doc: &HostMcpDoc, name: &str) -> Option<&'a Value> {
     match doc.container {
-        None => document.get(MCP_SERVER_NAME),
-        Some(key) => document.get(key).and_then(|map| map.get(MCP_SERVER_NAME)),
+        None => document.get(name),
+        Some(key) => document.get(key).and_then(|map| map.get(name)),
     }
 }
 
@@ -2065,5 +2532,523 @@ mod tests {
         .unwrap();
         assert!(hooks_doc["hooks"]["PostToolUse"].is_array());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Servers a caller registers (`--servers-stdin`) -------------------
+    //
+    // These carry the contracts DevCouncil's Go integrator held for its own
+    // `devcouncil` entry before that entry moved here: the neighbours in a
+    // host's document survive, each host gets its own spelling, a file this
+    // module cannot read is kept, and a link is never followed.
+
+    fn every_host() -> Vec<Host> {
+        <Host as clap::ValueEnum>::value_variants().to_vec()
+    }
+
+    fn devcouncil_spec(root: &Path) -> ServerSpec {
+        let root = root.to_str().unwrap().to_string();
+        ServerSpec {
+            name: "devcouncil".into(),
+            command: "/opt/devcouncil/bin/devcouncil".into(),
+            args: vec!["mcp".into()],
+            env: BTreeMap::from([("DEVCOUNCIL_PROJECT_ROOT".into(), root.clone())]),
+            cwd: Some(root),
+        }
+    }
+
+    /// The registered entry, read back through the host's own document shape.
+    fn registered(host: Host, root: &Path, name: &str) -> Option<Value> {
+        let doc = host.project_document();
+        let text = fs::read_to_string(root.join(doc.rel)).ok()?;
+        let document: Value = match doc.format {
+            DocFormat::Json => serde_json::from_str(&text).unwrap(),
+            DocFormat::Toml => {
+                let table: toml::Table = text.parse().unwrap();
+                serde_json::to_value(table).unwrap()
+            }
+        };
+        match doc.container {
+            None => document.get(name).cloned(),
+            Some(key) => document.get(key)?.get(name).cloned(),
+        }
+    }
+
+    /// Each host's skills land where that host reads them. DevCouncil's Go
+    /// integrator kept its own copy of this map, which sent Codex, OpenCode and
+    /// Warp DevMap's three defaults; the one map is here.
+    #[test]
+    fn each_host_installs_skills_where_it_reads_them() {
+        for (host, want) in [
+            (Host::Cursor, &[".cursor/skills"][..]),
+            (Host::Claude, &[".claude/skills"][..]),
+            (Host::Codex, &[".agents/skills"][..]),
+            (Host::Antigravity, &[".agents/skills"][..]),
+            (Host::OpenCode, &[][..]),
+            (Host::Warp, &[][..]),
+        ] {
+            assert_eq!(host.skill_destinations(), want, "{host:?}");
+            for dest in host.skill_destinations() {
+                assert!(
+                    !dest.starts_with('/'),
+                    "{host:?}: {dest} is not project-relative"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_host_has_one_project_document_and_no_two_share_a_path() {
+        let mut seen = std::collections::BTreeMap::new();
+        for host in every_host() {
+            let doc = host.project_document();
+            if let Some(other) = seen.insert(doc.rel, host) {
+                panic!("{host:?} and {other:?} both write {}", doc.rel);
+            }
+            assert_eq!(
+                doc.format == DocFormat::Toml,
+                doc.rel.ends_with(".toml"),
+                "{host:?}: format disagrees with the file name {}",
+                doc.rel
+            );
+        }
+        // DevMap's own entry reaches Cursor and Claude through the plugin-aware
+        // merge and Codex through the user-level config; only these three
+        // carry it in the project document.
+        let carrying: Vec<Host> = every_host()
+            .into_iter()
+            .filter(|host| host.mcp_document().is_some())
+            .collect();
+        assert_eq!(carrying, [Host::Antigravity, Host::OpenCode, Host::Warp]);
+    }
+
+    #[test]
+    fn a_registered_server_keeps_every_neighbour_on_every_host() {
+        for host in every_host() {
+            let root = scratch(&format!("neighbours-{}", host.as_str()));
+            let doc = host.project_document();
+            let path = root.join(doc.rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let before = match (doc.format, doc.container) {
+                (DocFormat::Toml, _) => "model = \"o3\" # keep this comment\n\n\
+                    [mcp_servers.theirs]\ncommand = \"/opt/theirs\"\n"
+                    .to_string(),
+                (DocFormat::Json, Some(key)) => json!({
+                    key: {"theirs": {"command": "/opt/theirs"}},
+                    "unrelated": "keep me",
+                })
+                .to_string(),
+                (DocFormat::Json, None) => {
+                    json!({"theirs": {"command": "/opt/theirs"}}).to_string()
+                }
+            };
+            fs::write(&path, &before).unwrap();
+
+            let outcome = register_server(host, &root, &devcouncil_spec(&root), false).unwrap();
+            assert!(outcome.changed, "{host:?}: reported no change");
+            assert!(
+                registered(host, &root, "devcouncil").is_some(),
+                "{host:?}: our server is missing"
+            );
+            assert!(
+                registered(host, &root, "theirs").is_some(),
+                "{host:?}: dropped a neighbouring server"
+            );
+            let after = fs::read_to_string(&path).unwrap();
+            match doc.format {
+                // Byte-for-byte: comments and layout are the user's.
+                DocFormat::Toml => assert!(
+                    after.starts_with(&before),
+                    "{host:?}: rewrote the user's TOML:\n{after}"
+                ),
+                DocFormat::Json if doc.container.is_some() => assert_eq!(
+                    serde_json::from_str::<Value>(&after).unwrap()["unrelated"],
+                    "keep me",
+                    "{host:?}: dropped an unrelated top-level key"
+                ),
+                DocFormat::Json => {}
+            }
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn a_registered_server_is_spelled_the_way_each_host_reads_it() {
+        for host in every_host() {
+            let root = scratch(&format!("shape-{}", host.as_str()));
+            let spec = devcouncil_spec(&root);
+            register_server(host, &root, &spec, false).unwrap();
+            let entry = registered(host, &root, "devcouncil").unwrap();
+            let doc = host.project_document();
+            if doc.argv_form {
+                assert_eq!(entry["type"], "local", "{host:?}: {entry}");
+                assert_eq!(entry["command"], json!([spec.command, "mcp"]), "{host:?}");
+                assert_eq!(entry["environment"], json!(spec.env), "{host:?}");
+                assert!(entry.get("env").is_none(), "{host:?}: {entry}");
+            } else {
+                assert_eq!(entry["command"], spec.command, "{host:?}");
+                assert_eq!(entry["args"], json!(["mcp"]), "{host:?}");
+                assert_eq!(entry["env"], json!(spec.env), "{host:?}");
+            }
+            assert_eq!(
+                entry.get("cwd").is_some(),
+                doc.accepts_cwd,
+                "{host:?}: cwd written where the host does not read it, or missing where it does: {entry}"
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn a_second_registration_changes_nothing_and_a_check_agrees() {
+        for host in every_host() {
+            let root = scratch(&format!("idempotent-{}", host.as_str()));
+            let spec = devcouncil_spec(&root);
+            register_server(host, &root, &spec, false).unwrap();
+            let path = root.join(host.project_document().rel);
+            let first = fs::read(&path).unwrap();
+            assert!(
+                !register_server(host, &root, &spec, false).unwrap().changed,
+                "{host:?}: a second apply reported a change"
+            );
+            assert_eq!(fs::read(&path).unwrap(), first, "{host:?}: bytes moved");
+            assert!(
+                !register_server(host, &root, &spec, true).unwrap().changed,
+                "{host:?}: a check reported drift on a current file"
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn a_dry_run_registration_writes_nothing() {
+        for host in every_host() {
+            let root = scratch(&format!("dry-{}", host.as_str()));
+            let outcome = register_server(host, &root, &devcouncil_spec(&root), true).unwrap();
+            assert!(outcome.changed, "{host:?}: a missing entry is a change");
+            assert_eq!(
+                fs::read_dir(&root).unwrap().count(),
+                0,
+                "{host:?}: dry run wrote into the tree"
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn opencode_preamble_is_established_not_imposed() {
+        let root = scratch("preamble");
+        fs::write(
+            root.join("opencode.json"),
+            r#"{"$schema":"https://opencode.ai/config-v2.json"}"#,
+        )
+        .unwrap();
+        register_server(Host::OpenCode, &root, &devcouncil_spec(&root), false).unwrap();
+        assert_eq!(
+            read(&root.join("opencode.json"))["$schema"],
+            "https://opencode.ai/config-v2.json"
+        );
+        let fresh = scratch("preamble-fresh");
+        register_server(Host::OpenCode, &fresh, &devcouncil_spec(&fresh), false).unwrap();
+        assert_eq!(
+            read(&fresh.join("opencode.json"))["$schema"],
+            "https://opencode.ai/config.json"
+        );
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&fresh).ok();
+    }
+
+    #[test]
+    fn a_document_this_module_cannot_read_is_kept_not_replaced() {
+        for (host, body) in [
+            (Host::OpenCode, "{ this is not json"),
+            (Host::OpenCode, r#"{"mcp": "not an object"}"#),
+            (
+                Host::OpenCode,
+                "{\n  // a comment a rewrite would drop\n  \"mcp\": {}\n}",
+            ),
+            (Host::Claude, "[]"),
+            (Host::Codex, "this is = = not toml"),
+            // An inline server map cannot take a `[mcp_servers.devcouncil]`
+            // table beside it; the append would not parse.
+            (
+                Host::Codex,
+                "mcp_servers = { theirs = { command = \"/opt/theirs\" } }\n",
+            ),
+            (Host::Codex, "mcp_servers = 3\n"),
+        ] {
+            let root = scratch(&format!("unreadable-{}", host.as_str()));
+            let path = root.join(host.project_document().rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+            assert!(
+                register_server(host, &root, &devcouncil_spec(&root), false).is_err(),
+                "{host:?}: accepted {body:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                body,
+                "{host:?}: rewrote {body:?}"
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn codex_replaces_only_its_own_table_and_keeps_every_other_byte() {
+        let root = scratch("codex-replace");
+        let path = root.join(".codex/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let head = "# my settings\nmodel = \"o3\"\n\n";
+        let ours_stale =
+            "[mcp_servers.devcouncil]\ncommand = \"/old/devcouncil\"\nargs = [\"mcp\"]\n\n\
+                          [mcp_servers.devcouncil.env]\nSTALE = \"1\"\n\n";
+        let tail = "[mcp_servers.theirs] # keep\ncommand = \"/opt/theirs\"\n";
+        fs::write(&path, format!("{head}{ours_stale}{tail}")).unwrap();
+
+        let spec = devcouncil_spec(&root);
+        assert!(
+            register_server(Host::Codex, &root, &spec, false)
+                .unwrap()
+                .changed
+        );
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with(head), "lost the head:\n{after}");
+        assert!(after.ends_with(tail), "lost the tail:\n{after}");
+        assert!(!after.contains("STALE"), "kept a stale subtable:\n{after}");
+        let entry = registered(Host::Codex, &root, "devcouncil").unwrap();
+        assert_eq!(entry["command"], spec.command);
+        assert_eq!(entry["env"], json!(spec.env));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_document_or_parent_is_refused_and_nothing_lands_outside() {
+        use std::os::unix::fs::symlink;
+        for host in every_host() {
+            let doc = host.project_document();
+            // A linked leaf: the outside file must neither be disclosed into
+            // the merge nor replaced.
+            let base = scratch(&format!("link-leaf-{}", host.as_str()));
+            let root = base.join("repo");
+            let outside = base.join("outside");
+            fs::create_dir_all(&root).unwrap();
+            fs::create_dir_all(&outside).unwrap();
+            let secret = outside.join("private");
+            let secret_body = match doc.format {
+                DocFormat::Json => r#"{"apiKey":"sk-SUPER-SECRET"}"#,
+                DocFormat::Toml => "api_key = \"sk-SUPER-SECRET\"\n",
+            };
+            fs::write(&secret, secret_body).unwrap();
+            let path = root.join(doc.rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            symlink(&secret, &path).unwrap();
+            assert!(
+                register_server(host, &root, &devcouncil_spec(&root), false).is_err(),
+                "{host:?}: followed a linked {}",
+                doc.rel
+            );
+            assert_eq!(fs::read_to_string(&secret).unwrap(), secret_body);
+            assert!(fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            fs::remove_dir_all(&base).ok();
+
+            // A linked parent directory, where the document has one.
+            let Some((parent, _)) = doc.rel.split_once('/') else {
+                continue;
+            };
+            let base = scratch(&format!("link-parent-{}", host.as_str()));
+            let root = base.join("repo");
+            let outside = base.join("outside");
+            fs::create_dir_all(&root).unwrap();
+            fs::create_dir_all(&outside).unwrap();
+            symlink(&outside, root.join(parent)).unwrap();
+            assert!(
+                register_server(host, &root, &devcouncil_spec(&root), false).is_err(),
+                "{host:?}: wrote through a linked {parent}"
+            );
+            assert_eq!(
+                fs::read_dir(&outside).unwrap().count(),
+                0,
+                "{host:?}: wrote outside the repository"
+            );
+            fs::remove_dir_all(&base).ok();
+        }
+    }
+
+    #[test]
+    fn a_server_request_is_validated_before_anything_is_written() {
+        let ok = br#"{"servers":[{"name":"devcouncil","command":"/opt/dc","args":["mcp"],
+                      "env":{"DEVCOUNCIL_PROJECT_ROOT":"/repo"},"cwd":"/repo"}]}"#;
+        let specs = parse_server_request(ok).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].env["DEVCOUNCIL_PROJECT_ROOT"], "/repo");
+
+        for (label, body) in [
+            ("not json", "{".to_string()),
+            ("not an object", "[]".to_string()),
+            ("no servers", "{}".to_string()),
+            ("empty", r#"{"servers":[]}"#.to_string()),
+            ("unknown top key", r#"{"servers":[],"extra":1}"#.to_string()),
+            (
+                "unknown server key",
+                r#"{"servers":[{"name":"a","command":"/x","shell":true}]}"#.to_string(),
+            ),
+            (
+                "relative command",
+                r#"{"servers":[{"name":"a","command":"devcouncil"}]}"#.to_string(),
+            ),
+            (
+                "relative cwd",
+                r#"{"servers":[{"name":"a","command":"/x","cwd":"repo"}]}"#.to_string(),
+            ),
+            (
+                "devmap is reserved",
+                r#"{"servers":[{"name":"devmap","command":"/x"}]}"#.to_string(),
+            ),
+            (
+                "bad name",
+                r#"{"servers":[{"name":"../x","command":"/x"}]}"#.to_string(),
+            ),
+            (
+                "upper name",
+                r#"{"servers":[{"name":"DevCouncil","command":"/x"}]}"#.to_string(),
+            ),
+            (
+                "duplicate",
+                r#"{"servers":[{"name":"a","command":"/x"},{"name":"a","command":"/y"}]}"#
+                    .to_string(),
+            ),
+            (
+                "arg not string",
+                r#"{"servers":[{"name":"a","command":"/x","args":[1]}]}"#.to_string(),
+            ),
+            (
+                "env not string",
+                r#"{"servers":[{"name":"a","command":"/x","env":{"K":1}}]}"#.to_string(),
+            ),
+            (
+                "env bad key",
+                r#"{"servers":[{"name":"a","command":"/x","env":{"1K":"v"}}]}"#.to_string(),
+            ),
+            (
+                "nul",
+                "{\"servers\":[{\"name\":\"a\",\"command\":\"/x\\u0000\"}]}".to_string(),
+            ),
+            (
+                "too many",
+                format!(
+                    r#"{{"servers":[{}]}}"#,
+                    (0..=MAX_REQUESTED_SERVERS)
+                        .map(|i| format!(r#"{{"name":"s{i}","command":"/x"}}"#))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            ),
+            ("oversized", " ".repeat(MAX_SERVER_REQUEST_BYTES + 1)),
+        ] {
+            assert!(
+                parse_server_request(body.as_bytes()).is_err(),
+                "{label}: accepted {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_its_document_refuses_stops_integrate_before_any_write() {
+        let root = scratch("integrate-preflight");
+        fs::write(root.join("opencode.json"), "{ not json").unwrap();
+        let result = integrate(
+            Host::OpenCode,
+            &root,
+            Path::new("/opt/devmap/bin/devmap"),
+            &empty_map(),
+            "m",
+            "g",
+            "s",
+            std::slice::from_ref(&devcouncil_spec(&root)),
+            false,
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "integrated past an unreadable opencode.json"
+        );
+        let mut left: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["opencode.json"],
+            "DevMap's half was written before the refusal"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn integrate_writes_the_callers_server_and_check_reports_instead_of_failing() {
+        let root = scratch("integrate-servers");
+        let spec = devcouncil_spec(&root);
+        let exe = PathBuf::from("/opt/devmap/bin/devmap");
+        let map = empty_map();
+        // Warp: no user-level document and no skills, so nothing here reaches
+        // the user's home directory.
+        let check = integrate(
+            Host::Warp,
+            &root,
+            &exe,
+            &map,
+            "m",
+            "g",
+            "s",
+            std::slice::from_ref(&spec),
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(!check.check_ok, "a missing server is drift");
+        assert!(check.servers.iter().all(|s| s.changed));
+        assert!(
+            registered(Host::Warp, &root, "devcouncil").is_none(),
+            "check wrote"
+        );
+
+        integrate(
+            Host::Warp,
+            &root,
+            &exe,
+            &map,
+            "m",
+            "g",
+            "s",
+            std::slice::from_ref(&spec),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(registered(Host::Warp, &root, "devcouncil").is_some());
+        assert!(registered(Host::Warp, &root, MCP_SERVER_NAME).is_some());
+        let again = integrate(
+            Host::Warp,
+            &root,
+            &exe,
+            &map,
+            "m",
+            "g",
+            "s",
+            std::slice::from_ref(&spec),
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(
+            again.check_ok,
+            "a current install reported drift: {again:?}"
+        );
+        fs::remove_dir_all(&root).ok();
     }
 }

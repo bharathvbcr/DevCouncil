@@ -62,15 +62,16 @@ Every one recorded `/Users/<user>/.local/bin/dev` as the server command, a
 `claude-plugin` and an "assist mode (no write-gate)" that has since been
 removed. They were captures of a program, not expectations of this one.
 
-They were also the wrong *shape* for what `integrate` now does. `planWrite`
+They were also the wrong *shape* for what `integrate` now does. The integrator
 folds our entry into whatever the host already has and compares against the
 merged result, so the bytes of `.mcp.json` are a function of the repository it
 runs in. A whole-file byte golden asserts the opposite — that the file equals
 these bytes — which is false the moment a neighbour server exists.
 
-What replaced the coverage: `devcouncil/integrate/host_documents_test.go`,
-`host_selection_test.go` and `integrate_write_security_test.go` assert the
-properties instead of the bytes — our entry added or replaced with neighbours
+What replaced the coverage asserts the properties instead of the bytes. Host
+documents are now written by `devmap integrate`, so those properties live in
+`rust/devmap-cli/src/integrate.rs` (and `devcouncil/integrate/` tests drive the
+delegation end to end): our entry added or replaced with neighbours
 untouched, the per-host entry shape, a preamble established but not imposed, a
 second apply clean and `--check` agreeing with it, an unreadable config kept
 rather than replaced, a dry run writing nothing, unknown and retired hosts
