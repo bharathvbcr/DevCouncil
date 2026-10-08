@@ -136,10 +136,10 @@ fn scan_secrets_precision_and_recall_on_the_tuning_corpus() {
     assert_eq!(
         matrix,
         Matrix {
-            tp: 40,
+            tp: 44,
             fp: 0,
             fn_: 0,
-            tn: 41
+            tn: 42
         },
         "scan_secrets moved on secrets.tsv; update the pinned counts here and the \
          figures in rust/STATUS.md together\n{}",
@@ -172,9 +172,9 @@ fn scan_secrets_precision_and_recall_on_the_held_out_corpus() {
 
 // Pinned after the fixes that followed its first run (precision 0.867,
 // recall 0.650); both figures are in rust/STATUS.md.
-const HOLDOUT_TP: usize = 19;
+const HOLDOUT_TP: usize = 20;
 const HOLDOUT_FP: usize = 0;
-const HOLDOUT_FN: usize = 1;
+const HOLDOUT_FN: usize = 0;
 const HOLDOUT_TN: usize = 28;
 
 /// One scope case: the plan, the change, and the hand label of every path the

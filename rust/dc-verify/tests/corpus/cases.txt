@@ -1227,3 +1227,35 @@ diff --git a/src/Shop/Legacy.cs b/src/Shop/Legacy.cs
 +        {
 +            // throw new NotImplementedException();
 +        }
+
+### case: default-logins-and-generic-url-passwords-are-clean
+### secret_scan: clean
+### stub_detection: clean
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: A URL password counts at any length, except a generic word or one
+###   that repeats the user name — RabbitMQ's documented `guest:guest`.
+diff --git a/docs/brokers.md b/docs/brokers.md
+--- a/docs/brokers.md
++++ b/docs/brokers.md
+@@ -0,0 +1,3 @@
++broker: amqp://guest:guest@localhost:5672/
++database: postgres://user:pass@localhost:5432/app
++cache: redis://default:password@cache:6379
+
+### case: short-url-password-on-a-real-host-blocks
+### secret_scan: blocking
+### stub_detection: clean
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: Seven characters, under the literal-assignment floor; in a URL's
+###   userinfo the context says what it is.
+diff --git a/config/app.ini b/config/app.ini
+--- a/config/app.ini
++++ b/config/app.ini
+@@ -0,0 +1 @@
++DATABASE_URL=postgres://app:hunter2@prod-db.internal:5432/app

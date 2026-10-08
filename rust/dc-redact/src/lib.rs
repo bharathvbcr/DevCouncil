@@ -370,6 +370,11 @@ const CONTEXT_PATTERNS: &[ContextPattern] = &[
         spans: url_password_spans,
     },
     ContextPattern {
+        name: "password on a command line",
+        keep: 0,
+        spans: cli_password_spans,
+    },
+    ContextPattern {
         name: "credential assigned to a named key",
         keep: 0,
         spans: assignment_spans,
@@ -485,9 +490,15 @@ fn url_password_spans(line: &str) -> Vec<std::ops::Range<usize>> {
                 .unwrap_or(rest.len())];
             let userinfo = &authority[..authority.rfind('@')?];
             let colon = userinfo.find(':')?;
-            let password = &userinfo[colon + 1..];
+            let (user, password) = (&userinfo[..colon], &userinfo[colon + 1..]);
             let start = authority_start + colon + 1;
-            (password.len() >= MIN_LITERAL_LEN && !is_placeholder(password))
+            // No length floor: in a URL's userinfo the context says what the
+            // value is, and a short password on a real host is still one. What
+            // is excused is a generic word and a password that repeats the
+            // user name — a documented default like RabbitMQ's `guest:guest`.
+            const GENERIC: &[&str] = &["pass", "password", "passwd", "pwd", "secret", "test"];
+            let generic = GENERIC.contains(&password.to_ascii_lowercase().as_str());
+            (!password.is_empty() && !generic && password != user && !is_placeholder(password))
                 .then(|| start..start + password.len())
         })
         .collect()
@@ -720,7 +731,13 @@ fn literal_after(line: &str, from: usize) -> Option<std::ops::Range<usize>> {
             .unwrap_or(rest.len());
         (start..start + len, false)
     };
-    let value = &line[span.clone()];
+    is_literal_secret(&line[span.clone()], quoted).then_some(span)
+}
+
+/// Whether `value` reads as a literal password or secret rather than a
+/// reference to one. `quoted` relaxes the expression test: inside quotes a
+/// `.` or `(` is a character, not member access or a call.
+fn is_literal_secret(value: &str, quoted: bool) -> bool {
     let has_digit = value.bytes().any(|b| b.is_ascii_digit());
     // A name, not a value: `session_token`, `settings.api_token`, `apiToken`.
     let reads_as_identifier = !has_digit
@@ -732,15 +749,73 @@ fn literal_after(line: &str, from: usize) -> Option<std::ops::Range<usize>> {
     // An expression rather than a literal: a call, an index, a member access.
     let expression = !quoted && (value.contains(['(', '[']) || value.contains('.') && !has_digit);
     let plain_word = value.bytes().all(|b| b.is_ascii_lowercase()) && value.len() < 12;
-    let literal = value.chars().count() >= MIN_LITERAL_LEN
+    value.chars().count() >= MIN_LITERAL_LEN
         && !value.contains(char::is_whitespace)
         && !value.contains("://")
         && !value.bytes().all(|b| b.is_ascii_digit())
         && !reads_as_identifier
         && !expression
         && !plain_word
-        && !is_placeholder(value);
-    literal.then_some(span)
+        && !is_placeholder(value)
+}
+
+/// A password given to a command-line client: the MySQL family's attached
+/// `-p<password>` (a detached `-p` prompts, and is not one), and
+/// `sshpass -p <password>`. Only after the client's own name, because `-p`
+/// means something else to nearly every other command (`mkdir -p`).
+fn cli_password_spans(line: &str) -> Vec<std::ops::Range<usize>> {
+    const ATTACHED: &[&str] = &[
+        "mysql",
+        "mysqldump",
+        "mysqladmin",
+        "mysqlimport",
+        "mariadb",
+        "mariadb-dump",
+    ];
+    let words: Vec<(usize, &str)> = line
+        .split_whitespace()
+        .map(|w| (w.as_ptr() as usize - line.as_ptr() as usize, w))
+        .collect();
+    let mut spans = Vec::new();
+    let mut client: Option<&str> = None;
+    for (i, &(at, word)) in words.iter().enumerate() {
+        let program = word.rsplit('/').next().unwrap_or(word);
+        if ATTACHED.contains(&program) || program == "sshpass" {
+            client = Some(program);
+            continue;
+        }
+        if matches!(word, "|" | "&&" | "||" | ";") {
+            client = None;
+            continue;
+        }
+        let (start, value) = match client {
+            Some("sshpass") if word == "-p" => match words.get(i + 1) {
+                Some(&(next_at, next)) => (next_at, next),
+                None => continue,
+            },
+            Some(c)
+                if c != "sshpass"
+                    && word.len() > 2
+                    && word.starts_with("-p")
+                    && !word.starts_with("--") =>
+            {
+                (at + 2, &word[2..])
+            }
+            _ => continue,
+        };
+        let quoted = value.len() >= 2
+            && matches!(value.as_bytes()[0], b'"' | b'\'')
+            && value.ends_with(value.as_bytes()[0] as char);
+        let (start, value) = if quoted {
+            (start + 1, &value[1..value.len() - 1])
+        } else {
+            (start, value)
+        };
+        if is_literal_secret(value, quoted) {
+            spans.push(start..start + value.len());
+        }
+    }
+    spans
 }
 
 /// A value standing in for a credential rather than being one: a template, a
@@ -977,6 +1052,66 @@ mod redaction_tests {
         }
     }
 
+    /// A password on a command line, in the spellings the clients accept: the
+    /// attached `-p<pw>` of the MySQL family, `sshpass -p <pw>`, and
+    /// `--password=<pw>` (which the named-key detector reads).
+    #[test]
+    fn command_line_passwords_are_found_and_prompts_are_not() {
+        for line in [
+            "mysql -u root -pS3cretRootPw appdb",
+            "mysqldump --user=app -pDumpP4ss2026 shop > shop.sql",
+            "/usr/bin/mariadb -h db -pM4riaPassw0rd",
+            "sshpass -p Tr0ub4dor3x ssh deploy@host",
+            "psql --password=xv9Lq2Rt7pW3 -h db",
+        ] {
+            assert!(contains_secret(line), "{line}");
+            let once = redact_secrets(line);
+            assert_eq!(redact_secrets(&once), once, "not idempotent: {once}");
+        }
+        for line in [
+            "mysql -u root -p appdb",
+            "mysql -u root -p\"$MYSQL_PWD\" appdb",
+            "mysql -u root -p${DB_PASS}",
+            "grep -pattern file.txt",
+            "mkdir -p build/output/dir",
+            "cp -preserve a b",
+            "sshpass -p \"$PASS\" ssh host",
+            "sshpass -f ~/.pw ssh host",
+        ] {
+            assert!(!contains_secret(line), "{line}");
+        }
+    }
+
+    /// A URL password is a secret at any length, unless it is a generic word
+    /// or repeats the user name — a documented default such as RabbitMQ's
+    /// `guest:guest`.
+    ///
+    /// Vendors' published example credentials are *not* excused, and that is
+    /// deliberate: this repository's own gate tests plant AWS's
+    /// `AKIAIOSFODNN7EXAMPLE` as the canonical way to prove the scanner fires
+    /// without committing a real key (dc/dcverify/client_interop_test.go,
+    /// devcouncil/stopgate/rigor_end_to_end_test.go). Judged by shape, they
+    /// are what a credential looks like.
+    #[test]
+    fn default_logins_are_not_credentials_and_published_examples_are() {
+        for line in [
+            r#"rabbit = "amqp://guest:guest@localhost:5672/""#,
+            "postgres://user:pass@localhost:5432/app",
+            "redis://default:password@cache:6379",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+        for line in [
+            r#"aws_access_key_id = "AKIAIOSFODNN7EXAMPLE""#,
+            r#"aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY""#,
+            r#"WEBHOOK = "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX""#,
+            "postgres://app:hunter2@prod-db.internal:5432/app",
+            "amqp://app:z9@mq:5672/",
+        ] {
+            assert!(find_secret(line).is_some(), "{line}");
+        }
+    }
+
     #[test]
     fn context_matches_redact_their_value_and_redaction_is_idempotent() {
         for (line, value) in [
@@ -1015,6 +1150,7 @@ mod redaction_tests {
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w",
             "api_key: ${API_KEY:?missing}",
             "-----BEGIN RSA PRIVATE KEY-----",
+            "mysql -u root -p\"S3cretRootPw\" db | sshpass -p Tr0ub4dor3x ssh h",
         ];
         for line in lines {
             let boundaries: Vec<usize> = line
