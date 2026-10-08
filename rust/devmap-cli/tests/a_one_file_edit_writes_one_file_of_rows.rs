@@ -27,14 +27,16 @@
 //!   extraction_json bytes                    82.4 MB    (-50%, the duplicate half exactly)
 //! ```
 //!
-//! **What this test does not assert, because it is not yet true.**
-//! `generation_edges` (96,525 rows) and `generation_unresolved` (89,537) are
-//! still re-materialised per generation — about 67 MB of the remaining growth.
-//! Those rows are not content-addressable per file the way a payload is: an
-//! edge's target depends on the whole corpus, so carrying one forward because
-//! its *source* file did not change would be wrong. That is B3's second half,
-//! recorded with its measured size rather than asserted here, because a red
-//! test standing in for unfinished work reports the same thing as a broken one.
+//! **What this test does not assert.** When it was written, `generation_edges`
+//! (96,525 rows) and `generation_unresolved` (89,537) were still
+//! re-materialised per generation — about 67 MB of the remaining growth. v18
+//! moved both onto validity ranges (`edge_rows` / `unresolved_rows`), so an
+//! edit now closes and opens only the rows it changes. What is still re-written
+//! per generation is the `generation_id`-keyed half — nodes, FTS mappings, file
+//! rows, digests and dead-symbol rows — and
+//! `test_findings_suite.rs::b3_one_file_edit_write_set_is_differential_for_ranges_and_o_repo_for_generation_keyed_rows`
+//! measures both halves per relation; `docs/devmap/DIVERGENCES.md` B3 carries
+//! the numbers.
 //!
 //! The bounds below are *ratios* rather than absolute counts, so they stay
 //! meaningful as the fixture grows: what a differential write stores must be

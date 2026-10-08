@@ -1,0 +1,16 @@
+diff --git a/rust/devmap-store/src/schema.rs b/rust/devmap-store/src/schema.rs
+index d4a99348..b2e9e5e5 100644
+--- a/rust/devmap-store/src/schema.rs
++++ b/rust/devmap-store/src/schema.rs
+@@ -1308,10 +1308,7 @@ pub const MIGRATION_V22_TO_V23: &str = "";
+ /// 8.55 ms → 3.00 ms. The index adds 2.4 MB (1.6%) to the file and took 42 to
+ /// 88 ms to build over the existing rows. What it costs a cold build — one more
+ /// b-tree insertion per ledger row — was not re-measured.
+-pub const MIGRATION_V23_TO_V24: &str = r#"
+-CREATE INDEX IF NOT EXISTS idx_unresolved_rows_callee
+-    ON unresolved_rows(callee_name);
+-"#;
++pub const MIGRATION_V23_TO_V24: &str = "";
+ 
+ /// v24 → v25 advances `user_version` only. The bump exists so an older binary
+ /// that does not know `EdgeKind::Registers` — route middleware, stored as the

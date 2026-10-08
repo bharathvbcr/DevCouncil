@@ -23,10 +23,16 @@ import threading
 import time
 
 from map_bench import BenchError, binary_identity, run
+import ground_truth
 
 MAX_RESPONSE = 16 * 1024 * 1024
 MAX_SESSION_OUTPUT = 64 * 1024 * 1024
 TOOLS = ("devmap", "codegraph", "cbm")
+# Edit-latency arms: config key -> tool kind. `devmap_b` is a second DevMap
+# executable timed against the first in the same interleaved schedule.
+ARMS = (("devmap", "devmap"), ("devmap_b", "devmap"), ("codegraph", "codegraph"), ("cbm", "cbm"))
+EDIT_LATENCY_REPEAT = (2, 60)
+CALLERS_LIMIT = 1000
 
 
 def save(path: Path, value: object) -> None:
@@ -346,6 +352,17 @@ class Adapter:
         return [self.binary, "cli", "search_graph", "--project", self.project,
                 "--name-pattern", "^" + re.escape(query) + "$", "--format", "json", "--limit", "100"]
 
+    def callers(self, symbol: str) -> list[str] | None:
+        """Direct callers of `symbol`, or None where this harness has not
+        verified a callers interface for the tool."""
+        if self.tool == "devmap":
+            return [self.binary, "--db", str(self.db), "--json", "impact", symbol,
+                    "--depth", "1", "--budget", "100000"]
+        if self.tool == "codegraph":
+            return [self.binary, "callers", symbol, "--path", str(self.root),
+                    "--limit", str(CALLERS_LIMIT), "--json"]
+        return None
+
     def server(self) -> list[str]:
         if self.tool == "devmap":
             return [self.binary, "--db", str(self.db), "mcp", "--root", str(self.root)]
@@ -372,19 +389,270 @@ def measure_search(recorder: Recorder, adapter: Adapter, label: str, env: dict,
     return sample, checked
 
 
+def callers_projection(tool: str, symbol: str, value: object) -> tuple[set[tuple[str, str]], bool, dict]:
+    """Function-level direct callers as (file, name), whether the answer was
+    capped, and what was set aside. Unknown schemas fail, never imply absence."""
+    value = unwrap(value)
+    if tool == "devmap" and isinstance(value, dict) and "items" in value:
+        if value.get("resolution") != "Available":
+            raise BenchError("DevMap impact resolution is not Available")
+        rows, other = set(), 0
+        for item in value["items"]:
+            if item["edge_kind"] == "Calls" and item["target_symbol"].rsplit("::", 1)[-1].rsplit(".", 1)[-1] == symbol:
+                rows.add((item["source_file"], item["source_symbol"].rsplit("::", 1)[-1].rsplit(".", 1)[-1]))
+            else:
+                other += 1
+        namesakes = value.get("unresolved_namesakes") or {}
+        return rows, bool(value["truncated"] or value.get("hidden")), {
+            "non_call_edges": other, "unresolved_namesake_sites": len(namesakes.get("sites") or [])}
+    if tool == "codegraph" and isinstance(value, dict) and isinstance(value.get("callers"), list):
+        callable_kinds = {"function", "method"}
+        rows = {(row["filePath"], row["name"]) for row in value["callers"] if row["kind"] in callable_kinds}
+        other = sum(row["kind"] not in callable_kinds for row in value["callers"])
+        return rows, len(value["callers"]) >= CALLERS_LIMIT, {"non_function_rows": other}
+    raise BenchError(f"unrecognized {tool} callers response; native output retained")
+
+
+def caller_check(recorder: Recorder, adapter: Adapter, arm: str, env: dict, truth: dict) -> dict:
+    """Score one arm's callers answers against the generated truth."""
+    if adapter.callers("probe") is None:
+        return {"arm": arm, "status": "not_measured",
+                "reason": f"no callers interface verified for {adapter.tool} in this harness"}
+    per_symbol, totals = [], {"expected": 0, "returned": 0, "true_positives": 0}
+    capped = unverified = 0
+    for symbol, rows in truth["callers"].items():
+        expected = {tuple(row) for row in rows}
+        sample = recorder.command(f"{arm}-callers-{symbol}", adapter.callers(symbol), adapter.root, env)
+        try:
+            returned, incomplete, set_aside = callers_projection(adapter.tool, symbol, recorder.read(sample))
+        except (BenchError, ValueError, KeyError, TypeError) as exc:
+            unverified += 1
+            per_symbol.append({"symbol": symbol, "status": "unverified", "error": str(exc),
+                               "native": sample["stdout"]})
+            continue
+        scored = ground_truth.score(expected, returned)
+        capped += incomplete
+        per_symbol.append({"symbol": symbol, "incomplete": incomplete, "native": sample["stdout"],
+                           **set_aside, **scored})
+        for key in totals:
+            totals[key] += scored[key]
+    return {"arm": arm, "status": "measured" if not unverified else "partially_unverified",
+            "symbols": len(truth["callers"]), "unverified_symbols": unverified, "capped_answers": capped,
+            **totals,
+            "precision": totals["true_positives"] / totals["returned"] if totals["returned"] else None,
+            "recall": totals["true_positives"] / totals["expected"] if totals["expected"] else None,
+            "per_symbol": per_symbol}
+
+
+def counterbalanced_orders(arms: list[str], rounds: int) -> list[list[str]]:
+    """One arm order per round: a rotated Latin square, every other block
+    reversed. Over each block of len(arms) rounds every arm takes every position
+    once; reversing alternate blocks also cancels a linear drift, which for two
+    arms is the ABBA design. A partial block cannot balance, so it is refused."""
+    count = len(arms)
+    if count == 0:
+        raise BenchError("no arms configured")
+    if rounds <= 0 or rounds % count:
+        raise BenchError(f"rounds ({rounds}) must be a positive multiple of the arm count ({count}) "
+                         "so every arm takes every position equally often")
+    orders = []
+    for block in range(rounds // count):
+        rotations = [arms[shift:] + arms[:shift] for shift in range(count)]
+        orders.extend(reversed(rotations) if block % 2 else rotations)
+    return orders
+
+
+def run_rounds(orders: list[list[str]], step) -> list[list[str]]:
+    """Call step(arm, round, position) in schedule order; return the order
+    actually executed, so the record proves what ran rather than what was planned."""
+    executed = []
+    for round_index, order in enumerate(orders):
+        executed.append([])
+        for position, arm in enumerate(order):
+            step(arm, round_index, position)
+            executed[-1].append(arm)
+    return executed
+
+
+def summarize_latency(samples: list[dict]) -> dict:
+    """Per arm and scenario: n, min, median, max over verified samples only,
+    the failures beside them, and the same split by position in the round."""
+    summary: dict[str, dict] = {}
+    for sample in samples:
+        cell = summary.setdefault(f"{sample['arm']}/{sample['scenario']}",
+                                  {"verified_ms": [], "failed": 0, "by_position": {}})
+        if not sample["verified"]:
+            cell["failed"] += 1
+            continue
+        cell["verified_ms"].append(sample["wall_ms"])
+        cell["by_position"].setdefault(str(sample["position"]), []).append(sample["wall_ms"])
+
+    def stats(values: list[float]) -> dict:
+        if not values:
+            return {"n": 0, "min_ms": None, "median_ms": None, "max_ms": None}
+        return {"n": len(values), "min_ms": min(values), "median_ms": statistics.median(values),
+                "max_ms": max(values)}
+
+    return {key: {**stats(cell["verified_ms"]), "failed": cell["failed"],
+                  "by_position": {position: stats(values) for position, values in sorted(cell["by_position"].items())}}
+            for key, cell in sorted(summary.items())}
+
+
+def bench_env(state: Path) -> dict:
+    env = {key: value for key, value in os.environ.items() if key in (
+        "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME", "SystemRoot")}
+    env.update({"XDG_CONFIG_HOME": str(state / "config"), "XDG_CACHE_HOME": str(state / "cache"),
+                "XDG_DATA_HOME": str(state / "data"), "CBM_CACHE_DIR": str(state / "cbm"),
+                "DO_NOT_TRACK": "1", "NO_COLOR": "1", "CODEGRAPH_MCP_TOOLS": "search,callers"})
+    return env
+
+
+def clone_revision(out: Path, repo: dict, root: Path, state: Path) -> None:
+    run(["git", "clone", "--quiet", "--no-hardlinks", "--no-checkout", repo["path"], str(root)], cwd=out)
+    run(["git", "-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", repo["revision"]], cwd=root)
+    actual_revision = run(["git", "rev-parse", "HEAD"], cwd=root).stdout.strip()
+    resolved_revision = run(["git", "rev-parse", repo["revision"] + "^{commit}"], cwd=Path(repo["path"])).stdout.strip()
+    if actual_revision != resolved_revision:
+        raise BenchError("clone revision differs from resolved source commit")
+    save(state / "revision.json", {"actual": actual_revision, "source": resolved_revision})
+
+
+def edit_latency(args: argparse.Namespace, config: dict, out: Path, recorder: Recorder) -> int:
+    """Interleaved, counterbalanced one-file edit latency, plus the caller check.
+
+    Every arm indexes its own clone of the same revision with the same planted
+    fixtures. Each round, in that round's counterbalanced order, every arm edits
+    one file, rebuilds, and must find the new symbol; then restores, rebuilds,
+    and must no longer find it. Only verified samples are timed."""
+    arms = [(key, tool) for key, tool in ARMS if config.get(key)]
+    skipped = [key for key, _ in ARMS if not config.get(key)]
+    names = [key for key, _ in arms]
+    low, high = EDIT_LATENCY_REPEAT
+    if not low <= args.repeat <= high:
+        raise BenchError(f"edit-latency repeat must be between {low} and {high}")
+    orders = counterbalanced_orders(names, args.repeat)
+    identities = {key: binary_identity(config[key]) for key in names}
+    save(out / "binaries.json", identities)
+    planted = ground_truth.truth(args.seed)
+    save(out / "ground_truth.json", planted)
+    samples: list[dict] = []
+    report: dict = {"mode": "edit-latency", "repeat": args.repeat, "seed": args.seed,
+                    "arms": names, "skipped_arms": skipped, "repositories": []}
+    for repo in config["repositories"]:
+        name = repo["name"]
+        if not re.fullmatch(r"[a-z0-9_-]{1,40}", name):
+            raise BenchError("repository name must be a safe directory component")
+        adapters, envs, baselines = {}, {}, {}
+        caller_results, cold_failed = [], []
+        for key, tool in arms:
+            prefix = f"{name}-{key}"
+            state = out / prefix
+            state.mkdir()
+            root = state / "repo"
+            clone_revision(out, repo, root, state)
+            ground_truth.generate(root, args.seed)
+            run(["git", "add", "--", *sorted({Path(p).parts[0] for p in ground_truth.sources(args.seed)})], cwd=root)
+            baselines[key] = manifest(root)
+            save(state / "source-manifest.json", baselines[key])
+            env = bench_env(state)
+            adapter = Adapter(tool, config[key], root, state, prefix)
+            if tool == "devmap":
+                paths = recorder.command(prefix + "-paths", [adapter.binary, "--json", "paths", str(root)], root, env)
+                locations = recorder.read(paths)
+                if locations["root"] != str(root):
+                    raise BenchError("DevMap resolved a different repository")
+                adapter.db = Path(locations["db_path"])
+            cold = recorder.command(prefix + "-cold", adapter.build(True), root, env)
+            if not cold["ok"]:
+                cold_failed.append(key)
+                continue
+            caller_results.append(caller_check(recorder, adapter, key, env, planted))
+            adapters[key], envs[key] = adapter, env
+        if set(baselines) != set(names) or len({json.dumps(b) for b in baselines.values()}) != 1:
+            raise BenchError(f"corpus bytes differ across arm clones: {name}")
+        live_orders = [[arm for arm in order if arm in adapters] for order in orders]
+        if cold_failed:
+            # A schedule with a missing arm no longer balances; say so rather
+            # than letting the surviving arms' numbers read as counterbalanced.
+            report.setdefault("unbalanced", []).append({"repository": name, "cold_failed": cold_failed})
+        probe_rel = ground_truth.module_path("python", 0)
+
+        def step(arm: str, round_index: int, position: int) -> None:
+            adapter, env = adapters[arm], envs[arm]
+            probe = adapter.root / probe_rel
+            original = probe.read_bytes()
+            symbol = f"gt_python_edit_r{round_index}"
+            load = os.getloadavg()
+            try:
+                probe.write_bytes(original + f"\n\ndef {symbol}():\n    return gt_python_leaf_0()\n".encode())
+                for scenario, expected in (("edit", {(probe_rel, symbol)}), ("restore", set())):
+                    if scenario == "restore":
+                        probe.write_bytes(original)
+                    update = recorder.command(f"{name}-{arm}-{scenario}", adapter.build(), adapter.root, env)
+                    check = recorder.command(f"{name}-{arm}-check-{scenario}", adapter.search(symbol), adapter.root, env)
+                    try:
+                        checked = qualify_search(check, adapter.tool, recorder.read(check), expected)
+                    except (BenchError, ValueError) as exc:
+                        checked = {"passed": False, "error": str(exc)}
+                    verified = bool(update["ok"] and checked.get("passed") is True)
+                    update.update({"arm": arm, "tool": adapter.tool, "scenario": scenario, "round": round_index,
+                                   "position": position, "loadavg": load, "verified": verified,
+                                   "semantic_status": "passed" if verified else "unverified"})
+                    samples.append({key: update[key] for key in ("arm", "scenario", "round", "position",
+                                                                 "wall_ms", "verified", "loadavg", "measurement_id")})
+            finally:
+                probe.write_bytes(original)
+
+        verifications = {}
+        guards = [source_guard(adapters[key].root, baselines[key], out / f"{name}-{key}") for key in adapters]
+        for guard in guards:
+            guard.__enter__()
+        try:
+            executed = run_rounds(live_orders, step)
+        finally:
+            for key, guard in zip(list(adapters), guards):
+                try:
+                    guard.__exit__(None, None, None)
+                    verifications[key] = "unchanged"
+                except BenchError as exc:
+                    verifications[key] = str(exc)
+        if executed != live_orders:
+            raise BenchError("executed order differs from the planned schedule")
+        report["repositories"].append({"name": name, "planned_orders": live_orders, "executed_orders": executed,
+                                       "source_verification": verifications, "callers": caller_results})
+        recorder.checkpoint()
+        print(f"{name} edit-latency complete", flush=True)
+    report["summary"] = summarize_latency(samples)
+    save(out / "samples.json", samples)
+    save(out / "edit-latency.json", report)
+    final = {key: binary_identity(config[key]) for key in names}
+    save(out / "binaries-after.json", final)
+    changed = [key for key in names if identities[key]["sha256"] != final[key]["sha256"]]
+    if changed:
+        raise BenchError(f"executable changed during campaign: {changed}; timings invalid")
+    if any(value != "unchanged" for repo in report["repositories"] for value in repo["source_verification"].values()):
+        raise BenchError("a corpus changed during the edit-latency rounds; timings invalid")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--mode", choices=("campaign", "edit-latency"), default="campaign")
+    parser.add_argument("--seed", type=int, default=20261007,
+                        help="edit-latency: seed for the generated caller ground truth")
     args = parser.parse_args()
-    if not 3 <= args.repeat <= 20:
+    if args.mode == "campaign" and not 3 <= args.repeat <= 20:
         parser.error("repeat must be between 3 and 20")
     config = json.loads(args.config.read_text())
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     recorder = Recorder(out)
     save(out / "config.json", config)
+    if args.mode == "edit-latency":
+        return edit_latency(args, config, out, recorder)
     identities = {tool: binary_identity(config[tool]) for tool in TOOLS}
     save(out / "binaries.json", identities)
     checks: list[dict] = []

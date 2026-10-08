@@ -9,7 +9,9 @@ import time
 import unittest
 from unittest.mock import patch
 
-from competition_bench import BenchError, MCP, Recorder, fixture_sources, search_projection, stop, qualify_search, source_guard
+from competition_bench import (BenchError, MCP, Recorder, callers_projection, counterbalanced_orders, fixture_sources,
+                               run_rounds, search_projection, stop, summarize_latency, qualify_search, source_guard)
+import ground_truth
 
 
 class ProjectionTests(unittest.TestCase):
@@ -197,6 +199,147 @@ class ProcessTests(unittest.TestCase):
             finally:
                 session.close()
             self.assertIsNotNone(session.process.poll())
+
+
+class ScheduleTests(unittest.TestCase):
+    def test_every_arm_takes_every_position_equally_often(self):
+        for arms in (["a", "b"], ["a", "b", "c"], ["a", "b", "c", "d"]):
+            for blocks in (1, 2, 3):
+                with self.subTest(arms=arms, blocks=blocks):
+                    orders = counterbalanced_orders(arms, len(arms) * blocks)
+                    self.assertEqual(len(orders), len(arms) * blocks)
+                    for order in orders:
+                        self.assertEqual(sorted(order), sorted(arms))
+                    for position in range(len(arms)):
+                        counts = {arm: sum(order[position] == arm for order in orders) for arm in arms}
+                        self.assertEqual(set(counts.values()), {blocks}, counts)
+
+    def test_two_arms_are_abba(self):
+        self.assertEqual(counterbalanced_orders(["a", "b"], 4),
+                         [["a", "b"], ["b", "a"], ["b", "a"], ["a", "b"]])
+
+    def test_a_partial_block_is_refused(self):
+        for arms, rounds in ((["a", "b"], 3), (["a", "b", "c"], 4), (["a"], 0), ([], 2)):
+            with self.subTest(arms=arms, rounds=rounds), self.assertRaises(BenchError):
+                counterbalanced_orders(arms, rounds)
+
+    def test_recorded_order_is_the_executed_order(self):
+        orders = counterbalanced_orders(["a", "b", "c"], 6)
+        calls = []
+        executed = run_rounds(orders, lambda arm, round_index, position: calls.append((round_index, position, arm)))
+        self.assertEqual(executed, orders)
+        self.assertEqual(calls, [(r, p, arm) for r, order in enumerate(orders) for p, arm in enumerate(order)])
+
+    def test_a_failing_step_stops_the_schedule_rather_than_skipping(self):
+        def step(arm, round_index, position):
+            if round_index == 1:
+                raise BenchError("boom")
+        with self.assertRaises(BenchError):
+            run_rounds(counterbalanced_orders(["a", "b"], 4), step)
+
+
+class LatencySummaryTests(unittest.TestCase):
+    def sample(self, arm, ms, position, verified=True, scenario="edit"):
+        return {"arm": arm, "scenario": scenario, "position": position, "wall_ms": ms, "verified": verified}
+
+    def test_min_median_n_cover_verified_samples_only(self):
+        summary = summarize_latency([
+            self.sample("a", 30.0, 0), self.sample("a", 10.0, 1), self.sample("a", 20.0, 0),
+            self.sample("a", 1.0, 1, verified=False), self.sample("b", 5.0, 0, scenario="restore")])
+        cell = summary["a/edit"]
+        self.assertEqual((cell["n"], cell["min_ms"], cell["median_ms"], cell["max_ms"], cell["failed"]),
+                         (3, 10.0, 20.0, 30.0, 1))
+        self.assertEqual(cell["by_position"]["0"]["n"], 2)
+        self.assertEqual(cell["by_position"]["0"]["median_ms"], 25.0)
+        self.assertEqual(cell["by_position"]["1"]["min_ms"], 10.0)
+        self.assertEqual(summary["b/restore"]["n"], 1)
+
+    def test_a_cell_with_only_failures_has_no_timing(self):
+        cell = summarize_latency([self.sample("a", 1.0, 0, verified=False)])["a/edit"]
+        self.assertEqual((cell["n"], cell["min_ms"], cell["median_ms"], cell["failed"]), (0, None, None, 1))
+
+
+class GroundTruthTests(unittest.TestCase):
+    def test_generation_is_deterministic_per_seed(self):
+        self.assertEqual(ground_truth.sources(7), ground_truth.sources(7))
+        self.assertEqual(ground_truth.truth(7), ground_truth.truth(7))
+        self.assertNotEqual(ground_truth.truth(7)["callers"], ground_truth.truth(8)["callers"])
+
+    def test_every_truth_pair_is_a_call_in_the_generated_source(self):
+        files = ground_truth.sources(11)
+        planted = ground_truth.truth(11)
+        pairs = 0
+        for callee, rows in planted["callers"].items():
+            for path, caller in rows:
+                body = files[path].split(caller, 1)
+                self.assertEqual(len(body), 2, (path, caller))
+                # The caller's own definition line, up to the next definition.
+                definition = body[1].split("\n\n", 1)[0]
+                self.assertIn(callee + "()", definition, (path, caller, callee))
+                callee_path = next(p for p, name in planted["definitions"] if name == callee)
+                self.assertNotEqual(callee_path, path, "truth pairs are cross-file")
+                pairs += 1
+        self.assertEqual(pairs, len(ground_truth.LANGUAGES) * ground_truth.MODULES * ground_truth.CALLERS_PER_MODULE)
+
+    def test_no_call_is_planted_that_the_truth_omits(self):
+        files = ground_truth.sources(11)
+        planted = ground_truth.truth(11)
+        listed = {(path, caller, callee) for callee, rows in planted["callers"].items() for path, caller in rows}
+        found = set()
+        for path, text in files.items():
+            for chunk in text.split("\n\n"):
+                for _, name in planted["definitions"]:
+                    if f"{name}()" in chunk and "caller" in chunk.split("(", 1)[0]:
+                        defined = next((n for p, n in planted["definitions"] if p == path and n in chunk.split("(", 1)[0]), None)
+                        if defined and defined != name:
+                            found.add((path, defined, name))
+        self.assertEqual(found, listed)
+
+    def test_truth_is_kept_out_of_the_indexed_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tree, answers = Path(tmp) / "tree", Path(tmp) / "truth.json"
+            ground_truth.generate(tree, 3, answers)
+            self.assertTrue(answers.exists())
+            self.assertFalse(any(p.name.endswith(".json") for p in tree.rglob("*")))
+
+    def test_score_reports_unmeasurable_ratios_as_none(self):
+        self.assertEqual(ground_truth.score(set(), set())["recall"], None)
+        self.assertEqual(ground_truth.score({("a", "b")}, set())["precision"], None)
+        scored = ground_truth.score({("a", "x"), ("a", "y")}, {("a", "x"), ("b", "z")})
+        self.assertEqual((scored["precision"], scored["recall"]), (0.5, 0.5))
+
+
+class CallersProjectionTests(unittest.TestCase):
+    def test_devmap_keeps_direct_calls_to_the_target_only(self):
+        native = {"items": [
+            {"edge_kind": "Calls", "source_file": "m1.py", "source_symbol": "m1.py::caller",
+             "target_symbol": "m0.py::leaf"},
+            {"edge_kind": "Imports", "source_file": "m2.py", "source_symbol": "m2.py",
+             "target_symbol": "m0.py::leaf"}],
+            "truncated": False, "hidden": 0, "resolution": "Available",
+            "unresolved_namesakes": {"sites": [{"x": 1}]}}
+        rows, incomplete, aside = callers_projection("devmap", "leaf", native)
+        self.assertEqual(rows, {("m1.py", "caller")})
+        self.assertFalse(incomplete)
+        self.assertEqual(aside, {"non_call_edges": 1, "unresolved_namesake_sites": 1})
+
+    def test_devmap_unavailable_cannot_score(self):
+        with self.assertRaises(BenchError):
+            callers_projection("devmap", "leaf", {"items": [], "truncated": False, "resolution": "Unavailable"})
+
+    def test_codegraph_file_rows_are_set_aside_not_counted(self):
+        native = {"symbol": "leaf", "callers": [
+            {"name": "caller", "kind": "function", "filePath": "m1.py", "startLine": 3},
+            {"name": "m1.py", "kind": "file", "filePath": "m1.py", "startLine": 1}]}
+        rows, incomplete, aside = callers_projection("codegraph", "leaf", native)
+        self.assertEqual(rows, {("m1.py", "caller")})
+        self.assertFalse(incomplete)
+        self.assertEqual(aside, {"non_function_rows": 1})
+
+    def test_unknown_schema_is_refused(self):
+        for tool in ("devmap", "codegraph", "cbm"):
+            with self.subTest(tool=tool), self.assertRaises(BenchError):
+                callers_projection(tool, "leaf", {"error": "x"})
 
 
 if __name__ == "__main__":

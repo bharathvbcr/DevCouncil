@@ -194,51 +194,185 @@ fn test_s3_fts_fuzz_corpus() {
     }
 }
 
-#[test]
-fn differential_membership_preserves_full_generation_while_b3_write_amplification_is_open() {
-    // Membership remains correct. This does not prove B3's <100-row gate;
-    // the current carry-forward schema still writes O(repository size) rows.
-    let n = 500usize;
-    let mut files = Vec::new();
-    for i in 0..n {
-        files.push(extract_file(
-            &format!("src/f{i}.py"),
-            &format!("def fn_{i}(): pass\n"),
-        ));
+/// Rows one generation's write left behind, per relation, for a corpus of `n`
+/// files where `src/f{i}.py` calls into `src/f{i+1}.py` and the second
+/// generation edits the body of `src/f0.py` alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct B3WriteSet {
+    /// Rows keyed `generation_id = 2`, one relation each.
+    nodes: i64,
+    file_rows: i64,
+    fts_map: i64,
+    digests: i64,
+    dead: i64,
+    gaps: i64,
+    /// `file_payloads` the edit added: content-addressed, so the unchanged
+    /// files reuse generation 1's payload and only the edited file adds one.
+    payloads_added: i64,
+    /// Range rows the edit opened (`valid_from = 2`) or closed (`valid_to = 2`).
+    edges_opened: i64,
+    edges_closed: i64,
+    unresolved_opened: i64,
+    unresolved_closed: i64,
+    /// Generation 1's edge count, so a fixture with no edges cannot pass the
+    /// "the range tables are differential" half vacuously.
+    gen1_edges: i64,
+    members: usize,
+}
+
+impl B3WriteSet {
+    /// The rows B3's gate counts that are written in proportion to the edit.
+    fn differential(&self) -> i64 {
+        self.payloads_added
+            + self.edges_opened
+            + self.edges_closed
+            + self.unresolved_opened
+            + self.unresolved_closed
     }
-    let mut resolver = Resolver::new();
-    resolver.index_extractions(&files);
-    let resolution = resolver.resolve_all(&files).unwrap();
-    let analysis = analyze(&files, &resolution);
-    let store = Store::open_in_memory().unwrap();
-    store
-        .save_generation(&files, &resolution, &analysis)
-        .unwrap();
+
+    /// The rows still copied for every file or symbol of the repository.
+    fn carried(&self) -> i64 {
+        self.nodes + self.file_rows + self.fts_map + self.digests + self.dead + self.gaps
+    }
+}
+
+fn b3_measure_one_file_edit(n: usize) -> B3WriteSet {
+    let source = |i: usize, next: usize| {
+        format!("from src.f{next} import fn_{next}\n\ndef fn_{i}():\n    return fn_{next}()\n")
+    };
+    let files: Vec<_> = (0..n)
+        .map(|i| extract_file(&format!("src/f{i}.py"), &source(i, (i + 1) % n)))
+        .collect();
+    let dir = std::env::temp_dir().join(format!("devmap-b3-gate-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("devmap.sqlite");
+
+    let resolve = |files: &[Extraction]| {
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(files);
+        let resolution = resolver.resolve_all(files).unwrap();
+        let analysis = analyze(files, &resolution);
+        (resolution, analysis)
+    };
+    // Every count is taken through a connection opened after the `Store` is
+    // dropped: a second connection on a file a live `Store` holds would release
+    // that store's POSIX locks when it closed.
+    let count = |sql: &str| -> i64 {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    };
+
+    {
+        let (resolution, analysis) = resolve(&files);
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            store
+                .save_generation(&files, &resolution, &analysis)
+                .unwrap(),
+            1
+        );
+    }
+    let payloads_before = count("SELECT COUNT(*) FROM file_payloads");
+    let gen1_edges = count("SELECT COUNT(*) FROM edge_rows WHERE valid_from = 1");
 
     let mut edited = files.clone();
-    edited[0] = extract_file("src/f0.py", "def fn_0(): return 1\n");
-    let mut resolver2 = Resolver::new();
-    resolver2.index_extractions(&edited);
-    let resolution2 = resolver2.resolve_all(&edited).unwrap();
-    let analysis2 = analyze(&edited, &resolution2);
-    let gen2 = store
-        .save_generation_with_opts(
-            &edited,
-            &resolution2,
-            &analysis2,
-            GenerationWriteOpts {
-                affected_paths: vec!["src/f0.py".into()],
-                deleted_paths: vec![],
-                build_started: None,
-                repo_root: None,
-                discovery_refusals: None,
-                verify_every_row: false,
-            },
-        )
-        .unwrap();
-    assert_eq!(gen2, 2);
-    let paths = store.list_generation_paths(2).unwrap();
-    assert_eq!(paths.len(), n);
+    // Retarget the call, so the edit has edges to close and to open.
+    edited[0] = extract_file("src/f0.py", &source(0, 2));
+    let members = {
+        let (resolution, analysis) = resolve(&edited);
+        let store = Store::open(&db).unwrap();
+        let generation = store
+            .save_generation_with_opts(
+                &edited,
+                &resolution,
+                &analysis,
+                GenerationWriteOpts {
+                    affected_paths: vec!["src/f0.py".into()],
+                    deleted_paths: vec![],
+                    build_started: None,
+                    repo_root: None,
+                    discovery_refusals: None,
+                    verify_every_row: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(generation, 2);
+        store.list_generation_paths(2).unwrap().len()
+    };
+
+    let at_two = |table: &str| {
+        count(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE generation_id = 2"
+        ))
+    };
+    let set = B3WriteSet {
+        nodes: at_two("generation_nodes"),
+        file_rows: at_two("generation_file_rows"),
+        fts_map: at_two("nodes_fts_map"),
+        digests: at_two("generation_file_digests"),
+        dead: at_two("generation_dead_symbols"),
+        gaps: at_two("generation_coverage_gaps"),
+        payloads_added: count("SELECT COUNT(*) FROM file_payloads") - payloads_before,
+        edges_opened: count("SELECT COUNT(*) FROM edge_rows WHERE valid_from = 2"),
+        edges_closed: count("SELECT COUNT(*) FROM edge_rows WHERE valid_to = 2"),
+        unresolved_opened: count("SELECT COUNT(*) FROM unresolved_rows WHERE valid_from = 2"),
+        unresolved_closed: count("SELECT COUNT(*) FROM unresolved_rows WHERE valid_to = 2"),
+        gen1_edges,
+        members,
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    set
+}
+
+/// B3's gate — "a one-file edit writes <100 rows for that generation" — is
+/// **open**, and this test is what says by how much.
+///
+/// It measures the same one-file edit at two corpus sizes and pins both halves
+/// of the write separately, because they answer differently:
+///
+/// - the range relations (`edge_rows`, `unresolved_rows`, since v18) and the
+///   content-addressed `file_payloads` (v17) are differential: what the edit
+///   writes there does not grow with the repository, and stays under 100;
+/// - `generation_nodes`, `nodes_fts_map`, `generation_file_rows`,
+///   `generation_file_digests` and `generation_dead_symbols` are keyed on
+///   `generation_id` and re-written for every file and symbol on every build.
+///
+/// The second half is the gate's whole remaining cost. Closing it means moving
+/// those relations onto validity ranges as v18 did for edges — a store schema
+/// change GitPulse's vendored `dc-store` and the CLI fixtures both read — so the
+/// gate is re-scoped in `docs/devmap/DIVERGENCES.md` (B3) with these numbers
+/// rather than claimed. When that change lands this test fails on the
+/// `carried` assertions, which is the signal to re-measure and close B3.
+#[test]
+fn b3_one_file_edit_write_set_is_differential_for_ranges_and_o_repo_for_generation_keyed_rows() {
+    let small = b3_measure_one_file_edit(200);
+    let large = b3_measure_one_file_edit(500);
+    eprintln!("B3 write set, n=200: {small:?}");
+    eprintln!("B3 write set, n=500: {large:?}");
+
+    for (n, set) in [(200i64, small), (500i64, large)] {
+        // Membership stays complete: an incremental generation is the whole tree.
+        assert_eq!(set.members as i64, n);
+        assert!(
+            set.gen1_edges >= n,
+            "fixture must carry its cross-file calls: {set:?}"
+        );
+        // The differential half: one payload for the edited file, and the two
+        // edges the retargeted call closed and opened (the call and its import).
+        assert_eq!(set.payloads_added, 1, "{set:?}");
+        assert_eq!((set.edges_closed, set.edges_opened), (2, 2), "{set:?}");
+        assert_eq!(set.differential(), 5, "{set:?}");
+        // The generation-keyed half is a full copy: a file row and a digest per
+        // file, and a node and an FTS mapping per symbol (the File node and the
+        // function), plus the one symbol the edit left uncalled.
+        assert_eq!((set.file_rows, set.digests), (n, n), "{set:?}");
+        assert_eq!((set.nodes, set.fts_map), (2 * n, 2 * n), "{set:?}");
+        assert_eq!(set.dead, 1, "{set:?}");
+        assert_eq!(set.carried(), 6 * n + 1, "{set:?}");
+    }
+    // The gate counts both halves; the open half is what keeps it over 100.
+    assert!(small.differential() + small.carried() >= 100);
 }
 
 #[test]

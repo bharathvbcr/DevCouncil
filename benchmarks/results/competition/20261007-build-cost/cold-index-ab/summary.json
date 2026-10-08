@@ -1,0 +1,141 @@
+{
+  "binaries": {
+    "a": {
+      "path": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/69398020-02b2-41ba-b896-b1fe31a8cb0a/scratchpad/bin/devmap-A-head",
+      "sha256": "43d89cb13ecc600cc167afd6d4aa4d68a801e2c33f08f2dda7600cd678b527ae"
+    },
+    "b": {
+      "path": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/69398020-02b2-41ba-b896-b1fe31a8cb0a/scratchpad/bin/devmap-noindex-head",
+      "sha256": "788df2af0e06dcf112fff0e5c15812f87df8803ef90d8b5860e9ce96c25f5eba"
+    }
+  },
+  "corpus": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/69398020-02b2-41ba-b896-b1fe31a8cb0a/scratchpad/corpus/devcouncil",
+  "index": "idx_unresolved_rows_callee",
+  "rounds": 12,
+  "schedule": [
+    [
+      "a",
+      "b"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "a",
+      "b"
+    ],
+    [
+      "a",
+      "b"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "a",
+      "b"
+    ],
+    [
+      "a",
+      "b"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "a",
+      "b"
+    ]
+  ],
+  "built": {
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126
+  },
+  "arms": {
+    "a": {
+      "wall_s": {
+        "n": 12,
+        "min": 2.8851638339983765,
+        "median": 4.936118103996705,
+        "max": 7.966479833004996
+      },
+      "persist_write_s": {
+        "n": 12,
+        "min": 0.90637225,
+        "median": 1.35286025,
+        "max": 2.213844209
+      },
+      "persist_unresolved_s": {
+        "n": 12,
+        "min": 0.378075667,
+        "median": 0.5052790625,
+        "max": 1.017920542
+      },
+      "persist_commit_s": {
+        "n": 12,
+        "min": 0.087544833,
+        "median": 0.1226298125,
+        "max": 0.61841725
+      },
+      "store_bytes": {
+        "n": 12,
+        "min": 151650304,
+        "median": 151650304.0,
+        "max": 151650304
+      }
+    },
+    "b": {
+      "wall_s": {
+        "n": 12,
+        "min": 2.931639250004082,
+        "median": 4.779879583500588,
+        "max": 12.964995875001478
+      },
+      "persist_write_s": {
+        "n": 12,
+        "min": 0.814166917,
+        "median": 1.2377747499999998,
+        "max": 4.543785
+      },
+      "persist_unresolved_s": {
+        "n": 12,
+        "min": 0.262539417,
+        "median": 0.444763979,
+        "max": 1.616810334
+      },
+      "persist_commit_s": {
+        "n": 12,
+        "min": 0.09475825,
+        "median": 0.124558084,
+        "max": 0.472452167
+      },
+      "store_bytes": {
+        "n": 12,
+        "min": 148815872,
+        "median": 148815872.0,
+        "max": 148815872
+      }
+    }
+  },
+  "load_1m_range": [
+    30.068359375,
+    44.509765625
+  ]
+}

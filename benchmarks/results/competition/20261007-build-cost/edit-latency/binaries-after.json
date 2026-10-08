@@ -1,0 +1,23 @@
+{
+  "devmap": {
+    "path": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/69398020-02b2-41ba-b896-b1fe31a8cb0a/scratchpad/bin/devmap-A-head",
+    "version": "devmap 0.2.4 (store schema 25, code graph schema 2, build 34e20a44fd0c-dirty)",
+    "sha256": "43d89cb13ecc600cc167afd6d4aa4d68a801e2c33f08f2dda7600cd678b527ae",
+    "size_bytes": 68782416,
+    "mtime": "2026-10-08T02:15:55.779147+00:00"
+  },
+  "devmap_b": {
+    "path": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/69398020-02b2-41ba-b896-b1fe31a8cb0a/scratchpad/bin/devmap-B-forget",
+    "version": "devmap 0.2.4 (store schema 25, code graph schema 2, build 34e20a44fd0c-dirty)",
+    "sha256": "0cdc40ba9040eab565b378abc07817035bd43bd1424901b48709c03b02daf4c2",
+    "size_bytes": 68782416,
+    "mtime": "2026-10-08T02:12:20.220257+00:00"
+  },
+  "codegraph": {
+    "path": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/tools/codegraph/x/codegraph-darwin-arm64/bin/codegraph",
+    "version": "1.6.0",
+    "sha256": "3184bbf582b5db7cffd07373017631fdc4392842860c2e3991be3f23b6fb3559",
+    "size_bytes": 1004,
+    "mtime": "2026-08-26T17:05:45+00:00"
+  }
+}

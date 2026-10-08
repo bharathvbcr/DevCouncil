@@ -1,0 +1,56 @@
+diff --git a/rust/devmap-cli/src/main.rs b/rust/devmap-cli/src/main.rs
+index 80ca8c13..53fc4755 100644
+--- a/rust/devmap-cli/src/main.rs
++++ b/rust/devmap-cli/src/main.rs
+@@ -5447,7 +5447,8 @@ async fn main() -> std::process::ExitCode {
+         Ok(()) => run(&cli, progress.as_ref()).await,
+         Err(message) => Err(anyhow::anyhow!(message)),
+     };
+-    match outcome {
++    teardown_probe("main:run_returned");
++    let code = match outcome {
+         Ok(()) => {
+             if let Some(presentation) = &presentation {
+                 presentation.finish(true);
+@@ -5539,6 +5540,18 @@ async fn main() -> std::process::ExitCode {
+             }
+             std::process::ExitCode::FAILURE
+         }
++    };
++    teardown_probe("main:matched");
++    drop(presentation); teardown_probe("drop:presentation");
++    drop(fallback); teardown_probe("drop:fallback");
++    drop(progress); teardown_probe("drop:progress");
++    code
++}
++
++fn teardown_probe(label: &str) {
++    if std::env::var_os("DEVMAP_TEARDOWN_PROBE").is_some() {
++        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
++        eprintln!("teardown-probe {label} {}", now.as_micros());
+     }
+ }
+ 
+@@ -6313,6 +6326,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
+                         "manifest": manifest.as_ref().map(|manifest| &manifest.json),
+                     }),
+                 )?;
++                teardown_probe("json:emitted");
+             } else {
+                 let mut summary = vec![
+                     format!(
+@@ -6364,6 +6378,14 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
+                     }
+                 }
+             }
++            teardown_probe("arm:end_of_output");
++            drop(manifest); teardown_probe("drop:manifest");
++            drop(analysis); teardown_probe("drop:analysis");
++            drop(resolution); teardown_probe("drop:resolution");
++            drop(resolver); teardown_probe("drop:resolver");
++            drop(extractions); teardown_probe("drop:extractions");
++            drop(discovery); teardown_probe("drop:discovery");
++            drop(store); teardown_probe("drop:store");
+         }
+         Commands::Search {
+             query,
